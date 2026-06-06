@@ -1632,4 +1632,42 @@ fi
 rm -f "$UI_INPUT"
 
 echo ""
+echo "=== Phase 16: stdio server leaves no orphan after shutdown ==="
+# Regression guard for the orphaned-server failure mode behind #406: a running
+# stdio MCP server must TERMINATE (not linger as a background process) once its
+# stdin closes. POSIX-only — Windows handles parent death via job objects and
+# mkfifo is unavailable on the MSYS2 shell.
+SHUT_FIFO="$TMPDIR/shutdown_stdin"
+if mkfifo "$SHUT_FIFO" 2>/dev/null; then
+  # Hold the FIFO's write end open with a slow writer so the server keeps
+  # running (blocked on stdin); killing the writer sends EOF → shutdown.
+  sleep 60 > "$SHUT_FIFO" &
+  SHUT_HOLDER_PID=$!
+  "$BINARY" < "$SHUT_FIFO" > /dev/null 2>&1 &
+  SHUT_SRV_PID=$!
+  sleep 1
+  if ! kill -0 "$SHUT_SRV_PID" 2>/dev/null; then
+    echo "FAIL 16: stdio server did not stay up with stdin held open"
+    kill "$SHUT_HOLDER_PID" 2>/dev/null || true
+    exit 1
+  fi
+  echo "OK 16a: stdio server running (pid $SHUT_SRV_PID)"
+  kill "$SHUT_HOLDER_PID" 2>/dev/null || true  # close stdin → EOF → shutdown
+  SHUT_GONE=0
+  for _ in $(seq 1 60); do
+    if ! kill -0 "$SHUT_SRV_PID" 2>/dev/null; then SHUT_GONE=1; break; fi
+    sleep 0.1
+  done
+  if [ "$SHUT_GONE" -ne 1 ]; then
+    echo "FAIL 16: stdio server still running after stdin closed (orphan process)"
+    kill -9 "$SHUT_SRV_PID" 2>/dev/null || true
+    exit 1
+  fi
+  wait "$SHUT_SRV_PID" 2>/dev/null || true
+  echo "OK 16b: stdio server terminated after shutdown, no orphan"
+else
+  echo "SKIP Phase 16: mkfifo unavailable (non-POSIX shell)"
+fi
+
+echo ""
 echo "=== smoke-test: ALL PASSED ==="
