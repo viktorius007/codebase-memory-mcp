@@ -35,6 +35,9 @@ extern void suite_repro_issue382(void);
 extern void suite_repro_issue408(void);
 extern void suite_repro_issue56(void);
 extern void suite_repro_issue480(void);
+extern void suite_repro_issue571(void);
+extern void suite_repro_issue523(void);
+extern void suite_repro_issue546(void);
 
 int main(void) {
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
@@ -57,6 +60,9 @@ int main(void) {
     RUN_SUITE(repro_issue408);
     RUN_SUITE(repro_issue56);
     RUN_SUITE(repro_issue480);
+    RUN_SUITE(repro_issue571);
+    RUN_SUITE(repro_issue523);
+    RUN_SUITE(repro_issue546);
 
     TEST_SUMMARY();
 }

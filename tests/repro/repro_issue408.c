@@ -29,7 +29,7 @@
  *
  * Expected (correct) behaviour:
  *   Indexing a minimal monorepo:
- *       root/package.json        { "workspaces": ["packages/*"] }
+ *       root/package.json        { "workspaces": ["packages/<glob>"] }
  *       packages/a/package.json  { "name": "@org/a", "main": "index.js" }
  *       packages/a/index.js      export function fromA() { return 1; }
  *       packages/b/package.json  { "name": "@org/b", "main": "index.js" }

@@ -19,6 +19,7 @@
 #include "cbm.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
+#include <pipeline/pipeline.h> /* cbm_project_name_from_path */
 
 #include <string.h>
 #include <stdlib.h>
