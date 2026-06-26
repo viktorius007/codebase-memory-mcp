@@ -793,14 +793,21 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     project_db_path(project, path, sizeof(path));
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
-        /* Check DB integrity — auto-clean corrupt databases */
+        /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {
             cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                          "deleting corrupt db — re-index required");
+                          "backing up corrupt db to .corrupt — re-index required");
             cbm_store_close(srv->store);
             srv->store = NULL;
-            /* Delete the corrupt DB + WAL/SHM files */
-            cbm_unlink(path);
+            /* #557 (data loss): rename the corrupt DB to a .corrupt backup instead
+             * of unlinking it, so the user's graph is recoverable / reportable.
+             * Re-index rebuilds a fresh DB at `path`. WAL/SHM are transient. */
+            char bak_path[MCP_FIELD_SIZE];
+            snprintf(bak_path, sizeof(bak_path), "%s.corrupt", path);
+            cbm_unlink(bak_path); /* clear any prior backup so rename succeeds on Windows */
+            if (rename(path, bak_path) != 0) {
+                cbm_unlink(path); /* rename failed (e.g. cross-device) — fall back to delete */
+            }
             char wal_path[MCP_FIELD_SIZE];
             char shm_path[MCP_FIELD_SIZE];
             snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
