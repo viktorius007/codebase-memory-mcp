@@ -1110,9 +1110,26 @@ static bool is_export_of_declaration(TSNode node) {
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth) {
     if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
-        const char *fqn = compute_func_qn(ctx, node, spec, state);
-        if (fqn) {
-            push_scope(state, SCOPE_FUNC, depth, fqn);
+        /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
+         * but the def walk does not descend into function bodies, so it emits no
+         * node for it. Pushing a func scope here would attribute in-body calls to
+         * that nodeless local binding — the CALLS edge then sources to neither a
+         * Function nor the Module. Only the OUTERMOST value_definition pushes a
+         * scope (none already on the stack), matching what the def walk extracts. */
+        bool skip_nested = false;
+        if (ctx->language == CBM_LANG_OCAML) {
+            for (int i = 0; i < state->scope_top; i++) {
+                if (state->scopes[i].kind == SCOPE_FUNC) {
+                    skip_nested = true;
+                    break;
+                }
+            }
+        }
+        if (!skip_nested) {
+            const char *fqn = compute_func_qn(ctx, node, spec, state);
+            if (fqn) {
+                push_scope(state, SCOPE_FUNC, depth, fqn);
+            }
         }
     } else if (spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)) {
         const char *cqn = compute_class_qn(ctx, node, state);
