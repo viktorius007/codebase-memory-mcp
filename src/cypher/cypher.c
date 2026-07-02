@@ -1593,15 +1593,35 @@ static char *parse_order_by_expr(parser_t *p, char *buf, size_t buf_sz) {
     return buf;
 }
 
+/* Consume an ORDER BY key's optional ASC/DESC direction; NULL if absent. */
+static const char *parse_order_dir_token(parser_t *p) {
+    if (match(p, TOK_ASC)) {
+        return "ASC";
+    }
+    if (match(p, TOK_DESC)) {
+        return "DESC";
+    }
+    return NULL;
+}
+
 static void parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
     expect(p, TOK_BY);
     char order_buf[CBM_SZ_256];
     parse_order_by_expr(p, order_buf, sizeof(order_buf));
     r->order_by = heap_strdup(order_buf);
-    if (match(p, TOK_ASC)) {
-        r->order_dir = heap_strdup("ASC");
-    } else if (match(p, TOK_DESC)) {
-        r->order_dir = heap_strdup("DESC");
+    const char *dir = parse_order_dir_token(p);
+    if (dir) {
+        r->order_dir = heap_strdup(dir);
+    }
+    /* openCypher allows a comma-separated list of sort keys. The single-column
+     * executor sorts by the first key only, but every remaining key MUST still
+     * be consumed here — otherwise the trailing ", key ..." is left unparsed and
+     * a following SKIP/LIMIT is silently dropped, materializing the whole
+     * unbounded result set. */
+    while (match(p, TOK_COMMA)) {
+        char extra_buf[CBM_SZ_256];
+        parse_order_by_expr(p, extra_buf, sizeof(extra_buf));
+        parse_order_dir_token(p);
     }
 }
 
@@ -1822,6 +1842,10 @@ static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recur
         q->union_next = sub.query;
         sub.query = NULL;
         cbm_parse_free(&sub);
+        /* The recursive sub-parse consumed and validated the entire UNION tail
+         * (including its own trailing EOF); mark it consumed so cbm_parse's
+         * end-of-input assertion below does not misfire on the UNION remainder. */
+        p->pos = p->count;
     }
     return 0;
 }
@@ -1881,6 +1905,17 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
 
     if (parse_post_where(&p, q, &pat_cap) < 0) {
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse query");
+        cbm_query_free(q);
+        return CBM_NOT_FOUND;
+    }
+
+    /* Every token must be consumed. A leftover non-EOF token means a clause was
+     * silently dropped (e.g. a second ORDER BY key that swallowed the LIMIT, or
+     * a SKIP after LIMIT) — surface it as an error instead of honoring a partial
+     * query whose LIMIT/SKIP was quietly discarded. */
+    if (!check(&p, TOK_EOF)) {
+        snprintf(p.error, sizeof(p.error), "unexpected trailing tokens at pos %d", peek(&p)->pos);
+        out->error = heap_strdup(p.error);
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
