@@ -515,6 +515,23 @@ TEST(sw_oversized_node) {
     PASS();
 }
 
+/* Test seam over the file-static text_serial_type in sqlite_writer.c. */
+extern int64_t cbm_text_serial_type_for_test(int len);
+
+/* Regression: TEXT serial type must be computed in 64-bit. For a length whose
+ * doubling overflows a 32-bit int, `len * 2` done in `int` wraps negative and
+ * sign-extends into the int64 result — so put_varint would emit 10 bytes into
+ * the 9-byte vbuf in rec_add_text (CWE-787). The correct serial type is the
+ * full 64-bit value len*2 + 13. Machine-safe: asserts the numeric contract
+ * directly, no ~1 GiB allocation. */
+TEST(sw_text_serial_type_no_int32_overflow) {
+    /* INT_MAX/2 + 1: smallest len whose *2 overflows int32. */
+    int len = 1073741824;
+    int64_t expected = (int64_t)len * 2 + 13; /* 2147483661 */
+    ASSERT_EQ(cbm_text_serial_type_for_test(len), expected);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(sqlite_writer) {
@@ -524,4 +541,5 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_empty);
     RUN_TEST(sw_multi_page);
     RUN_TEST(sw_oversized_node);
+    RUN_TEST(sw_text_serial_type_no_int32_overflow);
 }

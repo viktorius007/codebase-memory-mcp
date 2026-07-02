@@ -212,6 +212,12 @@ static int64_t text_serial_type(int len) {
     return (len * PAIR_LEN) + TEXT_SERIAL_BASE;
 }
 
+// Test seam: exposes the file-static text_serial_type so its 64-bit numeric
+// contract can be asserted directly, without constructing a ~1 GiB TEXT value.
+int64_t cbm_text_serial_type_for_test(int len) {
+    return text_serial_type(len);
+}
+
 // SQLite serial type for an integer value
 static int64_t int_serial_type(int64_t val) {
     if (val == 0) {
