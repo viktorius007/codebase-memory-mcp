@@ -4118,6 +4118,35 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     return CBM_STORE_OK;
 }
 
+/* Populate each package's cross-package fan-in/fan-out from call boundaries,
+ * joining by package name. Uses the SAME arch_boundaries data the layer
+ * analysis consumes, so the packages aspect reports counts consistent with the
+ * layers aspect instead of a hard-coded zero. Best-effort: on failure the fan
+ * fields stay zero and the packages aspect still succeeds. */
+static void arch_fill_package_fan(cbm_store_t *s, const char *project, const char *path,
+                                  cbm_package_summary_t *pkgs, int npkgs) {
+    cbm_cross_pkg_boundary_t *boundaries = NULL;
+    int bcount = 0;
+    if (arch_boundaries(s, project, path, &boundaries, &bcount) != CBM_STORE_OK) {
+        return;
+    }
+    for (int i = 0; i < npkgs; i++) {
+        for (int b = 0; b < bcount; b++) {
+            if (strcmp(boundaries[b].from, pkgs[i].name) == 0) {
+                pkgs[i].fan_out += boundaries[b].call_count;
+            }
+            if (strcmp(boundaries[b].to, pkgs[i].name) == 0) {
+                pkgs[i].fan_in += boundaries[b].call_count;
+            }
+        }
+    }
+    for (int i = 0; i < bcount; i++) {
+        safe_str_free(&boundaries[i].from);
+        safe_str_free(&boundaries[i].to);
+    }
+    free(boundaries);
+}
+
 static int arch_packages(cbm_store_t *s, const char *project, const char *path,
                          cbm_architecture_info_t *out) {
     char norm[CBM_SZ_512];
@@ -4166,6 +4195,8 @@ static int arch_packages(cbm_store_t *s, const char *project, const char *path,
             return rc;
         }
     }
+
+    arch_fill_package_fan(s, project, path, arr, n);
 
     out->packages = arr;
     out->package_count = n;
