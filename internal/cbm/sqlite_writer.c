@@ -209,7 +209,7 @@ static int varint_len(int64_t value) {
 
 // SQLite serial type for a TEXT value
 static int64_t text_serial_type(int len) {
-    return (len * PAIR_LEN) + TEXT_SERIAL_BASE;
+    return ((int64_t)len * PAIR_LEN) + TEXT_SERIAL_BASE;
 }
 
 // Test seam: exposes the file-static text_serial_type so its 64-bit numeric
