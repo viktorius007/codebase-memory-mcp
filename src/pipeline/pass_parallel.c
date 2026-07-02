@@ -1400,6 +1400,13 @@ static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
     return !is_junk_url(norm);
 }
 
+/* Strict HTTP-route-literal predicate (owned by service_patterns.c; declared
+ * locally, mirroring pass_route_nodes.c, because service_patterns.h does not
+ * export it). Rejects filesystem roots (/tmp, /Users, ...), filesystem
+ * extensions (.db, .conf, ...) and delimiter/path-builder callees while
+ * accepting http(s):// and /api-style routes. */
+bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
+
 /* Detect API paths in call arguments and create HTTP_CALLS edges. */
 static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                const CBMCall *call) {
@@ -1411,6 +1418,13 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         }
         char norm[CBM_SZ_256];
         if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
+            continue;
+        }
+        /* Gate on the strict predicate so ordinary filesystem-path literals
+         * (Path::new("/tmp/fixture"), PathBuf::from("/x.db"), ...) do not mint
+         * phantom Routes. route_edge_visitor already gates HTTP_CALLS on this;
+         * this closes the detect_url_in_args bypass. */
+        if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
             continue;
         }
         char route_qn[CBM_ROUTE_QN_SIZE];
