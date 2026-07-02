@@ -39,6 +39,9 @@
 
 /* Forward declarations for early callers in the file. */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
+static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node);
+static const CBMType *rust_parse_type_node_inner(RustLSPContext *ctx, TSNode node);
+static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node);
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
                                     const char *strategy, float confidence);
 static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn);
@@ -56,6 +59,13 @@ static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char 
 static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text);
 static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_name,
                                          const char *trait_qn);
+
+/* Depth caps for the recursive resolver/parser walks. One C frame per level of
+ * nested expression/type; past the cap the subtree degrades to unknown / stops
+ * resolving rather than exhausting the stack. Mirrors c_lsp.c's walk guard. */
+#define RUST_LSP_MAX_TYPE_DEPTH 512
+#define RUST_LSP_MAX_EVAL_DEPTH 512
+#define RUST_LSP_MAX_WALK_DEPTH 512
 
 void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
                    const CBMTypeRegistry *registry, const char *module_qn,
@@ -572,6 +582,15 @@ static const char *resolve_path_to_type_qn(RustLSPContext *ctx, const char *path
 }
 
 const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
+    if (ctx->type_depth >= RUST_LSP_MAX_TYPE_DEPTH)
+        return cbm_type_unknown();
+    ctx->type_depth++;
+    const CBMType *result = rust_parse_type_node_inner(ctx, node);
+    ctx->type_depth--;
+    return result;
+}
+
+static const CBMType *rust_parse_type_node_inner(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
     }
@@ -1246,6 +1265,15 @@ static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType
                                               const char *member);
 
 const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
+    if (ctx->eval_depth >= RUST_LSP_MAX_EVAL_DEPTH)
+        return cbm_type_unknown();
+    ctx->eval_depth++;
+    const CBMType *result = rust_eval_expr_type_inner(ctx, node);
+    ctx->eval_depth--;
+    return result;
+}
+
+static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
     }
@@ -3831,7 +3859,21 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
 /* Walk every node in a function body, recording calls and refining scope
  * for control-flow constructs that bind variables. */
 #define CBM_RUST_EVAL_STEP_CAP 200000 /* per-file budget */
+
+/* Depth-guarded entry. eval_step_count (below) is a per-file TOTAL-work budget
+ * — it bounds width but a linearly deep tree recurses ~200 000 frames before it
+ * trips, overflowing the 8 MB C stack first. walk_depth adds the true per-level
+ * depth bound; past the cap the subtree is skipped (calls stay unresolved =
+ * graceful degradation). Mirrors c_resolve_calls_in_node. */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= RUST_LSP_MAX_WALK_DEPTH)
+        return;
+    ctx->walk_depth++;
+    rust_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
+
+static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     /* Pathological-input guard: bail out once we've spent too many

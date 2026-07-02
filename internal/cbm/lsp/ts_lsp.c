@@ -43,6 +43,7 @@ extern const TSLanguage *tree_sitter_javascript(void);
 
 static const CBMType *parse_ts_type_text(CBMArena *arena, const char *text, const char *module_qn);
 static void process_node(TSLSPContext *ctx, TSNode node);
+static void process_node_inner(TSLSPContext *ctx, TSNode node);
 static void process_function_body(TSLSPContext *ctx, TSNode body, const char *func_qn,
                                   const char *class_qn);
 static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name);
@@ -2671,7 +2672,23 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
     ts_emit_unresolved_call(ctx, tag_name, "jsx_component_not_in_registry");
 }
 
+#define TS_LSP_MAX_WALK_DEPTH 512
+
+/* Depth-guarded entry: the call-resolution walk recurses one C frame per AST
+ * nesting level (e.g. deeply nested call expressions). Past the cap the subtree
+ * is skipped — its calls stay unresolved, graceful degradation, not a
+ * stack-exhaustion crash. Mirrors c_resolve_calls_in_node. */
 static void process_node(TSLSPContext *ctx, TSNode node) {
+    if (!ctx)
+        return;
+    if (ctx->walk_depth >= TS_LSP_MAX_WALK_DEPTH)
+        return;
+    ctx->walk_depth++;
+    process_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
+
+static void process_node_inner(TSLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);

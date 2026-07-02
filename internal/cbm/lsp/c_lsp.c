@@ -920,7 +920,24 @@ static const CBMType *c_resolve_name_to_type(CLSPContext *ctx, const char *name)
 // c_parse_type_node: AST type node -> CBMType
 // ============================================================================
 
+static const CBMType *c_parse_type_node_inner(CLSPContext *ctx, TSNode node);
+
+#define C_LSP_MAX_TYPE_DEPTH 512
+
+/* Depth-guarded entry: type parsing recurses one C frame per level of nested
+ * generic/pointer type (e.g. Vec<Vec<...>>). Past the cap the subtree collapses
+ * to `unknown` — graceful degradation, not a stack-exhaustion crash. Mirrors
+ * the c_resolve_calls_in_node walk guard. */
 const CBMType *c_parse_type_node(CLSPContext *ctx, TSNode node) {
+    if (ctx->type_depth >= C_LSP_MAX_TYPE_DEPTH)
+        return cbm_type_unknown();
+    ctx->type_depth++;
+    const CBMType *result = c_parse_type_node_inner(ctx, node);
+    ctx->type_depth--;
+    return result;
+}
+
+static const CBMType *c_parse_type_node_inner(CLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
     const char *kind = ts_node_type(node);

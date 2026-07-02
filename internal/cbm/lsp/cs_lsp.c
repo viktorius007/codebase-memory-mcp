@@ -57,6 +57,14 @@ extern const TSLanguage *tree_sitter_c_sharp(void);
 /* ── forward decls ──────────────────────────────────────────────── */
 
 static void cs_resolve_calls_in_node(CSLSPContext *ctx, TSNode node);
+static void cs_resolve_calls_in_node_inner(CSLSPContext *ctx, TSNode node);
+static const CBMType *cs_parse_type_node_inner(CSLSPContext *ctx, TSNode node);
+
+/* Recursion-depth caps for the AST walks that lacked one. One C frame per level
+ * of nesting; past the cap the subtree is skipped / collapses to unknown rather
+ * than exhausting the stack. Mirrors c_lsp.c's walk guard. */
+#define CS_LSP_MAX_WALK_DEPTH 512
+#define CS_LSP_MAX_TYPE_DEPTH 512
 static void cs_process_function_like(CSLSPContext *ctx, TSNode node);
 static void cs_process_type_decl(CSLSPContext *ctx, TSNode node);
 static const CBMType *cs_eval_invocation_type(CSLSPContext *ctx, TSNode call);
@@ -571,6 +579,15 @@ static const CBMRegisteredFunc *cs_lookup_extension(CSLSPContext *ctx,
 /* ── type AST parsing ───────────────────────────────────────────── */
 
 const CBMType *cs_parse_type_node(CSLSPContext *ctx, TSNode node) {
+    if (ctx->type_depth >= CS_LSP_MAX_TYPE_DEPTH)
+        return cbm_type_unknown();
+    ctx->type_depth++;
+    const CBMType *result = cs_parse_type_node_inner(ctx, node);
+    ctx->type_depth--;
+    return result;
+}
+
+static const CBMType *cs_parse_type_node_inner(CSLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) return cbm_type_unknown();
     const char *kind = ts_node_type(node);
 
@@ -1628,6 +1645,14 @@ static void cs_resolve_object_creation(CSLSPContext *ctx, TSNode call) {
 }
 
 static void cs_resolve_calls_in_node(CSLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= CS_LSP_MAX_WALK_DEPTH)
+        return;
+    ctx->walk_depth++;
+    cs_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
+
+static void cs_resolve_calls_in_node_inner(CSLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) return;
     const char *kind = ts_node_type(node);
 

@@ -69,6 +69,16 @@ typedef struct {
     int dict_literal_count;
     int dict_literal_cap;
 
+    // Recursion-depth guards (crash guard). The call-resolution and
+    // expression-type walks recurse one C frame per AST nesting level
+    // (deeply nested calls `f(f(…))`, parenthesized expressions `((…))`) — no
+    // context existed before, so a pathological file exhausted the stack.
+    // walk_depth bounds py_resolve_calls_in; eval_depth bounds
+    // py_eval_expr_type. Past the cap the subtree degrades gracefully. Mirrors
+    // c_lsp.c's walk/eval guards.
+    int walk_depth;
+    int eval_depth;
+
     // Debug mode (CBM_LSP_DEBUG env, shared across all language LSPs).
     bool debug;
 } PyLSPContext;

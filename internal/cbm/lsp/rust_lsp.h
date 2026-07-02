@@ -164,6 +164,17 @@ typedef struct {
      * produced a call node. */
     int inject_syn_calls;
 
+    /* Recursion-depth guards (crash guard, distinct from the eval_step_count
+     * width budget). Separate counters mirror c_lsp.c so mutually-recursive
+     * walks don't share a budget and prematurely degrade legitimately-deep
+     * code. type_depth bounds rust_parse_type_node on deeply nested generics
+     * (Vec<Vec<…>>); eval_depth bounds rust_eval_expr_type; walk_depth bounds
+     * rust_resolve_calls_in_node. Past the cap the subtree collapses to unknown
+     * / stops resolving — graceful degradation, not stack exhaustion. */
+    int type_depth;
+    int eval_depth;
+    int walk_depth;
+
     /* CBM_LSP_DEBUG=1 in env enables verbose stderr trace. */
     bool debug;
 } RustLSPContext;
