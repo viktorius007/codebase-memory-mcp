@@ -2109,6 +2109,79 @@ TEST(snippet_enriched_properties) {
     PASS();
 }
 
+/* ── TestOutput_OmitsInternalSimilarityFields ─────────────────────
+ * The similarity-detection pipeline persists three internal-only fields in a
+ * node's properties_json — "fp" (MinHash fingerprint hex), "sp" (AST structural
+ * profile vector) and "bt" (body-token bag). These exist purely so the indexing
+ * passes can recompute similarity edges from the DB column; they are noise to an
+ * MCP consumer and waste its context. enrich_node_properties must filter them out
+ * of BOTH tool responses (get_code_snippet and search_graph) while still surfacing
+ * genuine public fields. This test injects a node whose properties mix a public
+ * field with all three internal blobs and pins that only the public field escapes. */
+TEST(tool_output_omits_internal_similarity_fields) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    /* A node carrying a public "signature" alongside the internal fp/sp/bt trio,
+     * with distinctive blob values so their absence is checkable by value too. */
+    cbm_node_t probe = {0};
+    probe.project = "test-project";
+    probe.label = "Function";
+    probe.name = "LeakProbe";
+    probe.qualified_name = "test-project.cmd.server.main.LeakProbe";
+    probe.file_path = "main.go";
+    probe.start_line = 3;
+    probe.end_line = 5;
+    probe.properties_json = "{\"signature\":\"func LeakProbe() error\","
+                            "\"is_exported\":true,"
+                            "\"fp\":\"deadbeefcafef00dfp\","
+                            "\"sp\":\"11,22,33,44,55\","
+                            "\"bt\":\"alphaProbe betaProbe gammaProbe\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &probe), 0);
+
+    /* get_code_snippet path (build_snippet_response → enrich_node_properties). */
+    char *snip = call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.LeakProbe\","
+                                   "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(snip);
+    ASSERT_NOT_NULL(strstr(snip, "\"signature\""));  /* public field survives */
+    ASSERT_NOT_NULL(strstr(snip, "func LeakProbe")); /* public value survives */
+    ASSERT_NULL(strstr(snip, "\"fp\""));             /* internal key filtered */
+    ASSERT_NULL(strstr(snip, "\"sp\""));
+    ASSERT_NULL(strstr(snip, "\"bt\""));
+    ASSERT_NULL(strstr(snip, "deadbeefcafef00dfp")); /* internal value gone */
+    ASSERT_NULL(strstr(snip, "11,22,33,44,55"));
+    ASSERT_NULL(strstr(snip, "alphaProbe"));
+    free(snip);
+
+    /* search_graph path (emit_search_results → enrich_node_properties). */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"LeakProbe\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"signature\"")); /* public field survives */
+    ASSERT_NOT_NULL(strstr(inner, "func LeakProbe"));
+    ASSERT_NULL(strstr(inner, "\"fp\"")); /* internal key filtered */
+    ASSERT_NULL(strstr(inner, "\"sp\""));
+    ASSERT_NULL(strstr(inner, "\"bt\""));
+    ASSERT_NULL(strstr(inner, "deadbeefcafef00dfp")); /* internal value gone */
+    ASSERT_NULL(strstr(inner, "11,22,33,44,55"));
+    ASSERT_NULL(strstr(inner, "alphaProbe"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ── TestSnippet_FuzzyLastSegment ─────────────────────────────── */
 
 TEST(snippet_fuzzy_last_segment) {
@@ -3371,6 +3444,7 @@ SUITE(mcp) {
     RUN_TEST(snippet_not_found);
     RUN_TEST(snippet_fuzzy_suggestions);
     RUN_TEST(snippet_enriched_properties);
+    RUN_TEST(tool_output_omits_internal_similarity_fields);
     RUN_TEST(snippet_fuzzy_last_segment);
     RUN_TEST(snippet_auto_resolve_default);
     RUN_TEST(snippet_auto_resolve_enabled);
