@@ -7,8 +7,12 @@
 #include "test_framework.h"
 #include <cypher/cypher.h>
 #include <store/store.h>
+#include <foundation/constants.h>
 #include <string.h>
 #include <stdlib.h>
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid crash isolation — POSIX only */
+#endif
 
 /* ══════════════════════════════════════════════════════════════════
  *  LEXER TESTS
@@ -2426,6 +2430,69 @@ TEST(cypher_parse_unwind_var) {
     PASS();
 }
 
+/* Regression: an UNWIND literal list whose JSON encoding far exceeds the
+ * parser's fixed 2KB scratch buffer must not overflow it. Before the fix,
+ * parse_unwind_clause grew its running length `blen` by snprintf's *intended*
+ * return value with no clamp, so once `blen` passed the buffer size the
+ * `sizeof(buf) - blen` size argument underflowed and `buf[blen++] = ']'` wrote
+ * past the 2KB stack buffer -> ASan stack-buffer-overflow / SIGSEGV.
+ *
+ * Machine-safe: the parse runs in a forked child so a crash on unfixed code is
+ * observed as a killed child, not a killed test runner. */
+TEST(cypher_unwind_long_list_bounded) {
+    char q[CBM_SZ_8K];
+    size_t off = 0;
+    int n = snprintf(q + off, sizeof(q) - off, "UNWIND [");
+    ASSERT_GT(n, 0);
+    off += (size_t)n;
+    /* 120 forty-char string elements -> ~5KB of JSON, far past the 2KB buf. */
+    for (int i = 0; i < 120; i++) {
+        n = snprintf(q + off, sizeof(q) - off, "%s\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+                     i ? "," : "");
+        ASSERT_GT(n, 0);
+        off += (size_t)n;
+    }
+    n = snprintf(q + off, sizeof(q) - off, "] AS x MATCH (nn) RETURN nn.name");
+    ASSERT_GT(n, 0);
+    off += (size_t)n;
+    ASSERT_LT(off, sizeof(q)); /* query fully built, not itself truncated */
+
+#if defined(_WIN32)
+    /* No fork on Windows: run inline — the fix must make this safe. */
+    cbm_query_t *parsed = NULL;
+    char *perr = NULL;
+    int rc = cbm_cypher_parse(q, &parsed, &perr);
+    (void)rc;
+    if (parsed) {
+        cbm_query_free(parsed);
+    }
+    free(perr);
+    PASS();
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    ASSERT_GTE(pid, 0);
+    if (pid == 0) {
+        cbm_query_t *parsed = NULL;
+        char *perr = NULL;
+        int rc = cbm_cypher_parse(q, &parsed, &perr);
+        (void)rc;
+        if (parsed) {
+            cbm_query_free(parsed);
+        }
+        free(perr);
+        _exit(0);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    /* RED on unfixed code: child dies mid-parse (ASan abort or SIGSEGV) — either
+     * a non-zero exit or a signal. GREEN: child parsed safely and exited 0. */
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
 /* ── Issue #389 group: Cypher feature reproductions ─────────────────
  * Each asserts the CORRECT behavior; a failure reproduces the bug. */
 
@@ -2681,4 +2748,5 @@ SUITE(cypher) {
     /* Phase 9: UNWIND */
     RUN_TEST(cypher_parse_unwind);
     RUN_TEST(cypher_parse_unwind_var);
+    RUN_TEST(cypher_unwind_long_list_bounded);
 }
