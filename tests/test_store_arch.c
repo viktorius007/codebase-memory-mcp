@@ -512,6 +512,82 @@ TEST(arch_layers) {
     PASS();
 }
 
+/* Packages array must report the SAME cross-package fan-in/fan-out that the
+ * layer analysis derives from call boundaries — not a hard-coded zero. Fixture
+ * has no Package nodes, so arch_packages derives names via cbm_qn_to_package,
+ * matching the boundary-derived names, and the join is unambiguous. */
+TEST(arch_packages_report_fan) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "fan", "/tmp/fan"), CBM_STORE_OK);
+
+    /* Two packages (alpha, beta) via 4-segment QNs: seg[2] is the package. */
+    cbm_node_t a1 = {.project = "fan",
+                     .label = "Function",
+                     .name = "a1",
+                     .qualified_name = "fan.src.alpha.a1",
+                     .file_path = "src/alpha/a.c"};
+    cbm_node_t a2 = {.project = "fan",
+                     .label = "Function",
+                     .name = "a2",
+                     .qualified_name = "fan.src.alpha.a2",
+                     .file_path = "src/alpha/a.c"};
+    cbm_node_t b1 = {.project = "fan",
+                     .label = "Function",
+                     .name = "b1",
+                     .qualified_name = "fan.src.beta.b1",
+                     .file_path = "src/beta/b.c"};
+    int64_t id_a1 = cbm_store_upsert_node(s, &a1);
+    int64_t id_a2 = cbm_store_upsert_node(s, &a2);
+    int64_t id_b1 = cbm_store_upsert_node(s, &b1);
+
+    /* Cross-package calls: alpha→beta and beta→alpha (each count 1). */
+    cbm_edge_t e_ab = {.project = "fan", .source_id = id_a1, .target_id = id_b1, .type = "CALLS"};
+    cbm_edge_t e_ba = {.project = "fan", .source_id = id_b1, .target_id = id_a2, .type = "CALLS"};
+    cbm_store_insert_edge(s, &e_ab);
+    cbm_store_insert_edge(s, &e_ba);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"packages", "boundaries"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "fan", NULL, aspects, 2, &info), CBM_STORE_OK);
+
+    ASSERT_TRUE(info.package_count >= 2);
+    ASSERT_TRUE(info.boundary_count > 0);
+
+    /* Ground truth: derive each package's fan from the boundaries aspect —
+     * exactly what the layer analysis does. The packages array must agree. */
+    bool saw_alpha = false, saw_beta = false;
+    for (int i = 0; i < info.package_count; i++) {
+        const char *pkg = info.packages[i].name;
+        int expect_in = 0, expect_out = 0;
+        for (int b = 0; b < info.boundary_count; b++) {
+            if (strcmp(info.boundaries[b].from, pkg) == 0)
+                expect_out += info.boundaries[b].call_count;
+            if (strcmp(info.boundaries[b].to, pkg) == 0)
+                expect_in += info.boundaries[b].call_count;
+        }
+        ASSERT_EQ(info.packages[i].fan_in, expect_in);
+        ASSERT_EQ(info.packages[i].fan_out, expect_out);
+        if (strcmp(pkg, "alpha") == 0) {
+            saw_alpha = true;
+            ASSERT_EQ(info.packages[i].fan_in, 1);
+            ASSERT_EQ(info.packages[i].fan_out, 1);
+        }
+        if (strcmp(pkg, "beta") == 0) {
+            saw_beta = true;
+            ASSERT_EQ(info.packages[i].fan_in, 1);
+            ASSERT_EQ(info.packages[i].fan_out, 1);
+        }
+    }
+    ASSERT_TRUE(saw_alpha);
+    ASSERT_TRUE(saw_beta);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_file_tree) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -1375,6 +1451,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_boundaries);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
+    RUN_TEST(arch_packages_report_fan);
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
 
