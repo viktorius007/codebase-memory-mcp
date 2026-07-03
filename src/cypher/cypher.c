@@ -30,6 +30,7 @@ enum {
     CYP_COL_BUF = 48,  /* max column buffer (16 vars * 3 cols) */
     CYP_FOUND_NONE = -1,
     /* search miss sentinel */ /* mask for ebuf ring buffer (8 entries) */
+    CYP_UNWIND_ELEM_MAX = 256, /* max chars copied from one UNWIND list token */
 };
 #define CYP_DBL_MAX 1e308
 
@@ -1717,33 +1718,54 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     return 0;
 }
 
+/* Append one UNWIND literal-list element token to `buf`, bounded against `cap`.
+ * `blen` is the current length; the return value is the new length, only ever
+ * advanced while it stays below `cap`, so `buf` can never overflow (over-long
+ * elements are truncated). Per-token text is additionally capped via `%.*s`. */
+static int unwind_append_elem(char *buf, int blen, int cap, const char *fmt, const char *text) {
+    int win = cap - blen;
+    if (win > 0) {
+        int w = snprintf(buf + blen, (size_t)win, fmt, CYP_UNWIND_ELEM_MAX, text);
+        blen += (w > 0 && w < win) ? w : (win - SKIP_ONE);
+    }
+    return blen;
+}
+
+/* Parse an UNWIND literal list [1, "a", ...] into a heap JSON array string.
+ * `cap` reserves the final two bytes for the closing ']' and NUL, and every
+ * write is bounded against it, so a list far larger than the fixed scratch
+ * buffer is truncated rather than overflowing it. Consumes through the ']'. */
+static char *parse_unwind_literal_list(parser_t *p) {
+    advance(p); /* '[' */
+    char buf[CBM_SZ_2K] = "[";
+    int blen = SKIP_ONE;
+    const int cap = (int)sizeof(buf) - PAIR_LEN;
+    while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
+        if (blen > SKIP_ONE && blen < cap) {
+            buf[blen++] = ',';
+        }
+        if (check(p, TOK_STRING)) {
+            blen = unwind_append_elem(buf, blen, cap, "\"%.*s\"", peek(p)->text);
+            advance(p);
+        } else if (check(p, TOK_NUMBER)) {
+            blen = unwind_append_elem(buf, blen, cap, "%.*s", peek(p)->text);
+            advance(p);
+        } else {
+            advance(p);
+        }
+        match(p, TOK_COMMA);
+    }
+    expect(p, TOK_RBRACKET);
+    buf[blen] = ']';
+    buf[blen + SKIP_ONE] = '\0';
+    return heap_strdup(buf);
+}
+
 /* Parse UNWIND [...] AS var clause into query */
 static void parse_unwind_clause(parser_t *p, cbm_query_t *q) {
     advance(p);
     if (check(p, TOK_LBRACKET)) {
-        /* Literal list: [1, 2, 3] — collect as JSON array string */
-        advance(p);
-        char buf[CBM_SZ_2K] = "[";
-        int blen = SKIP_ONE;
-        while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
-            if (blen > SKIP_ONE) {
-                buf[blen++] = ',';
-            }
-            if (check(p, TOK_STRING)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "\"%s\"", peek(p)->text);
-                advance(p);
-            } else if (check(p, TOK_NUMBER)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "%s", peek(p)->text);
-                advance(p);
-            } else {
-                advance(p);
-            }
-            match(p, TOK_COMMA);
-        }
-        expect(p, TOK_RBRACKET);
-        buf[blen++] = ']';
-        buf[blen] = '\0';
-        q->unwind_expr = heap_strdup(buf);
+        q->unwind_expr = parse_unwind_literal_list(p);
     } else if (check(p, TOK_IDENT)) {
         q->unwind_expr = heap_strdup(advance(p)->text);
     }
