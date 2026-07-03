@@ -274,6 +274,24 @@ static const char *path_basename(const char *path) {
     return last ? last + SKIP_ONE : path;
 }
 
+// True when `dir` (e.g. "tests") is a PATH SEGMENT of `path`, i.e. `path`
+// starts with "dir/" or contains "/dir/". A bare substring match is rejected on
+// purpose: `src/testing.rs` and `latest.rs` must NOT count as living under a
+// `tests/` directory.
+static bool has_path_dir_segment(const char *path, const char *dir) {
+    size_t dlen = strlen(dir);
+    if (strncmp(path, dir, dlen) == 0 && path[dlen] == '/') {
+        return true;
+    }
+    for (const char *slash = strchr(path, '/'); slash; slash = strchr(slash + SKIP_ONE, '/')) {
+        const char *seg = slash + SKIP_ONE;
+        if (strncmp(seg, dir, dlen) == 0 && seg[dlen] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Strip extension from basename
 static void strip_ext(const char *base, char *buf, size_t buflen) {
     const char *dot = strrchr(base, '.');
@@ -317,8 +335,13 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
                has_suffix(base, "Spec.kt") || has_suffix(base, "Test.scala") ||
                has_suffix(base, "Spec.scala");
     case CBM_LANG_RUST:
-        // Rust tests are typically mod tests inside the file, but test files too
-        return has_suffix(base, "_test.rs") || has_prefix(base, "test_");
+        // Rust tests are typically mod tests inside the file, but test files too.
+        // Cargo also places integration tests under a crate-root `tests/` dir and
+        // benchmarks under `benches/`, where the basename carries no _test.rs /
+        // test_ affix (e.g. tests/contract_tests.rs) — a basename-only rule
+        // misses those, so also honour the directory convention.
+        return has_suffix(base, "_test.rs") || has_prefix(base, "test_") ||
+               has_path_dir_segment(rel_path, "tests") || has_path_dir_segment(rel_path, "benches");
     case CBM_LANG_RUBY:
         return has_suffix(base, "_test.rb") || has_suffix(base, "_spec.rb") ||
                has_prefix(base, "test_");
