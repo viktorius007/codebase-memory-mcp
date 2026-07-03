@@ -1284,6 +1284,74 @@ TEST(arch_clusters_basic) {
     PASS();
 }
 
+/* A cluster's label must be the real package/crate name (QN segment[2]), not
+ * the top-level directory (segment[1]). With a repo layout like
+ * crates/<crate>/... every cluster would otherwise be uselessly labeled
+ * "crates". Two cliques, each dominated by a distinct crate under a shared top
+ * dir; each cluster's label must be that crate's name, never the top dir. */
+TEST(arch_cluster_label_is_crate_not_topdir) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* 5-segment QNs: test.crates.<crate>.mod.fnN — seg[1]="crates" (top dir),
+     * seg[2]=<crate> (real package). Two crates, one clique each. */
+    const char *crates[2] = {"alphacrate", "betacrate"};
+    int64_t id[8];
+    for (int i = 0; i < 8; i++) {
+        char nm[32];
+        char qn[80];
+        int grp = i / 4;
+        snprintf(nm, sizeof(nm), "fn%d", i);
+        snprintf(qn, sizeof(qn), "test.crates.%s.mod.fn%d", crates[grp], i);
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = nm,
+                           .qualified_name = qn,
+                           .file_path = "f.rs"};
+        id[i] = cbm_store_upsert_node(s, &node);
+    }
+    for (int g = 0; g < 2; g++) {
+        for (int a = 0; a < 4; a++) {
+            for (int b = a + 1; b < 4; b++) {
+                cbm_edge_t e = {.project = "test",
+                                .source_id = id[(g * 4) + a],
+                                .target_id = id[(g * 4) + b],
+                                .type = "CALLS"};
+                cbm_store_insert_edge(s, &e);
+            }
+        }
+    }
+    cbm_edge_t bridge = {
+        .project = "test", .source_id = id[0], .target_id = id[4], .type = "CALLS"};
+    cbm_store_insert_edge(s, &bridge);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_TRUE(info.cluster_count >= 2);
+
+    bool saw_alpha = false, saw_beta = false;
+    for (int i = 0; i < info.cluster_count; i++) {
+        ASSERT_NOT_NULL(info.clusters[i].label);
+        /* Never the top-level directory. */
+        ASSERT_TRUE(strcmp(info.clusters[i].label, "crates") != 0);
+        /* Always a real crate name. */
+        ASSERT_TRUE(strcmp(info.clusters[i].label, "alphacrate") == 0 ||
+                    strcmp(info.clusters[i].label, "betacrate") == 0);
+        if (strcmp(info.clusters[i].label, "alphacrate") == 0)
+            saw_alpha = true;
+        if (strcmp(info.clusters[i].label, "betacrate") == 0)
+            saw_beta = true;
+    }
+    ASSERT_TRUE(saw_alpha);
+    ASSERT_TRUE(saw_beta);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Helper function tests ──────────────────────────────────────── */
 
 TEST(qn_to_package) {
@@ -1489,6 +1557,7 @@ SUITE(store_arch) {
     RUN_TEST(leiden_multilevel_collapses_noise);
     RUN_TEST(leiden_resolution_controls_granularity);
     RUN_TEST(arch_clusters_basic);
+    RUN_TEST(arch_cluster_label_is_crate_not_topdir);
 
     /* Helpers */
     RUN_TEST(qn_to_package);

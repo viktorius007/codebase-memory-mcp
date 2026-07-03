@@ -5268,14 +5268,17 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
         ci->top_node_count = tn;
     }
 
-    /* Distinct packages (+ dominant one as the label). */
+    /* Distinct packages (+ dominant one as the label). Use cbm_qn_to_package
+     * (QN segment[2] — the real crate/package name) rather than
+     * cbm_qn_to_top_package (segment[1] — the top-level directory), so clusters
+     * in a crates/<crate>/... layout get meaningful crate-name labels instead
+     * of all collapsing to the shared top dir. */
     const char *pkgs[CBM_CLUSTER_MAX_PKGS];
     int pkg_counts[CBM_CLUSTER_MAX_PKGS];
     int pc = 0;
     for (int i = 0; i < n; i++) {
         if (comm[i] == c) {
-            cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS,
-                            cbm_qn_to_top_package(qns[i]));
+            cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS, cbm_qn_to_package(qns[i]));
         }
     }
     if (pc > 0) {
