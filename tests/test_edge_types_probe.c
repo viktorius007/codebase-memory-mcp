@@ -610,6 +610,83 @@ TEST(http_calls_reqwest_rust) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  HTTP_CALLS false-positives — filesystem paths must NOT mint Routes
+ *
+ *  detect_url_in_args (pass_parallel.c) runs for EVERY resolved call and,
+ *  pre-fix, minted a Route + HTTP_CALLS edge from ANY argument string whose
+ *  first char is '/', gated only by a weak junk filter with no filesystem-path
+ *  exclusion. On a pure-CLI codebase this invented HTTP Routes (and a downstream
+ *  "api" layer) from ordinary path literals like Path::new("/tmp/fixture").
+ *  The fix routes detect_url_in_args through the strict
+ *  cbm_service_pattern_is_http_route_literal predicate (already used by
+ *  route_edge_visitor) so filesystem roots (/tmp) and filesystem extensions
+ *  (.db) are rejected while genuine http(s):// and /api routes still pass.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* True iff a Route node with the exact given name exists in the graph. */
+static bool et_has_route_named(cbm_store_t *store, const char *project, const char *name) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(store, project, "Route", &nodes, &count) != CBM_STORE_OK) {
+        return false;
+    }
+    bool found = false;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].name && strcmp(nodes[i].name, name) == 0) {
+            found = true;
+            break;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    return found;
+}
+
+/* Filesystem-path args to resolved calls must NOT become Routes, while a genuine
+ * HTTP client route (reqwest → "/api/items") AND a bare "/api" route arg still do.
+ * Uses the parallel path (>=50 files) because detect_url_in_args lives there. */
+TEST(http_calls_no_route_from_filesystem_path) {
+    static const EtFile meaningful[] = {
+        {"paths.rs",
+         /* Genuine HTTP client call: reqwest wrapper (QN carries "reqwest") with
+          * a real /api route — its Route flows through the recognized-client path
+          * (emit_http_async_service_edge), proving genuine detection is intact. */
+         "pub fn reqwest_get(url: &str) -> String {\n    url.to_string()\n}\n\n"
+         "pub fn fetch_items() -> String {\n    reqwest_get(\"/api/items\")\n}\n\n"
+         /* Genuine /api route arg to a NON-client call — pre-fix and post-fix this
+          * is minted by detect_url_in_args itself; proves the fix does not over-
+          * reject legitimate route-shaped args. */
+         "pub fn register(path: &str) -> String {\n    path.to_string()\n}\n\n"
+         "pub fn wire_routes() -> String {\n    register(\"/api/reports\")\n}\n\n"
+         /* False positives: ordinary filesystem paths passed to a resolved call.
+          * "/tmp/fixture" hits the filesystem-root branch; "/nonexistent/data.db"
+          * hits the filesystem-extension branch. Neither may become a Route. */
+         "pub fn load_fixture(path: &str) -> String {\n    path.to_string()\n}\n\n"
+         "pub fn seed() -> String {\n    load_fixture(\"/tmp/fixture\")\n}\n\n"
+         "pub fn open_db() -> String {\n    load_fixture(\"/nonexistent/data.db\")\n}\n"}};
+    EtProj lp;
+    cbm_store_t *store =
+        et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
+    bool tmp_route = store && et_has_route_named(store, lp.project, "/tmp/fixture");
+    bool db_route = store && et_has_route_named(store, lp.project, "/nonexistent/data.db");
+    bool api_items_route = store && et_has_route_named(store, lp.project, "/api/items");
+    bool api_reports_route = store && et_has_route_named(store, lp.project, "/api/reports");
+    if (tmp_route || db_route || !api_items_route || !api_reports_route) {
+        fprintf(stderr,
+                "  [ET-ROUTE-FP] tmp_route=%d db_route=%d api_items=%d api_reports=%d "
+                "(want 0 0 1 1)\n",
+                tmp_route, db_route, api_items_route, api_reports_route);
+    }
+    et_cleanup(&lp, store);
+    /* (a) filesystem paths must NOT be Routes (the false-positive being fixed) */
+    ASSERT_FALSE(tmp_route);
+    ASSERT_FALSE(db_route);
+    /* (b) genuine routes must STILL be Routes (detection not broken) */
+    ASSERT_TRUE(api_items_route);
+    ASSERT_TRUE(api_reports_route);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  ASYNC_CALLS — message/queue/pubsub dispatch
  *
  *  Strategy: local wrappers whose QN carries the broker substring
@@ -1409,6 +1486,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(http_calls_httparty_ruby);
     RUN_TEST(http_calls_guzzle_php);
     RUN_TEST(http_calls_reqwest_rust);
+    RUN_TEST(http_calls_no_route_from_filesystem_path);
 
     /* ASYNC_CALLS — message queue dispatch (5 brokers × languages) */
     RUN_TEST(async_calls_celery_python);
