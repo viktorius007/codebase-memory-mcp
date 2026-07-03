@@ -9,6 +9,11 @@
 #include <store/store.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid crash isolation — POSIX only */
+#include <unistd.h>
+#endif
 
 /* ══════════════════════════════════════════════════════════════════
  *  LEXER TESTS
@@ -2325,6 +2330,93 @@ TEST(cypher_exec_multi_match) {
     PASS();
 }
 
+/* ──────────────────────────────────────────────────────────────────
+ * Regression: node-only cross-join must not overflow / exhaust memory.
+ *
+ * cross_join_nodes() (src/cypher/cypher.c) sizes its result buffer from
+ * `*bind_count * extra_count`. Before the fix this product was computed in
+ * `int`: a two-pattern node-only match over a large graph (e.g.
+ * `MATCH (a) MATCH (b) RETURN a.name LIMIT 1`) makes both factors the full
+ * node count, and their product overflows signed 32-bit `int`, wrapping to a
+ * garbage malloc size → tiny/failed allocation → heap out-of-bounds write, or
+ * (for a non-overflowing but huge product) a multi-hundred-GB allocation the
+ * fill loop then commits → OOM kill. The sibling cross_join_with_rels() was
+ * hardened for this class under #627; the node-only path was left unsafe.
+ *
+ * We drive the exact node-only two-pattern shape over 46341 nodes. With
+ * 46341 * 46341 = 2,147,488,281 > INT_MAX (2,147,483,647), the pre-fix `int`
+ * product overflows. Crucially this does NOT commit hundreds of GB: the
+ * wrapped size makes malloc fail/abort under the ASan+UBSan test build, so the
+ * defect surfaces as a child-process crash — not a live OOM of the test host.
+ *
+ * POSIX: run the query in a forked child (same crash-isolation idiom as
+ * tests/repro/repro_issue627.c). The child exits 0 only if the query both
+ * succeeds AND returns the single LIMIT-1 row; the parent asserts the child
+ * exited cleanly. Pre-fix the child is killed by a signal (overflow →
+ * bad-size malloc / heap OOB) → RED. Post-fix the size_t product is clamped to
+ * the executor's result ceiling, so the query returns 1 row → GREEN.
+ * ────────────────────────────────────────────────────────────────── */
+TEST(cypher_exec_cross_join_nodes_no_overflow) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "xj", "/tmp/xj");
+
+    /* 46341 nodes: 46341^2 = 2,147,488,281 > INT_MAX. This is the smallest
+     * equal-factor node count whose self cross-product overflows 32-bit int. */
+    const int node_count = 46341;
+    cbm_store_begin(s);
+    for (int i = 0; i < node_count; i++) {
+        char name[32], qn[48];
+        snprintf(name, sizeof(name), "x%d", i);
+        snprintf(qn, sizeof(qn), "xj.x%d", i);
+        cbm_node_t n = {.project = "xj",
+                        .label = "XJ",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "xj.c"};
+        cbm_store_upsert_node(s, &n);
+    }
+    cbm_store_commit(s);
+
+    /* Two node-only patterns → cross_join_nodes(bind_count=46341,
+     * extra_count=46341). LIMIT 1 keeps the projected result tiny; the danger
+     * is entirely in the intermediate cross-join buffer sizing. */
+    const char *query = "MATCH (a:XJ) MATCH (b:XJ) RETURN a.name LIMIT 1";
+
+#if !defined(_WIN32)
+    /* Crash-isolate the query: an overflow-driven bad malloc / heap OOB kills
+     * only the child, which the parent then observes via wait status. */
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        cbm_cypher_result_t cr = {0};
+        int crc = cbm_cypher_execute(s, query, "xj", 0, &cr);
+        int ok = (crc == 0 && cr.row_count == 1);
+        cbm_cypher_result_free(&cr);
+        _exit(ok ? 0 : 2);
+    }
+    int st = 0;
+    (void)waitpid(pid, &st, 0);
+
+    /* Pre-fix: WIFSIGNALED(st) — child killed by SIGABRT/SIGSEGV from the
+     * overflowed allocation size. Post-fix: clean exit 0. */
+    ASSERT_TRUE(WIFEXITED(st));
+    ASSERT_EQ(WEXITSTATUS(st), 0);
+#else
+    /* No fork on Windows: run in-process. On pre-fix code this aborts the
+     * runner (the bug's presence is itself the failure signal); post-fix it
+     * returns the single row. */
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, query, "xj", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    cbm_cypher_result_free(&r);
+#endif
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_parse_optional_match) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -2672,6 +2764,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_optional_match_no_result);
     RUN_TEST(cypher_exec_optional_match_has_result);
     RUN_TEST(cypher_exec_multi_match);
+    RUN_TEST(cypher_exec_cross_join_nodes_no_overflow);
     RUN_TEST(cypher_parse_optional_match);
     RUN_TEST(cypher_parse_multi_match);
     /* Phase 8: UNION */

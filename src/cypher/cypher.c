@@ -4151,16 +4151,35 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
 /* Cross-join node-only pattern into existing bindings */
 static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
                              int extra_count, const char *nvar, bool opt) {
-    binding_t *new_bindings = malloc(((*bind_count * extra_count) + SKIP_ONE) * sizeof(binding_t));
-    int new_count = 0;
-    for (int bi = 0; bi < *bind_count; bi++) {
-        for (int ni = 0; ni < extra_count; ni++) {
+    /* size_t arithmetic + cap: bind_count * extra_count can exceed INT_MAX on
+     * large graphs (a two-pattern node-only match cross-joins every node set),
+     * wrapping the int product negative and yielding a tiny/garbage malloc ->
+     * heap OOB write. Even without overflow the raw product can demand hundreds
+     * of GB, which the fill loop then commits -> OOM kill. The executor never
+     * surfaces more than CYPHER_RESULT_CEILING rows, so clamp the intermediate
+     * cross-product to that ceiling: it bounds both the allocation and the fill
+     * loop without dropping any row the engine could return. Mirrors the #627
+     * hardening of the sibling cross_join_with_rels(). */
+    size_t product = (size_t)*bind_count * (size_t)extra_count;
+    if (opt && extra_count == 0) {
+        product = (size_t)*bind_count;
+    }
+    if (product > (size_t)CYPHER_RESULT_CEILING) {
+        product = (size_t)CYPHER_RESULT_CEILING;
+    }
+    binding_t *new_bindings = malloc((product + SKIP_ONE) * sizeof(binding_t));
+    if (!new_bindings) {
+        return; /* OOM: leave existing bindings untouched rather than corrupt */
+    }
+    size_t new_count = 0;
+    for (int bi = 0; bi < *bind_count && new_count < product; bi++) {
+        for (int ni = 0; ni < extra_count && new_count < product; ni++) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
             new_bindings[new_count++] = nb;
         }
-        if (opt && extra_count == 0) {
+        if (opt && extra_count == 0 && new_count < product) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             new_bindings[new_count++] = nb;
@@ -4171,7 +4190,7 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
     }
     free(*bindings);
     *bindings = new_bindings;
-    *bind_count = new_count;
+    *bind_count = (int)new_count;
 }
 
 /* Cross-join pattern-with-rels into existing bindings */
