@@ -2582,6 +2582,48 @@ TEST(cypher_unwind_long_list_bounded) {
 #endif
 }
 
+/* Regression: a multi-key ORDER BY must still honor a trailing LIMIT. Before the
+ * fix, parse_order_by_clause parsed only the FIRST sort key, so the remaining
+ * ", f.file_path LIMIT 2" was left unconsumed, the LIMIT was silently dropped
+ * (r->limit stayed at the -1 sentinel) and the full unbounded result set was
+ * materialized. The observable contract: exactly LIMIT rows come back. */
+TEST(cypher_order_by_multikey_honors_limit) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    /* Ground truth: with no LIMIT the fixture yields all 4 Function rows. */
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+
+    /* Two sort keys, then LIMIT 2 — must return exactly 2 rows, not all 4. */
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) RETURN f.name ORDER BY f.name, f.file_path LIMIT 2", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2); /* RED on unfixed code: returns 4 */
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Regression: the parser must not silently drop trailing tokens it cannot place.
+ * `LIMIT 2 SKIP 1` is not valid grammar (SKIP must precede LIMIT); before the
+ * fix cbm_parse never asserted end-of-input, so the trailing `SKIP 1` vanished
+ * and the query parsed as success. It must now surface as an error instead. */
+TEST(cypher_parse_trailing_tokens_rejected) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name LIMIT 2 SKIP 1", &q, &err);
+    ASSERT_EQ(rc, -1); /* RED on unfixed code: rc == 0, trailing SKIP dropped */
+    ASSERT_NOT_NULL(err);
+    cbm_query_free(q);
+    free(err);
+    PASS();
+}
+
 /* ── Issue #389 group: Cypher feature reproductions ─────────────────
  * Each asserts the CORRECT behavior; a failure reproduces the bug. */
 
@@ -2839,4 +2881,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_unwind);
     RUN_TEST(cypher_parse_unwind_var);
     RUN_TEST(cypher_unwind_long_list_bounded);
+    /* Phase 10: multi-key ORDER BY + trailing-token honesty */
+    RUN_TEST(cypher_order_by_multikey_honors_limit);
+    RUN_TEST(cypher_parse_trailing_tokens_rejected);
 }
