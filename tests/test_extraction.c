@@ -7,6 +7,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "helpers.h" // cbm_is_test_file (directory-aware test detection)
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -3113,6 +3114,82 @@ TEST(extract_non_perl_method_call_not_flagged_is_method) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * is_test detection: directory-aware (Rust tests/ + benches/)
+ *
+ * cbm_is_test_file was a basename-only per-language switch, so Rust
+ * integration-test files whose basename lacks the _test.rs / test_ affix
+ * (e.g. tests/contract_tests.rs) and benchmarks under benches/ read as
+ * PRODUCTION. That verdict flows to the Module node's is_test flag, which the
+ * default architecture views filter on — so test-only code polluted the
+ * hotspot / cluster / coupling views. The fix teaches the Rust arm the Cargo
+ * tests/ + benches/ directory convention. (Fix A)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Locate the synthetic per-file Module definition (label "Module"). */
+static const CBMDefinition *find_module_def(CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Module") == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+TEST(is_test_rust_tests_dir_directory_aware) {
+    /* Core miss: a Rust integration-test file whose basename lacks the
+     * _test.rs / test_ affix but lives under a crate `tests/` directory. */
+    ASSERT_TRUE(cbm_is_test_file("crates/foo/tests/contract_tests.rs", CBM_LANG_RUST));
+    ASSERT_TRUE(cbm_is_test_file("tests/contract_tests.rs", CBM_LANG_RUST));
+    /* Benchmarks under `benches/` are test-tier code too. */
+    ASSERT_TRUE(cbm_is_test_file("benches/throughput.rs", CBM_LANG_RUST));
+    ASSERT_TRUE(cbm_is_test_file("crates/foo/benches/throughput.rs", CBM_LANG_RUST));
+
+    /* Pre-existing basename affixes must keep working. */
+    ASSERT_TRUE(cbm_is_test_file("handler_test.rs", CBM_LANG_RUST));
+    ASSERT_TRUE(cbm_is_test_file("test_handler.rs", CBM_LANG_RUST));
+
+    /* No over-broadening: genuine production Rust stays production. A `tests/`
+     * path SEGMENT is required — a mere substring like `src/testing.rs` or a
+     * filename such as `latest.rs` must NOT be misclassified. */
+    ASSERT_FALSE(cbm_is_test_file("src/lib.rs", CBM_LANG_RUST));
+    ASSERT_FALSE(cbm_is_test_file("crates/foo/src/handler.rs", CBM_LANG_RUST));
+    ASSERT_FALSE(cbm_is_test_file("src/testing.rs", CBM_LANG_RUST));
+    ASSERT_FALSE(cbm_is_test_file("crates/foo/src/latest.rs", CBM_LANG_RUST));
+
+    /* Every OTHER language's switch arm is UNCHANGED: the directory rule is
+     * Rust-only. Go stays basename `_test.go`, so a Go file merely under
+     * tests/ is NOT flagged, while `_test.go` still is. */
+    ASSERT_FALSE(cbm_is_test_file("tests/contract.go", CBM_LANG_GO));
+    ASSERT_TRUE(cbm_is_test_file("handler_test.go", CBM_LANG_GO));
+
+    PASS();
+}
+
+TEST(is_test_rust_tests_dir_propagates_to_module) {
+    /* The per-file verdict must reach the Module definition's is_test flag —
+     * that flag is what the architecture-view SQL filters read. */
+    CBMFileResult *r = extract("fn checks_contract() { assert_eq!(1, 1); }\n", CBM_LANG_RUST, "t",
+                               "crates/foo/tests/contract_tests.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_TRUE(mod->is_test);
+    cbm_free_result(r);
+
+    /* A production file's Module must stay is_test=false. */
+    CBMFileResult *p =
+        extract("pub fn handle() {}\n", CBM_LANG_RUST, "t", "crates/foo/src/handler.rs");
+    ASSERT_NOT_NULL(p);
+    ASSERT_FALSE(p->has_error);
+    const CBMDefinition *pmod = find_module_def(p);
+    ASSERT_NOT_NULL(pmod);
+    ASSERT_FALSE(pmod->is_test);
+    cbm_free_result(p);
+
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -3354,6 +3431,10 @@ SUITE(extraction) {
     RUN_TEST(complexity_recursion_in_loop_unguarded);
     RUN_TEST(complexity_guarded_recursion);
     RUN_TEST(complexity_access_depth_and_params);
+
+    /* is_test detection (Fix A): directory-aware Rust tests/ + benches/ */
+    RUN_TEST(is_test_rust_tests_dir_directory_aware);
+    RUN_TEST(is_test_rust_tests_dir_propagates_to_module);
 
     cbm_shutdown();
 }
