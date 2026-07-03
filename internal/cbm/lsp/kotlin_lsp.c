@@ -63,6 +63,14 @@
 /* ── forward declarations ─────────────────────────────────────────── */
 
 static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node);
+static void kt_resolve_calls_in_node_inner(KotlinLSPContext *ctx, TSNode node);
+static const CBMType *kotlin_parse_type_node_inner(KotlinLSPContext *ctx, TSNode node);
+
+/* Recursion-depth caps for the AST walks that lacked one. One C frame per level
+ * of nesting; past the cap the subtree is skipped / collapses to unknown rather
+ * than exhausting the stack. Mirrors c_lsp.c's walk guard. */
+#define KT_LSP_MAX_WALK_DEPTH 512
+#define KT_LSP_MAX_TYPE_DEPTH 512
 static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node);
 static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_companion,
                                    const char *outer_class_qn);
@@ -1679,6 +1687,15 @@ static void kt_process_property_decl(KotlinLSPContext *ctx, TSNode node) {
 /* ── type parsing ─────────────────────────────────────────────────── */
 
 const CBMType *kotlin_parse_type_node(KotlinLSPContext *ctx, TSNode node) {
+    if (ctx->type_depth >= KT_LSP_MAX_TYPE_DEPTH)
+        return cbm_type_unknown();
+    ctx->type_depth++;
+    const CBMType *result = kotlin_parse_type_node_inner(ctx, node);
+    ctx->type_depth--;
+    return result;
+}
+
+static const CBMType *kotlin_parse_type_node_inner(KotlinLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
     }
@@ -3175,6 +3192,14 @@ static void kt_process_statement(KotlinLSPContext *ctx, TSNode stmt) {
  * a subtree, *without* descending into nested function/class bodies (those
  * are processed separately with their own scope). */
 static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= KT_LSP_MAX_WALK_DEPTH)
+        return;
+    ctx->walk_depth++;
+    kt_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
+
+static void kt_resolve_calls_in_node_inner(KotlinLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return;
     }

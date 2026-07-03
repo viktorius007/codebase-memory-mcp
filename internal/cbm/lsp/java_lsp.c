@@ -343,8 +343,24 @@ static void pop_enclosing_class(JavaLSPContext *ctx) {
 /* ── Type-AST → CBMType ───────────────────────────────────────────── */
 
 static const CBMType *parse_type_arguments(JavaLSPContext *ctx, TSNode targs_node);
+static const CBMType *java_parse_type_node_inner(JavaLSPContext *ctx, TSNode node);
 
+#define JAVA_LSP_MAX_TYPE_DEPTH 512
+
+/* Depth-guarded entry: type parsing recurses one C frame per level of nested
+ * generic type (List<List<…>>). Past the cap the subtree collapses to unknown —
+ * graceful degradation, not a stack-exhaustion crash. Mirrors
+ * java_resolve_calls_in_node's walk guard. */
 const CBMType *java_parse_type_node(JavaLSPContext *ctx, TSNode node) {
+    if (ctx->type_depth >= JAVA_LSP_MAX_TYPE_DEPTH)
+        return cbm_type_unknown();
+    ctx->type_depth++;
+    const CBMType *result = java_parse_type_node_inner(ctx, node);
+    ctx->type_depth--;
+    return result;
+}
+
+static const CBMType *java_parse_type_node_inner(JavaLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
     const char *kind = ts_node_type(node);

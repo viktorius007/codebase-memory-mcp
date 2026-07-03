@@ -60,6 +60,10 @@ typedef struct {
     // recursive unions/wrappers across registered types) otherwise recurse
     // without bound — stack overflow on real repos.
     int member_depth;
+    // Recursion guard for process_node: the call-resolution walk recurses one
+    // C frame per AST nesting level (deeply nested calls) — bound it so
+    // pathological input degrades gracefully instead of exhausting the stack.
+    int walk_depth;
 } TSLSPContext;
 
 // --- Initialization ---

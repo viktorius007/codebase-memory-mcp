@@ -87,6 +87,7 @@ typedef struct {
     int eval_depth;
     int statement_depth;
     int walk_depth; /* java_resolve_calls_in_node self-recursion (AST nesting) */
+    int type_depth; /* java_parse_type_node self-recursion (nested-generic depth) */
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
