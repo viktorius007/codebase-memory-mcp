@@ -57,6 +57,37 @@ typedef struct {
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 
+/* A workspace member: the DIRECTORY that owns a manifest and the package NAME
+ * that manifest declares. Unlike cbm_pkg_entry_t (which maps an import specifier
+ * to a resolved entry-file QN for IMPORTS resolution), this pairs a member's
+ * on-disk location with its authoritative name so def/File nodes can be labelled
+ * by their true package regardless of directory layout (a crate at xtask/ whose
+ * [package] name is "buildtool" reads as "buildtool", not the "src" QN segment). */
+typedef struct {
+    char *dir;  /* heap: manifest directory, rel to repo root ("" = root) */
+    char *name; /* heap: declared package name from the manifest */
+} cbm_pkg_member_t;
+
+typedef struct {
+    cbm_pkg_member_t *items;
+    int count;
+    int cap;
+} cbm_pkg_members_t;
+
+void cbm_pkg_members_init(cbm_pkg_members_t *m);
+void cbm_pkg_members_free(cbm_pkg_members_t *m);
+
+/* Walk repo_path for package manifests and record (directory, declared-name) for
+ * each. Reuses the same manifest parsers as pkgmap (no new parsing); the declared
+ * name is each manifest's primary/first parsed package name. NULL-safe. Returns
+ * the number of members collected. */
+int cbm_pkgmap_collect_members(const char *repo_path, cbm_pkg_members_t *out);
+
+/* Return the declared name of the member owning file_rel — the LONGEST member
+ * directory that is a path-prefix of file_rel — or NULL when no member owns it
+ * (the file falls back to QN-segment package derivation downstream). Borrowed. */
+const char *cbm_pkg_members_lookup(const cbm_pkg_members_t *m, const char *file_rel);
+
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {

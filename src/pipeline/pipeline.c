@@ -364,6 +364,17 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         }
     }
 
+    /* Collect workspace members (manifest directory → declared package name) so
+     * every File node can carry its TRUE package identity as a "pkg" property.
+     * This is what lets the store label a member by its manifest name regardless
+     * of directory layout — a crate at xtask/ whose [package] name is "buildtool"
+     * reads as "buildtool", not the "src" QN segment. Reuses the pkgmap manifest
+     * parsers (no new parsing); repos with no manifests collect zero members and
+     * pay only one bounded directory walk. */
+    cbm_pkg_members_t members;
+    cbm_pkg_members_init(&members);
+    cbm_pkgmap_collect_members(p->repo_path, &members);
+
     /* Collect unique directories and create Folder/Package nodes */
     CBMHashTable *seen_dirs = cbm_ht_create(CBM_SZ_256);
 
@@ -381,7 +392,15 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
 
         char props[CBM_SZ_256];
         const char *ext = strrchr(basename, '.');
-        snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
+        const char *pkg = cbm_pkg_members_lookup(&members, rel);
+        if (pkg && pkg[0]) {
+            char pkg_esc[CBM_SZ_128];
+            cbm_json_escape(pkg_esc, sizeof(pkg_esc), pkg);
+            snprintf(props, sizeof(props), "{\"extension\":\"%s\",\"pkg\":\"%s\"}", ext ? ext : "",
+                     pkg_esc);
+        } else {
+            snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
+        }
 
         const char *qualified_name = file_qn;
         const char *file_path = rel;
@@ -426,6 +445,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     /* Free seen_dirs keys */
     cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
     cbm_ht_free(seen_dirs);
+    cbm_pkg_members_free(&members);
 
     cbm_log_info("pass.done", "pass", "structure", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)),
                  "edges", itoa_buf(cbm_gbuf_edge_count(p->gbuf)));

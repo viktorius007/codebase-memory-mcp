@@ -66,6 +66,7 @@ enum {
 #include "foundation/log.h"
 #include "foundation/compat_regex.h"
 #include "foundation/str_util.h"
+#include "foundation/hash_table.h"
 
 #define XXH_INLINE_ALL
 #include "xxhash/xxhash.h"
@@ -3557,6 +3558,89 @@ bool cbm_is_test_file_path(const char *fp) {
     return strstr(fp, "test") != NULL;
 }
 
+/* ── Package identity: manifest name > QN-segment heuristic ─────── */
+
+/* Build a map file_path → manifest-declared package name from File nodes that
+ * carry a "pkg" property (stamped by the pipeline from the owning manifest). Both
+ * key and value are heap-owned by the map; free via arch_free_file_pkg_map.
+ * Returns NULL when no File node declares a package (no manifests in the repo),
+ * which makes the whole package-identity layer a transparent no-op that leaves
+ * the QN-segment fallback in charge. */
+static CBMHashTable *arch_build_file_pkg_map(cbm_store_t *s, const char *project) {
+    const char *sql = "SELECT file_path, json_extract(properties, '$.pkg') FROM nodes "
+                      "WHERE project=?1 AND label='File' "
+                      "AND json_extract(properties, '$.pkg') IS NOT NULL";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return NULL;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    CBMHashTable *map = NULL;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *fp = (const char *)sqlite3_column_text(stmt, 0);
+        const char *pkg = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (!fp || !fp[0] || !pkg || !pkg[0]) {
+            continue;
+        }
+        if (!map) {
+            map = cbm_ht_create(CBM_SZ_64);
+            if (!map) {
+                break;
+            }
+        }
+        if (cbm_ht_has(map, fp)) {
+            continue;
+        }
+        char *key = heap_strdup(fp);
+        char *val = heap_strdup(pkg);
+        if (key && val) {
+            cbm_ht_set(map, key, val); /* map owns key + val */
+        } else {
+            free(key);
+            free(val);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return map;
+}
+
+static void arch_file_pkg_free_entry(const char *key, void *value, void *ud) {
+    (void)ud;
+    free((void *)key);
+    free(value);
+}
+
+static void arch_free_file_pkg_map(CBMHashTable *map) {
+    if (!map) {
+        return;
+    }
+    cbm_ht_foreach(map, arch_file_pkg_free_entry, NULL);
+    cbm_ht_free(map);
+}
+
+/* The manifest-declared package name of a file's owning workspace member, or
+ * NULL when unknown (no map, no file_path, or the file is under no member). */
+static const char *arch_declared_pkg(CBMHashTable *file_pkg, const char *file_path) {
+    if (file_pkg && file_path && file_path[0]) {
+        const char *declared = (const char *)cbm_ht_get(file_pkg, file_path);
+        if (declared && declared[0]) {
+            return declared;
+        }
+    }
+    return NULL;
+}
+
+/* Resolve a node's package: the manifest-declared member name when known, else
+ * the QN segment[2] heuristic as a last resort. `file_pkg` may be NULL (no
+ * manifests) — then this is always the QN fallback. The QN branch returns a
+ * thread-local buffer (cbm_qn_to_package), so callers must copy the result
+ * before the next cbm_qn_to_package call — every caller heap_strdup's it
+ * immediately, matching the pre-existing contract. */
+static const char *arch_pkg_for(CBMHashTable *file_pkg, const char *file_path, const char *qn) {
+    const char *declared = arch_declared_pkg(file_pkg, file_path);
+    return declared ? declared : cbm_qn_to_package(qn);
+}
+
 /* File extension → language name mapping (table-driven) */
 typedef struct {
     const char *ext;
@@ -3956,6 +4040,7 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
         arch_bind_path_scope(nstmt, ST_COL_2, ST_COL_3, norm, like);
     }
 
+    CBMHashTable *file_pkg = arch_build_file_pkg_map(s, project);
     int ncap = CBM_SZ_256;
     int nn = 0;
     int64_t *nids = malloc(ncap * sizeof(int64_t));
@@ -3970,10 +4055,12 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
         int64_t nid = sqlite3_column_int64(nstmt, 0);
         nids[nn] = nid;
         const char *qn = (const char *)sqlite3_column_text(nstmt, SKIP_ONE);
-        npkgs[nn] = heap_strdup(cbm_qn_to_package(qn));
+        const char *fp = (const char *)sqlite3_column_text(nstmt, ST_COL_2);
+        npkgs[nn] = heap_strdup(arch_pkg_for(file_pkg, fp, qn));
         nn++;
     }
     sqlite3_finalize(nstmt);
+    arch_free_file_pkg_map(file_pkg);
 
     /* Scan edges, count cross-package calls */
     const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
@@ -4060,7 +4147,7 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char qsqlbuf[ST_SQL_BUF];
-    const char *qbase = "SELECT qualified_name FROM nodes WHERE project=?1 AND label IN "
+    const char *qbase = "SELECT qualified_name, file_path FROM nodes WHERE project=?1 AND label IN "
                         "('Function','Method','Class')";
     if (scoped) {
         snprintf(qsqlbuf, sizeof(qsqlbuf), "%s%s", qbase, arch_path_scope_sql());
@@ -4077,12 +4164,14 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
     }
 
+    CBMHashTable *file_pkg = arch_build_file_pkg_map(s, project);
     char *pnames[CBM_SZ_64];
     int pcounts[CBM_SZ_64];
     int np = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *qn = (const char *)sqlite3_column_text(stmt, 0);
-        const char *pkg = cbm_qn_to_package(qn);
+        const char *fp = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        const char *pkg = arch_pkg_for(file_pkg, fp, qn);
         if (!pkg[0]) {
             continue;
         }
@@ -4102,6 +4191,7 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         }
     }
     sqlite3_finalize(stmt);
+    arch_free_file_pkg_map(file_pkg);
 
     /* Sort by count desc */
     for (int i = SKIP_ONE; i < np; i++) {
@@ -4279,9 +4369,12 @@ static bool pkg_in_list(const char *pkg, char **list, int count) {
     return false;
 }
 
-/* Collect package names from nodes matching a SQL query (must use ?1 = project). */
+/* Collect package names from nodes matching a SQL query (must use ?1 = project
+ * and SELECT qualified_name AS column 0, file_path AS column 1). Uses the
+ * manifest-declared package when file_pkg maps the node's file, else the
+ * QN-segment fallback, so layer names agree with the packages aspect. */
 static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *project, const char *path,
-                             char **pkgs, int max_pkgs) {
+                             CBMHashTable *file_pkg, char **pkgs, int max_pkgs) {
     char norm[CBM_SZ_512];
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
@@ -4305,7 +4398,8 @@ static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *projec
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_pkgs) {
         const char *qn = (const char *)sqlite3_column_text(stmt, 0);
-        pkgs[count++] = heap_strdup(cbm_qn_to_package(qn));
+        const char *fp = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        pkgs[count++] = heap_strdup(arch_pkg_for(file_pkg, fp, qn));
     }
     sqlite3_finalize(stmt);
     return count;
@@ -4322,16 +4416,19 @@ static int arch_layers(cbm_store_t *s, const char *project, const char *path,
     }
 
     /* Collect route and entry point packages */
+    CBMHashTable *file_pkg = arch_build_file_pkg_map(s, project);
     char *route_pkgs[CBM_SZ_32];
-    int nrpkgs =
-        collect_pkg_names(s, "SELECT qualified_name FROM nodes WHERE project=?1 AND label='Route'",
-                          project, path, route_pkgs, CBM_SZ_32);
+    int nrpkgs = collect_pkg_names(
+        s, "SELECT qualified_name, file_path FROM nodes WHERE project=?1 AND label='Route'",
+        project, path, file_pkg, route_pkgs, CBM_SZ_32);
 
     char *entry_pkgs[CBM_SZ_32];
-    int nepkgs = collect_pkg_names(s,
-                                   "SELECT qualified_name FROM nodes WHERE project=?1 AND "
-                                   "json_extract(properties, '$.is_entry_point') = 1",
-                                   project, path, entry_pkgs, CBM_SZ_32);
+    int nepkgs =
+        collect_pkg_names(s,
+                          "SELECT qualified_name, file_path FROM nodes WHERE project=?1 AND "
+                          "json_extract(properties, '$.is_entry_point') = 1",
+                          project, path, file_pkg, entry_pkgs, CBM_SZ_32);
+    arch_free_file_pkg_map(file_pkg);
 
     /* Compute fan-in/out per package */
     char *all_pkgs[CBM_SZ_64];
@@ -5242,7 +5339,8 @@ static void cluster_add_pkg(const char **pkgs, int *counts, int *count, int cap,
 
 /* Build the cluster_info for one community c into *ci. */
 static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *comm,
-                              const int *degree, const char **names, const char **qns, int members,
+                              const int *degree, const char **names, const char **qns,
+                              const char **fps, CBMHashTable *file_pkg, int members,
                               double cohesion) {
     memset(ci, 0, sizeof(*ci));
     ci->id = c;
@@ -5293,7 +5391,8 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
     int pc = 0;
     for (int i = 0; i < n; i++) {
         if (comm[i] == c) {
-            cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS, cbm_qn_to_package(qns[i]));
+            cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS,
+                            arch_pkg_for(file_pkg, fps[i], qns[i]));
         }
     }
     if (pc > 0) {
@@ -5361,16 +5460,19 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     int64_t *ids = malloc((size_t)cap * sizeof(int64_t));
     const char **names = malloc((size_t)cap * sizeof(char *));
     const char **qns = malloc((size_t)cap * sizeof(char *));
+    const char **fps = malloc((size_t)cap * sizeof(char *));
     while (sqlite3_step(st) == SQLITE_ROW) {
         if (n >= cap) {
             cap *= ST_GROWTH;
             ids = safe_realloc(ids, (size_t)cap * sizeof(int64_t));
             names = safe_realloc(names, (size_t)cap * sizeof(char *));
             qns = safe_realloc(qns, (size_t)cap * sizeof(char *));
+            fps = safe_realloc(fps, (size_t)cap * sizeof(char *));
         }
         ids[n] = sqlite3_column_int64(st, 0);
         names[n] = heap_strdup((const char *)sqlite3_column_text(st, SKIP_ONE));
         qns[n] = heap_strdup((const char *)sqlite3_column_text(st, CBM_SZ_2));
+        fps[n] = heap_strdup((const char *)sqlite3_column_text(st, ST_COL_3));
         n++;
     }
     sqlite3_finalize(st);
@@ -5378,12 +5480,15 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
         for (int i = 0; i < n; i++) {
             safe_str_free(&names[i]);
             safe_str_free(&qns[i]);
+            safe_str_free(&fps[i]);
         }
         free(ids);
         free(names);
         free(qns);
+        free(fps);
         return CBM_STORE_OK;
     }
+    CBMHashTable *file_pkg = arch_build_file_pkg_map(s, project);
 
     /* 2. Load CALLS edges with both endpoints in the node set (store indices). */
     cbm_louvain_edge_t *edges = malloc((size_t)n * sizeof(cbm_louvain_edge_t));
@@ -5470,7 +5575,8 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             }
             double denom = internal[c] + boundary[c];
             double cohesion = denom > 0 ? (double)internal[c] / denom : 0.0;
-            cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns, members[c], cohesion);
+            cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns, fps, file_pkg,
+                              members[c], cohesion);
             cc++;
         }
         out->clusters = clusters;
@@ -5483,13 +5589,16 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     }
 
     free(comm);
+    arch_free_file_pkg_map(file_pkg);
     for (int i = 0; i < n; i++) {
         safe_str_free(&names[i]);
         safe_str_free(&qns[i]);
+        safe_str_free(&fps[i]);
     }
     free(ids);
     free(names);
     free(qns);
+    free(fps);
     free(edges);
     free(esrc);
     free(edst);
