@@ -844,8 +844,17 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
  * recursion bound — even directory junctions / symlink cycles cannot make
  * it hang. On Windows we additionally skip reparse points before
  * descending as a best-effort early-out. */
-static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
-                           int depth) {
+/* Per-manifest callback: invoked once for every manifest file the walk finds,
+ * with the file already read into `source`. */
+typedef void (*pkgmap_manifest_cb)(const char *basename, const char *rel_path, const char *source,
+                                   int source_len, void *userdata);
+
+/* Generic manifest walk. Owns the symlink-skip / depth-cap / skip-dir
+ * termination guarantees so callers (pkgmap entries + member collection) share
+ * one traversal instead of duplicating the load-bearing safety logic. Returns
+ * the number of manifest files dispatched to `cb`. */
+static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgmap_manifest_cb cb,
+                                 void *userdata, int depth) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
         cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
         return 0;
@@ -886,7 +895,7 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
                 continue;
             }
 #endif
-            parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1);
+            parsed += pkgmap_walk_manifests(abs_path, rel_path, cb, userdata, depth + 1);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
@@ -900,13 +909,23 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (!source) {
             continue;
         }
-        if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
-            parsed++;
-        }
+        cb(name, rel_path, source, source_len, userdata);
+        parsed++;
         free(source);
     }
     cbm_closedir(dir);
     return parsed;
+}
+
+/* Callback adapter: parse a manifest into the pkgmap entries collection. */
+static void pkgmap_entries_cb(const char *basename, const char *rel_path, const char *source,
+                              int source_len, void *userdata) {
+    cbm_pkgmap_try_parse(basename, rel_path, source, source_len, (cbm_pkg_entries_t *)userdata);
+}
+
+static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
+                           int depth) {
+    return pkgmap_walk_manifests(abs_dir, rel_dir, pkgmap_entries_cb, entries, depth);
 }
 
 /* Scan a repository for package manifest files via the filesystem
@@ -927,6 +946,115 @@ int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries) {
     int parsed = pkgmap_walk_dir(repo_path, "", entries, 0);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
+}
+
+/* ── Workspace member collection (directory → declared name) ───── */
+
+void cbm_pkg_members_init(cbm_pkg_members_t *m) {
+    m->items = NULL;
+    m->count = 0;
+    m->cap = 0;
+}
+
+void cbm_pkg_members_free(cbm_pkg_members_t *m) {
+    if (!m) {
+        return;
+    }
+    for (int i = 0; i < m->count; i++) {
+        free(m->items[i].dir);
+        free(m->items[i].name);
+    }
+    free(m->items);
+    m->items = NULL;
+    m->count = 0;
+    m->cap = 0;
+}
+
+static void pkg_members_push(cbm_pkg_members_t *m, char *dir, char *name) {
+    /* First manifest to claim a directory wins — a polyglot dir with two
+     * manifests keeps a single stable name. */
+    for (int i = 0; i < m->count; i++) {
+        if (strcmp(m->items[i].dir, dir) == 0) {
+            free(dir);
+            free(name);
+            return;
+        }
+    }
+    if (m->count >= m->cap) {
+        int new_cap = m->cap == 0 ? PKGMAP_INIT_CAP : m->cap * PAIR_LEN;
+        cbm_pkg_member_t *tmp = realloc(m->items, (size_t)new_cap * sizeof(cbm_pkg_member_t));
+        if (!tmp) {
+            free(dir);
+            free(name);
+            return;
+        }
+        m->items = tmp;
+        m->cap = new_cap;
+    }
+    m->items[m->count].dir = dir;
+    m->items[m->count].name = name;
+    m->count++;
+}
+
+/* Callback adapter: record the manifest's DIRECTORY and its declared package
+ * NAME as a workspace member. The declared name is the manifest's primary parsed
+ * package name (the first pkg entry). A manifest that declares no package name
+ * (e.g. a virtual Cargo [workspace] root with no [package]) yields no entries and
+ * therefore contributes NO member — exactly right, so a workspace root never
+ * masquerades as a package. */
+static void pkg_members_cb(const char *basename, const char *rel_path, const char *source,
+                           int source_len, void *userdata) {
+    cbm_pkg_entries_t tmp;
+    cbm_pkg_entries_init(&tmp);
+    cbm_pkgmap_try_parse(basename, rel_path, source, source_len, &tmp);
+    if (tmp.count > 0 && tmp.items[0].pkg_name && tmp.items[0].pkg_name[0]) {
+        pkg_members_push((cbm_pkg_members_t *)userdata, path_dirname(rel_path),
+                         strdup(tmp.items[0].pkg_name));
+    }
+    cbm_pkg_entries_free(&tmp);
+}
+
+int cbm_pkgmap_collect_members(const char *repo_path, cbm_pkg_members_t *out) {
+    if (!repo_path || !out) {
+        return 0;
+    }
+    int parsed = pkgmap_walk_manifests(repo_path, "", pkg_members_cb, out, 0);
+    cbm_log_info("pkgmap.members", "manifests", pkgmap_itoa(parsed), "members",
+                 pkgmap_itoa(out->count));
+    return out->count;
+}
+
+/* True when `dir` is a path-prefix of `file_rel` at a path boundary: dir=="" (the
+ * repo root, matches anything) or file_rel begins with "dir/". Rejects the
+ * spurious "src" ⊂ "srcfoo/x" match a bare strncmp would accept. */
+static bool member_dir_owns(const char *dir, const char *file_rel) {
+    if (dir[0] == '\0') {
+        return true;
+    }
+    size_t dl = strlen(dir);
+    return strncmp(file_rel, dir, dl) == 0 && file_rel[dl] == '/';
+}
+
+const char *cbm_pkg_members_lookup(const cbm_pkg_members_t *m, const char *file_rel) {
+    if (!m || !file_rel) {
+        return NULL;
+    }
+    const char *best = NULL;
+    size_t best_len = 0;
+    /* Nearest enclosing member wins: crates/mycore/src/lib.rs is owned by
+     * crates/mycore, not by a root-level "" member. */
+    for (int i = 0; i < m->count; i++) {
+        const char *dir = m->items[i].dir;
+        if (!member_dir_owns(dir, file_rel)) {
+            continue;
+        }
+        size_t dl = strlen(dir);
+        if (best == NULL || dl > best_len) {
+            best = m->items[i].name;
+            best_len = dl;
+        }
+    }
+    return best;
 }
 
 /* Build pkgmap for sequential path (reads manifest files directly) */
