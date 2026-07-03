@@ -3833,9 +3833,24 @@ static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char sqlbuf[ST_SQL_BUF];
+    /* Count a CALLS edge toward fan-in only when its resolution confidence is
+     * absent (legacy / non-resolver edge) or >= 0.5. Call resolution stamps every
+     * CALLS edge with a `confidence` (pass_calls.c / pass_parallel.c); a bare
+     * std/builtin method call (`x.collect()`, `.new()`, `.from()`) that the
+     * registry mis-binds onto a lone same-named user function resolves via a WEAK
+     * short-name strategy whose confidence the import-unreachability penalty floors
+     * to ~0.375 — below 0.5. Gating the COUNT keeps such name-collision noise out
+     * of the flagship fan-in/hotspot signal WITHOUT deleting the edges (they stay
+     * in the graph for display / traversal, flagged by their low confidence). The
+     * 0.5 bound mirrors registry.c's DEFAULT_CONFIDENCE: genuine same-module /
+     * import / unique matches (>= 0.75) count; penalised short-name guesses do not.
+     * Edges with no confidence property are kept because json_extract returns NULL
+     * and `NULL >= 0.5` is NULL/false, so the explicit IS NULL arm is required. */
     const char *base = "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
                        "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
                        "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
+                       "AND (json_extract(e.properties, '$.confidence') IS NULL OR "
+                       "json_extract(e.properties, '$.confidence') >= 0.5) "
                        "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
                        "json_extract(n.properties, '$.is_test') != 1) "
                        "AND n.file_path NOT LIKE '%test%'";
