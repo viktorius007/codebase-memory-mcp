@@ -1925,6 +1925,41 @@ TEST(python_docstring) {
     PASS();
 }
 
+/* A multi-line Rust `///` doc block must be captured in FULL, not collapsed to
+ * its last physical line. tree-sitter-rust parses each `///` line as its own
+ * line_comment sibling, so reading a single prev-sibling truncates the block to
+ * the last line only. */
+TEST(rust_multiline_docstring) {
+    CBMFileResult *r = extract("/// First summary line.\n"
+                               "/// Second detail line.\n"
+                               "/// Third closing line.\n"
+                               "pub fn documented() {}\n",
+                               CBM_LANG_RUST, "t", "doc.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "documented"));
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "documented") == 0) {
+            found = 1;
+            const char *doc = r->defs.items[i].docstring;
+            ASSERT_NOT_NULL(doc);
+            /* All three lines present, in source order — not just the last. */
+            const char *p1 = strstr(doc, "First summary line");
+            const char *p2 = strstr(doc, "Second detail line");
+            const char *p3 = strstr(doc, "Third closing line");
+            ASSERT_NOT_NULL(p1);
+            ASSERT_NOT_NULL(p2);
+            ASSERT_NOT_NULL(p3);
+            ASSERT_TRUE(p1 < p2);
+            ASSERT_TRUE(p2 < p3);
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(go_function_extraction) {
     CBMFileResult *r =
         extract("package main\n\n// Greet returns a greeting.\nfunc Greet(name string) string "
@@ -3276,6 +3311,7 @@ SUITE(extraction) {
 
     /* cbm_test.go ports */
     RUN_TEST(python_docstring);
+    RUN_TEST(rust_multiline_docstring);
     RUN_TEST(go_function_extraction);
     RUN_TEST(js_arrow_function);
 

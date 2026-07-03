@@ -1172,6 +1172,127 @@ static char *extract_comment_text(CBMArena *a, TSNode node, const char *source) 
     return text;
 }
 
+// Max contiguous single-line doc-comment lines joined into one docstring.
+#define MAX_DOC_COMMENT_LINES 128
+
+// Strip a leading C-family line-comment marker (`//`, `///`, `//!`) plus one
+// following space from a single comment line. Returns a pointer into `s` (no
+// copy). Leaves non-`//` text untouched so other comment styles are unchanged.
+static const char *strip_line_comment_marker(const char *s) {
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    if (s[0] == '/' && s[1] == '/') {
+        s += 2;
+        while (*s == '/') { // extra slashes: `///`, `////`
+            s++;
+        }
+        if (*s == '!') { // `//!` inner doc comment
+            s++;
+        }
+        if (*s == ' ') { // single leading space after the marker
+            s++;
+        }
+    }
+    return s;
+}
+
+// True if `text` is a `//`-style line comment (as opposed to a `/* */` block
+// comment). A `//` comment is single-physical-line by construction — it runs to
+// end-of-line — so the leading marker alone identifies it; block comments start
+// with `/*` and are left to the single-node fallback (unchanged behavior).
+static bool is_line_doc_comment(const char *text) {
+    const char *s = text;
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    return s[0] == '/' && s[1] == '/';
+}
+
+// Given the nearest leading comment node, join a contiguous run of single-line
+// `//` comments into the full docstring. tree-sitter parses each `///`/`//`
+// physical line as its own comment sibling, so reading a single prev-sibling
+// truncates a multi-line block to just its last line. This walks prev-siblings
+// backward while each stays a `//` comment that sits on the row directly above
+// the one below it (a blank line breaks the run, so a detached comment is not
+// glued on), then joins the run in source order with the `//` marker and the
+// node's trailing newline stripped from each line. Block comments and non-`//`
+// styles fall back to the raw single-node text (unchanged behavior).
+static const char *join_leading_line_comments(CBMArena *a, TSNode anchor, const char *source) {
+    char *anchor_text = cbm_node_text(a, anchor, source);
+    if (!anchor_text || !is_line_doc_comment(anchor_text)) {
+        return extract_comment_text(a, anchor, source);
+    }
+
+    // Collect the contiguous run of `//` comment lines, walking upward. Each
+    // tree-sitter line_comment node spans [row, 0 .. row+1, 0] — it includes the
+    // trailing newline — so contiguity is a start-row comparison, not end-row.
+    char *texts[MAX_DOC_COMMENT_LINES];
+    int n = 0;
+    texts[n++] = anchor_text;
+    TSNode cur = anchor;
+    while (n < MAX_DOC_COMMENT_LINES) {
+        TSNode p = ts_node_prev_sibling(cur);
+        if (ts_node_is_null(p) || !is_comment_node(ts_node_type(p))) {
+            break;
+        }
+        char *pt = cbm_node_text(a, p, source);
+        if (!pt || !is_line_doc_comment(pt)) {
+            break;
+        }
+        if (ts_node_start_point(cur).row != ts_node_start_point(p).row + 1) {
+            break; // blank line between — detached, not part of this block
+        }
+        texts[n++] = pt;
+        cur = p;
+    }
+
+    // Strip the marker and any trailing newline from each line, once.
+    const char *lines[MAX_DOC_COMMENT_LINES];
+    size_t lens[MAX_DOC_COMMENT_LINES];
+    for (int i = 0; i < n; i++) {
+        const char *line = strip_line_comment_marker(texts[i]);
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            len--;
+        }
+        lines[i] = line;
+        lens[i] = len;
+    }
+
+    if (n == 1) {
+        char *out = cbm_arena_strndup(a, lines[0], lens[0]);
+        if (out && strlen(out) > MAX_COMMENT_LEN) {
+            out[MAX_COMMENT_LEN] = '\0';
+        }
+        return out;
+    }
+
+    // texts[n-1] is the topmost line, texts[0] the anchor (last) line. Emit in
+    // source order, marker-stripped, newline-joined.
+    size_t total = 0;
+    for (int i = 0; i < n; i++) {
+        total += lens[i] + 1; // + '\n' between lines / final '\0'
+    }
+    char *buf = (char *)cbm_arena_alloc(a, total + 1);
+    if (!buf) {
+        return extract_comment_text(a, anchor, source);
+    }
+    size_t off = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        memcpy(buf + off, lines[i], lens[i]);
+        off += lens[i];
+        if (i > 0) {
+            buf[off++] = '\n';
+        }
+    }
+    buf[off] = '\0';
+    if (strlen(buf) > MAX_COMMENT_LEN) {
+        buf[MAX_COMMENT_LEN] = '\0';
+    }
+    return buf;
+}
+
 // Go-specific: type_spec/type_alias comment is before the parent type_declaration.
 static const char *extract_go_type_docstring(CBMArena *a, TSNode node, const char *source) {
     const char *kind = ts_node_type(node);
@@ -1184,7 +1305,7 @@ static const char *extract_go_type_docstring(CBMArena *a, TSNode node, const cha
     }
     TSNode pprev = ts_node_prev_sibling(parent);
     if (!ts_node_is_null(pprev) && is_comment_node(ts_node_type(pprev))) {
-        return extract_comment_text(a, pprev, source);
+        return join_leading_line_comments(a, pprev, source);
     }
     return NULL;
 }
@@ -1225,7 +1346,7 @@ static const char *extract_docstring(CBMArena *a, TSNode node, const char *sourc
 
     TSNode prev = ts_node_prev_sibling(node);
     if (!ts_node_is_null(prev) && is_comment_node(ts_node_type(prev))) {
-        return extract_comment_text(a, prev, source);
+        return join_leading_line_comments(a, prev, source);
     }
 
     if (lang == CBM_LANG_PYTHON) {
