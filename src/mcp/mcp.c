@@ -3391,6 +3391,19 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
     return result;
 }
 
+/* Internal-only property keys the similarity pipeline persists in a node's
+ * properties_json purely so the indexing passes can recompute similarity edges
+ * from the DB column: "fp" (MinHash fingerprint hex), "sp" (AST structural
+ * profile vector) and "bt" (body-token bag). They are noise to an MCP consumer
+ * and must never reach a client response — see pass_definitions.c /
+ * pass_parallel.c (writers) and pass_similarity.c / pass_semantic_edges.c
+ * (readers, which take them straight from the column, not this path). A skip-set
+ * rather than an allowlist keeps genuine public fields open-ended: new extractor
+ * fields surface automatically, only this closed internal set is withheld. */
+static bool is_internal_property_key(const char *k) {
+    return strcmp(k, "fp") == 0 || strcmp(k, "sp") == 0 || strcmp(k, "bt") == 0;
+}
+
 /* Enrich a mutable JSON object with key-value pairs from a node's properties_json.
  * Returns the parsed yyjson_doc (caller frees AFTER serialization — zero-copy). */
 static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
@@ -3413,7 +3426,7 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
     while ((key = yyjson_obj_iter_next(&iter))) {
         yyjson_val *val = yyjson_obj_iter_get_val(key);
         const char *k = yyjson_get_str(key);
-        if (!k) {
+        if (!k || is_internal_property_key(k)) {
             continue;
         }
         if (yyjson_is_str(val)) {
