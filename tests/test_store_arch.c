@@ -378,6 +378,120 @@ TEST(arch_hotspots) {
     PASS();
 }
 
+/* Regression: a private, single-definition function whose simple name collides
+ * with a std/builtin method (`collect`, `new`, `from`, `iter`, `clone`) must NOT
+ * accrue hotspot fan-in from unrelated std-method call sites. The resolver binds
+ * a bare `x.collect()` (std Iterator::collect) onto the lone user `collect` via a
+ * weak short-name strategy (unique_name / suffix_match), and stamps a LOW
+ * confidence (import-unreachability floors it to ~0.375). arch_hotspots counted
+ * every CALLS edge regardless, inflating fan-in (observed 358 across 86 files for
+ * one private helper). The ranking must count only high-confidence CALLS edges,
+ * while genuine same-name user→user calls (high confidence) still count.
+ *
+ * RED at branch base (arch_hotspots counts all edges): `collect` fan_in == 6.
+ * GREEN after fix (low-confidence std-collision edges excluded): fan_in == 1. */
+static int hotspot_fanin_helper(cbm_architecture_info_t *info, const char *name) {
+    for (int i = 0; i < info->hotspot_count; i++) {
+        if (info->hotspots[i].name && strcmp(info->hotspots[i].name, name) == 0) {
+            return info->hotspots[i].fan_in;
+        }
+    }
+    return -1; /* not present in the hotspot list */
+}
+
+TEST(arch_hotspots_exclude_low_confidence_name_collisions) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_TRUE(s != NULL);
+    cbm_store_upsert_project(s, "hs", "/tmp/hs");
+
+    /* One private, single-definition helper named `collect` (collides with the
+     * std Iterator::collect method name). */
+    cbm_node_t fn_collect = {.project = "hs",
+                             .label = "Function",
+                             .name = "collect",
+                             .qualified_name = "hs.src.lint.collect",
+                             .file_path = "src/lint.rs"};
+    int64_t id_collect = cbm_store_upsert_node(s, &fn_collect);
+
+    /* A genuinely high-fan-in user function to prove real hotspots survive. */
+    cbm_node_t fn_process = {.project = "hs",
+                             .label = "Function",
+                             .name = "process",
+                             .qualified_name = "hs.src.core.process",
+                             .file_path = "src/core.rs"};
+    int64_t id_process = cbm_store_upsert_node(s, &fn_process);
+
+    /* Six distinct caller functions in six files. */
+    int64_t callers[6];
+    for (int i = 0; i < 6; i++) {
+        char name[32], qn[64], path[64];
+        snprintf(name, sizeof(name), "caller_%d", i);
+        snprintf(qn, sizeof(qn), "hs.src.mod%d.caller_%d", i, i);
+        snprintf(path, sizeof(path), "src/mod%d.rs", i);
+        cbm_node_t c = {.project = "hs",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = path};
+        callers[i] = cbm_store_upsert_node(s, &c);
+    }
+
+    /* Five LOW-confidence edges onto `collect`: these are the std `x.collect()`
+     * call sites mis-bound to the lone user def via a weak short-name strategy
+     * (import-unreachable unique_name → confidence floored to 0.375). They are
+     * name-collision noise and must NOT count toward fan-in. */
+    for (int i = 0; i < 5; i++) {
+        cbm_edge_t e = {.project = "hs",
+                        .source_id = callers[i],
+                        .target_id = id_collect,
+                        .type = "CALLS",
+                        .properties_json =
+                            "{\"callee\":\"collect\",\"confidence\":0.375,"
+                            "\"strategy\":\"unique_name\",\"candidates\":1}"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    /* One HIGH-confidence, genuine same-name user→user call onto `collect`
+     * (same_module). This is a real call and MUST count. */
+    cbm_edge_t legit = {.project = "hs",
+                        .source_id = callers[5],
+                        .target_id = id_collect,
+                        .type = "CALLS",
+                        .properties_json = "{\"callee\":\"collect\",\"confidence\":0.90,"
+                                           "\"strategy\":\"same_module\",\"candidates\":1}"};
+    cbm_store_insert_edge(s, &legit);
+
+    /* Three HIGH-confidence callers of `process` (a real hotspot). */
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t e = {.project = "hs",
+                        .source_id = callers[i],
+                        .target_id = id_process,
+                        .type = "CALLS",
+                        .properties_json = "{\"callee\":\"process\",\"confidence\":0.90,"
+                                           "\"strategy\":\"same_module\",\"candidates\":1}"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"hotspots"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "hs", NULL, aspects, 1, &info), CBM_STORE_OK);
+
+    /* `collect` accrues fan-in only from the single genuine high-confidence
+     * user→user call, NOT the five std-collision noise edges. */
+    ASSERT_EQ(hotspot_fanin_helper(&info, "collect"), 1);
+
+    /* The genuine hotspot keeps its full high-confidence fan-in. */
+    ASSERT_EQ(hotspot_fanin_helper(&info, "process"), 3);
+
+    /* And the real hotspot outranks the de-noised helper. */
+    ASSERT_TRUE(hotspot_fanin_helper(&info, "process") > hotspot_fanin_helper(&info, "collect"));
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_boundaries) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -1372,6 +1486,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_languages);
     RUN_TEST(arch_routes);
     RUN_TEST(arch_hotspots);
+    RUN_TEST(arch_hotspots_exclude_low_confidence_name_collisions);
     RUN_TEST(arch_boundaries);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
