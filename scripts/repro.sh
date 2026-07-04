@@ -6,18 +6,30 @@
 #   - BUILD/LINK failure  → real breakage → exit non-zero (fail the CI job).
 #   - Test redness        → EXPECTED → report the count, exit 0 (green board).
 #
-# Usage: scripts/repro.sh [CC=clang] [CXX=clang++] [--arch arm64|x86_64]
+# Usage:
+#   scripts/repro.sh                          # Auto-detect everything
+#   scripts/repro.sh --ccache                 # Use sccache for compile steps
+#   scripts/repro.sh --quiet                  # Suppress command echo from make
+#   scripts/repro.sh --jobs 16                # Override make parallelism
+#   scripts/repro.sh [CC=clang] [CXX=clang++] [--arch arm64|x86_64]
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# --arch before sourcing env.sh (mirrors test.sh)
+# --arch/--jobs before sourcing env.sh (mirrors test.sh)
 prev_arg=""
 for arg in "$@"; do
     case "$arg" in
+        --arch|--jobs) ;;
+        --jobs=*) export CBM_JOBS="${arg#--jobs=}" ;;
         arm64|x86_64) [[ "$prev_arg" == "--arch" ]] && export CBM_ARCH="$arg" ;;
         --arch=*) export CBM_ARCH="${arg#--arch=}" ;;
+        *)
+            if [[ "${prev_arg:-}" == "--jobs" ]]; then
+                export CBM_JOBS="$arg"
+            fi
+            ;;
     esac
     prev_arg="$arg"
 done
@@ -25,17 +37,42 @@ done
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
 
-MAKE_ARGS=""
+MAKE_ARGS=()
+MAKE_FLAGS=()
+USE_CCACHE=false
+QUIET=false
+prev_arg=""
 for arg in "$@"; do
+    if [[ "${prev_arg:-}" == "--jobs" || "${prev_arg:-}" == "--arch" ]]; then
+        prev_arg="$arg"
+        continue
+    fi
     case "$arg" in
-        CC=*|CXX=*) export "${arg?}" ;;
-        --arch|--arch=*|arm64|x86_64) ;;
-        *=*) MAKE_ARGS="$MAKE_ARGS $arg" ;;
+        CC=*|CXX=*) export "${arg?}"; MAKE_ARGS+=("$arg") ;;
+        --ccache) USE_CCACHE=true ;;
+        --quiet) QUIET=true ;;
+        --jobs) prev_arg="$arg"; continue ;;
+        --arch|--arch=*|--jobs=*|arm64|x86_64) ;;
+        *=*) MAKE_ARGS+=("$arg") ;;
     esac
+    prev_arg="$arg"
 done
 
 print_env "repro.sh"
+echo "  ccache=$USE_CCACHE quiet=$QUIET"
 verify_compiler "$CC"
+
+if $USE_CCACHE; then
+    if ! command -v sccache >/dev/null 2>&1; then
+        echo "ERROR: --ccache requested but sccache was not found in PATH" >&2
+        exit 1
+    fi
+    MAKE_ARGS+=("CCACHE=sccache")
+fi
+
+if $QUIET; then
+    MAKE_FLAGS+=("-s")
+fi
 
 OUT="$ROOT/repro-out.txt"
 # A RED reproduction fails its assertion and returns EARLY — before any cleanup —
@@ -47,7 +84,7 @@ export ASAN_OPTIONS="detect_leaks=0${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 
 # test-repro both builds and runs the runner; tolerate its non-zero (red) exit.
 set +e
-$ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm test-repro $MAKE_ARGS 2>&1 | tee "$OUT"
+$ARCH_PREFIX make "${MAKE_FLAGS[@]+"${MAKE_FLAGS[@]}"}" -j"$NPROC" -f Makefile.cbm test-repro "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}" 2>&1 | tee "$OUT"
 set -e
 
 # The runner prints a "<N> passed[, <M> failed]" summary line only if it actually

@@ -754,6 +754,87 @@ TEST(lsp_rust_deep_nesting_no_crash) {
  * Suite registration
  * ═══════════════════════════════════════════════════════════════════ */
 
+SUITE(stack_overflow_runtime) {
+    cbm_init();
+
+    RUN_TEST(ts_allocator_bound_to_mimalloc_issue424);
+    RUN_TEST(cpp_large_templated_header_no_crash_issue424);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_lsp_front) {
+    cbm_init();
+
+    RUN_TEST(lsp_java_deep_nesting_no_crash);
+    RUN_TEST(lsp_java_lambda_args_exceed_params_no_crash);
+    RUN_TEST(lsp_cpp_deep_expression_no_crash);
+    RUN_TEST(lsp_ts_cyclic_types_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_nested_types) {
+    cbm_init();
+
+    RUN_TEST(lsp_rust_nested_generic_type_no_crash);
+    RUN_TEST(lsp_java_nested_generic_type_no_crash);
+    RUN_TEST(lsp_csharp_nested_generic_type_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_nested_rust) {
+    cbm_init();
+
+    RUN_TEST(lsp_rust_nested_generic_type_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_nested_java) {
+    cbm_init();
+
+    RUN_TEST(lsp_java_nested_generic_type_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_nested_csharp) {
+    cbm_init();
+
+    RUN_TEST(lsp_csharp_nested_generic_type_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_call_walkers) {
+    cbm_init();
+
+    RUN_TEST(lsp_python_deep_nesting_no_crash);
+    RUN_TEST(lsp_python_deep_parens_no_crash);
+    RUN_TEST(lsp_ts_deep_nesting_no_crash);
+    RUN_TEST(lsp_kotlin_deep_nesting_no_crash);
+    RUN_TEST(lsp_csharp_deep_nesting_no_crash);
+    RUN_TEST(lsp_rust_deep_nesting_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_extractors) {
+    cbm_init();
+
+    RUN_TEST(js_calls_exceed_512);
+    RUN_TEST(python_calls_exceed_512);
+    RUN_TEST(go_calls_exceed_1024);
+    RUN_TEST(express_routes_exceed_512);
+    RUN_TEST(ts_imports_exceed_512);
+    RUN_TEST(js_deeply_nested_calls);
+    RUN_TEST(yaml_vars_exceed_256);
+
+    cbm_shutdown();
+}
+
 SUITE(stack_overflow) {
     cbm_init();
 

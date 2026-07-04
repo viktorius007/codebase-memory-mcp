@@ -6,7 +6,7 @@
 # Exports:
 #   ARCH        — target architecture (arm64 / x86_64)
 #   ARCH_PREFIX — "arch -arm64" on macOS, empty on Linux/Windows
-#   NPROC       — number of CPU cores
+#   NPROC       — number of make jobs
 #   OS          — darwin / linux / windows
 
 set -euo pipefail
@@ -42,8 +42,16 @@ if [[ "$OS" == "darwin" ]]; then
     ARCH_PREFIX="arch -${ARCH}"
 fi
 
-# ── Detect parallelism ─────────────────────────────────────────
-NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+# ── Detect / override parallelism ──────────────────────────────
+if [[ -n "${CBM_JOBS:-}" ]]; then
+    if [[ ! "$CBM_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: CBM_JOBS must be a positive integer" >&2
+        exit 1
+    fi
+    NPROC="$CBM_JOBS"
+else
+    NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+fi
 
 # ── Verify compiler is available for target arch ───────────────
 verify_compiler() {

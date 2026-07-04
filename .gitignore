@@ -48,11 +48,14 @@ private/
 build/
 node_modules/
 graph-ui/dist/
+graph-ui/.dist.stamp
+src/ui/embedded_assets.c
 
 # Generated reports
 BENCHMARK_REPORT.md
 TEST_PLAN.md
 CHANGELOG.md
+repro-out.txt
 
 # Soak test output
 soak-results/

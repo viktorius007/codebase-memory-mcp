@@ -11,7 +11,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARY="${ROOT}/build/c/codebase-memory-mcp"
+BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
@@ -51,7 +51,7 @@ SH
 chmod +x "${tmpdir}/wrapper.sh"
 mkfifo "${tmpdir}/stdin"
 
-CBM_BINARY="${BINARY}" FIFO="${tmpdir}/stdin" TMPDIR_PATH="${tmpdir}" \
+CBM_BINARY="${BINARY}" FIFO="${tmpdir}/stdin" TMPDIR_PATH="${tmpdir}" CBM_LOG_LEVEL=info \
   "${tmpdir}/wrapper.sh" &
 wrapper_pid=$!
 
@@ -70,6 +70,36 @@ fi
 child_pid="$(cat "${tmpdir}/child.pid")"
 if ! kill -0 "${child_pid}" 2>/dev/null; then
   echo "child did not start" >&2
+  exit 3
+fi
+
+# The pid file is written immediately after fork/exec. Wait until the child has
+# reached server startup, which happens after the watchdog thread is created, so
+# a slow scheduler does not turn this regression into a race.
+for _ in {1..50}; do
+  if grep -q 'level=info msg=server.start' "${tmpdir}/child.err" 2>/dev/null; then
+    break
+  fi
+  if grep -q 'parent.watchdog.unavailable' "${tmpdir}/child.err" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "${child_pid}" 2>/dev/null; then
+    echo "child exited before startup" >&2
+    [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
+    exit 3
+  fi
+  sleep 0.1
+done
+
+if grep -q 'parent.watchdog.unavailable' "${tmpdir}/child.err" 2>/dev/null; then
+  echo "parent watchdog did not start" >&2
+  [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
+  exit 3
+fi
+
+if ! grep -q 'level=info msg=server.start' "${tmpdir}/child.err" 2>/dev/null; then
+  echo "child did not report startup" >&2
+  [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
   exit 3
 fi
 

@@ -1491,77 +1491,85 @@ TEST(watcher_null_watch_count) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+#define RUN_WATCHER_CORE_TESTS()            \
+    do {                                    \
+        RUN_TEST(poll_interval_base);       \
+        RUN_TEST(poll_interval_scaling);    \
+        RUN_TEST(poll_interval_cap);        \
+        RUN_TEST(poll_interval_small);      \
+        RUN_TEST(watcher_create_free);      \
+        RUN_TEST(watcher_watch_unwatch);    \
+        RUN_TEST(watcher_unwatch_nonexistent); \
+        RUN_TEST(watcher_watch_replace);    \
+        RUN_TEST(watcher_null_safety);      \
+        RUN_TEST(watcher_poll_no_projects); \
+        RUN_TEST(watcher_poll_nonexistent_path); \
+        RUN_TEST(watcher_poll_this_repo);   \
+        RUN_TEST(watcher_stop_flag);        \
+    } while (0)
+
+#define RUN_WATCHER_GIT_TESTS()             \
+    do {                                    \
+        RUN_TEST(watcher_detects_git_commit); \
+        RUN_TEST(watcher_detects_dirty_worktree); \
+        RUN_TEST(watcher_detects_new_file); \
+        RUN_TEST(watcher_no_change_no_reindex); \
+        RUN_TEST(watcher_multiple_projects); \
+        RUN_TEST(watcher_non_git_skips);    \
+        RUN_TEST(watcher_interval_blocks_repoll); \
+        RUN_TEST(watcher_poll_interval_full_table); \
+        RUN_TEST(watcher_git_removed_no_crash); \
+        RUN_TEST(watcher_continued_dirty);  \
+        RUN_TEST(watcher_baseline_dirty_repo); \
+        RUN_TEST(watcher_unwatch_prunes_state); \
+        RUN_TEST(watcher_watch_after_unwatch); \
+    } while (0)
+
+#define RUN_WATCHER_FS_TESTS()              \
+    do {                                    \
+        RUN_TEST(watcher_detects_file_delete); \
+        RUN_TEST(watcher_detects_subdir_file); \
+        RUN_TEST(watcher_free_idempotent);  \
+        RUN_TEST(watcher_full_flow_new_file); \
+        RUN_TEST(watcher_fallback_still_detects); \
+        RUN_TEST(watcher_poll_only_watched_projects); \
+        RUN_TEST(watcher_touch_resets_immediate); \
+        RUN_TEST(watcher_modify_tracked_file); \
+        RUN_TEST(watcher_null_store_handling); \
+        RUN_TEST(watcher_free_null_safe);   \
+        RUN_TEST(watcher_empty_count);      \
+        RUN_TEST(watcher_watch_multiple_verify_count); \
+        RUN_TEST(watcher_watch_same_project_idempotent); \
+        RUN_TEST(watcher_unwatch_nonexistent_safe); \
+        RUN_TEST(watcher_touch_nonexistent_project); \
+        RUN_TEST(watcher_poll_interval_zero_files); \
+        RUN_TEST(watcher_poll_interval_small_files); \
+        RUN_TEST(watcher_poll_interval_medium_files); \
+        RUN_TEST(watcher_poll_interval_capped); \
+        RUN_TEST(watcher_poll_interval_negative); \
+        RUN_TEST(watcher_poll_empty_returns_zero); \
+        RUN_TEST(watcher_poll_non_git_dir); \
+        RUN_TEST(watcher_stop_prevents_run); \
+        RUN_TEST(watcher_watch_unwatch_rapid_cycle); \
+        RUN_TEST(watcher_callback_data_passed); \
+        RUN_TEST(watcher_null_poll_once);   \
+        RUN_TEST(watcher_null_watch_count); \
+    } while (0)
+
+SUITE(watcher_core) {
+    RUN_WATCHER_CORE_TESTS();
+}
+
+SUITE(watcher_git) {
+    RUN_WATCHER_GIT_TESTS();
+}
+
+SUITE(watcher_fs) {
+    RUN_WATCHER_FS_TESTS();
+}
+
 SUITE(watcher) {
-    /* Adaptive interval */
-    RUN_TEST(poll_interval_base);
-    RUN_TEST(poll_interval_scaling);
-    RUN_TEST(poll_interval_cap);
-    RUN_TEST(poll_interval_small);
-
-    /* Lifecycle */
-    RUN_TEST(watcher_create_free);
-    RUN_TEST(watcher_watch_unwatch);
-    RUN_TEST(watcher_unwatch_nonexistent);
-    RUN_TEST(watcher_watch_replace);
-    RUN_TEST(watcher_null_safety);
-
-    /* Polling */
-    RUN_TEST(watcher_poll_no_projects);
-    RUN_TEST(watcher_poll_nonexistent_path);
-    RUN_TEST(watcher_poll_this_repo);
-    RUN_TEST(watcher_stop_flag);
-
-    /* Git change detection */
-    RUN_TEST(watcher_detects_git_commit);
-    RUN_TEST(watcher_detects_dirty_worktree);
-    RUN_TEST(watcher_detects_new_file);
-    RUN_TEST(watcher_no_change_no_reindex);
-    RUN_TEST(watcher_multiple_projects);
-
-    /* Non-git project */
-    RUN_TEST(watcher_non_git_skips);
-
-    /* Adaptive interval behavior */
-    RUN_TEST(watcher_interval_blocks_repoll);
-    RUN_TEST(watcher_poll_interval_full_table);
-
-    /* Git removal + continued dirty + baseline dirty */
-    RUN_TEST(watcher_git_removed_no_crash);
-    RUN_TEST(watcher_continued_dirty);
-    RUN_TEST(watcher_baseline_dirty_repo);
-    RUN_TEST(watcher_unwatch_prunes_state);
-    RUN_TEST(watcher_watch_after_unwatch);
-
-    /* FSNotify ports (adapted for git-based detection) */
-    RUN_TEST(watcher_detects_file_delete);
-    RUN_TEST(watcher_detects_subdir_file);
-    RUN_TEST(watcher_free_idempotent);
-    RUN_TEST(watcher_full_flow_new_file);
-    RUN_TEST(watcher_fallback_still_detects);
-    RUN_TEST(watcher_poll_only_watched_projects);
-    RUN_TEST(watcher_touch_resets_immediate);
-    RUN_TEST(watcher_modify_tracked_file);
-
-    /* Resource management & auto-indexing behavior */
-    RUN_TEST(watcher_null_store_handling);
-    RUN_TEST(watcher_free_null_safe);
-    RUN_TEST(watcher_empty_count);
-    RUN_TEST(watcher_watch_multiple_verify_count);
-    RUN_TEST(watcher_watch_same_project_idempotent);
-    RUN_TEST(watcher_unwatch_nonexistent_safe);
-    RUN_TEST(watcher_touch_nonexistent_project);
-    /* Poll interval edge cases */
-    RUN_TEST(watcher_poll_interval_zero_files);
-    RUN_TEST(watcher_poll_interval_small_files);
-    RUN_TEST(watcher_poll_interval_medium_files);
-    RUN_TEST(watcher_poll_interval_capped);
-    RUN_TEST(watcher_poll_interval_negative);
-    /* Poll edge cases */
-    RUN_TEST(watcher_poll_empty_returns_zero);
-    RUN_TEST(watcher_poll_non_git_dir);
-    RUN_TEST(watcher_stop_prevents_run);
-    RUN_TEST(watcher_watch_unwatch_rapid_cycle);
-    RUN_TEST(watcher_callback_data_passed);
-    RUN_TEST(watcher_null_poll_once);
-    RUN_TEST(watcher_null_watch_count);
+    RUN_WATCHER_CORE_TESTS();
+    RUN_WATCHER_GIT_TESTS();
+    RUN_WATCHER_FS_TESTS();
 }

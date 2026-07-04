@@ -31,6 +31,7 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 /* ── Global counters (defined in test_main.c) ──────────────────── */
 
@@ -222,13 +223,35 @@ static inline const char *tf_reset(void) {
 
 /* ── Test runner ───────────────────────────────────────────────── */
 
+static inline double tf_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((double)tv.tv_sec * 1000.0) + ((double)tv.tv_usec / 1000.0);
+}
+
+static inline int tf_timings_enabled(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *v = getenv("CBM_TEST_TIMINGS");
+    cached = v && v[0] && strcmp(v, "0") != 0;
+    return cached;
+}
+
 #define RUN_TEST(name)                                    \
     do {                                                  \
+        int _timed = tf_timings_enabled();                \
+        double _start_ms = _timed ? tf_now_ms() : 0.0;    \
         printf("  %-55s", #name);                         \
         fflush(stdout);                                   \
         int _result = test_##name();                      \
         if (_result == 0) {                               \
-            printf("%sPASS%s\n", tf_green(), tf_reset()); \
+            if (_timed) {                                 \
+                printf("%sPASS%s %.1fms\n", tf_green(), tf_reset(), tf_now_ms() - _start_ms); \
+            } else {                                      \
+                printf("%sPASS%s\n", tf_green(), tf_reset()); \
+            }                                             \
             tf_pass_count++;                              \
         } else if (_result == -1) {                       \
             /* skip — already printed */                  \

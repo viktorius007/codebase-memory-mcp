@@ -328,6 +328,8 @@ git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh                    # standard binary
 scripts/build.sh --with-ui          # with graph visualization
+scripts/build.sh --incremental --ccache --fast-grammars --quiet --jobs 16  # warm local rebuilds
+scripts/test.sh --incremental --ccache --fast-grammars --quiet --jobs 16 --parallel-suites  # warm local tests
 # Binary at: build/c/codebase-memory-mcp
 ```
 

@@ -35,6 +35,13 @@ static bool suite_requested(const char *name) {
         }                             \
     } while (0)
 
+#define RUN_EXPLICIT_SUITE(name)                     \
+    do {                                             \
+        if (g_suite_argc > 1 && suite_requested(#name)) { \
+            RUN_SUITE(name);                         \
+        }                                            \
+    } while (0)
+
 /* Forward declarations of suite functions */
 extern void suite_arena(void);
 extern void suite_hash_table(void);
@@ -67,6 +74,9 @@ extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
 extern void suite_watcher(void);
+extern void suite_watcher_core(void);
+extern void suite_watcher_git(void);
+extern void suite_watcher_fs(void);
 extern void suite_lz4(void);
 extern void suite_zstd(void);
 extern void suite_artifact(void);
@@ -105,6 +115,8 @@ extern void suite_security(void);
 extern void suite_yaml(void);
 extern void suite_integration(void);
 extern void suite_lang_contract(void);
+extern void suite_lang_contract_rest(void);
+extern void suite_lang_contract_breadth(void);
 extern void suite_edge_imports(void);
 extern void suite_edge_structural(void);
 extern void suite_lsp_resolution_probe(void);
@@ -121,8 +133,28 @@ extern void suite_grammar_probe_e(void);
 extern void suite_grammar_probe_f(void);
 extern void suite_grammar_probe_g(void);
 extern void suite_incremental(void);
+extern void suite_incremental_mutation_core(void);
+extern void suite_incremental_mutation_edge(void);
+extern void suite_incremental_mutation_adversarial(void);
+extern void suite_incremental_mutation_adversarial_light(void);
+extern void suite_incremental_mutation_adversarial_heavy(void);
+extern void suite_incremental_mutation_stress(void);
+extern void suite_incremental_mutation_recovery(void);
+extern void suite_incremental_mutation(void);
+extern void suite_incremental_search_graph(void);
+extern void suite_incremental_query_graph(void);
+extern void suite_incremental_code_trace(void);
+extern void suite_incremental_misc_tools(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
+extern void suite_stack_overflow_runtime(void);
+extern void suite_stack_overflow_lsp_front(void);
+extern void suite_stack_overflow_nested_types(void);
+extern void suite_stack_overflow_nested_rust(void);
+extern void suite_stack_overflow_nested_java(void);
+extern void suite_stack_overflow_nested_csharp(void);
+extern void suite_stack_overflow_call_walkers(void);
+extern void suite_stack_overflow_extractors(void);
 extern void suite_dump_verify(void);
 extern void suite_dump_verify_io(void);
 
@@ -189,6 +221,9 @@ int main(int argc, char **argv) {
 
     /* Watcher (M10) */
     RUN_SELECTED_SUITE(watcher);
+    RUN_EXPLICIT_SUITE(watcher_core);
+    RUN_EXPLICIT_SUITE(watcher_git);
+    RUN_EXPLICIT_SUITE(watcher_fs);
 
     /* LZ4 + zstd + SQLite writer */
     RUN_SELECTED_SUITE(lz4);
@@ -260,12 +295,22 @@ int main(int argc, char **argv) {
 
     /* Stack overflow regression (GitHub #199) */
     RUN_SELECTED_SUITE(stack_overflow);
+    RUN_EXPLICIT_SUITE(stack_overflow_runtime);
+    RUN_EXPLICIT_SUITE(stack_overflow_lsp_front);
+    RUN_EXPLICIT_SUITE(stack_overflow_nested_types);
+    RUN_EXPLICIT_SUITE(stack_overflow_nested_rust);
+    RUN_EXPLICIT_SUITE(stack_overflow_nested_java);
+    RUN_EXPLICIT_SUITE(stack_overflow_nested_csharp);
+    RUN_EXPLICIT_SUITE(stack_overflow_call_walkers);
+    RUN_EXPLICIT_SUITE(stack_overflow_extractors);
 
     /* Integration (end-to-end) */
     RUN_SELECTED_SUITE(integration);
 
     /* Per-language graph contracts (node/edge types, attribution, no-crash) */
     RUN_SELECTED_SUITE(lang_contract);
+    RUN_EXPLICIT_SUITE(lang_contract_rest);
+    RUN_EXPLICIT_SUITE(lang_contract_breadth);
     RUN_SELECTED_SUITE(edge_imports);
     RUN_SELECTED_SUITE(edge_structural);
     RUN_SELECTED_SUITE(lsp_resolution_probe);
@@ -283,6 +328,18 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(grammar_probe_g);
 
     RUN_SELECTED_SUITE(incremental);
+    RUN_EXPLICIT_SUITE(incremental_mutation_core);
+    RUN_EXPLICIT_SUITE(incremental_mutation_edge);
+    RUN_EXPLICIT_SUITE(incremental_mutation_adversarial);
+    RUN_EXPLICIT_SUITE(incremental_mutation_adversarial_light);
+    RUN_EXPLICIT_SUITE(incremental_mutation_adversarial_heavy);
+    RUN_EXPLICIT_SUITE(incremental_mutation_stress);
+    RUN_EXPLICIT_SUITE(incremental_mutation_recovery);
+    RUN_EXPLICIT_SUITE(incremental_mutation);
+    RUN_EXPLICIT_SUITE(incremental_search_graph);
+    RUN_EXPLICIT_SUITE(incremental_query_graph);
+    RUN_EXPLICIT_SUITE(incremental_code_trace);
+    RUN_EXPLICIT_SUITE(incremental_misc_tools);
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();

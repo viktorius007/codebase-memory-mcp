@@ -20,13 +20,32 @@ Linux: `sudo apt install build-essential zlib1g-dev` (Debian/Ubuntu) or `sudo dn
 
 The binary is output to `build/c/codebase-memory-mcp`.
 
+For local edit/build loops, preserve object files and use the compiler cache:
+
+```bash
+scripts/build.sh --incremental --ccache --fast-grammars --quiet --jobs 16
+```
+
+The build also accepts `EXTRA_CFLAGS`, `EXTRA_CXXFLAGS`, and `EXTRA_LDFLAGS` for
+local instrumentation or platform-specific linker experiments. On macOS with the
+default Apple linker, the final link remains a single serial step.
+
 ## Run Tests
 
 ```bash
 scripts/test.sh
 ```
 
-This builds with ASan + UBSan and runs all tests (~2040 cases). Key test files:
+For warm local test runs, preserve build outputs and use the compiler cache:
+
+```bash
+scripts/test.sh --incremental --ccache --fast-grammars --quiet --jobs 16 --parallel-suites
+```
+
+This builds with ASan + UBSan and runs the full C test suite. Local runs shard
+the sanitizer suites near available core count by default; CI keeps serial suite
+execution unless `--parallel-suites` or `CBM_PARALLEL_SUITES=1` is set. Use
+`--serial-suites` to force the old single-runner mode. Key test files:
 - `tests/test_pipeline.c` — pipeline integration tests
 - `tests/test_httplink.c` — HTTP route extraction and linking
 - `tests/test_mcp.c` — MCP protocol and tool handler tests

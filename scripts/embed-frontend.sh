@@ -48,11 +48,11 @@ mangle() {
     echo "$1" | sed 's/[^a-zA-Z0-9]/_/g'
 }
 
-# Collect all files
+# Collect all public files. Dotfiles in dist are build metadata, not assets.
 FILES=()
 while IFS= read -r -d '' file; do
     FILES+=("$file")
-done < <(find "$DIST_DIR" -type f -print0 | sort -z)
+done < <(find "$DIST_DIR" -type f ! -name '.*' -print0 | sort -z)
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
     echo "Error: no files found in $DIST_DIR" >&2
@@ -61,12 +61,30 @@ fi
 
 echo "Embedding ${#FILES[@]} files from $DIST_DIR"
 
-# Generate object files
+# Generate object files. Each asset is independent, so run them in parallel.
+EMBED_JOBS="${CBM_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+if [[ ! "$EMBED_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    EMBED_JOBS=4
+fi
+
 OBJ_FILES=()
-for file in "${FILES[@]}"; do
+RELS=()
+MANGLED=()
+for i in "${!FILES[@]}"; do
+    file="${FILES[$i]}"
     rel="${file#$DIST_DIR/}"
     mangled=$(mangle "$rel")
-    obj="$OUTPUT_DIR/embed_${mangled}.o"
+    RELS[$i]="$rel"
+    MANGLED[$i]="$mangled"
+    OBJ_FILES[$i]="$OUTPUT_DIR/embed_${mangled}.o"
+done
+
+embed_one() {
+    local i="$1"
+    local file="${FILES[$i]}"
+    local rel="${RELS[$i]}"
+    local mangled="${MANGLED[$i]}"
+    local obj="${OBJ_FILES[$i]}"
 
     if $IS_LINUX; then
         # Linux: ld -r -b binary (zero bloat, ELF only)
@@ -88,9 +106,27 @@ for file in "${FILES[@]}"; do
         rm -f "$local_c"
     fi
 
-    OBJ_FILES+=("$obj")
     echo "  $rel -> $obj"
+}
+
+pids=()
+for i in "${!FILES[@]}"; do
+    while (( $(jobs -pr | wc -l | tr -d ' ') >= EMBED_JOBS )); do
+        sleep 0.05
+    done
+    embed_one "$i" &
+    pids+=("$!")
 done
+
+embed_rc=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        embed_rc=1
+    fi
+done
+if [[ "$embed_rc" -ne 0 ]]; then
+    exit "$embed_rc"
+fi
 
 # Generate embedded_assets.c
 ASSETS_C="src/ui/embedded_assets.c"

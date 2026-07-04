@@ -20,20 +20,28 @@
 #include <foundation/mem.h>
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 
 /* ── Globals ──────────────────────────────────────────────────────── */
 
 static char g_tmpdir[256];
 static char g_repodir[512];
+static char g_cache_dir[512];
 static char g_dbpath[512];
 static cbm_mcp_server_t *g_srv = NULL;
 static char *g_project = NULL;
+static char *g_prev_cache_dir = NULL;
+static int g_prev_cache_dir_was_set = 0;
+static int g_baseline_restored = 0;
+static int g_baseline_cache_writer = 0;
+static char g_baseline_lockdir[512];
 
 /* Baseline counts after full index */
 static int g_full_nodes = 0;
@@ -44,6 +52,23 @@ static int g_full_imports = 0;
 /* Performance: track peak RSS and timing per test phase */
 static size_t g_rss_before_full = 0;
 static double g_full_index_ms = 0;
+static CBMLogLevel g_prev_log_level = CBM_LOG_INFO;
+static int g_log_level_saved = 0;
+
+enum {
+    INCR_COPY_BUF = 64 * 1024,
+    INCR_BASELINE_WAIT_ATTEMPTS = 600,
+    INCR_BASELINE_WAIT_US = 100000,
+};
+
+static const char *incremental_baseline_project(void) {
+    return "cbm_fastapi_incremental_fixture";
+}
+
+static const char *incremental_baseline_cache_dir(void) {
+    const char *dir = getenv("CBM_INCREMENTAL_DB_CACHE_DIR");
+    return (dir && dir[0]) ? dir : NULL;
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -104,8 +129,16 @@ static int reformat_files(const char *subdir, int max_files) {
 }
 
 static char *index_repo(void) {
-    char args[512];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", g_repodir);
+    char args[1024];
+    const char *mode = getenv("CBM_INCREMENTAL_REINDEX_MODE");
+    if (g_full_nodes > 0 && mode && (strcmp(mode, "fast") == 0 ||
+                                     strcmp(mode, "moderate") == 0 ||
+                                     strcmp(mode, "full") == 0)) {
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"%s\",\"mode\":\"%s\"}",
+                 g_repodir, g_project, mode);
+    } else {
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"%s\"}", g_repodir, g_project);
+    }
     return cbm_mcp_handle_tool(g_srv, "index_repository", args);
 }
 
@@ -193,29 +226,210 @@ static int count_by_label(const char *label) {
     return total;
 }
 
+static int file_exists_nonempty(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && st.st_size > 0;
+}
+
+static int copy_file_bytes(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) {
+        return 0;
+    }
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+
+    char *buf = malloc(INCR_COPY_BUF);
+    if (!buf) {
+        fclose(out);
+        fclose(in);
+        return 0;
+    }
+
+    int ok = 1;
+    size_t n = 0;
+    while ((n = fread(buf, 1, INCR_COPY_BUF, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ferror(in)) {
+        ok = 0;
+    }
+    if (fclose(out) != 0) {
+        ok = 0;
+    }
+    fclose(in);
+    free(buf);
+    return ok;
+}
+
+static int64_t incremental_stat_mtime_ns(const struct stat *st) {
+#ifdef __APPLE__
+    return ((int64_t)st->st_mtimespec.tv_sec * 1000000000LL) + (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * 1000000000LL;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * 1000000000LL) + (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
+static void incremental_baseline_cache_path(char *buf, size_t bufsz) {
+    const char *dir = incremental_baseline_cache_dir();
+    if (!dir) {
+        buf[0] = '\0';
+        return;
+    }
+    snprintf(buf, bufsz, "%s/%s.db", dir, incremental_baseline_project());
+}
+
+static void incremental_release_baseline_lock(void) {
+    if (g_baseline_cache_writer && g_baseline_lockdir[0]) {
+        rmdir(g_baseline_lockdir);
+    }
+    g_baseline_cache_writer = 0;
+    g_baseline_lockdir[0] = '\0';
+}
+
+static int incremental_acquire_baseline_lock(const char *cache_path) {
+    snprintf(g_baseline_lockdir, sizeof(g_baseline_lockdir), "%s.lock", cache_path);
+    if (mkdir(g_baseline_lockdir, 0700) == 0) {
+        g_baseline_cache_writer = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int incremental_copy_baseline_from_cache(const char *cache_path) {
+    if (!copy_file_bytes(cache_path, g_dbpath)) {
+        return 0;
+    }
+
+    cbm_store_t *s = cbm_store_open_path(g_dbpath);
+    if (!s) {
+        return 0;
+    }
+    int ok = cbm_store_upsert_project(s, g_project, g_repodir) == CBM_STORE_OK;
+    cbm_file_hash_t *hashes = NULL;
+    int hash_count = 0;
+    if (ok && cbm_store_get_file_hashes(s, g_project, &hashes, &hash_count) == CBM_STORE_OK) {
+        for (int i = 0; i < hash_count; i++) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s", g_repodir, hashes[i].rel_path);
+            struct stat st;
+            if (stat(path, &st) == 0) {
+                if (cbm_store_upsert_file_hash(s, g_project, hashes[i].rel_path,
+                                               hashes[i].sha256 ? hashes[i].sha256 : "",
+                                               incremental_stat_mtime_ns(&st),
+                                               st.st_size) != CBM_STORE_OK) {
+                    ok = 0;
+                    break;
+                }
+            }
+        }
+        cbm_store_free_file_hashes(hashes, hash_count);
+    }
+    cbm_store_close(s);
+    return ok;
+}
+
+static int incremental_try_restore_baseline_cache(void) {
+    const char *dir = incremental_baseline_cache_dir();
+    if (!dir) {
+        return 0;
+    }
+
+    char cache_path[512];
+    incremental_baseline_cache_path(cache_path, sizeof(cache_path));
+    if (!cache_path[0]) {
+        return 0;
+    }
+
+    if (file_exists_nonempty(cache_path)) {
+        g_baseline_restored = incremental_copy_baseline_from_cache(cache_path);
+        return g_baseline_restored;
+    }
+
+    if (incremental_acquire_baseline_lock(cache_path)) {
+        return 0;
+    }
+
+    for (int i = 0; i < INCR_BASELINE_WAIT_ATTEMPTS; i++) {
+        if (file_exists_nonempty(cache_path)) {
+            g_baseline_restored = incremental_copy_baseline_from_cache(cache_path);
+            return g_baseline_restored;
+        }
+        if (incremental_acquire_baseline_lock(cache_path)) {
+            return 0;
+        }
+        usleep(INCR_BASELINE_WAIT_US);
+    }
+
+    return 0;
+}
+
+static void incremental_save_baseline_cache(void) {
+    if (!g_baseline_cache_writer) {
+        return;
+    }
+
+    char cache_path[512];
+    incremental_baseline_cache_path(cache_path, sizeof(cache_path));
+    if (!cache_path[0] || file_exists_nonempty(cache_path)) {
+        incremental_release_baseline_lock();
+        return;
+    }
+
+    char tmp_path[640];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", cache_path, (long)getpid());
+    if (copy_file_bytes(g_dbpath, tmp_path)) {
+        rename(tmp_path, cache_path);
+    }
+    incremental_release_baseline_lock();
+}
+
 /* ── Setup / Teardown ─────────────────────────────────────────────── */
 
 static int incremental_setup(void) {
+    g_cache_dir[0] = '\0';
+    g_dbpath[0] = '\0';
+    g_baseline_restored = 0;
+    g_baseline_cache_writer = 0;
+    g_baseline_lockdir[0] = '\0';
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    g_prev_cache_dir_was_set = old_cache != NULL;
+    g_prev_cache_dir = old_cache ? strdup(old_cache) : NULL;
+
     snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_incr_XXXXXX");
     if (!cbm_mkdtemp(g_tmpdir))
         return -1;
 
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
+    snprintf(g_cache_dir, sizeof(g_cache_dir), "%s/cache", g_tmpdir);
+    cbm_mkdir(g_cache_dir);
+    cbm_setenv("CBM_CACHE_DIR", g_cache_dir, 1);
 
-    /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
-     * Cuts indexing time roughly in half on slow shared runners. */
+    /* Use the same sparse fixture locally and in CI: docs/ and tests/ make the
+     * integration run much larger without adding coverage for incremental
+     * source indexing behavior. */
     char cmd[1024];
-    if (getenv("CI")) {
+    const char *fixture_cache = getenv("CBM_FASTAPI_FIXTURE_CACHE");
+    if (fixture_cache && fixture_cache[0]) {
         snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet --filter=blob:none "
-                 "--sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
-                 "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1",
-                 g_repodir, g_repodir);
+                 "git -c advice.detachedHead=false clone --quiet --shared --sparse '%s' '%s' "
+                 "2>&1 && cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' "
+                 "'!/tests' 2>&1",
+                 fixture_cache, g_repodir, g_repodir);
     } else {
         snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet "
-                 "https://github.com/fastapi/fastapi.git '%s' 2>&1",
-                 g_repodir);
+                 "git -c advice.detachedHead=false clone --depth=1 --branch 0.99.1 --quiet "
+                 "--filter=blob:none --sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
+                 "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1",
+                 g_repodir, g_repodir);
     }
     int rc = system(cmd);
     if (rc != 0) {
@@ -223,24 +437,24 @@ static int incremental_setup(void) {
         return -1;
     }
 
-    g_project = cbm_project_name_from_path(g_repodir);
+    if (incremental_baseline_cache_dir()) {
+        g_project = strdup(incremental_baseline_project());
+    } else {
+        g_project = cbm_project_name_from_path(g_repodir);
+    }
     if (!g_project)
         return -1;
 
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
-
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
-
+    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", g_cache_dir, g_project);
     unlink(g_dbpath);
 
     g_srv = cbm_mcp_server_new(NULL);
     if (!g_srv)
         return -1;
+
+    g_prev_log_level = cbm_log_get_level();
+    g_log_level_saved = 1;
+    cbm_log_set_level(CBM_LOG_WARN);
 
     g_rss_before_full = cbm_mem_rss();
 
@@ -252,6 +466,7 @@ static void incremental_teardown(void) {
         cbm_mcp_server_free(g_srv);
         g_srv = NULL;
     }
+    incremental_release_baseline_lock();
     if (g_project) {
         unlink(g_dbpath);
         char wal[520], shm[520];
@@ -260,8 +475,21 @@ static void incremental_teardown(void) {
         unlink(wal);
         unlink(shm);
     }
+    if (g_log_level_saved) {
+        cbm_log_set_level(g_prev_log_level);
+        g_log_level_saved = 0;
+    }
     free(g_project);
     g_project = NULL;
+
+    if (g_prev_cache_dir_was_set) {
+        cbm_setenv("CBM_CACHE_DIR", g_prev_cache_dir ? g_prev_cache_dir : "", 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(g_prev_cache_dir);
+    g_prev_cache_dir = NULL;
+    g_prev_cache_dir_was_set = 0;
 
     th_rmtree(g_tmpdir);
 }
@@ -271,6 +499,24 @@ static void incremental_teardown(void) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(incr_full_index) {
+    if (incremental_try_restore_baseline_cache()) {
+        g_full_nodes = get_node_count();
+        g_full_edges = get_edge_count();
+        g_full_calls = get_edge_count_by_type("CALLS");
+        g_full_imports = get_edge_count_by_type("IMPORTS");
+        g_full_index_ms = 0;
+
+        ASSERT_GT(g_full_nodes, 2000);
+        ASSERT_GT(g_full_edges, 500);
+        ASSERT_GT(g_full_calls, 200);
+        ASSERT_GT(g_full_imports, 50);
+
+        printf("    [perf] full: restored baseline cache, %d nodes, %d edges "
+               "(%d CALLS, %d IMPORTS)\n",
+               g_full_nodes, g_full_edges, g_full_calls, g_full_imports);
+        PASS();
+    }
+
     double ms = 0;
     size_t peak_mb = 0;
     char *resp = index_repo_timed(&ms, &peak_mb);
@@ -327,6 +573,8 @@ TEST(incr_full_index) {
     printf("    [perf] full: %d nodes, %d edges (%d CALLS, %d IMPORTS) "
            "in %.0fms, peak=%zuMB\n",
            g_full_nodes, g_full_edges, g_full_calls, g_full_imports, ms, peak_mb);
+
+    incremental_save_baseline_cache();
 
     PASS();
 }
@@ -422,12 +670,16 @@ TEST(incr_modify_file) {
     ASSERT_GT(get_node_count(), nodes_before);
 
     /* Single-file incremental should be faster than full */
-    if ((int)ms > (int)(g_full_index_ms * 1.5)) {
+    if (!g_baseline_restored && (int)ms > (int)(g_full_index_ms * 1.5)) {
         printf("    [PERF WARNING] incremental slower than 1.5x full: %.0fms vs %.0fms\n", ms,
                g_full_index_ms);
     }
 
-    printf("    [perf] modify 1 file: %.0fms (full was %.0fms)\n", ms, g_full_index_ms);
+    if (g_baseline_restored) {
+        printf("    [perf] modify 1 file: %.0fms (full baseline restored from cache)\n", ms);
+    } else {
+        printf("    [perf] modify 1 file: %.0fms (full was %.0fms)\n", ms, g_full_index_ms);
+    }
 
     PASS();
 }
@@ -562,7 +814,6 @@ TEST(incr_empty_file) {
     ASSERT(resp != NULL);
     ASSERT(strstr(resp, "indexed") != NULL);
     ASSERT(has_function("incr_test_injected"));
-    delete_file_at("fastapi/incr_empty.py");
     free(resp);
     PASS();
 }
@@ -585,7 +836,6 @@ TEST(incr_syntax_error) {
     int diff = abs(get_node_count() - nodes_before);
     ASSERT_LT(diff, 20);
 
-    delete_file_at("fastapi/incr_broken.py");
     free(resp);
     PASS();
 }
@@ -615,7 +865,6 @@ TEST(incr_huge_single_function) {
     /* Key: must not crash or corrupt graph */
     ASSERT(has_function("incr_test_injected"));
 
-    delete_file_at("fastapi/incr_huge.py");
     PASS();
 }
 
@@ -637,7 +886,6 @@ TEST(incr_binary_content) {
     ASSERT(strstr(resp, "indexed") != NULL);
     ASSERT(has_function("incr_test_injected"));
 
-    delete_file_at("fastapi/incr_binary.py");
     free(resp);
     PASS();
 }
@@ -661,7 +909,6 @@ TEST(incr_large_generated) {
     ASSERT(has_function("incr_gen_0"));
     ASSERT(has_function("incr_gen_299"));
 
-    delete_file_at("fastapi/incr_generated.py");
     free(resp);
     PASS();
 }
@@ -677,8 +924,6 @@ TEST(incr_new_subdir) {
     ASSERT(strstr(resp, "indexed") != NULL);
     ASSERT(has_function("newpkg_handler"));
 
-    delete_file_at("fastapi/newpkg/handler.py");
-    delete_file_at("fastapi/newpkg/__init__.py");
     free(resp);
     PASS();
 }
@@ -2910,6 +3155,355 @@ TEST(tool_delete_and_verify) {
     PASS();
 }
 
+static int incremental_inject_tool_fixture(void) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    FILE *f = fopen(path, "a");
+    if (!f)
+        return 1;
+    fprintf(f, "\n\ndef incr_test_injected(x: int) -> int:\n"
+               "    return x * 42\n"
+               "\n"
+               "def incr_test_helper(y: str) -> str:\n"
+               "    return y.upper()\n");
+    fclose(f);
+    return 0;
+}
+
+static int incremental_prepare_split_fixture(void) {
+    if (incremental_setup() != 0) {
+        printf("  SETUP FAILED — skipping incremental tests (network?)\n");
+        return -1;
+    }
+    if (incremental_inject_tool_fixture() != 0)
+        return 1;
+    if (test_incr_full_index() != 0)
+        return 1;
+    if (test_incr_full_has_functions() != 0)
+        return 1;
+    if (test_incr_full_edge_types() != 0)
+        return 1;
+    return 0;
+}
+
+#define PREPARE_INCREMENTAL_SPLIT_SUITE()      \
+    do {                                       \
+        int _prep_rc = incremental_prepare_split_fixture(); \
+        if (_prep_rc != 0) {                   \
+            if (_prep_rc > 0) {                \
+                tf_fail_count++;               \
+            }                                  \
+            incremental_teardown();            \
+            return;                            \
+        }                                      \
+    } while (0)
+
+#define PREPARE_INCREMENTAL_COUNTED_SPLIT_SUITE()        \
+    do {                                                 \
+        if (incremental_setup() != 0) {                  \
+            printf("  SETUP FAILED — skipping incremental tests (network?)\n"); \
+            incremental_teardown();                      \
+            return;                                      \
+        }                                                \
+        if (incremental_inject_tool_fixture() != 0) {    \
+            tf_fail_count++;                             \
+            incremental_teardown();                      \
+            return;                                      \
+        }                                                \
+        int _fail_before = tf_fail_count;                \
+        RUN_TEST(incr_full_index);                       \
+        RUN_TEST(incr_full_has_functions);               \
+        RUN_TEST(incr_full_edge_types);                  \
+        if (tf_fail_count != _fail_before) {             \
+            incremental_teardown();                      \
+            return;                                      \
+        }                                                \
+    } while (0)
+
+#define RUN_INCREMENTAL_MUTATION_CORE_TESTS()  \
+    do {                                       \
+        RUN_TEST(incr_noop_reindex);           \
+        RUN_TEST(incr_modify_file);            \
+        RUN_TEST(incr_formatter_run);          \
+        RUN_TEST(incr_add_file);               \
+        RUN_TEST(incr_delete_file);            \
+        RUN_TEST(incr_simultaneous_changes);   \
+    } while (0)
+
+#define RUN_INCREMENTAL_MUTATION_ADVERSARIAL_TESTS() \
+    do {                                       \
+        RUN_TEST(incr_empty_file);             \
+        RUN_TEST(incr_syntax_error);           \
+        RUN_TEST(incr_huge_single_function);   \
+        RUN_TEST(incr_binary_content);         \
+        RUN_TEST(incr_large_generated);        \
+        RUN_TEST(incr_new_subdir);             \
+    } while (0)
+
+#define RUN_INCREMENTAL_MUTATION_ADVERSARIAL_LIGHT_TESTS() \
+    do {                                                   \
+        RUN_TEST(incr_empty_file);                         \
+        RUN_TEST(incr_syntax_error);                       \
+        RUN_TEST(incr_binary_content);                     \
+        RUN_TEST(incr_new_subdir);                         \
+    } while (0)
+
+#define RUN_INCREMENTAL_MUTATION_ADVERSARIAL_HEAVY_TESTS() \
+    do {                                                   \
+        RUN_TEST(incr_huge_single_function);               \
+        RUN_TEST(incr_large_generated);                    \
+    } while (0)
+
+#define RUN_INCREMENTAL_MUTATION_STRESS_TESTS() \
+    do {                                        \
+        RUN_TEST(incr_rapid_reindex);          \
+        RUN_TEST(incr_replace_file_content);   \
+        RUN_TEST(incr_batch_add_delete);       \
+    } while (0)
+
+#define RUN_INCREMENTAL_MUTATION_RECOVERY_TESTS() \
+    do {                                          \
+        RUN_TEST(incr_db_deleted_recovery);       \
+        RUN_TEST(incr_accuracy_vs_full);          \
+        RUN_TEST(incr_perf_single_file_fast);     \
+    } while (0)
+
+SUITE(incremental_mutation_core) {
+    PREPARE_INCREMENTAL_COUNTED_SPLIT_SUITE();
+
+    RUN_INCREMENTAL_MUTATION_CORE_TESTS();
+
+    incremental_teardown();
+}
+
+SUITE(incremental_mutation_edge) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_INCREMENTAL_MUTATION_ADVERSARIAL_TESTS();
+    RUN_INCREMENTAL_MUTATION_STRESS_TESTS();
+
+    incremental_teardown();
+}
+
+SUITE(incremental_mutation_adversarial) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_INCREMENTAL_MUTATION_ADVERSARIAL_TESTS();
+
+    incremental_teardown();
+}
+
+SUITE(incremental_mutation_adversarial_light) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_INCREMENTAL_MUTATION_ADVERSARIAL_LIGHT_TESTS();
+
+    incremental_teardown();
+}
+
+SUITE(incremental_mutation_adversarial_heavy) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_INCREMENTAL_MUTATION_ADVERSARIAL_HEAVY_TESTS();
+
+    incremental_teardown();
+}
+
+SUITE(incremental_mutation_stress) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_INCREMENTAL_MUTATION_STRESS_TESTS();
+
+    incremental_teardown();
+}
+
+SUITE(incremental_mutation_recovery) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_INCREMENTAL_MUTATION_RECOVERY_TESTS();
+
+    incremental_teardown();
+}
+
+SUITE(incremental_mutation) {
+    PREPARE_INCREMENTAL_COUNTED_SPLIT_SUITE();
+
+    RUN_INCREMENTAL_MUTATION_CORE_TESTS();
+    RUN_INCREMENTAL_MUTATION_ADVERSARIAL_TESTS();
+    RUN_INCREMENTAL_MUTATION_STRESS_TESTS();
+    RUN_INCREMENTAL_MUTATION_RECOVERY_TESTS();
+
+    incremental_teardown();
+}
+
+SUITE(incremental_search_graph) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_TEST(tool_list_projects_basic);
+    RUN_TEST(tool_list_projects_has_current);
+    RUN_TEST(tool_index_status_basic);
+    RUN_TEST(tool_index_status_nonexistent);
+    RUN_TEST(tool_schema_has_labels);
+    RUN_TEST(tool_schema_has_edge_types);
+    RUN_TEST(tool_sg_label_function);
+    RUN_TEST(tool_sg_label_method);
+    RUN_TEST(tool_sg_label_module);
+    RUN_TEST(tool_sg_label_variable);
+    RUN_TEST(tool_sg_label_class);
+    RUN_TEST(tool_sg_label_route);
+    RUN_TEST(tool_sg_label_nonexistent);
+    RUN_TEST(tool_sg_name_exact);
+    RUN_TEST(tool_sg_name_regex);
+    RUN_TEST(tool_sg_name_no_match);
+    RUN_TEST(tool_sg_min_degree);
+    RUN_TEST(tool_sg_max_degree_zero);
+    RUN_TEST(tool_sg_degree_range);
+    RUN_TEST(tool_sg_limit);
+    RUN_TEST(tool_sg_offset);
+    RUN_TEST(tool_sg_file_pattern);
+    RUN_TEST(tool_sg_include_connected);
+    RUN_TEST(tool_sg_relationship);
+    RUN_TEST(tool_sg_qn_pattern);
+    RUN_TEST(tool_sg_combined_filters);
+    RUN_TEST(tool_sg_project_only);
+    RUN_TEST(tool_sg_invalid_project);
+    RUN_TEST(tool_sg_exclude_entry_points);
+    RUN_TEST(tool_sg_exclude_entry_points_false);
+    RUN_TEST(tool_sg_high_offset);
+    RUN_TEST(tool_sg_name_pattern_dot_star);
+    RUN_TEST(tool_sg_name_pattern_anchored);
+    RUN_TEST(tool_sg_rel_imports);
+    RUN_TEST(tool_sg_rel_defines);
+    RUN_TEST(tool_sg_rel_contains_file);
+    RUN_TEST(tool_sg_label_file);
+    RUN_TEST(tool_sg_label_folder);
+    RUN_TEST(tool_sg_label_package);
+    RUN_TEST(tool_sg_include_connected_false);
+    RUN_TEST(tool_sg_qn_and_label);
+    RUN_TEST(tool_sg_file_and_name);
+
+    incremental_teardown();
+}
+
+SUITE(incremental_query_graph) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_TEST(tool_qg_match_nodes);
+    RUN_TEST(tool_qg_match_edges);
+    RUN_TEST(tool_qg_match_imports);
+    RUN_TEST(tool_qg_match_defines);
+    RUN_TEST(tool_qg_match_contains);
+    RUN_TEST(tool_qg_where_name);
+    RUN_TEST(tool_qg_two_hop);
+    RUN_TEST(tool_qg_max_rows);
+    RUN_TEST(tool_qg_return_properties);
+    RUN_TEST(tool_qg_invalid_project);
+    RUN_TEST(tool_qg_count_functions);
+    RUN_TEST(tool_qg_edge_properties);
+    RUN_TEST(tool_qg_node_file_path);
+    RUN_TEST(tool_qg_match_module_defines);
+    RUN_TEST(tool_qg_max_rows_1);
+    RUN_TEST(tool_qg_configures);
+    RUN_TEST(tool_qg_handles);
+    RUN_TEST(tool_qg_defines_method);
+    RUN_TEST(tool_qg_defines_method_more_than_10);
+    RUN_TEST(tool_qg_class_lines_nonzero);
+    RUN_TEST(tool_qg_no_limit);
+    RUN_TEST(tool_qg_empty_result);
+
+    incremental_teardown();
+}
+
+SUITE(incremental_code_trace) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_TEST(tool_sc_compact);
+    RUN_TEST(tool_sc_full);
+    RUN_TEST(tool_sc_files);
+    RUN_TEST(tool_sc_regex);
+    RUN_TEST(tool_sc_file_pattern);
+    RUN_TEST(tool_sc_path_filter);
+    RUN_TEST(tool_sc_context);
+    RUN_TEST(tool_sc_no_results);
+    RUN_TEST(tool_snippet_short_name);
+    RUN_TEST(tool_snippet_nonexistent);
+    RUN_TEST(tool_snippet_include_neighbors);
+    RUN_TEST(tool_trace_outbound);
+    RUN_TEST(tool_trace_inbound);
+    RUN_TEST(tool_trace_both);
+    RUN_TEST(tool_trace_depth_1);
+    RUN_TEST(tool_trace_nonexistent);
+    RUN_TEST(tool_trace_edge_types);
+    RUN_TEST(tool_sc_limit_1);
+    RUN_TEST(tool_sc_limit_50);
+    RUN_TEST(tool_sc_combined);
+    RUN_TEST(tool_snippet_full_qn);
+    RUN_TEST(tool_trace_imports_only);
+    RUN_TEST(tool_trace_calls_and_imports);
+    RUN_TEST(tool_trace_deep);
+    RUN_TEST(tool_sc_regex_false);
+    RUN_TEST(tool_sc_context_zero);
+    RUN_TEST(tool_sc_special_chars);
+    RUN_TEST(tool_snippet_neighbors_false);
+    RUN_TEST(tool_snippet_class);
+    RUN_TEST(tool_trace_depth_0);
+    RUN_TEST(tool_trace_defines_only);
+    RUN_TEST(tool_trace_include_tests);
+    RUN_TEST(tool_trace_risk_labels);
+
+    incremental_teardown();
+}
+
+SUITE(incremental_misc_tools) {
+    PREPARE_INCREMENTAL_SPLIT_SUITE();
+
+    RUN_TEST(tool_arch_structure);
+    RUN_TEST(tool_arch_all);
+    RUN_TEST(tool_arch_no_aspects);
+    RUN_TEST(tool_detect_changes_default);
+    RUN_TEST(tool_detect_changes_custom_branch);
+    RUN_TEST(tool_detect_changes_since);
+    RUN_TEST(tool_detect_changes_since_precedence);
+    RUN_TEST(tool_detect_changes_depth);
+    RUN_TEST(tool_adr_get);
+    RUN_TEST(tool_adr_sections);
+    RUN_TEST(tool_ingest_traces_empty);
+    RUN_TEST(tool_ingest_traces_basic);
+    RUN_TEST(tool_err_query_bad_project);
+    RUN_TEST(tool_err_search_code_bad_project);
+    RUN_TEST(tool_err_snippet_bad_project);
+    RUN_TEST(tool_err_trace_bad_project);
+    RUN_TEST(tool_err_arch_bad_project);
+    RUN_TEST(tool_err_detect_bad_project);
+    RUN_TEST(tool_err_delete_nonexistent);
+    RUN_TEST(tool_index_mode_fast);
+    RUN_TEST(tool_index_invalid_path);
+    RUN_TEST(tool_index_missing_param);
+    RUN_TEST(tool_arch_dependencies);
+    RUN_TEST(tool_arch_entry_points);
+    RUN_TEST(tool_arch_routes);
+    RUN_TEST(tool_arch_multi_aspects);
+    RUN_TEST(tool_detect_changes_scope);
+    RUN_TEST(tool_adr_update);
+    RUN_TEST(tool_adr_sections_array);
+    RUN_TEST(tool_ingest_traces_multiple);
+    RUN_TEST(tool_detect_nonexistent_branch);
+    RUN_TEST(tool_detect_depth_1);
+    RUN_TEST(tool_adr_default_mode);
+    RUN_TEST(tool_adr_update_empty);
+    RUN_TEST(tool_ingest_traces_partial);
+    RUN_TEST(tool_err_schema_bad_project);
+    RUN_TEST(tool_err_index_status_no_project);
+    RUN_TEST(tool_err_adr_bad_project);
+    RUN_TEST(tool_err_ingest_bad_project);
+    RUN_TEST(tool_err_ingest_no_traces);
+    RUN_TEST(tool_index_mode_full);
+    RUN_TEST(tool_arch_empty_aspects);
+    RUN_TEST(tool_delete_and_verify);
+
+    incremental_teardown();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -2917,6 +3511,16 @@ TEST(tool_delete_and_verify) {
 SUITE(incremental) {
     if (incremental_setup() != 0) {
         printf("  SETUP FAILED — skipping incremental tests (network?)\n");
+        incremental_teardown();
+        return;
+    }
+
+    /* Inject test functions so tool tests (trace_path etc.) always have data,
+     * even when perf phases are skipped on CI. Do this before the full index so
+     * every shard avoids a second index pass just to pick up the sentinel. */
+    if (incremental_inject_tool_fixture() != 0) {
+        tf_fail_count++;
+        incremental_teardown();
         return;
     }
 
@@ -2924,28 +3528,6 @@ SUITE(incremental) {
     RUN_TEST(incr_full_index);
     RUN_TEST(incr_full_has_functions);
     RUN_TEST(incr_full_edge_types);
-
-    /* Inject test functions so tool tests (trace_path etc.) always have data,
-     * even when perf phases are skipped on CI. Update baseline counts. */
-    {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
-        FILE *f = fopen(path, "a");
-        if (f) {
-            fprintf(f, "\n\ndef incr_test_injected(x: int) -> int:\n"
-                       "    return x * 42\n"
-                       "\n"
-                       "def incr_test_helper(y: str) -> str:\n"
-                       "    return y.upper()\n");
-            fclose(f);
-        }
-        char *resp = index_repo();
-        free(resp);
-        g_full_nodes = get_node_count();
-        g_full_edges = get_edge_count();
-        g_full_calls = get_edge_count_by_type("CALLS");
-        g_full_imports = get_edge_count_by_type("IMPORTS");
-    }
 
     /* Phase 2: Noop */
     RUN_TEST(incr_noop_reindex);
