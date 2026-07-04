@@ -95,7 +95,7 @@ CXX_COMPILE = $(if $(CCACHE),$(CCACHE) $(CXX),$(CXX))
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-PROD_OPT ?= -O2
+PROD_OPT ?= -O3
 CFLAGS_PROD = $(CFLAGS_COMMON) $(PROD_OPT) -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
 CXXFLAGS_PROD = $(CXXFLAGS_COMMON) $(PROD_OPT)
 
@@ -516,7 +516,7 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
-GRAMMAR_OPT ?= -O2
+GRAMMAR_OPT ?= -O3
 GRAMMAR_OPT_TEST ?= -O1
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE $(GRAMMAR_OPT) -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) $(EXTRA_CFLAGS)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g $(GRAMMAR_OPT_TEST) -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
@@ -722,7 +722,7 @@ test-tsan:
 
 # ── Production binary ────────────────────────────────────────────
 
-# Grammar/TS/LSP objects for production (compiled with relaxed warnings, -O2)
+# Grammar/TS/LSP objects for production (compiled with relaxed warnings)
 GRAMMAR_OBJS_PROD = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/prod_%.o,$(GRAMMAR_SRCS))
 TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
 PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
