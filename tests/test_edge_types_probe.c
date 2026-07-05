@@ -99,12 +99,9 @@ static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) 
     lp->project = cbm_project_name_from_path(lp->tmpdir);
     if (!lp->project) return NULL;
 
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
-    snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
+    /* Resolve THROUGH the production resolver so the runner's
+     * CBM_CACHE_DIR isolation applies (never the user's real cache). */
+    th_cache_db_path(lp->dbpath, sizeof(lp->dbpath), lp->project);
     unlink(lp->dbpath);
 
     lp->srv = cbm_mcp_server_new(NULL);

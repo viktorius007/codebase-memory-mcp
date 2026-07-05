@@ -145,11 +145,10 @@ TEST(repro_issue434_persistence_honored_on_first_create) {
 
     /* Clean up the cache DB the pipeline wrote */
     if (proj) {
-        const char *home = getenv("HOME");
-        if (!home) home = "/tmp";
         char dbpath[600];
-        snprintf(dbpath, sizeof(dbpath), "%s/.cache/codebase-memory-mcp/%s.db",
-                 home, proj);
+        /* Resolve THROUGH the production resolver so the runner's
+         * CBM_CACHE_DIR isolation applies (never the user's real cache). */
+        th_cache_db_path(dbpath, sizeof(dbpath), proj);
         unlink(dbpath);
         free(proj);
     }

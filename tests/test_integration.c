@@ -105,16 +105,10 @@ static int integration_setup(void) {
     if (!g_project)
         return -1;
 
-    /* Build db path for direct store queries (pipeline writes here) */
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
-
-    /* Ensure cache dir exists */
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    /* Build db path for direct store queries (pipeline writes here). Resolve
+     * THROUGH the production resolver so the runner's CBM_CACHE_DIR isolation
+     * applies (never the user's real cache). */
+    th_cache_db_path(g_dbpath, sizeof(g_dbpath), g_project);
 
     /* Remove stale db from previous test runs */
     unlink(g_dbpath);
@@ -679,12 +673,10 @@ TEST(arch_packages_use_manifest_name_not_qn_segment) {
 
     char *project = cbm_project_name_from_path(tmp);
     ASSERT_NOT_NULL(project);
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
-    }
     char dbpath[600];
-    snprintf(dbpath, sizeof(dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, project);
+    /* Resolve THROUGH the production resolver so the runner's CBM_CACHE_DIR
+     * isolation applies (never the user's real cache). */
+    th_cache_db_path(dbpath, sizeof(dbpath), project);
 
     cbm_store_t *store = cbm_store_open_path(dbpath);
     ASSERT_NOT_NULL(store);
@@ -789,12 +781,10 @@ TEST(arch_packages_manifest_name_survives_git_history) {
 
     char *project = cbm_project_name_from_path(tmp);
     ASSERT_NOT_NULL(project);
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
-    }
     char dbpath[600];
-    snprintf(dbpath, sizeof(dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, project);
+    /* Resolve THROUGH the production resolver so the runner's CBM_CACHE_DIR
+     * isolation applies (never the user's real cache). */
+    th_cache_db_path(dbpath, sizeof(dbpath), project);
 
     cbm_store_t *store = cbm_store_open_path(dbpath);
     ASSERT_NOT_NULL(store);

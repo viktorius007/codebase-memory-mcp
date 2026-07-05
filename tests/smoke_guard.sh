@@ -13,7 +13,10 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="$PROJECT_ROOT/build/c/codebase-memory-mcp"
 FAKE_PROJECT="nonexistent_smoke_test_xyz"
-CACHE_DIR="${HOME}/.cache/codebase-memory-mcp"
+# Honor CBM_CACHE_DIR (the binary under test does): with it set, the ghost
+# check must look where the binary would actually write, or a ghost in the
+# override dir passes undetected.
+CACHE_DIR="${CBM_CACHE_DIR:-${HOME}/.cache/codebase-memory-mcp}"
 GHOST_FILE="$CACHE_DIR/${FAKE_PROJECT}.db"
 FAILURES=0
 
