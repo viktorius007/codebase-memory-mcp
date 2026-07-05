@@ -6142,6 +6142,126 @@ TEST(pipeline_committed_counts_match_persisted) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * Cross-file Rust #[cfg(test)] mod propagation (Fix A, deferred half)
+ *
+ * A module gated by a #[cfg(test)]-style attribute on its DECLARATION
+ * (`#[cfg(any(test, feature="testkit"))] pub mod fakes;`) lives in a separate
+ * file. Per-file extraction can't see the parent's attribute, so the child
+ * file's defs index is_test=false. The pipeline propagation step must flip them
+ * true — transitively through the child module's own (non-repeated) `mod x;`
+ * declarations — while non-gated sibling modules stay production.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Write `content` to `dir/rel`, creating no intermediate dirs (caller mkdirs). */
+static void write_file_at(const char *dir, const char *rel, const char *content) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, rel);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fputs(content, f);
+        fclose(f);
+    }
+}
+
+/* True iff at least one def node named `name` carries is_test=true; sets
+ * *found_any to whether any node of that name exists at all. */
+static bool def_named_is_test(cbm_store_t *s, const char *project, const char *name,
+                              bool *found_any) {
+    cbm_node_t *nodes = NULL;
+    int n = 0;
+    cbm_store_find_nodes_by_name(s, project, name, &nodes, &n);
+    *found_any = (n > 0);
+    bool is_test = false;
+    for (int i = 0; i < n; i++) {
+        if (nodes[i].properties_json && strstr(nodes[i].properties_json, "\"is_test\":true")) {
+            is_test = true;
+        }
+    }
+    cbm_store_free_nodes(nodes, n);
+    return is_test;
+}
+
+TEST(pipeline_cfg_test_mod_propagates_across_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cfgtest_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char sub[512];
+
+    /* Crate root: src/lib.rs gates a sibling-file module (case a) and a
+     * directory module (case b), plus a NON-gated production sibling module. */
+    snprintf(sub, sizeof(sub), "%s/src", tmp);
+    cbm_mkdir(sub);
+    write_file_at(tmp, "src/lib.rs",
+                  "#[cfg(any(test, feature = \"testkit\"))]\n"
+                  "pub mod sibling_fake;\n"          // -> src/sibling_fake.rs   (case a)
+                  "#[cfg(test)]\n"
+                  "pub mod fakes;\n"                 // -> src/fakes/mod.rs      (case b)
+                  "pub mod real;\n");                // -> src/real.rs (production)
+
+    /* case a: sibling-file module — a bodyless `mod x;` resolving to x.rs. */
+    write_file_at(tmp, "src/sibling_fake.rs", "pub struct SiblingFake {}\n");
+
+    /* production sibling — must stay is_test=false. */
+    write_file_at(tmp, "src/real.rs", "pub struct RealThing {}\n");
+
+    /* case b: directory module src/fakes/ with a nested child file, re-declared
+     * WITHOUT repeating the cfg attribute (transitive gating). */
+    snprintf(sub, sizeof(sub), "%s/src/fakes", tmp);
+    cbm_mkdir(sub);
+    write_file_at(tmp, "src/fakes/mod.rs",
+                  "mod decision_store;\n"            // -> src/fakes/decision_store.rs
+                  "pub use decision_store::InMemoryDecisionStore;\n");
+    /* decision_store.rs itself pulls its tests in via a #[path] override — the
+     * child file is NOT decision_store/tests.rs but decision_store_tests.rs in
+     * the SAME dir. The whole chain is already test (fakes is gated), so the
+     * #[path] child must be flagged too (transitive + path override). */
+    write_file_at(tmp, "src/fakes/decision_store.rs",
+                  "pub struct InMemoryDecisionStore {}\n"
+                  "#[cfg(test)]\n"
+                  "#[path = \"decision_store_tests.rs\"]\n"
+                  "mod tests;\n");
+    write_file_at(tmp, "src/fakes/decision_store_tests.rs", "fn covers_decision_store() {}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    bool found = false;
+
+    /* case a: struct in the gated sibling file is test code. */
+    ASSERT_TRUE(def_named_is_test(s, project, "SiblingFake", &found));
+    ASSERT_TRUE(found);
+
+    /* case b: struct in the nested child file of a gated directory module,
+     * reached transitively through fakes/mod.rs, is test code. */
+    ASSERT_TRUE(def_named_is_test(s, project, "InMemoryDecisionStore", &found));
+    ASSERT_TRUE(found);
+
+    /* case b+: a #[path]-override child of a file that is itself test code
+     * (decision_store.rs, gated transitively) is test code too. */
+    ASSERT_TRUE(def_named_is_test(s, project, "covers_decision_store", &found));
+    ASSERT_TRUE(found);
+
+    /* production sibling module stays is_test=false. */
+    bool real_is_test = def_named_is_test(s, project, "RealThing", &found);
+    ASSERT_TRUE(found);
+    ASSERT_FALSE(real_is_test);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -6403,4 +6523,7 @@ SUITE(pipeline) {
     /* Project name edge cases */
     RUN_TEST(project_name_special_chars);
     RUN_TEST(project_name_trailing_slash);
+
+    /* Cross-file Rust #[cfg(test)] mod propagation (Fix A, deferred half) */
+    RUN_TEST(pipeline_cfg_test_mod_propagates_across_files);
 }

@@ -188,6 +188,11 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
     arr->items[arr->count++] = ch;
 }
 
+void cbm_moddecls_push(CBMModDeclArray *arr, CBMArena *a, CBMModDecl md) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = md;
+}
+
 // --- String input reader (for parse_with_options) ---
 
 typedef struct {

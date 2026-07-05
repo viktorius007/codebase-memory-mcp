@@ -590,6 +590,191 @@ static bool route_sr_denied(const CBMStringRef *sr) {
     return is_upstream_config_key(sr->key_path);
 }
 
+/* ── Cross-file Rust #[cfg(test)] mod propagation ────────────────────
+ *
+ * A file's defs are extracted in isolation, so a module gated by a
+ * #[cfg(test)]-style attribute on its DECLARATION in the PARENT file
+ * (`#[cfg(any(test, feature="testkit"))] pub mod fakes;`) is invisible to the
+ * child file's own extraction — every def in the fakes/ files indexes is_test=false.
+ * Test-gating is transitive: once `fakes` is test, every module it declares
+ * (`mod decision_store;` in fakes/mod.rs) is test too, whether or not that inner
+ * declaration repeats the attribute. This step runs after all files are
+ * extracted and their nodes are in the graph — the only point with the whole
+ * file set in view — seeds a worklist from gated declarations, BFS-marks the
+ * transitive child-file closure, then flips is_test on those files' def nodes. */
+
+/* Resolve the directory that a Rust source file's inline modules live under.
+ * For dir/mod.rs, dir/lib.rs, dir/main.rs the module dir IS `dir`; for any
+ * other dir/stem.rs it is `dir/stem` (the `dir.rs` + `dir/` sibling layout).
+ * Writes up to buflen bytes (no trailing slash); returns false on overflow. */
+static bool rust_module_dir_for_file(const char *rel_path, char *buf, size_t buflen) {
+    const char *slash = strrchr(rel_path, '/');
+    const char *base = slash ? slash + SKIP_ONE : rel_path;
+    size_t dir_len = slash ? (size_t)(slash - rel_path) : 0;
+
+    /* stem = basename without the ".rs" extension */
+    const char *dot = strrchr(base, '.');
+    size_t stem_len = dot ? (size_t)(dot - base) : strlen(base);
+
+    bool base_is_entry = (stem_len == 3 && strncmp(base, "mod", 3) == 0) ||
+                         (stem_len == 3 && strncmp(base, "lib", 3) == 0) ||
+                         (stem_len == 4 && strncmp(base, "main", 4) == 0);
+
+    if (base_is_entry) {
+        if (dir_len >= buflen) {
+            return false;
+        }
+        memcpy(buf, rel_path, dir_len);
+        buf[dir_len] = '\0';
+        return true;
+    }
+    /* dir/stem  (dir may be empty for a crate-root file like `foo.rs`) */
+    size_t need = dir_len + (dir_len ? 1 : 0) + stem_len;
+    if (need >= buflen) {
+        return false;
+    }
+    size_t p = 0;
+    if (dir_len) {
+        memcpy(buf, rel_path, dir_len);
+        p = dir_len;
+        buf[p++] = '/';
+    }
+    memcpy(buf + p, base, stem_len);
+    buf[p + stem_len] = '\0';
+    return true;
+}
+
+/* Given a declaring file and a child module name, resolve the two candidate
+ * child files (`<moduledir>/<child>.rs` and `<moduledir>/<child>/mod.rs`) and,
+ * for each that exists in path_to_idx, mark it test and enqueue it. */
+/* Mark the file at rel_path (if present in path_to_idx) test and enqueue it. */
+static void rust_mark_candidate(const char *cand, const CBMHashTable *path_to_idx, char *marked,
+                                int *queue, int *qtail) {
+    void *slot = cbm_ht_get(path_to_idx, cand);
+    if (!slot) {
+        return;
+    }
+    int idx = (int)(intptr_t)slot - 1; /* stored as idx+1 to keep non-NULL */
+    if (!marked[idx]) {
+        marked[idx] = 1;
+        queue[(*qtail)++] = idx;
+    }
+}
+
+static void rust_resolve_and_mark_child(const char *decl_rel, const CBMModDecl *md,
+                                        const CBMHashTable *path_to_idx, char *marked, int *queue,
+                                        int *qtail) {
+    char cand[CBM_PATH_MAX];
+
+    /* `#[path = "FILE"]` overrides the default mapping: FILE is relative to the
+     * declaring file's own directory. */
+    if (md->path_override && md->path_override[0]) {
+        const char *slash = strrchr(decl_rel, '/');
+        size_t dir_len = slash ? (size_t)(slash - decl_rel) : 0;
+        int n = dir_len
+                    ? snprintf(cand, sizeof(cand), "%.*s/%s", (int)dir_len, decl_rel,
+                               md->path_override)
+                    : snprintf(cand, sizeof(cand), "%s", md->path_override);
+        if (n > 0 && (size_t)n < sizeof(cand)) {
+            rust_mark_candidate(cand, path_to_idx, marked, queue, qtail);
+        }
+        return;
+    }
+
+    /* Default Cargo mapping: <moduledir>/<child>.rs OR <moduledir>/<child>/mod.rs. */
+    char moddir[CBM_PATH_MAX];
+    if (!rust_module_dir_for_file(decl_rel, moddir, sizeof(moddir))) {
+        return;
+    }
+    const char *fmts[] = {"%s/%s.rs", "%s/%s/mod.rs"};
+    /* A crate-root moduledir is empty (""); avoid a leading "/". */
+    for (int f = 0; f < 2; f++) {
+        int n = moddir[0]
+                    ? snprintf(cand, sizeof(cand), fmts[f], moddir, md->child_name)
+                    : snprintf(cand, sizeof(cand), f == 0 ? "%s.rs" : "%s/mod.rs", md->child_name);
+        if (n <= 0 || (size_t)n >= sizeof(cand)) {
+            continue;
+        }
+        rust_mark_candidate(cand, path_to_idx, marked, queue, qtail);
+    }
+}
+
+static void cbm_pipeline_propagate_cfg_test_modules(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
+                                                    CBMFileResult **result_cache, int file_count) {
+    if (file_count <= 0) {
+        return;
+    }
+    /* rel_path → (idx+1). +1 so a real index 0 stays a non-NULL value. */
+    CBMHashTable *path_to_idx = cbm_ht_create((uint32_t)file_count * 2 + 1);
+    for (int i = 0; i < file_count; i++) {
+        if (result_cache[i] && files[i].rel_path) {
+            cbm_ht_set(path_to_idx, files[i].rel_path, (void *)(intptr_t)(i + 1));
+        }
+    }
+
+    char *marked = (char *)calloc((size_t)file_count, sizeof(char));
+    int *queue = (int *)calloc((size_t)file_count, sizeof(int));
+    if (!marked || !queue) {
+        free(marked);
+        free(queue);
+        cbm_ht_free(path_to_idx);
+        return;
+    }
+    int qhead = 0, qtail = 0;
+
+    /* Seed: every GATED bodyless declaration marks its child file(s). */
+    for (int i = 0; i < file_count; i++) {
+        CBMFileResult *r = result_cache[i];
+        if (!r) {
+            continue;
+        }
+        for (int d = 0; d < r->mod_decls.count; d++) {
+            if (r->mod_decls.items[d].is_cfg_test_gated) {
+                rust_resolve_and_mark_child(files[i].rel_path, &r->mod_decls.items[d], path_to_idx,
+                                            marked, queue, &qtail);
+            }
+        }
+    }
+
+    /* BFS: a marked file's OWN declarations (gated or not) mark their children —
+     * the whole subtree under a gated module is test code. */
+    while (qhead < qtail) {
+        int i = queue[qhead++];
+        CBMFileResult *r = result_cache[i];
+        if (!r) {
+            continue;
+        }
+        for (int d = 0; d < r->mod_decls.count; d++) {
+            rust_resolve_and_mark_child(files[i].rel_path, &r->mod_decls.items[d], path_to_idx,
+                                        marked, queue, &qtail);
+        }
+    }
+
+    /* Flip is_test on the marked files' def nodes. */
+    CBMHashTable *marked_paths = cbm_ht_create((uint32_t)qtail * 2 + 1);
+    int marked_count = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (marked[i] && files[i].rel_path) {
+            cbm_ht_set(marked_paths, files[i].rel_path, (void *)1);
+            marked_count++;
+        }
+    }
+    int flipped = marked_count ? cbm_gbuf_mark_test_files(gbuf, marked_paths) : 0;
+    cbm_ht_free(marked_paths);
+
+    if (marked_count) {
+        char f_buf[CBM_SZ_16];
+        char n_buf[CBM_SZ_16];
+        snprintf(f_buf, sizeof(f_buf), "%d", marked_count);
+        snprintf(n_buf, sizeof(n_buf), "%d", flipped);
+        cbm_log_info("cfg_test.propagate", "files", f_buf, "defs_flipped", n_buf);
+    }
+
+    free(marked);
+    free(queue);
+    cbm_ht_free(path_to_idx);
+}
+
 static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
                                               CBMFileResult **result_cache, int file_count) {
     /* DENY-WINS-BY-VALUE: the same URL is often extracted as several string_refs
@@ -735,6 +920,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (seq_cache && rc == 0) {
         cbm_pipeline_extract_infra_routes(p->gbuf, files, seq_cache, file_count);
         cbm_pipeline_process_infra_bindings(p->gbuf, files, seq_cache, file_count);
+        cbm_pipeline_propagate_cfg_test_modules(p->gbuf, files, seq_cache, file_count);
     }
     if (seq_cache) {
         for (int i = 0; i < file_count; i++) {
@@ -869,6 +1055,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
     cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
+    cbm_pipeline_propagate_cfg_test_modules(p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
             cbm_free_result(cache[i]);

@@ -323,6 +323,18 @@ typedef struct {
     const char *struct_name; // struct/type name (raw text)
 } CBMImplTrait;
 
+// Rust: a bodyless `mod NAME;` declaration (the child module lives in another
+// file). is_cfg_test_gated is true when the declaration is preceded by a
+// #[cfg(test)]-style attribute whose predicate contains the `test` token. Used
+// by the pipeline to propagate is_test across the file boundary to the child
+// module's own file (and transitively to its descendants).
+typedef struct {
+    const char *child_name;    // module name in `mod NAME;`
+    const char *path_override; // `#[path = "..."]` value, relative to the
+                               // declaring file's directory; NULL if absent
+    bool is_cfg_test_gated;    // declaration carries a cfg(test)-style gate
+} CBMModDecl;
+
 // LSP-resolved call: high-confidence type-aware call resolution
 typedef struct {
     const char *caller_qn; // enclosing function QN
@@ -417,6 +429,12 @@ typedef struct {
     int cap;
 } CBMChannelArray;
 
+typedef struct {
+    CBMModDecl *items;
+    int count;
+    int cap;
+} CBMModDeclArray;
+
 // Full extraction result for one file.
 typedef struct {
     CBMArena arena; // owns all string memory
@@ -435,6 +453,7 @@ typedef struct {
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
+    CBMModDeclArray mod_decls;           // Rust: bodyless `mod NAME;` child declarations
 
     const char *module_qn;      // module qualified name
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none
@@ -580,6 +599,7 @@ void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBindi
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
+void cbm_moddecls_push(CBMModDeclArray *arr, CBMArena *a, CBMModDecl md);
 
 // --- Sub-extractor entry points ---
 
