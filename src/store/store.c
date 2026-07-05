@@ -4056,7 +4056,13 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
         nids[nn] = nid;
         const char *qn = (const char *)sqlite3_column_text(nstmt, SKIP_ONE);
         const char *fp = (const char *)sqlite3_column_text(nstmt, ST_COL_2);
-        npkgs[nn] = heap_strdup(arch_pkg_for(file_pkg, fp, qn));
+        /* Synthetic builtin/stdlib nodes carry sentinel file_paths
+         * (<python-builtins>, <kotlin-builtins>). They are not repo code:
+         * attributing a package from their builtins.* QN mints pseudo-packages
+         * ("len", "dict") into boundaries/fan/layers. Empty pkg makes the edge
+         * loop below skip them, same as any package-less node. */
+        bool synthetic = fp && fp[0] == '<';
+        npkgs[nn] = heap_strdup(synthetic ? "" : arch_pkg_for(file_pkg, fp, qn));
         nn++;
     }
     sqlite3_finalize(nstmt);
