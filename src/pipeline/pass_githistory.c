@@ -24,6 +24,7 @@ enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_M
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
+#include "yyjson/yyjson.h"
 
 /* Minimum coupling score to create an edge */
 #define MIN_COUPLING_SCORE 0.3
@@ -573,9 +574,13 @@ int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_
     }
 
     /* Apply per-file temporal metadata to existing File nodes so callers
-     * can query change_count / last_modified for hotspot analysis. The
-     * extension is re-derived and JSON-escaped to keep the props blob
-     * well-formed even for paths with quotes or backslashes. */
+     * can query change_count / last_modified for hotspot analysis. The temporal
+     * keys are MERGED into the node's existing props (not rebuilt from scratch):
+     * pass_structure stamps a "pkg" property carrying the file's manifest package
+     * identity, and cbm_gbuf_upsert_node REPLACES properties_json wholesale — so
+     * an overwrite here would silently drop pkg on every git-tracked file. Copy
+     * the existing object and set only our three keys, mirroring the
+     * read-modify-write idiom in pass_enrichment.c::inject_decorator_tags. */
     for (int i = 0; i < result->file_temporal_count; i++) {
         const cbm_file_temporal_t *ft = &result->file_temporal[i];
         char *qn = cbm_pipeline_fqn_compute(ctx->project_name, ft->file_path, "__file__");
@@ -588,16 +593,31 @@ int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_
         const char *base = strrchr(ft->file_path, '/');
         base = base ? base + SKIP_ONE : ft->file_path;
         const char *ext = strrchr(base, '.');
-        char ext_escaped[CBM_SZ_64];
-        cbm_json_escape(ext_escaped, (int)sizeof(ext_escaped), ext ? ext : "");
 
-        char props[CBM_SZ_256];
-        snprintf(props, sizeof(props),
-                 "{\"extension\":\"%s\",\"last_modified\":%lld,\"change_count\":%d}", ext_escaped,
-                 ft->last_modified, ft->change_count);
+        const char *existing = node->properties_json ? node->properties_json : "{}";
+        yyjson_doc *doc = yyjson_read(existing, strlen(existing), 0);
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *mroot = (root && yyjson_is_obj(root)) ? yyjson_val_mut_copy(mdoc, root)
+                                                              : yyjson_mut_obj(mdoc);
+        yyjson_mut_doc_set_root(mdoc, mroot);
 
-        cbm_gbuf_upsert_node(ctx->gbuf, node->label, node->name, node->qualified_name,
-                             node->file_path, node->start_line, node->end_line, props);
+        /* Overwrite (not duplicate) the temporal keys on re-index. */
+        yyjson_mut_obj_remove_key(mroot, "extension");
+        yyjson_mut_obj_remove_key(mroot, "last_modified");
+        yyjson_mut_obj_remove_key(mroot, "change_count");
+        yyjson_mut_obj_add_strcpy(mdoc, mroot, "extension", ext ? ext : "");
+        yyjson_mut_obj_add_int(mdoc, mroot, "last_modified", ft->last_modified);
+        yyjson_mut_obj_add_int(mdoc, mroot, "change_count", ft->change_count);
+
+        char *props = yyjson_mut_write(mdoc, 0, NULL);
+        if (props) {
+            cbm_gbuf_upsert_node(ctx->gbuf, node->label, node->name, node->qualified_name,
+                                 node->file_path, node->start_line, node->end_line, props);
+            free(props);
+        }
+        yyjson_mut_doc_free(mdoc);
+        yyjson_doc_free(doc);
     }
 
     return edge_count;
