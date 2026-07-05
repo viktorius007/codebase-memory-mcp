@@ -3279,6 +3279,50 @@ TEST(is_test_cfg_test_mod_marks_defs_per_definition) {
     PASS();
 }
 
+TEST(is_test_file_marks_every_definition) {
+    /* A test-tier FILE's verdict must reach every definition in it, not just
+     * the Module node. Before this rule, a fn in crates/foo/tests/e2e.rs
+     * carried is_test=false (only its parent Module got true), so integration
+     * tests and trybuild UI fixtures polluted the production boundary / fan /
+     * hotspot views exactly like the pre-Fix-A cfg(test) gap — observed live
+     * as pm-cli→pm-entity-derive weight 13, ~all e2e test callers binding a
+     * fixture's StorageRow.get. */
+    CBMFileResult *r = extract("fn checks_contract() { assert_eq!(1, 1); }\n"
+                               "struct Fixture;\n",
+                               CBM_LANG_RUST, "t", "crates/foo/tests/contract_tests.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *f = find_def_by_name(r, "checks_contract");
+    ASSERT_NOT_NULL(f);
+    ASSERT_TRUE(f->is_test);
+    const CBMDefinition *s = find_def_by_name(r, "Fixture");
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(s->is_test);
+    cbm_free_result(r);
+
+    /* Language-agnostic: a Python test_*.py file's defs are test code. */
+    CBMFileResult *py =
+        extract("def test_it():\n    pass\n", CBM_LANG_PYTHON, "t", "scripts/test_runner.py");
+    ASSERT_NOT_NULL(py);
+    ASSERT_FALSE(py->has_error);
+    const CBMDefinition *pyf = find_def_by_name(py, "test_it");
+    ASSERT_NOT_NULL(pyf);
+    ASSERT_TRUE(pyf->is_test);
+    cbm_free_result(py);
+
+    /* Control: a production file's defs stay is_test=false. */
+    CBMFileResult *p =
+        extract("pub fn handle() {}\n", CBM_LANG_RUST, "t", "crates/foo/src/handler.rs");
+    ASSERT_NOT_NULL(p);
+    ASSERT_FALSE(p->has_error);
+    const CBMDefinition *h = find_def_by_name(p, "handle");
+    ASSERT_NOT_NULL(h);
+    ASSERT_FALSE(h->is_test);
+    cbm_free_result(p);
+
+    PASS();
+}
+
 TEST(is_test_cfg_any_test_mod_marks_defs) {
     /* The cfg predicate need not be a bare `test`: any cfg whose argument list
      * contains the `test` token gates the module — e.g.
@@ -3557,6 +3601,7 @@ SUITE(extraction) {
     RUN_TEST(is_test_rust_tests_dir_directory_aware);
     RUN_TEST(is_test_rust_tests_dir_propagates_to_module);
     RUN_TEST(is_test_cfg_test_mod_marks_defs_per_definition);
+    RUN_TEST(is_test_file_marks_every_definition);
     RUN_TEST(is_test_cfg_any_test_mod_marks_defs);
 
     cbm_shutdown();
