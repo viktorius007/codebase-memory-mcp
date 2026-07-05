@@ -826,7 +826,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
 /* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns edge count. */
 static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
-                                 int *reg_entries) {
+                                 CBMLanguage lang, int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
@@ -839,7 +839,7 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
         strcmp(def->label, "Field") == 0) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label, lang);
         (*reg_entries)++;
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -969,7 +969,9 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
         for (int d = 0; d < result->defs.count; d++) {
-            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
+            defines_edges +=
+                register_and_link_def(ctx, &result->defs.items[d], rel, files[i].language,
+                                      &reg_entries);
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
@@ -1733,6 +1735,11 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     int cand_count = 0;
     cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
     for (int ci = 0; ci < cand_count; ci++) {
+        /* Honour the caller's language scope: a cross-language name collision
+         * must not win the field-type hint any more than a registry resolve. */
+        if (!cbm_registry_candidate_in_resolve_scope(rc->registry, cands[ci])) {
+            continue;
+        }
         if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
             const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
             if (better && better->id != source_id) {
@@ -2278,6 +2285,12 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * 98.7% hot spot in resolve_file_calls (881 of 893s CPU). */
         cbm_registry_resolve_cache_begin(result->calls.count + result->usages.count + 64);
 
+        /* Scope every resolve in this file to the caller's language-group so a
+         * cross-language name collision cannot bind (e.g. a Python `dict.get()`
+         * call binding to a Rust `get` fn). Spans all resolve sub-passes and
+         * the field-type hint; cleared at file exit. */
+        cbm_registry_resolve_scope_begin(lang);
+
         char *module_qn =
             cbm_pipeline_fqn_module_dir(rc->project_name, rel, pp_module_is_dir(lang));
 
@@ -2476,6 +2489,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         cbm_registry_reach_cache_end();
         cbm_registry_import_map_cache_end();
         cbm_registry_resolve_cache_end();
+        cbm_registry_resolve_scope_clear();
 
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);

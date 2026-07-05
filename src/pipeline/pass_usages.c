@@ -366,12 +366,18 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pu_module_is_dir(files[i].language));
 
+        /* Scope resolution to the caller's language-group (mirrors pass_calls
+         * and the parallel path) so READS/WRITES/THROWS cannot bind across
+         * languages on a bare name collision. */
+        cbm_registry_resolve_scope_begin(files[i].language);
+
         usage_resolved +=
             resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
         throw_resolved +=
             resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
         rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
 
+        cbm_registry_resolve_scope_clear();
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {

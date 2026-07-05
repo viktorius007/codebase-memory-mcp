@@ -80,7 +80,107 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+
+    /* qnGroup: qualifiedName → resolution language-group, encoded via
+     * REG_GROUP_ENC so the stored void* is never NULL (which cbm_ht cannot
+     * distinguish from "absent"). Populated per definition by cbm_registry_add.
+     * Consulted by the by-name resolution strategies to drop candidates whose
+     * language-group is incompatible with the caller's — see
+     * cbm_registry_lang_group / group_compatible. Keys are BORROWED from the
+     * exact map's heap-owned key strings, so no separate free is needed. */
+    CBMHashTable *qn_group;
 };
+
+/* Encode/decode a language-group as a non-NULL void* for the qn_group table.
+ * REG_LANG_GROUP_ANY is -1, real groups are >= 0, so +2 keeps every encoding
+ * strictly positive and distinct from NULL ("absent"). */
+#define REG_GROUP_ENC(g) ((void *)(intptr_t)((g) + 2))
+#define REG_GROUP_DEC(v) ((int)((intptr_t)(v) - 2))
+
+/* Caller/definition language-group for the current thread. Definitions are
+ * tagged with _add_lang_group at registration; resolution filters candidates
+ * against _resolve_lang_group. Both default to the wildcard group so that,
+ * absent any scope, behaviour is identical to the pre-scoping resolver. */
+static CBM_TLS int _add_lang_group = REG_LANG_GROUP_ANY;
+static CBM_TLS int _resolve_lang_group = REG_LANG_GROUP_ANY;
+
+/* Two groups resolve to each other iff equal, or either is the wildcard. */
+static inline bool group_compatible(int a, int b) {
+    return a == REG_LANG_GROUP_ANY || b == REG_LANG_GROUP_ANY || a == b;
+}
+
+int cbm_registry_lang_group(CBMLanguage lang) {
+    switch (lang) {
+    /* C family: one symbol table in practice (shared headers, extern "C",
+     * CUDA/ObjC/shader dialects that run through the C preprocessor). */
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+    case CBM_LANG_OBJC:
+    case CBM_LANG_GLSL:
+    case CBM_LANG_HLSL:
+    case CBM_LANG_ISPC:
+    case CBM_LANG_SLANG:
+        return (int)CBM_LANG_C;
+    /* JS/TS family: TS/TSX compile to JS and share a module/symbol space;
+     * the cross-LSP layer already treats them as one (pass_lsp_cross.h). */
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+        return (int)CBM_LANG_JAVASCRIPT;
+    case CBM_LANG_COUNT:
+        return REG_LANG_GROUP_ANY; /* unknown language → wildcard */
+    default:
+        return (int)lang; /* every other language is its own group */
+    }
+}
+
+void cbm_registry_add_scope_begin(CBMLanguage lang) {
+    _add_lang_group = cbm_registry_lang_group(lang);
+}
+
+void cbm_registry_add_scope_clear(void) {
+    _add_lang_group = REG_LANG_GROUP_ANY;
+}
+
+void cbm_registry_resolve_scope_begin(CBMLanguage lang) {
+    _resolve_lang_group = cbm_registry_lang_group(lang);
+}
+
+void cbm_registry_resolve_scope_clear(void) {
+    _resolve_lang_group = REG_LANG_GROUP_ANY;
+}
+
+/* Language-group of a registered QN, or the wildcard group when the QN was
+ * never tagged (defensive: an untagged symbol must not be silently dropped). */
+static int group_of_qn(const cbm_registry_t *r, const char *qn) {
+    if (!r->qn_group) {
+        return REG_LANG_GROUP_ANY;
+    }
+    void *v = cbm_ht_get(r->qn_group, qn);
+    return v ? REG_GROUP_DEC(v) : REG_LANG_GROUP_ANY;
+}
+
+/* True when candidate `qn` is resolvable from the current resolve scope. A QN
+ * whose group is incompatible with _resolve_lang_group is a cross-language name
+ * collision and must not bind. */
+static bool candidate_in_resolve_scope(const cbm_registry_t *r, const char *qn) {
+    return group_compatible(_resolve_lang_group, group_of_qn(r, qn));
+}
+
+/* Copy the group-compatible subset of `arr` into `out` (capacity `max`),
+ * returning the count. When the resolve scope is the wildcard, this is a
+ * verbatim copy (no filtering) — the pre-scoping candidate set. */
+static int filter_candidates_by_group(const cbm_registry_t *r, const qn_array_t *arr,
+                                      const char **out, int max) {
+    int n = 0;
+    for (int i = 0; i < arr->count && n < max; i++) {
+        if (candidate_in_resolve_scope(r, arr->items[i])) {
+            out[n++] = arr->items[i];
+        }
+    }
+    return n;
+}
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -432,6 +532,7 @@ cbm_registry_t *cbm_registry_new(void) {
     }
     r->exact = cbm_ht_create(CBM_SZ_1K);
     r->by_name = cbm_ht_create(CBM_SZ_512);
+    r->qn_group = cbm_ht_create(CBM_SZ_1K);
     return r;
 }
 
@@ -462,13 +563,16 @@ void cbm_registry_free(cbm_registry_t *r) {
     cbm_ht_free(r->exact);
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    /* qn_group values are encoded scalars and its keys are borrowed from the
+     * exact map's heap-owned keys (already freed above) — free the table only. */
+    cbm_ht_free(r->qn_group);
     free(r);
 }
 
 /* ── Registration ────────────────────────────────────────────────── */
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label) {
+                      const char *label, CBMLanguage lang) {
     (void)name;
     if (!r || !qualified_name || !label) {
         return;
@@ -481,6 +585,18 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
     /* Store in exact map: QN → label */
     cbm_ht_set(r->exact, strdup(qualified_name), strdup(label));
+
+    /* Tag this definition's resolution language-group. Key off the exact map's
+     * persistent heap-owned key so qn_group borrows (no second strdup, no
+     * separate free). `lang` is the file's language; the current add-scope
+     * (cbm_registry_add_scope_begin) is a fallback for callers that register
+     * from a per-language loop without a per-def language. An explicit `lang`
+     * always wins over the scope. */
+    int group = (lang == CBM_LANG_COUNT) ? _add_lang_group : cbm_registry_lang_group(lang);
+    const char *persistent_key = cbm_ht_get_key(r->exact, qualified_name);
+    if (persistent_key) {
+        cbm_ht_set(r->qn_group, persistent_key, REG_GROUP_ENC(group));
+    }
 
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
@@ -595,7 +711,8 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
                 const char *qn = arr->items[i];
                 size_t klen = strlen(qn);
                 if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
-                    strcmp(qn + klen - ds_len, dot_suffix) == 0) {
+                    strcmp(qn + klen - ds_len, dot_suffix) == 0 &&
+                    candidate_in_resolve_scope(r, qn)) {
                     return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
                                               REG_RESOLVED};
                 }
@@ -716,13 +833,26 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
                                             const char *module_qn, const char **import_vals,
                                             int import_count) {
     const char *lookup = simple_name(callee_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
-    if (!arr || arr->count == 0) {
+    qn_array_t *raw = cbm_ht_get(r->by_name, lookup);
+    if (!raw || raw->count == 0) {
         return empty_result();
     }
-    if (arr->count > REG_MAX_CANDIDATES) {
+    if (raw->count > REG_MAX_CANDIDATES) {
         return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
+
+    /* Language-scope the candidate set: a caller in language X can only bind to
+     * a same-group definition, so drop cross-group name collisions BEFORE any
+     * strategy runs. `arr` is a shallow view over the filtered buffer; when the
+     * resolve scope is the wildcard this is a verbatim copy (no behaviour
+     * change). Bounded by REG_MAX_CANDIDATES, checked above. */
+    const char *scoped[CBM_SZ_256];
+    int scoped_count = filter_candidates_by_group(r, raw, scoped, CBM_SZ_256);
+    if (scoped_count == 0) {
+        return empty_result(); /* every candidate was another language */
+    }
+    qn_array_t arr_view = {.items = (char **)scoped, .count = scoped_count, .cap = scoped_count};
+    const qn_array_t *arr = &arr_view;
 
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
@@ -855,13 +985,24 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
 
     /* Extract simple name (last segment after dots) */
     const char *lookup = simple_name(callee_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
-    if (!arr || arr->count == 0) {
+    qn_array_t *raw = cbm_ht_get(r->by_name, lookup);
+    if (!raw || raw->count == 0) {
         return no_match;
     }
-    if (arr->count > REG_MAX_CANDIDATES) {
+    if (raw->count > REG_MAX_CANDIDATES) {
         return no_match; /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
+
+    /* Language-scope first: a fuzzy bare-name guess must not cross language
+     * groups any more than a strict resolve can. Wildcard scope → verbatim
+     * copy (pre-scoping behaviour). */
+    const char *scoped[CBM_SZ_256];
+    int scoped_count = filter_candidates_by_group(r, raw, scoped, CBM_SZ_256);
+    if (scoped_count == 0) {
+        return no_match;
+    }
+    qn_array_t arr_view = {.items = (char **)scoped, .count = scoped_count, .cap = scoped_count};
+    const qn_array_t *arr = &arr_view;
 
     bool have_imports = (import_map_vals && import_map_count > 0);
 
@@ -960,4 +1101,11 @@ int cbm_registry_find_ending_with(const cbm_registry_t *r, const char *suffix, c
 bool cbm_registry_is_import_reachable(const char *candidate_qn, const char **import_vals,
                                       int import_count) {
     return is_import_reachable(candidate_qn, import_vals, import_count);
+}
+
+bool cbm_registry_candidate_in_resolve_scope(const cbm_registry_t *r, const char *candidate_qn) {
+    if (!r || !candidate_qn) {
+        return true;
+    }
+    return candidate_in_resolve_scope(r, candidate_qn);
 }

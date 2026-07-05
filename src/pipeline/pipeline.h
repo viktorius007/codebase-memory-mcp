@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "cbm.h" /* CBMLanguage — registry language-scoping API */
+
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
@@ -142,9 +144,46 @@ typedef struct {
 cbm_registry_t *cbm_registry_new(void);
 void cbm_registry_free(cbm_registry_t *r);
 
-/* Register a function/method/class. All strings are copied. */
+/* Register a function/method/class. All strings are copied.
+ * The definition is tagged with the resolution language-group derived from
+ * `lang` (see cbm_registry_lang_group). Call resolution filters candidates to
+ * the caller's group so a name collision across unrelated languages (e.g. a
+ * Python `get` call and a Rust `get` fn) can never bind — only same-group
+ * dialects (C/C++/CUDA, JS/TS/TSX, …) remain mutually resolvable. Pass
+ * CBM_LANG_COUNT when the language is unknown to tag the definition as the
+ * wildcard group (always resolvable) — an unknown language never drops an
+ * otherwise-valid edge. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label);
+                      const char *label, CBMLanguage lang);
+
+/* Coarse resolution language-group for cross-language collision suppression.
+ * Same-group languages resolve to each other's symbols; different groups never
+ * do. Dialect families that share a symbol table in practice map to one group
+ * (C/C++/CUDA/ObjC and the C-preprocessor shader langs; JS/TS/TSX). A language
+ * with no meaningful cross-language partner is its own group. CBM_LANG_COUNT
+ * (unknown) maps to the wildcard group REG_LANG_GROUP_ANY, which is compatible
+ * with every group. Pure; unit-tested in test_registry.c. */
+int cbm_registry_lang_group(CBMLanguage lang);
+
+/* Wildcard group: compatible with every other group in both directions. Used
+ * for definitions/callers whose language is unknown (CBM_LANG_COUNT). */
+#define REG_LANG_GROUP_ANY (-1)
+
+/* Set the language-group of the DEFINITIONS being registered on this thread.
+ * cbm_registry_add reads it to tag each entry. Scope it around a per-file (or
+ * per-language) registration loop; reset with cbm_registry_add_scope_clear when
+ * the language is unknown so the wildcard group applies. Thread-local — each
+ * extract/registration worker owns its own value. */
+void cbm_registry_add_scope_begin(CBMLanguage lang);
+void cbm_registry_add_scope_clear(void);
+
+/* Set the CALLER language-group for resolution on this thread. cbm_registry_
+ * resolve / cbm_registry_fuzzy_resolve filter by-name candidates to this group.
+ * Scope it around a per-file resolve loop (alongside the resolve/reach/import
+ * caches). Clear (or set CBM_LANG_COUNT) to disable filtering — every candidate
+ * is then eligible, preserving pre-scoping behaviour. Thread-local. */
+void cbm_registry_resolve_scope_begin(CBMLanguage lang);
+void cbm_registry_resolve_scope_clear(void);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
@@ -213,6 +252,15 @@ int cbm_registry_find_ending_with(const cbm_registry_t *r, const char *suffix, c
 /* Check if candidate QN's module prefix is reachable via any import value. */
 bool cbm_registry_is_import_reachable(const char *candidate_qn, const char **import_vals,
                                       int import_count);
+
+/* True when `candidate_qn` is resolvable from the current thread's resolve
+ * scope (cbm_registry_resolve_scope_begin). A candidate whose registered
+ * language-group is incompatible with the caller's returns false. Used by
+ * ad-hoc candidate walks outside cbm_registry_resolve (e.g. the field-type
+ * hint in pass_parallel.c) so they honour the same cross-language gate. A NULL
+ * registry/candidate, or an untagged candidate under the wildcard scope,
+ * returns true (never drops an otherwise-valid edge). */
+bool cbm_registry_candidate_in_resolve_scope(const cbm_registry_t *r, const char *candidate_qn);
 
 /* Fuzzy resolve: match callee by bare function name (last segment after dots).
  * Returns result with ok=true if found, ok=false if not.
