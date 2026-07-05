@@ -1954,6 +1954,25 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             }
             continue;
         }
+        /* Rust cross-package generic-name phantom guard. A bare std-trait method
+         * (`x.clone()` / `parts.extend()`) whose receiver type the LSP could not
+         * resolve falls through to the registry's weak textual strategies, which
+         * bind the short name to a same-named def in an UNRELATED package. Drop
+         * only those cross-package weak-strategy generic-name edges; same-package
+         * generic calls and every high-confidence strategy survive. Placed after
+         * target resolution so the package boundary is known; mirrors the
+         * sequential pass (pass_calls.c). Gated to Rust — other languages
+         * unaffected. */
+        {
+            bool has_receiver = strchr(call->callee_name, '.') != NULL ||
+                                strstr(call->callee_name, "::") != NULL;
+            if (cbm_rust_suppress_cross_pkg_generic(lang == CBM_LANG_RUST, has_receiver,
+                                                    call->callee_name, res.strategy,
+                                                    source_node->file_path,
+                                                    target_node->file_path)) {
+                continue;
+            }
+        }
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count);

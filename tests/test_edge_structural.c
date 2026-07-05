@@ -273,6 +273,122 @@ static int es_edge_present(const ES_LangFile *files, int nfiles, const char *edg
     return got >= floor;
 }
 
+/* Count CALLS edges landing on ANY node named `method_name` that lives under a
+ * different Cargo package root than its caller. Reproduces the phantom-edge
+ * audit: a bare generic method name textually bound across a package boundary.
+ * `pkg_of` mirrors registry.c's rust_pkg_root (segment before "/src/"). */
+static void es_pkg_of(const char *file_path, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!file_path) {
+        return;
+    }
+    const char *src = strstr(file_path, "/src/");
+    if (!src) {
+        return;
+    }
+    const char *seg_start = src;
+    while (seg_start > file_path && seg_start[-1] != '/') {
+        seg_start--;
+    }
+    size_t len = (size_t)(src - seg_start);
+    if (len == 0 || len >= cap) {
+        return;
+    }
+    memcpy(out, seg_start, len);
+    out[len] = '\0';
+}
+
+static int es_cross_pkg_calls_to_method(const ES_LangFile *files, int nfiles,
+                                        const char *method_name) {
+    ES_LangProj lp;
+    cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
+    int phantom = 0;
+    if (store) {
+        cbm_node_t *targets = NULL;
+        int tcount = 0;
+        cbm_store_find_nodes_by_name(store, lp.project, method_name, &targets, &tcount);
+        for (int ti = 0; ti < tcount; ti++) {
+            char tpkg[128];
+            es_pkg_of(targets[ti].file_path, tpkg, sizeof(tpkg));
+            if (!tpkg[0]) {
+                continue;
+            }
+            cbm_edge_t *edges = NULL;
+            int ecount = 0;
+            cbm_store_find_edges_by_target_type(store, targets[ti].id, "CALLS", &edges, &ecount);
+            for (int ei = 0; ei < ecount; ei++) {
+                cbm_node_t src_node;
+                if (cbm_store_find_node_by_id(store, edges[ei].source_id, &src_node) !=
+                    CBM_STORE_OK) {
+                    continue;
+                }
+                char spkg[128];
+                es_pkg_of(src_node.file_path, spkg, sizeof(spkg));
+                if (spkg[0] && strcmp(spkg, tpkg) != 0) {
+                    phantom++;
+                    fprintf(stderr, "  [ES-PHANTOM] %s/... -> %s/%s (%s)\n", spkg, tpkg, method_name,
+                            targets[ti].qualified_name);
+                }
+            }
+            free(edges);
+        }
+        free(targets);
+    }
+    es_lang_cleanup(&lp, store);
+    return phantom;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * FAMILY 0: Rust cross-package generic-name phantom guard
+ *
+ * A bare std-trait method call (`x.clone()`) whose receiver type the LSP
+ * cannot resolve must NOT be textually bound to a same-named method in an
+ * unrelated Cargo package. Reproduces the live pm defect class (pm-core
+ * `String.clone()` → pm-infra `SqliteProjectStore.clone`). The same-package
+ * companion call MUST still resolve, proving the guard is boundary-scoped
+ * rather than a blunt name denylist.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* RED before fix: `used.clone()` in the producer crate binds cross-package to
+ * consumer's `Store::clone`. GREEN after: zero cross-package CALLS into `clone`. */
+TEST(es_rust_cross_pkg_generic_clone_suppressed) {
+    static const ES_LangFile f[] = {
+        /* consumer crate: defines a method literally named `clone`. */
+        {"consumer/src/lib.rs",
+         "pub struct Store {\n    pub n: u32,\n}\n\n"
+         "impl Store {\n    pub fn clone(&self) -> u32 {\n        self.n\n    }\n}\n"},
+        /* producer crate: calls the std `Clone::clone` on a String. The LSP has
+         * no receiver type here, so the registry's unique_name strategy would
+         * otherwise bind the bare `clone` to consumer's Store::clone. */
+        {"producer/src/lib.rs",
+         "pub fn duplicate(used: &String) -> String {\n    used.clone()\n}\n"}};
+    int phantom = es_cross_pkg_calls_to_method(f, 2, "clone");
+    if (phantom > 0) {
+        fprintf(stderr, "  [ES-EDGE] FAIL cross-pkg generic `clone` phantom edges=%d (expected 0)\n",
+                phantom);
+    }
+    ASSERT_TRUE(phantom == 0);
+    PASS();
+}
+
+/* Same-package generic call MUST survive — the guard is boundary-scoped, not a
+ * name denylist. `caller.clone()` and `Store::clone` share the consumer crate. */
+TEST(es_rust_same_pkg_generic_clone_survives) {
+    static const ES_LangFile f[] = {
+        {"consumer/src/lib.rs",
+         "pub struct Store {\n    pub n: u32,\n}\n\n"
+         "impl Store {\n    pub fn clone(&self) -> u32 {\n        self.n\n    }\n}\n"},
+        {"consumer/src/caller.rs",
+         "use crate::Store;\n\n"
+         "pub fn use_it(s: &Store) -> u32 {\n    s.clone()\n}\n"}};
+    /* The same-package s.clone() → Store::clone edge must exist; the cross-pkg
+     * guard must not touch it. At least one CALLS edge into `clone` overall. */
+    ASSERT_TRUE(es_edge_present(f, 2, "CALLS", 1));
+    /* And it must NOT be counted as cross-package (there is only one package). */
+    ASSERT_TRUE(es_cross_pkg_calls_to_method(f, 2, "clone") == 0);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * FAMILY 1: CALLS cross-file
  *
@@ -847,6 +963,10 @@ TEST(es_tests_crossfile_typescript) {
 SUITE(edge_structural) {
     /* ── FAMILY 1: CALLS cross-file (all 9 hybrid-LSP languages) ─ */
     /* All expected GREEN: registry is project-wide, cross-file == same-file. */
+    /* ── FAMILY 0: Rust cross-package generic-name phantom guard ── */
+    RUN_TEST(es_rust_cross_pkg_generic_clone_suppressed);
+    RUN_TEST(es_rust_same_pkg_generic_clone_survives);
+
     RUN_TEST(es_calls_crossfile_go);
     RUN_TEST(es_calls_crossfile_c);
     RUN_TEST(es_calls_crossfile_cpp);

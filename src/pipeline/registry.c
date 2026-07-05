@@ -523,6 +523,27 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
+/* RED stub — the real gate lands in the following GREEN commit. Returning the
+ * "keep everything" answer here makes the RED test observe the phantom edge that
+ * the fix must eliminate, while keeping the workspace compilable (callers and
+ * unit tests already reference these symbols). */
+bool cbm_rust_is_generic_method(const char *name) {
+    (void)name;
+    return false;
+}
+
+bool cbm_rust_suppress_cross_pkg_generic(bool is_rust, bool has_receiver, const char *callee_name,
+                                         const char *strategy, const char *source_file,
+                                         const char *target_file) {
+    (void)is_rust;
+    (void)has_receiver;
+    (void)callee_name;
+    (void)strategy;
+    (void)source_file;
+    (void)target_file;
+    return false;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
