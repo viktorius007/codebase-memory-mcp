@@ -5,16 +5,15 @@
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
 #include "../src/foundation/platform.h"
 #include "../src/foundation/system_info_internal.h"
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #ifdef __linux__
-/* Linux-only cgroup tests need stdio for FILE*, stdlib for mkdtemp,
- * string for strncpy/strchr, sys/stat for mkdir, dirent for the
- * shell-free recursive teardown. */
+/* Linux-only cgroup tests additionally need sys/stat for mkdir and dirent
+ * for the shell-free recursive teardown. */
 #include <dirent.h>
-#include <stdio.h>
-#include <string.h>
 #include <sys/stat.h>
 #endif
 
@@ -304,7 +303,30 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
+/* The test runner must NEVER read or write the user's real project cache.
+ * Hundreds of orphaned tmp-cbm_* project dbs were found leaked into
+ * ~/.cache/codebase-memory-mcp because indexing tests ran against the default
+ * cache dir and skipped (or crashed before) their unlink teardown. The
+ * structural fix is runner-level: main() points CBM_CACHE_DIR at a fresh temp
+ * dir before any suite runs, so every store the tests touch lives — and dies —
+ * outside the user's cache. This test is the guard: it fails if the runner
+ * ever again resolves to the real user cache. RED before the runner sets
+ * CBM_CACHE_DIR; GREEN after. */
+TEST(runner_cache_isolated_from_user_cache) {
+    const char *resolved = cbm_resolve_cache_dir();
+    ASSERT_NOT_NULL(resolved);
+
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char user_cache[1024];
+        snprintf(user_cache, sizeof(user_cache), "%s/.cache/codebase-memory-mcp", home);
+        ASSERT_TRUE(strcmp(resolved, user_cache) != 0);
+    }
+    PASS();
+}
+
 SUITE(platform) {
+    RUN_TEST(runner_cache_isolated_from_user_cache);
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
     RUN_TEST(platform_nprocs);

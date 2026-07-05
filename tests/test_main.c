@@ -9,8 +9,11 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "../src/foundation/compat.h" /* cbm_mkdtemp / cbm_setenv / cbm_tmpdir */
 #include <sqlite3.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_suite_argc = 0;
@@ -166,6 +169,24 @@ extern void cbm_kind_in_set_free_cache(void);
 int main(int argc, char **argv) {
     g_suite_argc = argc;
     g_suite_argv = argv;
+
+    /* Isolate ALL store I/O from the user's real project cache. Without this,
+     * every indexing test writes its fixture db into cbm_resolve_cache_dir()'s
+     * default (~/.cache/codebase-memory-mcp), and any skipped or crashed
+     * teardown leaks an orphan project into the user's live store (observed:
+     * hundreds of tmp-cbm_* orphans). A fresh per-run temp dir makes leaks
+     * harmless and cross-run collisions impossible. Tests that exercise
+     * CBM_CACHE_DIR themselves save/restore the variable around their own
+     * override, so they compose with this baseline. An explicit pre-set
+     * CBM_CACHE_DIR (e.g. a CI sandbox) is respected. */
+    if (!getenv("CBM_CACHE_DIR")) {
+        static char cache_tmpl[256];
+        snprintf(cache_tmpl, sizeof(cache_tmpl), "%s/cbm-test-cache_XXXXXX", cbm_tmpdir());
+        if (cbm_mkdtemp(cache_tmpl)) {
+            cbm_setenv("CBM_CACHE_DIR", cache_tmpl, 1);
+        }
+    }
+
     printf("\n  codebase-memory-mcp  C test suite\n");
 
     /* Foundation */

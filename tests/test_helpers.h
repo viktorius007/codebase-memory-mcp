@@ -14,6 +14,7 @@
 
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/platform.h" /* cbm_resolve_cache_dir (th_cache_dir) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +167,28 @@ static inline void th_cleanup(const char *path) {
     if (path && path[0]) {
         th_rmtree(path);
     }
+}
+
+/* ── Cache-dir helpers ────────────────────────────────────────── */
+
+/* Resolve the store cache directory THROUGH the production resolver
+ * (CBM_CACHE_DIR > ~/.cache/codebase-memory-mcp), creating it if needed.
+ * Tests MUST use this instead of hand-building "$HOME/.cache/..." paths:
+ * a hand-built path bypasses the runner's CBM_CACHE_DIR isolation and
+ * reads/writes the user's real project store (the tmp-cbm_* orphan-leak
+ * bug). Returns the resolver's static buffer. */
+static inline const char *th_cache_dir(void) {
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir) {
+        dir = cbm_tmpdir();
+    }
+    cbm_mkdir_p(dir, 0755);
+    return dir;
+}
+
+/* Build "<cache>/<project>.db" into buf via th_cache_dir(). */
+static inline void th_cache_db_path(char *buf, size_t bufsz, const char *project) {
+    snprintf(buf, bufsz, "%s/%s.db", th_cache_dir(), project);
 }
 
 #endif /* TEST_HELPERS_H */
