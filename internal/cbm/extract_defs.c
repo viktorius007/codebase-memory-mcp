@@ -6300,6 +6300,112 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     }
 }
 
+// True when `node`'s source text equals the literal `lit` (byte-exact).
+static bool cbm_node_text_is(TSNode node, const char *source, const char *lit) {
+    uint32_t s = ts_node_start_byte(node);
+    uint32_t e = ts_node_end_byte(node);
+    size_t len = (size_t)(e - s);
+    return len == strlen(lit) && strncmp(source + s, lit, len) == 0;
+}
+
+// True if any descendant `identifier` node (bounded depth) has the text "test".
+// Bounded so a deeply-nested cfg predicate still terminates; trees are acyclic.
+static bool rust_subtree_has_test_ident(TSNode node, // NOLINT(misc-no-recursion)
+                                        const char *source, int max_depth) {
+    if (max_depth < 0 || ts_node_is_null(node)) {
+        return false;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(c), "identifier") == 0 && cbm_node_text_is(c, source, "test")) {
+            return true;
+        }
+        if (rust_subtree_has_test_ident(c, source, max_depth - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when `attr_item` is `#[cfg(...)]` whose predicate token list contains a
+// bare `test` identifier. Matches #[cfg(test)] AND #[cfg(any(test, feature =
+// "testkit"))] (the token list carries `test`), but NOT #[cfg(feature =
+// "serde")] nor a "test" substring inside a string literal (string content is
+// not an identifier node).
+static bool rust_attr_is_cfg_test(TSNode attr_item, const char *source) {
+    TSNode attr = find_first_descendant_by_kind(attr_item, "attribute", CBM_DESCENDANT_MAX_DEPTH);
+    if (ts_node_is_null(attr)) {
+        return false;
+    }
+    // The attribute's head identifier must be `cfg`.
+    TSNode head = ts_node_named_child(attr, 0);
+    if (ts_node_is_null(head) || strcmp(ts_node_type(head), "identifier") != 0 ||
+        !cbm_node_text_is(head, source, "cfg")) {
+        return false;
+    }
+    // The predicate lives in the attribute's token_tree; scan it for `test`.
+    TSNode tt = find_first_descendant_by_kind(attr, "token_tree", CBM_DESCENDANT_MAX_DEPTH);
+    if (ts_node_is_null(tt)) {
+        return false;
+    }
+    return rust_subtree_has_test_ident(tt, source, CBM_DESCENDANT_MAX_DEPTH);
+}
+
+// True when `mod_item` is gated by a preceding `#[cfg(test)]`-style attribute.
+// Walks the attribute run immediately preceding the mod (mirrors the decorator
+// scan): any preceding attribute_item that is a cfg-with-`test` gates it; a
+// real (named) non-attribute sibling ends the run.
+static bool rust_mod_is_cfg_test_gated(TSNode mod_item, const char *source) {
+    TSNode prev = ts_node_prev_sibling(mod_item);
+    while (!ts_node_is_null(prev)) {
+        if (strcmp(ts_node_type(prev), "attribute_item") == 0) {
+            if (rust_attr_is_cfg_test(prev, source)) {
+                return true;
+            }
+        } else if (ts_node_is_named(prev)) {
+            break;
+        }
+        prev = ts_node_prev_sibling(prev);
+    }
+    return false;
+}
+
+// Rust post-pass: flag every definition lexically inside a #[cfg(test)]-gated
+// `mod` as test code (is_test=true), at any nesting depth. File-level
+// cbm_is_test_file only flags whole test-tier FILES (tests/ + benches/); unit
+// tests and test doubles live in `#[cfg(test)] mod tests { ... }` blocks inside
+// ordinary src/ production files, so their defs must be flagged per-DEFINITION
+// or they pollute the production hotspot / architecture views. Nested defs are
+// covered by the gated mod's line span, so a gated mod is not descended into.
+// Uses the same line-span containment idiom as call→def range attribution.
+static void mark_cfg_test_defs_rust(CBMExtractCtx *ctx) {
+    TSNode stack[CBM_WALK_DEFS_STACK_CAP];
+    int top = 0;
+    stack[top++] = ctx->root;
+    while (top > 0) {
+        TSNode node = stack[--top];
+        if (strcmp(ts_node_type(node), "mod_item") == 0 &&
+            rust_mod_is_cfg_test_gated(node, ctx->source)) {
+            uint32_t lo = ts_node_start_point(node).row + TS_LINE_OFFSET;
+            uint32_t hi = ts_node_end_point(node).row + TS_LINE_OFFSET;
+            CBMDefArray *defs = &ctx->result->defs;
+            for (int i = 0; i < defs->count; i++) {
+                uint32_t sl = defs->items[i].start_line;
+                if (sl >= lo && sl <= hi) {
+                    defs->items[i].is_test = true;
+                }
+            }
+            // Nested defs are already inside [lo, hi]; skip descent.
+            continue;
+        }
+        uint32_t nc = ts_node_child_count(node);
+        for (int i = (int)nc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
+            stack[top++] = ts_node_child(node, (uint32_t)i);
+        }
+    }
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -6326,4 +6432,10 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
 
     // Extract module-level variables
     extract_variables(ctx, ctx->root, spec);
+
+    // Rust: flag defs lexically inside #[cfg(test)] modules as test code. Runs
+    // last so it covers every pushed def (functions, methods, types, variables).
+    if (ctx->language == CBM_LANG_RUST) {
+        mark_cfg_test_defs_rust(ctx);
+    }
 }
