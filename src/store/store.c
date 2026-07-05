@@ -4062,8 +4062,15 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     sqlite3_finalize(nstmt);
     arch_free_file_pkg_map(file_pkg);
 
-    /* Scan edges, count cross-package calls */
-    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
+    /* Scan edges, count cross-package calls. Gate on confidence exactly as
+     * arch_hotspots does: low-confidence name-collision bindings (std
+     * `x.collect()` mis-bound cross-package) otherwise manufacture phantom
+     * boundaries — and this scan also feeds package fan_in/fan_out and the
+     * layer classifier, so an ungated collision promotes a leaf crate to
+     * "core". The IS NULL arm keeps legacy edges that carry no confidence. */
+    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS' "
+                       "AND (json_extract(properties, '$.confidence') IS NULL OR "
+                       "json_extract(properties, '$.confidence') >= 0.5)";
     sqlite3_stmt *estmt = NULL;
     if (sqlite3_prepare_v2(s->db, esql, CBM_NOT_FOUND, &estmt, NULL) != SQLITE_OK) {
         for (int i = 0; i < nn; i++) {
