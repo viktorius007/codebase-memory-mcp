@@ -6516,6 +6516,19 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     // Extract module-level variables
     extract_variables(ctx, ctx->root, spec);
 
+    // A test-tier FILE's verdict (cbm_is_test_file: Rust tests/ + benches/
+    // integration tests, Python test_*.py, Go *_test.go, …) marks EVERY
+    // definition in it, not just the Module node above — the architecture
+    // views (boundaries / fan / hotspots) filter on the per-definition flag,
+    // so a Module-only verdict leaves integration-test fns and trybuild UI
+    // fixtures classified as production callers/callees.
+    if (ctx->result->is_test_file) {
+        CBMDefArray *defs = &ctx->result->defs;
+        for (int i = 0; i < defs->count; i++) {
+            defs->items[i].is_test = true;
+        }
+    }
+
     // Rust: flag defs lexically inside #[cfg(test)] modules as test code. Runs
     // last so it covers every pushed def (functions, methods, types, variables).
     // Then collect bodyless `mod NAME;` declarations so the pipeline can
