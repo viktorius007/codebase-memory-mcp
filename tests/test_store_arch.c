@@ -492,6 +492,135 @@ TEST(arch_hotspots_exclude_low_confidence_name_collisions) {
     PASS();
 }
 
+/* Cross-package boundaries (and the fan/layer aspects derived from the same
+ * arch_boundaries scan) must count only high-confidence CALLS edges — the same
+ * gate arch_hotspots applies. Ungated, low-confidence name-collision edges
+ * (std `x.collect()` mis-bound cross-package at ~0.14-0.375) manufacture
+ * phantom boundaries: observed live as pm-cli→xtask 180 / pm-core→xtask 117,
+ * promoting a leaf dev-tooling crate to a "core" layer.
+ *
+ * RED at branch base (edge scan has no confidence filter): the collision-only
+ * pair app→tool appears with call_count 5. GREEN after gating: app→tool absent;
+ * the genuine high-confidence app→lib boundary survives with its full count. */
+static int boundary_count_helper(cbm_architecture_info_t *info, const char *from, const char *to) {
+    for (int i = 0; i < info->boundary_count; i++) {
+        if (strcmp(info->boundaries[i].from, from) == 0 &&
+            strcmp(info->boundaries[i].to, to) == 0) {
+            return info->boundaries[i].call_count;
+        }
+    }
+    return -1; /* boundary not reported */
+}
+
+TEST(arch_boundaries_exclude_low_confidence_name_collisions) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_TRUE(s != NULL);
+    cbm_store_upsert_project(s, "bd", "/tmp/bd");
+
+    /* Three packages via File-node pkg props: app (callers), tool (collision
+     * target), lib (genuine dependency). */
+    cbm_node_t f_app = {.project = "bd",
+                        .label = "File",
+                        .name = "main.rs",
+                        .qualified_name = "bd.app.src.main.__file__",
+                        .file_path = "app/src/main.rs",
+                        .properties_json = "{\"extension\":\".rs\",\"pkg\":\"app\"}"};
+    cbm_store_upsert_node(s, &f_app);
+    cbm_node_t f_tool = {.project = "bd",
+                         .label = "File",
+                         .name = "util.rs",
+                         .qualified_name = "bd.tool.src.util.__file__",
+                         .file_path = "tool/src/util.rs",
+                         .properties_json = "{\"extension\":\".rs\",\"pkg\":\"tool\"}"};
+    cbm_store_upsert_node(s, &f_tool);
+    cbm_node_t f_lib = {.project = "bd",
+                        .label = "File",
+                        .name = "core.rs",
+                        .qualified_name = "bd.lib.src.core.__file__",
+                        .file_path = "lib/src/core.rs",
+                        .properties_json = "{\"extension\":\".rs\",\"pkg\":\"lib\"}"};
+    cbm_store_upsert_node(s, &f_lib);
+
+    /* Collision target in `tool`: a private fn named `collect`. */
+    cbm_node_t fn_collect = {.project = "bd",
+                             .label = "Function",
+                             .name = "collect",
+                             .qualified_name = "bd.tool.src.util.collect",
+                             .file_path = "tool/src/util.rs"};
+    int64_t id_collect = cbm_store_upsert_node(s, &fn_collect);
+
+    /* Genuine dependency target in `lib`. */
+    cbm_node_t fn_run = {.project = "bd",
+                         .label = "Function",
+                         .name = "run",
+                         .qualified_name = "bd.lib.src.core.run",
+                         .file_path = "lib/src/core.rs"};
+    int64_t id_run = cbm_store_upsert_node(s, &fn_run);
+
+    /* Five caller functions in `app`. */
+    int64_t callers[5];
+    for (int i = 0; i < 5; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "caller_%d", i);
+        snprintf(qn, sizeof(qn), "bd.app.src.main.caller_%d", i);
+        cbm_node_t c = {.project = "bd",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "app/src/main.rs"};
+        callers[i] = cbm_store_upsert_node(s, &c);
+    }
+
+    /* Five LOW-confidence collision edges app→tool: std `x.collect()` call
+     * sites mis-bound cross-package. Must NOT create a boundary. */
+    for (int i = 0; i < 5; i++) {
+        cbm_edge_t e = {.project = "bd",
+                        .source_id = callers[i],
+                        .target_id = id_collect,
+                        .type = "CALLS",
+                        .properties_json =
+                            "{\"callee\":\"collect\",\"confidence\":0.375,"
+                            "\"strategy\":\"unique_name\",\"candidates\":1}"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    /* Three HIGH-confidence genuine edges app→lib. Must survive in full. */
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t e = {.project = "bd",
+                        .source_id = callers[i],
+                        .target_id = id_run,
+                        .type = "CALLS",
+                        .properties_json = "{\"callee\":\"run\",\"confidence\":0.90,"
+                                           "\"strategy\":\"import_match\",\"candidates\":1}"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    /* One legacy edge app→lib with NO confidence property: the IS NULL arm
+     * must keep counting it (same semantics as the hotspot gate). */
+    cbm_edge_t legacy = {.project = "bd",
+                         .source_id = callers[3],
+                         .target_id = id_run,
+                         .type = "CALLS",
+                         .properties_json = "{\"callee\":\"run\"}"};
+    cbm_store_insert_edge(s, &legacy);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"boundaries"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "bd", NULL, aspects, 1, &info), CBM_STORE_OK);
+
+    /* The collision-only pair must not be reported as a boundary at all. */
+    ASSERT_EQ(boundary_count_helper(&info, "app", "tool"), -1);
+
+    /* The genuine boundary keeps its full count: 3 high-confidence + 1 legacy
+     * no-confidence edge. */
+    ASSERT_EQ(boundary_count_helper(&info, "app", "lib"), 4);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_boundaries) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -1631,6 +1760,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_routes);
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_hotspots_exclude_low_confidence_name_collisions);
+    RUN_TEST(arch_boundaries_exclude_low_confidence_name_collisions);
     RUN_TEST(arch_boundaries);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
