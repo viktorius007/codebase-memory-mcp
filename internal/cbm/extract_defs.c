@@ -6371,6 +6371,35 @@ static bool rust_mod_is_cfg_test_gated(TSNode mod_item, const char *source) {
     return false;
 }
 
+// If `mod_item` carries a preceding `#[path = "FILE"]` attribute, return the
+// FILE string (arena-copied, quotes stripped); NULL otherwise. `#[path]`
+// overrides Cargo's default module→file mapping, so `#[path = "x_tests.rs"]
+// mod tests;` puts the child's code in x_tests.rs, not tests.rs / tests/mod.rs.
+static const char *rust_mod_path_override(CBMArena *a, TSNode mod_item, const char *source) {
+    TSNode prev = ts_node_prev_sibling(mod_item);
+    while (!ts_node_is_null(prev)) {
+        if (strcmp(ts_node_type(prev), "attribute_item") == 0) {
+            TSNode attr =
+                find_first_descendant_by_kind(prev, "attribute", CBM_DESCENDANT_MAX_DEPTH);
+            if (!ts_node_is_null(attr)) {
+                TSNode head = ts_node_named_child(attr, 0);
+                if (!ts_node_is_null(head) && strcmp(ts_node_type(head), "identifier") == 0 &&
+                    cbm_node_text_is(head, source, "path")) {
+                    TSNode content = find_first_descendant_by_kind(attr, "string_content",
+                                                                   CBM_DESCENDANT_MAX_DEPTH);
+                    if (!ts_node_is_null(content)) {
+                        return cbm_node_text(a, content, source);
+                    }
+                }
+            }
+        } else if (ts_node_is_named(prev)) {
+            break;
+        }
+        prev = ts_node_prev_sibling(prev);
+    }
+    return NULL;
+}
+
 // Rust post-pass: flag every definition lexically inside a #[cfg(test)]-gated
 // `mod` as test code (is_test=true), at any nesting depth. File-level
 // cbm_is_test_file only flags whole test-tier FILES (tests/ + benches/); unit
@@ -6406,6 +6435,60 @@ static void mark_cfg_test_defs_rust(CBMExtractCtx *ctx) {
     }
 }
 
+// A bodyless Rust `mod NAME;` declaration: the `mod` keyword and identifier
+// with a trailing `;` and NO declaration_list body — the child module's code
+// lives in a separate file (NAME.rs or NAME/mod.rs). Distinguished from an
+// inline `mod NAME { ... }` by the absence of a declaration_list child.
+static bool rust_mod_item_is_bodyless(TSNode mod_item) {
+    return ts_node_is_null(ts_node_child_by_field_name(mod_item, TS_FIELD("body"))) &&
+           ts_node_is_null(find_first_descendant_by_kind(mod_item, "declaration_list", 1));
+}
+
+// Rust: collect every bodyless `mod NAME;` declaration into ctx->result->mod_decls,
+// tagging each with whether it is test-gated. A declaration is gated when it
+// carries its own #[cfg(test)]-style attribute OR is lexically nested inside a
+// gated `mod` (an inline `#[cfg(test)] mod tests { mod helper; }` gates helper
+// transitively). The pipeline resolves each child NAME to its defining file and
+// propagates is_test across the file boundary — extraction alone cannot, since
+// the child module's defs live in a different file. The stack carries an
+// inherited-gated flag so nesting is honoured without a second pass.
+static void collect_mod_decls_rust(CBMExtractCtx *ctx) {
+    typedef struct {
+        TSNode node;
+        bool inherited_gated;
+    } frame_t;
+    frame_t stack[CBM_WALK_DEFS_STACK_CAP];
+    int top = 0;
+    stack[top++] = (frame_t){ctx->root, false};
+    while (top > 0) {
+        frame_t frame = stack[--top];
+        TSNode node = frame.node;
+        bool child_gated = frame.inherited_gated;
+        if (strcmp(ts_node_type(node), "mod_item") == 0) {
+            bool gated = frame.inherited_gated || rust_mod_is_cfg_test_gated(node, ctx->source);
+            if (rust_mod_item_is_bodyless(node)) {
+                TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+                if (!ts_node_is_null(name)) {
+                    CBMModDecl md;
+                    md.child_name = cbm_node_text(ctx->arena, name, ctx->source);
+                    md.path_override = rust_mod_path_override(ctx->arena, node, ctx->source);
+                    md.is_cfg_test_gated = gated;
+                    if (md.child_name && md.child_name[0]) {
+                        cbm_moddecls_push(&ctx->result->mod_decls, ctx->arena, md);
+                    }
+                }
+                continue; // bodyless mod has no descendants to walk
+            }
+            // Inline mod with a body: its descendants inherit this mod's gating.
+            child_gated = gated;
+        }
+        uint32_t nc = ts_node_child_count(node);
+        for (int i = (int)nc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
+            stack[top++] = (frame_t){ts_node_child(node, (uint32_t)i), child_gated};
+        }
+    }
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -6435,7 +6518,10 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
 
     // Rust: flag defs lexically inside #[cfg(test)] modules as test code. Runs
     // last so it covers every pushed def (functions, methods, types, variables).
+    // Then collect bodyless `mod NAME;` declarations so the pipeline can
+    // propagate is_test across the file boundary to child-module files.
     if (ctx->language == CBM_LANG_RUST) {
         mark_cfg_test_defs_rust(ctx);
+        collect_mod_decls_rust(ctx);
     }
 }

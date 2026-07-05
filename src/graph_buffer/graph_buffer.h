@@ -20,6 +20,9 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 /* Forward declare store for dump path */
 typedef struct cbm_store cbm_store_t;
 
+/* Forward declare hash table for the test-file marking API */
+typedef struct CBMHashTable CBMHashTable;
+
 /* ── Node / Edge structs (owned by the buffer) ───────────────────── */
 
 typedef struct {
@@ -105,6 +108,12 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
 /* Delete all nodes for a given file path. Cascade-deletes referencing edges.
  * Used by incremental indexing to remove stale nodes before re-extraction. */
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
+
+/* Flip is_test=true in the properties JSON of every def node whose file_path is
+ * a key in file_paths (keys are borrowed rel-path strings, values ignored).
+ * Used by the pipeline to propagate cross-file Rust #[cfg(test)] mod gating to
+ * child-module files. Returns the number of nodes flipped. */
+int cbm_gbuf_mark_test_files(cbm_gbuf_t *gb, const CBMHashTable *file_paths);
 
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */
