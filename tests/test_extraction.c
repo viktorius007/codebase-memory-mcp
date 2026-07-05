@@ -3225,6 +3225,91 @@ TEST(is_test_rust_tests_dir_propagates_to_module) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * is_test detection: per-DEFINITION (Rust #[cfg(test)] mod under src/)
+ *
+ * The directory rule above only flags whole test-tier FILES. Rust unit tests
+ * and test doubles live in `#[cfg(test)] mod tests { ... }` blocks inside
+ * ordinary src/ production files, so file-level detection leaves every def in
+ * those modules classified as production (is_test=false) — the exact defs
+ * (fakes, fixtures) that then pollute the hotspot / architecture views.
+ *
+ * The producer must set is_test PER DEFINITION: any def lexically inside a
+ * `#[cfg(test)]`-attributed module (any nesting depth) is test code, while a
+ * sibling def outside such a module in the SAME file stays production.
+ *
+ * Matching rule: a `mod` whose preceding attribute is `#[cfg(...)]` and whose
+ * cfg predicate token list contains the `test` token gates its body — this
+ * also catches `#[cfg(any(test, feature = "testkit"))]`, the pattern the real
+ * codebase uses. (Fix A, deferred half.)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(is_test_cfg_test_mod_marks_defs_per_definition) {
+    /* A production src/ file: a #[cfg(test)] mod alongside real production
+     * code. File-level detection says is_test_file=false (it is under src/,
+     * not tests/), so only the per-def rule can flag the module's contents. */
+    const char *src =
+        "pub fn handle() {}\n"                 // production sibling -> false
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    fn helper() {}\n"                 // inside cfg(test) mod -> true
+        "    mod nested {\n"
+        "        fn deep() {}\n"               // nested inside cfg(test) -> true
+        "    }\n"
+        "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "crates/foo/src/handler.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* (b) sibling outside the cfg(test) mod stays production. */
+    const CBMDefinition *handle = find_def_by_name(r, "handle");
+    ASSERT_NOT_NULL(handle);
+    ASSERT_FALSE(handle->is_test);
+
+    /* (a) fn directly inside #[cfg(test)] mod tests {} is test code. */
+    const CBMDefinition *helper = find_def_by_name(r, "helper");
+    ASSERT_NOT_NULL(helper);
+    ASSERT_TRUE(helper->is_test);
+
+    /* (c) fn in a NESTED mod inside the cfg(test) mod is test code too. */
+    const CBMDefinition *deep = find_def_by_name(r, "deep");
+    ASSERT_NOT_NULL(deep);
+    ASSERT_TRUE(deep->is_test);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(is_test_cfg_any_test_mod_marks_defs) {
+    /* The cfg predicate need not be a bare `test`: any cfg whose argument list
+     * contains the `test` token gates the module — e.g.
+     * #[cfg(any(test, feature = "testkit"))], the user's real pattern. A
+     * cfg WITHOUT a test token must NOT flag its module. */
+    const char *src =
+        "#[cfg(any(test, feature = \"testkit\"))]\n"
+        "mod kit {\n"
+        "    fn fake() {}\n"                   // cfg(any(test,...)) -> true
+        "}\n"
+        "#[cfg(feature = \"serde\")]\n"
+        "mod ser {\n"
+        "    fn real() {}\n"                   // cfg without test token -> false
+        "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "crates/foo/src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *fake = find_def_by_name(r, "fake");
+    ASSERT_NOT_NULL(fake);
+    ASSERT_TRUE(fake->is_test);
+
+    const CBMDefinition *real = find_def_by_name(r, "real");
+    ASSERT_NOT_NULL(real);
+    ASSERT_FALSE(real->is_test);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -3471,6 +3556,8 @@ SUITE(extraction) {
     /* is_test detection (Fix A): directory-aware Rust tests/ + benches/ */
     RUN_TEST(is_test_rust_tests_dir_directory_aware);
     RUN_TEST(is_test_rust_tests_dir_propagates_to_module);
+    RUN_TEST(is_test_cfg_test_mod_marks_defs_per_definition);
+    RUN_TEST(is_test_cfg_any_test_mod_marks_defs);
 
     cbm_shutdown();
 }
