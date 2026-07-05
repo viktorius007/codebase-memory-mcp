@@ -4162,7 +4162,13 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     return CBM_STORE_OK;
 }
 
-#define MAX_PREVIEW_NAMES 15
+/* Package-list cap for the packages aspect. MUST equal the layers aspect's cap
+ * (ST_MAX_PKGS): both views enumerate the same package universe, and a smaller
+ * cap here made small-but-real packages (single-file scripts) appear in layers
+ * while silently missing from packages. The collection buffers (CBM_SZ_64) and
+ * layers' find_or_add_pkg share the same 64 bound, so the aspects stay in
+ * agreement up to the shared limit. */
+#define MAX_PREVIEW_NAMES ST_MAX_PKGS
 
 /* Fallback: derive packages from QN segments when no Package nodes exist. */
 static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char *path,
