@@ -1064,6 +1064,69 @@ TEST(arch_packages_report_fan) {
     PASS();
 }
 
+TEST(arch_packages_include_small_layer_packages) {
+    /* The packages aspect truncated to the top-15 groups by node count while
+     * the layers aspect caps at ST_MAX_PKGS (64), so a small package that
+     * layers reports (observed live: single-file Python scripts with 3-5 defs,
+     * classified via their entry points) was silently absent from packages —
+     * the two aspects contradicted each other. Both must honour the same cap:
+     * any package small enough to be truncated from packages must not appear
+     * in layers either; with ≤64 groups, both list it. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "trunc", "/tmp/trunc"), CBM_STORE_OK);
+
+    /* 16 bulk packages (pkg00..pkg15) with 2 defs each outrank... */
+    for (int p = 0; p < 16; p++) {
+        for (int d = 0; d < 2; d++) {
+            char qn[128], fp[64], nm[32];
+            snprintf(nm, sizeof(nm), "f%d_%d", p, d);
+            snprintf(qn, sizeof(qn), "trunc.src.pkg%02d.f%d_%d", p, p, d);
+            snprintf(fp, sizeof(fp), "src/pkg%02d/a.c", p);
+            cbm_node_t n = {.project = "trunc",
+                            .label = "Function",
+                            .name = nm,
+                            .qualified_name = qn,
+                            .file_path = fp};
+            ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+        }
+    }
+    /* ...one single-definition package whose def is an entry point, so the
+     * layers aspect names it. */
+    cbm_node_t script = {.project = "trunc",
+                         .label = "Function",
+                         .name = "main",
+                         .qualified_name = "trunc.scripts.tiny-script.main",
+                         .file_path = "scripts/tiny-script.py",
+                         .properties_json = "{\"is_entry_point\":true}"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &script) > 0);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"packages", "layers"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "trunc", NULL, aspects, 2, &info), CBM_STORE_OK);
+
+    bool in_layers = false;
+    for (int i = 0; i < info.layer_count; i++) {
+        if (strcmp(info.layers[i].name, "tiny-script") == 0) {
+            in_layers = true;
+        }
+    }
+    ASSERT_TRUE(in_layers); /* precondition: layers does report it */
+
+    bool in_packages = false;
+    for (int i = 0; i < info.package_count; i++) {
+        if (strcmp(info.packages[i].name, "tiny-script") == 0) {
+            in_packages = true;
+        }
+    }
+    ASSERT_TRUE(in_packages); /* the defect: truncated out before the fix */
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_file_tree) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -2000,6 +2063,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
     RUN_TEST(arch_packages_report_fan);
+    RUN_TEST(arch_packages_include_small_layer_packages);
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
 
