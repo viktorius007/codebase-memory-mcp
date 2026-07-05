@@ -523,6 +523,117 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
+/* Ubiquitous Rust method/associated-function names — std-trait methods and the
+ * handful of one-word accessors that recur on nearly every type (`clone`,
+ * `iter`, `parse`, `value`, `path`, ...). The Rust LSP resolves these when it
+ * knows the receiver type; when it does NOT (std/proc-macro receivers), the
+ * call falls through to the registry's short-name textual strategies, which
+ * bind the bare name to whatever same-named def exists — routinely one in an
+ * unrelated package. This is the Rust analogue of PERL_BUILTINS: a name on this
+ * list carries no package-disambiguating signal on its own. MUST stay sorted
+ * ASCII-ascending for bsearch. */
+static const char *const RUST_GENERIC_METHODS[] = {
+    "clone", "extend", "from_str", "into_iter", "iter", "iter_mut", "next", "parse", "path", "value",
+};
+
+static int rust_generic_method_cmp(const void *key, const void *elem) {
+    return strcmp((const char *)key, *(const char *const *)elem);
+}
+
+/* True if `name` is one of the curated ubiquitous Rust method names. `name` is
+ * the callee's terminal segment (after the last `.`/`::`). Used only by the
+ * cross-package suppression gate below. Empty/NULL → false. */
+bool cbm_rust_is_generic_method(const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    return bsearch(name, RUST_GENERIC_METHODS,
+                   sizeof(RUST_GENERIC_METHODS) / sizeof(RUST_GENERIC_METHODS[0]),
+                   sizeof(RUST_GENERIC_METHODS[0]), rust_generic_method_cmp) != NULL;
+}
+
+/* Rust package-root token for a workspace-relative file path, written into
+ * `out` (capacity `cap`). Canonical Cargo layout is `<pkg-root>/src/...`, so the
+ * package identity is the path segment immediately preceding `/src/` — this
+ * captures both the flat `xtask/src/...` and nested `crates/pm-core/src/...`
+ * conventions with one rule, and is layout-derived rather than hard-coded to any
+ * one repo. Returns true and fills `out` on success; false (out untouched) when
+ * the path has no `/src/` segment (e.g. `tests/` integration files, non-Rust
+ * paths) — the caller then treats the boundary as unknown and does not suppress.
+ */
+static bool rust_pkg_root(const char *file_path, char *out, size_t cap) {
+    if (!file_path) {
+        return false;
+    }
+    const char *src = strstr(file_path, "/src/");
+    if (!src) {
+        return false;
+    }
+    /* Package root is the segment just before "/src/": walk back to the prior
+     * '/' (or path start). */
+    const char *seg_end = src;
+    const char *seg_start = seg_end;
+    while (seg_start > file_path && seg_start[-1] != '/') {
+        seg_start--;
+    }
+    size_t len = (size_t)(seg_end - seg_start);
+    if (len == 0 || len >= cap) {
+        return false;
+    }
+    memcpy(out, seg_start, len);
+    out[len] = '\0';
+    return true;
+}
+
+/* Decide whether a *resolved* Rust call edge is a cross-package phantom that a
+ * weak textual strategy manufactured from a bare generic method name. The Rust
+ * LSP models receiver types and, when confident, resolves the call before this
+ * gate is ever reached (the registry is bypassed entirely). Reaching here with
+ * a weak strategy means the LSP had NO receiver evidence (std-trait method on a
+ * std type, proc-macro context), and the registry guessed a same-named def. The
+ * guess is only dangerous when it crosses a package boundary — a same-package
+ * `x.clone()` → local `clone` is almost always right and MUST survive, which is
+ * exactly what the boundary check preserves (this is why a bare name denylist is
+ * wrong: it would also kill every legitimate same-package generic-method edge).
+ *
+ * Suppress iff ALL hold: Rust; the callee is a method/associated call carrying a
+ * receiver (`recv.m` / `Type::m`, i.e. `has_receiver`); the match landed via a
+ * WEAK short-name strategy (unique_name / suffix_match / field_type_hint /
+ * fuzzy_*); the callee's terminal segment is a curated generic method name; and
+ * the source and target resolve to DIFFERENT Rust package roots. High-confidence
+ * strategies (import_map / same_module / qualified_suffix) are kept, and any
+ * call whose package boundary can't be determined (missing `/src/` root) is kept
+ * — suppression is opt-in on positively-established cross-package evidence.
+ *
+ * Pure + side-effect-free so the contract is unit-testable without a pipeline. */
+bool cbm_rust_suppress_cross_pkg_generic(bool is_rust, bool has_receiver, const char *callee_name,
+                                         const char *strategy, const char *source_file,
+                                         const char *target_file) {
+    if (!is_rust || !has_receiver) {
+        return false;
+    }
+    if (!strategy || !strategy[0]) {
+        return false;
+    }
+    /* Only the weak short-name strategies are eligible; high-confidence import/
+     * same-module/qualified matches carry real disambiguating signal. */
+    if (!(strcmp(strategy, "unique_name") == 0 || strcmp(strategy, "suffix_match") == 0 ||
+          strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy_single") == 0 ||
+          strcmp(strategy, "fuzzy_multi") == 0)) {
+        return false;
+    }
+    if (!cbm_rust_is_generic_method(simple_name(callee_name))) {
+        return false;
+    }
+    char src_pkg[CBM_SZ_256];
+    char tgt_pkg[CBM_SZ_256];
+    if (!rust_pkg_root(source_file, src_pkg, sizeof(src_pkg)) ||
+        !rust_pkg_root(target_file, tgt_pkg, sizeof(tgt_pkg))) {
+        return false; /* boundary undeterminable — keep the edge */
+    }
+    return strcmp(src_pkg, tgt_pkg) != 0; /* cross-package generic bare-name guess → drop */
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {

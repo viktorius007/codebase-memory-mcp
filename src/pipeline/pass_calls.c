@@ -537,6 +537,24 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
+
+    /* Rust cross-package generic-name phantom guard (parallel twin in
+     * pass_parallel.c). A bare std-trait method (`x.clone()`, `parts.extend()`)
+     * whose receiver type the LSP could not resolve falls through to the
+     * registry's weak textual strategies, which bind the short name to a
+     * same-named def in an UNRELATED package. Drop only cross-package
+     * weak-strategy generic-name edges; same-package generic calls and every
+     * high-confidence strategy survive. Placed after target resolution so the
+     * package boundary is known. Gated to Rust — other languages unaffected. */
+    {
+        bool has_receiver =
+            strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
+        if (cbm_rust_suppress_cross_pkg_generic(lang == CBM_LANG_RUST, has_receiver,
+                                                call->callee_name, res.strategy,
+                                                source_node->file_path, target_node->file_path)) {
+            return 0;
+        }
+    }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count);
     return SKIP_ONE;

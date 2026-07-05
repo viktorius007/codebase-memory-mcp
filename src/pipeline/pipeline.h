@@ -232,6 +232,24 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
+/* True if `name` (a callee's terminal segment) is a curated ubiquitous Rust
+ * method/associated-function name (clone/iter/parse/value/path/...). These carry
+ * no package-disambiguating signal; used by the cross-package suppression gate.
+ * The Rust analogue of cbm_perl_is_builtin. */
+bool cbm_rust_is_generic_method(const char *name);
+
+/* Decide whether a resolved Rust call edge is a cross-package phantom: a bare
+ * generic method name (cbm_rust_is_generic_method) that a WEAK textual strategy
+ * (unique_name/suffix_match/field_type_hint/fuzzy_*) bound across a package
+ * boundary because the LSP had no receiver evidence. Same-package generic-method
+ * edges are KEPT (the boundary check is what makes this safe vs a name denylist);
+ * high-confidence strategies and boundary-undeterminable calls are KEPT. Package
+ * identity is the Cargo `<pkg>/src/...` root of each file. Pure; unit-tested in
+ * test_registry.c. */
+bool cbm_rust_suppress_cross_pkg_generic(bool is_rust, bool has_receiver, const char *callee_name,
+                                         const char *strategy, const char *source_file,
+                                         const char *target_file);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 

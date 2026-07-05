@@ -808,6 +808,92 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
     PASS();
 }
 
+/* ── Rust cross-package generic-name guard (receiver-evidence fallback) ── */
+
+TEST(rust_generic_method_set_recognizes_ubiquitous_names) {
+    ASSERT_TRUE(cbm_rust_is_generic_method("clone")); /* first element */
+    ASSERT_TRUE(cbm_rust_is_generic_method("value")); /* last element */
+    ASSERT_TRUE(cbm_rust_is_generic_method("iter"));
+    ASSERT_TRUE(cbm_rust_is_generic_method("extend"));
+    ASSERT_TRUE(cbm_rust_is_generic_method("parse"));
+    ASSERT_TRUE(cbm_rust_is_generic_method("path"));
+    PASS();
+}
+
+TEST(rust_generic_method_set_rejects_domain_names) {
+    /* Domain method names carry package signal and must NOT be flagged. */
+    ASSERT_FALSE(cbm_rust_is_generic_method("verify_integrity"));
+    ASSERT_FALSE(cbm_rust_is_generic_method("as_uuid"));
+    ASSERT_FALSE(cbm_rust_is_generic_method("public_scalar_values"));
+    ASSERT_FALSE(cbm_rust_is_generic_method("Clone")); /* case-sensitive */
+    ASSERT_FALSE(cbm_rust_is_generic_method(""));
+    ASSERT_FALSE(cbm_rust_is_generic_method(NULL));
+    PASS();
+}
+
+TEST(rust_suppress_drops_cross_pkg_weak_generic_edges) {
+    /* The live pm phantom: pm-core `String.clone()` textually bound to
+     * pm-infra's SqliteProjectStore.clone via unique_name across packages. */
+    ASSERT_TRUE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "self.clone", "unique_name",
+        "crates/pm-core/src/entity_model.rs", "crates/pm-infra/src/sqlite/mod.rs"));
+    /* parts.extend → xtask CoverageMarkerFindings.extend via suffix_match. */
+    ASSERT_TRUE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "parts.extend", "suffix_match",
+        "crates/pm-core/src/entity_shape.rs", "xtask/src/coverage_off_lint.rs"));
+    /* attr.path → xtask AttrVisitor.path via field_type_hint. */
+    ASSERT_TRUE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "attr.path", "field_type_hint",
+        "crates/pm-entity-derive/src/lib.rs", "xtask/src/cli_grammar.rs"));
+    /* Turbofish/associated receiver form (`Type::parse`) is a method call. */
+    ASSERT_TRUE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "Foo::parse", "unique_name",
+        "crates/a/src/lib.rs", "crates/b/src/lib.rs"));
+    PASS();
+}
+
+TEST(rust_suppress_keeps_same_pkg_and_genuine_edges) {
+    /* SAME package — a local `x.clone()` to a same-crate `clone` is almost
+     * always right and MUST survive (this is why a bare name denylist is wrong). */
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "x.clone", "unique_name",
+        "crates/pm-core/src/a.rs", "crates/pm-core/src/b.rs"));
+    /* High-confidence strategies are kept even cross-package. */
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "x.clone", "import_map",
+        "crates/pm-cli/src/a.rs", "crates/pm-core/src/b.rs"));
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "x.value", "same_module",
+        "crates/pm-cli/src/a.rs", "crates/pm-core/src/b.rs"));
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "graph.relationship_frame", "qualified_suffix",
+        "crates/pm-cli/src/a.rs", "crates/pm-core/src/b.rs"));
+    /* Domain method name — never suppressed even cross-package + weak. */
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "adr.as_uuid", "suffix_match",
+        "crates/pm-cli/src/a.rs", "crates/pm-core/src/b.rs"));
+    /* Free function (no receiver) — the guard only targets method/assoc calls. */
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, false, "clone", "unique_name",
+        "crates/a/src/lib.rs", "crates/b/src/lib.rs"));
+    /* Non-Rust languages are never affected. */
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        false, true, "x.clone", "unique_name",
+        "crates/a/src/lib.rs", "crates/b/src/lib.rs"));
+    /* NULL/empty strategy → nothing resolved, nothing to suppress. */
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "x.clone", NULL,
+        "crates/a/src/lib.rs", "crates/b/src/lib.rs"));
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "x.clone", "",
+        "crates/a/src/lib.rs", "crates/b/src/lib.rs"));
+    /* Boundary undeterminable (no `/src/` root, e.g. tests/ file) → keep. */
+    ASSERT_FALSE(cbm_rust_suppress_cross_pkg_generic(
+        true, true, "x.clone", "unique_name",
+        "crates/pm-cli/tests/e2e.rs", "crates/pm-core/src/b.rs"));
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(registry) {
@@ -876,4 +962,9 @@ SUITE(registry) {
     RUN_TEST(perl_builtin_set_rejects_project_subs);
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
+    /* Rust cross-package generic-name guard */
+    RUN_TEST(rust_generic_method_set_recognizes_ubiquitous_names);
+    RUN_TEST(rust_generic_method_set_rejects_domain_names);
+    RUN_TEST(rust_suppress_drops_cross_pkg_weak_generic_edges);
+    RUN_TEST(rust_suppress_keeps_same_pkg_and_genuine_edges);
 }
