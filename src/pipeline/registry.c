@@ -104,14 +104,9 @@ struct cbm_registry {
 static CBM_TLS int _add_lang_group = REG_LANG_GROUP_ANY;
 static CBM_TLS int _resolve_lang_group = REG_LANG_GROUP_ANY;
 
-/* Two groups resolve to each other iff equal, or either is the wildcard.
- * NOTE (RED commit): the real predicate is intentionally not yet wired — this
- * stub keeps every candidate eligible so the language-scoping test fails,
- * proving the gate is load-bearing. The next commit implements the predicate. */
+/* Two groups resolve to each other iff equal, or either is the wildcard. */
 static inline bool group_compatible(int a, int b) {
-    (void)a;
-    (void)b;
-    return true;
+    return a == REG_LANG_GROUP_ANY || b == REG_LANG_GROUP_ANY || a == b;
 }
 
 int cbm_registry_lang_group(CBMLanguage lang) {
