@@ -621,6 +621,105 @@ TEST(arch_boundaries_exclude_low_confidence_name_collisions) {
     PASS();
 }
 
+/* Synthetic builtin nodes must not mint pseudo-packages. The Python/Kotlin
+ * builtin registries create real graph nodes with sentinel file_paths
+ * (<python-builtins>, <kotlin-builtins>) and QNs like builtins.len. They are
+ * Function/Class labelled, so the arch_boundaries node scan picks them up,
+ * finds no declared pkg for the sentinel path, and the QN fallback mints
+ * "len"/"dict"/"list" as packages — observed live as boundaries
+ * pm-cli→dict 8 and layer entries "dict — core — high fan-in". A call to a
+ * builtin is stdlib usage, not a cross-package dependency.
+ *
+ * RED at branch base: app→len reported as a boundary with call_count 3.
+ * GREEN: no boundary targets a builtin; genuine app→lib survives. */
+TEST(arch_boundaries_exclude_synthetic_builtin_nodes) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_TRUE(s != NULL);
+    cbm_store_upsert_project(s, "sb", "/tmp/sb");
+
+    cbm_node_t f_app = {.project = "sb",
+                        .label = "File",
+                        .name = "run.py",
+                        .qualified_name = "sb.app.run.__file__",
+                        .file_path = "app/run.py",
+                        .properties_json = "{\"extension\":\".py\",\"pkg\":\"app\"}"};
+    cbm_store_upsert_node(s, &f_app);
+    cbm_node_t f_lib = {.project = "sb",
+                        .label = "File",
+                        .name = "core.py",
+                        .qualified_name = "sb.lib.core.__file__",
+                        .file_path = "lib/core.py",
+                        .properties_json = "{\"extension\":\".py\",\"pkg\":\"lib\"}"};
+    cbm_store_upsert_node(s, &f_lib);
+
+    /* Synthetic builtin node exactly as the Python builtin registry mints it:
+     * sentinel file_path, builtins.* QN. */
+    cbm_node_t fn_len = {.project = "sb",
+                         .label = "Function",
+                         .name = "len",
+                         .qualified_name = "builtins.len",
+                         .file_path = "<python-builtins>"};
+    int64_t id_len = cbm_store_upsert_node(s, &fn_len);
+
+    cbm_node_t fn_core = {.project = "sb",
+                          .label = "Function",
+                          .name = "core_fn",
+                          .qualified_name = "sb.lib.core.core_fn",
+                          .file_path = "lib/core.py"};
+    int64_t id_core = cbm_store_upsert_node(s, &fn_core);
+
+    int64_t callers[3];
+    for (int i = 0; i < 3; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "caller_%d", i);
+        snprintf(qn, sizeof(qn), "sb.app.run.caller_%d", i);
+        cbm_node_t c = {.project = "sb",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "app/run.py"};
+        callers[i] = cbm_store_upsert_node(s, &c);
+    }
+
+    /* Three HIGH-confidence calls onto the builtin — resolution is confident,
+     * the target is just not repo code. Must NOT create a boundary. */
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t e = {.project = "sb",
+                        .source_id = callers[i],
+                        .target_id = id_len,
+                        .type = "CALLS",
+                        .properties_json = "{\"callee\":\"len\",\"confidence\":0.95,"
+                                           "\"strategy\":\"builtin\",\"candidates\":1}"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    /* Two genuine cross-package calls app→lib. Must survive. */
+    for (int i = 0; i < 2; i++) {
+        cbm_edge_t e = {.project = "sb",
+                        .source_id = callers[i],
+                        .target_id = id_core,
+                        .type = "CALLS",
+                        .properties_json = "{\"callee\":\"core_fn\",\"confidence\":0.90,"
+                                           "\"strategy\":\"import_match\",\"candidates\":1}"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"boundaries"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "sb", NULL, aspects, 1, &info), CBM_STORE_OK);
+
+    /* No boundary may target the builtin pseudo-package. */
+    ASSERT_EQ(boundary_count_helper(&info, "app", "len"), -1);
+
+    /* The genuine cross-package boundary keeps its count. */
+    ASSERT_EQ(boundary_count_helper(&info, "app", "lib"), 2);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_boundaries) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -1761,6 +1860,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_hotspots_exclude_low_confidence_name_collisions);
     RUN_TEST(arch_boundaries_exclude_low_confidence_name_collisions);
+    RUN_TEST(arch_boundaries_exclude_synthetic_builtin_nodes);
     RUN_TEST(arch_boundaries);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
