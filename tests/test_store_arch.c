@@ -720,6 +720,140 @@ TEST(arch_boundaries_exclude_synthetic_builtin_nodes) {
     PASS();
 }
 
+/* Test-code callers must not manufacture cross-package boundaries. A test
+ * function (is_test=true) that calls a bare generic method — `.new()`,
+ * `.canonicalize()`, `.env()` — gets its CALLS edge mis-bound onto a lone
+ * same-named function in another package. The short-name resolver floors such
+ * a guess to ~0.55: JUST past the 0.5 confidence gate, so the confidence
+ * filter alone does NOT drop it. Observed live on the pm repo as a spurious
+ * pm-git-safety→pm-cli boundary (weight 16), driven entirely by is_test
+ * callers in crates/git-safety/src/db_path.rs invoking `new`/`canonicalize`.
+ * Test code is not part of the architecture's dependency structure, so its
+ * callers must be excluded from boundary/fan/layer aggregation — the same gate
+ * arch_hotspots/arch_entry_points already apply to their node scans.
+ *
+ * RED at branch base (node scan has no is_test filter): app→tool reported as a
+ * boundary with call_count 5. GREEN: the test-caller pair is gone, while the
+ * genuine non-test app→lib boundary survives with its full count. */
+TEST(arch_boundaries_exclude_test_callers) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_TRUE(s != NULL);
+    cbm_store_upsert_project(s, "tc", "/tmp/tc");
+
+    /* Three packages via File-node pkg props: app (callers), tool (collision
+     * target), lib (genuine dependency). */
+    cbm_node_t f_app = {.project = "tc",
+                        .label = "File",
+                        .name = "lib.rs",
+                        .qualified_name = "tc.app.src.lib.__file__",
+                        .file_path = "app/src/lib.rs",
+                        .properties_json = "{\"extension\":\".rs\",\"pkg\":\"app\"}"};
+    cbm_store_upsert_node(s, &f_app);
+    cbm_node_t f_tool = {.project = "tc",
+                         .label = "File",
+                         .name = "util.rs",
+                         .qualified_name = "tc.tool.src.util.__file__",
+                         .file_path = "tool/src/util.rs",
+                         .properties_json = "{\"extension\":\".rs\",\"pkg\":\"tool\"}"};
+    cbm_store_upsert_node(s, &f_tool);
+    cbm_node_t f_lib = {.project = "tc",
+                        .label = "File",
+                        .name = "core.rs",
+                        .qualified_name = "tc.lib.src.core.__file__",
+                        .file_path = "lib/src/core.rs",
+                        .properties_json = "{\"extension\":\".rs\",\"pkg\":\"lib\"}"};
+    cbm_store_upsert_node(s, &f_lib);
+
+    /* Collision target in `tool`: a lone fn named `new`. */
+    cbm_node_t fn_new = {.project = "tc",
+                         .label = "Function",
+                         .name = "new",
+                         .qualified_name = "tc.tool.src.util.new",
+                         .file_path = "tool/src/util.rs"};
+    int64_t id_new = cbm_store_upsert_node(s, &fn_new);
+
+    /* Genuine dependency target in `lib`. */
+    cbm_node_t fn_run = {.project = "tc",
+                         .label = "Function",
+                         .name = "run",
+                         .qualified_name = "tc.lib.src.core.run",
+                         .file_path = "lib/src/core.rs"};
+    int64_t id_run = cbm_store_upsert_node(s, &fn_run);
+
+    /* Five TEST caller functions in `app` (is_test=true), same file as a
+     * source file — the #[cfg(test)] mod case: file_path is NOT a test path,
+     * only the node's is_test flag marks it. */
+    int64_t test_callers[5];
+    for (int i = 0; i < 5; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "test_case_%d", i);
+        snprintf(qn, sizeof(qn), "tc.app.src.lib.test_case_%d", i);
+        cbm_node_t c = {.project = "tc",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "app/src/lib.rs",
+                        .properties_json = "{\"is_test\":true}"};
+        test_callers[i] = cbm_store_upsert_node(s, &c);
+    }
+
+    /* Three genuine NON-test callers in `app` (distinct sources so their edges
+     * do not dedup to one). */
+    int64_t prod_callers[3];
+    for (int i = 0; i < 3; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "drive_%d", i);
+        snprintf(qn, sizeof(qn), "tc.app.src.lib.drive_%d", i);
+        cbm_node_t c = {.project = "tc",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "app/src/lib.rs",
+                        .properties_json = "{\"is_test\":false}"};
+        prod_callers[i] = cbm_store_upsert_node(s, &c);
+    }
+
+    /* Five edges test→tool onto `new` at confidence 0.55 — PAST the 0.5 gate,
+     * so only the is_test-caller exclusion can drop them. Must NOT create a
+     * boundary. */
+    for (int i = 0; i < 5; i++) {
+        cbm_edge_t e = {.project = "tc",
+                        .source_id = test_callers[i],
+                        .target_id = id_new,
+                        .type = "CALLS",
+                        .properties_json = "{\"callee\":\"new\",\"confidence\":0.55,"
+                                           "\"strategy\":\"unique_name\",\"candidates\":1}"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    /* Three HIGH-confidence genuine edges drive→lib from the non-test callers.
+     * Must survive in full. */
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t e = {.project = "tc",
+                        .source_id = prod_callers[i],
+                        .target_id = id_run,
+                        .type = "CALLS",
+                        .properties_json = "{\"callee\":\"run\",\"confidence\":0.90,"
+                                           "\"strategy\":\"import_match\",\"candidates\":1}"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"boundaries"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "tc", NULL, aspects, 1, &info), CBM_STORE_OK);
+
+    /* The test-caller-only pair must not be reported as a boundary at all. */
+    ASSERT_EQ(boundary_count_helper(&info, "app", "tool"), -1);
+
+    /* The genuine non-test boundary keeps its full count. */
+    ASSERT_EQ(boundary_count_helper(&info, "app", "lib"), 3);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_boundaries) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -1861,6 +1995,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_hotspots_exclude_low_confidence_name_collisions);
     RUN_TEST(arch_boundaries_exclude_low_confidence_name_collisions);
     RUN_TEST(arch_boundaries_exclude_synthetic_builtin_nodes);
+    RUN_TEST(arch_boundaries_exclude_test_callers);
     RUN_TEST(arch_boundaries);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);

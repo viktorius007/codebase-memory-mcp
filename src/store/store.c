@@ -4023,7 +4023,8 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char nsqlbuf[ST_SQL_BUF];
     const char *nbase =
-        "SELECT id, qualified_name, file_path FROM nodes WHERE project=?1 AND label IN "
+        "SELECT id, qualified_name, file_path, "
+        "json_extract(properties, '$.is_test') FROM nodes WHERE project=?1 AND label IN "
         "('Function','Method','Class')";
     if (scoped) {
         snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", nbase, arch_path_scope_sql());
@@ -4062,7 +4063,17 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
          * ("len", "dict") into boundaries/fan/layers. Empty pkg makes the edge
          * loop below skip them, same as any package-less node. */
         bool synthetic = fp && fp[0] == '<';
-        npkgs[nn] = heap_strdup(synthetic ? "" : arch_pkg_for(file_pkg, fp, qn));
+        /* Test-code nodes (is_test=true) are not part of the architecture's
+         * dependency structure: a test's bare generic call (`.new()`,
+         * `.canonicalize()`) mis-binds onto a lone same-named function in another
+         * package at a short-name confidence (~0.55) that clears the 0.5 edge
+         * gate, minting a phantom cross-package boundary (observed live as
+         * pm-git-safety→pm-cli, weight 16). Forcing an empty pkg makes the edge
+         * loop skip every edge touching a test node, mirroring the is_test filter
+         * arch_hotspots/arch_entry_points apply to their own scans. json_extract
+         * returns SQLite integer 1 for a JSON `true`. */
+        bool is_test = sqlite3_column_int(nstmt, ST_COL_3) == 1;
+        npkgs[nn] = heap_strdup((synthetic || is_test) ? "" : arch_pkg_for(file_pkg, fp, qn));
         nn++;
     }
     sqlite3_finalize(nstmt);
