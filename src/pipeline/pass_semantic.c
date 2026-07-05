@@ -554,6 +554,10 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       ps_module_is_dir(files[i].language));
 
+        /* Scope INHERITS/DECORATES/IMPLEMENTS resolution to the caller's
+         * language-group (mirrors pass_calls / pass_usages / parallel path). */
+        cbm_registry_resolve_scope_begin(files[i].language);
+
         /* ── INHERITS + DECORATES from definitions ──────────────── */
         for (int d = 0; d < result->defs.count; d++) {
             sem_process_def_edges(ctx, &result->defs.items[d], module_qn, imp_keys, imp_vals,
@@ -564,6 +568,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         implements_count +=
             resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
 
+        cbm_registry_resolve_scope_clear();
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {

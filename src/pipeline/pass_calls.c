@@ -601,6 +601,10 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pc_module_is_dir(files[i].language));
 
+        /* Scope resolution to the caller's language-group so cross-language
+         * name collisions cannot bind (mirrors the parallel path). */
+        cbm_registry_resolve_scope_begin(files[i].language);
+
         /* Resolve each call */
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
@@ -616,6 +620,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             }
         }
 
+        cbm_registry_resolve_scope_clear();
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {

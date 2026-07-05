@@ -527,7 +527,14 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
-    cbm_registry_add(r, node->name, node->qualified_name, node->label);
+    /* Derive the definition's language from its file path so the incremental
+     * registry seeds the SAME language-group tags a full reindex would (the
+     * gbuf node carries no language field). cbm_language_for_filename wants a
+     * basename; the full rel-path works because the extension lookup only reads
+     * the tail. An unknown extension yields CBM_LANG_COUNT → wildcard group. */
+    CBMLanguage lang =
+        node->file_path ? cbm_language_for_filename(node->file_path) : CBM_LANG_COUNT;
+    cbm_registry_add(r, node->name, node->qualified_name, node->label, lang);
 }
 
 /* Run parallel or sequential extract+resolve for changed files. */

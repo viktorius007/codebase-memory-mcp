@@ -287,7 +287,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
 }
 
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
-static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel) {
+static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
+                        CBMLanguage lang) {
     if (!def->qualified_name || !def->name) {
         return;
     }
@@ -308,7 +309,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
         (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
          cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
          strcmp(def->label, "Field") == 0)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label, lang);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -507,7 +508,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Create nodes for each definition */
         for (int d = 0; d < result->defs.count; d++) {
-            process_def(ctx, &result->defs.items[d], rel);
+            process_def(ctx, &result->defs.items[d], rel, lang);
             total_defs++;
         }
 

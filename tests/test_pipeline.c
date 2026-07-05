@@ -3956,8 +3956,8 @@ TEST(helm_parse_chart_no_deps_issue338) {
 
 TEST(registry_resolve_single_candidate) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
-    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function");
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function", CBM_LANG_COUNT);
 
     /* Normal resolve unique name */
     cbm_resolution_t r = cbm_registry_resolve(reg, "CreateOrder", "svcC.caller", NULL, NULL, 0);
@@ -3975,7 +3975,7 @@ TEST(registry_resolve_single_candidate) {
 
 TEST(registry_fuzzy_nonexistent) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function", CBM_LANG_COUNT);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "NonExistent", "svcC.caller", NULL, NULL, 0);
@@ -3987,8 +3987,8 @@ TEST(registry_fuzzy_nonexistent) {
 
 TEST(registry_fuzzy_multiple_best_by_distance) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function");
-    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function");
+    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function", CBM_LANG_COUNT);
 
     /* Caller in svcA → prefer svcA */
     cbm_fuzzy_result_t fr =
@@ -4007,7 +4007,7 @@ TEST(registry_fuzzy_multiple_best_by_distance) {
 
 TEST(registry_fuzzy_simple_name_extraction) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function");
+    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function", CBM_LANG_COUNT);
 
     /* Deeply qualified name → extract "DoWork" */
     cbm_fuzzy_result_t fr = cbm_registry_fuzzy_resolve(reg, "some.deep.module.DoWork",
@@ -4032,8 +4032,8 @@ TEST(registry_fuzzy_empty) {
 
 TEST(registry_exists) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method");
+    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method", CBM_LANG_COUNT);
 
     ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Foo"));
     ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Bar"));
@@ -4046,7 +4046,7 @@ TEST(registry_exists) {
 
 TEST(registry_confidence_import_map) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", CBM_LANG_COUNT);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -4061,7 +4061,7 @@ TEST(registry_confidence_import_map) {
 
 TEST(registry_confidence_import_map_suffix) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function", CBM_LANG_COUNT);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -4076,7 +4076,7 @@ TEST(registry_confidence_import_map_suffix) {
 
 TEST(registry_confidence_same_module) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", CBM_LANG_COUNT);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Foo", "proj.pkg", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Foo");
@@ -4089,7 +4089,7 @@ TEST(registry_confidence_same_module) {
 
 TEST(registry_confidence_unique_name) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", CBM_LANG_COUNT);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Bar", "proj.unrelated", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Bar");
@@ -4102,8 +4102,8 @@ TEST(registry_confidence_unique_name) {
 
 TEST(registry_confidence_suffix_match) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function", CBM_LANG_COUNT);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.svcA.caller", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.svcA.Process");
@@ -4116,7 +4116,7 @@ TEST(registry_confidence_suffix_match) {
 
 TEST(registry_fuzzy_confidence_single) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function", CBM_LANG_COUNT);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.Handler", "proj.caller", NULL, NULL, 0);
@@ -4130,8 +4130,8 @@ TEST(registry_fuzzy_confidence_single) {
 
 TEST(registry_fuzzy_confidence_distance) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function", CBM_LANG_COUNT);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.Process", "proj.svcA.other", NULL, NULL, 0);
@@ -4145,8 +4145,8 @@ TEST(registry_fuzzy_confidence_distance) {
 
 TEST(registry_negative_import_rejects) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function", CBM_LANG_COUNT);
 
     /* Import only handler's module → should prefer handler */
     const char *keys[] = {"handler"};
@@ -4160,7 +4160,7 @@ TEST(registry_negative_import_rejects) {
 
 TEST(registry_fuzzy_import_penalty) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function", CBM_LANG_COUNT);
 
     /* Has imports but billing not imported → confidence halved */
     const char *keys[] = {"other"};
@@ -4177,7 +4177,7 @@ TEST(registry_fuzzy_import_penalty) {
 
 TEST(registry_fuzzy_no_import_map_passthrough) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function", CBM_LANG_COUNT);
 
     /* NULL import map → no penalty, full fuzzy confidence */
     cbm_fuzzy_result_t fr =
@@ -4191,10 +4191,10 @@ TEST(registry_fuzzy_no_import_map_passthrough) {
 
 TEST(registry_find_by_name) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
-    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method", CBM_LANG_COUNT);
 
     /* FindByName returns all entries for "Foo" */
     const char **foos = NULL;
@@ -4929,10 +4929,10 @@ TEST(registry_is_import_reachable) {
 /* Port of FindEndingWith portion from Go TestFunctionRegistry in pipeline_test.go */
 TEST(registry_find_ending_with) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
-    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", CBM_LANG_COUNT);
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method", CBM_LANG_COUNT);
 
     /* FindEndingWith "DataProcessor.transform" → 1 match */
     const char **matches = NULL;
