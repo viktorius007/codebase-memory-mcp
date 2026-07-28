@@ -12,10 +12,14 @@
 # Linux: gcc/g++ — system default with full sanitizer support
 # CI scripts pass CC/CXX explicitly; don't rely on defaults here
 
-# This Makefile declares explicit rules for all build products. Disabling
-# built-in implicit rules avoids a large no-op/warm-build rule-search cost.
-MAKEFLAGS += -r
-.SUFFIXES:
+# Target architecture (macOS): build.sh/test.sh export ARCHFLAGS="-arch <arch>"
+# (see scripts/env.sh). Fold it into the compiler drivers with `override` so it
+# reaches EVERY compile and link recipe — including the vendored objects below
+# that use their own *_CFLAGS — and so it survives a command-line `CC=` override.
+# ARCHFLAGS is empty on Linux/Windows and for native direct `make` invocations,
+# leaving CC/CXX unchanged there.
+override CC := $(CC) $(ARCHFLAGS)
+override CXX := $(CXX) $(ARCHFLAGS)
 
 # ── Common flags ─────────────────────────────────────────────────
 
@@ -30,40 +34,9 @@ TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
 # This ensures we use our vendored copies instead of requiring system libicu-dev.
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 
-# ── Optional libgit2 (faster git history parsing) ────────────────
-# Auto-detected via pkg-config. Falls back to popen("git log ...") if absent.
-LIBGIT2_PC := $(shell found=; old_ifs=$$IFS; IFS=:; \
-	for dir in $${PKG_CONFIG_PATH:-} $${PKG_CONFIG_LIBDIR:-}; do \
-		if [ -f "$$dir/libgit2.pc" ]; then found=1; break; fi; \
-	done; \
-	IFS=$$old_ifs; \
-	if [ -z "$$found" ]; then \
-		for dir in /opt/homebrew/lib/pkgconfig /opt/homebrew/share/pkgconfig /usr/local/lib/pkgconfig /usr/local/share/pkgconfig /usr/lib/pkgconfig /usr/share/pkgconfig /usr/lib/*/pkgconfig; do \
-			if [ -f "$$dir/libgit2.pc" ]; then found=1; break; fi; \
-		done; \
-	fi; \
-	if [ -n "$$found" ]; then echo yes; fi)
-ifeq ($(LIBGIT2_PC),yes)
-LIBGIT2_CFLAGS := $(shell pkg-config --cflags libgit2 2>/dev/null)
-LIBGIT2_LIBS := $(shell pkg-config --libs libgit2 2>/dev/null)
-else
-LIBGIT2_CFLAGS :=
-LIBGIT2_LIBS :=
-endif
-ifneq ($(LIBGIT2_LIBS),)
-LIBGIT2_FLAGS = -DHAVE_LIBGIT2 $(LIBGIT2_CFLAGS)
-else
-LIBGIT2_FLAGS =
-LIBGIT2_LIBS =
-endif
-
-# Compiler feature probes. Keep this to one preprocessor invocation so warm/no-op
-# builds do not spend avoidable time in Makefile setup.
-COMPILER_FEATURES := $(shell printf '\n' | $(CC) -dM -E - 2>/dev/null | sed -n -e 's/^\#define __GNUC__ .*/GCC=1/p' -e 's/^\#define __clang__ .*/CLANG=1/p' -e 's/^\#define _WIN32 .*/WIN32=1/p' | tr '\n' ' ')
-
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
 # Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
-IS_GCC := $(if $(findstring GCC=1,$(COMPILER_FEATURES)),$(if $(findstring CLANG=1,$(COMPILER_FEATURES)),no,yes),no)
+IS_GCC := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
 GCC_ONLY_FLAGS :=
 ifeq ($(IS_GCC),yes)
 GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
@@ -71,52 +44,83 @@ GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
 endif
 
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
-	                -Wno-unused-parameter -Wno-sign-compare \
-	                $(GCC_ONLY_FLAGS) \
-	                -Isrc -Ivendored -Ivendored/sqlite3 \
-	                -Ivendored/mimalloc/include \
-	                -I$(CBM_DIR) -I$(TS_INCLUDE) \
-	                $(LIBGIT2_FLAGS) \
-	                $(EXTRA_CFLAGS)
+                -Wno-unused-parameter -Wno-sign-compare \
+                $(GCC_ONLY_FLAGS) \
+                -Isrc -Ivendored -Ivendored/sqlite3 \
+                -Ivendored/mimalloc/include \
+                -I$(CBM_DIR) -I$(TS_INCLUDE)
 
 CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
-	                  -Wno-unused-parameter \
-	                  -I$(CBM_DIR) -I$(TS_INCLUDE) \
-	                  $(EXTRA_CXXFLAGS)
-
-# Optional compiler cache wrapper. Example:
-#   make -f Makefile.cbm cbm CCACHE=sccache
-# Keep link steps on the raw compiler; cache wrappers only help compile steps.
-CCACHE ?=
-CC_COMPILE = $(if $(CCACHE),$(CCACHE) $(CC),$(CC))
-CXX_COMPILE = $(if $(CCACHE),$(CCACHE) $(CXX),$(CXX))
+                  -Wno-unused-parameter \
+                  -I$(CBM_DIR) -I$(TS_INCLUDE)
 
 # Production flags (CFLAGS_EXTRA allows CI to inject -DCBM_VERSION)
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-PROD_OPT ?= -O3
-CFLAGS_PROD = $(CFLAGS_COMMON) $(PROD_OPT) -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
-CXXFLAGS_PROD = $(CXXFLAGS_COMMON) $(PROD_OPT)
+CFLAGS_PROD = $(CFLAGS_COMMON) -O3 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
+CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O3
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
-CFLAGS_TEST = $(CFLAGS_COMMON) -g -O1 $(SANITIZE)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O1 $(SANITIZE)
+EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
+	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
+	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
+	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1
+# The build system is the single source of truth for "is this binary
+# instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
+# clang's feature-check spelling and every non-ASan sanitizer, so the
+# trap-UBSan leg once ran NATIVE timing budgets on an instrumented
+# binary. Any non-empty SANITIZE ⇒ sanitized budgets everywhere.
+ifneq ($(strip $(SANITIZE)),)
+SANITIZED_DEFINE = -DCBM_SANITIZED_BUILD=1
+else
+SANITIZED_DEFINE =
+endif
+CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
+CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
 
 # TSan (can't combine with ASan)
-CFLAGS_TSAN = $(CFLAGS_COMMON) -g -O1 \
-              -fsanitize=thread -fno-omit-frame-pointer
+TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
+CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 \
+              $(TSAN_SANITIZE)
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
-                -fsanitize=thread -fno-omit-frame-pointer
+                $(TSAN_SANITIZE)
 
-# Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), and
+# Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
+# (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
+# advapi32 (owner-only activation-candidate ACLs), plus
 # --allow-multiple-definition (MinGW CRT symbol clashes).
 # Auto-detected via compiler; no manual override needed.
-IS_MINGW := $(if $(findstring WIN32=1,$(COMPILER_FEATURES)),yes,no)
+IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
+# Route Windows allocations through mimalloc (#581). mimalloc's own static
+# override is gated on _MSC_VER, which clang/MinGW never defines, so it
+# compiled out and the CRT won the link: ordinary malloc went to the CRT heap,
+# which keeps freed pages committed, leaving every allocator tuning in
+# cbm_mem_init POSIX-only. --wrap redirects the same population of allocations
+# that link-order override captures on POSIX, so the purge configuration
+# finally applies here too. src/foundation/mem_override_win.c supplies the
+# wrappers; its deallocating paths check mi_is_in_heap_region so a CRT-owned
+# pointer can never reach mi_free (#424).
+MIMALLOC_WRAP_SYMS := malloc calloc realloc free strdup strndup _msize \
+                      _aligned_malloc _aligned_free
+MIMALLOC_WRAP_FLAGS :=
 ifeq ($(IS_MINGW),yes)
-WIN32_LIBS := -lws2_32 -lpsapi -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
+MIMALLOC_WRAP_FLAGS := $(foreach sym,$(MIMALLOC_WRAP_SYMS),-Wl,--wrap=$(sym))
+endif
+# Linux wraps a smaller set for MEASUREMENT only (see mem_override_posix.c):
+# allocations already reach mimalloc here, but the profiler needs the same
+# observation point as Windows or the platform comparison is not like-for-like.
+# macOS ld has no --wrap, so it stays census-only.
+IS_LINUX := $(shell uname -s 2>/dev/null | grep -q Linux && echo yes || echo no)
+MIMALLOC_WRAP_SYMS_POSIX := malloc calloc realloc free strdup
+MIMALLOC_WRAP_FLAGS_POSIX :=
+ifeq ($(IS_LINUX),yes)
+MIMALLOC_WRAP_FLAGS_POSIX := $(foreach sym,$(MIMALLOC_WRAP_SYMS_POSIX),-Wl,--wrap=$(sym))
+endif
+ifeq ($(IS_MINGW),yes)
+WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -124,13 +128,19 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS) $(EXTRA_LDFLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS) $(EXTRA_LDFLAGS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS) $(EXTRA_LDFLAGS)
+# The POSIX wrap shim exists only so the profiler can observe allocations. It
+# must never reach a sanitized build: the Linux/macOS test builds are CRT+ASan,
+# and redirecting malloc into mimalloc underneath ASan's own interception mixes
+# two allocators on the same pointers. Windows keeps its wrap flags everywhere,
+# because there the shim is what makes mimalloc own the allocations at all.
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS)
+LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS)
+LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS)
 
 # ── Source files ─────────────────────────────────────────────────
 
 FOUNDATION_SRCS = \
+	src/foundation/mem_override_win.c \
     src/foundation/arena.c \
     src/foundation/hash_table.c \
     src/foundation/str_intern.c \
@@ -147,7 +157,13 @@ FOUNDATION_SRCS = \
     src/foundation/mem.c \
     src/foundation/diagnostics.c \
     src/foundation/profile.c \
-    src/foundation/dump_verify.c
+    src/foundation/dump_verify.c \
+    src/foundation/limits.c \
+    src/foundation/subprocess.c \
+    src/foundation/sha256.c \
+    src/foundation/macos_acl.c \
+    src/foundation/private_file_lock.c \
+    src/foundation/lock_registry.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -165,15 +181,12 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c \
+    $(CBM_DIR)/macro_table.c \
+    $(CBM_DIR)/iris_export_xml.c \
     $(CBM_DIR)/service_patterns.c
 
-# LSP resolvers (kept as one CGo/package unit via lsp_all.c, but split into
-# separate objects for this Makefile so cold sanitizer builds can use more cores).
+# LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
-LSP_CORE_SRCS = $(filter-out $(CBM_DIR)/lsp/py_builtins.c $(CBM_DIR)/lsp/kotlin_builtins.c, \
-                $(wildcard $(CBM_DIR)/lsp/*.c))
-LSP_GENERATED_SRCS = $(wildcard $(CBM_DIR)/lsp/generated/*.c)
-LSP_SPLIT_SRCS = $(LSP_CORE_SRCS) $(LSP_GENERATED_SRCS)
 
 # Header/source dependencies of the lsp_all unity object. lsp_all.c #includes
 # every lsp/*.c resolver, which in turn include cbm.h — and CBMCall is copied
@@ -189,6 +202,13 @@ LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
+TS_RUNTIME_DEPS = \
+	$(TS_RUNTIME_SRC) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/include/tree_sitter/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/*.c) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/portable/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/unicode/*.h)
 
 # All 64 grammar shim files
 GRAMMAR_SRCS = $(wildcard $(CBM_DIR)/grammar_*.c)
@@ -212,7 +232,20 @@ STORE_SRCS = src/store/store.c
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c
+MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
+
+# Shared MCP daemon coordination and local transport
+DAEMON_SRCS = \
+    src/daemon/daemon.c \
+    src/daemon/project_lock.c \
+    src/daemon/version_cohort.c \
+    src/daemon/service.c \
+    src/daemon/runtime.c \
+    src/daemon/application.c \
+    src/daemon/frontend.c \
+    src/daemon/host.c \
+    src/daemon/bootstrap.c \
+    src/daemon/ipc.c
 
 # Discover module (new)
 DISCOVER_SRCS = \
@@ -260,7 +293,7 @@ PIPELINE_SRCS = \
 SIMHASH_SRCS = src/simhash/minhash.c
 
 # Semantic embedding module
-SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c
+SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c src/semantic/rotsq.c
 
 # nomic-embed-code pretrained vectors (assembler blob)
 UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
@@ -275,7 +308,15 @@ WATCHER_SRCS = src/watcher/watcher.c
 GIT_SRCS = src/git/git_context.c
 
 # CLI module (new)
-CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c
+CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c \
+	src/cli/agent_clients.c src/cli/agent_profiles.c \
+	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
+	src/cli/config_text_edit.c src/cli/activation_transaction.c \
+	src/cli/windows_launcher_state.c
+
+# Tiny permanent Windows launcher.  It deliberately links only the stable
+# launcher-state module and Windows SDK libraries, never the parser/indexer.
+WINDOWS_LAUNCHER_SRC = src/launcher/windows_launcher.c
 
 # UI module (graph visualization)
 UI_SRCS = \
@@ -310,44 +351,38 @@ ifeq ($(IS_MINGW),yes)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
 endif
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
-	                  -Ivendored/mimalloc/include \
-	                  -Ivendored/mimalloc/src \
-	                  -DMI_OVERRIDE=1 \
-	                  $(MIMALLOC_OVERRIDE_DEFINE) \
-	                  $(EXTRA_CFLAGS)
+                  -Ivendored/mimalloc/include \
+                  -Ivendored/mimalloc/src \
+                  -DMI_OVERRIDE=1 \
+                  $(MIMALLOC_OVERRIDE_DEFINE)
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
-	                       -Ivendored/mimalloc/include \
-	                       -Ivendored/mimalloc/src \
-	                       -DMI_OVERRIDE=0 \
-	                       $(EXTRA_CFLAGS)
+                       -Ivendored/mimalloc/include \
+                       -Ivendored/mimalloc/src \
+                       -DMI_OVERRIDE=0
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
 # BM25 search path in search_graph (see nodes_fts virtual table in store.c).
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
-SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 $(EXTRA_CFLAGS)
-SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 $(EXTRA_CFLAGS)
+SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
+SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
-TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre $(EXTRA_CFLAGS)
+TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 
 # yyjson (vendored)
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
-MAIN_SRC = src/main.c
-
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
-CORE_SRCS = $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
 # ── Test sources ─────────────────────────────────────────────────
 
-TEST_MAIN_SRC = tests/test_main.c
-TEST_FOUNDATION_MAIN_SRC = tests/test_foundation_main.c
 TEST_FOUNDATION_SRCS = \
+    tests/test_main.c \
     tests/test_arena.c \
     tests/test_hash_table.c \
     tests/test_dyn_array.c \
@@ -355,12 +390,17 @@ TEST_FOUNDATION_SRCS = \
     tests/test_log.c \
     tests/test_str_util.c \
     tests/test_platform.c \
-    tests/test_dump_verify.c
+    tests/test_diagnostics.c \
+    tests/test_dump_verify.c \
+    tests/test_subprocess.c \
+    tests/test_private_file_lock.c \
+    tests/test_lock_registry.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
     tests/test_extraction_inheritance.c \
     tests/test_extraction_imports.c \
+    tests/test_parse_coverage.c \
     tests/test_grammar_regression.c \
     tests/test_grammar_labels.c \
     tests/test_grammar_imports.c \
@@ -380,7 +420,19 @@ TEST_CYPHER_SRCS = \
     tests/test_cypher.c
 
 TEST_MCP_SRCS = \
-    tests/test_mcp.c
+    tests/test_mcp.c \
+    tests/test_index_supervisor.c
+
+TEST_DAEMON_SRCS = \
+    tests/test_daemon.c \
+    tests/test_project_lock.c \
+    tests/test_version_cohort.c \
+    tests/test_daemon_version.c \
+    tests/test_daemon_runtime.c \
+    tests/test_daemon_application.c \
+    tests/test_daemon_frontend.c \
+    tests/test_daemon_bootstrap.c \
+    tests/test_daemon_ipc.c
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
@@ -391,7 +443,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -410,6 +462,8 @@ TEST_PHP_LSP_SRCS = tests/test_php_lsp.c
 TEST_CS_LSP_SRCS = tests/test_cs_lsp.c
 
 TEST_CS_LSP_BENCH_SRCS = tests/test_cs_lsp_bench.c
+
+TEST_PERL_LSP_SRCS = tests/test_perl_lsp.c
 
 TEST_SCOPE_SRCS = tests/test_scope.c
 
@@ -433,7 +487,11 @@ TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/
 TEST_TRACES_SRCS = tests/test_traces.c
 
 
-TEST_CLI_SRCS = tests/test_cli.c
+TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
+	tests/test_config_json_like.c \
+	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
+	tests/test_activation_transaction.c \
+	tests/test_windows_launcher_state.c
 
 TEST_MEM_SRCS = tests/test_mem.c
 
@@ -444,6 +502,10 @@ TEST_SECURITY_SRCS = tests/test_security.c
 
 TEST_YAML_SRCS = tests/test_yaml.c
 
+TEST_SEMANTIC_SRCS = tests/test_semantic.c
+TEST_AST_PROFILE_SRCS = tests/test_ast_profile.c
+TEST_SLAB_ALLOC_SRCS = tests/test_slab_alloc.c
+
 TEST_SIMHASH_SRCS = tests/test_simhash.c
 
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
@@ -453,6 +515,7 @@ TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
 # Kept out of the gating `make test` so `ci-ok` stays green; run via `make test-repro`.
 TEST_REPRO_SRCS = \
     tests/repro/repro_main.c \
+    tests/repro/repro_parallel_determinism.c \
     tests/repro/repro_extraction.c \
     tests/repro/repro_issue495.c \
     tests/repro/repro_issue521.c \
@@ -483,6 +546,9 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_new_cypher_limit_zero.c \
     tests/repro/repro_issue363.c \
     tests/repro/repro_issue581.c \
+    tests/repro/repro_issue787.c \
+    tests/repro/repro_issue842.c \
+    tests/repro/repro_issue964.c \
     tests/repro/repro_invariant_calls.c \
     tests/repro/repro_invariant_graph.c \
     tests/repro/repro_invariant_breadth.c \
@@ -503,10 +569,11 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_c_cpp.c \
     tests/repro/repro_lsp_go_py.c \
     tests/repro/repro_lsp_ts.c \
+    tests/repro/repro_ts_inherited_method.c \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_MAIN_SRC) $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DAEMON_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -516,84 +583,33 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
-GRAMMAR_OPT ?= -O3
-GRAMMAR_OPT_TEST ?= -O1
-GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE $(GRAMMAR_OPT) -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) $(EXTRA_CFLAGS)
-GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g $(GRAMMAR_OPT_TEST) -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-	                      $(SANITIZE) $(EXTRA_CFLAGS)
-GRAMMAR_CFLAGS_TEST_O0 = -std=c11 -D_DEFAULT_SOURCE -g -O0 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-	                         $(SANITIZE) $(EXTRA_CFLAGS)
-GRAMMAR_CFLAGS_TEST_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g $(GRAMMAR_OPT_TEST) -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-	                            $(EXTRA_CFLAGS)
-GRAMMAR_CFLAGS_TEST_NOSAN_O0 = -std=c11 -D_DEFAULT_SOURCE -g -O0 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-	                               $(EXTRA_CFLAGS)
-GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g $(GRAMMAR_OPT_TEST) -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-	                      -fsanitize=thread -fno-omit-frame-pointer $(EXTRA_CFLAGS)
+GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O3 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+                      $(SANITIZE)
+GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+                      $(TSAN_SANITIZE)
 
-# Object files for grammars + ts_runtime + LSP resolvers + preprocessor
+# Object files for grammars + ts_runtime + lsp_all + preprocessor
 GRAMMAR_OBJS_TEST = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/%.o,$(GRAMMAR_SRCS))
-TEST_GRAMMAR_FAST_O0 ?= 0
-# Keep stack-sensitive parser families at -O1; global test-grammar -O0 regressed
-# the nested Java/C#/Rust and front-end LSP stack guards.
-TEST_GRAMMAR_O0_EXCLUDE ?= c c_sharp cpp java javascript rust tsx typescript
-TEST_GRAMMAR_O0_NAMES ?= $(filter-out $(TEST_GRAMMAR_O0_EXCLUDE),$(patsubst grammar_%,%,$(basename $(notdir $(GRAMMAR_SRCS)))))
-TEST_GRAMMAR_O0_OBJS = $(if $(filter 1 true TRUE yes YES on ON,$(TEST_GRAMMAR_FAST_O0)),$(addprefix $(BUILD_DIR)/grammar_,$(addsuffix .o,$(TEST_GRAMMAR_O0_NAMES))))
 TS_RUNTIME_OBJ_TEST = $(BUILD_DIR)/ts_runtime.o
-LSP_GENERATED_OBJ_TEST = $(patsubst $(CBM_DIR)/lsp/generated/%.c,$(BUILD_DIR)/lsp/generated/%.o,$(LSP_GENERATED_SRCS))
-LSP_OBJ_TEST = $(patsubst $(CBM_DIR)/lsp/%.c,$(BUILD_DIR)/lsp/%.o,$(LSP_CORE_SRCS)) $(LSP_GENERATED_OBJ_TEST)
-LSP_OBJ_PROD = $(patsubst $(CBM_DIR)/lsp/%.c,$(BUILD_DIR)/prod_lsp/%.o,$(LSP_SPLIT_SRCS))
+LSP_OBJ_TEST = $(BUILD_DIR)/lsp_all.o
 PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
-
-$(TEST_GRAMMAR_O0_OBJS): GRAMMAR_CFLAGS_TEST = $(GRAMMAR_CFLAGS_TEST_O0)
-$(LSP_GENERATED_OBJ_TEST): GRAMMAR_CFLAGS_TEST_NOSAN = $(GRAMMAR_CFLAGS_TEST_NOSAN_O0)
+GRAMMAR_OBJS_TSAN = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/tsan_%.o,$(GRAMMAR_SRCS))
+TS_RUNTIME_OBJ_TSAN = $(BUILD_DIR)/tsan_ts_runtime.o
+LSP_OBJ_TSAN = $(BUILD_DIR)/tsan_lsp_all.o
+PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-artifacts test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-launcher cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# First-party object files. Grammars and selected vendored sources keep their
-# specialized rules below; these rules split the project sources into parallel
-# compilation units and emit depfiles for accurate warm rebuilds.
-PROD_CORE_OBJS = $(patsubst %.c,$(BUILD_DIR)/prod/%.o,$(MAIN_SRC) $(CORE_SRCS))
-TEST_CORE_OBJS = $(patsubst %.c,$(BUILD_DIR)/test/%.o,$(CORE_SRCS))
-TEST_RUNNER_OBJS = $(patsubst %.c,$(BUILD_DIR)/test/%.o,$(ALL_TEST_SRCS)) $(TEST_CORE_OBJS)
-TEST_REPRO_OBJS = $(patsubst %.c,$(BUILD_DIR)/test/%.o,$(TEST_REPRO_SRCS) $(CORE_SRCS))
-TEST_FOUNDATION_OBJS = $(patsubst %.c,$(BUILD_DIR)/test/%.o,$(TEST_FOUNDATION_MAIN_SRC) $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS))
-OBJ_DIRS = $(patsubst %/,%,$(sort $(dir $(PROD_CORE_OBJS) $(PROD_CORE_OBJS_WITH_ASSETS) $(TEST_RUNNER_OBJS) $(TEST_REPRO_OBJS) $(TEST_FOUNDATION_OBJS) $(LSP_OBJ_TEST) $(LSP_OBJ_PROD))))
-
-VENDORED_DEP_OBJS = $(filter-out $(UNIXCODER_OBJ),$(OBJS_VENDORED_TEST) $(OBJS_VENDORED_PROD))
-
-DEPFILES = $(PROD_CORE_OBJS:.o=.d) \
-           $(PROD_CORE_OBJS_WITH_ASSETS:.o=.d) \
-           $(TEST_RUNNER_OBJS:.o=.d) \
-           $(TEST_REPRO_OBJS:.o=.d) \
-           $(TEST_FOUNDATION_OBJS:.o=.d) \
-           $(VENDORED_DEP_OBJS:.o=.d)
-
-$(OBJ_DIRS):
-	mkdir -p $@
-
-.SECONDEXPANSION:
-
-$(filter-out $(LSP_GENERATED_OBJ_TEST),$(LSP_OBJ_TEST)): | $(BUILD_DIR)/lsp/generated
-$(LSP_OBJ_PROD): | $(BUILD_DIR)/prod_lsp/generated
-
-$(BUILD_DIR)/prod/%.o: %.c | $(BUILD_DIR) $$(dir $$@)
-	$(CC_COMPILE) $(CFLAGS_PROD) -MMD -MP -c -o $@ $<
-
-$(BUILD_DIR)/test/%.o: %.c | $(BUILD_DIR) $$(dir $$@)
-	$(CC_COMPILE) $(CFLAGS_TEST) -Itests -MMD -MP -c -o $@ $<
-
-$(BUILD_DIR)/test/vendored/yyjson/yyjson.o: $(YYJSON_SRC) | $(BUILD_DIR) $$(dir $$@)
-	$(CC_COMPILE) $(CFLAGS_COMMON) -g -O1 -Itests -MMD -MP -c -o $@ $<
-
 # ── Foundation-only test (fast, no extraction) ───────────────────
 
-$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_OBJS) $(TS_RUNTIME_OBJ_TEST) $(BUILD_DIR)/mimalloc.o | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_OBJS) $(TS_RUNTIME_OBJ_TEST) $(BUILD_DIR)/mimalloc.o $(LDFLAGS_TEST)
+$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
 
 test-foundation: $(BUILD_DIR)/test-foundation
 	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
@@ -601,114 +617,138 @@ test-foundation: $(BUILD_DIR)/test-foundation
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
 $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
-$(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -c -o $@ $<
+$(BUILD_DIR)/ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
 $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -MMD -MP -c -o $@ $<
-
-$(BUILD_DIR)/lsp/py_lsp.o: $(CBM_DIR)/lsp/py_lsp.c | $(BUILD_DIR) $$(dir $$@)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS_TEST) -DCBM_PYTHON_STDLIB_GENERATED -MMD -MP -c -o $@ $<
-
-$(LSP_GENERATED_OBJ_TEST): $(BUILD_DIR)/lsp/generated/%.o: $(CBM_DIR)/lsp/generated/%.c | $(BUILD_DIR)/lsp/generated
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS_TEST_NOSAN) -MMD -MP -c -o $@ $<
-
-$(BUILD_DIR)/lsp/%.o: $(CBM_DIR)/lsp/%.c | $(BUILD_DIR) $$(dir $$@)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
-	$(CXX_COMPILE) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -MMD -MP -c -o $@ $<
+	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -c -o $@ $<
+
+$(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
+
+$(BUILD_DIR)/tsan_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
+
+$(BUILD_DIR)/tsan_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
+
+$(BUILD_DIR)/tsan_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_TSAN) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 # ── Full test binary ─────────────────────────────────────────────
 
 # mimalloc object files
 MIMALLOC_OBJ_TEST = $(BUILD_DIR)/mimalloc.o
+MIMALLOC_OBJ_TSAN = $(BUILD_DIR)/tsan_mimalloc.o
 MIMALLOC_OBJ_PROD = $(BUILD_DIR)/prod_mimalloc.o
 
 $(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
-	$(CC_COMPILE) $(MIMALLOC_CFLAGS_TEST) -MMD -MP -c -o $@ $<
+	$(CC) $(MIMALLOC_CFLAGS_TEST) -c -o $@ $<
+
+$(BUILD_DIR)/tsan_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+	$(CC) $(MIMALLOC_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
-	$(CC_COMPILE) $(MIMALLOC_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) $(MIMALLOC_CFLAGS) -c -o $@ $<
 
 # sqlite3 object files (vendored amalgamation)
 SQLITE3_OBJ_TEST = $(BUILD_DIR)/sqlite3.o
+SQLITE3_OBJ_TSAN = $(BUILD_DIR)/tsan_sqlite3.o
 SQLITE3_OBJ_PROD = $(BUILD_DIR)/prod_sqlite3.o
 
 $(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
-	$(CC_COMPILE) $(SQLITE3_CFLAGS_TEST) -MMD -MP -c -o $@ $<
+	$(CC) $(SQLITE3_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
+
+$(BUILD_DIR)/tsan_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
+	$(CC) $(SQLITE3_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
-	$(CC_COMPILE) $(SQLITE3_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) $(SQLITE3_CFLAGS) -c -o $@ $<
 
 # TRE regex (only compiled on Windows — POSIX uses system <regex.h>)
 TRE_OBJ_TEST :=
+TRE_OBJ_TSAN :=
 TRE_OBJ_PROD :=
 ifeq ($(IS_MINGW),yes)
 TRE_OBJ_TEST = $(BUILD_DIR)/tre.o
+TRE_OBJ_TSAN = $(BUILD_DIR)/tsan_tre.o
 TRE_OBJ_PROD = $(BUILD_DIR)/prod_tre.o
 
 $(BUILD_DIR)/tre.o: $(TRE_SRC) | $(BUILD_DIR)
-	$(CC_COMPILE) $(TRE_CFLAGS) $(SANITIZE) -fno-sanitize=alignment -MMD -MP -c -o $@ $<
+	$(CC) $(TRE_CFLAGS) $(SANITIZE) -fno-sanitize=alignment -c -o $@ $<
+
+$(BUILD_DIR)/tsan_tre.o: $(TRE_SRC) | $(BUILD_DIR)
+	$(CC) $(TRE_CFLAGS) $(TSAN_SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
-	$(CC_COMPILE) $(TRE_CFLAGS) -O2 -MMD -MP -c -o $@ $<
+	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
 endif
 
 # Vendored LZ4 (test build)
 LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
+LZ4_OBJ_TSAN = $(BUILD_DIR)/tsan_lz4.o $(BUILD_DIR)/tsan_lz4hc.o
 $(BUILD_DIR)/test_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC_COMPILE) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR) $(EXTRA_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/test_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC_COMPILE) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 $(EXTRA_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+$(BUILD_DIR)/tsan_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
+$(BUILD_DIR)/tsan_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 # Vendored zstd (test build)
 ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
+ZSTD_OBJ_TSAN = $(BUILD_DIR)/tsan_zstd.o
 $(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC_COMPILE) -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR)/vendored/zstd $(EXTRA_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+$(BUILD_DIR)/tsan_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 # nomic-embed-code pretrained vector blob
 UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o
 $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
-	$(CC_COMPILE) -c -o $@ $<
+	$(CC) -c -o $@ $<
 
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
+OBJS_VENDORED_TSAN = $(MIMALLOC_OBJ_TSAN) $(SQLITE3_OBJ_TSAN) $(TRE_OBJ_TSAN) $(GRAMMAR_OBJS_TSAN) $(TS_RUNTIME_OBJ_TSAN) $(LSP_OBJ_TSAN) $(PP_OBJ_TSAN) $(LZ4_OBJ_TSAN) $(ZSTD_OBJ_TSAN) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test/tests/test_c_lsp.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/tests/test_cypher.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/tests/test_extraction.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/tests/test_java_lsp_coverage.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/tests/test_php_lsp.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/tests/test_pipeline.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/tests/test_rust_lsp.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/tests/test_ts_lsp.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/src/mcp/mcp.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/test/src/semantic/semantic.o: CFLAGS_TEST = $(CFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/preprocessor.o: CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O0 $(SANITIZE)
-$(BUILD_DIR)/sqlite3.o: SQLITE3_CFLAGS_TEST = -std=c11 -g -O0 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 $(EXTRA_CFLAGS)
-
-TEST_HEAVY_FIRST_OBJS = $(BUILD_DIR)/lsp/generated/go_stdlib_data.o $(BUILD_DIR)/test/src/semantic/semantic.o $(BUILD_DIR)/ts_runtime.o $(BUILD_DIR)/preprocessor.o $(BUILD_DIR)/test_lz4hc.o $(BUILD_DIR)/test_zstd.o $(BUILD_DIR)/test/tests/test_rust_lsp.o $(BUILD_DIR)/grammar_cobol.o $(BUILD_DIR)/grammar_lean.o $(BUILD_DIR)/lsp/generated/python_stdlib_data.o $(BUILD_DIR)/test/tests/test_pipeline.o $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test/src/mcp/mcp.o $(BUILD_DIR)/grammar_systemverilog.o $(BUILD_DIR)/grammar_vim.o $(BUILD_DIR)/test/tests/test_java_lsp_coverage.o $(BUILD_DIR)/test/vendored/yyjson/yyjson.o $(BUILD_DIR)/grammar_fortran.o $(BUILD_DIR)/grammar_verilog.o $(BUILD_DIR)/grammar_blade.o $(BUILD_DIR)/test/tests/test_extraction.o $(BUILD_DIR)/test/tests/test_ts_lsp.o $(BUILD_DIR)/grammar_llvm.o $(BUILD_DIR)/grammar_sql.o $(BUILD_DIR)/test/tests/test_php_lsp.o $(BUILD_DIR)/lsp/generated/rust_stdlib_data.o $(BUILD_DIR)/grammar_ocaml.o $(BUILD_DIR)/grammar_cpp.o $(BUILD_DIR)/test/tests/test_cypher.o $(BUILD_DIR)/grammar_swift.o $(BUILD_DIR)/grammar_tlaplus.o $(BUILD_DIR)/test/src/cli/cli.o $(BUILD_DIR)/test/internal/cbm/extract_defs.o $(BUILD_DIR)/test/src/store/store.o $(BUILD_DIR)/grammar_fsharp.o $(BUILD_DIR)/test/tests/test_c_lsp.o $(BUILD_DIR)/sqlite3.o
-TEST_RUNNER_OBJS_ORDERED = $(TEST_HEAVY_FIRST_OBJS) $(filter-out $(TEST_HEAVY_FIRST_OBJS),$(TEST_RUNNER_OBJS) $(OBJS_VENDORED_TEST))
-
-$(BUILD_DIR)/test-runner: $(TEST_RUNNER_OBJS_ORDERED) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -o $@ \
-		$(TEST_RUNNER_OBJS_ORDERED) \
+$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
 test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
 
-test-artifacts: $(BUILD_DIR)/test-runner $(BUILD_DIR)/codebase-memory-mcp
+# Parallel variant: every suite as its own process; identical gate quality
+# (see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh — union guard
+# against --list-suites + aggregated pass/fail/skip totals).
+test-par: $(BUILD_DIR)/test-runner
+	cd $(CURDIR) && bash scripts/run-tests-parallel.sh $(BUILD_DIR)/test-runner
+
+# Focused native development is intentionally a separate, explicit target so
+# an inherited TEST_SUITES value cannot silently narrow the gating test target.
+TEST_SUITES ?=
+test-focused: $(BUILD_DIR)/test-runner
+	@test -n "$(strip $(TEST_SUITES))" || \
+		(echo "TEST_SUITES is required for test-focused"; exit 2)
+	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
 
 # ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
 # and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
 # still reproduced (the expected state); bug-repro.yml surfaces it as a board.
-$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_OBJS) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -Itests -o $@ \
-		$(TEST_REPRO_OBJS) \
+		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
@@ -717,115 +757,156 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 
 # ── TSan full test ───────────────────────────────────────────────
 
-test-tsan:
-	@echo "TSan not yet wired for full extraction tests"
+# Every threaded production surface that runs clean AND stable under TSan:
+# allocator concurrency (mem, slab_alloc), the parallel extraction worker pool
+# (parallel, worker_pool, pipeline), the filesystem watcher (watcher), the
+# embedded HTTP server (httpd), diagnostics sampling (diagnostics), the MCP
+# server + mutation guard (mcp, mcp_mutation_guard), subprocess supervision
+# (subprocess), and the runnable daemon-coordination paths (daemon,
+# daemon_application). Was `mem slab_alloc parallel` — a keyhole that ran TSan
+# over no real threaded production code.
+#
+# Deliberately EXCLUDED (documented, not forgotten):
+#   daemon_runtime   — deadlocks under TSan: it forks after going
+#                      multi-threaded and the child re-enters the runtime, a
+#                      combination TSan's runtime does not support (hangs).
+#   daemon_ipc       — a TEST-harness data race (a helper thread writes a
+#                      main-thread stack slot without synchronization,
+#                      test_daemon_ipc.c:2088); production IPC is not implicated.
+#   daemon_frontend  — TEST-harness thread leaks (fixture threads left unjoined,
+#                      test_daemon_frontend.c:698) plus a fork-under-TSan fixture
+#                      failure. Test-quality work, tracked separately.
+# Re-enabling these three needs test-harness synchronization + a TSan-fork
+# strategy; it is out of scope for the current sanitizer-coverage pass.
+TEST_TSAN_SUITES ?= mem slab_alloc parallel worker_pool watcher httpd pipeline \
+                    diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application
+TSAN_OPTIONS ?= halt_on_error=1
+# A fixed concurrent envelope keeps TSan deterministic across developer hosts
+# and GitHub runners. Four workers still exercise real races without turning
+# sanitizer-instrumented allocator bookkeeping into a high-core lock convoy.
+# Normal ASan/native/soak paths remain uncapped. High-worker TSan diagnostics
+# invoke test-runner-tsan directly so release gates cannot drift accidentally.
+
+$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TSAN) -Itests -Itests/repro -o $@ \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_TSAN) \
+		$(LDFLAGS_TSAN)
+
+test-tsan: $(BUILD_DIR)/test-runner-tsan
+	@echo "ThreadSanitizer workers: 4"
+	cd $(CURDIR) && CBM_WORKERS=4 TSAN_OPTIONS="$(TSAN_OPTIONS)" \
+		$(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
+
+# Real-binary POSIX lifecycle smoke. The endpoint is deliberately account-wide;
+# an explicit Make invocation requires a clean rendezvous and fails rather than
+# silently skipping an occupied one. Deterministic C tests cover Windows IPC.
+test-daemon-smoke: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(BUILD_DIR)/codebase-memory-mcp
 
 # ── Production binary ────────────────────────────────────────────
 
-# Grammar/TS/LSP objects for production (compiled with relaxed warnings)
+# Grammar/TS/LSP objects for production (compiled with relaxed warnings, -O2)
 GRAMMAR_OBJS_PROD = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/prod_%.o,$(GRAMMAR_SRCS))
 TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
+LSP_OBJ_PROD = $(BUILD_DIR)/prod_lsp_all.o
 PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 
 $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS) -MMD -MP -c -o $@ $<
+$(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS) -MMD -MP -c -o $@ $<
-
-$(BUILD_DIR)/prod_lsp/py_lsp.o: $(CBM_DIR)/lsp/py_lsp.c | $(BUILD_DIR) $$(dir $$@)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS) -DCBM_PYTHON_STDLIB_GENERATED -MMD -MP -c -o $@ $<
-
-$(BUILD_DIR)/prod_lsp/%.o: $(CBM_DIR)/lsp/%.c | $(BUILD_DIR) $$(dir $$@)
-	$(CC_COMPILE) $(GRAMMAR_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
-	$(CXX_COMPILE) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -MMD -MP -c -o $@ $<
+	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 # Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
 LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
 $(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC_COMPILE) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) $(EXTRA_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC_COMPILE) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/lz4 $(EXTRA_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 # Vendored zstd (compiled separately, not unity-built via zstd_store.c)
 ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
 $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC_COMPILE) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd $(EXTRA_CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
-PROD_HEAVY_FIRST_OBJS = $(BUILD_DIR)/prod_grammar_lean.o $(BUILD_DIR)/prod_grammar_systemverilog.o $(BUILD_DIR)/prod_grammar_verilog.o $(BUILD_DIR)/prod_grammar_cobol.o $(BUILD_DIR)/prod_preprocessor.o $(BUILD_DIR)/prod_lsp/generated/go_stdlib_data.o $(BUILD_DIR)/prod/vendored/yyjson/yyjson.o $(BUILD_DIR)/prod/src/mcp/mcp.o
-PROD_OBJS_ORDERED = $(PROD_HEAVY_FIRST_OBJS) $(filter-out $(PROD_HEAVY_FIRST_OBJS),$(PROD_CORE_OBJS) $(OBJS_VENDORED_PROD))
-PROD_UI_OBJS_ORDERED = $(PROD_HEAVY_FIRST_OBJS) $(filter-out $(PROD_HEAVY_FIRST_OBJS),$(PROD_CORE_OBJS_WITH_ASSETS) $(OBJS_VENDORED_PROD))
+MAIN_SRC = src/main.c
 
-$(BUILD_DIR)/codebase-memory-mcp: $(PROD_OBJS_ORDERED) | $(BUILD_DIR)
+WINDOWS_LAUNCHER_TARGET :=
+ifeq ($(IS_MINGW),yes)
+WINDOWS_LAUNCHER_TARGET := $(BUILD_DIR)/codebase-memory-mcp-launcher.exe
+endif
+
+# Keep the explicit .exe target even on non-Windows hosts: packaging contracts
+# and native-Windows invocations share this single artifact name.  A non-Windows
+# direct invocation builds a diagnostic stub and is not part of `cbm`.
+$(BUILD_DIR)/codebase-memory-mcp-launcher.exe: $(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c src/cli/windows_launcher_state.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
-		$(PROD_OBJS_ORDERED) \
+		$(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c \
+		$(if $(filter yes,$(IS_MINGW)),-municode -lbcrypt $(WIN32_LIBS),)
+
+# Native-Windows compatibility fixture: its launcher ABI intentionally does
+# not fit the production payload's default [1,1] range.  It is never packaged.
+$(BUILD_DIR)/codebase-memory-mcp-launcher-abi2.exe: $(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c src/cli/windows_launcher_state.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) -DCBM_WINDOWS_LAUNCHER_ABI_CURRENT=2 -o $@ \
+		$(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c \
+		$(if $(filter yes,$(IS_MINGW)),-municode -lbcrypt $(WIN32_LIBS),)
+
+$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) -o $@ \
+		$(MAIN_SRC) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_PROD) \
 		$(LDFLAGS)
 
-cbm: $(BUILD_DIR)/codebase-memory-mcp
+cbm: $(BUILD_DIR)/codebase-memory-mcp $(WINDOWS_LAUNCHER_TARGET)
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
+
+cbm-launcher: $(BUILD_DIR)/codebase-memory-mcp-launcher.exe
+	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp-launcher.exe"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
-FRONTEND_DIR = graph-ui
-FRONTEND_NODE_MODULES_STAMP = $(FRONTEND_DIR)/node_modules/.package-lock.stamp
-FRONTEND_DIST_STAMP = $(FRONTEND_DIR)/.dist.stamp
-FRONTEND_SRCS = $(shell find $(FRONTEND_DIR)/src $(FRONTEND_DIR)/@ -type f 2>/dev/null)
-FRONTEND_DIST_FILES = $(shell find $(FRONTEND_DIR)/dist -type f ! -name '.*' 2>/dev/null)
-FRONTEND_CONFIGS = $(FRONTEND_DIR)/package.json \
-                   $(FRONTEND_DIR)/package-lock.json \
-                   $(FRONTEND_DIR)/index.html \
-                   $(FRONTEND_DIR)/tsconfig.json \
-                   $(FRONTEND_DIR)/vite.config.ts
-
 # Swap embedded_stub.c for the generated embedded_assets.c
 UI_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,$(UI_SRCS))
-CORE_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,$(CORE_SRCS))
-PROD_CORE_OBJS_WITH_ASSETS = $(patsubst %.c,$(BUILD_DIR)/prod/%.o,$(MAIN_SRC) $(CORE_SRCS_WITH_ASSETS))
+PROD_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,$(PROD_SRCS))
 
 # Embedded asset object files (generated by embed script)
 EMBED_OBJS = $(wildcard $(BUILD_DIR)/embedded/embed_*.o)
-EMBED_STAMP = $(BUILD_DIR)/embedded/.stamp
 
-$(FRONTEND_NODE_MODULES_STAMP): $(FRONTEND_DIR)/package.json $(FRONTEND_DIR)/package-lock.json
-	cd $(FRONTEND_DIR) && npm ci
-	touch $@
+frontend:
+	cd graph-ui && npm ci && npm run build
 
-$(FRONTEND_DIST_STAMP): $(FRONTEND_NODE_MODULES_STAMP) $(FRONTEND_CONFIGS) $(FRONTEND_SRCS)
-	cd $(FRONTEND_DIR) && { npm run build:typecheck & pid_typecheck=$$!; npm run build:bundle & pid_bundle=$$!; wait $$pid_typecheck; rc_typecheck=$$?; wait $$pid_bundle; rc_bundle=$$?; test $$rc_typecheck -eq 0 && test $$rc_bundle -eq 0; }
-	touch $@
-
-frontend: $(FRONTEND_DIST_STAMP)
-
-$(EMBED_STAMP): $(FRONTEND_DIST_STAMP) $(FRONTEND_DIST_FILES) scripts/embed-frontend.sh | $(BUILD_DIR)
+embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
-	touch $@
 
-src/ui/embedded_assets.c: $(EMBED_STAMP)
-
-embed: $(EMBED_STAMP)
-
-cbm-with-ui: $(EMBED_STAMP) $(PROD_UI_OBJS_ORDERED)
+cbm-with-ui: embed $(OBJS_VENDORED_PROD) $(WINDOWS_LAUNCHER_TARGET)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
-		$(PROD_UI_OBJS_ORDERED) \
+		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_PROD) \
 		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
 		$(LDFLAGS)
 	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
 
+clean-c: export BUILD_DIR := $(BUILD_DIR)
 clean-c:
-	rm -rf $(BUILD_DIR)
+	@bash -c 'source scripts/path-safety.sh && cbm_remove_build_dir "$$PWD" "$$BUILD_DIR"'
 
 # ── Linting ─────────────────────────────────────────────────────
 
 # clang-tidy and clang-format: use Homebrew LLVM on macOS, overridable via make args
 # e.g. make lint-format CLANG_FORMAT=clang-format-18
-LLVM_BIN = $(shell brew --prefix llvm 2>/dev/null)/bin
+LLVM_BIN := $(shell brew --prefix llvm 2>/dev/null)/bin
 CLANG_TIDY ?= $(shell [ -x "$(LLVM_BIN)/clang-tidy" ] && echo "$(LLVM_BIN)/clang-tidy" || echo clang-tidy)
 CLANG_FORMAT ?= $(shell [ -x "$(LLVM_BIN)/clang-format" ] && echo "$(LLVM_BIN)/clang-format" || echo clang-format)
 CPPCHECK ?= cppcheck
@@ -835,10 +916,10 @@ SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
 SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
-LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) \
+LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) \
             $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) \
             $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
-            $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)
+            $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC) $(WINDOWS_LAUNCHER_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
 LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 
@@ -890,7 +971,7 @@ lint-no-suppress:
 	@echo "  Checking NOLINT(misc-no-recursion) against whitelist..."
 	@scripts/check-nolint-whitelist.sh
 
-# All linters (run with make -j lint for parallel execution)
+# All linters (run with make -j3 lint for parallel execution)
 lint: lint-tidy lint-cppcheck lint-format lint-no-suppress
 	@echo "=== All linters passed ==="
 
@@ -912,5 +993,3 @@ security: cbm
 	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
 	scripts/security-vendored.sh
 	@echo "=== All security checks passed ==="
-
--include $(DEPFILES)

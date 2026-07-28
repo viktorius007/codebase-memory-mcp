@@ -19,6 +19,7 @@
 #include "foundation/log.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "cbm.h"
 
 #include <stdio.h>
@@ -41,7 +42,7 @@ static char *read_file(const char *path, int *out_len) {
     (void)fseek(f, 0, SEEK_END);
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
+    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
         (void)fclose(f);
         return NULL;
     }
@@ -196,6 +197,12 @@ static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const
     const cbm_gbuf_node_t *node = NULL;
     if (func_qn && func_qn[0]) {
         node = cbm_gbuf_find_by_qn(ctx->gbuf, func_qn);
+        /* A class-level reference in a directory-module language carries the
+         * DIRECTORY module QN, which hits the shared Folder/Project node —
+         * attribute to this file's File node instead (#787). */
+        if (cbm_pipeline_node_is_dir_container(node)) {
+            node = NULL;
+        }
     }
     if (!node) {
         char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");

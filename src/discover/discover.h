@@ -39,6 +39,17 @@ const char *cbm_language_name(CBMLanguage lang);
  * On read failure, defaults to CBM_LANG_MATLAB. */
 CBMLanguage cbm_disambiguate_m(const char *path);
 
+/* Disambiguate .cls files by reading first 4KB of content.
+ * Returns CBM_LANG_OBJECTSCRIPT_UDL if a line starts with "Class <Uppercase>",
+ * otherwise CBM_LANG_APEX. On read failure, defaults to CBM_LANG_APEX. */
+CBMLanguage cbm_disambiguate_cls(const char *path);
+
+/* Disambiguate .inc files by reading first 4KB of content.
+ * Returns CBM_LANG_OBJECTSCRIPT_ROUTINE if it looks like an ObjectScript
+ * include (a "ROUTINE <Uppercase>" header), otherwise CBM_LANG_BITBAKE.
+ * On read failure, defaults to CBM_LANG_BITBAKE. */
+CBMLanguage cbm_disambiguate_inc(const char *path);
+
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
 typedef struct cbm_gitignore cbm_gitignore_t;
@@ -111,12 +122,27 @@ typedef struct {
     int64_t max_file_size;   /* 0 = no limit */
 } cbm_discover_opts_t;
 
+typedef enum {
+    CBM_DISCOVER_ERROR = -1,
+    CBM_DISCOVER_OK = 0,
+    CBM_DISCOVER_LIMIT_EXCEEDED = 1,
+} cbm_discover_status_t;
+
 /* Walk a repository directory tree and discover all source files.
  * Applies hardcoded filters, gitignore patterns, and language detection.
  * Returns 0 on success, -1 on error.
  * Caller must call cbm_discover_free() on the results. */
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count);
+
+/* Apply the exact same full discovery/filter policy without retaining a file
+ * array. Stops before counting more than max_files and performs no per-file
+ * allocation. deadline_ms is an absolute cbm_now_ms() deadline; zero disables
+ * it. Returns LIMIT_EXCEEDED when at least max_files + 1 indexable files exist,
+ * ERROR on traversal/deadline/allocation failure, or OK with the exact count. */
+cbm_discover_status_t cbm_discover_count_bounded(const char *repo_path,
+                                                 const cbm_discover_opts_t *opts, int max_files,
+                                                 uint64_t deadline_ms, int *count_out);
 
 /* Like cbm_discover(), but also reports the directory subtrees that were
  * skipped during the walk (hardcoded ALWAYS_SKIP/FAST_SKIP dirs + gitignore
@@ -130,10 +156,40 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                     int *count, char ***excluded_out, int *excluded_count_out);
 
+/* One deliberately-not-indexed file (#963): an individual file dropped by an
+ * ignore mechanism during the walk (its parent directory was NOT excluded —
+ * whole subtrees are reported separately as excluded dirs). BY DESIGN, not a
+ * failure. */
+typedef struct {
+    char *rel_path; /* heap-allocated, relative to repo root */
+    char *reason;   /* heap-allocated: "gitignore" | "cbmignore" |
+                     * "skip-list" | "ignored-suffix" | "fast-pattern" |
+                     * "size-cap" */
+} cbm_ignored_file_t;
+
+/* Stored per-file ignore entries are capped (the walk still counts ALL of
+ * them in *ignored_total_out, so truncation is always explicit, never
+ * silent). Whole excluded subtrees stay exhaustive via excluded_out. */
+enum { CBM_DISCOVER_IGNORED_CAP = 2000 };
+
+/* Like cbm_discover_ex(), but additionally reports the individual files that
+ * ignore rules dropped (#963 "purposely not indexed"). *ignored_out receives
+ * a heap array (caller frees via cbm_discover_free_ignored),
+ * *ignored_count_out its stored length (<= CBM_DISCOVER_IGNORED_CAP), and
+ * *ignored_total_out the TOTAL number of ignored files seen. Pass NULL to
+ * skip the collection entirely. */
+int cbm_discover_ex2(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
+                     int *count, char ***excluded_out, int *excluded_count_out,
+                     cbm_ignored_file_t **ignored_out, int *ignored_count_out,
+                     int *ignored_total_out);
+
 /* Free an array of file info results. NULL-safe. */
 void cbm_discover_free(cbm_file_info_t *files, int count);
 
 /* Free the excluded-directory list returned by cbm_discover_ex(). NULL-safe. */
 void cbm_discover_free_excluded(char **excluded, int count);
+
+/* Free the ignored-file list returned by cbm_discover_ex2(). NULL-safe. */
+void cbm_discover_free_ignored(cbm_ignored_file_t *ignored, int count);
 
 #endif /* CBM_DISCOVER_H */

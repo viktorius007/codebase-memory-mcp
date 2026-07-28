@@ -1,14 +1,10 @@
-#!/bin/bash
-# build.sh — Build production binary (standard or with UI).
+#!/usr/bin/env bash
+# build.sh — Clean build of production binary (standard or with UI).
 #
 # Usage:
 #   scripts/build.sh                              # Standard binary
-#   scripts/build.sh --incremental                # Preserve build/c for warm rebuilds
-#   scripts/build.sh --ccache                     # Use sccache for compile steps
-#   scripts/build.sh --fast-grammars              # Compile generated grammars with -O0
-#   scripts/build.sh --quiet                      # Suppress command echo from make
-#   scripts/build.sh --jobs 16                    # Override make parallelism
 #   scripts/build.sh --with-ui                    # Binary with embedded UI
+#   scripts/build.sh --help                       # Full usage
 #   scripts/build.sh --version v0.8.0             # With version stamp
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
 #   scripts/build.sh CC=gcc-14 CXX=g++-14        # Override compiler
@@ -21,11 +17,49 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Pre-parse --arch/--jobs flags before sourcing env.sh
+usage() {
+    cat <<'EOF'
+Usage: scripts/build.sh [--with-ui] [--version V] [--arch ARCH] [VAR=VAL ...]
+
+The canonical production-build entry: identical in local CI, PR CI, dry run
+and release. Always a CLEAN build of BUILD_DIR (build/c by default) — the
+content-verified compiler cache (ccache via scripts/env.sh) makes repeat
+builds fast without ever reusing a stale object: every object is re-derived
+from current sources; a cache hit is byte-identical to a cold compile by
+construction (CCACHE_COMPILERCHECK=content).
+
+Options:
+  --with-ui       Embed the web UI (builds the frontend first; needs node).
+  --version V     Stamp the version string (release venue passes the tag).
+  --arch ARCH     Force target arch (arm64 | x86_64), e.g. under Rosetta.
+  -h, --help      This text.
+
+Make passthrough (VAR=VAL, forwarded verbatim):
+  CC= CXX=        Compiler override (venues pass their matrix compiler).
+  BUILD_DIR=      Build in an isolated directory — REQUIRED when a clean
+                  product build must not wipe build/c's test-runner (e.g.
+                  build/smoke for the local ladder smoke).
+  STATIC=1        Fully static portable build (Alpine/musl leg).
+  EXTRA_CFLAGS= EXTRA_LDFLAGS=   Sanitizer soak builds (see _soak.yml).
+
+Environment:
+  CBM_NO_CCACHE=1  Disable the compiler cache (build correctness is identical;
+                   only speed changes).
+
+Callers: _build.yml (all release artifacts) · pr.yml pr-smoke · every
+docker-compose build/smoke service · win.sh build (Windows VM ladder).
+EOF
+}
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage; exit 0 ;;
+    esac
+done
+
+# Pre-parse --arch flag before sourcing env.sh
 for arg in "$@"; do
     case "$arg" in
         --arch=*) export CBM_ARCH="${arg#--arch=}" ;;
-        --jobs=*) export CBM_JOBS="${arg#--jobs=}" ;;
     esac
 done
 prev_arg=""
@@ -33,30 +67,26 @@ for arg in "$@"; do
     if [[ "${prev_arg:-}" == "--arch" ]]; then
         export CBM_ARCH="$arg"
     fi
-    if [[ "${prev_arg:-}" == "--jobs" ]]; then
-        export CBM_JOBS="$arg"
-    fi
     prev_arg="$arg"
 done
 
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
+# shellcheck source=path-safety.sh
+source "$ROOT/scripts/path-safety.sh"
 
-# Parse remaining arguments
+# Parse remaining arguments. BUILD_DIR is tracked for the clean step below so
+# containerized legs can build in their own directory instead of deleting and
+# clobbering the host's native build/c artifacts.
 WITH_UI=false
-INCREMENTAL=false
-USE_CCACHE=false
-FAST_GRAMMARS=false
-QUIET=false
 VERSION=""
+BUILD_DIR="build/c"
 EXTRA_MAKE_ARGS=()
-MAKE_FLAGS=()
-BUILD_OUT_DIR="build/c"
 
 prev_arg=""
 for arg in "$@"; do
-    # Skip --arch/--jobs and their values (already handled)
-    if [[ "${prev_arg:-}" == "--arch" || "${prev_arg:-}" == "--jobs" ]]; then
+    # Skip --arch and its value (already handled)
+    if [[ "${prev_arg:-}" == "--arch" ]]; then
         prev_arg="$arg"
         continue
     fi
@@ -64,42 +94,37 @@ for arg in "$@"; do
         --with-ui)
             WITH_UI=true
             ;;
-        --incremental)
-            INCREMENTAL=true
-            ;;
-        --ccache)
-            USE_CCACHE=true
-            ;;
-        --fast-grammars)
-            FAST_GRAMMARS=true
-            ;;
-        --quiet)
-            QUIET=true
-            ;;
         --version)
             prev_arg="$arg"
             continue
             ;;
-        --jobs)
-            prev_arg="$arg"
-            continue
-            ;;
-        --arch|--arch=*|--jobs=*)
+        --arch|--arch=*)
             ;; # already handled
+        -*)
+            # STRICT: an unknown flag never falls through into make where it
+            # would fail cryptically (or worse, be absorbed).
+            echo "build.sh: unknown option '$arg'. Please consult --help." >&2
+            exit 2
+            ;;
+        BUILD_DIR=*)
+            BUILD_DIR="${arg#BUILD_DIR=}"
+            EXTRA_MAKE_ARGS+=("$arg")
+            ;;
         CC=*|CXX=*)
             export "${arg}"
             EXTRA_MAKE_ARGS+=("$arg")
             ;;
-        BUILD_DIR=*)
-            BUILD_OUT_DIR="${arg#BUILD_DIR=}"
-            EXTRA_MAKE_ARGS+=("$arg")
+        *=*)
+            EXTRA_MAKE_ARGS+=("$arg") # VAR=VAL make passthrough
             ;;
         *)
-            # Check if this is the value for --version
+            # Bare words are only ever the value of --version; anything else is
+            # a usage error, not a silent make argument.
             if [[ "${prev_arg:-}" == "--version" ]]; then
                 VERSION="$arg"
             else
-                EXTRA_MAKE_ARGS+=("$arg")
+                echo "build.sh: unexpected argument '$arg'. Please consult --help." >&2
+                exit 2
             fi
             ;;
     esac
@@ -114,53 +139,21 @@ if [[ -n "$VERSION" ]]; then
 fi
 
 print_env "build.sh"
-echo "  ui=$WITH_UI version=${VERSION:-dev} incremental=$INCREMENTAL ccache=$USE_CCACHE fast_grammars=$FAST_GRAMMARS quiet=$QUIET"
+echo "  ui=$WITH_UI version=${VERSION:-dev}"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
-if $USE_CCACHE; then
-    if ! command -v sccache >/dev/null 2>&1; then
-        echo "ERROR: --ccache requested but sccache was not found in PATH" >&2
-        exit 1
-    fi
-    EXTRA_MAKE_ARGS+=("CCACHE=sccache")
-fi
+# Step 1: Clean C build artifacts only (not node_modules — npm ci handles that)
+cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
 
-if $FAST_GRAMMARS; then
-    EXTRA_MAKE_ARGS+=("GRAMMAR_OPT=-O0")
-fi
-
-if $QUIET; then
-    MAKE_FLAGS+=("-s")
-fi
-
-# Step 1: Clean C build artifacts only unless this is a warm dev rebuild.
-# node_modules is never removed here — npm ci handles frontend dependencies.
-if ! $INCREMENTAL; then
-    if [[ "$BUILD_OUT_DIR" != "build/c" ]]; then
-        echo "ERROR: refusing to clean custom BUILD_DIR='$BUILD_OUT_DIR'" >&2
-        echo "       Pass --incremental for custom build directories." >&2
-        exit 1
-    fi
-    case "$BUILD_OUT_DIR" in
-        build/c)
-            rm -rf "$ROOT/build/c"
-            ;;
-        *)
-            echo "ERROR: refusing to clean unsafe BUILD_DIR='$BUILD_OUT_DIR'" >&2
-            exit 1
-            ;;
-    esac
-fi
-
-# Step 2: Build (with arch prefix on macOS)
+# Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
 if $WITH_UI; then
-    $ARCH_PREFIX make "${MAKE_FLAGS[@]+"${MAKE_FLAGS[@]}"}" -j"$NPROC" -f Makefile.cbm cbm-with-ui \
+    make -j"$NPROC" -f Makefile.cbm cbm-with-ui \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 else
-    $ARCH_PREFIX make "${MAKE_FLAGS[@]+"${MAKE_FLAGS[@]}"}" -j"$NPROC" -f Makefile.cbm cbm \
+    make -j"$NPROC" -f Makefile.cbm cbm \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 
-echo "=== Build complete: $BUILD_OUT_DIR/codebase-memory-mcp ==="
+echo "=== Build complete: ${BUILD_DIR}/codebase-memory-mcp ==="

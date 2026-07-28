@@ -110,10 +110,13 @@ typedef struct KotlinLSPContext {
     /* Recursion guard for kotlin_eval_expr_type. */
     int eval_depth;
 
-    /* Recursion guards (crash guard) for the AST walks that lacked one.
-     * walk_depth bounds kt_resolve_calls_in_node on deeply nested calls;
-     * type_depth bounds kotlin_parse_type_node on deeply nested generics. */
+    /* AST-walk recursion depth for kt_resolve_calls_in_node (guards stack
+     * overflow on deeply-nested/cyclic files; see cbm_lsp_max_walk_depth).
+     * Zero via memset. */
     int walk_depth;
+
+    /* Recursion guard for kotlin_parse_type_node on deeply nested generics
+     * (same cap; see cbm_lsp_max_walk_depth). Zero via memset. */
     int type_depth;
 
     /* Debug mode (CBM_LSP_DEBUG env). */

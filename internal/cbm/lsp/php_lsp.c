@@ -32,7 +32,22 @@
 extern const TSLanguage *tree_sitter_php_only(void);
 
 /* Forward decls */
-static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node);
+static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node);
+
+/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
+ * per nesting level; a deeply-nested or cyclic file can overflow the native
+ * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
+ * skipped — its calls stay unresolved, which is graceful degradation, not a
+ * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * The walk_depth-- runs after the inner returns, so early returns in the body
+ * never leak the counter. */
+static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+        return;
+    ctx->walk_depth++;
+    php_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
 static void process_function_like(PHPLSPContext *ctx, TSNode node);
 static void process_class_decl(PHPLSPContext *ctx, TSNode node);
 static const CBMType *php_substitute_template(CBMArena *arena, const CBMType *t,
@@ -2110,7 +2125,7 @@ static void process_if_statement(PHPLSPContext *ctx, TSNode node) {
 }
 
 /* Walk a subtree, binding scope and resolving calls. */
-static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node) {
+static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);
@@ -3444,13 +3459,31 @@ static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, c
         t = lookup_type_with_project(ctx, trait_qn);
     const char *canonical_trait_qn = t ? t->qualified_name : trait_qn;
 
+    /* A trait cannot meaningfully flatten into itself. PHP itself rejects
+     * `trait T { use T; }` ("Trait T cannot use itself"), and an aliased
+     * `use X as Y; use Y;` can resolve back onto the enclosing trait by short
+     * name. Without this guard the loop below copies the trait's own methods
+     * back onto it with receiver_type == canonical_trait_qn; because each copy
+     * then re-matches the loop's filter while cbm_registry_add_func() keeps
+     * growing reg->func_count, the iteration never terminates — it arena-
+     * allocates a fresh method every pass until the process exhausts all
+     * memory (observed: 40 GB+, freezing the host). See regression test
+     * phplsp_trait_self_use_terminates. */
+    if (strcmp(class_qn, canonical_trait_qn) == 0)
+        return;
+
     /* Iterate registry funcs whose receiver_type is the trait.
      *
      * Self-substitution: when the trait's method has a return type that
      * names the trait itself (e.g. `tap(): self` registered as
      * NAMED(trait_qn)), rewrite it to NAMED(using_class_qn) so chains
-     * like `$c->tap()->classMethod()` resolve correctly. */
-    for (int i = 0; i < reg->func_count; i++) {
+     * like `$c->tap()->classMethod()` resolve correctly.
+     *
+     * Snapshot the count before iterating: cbm_registry_add_func() below
+     * appends to reg->funcs, so the loop must never visit entries it adds
+     * during iteration (a mutate-while-iterating hazard). */
+    const int func_count_before = reg->func_count;
+    for (int i = 0; i < func_count_before; i++) {
         const CBMRegisteredFunc *src = &reg->funcs[i];
         if (!src->receiver_type || strcmp(src->receiver_type, canonical_trait_qn) != 0) {
             continue;

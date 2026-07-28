@@ -1,45 +1,127 @@
-#!/bin/bash
-# test.sh — Build + run all C tests with ASan + UBSan.
-#
-# Usage:
-#   scripts/test.sh                          # Auto-detect everything
-#   scripts/test.sh --incremental            # Preserve build/c for warm rebuilds
-#   scripts/test.sh --ccache                 # Use sccache for compile steps
-#   scripts/test.sh --fast-grammars          # Compile prod + selected slow test grammars with -O0
-#   scripts/test.sh --quiet                  # Suppress command echo from make
-#   scripts/test.sh --jobs 16                # Override make parallelism
-#   scripts/test.sh --parallel-suites        # Run sanitizer suites in parallel
-#   scripts/test.sh --serial-suites          # Force one sanitizer runner process
-#   scripts/test.sh --arch x86_64            # Force x86_64 build
-#   scripts/test.sh CC=gcc-14 CXX=g++-14    # Override compiler
-#
-# This script is the SINGLE source of truth for running tests.
-# Used identically in local development and CI workflows.
+#!/usr/bin/env bash
+# test.sh — THE canonical test leg. Every venue (local ladder, PR CI, dry run,
+# release) runs tests through this file; iteration happens through its flags,
+# never through a second entry point.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Parse --arch/--jobs flags before sourcing env.sh
+usage() {
+    cat <<'EOF'
+Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
+
+The canonical test entry: identical in local CI, PR CI, dry run and release.
+DEFAULT (no --suites) is exactly what CI runs: static contract checks
+(Step 0a-0j), a CLEAN sanitizer build, every suite via the parallel harness,
+then the prod-binary regression guards (Steps 4-6).
+
+Modes:
+  (default)      The venue leg. Clean build (scripts/clean.sh) + all suites +
+                 all contract steps. This is the shape every gate runs.
+  --suites LIST  ITERATION mode: comma- or space-separated suite names, e.g.
+                 --suites daemon,daemon_ipc. Rebuilds the test-runner
+                 INCREMENTALLY (make dependency tracking, no clean) and runs
+                 only those suites — seconds, not minutes. Skips the contract
+                 steps and prod-binary guards; the full default run remains
+                 the merge gate. Suite names: build/c/test-runner --list-suites.
+  --tsan         ThreadSanitizer leg (data-race gate): builds and runs the
+                 widened TSan runner via make test-tsan — the same leg CI's
+                 tsan jobs and the compose test-tsan service run.
+
+Options:
+  --arch ARCH    Force target arch (arm64 | x86_64), e.g. under Rosetta.
+  -h, --help     This text.
+
+Make passthrough (VAR=VAL, forwarded verbatim):
+  CC= CXX=       Compiler override, e.g. CC=gcc-14 CXX=g++-14.
+  BUILD_DIR=     Build in an isolated directory (containers/sanitizer variants).
+  SANITIZE=      Override sanitizer flags. Platform defaults when unset:
+                 unix/CLANG64 use the Makefile's ASan+UBSan test flags;
+                 CLANGARM64 (Windows on ARM, no ASan runtime) gets CI's
+                 trap-UBSan set (-fsanitize=undefined -fsanitize-trap=undefined
+                 -fstack-protector-strong -fno-omit-frame-pointer) applied HERE
+                 so local and CI build identical test binaries. Pass SANITIZE=
+                 (empty) for a plain build when debugging a trap.
+
+Environment:
+  CBM_TEST_SEQUENTIAL=1   Single-process runner instead of the parallel harness.
+  CBM_RUN_HANG_TEST=1     Opt-in C++ index-hang regression (#410, needs prod).
+  CBM_NO_CCACHE=1         Disable the content-verified compiler cache.
+  CBM_TEST_SHARD/_LEG     Set by CI's sharded legs; leave unset locally.
+
+Examples:
+  scripts/test.sh                          # the full venue leg (what CI runs)
+  scripts/test.sh --suites daemon_ipc      # one suite, incremental, seconds
+  scripts/test.sh --suites "arena hash_table" CC=clang CXX=clang++
+  scripts/test.sh SANITIZE= --suites daemon_ipc # plain build for trap debugging
+EOF
+}
+
+# Parse --help / --suites / --tsan / --arch before sourcing env.sh.
+# STRICT: an unknown flag or a stray word is an immediate usage error, never
+# silently swallowed — agents must know exactly what a run will do.
+SUITES=""
+TSAN=0
+prev_arg=""
 for arg in "$@"; do
     case "$arg" in
-        --arch|--jobs) :;; # next arg is the value, handled below
-        --jobs=*) export CBM_JOBS="${arg#--jobs=}" ;;
+        -h|--help) usage; exit 0 ;;
+        --tsan) :;;
+        --suites) :;; # next arg is the value, handled below
+        --suites=*) SUITES="${arg#--suites=}" ;;
+        --arch) :;; # next arg is the value, handled below
+        --arch=*) :;; # handled below
+        -*)
+            echo "test.sh: unknown option '$arg'. Please consult --help." >&2
+            exit 2
+            ;;
         arm64|x86_64)
-            # Check if previous arg was --arch
-            if [[ "${prev_arg:-}" == "--arch" ]]; then
-                export CBM_ARCH="$arg"
+            if [[ "${prev_arg:-}" != "--arch" && "${prev_arg:-}" != "--suites" ]]; then
+                echo "test.sh: unexpected argument '$arg' (did you mean --arch $arg?). Please consult --help." >&2
+                exit 2
             fi
             ;;
+        *=*) :;; # VAR=VAL make passthrough, validated below
         *)
-            if [[ "${prev_arg:-}" == "--jobs" ]]; then
-                export CBM_JOBS="$arg"
+            if [[ "${prev_arg:-}" != "--suites" ]]; then
+                echo "test.sh: unexpected argument '$arg'. Please consult --help." >&2
+                exit 2
             fi
             ;;
     esac
     prev_arg="$arg"
 done
+for arg in "$@"; do
+    case "$arg" in
+        --tsan) TSAN=1 ;;
+        arm64|x86_64)
+            if [[ "${prev_arg2:-}" == "--arch" ]]; then
+                export CBM_ARCH="$arg"
+            fi
+            ;;
+        *)
+            if [[ "${prev_arg2:-}" == "--suites" ]]; then
+                SUITES="$arg"
+            fi
+            ;;
+    esac
+    prev_arg2="$arg"
+done
+# Normalize comma separation to the runner's space-separated argv form.
+SUITES="${SUITES//,/ }"
+case "${prev_arg:-}" in
+    --suites|--arch)
+        echo "test.sh: '$prev_arg' needs a value. Please consult --help." >&2
+        exit 2
+        ;;
+esac
+if [ "$TSAN" -eq 1 ] && [ -n "$SUITES" ]; then
+    echo "test.sh: --tsan and --suites are separate modes (the TSan leg has its own suite set). Please consult --help." >&2
+    exit 2
+fi
+prev_arg=""
 
 # Also support --arch=value
 for arg in "$@"; do
@@ -50,450 +132,120 @@ done
 
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
+# shellcheck source=path-safety.sh
+source "$ROOT/scripts/path-safety.sh"
 
-# Forward CC/CXX and collect make-passthrough args
+# Forward CC/CXX and collect make-passthrough args. BUILD_DIR is honored for
+# the explicit target path below so containerized legs can build in their own
+# directory instead of clobbering the host's native build/c artifacts.
+# MAKE_ARGS is an ARRAY so a VAR=VAL whose value contains spaces (the
+# windows-11-arm leg passes SANITIZE with four flags) survives as ONE make
+# argument. The old string accumulation re-split it at every expansion and
+# make swallowed the second flag's leading -f as its makefile option.
 MAKE_ARGS=()
-INCREMENTAL=false
-USE_CCACHE=false
-FAST_GRAMMARS=false
-QUIET=false
-PARALLEL_SUITES=true
-if [[ "${CI:-}" == "true" ]]; then
-    PARALLEL_SUITES=false
-fi
-case "${CBM_PARALLEL_SUITES:-}" in
-    1|true|TRUE|yes|YES|on|ON) PARALLEL_SUITES=true ;;
-    0|false|FALSE|no|NO|off|OFF) PARALLEL_SUITES=false ;;
-    "") ;;
-    *)
-        echo "ERROR: CBM_PARALLEL_SUITES must be 0/1, true/false, yes/no, or on/off" >&2
-        exit 1
-        ;;
-esac
-MAKE_FLAGS=()
-BUILD_OUT_DIR="build/c"
-SUITE_JOBS="${CBM_SUITE_JOBS:-}"
-SQLITE3_OBJ_PROD_OVERRIDDEN=false
-ZSTD_OBJ_PROD_OVERRIDDEN=false
-SUBPROCESS_BINARY=""
+BUILD_DIR="build/c"
+SANITIZE_GIVEN=0
 prev_arg=""
 for arg in "$@"; do
-    if [[ "${prev_arg:-}" == "--jobs" || "${prev_arg:-}" == "--arch" || "${prev_arg:-}" == "--suite-jobs" ]]; then
-        if [[ "${prev_arg:-}" == "--suite-jobs" ]]; then
-            SUITE_JOBS="$arg"
-        fi
-        prev_arg="$arg"
-        continue
-    fi
     case "$arg" in
-        CC=*|CXX=*) export "${arg}"; MAKE_ARGS+=("$arg") ;;
-        --incremental) INCREMENTAL=true ;;
-        --ccache) USE_CCACHE=true ;;
-        --fast-grammars) FAST_GRAMMARS=true ;;
-        --quiet) QUIET=true ;;
-        --parallel-suites) PARALLEL_SUITES=true ;;
-        --serial-suites) PARALLEL_SUITES=false ;;
-        --suite-jobs) prev_arg="$arg"; continue ;;
-        --suite-jobs=*) SUITE_JOBS="${arg#--suite-jobs=}" ;;
-        --jobs) prev_arg="$arg"; continue ;;
-        --arch|--arch=*|--jobs=*) ;; # already handled
+        CC=*|CXX=*) export "${arg}" ;;
+        --arch|--arch=*) ;; # already handled
         arm64|x86_64) ;; # already handled
-        BUILD_DIR=*) BUILD_OUT_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS+=("$arg") ;;
-        SQLITE3_OBJ_PROD=*) SQLITE3_OBJ_PROD_OVERRIDDEN=true; MAKE_ARGS+=("$arg") ;;
-        ZSTD_OBJ_PROD=*) ZSTD_OBJ_PROD_OVERRIDDEN=true; MAKE_ARGS+=("$arg") ;;
-        *=*) MAKE_ARGS+=("$arg") ;; # forward any VAR=VAL to make
+        --tsan) ;; # already handled
+        --suites|--suites=*) ;; # already handled (value skipped via prev_arg below)
+        BUILD_DIR=*) BUILD_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS+=("$arg") ;;
+        SANITIZE=*) SANITIZE_GIVEN=1; MAKE_ARGS+=("$arg") ;;
+        *=*)
+            if [[ "${prev_arg:-}" != "--suites" ]]; then
+                MAKE_ARGS+=("$arg") # forward any VAR=VAL to make
+            fi
+            ;;
     esac
     prev_arg="$arg"
 done
 
-print_env "test.sh"
-echo "  incremental=$INCREMENTAL ccache=$USE_CCACHE fast_grammars=$FAST_GRAMMARS quiet=$QUIET parallel_suites=$PARALLEL_SUITES"
-
-if [[ -n "$SUITE_JOBS" && ! "$SUITE_JOBS" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: --suite-jobs/CBM_SUITE_JOBS must be a positive integer" >&2
-    exit 1
+# Platform default absorbed FROM CI (previously inline in _test.yml, so the
+# local arm64 leg silently built without it — that divergence is why the SQLite
+# page-cache misalignment was fatal only on the windows-11-arm runner): native
+# ARM64 Windows has no ASan runtime, so its sanitizer gate is UBSan in trap
+# mode + stack protector. Applied here, once, for every venue; an explicit
+# SANITIZE=... (or SANITIZE=) argument overrides.
+if [ "$SANITIZE_GIVEN" -eq 0 ] && [ "${MSYSTEM:-}" = "CLANGARM64" ]; then
+    MAKE_ARGS+=("SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer")
 fi
 
-run_serial_suites() {
-    cd "$ROOT" && "$BUILD_OUT_DIR/test-runner"
-}
+print_env "test.sh"
 
-run_parallel_suites() {
-    local runner log_dir
-    if [[ "$BUILD_OUT_DIR" = /* ]]; then
-        runner="$BUILD_OUT_DIR/test-runner"
-        log_dir="$BUILD_OUT_DIR/test-logs"
-    else
-        runner="$ROOT/$BUILD_OUT_DIR/test-runner"
-        log_dir="$ROOT/$BUILD_OUT_DIR/test-logs"
-    fi
+# ── TSan mode (--tsan): the data-race gate ──
+# One entry for every venue: CI's tsan jobs and the compose test-tsan service
+# both run this instead of carrying their own make invocation.
+if [ "$TSAN" -eq 1 ]; then
+    echo "=== test.sh: TSan leg (make test-tsan) ==="
+    make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner-tsan" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    make -f Makefile.cbm test-tsan ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    exit "$?"
+fi
 
-    if [[ ! -x "$runner" ]]; then
-        echo "ERROR: missing test runner: $runner" >&2
-        exit 2
-    fi
+# ── Iteration mode (--suites): incremental rebuild + subset run ──
+# The documented fast path: no clean, no contract steps, no prod-binary
+# guards — those all still gate every merge through the default full run.
+if [ -n "$SUITES" ]; then
+    echo "=== test.sh: ITERATION mode — suites: $SUITES (incremental build) ==="
+    make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    # shellcheck disable=SC2086  # suite list is deliberately word-split
+    "$BUILD_DIR/test-runner" $SUITES
+    exit "$?"
+fi
 
-    local -a shard_names=()
-    local -a shard_suites=()
-    add_shard() {
-        shard_names+=("$1")
-        shard_suites+=("$2")
-    }
+# Step 0: fast build/security harness regressions run before the compiler-heavy
+# suite. The Windows package surface is static here; native launcher behavior is
+# exercised by scripts/test-windows.ps1.
+echo "=== Step 0a: build directory safety contract ==="
+bash "$ROOT/tests/test_build_dir_safety.sh"
 
-    # Launch the longest shards first so the suite phase does not end with a
-    # single long-running process after most cores have gone idle.
-    add_shard incremental_mutation_adversarial_heavy "incremental_mutation_adversarial_heavy"
-    add_shard foundation_mcp "mcp"
-    add_shard infra_ui "store_arch traces configlink infrascan cli system_info worker_pool parallel mem ui httpd security yaml simhash"
-    add_shard watcher_git "watcher_git"
-    add_shard watcher_fs "watcher_fs"
-    add_shard watcher_core "watcher_core"
-    add_shard incremental_mutation_core "incremental_mutation_core"
-    add_shard stack_overflow_nested_csharp "stack_overflow_nested_csharp"
-    add_shard node_creation_probe "node_creation_probe"
-    add_shard lsp_resolution_probe "lsp_resolution_probe"
-    add_shard lang_contract_breadth "lang_contract_breadth"
-    add_shard lang_contract_rest "lang_contract_rest"
-    add_shard lsp_back "py_lsp kotlin_lsp rust_lsp py_lsp_bench py_lsp_stress py_lsp_scale ts_lsp java_lsp java_lsp_coverage"
-    add_shard pipeline "pipeline"
-    add_shard foundation_cypher "cypher"
-    add_shard foundation_extraction "extraction extraction_inheritance extraction_imports"
-    add_shard incremental_mutation_adversarial_light "incremental_mutation_adversarial_light"
-    add_shard incremental_mutation_stress "incremental_mutation_stress"
-    add_shard incremental_mutation_recovery "incremental_mutation_recovery"
-    add_shard stack_overflow_nested_java "stack_overflow_nested_java"
-    add_shard stack_overflow_call_walkers "stack_overflow_call_walkers"
-    add_shard edge_types_probe "edge_types_probe"
-    add_shard matrix_new_constructs "matrix_new_constructs"
-    add_shard edge_imports "edge_imports"
-    add_shard grammar_probe_d "grammar_probe_d"
-    add_shard stack_overflow_nested_rust "stack_overflow_nested_rust"
-    add_shard convergence_probe "convergence_probe"
-    add_shard incremental_misc_tools "incremental_misc_tools"
-    add_shard matrix_known_classes "matrix_known_classes"
-    add_shard grammar_probe_a "grammar_probe_a"
-    add_shard grammar_probe_e "grammar_probe_e"
-    add_shard grammar_probe_f "grammar_probe_f"
-    add_shard incremental_query_graph "incremental_query_graph"
-    add_shard grammar_probe_b "grammar_probe_b"
-    add_shard grammar_probe_g "grammar_probe_g"
-    add_shard edge_structural "edge_structural"
-    add_shard stack_overflow_lsp_front "stack_overflow_lsp_front"
-    add_shard foundation_store "store_nodes store_edges store_search store_bulk store_pragmas store_checkpoint dump_verify_io"
-    add_shard foundation_small "arena hash_table dyn_array str_intern log str_util platform dump_verify ac grammar_regression grammar_labels grammar_imports"
-    add_shard discover_core "language userconfig gitignore git_context discover"
-    add_shard incremental_search_graph "incremental_search_graph"
-    add_shard incremental_code_trace "incremental_code_trace"
-    add_shard grammar_probe_c "grammar_probe_c"
-    add_shard lsp_front "scope type_rep go_lsp c_lsp php_lsp cs_lsp cs_lsp_bench"
-    add_shard storage_artifact "lz4 zstd sqlite_writer artifact"
-    add_shard integration "integration"
-    add_shard stack_overflow_runtime "stack_overflow_runtime"
-    add_shard stack_overflow_extractors "stack_overflow_extractors"
-    add_shard pipeline_small "graph_buffer registry fqn route_canon path_alias"
+echo "=== Step 0b: Windows VM worktree sync contract ==="
+bash "$ROOT/tests/test_vm_worktree_manifest.sh"
 
-    local shard_count="${#shard_names[@]}"
-    local default_suite_jobs="$NPROC"
-    local suite_jobs="${SUITE_JOBS:-$default_suite_jobs}"
-    if (( suite_jobs > shard_count )); then
-        suite_jobs="$shard_count"
-    fi
+echo "=== Step 0c: UI development proxy security contract ==="
+bash "$ROOT/tests/test_ui_dev_proxy_security.sh"
 
-    mkdir -p "$log_dir"
-    echo "=== Step 3: sanitizer test suites (${shard_count} shards, jobs=${suite_jobs}) ==="
-    echo "    logs: $log_dir"
+echo "=== Step 0d: daemon soak recovery contract ==="
+bash "$ROOT/tests/test_soak_daemon_recovery_contract.sh"
 
-    local -a pids=()
-    local -a running_names=()
-    local -a running_logs=()
-    local -a running_statuses=()
-    local -a all_logs=()
-    local running=0
-    local failed=0
+echo "=== Step 0e: Windows launcher bundle contract ==="
+bash "$ROOT/tests/test_windows_bundle_contract.sh"
 
-    finish_shard_at() {
-        local idx="$1"
-        local pid="${pids[$idx]}"
-        local name="${running_names[$idx]}"
-        local log="${running_logs[$idx]}"
-        local rc=0
+echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
+bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
-        if wait "$pid"; then
-            echo "PASS $name"
-        else
-            rc=$?
-            echo "FAIL $name rc=$rc log=$log" >&2
-            sed -n '1,220p' "$log" >&2 || true
-            failed=1
-        fi
+echo "=== Step 0g: security fuzz harness self-test ==="
+bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
-        pids=("${pids[@]:0:$idx}" "${pids[@]:$((idx + 1))}")
-        running_names=("${running_names[@]:0:$idx}" "${running_names[@]:$((idx + 1))}")
-        running_logs=("${running_logs[@]:0:$idx}" "${running_logs[@]:$((idx + 1))}")
-        running_statuses=("${running_statuses[@]:0:$idx}" "${running_statuses[@]:$((idx + 1))}")
-        running=$((running - 1))
-    }
+echo "=== Step 0h: smoke release-fixture contract ==="
+bash "$ROOT/tests/test_smoke_fixture_contract.sh"
 
-    wait_for_any_shard() {
-        local idx
-        while true; do
-            for idx in "${!running_statuses[@]}"; do
-                if [[ -f "${running_statuses[$idx]}" ]]; then
-                    finish_shard_at "$idx"
-                    return
-                fi
-            done
-            sleep 0.05
-        done
-    }
+echo "=== Step 0i: parallel suite scheduler contract ==="
+bash "$ROOT/tests/test_parallel_harness_contract.sh"
 
-    local start_all end_all i
-    start_all="$(date +%s)"
-    for i in "${!shard_names[@]}"; do
-        local name="${shard_names[$i]}"
-        local suite_list="${shard_suites[$i]}"
-        local log="$log_dir/$name.log"
-        local status_file="$log.$$.status"
-        all_logs+=("$log")
-
-        (
-            trap 'printf "%s\n" "$?" > "$status_file"' EXIT
-            cd "$ROOT"
-            shard_start="$(date +%s)"
-            echo "=== shard $name start ==="
-            echo "suites: $suite_list"
-            IFS=" " read -r -a suite_args <<< "$suite_list"
-            "$runner" "${suite_args[@]}"
-            rc=$?
-            shard_end="$(date +%s)"
-            echo "=== shard $name end rc=$rc duration=$((shard_end - shard_start))s ==="
-            exit "$rc"
-        ) > "$log" 2>&1 &
-
-        pids+=("$!")
-        running_names+=("$name")
-        running_logs+=("$log")
-        running_statuses+=("$status_file")
-        running=$((running + 1))
-
-        if (( running >= suite_jobs )); then
-            wait_for_any_shard
-        fi
-    done
-
-    while (( running > 0 )); do
-        wait_for_any_shard
-    done
-
-    end_all="$(date +%s)"
-    echo "--- suite shard summaries ($((end_all - start_all))s) ---"
-    for i in "${!shard_names[@]}"; do
-        local name="${shard_names[$i]}"
-        local log="${all_logs[$i]}"
-        local summary
-        summary="$(grep -E '^[[:space:]]+[0-9]+ passed|^=== shard .* end' "$log" | tail -n 2 | tr '\n' ' ' || true)"
-        echo "  $name: ${summary:-see $log}"
-    done
-
-    if (( failed != 0 )); then
-        return 1
-    fi
-}
+echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
+bash "$ROOT/tests/test_venue_parity_contract.sh"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
-if $USE_CCACHE; then
-    if ! command -v sccache >/dev/null 2>&1; then
-        echo "ERROR: --ccache requested but sccache was not found in PATH" >&2
-        exit 1
-    fi
-    MAKE_ARGS+=("CCACHE=sccache")
-fi
+# Step 1: Clean (scoped to this leg's build directory)
+BUILD_DIR="$BUILD_DIR" scripts/clean.sh
 
-if $FAST_GRAMMARS; then
-    MAKE_ARGS+=("GRAMMAR_OPT=-O0")
-    MAKE_ARGS+=("TEST_GRAMMAR_FAST_O0=1")
-fi
-
-# The production binary in this script is an auxiliary test artifact used by
-# subprocess checks. Reuse vendored objects that are already non-sanitized in the
-# test runner so cold builds do not compile SQLite/zstd twice. The normal
-# `make cbm` production build still uses its dedicated prod objects.
-if ! $SQLITE3_OBJ_PROD_OVERRIDDEN; then
-    MAKE_ARGS+=('SQLITE3_OBJ_PROD=$(SQLITE3_OBJ_TEST)')
-fi
-if ! $ZSTD_OBJ_PROD_OVERRIDDEN; then
-    MAKE_ARGS+=('ZSTD_OBJ_PROD=$(ZSTD_OBJ_TEST)')
-fi
-
-if $QUIET; then
-    MAKE_FLAGS+=("-s")
-fi
-
-POST_CHECKS_STARTED=false
-POST_CHECK_PIDS=()
-POST_CHECK_NAMES=()
-POST_CHECK_LOGS=()
-
-run_parent_watchdog_check() {
-    echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
-    CBM_TEST_BINARY="$SUBPROCESS_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
-}
-
-run_security_strings_check() {
-    echo "=== Step 6: security-strings allow-list regression ==="
-    bash "$ROOT/tests/test_security_strings_allowlist.sh"
-}
-
-start_default_post_checks() {
-    local log_dir
-    if [[ "$BUILD_OUT_DIR" = /* ]]; then
-        log_dir="$BUILD_OUT_DIR/test-logs"
-    else
-        log_dir="$ROOT/$BUILD_OUT_DIR/test-logs"
-    fi
-    mkdir -p "$log_dir"
-
-    local log
-    log="$log_dir/parent_watchdog.log"
-    (run_parent_watchdog_check) > "$log" 2>&1 &
-    POST_CHECK_PIDS+=("$!")
-    POST_CHECK_NAMES+=("parent_watchdog")
-    POST_CHECK_LOGS+=("$log")
-
-    log="$log_dir/security_strings_allowlist.log"
-    (run_security_strings_check) > "$log" 2>&1 &
-    POST_CHECK_PIDS+=("$!")
-    POST_CHECK_NAMES+=("security_strings_allowlist")
-    POST_CHECK_LOGS+=("$log")
-
-    POST_CHECKS_STARTED=true
-}
-
-finish_default_post_checks() {
-    local failed=0
-    local i pid name log rc
-    for i in "${!POST_CHECK_PIDS[@]}"; do
-        pid="${POST_CHECK_PIDS[$i]}"
-        name="${POST_CHECK_NAMES[$i]}"
-        log="${POST_CHECK_LOGS[$i]}"
-        if wait "$pid"; then
-            cat "$log"
-        else
-            rc=$?
-            cat "$log" >&2 || true
-            echo "FAIL $name rc=$rc log=$log" >&2
-            failed=1
-        fi
-    done
-    return "$failed"
-}
-
-FASTAPI_FIXTURE_CACHE=""
-FASTAPI_FIXTURE_CACHE_LOG=""
-FASTAPI_FIXTURE_CACHE_PID=""
-FASTAPI_DB_CACHE_DIR=""
-FASTAPI_DB_CACHE_READY=false
-TEST_FIXTURE_ROOT="${CBM_TEST_FIXTURE_DIR:-$ROOT/build/test-fixtures}"
-if [[ "$TEST_FIXTURE_ROOT" != /* ]]; then
-    TEST_FIXTURE_ROOT="$ROOT/$TEST_FIXTURE_ROOT"
-fi
-
-start_fastapi_fixture_cache() {
-    if ! $PARALLEL_SUITES; then
-        return 0
-    fi
-
-    FASTAPI_FIXTURE_CACHE="$TEST_FIXTURE_ROOT/fastapi-0.99.1"
-    FASTAPI_FIXTURE_CACHE_LOG="$TEST_FIXTURE_ROOT/fastapi-0.99.1.log"
-    FASTAPI_DB_CACHE_DIR="$TEST_FIXTURE_ROOT/fastapi-db-cache"
-    mkdir -p "$FASTAPI_DB_CACHE_DIR"
-    export CBM_INCREMENTAL_DB_CACHE_DIR="$FASTAPI_DB_CACHE_DIR"
-    export CBM_INCREMENTAL_REINDEX_MODE="${CBM_INCREMENTAL_REINDEX_MODE:-fast}"
-    if [[ -s "$FASTAPI_DB_CACHE_DIR/cbm_fastapi_incremental_fixture.db" ]]; then
-        FASTAPI_DB_CACHE_READY=true
-    else
-        FASTAPI_DB_CACHE_READY=false
-    fi
-
-    if [[ -d "$FASTAPI_FIXTURE_CACHE/.git" ]]; then
-        export CBM_FASTAPI_FIXTURE_CACHE="$FASTAPI_FIXTURE_CACHE"
-        return 0
-    fi
-
-    mkdir -p "$(dirname "$FASTAPI_FIXTURE_CACHE")"
-    (
-        set -euo pipefail
-        tmp="${FASTAPI_FIXTURE_CACHE}.tmp.$$"
-        git -c advice.detachedHead=false clone --depth=1 --branch 0.99.1 --quiet --sparse \
-            https://github.com/fastapi/fastapi.git "$tmp" 2>&1
-        cd "$tmp"
-        git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1
-        cd "$ROOT"
-        if [[ ! -e "$FASTAPI_FIXTURE_CACHE" ]]; then
-            mv "$tmp" "$FASTAPI_FIXTURE_CACHE"
-        fi
-    ) > "$FASTAPI_FIXTURE_CACHE_LOG" 2>&1 &
-    FASTAPI_FIXTURE_CACHE_PID="$!"
-}
-
-finish_fastapi_fixture_cache() {
-    if [[ -z "$FASTAPI_FIXTURE_CACHE_PID" ]]; then
-        return 0
-    fi
-
-    if ! wait "$FASTAPI_FIXTURE_CACHE_PID"; then
-        echo "WARN: FastAPI fixture cache unavailable; incremental shards will clone remotely" >&2
-        sed -n '1,80p' "$FASTAPI_FIXTURE_CACHE_LOG" >&2 || true
-        return 0
-    fi
-
-    if [[ -d "$FASTAPI_FIXTURE_CACHE/.git" ]]; then
-        export CBM_FASTAPI_FIXTURE_CACHE="$FASTAPI_FIXTURE_CACHE"
-    else
-        echo "WARN: FastAPI fixture cache missing after prepare; incremental shards will clone remotely" >&2
-    fi
-}
-
-# Step 1: Clean unless this is a warm dev test run.
-if ! $INCREMENTAL; then
-    scripts/clean.sh --c-only
-fi
-
-start_fastapi_fixture_cache
-
-if [[ "$BUILD_OUT_DIR" = /* ]]; then
-    SUBPROCESS_BINARY="$BUILD_OUT_DIR/codebase-memory-mcp"
+# Step 2 + 3: Build, then run every suite as parallel processes (identical
+# gate quality — see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh:
+# the suite set is enumerated from the runner itself and union-guarded, and
+# pass/fail/skip totals aggregate to the same numbers as the sequential run).
+# CBM_TEST_SEQUENTIAL=1 restores the single-process runner.
+make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+if [ "${CBM_TEST_SEQUENTIAL:-0}" = "1" ]; then
+    make -f Makefile.cbm test ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 else
-    SUBPROCESS_BINARY="$ROOT/$BUILD_OUT_DIR/codebase-memory-mcp"
-fi
-
-# Step 2: Build the sanitizer runner and production subprocess binary used by
-# shell regression checks.
-$ARCH_PREFIX make "${MAKE_FLAGS[@]+"${MAKE_FLAGS[@]}"}" -j"$NPROC" -f Makefile.cbm test-artifacts "${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}"
-
-finish_fastapi_fixture_cache
-
-if [ "${CBM_RUN_HANG_TEST:-0}" != "1" ]; then
-    start_default_post_checks
-fi
-
-# Step 3: Run sanitizer tests.
-suite_rc=0
-if $PARALLEL_SUITES; then
-    run_parallel_suites || suite_rc=$?
-else
-    run_serial_suites || suite_rc=$?
-fi
-
-post_rc=0
-if $POST_CHECKS_STARTED; then
-    finish_default_post_checks || post_rc=$?
-fi
-
-if (( suite_rc != 0 )); then
-    exit "$suite_rc"
+    make -f Makefile.cbm test-par ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 fi
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
@@ -502,24 +254,26 @@ fi
 # run above does not build). Skipped by default so the fast unit run stays fast.
 if [ "${CBM_RUN_HANG_TEST:-0}" = "1" ]; then
     echo "=== Step 4: C++ index-hang regression (#410) ==="
-    CBM_TEST_BINARY="$SUBPROCESS_BINARY" bash "$ROOT/tests/test_cpp_index_hang.sh"
+    bash "$ROOT/tests/test_cpp_index_hang.sh"
 fi
 
-# Step 5: Parent-death watchdog regression (#406/#407). Verifies the prod stdio
-# binary built in Step 2 self-exits when its launching parent is killed.
-if ! $POST_CHECKS_STARTED; then
-    run_parent_watchdog_check
-fi
+# Step 5: Parent-death watchdog regression (#406/#407). Builds the prod stdio
+# binary and verifies it self-exits when its launching parent is killed.
+echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
+make -j"$NPROC" -f Makefile.cbm cbm ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
+
+# Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
+# (`cli --index-worker …`) whose supervisor dies must self-exit instead of
+# indexing on as an orphan. Reuses the prod binary built in Step 5.
+echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).
-if ! $POST_CHECKS_STARTED; then
-    run_security_strings_check
-fi
-
-if (( post_rc != 0 )); then
-    exit "$post_rc"
-fi
+echo "=== Step 6: security-strings allow-list regression ==="
+bash "$ROOT/tests/test_security_strings_allowlist.sh"
 
 echo "=== All tests passed ==="

@@ -164,12 +164,16 @@ typedef enum {
     CBM_LANG_APEX,
     CBM_LANG_SOQL,
     CBM_LANG_SOSL,
-    CBM_LANG_KUSTOMIZE, // kustomization.yaml — Kubernetes overlay tool
-    CBM_LANG_K8S,       // Generic Kubernetes manifest (apiVersion: detected)
-    CBM_LANG_PINE,      // Pine Script (TradingView indicator / strategy language)
-    CBM_LANG_QML,       // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
-    CBM_LANG_CFSCRIPT,  // CFML script dialect (.cfc components — Lucee/ColdFusion)
-    CBM_LANG_CFML,      // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
+    CBM_LANG_KUSTOMIZE,            // kustomization.yaml — Kubernetes overlay tool
+    CBM_LANG_K8S,                  // Generic Kubernetes manifest (apiVersion: detected)
+    CBM_LANG_PINE,                 // Pine Script (TradingView indicator / strategy language)
+    CBM_LANG_QML,                  // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
+    CBM_LANG_CFSCRIPT,             // CFML script dialect (.cfc components — Lucee/ColdFusion)
+    CBM_LANG_CFML,                 // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
+    CBM_LANG_MOJO,                 // Mojo
+    CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
+    CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
+    CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -236,7 +240,9 @@ typedef struct {
     int loop_depth;                     // enclosing loop nesting at the call site
     int branch_depth;                   // enclosing branch nesting at the call site
     int start_line;                     // 1-based source line of the call (for def range-match)
-    bool is_method;                     // Perl-only: arrow/method call ($obj->m). Default false.
+    bool is_method;                     // method/member call with a non-self receiver. Perl:
+                                        // arrow/method call ($obj->m). TS/JS/TSX: member call
+                                        // x.foo() whose receiver is not this/super. Default false.
 } CBMCall;
 
 typedef struct {
@@ -464,6 +470,16 @@ typedef struct {
 
     bool has_error;
     const char *error_msg;
+    /* Best-effort parse-coverage signal (experimental). parse_incomplete is true
+     * when the parse tree contains tree-sitter ERROR/MISSING nodes — constructs
+     * in those regions are silently absent from the graph. error_ranges is a
+     * compact "start-end,start-end" list of 1-based line ranges (arena-owned) or
+     * NULL. This only marks what we can DETECT: the absence of a flag is NOT a
+     * completeness guarantee. Callers should treat a flagged file as "prefer
+     * grep here", never treat an unflagged file as provably complete. */
+    bool parse_incomplete;
+    const char *error_ranges;
+    int error_region_count;
     bool is_test_file;
     int imports_count;
     TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)
@@ -505,6 +521,24 @@ typedef struct {
     int count;
 } CBMStringConstantMap;
 
+// Forward declaration: ObjectScript macro table (defined in macro_table.h).
+typedef struct CBMMacroTable CBMMacroTable;
+
+// Method-return-type table for ObjectScript variable type inference. Populated
+// from definition nodes (method QN -> declared return type) so a later
+// `Set x = obj.Method()` can resolve x's class.
+#define CBM_RETURN_TYPE_TABLE_CAP 2048
+
+typedef struct {
+    const char *method_qn;
+    const char *return_type;
+} CBMReturnTypeEntry;
+
+typedef struct {
+    CBMReturnTypeEntry entries[CBM_RETURN_TYPE_TABLE_CAP];
+    int count;
+} CBMReturnTypeTable;
+
 typedef struct {
     CBMArena *arena;
     CBMFileResult *result;
@@ -515,18 +549,20 @@ typedef struct {
     const char *rel_path;
     const char *module_qn;
     TSNode root;
-    EFCache ef_cache;                      // enclosing function cache
-    const char *enclosing_class_qn;        // for nested class QN computation
-    CBMStringConstantMap string_constants; // module-level NAME = "value" pairs
+    EFCache ef_cache;                            // enclosing function cache
+    const char *enclosing_class_qn;              // for nested class QN computation
+    CBMStringConstantMap string_constants;       // module-level NAME = "value" pairs
+    const CBMMacroTable *macro_table;            // ObjectScript $$$macro table (NULL if none)
+    const CBMReturnTypeTable *return_type_table; // ObjectScript method return types (NULL if none)
 } CBMExtractCtx;
 
 // --- Public API ---
 
-// Bind third-party allocators (tree-sitter, sqlite3, libgit2) to mimalloc as
+// Bind third-party allocators (tree-sitter, sqlite3) to mimalloc as
 // defense-in-depth, so they never depend on the fragile MI_OVERRIDE symbol
 // override (#424). MUST be called as the very first statement of main(), before
 // any sqlite3_open*/sqlite3_initialize (SQLITE_CONFIG_MALLOC returns
-// SQLITE_MISUSE once sqlite has initialized) and before any git_libgit2_init.
+// SQLITE_MISUSE once sqlite has initialized).
 // Idempotent (static guard); intended for single-threaded startup. cbm_init()
 // also calls it so non-main entry points (pipeline passes) still get the binds.
 // In the test build (no CBM_BIND_TS_ALLOCATOR) this is a no-op.
@@ -535,6 +571,29 @@ void cbm_alloc_init(void);
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
 
+// True when rel_path is in the crash-quarantine set — the newline-delimited list
+// of files (CBM_INDEX_QUARANTINE_FILE) the crash supervisor pinned as crashers
+// during its single-threaded recovery re-run. Loaded once, lazily; read-only
+// after load. cbm_extract_file short-circuits such files to an empty result so no
+// pass can crash on them; the pipeline extract loops call this to also REPORT the
+// skip as phase="crash". Always false (cheap no-op) when the env var is unset.
+bool cbm_index_is_quarantined(const char *rel_path);
+
+// Phase a quarantined file was pinned under: "crash" (a fault signal) or "hang"
+// (killed for making no progress). Returns NULL when rel_path is not quarantined.
+// Drives the same lazy once-load as cbm_index_is_quarantined. Used by the pipeline
+// extract loops to report the skip's phase in skipped[] (falls back to "crash").
+const char *cbm_index_quarantine_phase(const char *rel_path);
+
+// Crash-supervisor marker journal (parallel-safe): appends "S <rel_path>" /
+// "D <rel_path>" to CBM_INDEX_MARKER_FILE. Files with an S but no D form the
+// parent's crash/hang suspect set. No-ops when the env var is unset.
+// cbm_extract_file journals its own start/done; long-running per-file phases
+// (cross-LSP resolve) call these around their per-file work so a hang there
+// is attributed to the RIGHT file instead of a stale extraction marker.
+void cbm_index_mark_start(const char *rel_path);
+void cbm_index_mark_done(const char *rel_path);
+
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file parse timeout in microseconds (0 = no timeout).
@@ -542,6 +601,18 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, // NULL-terminated, or NULL
                                 const char **include_paths  // NULL-terminated, or NULL
+);
+
+// Pipeline-internal variant of cbm_extract_file() carrying ObjectScript
+// per-project tables (macro table + method-return-type table). The public
+// cbm_extract_file() is a thin wrapper that passes NULL, NULL for both.
+CBMFileResult *cbm_extract_file_ex(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, int64_t timeout_micros,
+    const char **extra_defines,                 // NULL-terminated, or NULL
+    const char **include_paths,                 // NULL-terminated, or NULL
+    const CBMMacroTable *macro_table,           // ObjectScript macros, or NULL
+    const CBMReturnTypeTable *return_type_table // OS return types, or NULL
 );
 
 // Free all memory associated with a result.

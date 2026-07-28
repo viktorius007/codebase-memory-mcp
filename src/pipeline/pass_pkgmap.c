@@ -426,8 +426,12 @@ static void parse_pyproject_toml(const char *source, int source_len, const char 
     pkg_entries_push(entries, name, entry);
 
     /* Also register <name>/__init__ as alternative (no src/ prefix) */
-    snprintf(suffix, sizeof(suffix), "%s/__init__", name_copy);
-    char *alt_entry = build_entry_path(rel_path, suffix);
+    char *alt_entry = NULL;
+    if (name_copy) {
+        snprintf(suffix, sizeof(suffix), "%s/__init__", name_copy);
+        alt_entry = build_entry_path(rel_path, suffix);
+    }
+
     if (name_copy && alt_entry) {
         pkg_entries_push(entries, name_copy, alt_entry);
     } else {
@@ -783,7 +787,7 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
  * safe_stat. */
 static int pkgmap_safe_stat(const char *abs_path, struct stat *st) {
 #ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    wchar_t *wpath = cbm_path_to_wide(abs_path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -816,7 +820,7 @@ static int pkgmap_safe_stat(const char *abs_path, struct stat *st) {
  * guarantee; this check is a best-effort early skip on top of it. */
 #ifdef _WIN32
 static bool pkgmap_is_reparse_point(const char *abs_path) {
-    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    wchar_t *wpath = cbm_path_to_wide(abs_path);
     if (!wpath) {
         return false;
     }
@@ -849,12 +853,13 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
 typedef void (*pkgmap_manifest_cb)(const char *basename, const char *rel_path, const char *source,
                                    int source_len, void *userdata);
 
-/* Generic manifest walk. Owns the symlink-skip / depth-cap / skip-dir
- * termination guarantees so callers (pkgmap entries + member collection) share
- * one traversal instead of duplicating the load-bearing safety logic. Returns
- * the number of manifest files dispatched to `cb`. */
+/* Generic manifest walk. Owns the symlink-skip / depth-cap / skip-dir /
+ * excluded-dir termination guarantees so callers (pkgmap entries + member
+ * collection) share one traversal instead of duplicating the load-bearing
+ * safety logic. Returns the number of manifest files dispatched to `cb`. */
 static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgmap_manifest_cb cb,
-                                 void *userdata, int depth) {
+                                 void *userdata, int depth, char **excluded_dirs,
+                                 int excluded_count) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
         cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
         return 0;
@@ -883,7 +888,8 @@ static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgma
             continue;
         }
         if (S_ISDIR(st.st_mode)) {
-            if (cbm_should_skip_dir(name, CBM_MODE_FULL)) {
+            if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+                cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
                 continue;
             }
 #ifdef _WIN32
@@ -895,7 +901,8 @@ static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgma
                 continue;
             }
 #endif
-            parsed += pkgmap_walk_manifests(abs_path, rel_path, cb, userdata, depth + 1);
+            parsed += pkgmap_walk_manifests(abs_path, rel_path, cb, userdata, depth + 1,
+                                            excluded_dirs, excluded_count);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
@@ -924,8 +931,9 @@ static void pkgmap_entries_cb(const char *basename, const char *rel_path, const 
 }
 
 static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
-                           int depth) {
-    return pkgmap_walk_manifests(abs_dir, rel_dir, pkgmap_entries_cb, entries, depth);
+                           int depth, char **excluded_dirs, int excluded_count) {
+    return pkgmap_walk_manifests(abs_dir, rel_dir, pkgmap_entries_cb, entries, depth,
+                                 excluded_dirs, excluded_count);
 }
 
 /* Scan a repository for package manifest files via the filesystem
@@ -939,11 +947,12 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
  * Windows reparse points, so it cannot hang on directory junctions.
  * This is what lets bare workspace imports (e.g. "@org/pkg" declared in
  * an ignored package.json) resolve on Windows as well as POSIX. */
-int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries) {
+int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
+                         int excluded_count) {
     if (!repo_path || !entries) {
         return 0;
     }
-    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0);
+    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
 }
@@ -1018,7 +1027,7 @@ int cbm_pkgmap_collect_members(const char *repo_path, cbm_pkg_members_t *out) {
     if (!repo_path || !out) {
         return 0;
     }
-    int parsed = pkgmap_walk_manifests(repo_path, "", pkg_members_cb, out, 0);
+    int parsed = pkgmap_walk_manifests(repo_path, "", pkg_members_cb, out, 0, NULL, 0);
     cbm_log_info("pkgmap.members", "manifests", pkgmap_itoa(parsed), "members",
                  pkgmap_itoa(out->count));
     return out->count;
@@ -1089,7 +1098,8 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
  * (the canonical case: package.json, which is in IGNORED_JSON_FILES).
  * Falls back to the files[]-only behaviour if repo_path is NULL. */
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name) {
+                                         int file_count, const char *project_name,
+                                         char **excluded_dirs, int excluded_count) {
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
 
@@ -1113,7 +1123,7 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
         free(source);
     }
 
-    int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries);
+    int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries, excluded_dirs, excluded_count);
     cbm_log_info("pkgmap.scan", "manifests_from_files", pkgmap_itoa(from_files),
                  "manifests_from_walk", pkgmap_itoa(from_walk), "entries",
                  pkgmap_itoa(entries.count));
@@ -1389,6 +1399,151 @@ static bool import_targetable_label(const char *label) {
     return false;
 }
 
+static const char *path_leaf(const char *path) {
+    const char *leaf = path;
+    for (const char *p = path; p && *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            leaf = p + 1;
+        }
+    }
+    return leaf;
+}
+
+static bool is_header_include(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    static const char *header_exts[] = {".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", NULL};
+    for (const char **ext = header_exts; *ext; ext++) {
+        size_t path_len = strlen(path);
+        size_t ext_len = strlen(*ext);
+        if (path_len > ext_len && strcmp(path + path_len - ext_len, *ext) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_c_family_source(const char *source_rel) {
+    if (!source_rel || !source_rel[0]) {
+        return false;
+    }
+    static const char *exts[] = {".c", ".cc", ".cpp", ".cxx", ".c++",
+                                 ".h", ".hh", ".hpp", ".hxx", NULL};
+    for (const char **ext = exts; *ext; ext++) {
+        size_t path_len = strlen(source_rel);
+        size_t ext_len = strlen(*ext);
+        if (path_len > ext_len && strcmp(source_rel + path_len - ext_len, *ext) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *ctx,
+                                                      const char *file_path,
+                                                      const char *source_file_qn) {
+    if (!ctx || !file_path || !file_path[0]) {
+        return NULL;
+    }
+
+    const char *leaf = path_leaf(file_path);
+    if (!leaf || !leaf[0]) {
+        return NULL;
+    }
+
+    char stem[PKGMAP_PATH_BUF];
+    snprintf(stem, sizeof(stem), "%s", leaf);
+    char *last_dot = strrchr(stem, '.');
+    if (last_dot && last_dot != stem) {
+        *last_dot = '\0';
+    }
+
+    const char *names[2] = {stem[0] ? stem : NULL, leaf};
+    const cbm_gbuf_node_t *best = NULL;
+    for (int ni = 0; ni < 2; ni++) {
+        const char *name = names[ni];
+        if (!name || !name[0]) {
+            continue;
+        }
+
+        const cbm_gbuf_node_t **hits = NULL;
+        int hit_count = 0;
+        if (cbm_gbuf_find_by_name(ctx->gbuf, name, &hits, &hit_count) != 0 || !hits) {
+            continue;
+        }
+
+        for (int i = 0; i < hit_count; i++) {
+            const cbm_gbuf_node_t *cand = hits[i];
+            if (!cand || !cand->file_path) {
+                continue;
+            }
+
+            /* Tie-breaker: Ensure the candidate's actual file_path ends with the
+             * specific include path requested (e.g., 'a/util.h' instead of just 'util.h'). */
+            if (!ends_with(cand->file_path, file_path)) {
+                continue;
+            }
+
+            if (!cand->label || !import_targetable_label(cand->label)) {
+                continue;
+            }
+            if (source_file_qn && cand->qualified_name &&
+                strcmp(cand->qualified_name, source_file_qn) == 0) {
+                continue;
+            }
+            if (strcmp(cand->label, "File") == 0) {
+                return cand;
+            }
+            if (!best) {
+                best = cand;
+            }
+        }
+        if (best) {
+            return best;
+        }
+    }
+    return NULL;
+}
+
+static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *ctx,
+                                                     const char *source_rel,
+                                                     const char *source_file_qn,
+                                                     const char *module_path) {
+    if (!is_c_family_source(source_rel) || !is_header_include(module_path)) {
+        return NULL;
+    }
+
+    const char *base = module_path;
+    if (base[0] == '.' && base[1] == '/') {
+        base += 2;
+    }
+
+    const cbm_gbuf_node_t *exact = resolve_exact_file_node(ctx, base, source_file_qn);
+    if (exact) {
+        return exact;
+    }
+
+    if (source_rel && source_rel[0]) {
+        char *dir = path_dirname(source_rel);
+        if (dir) {
+            char candidate[PKGMAP_PATH_BUF];
+            if (dir[0]) {
+                snprintf(candidate, sizeof(candidate), "%s/%s", dir, base);
+            } else {
+                snprintf(candidate, sizeof(candidate), "%s", base);
+            }
+            free(dir);
+            exact = resolve_exact_file_node(ctx, candidate, source_file_qn);
+            if (exact) {
+                return exact;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
  * a file relative to the importer's directory.  This covers build/markup
  * grammars whose import string is a sibling filename or directory rather than a
@@ -1456,8 +1611,9 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
         }
         const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
         free(qn);
-        if (n && (!source_file_qn || !n->qualified_name ||
-                  strcmp(n->qualified_name, source_file_qn) != 0)) {
+        if (n && import_targetable_label(n->label) &&
+            (!source_file_qn || !n->qualified_name ||
+             strcmp(n->qualified_name, source_file_qn) != 0)) {
             found = n;
             break;
         }
@@ -1475,7 +1631,21 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return NULL;
     }
 
-    /* Strategy 1: module-path resolution → existing node (Python/TS/Go). */
+    /* Prefer exact header-file nodes for C/C++ includes so same-stem source or
+     * module nodes do not steal the edge target. */
+    const cbm_gbuf_node_t *header_target =
+        resolve_header_include(ctx, source_rel, source_file_qn, imp->module_path);
+    if (header_target) {
+        return header_target;
+    }
+
+    /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
+     * No label filter here: directory-module languages (Go/Java packages)
+     * legitimately resolve straight to a Folder node -- that's the intended,
+     * correct import target, not a collision. The Folder-collision problem
+     * (#767) only shows up downstream, in Strategy 4's retry-with-truncated-
+     * path loop, which re-enters resolve_module with a DIFFERENT, shortened
+     * string that the original import never named. */
     char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
@@ -1632,6 +1802,14 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
             if (cbm_gbuf_find_by_name(ctx->gbuf, cands[ci], &hits, &n) == 0 && hits) {
+                /* Deterministic winner: hits[] is in node-registration order,
+                 * which under parallel extraction varies run to run — taking
+                 * the FIRST targetable hit made the same import resolve to
+                 * different same-named nodes across runs (xfs: 360 flickering
+                 * IMPORTS diff lines between two MT runs). Pick the candidate
+                 * with the lexicographically smallest qualified name instead:
+                 * stable, content-derived, identical for ST and MT. */
+                const cbm_gbuf_node_t *best = NULL;
                 for (int i = 0; i < n; i++) {
                     const cbm_gbuf_node_t *cand = hits[i];
                     if (!cand || !import_targetable_label(cand->label)) {
@@ -1641,7 +1819,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                         strcmp(cand->qualified_name, source_file_qn) == 0) {
                         continue; /* self */
                     }
-                    return cand;
+                    if (!best || (cand->qualified_name && best->qualified_name &&
+                                  strcmp(cand->qualified_name, best->qualified_name) < 0)) {
+                        best = cand;
+                    }
+                }
+                if (best) {
+                    return best;
                 }
             }
         }
@@ -1699,8 +1883,9 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                 char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, work);
                 const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
                 free(rqn);
-                if (n && (!source_file_qn || !n->qualified_name ||
-                          strcmp(n->qualified_name, source_file_qn) != 0)) {
+                if (n && import_targetable_label(n->label) &&
+                    (!source_file_qn || !n->qualified_name ||
+                     strcmp(n->qualified_name, source_file_qn) != 0)) {
                     return n;
                 }
                 char *sl = strrchr(work, '/');
