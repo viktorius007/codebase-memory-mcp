@@ -60,6 +60,7 @@ enum {
     APPLICATION_UPDATE_VERSION_CAP = 128,
     APPLICATION_UPDATE_NOTICE_CAP = 1024,
     APPLICATION_UPDATE_RESPONSE_MAX = 1024 * 1024,
+    APPLICATION_OVERSIZE_MESSAGE_CAP = 512,
 };
 
 #define APPLICATION_UPDATE_URL \
@@ -2105,6 +2106,25 @@ static void application_background_initialize(cbm_daemon_application_session_t *
                               memory_order_release);
 }
 
+/* A result the daemon cannot frame is a REPORTABLE outcome, not a transport
+ * fault: the handler already succeeded, so the only thing missing is a way to
+ * say so. Substituting a bounded MCP error envelope for the unsendable payload
+ * keeps the caller — usually an agent that sees one line of output and cannot
+ * ask a follow-up question — able to tell "your result was too big" from "the
+ * daemon died", and tells it what to change. The alternative (dropping to
+ * HANDLER_ERROR) is the collapse this exists to prevent. */
+static char *application_oversize_result(const char *tool, size_t response_length) {
+    char message[APPLICATION_OVERSIZE_MESSAGE_CAP];
+    (void)snprintf(message, sizeof(message),
+                   "result too large to return: %.64s produced %zu bytes, over the %u-byte daemon "
+                   "response limit. The query itself succeeded — only the payload is unsendable. "
+                   "Narrow it and retry: return fewer or shorter fields, lower the row limit, or "
+                   "add a filter.",
+                   tool && tool[0] ? tool : "this request", response_length,
+                   (unsigned)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX);
+    return cbm_mcp_text_result(message, true);
+}
+
 static bool application_jsonrpc_success(const char *response) {
     yyjson_doc *document = response ? yyjson_read(response, strlen(response), 0) : NULL;
     yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
@@ -2473,12 +2493,32 @@ static cbm_daemon_runtime_application_status_t application_mcp_request(
     } else if (tool_request && response) {
         application_update_notice_inject(session, &response);
     }
+    if (response && strlen(response) > CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX) {
+        /* Same substitution as the CLI tool path, in this transport's own
+         * envelope. Without it the runtime drops the frame as HANDLER_ERROR
+         * and the stdio frontend exits the whole MCP session — one oversize
+         * query would look to the agent like the server crashing. */
+        char *tool_name = tool_request ? cbm_mcp_get_string_arg(parsed.params_raw, "name") : NULL;
+        char *envelope = application_oversize_result(tool_name, strlen(response));
+        cbm_jsonrpc_response_t substitute = {
+            .id = parsed.id,
+            .id_str = parsed.id_str,
+            .result_json = envelope,
+        };
+        char *framed = envelope && parsed_ok && parsed.has_id
+                           ? cbm_jsonrpc_format_response(&substitute)
+                           : NULL;
+        free(tool_name);
+        free(envelope);
+        free(response);
+        response = framed;
+    }
     if (parsed_ok) {
         cbm_jsonrpc_request_free(&parsed);
     }
     if (response) {
         size_t response_length = strlen(response);
-        if (response_length > UINT32_MAX) {
+        if (response_length > CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX) {
             free(response);
             return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
         }
@@ -2509,15 +2549,23 @@ static cbm_daemon_runtime_application_status_t application_tool_request(
         return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     }
     char *response = cbm_mcp_handle_tool(session->mcp, tool, args);
-    free(tool);
     free(args);
     if (!response) {
+        free(tool);
         return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
     }
     size_t response_length = strlen(response);
-    if (response_length > UINT32_MAX) {
+    if (response_length > CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX) {
+        char *oversize = application_oversize_result(tool, response_length);
         free(response);
-        return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        free(tool);
+        if (!oversize) {
+            return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        }
+        response = oversize;
+        response_length = strlen(response);
+    } else {
+        free(tool);
     }
     *response_out = (uint8_t *)response;
     *response_length_out = (uint32_t)response_length;

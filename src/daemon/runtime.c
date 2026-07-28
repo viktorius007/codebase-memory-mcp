@@ -980,6 +980,27 @@ static bool runtime_worker_send_status(cbm_daemon_runtime_worker_t *worker,
                                      (uint32_t)sizeof(payload));
 }
 
+const char *cbm_daemon_runtime_application_status_str(
+    cbm_daemon_runtime_application_status_t status) {
+    switch (status) {
+    case CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR:
+        return "the daemon connection failed or the daemon exited mid-request";
+    case CBM_DAEMON_RUNTIME_APPLICATION_OK:
+        return "the request completed";
+    case CBM_DAEMON_RUNTIME_APPLICATION_BUSY:
+        return "the daemon session already has a request in flight";
+    case CBM_DAEMON_RUNTIME_APPLICATION_UNAVAILABLE:
+        return "the daemon is shutting down and accepted no new work";
+    case CBM_DAEMON_RUNTIME_APPLICATION_REJECTED:
+        return "the daemon rejected the request as malformed or not permitted";
+    case CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR:
+        return "the daemon handler failed to produce a result";
+    case CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED:
+        return "the request was cancelled";
+    }
+    return "the daemon reported an unrecognised status";
+}
+
 static bool runtime_application_status_is_callback_result(
     cbm_daemon_runtime_application_status_t status) {
     return status == CBM_DAEMON_RUNTIME_APPLICATION_OK ||

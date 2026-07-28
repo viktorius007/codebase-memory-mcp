@@ -1336,11 +1336,15 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
         main_session_context(NULL, session_root, allowed_root, &allowed_root_ptr) &&
         main_set_client_context(bootstrap.client, session_root, CBM_MCP_TOOL_PROFILE_ALL, NULL,
                                 NULL, MAIN_CONNECT_TIMEOUT_MS);
-    if (context_ok &&
-        cbm_daemon_application_client_tool(bootstrap.client, tool_name, args_json, &response,
-                                           &response_length, MAIN_REQUEST_TIMEOUT_MS) ==
-            CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-        response && response_length > 0) {
+    /* Distinct failures must stay distinct here: this is the last point at
+     * which the reason still exists, and the caller is typically an agent
+     * that gets exactly this one line and no way to ask what happened. */
+    cbm_daemon_runtime_application_status_t tool_status =
+        context_ok
+            ? cbm_daemon_application_client_tool(bootstrap.client, tool_name, args_json, &response,
+                                                 &response_length, MAIN_REQUEST_TIMEOUT_MS)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    if (tool_status == CBM_DAEMON_RUNTIME_APPLICATION_OK && response && response_length > 0) {
         result = malloc((size_t)response_length + 1U);
         if (result) {
             memcpy(result, response, response_length);
@@ -1349,7 +1353,18 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
     }
     free(response);
     if (!result) {
-        (void)fprintf(stderr, "error: daemon-backed CLI execution failed\n");
+        if (!context_ok) {
+            (void)fprintf(stderr,
+                          "error: the CLI session context could not be established with the "
+                          "daemon\n");
+        } else if (tool_status == CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+            (void)fprintf(stderr, "error: the daemon returned an empty result for '%s'\n",
+                          tool_name ? tool_name : "this request");
+        } else {
+            (void)fprintf(stderr, "error: %s (tool '%s')\n",
+                          cbm_daemon_runtime_application_status_str(tool_status),
+                          tool_name ? tool_name : "unknown");
+        }
     }
     (void)cbm_daemon_runtime_client_close(bootstrap.client, MAIN_CLOSE_TIMEOUT_MS);
     return result;

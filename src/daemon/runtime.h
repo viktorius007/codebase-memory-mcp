@@ -123,6 +123,12 @@ typedef enum {
     CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED = 6,
 } cbm_daemon_runtime_application_status_t;
 
+/* An agent reading one line of CLI output cannot see a stack trace or ask a
+ * follow-up question, so every terminal status must name itself rather than
+ * collapse into one generic failure. Static storage; never NULL. */
+const char *cbm_daemon_runtime_application_status_str(
+    cbm_daemon_runtime_application_status_t status);
+
 typedef uint64_t cbm_daemon_runtime_application_token_t;
 #define CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID UINT64_C(0)
 
