@@ -11767,6 +11767,59 @@ TEST(cli_build_args_json_repeated_array_issue680) {
     PASS();
 }
 
+/* An array-typed flag handed a JSON-array LITERAL must be rejected, not
+ * swallowed as one element (#997 applied to array flags). Silently accepting
+ * `--semantic-query '["retry","backoff"]'` made the vector search treat the
+ * whole bracketed blob as a single keyword: top cosine 0.02 (noise) where the
+ * same words as repeated flags score 0.95+ — a confident, wrong-looking-right
+ * answer. `--fields '["complexity"]'` likewise emitted a result column named
+ * literally `["complexity"]` full of empty cells. The error must name the flag,
+ * echo what was given, and state the repeated-flag form that works. */
+TEST(cli_build_args_json_array_flag_rejects_json_literal) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[\"retry\",\"backoff\"]"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NULL(json);
+    ASSERT_NOT_NULL(err);
+    ASSERT(strstr(err, "--semantic-query") != NULL);        /* names the flag */
+    ASSERT(strstr(err, "[\"retry\",\"backoff\"]") != NULL); /* echoes what was given */
+    ASSERT(strstr(err, "Repeat the flag") != NULL);         /* states the form that works */
+    free(err);
+
+    /* Same ruling for every array-typed property, not just semantic_query. */
+    err = NULL;
+    char *fargv[] = {"--fields", "[\"complexity\"]"};
+    json = cbm_cli_build_args_json("search_graph", 2, fargv, &err);
+    ASSERT_NULL(json);
+    ASSERT_NOT_NULL(err);
+    ASSERT(strstr(err, "--fields") != NULL);
+    free(err);
+
+    /* --key=value form is the same input path and must reject identically. */
+    err = NULL;
+    char *eargv[] = {"--aspects=[\"clusters\"]"};
+    json = cbm_cli_build_args_json("get_architecture", 1, eargv, &err);
+    ASSERT_NULL(json);
+    ASSERT_NOT_NULL(err);
+    ASSERT(strstr(err, "--aspects") != NULL);
+    free(err);
+    PASS();
+}
+
+/* The rejection is scoped to ARRAY-typed flags. A string-typed flag whose
+ * value legitimately starts with '[' — a character class in a regex — must
+ * still be accepted verbatim, or the guard breaks real searches. */
+TEST(cli_build_args_json_string_flag_keeps_bracket_value) {
+    char *err = NULL;
+    char *argv[] = {"--name-pattern", "[A-Z].*Handler"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(err);
+    ASSERT(strstr(json, "\"name_pattern\":\"[A-Z].*Handler\"") != NULL);
+    free(json);
+    PASS();
+}
+
 /* kebab-case flag names map to snake_case JSON keys. */
 TEST(cli_build_args_json_kebab_to_snake_issue680) {
     char *err = NULL;
@@ -12384,6 +12437,8 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_bare_boolean_issue680);
     RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
+    RUN_TEST(cli_build_args_json_array_flag_rejects_json_literal);
+    RUN_TEST(cli_build_args_json_string_flag_keeps_bracket_value);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);

@@ -3018,6 +3018,11 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
 
 enum { SG_MAX_EXTRA_FIELDS = 12 };
 
+/* Hint-composition buffers. The one-line note ceiling the output-regression
+ * gate enforces is ~220 chars; these leave room to name every dropped field
+ * without ever reaching it. */
+enum { CBM_HINT_FIELDS_BUF = 256, CBM_HINT_BUF = 512 };
+
 /* Internal-only node properties never emitted to agents: similarity /
  * semantic pipeline intermediates (minhash fingerprint, structural profile,
  * body-token bag). They dominate payload size and carry zero agent value. */
@@ -3483,7 +3488,24 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                     emit_search_results_tree(&sb, &tout, offset, fields, nfields, store,
                                              relationship, include_connected);
                 }
-                if (core_fields_requested) {
+                if (detail_ids && nfields > 0) {
+                    /* detail:"ids" is a one-column enumeration by contract, so
+                     * `fields` columns are correctly dropped — but dropping
+                     * them in silence is indistinguishable from returning them
+                     * empty. Say so, as the core-column case beside this does. */
+                    char dropped[CBM_HINT_FIELDS_BUF];
+                    size_t off = 0;
+                    for (int f = 0; f < nfields && off < sizeof(dropped); f++) {
+                        off += (size_t)snprintf(dropped + off, sizeof(dropped) - off, "%s%s",
+                                                f > 0 ? ", " : "", fields[f]);
+                    }
+                    char hint[CBM_HINT_BUF];
+                    snprintf(hint, sizeof(hint),
+                             "fields (%s) were dropped: detail=\"ids\" is a one-column "
+                             "qualified-name enumeration. Drop detail=\"ids\" to get them",
+                             dropped);
+                    cbm_tree_scalar_str(&sb, "hint", hint);
+                } else if (core_fields_requested) {
                     cbm_tree_scalar_str(
                         &sb, "hint",
                         "some requested fields (file/name/qn/label/lines) are already core "
