@@ -869,10 +869,9 @@ static void rust_resolve_and_mark_child(const char *decl_rel, const CBMModDecl *
     if (md->path_override && md->path_override[0]) {
         const char *slash = strrchr(decl_rel, '/');
         size_t dir_len = slash ? (size_t)(slash - decl_rel) : 0;
-        int n = dir_len
-                    ? snprintf(cand, sizeof(cand), "%.*s/%s", (int)dir_len, decl_rel,
-                               md->path_override)
-                    : snprintf(cand, sizeof(cand), "%s", md->path_override);
+        int n = dir_len ? snprintf(cand, sizeof(cand), "%.*s/%s", (int)dir_len, decl_rel,
+                                   md->path_override)
+                        : snprintf(cand, sizeof(cand), "%s", md->path_override);
         if (n > 0 && (size_t)n < sizeof(cand)) {
             rust_mark_candidate(cand, path_to_idx, marked, queue, qtail);
         }

@@ -1390,9 +1390,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
         for (int d = 0; d < result->defs.count; d++) {
-            defines_edges +=
-                register_and_link_def(ctx, &result->defs.items[d], rel, files[i].language,
-                                      &reg_entries);
+            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel,
+                                                   files[i].language, &reg_entries);
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
@@ -2451,12 +2450,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * sequential pass (pass_calls.c). Gated to Rust — other languages
          * unaffected. */
         {
-            bool has_receiver = strchr(call->callee_name, '.') != NULL ||
-                                strstr(call->callee_name, "::") != NULL;
-            if (cbm_rust_suppress_cross_pkg_generic(lang == CBM_LANG_RUST, has_receiver,
-                                                    call->callee_name, res.strategy,
-                                                    source_node->file_path,
-                                                    target_node->file_path)) {
+            bool has_receiver =
+                strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
+            if (cbm_rust_suppress_cross_pkg_generic(
+                    lang == CBM_LANG_RUST, has_receiver, call->callee_name, res.strategy,
+                    source_node->file_path, target_node->file_path)) {
                 continue;
             }
         }
