@@ -3760,6 +3760,26 @@ TEST(cypher_order_by_aggregate_call_still_sorts) {
     PASS();
 }
 
+/* NON-REGRESSION (green in both states): `RETURN *` projects var.name /
+ * .qualified_name / .label / .file_path, so those ARE resolvable columns and
+ * must keep sorting — the boundary is what the result table holds, not whether
+ * the key was written out in the RETURN list. */
+TEST(cypher_order_by_star_projection_still_sorts) {
+    cbm_store_t *s = setup_order_by_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN * ORDER BY f.file_path ASC", "test",
+                                0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "Gamma"); /* a.go — col 0 is f.name */
+    ASSERT_STR_EQ(r.rows[1][0], "Beta");  /* m.go */
+    ASSERT_STR_EQ(r.rows[2][0], "Alpha"); /* z.go */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* NON-REGRESSION (green in both states): sorting on an AS alias. */
 TEST(cypher_order_by_alias_still_sorts) {
     cbm_store_t *s = setup_order_by_store();
@@ -4091,6 +4111,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_order_by_returned_second_column_still_sorts);
     RUN_TEST(cypher_order_by_returned_json_metric_still_sorts);
     RUN_TEST(cypher_order_by_aggregate_call_still_sorts);
+    RUN_TEST(cypher_order_by_star_projection_still_sorts);
     RUN_TEST(cypher_order_by_alias_still_sorts);
     /* Keyword-shaped property names after '.' */
     RUN_TEST(cypher_node_property_named_count_parses);
