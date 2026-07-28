@@ -3590,6 +3590,325 @@ TEST(cypher_with_agg_group_by_bare_property) {
     PASS();
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ *  ORDER BY RESOLVABILITY  (silent-wrong-answer class)
+ *
+ *  The engine sorts the MATERIALIZED result table: result_builder_t rows hold
+ *  already-projected strings and the bindings that produced them are gone by
+ *  then, so the only sort keys it can evaluate are the result's own column
+ *  names and aliases. A key outside that set was looked up, missed, and then
+ *  silently skipped — the query returned UNSORTED rows with rc==0 and no
+ *  error, indistinguishable from a correct answer. Anything the engine cannot
+ *  evaluate must now fail loudly instead.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Fixture whose name order and file_path order DISAGREE (and whose complexity
+ * order disagrees with both), so a test asserting a file_path/complexity sort
+ * cannot pass by accidentally receiving name order or insertion order. */
+static cbm_store_t *setup_order_by_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "Alpha",
+                     .qualified_name = "test.Alpha",
+                     .file_path = "z.go",
+                     .properties_json = "{\"complexity\":1}"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Function",
+                     .name = "Beta",
+                     .qualified_name = "test.Beta",
+                     .file_path = "m.go",
+                     .properties_json = "{\"complexity\":3}"};
+    cbm_node_t n3 = {.project = "test",
+                     .label = "Function",
+                     .name = "Gamma",
+                     .qualified_name = "test.Gamma",
+                     .file_path = "a.go",
+                     .properties_json = "{\"complexity\":2}"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    cbm_store_upsert_node(s, &n3);
+    return s;
+}
+
+/* An ORDER BY key that names no column, alias, or property must be rejected.
+ * RED on unfixed code: rc == 0 and the rows come back in insertion order with
+ * r.error NULL — the sort was silently dropped. */
+TEST(cypher_order_by_unknown_column_errors) {
+    cbm_store_t *s = setup_order_by_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) RETURN f.name ORDER BY f.nonexistent_col DESC", "test", 0, &r);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "f.nonexistent_col") != NULL); /* names the real key */
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The boundary case: openCypher permits sorting on an expression absent from
+ * RETURN, but this engine sorts the projected table and cannot evaluate one.
+ * It must say so rather than return unsorted rows.
+ * RED on unfixed code: rc == 0, rows in insertion order, no error. */
+TEST(cypher_order_by_unreturned_column_errors) {
+    cbm_store_t *s = setup_order_by_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name ORDER BY f.file_path", "test",
+                                0, &r);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "f.file_path") != NULL);
+    ASSERT_TRUE(strstr(r.error, "RETURN") != NULL); /* actionable: add it to RETURN */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Same defect on the WITH path, which sorts bindings by projected alias.
+ * RED on unfixed code: rc == 0 and the unresolvable key sorts nothing. */
+TEST(cypher_with_order_by_unknown_alias_errors) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function)-[:CALLS]->(g:Function) "
+                                "WITH f.name AS caller, COUNT(g) AS cnt "
+                                "ORDER BY bogus DESC "
+                                "RETURN caller, cnt",
+                                "test", 0, &r);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "bogus") != NULL);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* `ORDER BY` with no sort key at all parsed to an empty key that then matched
+ * no column and was silently dropped.
+ * RED on unfixed code: rc == 0 — a malformed query accepted. */
+TEST(cypher_order_by_missing_key_rejected) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name ORDER BY", &q, &err);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NOT_NULL(err);
+    cbm_query_free(q);
+    free(err);
+    PASS();
+}
+
+/* NON-REGRESSION (green in both states): sorting on a returned column that is
+ * NOT the first one must still order by that column. The fixture's file_path
+ * order differs from its name order, so name order cannot fake a pass. */
+TEST(cypher_order_by_returned_second_column_still_sorts) {
+    cbm_store_t *s = setup_order_by_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) RETURN f.name, f.file_path ORDER BY f.file_path ASC", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "Gamma"); /* a.go */
+    ASSERT_STR_EQ(r.rows[1][0], "Beta");  /* m.go */
+    ASSERT_STR_EQ(r.rows[2][0], "Alpha"); /* z.go */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* NON-REGRESSION (green in both states): the live-repro shape — a numeric
+ * JSON-derived property, returned and sorted DESC. */
+TEST(cypher_order_by_returned_json_metric_still_sorts) {
+    cbm_store_t *s = setup_order_by_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) RETURN f.name, f.complexity ORDER BY f.complexity DESC", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "Beta");  /* 3 */
+    ASSERT_STR_EQ(r.rows[1][0], "Gamma"); /* 2 */
+    ASSERT_STR_EQ(r.rows[2][0], "Alpha"); /* 1 */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* NON-REGRESSION (green in both states): the README/skill-documented grouped-
+ * aggregate recipe `... RETURN k, count(x) ORDER BY count(x) DESC`. The sort key
+ * is an aggregate CALL, not a bare name, so it exercises the aggregate branch of
+ * parse_order_by_expr — the branch the `count`-as-a-name fix had to narrow. */
+TEST(cypher_order_by_aggregate_call_still_sorts) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a)-[r]->(b) RETURN type(r), count(r) ORDER BY count(r) DESC", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "CALLS"); /* 3 */
+    ASSERT_STR_EQ(r.rows[0][1], "3");
+    ASSERT_STR_EQ(r.rows[1][0], "DEFINES"); /* 1 */
+    ASSERT_STR_EQ(r.rows[1][1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* NON-REGRESSION (green in both states): `RETURN *` projects var.name /
+ * .qualified_name / .label / .file_path, so those ARE resolvable columns and
+ * must keep sorting — the boundary is what the result table holds, not whether
+ * the key was written out in the RETURN list. */
+TEST(cypher_order_by_star_projection_still_sorts) {
+    cbm_store_t *s = setup_order_by_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN * ORDER BY f.file_path ASC", "test",
+                                0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "Gamma"); /* a.go — col 0 is f.name */
+    ASSERT_STR_EQ(r.rows[1][0], "Beta");  /* m.go */
+    ASSERT_STR_EQ(r.rows[2][0], "Alpha"); /* z.go */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* NON-REGRESSION (green in both states): sorting on an AS alias. */
+TEST(cypher_order_by_alias_still_sorts) {
+    cbm_store_t *s = setup_order_by_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name AS n ORDER BY n DESC", "test",
+                                0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "Gamma");
+    ASSERT_STR_EQ(r.rows[1][0], "Beta");
+    ASSERT_STR_EQ(r.rows[2][0], "Alpha");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  KEYWORD-SHAPED PROPERTY NAMES
+ *
+ *  The lexer maps every keyword unconditionally, so `count` after a dot came
+ *  back as TOK_COUNT where a property name was expected. The property was
+ *  dropped, the token left unconsumed, and the query died with "unexpected
+ *  trailing tokens" — an error naming the wrong problem. In openCypher a
+ *  keyword IS a legal property key after `.`; nothing else can appear there.
+ * ══════════════════════════════════════════════════════════════════ */
+
+static cbm_store_t *setup_keyword_prop_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "File",
+                     .name = "a.go",
+                     .qualified_name = "test.a.go",
+                     .file_path = "a.go",
+                     .properties_json = "{\"count\":7,\"end\":\"tail\"}"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "File",
+                     .name = "b.go",
+                     .qualified_name = "test.b.go",
+                     .file_path = "b.go",
+                     .properties_json = "{\"count\":2,\"end\":\"head\"}"};
+    int64_t id1 = cbm_store_upsert_node(s, &n1);
+    int64_t id2 = cbm_store_upsert_node(s, &n2);
+
+    cbm_edge_t e1 = {.project = "test",
+                     .source_id = id1,
+                     .target_id = id2,
+                     .type = "FILE_CHANGES_WITH",
+                     .properties_json = "{\"count\":5}"};
+    cbm_store_insert_edge(s, &e1);
+    return s;
+}
+
+/* RED on unfixed code: rc == -1 with "unexpected trailing tokens at pos 24". */
+TEST(cypher_node_property_named_count_parses) {
+    cbm_store_t *s = setup_keyword_prop_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (a:File) RETURN a.name, a.count ORDER BY a.name ASC",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][1], "7");
+    ASSERT_STR_EQ(r.rows[1][1], "2");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* RED on unfixed code: rc == -1, "unexpected trailing tokens". */
+TEST(cypher_edge_property_named_count_parses) {
+    cbm_store_t *s = setup_keyword_prop_store();
+    cbm_cypher_result_t r = {0};
+    int rc =
+        cbm_cypher_execute(s, "MATCH (a)-[r:FILE_CHANGES_WITH]->(b) RETURN r.count", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "5");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The same lexer collision hits every dot-property position, not just RETURN:
+ * WHERE, and other keyword-shaped names such as `end`.
+ * RED on unfixed code: rc == -1 for both queries. */
+TEST(cypher_where_property_named_keyword_parses) {
+    cbm_store_t *s = setup_keyword_prop_store();
+
+    cbm_cypher_result_t r = {0};
+    int rc =
+        cbm_cypher_execute(s, "MATCH (a:File) WHERE a.count = \"7\" RETURN a.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "a.go");
+    cbm_cypher_result_free(&r);
+
+    cbm_cypher_result_t r2 = {0};
+    int rc2 =
+        cbm_cypher_execute(s, "MATCH (a:File) WHERE a.end = \"head\" RETURN a.end", "test", 0, &r2);
+    ASSERT_EQ(rc2, 0);
+    ASSERT_NULL(r2.error);
+    ASSERT_EQ(r2.row_count, 1);
+    ASSERT_STR_EQ(r2.rows[0][0], "head");
+    cbm_cypher_result_free(&r2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A quoted string in property position is NOT a property name (openCypher uses
+ * backticks, not quotes, to escape names). Accepting keywords after `.` must
+ * not widen into accepting literals there.
+ * Green in both states: pins the accept-set so the fix cannot over-open it. */
+TEST(cypher_quoted_string_not_a_property_name) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (a:File) RETURN a.\"count\"", &q, &err);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NOT_NULL(err);
+    cbm_query_free(q);
+    free(err);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
@@ -3784,4 +4103,19 @@ SUITE(cypher) {
     RUN_TEST(cypher_agg_group_key_within_bounds_ok);
     RUN_TEST(cypher_agg_group_by_bare_property);
     RUN_TEST(cypher_with_agg_group_by_bare_property);
+    /* ORDER BY resolvability: unresolvable sort keys must not be dropped */
+    RUN_TEST(cypher_order_by_unknown_column_errors);
+    RUN_TEST(cypher_order_by_unreturned_column_errors);
+    RUN_TEST(cypher_with_order_by_unknown_alias_errors);
+    RUN_TEST(cypher_order_by_missing_key_rejected);
+    RUN_TEST(cypher_order_by_returned_second_column_still_sorts);
+    RUN_TEST(cypher_order_by_returned_json_metric_still_sorts);
+    RUN_TEST(cypher_order_by_aggregate_call_still_sorts);
+    RUN_TEST(cypher_order_by_star_projection_still_sorts);
+    RUN_TEST(cypher_order_by_alias_still_sorts);
+    /* Keyword-shaped property names after '.' */
+    RUN_TEST(cypher_node_property_named_count_parses);
+    RUN_TEST(cypher_edge_property_named_count_parses);
+    RUN_TEST(cypher_where_property_named_keyword_parses);
+    RUN_TEST(cypher_quoted_string_not_a_property_name);
 }
