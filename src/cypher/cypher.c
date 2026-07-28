@@ -3681,6 +3681,43 @@ static bool is_aggregate_func(const char *func) {
             strcmp(func, "MIN") == 0 || strcmp(func, "MAX") == 0 || strcmp(func, "COLLECT") == 0);
 }
 
+/* True when a RETURN/WITH item is a grouping key rather than an aggregate.
+ * `item->func` carries scalar and entity-introspection functions (type, labels,
+ * toLower, coalesce, ...) as well as aggregates, so its mere presence must never
+ * stand in for "this is an aggregate": doing so drops the item from the group
+ * key and then formats it as an aggregate, collapsing every row into one group
+ * and emitting the row count in the grouping column. */
+static bool is_group_key_item(const cbm_return_item_t *item) {
+    return !is_aggregate_func(item->func);
+}
+
+/* Build the group key for one binding, and project each grouping item's value
+ * into caller-owned `valbufs` (vals[ci] points into it, so the values survive
+ * until the group entry strdup's them). Aggregate columns get the placeholder
+ * "0" and contribute nothing to the key. Shared by the RETURN and WITH
+ * aggregation paths — both group by exactly the non-aggregate items. */
+static void agg_build_group_key(cbm_return_clause_t *rc, binding_t *b, char *key, size_t key_sz,
+                                const char **vals, char valbufs[][CBM_SZ_512]) {
+    int klen = 0;
+    for (int ci = 0; ci < rc->count; ci++) {
+        if (!is_group_key_item(&rc->items[ci])) {
+            vals[ci] = "0";
+            continue;
+        }
+        /* project_item may return its own scratch (a stable static, or a
+         * per-column buffer it copied into); persist the value in valbufs. */
+        const char *v = project_item(b, &rc->items[ci], valbufs[ci], CBM_SZ_512);
+        if (v != valbufs[ci]) {
+            snprintf(valbufs[ci], CBM_SZ_512, "%s", v ? v : "");
+        }
+        vals[ci] = valbufs[ci];
+        klen += snprintf(key + klen, key_sz - (size_t)klen, "%s|", vals[ci]);
+        if (klen >= (int)key_sz) {
+            klen = (int)key_sz - SKIP_ONE;
+        }
+    }
+}
+
 /* Append `val` to a string list only if not already present — i.e. maintain a
  * set of distinct values. Used by COUNT(DISTINCT x) (#239). */
 static void distinct_list_add(char ***list, int *count, const char *val) {
@@ -3773,25 +3810,11 @@ typedef struct {
     int64_t *group_node_ids; /* per-item node id when the group var is a node (0 = not) */
 } with_agg_t;
 
-/* Build a group key from non-aggregate WITH items */
-static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
-    int kl = 0;
-    for (int ci = 0; ci < wc->count; ci++) {
-        if (wc->items[ci].func) {
-            continue;
-        }
-        const char *v = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
-        kl += snprintf(key + kl, key_sz - (size_t)kl, "%s|", v);
-        if (kl >= (int)key_sz) {
-            kl = (int)key_sz - SKIP_ONE;
-        }
-    }
-    return kl;
-}
-
-/* Find or create an aggregation group. Returns index. */
+/* Find or create an aggregation group. Returns index. `vals` holds the already-
+ * projected grouping values for this binding (see agg_build_group_key). */
 static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap,
-                                   cbm_return_clause_t *wc, binding_t *b, const char *key) {
+                                   cbm_return_clause_t *wc, binding_t *b, const char *key,
+                                   const char **vals) {
     for (int a = 0; a < *agg_cnt; a++) {
         if (strcmp((*aggs)[a].group_key, key) == 0) {
             return a;
@@ -3816,16 +3839,12 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         (*aggs)[found].maxs[ci] = -CYP_DBL_MAX;
     }
     for (int ci = 0; ci < wc->count; ci++) {
-        if (wc->items[ci].func) {
-            (*aggs)[found].group_vals[ci] = heap_strdup("0");
-            continue;
-        }
-        const char *v = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
-        (*aggs)[found].group_vals[ci] = heap_strdup(v);
+        (*aggs)[found].group_vals[ci] = heap_strdup(vals[ci]);
         /* If this group item is a bare node variable, remember its id so the
          * carried virtual var can re-fetch any property (group_vals holds only
-         * the name). */
-        if (!wc->items[ci].property && wc->items[ci].variable) {
+         * the name). A function's result is a computed scalar, not the node, so
+         * it carries no id. */
+        if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
             cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
             if (gn) {
                 (*aggs)[found].group_node_ids[ci] = gn->id;
@@ -3838,7 +3857,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
 /* Accumulate aggregation values for a binding */
 static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, binding_t *b) {
     for (int ci = 0; ci < wc->count; ci++) {
-        if (!wc->items[ci].func) {
+        if (is_group_key_item(&wc->items[ci])) {
             continue;
         }
         agg->counts[ci]++;
@@ -3915,8 +3934,11 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
 
     for (int bi = 0; bi < bind_count; bi++) {
         char key[CBM_SZ_1K] = "";
-        with_agg_build_key(wc, &bindings[bi], key, sizeof(key));
-        int found = with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, wc, &bindings[bi], key);
+        const char *vals[CBM_SZ_32];
+        char valbufs[CBM_SZ_32][CBM_SZ_512];
+        agg_build_group_key(wc, &bindings[bi], key, sizeof(key), vals, valbufs);
+        int found =
+            with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, wc, &bindings[bi], key, vals);
         with_agg_accumulate(&aggs[found], wc, &bindings[bi]);
     }
 
@@ -3933,7 +3955,7 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-            if (wc->items[ci].func) {
+            if (!is_group_key_item(&wc->items[ci])) {
                 char vbuf[CBM_SZ_64];
                 if (wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0) {
                     snprintf(vbuf, sizeof(vbuf), "%d", aggs[a].distinct_n[ci]); /* #239 */
@@ -4232,7 +4254,7 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
 /* Accumulate a binding into RETURN aggregation */
 static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
-        if (!ret->items[ci].func) {
+        if (is_group_key_item(&ret->items[ci])) {
             continue;
         }
         entry->counts[ci]++;
@@ -4278,37 +4300,12 @@ static void ret_agg_free(ret_agg_entry_t *aggs, int agg_count, int item_count) {
     free(aggs);
 }
 
-/* Execute RETURN with aggregation */
-/* Build group key and projected values for one binding */
-static void ret_agg_build_key(cbm_return_clause_t *ret, binding_t *b, char *key, size_t key_sz,
-                              const char **vals, char valbufs[][CBM_SZ_512]) {
-    int klen = 0;
-    for (int ci = 0; ci < ret->count; ci++) {
-        if (ret->items[ci].func) {
-            vals[ci] = "0";
-            continue;
-        }
-        /* project_item may return its own scratch (stable static or a per-column
-         * buffer it copied into); persist the value in the caller-owned valbufs
-         * so vals[] survives until ret_agg_init_group strdup's it. */
-        const char *v = project_item(b, &ret->items[ci], valbufs[ci], CBM_SZ_512);
-        if (v != valbufs[ci]) {
-            snprintf(valbufs[ci], CBM_SZ_512, "%s", v ? v : "");
-        }
-        vals[ci] = valbufs[ci];
-        klen += snprintf(key + klen, key_sz - (size_t)klen, "%s|", vals[ci]);
-        if (klen >= (int)key_sz) {
-            klen = (int)key_sz - SKIP_ONE;
-        }
-    }
-}
-
 /* Emit one aggregated row into the result builder */
 static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, result_builder_t *rb) {
     const char *row[CBM_SZ_32];
     char bufs[CBM_SZ_32][CBM_SZ_64];
     for (int ci = 0; ci < ret->count; ci++) {
-        if (!ret->items[ci].func) {
+        if (is_group_key_item(&ret->items[ci])) {
             row[ci] = agg->group_vals[ci];
             continue;
         }
@@ -4341,7 +4338,7 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
         char key[CBM_SZ_1K] = "";
         const char *vals[CBM_SZ_32];
         char valbufs[CBM_SZ_32][CBM_SZ_512];
-        ret_agg_build_key(ret, &bindings[bi], key, sizeof(key), vals, valbufs);
+        agg_build_group_key(ret, &bindings[bi], key, sizeof(key), vals, valbufs);
 
         int found = CYP_FOUND_NONE;
         for (int a = 0; a < agg_count; a++) {

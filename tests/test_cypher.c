@@ -3351,6 +3351,185 @@ TEST(cypher_exec_deadline_allows_normal_query_issue601) {
     PASS();
 }
 
+/* ── Grouped aggregation with a scalar function as the group key ─────
+ * The group key must be the *projected* value of every non-aggregate item,
+ * including scalar/introspection functions (type(), labels(), toLower(), ...).
+ * Previously any item carrying a `func` — aggregate or not — was excluded from
+ * the key AND formatted as an aggregate, so every row collapsed into one group
+ * and the row count was emitted in the group column too. Ground truth comes
+ * from the fixture graph, not from the engine. */
+
+/* Find the row whose first column equals `key`; NULL if absent. */
+static const char **find_row_by_col0(const cbm_cypher_result_t *r, const char *key) {
+    for (int i = 0; i < r->row_count; i++) {
+        if (strcmp(r->rows[i][0], key) == 0) {
+            return r->rows[i];
+        }
+    }
+    return NULL;
+}
+
+/* Ground truth: fixture has 3 CALLS edges and 1 DEFINES edge. */
+TEST(cypher_agg_group_by_type_func) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (a)-[r]->(b) RETURN type(r), count(r)", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    const char **calls = find_row_by_col0(&r, "CALLS");
+    ASSERT_NOT_NULL(calls);
+    ASSERT_STR_EQ(calls[1], "3");
+    const char **defines = find_row_by_col0(&r, "DEFINES");
+    ASSERT_NOT_NULL(defines);
+    ASSERT_STR_EQ(defines[1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Ground truth: fixture has 4 Function nodes and 1 Module node. */
+TEST(cypher_agg_group_by_labels_func) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN labels(n), count(n)", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    const char **fn = find_row_by_col0(&r, "[\"Function\"]");
+    ASSERT_NOT_NULL(fn);
+    ASSERT_STR_EQ(fn[1], "4");
+    const char **mod = find_row_by_col0(&r, "[\"Module\"]");
+    ASSERT_NOT_NULL(mod);
+    ASSERT_STR_EQ(mod[1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Same defect class for a value-transforming scalar function (#toLower). */
+TEST(cypher_agg_group_by_tolower_func) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN toLower(n.label) AS l, count(n) AS c", "test",
+                                0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    const char **fn = find_row_by_col0(&r, "function");
+    ASSERT_NOT_NULL(fn);
+    ASSERT_STR_EQ(fn[1], "4");
+    const char **mod = find_row_by_col0(&r, "module");
+    ASSERT_NOT_NULL(mod);
+    ASSERT_STR_EQ(mod[1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The WITH-clause aggregation path has the same grouping contract. */
+TEST(cypher_with_agg_group_by_type_func) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a)-[r]->(b) WITH type(r) AS t, count(r) AS c RETURN t, c", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    const char **calls = find_row_by_col0(&r, "CALLS");
+    ASSERT_NOT_NULL(calls);
+    ASSERT_STR_EQ(calls[1], "3");
+    const char **defines = find_row_by_col0(&r, "DEFINES");
+    ASSERT_NOT_NULL(defines);
+    ASSERT_STR_EQ(defines[1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Same defect class for a multi-argument scalar function as the group key. */
+TEST(cypher_agg_group_by_multiarg_func) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN left(n.label, 1) AS i, count(n) AS c", "test",
+                                0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    const char **fn = find_row_by_col0(&r, "F");
+    ASSERT_NOT_NULL(fn);
+    ASSERT_STR_EQ(fn[1], "4");
+    const char **mod = find_row_by_col0(&r, "M");
+    ASSERT_NOT_NULL(mod);
+    ASSERT_STR_EQ(mod[1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* WITH grouping keyed on a CASE expression: the WITH path used to read the
+ * group value with binding_get_virtual, which cannot evaluate a CASE, so the
+ * key was the literal variable name "CASE" for every row — one group. */
+TEST(cypher_with_agg_group_by_case) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (n) WITH CASE WHEN n.label = \"Function\" THEN \"fn\" "
+                                "ELSE \"other\" END AS k, count(n) AS c RETURN k, c",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    const char **fn = find_row_by_col0(&r, "fn");
+    ASSERT_NOT_NULL(fn);
+    ASSERT_STR_EQ(fn[1], "4");
+    const char **other = find_row_by_col0(&r, "other");
+    ASSERT_NOT_NULL(other);
+    ASSERT_STR_EQ(other[1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Non-regression: grouping by a bare property must keep working unchanged. */
+TEST(cypher_agg_group_by_bare_property) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN n.label, count(n)", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    const char **fn = find_row_by_col0(&r, "Function");
+    ASSERT_NOT_NULL(fn);
+    ASSERT_STR_EQ(fn[1], "4");
+    const char **mod = find_row_by_col0(&r, "Module");
+    ASSERT_NOT_NULL(mod);
+    ASSERT_STR_EQ(mod[1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Non-regression: WITH grouping by a bare property. */
+TEST(cypher_with_agg_group_by_bare_property) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) WITH n.label AS l, count(n) AS c RETURN l, c", "test",
+                                0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    const char **fn = find_row_by_col0(&r, "Function");
+    ASSERT_NOT_NULL(fn);
+    ASSERT_STR_EQ(fn[1], "4");
+    const char **mod = find_row_by_col0(&r, "Module");
+    ASSERT_NOT_NULL(mod);
+    ASSERT_STR_EQ(mod[1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
@@ -3534,4 +3713,13 @@ SUITE(cypher) {
     /* Composite property projection (arrays/objects, escaped quotes) */
     RUN_TEST(cypher_exec_prop_array_with_internal_commas);
     RUN_TEST(cypher_exec_prop_string_with_escaped_quote);
+    /* Grouped aggregation keyed on a scalar function */
+    RUN_TEST(cypher_agg_group_by_type_func);
+    RUN_TEST(cypher_agg_group_by_labels_func);
+    RUN_TEST(cypher_agg_group_by_tolower_func);
+    RUN_TEST(cypher_agg_group_by_multiarg_func);
+    RUN_TEST(cypher_with_agg_group_by_type_func);
+    RUN_TEST(cypher_with_agg_group_by_case);
+    RUN_TEST(cypher_agg_group_by_bare_property);
+    RUN_TEST(cypher_with_agg_group_by_bare_property);
 }
