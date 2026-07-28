@@ -2835,8 +2835,15 @@ static _Thread_local uint64_t g_cypher_deadline_ms = 0; /* absolute; 0 = disarme
 static _Thread_local bool g_cypher_timed_out = false;
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
 
+/* Set when a grouping value or the assembled group key did not fit its fixed
+ * buffer. Two rows whose keys differ only past the cut then collide into one
+ * group, so the emitted count is wrong with nothing to show for it — the one
+ * failure mode a query engine must never have. Surfaced as a hard error. */
+static _Thread_local bool g_cypher_group_key_truncated = false;
+
 static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
+    g_cypher_group_key_truncated = false;
     int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
                                                         : CYPHER_DEADLINE_BUDGET_MS;
     g_cypher_deadline_ms = cbm_now_ms() + (uint64_t)budget;
@@ -3708,10 +3715,20 @@ static void agg_build_group_key(cbm_return_clause_t *rc, binding_t *b, char *key
          * per-column buffer it copied into); persist the value in valbufs. */
         const char *v = project_item(b, &rc->items[ci], valbufs[ci], CBM_SZ_512);
         if (v != valbufs[ci]) {
-            snprintf(valbufs[ci], CBM_SZ_512, "%s", v ? v : "");
+            if (snprintf(valbufs[ci], CBM_SZ_512, "%s", v ? v : "") >= CBM_SZ_512) {
+                g_cypher_group_key_truncated = true;
+            }
+        } else if (strlen(valbufs[ci]) == CBM_SZ_512 - SKIP_ONE) {
+            /* project_item filled the buffer exactly to its limit — indis-
+             * tinguishable from a value it had to cut, so treat it as cut. */
+            g_cypher_group_key_truncated = true;
         }
         vals[ci] = valbufs[ci];
-        klen += snprintf(key + klen, key_sz - (size_t)klen, "%s|", vals[ci]);
+        int need = snprintf(key + klen, key_sz - (size_t)klen, "%s|", vals[ci]);
+        if (need < 0 || (size_t)need >= key_sz - (size_t)klen) {
+            g_cypher_group_key_truncated = true;
+        }
+        klen += need;
         if (klen >= (int)key_sz) {
             klen = (int)key_sz - SKIP_ONE;
         }
@@ -4826,6 +4843,19 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
             heap_strdup("query exceeded the execution time limit — narrow the pattern with a WHERE "
                         "filter, use a directed MATCH instead of an unbounded OPTIONAL MATCH, or "
                         "add LIMIT");
+        return CBM_NOT_FOUND;
+    }
+
+    /* A truncated grouping value merges rows that differ only past the cut,
+     * producing a wrong count that looks exactly like a correct one. Fail loudly
+     * rather than return it. */
+    if (g_cypher_group_key_truncated) {
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error = heap_strdup(
+            "unsupported: a grouping value exceeded the group-key buffer — aggregating on it "
+            "would silently merge distinct groups; return a shorter key (e.g. left(x, 200)) "
+            "or group on a different property");
         return CBM_NOT_FOUND;
     }
 

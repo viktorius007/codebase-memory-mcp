@@ -3491,6 +3491,66 @@ TEST(cypher_with_agg_group_by_case) {
     PASS();
 }
 
+/* A grouping value too long for the group-key buffer must not silently merge
+ * two distinct groups into one. Two nodes whose qualified_name differs only
+ * past the buffer cut are distinct groups; the engine cannot represent that, so
+ * the documented contract requires a loud `unsupported ...` error, never a
+ * plausible-looking single group carrying the row count. */
+TEST(cypher_agg_group_key_truncation_errors) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    /* Longer than the CBM_SZ_512 per-value projection buffer; the two names
+     * share every byte the engine can keep and differ only in the tail. */
+    char qn_a[900];
+    char qn_b[900];
+    memset(qn_a, 'x', sizeof(qn_a));
+    qn_a[sizeof(qn_a) - 1] = '\0';
+    memcpy(qn_b, qn_a, sizeof(qn_b));
+    qn_a[880] = 'A';
+    qn_b[880] = 'B';
+    cbm_node_t n1 = {.project = "test", .label = "Function", .name = "f1", .qualified_name = qn_a};
+    cbm_node_t n2 = {.project = "test", .label = "Function", .name = "f2", .qualified_name = qn_b};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN n.qualified_name, count(n)", "test", 0, &r);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "unsupported"));
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Companion: a grouping value that fits must NOT trip the truncation guard —
+ * otherwise the guard would reject ordinary queries and the test above could
+ * pass for the wrong reason. */
+TEST(cypher_agg_group_key_within_bounds_ok) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    char qn_a[400];
+    char qn_b[400];
+    memset(qn_a, 'x', sizeof(qn_a));
+    qn_a[sizeof(qn_a) - 1] = '\0';
+    memcpy(qn_b, qn_a, sizeof(qn_b));
+    qn_a[380] = 'A';
+    qn_b[380] = 'B';
+    cbm_node_t n1 = {.project = "test", .label = "Function", .name = "f1", .qualified_name = qn_a};
+    cbm_node_t n2 = {.project = "test", .label = "Function", .name = "f2", .qualified_name = qn_b};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN n.qualified_name, count(n)", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2); /* two distinct long-but-representable groups */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* Non-regression: grouping by a bare property must keep working unchanged. */
 TEST(cypher_agg_group_by_bare_property) {
     cbm_store_t *s = setup_cypher_store();
@@ -3720,6 +3780,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_agg_group_by_multiarg_func);
     RUN_TEST(cypher_with_agg_group_by_type_func);
     RUN_TEST(cypher_with_agg_group_by_case);
+    RUN_TEST(cypher_agg_group_key_truncation_errors);
+    RUN_TEST(cypher_agg_group_key_within_bounds_ok);
     RUN_TEST(cypher_agg_group_by_bare_property);
     RUN_TEST(cypher_with_agg_group_by_bare_property);
 }
