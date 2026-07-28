@@ -1819,6 +1819,74 @@ TEST(tool_search_graph_includes_node_properties) {
     PASS();
 }
 
+/* detail:"ids" DROPPING the `fields` columns is by design — the schema calls
+ * ids a "bare qualified-name enumeration (one column)", so a second column
+ * would contradict the contract the agent read. What is NOT by design is doing
+ * it in SILENCE: the caller asked for complexity, got a qn list, and has no
+ * way to tell the column was refused from the column being empty. The repo
+ * already ruled on exactly this shape one line away — requesting a CORE column
+ * via `fields` drops it and emits a hint rather than empty cells (c5bffb7f:
+ * "requesting core columns via fields hints instead of emitting empty cells").
+ * Same silent-drop, same remedy. */
+TEST(tool_search_graph_detail_ids_hints_dropped_fields) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* detail:"ids" + fields: one column stays (the contract), and the drop is
+     * announced (the fix). */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\".*\",\"detail\":\"ids\","
+             "\"fields\":[\"signature\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "(cols: qn)"));     /* one column, per the schema */
+    ASSERT_NULL(strstr(inner, "func HandleRequest")); /* no signature values */
+    ASSERT_NOT_NULL(strstr(inner, "hint"));           /* the drop is not silent */
+    ASSERT_NOT_NULL(strstr(inner, "signature"));      /* names what was dropped */
+    ASSERT_NOT_NULL(strstr(inner, "detail"));         /* names the cause */
+    free(inner);
+    free(resp);
+
+    /* Second config value: detail:"ids" with NO fields must stay hint-free, or
+     * the hint is unconditional noise rather than a report of a real drop. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\".*\",\"detail\":\"ids\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "(cols: qn)"));
+    ASSERT_NULL(strstr(inner, "hint"));
+    free(inner);
+    free(resp);
+
+    /* Third config value: fields WITHOUT detail:"ids" still delivers the real
+     * column and stays hint-free — the guard must not fire on the happy path. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"fields\":[\"signature\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
+    ASSERT_NULL(strstr(inner, "hint"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 TEST(tool_output_byte_budgets) {
     /* GUARD: absolute byte ceilings on default tool outputs. Re-bloat (e.g.
      * a property blob sneaking back into row emission — the fp field alone
@@ -9648,6 +9716,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_search_graph_includes_node_properties);
+    RUN_TEST(tool_search_graph_detail_ids_hints_dropped_fields);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_lean_defaults_schema_and_status);
     RUN_TEST(tool_output_regression_gate);

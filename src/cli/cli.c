@@ -13684,6 +13684,30 @@ static const char *cli_schema_type(yyjson_val *props, const char *key) {
     return (t && yyjson_is_str(t)) ? yyjson_get_str(t) : NULL;
 }
 
+/* True when `value` has the shape of a JSON-array literal — `[` ... `]` after
+ * surrounding whitespace. Only ever consulted for array-typed flags, whose
+ * legitimate elements (keywords, property names, enum values, paths, project
+ * names) are never bracket-wrapped; string-typed flags such as --name-pattern
+ * keep accepting regex character classes untouched. */
+static bool cli_looks_like_json_array(const char *value) {
+    if (!value) {
+        return false;
+    }
+    const char *first = value;
+    while (*first == ' ' || *first == '\t' || *first == '\n' || *first == '\r') {
+        first++;
+    }
+    if (*first != '[') {
+        return false;
+    }
+    const char *last = first + strlen(first);
+    while (last > first &&
+           (last[-1] == ' ' || last[-1] == '\t' || last[-1] == '\n' || last[-1] == '\r')) {
+        last--;
+    }
+    return last > first + CLI_SKIP_ONE && last[-1] == ']';
+}
+
 /* Append a typed value to the output object under `key`. For array-typed
  * properties, repeated flags accumulate into a single JSON array. */
 static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *key,
@@ -13825,6 +13849,29 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
         if (type && strcmp(type, "array") == 0 && !have_value) {
             if (err_out) {
                 *err_out = cli_heap_msgf("flag --%s requires a value", key);
+            }
+            ok = false;
+            break;
+        }
+
+        /* An array flag handed a JSON-array LITERAL is the #997 failure in
+         * array clothing: `--semantic-query '["retry","backoff"]'` used to
+         * become ONE keyword containing brackets and quotes, and the vector
+         * search returned noise (top cosine 0.02 vs 0.95+ for the same words
+         * repeated properly) — silently-wrong output the caller reads as a
+         * real result. Reject it and name the form that works. */
+        if (type && strcmp(type, "array") == 0 && cli_looks_like_json_array(value)) {
+            if (err_out) {
+                char kebab_key[CLI_BUF_256];
+                snprintf(kebab_key, sizeof(kebab_key), "%s", key);
+                cli_snake_to_kebab(kebab_key);
+                char buf[CLI_BUF_512];
+                snprintf(buf, sizeof(buf),
+                         "flag --%s takes one value per occurrence, not a JSON array — given "
+                         "'%.120s'. Repeat the flag instead (--%s a --%s b), or pass the whole "
+                         "call as JSON via --args-file or stdin",
+                         kebab_key, value, kebab_key, kebab_key);
+                *err_out = cbm_strdup(buf);
             }
             ok = false;
             break;
