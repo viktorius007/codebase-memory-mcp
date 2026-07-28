@@ -538,7 +538,8 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * list carries no package-disambiguating signal on its own. MUST stay sorted
  * ASCII-ascending for bsearch. */
 static const char *const RUST_GENERIC_METHODS[] = {
-    "clone", "extend", "from_str", "into_iter", "iter", "iter_mut", "next", "parse", "path", "value",
+    "clone",    "extend", "from_str", "into_iter", "iter",
+    "iter_mut", "next",   "parse",    "path",      "value",
 };
 
 static int rust_generic_method_cmp(const void *key, const void *elem) {

@@ -932,8 +932,8 @@ static void pkgmap_entries_cb(const char *basename, const char *rel_path, const 
 
 static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
                            int depth, char **excluded_dirs, int excluded_count) {
-    return pkgmap_walk_manifests(abs_dir, rel_dir, pkgmap_entries_cb, entries, depth,
-                                 excluded_dirs, excluded_count);
+    return pkgmap_walk_manifests(abs_dir, rel_dir, pkgmap_entries_cb, entries, depth, excluded_dirs,
+                                 excluded_count);
 }
 
 /* Scan a repository for package manifest files via the filesystem

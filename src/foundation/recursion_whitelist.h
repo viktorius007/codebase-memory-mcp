@@ -21,6 +21,8 @@
  * Extraction descendant search (bounded by AST depth):
  *   - find_first_descendant_by_kind (Verilog/SystemVerilog name wrappers)
  *   - find_first_descendant_of (Dart/Zig import URI/string nesting)
+ *   - rust_subtree_has_test_ident (Rust #[cfg(test)] predicate scan; the
+ *     explicit max_depth parameter bounds it independently of tree shape)
  *
  * To add a function: add it below AND add NOLINT(misc-no-recursion) on
  * the function definition line. The lint gate verifies both match.
@@ -30,4 +32,4 @@
         "parse_post_where", "cbm_parse", "eval_expr", "glob_match", "glob_match_star",        \
         "glob_match_doublestar", "glob_match_doublestar_slash", "glob_match_doublestar_any",  \
         "parse_bool_expr", "parse_bool_atom", "r_collect_imports",                            \
-        "find_first_descendant_by_kind", "find_first_descendant_of"
+        "find_first_descendant_by_kind", "find_first_descendant_of", "rust_subtree_has_test_ident"

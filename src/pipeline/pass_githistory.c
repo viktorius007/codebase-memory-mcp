@@ -487,8 +487,8 @@ int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_
         yyjson_doc *doc = yyjson_read(existing, strlen(existing), 0);
         yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
         yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
-        yyjson_mut_val *mroot = (root && yyjson_is_obj(root)) ? yyjson_val_mut_copy(mdoc, root)
-                                                              : yyjson_mut_obj(mdoc);
+        yyjson_mut_val *mroot =
+            (root && yyjson_is_obj(root)) ? yyjson_val_mut_copy(mdoc, root) : yyjson_mut_obj(mdoc);
         yyjson_mut_doc_set_root(mdoc, mroot);
 
         /* Overwrite (not duplicate) the temporal keys on re-index. */
