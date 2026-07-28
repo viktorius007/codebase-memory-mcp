@@ -474,6 +474,42 @@ static const cbm_token_t *expect(parser_t *p, cbm_token_type_t type) {
     return NULL;
 }
 
+/* True when a token is word-shaped: a bare identifier or any keyword. Keywords
+ * are produced only by lex_try_ident via keyword_lookup, so the keyword table
+ * is the authority — enumerating token types here would silently drift the
+ * moment a keyword is added. */
+static bool is_word_token(cbm_token_type_t t) {
+    if (t == TOK_IDENT) {
+        return true;
+    }
+    for (const kw_entry_t *kw = keywords; kw->name; kw++) {
+        if (kw->type == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Consume the property name after a '.'.
+ *
+ * openCypher allows a keyword as a property key — after a dot nothing else can
+ * appear — but the lexer maps keywords unconditionally, so `a.count` arrived as
+ * TOK_COUNT, `expect(TOK_IDENT)` missed, the property was dropped AND the token
+ * was left unconsumed. The query then died at the trailing-token check with
+ * "unexpected trailing tokens", an error naming the wrong problem entirely.
+ *
+ * Any word-shaped token is a valid property name here. A literal or punctuation
+ * still is not, and a missing name is now a hard error rather than a silently
+ * property-less item that projects blank. */
+static const cbm_token_t *expect_property_name(parser_t *p) {
+    if (is_word_token(peek(p)->type)) {
+        return advance(p);
+    }
+    snprintf(p->error, sizeof(p->error), "expected a property name after '.', got '%s' at pos %d",
+             peek(p)->text, peek(p)->pos);
+    return NULL;
+}
+
 /* Parse inline properties: {key: "value", ...} */
 static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
     *out = NULL;
@@ -1162,7 +1198,7 @@ static int parse_condition_lhs(parser_t *p, cbm_condition_t *c) {
     }
 
     if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect(p, TOK_IDENT);
+        const cbm_token_t *prop = expect_property_name(p);
         if (!prop) {
             return CBM_NOT_FOUND;
         }
@@ -1344,7 +1380,7 @@ static const char *parse_value_literal(parser_t *p) {
         char buf[CBM_SZ_256];
         const cbm_token_t *v = advance(p);
         if (match(p, TOK_DOT)) {
-            const cbm_token_t *pr = expect(p, TOK_IDENT);
+            const cbm_token_t *pr = expect_property_name(p);
             snprintf(buf, sizeof(buf), "%s.%s", v->text, pr ? pr->text : "");
         } else {
             snprintf(buf, sizeof(buf), "%s", v->text);
@@ -1461,10 +1497,11 @@ static int parse_var_dot_prop(parser_t *p, cbm_return_item_t *item) {
     }
     item->variable = heap_strdup(var->text);
     if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect(p, TOK_IDENT);
-        if (prop) {
-            item->property = heap_strdup(prop->text);
+        const cbm_token_t *prop = expect_property_name(p);
+        if (!prop) {
+            return CBM_NOT_FOUND;
         }
+        item->property = heap_strdup(prop->text);
     }
     return 0;
 }
@@ -1529,10 +1566,11 @@ static int parse_func_arg(parser_t *p, cbm_func_arg_t *arg) {
     }
     arg->variable = heap_strdup(var->text);
     if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect(p, TOK_IDENT);
-        if (prop) {
-            arg->property = heap_strdup(prop->text);
+        const cbm_token_t *prop = expect_property_name(p);
+        if (!prop) {
+            return CBM_NOT_FOUND;
         }
+        arg->property = heap_strdup(prop->text);
     }
     return 0;
 }
@@ -1657,43 +1695,55 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
 
 /* Parse ORDER BY field into r->order_by and r->order_dir */
 /* Parse aggregate function call for ORDER BY */
-static void parse_order_by_agg(parser_t *p, char *buf, size_t buf_sz) {
+static int parse_order_by_agg(parser_t *p, char *buf, size_t buf_sz) {
     const char *fn = agg_func_name(peek(p)->type);
     advance(p);
-    expect(p, TOK_LPAREN);
+    if (!expect(p, TOK_LPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     if (match(p, TOK_STAR)) {
         snprintf(buf, buf_sz, "%s(*)", fn);
     } else {
         const cbm_token_t *var = expect(p, TOK_IDENT);
-        snprintf(buf, buf_sz, "%s(%s)", fn, var ? var->text : "");
+        if (!var) {
+            return CBM_NOT_FOUND;
+        }
+        snprintf(buf, buf_sz, "%s(%s)", fn, var->text);
     }
-    expect(p, TOK_RPAREN);
+    return expect(p, TOK_RPAREN) ? 0 : CBM_NOT_FOUND;
 }
 
 /* Parse var[.prop] for ORDER BY */
-static void parse_order_by_var(parser_t *p, char *buf, size_t buf_sz) {
+static int parse_order_by_var(parser_t *p, char *buf, size_t buf_sz) {
     const cbm_token_t *var = expect(p, TOK_IDENT);
     if (!var) {
-        return;
+        return CBM_NOT_FOUND;
     }
     snprintf(buf, buf_sz, "%s", var->text);
     if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect(p, TOK_IDENT);
-        if (prop) {
-            snprintf(buf, buf_sz, "%s.%s", var->text, prop->text);
+        const cbm_token_t *prop = expect_property_name(p);
+        if (!prop) {
+            return CBM_NOT_FOUND;
         }
+        snprintf(buf, buf_sz, "%s.%s", var->text, prop->text);
     }
+    return 0;
 }
 
-/* Parse ORDER BY expression into buf. Returns buf. */
-static char *parse_order_by_expr(parser_t *p, char *buf, size_t buf_sz) {
+/* Parse one ORDER BY sort key into buf. Returns 0, or CBM_NOT_FOUND with
+ * p->error set. A missing key used to leave buf empty, which then matched no
+ * column and was silently dropped — `ORDER BY` with nothing after it parsed
+ * clean and sorted nothing. */
+static int parse_order_by_expr(parser_t *p, char *buf, size_t buf_sz) {
     buf[0] = '\0';
-    if (is_aggregate_tok(peek(p)->type)) {
-        parse_order_by_agg(p, buf, buf_sz);
-    } else {
-        parse_order_by_var(p, buf, buf_sz);
+    /* An aggregate keyword is only a call when a '(' follows; otherwise it is a
+     * projected alias that happens to be keyword-shaped (e.g. `... AS count`),
+     * and consuming it as a call would misparse the key. */
+    if (is_aggregate_tok(peek(p)->type) && p->pos + SKIP_ONE < p->count &&
+        p->tokens[p->pos + SKIP_ONE].type == TOK_LPAREN) {
+        return parse_order_by_agg(p, buf, buf_sz);
     }
-    return buf;
+    return parse_order_by_var(p, buf, buf_sz);
 }
 
 /* Consume an ORDER BY key's optional ASC/DESC direction; NULL if absent. */
@@ -1707,10 +1757,14 @@ static const char *parse_order_dir_token(parser_t *p) {
     return NULL;
 }
 
-static void parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
-    expect(p, TOK_BY);
+static int parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
+    if (!expect(p, TOK_BY)) {
+        return CBM_NOT_FOUND;
+    }
     char order_buf[CBM_SZ_256];
-    parse_order_by_expr(p, order_buf, sizeof(order_buf));
+    if (parse_order_by_expr(p, order_buf, sizeof(order_buf)) < 0) {
+        return CBM_NOT_FOUND;
+    }
     r->order_by = heap_strdup(order_buf);
     const char *dir = parse_order_dir_token(p);
     if (dir) {
@@ -1723,10 +1777,15 @@ static void parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
      * unbounded result set. */
     while (match(p, TOK_COMMA)) {
         char extra_buf[CBM_SZ_256];
-        parse_order_by_expr(p, extra_buf, sizeof(extra_buf));
+        if (parse_order_by_expr(p, extra_buf, sizeof(extra_buf)) < 0) {
+            return CBM_NOT_FOUND;
+        }
         parse_order_dir_token(p);
     }
+    return 0;
 }
+
+static void free_return_clause(cbm_return_clause_t *r); /* defined below; used on parse failure */
 
 /* Parse RETURN/WITH clause (shared logic) */
 static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_with) {
@@ -1786,8 +1845,9 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
 
 tail:
     /* Optional ORDER BY */
-    if (match(p, TOK_ORDER)) {
-        parse_order_by_clause(p, r);
+    if (match(p, TOK_ORDER) && parse_order_by_clause(p, r) < 0) {
+        free_return_clause(r);
+        return CBM_NOT_FOUND;
     }
 
     /* Optional SKIP */
@@ -2841,9 +2901,24 @@ static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <
  * failure mode a query engine must never have. Surfaced as a hard error. */
 static _Thread_local bool g_cypher_group_key_truncated = false;
 
+/* The ORDER BY key that could not be resolved to a sortable column, or "" when
+ * every sort key resolved. An unresolvable key silently skipped the sort and
+ * returned scan-ordered rows that are indistinguishable from sorted ones, so
+ * the key is captured here and the entry point fails the query with it named. */
+static _Thread_local char g_cypher_unresolved_order_key[CBM_SZ_256] = "";
+
+static void cypher_record_unresolved_order_key(const char *key) {
+    if (g_cypher_unresolved_order_key[0]) {
+        return; /* keep the first, matching the deadline flag's sticky semantics */
+    }
+    snprintf(g_cypher_unresolved_order_key, sizeof(g_cypher_unresolved_order_key), "%s",
+             key ? key : "");
+}
+
 static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
     g_cypher_group_key_truncated = false;
+    g_cypher_unresolved_order_key[0] = '\0';
     int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
                                                         : CYPHER_DEADLINE_BUDGET_MS;
     g_cypher_deadline_ms = cbm_now_ms() + (uint64_t)budget;
@@ -3377,6 +3452,12 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
     }
     int order_col = rb_find_order_column(rb, ret);
     if (order_col < 0) {
+        /* The sort key names no projected column and no alias. Sorting is the
+         * only thing this clause was asked to do, so skipping it returns rows in
+         * scan order that look exactly like a correctly sorted answer — the one
+         * failure a query engine must never have. Record it; the entry point
+         * turns it into an error. */
+        cypher_record_unresolved_order_key(ret->order_by);
         return;
     }
 
@@ -3790,15 +3871,6 @@ static void bindings_skip_limit(binding_t *vbindings, int *count, int skip, int 
     }
 }
 
-/* Sort, skip, and limit binding array in-place */
-static void with_sort_skip_limit(const cbm_return_clause_t *wc, binding_t *vbindings, int *vcount) {
-    if (wc->order_by) {
-        bool wdesc = wc->order_dir && strcmp(wc->order_dir, "DESC") == 0;
-        sort_bindings(vbindings, *vcount, wc->order_by, wdesc);
-    }
-    bindings_skip_limit(vbindings, vcount, wc->skip, wc->limit);
-}
-
 /* Resolve the alias or compute a default name for a WITH/RETURN item */
 static const char *resolve_item_alias(const cbm_return_item_t *item, char *name_buf,
                                       size_t buf_sz) {
@@ -3811,6 +3883,36 @@ static const char *resolve_item_alias(const cbm_return_item_t *item, char *name_
         snprintf(name_buf, buf_sz, "%s", item->variable);
     }
     return name_buf;
+}
+
+/* True when a WITH sort key names one of the clause's own projected outputs.
+ *
+ * The projected vbindings carry exactly one virtual var per WITH item, named by
+ * resolve_item_alias, so that alias set is the complete set of sortable keys.
+ * Anything else made binding_get_virtual return "" for every row, which compares
+ * equal throughout and left the rows in scan order — a silent non-sort. */
+static bool with_order_key_resolves(const cbm_return_clause_t *wc) {
+    for (int ci = 0; ci < wc->count; ci++) {
+        char name_buf[CBM_SZ_256];
+        const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
+        if (strcmp(alias, wc->order_by) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Sort, skip, and limit binding array in-place */
+static void with_sort_skip_limit(const cbm_return_clause_t *wc, binding_t *vbindings, int *vcount) {
+    if (wc->order_by) {
+        if (!with_order_key_resolves(wc)) {
+            cypher_record_unresolved_order_key(wc->order_by);
+            return; /* leave SKIP/LIMIT unapplied too: the query fails as a whole */
+        }
+        bool wdesc = wc->order_dir && strcmp(wc->order_dir, "DESC") == 0;
+        sort_bindings(vbindings, *vcount, wc->order_by, wdesc);
+    }
+    bindings_skip_limit(vbindings, vcount, wc->skip, wc->limit);
 }
 
 /* ── WITH clause: project bindings through aggregation or rename ── */
@@ -4843,6 +4945,23 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
             heap_strdup("query exceeded the execution time limit — narrow the pattern with a WHERE "
                         "filter, use a directed MATCH instead of an unbounded OPTIONAL MATCH, or "
                         "add LIMIT");
+        return CBM_NOT_FOUND;
+    }
+
+    /* An ORDER BY key that resolved to no column sorted nothing, and unsorted
+     * rows in scan order are indistinguishable from correctly sorted ones. Name
+     * the key and say what would fix it, rather than return the wrong order. */
+    if (g_cypher_unresolved_order_key[0]) {
+        char ebuf[CBM_SZ_512];
+        snprintf(ebuf, sizeof(ebuf),
+                 "unsupported: ORDER BY '%s' — sorting works on the returned columns, and '%s' is "
+                 "not one of them; add it to RETURN (e.g. RETURN ..., %s) or sort by a projected "
+                 "column or its AS alias",
+                 g_cypher_unresolved_order_key, g_cypher_unresolved_order_key,
+                 g_cypher_unresolved_order_key);
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error = heap_strdup(ebuf);
         return CBM_NOT_FOUND;
     }
 
