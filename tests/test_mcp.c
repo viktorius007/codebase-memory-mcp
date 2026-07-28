@@ -2536,6 +2536,391 @@ TEST(tool_trace_missing_function_name) {
     PASS();
 }
 
+/* An unrecognised edge_types entry must be REJECTED, not traversed. The store
+ * binds these strings into `WHERE e.type IN (...)`, so "CALLS,OVERRIDE" (the
+ * natural thing to type) matched nothing and returned a clean-looking
+ * `callers_total: 0` — indistinguishable from a genuine zero. */
+TEST(tool_trace_rejects_unknown_edge_type) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "etproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/et");
+
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "etproj.a.target",
+                         .file_path = "a.c",
+                         .start_line = 10,
+                         .end_line = 20};
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "source",
+                         .qualified_name = "etproj.a.source",
+                         .file_path = "a.c",
+                         .start_line = 30,
+                         .end_line = 40};
+    int64_t idt = cbm_store_upsert_node(st, &callee);
+    int64_t ids = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(idt, 0);
+    ASSERT_GT(ids, 0);
+    cbm_edge_t e = {.project = proj, .source_id = ids, .target_id = idt, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+    /* Comma-joined form: one string, not two types. */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":65,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"target\",\"project\":\"etproj\","
+             "\"direction\":\"inbound\",\"edge_types\":[\"CALLS,OVERRIDE\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "invalid edge_types"));
+    /* The silent zero is exactly what must NOT come back. */
+    ASSERT_NULL(strstr(inner, "callers_total: 0"));
+    free(inner);
+    free(resp);
+
+    /* Lowercase is equally unmatched and equally silent today. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":66,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"target\",\"project\":\"etproj\","
+             "\"direction\":\"inbound\",\"edge_types\":[\"calls\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "invalid edge_types"));
+    free(inner);
+    free(resp);
+
+    /* A well-formed type still traverses — the guard rejects, it does not
+     * break the working path. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":67,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"target\",\"project\":\"etproj\","
+             "\"direction\":\"inbound\",\"edge_types\":[\"CALLS\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "source"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Dynamic dispatch: an impl method reached only through a dyn/interface hop
+ * used to report a bare `callers_total: 0` — shaped exactly like a genuine
+ * zero, one inference away from "this adapter is dead code". OVERRIDE runs
+ * impl -> trait, so no inbound edge_types set can reach the caller; the walk
+ * needed is outbound-over-OVERRIDE then inbound-over-CALLS.
+ *
+ * Shape C (owner-approved): report the exact fact and the inferred fact in
+ * SEPARATE labelled sections. The port-mediated callers are an over-set (they
+ * may reach a sibling impl), so they must never be merged into `callers`,
+ * which would assert something false about rows that reach the fake. */
+TEST(tool_trace_reports_port_mediated_callers_separately) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "dynproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/dyn");
+
+    /* The hexagonal shape: one port trait, two impls, one production caller
+     * that only ever names the PORT. */
+    cbm_node_t port = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "dynproj.ports.CommandExecutor.execute",
+                       .file_path = "ports/command.rs",
+                       .start_line = 80,
+                       .end_line = 88};
+    cbm_node_t real = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "dynproj.adapters.ProcessExecutor.execute",
+                       .file_path = "adapters/process_executor.rs",
+                       .start_line = 220,
+                       .end_line = 298};
+    cbm_node_t fake = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "dynproj.fakes.FakeCommandExecutor.execute",
+                       .file_path = "fakes/command.rs",
+                       .start_line = 30,
+                       .end_line = 42};
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "run_tool",
+                         .qualified_name = "dynproj.core.run_tool",
+                         .file_path = "core/tool.rs",
+                         .start_line = 10,
+                         .end_line = 40};
+    int64_t idp = cbm_store_upsert_node(st, &port);
+    int64_t idr = cbm_store_upsert_node(st, &real);
+    int64_t idf = cbm_store_upsert_node(st, &fake);
+    int64_t idc = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(idp, 0);
+    ASSERT_GT(idr, 0);
+    ASSERT_GT(idf, 0);
+    ASSERT_GT(idc, 0);
+
+    /* OVERRIDE points impl -> trait (the direction that makes an inbound
+     * trace from the impl unable to reach the caller at any depth). */
+    cbm_edge_t ov_r = {.project = proj, .source_id = idr, .target_id = idp, .type = "OVERRIDE"};
+    cbm_edge_t ov_f = {.project = proj, .source_id = idf, .target_id = idp, .type = "OVERRIDE"};
+    cbm_edge_t call = {.project = proj, .source_id = idc, .target_id = idp, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &ov_r), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &ov_f), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"dynproj.adapters.ProcessExecutor.execute\","
+             "\"project\":\"dynproj\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* The exact fact is unchanged and stays exact: nothing CALLS the impl. */
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 0"));
+    /* The inferred fact must be present, attributed to the port it came from,
+     * and counted — this is the whole of what a bare 0 was hiding. */
+    ASSERT_NOT_NULL(strstr(inner, "via_port_total: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "dynproj.ports.CommandExecutor.execute"));
+    ASSERT_NOT_NULL(strstr(inner, "run_tool"));
+    /* Separation is the point of shape C: the inferred caller must NOT be
+     * merged into the exact `callers` table. `callers` is emitted with its
+     * count on the same line, so an empty table reads "callers: 0". */
+    ASSERT_NOT_NULL(strstr(inner, "callers: 0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Sibling impls must not be reported as each other's port-mediated callers:
+ * FakeCommandExecutor.execute is reachable from ProcessExecutor.execute via
+ * the shared port, but it is an implementation, not a caller. */
+TEST(tool_trace_port_mediated_excludes_sibling_impls) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "sibproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/sib");
+
+    cbm_node_t port = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "sibproj.ports.CommandExecutor.execute",
+                       .file_path = "ports/command.rs",
+                       .start_line = 80,
+                       .end_line = 88};
+    cbm_node_t real = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "sibproj.adapters.ProcessExecutor.execute",
+                       .file_path = "adapters/process_executor.rs",
+                       .start_line = 220,
+                       .end_line = 298};
+    cbm_node_t sibling = {.project = proj,
+                          .label = "Method",
+                          .name = "execute",
+                          .qualified_name = "sibproj.adapters.SshExecutor.execute",
+                          .file_path = "adapters/ssh_executor.rs",
+                          .start_line = 15,
+                          .end_line = 60};
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "run_tool",
+                         .qualified_name = "sibproj.core.run_tool",
+                         .file_path = "core/tool.rs",
+                         .start_line = 10,
+                         .end_line = 40};
+    int64_t idp = cbm_store_upsert_node(st, &port);
+    int64_t idr = cbm_store_upsert_node(st, &real);
+    int64_t ids = cbm_store_upsert_node(st, &sibling);
+    int64_t idc = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(idp, 0);
+    ASSERT_GT(idr, 0);
+    ASSERT_GT(ids, 0);
+    ASSERT_GT(idc, 0);
+
+    cbm_edge_t ov_r = {.project = proj, .source_id = idr, .target_id = idp, .type = "OVERRIDE"};
+    cbm_edge_t ov_s = {.project = proj, .source_id = ids, .target_id = idp, .type = "OVERRIDE"};
+    cbm_edge_t call = {.project = proj, .source_id = idc, .target_id = idp, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &ov_r), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &ov_s), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"sibproj.adapters.ProcessExecutor.execute\","
+             "\"project\":\"sibproj\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* Exactly one port-mediated caller: run_tool. The sibling impl reached
+     * through the same port is NOT a caller and must be excluded. */
+    ASSERT_NOT_NULL(strstr(inner, "via_port_total: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "run_tool"));
+    ASSERT_NULL(strstr(inner, "SshExecutor"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* A section heading is a factual claim about the rows under it. The legs
+ * emitted "callers"/"callees" as hardcoded literals regardless of which edge
+ * type was traversed, so an inbound OVERRIDE trace of a port trait method
+ * listed its IMPLEMENTATIONS under a heading reading `callers` — a relationship
+ * the traversal never established, and one an agent reads as fact.
+ *
+ * The heading may name the CALLS relationship only when CALLS is exactly what
+ * was walked. For any other edge set the leg is named by the direction it
+ * actually traversed (`inbound`/`outbound`) and the traversed types are echoed
+ * in `edges`, so a cold reader can still tell what the rows are. */
+TEST(tool_trace_sections_do_not_claim_untraversed_relationship) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "secproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/sec");
+
+    cbm_node_t port = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "secproj.ports.CommandExecutor.execute",
+                       .file_path = "ports/command.rs",
+                       .start_line = 80,
+                       .end_line = 88};
+    cbm_node_t real = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "secproj.adapters.ProcessExecutor.execute",
+                       .file_path = "adapters/process_executor.rs",
+                       .start_line = 220,
+                       .end_line = 298};
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "run_tool",
+                         .qualified_name = "secproj.core.run_tool",
+                         .file_path = "core/tool.rs",
+                         .start_line = 10,
+                         .end_line = 40};
+    int64_t idp = cbm_store_upsert_node(st, &port);
+    int64_t idr = cbm_store_upsert_node(st, &real);
+    int64_t idc = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(idp, 0);
+    ASSERT_GT(idr, 0);
+    ASSERT_GT(idc, 0);
+
+    cbm_edge_t ov = {.project = proj, .source_id = idr, .target_id = idp, .type = "OVERRIDE"};
+    cbm_edge_t call = {.project = proj, .source_id = idc, .target_id = idp, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &ov), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+
+    /* Inbound over OVERRIDE from the PORT reaches the impl that overrides it.
+     * That impl is not a caller of anything. */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"secproj.ports.CommandExecutor.execute\","
+             "\"project\":\"secproj\",\"direction\":\"inbound\",\"depth\":1,"
+             "\"edge_types\":[\"OVERRIDE\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* The row is really there — the assertions below are about its LABEL,
+     * not about the traversal having found nothing. */
+    ASSERT_NOT_NULL(strstr(inner, "ProcessExecutor"));
+    /* The false claim, in either spelling, must be gone. */
+    ASSERT_NULL(strstr(inner, "callers"));
+    ASSERT_NULL(strstr(inner, "callees"));
+    /* Replaced by what the traversal actually did. */
+    ASSERT_NOT_NULL(strstr(inner, "inbound_total: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "inbound: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "edges: OVERRIDE"));
+    free(inner);
+    free(resp);
+
+    /* Same query through the structured-JSON encoder: the object KEYS carry
+     * the identical claim, so they must tell the identical truth. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"secproj.ports.CommandExecutor.execute\","
+             "\"project\":\"secproj\",\"direction\":\"inbound\",\"depth\":1,"
+             "\"edge_types\":[\"OVERRIDE\"],\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "ProcessExecutor"));
+    ASSERT_NULL(strstr(inner, "\"callers\""));
+    ASSERT_NULL(strstr(inner, "\"callers_total\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"inbound_total\""));
+    /* Key form, not the bare word: "direction":"inbound" already contains
+     * "inbound" as a VALUE, so asserting the bare quoted string would pass
+     * without the leg key ever having been renamed. */
+    ASSERT_NOT_NULL(strstr(inner, "\"inbound\":{"));
+    ASSERT_NOT_NULL(strstr(inner, "\"edges\":"));
+    free(inner);
+    free(resp);
+
+    /* Two distinct edge-type configs prove the name is derived, not hardcoded
+     * to a second constant: a plain CALLS trace of the same node keeps saying
+     * `callers`, because there the claim is true — and emits no `edges` echo,
+     * since the heading already names the relationship. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"secproj.ports.CommandExecutor.execute\","
+             "\"project\":\"secproj\",\"direction\":\"inbound\",\"depth\":1,"
+             "\"edge_types\":[\"CALLS\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "run_tool"));
+    ASSERT_NULL(strstr(inner, "inbound_total"));
+    ASSERT_NULL(strstr(inner, "edges:"));
+    free(inner);
+    free(resp);
+
+    /* A multi-type set is still named by direction, and `edges` lists every
+     * type walked so the reader can see the rows are a union. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"secproj.ports.CommandExecutor.execute\","
+             "\"project\":\"secproj\",\"direction\":\"inbound\",\"depth\":1,"
+             "\"edge_types\":[\"CALLS\",\"OVERRIDE\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "inbound_total: 2"));
+    ASSERT_NOT_NULL(strstr(inner, "edges: CALLS,OVERRIDE"));
+    ASSERT_NULL(strstr(inner, "callers"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Regression: two same-named definitions with equal rank must be reported
  * ambiguous, not silently traced (trace_path previously took nodes[0]). */
 TEST(tool_trace_call_path_ambiguous) {
@@ -9736,6 +10121,10 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
+    RUN_TEST(tool_trace_rejects_unknown_edge_type);
+    RUN_TEST(tool_trace_reports_port_mediated_callers_separately);
+    RUN_TEST(tool_trace_port_mediated_excludes_sibling_impls);
+    RUN_TEST(tool_trace_sections_do_not_claim_untraversed_relationship);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
     RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_call_path_prefers_definition);

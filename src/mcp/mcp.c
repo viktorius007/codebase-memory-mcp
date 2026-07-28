@@ -471,11 +471,20 @@ static const tool_def_t TOOLS[] = {
      "Trace paths through the code graph. Modes: calls (callers/callees), data_flow (value "
      "propagation with args at each hop), cross_service (through HTTP/async Route nodes). "
      "Use INSTEAD OF grep for callers, dependencies, impact analysis, or data flow tracing. "
-     "RESPONSE: prefix-grouped tree rows — callees/callers grouped under their shared "
-     "qn-prefix, `name hop` per row (full qn = group prefix + dot + name); exact "
-     "callees_total/callers_total on every page = ALL nodes reachable within depth (transitive, "
+     "RESPONSE: prefix-grouped tree rows under their shared "
+     "qn-prefix, `name hop` per row (full qn = group prefix + dot + name); each leg's "
+     "total on every page = ALL nodes reachable within depth (transitive, "
      "not just direct; test files excluded unless include_tests). risk/args flags use a flat "
      "table. "
+     "SECTION NAMES track what was traversed: the default CALLS walk reports "
+     "`callers`/`callees` (+ `_total`); any other edge_types reports `inbound`/`outbound` "
+     "(+ `_total`) plus `edges` naming the types walked — rows reached via OVERRIDE are "
+     "implementations, NOT callers, and must never be read as such. "
+     "DYNAMIC DISPATCH: a method called only through a dyn/interface reference has no inbound "
+     "CALLS edge, so `callers` is legitimately empty for it. Those callers appear separately as "
+     "`via_port_total` + `via_port`/`via_port_callers`, keyed by the trait method they name. "
+     "They are an OVER-SET (the bound implementation is a runtime fact the graph cannot see), "
+     "which is why they are never merged into `callers`. "
      "`truncated: true` + `next` = more rows — pass next back as cursor. "
      "format=\"json\" returns the SAME tree model as structured JSON.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
@@ -5495,9 +5504,16 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
 /* Resolve edge types from args: explicit array > mode-based > default ("CALLS").
  * Writes types into out_types (max 16). Returns the parsed yyjson_doc if explicit
- * edge_types were found (caller must keep alive until types are consumed), or NULL. */
+ * edge_types were found (caller must keep alive until types are consumed), or NULL.
+ *
+ * An unrecognised type is REJECTED via *out_invalid, never traversed: the store
+ * binds these strings straight into `WHERE e.type IN (...)`, so a typo, a
+ * lowercase name, or the natural-to-type comma form ("CALLS,OVERRIDE") matched
+ * nothing and returned a clean-looking `callers_total: 0` — indistinguishable
+ * from a genuine zero, and a wrong parse of that reads as a real result. */
 static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
-                                            const char **out_types, int *out_count) {
+                                            const char **out_types, int *out_count,
+                                            const char **out_invalid) {
     static const char *mode_calls[] = {"CALLS"};
     static const char *mode_data_flow[] = {"CALLS", "DATA_FLOWS"};
     static const char *mode_cross_svc[] = {
@@ -5506,6 +5522,7 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
         "CROSS_GRAPHQL_CALLS", "CROSS_TRPC_CALLS"};
 
     *out_count = 0;
+    *out_invalid = NULL;
 
     yyjson_doc *et_doc = yyjson_read(args, strlen(args), 0);
     if (et_doc) {
@@ -5516,7 +5533,12 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
             yyjson_val *val2;
             yyjson_arr_foreach(et_arr, idx2, max2, val2) {
                 if (yyjson_is_str(val2) && *out_count < MCP_COL_16) {
-                    out_types[(*out_count)++] = yyjson_get_str(val2);
+                    const char *et = yyjson_get_str(val2);
+                    if (!validate_edge_type(et)) {
+                        *out_invalid = et; /* borrows doc memory — kept alive below */
+                        return et_doc;
+                    }
+                    out_types[(*out_count)++] = et;
                 }
             }
         }
@@ -5827,6 +5849,79 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
     if (out->visited_count > 1) {
         qsort(out->visited, (size_t)out->visited_count, sizeof(cbm_node_hop_t),
               node_hop_cmp_hop_id);
+    }
+}
+
+/* ── Port-mediated callers (dynamic dispatch) ────────────────────────
+ * A method invoked only through a `dyn Trait` / interface reference has NO
+ * inbound CALLS edge: callers name the trait method, and the vtable link is
+ * an OVERRIDE edge running impl -> trait. An inbound trace from the impl
+ * therefore cannot reach them at any depth or edge_types set — the walk
+ * required is outbound-over-OVERRIDE, then inbound-over-CALLS.
+ *
+ * These callers are an OVER-SET: the graph cannot see which impl the runtime
+ * wiring binds, so a caller of the trait may reach a sibling impl instead of
+ * this one. They are therefore reported in their own section, never merged
+ * into `callers` — merging would assert something false about every row that
+ * actually reaches a sibling. Exact facts and inferred facts stay separate.
+ *
+ * Sibling impls are excluded structurally rather than by a filter: the
+ * port's closure is traversed over CALLS only, and a sibling attaches to the
+ * trait by OVERRIDE, so it is never reachable here in the first place. */
+typedef struct {
+    char *port_qn;               /* trait method the callers name */
+    cbm_traverse_result_t via;   /* inbound CALLS closure of the port */
+} port_mediated_t;
+
+/* Collect the CALLS-callers of every trait method this node OVERRIDEs.
+ * Returns the number of ports resolved (0 when the node overrides nothing,
+ * i.e. every non-dyn symbol — the common case, one cheap query). */
+static int collect_port_mediated(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
+                                 int depth, port_mediated_t *out, int out_cap) {
+    static const char *ov_types[] = {"OVERRIDE"};
+    static const char *calls_types[] = {"CALLS"};
+    int found = 0;
+
+    for (int k = 0; k < node_count && found < out_cap; k++) {
+        /* Hop 1 only: the trait this impl directly overrides. */
+        cbm_traverse_result_t traits = {0};
+        cbm_store_bfs(store, nodes[k].id, "outbound", ov_types, 1, 1, MCP_BFS_LIMIT_MAX, &traits);
+
+        for (int t = 0; t < traits.visited_count && found < out_cap; t++) {
+            const char *tqn = traits.visited[t].node.qualified_name;
+            if (!tqn) {
+                continue;
+            }
+            bool dup = false;
+            for (int d = 0; d < found; d++) {
+                if (out[d].port_qn && strcmp(out[d].port_qn, tqn) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            cbm_traverse_result_t via = {0};
+            cbm_store_bfs(store, traits.visited[t].node.id, "inbound", calls_types, 1, depth,
+                          MCP_BFS_LIMIT_MAX, &via);
+            if (via.visited_count == 0) {
+                cbm_store_traverse_free(&via);
+                continue;
+            }
+            out[found].port_qn = heap_strdup(tqn);
+            out[found].via = via;
+            found++;
+        }
+        cbm_store_traverse_free(&traits);
+    }
+    return found;
+}
+
+static void free_port_mediated(port_mediated_t *pm, int count) {
+    for (int i = 0; i < count; i++) {
+        free(pm[i].port_qn);
+        cbm_store_traverse_free(&pm[i].via);
     }
 }
 
@@ -6248,7 +6343,26 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     /* Edge types: explicit > mode-based > default */
     const char *edge_types[MCP_COL_16];
     int edge_type_count = 0;
-    yyjson_doc *et_doc_keep = resolve_trace_edge_types(args, mode, edge_types, &edge_type_count);
+    const char *bad_edge_type = NULL;
+    yyjson_doc *et_doc_keep =
+        resolve_trace_edge_types(args, mode, edge_types, &edge_type_count, &bad_edge_type);
+    if (bad_edge_type) {
+        char errbuf[CBM_SZ_512];
+        snprintf(errbuf, sizeof(errbuf),
+                 "invalid edge_types entry \"%s\" — edge types are UPPERCASE with underscores "
+                 "(e.g. \"CALLS\", \"OVERRIDE\", \"DATA_FLOWS\"), one per array element. A "
+                 "comma-joined string is not a type; pass [\"CALLS\",\"OVERRIDE\"]. Call "
+                 "get_graph_schema for the exact types this project has.",
+                 bad_edge_type);
+        yyjson_doc_free(et_doc_keep);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        free(param_name);
+        cbm_store_free_nodes(nodes, node_count);
+        return cbm_mcp_text_result(errbuf, true);
+    }
 
     /* Run BFS for each requested direction.
      * IMPORTANT: emitters borrow node-string pointers — traversal results
@@ -6358,6 +6472,60 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
+    /* Dynamic dispatch: when the caller asked for callers, also resolve the
+     * port-mediated ones — otherwise an adapter reached only through a `dyn`
+     * hop reports a bare 0 that reads exactly like dead code. Reported in
+     * their own section (never merged into callers) because they are an
+     * over-set; see collect_port_mediated. */
+    enum { TRACE_MAX_PORTS = 8 };
+    port_mediated_t ports[TRACE_MAX_PORTS];
+    int port_count = 0;
+    int via_port_total = 0;
+    if (do_inbound) {
+        port_count = collect_port_mediated(store, nodes, node_count, depth, ports, TRACE_MAX_PORTS);
+        for (int p = 0; p < port_count; p++) {
+            for (int i = 0; i < ports[p].via.visited_count; i++) {
+                const cbm_node_t *n = &ports[p].via.visited[i].node;
+                if (!include_tests && is_test_file(n->file_path)) {
+                    continue;
+                }
+                via_port_total++;
+            }
+        }
+    }
+
+    /* A section heading is a factual claim about the rows beneath it. "callers"
+     * / "callees" name the CALLS relationship, so they may be used ONLY when
+     * CALLS is exactly what was walked — an inbound OVERRIDE trace of a trait
+     * method returns its IMPLEMENTATIONS, and heading those "callers" asserts a
+     * relationship the traversal never established. edge_types is open-ended
+     * (validate_edge_type admits any uppercase name), so no fixed per-type
+     * vocabulary can be complete: for every other edge set the leg is named by
+     * the one thing the traversal DID establish — its direction — and the
+     * traversed types are echoed in `edges` so a cold reader can still tell
+     * what the rows are. */
+    bool calls_only = (edge_type_count == 1 && strcmp(edge_types[0], "CALLS") == 0);
+    const char *out_key = calls_only ? "callees" : "outbound";
+    const char *in_key = calls_only ? "callers" : "inbound";
+    char out_total_key[CBM_SZ_64];
+    char in_total_key[CBM_SZ_64];
+    snprintf(out_total_key, sizeof(out_total_key), "%s_total", out_key);
+    snprintf(in_total_key, sizeof(in_total_key), "%s_total", in_key);
+    /* Echoed only when the heading no longer names the relationship; with
+     * CALLS the heading already says it and a duplicate would be noise. */
+    char edges_joined[CBM_SZ_512] = "";
+    if (!calls_only) {
+        size_t used = 0;
+        for (int i = 0; i < edge_type_count; i++) {
+            int w = snprintf(edges_joined + used, sizeof(edges_joined) - used, "%s%s",
+                             i ? "," : "", edge_types[i]);
+            if (w <= 0 || (size_t)w >= sizeof(edges_joined) - used) {
+                break;
+            }
+            used += (size_t)w;
+        }
+    }
+
     char *json = NULL;
     if (!trace_legacy_json) {
         cbm_sb_t sb;
@@ -6367,23 +6535,42 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (mode) {
             cbm_tree_scalar_str(&sb, "mode", mode);
         }
+        if (edges_joined[0]) {
+            cbm_tree_scalar_str(&sb, "edges", edges_joined);
+        }
         /* Grouped tree is THE default; risk_labels/data_flow keep the flat
          * table (extra columns) in the same tree syntax. */
         bool flat_trace = risk_labels || data_flow;
         if (do_outbound) {
-            cbm_tree_scalar_int(&sb, "callees_total", out_total);
+            cbm_tree_scalar_int(&sb, out_total_key, out_total);
             if (flat_trace) {
-                bfs_to_toon_table(&sb, "callees", &view_out, risk_labels, include_tests, data_flow);
+                bfs_to_toon_table(&sb, out_key, &view_out, risk_labels, include_tests, data_flow);
             } else {
-                bfs_to_tree_table(&sb, "callees", &view_out, include_tests);
+                bfs_to_tree_table(&sb, out_key, &view_out, include_tests);
             }
         }
         if (do_inbound) {
-            cbm_tree_scalar_int(&sb, "callers_total", in_total);
+            cbm_tree_scalar_int(&sb, in_total_key, in_total);
             if (flat_trace) {
-                bfs_to_toon_table(&sb, "callers", &view_in, risk_labels, include_tests, data_flow);
+                bfs_to_toon_table(&sb, in_key, &view_in, risk_labels, include_tests, data_flow);
             } else {
-                bfs_to_tree_table(&sb, "callers", &view_in, include_tests);
+                bfs_to_tree_table(&sb, in_key, &view_in, include_tests);
+            }
+            /* Inferred, never merged with the exact set above (shape C). */
+            if (port_count > 0) {
+                cbm_tree_scalar_int(&sb, "via_port_total", via_port_total);
+                cbm_tree_scalar_str(&sb, "via_port_note",
+                                    "reached through dynamic dispatch — these call the port, so "
+                                    "some may bind to a sibling implementation, not this one");
+                for (int p = 0; p < port_count; p++) {
+                    cbm_tree_scalar_str(&sb, "via_port", ports[p].port_qn);
+                    if (flat_trace) {
+                        bfs_to_toon_table(&sb, "via_port_callers", &ports[p].via, risk_labels,
+                                          include_tests, data_flow);
+                    } else {
+                        bfs_to_tree_table(&sb, "via_port_callers", &ports[p].via, include_tests);
+                    }
+                }
             }
         }
         if (more_rows) {
@@ -6411,17 +6598,37 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (mode) {
             yyjson_mut_obj_add_str(doc, root, "mode", mode);
         }
+        if (edges_joined[0]) {
+            yyjson_mut_obj_add_strcpy(doc, root, "edges", edges_joined);
+        }
         if (do_outbound) {
-            yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
+            yyjson_mut_obj_add_int(doc, root, out_total_key, out_total);
             yyjson_mut_obj_add_val(
-                doc, root, "callees",
+                doc, root, out_key,
                 bfs_to_tree_json(doc, &view_out, risk_labels, include_tests, data_flow));
         }
         if (do_inbound) {
-            yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
+            yyjson_mut_obj_add_int(doc, root, in_total_key, in_total);
             yyjson_mut_obj_add_val(
-                doc, root, "callers",
+                doc, root, in_key,
                 bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow));
+            /* Inferred, never merged with the exact set above (shape C). */
+            if (port_count > 0) {
+                yyjson_mut_obj_add_int(doc, root, "via_port_total", via_port_total);
+                yyjson_mut_obj_add_str(doc, root, "via_port_note",
+                                       "reached through dynamic dispatch — these call the port, so "
+                                       "some may bind to a sibling implementation, not this one");
+                yyjson_mut_val *pa = yyjson_mut_arr(doc);
+                for (int p = 0; p < port_count; p++) {
+                    yyjson_mut_val *pe = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_strcpy(doc, pe, "port", ports[p].port_qn);
+                    yyjson_mut_obj_add_val(
+                        doc, pe, "callers",
+                        bfs_to_tree_json(doc, &ports[p].via, risk_labels, include_tests, data_flow));
+                    yyjson_mut_arr_add_val(pa, pe);
+                }
+                yyjson_mut_obj_add_val(doc, root, "via_port", pa);
+            }
         }
         if (more_rows) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
@@ -6441,6 +6648,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (do_inbound) {
         cbm_store_traverse_free(&tr_in);
     }
+    free_port_mediated(ports, port_count);
 
     cbm_store_free_nodes(nodes, node_count);
     free(func_name);
