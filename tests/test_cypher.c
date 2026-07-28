@@ -379,9 +379,31 @@ TEST(cypher_parse_return_order_limit) {
     int rc =
         cbm_cypher_parse("MATCH (f:Function) RETURN f.name ORDER BY f.name DESC LIMIT 5", &q, &err);
     ASSERT_EQ(rc, 0);
-    ASSERT_NOT_NULL(q->ret->order_by);
-    ASSERT_STR_EQ(q->ret->order_dir, "DESC");
+    ASSERT_EQ(q->ret->order_key_count, 1);
+    ASSERT_STR_EQ(q->ret->order_keys[0].expr, "f.name");
+    ASSERT_TRUE(q->ret->order_keys[0].desc);
     ASSERT_EQ(q->ret->limit, 5);
+
+    cbm_query_free(q);
+    PASS();
+}
+
+/* The AST must retain EVERY sort key with its own direction — the parser used
+ * to consume the trailing keys and throw them away, leaving a one-key clause. */
+TEST(cypher_parse_order_by_keeps_all_keys) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse(
+        "MATCH (f:Function) RETURN f.name ORDER BY f.file_path, f.name DESC, f.label ASC", &q,
+        &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(q->ret->order_key_count, 3); /* RED on unfixed code: 1 */
+    ASSERT_STR_EQ(q->ret->order_keys[0].expr, "f.file_path");
+    ASSERT_FALSE(q->ret->order_keys[0].desc); /* no direction given → ASC */
+    ASSERT_STR_EQ(q->ret->order_keys[1].expr, "f.name");
+    ASSERT_TRUE(q->ret->order_keys[1].desc);
+    ASSERT_STR_EQ(q->ret->order_keys[2].expr, "f.label");
+    ASSERT_FALSE(q->ret->order_keys[2].desc);
 
     cbm_query_free(q);
     PASS();
@@ -3030,7 +3052,15 @@ TEST(cypher_unwind_long_list_bounded) {
  * fix, parse_order_by_clause parsed only the FIRST sort key, so the remaining
  * ", f.file_path LIMIT 2" was left unconsumed, the LIMIT was silently dropped
  * (r->limit stayed at the -1 sentinel) and the full unbounded result set was
- * materialized. The observable contract: exactly LIMIT rows come back. */
+ * materialized. The observable contract: exactly LIMIT rows come back.
+ *
+ * The query projects BOTH sort keys: sorting reads the materialized result
+ * table, so every key — tie-breakers included — must name a returned column or
+ * an alias, else the query is refused rather than silently under-sorted. The
+ * original form here returned only f.name while sorting on f.file_path too,
+ * which is now that refusal (covered by
+ * cypher_order_by_second_key_unresolvable_errors); projecting both keeps this
+ * test on its own subject, the trailing LIMIT. */
 TEST(cypher_order_by_multikey_honors_limit) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -3043,8 +3073,10 @@ TEST(cypher_order_by_multikey_honors_limit) {
 
     /* Two sort keys, then LIMIT 2 — must return exactly 2 rows, not all 4. */
     memset(&r, 0, sizeof(r));
-    rc = cbm_cypher_execute(
-        s, "MATCH (f:Function) RETURN f.name ORDER BY f.name, f.file_path LIMIT 2", "test", 0, &r);
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) RETURN f.name, f.file_path "
+                            "ORDER BY f.name, f.file_path LIMIT 2",
+                            "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 2); /* RED on unfixed code: returns 4 */
 
@@ -3909,6 +3941,248 @@ TEST(cypher_quoted_string_not_a_property_name) {
     PASS();
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ *  MULTI-KEY ORDER BY  (silent partial-sort)
+ *
+ *  `ORDER BY a, b` has exactly one meaning — sort by a, break ties with b —
+ *  in the SQL standard and in openCypher/Neo4j alike. The parser consumed the
+ *  trailing keys (so a following LIMIT was not dropped) but THREW THEM AWAY:
+ *  the AST held one key, so ties on the first key were left in scan order and
+ *  the result looked correctly sorted to any caller. Every key now sorts, in
+ *  order, each with its own ASC/DESC.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Fixture built so the FIRST key TIES across rows the second key orders
+ * differently — the property the defect actually breaks. Without a tie a
+ * first-key-only implementation passes and the test proves nothing.
+ *
+ * INSERTION ORDER MATTERS AND IS CHOSEN, NOT INCIDENTAL. Pre-fix the engine
+ * leaves tied rows in scan (= insertion) order, so any expected order that
+ * coincides with insertion order is invisible to the defect. The a.go block is
+ * inserted charlie, alpha, delta, which differs from name ASC (alpha, charlie,
+ * delta) AND from name DESC (delta, charlie, alpha) — so both directions are
+ * discriminating.
+ *
+ *   insertion  file_path  name     complexity
+ *   1          a.go       charlie  9
+ *   2          a.go       alpha    9    <- ties on file_path AND complexity
+ *   3          a.go       delta    2    <- ties on file_path only
+ *   4          b.go       bravo    1
+ */
+static cbm_store_t *setup_multikey_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "charlie",
+                     .qualified_name = "test.charlie",
+                     .file_path = "a.go",
+                     .properties_json = "{\"complexity\":9}"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Function",
+                     .name = "alpha",
+                     .qualified_name = "test.alpha",
+                     .file_path = "a.go",
+                     .properties_json = "{\"complexity\":9}"};
+    cbm_node_t n3 = {.project = "test",
+                     .label = "Function",
+                     .name = "delta",
+                     .qualified_name = "test.delta",
+                     .file_path = "a.go",
+                     .properties_json = "{\"complexity\":2}"};
+    cbm_node_t n4 = {.project = "test",
+                     .label = "Function",
+                     .name = "bravo",
+                     .qualified_name = "test.bravo",
+                     .file_path = "b.go",
+                     .properties_json = "{\"complexity\":1}"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    cbm_store_upsert_node(s, &n3);
+    cbm_store_upsert_node(s, &n4);
+    return s;
+}
+
+/* Two keys: ties on file_path must be broken by name.
+ * RED on unfixed code: the three a.go rows keep scan order (delta, charlie,
+ * alpha) because the second key is discarded — row 0 is "delta", not "alpha". */
+TEST(cypher_order_by_two_keys_breaks_ties) {
+    cbm_store_t *s = setup_multikey_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) RETURN f.file_path, f.name ORDER BY f.file_path ASC, f.name ASC",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 4);
+    ASSERT_STR_EQ(r.rows[0][1], "alpha"); /* a.go group, sorted by name */
+    ASSERT_STR_EQ(r.rows[1][1], "charlie");
+    ASSERT_STR_EQ(r.rows[2][1], "delta");
+    ASSERT_STR_EQ(r.rows[3][1], "bravo"); /* b.go */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Each key carries its OWN direction: ASC then DESC.
+ * RED on unfixed code: the second key is ignored, so the a.go block keeps scan
+ * order (charlie, alpha, delta) instead of name DESC (delta, charlie, alpha). */
+TEST(cypher_order_by_mixed_directions) {
+    cbm_store_t *s = setup_multikey_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) RETURN f.file_path, f.name ORDER BY f.file_path ASC, f.name DESC",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 4);
+    ASSERT_STR_EQ(r.rows[0][1], "delta"); /* a.go, name DESC */
+    ASSERT_STR_EQ(r.rows[1][1], "charlie");
+    ASSERT_STR_EQ(r.rows[2][1], "alpha");
+    ASSERT_STR_EQ(r.rows[3][1], "bravo");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Three keys, with the first TWO tying on the alpha/charlie pair so only the
+ * third can order them — proves the tuple comparison recurses past key 2.
+ * RED on unfixed code: keys 2 and 3 are discarded, so scan order puts charlie
+ * (complexity 9) first and delta (complexity 2) second, and row 0 is not
+ * alpha. */
+TEST(cypher_order_by_three_keys) {
+    cbm_store_t *s = setup_multikey_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) RETURN f.file_path, f.complexity, f.name "
+                                "ORDER BY f.file_path ASC, f.complexity DESC, f.name ASC",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 4);
+    /* a.go: complexity 9 before 2; within 9, name breaks the tie */
+    ASSERT_STR_EQ(r.rows[0][2], "alpha");
+    ASSERT_STR_EQ(r.rows[1][2], "charlie");
+    ASSERT_STR_EQ(r.rows[2][2], "delta");
+    ASSERT_STR_EQ(r.rows[3][2], "bravo");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The numeric-vs-string decision must be made PER KEY, not once for the sort:
+ * key 1 is a string column and key 2 numeric. Numeric ordering must not
+ * degrade to lexicographic (which would put "10" and "100" before "9").
+ *
+ * Inserted 100, 9, 10 — deliberately NOT the expected order and NOT the
+ * lexicographic one, so neither a discarded second key (which leaves scan
+ * order) nor a string comparison can pass this.
+ * RED on unfixed code: the numeric second key is ignored entirely, so the rows
+ * come back 100, 9, 10. */
+TEST(cypher_order_by_numeric_second_key) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t a = {.project = "test",
+                    .label = "Function",
+                    .name = "c",
+                    .qualified_name = "test.c",
+                    .file_path = "same.go",
+                    .properties_json = "{\"complexity\":100}"};
+    cbm_node_t b = {.project = "test",
+                    .label = "Function",
+                    .name = "a",
+                    .qualified_name = "test.a",
+                    .file_path = "same.go",
+                    .properties_json = "{\"complexity\":9}"};
+    cbm_node_t c = {.project = "test",
+                    .label = "Function",
+                    .name = "b",
+                    .qualified_name = "test.b",
+                    .file_path = "same.go",
+                    .properties_json = "{\"complexity\":10}"};
+    cbm_store_upsert_node(s, &a);
+    cbm_store_upsert_node(s, &b);
+    cbm_store_upsert_node(s, &c);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) RETURN f.file_path, f.complexity "
+                                "ORDER BY f.file_path ASC, f.complexity ASC",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][1], "9"); /* lexicographic would give 10, 100, 9 */
+    ASSERT_STR_EQ(r.rows[1][1], "10");
+    ASSERT_STR_EQ(r.rows[2][1], "100");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A SECOND key that is not evaluable gets the same clear error the first one
+ * does — the resolvability boundary applies to every key, not just key 1.
+ * RED on unfixed code: rc == 0, the bad key is silently discarded. */
+TEST(cypher_order_by_second_key_unresolvable_errors) {
+    cbm_store_t *s = setup_multikey_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) RETURN f.file_path ORDER BY f.file_path ASC, f.nonexistent_col DESC",
+        "test", 0, &r);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "f.nonexistent_col") != NULL);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Multi-key on the WITH path sorts bindings, not the result table — the same
+ * defect lived there independently.
+ * RED on unfixed code: only `grp` sorts, so the tie is left in scan order. */
+TEST(cypher_with_order_by_two_keys_breaks_ties) {
+    cbm_store_t *s = setup_multikey_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) "
+                                "WITH f.file_path AS grp, f.name AS nm "
+                                "ORDER BY grp ASC, nm ASC "
+                                "RETURN grp, nm",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 4);
+    ASSERT_STR_EQ(r.rows[0][1], "alpha");
+    ASSERT_STR_EQ(r.rows[1][1], "charlie");
+    ASSERT_STR_EQ(r.rows[2][1], "delta");
+    ASSERT_STR_EQ(r.rows[3][1], "bravo");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* NON-REGRESSION (green in both states): multi-key sorting must be STABLE —
+ * rows equal on every key keep their relative order. Both rows here tie on the
+ * only key, so any reordering is a stability break. */
+TEST(cypher_order_by_all_keys_equal_is_stable) {
+    cbm_store_t *s = setup_multikey_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) RETURN f.file_path, f.name ORDER BY f.file_path ASC", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 4);
+    /* a.go rows keep insertion order among themselves: charlie, alpha, delta */
+    ASSERT_STR_EQ(r.rows[0][1], "charlie");
+    ASSERT_STR_EQ(r.rows[1][1], "alpha");
+    ASSERT_STR_EQ(r.rows[2][1], "delta");
+    ASSERT_STR_EQ(r.rows[3][1], "bravo");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
@@ -3937,6 +4211,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_return_simple);
     RUN_TEST(cypher_parse_return_count);
     RUN_TEST(cypher_parse_return_order_limit);
+    RUN_TEST(cypher_parse_order_by_keeps_all_keys);
     RUN_TEST(cypher_parse_return_distinct);
     RUN_TEST(cypher_parse_inline_props);
     RUN_TEST(cypher_parse_error);
@@ -4118,4 +4393,12 @@ SUITE(cypher) {
     RUN_TEST(cypher_edge_property_named_count_parses);
     RUN_TEST(cypher_where_property_named_keyword_parses);
     RUN_TEST(cypher_quoted_string_not_a_property_name);
+    /* Multi-key ORDER BY: every key sorts, in order, with its own direction */
+    RUN_TEST(cypher_order_by_two_keys_breaks_ties);
+    RUN_TEST(cypher_order_by_mixed_directions);
+    RUN_TEST(cypher_order_by_three_keys);
+    RUN_TEST(cypher_order_by_numeric_second_key);
+    RUN_TEST(cypher_order_by_second_key_unresolvable_errors);
+    RUN_TEST(cypher_with_order_by_two_keys_breaks_ties);
+    RUN_TEST(cypher_order_by_all_keys_equal_is_stable);
 }

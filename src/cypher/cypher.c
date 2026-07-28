@@ -1757,31 +1757,40 @@ static const char *parse_order_dir_token(parser_t *p) {
     return NULL;
 }
 
+/* Append one parsed sort key (expression + its own direction) to the clause. */
+static int append_order_key(parser_t *p, cbm_return_clause_t *r, int *cap) {
+    char key_buf[CBM_SZ_256];
+    if (parse_order_by_expr(p, key_buf, sizeof(key_buf)) < 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (r->order_key_count >= *cap) {
+        *cap = *cap ? *cap * PAIR_LEN : CYP_INIT_CAP4;
+        r->order_keys = safe_realloc(r->order_keys, (size_t)*cap * sizeof(cbm_order_key_t));
+    }
+    const char *dir = parse_order_dir_token(p);
+    r->order_keys[r->order_key_count++] =
+        (cbm_order_key_t){.expr = heap_strdup(key_buf), .desc = dir && strcmp(dir, "DESC") == 0};
+    return 0;
+}
+
+/* Parse `ORDER BY k1 [ASC|DESC] [, k2 [ASC|DESC]]...`.
+ *
+ * openCypher (and the SQL standard it follows here) define this as a
+ * lexicographic tuple sort: order by k1, break ties with k2, and so on, each
+ * key carrying its own direction. Every key is now KEPT. Previously the
+ * trailing keys were consumed only so a following SKIP/LIMIT would not be left
+ * unparsed, then thrown away — silently degrading the query to a first-key-only
+ * sort whose output is indistinguishable from a correct one. */
 static int parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
     if (!expect(p, TOK_BY)) {
         return CBM_NOT_FOUND;
     }
-    char order_buf[CBM_SZ_256];
-    if (parse_order_by_expr(p, order_buf, sizeof(order_buf)) < 0) {
-        return CBM_NOT_FOUND;
-    }
-    r->order_by = heap_strdup(order_buf);
-    const char *dir = parse_order_dir_token(p);
-    if (dir) {
-        r->order_dir = heap_strdup(dir);
-    }
-    /* openCypher allows a comma-separated list of sort keys. The single-column
-     * executor sorts by the first key only, but every remaining key MUST still
-     * be consumed here — otherwise the trailing ", key ..." is left unparsed and
-     * a following SKIP/LIMIT is silently dropped, materializing the whole
-     * unbounded result set. */
-    while (match(p, TOK_COMMA)) {
-        char extra_buf[CBM_SZ_256];
-        if (parse_order_by_expr(p, extra_buf, sizeof(extra_buf)) < 0) {
+    int cap = 0;
+    do {
+        if (append_order_key(p, r, &cap) < 0) {
             return CBM_NOT_FOUND;
         }
-        parse_order_dir_token(p);
-    }
+    } while (match(p, TOK_COMMA));
     return 0;
 }
 
@@ -2206,8 +2215,10 @@ static void free_return_clause(cbm_return_clause_t *r) {
         free(r->items[i].args);
     }
     free(r->items);
-    safe_str_free(&r->order_by);
-    safe_str_free(&r->order_dir);
+    for (int i = 0; i < r->order_key_count; i++) {
+        safe_str_free(&r->order_keys[i].expr);
+    }
+    free(r->order_keys);
     free(r);
 }
 
@@ -3410,16 +3421,17 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
 /* ── Result postprocessing helpers ─────────────────────────────── */
 
-/* Find the column index for ORDER BY, checking both column names and aliases.
- * Returns -1 if not found. */
-static int rb_find_order_column(const result_builder_t *rb, const cbm_return_clause_t *ret) {
+/* Find the column index for one ORDER BY key, checking both column names and
+ * aliases. Returns -1 if not found. */
+static int rb_find_order_column(const result_builder_t *rb, const cbm_return_clause_t *ret,
+                                const char *key) {
     for (int ci = 0; ci < rb->col_count; ci++) {
-        if (strcmp(rb->columns[ci], ret->order_by) == 0) {
+        if (strcmp(rb->columns[ci], key) == 0) {
             return ci;
         }
     }
     for (int ci = 0; ci < ret->count; ci++) {
-        if (ret->items[ci].alias && strcmp(ret->items[ci].alias, ret->order_by) == 0) {
+        if (ret->items[ci].alias && strcmp(ret->items[ci].alias, key) == 0) {
             return ci;
         }
     }
@@ -3446,33 +3458,68 @@ static bool rb_is_numeric_column(const result_builder_t *rb, int col) {
     return false;
 }
 
-static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *ret) {
-    if (!ret->order_by) {
-        return;
+/* A resolved sort key: which result column it reads, how to compare it, and
+ * which way round. Resolution and numeric typing are done once per key before
+ * sorting, not per comparison. */
+typedef struct {
+    int col;
+    bool numeric;
+    bool desc;
+} rb_sort_key_t;
+
+/* Compare two rows as a lexicographic tuple over the resolved keys: the first
+ * key that separates them decides, so later keys act purely as tie-breakers.
+ * Returns <0, 0 or >0. Zero means equal on EVERY key, which the caller relies
+ * on to keep the sort stable. */
+static int rb_compare_rows(const char **ra, const char **rb2, const rb_sort_key_t *keys,
+                           int key_count) {
+    for (int k = 0; k < key_count; k++) {
+        const char *va = ra[keys[k].col];
+        const char *vb = rb2[keys[k].col];
+        int cmp;
+        if (keys[k].numeric) {
+            long da = strtol(va, NULL, CBM_DECIMAL_BASE);
+            long db = strtol(vb, NULL, CBM_DECIMAL_BASE);
+            cmp = (da > db) - (da < db);
+        } else {
+            cmp = strcmp(va, vb);
+        }
+        if (cmp != 0) {
+            return keys[k].desc ? -cmp : cmp;
+        }
     }
-    int order_col = rb_find_order_column(rb, ret);
-    if (order_col < 0) {
-        /* The sort key names no projected column and no alias. Sorting is the
-         * only thing this clause was asked to do, so skipping it returns rows in
-         * scan order that look exactly like a correctly sorted answer — the one
-         * failure a query engine must never have. Record it; the entry point
-         * turns it into an error. */
-        cypher_record_unresolved_order_key(ret->order_by);
+    return 0;
+}
+
+static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *ret) {
+    if (ret->order_key_count <= 0) {
         return;
     }
 
-    bool desc = ret->order_dir && strcmp(ret->order_dir, "DESC") == 0;
-    bool numeric = rb_is_numeric_column(rb, order_col);
+    /* Resolve every key up front. A key naming no projected column and no alias
+     * cannot be evaluated here — the rows hold projected strings and the
+     * bindings are gone — and skipping it would return scan-ordered rows that
+     * look exactly like a correctly sorted answer, the one failure a query
+     * engine must never have. This applies to EVERY key, not just the first:
+     * an unresolvable tie-breaker is as silent as an unresolvable primary key.
+     * Record it; the entry point turns it into an error. */
+    rb_sort_key_t keys[CBM_SZ_32];
+    int key_count = 0;
+    for (int k = 0; k < ret->order_key_count && k < CBM_SZ_32; k++) {
+        int col = rb_find_order_column(rb, ret, ret->order_keys[k].expr);
+        if (col < 0) {
+            cypher_record_unresolved_order_key(ret->order_keys[k].expr);
+            return;
+        }
+        keys[key_count++] = (rb_sort_key_t){
+            .col = col, .numeric = rb_is_numeric_column(rb, col), .desc = ret->order_keys[k].desc};
+    }
+
+    /* Bubble sort: swapping only on cmp > 0 (never on 0) keeps it stable, so
+     * rows equal on every key retain their relative order. */
     for (int i = 0; i < rb->row_count - SKIP_ONE; i++) {
         for (int j = 0; j < rb->row_count - i - SKIP_ONE; j++) {
-            int cmp;
-            if (numeric) {
-                cmp = (int)strtol(rb->rows[j][order_col], NULL, CBM_DECIMAL_BASE) -
-                      (int)strtol(rb->rows[j + SKIP_ONE][order_col], NULL, CBM_DECIMAL_BASE);
-            } else {
-                cmp = strcmp(rb->rows[j][order_col], rb->rows[j + SKIP_ONE][order_col]);
-            }
-            if (desc ? cmp < 0 : cmp > 0) {
+            if (rb_compare_rows(rb->rows[j], rb->rows[j + SKIP_ONE], keys, key_count) > 0) {
                 const char **tmp = rb->rows[j];
                 rb->rows[j] = rb->rows[j + SKIP_ONE];
                 rb->rows[j + SKIP_ONE] = tmp;
@@ -3829,18 +3876,35 @@ static void distinct_list_add(char ***list, int *count, const char *val) {
     (*list)[idx] = heap_strdup(val);
 }
 
-/* Sort bindings by a virtual variable using bubble sort */
-static void sort_bindings(binding_t *vbindings, int count, const char *key, bool desc) {
+/* Compare two projected bindings as a lexicographic tuple over the ORDER BY
+ * keys: the first key that separates them decides, later keys break ties.
+ * Values are compared numerically when BOTH parse as numbers, else as strings —
+ * decided per key and per pair, since a virtual var carries no column type.
+ * Returns 0 only when the two are equal on every key. */
+static int compare_bindings(binding_t *a, binding_t *b, const cbm_order_key_t *keys,
+                            int key_count) {
+    for (int k = 0; k < key_count; k++) {
+        const char *va = binding_get_virtual(a, keys[k].expr, NULL);
+        const char *vb = binding_get_virtual(b, keys[k].expr, NULL);
+        char *ea = NULL;
+        char *eb = NULL;
+        double da = strtod(va, &ea);
+        double db = strtod(vb, &eb);
+        int cmp = (ea != va && eb != vb) ? ((da > db) - (da < db)) : strcmp(va, vb);
+        if (cmp != 0) {
+            return keys[k].desc ? -cmp : cmp;
+        }
+    }
+    return 0;
+}
+
+/* Sort bindings by the ORDER BY key tuple using a stable bubble sort (it swaps
+ * only on cmp > 0, never on equal, so ties keep their relative order). */
+static void sort_bindings(binding_t *vbindings, int count, const cbm_order_key_t *keys,
+                          int key_count) {
     for (int i = 0; i < count - SKIP_ONE; i++) {
         for (int j = 0; j < count - i - SKIP_ONE; j++) {
-            const char *va = binding_get_virtual(&vbindings[j], key, NULL);
-            const char *vb2 = binding_get_virtual(&vbindings[j + SKIP_ONE], key, NULL);
-            char *ea = NULL;
-            char *eb = NULL;
-            double da = strtod(va, &ea);
-            double db = strtod(vb2, &eb);
-            int cmp = (ea != va && eb != vb2) ? ((da > db) - (da < db)) : strcmp(va, vb2);
-            if (desc ? cmp < 0 : cmp > 0) {
+            if (compare_bindings(&vbindings[j], &vbindings[j + SKIP_ONE], keys, key_count) > 0) {
                 binding_t tmp = vbindings[j];
                 vbindings[j] = vbindings[j + SKIP_ONE];
                 vbindings[j + SKIP_ONE] = tmp;
@@ -3891,11 +3955,11 @@ static const char *resolve_item_alias(const cbm_return_item_t *item, char *name_
  * resolve_item_alias, so that alias set is the complete set of sortable keys.
  * Anything else made binding_get_virtual return "" for every row, which compares
  * equal throughout and left the rows in scan order — a silent non-sort. */
-static bool with_order_key_resolves(const cbm_return_clause_t *wc) {
+static bool with_order_key_resolves(const cbm_return_clause_t *wc, const char *key) {
     for (int ci = 0; ci < wc->count; ci++) {
         char name_buf[CBM_SZ_256];
         const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-        if (strcmp(alias, wc->order_by) == 0) {
+        if (strcmp(alias, key) == 0) {
             return true;
         }
     }
@@ -3904,13 +3968,16 @@ static bool with_order_key_resolves(const cbm_return_clause_t *wc) {
 
 /* Sort, skip, and limit binding array in-place */
 static void with_sort_skip_limit(const cbm_return_clause_t *wc, binding_t *vbindings, int *vcount) {
-    if (wc->order_by) {
-        if (!with_order_key_resolves(wc)) {
-            cypher_record_unresolved_order_key(wc->order_by);
-            return; /* leave SKIP/LIMIT unapplied too: the query fails as a whole */
+    if (wc->order_key_count > 0) {
+        /* Every key must resolve, not just the first — an unresolvable
+         * tie-breaker sorts as silently as an unresolvable primary key. */
+        for (int k = 0; k < wc->order_key_count; k++) {
+            if (!with_order_key_resolves(wc, wc->order_keys[k].expr)) {
+                cypher_record_unresolved_order_key(wc->order_keys[k].expr);
+                return; /* leave SKIP/LIMIT unapplied too: the query fails as a whole */
+            }
         }
-        bool wdesc = wc->order_dir && strcmp(wc->order_dir, "DESC") == 0;
-        sort_bindings(vbindings, *vcount, wc->order_by, wdesc);
+        sort_bindings(vbindings, *vcount, wc->order_keys, wc->order_key_count);
     }
     bindings_skip_limit(vbindings, vcount, wc->skip, wc->limit);
 }
@@ -4517,7 +4584,7 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
 static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
-    if (ret->limit > 0 && !ret->distinct && !ret->order_by && ret->skip <= 0) {
+    if (ret->limit > 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
         proj_cap = ret->limit;
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
