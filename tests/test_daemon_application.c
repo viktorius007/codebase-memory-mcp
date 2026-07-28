@@ -776,6 +776,134 @@ TEST(daemon_application_restricted_profile_owns_no_background_surfaces) {
     PASS();
 }
 
+/* A tool result larger than one daemon frame is a REPORTABLE outcome, not a
+ * transport fault. Before this contract the daemon dropped the response and
+ * returned HANDLER_ERROR, which the CLI collapsed into one opaque line — an
+ * agent could not tell "your result was too big" from "the daemon died", and
+ * was told nothing about narrowing the query. The payload here is built from
+ * a real tool (manage_adr get) whose response the daemon cannot frame. */
+TEST(daemon_application_oversize_tool_result_reports_cause_and_remedy) {
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    bool had_cache = old_cache != NULL;
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    char root[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-oversize-root-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-oversize-cache-XXXXXX", cbm_tmpdir());
+    bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
+    bool env_ok =
+        dirs_ok && (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    char *project = env_ok ? cbm_project_name_from_path(root) : NULL;
+
+    /* One byte over the frame budget is enough: the guard is on total payload
+     * bytes, so a boundary-sized ADR proves the limit is the real one and not
+     * a rounder number that merely happens to be larger. */
+    size_t adr_bytes = (size_t)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX + 1U;
+    char *huge_adr = project ? malloc(adr_bytes + 1U) : NULL;
+    if (huge_adr) {
+        memset(huge_adr, 'A', adr_bytes);
+        huge_adr[adr_bytes] = '\0';
+    }
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    bool seeded = false;
+    if (huge_adr) {
+        (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+        cbm_store_t *seed = cbm_store_open_path(db_path);
+        seeded = seed && cbm_store_upsert_project(seed, project, root) == CBM_STORE_OK &&
+                 cbm_store_adr_store(seed, project, huge_adr) == CBM_STORE_OK;
+        cbm_store_close(seed);
+    }
+
+    cbm_daemon_application_t *application = seeded ? cbm_daemon_application_new(NULL) : NULL;
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session =
+        application ? app_test_open(&callbacks, 306) : NULL;
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    char adr_args[APP_TEST_PATH_CAP + 64];
+    (void)snprintf(adr_args, sizeof(adr_args), "{\"project\":\"%s\",\"mode\":\"get\"}",
+                   project ? project : "");
+    uint8_t *adr_tool = NULL;
+    uint32_t adr_tool_length = 0;
+    bool encoded = session && app_test_context_request(root, root, &context, &context_length) &&
+                   app_test_tool_request("manage_adr", adr_args, &adr_tool, &adr_tool_length);
+
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t context_status =
+        encoded ? app_test_request(&callbacks, session, context, context_length, &response,
+                                   &response_length)
+                : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(response);
+    response = NULL;
+    response_length = 0;
+    cbm_daemon_runtime_application_status_t adr_status =
+        context_status == CBM_DAEMON_RUNTIME_APPLICATION_OK
+            ? app_test_request(&callbacks, session, adr_tool, adr_tool_length, &response,
+                               &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+
+    /* The substituted envelope must be a well-formed, sendable MCP error that
+     * names the cause, states the REAL limit, and says what to change. */
+    char limit_text[64];
+    (void)snprintf(limit_text, sizeof(limit_text), "%u",
+                   (unsigned)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX);
+    const char *text = response ? (const char *)response : "";
+    bool sendable = response && response_length > 0 &&
+                    response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX;
+    bool flagged_error = sendable && strstr(text, "\"isError\":true") != NULL;
+    bool names_cause = sendable && strstr(text, "result too large to return") != NULL &&
+                       strstr(text, "manage_adr") != NULL;
+    bool states_real_limit = sendable && strstr(text, limit_text) != NULL;
+    bool gives_remedy = sendable && strstr(text, "Narrow it and retry") != NULL;
+    /* The bulk payload itself must NOT have been smuggled through. */
+    bool payload_withheld = sendable && strstr(text, "AAAAAAAAAAAAAAAA") == NULL;
+
+    free(response);
+    free(context);
+    free(adr_tool);
+    free(huge_adr);
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (db_path[0]) {
+        char sidecar[APP_TEST_PATH_CAP];
+        (void)cbm_unlink(db_path);
+        (void)snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
+        (void)cbm_unlink(sidecar);
+        (void)snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
+        (void)cbm_unlink(sidecar);
+    }
+    free(project);
+    if (dirs_ok) {
+        (void)cbm_rmdir(root);
+        (void)th_rmtree(cache);
+    }
+    if (had_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+
+    ASSERT_TRUE(env_ok);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(encoded);
+    ASSERT_EQ(context_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(adr_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(sendable);
+    ASSERT_TRUE(flagged_error);
+    ASSERT_TRUE(names_cause);
+    ASSERT_TRUE(states_real_limit);
+    ASSERT_TRUE(gives_remedy);
+    ASSERT_TRUE(payload_withheld);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 /* The thin hook process parses CLI metadata, but the daemon owns the MCP
  * session and therefore must retain that metadata with the session context.
  * Copilot deliberately omits the event from stdin, making this non-vacuous. */
@@ -4877,6 +5005,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_ui_config_updates_are_masked_and_serialized);
     RUN_TEST(daemon_application_ui_config_rejects_noncanonical_frames);
     RUN_TEST(daemon_application_restricted_profile_owns_no_background_surfaces);
+    RUN_TEST(daemon_application_oversize_tool_result_reports_cause_and_remedy);
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
