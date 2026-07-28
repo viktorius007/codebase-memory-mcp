@@ -5618,8 +5618,18 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
             j--;
         }
     }
+    /* Retained as a safety net: MAX_PREVIEW_NAMES was 15 until it was raised to
+     * ST_MAX_PKGS (64) to keep the packages and layers aspects in agreement. It
+     * guards the case where the preview cap is lowered again below the
+     * collection bound. While the two are equal the block is unreachable — the
+     * collection loop above only appends while `np < CBM_SZ_64`, and CBM_SZ_64,
+     * ST_MAX_PKGS and MAX_PREVIEW_NAMES are all 64, so `np` cannot exceed the
+     * cap. cppcheck reports the index as out of bounds because it evaluates the
+     * loop body without that guard; the access cannot occur. */
     if (np > MAX_PREVIEW_NAMES) {
         for (int i = MAX_PREVIEW_NAMES; i < np; i++) {
+            // cppcheck-suppress arrayIndexOutOfBounds - unreachable while
+            // MAX_PREVIEW_NAMES == CBM_SZ_64; see the comment above.
             free(pnames[i]);
         }
         np = MAX_PREVIEW_NAMES;
