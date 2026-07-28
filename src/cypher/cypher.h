@@ -262,15 +262,23 @@ typedef struct {
     int arg_count;
 } cbm_return_item_t;
 
+/* One ORDER BY sort key. `ORDER BY a, b DESC` is a lexicographic tuple sort:
+ * rows are ordered by the first key, ties broken by the next, and so on — each
+ * key carrying its own direction. */
+typedef struct {
+    const char *expr; /* "variable.property" or "COUNT(var)" or alias */
+    bool desc;        /* true = DESC; false = ASC, the default */
+} cbm_order_key_t;
+
 typedef struct {
     cbm_return_item_t *items;
     int count;
     bool distinct;
-    bool star;             /* RETURN * */
-    const char *order_by;  /* "variable.property" or "COUNT(var)" or alias */
-    const char *order_dir; /* "ASC" or "DESC", NULL = default */
-    int skip;              /* SKIP N, 0 = none */
-    int limit;             /* 0 = default */
+    bool star;                   /* RETURN * */
+    cbm_order_key_t *order_keys; /* NULL if no ORDER BY */
+    int order_key_count;         /* 0 if no ORDER BY */
+    int skip;                    /* SKIP N, 0 = none */
+    int limit;                   /* 0 = default */
 } cbm_return_clause_t;
 
 /* Full query AST */
