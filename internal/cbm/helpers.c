@@ -913,6 +913,48 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     return NULL;
 }
 
+/* Fold a Rust `#[cfg(...)]` predicate into a function QN. See helpers.h for the
+ * single-source-of-truth contract this upholds between the def walk and the call
+ * walk. The suffix is built from the raw `cfg(` text with whitespace and quotes
+ * dropped, so `#[cfg(feature = "x")]` and `#[cfg(feature="x")]` agree. */
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
+                                        const char *source, CBMLanguage lang) {
+    if (lang != CBM_LANG_RUST || !base_qn || ts_node_is_null(func_node) || !source) {
+        return base_qn;
+    }
+    /* Attributes are prev-siblings of the function item; an anonymous token
+     * (e.g. a visibility modifier) does not end the run, a named construct does
+     * — the same shape extract_decorators() walks on the definition side. */
+    for (TSNode prev = ts_node_prev_sibling(func_node); !ts_node_is_null(prev);
+         prev = ts_node_prev_sibling(prev)) {
+        if (strcmp(ts_node_type(prev), "attribute_item") != 0) {
+            if (ts_node_is_named(prev)) {
+                break;
+            }
+            continue;
+        }
+        const char *attr = cbm_node_text(a, prev, source);
+        if (!attr) {
+            continue;
+        }
+        const char *cfg = strstr(attr, "cfg(");
+        if (!cfg) {
+            continue;
+        }
+        char buf[CBM_SZ_256];
+        size_t bi = 0;
+        for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
+            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
+                continue;
+            }
+            buf[bi++] = *p;
+        }
+        buf[bi] = '\0';
+        return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);
+    }
+    return base_qn;
+}
+
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path,
                                   const char *module_qn) {
@@ -955,11 +997,13 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         }
         if (class_chain) {
             const char *class_qn = cbm_fqn_compute(a, project, rel_path, class_chain);
-            return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+            return cbm_rust_cfg_qualified_name(
+                a, cbm_arena_sprintf(a, "%s.%s", class_qn, name), func_node, source, lang);
         }
     }
 
-    return cbm_fqn_compute(a, project, rel_path, name);
+    return cbm_rust_cfg_qualified_name(a, cbm_fqn_compute(a, project, rel_path, name), func_node,
+                                       source, lang);
 }
 
 // --- Cached enclosing function QN ---

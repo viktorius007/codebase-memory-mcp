@@ -2109,30 +2109,15 @@ static bool rust_def_is_test(const char *const *decorators) {
     return false;
 }
 
-static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
-                                           const char *const *decorators) {
-    if (!decorators) {
-        return base_qn;
-    }
-    for (int i = 0; decorators[i]; i++) {
-        const char *cfg = strstr(decorators[i], "cfg(");
-        if (!cfg) {
-            continue;
-        }
-        /* Build a compact predicate suffix from the cfg(...) text, dropping
-         * whitespace and quotes so the QN stays readable and stable. */
-        char buf[CBM_SZ_256];
-        size_t bi = 0;
-        for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
-            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
-                continue;
-            }
-            buf[bi++] = *p;
-        }
-        buf[bi] = '\0';
-        return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);
-    }
-    return base_qn;
+/* The suffix itself is built by cbm_rust_cfg_qualified_name (helpers.c) — the
+ * SINGLE source of truth shared with the call walk's enclosing-function
+ * attribution, which must produce a byte-identical QN or every call inside a
+ * cfg-gated fn is re-attributed to the file node. This wrapper only adapts the
+ * def walk's already-extracted decorator TEXTS to that contract; both paths
+ * therefore agree by construction rather than by two copies staying in step. */
+static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
+                                           const char *source) {
+    return cbm_rust_cfg_qualified_name(a, base_qn, func_node, source, CBM_LANG_RUST);
 }
 
 // Extract base class name text from a single base_class child node.
@@ -3462,7 +3447,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into the QN so both branches survive the graph upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
+        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, node, ctx->source);
         def.is_test = rust_def_is_test(def.decorators);
     }
 

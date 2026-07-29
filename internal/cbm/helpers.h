@@ -41,6 +41,22 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path, const char *module_qn);
 
+// Rust only: fold a `#[cfg(...)]` predicate carried by `func_node` into `base_qn`,
+// producing the cfg-disambiguated QN (`foo` -> `foo#cfg(unix)]`) that keeps
+// cfg-gated twin definitions distinct in the graph (#495). Returns `base_qn`
+// unchanged when the function carries no cfg attribute or the language is not
+// Rust.
+//
+// SINGLE SOURCE OF TRUTH for that suffix: the DEFINITION walk (extract_defs.c)
+// and the enclosing-function attribution used by the CALL walk must produce
+// byte-identical QNs, because calls_find_source() (src/pipeline/pass_calls.c)
+// joins them by exact QN equality. When only the def side applied the suffix,
+// every call inside a cfg-gated fn missed that lookup and was silently
+// re-attributed to the file's `__file__` node — inflating trace_path's
+// `callers_total` with a non-callable row while dropping the real caller.
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
+                                        const char *source, CBMLanguage lang);
+
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 

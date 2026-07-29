@@ -3891,6 +3891,97 @@ TEST(tool_project_arg_resolves_unique_tail_issue1025) {
     PASS();
 }
 
+/*
+ * A call made INSIDE a Rust `#[cfg(...)]`-gated function must be attributed to
+ * that FUNCTION, never to the file's `__file__` node.
+ *
+ * Mechanism (measured 2026-07-29 on a ~9k-node Rust workspace): the def walk
+ * folds the cfg predicate into the definition QN via rust_cfg_qualified_name()
+ * (`foo` -> `foo#cfg(unix)]`) so cfg-gated twins stay distinct (#495), but the
+ * CALL side computes the enclosing-function QN through cbm_enclosing_func_qn(),
+ * which applied no such suffix. The QNs therefore disagreed, the gbuf lookup in
+ * calls_find_source() missed, and the call fell back to the `__file__` node.
+ *
+ * Consequence, and why this is a lying-count defect rather than cosmetics: the
+ * File node then appears as a row in trace_path's caller list and is counted in
+ * `callers_total`, while the REAL caller is missing from it. 225 of 240
+ * File-sourced CALLS in that workspace were such mis-attributions; 194 of them
+ * came from this cfg-suffix mismatch.
+ *
+ * The property under test is attribution parity, asserted in BOTH directions so
+ * the test cannot pass by merely dropping the edge: the cfg-gated caller must
+ * appear as a caller of the callee, and the file node must not.
+ */
+static void cfgattr_write_repo(const char *dir) {
+    char path[CBM_SZ_512];
+    snprintf(path, sizeof(path), "%s/lib.rs", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "pub fn cfgattr_callee() -> u32 { 7 }\n"
+               "\n"
+               "#[cfg(unix)]\n"
+               "pub fn cfgattr_gated_caller() -> u32 {\n"
+               "    cfgattr_callee()\n"
+               "}\n");
+    fclose(f);
+}
+
+TEST(tool_trace_cfg_gated_caller_not_attributed_to_file_node) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-cfgattr-repo-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-cfgattr-cache-XXXXXX");
+    if (!cbm_mkdtemp(repo) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cfgattr_write_repo(repo);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"cfgattr-proj\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    /* Callers of the callee, tests included so nothing is filtered by policy. */
+    r = cbm_mcp_handle_tool(srv, "trace_call_path",
+                            "{\"project\":\"cfgattr-proj\",\"function_name\":\"cfgattr_callee\","
+                            "\"direction\":\"inbound\",\"include_tests\":true}");
+    ASSERT_NOT_NULL(r);
+
+    /* The real, cfg-gated call site must be reported as the caller. */
+    if (!strstr(r, "cfgattr_gated_caller")) {
+        fprintf(stderr, "  [cfgattr] FAIL cfg-gated caller absent from callers: %.400s\n", r);
+    }
+    ASSERT_NOT_NULL(strstr(r, "cfgattr_gated_caller"));
+    /* ...and the File node must NOT stand in for it. */
+    if (strstr(r, "__file__")) {
+        fprintf(stderr, "  [cfgattr] FAIL __file__ node listed as a caller: %.400s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "__file__"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(repo);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* Regression for #604: path scopes architecture totals and content. */
 TEST(tool_get_architecture_path_scoping) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -10139,6 +10230,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
     RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
+    RUN_TEST(tool_trace_cfg_gated_caller_not_attributed_to_file_node);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
