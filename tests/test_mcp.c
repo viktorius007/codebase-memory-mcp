@@ -4156,6 +4156,94 @@ TEST(tool_trace_nested_fn_caller_not_attributed_to_file_node) {
     PASS();
 }
 
+/*
+ * A call inside a `#[cfg(...)]`-gated METHOD of an impl block must be attributed
+ * to that method, never to the file's `__file__` node.
+ *
+ * This pins an ASYMMETRY in the def walk that is easy to "tidy" into a bug: a
+ * free function's node QN carries the cfg predicate (extract_func_def ->
+ * rust_cfg_qualified_name), but a method inside an `impl` block is emitted by
+ * extract_rust_impl() as plain `<type_qn>.<name>` with NO predicate. The call
+ * walk must therefore suffix the free-function QN and must NOT suffix the
+ * method QN. Applying the suffix uniformly looks more consistent and silently
+ * re-breaks exactly this case — measured: 9 call sites regressed that way while
+ * the free-function fix was landing.
+ *
+ * Guard both directions at once: the sibling cfg test above fails if the free
+ * function stops being suffixed, this one fails if the method starts being.
+ */
+static void cfgmethod_write_repo(const char *dir) {
+    char path[CBM_SZ_512];
+    snprintf(path, sizeof(path), "%s/lib.rs", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "pub fn cfgmethod_callee() -> u32 { 7 }\n"
+               "\n"
+               "pub struct Registry;\n"
+               "\n"
+               "impl Registry {\n"
+               "    #[cfg(feature = \"test-util\")]\n"
+               "    pub fn cfgmethod_gated_method(&self) -> u32 {\n"
+               "        cfgmethod_callee()\n"
+               "    }\n"
+               "}\n");
+    fclose(f);
+}
+
+TEST(tool_trace_cfg_gated_method_not_attributed_to_file_node) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-cfgmethod-repo-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-cfgmethod-cache-XXXXXX");
+    if (!cbm_mkdtemp(repo) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cfgmethod_write_repo(repo);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"cfgmethod-proj\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    r = cbm_mcp_handle_tool(srv, "trace_call_path",
+                            "{\"project\":\"cfgmethod-proj\","
+                            "\"function_name\":\"cfgmethod_callee\","
+                            "\"direction\":\"inbound\",\"include_tests\":true}");
+    ASSERT_NOT_NULL(r);
+
+    if (!strstr(r, "cfgmethod_gated_method")) {
+        fprintf(stderr, "  [cfgmethod] FAIL cfg-gated method absent from callers: %.400s\n", r);
+    }
+    ASSERT_NOT_NULL(strstr(r, "cfgmethod_gated_method"));
+    if (strstr(r, "__file__")) {
+        fprintf(stderr, "  [cfgmethod] FAIL __file__ node listed as a caller: %.400s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "__file__"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(repo);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* Regression for #604: path scopes architecture totals and content. */
 TEST(tool_get_architecture_path_scoping) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -10407,6 +10495,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_cfg_gated_caller_not_attributed_to_file_node);
     RUN_TEST(tool_trace_generic_impl_caller_not_attributed_to_file_node);
     RUN_TEST(tool_trace_nested_fn_caller_not_attributed_to_file_node);
+    RUN_TEST(tool_trace_cfg_gated_method_not_attributed_to_file_node);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 

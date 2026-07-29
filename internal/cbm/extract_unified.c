@@ -652,9 +652,14 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * and is counted in `callers_total` while the real caller is missing.
      * Same suffix builder as the def side, so the two agree by construction. */
     if (state->enclosing_class_qn) {
-        return cbm_rust_cfg_qualified_name(
-            ctx->arena, cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name),
-            node, ctx->source, ctx->language);
+        /* NOT cfg-suffixed: a method inside an `impl` block is emitted by
+         * extract_rust_impl(), which names it `<type_qn>.<name>` with no cfg
+         * predicate — unlike the free-function path below (extract_func_def).
+         * Suffixing here would invent a QN no node carries and push the call
+         * onto the file node, which is precisely the bug this seam causes in
+         * the other direction. Parity with the def walk is the rule; the def
+         * walk's two paths differ, so this one must too. */
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
      * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
