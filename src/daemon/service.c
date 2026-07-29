@@ -17,6 +17,51 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef __APPLE__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include <CommonCrypto/CommonDigest.h>
+typedef CC_SHA256_CTX daemon_sha256_ctx_t;
+static bool daemon_sha256_init(daemon_sha256_ctx_t *context) {
+    return context && CC_SHA256_Init(context) == 1;
+}
+static bool daemon_sha256_update(daemon_sha256_ctx_t *context, const void *data, size_t length) {
+    return context && data && length <= UINT_MAX &&
+           CC_SHA256_Update(context, data, (CC_LONG)length) == 1;
+}
+static bool daemon_sha256_final(daemon_sha256_ctx_t *context,
+                                uint8_t digest[CBM_SHA256_DIGEST_LEN]) {
+    return context && digest && CC_SHA256_Final(digest, context) == 1;
+}
+#pragma clang diagnostic pop
+_Static_assert(CC_SHA256_DIGEST_LENGTH == CBM_SHA256_DIGEST_LEN,
+               "system and portable SHA-256 digest sizes must match");
+#else
+typedef cbm_sha256_ctx daemon_sha256_ctx_t;
+static bool daemon_sha256_init(daemon_sha256_ctx_t *context) {
+    if (!context) {
+        return false;
+    }
+    cbm_sha256_init(context);
+    return true;
+}
+static bool daemon_sha256_update(daemon_sha256_ctx_t *context, const void *data, size_t length) {
+    if (!context || !data) {
+        return false;
+    }
+    cbm_sha256_update(context, data, length);
+    return true;
+}
+static bool daemon_sha256_final(daemon_sha256_ctx_t *context,
+                                uint8_t digest[CBM_SHA256_DIGEST_LEN]) {
+    if (!context || !digest) {
+        return false;
+    }
+    cbm_sha256_final(context, digest);
+    return true;
+}
+#endif
+
 enum {
     DAEMON_SERVICE_PATH_CAP = 4096,
     DAEMON_SERVICE_IO_CAP = 64 * 1024,
@@ -370,18 +415,19 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         return false;
     }
 
-    cbm_sha256_ctx context;
-    cbm_sha256_init(&context);
+    daemon_sha256_ctx_t context;
+    bool ok = daemon_sha256_init(&context);
     unsigned char buffer[DAEMON_SERVICE_IO_CAP];
     off_t offset = 0;
-    bool ok = true;
-    while (offset < before.st_size) {
+    while (ok && offset < before.st_size) {
         off_t remaining = before.st_size - offset;
         size_t request = remaining < (off_t)sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
         ssize_t count = pread(fd, buffer, request, offset);
         if (count > 0) {
-            cbm_sha256_update(&context, buffer, (size_t)count);
-            offset += (off_t)count;
+            ok = daemon_sha256_update(&context, buffer, (size_t)count);
+            if (ok) {
+                offset += (off_t)count;
+            }
         } else if (count == 0) {
             ok = false;
             break;
@@ -398,7 +444,9 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         return false;
     }
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
-    cbm_sha256_final(&context, digest);
+    if (!daemon_sha256_final(&context, digest)) {
+        return false;
+    }
     digest_to_hex(digest, out);
     return true;
 }
@@ -697,8 +745,8 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
         windows_same_file_identity(&original_info, &info) && GetFileSizeEx(file, &before) != 0 &&
         before.QuadPart >= 0;
-    cbm_sha256_ctx context;
-    cbm_sha256_init(&context);
+    daemon_sha256_ctx_t context;
+    ok = ok && daemon_sha256_init(&context);
     unsigned char buffer[DAEMON_SERVICE_IO_CAP];
     uint64_t total = 0;
     while (ok) {
@@ -708,8 +756,10 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         } else if (count == 0) {
             break;
         } else {
-            cbm_sha256_update(&context, buffer, count);
-            total += count;
+            ok = daemon_sha256_update(&context, buffer, count);
+            if (ok) {
+                total += count;
+            }
         }
     }
     LARGE_INTEGER after;
@@ -725,7 +775,9 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
         return false;
     }
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
-    cbm_sha256_final(&context, digest);
+    if (!daemon_sha256_final(&context, digest)) {
+        return false;
+    }
     digest_to_hex(digest, out);
     return true;
 }
