@@ -53,3 +53,72 @@ re-run it rather than trust the write-up.
   is deliberately out of scope, mark the response — a `dispatch: dynamic` note, or a
   `partial` flag naming the skipped edge class — so a zero is legible as "not traversed"
   rather than "not called". Option 2 alone would have prevented the near-miss above.
+
+- **A `__file__` node is returned inside a callers list, inflating `callers_total`.**
+  (found 2026-07-29)
+
+  Reproduced on the Rust ports-and-adapters workspace `Users-viktor-Projects-agent`
+  (~8.9k nodes / 33.8k edges):
+
+      codebase-memory-mcp cli trace_path '{"project_name":"Users-viktor-Projects-agent",
+        "function_name":"ensure_single_link_regular_file","direction":"inbound",
+        "include_tests":true}'
+
+  returns `callers_total: 12`, and among the listed callers is a row
+
+      agent-store.src.scan.rs:
+        __file__ 2
+
+  A File node is not a caller. The reported total therefore includes at least one
+  non-caller, with nothing in the response marking which rows are real call sites and
+  which are containment artifacts.
+
+  **Why it matters even though this instance is benign:** the consumer that hit it ignored
+  the row and its verdict was unaffected — but `callers_total` is exactly the field an
+  agent reads to answer "how many places call this", and to decide whether a symbol is
+  safe to change. An inflated count is a silent wrong answer: it looks like a clean
+  result, and nothing prompts the reader to check. It is the same failure shape as the
+  OVERRIDE zero-callers defect above, in the opposite direction — that one under-reports,
+  this one over-reports, and neither is marked.
+
+  **Suggested fix**, in preference order: (1) exclude non-callable node labels (`File`,
+  `Folder`, `Module`) from callers lists and from `callers_total`; or (2) if a containment
+  edge is deliberately surfaced, label the row with its node kind so a reader can tell a
+  call site from a file, and exclude it from the total.
+
+- **The CLI pays a full daemon cold start per invocation, and prints daemon chatter into
+  the result stream.** (found 2026-07-29)
+
+  Measured on the same project. Each `codebase-memory-mcp cli <tool>` call costs ~1.35 s
+  before any query work, and emits to the result stream:
+
+      level=warn msg=mem.allocator.not_owned owned_classes=0/6 …
+      level=info msg=mem.init budget_mb=24576 total_ram_mb=49152 source=ram_fraction
+      hint: this command started a temporary CBM daemon…
+
+  One consumer traced six symbols in sequence and spent ~8 s on startup for ~0 s of query.
+  For comparison, `rg` answered the same six single-symbol questions in ~0.05 s each, which
+  is what that consumer concluded made the graph net-negative for uniquely-named symbols.
+
+  Two separable asks: (1) reuse a warm daemon across invocations, or document
+  `daemon start` as the harness-setup step so a batch of calls pays the cost once; and
+  (2) send `level=` diagnostics to stderr rather than into the tool result — an LLM
+  consumer receives them as part of the answer, and CLAUDE.md's agent-consumed-output rule
+  says a tool's default output should be decision-ready, not something the reader must
+  filter.
+
+## Confirmed working — do not "fix"
+
+- **`status: ambiguous` on an ambiguous symbol is correct behaviour.** Tracing
+  `execute_plan` on `Users-viktor-Projects-agent` (three same-named candidates) returned
+  `status: ambiguous` naming all three with file paths, rather than guessing one. The
+  consumer reported this cost it nothing and required no correction. This is the *safe*
+  failure mode, and the direct counterpart to the OVERRIDE defect's silent zero — resist
+  any change that turns it into a best-guess single answer.
+
+- **Both CLI invocation forms work.** Positional JSON
+  (`cli trace_path '{"project_name":…}'`) and flags
+  (`cli trace_path --project <slug> --function-name <qn> --direction inbound`) were both
+  verified to return identical output on 2026-07-29. Recorded because two consumers
+  independently reported the JSON form as broken; re-testing showed it works, so the
+  reports were wrong and no fix is needed. Kept here so the claim is not re-filed.
