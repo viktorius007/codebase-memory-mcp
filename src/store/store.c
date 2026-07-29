@@ -3850,13 +3850,14 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
 
     char edge_sql[ST_SQL_BUF];
     snprintf(edge_sql, sizeof(edge_sql),
-             "SELECT n1.name, n2.name, e.type, e.source_id, e.target_id, e.properties "
+             "SELECT e.id, n1.name, n2.name, e.type, e.source_id, e.target_id, e.properties "
              "FROM edges e "
              "JOIN nodes n1 ON n1.id = e.source_id "
              "JOIN nodes n2 ON n2.id = e.target_id "
              "WHERE e.source_id IN (SELECT id FROM bfs_ids) "
              "AND e.target_id IN (SELECT id FROM bfs_ids) "
-             "AND e.type IN (%s)",
+             "AND e.type IN (%s) "
+             "ORDER BY e.id",
              types_clause);
 
     sqlite3_stmt *estmt = NULL;
@@ -3885,13 +3886,15 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
             ecap *= ST_GROWTH;
             edges = safe_realloc(edges, ecap * sizeof(cbm_edge_info_t));
         }
-        edges[en].from_name = heap_strdup((const char *)sqlite3_column_text(estmt, 0));
-        edges[en].to_name = heap_strdup((const char *)sqlite3_column_text(estmt, SKIP_ONE));
-        edges[en].type = heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_2));
+        edges[en].edge_id = sqlite3_column_int64(estmt, 0);
+        edges[en].from_name = heap_strdup((const char *)sqlite3_column_text(estmt, SKIP_ONE));
+        edges[en].to_name = heap_strdup((const char *)sqlite3_column_text(estmt, ST_COL_2));
+        edges[en].type = heap_strdup((const char *)sqlite3_column_text(estmt, ST_COL_3));
         edges[en].confidence = (double)SKIP_ONE;
-        edges[en].source_id = sqlite3_column_int64(estmt, ST_COL_3);
-        edges[en].target_id = sqlite3_column_int64(estmt, ST_COL_4);
-        edges[en].properties_json = heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_5));
+        edges[en].source_id = sqlite3_column_int64(estmt, ST_COL_4);
+        edges[en].target_id = sqlite3_column_int64(estmt, CBM_SZ_5);
+        edges[en].properties_json =
+            heap_strdup((const char *)sqlite3_column_text(estmt, ST_COL_6));
         en++;
     }
     if (scan_rc14 != SQLITE_DONE) { /* SCANCHK:14:estmt */
@@ -3906,6 +3909,73 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
     *out_edges = edges;
     *out_edge_count = en;
     return CBM_STORE_OK;
+}
+
+typedef struct {
+    int64_t id;
+    int hop;
+    cbm_node_hop_t *row;
+    int64_t best_other;
+    const char *best_type;
+    int64_t best_edge_id;
+} bfs_node_ref_t;
+
+static int bfs_node_ref_cmp(const void *left, const void *right) {
+    const bfs_node_ref_t *a = (const bfs_node_ref_t *)left;
+    const bfs_node_ref_t *b = (const bfs_node_ref_t *)right;
+    return (a->id > b->id) - (a->id < b->id);
+}
+
+static bfs_node_ref_t *bfs_node_ref_find(bfs_node_ref_t *refs, int count, int64_t id) {
+    bfs_node_ref_t key = {.id = id};
+    return (bfs_node_ref_t *)bsearch(&key, refs, (size_t)count, sizeof(*refs),
+                                     bfs_node_ref_cmp);
+}
+
+static void bfs_assign_predecessor_edges(cbm_traverse_result_t *tr, const char *direction) {
+    bool inbound = direction && strcmp(direction, "inbound") == 0;
+    for (int i = 0; i < tr->visited_count; i++) {
+        tr->visited[i].predecessor_edge_id = 0;
+    }
+    int ref_count = tr->visited_count;
+    if (ref_count == 0) {
+        return;
+    }
+    bfs_node_ref_t *refs = malloc(sizeof(*refs) * (size_t)ref_count);
+    if (!refs) {
+        return;
+    }
+    for (int i = 0; i < tr->visited_count; i++) {
+        refs[i] = (bfs_node_ref_t){
+            .id = tr->visited[i].node.id, .hop = tr->visited[i].hop, .row = &tr->visited[i]};
+    }
+    qsort(refs, (size_t)ref_count, sizeof(*refs), bfs_node_ref_cmp);
+
+    for (int e = 0; e < tr->edge_count; e++) {
+        const cbm_edge_info_t *edge = &tr->edges[e];
+        int64_t reached_id = inbound ? edge->source_id : edge->target_id;
+        int64_t other_id = inbound ? edge->target_id : edge->source_id;
+        bfs_node_ref_t *reached = bfs_node_ref_find(refs, ref_count, reached_id);
+        bfs_node_ref_t *other = bfs_node_ref_find(refs, ref_count, other_id);
+        int other_hop = other_id == tr->root.id ? 0 : (other ? other->hop : CBM_NOT_FOUND);
+        if (!reached || !reached->row || other_hop != reached->hop - 1) {
+            continue;
+        }
+        cbm_node_hop_t *row = reached->row;
+        int type_cmp = reached->best_type
+                           ? strcmp(edge->type ? edge->type : "", reached->best_type)
+                           : -1;
+        if (reached->best_edge_id == 0 || other_id < reached->best_other ||
+            (other_id == reached->best_other &&
+             (type_cmp < 0 ||
+              (type_cmp == 0 && edge->edge_id < reached->best_edge_id)))) {
+            reached->best_other = other_id;
+            reached->best_type = edge->type ? edge->type : "";
+            reached->best_edge_id = edge->edge_id;
+            row->predecessor_edge_id = edge->edge_id;
+        }
+    }
+    free(refs);
 }
 
 /* Build parameterized placeholder list "?1,?2,?3" for N edge types. */
@@ -4031,6 +4101,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     if (n > 0) {
         bfs_collect_edges(s, start_id, out->visited, n, types_clause, edge_types, edge_type_count,
                           &out->edges, &out->edge_count);
+        bfs_assign_predecessor_edges(out, direction);
     } else {
         out->edges = NULL;
         out->edge_count = 0;

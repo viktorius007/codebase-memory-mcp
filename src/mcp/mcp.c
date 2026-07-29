@@ -186,7 +186,9 @@ int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out) {
         out->params_raw = yyjson_val_write(v_params, 0, NULL);
     }
 
-    yyjson_doc_free(doc);
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
     return 0;
 }
 
@@ -486,10 +488,11 @@ static const tool_def_t TOOLS[] = {
      "They are an OVER-SET (the bound implementation is a runtime fact the graph cannot see), "
      "which is why they are never merged into `callers`. "
      "UNATTRIBUTED CALL SITES: a call the extractor could not tie to an enclosing function "
-     "(e.g. one written at file/module scope) is held by its FILE, which is not a caller and "
-     "is excluded from `callers`/`callees` and their totals so those counts stay true. Such "
-     "rows appear as `unattributed_total` + `unattributed_files`: a call exists in each listed "
-     "file, but its call site is unresolved. "
+     "(e.g. one written at file/module scope) is held by a structural File/Module node, which "
+     "is not callable and is excluded from `callers`/`callees` and their totals so those counts "
+     "stay true. Such rows consume the same page budget and cursor stream as callable rows and "
+     "appear under `unattributed_inbound` / `unattributed_outbound` with directional totals: a "
+     "call exists at each listed structural node, but its call site is unresolved. "
      "`truncated: true` + `next` = more rows — pass next back as cursor. "
      "format=\"json\" returns the SAME tree model as structured JSON.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
@@ -506,9 +509,7 @@ static const tool_def_t TOOLS[] = {
      "\"calls\",\"description\":\"calls: follow CALLS edges. data_flow: follow CALLS+DATA_FLOWS "
      "with arg expressions. cross_service: follow HTTP_CALLS+ASYNC_CALLS+DATA_FLOWS through "
      "Routes, plus CROSS_* cross-repo edges (CROSS_HTTP_CALLS/ASYNC_CALLS/CHANNEL/GRPC_CALLS/"
-     "GRAPHQL_CALLS/TRPC_CALLS) to hop into other services.\"},\"parameter_name\":{\"type\":"
-     "\"string\",\"description\":\"For data_flow mode: "
-     "scope trace to a specific parameter name\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
+     "GRAPHQL_CALLS/TRPC_CALLS) to hop into other services.\"},\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Add risk classification (CRITICAL/HIGH/MEDIUM/LOW) based on hop distance"
      "\"},\"include_tests\":{\"type\":\"boolean\",\"default\":false,"
@@ -1268,6 +1269,20 @@ char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
     }
     yyjson_doc_free(doc);
     return result;
+}
+
+static bool mcp_arg_present(const char *args_json, const char *key) {
+    if (!args_json || !key) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    bool present = root && yyjson_is_obj(root) && yyjson_obj_get(root, key) != NULL;
+    yyjson_doc_free(doc);
+    return present;
 }
 
 static char *canonicalize_repo_path_if_exists(char *repo_path) {
@@ -5532,19 +5547,33 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     yyjson_doc *et_doc = yyjson_read(args, strlen(args), 0);
     if (et_doc) {
         yyjson_val *et_arr = yyjson_obj_get(yyjson_doc_get_root(et_doc), "edge_types");
+        if (et_arr && !yyjson_is_arr(et_arr)) {
+            *out_invalid = "<must be an array>";
+            return et_doc;
+        }
+        if (et_arr && yyjson_arr_size(et_arr) == 0) {
+            *out_invalid = "<array must not be empty>";
+            return et_doc;
+        }
         if (et_arr && yyjson_is_arr(et_arr)) {
             size_t idx2;
             size_t max2;
             yyjson_val *val2;
             yyjson_arr_foreach(et_arr, idx2, max2, val2) {
-                if (yyjson_is_str(val2) && *out_count < MCP_COL_16) {
-                    const char *et = yyjson_get_str(val2);
-                    if (!validate_edge_type(et)) {
-                        *out_invalid = et; /* borrows doc memory — kept alive below */
-                        return et_doc;
-                    }
-                    out_types[(*out_count)++] = et;
+                if (!yyjson_is_str(val2)) {
+                    *out_invalid = "<every entry must be a string>";
+                    return et_doc;
                 }
+                if (*out_count >= MCP_COL_16) {
+                    *out_invalid = "<at most 16 entries are allowed>";
+                    return et_doc;
+                }
+                const char *et = yyjson_get_str(val2);
+                if (!validate_edge_type(et)) {
+                    *out_invalid = et; /* borrows doc memory — kept alive below */
+                    return et_doc;
+                }
+                out_types[(*out_count)++] = et;
             }
         }
     }
@@ -5581,47 +5610,47 @@ static bool is_test_file(const char *path) {
            strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL;
 }
 
+/* Indexed definitions carry the authoritative is_test property, including
+ * inline Rust #[cfg(test)] functions whose file lives under ordinary src/.
+ * Keep the path fallback for structural/legacy nodes that predate the flag. */
+static bool trace_node_is_test(const cbm_node_t *node) {
+    if (!node) {
+        return false;
+    }
+    if (node->properties_json &&
+        strstr(node->properties_json, "\"is_test\":true") != NULL) {
+        return true;
+    }
+    if (node->properties_json &&
+        strstr(node->properties_json, "\"is_test\":false") != NULL) {
+        return false;
+    }
+    return is_test_file(node->file_path);
+}
+
 /* Convert BFS traversal results into a yyjson_mut array. */
-/* Find the CALLS-edge "args" JSON (the serialized arg expressions) on the edge
- * that leads to the given hop node, so data_flow mode can surface argument
- * expressions (#514). Returns the borrowed substring "[...]" inside the edge's
- * properties_json, with its length, or NULL when no args are recorded. */
-static const char *bfs_edge_args_for_hop(cbm_traverse_result_t *tr, int64_t hop_node_id,
-                                         size_t *out_len) {
+/* Serialize the args array on this row's deterministic shortest-path
+ * predecessor edge. The store records that exact edge after BFS; selecting an
+ * arbitrary incident edge attached wrong arguments at fan-in/fan-out nodes.
+ * yyjson handles brackets and escapes inside strings correctly. */
+static char *bfs_edge_args_for_hop(cbm_traverse_result_t *tr, const cbm_node_hop_t *row) {
+    if (!tr || !row || row->predecessor_edge_id <= 0) {
+        return NULL;
+    }
     for (int e = 0; e < tr->edge_count; e++) {
-        /* The hop node is the edge endpoint reached from the root side: for an
-         * outbound trace it is the target, for inbound it is the source. Match
-         * on either so both directions surface their args. */
-        if (tr->edges[e].target_id != hop_node_id && tr->edges[e].source_id != hop_node_id) {
+        if (tr->edges[e].edge_id != row->predecessor_edge_id) {
             continue;
         }
         const char *pj = tr->edges[e].properties_json;
         if (!pj) {
-            continue;
+            return NULL;
         }
-        const char *args = strstr(pj, "\"args\"");
-        if (!args) {
-            continue;
-        }
-        const char *open = strchr(args, '[');
-        if (!open) {
-            continue;
-        }
-        int depth = 0;
-        const char *p = open;
-        for (; *p; p++) {
-            if (*p == '[') {
-                depth++;
-            } else if (*p == ']') {
-                depth--;
-                if (depth == 0) {
-                    p++;
-                    break;
-                }
-            }
-        }
-        *out_len = (size_t)(p - open);
-        return open;
+        yyjson_doc *doc = yyjson_read(pj, strlen(pj), 0);
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        yyjson_val *args = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "args") : NULL;
+        char *serialized = args && yyjson_is_arr(args) ? yyjson_val_write(args, 0, NULL) : NULL;
+        yyjson_doc_free(doc);
+        return serialized;
     }
     return NULL;
 }
@@ -5633,7 +5662,7 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
                               bool risk_labels, bool include_tests, bool data_flow) {
     int visible = 0;
     for (int i = 0; i < tr->visited_count; i++) {
-        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+        if (!include_tests && trace_node_is_test(&tr->visited[i].node)) {
             continue;
         }
         visible++;
@@ -5651,8 +5680,7 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
     }
     cbm_tree_table_header(sb, key, visible, cols, ncols);
     for (int i = 0; i < tr->visited_count; i++) {
-        const char *fp = tr->visited[i].node.file_path;
-        bool test = is_test_file(fp);
+        bool test = trace_node_is_test(&tr->visited[i].node);
         if (!include_tests && test) {
             continue;
         }
@@ -5666,16 +5694,13 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
             cbm_tree_cell_bool(sb, test, false);
         }
         if (data_flow) {
-            size_t alen = 0;
-            const char *ea = bfs_edge_args_for_hop(tr, tr->visited[i].node.id, &alen);
-            if (ea && alen > 0 && alen < CBM_SZ_1K) {
-                char abuf[CBM_SZ_1K];
-                memcpy(abuf, ea, alen);
-                abuf[alen] = '\0';
-                cbm_tree_cell_str(sb, abuf, false);
+            char *ea = bfs_edge_args_for_hop(tr, &tr->visited[i]);
+            if (ea && strlen(ea) < CBM_SZ_1K) {
+                cbm_tree_cell_str(sb, ea, false);
             } else {
                 cbm_tree_cell_str(sb, "", false);
             }
+            free(ea);
         }
         cbm_tree_row_end(sb);
     }
@@ -5791,15 +5816,21 @@ static int node_hop_cmp_hop_id(const void *pa, const void *pb) {
  * nodes and silently truncated by tracing only one (#546). visited hops are
  * deduped by node id; edges are concatenated. Ownership of all heap fields
  * transfers into *out, freed by cbm_store_traverse_free. */
-static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
+static bool bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
                                 const char *direction, const char **edge_types, int edge_type_count,
                                 int depth, int limit, cbm_traverse_result_t *out) {
     memset(out, 0, sizeof(*out));
     int vcap = 0, ecap = 0;
     for (int k = 0; k < node_count; k++) {
         cbm_traverse_result_t tr = {0};
-        cbm_store_bfs(store, nodes[k].id, direction, edge_types, edge_type_count, depth, limit,
-                      &tr);
+        cbm_store_bfs(store, nodes[k].id, direction, edge_types, edge_type_count, depth,
+                      limit + SKIP_ONE, &tr);
+        if (tr.visited_count > limit) {
+            cbm_store_traverse_free(&tr);
+            cbm_store_traverse_free(out);
+            memset(out, 0, sizeof(*out));
+            return false;
+        }
         for (int i = 0; i < tr.visited_count; i++) {
             bool dup = false;
             for (int j = 0; j < out->visited_count; j++) {
@@ -5810,6 +5841,15 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
                      * single-BFS MIN(hop) semantics (#797). */
                     if (tr.visited[i].hop < out->visited[j].hop) {
                         out->visited[j].hop = tr.visited[i].hop;
+                        out->visited[j].predecessor_edge_id =
+                            tr.visited[i].predecessor_edge_id;
+                    } else if (tr.visited[i].hop == out->visited[j].hop &&
+                               tr.visited[i].predecessor_edge_id > 0 &&
+                               (out->visited[j].predecessor_edge_id == 0 ||
+                                tr.visited[i].predecessor_edge_id <
+                                    out->visited[j].predecessor_edge_id)) {
+                        out->visited[j].predecessor_edge_id =
+                            tr.visited[i].predecessor_edge_id;
                     }
                     dup = true;
                     break;
@@ -5824,15 +5864,20 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
             }
             out->visited[out->visited_count++] = tr.visited[i];
             memset(&tr.visited[i], 0, sizeof(tr.visited[i])); /* ownership moved */
+            if (out->visited_count > limit) {
+                cbm_store_traverse_free(&tr);
+                cbm_store_traverse_free(out);
+                memset(out, 0, sizeof(*out));
+                return false;
+            }
         }
         for (int i = 0; i < tr.edge_count; i++) {
-            /* Overlapping seed neighborhoods yield the same edge from more
-             * than one BFS — dedup by (source, target, type). */
+            /* Overlapping seed neighborhoods yield the same physical edge from
+             * more than one BFS. Dedup by store edge identity; parallel edges
+             * with distinct properties must remain distinct. */
             bool edup = false;
             for (int j = 0; j < out->edge_count; j++) {
-                if (out->edges[j].source_id == tr.edges[i].source_id &&
-                    out->edges[j].target_id == tr.edges[i].target_id && out->edges[j].type &&
-                    tr.edges[i].type && strcmp(out->edges[j].type, tr.edges[i].type) == 0) {
+                if (out->edges[j].edge_id == tr.edges[i].edge_id) {
                     edup = true;
                     break;
                 }
@@ -5855,6 +5900,7 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
         qsort(out->visited, (size_t)out->visited_count, sizeof(cbm_node_hop_t),
               node_hop_cmp_hop_id);
     }
+    return true;
 }
 
 /* ── Port-mediated callers (dynamic dispatch) ────────────────────────
@@ -5882,24 +5928,38 @@ typedef struct {
  * Returns the number of ports resolved (0 when the node overrides nothing,
  * i.e. every non-dyn symbol — the common case, one cheap query). */
 static int collect_port_mediated(cbm_store_t *store, const cbm_node_t *nodes, int node_count,
-                                 int depth, port_mediated_t *out, int out_cap) {
+                                 int depth, port_mediated_t **out, bool *truncated) {
     static const char *ov_types[] = {"OVERRIDE"};
     static const char *calls_types[] = {"CALLS"};
+    *out = NULL;
+    if (truncated) {
+        *truncated = false;
+    }
+    int cap = 0;
     int found = 0;
+    int retained_rows = 0;
 
-    for (int k = 0; k < node_count && found < out_cap; k++) {
+    for (int k = 0; k < node_count; k++) {
         /* Hop 1 only: the trait this impl directly overrides. */
         cbm_traverse_result_t traits = {0};
-        cbm_store_bfs(store, nodes[k].id, "outbound", ov_types, 1, 1, MCP_BFS_LIMIT_MAX, &traits);
+        cbm_store_bfs(store, nodes[k].id, "outbound", ov_types, 1, 1,
+                      MCP_BFS_LIMIT_MAX + SKIP_ONE, &traits);
+        if (traits.visited_count > MCP_BFS_LIMIT_MAX) {
+            if (truncated) {
+                *truncated = true;
+            }
+            cbm_store_traverse_free(&traits);
+            break;
+        }
 
-        for (int t = 0; t < traits.visited_count && found < out_cap; t++) {
+        for (int t = 0; t < traits.visited_count; t++) {
             const char *tqn = traits.visited[t].node.qualified_name;
             if (!tqn) {
                 continue;
             }
             bool dup = false;
             for (int d = 0; d < found; d++) {
-                if (out[d].port_qn && strcmp(out[d].port_qn, tqn) == 0) {
+                if ((*out)[d].port_qn && strcmp((*out)[d].port_qn, tqn) == 0) {
                     dup = true;
                     break;
                 }
@@ -5909,16 +5969,57 @@ static int collect_port_mediated(cbm_store_t *store, const cbm_node_t *nodes, in
             }
             cbm_traverse_result_t via = {0};
             cbm_store_bfs(store, traits.visited[t].node.id, "inbound", calls_types, 1, depth,
-                          MCP_BFS_LIMIT_MAX, &via);
+                          MCP_BFS_LIMIT_MAX + SKIP_ONE, &via);
+            if (via.visited_count > MCP_BFS_LIMIT_MAX) {
+                if (truncated) {
+                    *truncated = true;
+                }
+                cbm_store_traverse_free(&via);
+                break;
+            }
             if (via.visited_count == 0) {
                 cbm_store_traverse_free(&via);
                 continue;
             }
-            out[found].port_qn = heap_strdup(tqn);
-            out[found].via = via;
+            if (via.visited_count > MCP_BFS_LIMIT_MAX - retained_rows) {
+                cbm_store_traverse_free(&via);
+                if (truncated) {
+                    *truncated = true;
+                }
+                break;
+            }
+            if (found >= cap) {
+                int next_cap = cap ? cap * 2 : 8;
+                port_mediated_t *grown =
+                    (port_mediated_t *)realloc(*out, sizeof(port_mediated_t) * (size_t)next_cap);
+                if (!grown) {
+                    cbm_store_traverse_free(&via);
+                    if (truncated) {
+                        *truncated = true;
+                    }
+                    break;
+                }
+                memset(grown + cap, 0, sizeof(port_mediated_t) * (size_t)(next_cap - cap));
+                *out = grown;
+                cap = next_cap;
+            }
+            char *port_qn = heap_strdup(tqn);
+            if (!port_qn) {
+                cbm_store_traverse_free(&via);
+                if (truncated) {
+                    *truncated = true;
+                }
+                break;
+            }
+            (*out)[found].port_qn = port_qn;
+            (*out)[found].via = via;
+            retained_rows += via.visited_count;
             found++;
         }
         cbm_store_traverse_free(&traits);
+        if (truncated && *truncated) {
+            break;
+        }
     }
     return found;
 }
@@ -5928,16 +6029,22 @@ static void free_port_mediated(port_mediated_t *pm, int count) {
         free(pm[i].port_qn);
         cbm_store_traverse_free(&pm[i].via);
     }
+    free(pm);
+}
+
+static int port_mediated_cmp_qn(const void *pa, const void *pb) {
+    const port_mediated_t *a = (const port_mediated_t *)pa;
+    const port_mediated_t *b = (const port_mediated_t *)pb;
+    return strcmp(a->port_qn ? a->port_qn : "", b->port_qn ? b->port_qn : "");
 }
 
 /* ── Pagination cursors (stateless, exactly-once) ────────────────────
- * Token: "c1.<leg>.<generation>.<qhash>.<hop>.<id>" — version, trace leg
- * (o=callees, i=callers), the store generation (per-DB uid + mutation
- * counter), an FNV-1a-64 hash of the canonical query params, and the
- * (hop, node_id) watermark of the last emitted row in canonical order.
+ * Token: "c2.<generation>.<qhash>.<offset>" — version, store generation
+ * (per-DB uid + mutation counter), an FNV-1a-64 hash of the canonical query
+ * params, and the next offset in the canonical VISIBLE row stream.
  * Stateless by design: the server re-traverses (the recursive CTE pays the
  * full reachable-set cost regardless of LIMIT, so a page costs what one
- * call costs today) and skips to the watermark. The generation stamp turns
+ * call costs today) and skips to the offset. The generation stamp turns
  * every post-reindex cursor into a loud, actionable error — node ids are
  * never reused across rebuilds, so silently resuming would be wrong. */
 
@@ -5950,17 +6057,38 @@ static uint64_t cursor_fnv1a64(const char *s, uint64_t h) {
 }
 
 typedef struct {
-    char leg;            /* 'o' callees, 'i' callers */
     char generation[96]; /* store generation at mint time */
     uint64_t qhash;      /* canonical-params hash */
-    int hop;             /* watermark: last emitted row */
-    int64_t node_id;
+    int offset;          /* next row in the visible combined stream */
 } trace_cursor_t;
 
 /* Hash the params that define the traversal identity. A cursor replayed with
  * different params must fail loudly, never silently mis-skip. */
+static uint64_t trace_hash_edge_types_arg(const char *args, uint64_t h) {
+    h = cursor_fnv1a64("|edge_types:", h);
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *values = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "edge_types") : NULL;
+    if (!values) {
+        h = cursor_fnv1a64("<default>", h);
+    } else if (!yyjson_is_arr(values)) {
+        h = cursor_fnv1a64("<invalid>", h);
+    } else {
+        size_t index = 0;
+        size_t count = 0;
+        yyjson_val *value = NULL;
+        yyjson_arr_foreach(values, index, count, value) {
+            h = cursor_fnv1a64("|", h);
+            h = cursor_fnv1a64(yyjson_is_str(value) ? yyjson_get_str(value) : "<non-string>", h);
+        }
+    }
+    yyjson_doc_free(doc);
+    return h;
+}
+
 static uint64_t trace_params_hash(const char *project, const char *func_name, const char *direction,
-                                  const char *mode, int depth, bool include_tests, int limit) {
+                                  const char *mode, int depth, bool include_tests, int limit,
+                                  const char *args) {
     uint64_t h = 0xcbf29ce484222325ULL;
     h = cursor_fnv1a64(project ? project : "", h);
     h = cursor_fnv1a64("|", h);
@@ -5972,27 +6100,22 @@ static uint64_t trace_params_hash(const char *project, const char *func_name, co
     char nums[64];
     snprintf(nums, sizeof(nums), "|%d|%d|%d", depth, include_tests ? 1 : 0, limit);
     h = cursor_fnv1a64(nums, h);
-    return h;
+    return trace_hash_edge_types_arg(args, h);
 }
 
 static void trace_cursor_encode(const trace_cursor_t *c, char *buf, size_t bufsz) {
-    snprintf(buf, bufsz, "c1.%c.%s.%016llx.%d.%lld", c->leg, c->generation,
-             (unsigned long long)c->qhash, c->hop, (long long)c->node_id);
+    snprintf(buf, bufsz, "c2.%s.%016llx.%d", c->generation,
+             (unsigned long long)c->qhash, c->offset);
 }
 
 /* Decode + validate. Returns NULL on success, else a static teaching error. */
 static const char *trace_cursor_decode(const char *token, const char *current_generation,
                                        uint64_t expected_qhash, trace_cursor_t *out) {
     memset(out, 0, sizeof(*out));
-    if (!token || strncmp(token, "c1.", 3) != 0) {
+    if (!token || strncmp(token, "c2.", 3) != 0) {
         return "invalid_cursor: unrecognized token — re-run the original query without 'cursor'";
     }
     const char *p = token + 3;
-    if (*p != 'o' && *p != 'i') {
-        return "invalid_cursor: unrecognized token — re-run the original query without 'cursor'";
-    }
-    out->leg = *p;
-    p += 2; /* leg + '.' */
     const char *gen_end = strchr(p, '.');
     if (!gen_end || (size_t)(gen_end - p) >= sizeof(out->generation)) {
         return "invalid_cursor: unrecognized token — re-run the original query without 'cursor'";
@@ -6000,33 +6123,19 @@ static const char *trace_cursor_decode(const char *token, const char *current_ge
     memcpy(out->generation, p, (size_t)(gen_end - p));
     out->generation[gen_end - p] = '\0';
     unsigned long long qh = 0;
-    long long nid = 0;
-    if (sscanf(gen_end + 1, "%16llx.%d.%lld", &qh, &out->hop, &nid) != 3) {
+    if (sscanf(gen_end + 1, "%16llx.%d", &qh, &out->offset) != 2 || out->offset < 0) {
         return "invalid_cursor: unrecognized token — re-run the original query without 'cursor'";
     }
     out->qhash = qh;
-    out->node_id = nid;
-    if (out->qhash != expected_qhash) {
-        return "cursor_params_mismatch: this cursor was issued for different arguments — "
-               "pass the cursor back with ALL other arguments identical";
-    }
     if (strcmp(out->generation, current_generation) != 0) {
         return "stale_cursor: the project was reindexed since this cursor was issued — "
                "re-run the original query without 'cursor' (node identities changed)";
     }
-    return NULL;
-}
-
-/* Slice a canonically-ordered traversal at the watermark: index of the first
- * row strictly AFTER (hop, id). */
-static int trace_watermark_index(const cbm_traverse_result_t *tr, int hop, int64_t node_id) {
-    for (int i = 0; i < tr->visited_count; i++) {
-        if (tr->visited[i].hop > hop ||
-            (tr->visited[i].hop == hop && tr->visited[i].node.id > node_id)) {
-            return i;
-        }
+    if (out->qhash != expected_qhash) {
+        return "cursor_params_mismatch: this cursor was issued for different arguments — "
+               "pass the cursor back with ALL other arguments identical";
     }
-    return tr->visited_count;
+    return NULL;
 }
 
 /* json-stringified tree for one trace leg: same grouped model as the text
@@ -6050,7 +6159,7 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
     char cur_group[CBM_SZ_1K] = "";
     bool have_group = false;
     for (int i = 0; i < tr->visited_count; i++) {
-        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+        if (!include_tests && trace_node_is_test(&tr->visited[i].node)) {
             continue;
         }
         const char *qn =
@@ -6075,10 +6184,9 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
             yyjson_mut_arr_add_str(doc, row, cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)));
         }
         if (data_flow) {
-            size_t alen = 0;
-            const char *ea = bfs_edge_args_for_hop(tr, tr->visited[i].node.id, &alen);
-            if (ea && alen > 0) {
-                yyjson_mut_val *av = yyjson_mut_rawn(doc, ea, alen);
+            char *ea = bfs_edge_args_for_hop(tr, &tr->visited[i]);
+            if (ea && ea[0]) {
+                yyjson_mut_val *av = yyjson_mut_rawcpy(doc, ea);
                 if (av) {
                     yyjson_mut_arr_add_val(row, av);
                 } else {
@@ -6087,6 +6195,7 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
             } else {
                 yyjson_mut_arr_add_str(doc, row, "");
             }
+            free(ea);
         }
         yyjson_mut_arr_add_val(cur_rows, row);
     }
@@ -6111,76 +6220,152 @@ static int tree_hop_cmp_qn(const void *pa, const void *pb) {
     return a->hop - b->hop;
 }
 
-/* Explains a non-empty `unattributed_files` section: these are NOT callers, and
- * are excluded from the total above precisely so that total stays true. */
-#define TRACE_UNATTRIBUTED_NOTE                                                                    \
-    "files holding a CALLS edge the extractor could not attribute to an enclosing function; "      \
-    "a call exists in each file but its call site is unresolved. NOT callers and NOT counted "     \
-    "in the total above."
+/* Direction matters: a structural CALLS source is an unattributed call site,
+ * while a structural target is an unresolved endpoint. Neither is a callable
+ * function/method, so neither belongs in caller/callee totals. */
+#define TRACE_UNATTRIBUTED_IN_NOTE                                                                 \
+    "structural File/Module sources holding a CALLS edge the extractor could not attribute to "     \
+    "an enclosing callable; a call exists at each source but its call site is unresolved. NOT "     \
+    "callers and NOT counted in callers_total."
+#define TRACE_UNATTRIBUTED_OUT_NOTE                                                                \
+    "structural File/Module targets reached by CALLS; they are unresolved/non-callable endpoints, " \
+    "NOT function/method callees and NOT counted in callees_total."
+#define TRACE_VIA_PORT_UNATTRIBUTED_NOTE                                                           \
+    "structural File/Module sources calling the dynamic-dispatch port but not attributed to an "    \
+    "enclosing callable; NOT inferred callers and NOT counted in via_port_total."
 
 /* True for a traversal row that cannot execute code, so cannot be a call site.
- * A File row reaches a CALLS walk only via an edge the extractor sourced at the
- * file because it could not attribute the call to an enclosing function. */
+ * File and Module are the only structural labels observed as CALLS endpoints;
+ * neither can itself call or be called. */
 static bool trace_row_is_uncallable(const cbm_node_hop_t *h) {
-    return h->node.label && strcmp(h->node.label, "File") == 0;
+    return h->node.label &&
+           (strcmp(h->node.label, "File") == 0 || strcmp(h->node.label, "Module") == 0);
 }
 
-/* Move every uncallable row out of `tr` and into `spill`, preserving the
- * canonical (hop,id) order of both. Stable partition within `tr`'s OWN array —
- * a short-lived scratch buffer holds the moved rows while the kept ones are
- * compacted, then they are parked in the tail — so no second owning allocation
- * survives the call. `spill` is a view over storage `tr` still owns, borrowing
- * the same node strings: it must not outlive `tr` and must never be freed
- * separately (doing so would double-free every row).
- *
- * The rows are moved rather than deleted because a File-sourced CALLS edge is
- * real evidence that the call exists somewhere in that file; it just is not a
- * caller. The count the tool reports must be true of the thing its field name
- * claims to count, and evidence a consumer might legitimately need must not be
- * silently discarded — partitioning satisfies both. */
-static void trace_split_unattributed(cbm_traverse_result_t *tr, cbm_traverse_result_t *spill) {
-    if (!tr || !spill || tr->visited_count <= 0 || !tr->visited) {
-        return;
+/* One page's rows, partitioned without taking ownership of any node strings.
+ * `rows` owns only the shallow-copy array: callable rows occupy the prefix and
+ * unattributed rows the tail. The full cbm_traverse_result_t remains untouched,
+ * so cbm_store_traverse_free always sees and frees every owned string. This
+ * distinct type cannot accidentally be passed to cbm_store_traverse_free. */
+typedef struct {
+    cbm_node_hop_t *rows;
+    int callable_count;
+    int unattributed_count;
+} trace_page_partition_t;
+
+typedef enum {
+    TRACE_STREAM_OUTBOUND = 0,
+    TRACE_STREAM_INBOUND = 1,
+    TRACE_STREAM_VIA_PORT = 2,
+} trace_stream_section_t;
+
+typedef struct {
+    const cbm_node_hop_t *row;
+    trace_stream_section_t section;
+    int port_index;
+} trace_stream_row_t;
+
+static int trace_stream_append(trace_stream_row_t *stream, int count,
+                               const cbm_traverse_result_t *source,
+                               trace_stream_section_t section, int port_index,
+                               bool include_tests) {
+    if (!stream || !source) {
+        return count;
     }
-    int keep = 0;
-    int moved = 0;
-    for (int i = 0; i < tr->visited_count; i++) {
-        if (trace_row_is_uncallable(&tr->visited[i])) {
-            moved++;
+    for (int i = 0; i < source->visited_count; i++) {
+        if (!include_tests && trace_node_is_test(&source->visited[i].node)) {
+            continue;
+        }
+        stream[count++] = (trace_stream_row_t){
+            .row = &source->visited[i], .section = section, .port_index = port_index};
+    }
+    return count;
+}
+
+/* Materialize one semantic section from the selected global page. Node strings
+ * remain owned by their full traversal; this owns only its shallow row array. */
+static bool trace_page_partition(const trace_stream_row_t *stream, int page_start, int page_len,
+                                 trace_stream_section_t section, int port_index,
+                                 bool split_uncallable, trace_page_partition_t *partition) {
+    if ((!stream && page_len > 0) || !partition || page_start < 0 || page_len < 0) {
+        return false;
+    }
+    memset(partition, 0, sizeof(*partition));
+    int section_count = 0;
+    for (int i = page_start; i < page_start + page_len; i++) {
+        if (stream[i].section == section &&
+            (section != TRACE_STREAM_VIA_PORT || stream[i].port_index == port_index)) {
+            section_count++;
         }
     }
-    if (moved == 0) {
-        return;
+    if (section_count == 0) {
+        return true;
     }
-    cbm_node_hop_t *held = (cbm_node_hop_t *)malloc(sizeof(cbm_node_hop_t) * (size_t)moved);
-    if (!held) {
-        return; /* keep the pre-existing (over-counting) behaviour over a crash */
+    partition->rows =
+        (cbm_node_hop_t *)malloc(sizeof(cbm_node_hop_t) * (size_t)section_count);
+    if (!partition->rows) {
+        return false;
     }
-    int h = 0;
-    for (int i = 0; i < tr->visited_count; i++) {
-        if (trace_row_is_uncallable(&tr->visited[i])) {
-            held[h++] = tr->visited[i];
+    for (int i = page_start; i < page_start + page_len; i++) {
+        if (stream[i].section != section ||
+            (section == TRACE_STREAM_VIA_PORT && stream[i].port_index != port_index)) {
+            continue;
+        }
+        if (split_uncallable && trace_row_is_uncallable(stream[i].row)) {
+            partition->unattributed_count++;
         } else {
-            tr->visited[keep++] = tr->visited[i];
+            partition->callable_count++;
         }
     }
-    /* Park the moved rows in the tail of the SAME array so no second owning
-     * allocation exists: `spill` is a view over storage `tr` still owns. */
-    for (int i = 0; i < moved; i++) {
-        tr->visited[keep + i] = held[i];
+    int callable = 0;
+    int unattributed = partition->callable_count;
+    for (int i = page_start; i < page_start + page_len; i++) {
+        if (stream[i].section != section ||
+            (section == TRACE_STREAM_VIA_PORT && stream[i].port_index != port_index)) {
+            continue;
+        }
+        if (split_uncallable && trace_row_is_uncallable(stream[i].row)) {
+            partition->rows[unattributed++] = *stream[i].row;
+        } else {
+            partition->rows[callable++] = *stream[i].row;
+        }
     }
-    free(held);
-    *spill = *tr;
-    spill->visited = tr->visited + keep;
-    spill->visited_count = moved;
-    tr->visited_count = keep;
+    return true;
+}
+
+static cbm_traverse_result_t trace_partition_view(const trace_page_partition_t *partition,
+                                                  const cbm_traverse_result_t *source,
+                                                  bool unattributed) {
+    cbm_traverse_result_t view = {0};
+    if (!partition || !source) {
+        return view;
+    }
+    view.visited = partition->rows;
+    view.visited_count = partition->callable_count;
+    if (unattributed) {
+        view.visited =
+            partition->rows ? partition->rows + partition->callable_count : NULL;
+        view.visited_count = partition->unattributed_count;
+    }
+    /* Borrowed so data-flow rendering can still resolve edge arguments. */
+    view.edges = source->edges;
+    view.edge_count = source->edge_count;
+    return view;
+}
+
+static void trace_page_partition_free(trace_page_partition_t *partition) {
+    if (!partition) {
+        return;
+    }
+    free(partition->rows);
+    memset(partition, 0, sizeof(*partition));
 }
 
 static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
                               bool include_tests) {
     int visible = 0;
     for (int i = 0; i < tr->visited_count; i++) {
-        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+        if (!include_tests && trace_node_is_test(&tr->visited[i].node)) {
             continue;
         }
         visible++;
@@ -6194,7 +6379,7 @@ static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
     }
     char cur_group[CBM_SZ_1K] = "";
     for (int i = 0; i < tr->visited_count; i++) {
-        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+        if (!include_tests && trace_node_is_test(&tr->visited[i].node)) {
             continue;
         }
         const char *qn =
@@ -6236,7 +6421,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     char *mode = cbm_mcp_get_string_arg(args, "mode");
-    char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
+    bool has_param_name = mcp_arg_present(args, "parameter_name");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH);
     depth = clamp_mcp_depth(depth, "trace_call_path");
     /* Per-direction node budget for the BFS working set. The old fixed
@@ -6254,11 +6439,26 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
 
+    /* This option was advertised but never implemented: DATA_FLOWS edges do
+     * not currently carry parameter identity, so accepting it silently
+     * returned an unfiltered trace. Keep old clients honest until they refresh
+     * the schema; implementing parameter scoping requires extraction support,
+     * not a renderer-side guess. */
+    if (has_param_name) {
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        return cbm_mcp_text_result(
+            "parameter_name is unsupported: the graph does not record parameter identity on "
+            "DATA_FLOWS edges, so parameter-scoped tracing cannot be answered truthfully",
+            true);
+    }
+
     if (!func_name) {
         free(project);
         free(direction);
         free(mode);
-        free(param_name);
         return cbm_mcp_text_result("function_name is required", true);
     }
     if (!store) {
@@ -6269,7 +6469,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(mode);
-        free(param_name);
         return _res;
     }
 
@@ -6279,7 +6478,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(mode);
-        free(param_name);
         return not_indexed;
     }
 
@@ -6302,7 +6500,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(mode);
-        free(param_name);
         return cbm_mcp_text_result(
             "cursor_unsupported: this project's index predates generation tracking, so cursor "
             "staleness cannot be detected. Re-call with a higher 'limit' instead, or re-index "
@@ -6310,10 +6507,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             true);
     }
     if (cursor_arg && cursor_arg[0]) {
-        uint64_t qh =
-            trace_params_hash(project, func_name, direction ? direction : "both", mode,
-                              cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH), include_tests,
-                              cbm_mcp_get_int_arg(args, "limit", MCP_BFS_LIMIT));
+        uint64_t qh = trace_params_hash(project, func_name, direction ? direction : "both", mode,
+                                        depth, include_tests, trace_limit, args);
         const char *cerr = trace_cursor_decode(cursor_arg, generation, qh, &cur);
         if (cerr) {
             free(cursor_arg);
@@ -6321,7 +6516,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             free(project);
             free(direction);
             free(mode);
-            free(param_name);
             return cbm_mcp_text_result(cerr, true);
         }
         have_cursor = true;
@@ -6344,7 +6538,18 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(mode);
-        free(param_name);
+        return cbm_mcp_text_result(errbuf, true);
+    }
+    if (mode && strcmp(mode, "calls") != 0 && strcmp(mode, "data_flow") != 0 &&
+        strcmp(mode, "cross_service") != 0) {
+        char errbuf[CBM_SZ_256];
+        snprintf(errbuf, sizeof(errbuf),
+                 "invalid mode \"%s\" — use \"calls\", \"data_flow\", or \"cross_service\"",
+                 mode);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
         return cbm_mcp_text_result(errbuf, true);
     }
 
@@ -6383,7 +6588,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(mode);
-        free(param_name);
         cbm_store_free_nodes(nodes, 0);
         return cbm_mcp_text_result(hint, true);
     }
@@ -6399,7 +6603,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(mode);
-        free(param_name);
         cbm_store_free_nodes(nodes, node_count);
         return result;
     }
@@ -6407,6 +6610,19 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     /* Response encoding: tree tables by default; format:"json" emits the
      * same grouped model as structured JSON. */
     char *trace_format = cbm_mcp_get_string_arg(args, "format");
+    if (trace_format && strcmp(trace_format, "tree") != 0 &&
+        strcmp(trace_format, "json") != 0) {
+        char errbuf[CBM_SZ_256];
+        snprintf(errbuf, sizeof(errbuf),
+                 "invalid format \"%s\" — use \"tree\" or \"json\"", trace_format);
+        free(trace_format);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        cbm_store_free_nodes(nodes, node_count);
+        return cbm_mcp_text_result(errbuf, true);
+    }
     bool trace_legacy_json = trace_format && strcmp(trace_format, "json") == 0;
     free(trace_format);
 
@@ -6429,7 +6645,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(direction);
         free(mode);
-        free(param_name);
         cbm_store_free_nodes(nodes, node_count);
         return cbm_mcp_text_result(errbuf, true);
     }
@@ -6452,130 +6667,49 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
      * materializing up to MCP_BFS_LIMIT_MAX rows costs the same traversal —
      * and gives exact totals plus the rows every later page needs. The page
      * size (trace_limit) only bounds what THIS response emits. */
+    bool traversal_within_ceiling = true;
     if (do_outbound) {
-        bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
-                            depth, MCP_BFS_LIMIT_MAX, &tr_out);
+        traversal_within_ceiling =
+            bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
+                                depth, MCP_BFS_LIMIT_MAX, &tr_out);
     }
-    if (do_inbound) {
-        bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count, depth,
-                            MCP_BFS_LIMIT_MAX, &tr_in);
+    if (traversal_within_ceiling && do_inbound) {
+        traversal_within_ceiling =
+            bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count,
+                                depth, MCP_BFS_LIMIT_MAX, &tr_in);
+    }
+    if (!traversal_within_ceiling) {
+        if (do_outbound) {
+            cbm_store_traverse_free(&tr_out);
+        }
+        if (do_inbound) {
+            cbm_store_traverse_free(&tr_in);
+        }
+        cbm_store_free_nodes(nodes, node_count);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        if (et_doc_keep) {
+            yyjson_doc_free(et_doc_keep);
+        }
+        return cbm_mcp_text_result(
+            "trace_too_large: reachable set exceeds the 5000-row safety ceiling; lower depth "
+            "or narrow edge_types. No partial totals were returned.",
+            true);
     }
 
     /* A pure-CALLS walk answers "what code calls this" / "what does it call",
-     * so every row must be something that can execute. A File node cannot: it
-     * appears only because the extractor could not attribute a call to an
-     * enclosing function and sourced the CALLS edge at the file instead. Left
-     * in, it became a row in `callers` and was counted in `callers_total` — the
-     * field an agent reads to decide whether a symbol is safe to change — so
-     * the count was simply not true of the thing its name claims to count.
-     *
-     * Partitioned rather than dropped: the edge is real evidence that a call
-     * exists somewhere in that file, so it is reported under its own key with
-     * the file paths (same shape as via_port_*, and for the same reason — a
-     * different kind of answer never gets merged into the exact one).
-     *
-     * Scoped to a pure-CALLS walk: for any other requested edge type (IMPORTS,
-     * CONTAINS_FILE, ...) a File node is a legitimate, often intended result. */
+     * so structural File/Module rows are evidence of unresolved call sites,
+     * not callers/callees. Keep the full traversal untouched: pagination must
+     * budget the canonical mixed row stream before a page is partitioned, and
+     * normal traversal cleanup must retain ownership of every node string. */
     bool calls_only_walk = (edge_type_count == 1 && strcmp(edge_types[0], "CALLS") == 0);
-    cbm_traverse_result_t unattr_out = {0};
-    cbm_traverse_result_t unattr_in = {0};
-    if (calls_only_walk) {
-        trace_split_unattributed(&tr_out, &unattr_out);
-        trace_split_unattributed(&tr_in, &unattr_in);
-    }
-
-    /* Page windows in canonical (hop,id) order. Legs drain in a fixed order
-     * (callees, then callers); a resume cursor starts its leg at the row
-     * after the watermark, and a page that finishes one leg with budget to
-     * spare continues into the next. */
-    int out_start = 0;
-    int in_start = 0;
-    if (have_cursor) {
-        if (cur.leg == 'o') {
-            out_start = trace_watermark_index(&tr_out, cur.hop, cur.node_id);
-        } else {
-            out_start = tr_out.visited_count; /* callees leg already drained */
-            in_start = trace_watermark_index(&tr_in, cur.hop, cur.node_id);
-        }
-    }
-    int budget = trace_limit;
-    int out_len = 0;
-    int in_len = 0;
-    if (do_outbound) {
-        out_len = tr_out.visited_count - out_start;
-        if (out_len > budget) {
-            out_len = budget;
-        }
-        budget -= out_len;
-    }
-    if (do_inbound) {
-        in_len = tr_in.visited_count - in_start;
-        if (in_len > budget) {
-            in_len = budget;
-        }
-    }
-    bool out_more = do_outbound && out_start + out_len < tr_out.visited_count;
-    bool in_more = do_inbound && in_start + in_len < tr_in.visited_count;
-    bool more_rows = out_more || in_more;
-    char next_tok[192] = "";
-    /* Never mint a cursor under a "legacy" generation (no staleness
-     * detection); the truncated flag + raise-limit hint still fire below. */
-    if (more_rows && !gen_legacy) {
-        trace_cursor_t nc = {0};
-        snprintf(nc.generation, sizeof(nc.generation), "%s", generation);
-        nc.qhash = trace_params_hash(project, func_name, direction, mode, depth, include_tests,
-                                     trace_limit);
-        if (out_more) {
-            nc.leg = 'o';
-            nc.hop = tr_out.visited[out_start + out_len - 1].hop;
-            nc.node_id = tr_out.visited[out_start + out_len - 1].node.id;
-        } else {
-            nc.leg = 'i';
-            nc.hop = tr_in.visited[in_start + in_len - 1].hop;
-            nc.node_id = tr_in.visited[in_start + in_len - 1].node.id;
-        }
-        trace_cursor_encode(&nc, next_tok, sizeof(next_tok));
-    }
-
-    /* Window views: visited offset + count; the full edges array stays
-     * attached so data_flow args resolve for boundary nodes whose incoming
-     * edge originated on an earlier page. */
-    cbm_traverse_result_t view_out = tr_out;
-    view_out.visited = tr_out.visited ? tr_out.visited + out_start : NULL;
-    view_out.visited_count = out_len;
-    cbm_traverse_result_t view_in = tr_in;
-    view_in.visited = tr_in.visited ? tr_in.visited + in_start : NULL;
-    view_in.visited_count = in_len;
-
-    /* Totals must count what the caller can actually enumerate: when
-     * include_tests=false the tables hide test-file rows, so raw
-     * visited_count overstated the reachable set (a field-eval agent read
-     * callers_total=175 against a handful of visible rows and distrusted
-     * the tool). Count with the same filter the emitters apply. */
-    int out_total = 0;
-    for (int i = 0; i < tr_out.visited_count; i++) {
-        if (include_tests || !is_test_file(tr_out.visited[i].node.file_path)) {
-            out_total++;
-        }
-    }
-    int in_total = 0;
-    for (int i = 0; i < tr_in.visited_count; i++) {
-        if (include_tests || !is_test_file(tr_in.visited[i].node.file_path)) {
-            in_total++;
-        }
-    }
-    /* Counted with the same test-file filter, and reported separately — never
-     * folded into the totals above, which is the whole point of the split. */
-    int unattr_out_total = 0;
-    for (int i = 0; i < unattr_out.visited_count; i++) {
-        if (include_tests || !is_test_file(unattr_out.visited[i].node.file_path)) {
-            unattr_out_total++;
-        }
-    }
-    int unattr_in_total = 0;
-    for (int i = 0; i < unattr_in.visited_count; i++) {
-        if (include_tests || !is_test_file(unattr_in.visited[i].node.file_path)) {
-            unattr_in_total++;
+    bool walks_calls = false;
+    for (int edge_index = 0; edge_index < edge_type_count; edge_index++) {
+        if (strcmp(edge_types[edge_index], "CALLS") == 0) {
+            walks_calls = true;
+            break;
         }
     }
 
@@ -6584,20 +6718,244 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
      * hop reports a bare 0 that reads exactly like dead code. Reported in
      * their own section (never merged into callers) because they are an
      * over-set; see collect_port_mediated. */
-    enum { TRACE_MAX_PORTS = 8 };
-    port_mediated_t ports[TRACE_MAX_PORTS];
+    port_mediated_t *ports = NULL;
     int port_count = 0;
-    int via_port_total = 0;
-    if (do_inbound) {
-        port_count = collect_port_mediated(store, nodes, node_count, depth, ports, TRACE_MAX_PORTS);
-        for (int p = 0; p < port_count; p++) {
-            for (int i = 0; i < ports[p].via.visited_count; i++) {
-                const cbm_node_t *n = &ports[p].via.visited[i].node;
-                if (!include_tests && is_test_file(n->file_path)) {
-                    continue;
-                }
-                via_port_total++;
+    if (do_inbound && walks_calls) {
+        bool port_limit_hit = false;
+        port_count =
+            collect_port_mediated(store, nodes, node_count, depth, &ports, &port_limit_hit);
+        if (port_limit_hit) {
+            if (do_outbound) {
+                cbm_store_traverse_free(&tr_out);
             }
+            if (do_inbound) {
+                cbm_store_traverse_free(&tr_in);
+            }
+            free_port_mediated(ports, port_count);
+            cbm_store_free_nodes(nodes, node_count);
+            free(func_name);
+            free(project);
+            free(direction);
+            free(mode);
+            if (et_doc_keep) {
+                yyjson_doc_free(et_doc_keep);
+            }
+            return cbm_mcp_text_result(
+                "trace_too_large: dynamic-dispatch traversal exceeds the 5000-row safety "
+                "ceiling; lower depth or narrow edge_types",
+                true);
+        }
+        if (port_count > 1) {
+            qsort(ports, (size_t)port_count, sizeof(port_mediated_t), port_mediated_cmp_qn);
+        }
+        for (int p = 0; p < port_count; p++) {
+            if (ports[p].via.visited_count > 1) {
+                qsort(ports[p].via.visited, (size_t)ports[p].via.visited_count,
+                      sizeof(cbm_node_hop_t), node_hop_cmp_hop_id);
+            }
+        }
+    }
+
+    /* Visibility is applied before budgeting. One deterministic stream covers
+     * both exact legs, structural endpoints, and port-mediated evidence, so a
+     * limit of N means at most N emitted rows and no hidden test row can create
+     * an empty truncated page. */
+    int stream_capacity = tr_out.visited_count + tr_in.visited_count;
+    for (int p = 0; p < port_count; p++) {
+        stream_capacity += ports[p].via.visited_count;
+    }
+    trace_stream_row_t *stream =
+        stream_capacity > 0
+            ? (trace_stream_row_t *)malloc(sizeof(trace_stream_row_t) * (size_t)stream_capacity)
+            : NULL;
+    if (stream_capacity > 0 && !stream) {
+        if (do_outbound) {
+            cbm_store_traverse_free(&tr_out);
+        }
+        if (do_inbound) {
+            cbm_store_traverse_free(&tr_in);
+        }
+        free_port_mediated(ports, port_count);
+        cbm_store_free_nodes(nodes, node_count);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        if (et_doc_keep) {
+            yyjson_doc_free(et_doc_keep);
+        }
+        return cbm_mcp_text_result(
+            "trace_path could not allocate its visible row stream; retry with a lower depth",
+            true);
+    }
+    int stream_count = 0;
+    if (do_outbound) {
+        stream_count = trace_stream_append(stream, stream_count, &tr_out, TRACE_STREAM_OUTBOUND,
+                                           CBM_NOT_FOUND, include_tests);
+    }
+    if (do_inbound) {
+        stream_count = trace_stream_append(stream, stream_count, &tr_in, TRACE_STREAM_INBOUND,
+                                           CBM_NOT_FOUND, include_tests);
+    }
+    for (int p = 0; p < port_count; p++) {
+        stream_count = trace_stream_append(stream, stream_count, &ports[p].via,
+                                           TRACE_STREAM_VIA_PORT, p, include_tests);
+    }
+
+    int page_start = have_cursor ? cur.offset : 0;
+    if (page_start > stream_count) {
+        free(stream);
+        if (do_outbound) {
+            cbm_store_traverse_free(&tr_out);
+        }
+        if (do_inbound) {
+            cbm_store_traverse_free(&tr_in);
+        }
+        free_port_mediated(ports, port_count);
+        cbm_store_free_nodes(nodes, node_count);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        if (et_doc_keep) {
+            yyjson_doc_free(et_doc_keep);
+        }
+        return cbm_mcp_text_result(
+            "invalid_cursor: row offset is beyond this trace — re-run without 'cursor'", true);
+    }
+    int page_len = stream_count - page_start;
+    if (page_len > trace_limit) {
+        page_len = trace_limit;
+    }
+    bool more_rows = page_start + page_len < stream_count;
+    char next_tok[192] = "";
+    if (more_rows && !gen_legacy) {
+        trace_cursor_t nc = {0};
+        snprintf(nc.generation, sizeof(nc.generation), "%s", generation);
+        nc.qhash =
+            trace_params_hash(project, func_name, direction ? direction : "both", mode, depth,
+                              include_tests, trace_limit, args);
+        nc.offset = page_start + page_len;
+        trace_cursor_encode(&nc, next_tok, sizeof(next_tok));
+    }
+
+    trace_page_partition_t page_out = {0};
+    trace_page_partition_t page_in = {0};
+    trace_page_partition_t *port_pages =
+        port_count > 0
+            ? (trace_page_partition_t *)calloc((size_t)port_count,
+                                                sizeof(trace_page_partition_t))
+            : NULL;
+    bool partition_ok = (port_count == 0 || port_pages != NULL) &&
+        trace_page_partition(stream, page_start, page_len, TRACE_STREAM_OUTBOUND, CBM_NOT_FOUND,
+                             calls_only_walk, &page_out) &&
+        trace_page_partition(stream, page_start, page_len, TRACE_STREAM_INBOUND, CBM_NOT_FOUND,
+                             calls_only_walk, &page_in);
+    for (int p = 0; partition_ok && p < port_count; p++) {
+        partition_ok =
+            trace_page_partition(stream, page_start, page_len, TRACE_STREAM_VIA_PORT, p, true,
+                                 &port_pages[p]);
+    }
+    if (!partition_ok) {
+        trace_page_partition_free(&page_out);
+        trace_page_partition_free(&page_in);
+        if (port_pages) {
+            for (int p = 0; p < port_count; p++) {
+                trace_page_partition_free(&port_pages[p]);
+            }
+        }
+        free(port_pages);
+        free(stream);
+        if (do_outbound) {
+            cbm_store_traverse_free(&tr_out);
+        }
+        if (do_inbound) {
+            cbm_store_traverse_free(&tr_in);
+        }
+        free_port_mediated(ports, port_count);
+        cbm_store_free_nodes(nodes, node_count);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        if (et_doc_keep) {
+            yyjson_doc_free(et_doc_keep);
+        }
+        return cbm_mcp_text_result(
+            "trace_path could not allocate its page partitions; retry with a lower limit", true);
+    }
+
+    cbm_traverse_result_t view_out = trace_partition_view(&page_out, &tr_out, false);
+    cbm_traverse_result_t unattr_out = trace_partition_view(&page_out, &tr_out, true);
+    cbm_traverse_result_t view_in = trace_partition_view(&page_in, &tr_in, false);
+    cbm_traverse_result_t unattr_in = trace_partition_view(&page_in, &tr_in, true);
+    cbm_traverse_result_t *port_views =
+        port_count > 0
+            ? (cbm_traverse_result_t *)calloc((size_t)port_count,
+                                               sizeof(cbm_traverse_result_t))
+            : NULL;
+    cbm_traverse_result_t *port_unattr =
+        port_count > 0
+            ? (cbm_traverse_result_t *)calloc((size_t)port_count,
+                                               sizeof(cbm_traverse_result_t))
+            : NULL;
+    if (port_count > 0 && (!port_views || !port_unattr)) {
+        trace_page_partition_free(&page_out);
+        trace_page_partition_free(&page_in);
+        for (int p = 0; p < port_count; p++) {
+            trace_page_partition_free(&port_pages[p]);
+        }
+        free(port_views);
+        free(port_unattr);
+        free(port_pages);
+        free(stream);
+        if (do_outbound) {
+            cbm_store_traverse_free(&tr_out);
+        }
+        if (do_inbound) {
+            cbm_store_traverse_free(&tr_in);
+        }
+        free_port_mediated(ports, port_count);
+        cbm_store_free_nodes(nodes, node_count);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        if (et_doc_keep) {
+            yyjson_doc_free(et_doc_keep);
+        }
+        return cbm_mcp_text_result(
+            "trace_path could not allocate its port views; retry with a lower depth", true);
+    }
+    for (int p = 0; p < port_count; p++) {
+        port_views[p] = trace_partition_view(&port_pages[p], &ports[p].via, false);
+        port_unattr[p] = trace_partition_view(&port_pages[p], &ports[p].via, true);
+    }
+
+    int out_total = 0;
+    int in_total = 0;
+    int unattr_out_total = 0;
+    int unattr_in_total = 0;
+    int via_port_total = 0;
+    int via_port_unattr_total = 0;
+    for (int i = 0; i < stream_count; i++) {
+        bool structural = trace_row_is_uncallable(stream[i].row);
+        if (stream[i].section == TRACE_STREAM_OUTBOUND) {
+            if (calls_only_walk && structural) {
+                unattr_out_total++;
+            } else {
+                out_total++;
+            }
+        } else if (stream[i].section == TRACE_STREAM_INBOUND) {
+            if (calls_only_walk && structural) {
+                unattr_in_total++;
+            } else {
+                in_total++;
+            }
+        } else if (structural) {
+            via_port_unattr_total++;
+        } else {
+            via_port_total++;
         }
     }
 
@@ -6656,9 +7014,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 bfs_to_tree_table(&sb, out_key, &view_out, include_tests);
             }
             if (unattr_out_total > 0) {
-                cbm_tree_scalar_int(&sb, "unattributed_total", unattr_out_total);
-                cbm_tree_scalar_str(&sb, "unattributed_note", TRACE_UNATTRIBUTED_NOTE);
-                bfs_to_tree_table(&sb, "unattributed_files", &unattr_out, include_tests);
+                cbm_tree_scalar_int(&sb, "unattributed_outbound_total", unattr_out_total);
+                cbm_tree_scalar_str(&sb, "unattributed_outbound_note",
+                                    TRACE_UNATTRIBUTED_OUT_NOTE);
+                if (flat_trace) {
+                    bfs_to_toon_table(&sb, "unattributed_outbound", &unattr_out, risk_labels,
+                                      include_tests, data_flow);
+                } else {
+                    bfs_to_tree_table(&sb, "unattributed_outbound", &unattr_out, include_tests);
+                }
             }
         }
         if (do_inbound) {
@@ -6669,23 +7033,51 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 bfs_to_tree_table(&sb, in_key, &view_in, include_tests);
             }
             if (unattr_in_total > 0) {
-                cbm_tree_scalar_int(&sb, "unattributed_total", unattr_in_total);
-                cbm_tree_scalar_str(&sb, "unattributed_note", TRACE_UNATTRIBUTED_NOTE);
-                bfs_to_tree_table(&sb, "unattributed_files", &unattr_in, include_tests);
+                cbm_tree_scalar_int(&sb, "unattributed_inbound_total", unattr_in_total);
+                cbm_tree_scalar_str(&sb, "unattributed_inbound_note",
+                                    TRACE_UNATTRIBUTED_IN_NOTE);
+                if (flat_trace) {
+                    bfs_to_toon_table(&sb, "unattributed_inbound", &unattr_in, risk_labels,
+                                      include_tests, data_flow);
+                } else {
+                    bfs_to_tree_table(&sb, "unattributed_inbound", &unattr_in, include_tests);
+                }
             }
             /* Inferred, never merged with the exact set above (shape C). */
-            if (port_count > 0) {
+            if (via_port_total > 0 || via_port_unattr_total > 0) {
                 cbm_tree_scalar_int(&sb, "via_port_total", via_port_total);
                 cbm_tree_scalar_str(&sb, "via_port_note",
                                     "reached through dynamic dispatch — these call the port, so "
                                     "some may bind to a sibling implementation, not this one");
+                if (via_port_unattr_total > 0) {
+                    cbm_tree_scalar_int(&sb, "via_port_unattributed_total",
+                                        via_port_unattr_total);
+                    cbm_tree_scalar_str(&sb, "via_port_unattributed_note",
+                                        TRACE_VIA_PORT_UNATTRIBUTED_NOTE);
+                }
                 for (int p = 0; p < port_count; p++) {
+                    if (port_views[p].visited_count == 0 &&
+                        port_unattr[p].visited_count == 0) {
+                        continue;
+                    }
                     cbm_tree_scalar_str(&sb, "via_port", ports[p].port_qn);
-                    if (flat_trace) {
-                        bfs_to_toon_table(&sb, "via_port_callers", &ports[p].via, risk_labels,
-                                          include_tests, data_flow);
-                    } else {
-                        bfs_to_tree_table(&sb, "via_port_callers", &ports[p].via, include_tests);
+                    if (port_views[p].visited_count > 0) {
+                        if (flat_trace) {
+                            bfs_to_toon_table(&sb, "via_port_callers", &port_views[p],
+                                              risk_labels, include_tests, data_flow);
+                        } else {
+                            bfs_to_tree_table(&sb, "via_port_callers", &port_views[p],
+                                              include_tests);
+                        }
+                    }
+                    if (port_unattr[p].visited_count > 0) {
+                        if (flat_trace) {
+                            bfs_to_toon_table(&sb, "via_port_unattributed", &port_unattr[p],
+                                              risk_labels, include_tests, data_flow);
+                        } else {
+                            bfs_to_tree_table(&sb, "via_port_unattributed", &port_unattr[p],
+                                              include_tests);
+                        }
                     }
                 }
             }
@@ -6724,10 +7116,12 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, root, out_key,
                 bfs_to_tree_json(doc, &view_out, risk_labels, include_tests, data_flow));
             if (unattr_out_total > 0) {
-                yyjson_mut_obj_add_int(doc, root, "unattributed_total", unattr_out_total);
-                yyjson_mut_obj_add_str(doc, root, "unattributed_note", TRACE_UNATTRIBUTED_NOTE);
+                yyjson_mut_obj_add_int(doc, root, "unattributed_outbound_total",
+                                       unattr_out_total);
+                yyjson_mut_obj_add_str(doc, root, "unattributed_outbound_note",
+                                       TRACE_UNATTRIBUTED_OUT_NOTE);
                 yyjson_mut_obj_add_val(
-                    doc, root, "unattributed_files",
+                    doc, root, "unattributed_outbound",
                     bfs_to_tree_json(doc, &unattr_out, risk_labels, include_tests, data_flow));
             }
         }
@@ -6737,25 +7131,45 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 doc, root, in_key,
                 bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow));
             if (unattr_in_total > 0) {
-                yyjson_mut_obj_add_int(doc, root, "unattributed_total", unattr_in_total);
-                yyjson_mut_obj_add_str(doc, root, "unattributed_note", TRACE_UNATTRIBUTED_NOTE);
+                yyjson_mut_obj_add_int(doc, root, "unattributed_inbound_total", unattr_in_total);
+                yyjson_mut_obj_add_str(doc, root, "unattributed_inbound_note",
+                                       TRACE_UNATTRIBUTED_IN_NOTE);
                 yyjson_mut_obj_add_val(
-                    doc, root, "unattributed_files",
+                    doc, root, "unattributed_inbound",
                     bfs_to_tree_json(doc, &unattr_in, risk_labels, include_tests, data_flow));
             }
             /* Inferred, never merged with the exact set above (shape C). */
-            if (port_count > 0) {
+            if (via_port_total > 0 || via_port_unattr_total > 0) {
                 yyjson_mut_obj_add_int(doc, root, "via_port_total", via_port_total);
                 yyjson_mut_obj_add_str(doc, root, "via_port_note",
                                        "reached through dynamic dispatch — these call the port, so "
                                        "some may bind to a sibling implementation, not this one");
+                if (via_port_unattr_total > 0) {
+                    yyjson_mut_obj_add_int(doc, root, "via_port_unattributed_total",
+                                           via_port_unattr_total);
+                    yyjson_mut_obj_add_str(doc, root, "via_port_unattributed_note",
+                                           TRACE_VIA_PORT_UNATTRIBUTED_NOTE);
+                }
                 yyjson_mut_val *pa = yyjson_mut_arr(doc);
                 for (int p = 0; p < port_count; p++) {
+                    if (port_views[p].visited_count == 0 &&
+                        port_unattr[p].visited_count == 0) {
+                        continue;
+                    }
                     yyjson_mut_val *pe = yyjson_mut_obj(doc);
                     yyjson_mut_obj_add_strcpy(doc, pe, "port", ports[p].port_qn);
-                    yyjson_mut_obj_add_val(
-                        doc, pe, "callers",
-                        bfs_to_tree_json(doc, &ports[p].via, risk_labels, include_tests, data_flow));
+                    if (port_views[p].visited_count > 0) {
+                        yyjson_mut_obj_add_val(
+                            doc, pe, "callers",
+                            bfs_to_tree_json(doc, &port_views[p], risk_labels, include_tests,
+                                             data_flow));
+                    }
+                    if (port_unattr[p].visited_count > 0) {
+                        yyjson_mut_obj_add_val(
+                            doc, pe, "unattributed",
+                            bfs_to_tree_json(doc, &port_unattr[p], risk_labels, include_tests,
+                                             data_flow));
+                    }
                     yyjson_mut_arr_add_val(pa, pe);
                 }
                 yyjson_mut_obj_add_val(doc, root, "via_port", pa);
@@ -6764,7 +7178,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (more_rows) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
             if (next_tok[0]) {
-                yyjson_mut_obj_add_strcpy(doc, root, "next_cursor", next_tok);
+                yyjson_mut_obj_add_strcpy(doc, root, "next", next_tok);
             }
         }
         /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
@@ -6773,6 +7187,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Now safe to free traversal data */
+    trace_page_partition_free(&page_out);
+    trace_page_partition_free(&page_in);
+    for (int p = 0; p < port_count; p++) {
+        trace_page_partition_free(&port_pages[p]);
+    }
+    free(port_views);
+    free(port_unattr);
+    free(port_pages);
+    free(stream);
     if (do_outbound) {
         cbm_store_traverse_free(&tr_out);
     }
@@ -6786,7 +7209,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     free(project);
     free(direction);
     free(mode);
-    free(param_name);
     if (et_doc_keep) {
         yyjson_doc_free(et_doc_keep);
     }

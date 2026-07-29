@@ -153,6 +153,7 @@ typedef struct {
 typedef struct {
     cbm_node_t node;
     int hop; /* BFS depth from root */
+    int64_t predecessor_edge_id; /* deterministic shortest-path edge from hop-1 */
 } cbm_node_hop_t;
 
 typedef struct {
@@ -162,6 +163,7 @@ typedef struct {
     double confidence;
     int64_t source_id; /* edge endpoints — let callers match an edge to a hop node */
     int64_t target_id;
+    int64_t edge_id;
     const char *properties_json; /* raw edge properties (carries CALLS arg expressions) */
 } cbm_edge_info_t;
 

@@ -1578,20 +1578,25 @@ TEST(tool_trace_totals_respect_test_filter) {
                        .label = "Function",
                        .name = "prod_caller",
                        .qualified_name = "totproj.a.prod_caller",
-                       .file_path = "a.c",
+                       .file_path = "src/testing/helpers.rs",
                        .start_line = 10,
-                       .end_line = 15};
-    int64_t pid = cbm_store_upsert_node(st, &prod);
-    ASSERT_GT(pid, 0);
+                       .end_line = 15,
+                       .properties_json = "{\"is_test\":false}"};
     cbm_node_t tst = {.project = proj,
                       .label = "Function",
                       .name = "test_caller",
                       .qualified_name = "totproj.t.test_caller",
-                      .file_path = "tests/test_x.c",
+                      .file_path = "src/lib.rs",
                       .start_line = 1,
-                      .end_line = 5};
+                      .end_line = 5,
+                      .properties_json = "{\"is_test\":true}"};
     int64_t xid = cbm_store_upsert_node(st, &tst);
     ASSERT_GT(xid, 0);
+    /* Insert the hidden inline-test node first so a raw limit=1 page lands on
+     * it. Pagination must filter before budgeting, then return prod_caller on
+     * the first (and only) visible page rather than an empty truncated page. */
+    int64_t pid = cbm_store_upsert_node(st, &prod);
+    ASSERT_GT(pid, 0);
     cbm_edge_t e1 = {.project = proj, .source_id = pid, .target_id = tid, .type = "CALLS"};
     ASSERT_GT(cbm_store_insert_edge(st, &e1), 0);
     cbm_edge_t e2 = {.project = proj, .source_id = xid, .target_id = tid, .type = "CALLS"};
@@ -1600,12 +1605,16 @@ TEST(tool_trace_totals_respect_test_filter) {
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\",\"params\":{"
              "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"totproj\","
-             "\"function_name\":\"tgt\",\"direction\":\"inbound\"}}}");
+             "\"function_name\":\"tgt\",\"direction\":\"inbound\",\"limit\":1}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     free(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "callers_total: 1")); /* test row filtered */
+    ASSERT_NOT_NULL(strstr(inner, "prod_caller"));
+    ASSERT_NULL(strstr(inner, "test_caller"));
+    ASSERT_NULL(strstr(inner, "truncated: true"));
+    ASSERT_NULL(strstr(inner, "next: "));
     free(inner);
 
     resp = cbm_mcp_server_handle(
@@ -2596,6 +2605,49 @@ TEST(tool_trace_rejects_unknown_edge_type) {
     free(inner);
     free(resp);
 
+    const char *bad_args[] = {
+        "{\"function_name\":\"target\",\"project\":\"etproj\",\"direction\":\"inbound\","
+        "\"edge_types\":\"CALLS\"}",
+        "{\"function_name\":\"target\",\"project\":\"etproj\",\"direction\":\"inbound\","
+        "\"edge_types\":[\"CALLS\",7]}",
+        "{\"function_name\":\"target\",\"project\":\"etproj\",\"direction\":\"inbound\","
+        "\"edge_types\":[]}",
+        "{\"function_name\":\"target\",\"project\":\"etproj\",\"direction\":\"inbound\","
+        "\"edge_types\":[\"CALLS\",\"CALLS\",\"CALLS\",\"CALLS\",\"CALLS\",\"CALLS\","
+        "\"CALLS\",\"CALLS\",\"CALLS\",\"CALLS\",\"CALLS\",\"CALLS\",\"CALLS\",\"CALLS\","
+        "\"CALLS\",\"CALLS\",\"CALLS\"]}",
+    };
+    for (size_t i = 0; i < sizeof(bad_args) / sizeof(bad_args[0]); i++) {
+        resp = cbm_mcp_handle_tool(srv, "trace_call_path", bad_args[i]);
+        ASSERT_NOT_NULL(resp);
+        inner = extract_text_content(resp);
+        free(resp);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "invalid edge_types"));
+        ASSERT_NULL(strstr(inner, "callers_total"));
+        free(inner);
+    }
+
+    resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"function_name\":\"target\",\"project\":\"etproj\",\"mode\":\"typo\"}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "invalid mode"));
+    free(inner);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"function_name\":\"target\",\"project\":\"etproj\",\"format\":\"yaml\"}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "invalid format"));
+    free(inner);
+
     /* A well-formed type still traverses — the guard rejects, it does not
      * break the working path. */
     resp = cbm_mcp_server_handle(
@@ -2703,6 +2755,271 @@ TEST(tool_trace_reports_port_mediated_callers_separately) {
 
     free(inner);
     free(resp);
+
+    /* `edge_types` is a real traversal boundary. An OVERRIDE-only request must
+     * not append callers discovered through a separate internal CALLS walk. */
+    resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"function_name\":\"dynproj.adapters.ProcessExecutor.execute\","
+        "\"project\":\"dynproj\",\"direction\":\"inbound\",\"edge_types\":[\"OVERRIDE\"]}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "via_port_total"));
+    ASSERT_NULL(strstr(inner, "run_tool"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Port-mediated rows are part of trace_path's one response budget and cursor
+ * stream. They must not bypass limit, repeat in full on every page, or promote
+ * structural CALLS endpoints into the inferred-caller count. */
+TEST(tool_trace_port_mediated_rows_are_budgeted_and_structural_rows_separated) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "dynpage";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/dynpage");
+
+    cbm_node_t port = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "dynpage.ports.Executor.execute",
+                       .file_path = "src/ports.rs",
+                       .start_line = 1,
+                       .end_line = 4};
+    cbm_node_t impl = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "dynpage.adapters.RealExecutor.execute",
+                       .file_path = "src/adapters.rs",
+                       .start_line = 10,
+                       .end_line = 20};
+    int64_t port_id = cbm_store_upsert_node(st, &port);
+    int64_t impl_id = cbm_store_upsert_node(st, &impl);
+    ASSERT_GT(port_id, 0);
+    ASSERT_GT(impl_id, 0);
+    cbm_edge_t override = {
+        .project = proj, .source_id = impl_id, .target_id = port_id, .type = "OVERRIDE"};
+    ASSERT_GT(cbm_store_insert_edge(st, &override), 0);
+
+    const char *labels[] = {"Function", "Module", "Function"};
+    const char *names[] = {"dyn_caller_a", "dyn_unattributed", "dyn_caller_b"};
+    for (int i = 0; i < 3; i++) {
+        char qn[96];
+        snprintf(qn, sizeof(qn), "dynpage.src.%s", names[i]);
+        cbm_node_t caller = {.project = proj,
+                             .label = labels[i],
+                             .name = names[i],
+                             .qualified_name = qn,
+                             .file_path = "src/lib.rs",
+                             .start_line = 30 + i,
+                             .end_line = 31 + i};
+        int64_t caller_id = cbm_store_upsert_node(st, &caller);
+        ASSERT_GT(caller_id, 0);
+        cbm_edge_t call = {
+            .project = proj, .source_id = caller_id, .target_id = port_id, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+    }
+
+    char pages[3][4096];
+    char cursor[192] = "";
+    int page_count = 0;
+    for (; page_count < 3; page_count++) {
+        char args[640];
+        if (cursor[0]) {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"dynpage\","
+                     "\"function_name\":\"dynpage.adapters.RealExecutor.execute\","
+                     "\"direction\":\"inbound\",\"limit\":1,\"include_tests\":true,"
+                     "\"cursor\":\"%s\"}",
+                     cursor);
+        } else {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"dynpage\","
+                     "\"function_name\":\"dynpage.adapters.RealExecutor.execute\","
+                     "\"direction\":\"inbound\",\"limit\":1,\"include_tests\":true}");
+        }
+        char *resp = cbm_mcp_handle_tool(srv, "trace_call_path", args);
+        ASSERT_NOT_NULL(resp);
+        char *inner = extract_text_content(resp);
+        free(resp);
+        ASSERT_NOT_NULL(inner);
+        snprintf(pages[page_count], sizeof(pages[page_count]), "%s", inner);
+        ASSERT_NOT_NULL(strstr(inner, "callers_total: 0"));
+        ASSERT_NOT_NULL(strstr(inner, "via_port_total: 2"));
+        ASSERT_NOT_NULL(strstr(inner, "via_port_unattributed_total: 1"));
+
+        int page_rows = 0;
+        for (int i = 0; i < 3; i++) {
+            if (strstr(inner, names[i])) {
+                page_rows++;
+            }
+        }
+        ASSERT_EQ(page_rows, 1);
+
+        const char *next = strstr(inner, "next: ");
+        if (next) {
+            const char *end = strchr(next + 6, '\n');
+            size_t len = end ? (size_t)(end - (next + 6)) : strlen(next + 6);
+            ASSERT_TRUE(len < sizeof(cursor));
+            memcpy(cursor, next + 6, len);
+            cursor[len] = '\0';
+        } else {
+            cursor[0] = '\0';
+        }
+        free(inner);
+        if (!cursor[0]) {
+            page_count++;
+            break;
+        }
+    }
+    ASSERT_EQ(page_count, 3);
+    for (int i = 0; i < 3; i++) {
+        int seen = 0;
+        for (int page = 0; page < page_count; page++) {
+            if (strstr(pages[page], names[i])) {
+                seen++;
+            }
+        }
+        ASSERT_EQ(seen, 1);
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_port_mediated_does_not_silently_drop_ninth_port) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "dynports";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/dynports");
+
+    cbm_node_t impl = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "dynports.Real.execute",
+                       .file_path = "src/lib.rs"};
+    int64_t impl_id = cbm_store_upsert_node(st, &impl);
+    ASSERT_GT(impl_id, 0);
+    for (int i = 0; i < 9; i++) {
+        char port_name[32];
+        char port_qn[64];
+        char caller_name[32];
+        char caller_qn[64];
+        snprintf(port_name, sizeof(port_name), "port_%d", i);
+        snprintf(port_qn, sizeof(port_qn), "dynports.Port.%s", port_name);
+        snprintf(caller_name, sizeof(caller_name), "caller_%d", i);
+        snprintf(caller_qn, sizeof(caller_qn), "dynports.%s", caller_name);
+        cbm_node_t port = {.project = proj,
+                           .label = "Method",
+                           .name = port_name,
+                           .qualified_name = port_qn,
+                           .file_path = "src/ports.rs"};
+        cbm_node_t caller = {.project = proj,
+                             .label = "Function",
+                             .name = caller_name,
+                             .qualified_name = caller_qn,
+                             .file_path = "src/lib.rs"};
+        int64_t port_id = cbm_store_upsert_node(st, &port);
+        int64_t caller_id = cbm_store_upsert_node(st, &caller);
+        ASSERT_GT(port_id, 0);
+        ASSERT_GT(caller_id, 0);
+        cbm_edge_t override = {
+            .project = proj, .source_id = impl_id, .target_id = port_id, .type = "OVERRIDE"};
+        cbm_edge_t call = {
+            .project = proj, .source_id = caller_id, .target_id = port_id, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &override), 0);
+        ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"dynports\",\"function_name\":\"dynports.Real.execute\","
+        "\"direction\":\"inbound\",\"include_tests\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "via_port_total: 9"));
+    for (int i = 0; i < 9; i++) {
+        char caller_name[32];
+        snprintf(caller_name, sizeof(caller_name), "caller_%d", i);
+        ASSERT_NOT_NULL(strstr(inner, caller_name));
+    }
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_port_mediated_enforces_aggregate_safety_ceiling) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "dyncap";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/dyncap");
+
+    cbm_node_t impl = {.project = proj,
+                       .label = "Method",
+                       .name = "execute",
+                       .qualified_name = "dyncap.Real.execute",
+                       .file_path = "src/lib.rs"};
+    int64_t impl_id = cbm_store_upsert_node(st, &impl);
+    ASSERT_GT(impl_id, 0);
+    for (int port_index = 0; port_index < 2; port_index++) {
+        char port_name[32];
+        char port_qn[64];
+        snprintf(port_name, sizeof(port_name), "port_%d", port_index);
+        snprintf(port_qn, sizeof(port_qn), "dyncap.Port.%s", port_name);
+        cbm_node_t port = {.project = proj,
+                           .label = "Method",
+                           .name = port_name,
+                           .qualified_name = port_qn,
+                           .file_path = "src/ports.rs"};
+        int64_t port_id = cbm_store_upsert_node(st, &port);
+        ASSERT_GT(port_id, 0);
+        cbm_edge_t override = {
+            .project = proj, .source_id = impl_id, .target_id = port_id, .type = "OVERRIDE"};
+        ASSERT_GT(cbm_store_insert_edge(st, &override), 0);
+        for (int caller_index = 0; caller_index < 2501; caller_index++) {
+            char caller_name[48];
+            char caller_qn[96];
+            snprintf(caller_name, sizeof(caller_name), "caller_%d_%d", port_index,
+                     caller_index);
+            snprintf(caller_qn, sizeof(caller_qn), "dyncap.%s", caller_name);
+            cbm_node_t caller = {.project = proj,
+                                 .label = "Function",
+                                 .name = caller_name,
+                                 .qualified_name = caller_qn,
+                                 .file_path = "src/lib.rs"};
+            int64_t caller_id = cbm_store_upsert_node(st, &caller);
+            ASSERT_GT(caller_id, 0);
+            cbm_edge_t call = {
+                .project = proj, .source_id = caller_id, .target_id = port_id, .type = "CALLS"};
+            ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+        }
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"dyncap\",\"function_name\":\"dyncap.Real.execute\","
+        "\"direction\":\"inbound\",\"include_tests\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "trace_too_large"));
+    ASSERT_NULL(strstr(inner, "via_port_total"));
+    free(inner);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -3158,6 +3475,120 @@ TEST(tool_trace_pagination_exactly_once) {
     ASSERT_NOT_NULL(strstr(inner, "cursor_params_mismatch"));
     free(inner);
 
+    /* Edge types are part of traversal identity too. Replaying a CALLS-only
+     * cursor against a wider edge set must fail before its watermark is
+     * applied to a different row array. */
+    snprintf(req2, sizeof(req2),
+             "{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+             "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,"
+             "\"edge_types\":[\"CALLS\",\"OVERRIDE\"],\"cursor\":\"%s\"}}}",
+             tok1);
+    resp = cbm_mcp_server_handle(srv, req2);
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "cursor_params_mismatch"));
+    free(inner);
+
+    /* Structured JSON uses the documented canonical `next` field too. */
+    resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"pageproj\",\"function_name\":\"hub\",\"direction\":\"outbound\","
+        "\"limit\":5,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *json_page = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(json_page);
+    yyjson_val *json_root = yyjson_doc_get_root(json_page);
+    yyjson_val *json_next = yyjson_obj_get(json_root, "next");
+    ASSERT_TRUE(json_next && yyjson_is_str(json_next));
+    snprintf(tok1, sizeof(tok1), "%s", yyjson_get_str(json_next));
+    ASSERT_NULL(yyjson_obj_get(json_root, "next_cursor"));
+    yyjson_doc_free(json_page);
+    free(inner);
+    snprintf(req2, sizeof(req2),
+             "{\"project\":\"pageproj\",\"function_name\":\"hub\",\"direction\":\"outbound\","
+             "\"limit\":5,\"format\":\"json\",\"cursor\":\"%s\"}",
+             tok1);
+    resp = cbm_mcp_handle_tool(srv, "trace_call_path", req2);
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "c05"));
+    free(inner);
+
+    /* Canonicalized params define cursor identity. An over-cap depth is
+     * clamped before traversal, so replaying the identical request must hash
+     * the same effective depth that was minted into the cursor. */
+    resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"pageproj\",\"function_name\":\"hub\",\"direction\":\"outbound\","
+        "\"limit\":5,\"depth\":1000}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    const char *clamped_next = strstr(inner, "next: ");
+    ASSERT_NOT_NULL(clamped_next);
+    const char *clamped_end = strchr(clamped_next + 6, '\n');
+    size_t clamped_len =
+        clamped_end ? (size_t)(clamped_end - (clamped_next + 6)) : strlen(clamped_next + 6);
+    ASSERT_TRUE(clamped_len < sizeof(tok1));
+    memcpy(tok1, clamped_next + 6, clamped_len);
+    tok1[clamped_len] = '\0';
+    free(inner);
+    snprintf(req2, sizeof(req2),
+             "{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+             "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,\"depth\":1000,"
+             "\"cursor\":\"%s\"}}}",
+             tok1);
+    resp = cbm_mcp_server_handle(srv, req2);
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
+    ASSERT_NOT_NULL(strstr(inner, "c05"));
+    free(inner);
+
+    /* Omitted direction canonically means "both". Cursor minting and replay
+     * must hash that same default rather than minting an unusable token from
+     * the raw NULL argument. */
+    resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"pageproj\",\"function_name\":\"hub\",\"limit\":5}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    const char *default_next = strstr(inner, "next: ");
+    ASSERT_NOT_NULL(default_next);
+    const char *default_end = strchr(default_next + 6, '\n');
+    size_t default_len =
+        default_end ? (size_t)(default_end - (default_next + 6)) : strlen(default_next + 6);
+    ASSERT_TRUE(default_len < sizeof(tok1));
+    memcpy(tok1, default_next + 6, default_len);
+    tok1[default_len] = '\0';
+    free(inner);
+    snprintf(req2, sizeof(req2),
+             "{\"project\":\"pageproj\",\"function_name\":\"hub\",\"limit\":5,"
+             "\"cursor\":\"%s\"}",
+             tok1);
+    resp = cbm_mcp_handle_tool(srv, "trace_call_path", req2);
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
+    ASSERT_NOT_NULL(strstr(inner, "  c05 1\n"));
+    free(inner);
+
     /* Stale: an index run (upsert_project bumps the generation) invalidates
      * outstanding cursors with a loud, actionable error. */
     cbm_store_upsert_project(st, proj, "/tmp/page");
@@ -3174,6 +3605,152 @@ TEST(tool_trace_pagination_exactly_once) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "stale_cursor"));
     free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The 5000-row safety ceiling must fail loudly instead of returning a
+ * clean-looking partial total that clients mistake for the reachable set. */
+TEST(tool_trace_rejects_reachable_set_beyond_safety_ceiling) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "trace-cap-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/trace-cap");
+
+    cbm_node_t hub = {.project = proj,
+                      .label = "Function",
+                      .name = "cap_hub",
+                      .qualified_name = "trace-cap-proj.cap_hub",
+                      .file_path = "src/lib.rs",
+                      .start_line = 1,
+                      .end_line = 3};
+    int64_t hub_id = cbm_store_upsert_node(st, &hub);
+    ASSERT_GT(hub_id, 0);
+    for (int i = 0; i < 5001; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "cap_%04d", i);
+        snprintf(qn, sizeof(qn), "trace-cap-proj.%s", name);
+        cbm_node_t callee = {.project = proj,
+                             .label = "Function",
+                             .name = name,
+                             .qualified_name = qn,
+                             .file_path = "src/lib.rs",
+                             .start_line = i + 10,
+                             .end_line = i + 11};
+        int64_t callee_id = cbm_store_upsert_node(st, &callee);
+        ASSERT_GT(callee_id, 0);
+        cbm_edge_t edge = {
+            .project = proj, .source_id = hub_id, .target_id = callee_id, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"trace-cap-proj\",\"function_name\":\"cap_hub\","
+        "\"direction\":\"outbound\",\"depth\":1,\"limit\":5000}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "trace_too_large"));
+    ASSERT_NULL(strstr(inner, "callees_total"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_data_flow_uses_shortest_path_predecessor_edge_args) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "flow-edge-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/flow-edge");
+
+    cbm_node_t a = {.project = proj,
+                    .label = "Function",
+                    .name = "flow_a",
+                    .qualified_name = "flow-edge-proj.flow_a",
+                    .file_path = "src/lib.rs"};
+    cbm_node_t b = {.project = proj,
+                    .label = "Function",
+                    .name = "flow_b",
+                    .qualified_name = "flow-edge-proj.flow_b",
+                    .file_path = "src/lib.rs"};
+    cbm_node_t c = {.project = proj,
+                    .label = "Function",
+                    .name = "flow_c",
+                    .qualified_name = "flow-edge-proj.flow_c",
+                    .file_path = "src/lib.rs"};
+    int64_t a_id = cbm_store_upsert_node(st, &a);
+    int64_t b_id = cbm_store_upsert_node(st, &b);
+    int64_t c_id = cbm_store_upsert_node(st, &c);
+    ASSERT_GT(a_id, 0);
+    ASSERT_GT(b_id, 0);
+    ASSERT_GT(c_id, 0);
+
+    /* Insert the later-hop edge first. The old renderer picked the first edge
+     * incident to flow_b, so insertion order attached beta to both rows. */
+    cbm_edge_t bc = {.project = proj,
+                     .source_id = b_id,
+                     .target_id = c_id,
+                     .type = "CALLS",
+                     .properties_json = "{\"args\":[{\"e\":\"beta\"}]}"};
+    cbm_edge_t ab = {.project = proj,
+                     .source_id = a_id,
+                     .target_id = b_id,
+                     .type = "CALLS",
+                     .properties_json =
+                         "{\"args\":[{\"e\":\"left]right\\\"tail\"}]}"};
+    ASSERT_GT(cbm_store_insert_edge(st, &bc), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &ab), 0);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"flow-edge-proj\",\"function_name\":\"flow_a\","
+        "\"direction\":\"outbound\",\"depth\":2,\"mode\":\"data_flow\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "left]right"));
+    ASSERT_NOT_NULL(strstr(inner, "tail"));
+    ASSERT_NOT_NULL(strstr(inner, "beta"));
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_rejects_unimplemented_parameter_filter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *tools = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                      "{\"project\":\"missing\",\"function_name\":\"f\","
+                                      "\"mode\":\"data_flow\",\"parameter_name\":\"input\"}");
+    ASSERT_NOT_NULL(tools);
+    char *inner = extract_text_content(tools);
+    free(tools);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "parameter_name is unsupported"));
+    ASSERT_NOT_NULL(strstr(inner, "cannot be answered truthfully"));
+    free(inner);
+
+    /* The live tool contract must not keep advertising a non-functional
+     * property after the handler starts rejecting it. */
+    char *schema = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(schema);
+    ASSERT_NULL(strstr(schema, "parameter_name"));
+    free(schema);
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -4130,14 +4707,16 @@ TEST(tool_trace_nested_fn_caller_not_attributed_to_file_node) {
 
     r = cbm_mcp_handle_tool(srv, "trace_call_path",
                             "{\"project\":\"nestattr-proj\",\"function_name\":\"nestattr_callee\","
-                            "\"direction\":\"inbound\",\"include_tests\":true}");
+                            "\"direction\":\"inbound\",\"depth\":1,\"include_tests\":true}");
     ASSERT_NOT_NULL(r);
 
-    /* The outer function is the callable node that contains the call site. */
-    if (!strstr(r, "nestattr_outer")) {
-        fprintf(stderr, "  [nestattr] FAIL outer fn absent from callers: %.400s\n", r);
+    /* The nested function owns the call site. The outer function calls the
+     * helper, not the callee directly; collapsing both invents a direct edge. */
+    if (!strstr(r, "  nestattr_inner 1")) {
+        fprintf(stderr, "  [nestattr] FAIL nested fn absent from callers: %.400s\n", r);
     }
-    ASSERT_NOT_NULL(strstr(r, "nestattr_outer"));
+    ASSERT_NOT_NULL(strstr(r, "  nestattr_inner 1"));
+    ASSERT_NULL(strstr(r, "  nestattr_outer 1"));
     if (strstr(r, "__file__")) {
         fprintf(stderr, "  [nestattr] FAIL __file__ node listed as a caller: %.400s\n", r);
     }
@@ -4259,9 +4838,9 @@ TEST(tool_trace_cfg_gated_method_not_attributed_to_file_node) {
  * REPORTING contract independently of whichever extraction paths currently mint
  * such edges: the row is excluded from `callers` and from `callers_total`, and
  * — because the edge is real evidence a call exists in that file — it is still
- * reported under `unattributed_files` rather than silently dropped.
+ * reported under the directional `unattributed_*` section rather than silently dropped.
  */
-TEST(tool_trace_file_node_excluded_from_callers_total) {
+TEST(tool_trace_file_and_module_nodes_excluded_from_callers_total) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -4291,19 +4870,31 @@ TEST(tool_trace_file_node_excluded_from_callers_total) {
                             .file_path = "src/lib.rs",
                             .start_line = 0,
                             .end_line = 0};
+    cbm_node_t module_node = {.project = proj,
+                              .label = "Module",
+                              .name = "lib",
+                              .qualified_name = "filetotal-proj.src.lib",
+                              .file_path = "src/lib.rs",
+                              .start_line = 1,
+                              .end_line = 30};
     int64_t id_callee = cbm_store_upsert_node(st, &callee);
     int64_t id_real = cbm_store_upsert_node(st, &real_caller);
     int64_t id_file = cbm_store_upsert_node(st, &file_node);
+    int64_t id_module = cbm_store_upsert_node(st, &module_node);
     ASSERT_GT(id_callee, 0);
     ASSERT_GT(id_real, 0);
     ASSERT_GT(id_file, 0);
+    ASSERT_GT(id_module, 0);
 
     cbm_edge_t e_real = {
         .project = proj, .source_id = id_real, .target_id = id_callee, .type = "CALLS"};
     cbm_edge_t e_file = {
         .project = proj, .source_id = id_file, .target_id = id_callee, .type = "CALLS"};
+    cbm_edge_t e_module = {
+        .project = proj, .source_id = id_module, .target_id = id_callee, .type = "CALLS"};
     cbm_store_insert_edge(st, &e_real);
     cbm_store_insert_edge(st, &e_file);
+    cbm_store_insert_edge(st, &e_module);
 
     char *resp = cbm_mcp_handle_tool(srv, "trace_call_path",
                                      "{\"project\":\"filetotal-proj\","
@@ -4313,18 +4904,218 @@ TEST(tool_trace_file_node_excluded_from_callers_total) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
 
-    /* Exactly one caller — the function. The File node is not one. */
+    /* Exactly one caller — the function. File and Module nodes are not. */
     if (!strstr(inner, "callers_total: 1")) {
-        fprintf(stderr, "  [filetotal] FAIL callers_total counts the File node: %.400s\n", inner);
+        fprintf(stderr, "  [filetotal] FAIL callers_total counts a structural node: %.400s\n",
+                inner);
     }
     ASSERT_NOT_NULL(strstr(inner, "callers_total: 1"));
     ASSERT_NOT_NULL(strstr(inner, "ft_real_caller"));
-    /* The evidence is kept, under a heading that does not claim it is a call. */
-    ASSERT_NOT_NULL(strstr(inner, "unattributed_files"));
-    ASSERT_NOT_NULL(strstr(inner, "unattributed_total: 1"));
+    /* The evidence is kept, under a directional heading that does not claim
+     * either structural node is a caller. */
+    const char *unattributed = strstr(inner, "unattributed_inbound");
+    ASSERT_NOT_NULL(unattributed);
+    const char *module_row = strstr(inner, "\n  lib 1\n");
+    ASSERT_TRUE(!module_row || module_row > unattributed);
+    ASSERT_NOT_NULL(strstr(inner, "unattributed_inbound_total: 2"));
 
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The response `limit` is one budget across callable and unattributed rows.
+ * Cursor replay must enumerate the mixed canonical row stream exactly once:
+ * a structural row cannot repeat on every page or arrive outside the budget.
+ *
+ * This also exercises the spill ownership path under Linux leak sanitizers.
+ * The old in-place split lowered visited_count, so normal traversal cleanup
+ * skipped the structural rows' six owned strings. */
+TEST(tool_trace_unattributed_pagination_exactly_once_and_budgeted) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "unattr-page-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/unattr-page");
+
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "up_callee",
+                         .qualified_name = "unattr-page-proj.src.up_callee",
+                         .file_path = "src/lib.rs",
+                         .start_line = 1,
+                         .end_line = 3};
+    int64_t callee_id = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(callee_id, 0);
+
+    const char *labels[] = {"Function", "File", "Function", "Module"};
+    const char *names[] = {"up_real_a", "__file__", "up_real_b", "up_module"};
+    const char *qns[] = {"unattr-page-proj.src.up_real_a",
+                         "unattr-page-proj.src.lib.rs.__file__",
+                         "unattr-page-proj.src.up_real_b",
+                         "unattr-page-proj.src.up_module"};
+    for (int i = 0; i < 4; i++) {
+        cbm_node_t caller = {.project = proj,
+                             .label = labels[i],
+                             .name = names[i],
+                             .qualified_name = qns[i],
+                             .file_path = "src/lib.rs",
+                             .start_line = i + 10,
+                             .end_line = i + 11};
+        int64_t caller_id = cbm_store_upsert_node(st, &caller);
+        ASSERT_GT(caller_id, 0);
+        cbm_edge_t edge = {
+            .project = proj, .source_id = caller_id, .target_id = callee_id, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    }
+
+    char pages[4][4096];
+    char cursor[192] = "";
+    int page_count = 0;
+    for (; page_count < 4; page_count++) {
+        char args[640];
+        if (cursor[0]) {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"unattr-page-proj\",\"function_name\":\"up_callee\","
+                     "\"direction\":\"inbound\",\"limit\":1,\"include_tests\":true,"
+                     "\"risk_labels\":true,\"cursor\":\"%s\"}",
+                     cursor);
+        } else {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"unattr-page-proj\",\"function_name\":\"up_callee\","
+                     "\"direction\":\"inbound\",\"limit\":1,\"include_tests\":true,"
+                     "\"risk_labels\":true}");
+        }
+        char *resp = cbm_mcp_handle_tool(srv, "trace_call_path", args);
+        ASSERT_NOT_NULL(resp);
+        char *inner = extract_text_content(resp);
+        free(resp);
+        ASSERT_NOT_NULL(inner);
+        snprintf(pages[page_count], sizeof(pages[page_count]), "%s", inner);
+        ASSERT_NOT_NULL(strstr(inner, "callers_total: 2"));
+        ASSERT_NOT_NULL(strstr(inner, "unattributed_inbound_total: 2"));
+
+        const char *unattr = strstr(inner, "unattributed_inbound:");
+        if (unattr) {
+            const char *line_end = strchr(unattr, '\n');
+            const char *risk = strstr(unattr, "risk");
+            ASSERT_NOT_NULL(risk);
+            ASSERT_TRUE(!line_end || risk < line_end);
+        }
+
+        const char *next = strstr(inner, "next: ");
+        if (next) {
+            const char *end = strchr(next + 6, '\n');
+            size_t len = end ? (size_t)(end - (next + 6)) : strlen(next + 6);
+            ASSERT_TRUE(len < sizeof(cursor));
+            memcpy(cursor, next + 6, len);
+            cursor[len] = '\0';
+        } else {
+            cursor[0] = '\0';
+        }
+        free(inner);
+        if (!cursor[0]) {
+            page_count++;
+            break;
+        }
+    }
+    ASSERT_EQ(page_count, 4);
+
+    for (int row = 0; row < 4; row++) {
+        int seen = 0;
+        for (int page = 0; page < page_count; page++) {
+            if (strstr(pages[page], qns[row])) {
+                seen++;
+            }
+        }
+        ASSERT_EQ(seen, 1);
+    }
+
+    /* With limit=1, exactly one of the four row identities is emitted on
+     * each page, regardless of which section owns it. */
+    for (int page = 0; page < page_count; page++) {
+        int rows_on_page = 0;
+        for (int row = 0; row < 4; row++) {
+            if (strstr(pages[page], qns[row])) {
+                rows_on_page++;
+            }
+        }
+        ASSERT_EQ(rows_on_page, 1);
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Both trace legs may contain structural CALLS endpoints. Directional keys
+ * keep the two evidence sets representable in JSON without duplicate object
+ * members and without calling a Module a "file". */
+TEST(tool_trace_unattributed_json_has_unique_directional_keys) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "unattr-json-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/unattr-json");
+
+    cbm_node_t hub = {.project = proj,
+                      .label = "Function",
+                      .name = "uj_hub",
+                      .qualified_name = "unattr-json-proj.src.uj_hub",
+                      .file_path = "src/lib.rs",
+                      .start_line = 1,
+                      .end_line = 3};
+    cbm_node_t inbound_module = {.project = proj,
+                                 .label = "Module",
+                                 .name = "uj_inbound_module",
+                                 .qualified_name = "unattr-json-proj.src.uj_inbound_module",
+                                 .file_path = "src/lib.rs",
+                                 .start_line = 5,
+                                 .end_line = 8};
+    cbm_node_t outbound_file = {.project = proj,
+                                .label = "File",
+                                .name = "__file__",
+                                .qualified_name = "unattr-json-proj.out.rs.__file__",
+                                .file_path = "out.rs",
+                                .start_line = 0,
+                                .end_line = 0};
+    int64_t hub_id = cbm_store_upsert_node(st, &hub);
+    int64_t inbound_id = cbm_store_upsert_node(st, &inbound_module);
+    int64_t outbound_id = cbm_store_upsert_node(st, &outbound_file);
+    ASSERT_GT(hub_id, 0);
+    ASSERT_GT(inbound_id, 0);
+    ASSERT_GT(outbound_id, 0);
+    cbm_edge_t inbound = {
+        .project = proj, .source_id = inbound_id, .target_id = hub_id, .type = "CALLS"};
+    cbm_edge_t outbound = {
+        .project = proj, .source_id = hub_id, .target_id = outbound_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &inbound), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &outbound), 0);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"unattr-json-proj\",\"function_name\":\"uj_hub\","
+        "\"direction\":\"both\",\"include_tests\":true,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"unattributed_outbound_total\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"unattributed_inbound_total\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"unattributed_outbound\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"unattributed_inbound\""));
+    ASSERT_NULL(strstr(inner, "\"unattributed_total\""));
+    ASSERT_NULL(strstr(inner, "\"unattributed_files\""));
+
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_NOT_NULL(root);
+    ASSERT_TRUE(yyjson_is_obj(root));
+    yyjson_doc_free(doc);
+    free(inner);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -9635,7 +10426,6 @@ TEST(index_recovery_parallel_quarantines_crasher) {
     ASSERT_NOT_NULL(f);
     fputs("def idxpar_crash_fn():\n    return 'boom'\n", f);
     fclose(f);
-
     int code = -1;
     bool signalled = false;
     int sig = 0;
@@ -9660,9 +10450,9 @@ TEST(index_recovery_parallel_quarantines_crasher) {
     free(project);
     restore_cache_dir(saved_cache_copy);
     free(saved_cache_copy);
-    remove(p1);
-    remove(p2);
-    remove(pc);
+    cbm_unlink(p1);
+    cbm_unlink(p2);
+    cbm_unlink(pc);
     cbm_rmdir(cache);
     cbm_rmdir(tmp_dir);
 
@@ -10561,10 +11351,16 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_rejects_unknown_edge_type);
     RUN_TEST(tool_trace_reports_port_mediated_callers_separately);
+    RUN_TEST(tool_trace_port_mediated_rows_are_budgeted_and_structural_rows_separated);
+    RUN_TEST(tool_trace_port_mediated_does_not_silently_drop_ninth_port);
+    RUN_TEST(tool_trace_port_mediated_enforces_aggregate_safety_ceiling);
     RUN_TEST(tool_trace_port_mediated_excludes_sibling_impls);
     RUN_TEST(tool_trace_sections_do_not_claim_untraversed_relationship);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
     RUN_TEST(tool_trace_pagination_exactly_once);
+    RUN_TEST(tool_trace_rejects_reachable_set_beyond_safety_ceiling);
+    RUN_TEST(tool_trace_data_flow_uses_shortest_path_predecessor_edge_args);
+    RUN_TEST(tool_trace_rejects_unimplemented_parameter_filter);
     RUN_TEST(tool_trace_call_path_prefers_definition);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
@@ -10581,7 +11377,9 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_generic_impl_caller_not_attributed_to_file_node);
     RUN_TEST(tool_trace_nested_fn_caller_not_attributed_to_file_node);
     RUN_TEST(tool_trace_cfg_gated_method_not_attributed_to_file_node);
-    RUN_TEST(tool_trace_file_node_excluded_from_callers_total);
+    RUN_TEST(tool_trace_file_and_module_nodes_excluded_from_callers_total);
+    RUN_TEST(tool_trace_unattributed_pagination_exactly_once_and_budgeted);
+    RUN_TEST(tool_trace_unattributed_json_has_unique_directional_keys);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
