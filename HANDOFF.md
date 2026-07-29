@@ -167,14 +167,20 @@ ISSUES.md timing table.
 - **`mcp` suite: 190 passed, 0 failed, 2 skipped.** Baseline was 185/0/2; I added 5 tests
   and lost none. Reproduce: `./build/c/test-runner mcp`. **This is the acceptance gate and
   it is green.**
-- **Full suite: one run was fully green; later runs were not, and every later failure is
-  now accounted for as environmental (2 self-inflicted, 3 load-induced) — none from my
-  code.**
-  - One earlier full run **was** green at **6870 passed / 0 failed / 4 skipped**.
-  - A later run: **6865 / 5 / 4**, dissected below. A final "clean run" was still
-    executing when I was retired; its totals are unknown. Log:
-    `/private/tmp/claude-502/.../scratchpad/cleanrun.log` (scratchpad is session-scoped and
-    may be gone; just re-run).
+- **Full suite: every failure ever observed is accounted for as environmental — none from
+  my code.**
+  - An early full run **was** green at **6870 passed / 0 failed / 4 skipped**.
+  - A middle run: **6865 / 5 / 4**, dissected below (2 self-inflicted by my own `pkill`,
+    3 load-induced watchdog timeouts).
+  - **The final clean run — no `pkill` during it — finished at 6868 passed / 2 failed /
+    4 skipped.** Both failures are the **Java + C# pair that fails identically on the
+    pre-existing baseline `357bfbdc`** (see the RESOLVED block below). The two
+    `pkill`-victim failures vanished once I stopped killing the runner, which confirms
+    that diagnosis directly rather than by argument.
+  - **Test inventory conserved:** `6868+2+4 = 6874` and `6870+0+4 = 6874`. Identical
+    totals, so no test was silently dropped between runs — the delta is pass/fail only,
+    not a changed roster. Worth repeating whenever these numbers move: a *shrinking total*,
+    not a rising failure count, is what a lost test looks like.
   - **The 5 failures, and what I established about each:**
     | test | assert | mechanism |
     |---|---|---|
@@ -388,10 +394,12 @@ list (`tests/test_mcp.c:10580-10584`) or it silently never runs. Never `rm` — 
 - All commits after `357bfbdc` are mine: 7 of work (`ab8fa46c`..`31771603`) plus this
   document and its corrections. **All local, nothing pushed**, origin still `8d2b9564`.
   Count them live: `git rev-list --count 357bfbdc..HEAD`.
-- **The baseline-worktree comparison DID complete** (after the first draft of this
-  document was written): baseline `357bfbdc` and HEAD produce the **identical**
-  `stack_overflow_a` failure set, so open question #1 is **answered — not my commits**.
-  §2 and §6 carry the numbers. No open question in this document now blocks judging the
+- **Both outstanding verifications completed** after the first draft was written:
+  (a) the baseline worktree built, and `357bfbdc` produces the **identical**
+  `stack_overflow_a` failure set as HEAD — open question #1 is **answered: not my
+  commits**; (b) the clean full run finished at **6868 / 2 / 4**, its 2 failures being
+  exactly that same baseline-shared pair, with the `pkill` victims gone.
+  §2 carries both sets of numbers. No open question in this document blocks judging the
   work; what remains open are design choices (§6.2–§6.5) and the untested pagination
   interaction in §5.
 - Graph projects left indexed: `Users-viktor-Projects-agent` and
