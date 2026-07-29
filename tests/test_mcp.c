@@ -4244,6 +4244,91 @@ TEST(tool_trace_cfg_gated_method_not_attributed_to_file_node) {
     PASS();
 }
 
+/*
+ * `callers_total` must count only things that can call. A File node cannot.
+ *
+ * The three extraction fixes above remove the causes of File-sourced CALLS
+ * edges that were really mis-attributions, but they cannot remove the category:
+ * a call genuinely written at file/module scope (a `const` initialiser, say) has
+ * no enclosing function to be attributed to, and the extractor is right to
+ * source it at the file. Reporting is therefore the last line — a count is the
+ * tool's claim about the world, and `callers_total` claims "this many places
+ * call this".
+ *
+ * This test drives the store directly rather than the indexer, so it pins the
+ * REPORTING contract independently of whichever extraction paths currently mint
+ * such edges: the row is excluded from `callers` and from `callers_total`, and
+ * — because the edge is real evidence a call exists in that file — it is still
+ * reported under `unattributed_files` rather than silently dropped.
+ */
+TEST(tool_trace_file_node_excluded_from_callers_total) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "filetotal-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/filetotal");
+
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "ft_callee",
+                         .qualified_name = "filetotal-proj.src.lib.ft_callee",
+                         .file_path = "src/lib.rs",
+                         .start_line = 1,
+                         .end_line = 3};
+    cbm_node_t real_caller = {.project = proj,
+                              .label = "Function",
+                              .name = "ft_real_caller",
+                              .qualified_name = "filetotal-proj.src.lib.ft_real_caller",
+                              .file_path = "src/lib.rs",
+                              .start_line = 10,
+                              .end_line = 20};
+    /* The File node: reachable only because a CALLS edge was sourced at it. */
+    cbm_node_t file_node = {.project = proj,
+                            .label = "File",
+                            .name = "__file__",
+                            .qualified_name = "filetotal-proj.src.lib.rs.__file__",
+                            .file_path = "src/lib.rs",
+                            .start_line = 0,
+                            .end_line = 0};
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    int64_t id_real = cbm_store_upsert_node(st, &real_caller);
+    int64_t id_file = cbm_store_upsert_node(st, &file_node);
+    ASSERT_GT(id_callee, 0);
+    ASSERT_GT(id_real, 0);
+    ASSERT_GT(id_file, 0);
+
+    cbm_edge_t e_real = {
+        .project = proj, .source_id = id_real, .target_id = id_callee, .type = "CALLS"};
+    cbm_edge_t e_file = {
+        .project = proj, .source_id = id_file, .target_id = id_callee, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e_real);
+    cbm_store_insert_edge(st, &e_file);
+
+    char *resp = cbm_mcp_handle_tool(srv, "trace_call_path",
+                                     "{\"project\":\"filetotal-proj\","
+                                     "\"function_name\":\"ft_callee\","
+                                     "\"direction\":\"inbound\",\"include_tests\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* Exactly one caller — the function. The File node is not one. */
+    if (!strstr(inner, "callers_total: 1")) {
+        fprintf(stderr, "  [filetotal] FAIL callers_total counts the File node: %.400s\n", inner);
+    }
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "ft_real_caller"));
+    /* The evidence is kept, under a heading that does not claim it is a call. */
+    ASSERT_NOT_NULL(strstr(inner, "unattributed_files"));
+    ASSERT_NOT_NULL(strstr(inner, "unattributed_total: 1"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Regression for #604: path scopes architecture totals and content. */
 TEST(tool_get_architecture_path_scoping) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -10496,6 +10581,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_generic_impl_caller_not_attributed_to_file_node);
     RUN_TEST(tool_trace_nested_fn_caller_not_attributed_to_file_node);
     RUN_TEST(tool_trace_cfg_gated_method_not_attributed_to_file_node);
+    RUN_TEST(tool_trace_file_node_excluded_from_callers_total);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 

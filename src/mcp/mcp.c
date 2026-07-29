@@ -6106,6 +6106,68 @@ static int tree_hop_cmp_qn(const void *pa, const void *pb) {
     return a->hop - b->hop;
 }
 
+/* Explains a non-empty `unattributed_files` section: these are NOT callers, and
+ * are excluded from the total above precisely so that total stays true. */
+#define TRACE_UNATTRIBUTED_NOTE                                                                    \
+    "files holding a CALLS edge the extractor could not attribute to an enclosing function; "      \
+    "a call exists in each file but its call site is unresolved. NOT callers and NOT counted "     \
+    "in the total above."
+
+/* True for a traversal row that cannot execute code, so cannot be a call site.
+ * A File row reaches a CALLS walk only via an edge the extractor sourced at the
+ * file because it could not attribute the call to an enclosing function. */
+static bool trace_row_is_uncallable(const cbm_node_hop_t *h) {
+    return h->node.label && strcmp(h->node.label, "File") == 0;
+}
+
+/* Move every uncallable row out of `tr` and into `spill`, preserving the
+ * canonical (hop,id) order of both. In-place stable partition: no allocation,
+ * and `spill` borrows the same node strings, which stay owned by `tr` — so
+ * `spill` must not outlive it and must not be freed separately.
+ *
+ * The rows are moved rather than deleted because a File-sourced CALLS edge is
+ * real evidence that the call exists somewhere in that file; it just is not a
+ * caller. The count the tool reports must be true of the thing its field name
+ * claims to count, and evidence a consumer might legitimately need must not be
+ * silently discarded — partitioning satisfies both. */
+static void trace_split_unattributed(cbm_traverse_result_t *tr, cbm_traverse_result_t *spill) {
+    if (!tr || !spill || tr->visited_count <= 0 || !tr->visited) {
+        return;
+    }
+    int keep = 0;
+    int moved = 0;
+    for (int i = 0; i < tr->visited_count; i++) {
+        if (trace_row_is_uncallable(&tr->visited[i])) {
+            moved++;
+        }
+    }
+    if (moved == 0) {
+        return;
+    }
+    cbm_node_hop_t *held = (cbm_node_hop_t *)malloc(sizeof(cbm_node_hop_t) * (size_t)moved);
+    if (!held) {
+        return; /* keep the pre-existing (over-counting) behaviour over a crash */
+    }
+    int h = 0;
+    for (int i = 0; i < tr->visited_count; i++) {
+        if (trace_row_is_uncallable(&tr->visited[i])) {
+            held[h++] = tr->visited[i];
+        } else {
+            tr->visited[keep++] = tr->visited[i];
+        }
+    }
+    /* Park the moved rows in the tail of the SAME array so no second owning
+     * allocation exists: `spill` is a view over storage `tr` still owns. */
+    for (int i = 0; i < moved; i++) {
+        tr->visited[keep + i] = held[i];
+    }
+    free(held);
+    *spill = *tr;
+    spill->visited = tr->visited + keep;
+    spill->visited_count = moved;
+    tr->visited_count = keep;
+}
+
 static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
                               bool include_tests) {
     int visible = 0;
@@ -6391,6 +6453,29 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                             MCP_BFS_LIMIT_MAX, &tr_in);
     }
 
+    /* A pure-CALLS walk answers "what code calls this" / "what does it call",
+     * so every row must be something that can execute. A File node cannot: it
+     * appears only because the extractor could not attribute a call to an
+     * enclosing function and sourced the CALLS edge at the file instead. Left
+     * in, it became a row in `callers` and was counted in `callers_total` — the
+     * field an agent reads to decide whether a symbol is safe to change — so
+     * the count was simply not true of the thing its name claims to count.
+     *
+     * Partitioned rather than dropped: the edge is real evidence that a call
+     * exists somewhere in that file, so it is reported under its own key with
+     * the file paths (same shape as via_port_*, and for the same reason — a
+     * different kind of answer never gets merged into the exact one).
+     *
+     * Scoped to a pure-CALLS walk: for any other requested edge type (IMPORTS,
+     * CONTAINS_FILE, ...) a File node is a legitimate, often intended result. */
+    bool calls_only_walk = (edge_type_count == 1 && strcmp(edge_types[0], "CALLS") == 0);
+    cbm_traverse_result_t unattr_out = {0};
+    cbm_traverse_result_t unattr_in = {0};
+    if (calls_only_walk) {
+        trace_split_unattributed(&tr_out, &unattr_out);
+        trace_split_unattributed(&tr_in, &unattr_in);
+    }
+
     /* Page windows in canonical (hop,id) order. Legs drain in a fixed order
      * (callees, then callers); a resume cursor starts its leg at the row
      * after the watermark, and a page that finishes one leg with budget to
@@ -6471,6 +6556,20 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             in_total++;
         }
     }
+    /* Counted with the same test-file filter, and reported separately — never
+     * folded into the totals above, which is the whole point of the split. */
+    int unattr_out_total = 0;
+    for (int i = 0; i < unattr_out.visited_count; i++) {
+        if (include_tests || !is_test_file(unattr_out.visited[i].node.file_path)) {
+            unattr_out_total++;
+        }
+    }
+    int unattr_in_total = 0;
+    for (int i = 0; i < unattr_in.visited_count; i++) {
+        if (include_tests || !is_test_file(unattr_in.visited[i].node.file_path)) {
+            unattr_in_total++;
+        }
+    }
 
     /* Dynamic dispatch: when the caller asked for callers, also resolve the
      * port-mediated ones — otherwise an adapter reached only through a `dyn`
@@ -6504,7 +6603,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
      * the one thing the traversal DID establish — its direction — and the
      * traversed types are echoed in `edges` so a cold reader can still tell
      * what the rows are. */
-    bool calls_only = (edge_type_count == 1 && strcmp(edge_types[0], "CALLS") == 0);
+    bool calls_only = calls_only_walk;
     const char *out_key = calls_only ? "callees" : "outbound";
     const char *in_key = calls_only ? "callers" : "inbound";
     char out_total_key[CBM_SZ_64];
@@ -6548,6 +6647,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             } else {
                 bfs_to_tree_table(&sb, out_key, &view_out, include_tests);
             }
+            if (unattr_out_total > 0) {
+                cbm_tree_scalar_int(&sb, "unattributed_total", unattr_out_total);
+                cbm_tree_scalar_str(&sb, "unattributed_note", TRACE_UNATTRIBUTED_NOTE);
+                bfs_to_tree_table(&sb, "unattributed_files", &unattr_out, include_tests);
+            }
         }
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, in_total_key, in_total);
@@ -6555,6 +6659,11 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 bfs_to_toon_table(&sb, in_key, &view_in, risk_labels, include_tests, data_flow);
             } else {
                 bfs_to_tree_table(&sb, in_key, &view_in, include_tests);
+            }
+            if (unattr_in_total > 0) {
+                cbm_tree_scalar_int(&sb, "unattributed_total", unattr_in_total);
+                cbm_tree_scalar_str(&sb, "unattributed_note", TRACE_UNATTRIBUTED_NOTE);
+                bfs_to_tree_table(&sb, "unattributed_files", &unattr_in, include_tests);
             }
             /* Inferred, never merged with the exact set above (shape C). */
             if (port_count > 0) {
@@ -6606,12 +6715,26 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_val(
                 doc, root, out_key,
                 bfs_to_tree_json(doc, &view_out, risk_labels, include_tests, data_flow));
+            if (unattr_out_total > 0) {
+                yyjson_mut_obj_add_int(doc, root, "unattributed_total", unattr_out_total);
+                yyjson_mut_obj_add_str(doc, root, "unattributed_note", TRACE_UNATTRIBUTED_NOTE);
+                yyjson_mut_obj_add_val(
+                    doc, root, "unattributed_files",
+                    bfs_to_tree_json(doc, &unattr_out, risk_labels, include_tests, data_flow));
+            }
         }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, in_total_key, in_total);
             yyjson_mut_obj_add_val(
                 doc, root, in_key,
                 bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow));
+            if (unattr_in_total > 0) {
+                yyjson_mut_obj_add_int(doc, root, "unattributed_total", unattr_in_total);
+                yyjson_mut_obj_add_str(doc, root, "unattributed_note", TRACE_UNATTRIBUTED_NOTE);
+                yyjson_mut_obj_add_val(
+                    doc, root, "unattributed_files",
+                    bfs_to_tree_json(doc, &unattr_in, risk_labels, include_tests, data_flow));
+            }
             /* Inferred, never merged with the exact set above (shape C). */
             if (port_count > 0) {
                 yyjson_mut_obj_add_int(doc, root, "via_port_total", via_port_total);
