@@ -9,15 +9,18 @@ re-run it rather than trust the write-up.
 - **The CLI costs ~2 s warm / ~5 s cold per invocation, and the cost is not process
   startup.** (found 2026-07-29, re-measured 2026-07-29 on a rebuilt binary)
 
-  Measured with `/usr/bin/time -p`, binary built from this tree, on a 16-core M3 Max:
+  Measured with `/usr/bin/time -p`, binary built from this tree, on a 16-core M3 Max **with
+  the machine otherwise idle** — these numbers are load-sensitive, so re-measure on a quiet
+  machine before comparing against them (an ASan test run in parallel pushed the warm figure
+  to 12-36 s, which says nothing about the tool):
 
   | condition | `cli list_projects` wall time |
   |---|---|
   | cold (no daemon; one is spawned and retired per call) | 4.71 / 4.71 / 5.78 s |
   | warm (`daemon start` running, daemon reused) | 1.93 / 1.95 / 1.96 s |
-  | `--version` (process loads, does no daemon work) | **0.00 s** |
+  | `--version` (process loads, does no daemon work) | **0.00-0.01 s** |
 
-  The `--version` row is the load-bearing one: the ~300 MB binary loads and exits in under
+  The `--version` row is the load-bearing one: the ~300 MB binary loads and exits in about
   10 ms, so the cost is **not** image size, dynamic linking, or process creation. It is
   work done on the daemon path — connect/activation handshake and per-request setup. A
   warm daemon removes roughly 3 s of the cold cost but leaves ~1.95 s, so the `hint:`

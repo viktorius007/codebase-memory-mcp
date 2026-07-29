@@ -485,6 +485,11 @@ static const tool_def_t TOOLS[] = {
      "`via_port_total` + `via_port`/`via_port_callers`, keyed by the trait method they name. "
      "They are an OVER-SET (the bound implementation is a runtime fact the graph cannot see), "
      "which is why they are never merged into `callers`. "
+     "UNATTRIBUTED CALL SITES: a call the extractor could not tie to an enclosing function "
+     "(e.g. one written at file/module scope) is held by its FILE, which is not a caller and "
+     "is excluded from `callers`/`callees` and their totals so those counts stay true. Such "
+     "rows appear as `unattributed_total` + `unattributed_files`: a call exists in each listed "
+     "file, but its call site is unresolved. "
      "`truncated: true` + `next` = more rows — pass next back as cursor. "
      "format=\"json\" returns the SAME tree model as structured JSON.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
@@ -6121,9 +6126,12 @@ static bool trace_row_is_uncallable(const cbm_node_hop_t *h) {
 }
 
 /* Move every uncallable row out of `tr` and into `spill`, preserving the
- * canonical (hop,id) order of both. In-place stable partition: no allocation,
- * and `spill` borrows the same node strings, which stay owned by `tr` — so
- * `spill` must not outlive it and must not be freed separately.
+ * canonical (hop,id) order of both. Stable partition within `tr`'s OWN array —
+ * a short-lived scratch buffer holds the moved rows while the kept ones are
+ * compacted, then they are parked in the tail — so no second owning allocation
+ * survives the call. `spill` is a view over storage `tr` still owns, borrowing
+ * the same node strings: it must not outlive `tr` and must never be freed
+ * separately (doing so would double-free every row).
  *
  * The rows are moved rather than deleted because a File-sourced CALLS edge is
  * real evidence that the call exists somewhere in that file; it just is not a
