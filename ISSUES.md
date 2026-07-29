@@ -6,6 +6,101 @@ re-run it rather than trust the write-up.
 
 ## Open
 
+- **`callers_total` still counts `Module` nodes — the non-callable-node fix covered `File`
+  only.** (re-opened 2026-07-29 by an independent review; **this entry corrects a false
+  claim made when the original item was closed**)
+
+  Commit `b87e995c` added `trace_row_is_uncallable` (`src/mcp/mcp.c:6124`), which tests
+  `strcmp(label, "File") == 0` and nothing else, and its commit message asserted the split
+  keeps non-callable nodes out of the totals *"regardless of which extractor path produced
+  the edge"*. **That sentence is false.** A `Module` node cannot execute either, and it
+  does source CALLS edges — **85** in `Users-viktor-Projects-agent` (verified on the
+  rebuilt binary):
+
+      cli query_graph --project Users-viktor-Projects-agent \
+        --query 'MATCH (a:Module)-[r:CALLS]->(b) RETURN count(r) AS n'   # -> 85
+
+  Reported live by the reviewer (re-verify before acting): tracing
+  `error_body_truncated_message` inbound returns `callers_total: 2`, one row being the
+  file's Module node from a module-scope `LazyLock` initializer, rendered as `error_body 1`
+  — indistinguishable from a function, and a real `Function` named `error_body` exists
+  elsewhere in the same graph. Worse in this repo: tracing `render` inbound reported
+  `callers_total: 5` where all five rows were Module nodes from `.tsx` files.
+
+  `Folder` is genuinely clean (0 CALLS edges as source, both projects), so the fix is to
+  widen the predicate to `Module` — the original filed item's own suggested fix named
+  `File`, `Folder` **and** `Module`, and only one was implemented.
+
+- **Memory leak: `trace_path` never frees the rows split out into `unattributed_files`.**
+  (found 2026-07-29 by an independent review of `b87e995c`; **a defect introduced by that
+  commit**)
+
+  `trace_split_unattributed` (`src/mcp/mcp.c:6141`) parks the spilled rows in the tail of
+  `tr->visited` and then lowers `tr->visited_count` to the kept count.
+  `cbm_store_traverse_free` (`src/store/store.c:4181`) frees per row, bounded by
+  `visited_count` — so the parked tail is never visited. Each `cbm_node_hop_t` owns 6
+  `heap_strdup`'d strings, so every CALLS `trace_path` leaks `6 x spilled_rows`
+  allocations, accumulating for the life of the MCP daemon. Reviewer measured a single
+  request spilling 57 rows (= 342 leaked strings).
+
+  **Why the suite cannot catch it:** `ASAN_OPTIONS=detect_leaks=1 ./build/c/test-runner`
+  prints `detect_leaks is not supported on this platform` on macOS. Leak detection runs
+  only in the Linux soak (`.github/workflows/_soak.yml:245`), which is unlikely to drive a
+  spilling `trace_path`. Verify the leak by reading the free loop's bound, not by running
+  the suite locally.
+
+  **Preferred fix** (reviewer's, and it is the right shape): give the spill a distinct
+  type that *cannot* be passed to `cbm_store_traverse_free`, and free the tail explicitly.
+  A plain "also free the tail" patch works but leaves the footgun: the spill aliases
+  `tr`'s `edges`/root pointers via `*spill = *tr`, so any future `cbm_store_traverse_free`
+  on it becomes a double-free of the whole edges array. Today that is safe **only** because
+  nothing frees the spill. The comment at `src/mcp/mcp.c:6123` warns of this; the type does
+  not enforce it.
+
+- **`unattributed_files` ignores the page budget and repeats in full on every page.**
+  (found 2026-07-29 by an independent review of `b87e995c`)
+
+  `src/mcp/mcp.c:6658-6675` (tree) and `:6726-6745` (JSON) emit `unattr_out`/`unattr_in`
+  **whole**, not the windowed view used for the main legs (`view_out`/`view_in`, sliced to
+  `out_len`/`in_len`). Reviewer measured `--limit 5` returning 5 callers plus all 57
+  unattributed rows, and an 11-page walk at `--limit 1` repeating the same `__file__` row
+  on every page. `limit` is documented as a context-bomb guard (`src/mcp/mcp.c:29`); this
+  section defeats it. No rows are lost and `truncated` stays consistent, so it is a
+  budget/noise defect, not a wrong answer.
+
+- **Latent: duplicate JSON keys if both legs spill.** (found 2026-07-29, same review)
+
+  `src/mcp/mcp.c:6727-6731` (outbound) and `:6740-6744` (inbound) add
+  `unattributed_total` / `unattributed_note` / `unattributed_files` to the **same** root
+  object. `yyjson_mut_obj_add_*` does not dedupe, so a `direction: both` request where both
+  legs spill emits each key twice and a last-wins parser silently drops the outbound set.
+  `via_port_*` never hits this (inbound-only); `callers`/`callees` never hit it (per-leg
+  key names). Introduced by choosing a leg-independent key name.
+
+  **Currently unreachable**, which is why it is filed rather than fixed:
+  `MATCH (a)-[r:CALLS]->(b) WHERE b.label = "File"` returns **0** in both indexed projects,
+  so `unattr_out` is always empty in practice. It bites the moment any extractor path emits
+  a File-targeted CALLS edge. Fix is per-leg key names.
+
+- **Pre-existing, newly aggravated: the trace cursor hash omits `edge_types`.**
+  (found 2026-07-29, same review)
+
+  `trace_params_hash` (`src/mcp/mcp.c:5957`) hashes project/func/direction/mode/depth/
+  include_tests/limit but **not** `edge_types`, so a cursor minted on a CALLS-only walk is
+  accepted on a `CALLS`+`OVERRIDE` walk whose row set differs (reviewer measured 12 vs 11
+  rows), and the watermark then indexes a different array — rows can be skipped or
+  repeated. Predates this work and is untouched by it, but `b87e995c` widens the gap: the
+  two sets previously differed only by *added* rows, and the CALLS leg now also has rows
+  *removed*. A concrete skipped row was **not** confirmed. Fix: include `edge_types` in the
+  hash.
+
+- **`unattributed_files` uses the tree table even under `risk_labels`.** (found 2026-07-29,
+  same review) `src/mcp/mcp.c:6661` always calls `bfs_to_tree_table` for the spill section,
+  while the main leg switches to `bfs_to_toon_table` when `risk_labels`/`data_flow` is set —
+  and the JSON branch (`:6731`) *does* pass `risk_labels` through. So a `risk_labels=true`
+  text response mixes two table shapes in one answer, and text and JSON disagree about the
+  spill's columns. Cosmetic; fix by mirroring the main leg's `flat_trace` branch.
+
 - **The CLI costs ~2 s warm / ~5 s cold per invocation, and the cost is not process
   startup.** (found 2026-07-29, re-measured 2026-07-29 on a rebuilt binary)
 
@@ -92,4 +187,3 @@ re-run it rather than trust the write-up.
   The dynamic-dispatch blind spot this was filed under is **fixed and shipped**:
   `trace_path` now reports port-mediated callers separately as `via_port_total` /
   `via_port` / `via_port_callers`. Do not re-file it.
-</content>
