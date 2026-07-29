@@ -585,6 +585,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
     bool tsjs_drop_plain_call =
         cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+    bool has_receiver =
+        strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -610,26 +612,20 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
-
-    /* Rust cross-package generic-name phantom guard (parallel twin in
-     * pass_parallel.c). A bare std-trait method (`x.clone()`, `parts.extend()`)
-     * whose receiver type the LSP could not resolve falls through to the
-     * registry's weak textual strategies, which bind the short name to a
-     * same-named def in an UNRELATED package. Drop only cross-package
-     * weak-strategy generic-name edges; same-package generic calls and every
-     * high-confidence strategy survive. Placed after target resolution so the
-     * package boundary is known. Gated to Rust — other languages unaffected. */
-    {
-        bool has_receiver =
-            strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
-        if (cbm_rust_suppress_cross_pkg_generic(lang == CBM_LANG_RUST, has_receiver,
-                                                call->callee_name, res.strategy,
-                                                source_node->file_path, target_node->file_path)) {
-            return 0;
-        }
+    /* The shared registry also contains Field/Variable nodes for USAGE and
+     * READS/WRITES resolution. They are never callable; a textual name match
+     * must not turn member access into a CALLS edge. */
+    if (target_node->label &&
+        (strcmp(target_node->label, "Field") == 0 ||
+         strcmp(target_node->label, "Variable") == 0)) {
+        return 0;
     }
+    bool rust_drop_plain_call = cbm_rust_suppress_weak_receiver_match(
+        lang == CBM_LANG_RUST, has_receiver, call->callee_name, res.strategy,
+        source_node->file_path, target_node->file_path, target_node->qualified_name);
+
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count, tsjs_drop_plain_call);
+                         imp_count, tsjs_drop_plain_call || rust_drop_plain_call);
     return SKIP_ONE;
 }
 

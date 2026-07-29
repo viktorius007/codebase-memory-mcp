@@ -927,42 +927,154 @@ void cbm_strip_generic_args(char *type_name) {
  * single-source-of-truth contract this upholds between the def walk and the call
  * walk. The suffix is built from the raw `cfg(` text with whitespace and quotes
  * dropped, so `#[cfg(feature = "x")]` and `#[cfg(feature="x")]` agree. */
+static const char *rust_cfg_normalized(CBMArena *a, const char *attr) {
+    const char *cfg = attr ? strstr(attr, "cfg(") : NULL;
+    if (!cfg) {
+        return NULL;
+    }
+    size_t max_len = strlen(cfg);
+    char *buf = (char *)cbm_arena_alloc(a, max_len + 1);
+    if (!buf) {
+        return NULL;
+    }
+    size_t len = 0;
+    int depth = 0;
+    bool closed = false;
+    for (const char *p = cfg; *p; p++) {
+        char ch = *p;
+        if (ch == '(') {
+            depth++;
+        } else if (ch == ')') {
+            depth--;
+        }
+        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' && ch != '"' && ch != '\'') {
+            buf[len++] = ch;
+        }
+        if (depth == 0 && ch == ')') {
+            closed = true;
+            break;
+        }
+    }
+    if (!closed) {
+        return NULL;
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
 const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
                                         const char *source, CBMLanguage lang) {
     if (lang != CBM_LANG_RUST || !base_qn || ts_node_is_null(func_node) || !source) {
         return base_qn;
     }
-    /* Attributes are prev-siblings of the function item; an anonymous token
-     * (e.g. a visibility modifier) does not end the run, a named construct does
-     * — the same shape extract_decorators() walks on the definition side. */
-    for (TSNode prev = ts_node_prev_sibling(func_node); !ts_node_is_null(prev);
-         prev = ts_node_prev_sibling(prev)) {
-        if (strcmp(ts_node_type(prev), "attribute_item") != 0) {
-            if (ts_node_is_named(prev)) {
-                break;
-            }
+
+    /* A method's identity is gated by attributes on the method AND its
+     * enclosing impl/module items. Collect from inner to outer and from nearest
+     * attribute backwards, then append in reverse so the suffix is stable
+     * source order (outer → inner). This keeps def and call-source QNs equal and
+     * prevents cfg-twin methods/impls from collapsing in the graph store. */
+    const char **predicates = NULL;
+    int count = 0;
+    int cap = 0;
+    for (TSNode subject = func_node; !ts_node_is_null(subject);
+         subject = ts_node_parent(subject)) {
+        const char *kind = ts_node_type(subject);
+        bool cfg_scope = strcmp(kind, "function_item") == 0 || strcmp(kind, "impl_item") == 0 ||
+                         strcmp(kind, "mod_item") == 0 || strcmp(kind, "trait_item") == 0 ||
+                         strcmp(kind, "foreign_mod_item") == 0;
+        if (!cfg_scope) {
             continue;
         }
-        const char *attr = cbm_node_text(a, prev, source);
-        if (!attr) {
-            continue;
-        }
-        const char *cfg = strstr(attr, "cfg(");
-        if (!cfg) {
-            continue;
-        }
-        char buf[CBM_SZ_256];
-        size_t bi = 0;
-        for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
-            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
+        for (TSNode prev = ts_node_prev_sibling(subject); !ts_node_is_null(prev);
+             prev = ts_node_prev_sibling(prev)) {
+            if (strcmp(ts_node_type(prev), "attribute_item") != 0) {
+                if (ts_node_is_named(prev)) {
+                    break;
+                }
                 continue;
             }
-            buf[bi++] = *p;
+            const char *attr = cbm_node_text(a, prev, source);
+            const char *normalized = rust_cfg_normalized(a, attr);
+            if (!normalized) {
+                continue;
+            }
+            if (count >= cap) {
+                int next_cap = cap ? cap * 2 : 4;
+                const char **grown =
+                    (const char **)realloc(predicates, sizeof(char *) * (size_t)next_cap);
+                if (!grown) {
+                    free(predicates);
+                    return base_qn;
+                }
+                predicates = grown;
+                cap = next_cap;
+            }
+            predicates[count++] = normalized;
         }
-        buf[bi] = '\0';
-        return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);
     }
-    return base_qn;
+
+    const char *qualified_name = base_qn;
+    for (int i = count - 1; i >= 0; i--) {
+        qualified_name = cbm_arena_sprintf(a, "%s#%s", qualified_name, predicates[i]);
+    }
+    free(predicates);
+    return qualified_name;
+}
+
+const char *cbm_rust_callable_qualified_name(CBMArena *a, const char *project,
+                                             const char *rel_path, const char *module_qn,
+                                             TSNode func_node, const char *source) {
+    if (!a || !project || !rel_path || !module_qn || ts_node_is_null(func_node) || !source) {
+        return module_qn;
+    }
+
+    const char **names = NULL;
+    int count = 0;
+    int cap = 0;
+    TSNode impl_node = {0};
+    for (TSNode cur = func_node; !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        const char *kind = ts_node_type(cur);
+        if (strcmp(kind, "function_item") == 0) {
+            TSNode name_node = ts_node_child_by_field_name(cur, TS_FIELD("name"));
+            char *name = ts_node_is_null(name_node) ? NULL : cbm_node_text(a, name_node, source);
+            if (name && name[0]) {
+                if (count >= cap) {
+                    int next_cap = cap ? cap * 2 : 4;
+                    const char **grown =
+                        (const char **)realloc(names, sizeof(char *) * (size_t)next_cap);
+                    if (!grown) {
+                        free(names);
+                        return module_qn;
+                    }
+                    names = grown;
+                    cap = next_cap;
+                }
+                names[count++] = name;
+            }
+        } else if (strcmp(kind, "impl_item") == 0 && ts_node_is_null(impl_node)) {
+            impl_node = cur;
+        }
+    }
+    if (count == 0) {
+        free(names);
+        return module_qn;
+    }
+
+    const char *qualified_name = module_qn;
+    if (!ts_node_is_null(impl_node)) {
+        TSNode type_node = ts_node_child_by_field_name(impl_node, TS_FIELD("type"));
+        char *type_name =
+            ts_node_is_null(type_node) ? NULL : cbm_node_text(a, type_node, source);
+        if (type_name && type_name[0]) {
+            cbm_strip_generic_args(type_name);
+            qualified_name = cbm_fqn_compute(a, project, rel_path, type_name);
+        }
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        qualified_name = cbm_arena_sprintf(a, "%s.%s", qualified_name, names[i]);
+    }
+    free(names);
+    return cbm_rust_cfg_qualified_name(a, qualified_name, func_node, source, CBM_LANG_RUST);
 }
 
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
@@ -975,6 +1087,9 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
     const char *name = func_node_name(a, func_node, source, lang);
     if (!name || !name[0]) {
         return module_qn;
+    }
+    if (lang == CBM_LANG_RUST) {
+        return cbm_rust_callable_qualified_name(a, project, rel_path, module_qn, func_node, source);
     }
 
     // Check if the function is inside a class — compute classQN.funcName.

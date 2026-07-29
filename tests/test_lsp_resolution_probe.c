@@ -738,11 +738,11 @@ TEST(lrp_rust_s6_trait_method) {
         {"display.rs",
          "pub trait Display {\n    fn show(&self) -> String;\n}\n"},
         {"dog.rs",
-         "mod display;\n\npub struct Dog { pub name: String }\n\n"
-         "impl display::Display for Dog {\n"
+         "use crate::display::Display;\n\npub struct Dog { pub name: String }\n\n"
+         "impl Display for Dog {\n"
          "    fn show(&self) -> String { self.name.clone() }\n}\n"},
         {"main.rs",
-         "mod dog;\n\nfn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
+         "mod display;\nmod dog;\n\nfn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
     /* RED: d.show() on &Dog requires knowing Dog implements Display and that
      * show() maps to Dog's impl — needs lsp_cross + trait resolution. */
     ASSERT_TRUE(lrp_assert_calls(f, 3, 1, "rust/S6/trait_method", 0));

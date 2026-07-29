@@ -2109,17 +2109,6 @@ static bool rust_def_is_test(const char *const *decorators) {
     return false;
 }
 
-/* The suffix itself is built by cbm_rust_cfg_qualified_name (helpers.c) — the
- * SINGLE source of truth shared with the call walk's enclosing-function
- * attribution, which must produce a byte-identical QN or every call inside a
- * cfg-gated fn is re-attributed to the file node. This wrapper only adapts the
- * def walk's already-extracted decorator TEXTS to that contract; both paths
- * therefore agree by construction rather than by two copies staying in step. */
-static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
-                                           const char *source) {
-    return cbm_rust_cfg_qualified_name(a, base_qn, func_node, source, CBM_LANG_RUST);
-}
-
 // Extract base class name text from a single base_class child node.
 static char *extract_cpp_base_text(CBMArena *a, TSNode bc, const char *source) {
     const char *bk = ts_node_type(bc);
@@ -3447,7 +3436,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into the QN so both branches survive the graph upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, node, ctx->source);
+        def.qualified_name = cbm_rust_callable_qualified_name(
+            a, ctx->project, ctx->rel_path, ctx->module_qn, node, ctx->source);
         def.is_test = rust_def_is_test(def.decorators);
     }
 
@@ -4586,7 +4576,8 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             continue;
         }
 
-        const char *method_qn = cbm_arena_sprintf(a, "%s.%s", type_qn, name);
+        const char *method_qn = cbm_rust_callable_qualified_name(
+            a, ctx->project, ctx->rel_path, ctx->module_qn, child, ctx->source);
 
         CBMDefinition def;
         memset(&def, 0, sizeof(def));
@@ -6762,6 +6753,28 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
     }
 }
 
+/* extract_rust_impl emits the direct methods itself. Walk only those methods'
+ * bodies so lexically nested `fn` items are also emitted without duplicating
+ * each direct method as a top-level Function. */
+static void push_rust_impl_method_bodies(TSNode impl_node, const CBMLangSpec *spec,
+                                         wd_stack_t *s) {
+    TSNode body = ts_node_child_by_field_name(impl_node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode method = ts_node_named_child(body, i);
+        if (!cbm_kind_in_set(method, spec->function_node_types)) {
+            continue;
+        }
+        TSNode method_body = ts_node_child_by_field_name(method, TS_FIELD("body"));
+        if (!ts_node_is_null(method_body)) {
+            wd_push_children_reverse(s, method_body, NULL);
+        }
+    }
+}
+
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused) {
     (void)depth_unused;
     wd_stack_t s = {0};
@@ -6859,7 +6872,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                 bool descend_into_func =
                     (ctx->language == CBM_LANG_WOLFRAM || ctx->language == CBM_LANG_TYPESCRIPT ||
                      ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TSX ||
-                     ctx->language == CBM_LANG_ADA);
+                     ctx->language == CBM_LANG_ADA || ctx->language == CBM_LANG_RUST);
                 if (!descend_into_func) {
                     continue;
                 }
@@ -6868,6 +6881,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 
         if (ctx->language == CBM_LANG_RUST && strcmp(kind, "impl_item") == 0) {
             extract_rust_impl(ctx, node, spec);
+            push_rust_impl_method_bodies(node, spec, &s);
             continue;
         }
 

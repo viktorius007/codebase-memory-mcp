@@ -273,6 +273,14 @@ static int es_edge_present(const ES_LangFile *files, int nfiles, const char *edg
     return got >= floor;
 }
 
+static int es_edge_count(const ES_LangFile *files, int nfiles, const char *edge) {
+    ES_LangProj lp;
+    cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
+    int count = store ? cbm_store_count_edges_by_type(store, lp.project, edge) : -1;
+    es_lang_cleanup(&lp, store);
+    return count;
+}
+
 /* Count CALLS edges landing on ANY node named `method_name` that lives under a
  * different Cargo package root than its caller. Reproduces the phantom-edge
  * audit: a bare generic method name textually bound across a package boundary.
@@ -339,14 +347,14 @@ static int es_cross_pkg_calls_to_method(const ES_LangFile *files, int nfiles,
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * FAMILY 0: Rust cross-package generic-name phantom guard
+ * FAMILY 0: Rust weak receiver-name phantom guard
  *
  * A bare std-trait method call (`x.clone()`) whose receiver type the LSP
  * cannot resolve must NOT be textually bound to a same-named method in an
- * unrelated Cargo package. Reproduces the live pm defect class (pm-core
- * `String.clone()` → pm-infra `SqliteProjectStore.clone`). The same-package
- * companion call MUST still resolve, proving the guard is boundary-scoped
- * rather than a blunt name denylist.
+ * unrelated Method node. Reproduces the live pm defect class (pm-core
+ * `String.clone()` → pm-infra `SqliteProjectStore.clone`). The typed companion
+ * call MUST still resolve through the Rust LSP, proving evidence-backed edges
+ * survive while text-only guesses do not.
  * ══════════════════════════════════════════════════════════════════ */
 
 /* RED before fix: `used.clone()` in the producer crate binds cross-package to
@@ -371,8 +379,31 @@ TEST(es_rust_cross_pkg_generic_clone_suppressed) {
     PASS();
 }
 
-/* Same-package generic call MUST survive — the guard is boundary-scoped, not a
- * name denylist. `caller.clone()` and `Store::clone` share the consumer crate. */
+/* A qualified external associated call must not bind to an unrelated
+ * same-crate method merely because the terminal name matches. This reproduces
+ * the live agent edge `Mode::empty()` → `FrozenPrefix::empty`. */
+TEST(es_rust_same_pkg_qualified_external_not_guessed) {
+    static const ES_LangFile f[] = {
+        {"core/src/prompt.rs",
+         "pub struct FrozenPrefix;\nimpl FrozenPrefix { pub fn empty() -> Self { Self } }\n"},
+        {"core/src/io.rs", "pub fn flags() { let _ = rustix::fs::Mode::empty(); }\n"}};
+    ASSERT_EQ(es_edge_count(f, 2, "CALLS"), 0);
+    PASS();
+}
+
+TEST(es_rust_field_access_never_becomes_call_target) {
+    static const ES_LangFile f[] = {
+        {"core/src/io.rs",
+         "struct SecureTarget { display: String }\n"
+         "fn render(target: SecureTarget) {\n"
+         "    let _ = format!(\"{}\", target.display.display());\n"
+         "}\n"}};
+    ASSERT_EQ(es_edge_count(f, 1, "CALLS"), 0);
+    PASS();
+}
+
+/* A receiver-typed call MUST survive. `s: &Store` supplies LSP evidence for
+ * `s.clone()` → `Store::clone`, so the weak-text guard is not involved. */
 TEST(es_rust_same_pkg_generic_clone_survives) {
     static const ES_LangFile f[] = {
         {"consumer/src/lib.rs",
@@ -381,8 +412,7 @@ TEST(es_rust_same_pkg_generic_clone_survives) {
         {"consumer/src/caller.rs",
          "use crate::Store;\n\n"
          "pub fn use_it(s: &Store) -> u32 {\n    s.clone()\n}\n"}};
-    /* The same-package s.clone() → Store::clone edge must exist; the cross-pkg
-     * guard must not touch it. At least one CALLS edge into `clone` overall. */
+    /* The typed s.clone() → Store::clone edge must exist. */
     ASSERT_TRUE(es_edge_present(f, 2, "CALLS", 1));
     /* And it must NOT be counted as cross-package (there is only one package). */
     ASSERT_TRUE(es_cross_pkg_calls_to_method(f, 2, "clone") == 0);
@@ -963,8 +993,10 @@ TEST(es_tests_crossfile_typescript) {
 SUITE(edge_structural) {
     /* ── FAMILY 1: CALLS cross-file (all 9 hybrid-LSP languages) ─ */
     /* All expected GREEN: registry is project-wide, cross-file == same-file. */
-    /* ── FAMILY 0: Rust cross-package generic-name phantom guard ── */
+    /* ── FAMILY 0: Rust weak receiver-name phantom guard ── */
     RUN_TEST(es_rust_cross_pkg_generic_clone_suppressed);
+    RUN_TEST(es_rust_same_pkg_qualified_external_not_guessed);
+    RUN_TEST(es_rust_field_access_never_becomes_call_target);
     RUN_TEST(es_rust_same_pkg_generic_clone_survives);
 
     RUN_TEST(es_calls_crossfile_go);

@@ -833,9 +833,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * skip in this worker's list (merged into the pipeline's file-error list
          * later, surfacing in skipped[]) and move on — the good files still
          * index and status stays "indexed". No-op unless the supervisor set
-         * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path; the supervisor's
-         * single-threaded recovery run instead takes the sequential path
-         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both. */
+         * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path used by supervised
+         * recovery; pass_definitions.c and cbm_extract_file retain the same guard
+         * for direct/sequential embedders. */
         if (cbm_index_is_quarantined(fi->rel_path)) {
             const char *phase = cbm_index_quarantine_phase(fi->rel_path);
             if (!phase) {
@@ -2355,6 +2355,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
         bool tsjs_drop_plain_call =
             cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+        bool has_receiver =
+            strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
@@ -2440,28 +2442,20 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             }
             continue;
         }
-        /* Rust cross-package generic-name phantom guard. A bare std-trait method
-         * (`x.clone()` / `parts.extend()`) whose receiver type the LSP could not
-         * resolve falls through to the registry's weak textual strategies, which
-         * bind the short name to a same-named def in an UNRELATED package. Drop
-         * only those cross-package weak-strategy generic-name edges; same-package
-         * generic calls and every high-confidence strategy survive. Placed after
-         * target resolution so the package boundary is known; mirrors the
-         * sequential pass (pass_calls.c). Gated to Rust — other languages
-         * unaffected. */
-        {
-            bool has_receiver =
-                strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
-            if (cbm_rust_suppress_cross_pkg_generic(
-                    lang == CBM_LANG_RUST, has_receiver, call->callee_name, res.strategy,
-                    source_node->file_path, target_node->file_path)) {
-                continue;
-            }
+        /* Field/Variable entries exist in the registry for usage edges, not as
+         * legal CALLS targets. Keep sequential and parallel behavior identical. */
+        if (target_node->label &&
+            (strcmp(target_node->label, "Field") == 0 ||
+             strcmp(target_node->label, "Variable") == 0)) {
+            continue;
         }
+        bool rust_drop_plain_call = cbm_rust_suppress_weak_receiver_match(
+            lang == CBM_LANG_RUST, has_receiver, call->callee_name, res.strategy,
+            source_node->file_path, target_node->file_path, target_node->qualified_name);
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          tsjs_drop_plain_call);
+                          tsjs_drop_plain_call || rust_drop_plain_call);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;

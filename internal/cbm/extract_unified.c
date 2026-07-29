@@ -627,6 +627,10 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     if (!name || !name[0]) {
         return NULL;
     }
+    if (ctx->language == CBM_LANG_RUST) {
+        return cbm_rust_callable_qualified_name(ctx->arena, ctx->project, ctx->rel_path,
+                                                ctx->module_qn, node, ctx->source);
+    }
 
     /* C++/CUDA out-of-line method `void Foo::bar() {...}`: the def extractor
      * records this as Method "proj.file.Foo.bar". The call-scope QN must match
@@ -644,29 +648,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
-    /* Rust: the def walk folds a `#[cfg(...)]` predicate into the definition QN
-     * (#495). This call-scope QN is joined to that def QN by EXACT equality in
-     * calls_find_source(), so it must carry the same suffix — otherwise every
-     * call inside a cfg-gated fn misses the lookup and falls back to the file's
-     * `__file__` node, which then appears as a row in trace_path's caller list
-     * and is counted in `callers_total` while the real caller is missing.
-     * Same suffix builder as the def side, so the two agree by construction. */
     if (state->enclosing_class_qn) {
-        /* NOT cfg-suffixed: a method inside an `impl` block is emitted by
-         * extract_rust_impl(), which names it `<type_qn>.<name>` with no cfg
-         * predicate — unlike the free-function path below (extract_func_def).
-         * Suffixing here would invent a QN no node carries and push the call
-         * onto the file node, which is precisely the bug this seam causes in
-         * the other direction. Parity with the def walk is the rule; the def
-         * walk's two paths differ, so this one must too. */
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
      * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
-    return cbm_rust_cfg_qualified_name(
-        ctx->arena,
-        cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name, ctx->language),
-        node, ctx->source, ctx->language);
+    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
+                                       ctx->language);
 }
 
 // Compute class QN for scope tracking.
@@ -1379,18 +1367,12 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
          * that nodeless local binding — the CALLS edge then sources to neither a
          * Function nor the Module. Only the OUTERMOST value_definition pushes a
          * scope (none already on the stack), matching what the def walk extracts.
-         *
-         * Rust has the identical shape: the def walk emits a node for a
-         * function_item and does NOT descend into its body, so a nested `fn`
-         * helper declared inside another fn gets no node. Pushing a scope for it
-         * made the enclosing QN name a function nothing in the graph carries, the
-         * exact-equality lookup in calls_find_source() missed, and the call was
-         * re-attributed to the file's `__file__` node — which then surfaced as a
-         * bogus row in trace_path's caller list and in `callers_total`. Skipping
-         * the nested push attributes those calls to the enclosing outer fn: the
-         * only callable node that textually contains the call site. */
+         * Rust nested functions are emitted as scoped Function nodes by the def
+         * walk, so they must push their own scope here; attributing their body
+         * calls to the outer function invents a runtime call that may never
+         * happen. */
         bool skip_nested = false;
-        if (ctx->language == CBM_LANG_OCAML || ctx->language == CBM_LANG_RUST) {
+        if (ctx->language == CBM_LANG_OCAML) {
             for (int i = 0; i < state->scope_top; i++) {
                 if (state->scopes[i].kind == SCOPE_FUNC) {
                     skip_nested = true;

@@ -112,6 +112,50 @@ TEST(rustlsp_two_free_functions) {
     PASS();
 }
 
+TEST(rustlsp_cfg_module_caller_qn_matches_extraction) {
+    CBMFileResult *r = extract_rust(
+        "fn target() {}\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    #[test]\n"
+        "    fn caller() { target(); }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    int idx = require_resolved(r, "caller#cfg(test)", "target");
+    ASSERT_GTE(idx, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idx].caller_qn, "test.src.main.caller#cfg(test)");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_nested_function_owns_its_calls) {
+    CBMFileResult *r = extract_rust(
+        "fn target() {}\n"
+        "fn outer() {\n"
+        "    fn inner() { target(); }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    int idx = require_resolved(r, "outer.inner", "target");
+    ASSERT_GTE(idx, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idx].caller_qn, "test.src.main.outer.inner");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_default_method_owns_its_calls) {
+    CBMFileResult *r = extract_rust(
+        "trait Port {\n"
+        "    fn complete(&self) { self.complete_with_attempts(); }\n"
+        "    fn complete_with_attempts(&self);\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    int idx = require_resolved(r, "Port.complete", "Port.complete_with_attempts");
+    ASSERT_GTE(idx, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idx].caller_qn, "test.src.main.Port.complete");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Category 2: Struct + inherent impl ────────────────────────── */
 
 TEST(rustlsp_struct_method_dispatch) {
@@ -5971,6 +6015,9 @@ void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
     RUN_TEST(rustlsp_two_free_functions);
+    RUN_TEST(rustlsp_cfg_module_caller_qn_matches_extraction);
+    RUN_TEST(rustlsp_nested_function_owns_its_calls);
+    RUN_TEST(rustlsp_trait_default_method_owns_its_calls);
 
     /* Inherent impl */
     RUN_TEST(rustlsp_struct_method_dispatch);

@@ -41,6 +41,7 @@
 /* Forward declarations for early callers in the file. */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
 static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node);
+static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const char *parent_qn);
 static const CBMType *rust_parse_type_node_inner(RustLSPContext *ctx, TSNode node);
 static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node);
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
@@ -579,6 +580,26 @@ static const char *resolve_path_to_type_qn(RustLSPContext *ctx, const char *path
     if (cbm_registry_lookup_type(ctx->registry, qn)) {
         return qn;
     }
+
+    /* A module-relative path such as `dog::Dog` has no explicit `crate::`
+     * prefix. The generic path resolver leaves it as `dog.Dog`, while the
+     * project registry stores `<crate-root>.dog.Dog`. Derive that root with
+     * the same convention as `crate::` above and use the registry's hashed
+     * lookup. Do not suffix-scan every registered type here: this function is
+     * called for every scoped type and an O(types) fallback makes large Rust
+     * repositories quadratic. */
+    if (ctx->module_qn && strstr(path, "::")) {
+        const char *first_dot = strchr(ctx->module_qn, '.');
+        const char *second_dot = first_dot ? strchr(first_dot + 1, '.') : NULL;
+        size_t root_len = second_dot ? (size_t)(second_dot - ctx->module_qn)
+                                     : (first_dot ? (size_t)(first_dot - ctx->module_qn)
+                                                  : strlen(ctx->module_qn));
+        char *root = cbm_arena_strndup(ctx->arena, ctx->module_qn, root_len);
+        const char *candidate = cbm_arena_sprintf(ctx->arena, "%s.%s", root, qn);
+        if (cbm_registry_lookup_type(ctx->registry, candidate)) {
+            return candidate;
+        }
+    }
     return qn; /* may not be registered yet but caller can still wrap as NAMED */
 }
 
@@ -618,7 +639,7 @@ static const CBMType *rust_parse_type_node_inner(RustLSPContext *ctx, TSNode nod
         if (strcmp(name, "Self") == 0 && ctx->self_type_qn) {
             return cbm_type_named(ctx->arena, ctx->self_type_qn);
         }
-        const char *qn = rust_resolve_path_expr(ctx, name);
+        const char *qn = resolve_path_to_type_qn(ctx, name);
         return cbm_type_named(ctx->arena, qn);
     }
 
@@ -628,7 +649,7 @@ static const CBMType *rust_parse_type_node_inner(RustLSPContext *ctx, TSNode nod
         if (!path) {
             return cbm_type_unknown();
         }
-        const char *qn = rust_resolve_path_expr(ctx, path);
+        const char *qn = resolve_path_to_type_qn(ctx, path);
         return cbm_type_named(ctx->arena, qn);
     }
 
@@ -715,7 +736,7 @@ static const CBMType *rust_parse_type_node_inner(RustLSPContext *ctx, TSNode nod
         if (!head) {
             return cbm_type_unknown();
         }
-        const char *head_qn = rust_resolve_path_expr(ctx, head);
+        const char *head_qn = resolve_path_to_type_qn(ctx, head);
 
         /* Gather type_arguments. */
         TSNode args = ts_node_child_by_field_name(node, "type_arguments", 14);
@@ -3967,6 +3988,17 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
     ctx->eval_step_count++;
     const char *kind = ts_node_type(node);
 
+    /* A nested Rust `fn` is a distinct callable and cannot capture the outer
+     * function. The definition/textual-call walks give it a lexical QN; the
+     * LSP walk must enter the same scope or its synthetic/resolved calls create
+     * duplicate File/outer-sourced CALLS edges. Top-level/direct impl methods
+     * are entered by rust_lsp_process_file/rust_process_impl, so this branch is
+     * only for a function encountered while another function is active. */
+    if (strcmp(kind, "function_item") == 0 && ctx->enclosing_func_qn) {
+        rust_process_function(ctx, node, ctx->enclosing_func_qn);
+        return;
+    }
+
     /* Bind variables introduced by this statement. */
     rust_process_statement(ctx, node);
 
@@ -4279,8 +4311,26 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
     if (!name || !name[0])
         return;
 
+    const char *saved_func_qn = ctx->enclosing_func_qn;
     const char *prefix = parent_qn ? parent_qn : ctx->module_qn;
-    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
+    /* parent_qn may already carry outer cfg suffixes. Definitions place all
+     * lexical names first and append the complete outer→inner cfg chain last,
+     * so strip the inherited suffix before adding a nested name, then rebuild
+     * the canonical suffix through the shared helper. */
+    const char *cfg_suffix = strstr(prefix, "#cfg(");
+    if (cfg_suffix) {
+        size_t prefix_len = (size_t)(cfg_suffix - prefix);
+        char *undecorated = (char *)cbm_arena_alloc(ctx->arena, prefix_len + 1);
+        if (!undecorated) {
+            return;
+        }
+        memcpy(undecorated, prefix, prefix_len);
+        undecorated[prefix_len] = '\0';
+        prefix = undecorated;
+    }
+    const char *base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
+    ctx->enclosing_func_qn = cbm_rust_cfg_qualified_name(
+        ctx->arena, base_qn, func_node, ctx->source, CBM_LANG_RUST);
 
     CBMScope *saved = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
@@ -4339,7 +4389,7 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
     }
 
     ctx->current_scope = saved;
-    ctx->enclosing_func_qn = NULL;
+    ctx->enclosing_func_qn = saved_func_qn;
     /* Restore bound-env count so the caller's bounds are unaffected. */
     ctx->type_param_bound_count = saved_bound_count;
 }
@@ -4583,6 +4633,41 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     ctx->self_trait_qn = saved_trait;
 }
 
+/* Trait functions with bodies are real default methods. They are not inside an
+ * `impl_item`, so the old top-level dispatcher skipped them entirely and every
+ * call in a default body fell back to the textual registry resolver with a File
+ * caller. Enter the trait as the receiver/parent scope so both caller and callee
+ * QNs match the Method nodes emitted by the definition walk. */
+static void rust_process_trait(RustLSPContext *ctx, TSNode trait_node) {
+    TSNode name_node = ts_node_child_by_field_name(trait_node, "name", 4);
+    TSNode body = ts_node_child_by_field_name(trait_node, "body", 4);
+    if (ts_node_is_null(name_node) || ts_node_is_null(body))
+        return;
+    char *name = rust_node_text(ctx, name_node);
+    if (!name || !name[0])
+        return;
+
+    const char *trait_base = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    const char *trait_qn = cbm_rust_cfg_qualified_name(
+        ctx->arena, trait_base, trait_node, ctx->source, CBM_LANG_RUST);
+    const char *saved_self = ctx->self_type_qn;
+    const char *saved_trait = ctx->self_trait_qn;
+    ctx->self_type_qn = trait_qn;
+    ctx->self_trait_qn = trait_qn;
+
+    uint32_t nc = ts_node_child_count(body);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode item = ts_node_child(body, i);
+        if (!ts_node_is_null(item) && ts_node_is_named(item) &&
+            strcmp(ts_node_type(item), "function_item") == 0) {
+            rust_process_function(ctx, item, trait_qn);
+        }
+    }
+
+    ctx->self_type_qn = saved_self;
+    ctx->self_trait_qn = saved_trait;
+}
+
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
     if (ts_node_is_null(root))
         return;
@@ -4651,6 +4736,8 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
             rust_process_function(ctx, c, NULL);
         } else if (strcmp(ck, "impl_item") == 0) {
             rust_process_impl(ctx, c);
+        } else if (strcmp(ck, "trait_item") == 0) {
+            rust_process_trait(ctx, c);
         } else if (strcmp(ck, "mod_item") == 0) {
             /* Inline module — recurse into its declaration_list. */
             TSNode body = ts_node_child_by_field_name(c, "body", 4);
@@ -4665,6 +4752,8 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
                         rust_process_function(ctx, mc, NULL);
                     } else if (strcmp(mck, "impl_item") == 0) {
                         rust_process_impl(ctx, mc);
+                    } else if (strcmp(mck, "trait_item") == 0) {
+                        rust_process_trait(ctx, mc);
                     }
                 }
             }

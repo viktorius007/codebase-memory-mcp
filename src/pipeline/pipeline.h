@@ -286,23 +286,15 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
-/* True if `name` (a callee's terminal segment) is a curated ubiquitous Rust
- * method/associated-function name (clone/iter/parse/value/path/...). These carry
- * no package-disambiguating signal; used by the cross-package suppression gate.
- * The Rust analogue of cbm_perl_is_builtin. */
-bool cbm_rust_is_generic_method(const char *name);
-
-/* Decide whether a resolved Rust call edge is a cross-package phantom: a bare
- * generic method name (cbm_rust_is_generic_method) that a WEAK textual strategy
- * (unique_name/suffix_match/field_type_hint/fuzzy_*) bound across a package
- * boundary because the LSP had no receiver evidence. Same-package generic-method
- * edges are KEPT (the boundary check is what makes this safe vs a name denylist);
- * high-confidence strategies and boundary-undeterminable calls are KEPT. Package
- * identity is the Cargo `<pkg>/src/...` root of each file. Pure; unit-tested in
- * test_registry.c. */
-bool cbm_rust_suppress_cross_pkg_generic(bool is_rust, bool has_receiver, const char *callee_name,
-                                         const char *strategy, const char *source_file,
-                                         const char *target_file);
+/* A Rust receiver/associated call that reached a weak text-only strategy has no
+ * receiver-type evidence. Reject ambiguous matches everywhere (including
+ * same-crate `Mode::empty` collisions) and unique matches across Cargo package
+ * boundaries. Preserve same-package unique fallback while cross-file typing is
+ * incomplete, plus all LSP/import/same-module/qualified matches. */
+bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver,
+                                           const char *callee_name, const char *strategy,
+                                           const char *source_file, const char *target_file,
+                                           const char *target_qn);
 
 /* Decide whether a resolved TS/JS/TSX member-call edge is weak-strategy noise to
  * drop (#592/#606): true only for TS/JS, only for a member call with a

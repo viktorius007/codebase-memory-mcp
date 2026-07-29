@@ -3958,6 +3958,76 @@ TEST(is_test_cfg_any_test_mod_marks_defs) {
     PASS();
 }
 
+TEST(rust_cfg_method_twins_have_balanced_collision_free_qns) {
+    const char *src =
+        "struct Runner;\n"
+        "#[cfg(unix)]\n"
+        "impl Runner {\n"
+        "    #[cfg(feature = \"fast\")]\n"
+        "    fn execute(&self) { unix_only(); }\n"
+        "}\n"
+        "#[cfg(windows)]\n"
+        "impl Runner {\n"
+        "    #[cfg(feature = \"safe\")]\n"
+        "    fn execute(&self) { windows_only(); }\n"
+        "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *methods[2] = {0};
+    int count = 0;
+    for (int i = 0; i < r->defs.count && count < 2; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && d->name && strcmp(d->label, "Method") == 0 &&
+            strcmp(d->name, "execute") == 0) {
+            methods[count++] = d;
+        }
+    }
+    ASSERT_EQ(count, 2);
+    ASSERT_NOT_NULL(methods[0]->qualified_name);
+    ASSERT_NOT_NULL(methods[1]->qualified_name);
+    ASSERT_STR_NEQ(methods[0]->qualified_name, methods[1]->qualified_name);
+    ASSERT_NULL(strchr(methods[0]->qualified_name, ']'));
+    ASSERT_NULL(strchr(methods[1]->qualified_name, ']'));
+    ASSERT_NOT_NULL(strstr(methods[0]->qualified_name, "#cfg("));
+    ASSERT_NOT_NULL(strstr(methods[1]->qualified_name, "#cfg("));
+    ASSERT_NOT_NULL(strstr(methods[0]->qualified_name, ")#cfg("));
+    ASSERT_NOT_NULL(strstr(methods[1]->qualified_name, ")#cfg("));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_cfg_module_call_scope_matches_definition_qn) {
+    const char *src =
+        "fn target() {}\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    #[test]\n"
+        "    fn caller() { target(); }\n"
+        "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *caller = find_def_by_name(r, "caller");
+    const CBMCall *target = find_call_by_callee(r, "target");
+    ASSERT_NOT_NULL(caller);
+    ASSERT_NOT_NULL(target);
+    ASSERT_NOT_NULL(caller->qualified_name);
+    ASSERT_NOT_NULL(target->enclosing_func_qn);
+    ASSERT_NOT_NULL(strstr(caller->qualified_name, "#cfg(test)"));
+    if (strcmp(target->enclosing_func_qn, caller->qualified_name) != 0) {
+        fprintf(stderr, "  cfg-module QN mismatch: def=%s call=%s\n", caller->qualified_name,
+                target->enclosing_func_qn);
+    }
+    ASSERT_STR_EQ(target->enclosing_func_qn, caller->qualified_name);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5212,6 +5282,8 @@ SUITE(extraction) {
     RUN_TEST(is_test_cfg_test_mod_marks_defs_per_definition);
     RUN_TEST(is_test_file_marks_every_definition);
     RUN_TEST(is_test_cfg_any_test_mod_marks_defs);
+    RUN_TEST(rust_cfg_method_twins_have_balanced_collision_free_qns);
+    RUN_TEST(rust_cfg_module_call_scope_matches_definition_qn);
 
     cbm_shutdown();
 }

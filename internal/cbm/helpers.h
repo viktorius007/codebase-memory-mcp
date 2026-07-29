@@ -56,6 +56,9 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
 // `callers_total` with a non-callable row while dropping the real caller.
 const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
                                         const char *source, CBMLanguage lang);
+const char *cbm_rust_callable_qualified_name(CBMArena *a, const char *project,
+                                             const char *rel_path, const char *module_qn,
+                                             TSNode func_node, const char *source);
 
 // Truncate a type's generic-argument list in place: `Holder<T>` -> `Holder`,
 // `From<Feet>` -> `From`. A qualified path with no `<` (`io::Write`) is left
