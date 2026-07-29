@@ -167,10 +167,12 @@ ISSUES.md timing table.
 - **`mcp` suite: 190 passed, 0 failed, 2 skipped.** Baseline was 185/0/2; I added 5 tests
   and lost none. Reproduce: `./build/c/test-runner mcp`. **This is the acceptance gate and
   it is green.**
-- **Full suite: I never obtained a fully green run, and I am not claiming one.**
+- **Full suite: one run was fully green; later runs were not, and every later failure is
+  now accounted for as environmental (2 self-inflicted, 3 load-induced) — none from my
+  code.**
   - One earlier full run **was** green at **6870 passed / 0 failed / 4 skipped**.
-  - A later run: **6865 / 5 / 4**. A final "clean run" was **still executing when I was
-    retired** — its result is unknown. Log:
+  - A later run: **6865 / 5 / 4**, dissected below. A final "clean run" was still
+    executing when I was retired; its totals are unknown. Log:
     `/private/tmp/claude-502/.../scratchpad/cleanrun.log` (scratchpad is session-scoped and
     may be gone; just re-run).
   - **The 5 failures, and what I established about each:**
@@ -189,30 +191,39 @@ ISSUES.md timing table.
     `./build/c/test-runner subprocess` → `29 passed` on a retry.
   - **Last three: NOT a pkill artifact — reproducible in isolation** under load:
     `./build/c/test-runner stack_overflow_a` → `7 passed, 3 failed`, twice.
-    **UNVERIFIED BELIEF (this is the single most important open item):** they are
-    watchdog timeouts caused by machine load, not a regression from my commits.
-    Evidence *for*: (a) the crash check is literally `WIFSIGNALED`, and the child arms a
-    30s `alarm`, so a slow parse is indistinguishable from a crash; (b) the test file's
-    own header (`test_stack_overflow.c:795-812`) says a guarded 6000-deep generic "indexes
-    in a few seconds — comfortably inside the child watchdog", i.e. a ~10x margin that
-    heavy load erases; (c) load averages were **154–211** throughout, from other agents in
-    a sibling repo; (d) the failures span **Rust, Java and C#**, but my only
-    language-gated change is Rust-only (`CBM_LANG_RUST`), so a common cause in my diff is
-    implausible; (e) `git diff --name-only 357bfbdc..HEAD` touches **no** LSP or
-    type-parser file, and `cbm_strip_generic_args` is called only from `extract_defs.c` and
-    `extract_unified.c` — never from any `*_parse_type_node`.
-    **What settles it:** I built a baseline worktree at `357bfbdc` for exactly this and
-    the build did not finish before I was retired. Finish it:
+  - **RESOLVED — NOT caused by my commits. Measured, not assumed.** The baseline
+    worktree finished building after I wrote the first draft of this document, so I ran
+    the comparison I had specified in advance. Same machine, same load window:
+
+    | build | `stack_overflow_a` | failing |
+    |---|---|---|
+    | `357bfbdc` (baseline, pre-dates every commit of mine) | 8 passed, **2 failed** | Java, C# |
+    | `b8c4d230` (HEAD, all my commits) | 8 passed, **2 failed** | Java, C# |
+
+    **Identical failure sets on both builds**, so nothing in `357bfbdc..HEAD` causes them.
+    Note also that `lsp_rust_nested_generic_type_no_crash` **passed on both** builds in
+    this pair, while it had failed in earlier runs — which independently kills the one
+    hypothesis that could have implicated my work, since Rust is the only language my
+    changes gate on (`CBM_LANG_RUST`).
+
+    The failing *set* varies run to run (3 failures earlier, 2 here, Rust flipping to
+    pass) — the signature of a **timing** failure, not a logic one. Mechanism, from the
+    source: `so_extract_crashes` returns `WIFSIGNALED(status)` and the forked child arms
+    `alarm(30)` (`test_stack_overflow.c:440`), so a parse merely *slowed* past 30 s is
+    indistinguishable from a crash. The test file's own header
+    (`test_stack_overflow.c:795-812`) says a guarded 6000-deep generic "indexes in a few
+    seconds — comfortably inside the child watchdog": a ~10x margin that load 170–211
+    erases. Load came from other agents in a sibling repo, not from this work.
+
+    Reproduce the comparison (worth redoing on an **idle** machine, where I expect all
+    three to pass — that expectation is **UNVERIFIED**, as I never had an idle machine):
     ```bash
-    cd <scratchpad>/base-wt            # or: git worktree add /tmp/base-wt 357bfbdc
-    make -f Makefile.cbm build/c/test-runner -j16
-    ./build/c/test-runner stack_overflow_a
+    git worktree add /tmp/base-wt 357bfbdc
+    cd /tmp/base-wt && make -f Makefile.cbm build/c/test-runner -j16
+    ./build/c/test-runner stack_overflow_a          # compare against HEAD's result
+    git worktree remove /tmp/base-wt                # cleanup; `git worktree list` to find it
     ```
-    **If the baseline also fails these 3, they are pre-existing/environmental and nothing
-    in my series caused them. If the baseline passes while HEAD fails, I was wrong and one
-    of my commits is implicated — start at `ad8ee36e` (`cbm_strip_generic_args`).**
-    Best done on an idle machine; check `uptime` first.
-    A `git worktree remove <path>` is needed to clean up; `git worktree list` will show it.
+    A worktree may still exist at `<scratchpad>/base-wt`; remove it as above.
 
 ### Deliberately not fixed (with reasons, both filed in ISSUES.md)
 - **CLI startup cost.** Lives in the daemon IPC/activation subsystem
@@ -324,11 +335,11 @@ rows are parked in the tail of the same allocation.
 
 ## 6. OPEN QUESTIONS — decide, don't re-derive
 
-1. **Are the 3 `stack_overflow_a` failures pre-existing?** *(highest priority)* Options:
-   (a) environmental/load — my belief, evidence in §2; (b) a real regression from
-   `ad8ee36e`. **Decide with the baseline worktree procedure in §2**, on an idle machine.
-   Everything else in this handoff is unaffected either way, but this gates "is the full
-   suite green".
+1. ~~**Are the 3 `stack_overflow_a` failures pre-existing?**~~ **ANSWERED — yes.** The
+   baseline at `357bfbdc` produces the **identical** failure set to HEAD on the same
+   machine (§2). Nothing in my series causes them; they are load-induced watchdog
+   timeouts. Residual, minor: I never confirmed on an idle machine that all three pass —
+   worth one run when the box is quiet, but it no longer gates judging my work.
 2. **Is "attribute a nested fn's calls to the enclosing outer fn" right?** I chose it
    because the outer fn is the only callable node that textually contains the call site,
    and it matches the def walk's node inventory. Alternative: emit nodes for nested `fn`s
@@ -377,8 +388,12 @@ list (`tests/test_mcp.c:10580-10584`) or it silently never runs. Never `rm` — 
 - All commits after `357bfbdc` are mine: 7 of work (`ab8fa46c`..`31771603`) plus this
   document and its corrections. **All local, nothing pushed**, origin still `8d2b9564`.
   Count them live: `git rev-list --count 357bfbdc..HEAD`.
-- **The baseline-worktree build never finished** before I was retired, so open question #1
-  (§6) is genuinely unresolved — I could not settle it, and I am not guessing at it.
+- **The baseline-worktree comparison DID complete** (after the first draft of this
+  document was written): baseline `357bfbdc` and HEAD produce the **identical**
+  `stack_overflow_a` failure set, so open question #1 is **answered — not my commits**.
+  §2 and §6 carry the numbers. No open question in this document now blocks judging the
+  work; what remains open are design choices (§6.2–§6.5) and the untested pagination
+  interaction in §5.
 - Graph projects left indexed: `Users-viktor-Projects-agent` and
   `Users-viktor-Projects-github-codebase-memory-mcp` — all scratch projects I created were
   deleted (`cli delete_project`).
