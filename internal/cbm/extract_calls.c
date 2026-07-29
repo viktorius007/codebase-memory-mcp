@@ -1916,6 +1916,14 @@ static void kt_push_implicit_call(CBMExtractCtx *ctx, TSNode node, const char *c
 // dropped — no spurious edge.
 static void extract_cpp_operator_call(CBMExtractCtx *ctx, TSNode node, const char *kind,
                                       const char *enclosing_func_qn) {
+    if (strcmp(kind, "subscript_expression") == 0) {
+        CBMCall call = {0};
+        call.callee_name = "operator[]";
+        call.enclosing_func_qn = enclosing_func_qn;
+        call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
+        cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+        return;
+    }
     if (strcmp(kind, "binary_expression") != 0) {
         return;
     }
