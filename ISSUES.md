@@ -6,106 +6,49 @@ re-run it rather than trust the write-up.
 
 ## Open
 
-- **`trace_path` reports an impl method reached only by dynamic dispatch as having ZERO
-  callers, with nothing marking the answer partial.** (found 2026-07-29)
+- **The CLI costs ~2 s warm / ~5 s cold per invocation, and the cost is not process
+  startup.** (found 2026-07-29, re-measured 2026-07-29 on a rebuilt binary)
 
-  The three documented modes — `calls` (CALLS), `data_flow` (CALLS+DATA_FLOWS),
-  `cross_service` (HTTP/ASYNC/DATA_FLOWS/CROSS_*) — traverse no `OVERRIDE` edge, and
-  `OVERRIDE` is where the vtable link lives. So for any method invoked through a
-  `dyn Trait` / interface reference, the caller side of the graph is unreachable from the
-  impl node.
+  Measured with `/usr/bin/time -p`, binary built from this tree, on a 16-core M3 Max:
 
-  Measured on a Rust ports-and-adapters workspace (project slug
-  `Users-viktor-Projects-agent`, ~8.9k nodes / 33.8k edges):
-
-  | query | `callers_total` |
+  | condition | `cli list_projects` wall time |
   |---|---|
-  | `…process_executor.ProcessExecutor.execute`, `--direction inbound --depth 2` | **0** |
-  | same, `--include-tests true` | 22 — every one a test |
-  | the port trait it implements, `…ports.command.CommandExecutor.execute` | **1** — the real production caller |
+  | cold (no daemon; one is spawned and retired per call) | 4.71 / 4.71 / 5.78 s |
+  | warm (`daemon start` running, daemon reused) | 1.93 / 1.95 / 1.96 s |
+  | `--version` (process loads, does no daemon work) | **0.00 s** |
 
-  The impl reads as dead code. There is no `partial: true`, no warning, no hint that a
-  traversal class was skipped — the response is shaped exactly like a genuine zero. A reader
-  acting on it concludes "this adapter is test-only" and may weaken or delete live production
-  code; that outcome was one inference away in the run that found this.
+  The `--version` row is the load-bearing one: the ~300 MB binary loads and exits in under
+  10 ms, so the cost is **not** image size, dynamic linking, or process creation. It is
+  work done on the daemon path — connect/activation handshake and per-request setup. A
+  warm daemon removes roughly 3 s of the cold cost but leaves ~1.95 s, so the `hint:`
+  text's claim that starting a daemon "removes this startup cost from every CLI command"
+  overstates what it actually buys.
 
-  Severity is a function of architecture: in a hexagonal/ports-and-adapters codebase EVERY
-  port crossing is a `dyn` hop, so every adapter method in the repo is affected
-  simultaneously — `Tool`, `DirectTool`, `ApprovalPort`, `CommandExecutor`, `CompletionPort`.
+  Not yet diagnosed to a specific call, and **deliberately not fixed here**: it lives in
+  the daemon IPC/activation path (`src/daemon/ipc.c`, `src/daemon/runtime.c`,
+  `src/cli/cli.c`), which is a different subsystem from the extraction/reporting work in
+  this session and carries different risk. Filed with the measurement so the next reader
+  starts from data rather than re-deriving it.
 
-  **Sub-defect: `--edge-types` does not do what its name implies here.** Passing
-  `--edge-types CALLS --edge-types OVERRIDE` on the impl query left `callers_total: 22`
-  unchanged (test-inclusive), i.e. requesting the edge type that carries the vtable link had
-  no effect on traversal. A separate observation from the same session reported
-  `CALLS`+`OVERRIDE` returning *fewer* callers than `CALLS` alone; that one was not
-  reproduced here and is recorded as unconfirmed. Either way the flag appears not to be
-  reaching the traversal it names.
+  Next step for whoever picks this up: attribute the ~1.95 s warm cost before changing
+  anything — the `--version` result already rules out the most-assumed cause.
 
-  **Current workaround, and it works:** resolve the *trait* method with `search_graph` (the
-  impls and the trait declaration share a bare name, so the qualified name disambiguates)
-  and trace that instead of the impl. This is documented consumer-side in the
-  `codebase-memory` agent skill, but a workaround in a skill file only protects readers who
-  have loaded that skill.
+- **Node QNs embed `#[cfg(...)]` predicate text, so a qualified name is not usable as an
+  identifier.** (found 2026-07-29)
 
-  **Suggested shape of a fix**, in preference order: (1) make `mode: calls` follow `OVERRIDE`
-  from an impl node to its trait declaration and continue from the trait's callers, since
-  "who can reach this code at runtime" is the question `trace_path` is asked; or (2) if that
-  is deliberately out of scope, mark the response — a `dispatch: dynamic` note, or a
-  `partial` flag naming the skipped edge class — so a zero is legible as "not traversed"
-  rather than "not called". Option 2 alone would have prevented the near-miss above.
+  A cfg-gated Rust function's node QN is e.g.
+  `…agent-store.src.scan.append_open_rejects_a_fifo_at_the_session_path#cfg(unix)]`
+  — note the unbalanced trailing `]`. Visible directly in `trace_path` output rows.
 
-- **A `__file__` node is returned inside a callers list, inflating `callers_total`.**
-  (found 2026-07-29)
+  This is deliberate (`#495`: cfg-gated twins would otherwise collide on upsert and one
+  branch would be lost) and the suffix is now applied consistently on both the definition
+  and call sides, so attribution is correct. What remains is a **presentation** problem:
+  the QN is what a consumer copies back into `--function-name` / `--qualified-name`, and
+  the suffix is neither documented in the tool descriptions nor obviously strippable.
 
-  Reproduced on the Rust ports-and-adapters workspace `Users-viktor-Projects-agent`
-  (~8.9k nodes / 33.8k edges):
-
-      codebase-memory-mcp cli trace_path '{"project_name":"Users-viktor-Projects-agent",
-        "function_name":"ensure_single_link_regular_file","direction":"inbound",
-        "include_tests":true}'
-
-  returns `callers_total: 12`, and among the listed callers is a row
-
-      agent-store.src.scan.rs:
-        __file__ 2
-
-  A File node is not a caller. The reported total therefore includes at least one
-  non-caller, with nothing in the response marking which rows are real call sites and
-  which are containment artifacts.
-
-  **Why it matters even though this instance is benign:** the consumer that hit it ignored
-  the row and its verdict was unaffected — but `callers_total` is exactly the field an
-  agent reads to answer "how many places call this", and to decide whether a symbol is
-  safe to change. An inflated count is a silent wrong answer: it looks like a clean
-  result, and nothing prompts the reader to check. It is the same failure shape as the
-  OVERRIDE zero-callers defect above, in the opposite direction — that one under-reports,
-  this one over-reports, and neither is marked.
-
-  **Suggested fix**, in preference order: (1) exclude non-callable node labels (`File`,
-  `Folder`, `Module`) from callers lists and from `callers_total`; or (2) if a containment
-  edge is deliberately surfaced, label the row with its node kind so a reader can tell a
-  call site from a file, and exclude it from the total.
-
-- **The CLI pays a full daemon cold start per invocation, and prints daemon chatter into
-  the result stream.** (found 2026-07-29)
-
-  Measured on the same project. Each `codebase-memory-mcp cli <tool>` call costs ~1.35 s
-  before any query work, and emits to the result stream:
-
-      level=warn msg=mem.allocator.not_owned owned_classes=0/6 …
-      level=info msg=mem.init budget_mb=24576 total_ram_mb=49152 source=ram_fraction
-      hint: this command started a temporary CBM daemon…
-
-  One consumer traced six symbols in sequence and spent ~8 s on startup for ~0 s of query.
-  For comparison, `rg` answered the same six single-symbol questions in ~0.05 s each, which
-  is what that consumer concluded made the graph net-negative for uniquely-named symbols.
-
-  Two separable asks: (1) reuse a warm daemon across invocations, or document
-  `daemon start` as the harness-setup step so a batch of calls pays the cost once; and
-  (2) send `level=` diagnostics to stderr rather than into the tool result — an LLM
-  consumer receives them as part of the answer, and CLAUDE.md's agent-consumed-output rule
-  says a tool's default output should be decision-ready, not something the reader must
-  filter.
+  Not fixed here because the fix is a design choice with no single right answer — carry
+  the predicate in a separate field and keep QNs clean, or document the suffix as part of
+  the QN grammar. Both are behaviour changes to a stable surface.
 
 ## Confirmed working — do not "fix"
 
@@ -113,8 +56,8 @@ re-run it rather than trust the write-up.
   `execute_plan` on `Users-viktor-Projects-agent` (three same-named candidates) returned
   `status: ambiguous` naming all three with file paths, rather than guessing one. The
   consumer reported this cost it nothing and required no correction. This is the *safe*
-  failure mode, and the direct counterpart to the OVERRIDE defect's silent zero — resist
-  any change that turns it into a best-guess single answer.
+  failure mode, and the direct counterpart to a silent zero — resist any change that turns
+  it into a best-guess single answer.
 
 - **Both CLI invocation forms work.** Positional JSON
   (`cli trace_path '{"project_name":…}'`) and flags
@@ -122,3 +65,28 @@ re-run it rather than trust the write-up.
   verified to return identical output on 2026-07-29. Recorded because two consumers
   independently reported the JSON form as broken; re-testing showed it works, so the
   reports were wrong and no fix is needed. Kept here so the claim is not re-filed.
+  (The JSON form does print a deprecation warning to stderr; it still works.)
+
+- **`--edge-types` DOES reach the traversal it names.** An earlier revision of this file
+  asserted that passing `--edge-types CALLS --edge-types OVERRIDE` "appears not to be
+  reaching the traversal it names". **That is false**, re-measured 2026-07-29 on
+  `Users-viktor-Projects-agent` with a binary built from this tree:
+
+  - `…ProcessExecutor.execute --direction inbound --edge-types CALLS --edge-types OVERRIDE`
+    returns `inbound_total: 22` — the same 22 as CALLS alone, *and* the response header
+    changes to `edges: CALLS,OVERRIDE` with the leg renamed `inbound`, proving the flag was
+    parsed and honoured.
+  - The same walk `--direction outbound --edge-types OVERRIDE` returns exactly 1 row:
+    `agent-core.src.ports.command.CommandExecutor.execute`.
+
+  The real reason OVERRIDE cannot rescue an impl trace is **edge direction**:
+  `MATCH (a)-[r:OVERRIDE]->(b)` shows the edge runs **impl → trait**
+  (`ProcessExecutor.execute` → `CommandExecutor.execute`). An *inbound* walk from the impl
+  therefore never crosses it — not because the flag was ignored, but because there is no
+  inbound OVERRIDE edge at that node. Anyone debugging the flag itself is looking in the
+  wrong place; the answer is the graph's edge orientation.
+
+  The dynamic-dispatch blind spot this was filed under is **fixed and shipped**:
+  `trace_path` now reports port-mediated callers separately as `via_port_total` /
+  `via_port` / `via_port_callers`. Do not re-file it.
+</content>
