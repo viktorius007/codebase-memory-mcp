@@ -4069,6 +4069,93 @@ TEST(tool_trace_generic_impl_caller_not_attributed_to_file_node) {
     PASS();
 }
 
+/*
+ * A call made inside a NESTED `fn` (a helper declared in another function's
+ * body) must be attributed to the enclosing OUTER function, never to the file's
+ * `__file__` node.
+ *
+ * Third and last variant of the same seam. Here the two walks disagree about
+ * which nodes EXIST: the Rust def walk emits a node for a function item and does
+ * not descend into its body, so a nested `fn` gets NO node at all — while the
+ * call walk pushed a SCOPE_FUNC for it anyway, making the enclosing QN name a
+ * function nothing in the graph carries. The lookup in calls_find_source()
+ * therefore missed and the call landed on the file node.
+ *
+ * The remedy is the one already proven for OCaml in push_boundary_scopes: only
+ * the outermost function pushes a scope, so attribution matches the def walk's
+ * inventory by construction. Attributing to the outer function is not an
+ * approximation — it is the only callable node that textually contains the call.
+ */
+static void nestattr_write_repo(const char *dir) {
+    char path[CBM_SZ_512];
+    snprintf(path, sizeof(path), "%s/lib.rs", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "pub fn nestattr_callee() -> u32 { 7 }\n"
+               "\n"
+               "pub fn nestattr_outer() -> u32 {\n"
+               "    fn nestattr_inner() -> u32 {\n"
+               "        nestattr_callee()\n"
+               "    }\n"
+               "    nestattr_inner()\n"
+               "}\n");
+    fclose(f);
+}
+
+TEST(tool_trace_nested_fn_caller_not_attributed_to_file_node) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-nestattr-repo-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-nestattr-cache-XXXXXX");
+    if (!cbm_mkdtemp(repo) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    nestattr_write_repo(repo);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"nestattr-proj\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    r = cbm_mcp_handle_tool(srv, "trace_call_path",
+                            "{\"project\":\"nestattr-proj\",\"function_name\":\"nestattr_callee\","
+                            "\"direction\":\"inbound\",\"include_tests\":true}");
+    ASSERT_NOT_NULL(r);
+
+    /* The outer function is the callable node that contains the call site. */
+    if (!strstr(r, "nestattr_outer")) {
+        fprintf(stderr, "  [nestattr] FAIL outer fn absent from callers: %.400s\n", r);
+    }
+    ASSERT_NOT_NULL(strstr(r, "nestattr_outer"));
+    if (strstr(r, "__file__")) {
+        fprintf(stderr, "  [nestattr] FAIL __file__ node listed as a caller: %.400s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "__file__"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(repo);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* Regression for #604: path scopes architecture totals and content. */
 TEST(tool_get_architecture_path_scoping) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -10319,6 +10406,7 @@ SUITE(mcp) {
     RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
     RUN_TEST(tool_trace_cfg_gated_caller_not_attributed_to_file_node);
     RUN_TEST(tool_trace_generic_impl_caller_not_attributed_to_file_node);
+    RUN_TEST(tool_trace_nested_fn_caller_not_attributed_to_file_node);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 

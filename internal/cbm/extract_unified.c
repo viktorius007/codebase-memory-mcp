@@ -1373,9 +1373,19 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
          * node for it. Pushing a func scope here would attribute in-body calls to
          * that nodeless local binding — the CALLS edge then sources to neither a
          * Function nor the Module. Only the OUTERMOST value_definition pushes a
-         * scope (none already on the stack), matching what the def walk extracts. */
+         * scope (none already on the stack), matching what the def walk extracts.
+         *
+         * Rust has the identical shape: the def walk emits a node for a
+         * function_item and does NOT descend into its body, so a nested `fn`
+         * helper declared inside another fn gets no node. Pushing a scope for it
+         * made the enclosing QN name a function nothing in the graph carries, the
+         * exact-equality lookup in calls_find_source() missed, and the call was
+         * re-attributed to the file's `__file__` node — which then surfaced as a
+         * bogus row in trace_path's caller list and in `callers_total`. Skipping
+         * the nested push attributes those calls to the enclosing outer fn: the
+         * only callable node that textually contains the call site. */
         bool skip_nested = false;
-        if (ctx->language == CBM_LANG_OCAML) {
+        if (ctx->language == CBM_LANG_OCAML || ctx->language == CBM_LANG_RUST) {
             for (int i = 0; i < state->scope_top; i++) {
                 if (state->scopes[i].kind == SCOPE_FUNC) {
                     skip_nested = true;
