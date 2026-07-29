@@ -5,9 +5,11 @@ verify everything. Every factual claim below names the command that produced it.
 did not verify are tagged **UNVERIFIED BELIEF** with what would settle them.
 
 Repo: `/Users/viktor/Projects/github/codebase-memory-mcp`, branch `main`.
-Baseline (last commit not mine): `357bfbdc`. My HEAD: `38ff24da` (this document).
-**8 commits, all local: 7 of work + this handoff. NOTHING PUSHED.**
-`git rev-parse origin/main` → `8d2b9564`.
+Baseline (last commit not mine): `357bfbdc`. Everything after it is mine.
+**7 commits of work + this document and its corrections. ALL LOCAL. NOTHING PUSHED.**
+Get the live count with `git rev-list --count 357bfbdc..HEAD` rather than trusting a
+number written here — I twice wrote a count that my next commit invalidated.
+`git rev-parse origin/main` → `8d2b9564`, unchanged.
 
 ---
 
@@ -372,8 +374,9 @@ list (`tests/test_mcp.c:10580-10584`) or it silently never runs. Never `rm` — 
 ## 8. STATE AT HANDOFF
 
 - Working tree **clean**; `git status --porcelain` empty.
-- 8 commits `357bfbdc..38ff24da` (7 of work + this handoff), **all local, nothing pushed**,
-  origin still `8d2b9564`. Verify: `git rev-list --count 357bfbdc..HEAD` → `8`.
+- All commits after `357bfbdc` are mine: 7 of work (`ab8fa46c`..`31771603`) plus this
+  document and its corrections. **All local, nothing pushed**, origin still `8d2b9564`.
+  Count them live: `git rev-list --count 357bfbdc..HEAD`.
 - **The baseline-worktree build never finished** before I was retired, so open question #1
   (§6) is genuinely unresolved — I could not settle it, and I am not guessing at it.
 - Graph projects left indexed: `Users-viktor-Projects-agent` and
