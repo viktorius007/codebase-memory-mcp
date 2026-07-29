@@ -913,6 +913,16 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     return NULL;
 }
 
+void cbm_strip_generic_args(char *type_name) {
+    if (!type_name) {
+        return;
+    }
+    char *lt = strchr(type_name, '<');
+    if (lt) {
+        *lt = '\0';
+    }
+}
+
 /* Fold a Rust `#[cfg(...)]` predicate into a function QN. See helpers.h for the
  * single-source-of-truth contract this upholds between the def walk and the call
  * walk. The suffix is built from the raw `cfg(` text with whitespace and quotes

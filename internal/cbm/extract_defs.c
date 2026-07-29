@@ -4538,13 +4538,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         return;
     }
     /* Strip generic args from the implementing type: `Buffer<T>` → `Buffer`,
-     * `Wrapper<T>` → `Wrapper`. The struct identity is the base name. */
-    {
-        char *lt = strchr(type_name, '<');
-        if (lt) {
-            *lt = '\0';
-        }
-    }
+     * `Wrapper<T>` → `Wrapper`. The struct identity is the base name. Shared
+     * with the call walk's class-scope QN, which must strip identically. */
+    cbm_strip_generic_args(type_name);
 
     // Check for "impl Trait for Struct" pattern
     TSNode trait_node = ts_node_child_by_field_name(node, TS_FIELD("trait"));
@@ -4553,12 +4549,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         /* Strip generic args from the trait: `From<Feet>` → `From`,
          * `Index<usize>` → `Index`, `AsRef<str>` → `AsRef`. Qualified paths
          * like `io::Write` / `fmt::Display` have no `<` and are preserved. */
-        if (trait_name) {
-            char *lt = strchr(trait_name, '<');
-            if (lt) {
-                *lt = '\0';
-            }
-        }
+        cbm_strip_generic_args(trait_name);
         if (trait_name && trait_name[0]) {
             CBMImplTrait it;
             it.trait_name = trait_name;

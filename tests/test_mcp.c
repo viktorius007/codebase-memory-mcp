@@ -3982,6 +3982,93 @@ TEST(tool_trace_cfg_gated_caller_not_attributed_to_file_node) {
     PASS();
 }
 
+/*
+ * A call made inside a method of a GENERIC `impl` block must be attributed to
+ * that method, never to the file's `__file__` node.
+ *
+ * Same class of defect as the cfg-suffix case above, different half of the same
+ * seam: the DEF walk strips generic arguments from the implementing type
+ * (`Holder<T>` -> `Holder`, extract_defs.c extract_rust_impl) so the Method node
+ * is `...Holder.run`, but the CALL walk's class-scope QN (compute_class_qn,
+ * extract_unified.c) used the `type` field's RAW text, yielding `Holder<T>.run`.
+ * calls_find_source() joins those by exact equality, so the lookup missed and
+ * the call fell back to the file node — inflating `callers_total` with a
+ * non-callable row while losing the real caller.
+ *
+ * Triggered by angle brackets in the impl's `type` text, which is why the
+ * fixture uses `impl<T> Holder<T>`: a bare `impl<T> Trait for Plain` has generic
+ * params but no brackets in `type` and was never affected.
+ */
+static void genattr_write_repo(const char *dir) {
+    char path[CBM_SZ_512];
+    snprintf(path, sizeof(path), "%s/lib.rs", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "pub fn genattr_callee() -> u32 { 7 }\n"
+               "\n"
+               "pub struct Holder<T> { pub item: T }\n"
+               "\n"
+               "impl<T> Holder<T> {\n"
+               "    pub fn genattr_generic_caller(&self) -> u32 {\n"
+               "        genattr_callee()\n"
+               "    }\n"
+               "}\n");
+    fclose(f);
+}
+
+TEST(tool_trace_generic_impl_caller_not_attributed_to_file_node) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-genattr-repo-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-genattr-cache-XXXXXX");
+    if (!cbm_mkdtemp(repo) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    genattr_write_repo(repo);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"genattr-proj\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    r = cbm_mcp_handle_tool(srv, "trace_call_path",
+                            "{\"project\":\"genattr-proj\",\"function_name\":\"genattr_callee\","
+                            "\"direction\":\"inbound\",\"include_tests\":true}");
+    ASSERT_NOT_NULL(r);
+
+    if (!strstr(r, "genattr_generic_caller")) {
+        fprintf(stderr, "  [genattr] FAIL generic-impl caller absent from callers: %.400s\n", r);
+    }
+    ASSERT_NOT_NULL(strstr(r, "genattr_generic_caller"));
+    if (strstr(r, "__file__")) {
+        fprintf(stderr, "  [genattr] FAIL __file__ node listed as a caller: %.400s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "__file__"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(repo);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* Regression for #604: path scopes architecture totals and content. */
 TEST(tool_get_architecture_path_scoping) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -10231,6 +10318,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
     RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
     RUN_TEST(tool_trace_cfg_gated_caller_not_attributed_to_file_node);
+    RUN_TEST(tool_trace_generic_impl_caller_not_attributed_to_file_node);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 

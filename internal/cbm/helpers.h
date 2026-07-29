@@ -57,6 +57,16 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
 const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
                                         const char *source, CBMLanguage lang);
 
+// Truncate a type's generic-argument list in place: `Holder<T>` -> `Holder`,
+// `From<Feet>` -> `From`. A qualified path with no `<` (`io::Write`) is left
+// alone. The base name IS the type's identity in the graph.
+//
+// SINGLE SOURCE OF TRUTH: the definition walk names an impl's Method node after
+// the STRIPPED type, so the call walk's class-scope QN must strip identically or
+// the exact-equality join in calls_find_source() misses and the call is
+// re-attributed to the file's `__file__` node.
+void cbm_strip_generic_args(char *type_name);
+
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 

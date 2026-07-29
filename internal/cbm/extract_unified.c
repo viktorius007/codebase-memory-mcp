@@ -701,6 +701,18 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
         return NULL;
     }
 
+    /* Rust impl: the def walk names the Method node after the type with its
+     * generic arguments STRIPPED (`Holder<T>` -> `Holder`), so this class-scope
+     * QN must strip too. Without it the QNs differ by the `<...>` text, the
+     * exact-equality join in calls_find_source() misses, and every call in a
+     * generic impl's method is re-attributed to the file's `__file__` node. */
+    if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
+        cbm_strip_generic_args(name);
+        if (!name[0]) {
+            return NULL;
+        }
+    }
+
     /* Nested class: prefix with the enclosing class QN (Outer.Inner) so this
      * scope QN matches the def-side class QN (extract_defs.c compute_class_qn /
      * extract_class_def), which the lsp_resolve join requires for nested types. */
