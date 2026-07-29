@@ -593,6 +593,14 @@ static bool runtime_windows_file_snapshot_same(const BY_HANDLE_FILE_INFORMATION 
 
 #elif defined(__APPLE__)
 
+#if defined(CBM_DAEMON_RUNTIME_ENABLE_TEST_API)
+static const char *g_runtime_test_process_image_path_override;
+
+void cbm_daemon_runtime_test_set_process_image_path_override(const char *path) {
+    g_runtime_test_process_image_path_override = path;
+}
+#endif
+
 static bool runtime_mac_process_instance(int process_id, struct proc_bsdinfo *info) {
     if (!info) {
         return false;
@@ -736,6 +744,13 @@ static bool runtime_process_image_reference_acquire(
     if (ok) {
         path[path_length] = '\0';
     }
+#if defined(CBM_DAEMON_RUNTIME_ENABLE_TEST_API)
+    if (ok && g_runtime_test_process_image_path_override) {
+        int overridden =
+            snprintf(path, sizeof(path), "%s", g_runtime_test_process_image_path_override);
+        ok = overridden > 0 && overridden < (int)sizeof(path);
+    }
+#endif
     int fd = ok ? open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
     struct stat file_before;
     struct stat file_after;

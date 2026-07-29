@@ -249,6 +249,12 @@ bool cbm_daemon_runtime_hello_request_encode(uint8_t out[CBM_DAEMON_RENDEZVOUS_R
 bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
                                                   char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
+#if defined(__APPLE__) && defined(CBM_DAEMON_RUNTIME_ENABLE_TEST_API)
+/* Test-only TOCTOU seam: substitute the candidate returned by proc_pidpath
+ * before the production vnode-to-executable-mapping checks run. */
+void cbm_daemon_runtime_test_set_process_image_path_override(const char *path);
+#endif
+
 /* Ask any current daemon generation to drain before install/update/uninstall.
  * This is not a normal HELLO and never creates an application session. The
  * kernel-authenticated peer image must match identity->build_fingerprint, but
