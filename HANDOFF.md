@@ -13,6 +13,36 @@ number written here — I twice wrote a count that my next commit invalidated.
 
 ---
 
+## 0a. READ FIRST — an independent review landed after this document was written
+
+An adversarial reviewer audited `357bfbdc..HEAD`; its findings are **committed to
+`ISSUES.md` (commit `c0e1f045`)**. Two are HIGH, and one means **P0 is NOT fully fixed**:
+
+1. **My `callers_total` fix covered `File` only, not `Module`.**
+   `trace_row_is_uncallable` (`src/mcp/mcp.c:6124`) tests one label. Module nodes are
+   equally non-callable and source **85** CALLS edges in `Users-viktor-Projects-agent` —
+   **I verified that count myself** before filing. So `callers_total` can still
+   over-report, and `b87e995c`'s claim that the split works "regardless of which extractor
+   path produced the edge" is **false**. I closed the item while the defect was live on a
+   differently-labelled node. `Folder` is genuinely clean (0 such edges).
+   **Fix: widen the predicate to `Module`, then re-run the P0 acceptance.**
+2. **A memory leak I introduced** in `trace_split_unattributed`: spilled rows are never
+   freed (the free loop is bounded by the `visited_count` the split lowers). macOS ASan
+   cannot see it. Preferred fix shape is in `ISSUES.md`.
+3. Plus: the spill ignores the page budget; a latent duplicate-JSON-key case; a
+   pre-existing cursor-hash gap this work aggravates; one cosmetic issue.
+
+**Confirmed correct by that review** (do not re-derive): all five red proofs are genuine
+and non-tautological; no test was lost (188 → 193 `RUN_TEST` entries); acceptance (g) was
+respected; **the nested-fn fix is not too broad** — closures provably never pushed a scope,
+which settles the worry I raise in §5; the P1 OVERRIDE correction is accurate; the P2
+stderr measurement holds.
+
+Read §1 as accurate about the **extraction** work and **over-claimed about the reporting
+split**.
+
+---
+
 ## 0. The 60-second version
 
 `trace_path`'s `callers_total` counted `__file__` (File) nodes as callers. Root cause was
