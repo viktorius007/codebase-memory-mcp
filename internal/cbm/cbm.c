@@ -28,6 +28,10 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h> // struct timespec, CLOCK_MONOTONIC
+#ifdef __APPLE__
+#include <signal.h>
+#include <unistd.h>
+#endif
 
 // Atomic counters for profiling parse vs extraction time (nanoseconds).
 // Accessed from multiple threads; using _Atomic for safe accumulation.
@@ -705,7 +709,15 @@ static void cbm_test_fault_inject(const char *rel_path) {
     }
     const char *crash_on = getenv("CBM_TEST_CRASH_ON");
     if (crash_on && crash_on[0] && strstr(rel_path, crash_on)) {
-        abort(); /* SIGABRT → WIFSIGNALED → classified as a crash */
+#ifdef __APPLE__
+        /* SIGABRT from an ASan-instrumented worker can become permanently
+         * wedged in __pthread_kill on macOS. SIGKILL still proves abrupt,
+         * response-less process death and cannot run cleanup handlers. */
+        (void)kill(getpid(), SIGKILL);
+        _Exit(128 + SIGKILL);
+#else
+        abort();
+#endif
     }
     const char *hang_on = getenv("CBM_TEST_HANG_ON");
     if (hang_on && hang_on[0] && strstr(rel_path, hang_on)) {

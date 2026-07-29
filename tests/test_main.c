@@ -198,7 +198,14 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
     if (strstr(args_json, "\"crash\"")) {
         (void)fprintf(stderr, "async worker crash probe\n");
         fflush(NULL);
+#ifdef __APPLE__
+        /* See cbm_test_fault_inject: SIGABRT can wedge ASan workers forever
+         * on macOS, whereas SIGKILL is still a real abrupt worker death. */
+        (void)kill(getpid(), SIGKILL);
+        _Exit(128 + SIGKILL);
+#else
         abort();
+#endif
     }
     if (strstr(args_json, "\"oversize\"")) {
         FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;

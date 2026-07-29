@@ -617,6 +617,8 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
         "crash", false, &crash_outcome, &crash_response, &crash_log, &crash_response_file);
 #ifdef _WIN32
     bool crash_classified_failure = crash_outcome != CBM_PROC_CLEAN;
+#elif defined(__APPLE__)
+    bool crash_classified_failure = crash_outcome == CBM_PROC_KILLED;
 #else
     bool crash_classified_failure = crash_outcome == CBM_PROC_CRASH;
 #endif

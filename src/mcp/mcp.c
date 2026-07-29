@@ -7837,10 +7837,11 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     return degraded;
 }
 
-/* Build the response for a worker that crashed/hung/failed without producing a
- * result. The crash is already contained (this process survived); we report it
- * rather than dying. Precise skip-and-continue (quarantine the culprit, index the
- * rest) is layered on in the probe stage. */
+/* Build the response for a worker that crashed/hung/was unexpectedly killed or
+ * otherwise failed without producing a result. The failure is already contained
+ * (this process survived); we report it rather than dying. Precise
+ * skip-and-continue (quarantine the culprit, index the rest) is layered on in
+ * the probe stage. */
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -7858,6 +7859,9 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     } else if (outcome == CBM_PROC_CRASH) {
         hint = "Indexing worker crashed on a file. The crash was contained (the server "
                "survived). Re-run to retry; a future release isolates the culprit file.";
+    } else if (outcome == CBM_PROC_KILLED) {
+        hint = "Indexing worker was unexpectedly killed. The failure was contained (the "
+               "server survived). Re-run to retry.";
     } else if (outcome == CBM_PROC_CLEAN) {
         hint = "Indexing worker exited without a valid response. No in-process fallback "
                "was attempted.";
@@ -8055,9 +8059,9 @@ cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
 /* Run index_repository in a supervised worker subprocess with skip-and-continue
  * (Stage 3c). Returns the response string (caller frees):
  *   - the worker's own response on a clean first run (the common path);
- *   - after a crash/hang, the response from a clean single-threaded RECOVERY run
- *     that quarantines the culprit file(s) — status="indexed" with them listed in
- *     skipped[] as phase="crash"/"hang", and the good files indexed;
+ *   - after a crash/hang/unexpected kill, the response from a clean parallel
+ *     RECOVERY run that quarantines the culprit file(s) — status="indexed" with
+ *     them listed in skipped[] as phase="crash"/"hang", and the good files indexed;
  *   - a best-effort PARTIAL index (one final quarantine-only run) if the recovery
  *     loop cannot converge but at least one file was quarantined;
  *   - a contained-failure response only if even that cannot produce a clean run.
@@ -8167,12 +8171,15 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             cbm_index_worker_result_free(&wr2);
             break; /* good files indexed; quarantined files reported as crash/hang */
         }
-        if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG) {
+        if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG ||
+            wr2.outcome == CBM_PROC_KILLED) {
             last_outcome = wr2.outcome;
             cbm_index_worker_result_free(&wr2);
             /* crash vs hang: the phase this file is quarantined under and
-             * reported as in skipped[]. A fault signal → "crash"; a
-             * no-progress kill → "hang". */
+             * reported as in skipped[]. A fault signal or an unexpected
+             * externally delivered kill → "crash"; a no-progress supervisor
+             * kill → "hang". Requested cancellation was rejected above as an
+             * unsafe terminal and never reaches recovery. */
             const char *phase = (last_outcome == CBM_PROC_HANG) ? "hang" : "crash";
             int sus_n = 0;
             char **suspects = supervisor_read_suspects(marker_path, &sus_n);
