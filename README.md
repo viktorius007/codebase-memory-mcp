@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
 [![Agents](https://img.shields.io/badge/agent_surfaces-43-purple)](https://github.com/DeusData/codebase-memory-mcp)
@@ -155,11 +155,25 @@ Watcher registration is controlled separately by `auto_watch` (default `true`). 
 
 ### Keeping Up to Date
 
+**Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp update` validates your flags and then prints the exact command to run:
+
 ```bash
-codebase-memory-mcp update
+# macOS / Linux
+bash "<install-dir>/install.sh"
 ```
 
-The MCP server also checks for updates on startup and notifies on the first tool call if a newer release is available.
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File "<install-dir>\install.ps1"
+```
+
+The install script is placed next to the binary at install time, so the printed path resolves beside the executable. It is idempotent, so re-running it *is* the update: it stops the daemon, retires the running binary, installs the new one, and cleans up.
+
+Why it works this way. On Windows it is a hard requirement — a running executable cannot replace its own image, so the swap has to happen from a process that is not the binary being replaced. On macOS and Linux it is a deliberate choice: an in-process updater is structurally a downloader (fetch an archive, verify it, unpack it, mark a file executable, run it), and shipping that composite in every binary to serve a command most people run a handful of times is a poor trade. The release archives now carry no download URLs at all, and **cbm makes no network request of its own accord** — it does not check for new versions in the background, and nothing phones home. You find out about releases from the install script, your package manager, or GitHub.
+
+If PowerShell refuses to run the script because the file came from the internet, `Unblock-File` it first.
+
+Installed through **npm or pip**? Update with your package manager on every platform (`npm install -g codebase-memory-mcp@latest` / `pip install -U codebase-memory-mcp`).
 
 ### Uninstall
 
@@ -168,6 +182,8 @@ codebase-memory-mcp uninstall
 ```
 
 Removes owned agent config entries, skills, hooks, instructions, and the installed binary. Existing graph indexes are listed and deleted only after confirmation.
+
+The install script placed beside the binary is **reported, not deleted** — uninstall prints its path and the `rm` command for it. It is left alone on purpose: it may be your own copy, a symlink into a checkout, or managed by a package manager, and an uninstaller should not delete a file it cannot prove it owns.
 
 ## Features
 
@@ -197,7 +213,10 @@ Removes owned agent config entries, skills, hooks, instructions, and the install
 - **Cross-repo architecture summary** combining services, routes, and dependencies across the indexed fleet
 
 ### Edge types (selected)
-- `CALLS`, `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`
+- `CALLS` — a callable is invoked at the source site
+- `CALL_REFERENCE` — a callable is used at a supported reference site (for example, a direct value argument) and resolves to one exact target
+- `USAGE` — an identifier is used, but a unique callable target is not proven (including ambiguous or complex expressions)
+- `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`
 - `HTTP_CALLS`, `ASYNC_CALLS` (cross-service)
 - `EMITS`, `LISTENS_ON` (channels)
 - `DATA_FLOWS` with arg-to-param mapping + field access chains
@@ -361,7 +380,23 @@ scripts/build.sh                    # standard binary
 scripts/build.sh --with-ui          # with graph visualization
 scripts/build.sh --incremental --ccache --fast-grammars --quiet --jobs 16  # warm local rebuilds
 scripts/test.sh --incremental --ccache --fast-grammars --quiet --jobs 16 --parallel-suites  # warm local tests
-# Binary at: build/c/codebase-memory-mcp
+# Binary at: build/c/codebase-memory-mcp   (codebase-memory-mcp.exe on Windows)
+```
+
+Every platform builds **one self-contained binary** — no runtime dependencies, no companion executables to keep alongside it.
+
+Run the test suite (6,768 tests across 120 suites):
+
+```bash
+scripts/test.sh                     # full: clean sanitizer build + all suites + guards
+scripts/test.sh --suites <name>     # one suite, incremental, seconds
+build/c/test-runner --list-suites   # what is available
+```
+
+`scripts/test.sh` is the same entry the CI gates run, so a local pass means the same thing a CI pass does. Packaging a release archive locally uses the same canonical script the release pipeline calls:
+
+```bash
+scripts/package-release.sh <linux|darwin|windows> <amd64|arm64>
 ```
 
 ### Manual MCP Configuration
@@ -586,8 +621,10 @@ JSON arguments can also be piped on stdin. Inline JSON remains accepted for back
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
-| `manage_adr` | CRUD for Architecture Decision Records. |
+| `manage_adr` | CRUD for Architecture Decision Records. Query modes do not wait behind a same-project reindex; writes remain serialized. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
+
+`manage_adr` query modes (`get` and `sections`) use the server's cached query store so they can proceed while a same-project reindex is running. If another process publishes a replacement store during reindexing, they can return the pre-publication ADR until idle eviction refreshes that cache. Updates remain serialized through the project mutation guard.
 
 ## Graph Data Model
 
@@ -597,7 +634,7 @@ JSON arguments can also be piped on stdin. Inline JSON remains accepted for back
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
 
 ### Qualified Names
 
@@ -635,7 +672,7 @@ codebase-memory-mcp config reset auto_index              # reset to default
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CBM_ALLOWED_ROOT` | *(unset)* | Restrict `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused; unset imposes no restriction. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
+| `CBM_ALLOWED_ROOT` | *(unset)* | Confine `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused, and the same check now applies to the graph UI's `POST /api/index` route rather than only to the MCP tool. Unset imposes no *containment* restriction — but see the always-on limits below, which apply whether or not this is set. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. One account can use only one canonical cache root at a time; close active CBM sessions/commands before switching it. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable the shared daemon's periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. Exact paths are logged by `diagnostics.start`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
@@ -696,7 +733,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 
 Tree-sitter alone gives a syntactic AST. That handles naming, structure, and call sites well, but it can't tell you that `user.profile.display_name()` resolves to `Profile.display_name` declared three modules away — tree-sitter doesn't track imports, generics, inheritance, or stdlib types.
 
-codebase-memory-mcp ships a **lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers** (tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, rust-analyzer), embedded directly into the static binary. No language server process, no per-project setup, no API key. We call this layer **Hybrid LSP**: it runs alongside tree-sitter on every parse and refines `CALLS`, `USAGE`, and `RESOLVED_CALLS` edges with type information, so the resulting graph mirrors what an IDE "Go to Definition" would resolve.
+codebase-memory-mcp ships a **lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers** (tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, rust-analyzer), embedded directly into the static binary. No language server process, no per-project setup, no API key. We call this layer **Hybrid LSP**: it runs alongside tree-sitter on every parse and refines invocation resolution (`CALLS` / `RESOLVED_CALLS`) and callable-value resolution (`CALL_REFERENCE`, with ambiguous values retained as `USAGE`) using type information, so the resulting graph mirrors what an IDE "Go to Definition" would resolve.
 
 **Languages with full Hybrid LSP:**
 

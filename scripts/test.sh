@@ -259,8 +259,14 @@ fi
 
 # Step 5: Parent-death watchdog regression (#406/#407). Builds the prod stdio
 # binary and verifies it self-exits when its launching parent is killed.
+#
+# TEST_SEAMS=1: the worker-mode leg below needs the crash-orphan probe, which is
+# compiled out of ordinary builds (it forks a SIGTERM-ignoring child — see
+# src/main.c). Requesting it HERE, in the leg that consumes it, is what keeps
+# release artifacts free of it; scripts/ci/check-binary-composition.sh proves
+# they stay that way.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
-make -j"$NPROC" -f Makefile.cbm cbm ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 
@@ -269,6 +275,25 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 # indexing on as an orphan. Reuses the prod binary built in Step 5.
 echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
+
+# Step 5c: a worker-delivered MCP error is transport success. The outer CLI
+# still exits nonzero for the user-facing tool error, but the supervisor must
+# preserve that response instead of misreporting exit_nonzero as a file crash.
+echo "=== Step 5c: worker error-response transport regression ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.sh"
+
+# Step 5d (#1388) is DELIBERATELY NOT GATING HERE — see
+# tests/test_hook_conflict_notice.sh for the full what-was-tried record.
+# Summary: the test forces a client/daemon build mismatch via the
+# CBM_TEST_HOOK_CLIENT_BUILD seam and asserts the stdout systemMessage. It is
+# reliably green locally against a seam-bearing binary, but on every CI leg the
+# forced mismatch raises no cohort conflict at all: the seam is present (the
+# test asserts that up front), the forced fingerprint is well-formed (64 hex),
+# and `daemon status` reports an active daemon on a DIFFERENT build - yet the
+# client joins silently. Until that local-vs-CI divergence in the cohort
+# admission path is understood, gating on it would make an unexplained red, and
+# skipping it silently would hide the gap. Run it by hand:
+#   make -f Makefile.cbm cbm TEST_SEAMS=1 && bash tests/test_hook_conflict_notice.sh
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string

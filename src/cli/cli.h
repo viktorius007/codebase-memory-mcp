@@ -336,7 +336,11 @@ int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
 /* Get the Codex CLI instructions content. */
 const char *cbm_get_codex_instructions(void);
 
-/* ── Tar.gz extraction ────────────────────────────────────────── */
+/* ── Tar.gz / zip extraction (TEST-ONLY) ──────────────────────────
+ * Reachable only from the excluded in-process updater and tests/test_cli.c.
+ * Declared and defined under the test guard so the capability is absent from
+ * release artifacts rather than present-but-unreachable. */
+#ifdef CBM_CLI_ENABLE_TEST_API
 
 /* Extract a binary named "codebase-memory-mcp*" from a tar.gz buffer.
  * Returns malloc'd binary content and sets *out_len.
@@ -348,18 +352,7 @@ unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len);
 
-/* Strict two-file Windows release bundle extraction. The archive must contain
- * exactly one root launcher and one root payload; ambiguous aliases,
- * traversal, duplicates, and malformed central/local metadata fail closed. */
-typedef struct {
-    unsigned char *launcher;
-    int launcher_len;
-    unsigned char *payload;
-    int payload_len;
-} cbm_windows_release_pair_t;
-bool cbm_extract_windows_release_pair_from_zip(const unsigned char *data, int data_len,
-                                               cbm_windows_release_pair_t *pair_out);
-void cbm_windows_release_pair_free(cbm_windows_release_pair_t *pair);
+#endif /* CBM_CLI_ENABLE_TEST_API */
 
 /* ── Index management ─────────────────────────────────────────── */
 
@@ -447,14 +440,6 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
  * command-line or environment override. */
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
 
-/* Consume and authenticate any inherited permanent-launcher context before
- * process-role classification. An absent context is the normal portable
- * payload case; an advertised but invalid context fails closed. */
-int cbm_cli_windows_launcher_startup_authenticate(int argc, char *const argv[]);
-/* Internal release-pair probe. Returns -1 when argv does not select the role,
- * otherwise a process exit code. It runs before cache/daemon initialization. */
-int cbm_cli_windows_payload_descriptor_role(int argc, char *const argv[]);
-
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
 /* install: copy binary, install skills, install editor MCP configs, ensure PATH.
@@ -491,6 +476,20 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
  * hard fail-open deadline without constructing a local MCP/store instance. */
 void cbm_hook_augment_arm_deadline(void);
 char *cbm_hook_augment_read_stdin(void);
+
+/* Why a hook client is not augmenting. The hook caller only ever sees stdout,
+ * so each reason that is actionable by the user must have a stdout notice
+ * (#1388: a build-conflicted daemon used to report on stderr alone, which is
+ * invisible in-session and reads as silent skips). */
+typedef enum {
+    CBM_HOOK_ADMISSION_DAEMON_ABSENT = 0, /* no daemon running: `daemon start` heals it */
+    CBM_HOOK_ADMISSION_BUILD_CONFLICT     /* daemon runs another build: needs `daemon stop` */
+} cbm_hook_admission_t;
+
+/* The JSON systemMessage a hook client must print on stdout for `reason`, or
+ * NULL when nothing should be printed. hook_dialect NULL = Claude Code, the
+ * only dialect that surfaces a stdout systemMessage to the user. */
+const char *cbm_hook_admission_notice(cbm_hook_admission_t reason, const char *hook_dialect);
 
 /* Process one already-read hook payload using a caller-owned MCP session.
  * Returns a malloc-owned hook output JSON string, or NULL for fail-open/no
