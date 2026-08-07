@@ -465,21 +465,17 @@ static cbm_cli_activation_ops_t cli_activation_fake_ops(cli_activation_fake_t *f
     return ops;
 }
 
-/* Every install/update/uninstall in this suite dispatches through here. On
- * Windows a test that has not installed its own activation ops gets a default
- * fake for the duration of the command: without the seam, `update` (correctly)
- * hands off to install.ps1 before the shared agent-config logic these tests
- * verify ever runs. POSIX behavior is untouched — tests without ops keep
- * exercising the real activation machinery. */
+/* Every install/update/uninstall in this suite dispatches through here. A test
+ * that has not installed its own activation ops gets a default fake for the
+ * duration of the command. This keeps agent-config tests independent of a live
+ * account daemon on POSIX and keeps Windows away from the managed-launcher
+ * handoff. Tests of the real activation machinery call the command directly
+ * after isolating its runtime parent. */
 static cli_activation_fake_t g_cli_test_seam_fake;
 static cbm_cli_activation_ops_t g_cli_test_seam_ops;
 
 static int cli_test_cmd_dispatch(int (*command)(int, char **), int argc, char **argv) {
-#ifdef _WIN32
     bool engage = !cbm_cli_activation_test_ops_installed();
-#else
-    bool engage = false;
-#endif
     if (engage) {
         memset(&g_cli_test_seam_fake, 0, sizeof(g_cli_test_seam_fake));
         g_cli_test_seam_fake.mutation_reserve_result = 1;
@@ -503,6 +499,19 @@ static int cli_test_cmd_uninstall(int argc, char **argv) {
 
 static int cli_test_cmd_update(int argc, char **argv) {
     return cli_test_cmd_dispatch(cbm_cmd_update, argc, argv);
+}
+
+static int cli_activation_test_wrapper_probe(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    return cbm_cli_activation_test_ops_installed() ? 23 : 24;
+}
+
+TEST(cli_activation_command_wrapper_isolates_account_daemon) {
+    ASSERT_FALSE(cbm_cli_activation_test_ops_installed());
+    ASSERT_EQ(cli_test_cmd_dispatch(cli_activation_test_wrapper_probe, 0, NULL), 23);
+    ASSERT_FALSE(cbm_cli_activation_test_ops_installed());
+    PASS();
 }
 
 static void cli_activation_save_env(char **home_out, char **cache_out) {
@@ -910,7 +919,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     char dir_arg[640];
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
-    int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    int install_rc = child_ready ? cbm_cmd_install(4, install_argv) : -1;
     cbm_cli_set_activation_runtime_parent_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -12010,6 +12019,7 @@ SUITE(cli) {
     RUN_TEST(cli_activation_refuses_unsafe_cohort_reservation);
     RUN_TEST(cli_activation_releases_maintenance_lease_after_success);
     RUN_TEST(cli_activation_releases_maintenance_lease_when_mutation_fails);
+    RUN_TEST(cli_activation_command_wrapper_isolates_account_daemon);
 #ifndef _WIN32
     RUN_TEST(cli_activation_cleanup_failure_fail_stops_before_lease_release);
     RUN_TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup);
