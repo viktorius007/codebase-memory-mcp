@@ -12,6 +12,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression (#913) */
+#include "lsp/java_lsp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -875,6 +876,87 @@ static bool so_type_in_param_crashes(const char *fmt, const char *nested, CBMLan
     return crashed;
 }
 
+static TSNode so_named_child_of_type(TSNode parent, const char *kind) {
+    uint32_t count = ts_node_named_child_count(parent);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(parent, i);
+        if (strcmp(ts_node_type(child), kind) == 0)
+            return child;
+    }
+    return (TSNode){0};
+}
+
+/* Parse Java once, then exercise java_parse_type_node directly.  The generic
+ * guard belongs to that semantic parser; running the entire extraction
+ * pipeline makes unrelated definition/signature work consume the watchdog. */
+static int so_java_parse_param_type(const char *source) {
+    const TSLanguage *language = cbm_ts_language(CBM_LANG_JAVA);
+    TSParser *parser = ts_parser_new();
+    if (!language || !parser || !ts_parser_set_language(parser, language)) {
+        if (parser)
+            ts_parser_delete(parser);
+        return 1;
+    }
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    if (!tree) {
+        ts_parser_delete(parser);
+        return 1;
+    }
+
+    TSNode root = ts_tree_root_node(tree);
+    TSNode class_decl = so_named_child_of_type(root, "class_declaration");
+    TSNode class_body = ts_node_child_by_field_name(class_decl, "body", 4);
+    TSNode method = so_named_child_of_type(class_body, "method_declaration");
+    TSNode parameters = ts_node_child_by_field_name(method, "parameters", 10);
+    TSNode parameter = so_named_child_of_type(parameters, "formal_parameter");
+    TSNode type = ts_node_child_by_field_name(parameter, "type", 4);
+    if (ts_node_is_null(type)) {
+        ts_tree_delete(tree);
+        ts_parser_delete(parser);
+        return 1;
+    }
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &arena);
+    CBMResolvedCallArray resolved = {0};
+    JavaLSPContext ctx;
+    java_lsp_init(&ctx, &arena, source, (int)strlen(source), &registry, "", "so", &resolved);
+    (void)java_parse_type_node(&ctx, type);
+
+    cbm_arena_destroy(&arena);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    return 0;
+}
+
+static bool so_java_param_type_crashes(const char *nested) {
+    size_t size = strlen(nested) + 64;
+    char *source = malloc(size);
+    if (!source)
+        return true;
+    snprintf(source, size, "class X { void f(%s p) {} }\n", nested);
+#if defined(_WIN32)
+    bool failed = so_java_parse_param_type(source) != 0;
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        free(source);
+        return true;
+    }
+    if (pid == 0) {
+        alarm(SO_CHILD_TIMEOUT_SECS);
+        _exit(so_java_parse_param_type(source));
+    }
+    int status = 0;
+    bool failed = waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+#endif
+    free(source);
+    return failed;
+}
+
 /* ── *_parse_type_node family: deeply nested generic parameter types ──
  *
  * rust / java / c# overflow their type parser on a deeply nested generic
@@ -897,8 +979,7 @@ TEST(lsp_java_nested_generic_type_no_crash) {
     /* java_parse_type_node (java_lsp.c) recurses on generic_type argument nesting. */
     char *ty = so_nest("List<", "String", ">", SO_TYPE_DEPTH);
     ASSERT_NOT_NULL(ty);
-    ASSERT_FALSE(so_type_in_param_crashes("class X { void f(%s p) {} }\n", ty, CBM_LANG_JAVA,
-                                          "NestedGeneric.java"));
+    ASSERT_FALSE(so_java_param_type_crashes(ty));
     free(ty);
     PASS();
 }
