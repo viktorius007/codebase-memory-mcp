@@ -13,6 +13,7 @@
 #include "cbm.h"
 #include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression (#913) */
 #include "lsp/java_lsp.h"
+#include "lsp/cs_lsp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -407,6 +408,7 @@ TEST(cpp_large_templated_header_no_crash_issue424) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 #if !defined(_WIN32)
+#include <errno.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -449,6 +451,60 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
     int status = 0;
     (void)waitpid(pid, &status, 0);
     return WIFSIGNALED(status);
+#endif
+}
+
+/* Exercise the C# type parser directly. The full extractor now materializes
+ * ordered signature text before the LSP runs; on this deliberately adversarial
+ * 6000-deep type that unrelated pass can consume the watchdog and falsely
+ * report that cs_parse_type_node's recursion guard failed. */
+static bool so_csharp_lsp_type_walk_fails_in_process(const char *content) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    TSParser *parser = ts_parser_new();
+    if (!parser || !ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_CSHARP))) {
+        if (parser)
+            ts_parser_delete(parser);
+        cbm_arena_destroy(&arena);
+        return true;
+    }
+    TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
+    if (!tree) {
+        ts_parser_delete(parser);
+        cbm_arena_destroy(&arena);
+        return true;
+    }
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &arena);
+    cbm_registry_finalize(&registry);
+    CBMResolvedCallArray resolved = {0};
+    CSLSPContext ctx;
+    cs_lsp_init(&ctx, &arena, content, (int)strlen(content), &registry, "so", &resolved);
+    cs_lsp_process_file(&ctx, ts_tree_root_node(tree));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    cbm_arena_destroy(&arena);
+    return false;
+}
+
+static bool so_csharp_lsp_type_walk_crashes(const char *content) {
+#if defined(_WIN32)
+    return so_csharp_lsp_type_walk_fails_in_process(content);
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0)
+        return true;
+    if (pid == 0) {
+        alarm(SO_CHILD_TIMEOUT_SECS);
+        _exit(so_csharp_lsp_type_walk_fails_in_process(content) ? 125 : 0);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited != pid || WIFSIGNALED(status) || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
 #endif
 }
 
@@ -988,8 +1044,12 @@ TEST(lsp_csharp_nested_generic_type_no_crash) {
     /* cs_parse_type_node (cs_lsp.c) recurses on generic_name argument nesting. */
     char *ty = so_nest("List<", "int", ">", SO_TYPE_DEPTH);
     ASSERT_NOT_NULL(ty);
-    ASSERT_FALSE(so_type_in_param_crashes("class X { void f(%s p) {} }\n", ty, CBM_LANG_CSHARP,
-                                          "NestedGeneric.cs"));
+    size_t source_size = strlen(ty) + 64;
+    char *source = malloc(source_size);
+    ASSERT_NOT_NULL(source);
+    snprintf(source, source_size, "class X { void f(%s p) {} }\n", ty);
+    ASSERT_FALSE(so_csharp_lsp_type_walk_crashes(source));
+    free(source);
     free(ty);
     PASS();
 }
