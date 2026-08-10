@@ -14,6 +14,7 @@
 #include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression (#913) */
 #include "lsp/java_lsp.h"
 #include "lsp/cs_lsp.h"
+#include "lsp/rust_lsp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -498,6 +499,59 @@ static bool so_csharp_lsp_type_walk_crashes(const char *content) {
     if (pid == 0) {
         alarm(SO_CHILD_TIMEOUT_SECS);
         _exit(so_csharp_lsp_type_walk_fails_in_process(content) ? 125 : 0);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited != pid || WIFSIGNALED(status) || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+#endif
+}
+
+/* Exercise the Rust call walker directly.  The full extractor copies each
+ * remaining nested argument before LSP runs, which makes this adversarial
+ * fixture measure unrelated quadratic work rather than the Rust depth guard. */
+static bool so_rust_lsp_walk_fails_in_process(const char *content) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    TSParser *parser = ts_parser_new();
+    if (!parser || !ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST))) {
+        if (parser)
+            ts_parser_delete(parser);
+        cbm_arena_destroy(&arena);
+        return true;
+    }
+    TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
+    if (!tree) {
+        ts_parser_delete(parser);
+        cbm_arena_destroy(&arena);
+        return true;
+    }
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &arena);
+    cbm_registry_finalize(&registry);
+    CBMResolvedCallArray resolved = {0};
+    RustLSPContext ctx;
+    rust_lsp_init(&ctx, &arena, content, (int)strlen(content), &registry, "so", &resolved);
+    rust_lsp_process_file(&ctx, ts_tree_root_node(tree));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    cbm_arena_destroy(&arena);
+    return false;
+}
+
+static bool so_rust_lsp_walk_crashes(const char *content) {
+#if defined(_WIN32)
+    return so_rust_lsp_walk_fails_in_process(content);
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0)
+        return true;
+    if (pid == 0) {
+        alarm(SO_CHILD_TIMEOUT_SECS);
+        _exit(so_rust_lsp_walk_fails_in_process(content) ? 125 : 0);
     }
     int status = 0;
     pid_t waited;
@@ -1104,14 +1158,14 @@ TEST(lsp_csharp_deep_nesting_no_crash) {
 }
 
 TEST(lsp_rust_deep_nesting_no_crash) {
-    /* rust_eval_expr_type + rust_resolve_calls_in_node (rust_lsp.c). */
+    /* rust_resolve_calls_in_node (rust_lsp.c). */
     char *call = so_nest_call("f", SO_DEEP_DEPTH);
     ASSERT_NOT_NULL(call);
     size_t sz = strlen(call) + 64;
     char *src = malloc(sz);
     ASSERT_NOT_NULL(src);
     snprintf(src, sz, "fn f(a: i32) -> i32 { a }\nfn g() -> i32 { %s }\n", call);
-    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_RUST, "deep_calls.rs"));
+    ASSERT_FALSE(so_rust_lsp_walk_crashes(src));
     free(src);
     free(call);
     PASS();
