@@ -1882,9 +1882,10 @@ TEST(tool_sc_compact) {
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
-    /* compact mode has "results" key with enriched matches */
+    /* Compact mode exposes enriched rows plus the verdict-first exact summary. */
     ASSERT(resp_has_key(r, "results"));
-    ASSERT(resp_has_key(r, "total_results"));
+    ASSERT(resp_has_key(r, "summary"));
+    ASSERT(strstr(r, "raw_matches=") != NULL);
     free(r);
     PASS();
 }
@@ -1963,7 +1964,7 @@ TEST(tool_sc_context) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"FastAPI\",\"context\":3,\"limit\":3}",
+                              "\"pattern\":\"FastAPI\",\"context\":2,\"limit\":3}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
