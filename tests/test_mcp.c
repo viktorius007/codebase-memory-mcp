@@ -5607,6 +5607,170 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
+/* A grep record can exceed the fixed parser buffer when the matching source
+ * line is long. Continuation chunks must never be interpreted as fresh
+ * "path:line:content" records, and files mode must honor its result limit. */
+TEST(search_code_files_mode_long_lines_and_limit) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_long_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "long-line-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, tmp);
+
+    char paths[4][640];
+    for (int i = 0; i < 4; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/file%d.txt", tmp, i);
+        FILE *fp = cbm_fopen(paths[i], "wb");
+        ASSERT_NOT_NULL(fp);
+        fputs("needle ", fp);
+        for (int j = 0; j < CBM_SZ_2K + 256; j++) {
+            fputc('x', fp);
+        }
+#ifdef _WIN32
+        fputs("\tfabricated_path_fragment\t123\tpayload\n", fp);
+#else
+        fputs(":fabricated_path_fragment:123:payload\n", fp);
+#endif
+        fclose(fp);
+
+        char qn[128];
+        snprintf(qn, sizeof(qn), "long-line-search.file%d.placeholder", i);
+        cbm_node_t n = {.project = proj,
+                        .label = "Function",
+                        .name = "placeholder",
+                        .qualified_name = qn,
+                        .file_path = paths[i] + strlen(tmp) + 1,
+                        .start_line = 100,
+                        .end_line = 100};
+        ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+    }
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"needle\",\"mode\":\"files\","
+                                   "\"limit\":2,\"project\":\"long-line-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *files = yyjson_obj_get(yyjson_doc_get_root(doc), "files");
+    ASSERT_TRUE(yyjson_is_arr(files));
+    ASSERT_EQ(yyjson_arr_size(files), 2);
+    for (size_t i = 0; i < yyjson_arr_size(files); i++) {
+        const char *file = yyjson_get_str(yyjson_arr_get(files, i));
+        ASSERT_NOT_NULL(file);
+        ASSERT_TRUE(strcmp(file, "file0.txt") == 0 || strcmp(file, "file1.txt") == 0 ||
+                    strcmp(file, "file2.txt") == 0 || strcmp(file, "file3.txt") == 0);
+    }
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    for (int i = 0; i < 4; i++) {
+        cbm_unlink(paths[i]);
+    }
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+/* A continuation chunk from one overlong grep record can itself contain the
+ * platform delimiter and masquerade as another file record. */
+TEST(search_code_long_line_continuation_is_not_file) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_cont_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    char path[640];
+    snprintf(path, sizeof(path), "%s/only.txt", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    fputs("needle ", fp);
+    for (int j = 0; j < CBM_SZ_2K + 256; j++) {
+        fputc('x', fp);
+    }
+#ifdef _WIN32
+    fputs("\tfabricated_path_fragment\t123\tpayload\n", fp);
+#else
+    fputs(":fabricated_path_fragment:123:payload\n", fp);
+#endif
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "long-continuation-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, tmp);
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "placeholder",
+                    .qualified_name = "long-continuation-search.only.placeholder",
+                    .file_path = "only.txt",
+                    .start_line = 100,
+                    .end_line = 100};
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"needle\",\"mode\":\"files\","
+                                   "\"limit\":10,\"project\":\"long-continuation-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *files = yyjson_obj_get(yyjson_doc_get_root(doc), "files");
+    ASSERT_TRUE(yyjson_is_arr(files));
+    ASSERT_EQ(yyjson_arr_size(files), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(files, 0)), "only.txt");
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+TEST(search_code_rejects_non_positive_limit) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    const int invalid_limits[] = {0, -1};
+    for (size_t i = 0; i < sizeof(invalid_limits) / sizeof(invalid_limits[0]); i++) {
+        char request[512];
+        snprintf(request, sizeof(request),
+                 "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\",\"params\":{"
+                 "\"name\":\"search_code\",\"arguments\":{\"pattern\":\"needle\","
+                 "\"project\":\"unused\",\"limit\":%d}}}",
+                 invalid_limits[i]);
+        char *resp = cbm_mcp_server_handle(srv, request);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+        ASSERT_NOT_NULL(strstr(resp, "limit must be a positive integer"));
+        free(resp);
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Reproduce-first (#687): scoped content search over a repo whose ROOT PATH
  * contains a space. write_scoped_filelist emits "<root>/<file>" records that the
  * Unix pipeline pipes to grep via xargs. With plain `xargs` (newline-split) the
@@ -12228,6 +12392,9 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_files_mode_long_lines_and_limit);
+    RUN_TEST(search_code_long_line_continuation_is_not_file);
+    RUN_TEST(search_code_rejects_non_positive_limit);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);
 #ifdef _WIN32
     RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);

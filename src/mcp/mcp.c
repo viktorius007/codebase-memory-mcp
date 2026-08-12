@@ -594,6 +594,7 @@ static const tool_def_t TOOLS[] = {
      "\"context\":{\"type\":\"integer\",\"description\":\"Lines of context around each match "
      "(like grep -C). Only used in compact mode.\"},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false},\"limit\":{\"type\":\"integer\","
+     "\"minimum\":1,"
      "\"description\":\"Max enriched results per call. Default 10. Response includes "
      "'total_grep_matches' and 'total_results' so callers can detect truncation. No "
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
@@ -9533,11 +9534,13 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
 
 /* Build deduplicated file list from search results + raw matches. */
 static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_result_t *sr,
-                                               int output_count, grep_match_t *raw, int raw_count) {
+                                               int output_count, grep_match_t *raw, int raw_count,
+                                               int limit) {
     yyjson_mut_val *files_arr = yyjson_mut_arr(doc);
     char *seen_files[CBM_SZ_512];
     int seen_count = 0;
-    for (int fi = 0; fi < output_count; fi++) {
+    int effective_limit = limit < CBM_SZ_512 ? limit : CBM_SZ_512;
+    for (int fi = 0; fi < output_count && seen_count < effective_limit; fi++) {
         bool dup = false;
         for (int j = 0; j < seen_count; j++) {
             if (strcmp(seen_files[j], sr[fi].file) == 0) {
@@ -9550,7 +9553,7 @@ static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_resul
             yyjson_mut_arr_add_str(doc, files_arr, sr[fi].file);
         }
     }
-    for (int fi = 0; fi < raw_count && seen_count < CBM_SZ_512; fi++) {
+    for (int fi = 0; fi < raw_count && seen_count < effective_limit; fi++) {
         bool dup = false;
         for (int j = 0; j < seen_count; j++) {
             if (strcmp(seen_files[j], raw[fi].file) == 0) {
@@ -9785,8 +9788,9 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     int output_count = sr_count < limit ? sr_count : limit;
 
     if (mode == MODE_FILES) {
-        yyjson_mut_obj_add_val(doc, root_obj, "files",
-                               build_dedup_files_array(doc, sr, output_count, raw, raw_count));
+        yyjson_mut_obj_add_val(
+            doc, root_obj, "files",
+            build_dedup_files_array(doc, sr, output_count, raw, raw_count, limit));
     } else {
         /* json-stringified tree: cols + column-ordered row arrays. FULL mode
          * appends a per-row object cell with the (guarded, windowed) source —
@@ -9924,6 +9928,14 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
 
     while (fgets(line, sizeof(line), fp) && gm_count < grep_limit) {
         size_t len = strlen(line);
+        /* fgets returns a partial record when grep emits a source line longer
+         * than this fixed buffer. Parse the first chunk, but drain the rest of
+         * that physical line so delimiter-like source text cannot become a
+         * fabricated path record on the next iteration. */
+        if (len > 0 && line[len - SKIP_ONE] != '\n') {
+            int ch;
+            while ((ch = fgetc(fp)) != '\n' && ch != EOF) {}
+        }
         while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
             line[--len] = '\0';
         }
@@ -10356,6 +10368,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     int mode = parse_search_mode(mode_str);
     free(mode_str);
+
+    if (limit < 1) {
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        free(path_filter);
+        return cbm_mcp_text_result("limit must be a positive integer", true);
+    }
 
     cbm_regex_t path_regex;
     bool has_path_filter = compile_path_filter(path_filter, &path_regex);
