@@ -5636,6 +5636,100 @@ static char *call_search_code_json(cbm_mcp_server_t *srv, const char *project,
     return inner;
 }
 
+TEST(search_code_rejects_limit_above_public_maximum) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), "search-limit-max");
+    ASSERT_NOT_NULL(srv);
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"needle\",\"project\":\"search-limit-max\",\"limit\":101}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "limit must be an integer from 1 to 100"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    free(response);
+    cbm_mcp_server_free(srv);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+TEST(search_code_rejects_truncated_grep_command_construction) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), "search-command-max");
+    ASSERT_NOT_NULL(srv);
+    char *oversized = malloc(6000);
+    ASSERT_NOT_NULL(oversized);
+    int prefix = snprintf(oversized, 6000,
+                          "{\"pattern\":\"needle\",\"project\":\"search-command-max\","
+                          "\"file_pattern\":\"");
+    ASSERT_TRUE(prefix > 0);
+    memset(oversized + prefix, 'x', 5000);
+    snprintf(oversized + prefix + 5000, 6000 - (size_t)prefix - 5000, "\"}");
+    char *response = cbm_mcp_handle_tool(srv, "search_code", oversized);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "grep command exceeds safe size"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    free(response);
+    free(oversized);
+    cbm_mcp_server_free(srv);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+TEST(search_code_full_response_is_byte_bounded_with_exact_population) {
+    char tmp[512];
+    const char *project = "search-byte-bound";
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), project);
+    ASSERT_NOT_NULL(srv);
+    char path[640];
+    snprintf(path, sizeof(path), "%s/many.c", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    for (int i = 0; i < 100; i++) {
+        fprintf(fp, "int hit_%03d(void) { /* needle ", i);
+        for (int j = 0; j < 900; j++) {
+            fputc('x', fp);
+        }
+        fputs(" */ return 1; }\n", fp);
+        char name[32];
+        char qn[96];
+        snprintf(name, sizeof(name), "hit_%03d", i);
+        snprintf(qn, sizeof(qn), "%s.many.%s", project, name);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "many.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(fclose(fp), 0);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"needle\",\"project\":\"search-byte-bound\",\"mode\":\"full\","
+        "\"format\":\"json\",\"limit\":100}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_TRUE(strlen(raw) <= 65536);
+    char *inner = extract_text_content(raw);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *summary = yyjson_obj_get(yyjson_doc_get_root(doc), "summary");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(summary, "raw_matches")), 100);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(summary, "symbols")), 100);
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(summary, "returned")) < 100);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(summary, "has_more")));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(summary, "response_byte_truncated")));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
 /* Regression: the old collector stopped after 500 records, so a structurally
  * exact high-value declaration at record 521 was invisible and every reported
  * total described only the prefix sample. */
@@ -6338,7 +6432,7 @@ TEST(search_code_rejects_non_positive_limit) {
         char *resp = cbm_mcp_server_handle(srv, request);
         ASSERT_NOT_NULL(resp);
         ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
-        ASSERT_NOT_NULL(strstr(resp, "limit must be a positive integer"));
+        ASSERT_NOT_NULL(strstr(resp, "limit must be an integer from 1 to 100"));
         free(resp);
     }
 
@@ -6790,6 +6884,167 @@ TEST(search_code_ampersand_accepted_issue272) {
     cleanup_snippet_dir(tmp);
     cbm_mcp_server_free(srv);
     PASS();
+}
+
+TEST(search_code_preserves_valid_utf8_and_replaces_only_invalid_sequences) {
+    char tmp[512];
+    const char *project = "search-utf8";
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), project);
+    ASSERT_NOT_NULL(srv);
+    char path[640];
+    snprintf(path, sizeof(path), "%s/utf8.c", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    const unsigned char line[] = "const char *needle = \"\xE4\xB8\xAD\xE6\x96\x87";
+    ASSERT_EQ(fwrite(line, 1, sizeof(line) - 1, fp), sizeof(line) - 1);
+    ASSERT_EQ(fputc(0xC0, fp), 0xC0);
+    ASSERT_TRUE(fputs("\";\n", fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
+    cbm_node_t node = {.project = project,
+                       .label = "Variable",
+                       .name = "needle",
+                       .qualified_name = "search-utf8.utf8.needle",
+                       .file_path = "utf8.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+
+    char *inner = call_search_code_json(srv, project, ",\"mode\":\"full\",\"limit\":1");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\xE4\xB8\xAD\xE6\x96\x87"));
+    ASSERT_NOT_NULL(strstr(inner, "\xEF\xBF\xBD"));
+    ASSERT_NULL(strstr(inner, "??????"));
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+TEST(search_code_ordinary_segments_ending_in_gen_remain_source) {
+    char tmp[512];
+    const char *project = "search-segment-classification";
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), project);
+    ASSERT_NOT_NULL(srv);
+    const char *dirs[] = {"src", "src/oxygen", "generated"};
+    char dir_paths[3][640];
+    for (int i = 0; i < 3; i++) {
+        snprintf(dir_paths[i], sizeof(dir_paths[i]), "%s/%s", tmp, dirs[i]);
+        ASSERT_EQ(cbm_mkdir(dir_paths[i]), 0);
+    }
+    const char *rels[] = {"src/oxygen/a.c", "generated/b.c"};
+    char paths[2][640];
+    for (int i = 0; i < 2; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmp, rels[i]);
+        FILE *fp = cbm_fopen(paths[i], "wb");
+        ASSERT_NOT_NULL(fp);
+        fputs("int needle;\n", fp);
+        ASSERT_EQ(fclose(fp), 0);
+        cbm_node_t node = {.project = project,
+                           .label = "Variable",
+                           .name = "needle",
+                           .qualified_name = i == 0 ? "search-segment.oxygen.needle"
+                                                    : "search-segment.generated.needle",
+                           .file_path = rels[i],
+                           .start_line = 1,
+                           .end_line = 1};
+        ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+    }
+    char *inner = call_search_code_json(srv, project, ",\"limit\":2");
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *categories = yyjson_obj_get(yyjson_doc_get_root(doc), "categories");
+    yyjson_val *rows = yyjson_obj_get(categories, "rows");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(yyjson_arr_get(rows, 0), 0)), "source");
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(yyjson_arr_get(rows, 0), 1)), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(yyjson_arr_get(rows, 2), 0)), "generated");
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(yyjson_arr_get(rows, 2), 1)), 1);
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(paths[0]);
+    cbm_unlink(paths[1]);
+    cbm_rmdir(dir_paths[1]);
+    cbm_rmdir(dir_paths[2]);
+    cbm_rmdir(dir_paths[0]);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+extern bool cbm_search_grep_exit_status_accepted(int status, int *exit_code);
+
+TEST(search_code_grep_exit_status_distinguishes_match_no_match_and_failure) {
+    int exit_code = -1;
+#ifdef _WIN32
+    ASSERT_TRUE(cbm_search_grep_exit_status_accepted(0, &exit_code));
+    ASSERT_EQ(exit_code, 0);
+    ASSERT_TRUE(cbm_search_grep_exit_status_accepted(1, &exit_code));
+    ASSERT_EQ(exit_code, 1);
+    ASSERT_FALSE(cbm_search_grep_exit_status_accepted(2, &exit_code));
+#else
+    ASSERT_TRUE(cbm_search_grep_exit_status_accepted(0 << 8, &exit_code));
+    ASSERT_EQ(exit_code, 0);
+    ASSERT_TRUE(cbm_search_grep_exit_status_accepted(1 << 8, &exit_code));
+    ASSERT_EQ(exit_code, 1);
+    ASSERT_FALSE(cbm_search_grep_exit_status_accepted(2 << 8, &exit_code));
+#endif
+    ASSERT_EQ(exit_code, 2);
+    PASS();
+}
+
+TEST(search_code_revalidates_indexed_path_after_symlink_replacement) {
+#ifdef _WIN32
+    PASS();
+#else
+    char tmp[512];
+    const char *project = "search-symlink-revalidation";
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), project);
+    ASSERT_NOT_NULL(srv);
+    char indexed[640];
+    char parked[640];
+    char outside[640];
+    snprintf(indexed, sizeof(indexed), "%s/indexed.c", tmp);
+    snprintf(parked, sizeof(parked), "%s/indexed.original", tmp);
+    snprintf(outside, sizeof(outside), "%s/cbm-search-outside-XXXXXX", cbm_tmpdir());
+    int outside_fd = cbm_mkstemp(outside);
+    ASSERT_TRUE(outside_fd >= 0);
+    ASSERT_EQ(close(outside_fd), 0);
+    FILE *fp = cbm_fopen(indexed, "wb");
+    ASSERT_NOT_NULL(fp);
+    fputs("int harmless;\n", fp);
+    ASSERT_EQ(fclose(fp), 0);
+    fp = cbm_fopen(outside, "wb");
+    ASSERT_NOT_NULL(fp);
+    fputs("outside_secret_needle\n", fp);
+    ASSERT_EQ(fclose(fp), 0);
+    cbm_node_t node = {.project = project,
+                       .label = "Variable",
+                       .name = "harmless",
+                       .qualified_name = "search-symlink-revalidation.indexed.harmless",
+                       .file_path = "indexed.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+    ASSERT_EQ(rename(indexed, parked), 0);
+    ASSERT_EQ(symlink(outside, indexed), 0);
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"outside_secret_needle\",\"project\":\"search-symlink-revalidation\","
+        "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NULL(strstr(raw, "outside_secret_needle"));
+    free(raw);
+    ASSERT_EQ(cbm_unlink(indexed), 0);
+    ASSERT_EQ(rename(parked, indexed), 0);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(outside);
+    cbm_unlink(indexed);
+    cbm_rmdir(tmp);
+    PASS();
+#endif
 }
 
 TEST(tool_detect_changes_no_project) {
@@ -10553,6 +10808,69 @@ TEST(snippet_oversized_class_returns_declaration_and_member_outline) {
     PASS();
 }
 
+TEST(snippet_partial_coverage_guidance_matches_response_mode) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Module", "snippet-pages.generated", 1400, 100,
+                                        "GRAPH_ONLY_MUST_NOT_CLAIM_SOURCE", false, false));
+    cbm_coverage_row_t coverage = {
+        .rel_path = "generated.py", .kind = "parse_partial", .detail = "20-30"};
+    ASSERT_EQ(cbm_store_upsert_file_hash(cbm_mcp_server_store(fx.srv), "snippet-pages",
+                                         "generated.py", "fixture", 1, (int64_t)fx.source_len),
+              CBM_STORE_OK);
+    ASSERT_EQ(
+        cbm_store_coverage_replace(cbm_mcp_server_store(fx.srv), "snippet-pages", &coverage, 1),
+        CBM_STORE_OK);
+    char *response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated\","
+                "\"max_response_bytes\":2048}");
+    ASSERT_NOT_NULL(strstr(response, "\"mode\":\"outline\""));
+    ASSERT_NOT_NULL(strstr(response, "graph-only outline"));
+    ASSERT_NOT_NULL(strstr(response, "raw source"));
+    ASSERT_NULL(strstr(response, "source above is ground truth"));
+    free(response);
+
+    response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated\","
+                "\"start_line\":1,\"end_line\":2,\"max_response_bytes\":65536}");
+    ASSERT_NOT_NULL(strstr(response, "source above is ground truth"));
+    ASSERT_NULL(strstr(response, "graph-only outline"));
+    free(response);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_class_outline_excludes_adjacent_top_level_symbol_on_closing_line) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Class", "snippet-pages.generated.A", 800, 100,
+                                        "class A {}; void outside() {}", false, false));
+    cbm_store_t *store = cbm_mcp_server_store(fx.srv);
+    cbm_node_t member = {.project = "snippet-pages",
+                         .label = "Method",
+                         .name = "inside",
+                         .qualified_name = "snippet-pages.generated.A.inside",
+                         .file_path = "generated.py",
+                         .start_line = 10,
+                         .end_line = 20};
+    cbm_node_t outside = {.project = "snippet-pages",
+                          .label = "Function",
+                          .name = "outside",
+                          .qualified_name = "snippet-pages.generated.outside",
+                          .file_path = "generated.py",
+                          .start_line = 800,
+                          .end_line = 800};
+    ASSERT_GT(cbm_store_upsert_node(store, &member), 0);
+    ASSERT_GT(cbm_store_upsert_node(store, &outside), 0);
+    char *response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated.A\","
+                "\"max_response_bytes\":2048}");
+    ASSERT_NOT_NULL(strstr(response, "\"mode\":\"outline\""));
+    ASSERT_NOT_NULL(strstr(response, "inside"));
+    ASSERT_NULL(strstr(response, "\"outside\""));
+    free(response);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING — EDGE CASES
  * ══════════════════════════════════════════════════════════════════ */
@@ -13608,6 +13926,9 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_rejects_limit_above_public_maximum);
+    RUN_TEST(search_code_rejects_truncated_grep_command_construction);
+    RUN_TEST(search_code_full_response_is_byte_bounded_with_exact_population);
     RUN_TEST(search_code_complete_over_500_and_globally_ranks_late_declaration);
     RUN_TEST(search_code_exact_counts_below_500_and_compact_evidence);
     RUN_TEST(search_code_ranks_source_then_test_then_generated_with_deterministic_ties);
@@ -13631,6 +13952,10 @@ SUITE(mcp) {
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
+    RUN_TEST(search_code_preserves_valid_utf8_and_replaces_only_invalid_sequences);
+    RUN_TEST(search_code_ordinary_segments_ending_in_gen_remain_source);
+    RUN_TEST(search_code_grep_exit_status_distinguishes_match_no_match_and_failure);
+    RUN_TEST(search_code_revalidates_indexed_path_after_symlink_replacement);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
@@ -13720,6 +14045,8 @@ SUITE(mcp) {
     RUN_TEST(snippet_ambiguous_suggestions_obey_serialized_result_budget);
     RUN_TEST(snippet_oversized_module_returns_bounded_exact_outline);
     RUN_TEST(snippet_oversized_class_returns_declaration_and_member_outline);
+    RUN_TEST(snippet_partial_coverage_guidance_matches_response_mode);
+    RUN_TEST(snippet_class_outline_excludes_adjacent_top_level_symbol_on_closing_line);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
