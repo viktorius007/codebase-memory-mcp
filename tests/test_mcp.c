@@ -5879,6 +5879,189 @@ TEST(search_code_files_mode_aggregates_complete_matches_directly_by_file) {
     PASS();
 }
 
+TEST(search_code_equal_span_prefers_symbol_over_structural_file_node) {
+    char tmp[512];
+    const char *project = "search-equal-span";
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), project);
+    ASSERT_NOT_NULL(srv);
+
+    char path[640];
+    snprintf(path, sizeof(path), "%s/one.c", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    fputs("int needle(void) { return 1; }\n", fp);
+    fclose(fp);
+
+    /* Deliberately insert the structural node first. The store query has no
+     * ordering contract, so search_code itself must resolve an equal-span tie
+     * by semantic specificity rather than row/insertion order. */
+    cbm_node_t file = {.project = project,
+                       .label = "File",
+                       .name = "one.c",
+                       .qualified_name = "search-equal-span.one",
+                       .file_path = "one.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    cbm_node_t function = {.project = project,
+                           .label = "Function",
+                           .name = "needle",
+                           .qualified_name = "search-equal-span.one.needle",
+                           .file_path = "one.c",
+                           .start_line = 1,
+                           .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &file), 0);
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &function), 0);
+
+    char *inner = call_search_code_json(srv, project, ",\"limit\":1");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *summary = yyjson_obj_get(root, "summary");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(summary, "raw_matches")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(summary, "symbols")), 1);
+    yyjson_val *rows = yyjson_obj_get(root, "rows");
+    ASSERT_EQ(yyjson_arr_size(rows), 1);
+    yyjson_val *row = yyjson_arr_get(rows, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(row, 0)), "search-equal-span.one.needle");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(row, 1)), "Function");
+
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+TEST(search_code_rollups_are_exact_over_unreturned_population) {
+    char tmp[512];
+    const char *project = "search-rollups-exact";
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), project);
+    ASSERT_NOT_NULL(srv);
+
+    char dirs[10][640];
+    char paths[10][704];
+    for (int i = 0; i < 10; i++) {
+        snprintf(dirs[i], sizeof(dirs[i]), "%s/area%02d", tmp, i);
+        ASSERT_EQ(cbm_mkdir(dirs[i]), 0);
+        snprintf(paths[i], sizeof(paths[i]), "%s/file.c", dirs[i]);
+        FILE *fp = cbm_fopen(paths[i], "wb");
+        ASSERT_NOT_NULL(fp);
+        for (int line = 0; line <= i; line++) {
+            fputs("needle\n", fp);
+        }
+        fclose(fp);
+        char rel[64];
+        char qn[128];
+        snprintf(rel, sizeof(rel), "area%02d/file.c", i);
+        snprintf(qn, sizeof(qn), "search-rollups-exact.area%02d.file", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "file",
+                           .qualified_name = qn,
+                           .file_path = rel,
+                           .start_line = 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+    }
+
+    char *inner = call_search_code_json(srv, project, ",\"limit\":1");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *summary = yyjson_obj_get(root, "summary");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(summary, "raw_matches")), 55);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(summary, "symbols")), 10);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(summary, "files")), 10);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(summary, "returned")), 1);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(summary, "has_more")));
+
+    yyjson_val *category_rows = yyjson_obj_get(yyjson_obj_get(root, "categories"), "rows");
+    ASSERT_EQ(yyjson_arr_size(category_rows), 4);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(yyjson_arr_get(category_rows, 0), 0)), "source");
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(yyjson_arr_get(category_rows, 0), 1)), 55);
+
+    yyjson_val *area_rows = yyjson_obj_get(yyjson_obj_get(root, "areas"), "rows");
+    ASSERT_EQ(yyjson_arr_size(area_rows), 9);
+    for (int i = 0; i < 8; i++) {
+        char expected_area[16];
+        snprintf(expected_area, sizeof(expected_area), "area%02d", 9 - i);
+        yyjson_val *row = yyjson_arr_get(area_rows, (size_t)i);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(row, 0)), expected_area);
+        ASSERT_EQ(yyjson_get_int(yyjson_arr_get(row, 1)), 10 - i);
+    }
+    yyjson_val *other = yyjson_arr_get(area_rows, 8);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(other, 0)), "other");
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(other, 1)), 3);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    for (int i = 0; i < 10; i++) {
+        cbm_unlink(paths[i]);
+        cbm_rmdir(dirs[i]);
+    }
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+TEST(search_code_full_mode_source_is_match_centered_and_bounded) {
+    char tmp[512];
+    const char *project = "search-full-bounded";
+    cbm_mcp_server_t *srv = setup_search_contract_server(tmp, sizeof(tmp), project);
+    ASSERT_NOT_NULL(srv);
+
+    char path[640];
+    snprintf(path, sizeof(path), "%s/long.c", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    for (int line = 1; line <= 100; line++) {
+        fprintf(fp, "row-%04d%s\n", line, line == 30 ? " needle" : "");
+    }
+    fclose(fp);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "long_function",
+                       .qualified_name = "search-full-bounded.long_function",
+                       .file_path = "long.c",
+                       .start_line = 1,
+                       .end_line = 100};
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+
+    char *inner = call_search_code_json(srv, project, ",\"mode\":\"full\",\"limit\":1");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *cols = yyjson_obj_get(root, "cols");
+    ASSERT_EQ(yyjson_arr_size(cols), 8);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(cols, 7)), "source");
+    yyjson_val *row = yyjson_arr_get(yyjson_obj_get(root, "rows"), 0);
+    yyjson_val *source_cell = yyjson_arr_get(row, 7);
+    ASSERT_TRUE(yyjson_is_obj(source_cell));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(source_cell, "source_truncated")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(source_cell, "source_start")), 25);
+    const char *source = yyjson_get_str(yyjson_obj_get(source_cell, "source"));
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(strstr(source, "row-0030 needle\n"));
+    ASSERT_NULL(strstr(source, "row-0024\n"));
+    ASSERT_NULL(strstr(source, "row-0085\n"));
+    int source_lines = 0;
+    for (const char *cursor = source; *cursor; cursor++) {
+        source_lines += *cursor == '\n';
+    }
+    ASSERT_EQ(source_lines, 60);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
 TEST(search_code_complete_above_4096_keeps_exact_totals_and_late_winner) {
     char tmp[512];
     const char *project = "search-pathological";
@@ -6162,6 +6345,37 @@ TEST(search_code_rejects_non_positive_limit) {
         ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
         ASSERT_NOT_NULL(strstr(resp, "limit must be a positive integer"));
         free(resp);
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_code_rejects_empty_and_multiline_patterns) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    const char *patterns[] = {"", "first\\nsecond", "first\\rsecond"};
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        char request[768];
+        snprintf(request, sizeof(request),
+                 "{\"jsonrpc\":\"2.0\",\"id\":758,\"method\":\"tools/call\",\"params\":{"
+                 "\"name\":\"search_code\",\"arguments\":{\"pattern\":\"%s\","
+                 "\"project\":\"unused\"}}}",
+                 patterns[i]);
+        char *response = cbm_mcp_server_handle(srv, request);
+        ASSERT_NOT_NULL(response);
+        yyjson_doc *doc = yyjson_read(response, strlen(response), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *result = yyjson_obj_get(yyjson_doc_get_root(doc), "result");
+        ASSERT_TRUE(yyjson_is_obj(result));
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(result, "isError")));
+        yyjson_val *content = yyjson_obj_get(result, "content");
+        yyjson_val *first = yyjson_arr_get(content, 0);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "text")),
+                      "pattern must be a non-empty single line");
+        yyjson_doc_free(doc);
+        free(response);
     }
 
     cbm_mcp_server_free(srv);
@@ -6475,6 +6689,34 @@ TEST(search_code_path_filter_matches_nothing) {
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+TEST(search_code_invalid_path_filter_is_an_explicit_error) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *response =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":756,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+                                   "\"pattern\":\"HandleRequest\",\"project\":\"test-project\","
+                                   "\"path_filter\":\"[unclosed\"}}}");
+    ASSERT_NOT_NULL(response);
+    yyjson_doc *doc = yyjson_read(response, strlen(response), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *result = yyjson_obj_get(yyjson_doc_get_root(doc), "result");
+    ASSERT_TRUE(yyjson_is_obj(result));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(result, "isError")));
+    yyjson_val *content = yyjson_obj_get(result, "content");
+    ASSERT_TRUE(yyjson_is_arr(content));
+    yyjson_val *first = yyjson_arr_get(content, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "text")), "invalid path_filter regex");
+
+    yyjson_doc_free(doc);
+    free(response);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -12779,17 +13021,22 @@ SUITE(mcp) {
     RUN_TEST(search_code_exact_counts_below_500_and_compact_evidence);
     RUN_TEST(search_code_ranks_source_then_test_then_generated_with_deterministic_ties);
     RUN_TEST(search_code_files_mode_aggregates_complete_matches_directly_by_file);
+    RUN_TEST(search_code_equal_span_prefers_symbol_over_structural_file_node);
+    RUN_TEST(search_code_rollups_are_exact_over_unreturned_population);
+    RUN_TEST(search_code_full_mode_source_is_match_centered_and_bounded);
     RUN_TEST(search_code_complete_above_4096_keeps_exact_totals_and_late_winner);
     RUN_TEST(search_code_centrality_tiebreak_survives_more_than_2046_symbols);
     RUN_TEST(search_code_files_mode_long_lines_and_limit);
     RUN_TEST(search_code_long_line_continuation_is_not_file);
     RUN_TEST(search_code_rejects_non_positive_limit);
+    RUN_TEST(search_code_rejects_empty_and_multiline_patterns);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);
 #ifdef _WIN32
     RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);
 #endif
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
+    RUN_TEST(search_code_invalid_path_filter_is_an_explicit_error);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);

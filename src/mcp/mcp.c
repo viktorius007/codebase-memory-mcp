@@ -586,7 +586,8 @@ static const tool_def_t TOOLS[] = {
      "rollups are exact and bounded with an exact other bucket. Successful calls aggregate the "
      "complete valid match population; allocation failure is an explicit error, never a partial "
      "success. There is no cursor pagination; raise limit or narrow file_pattern/path_filter.",
-     "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
+     "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"minLength\":1,"
+     "\"description\":\"Non-empty single-line search pattern\"},\"project\":{\"type\":"
      "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob for grep "
      "--include (e.g. *.go)\"},\"path_filter\":{\"type\":\"string\",\"description\":\"Regex "
      "filter on result file paths (e.g. ^src/ or \\\\.(go|ts)$)\"},\"mode\":{\"type\":\"string\","
@@ -10105,7 +10106,17 @@ static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
     for (int j = 0; j < count; j++) {
         if (nodes[j].start_line <= line && nodes[j].end_line >= line) {
             int span = nodes[j].end_line - nodes[j].start_line;
-            if (span < best_span) {
+            int rank = search_label_rank(nodes[j].label ? nodes[j].label : "");
+            int best_rank = best >= 0 ? search_label_rank(nodes[best].label ? nodes[best].label : "")
+                                      : CBM_NOT_FOUND;
+            const char *qualified_name =
+                nodes[j].qualified_name ? nodes[j].qualified_name : "";
+            const char *best_qualified_name =
+                best >= 0 && nodes[best].qualified_name ? nodes[best].qualified_name : "";
+            if (span < best_span ||
+                (span == best_span &&
+                 (rank > best_rank ||
+                  (rank == best_rank && strcmp(qualified_name, best_qualified_name) < 0)))) {
                 best = j;
                 best_span = span;
             }
@@ -10604,21 +10615,25 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("context must be an integer from 0 to 2", true);
     }
 
-    cbm_regex_t path_regex;
-    bool has_path_filter = compile_path_filter(path_filter, &path_regex);
-    free(path_filter);
-    path_filter = NULL;
-
     if (!pattern) {
         free(project);
         free(file_pattern);
+        free(path_filter);
         return cbm_mcp_text_result("pattern is required", true);
+    }
+    if (pattern[0] == '\0' || strpbrk(pattern, "\r\n") != NULL) {
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        free(path_filter);
+        return cbm_mcp_text_result("pattern must be a non-empty single line", true);
     }
 
     /* Project is required */
     if (!project) {
         free(pattern);
         free(file_pattern);
+        free(path_filter);
         char *_err = build_project_list_error("project is required");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
@@ -10630,11 +10645,26 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(pattern);
         free(project);
         free(file_pattern);
+        free(path_filter);
         char *_err = build_project_list_error("project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         return _res;
     }
+
+    cbm_regex_t path_regex;
+    bool path_filter_requested = path_filter && path_filter[0] != '\0';
+    bool has_path_filter = compile_path_filter(path_filter, &path_regex);
+    if (path_filter_requested && !has_path_filter) {
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        free(path_filter);
+        return cbm_mcp_text_result("invalid path_filter regex", true);
+    }
+    free(path_filter);
+    path_filter = NULL;
 
     if (!validate_search_args(root_path, file_pattern)) {
         if (has_path_filter) {
