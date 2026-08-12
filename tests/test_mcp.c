@@ -1763,12 +1763,10 @@ TEST(tool_get_architecture_cycles_detects_scc) {
     PASS();
 }
 
-/* Context-bomb guard: get_code_snippet on a whole-file node (a Module/File
- * span) used to read the ENTIRE file into one response — a field-eval agent
- * that fell back to a Module snippet pulled ~400KB in a single call. The read
- * must clip at MCP_SNIPPET_MAX_LINES and flag source_clipped, while the exact
- * start/end range stays in the response for a targeted re-read. */
-TEST(tool_get_code_snippet_clips_whole_file_node) {
+/* Context-bomb guard: an oversized whole-file node returns an outline, not an
+ * arbitrary source prefix. The immutable symbol range tells callers which raw
+ * start/end range they may request explicitly. */
+TEST(tool_get_code_snippet_outlines_whole_file_node) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_snipcap_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -1809,11 +1807,13 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"source_clipped\":true"));
-    /* The whole 2000-line file (~100KB) must NOT be in the response. */
+    ASSERT_NOT_NULL(strstr(inner, "\"mode\":\"outline\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"symbol_start_line\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"symbol_end_line\":2000"));
+    ASSERT_NOT_NULL(strstr(inner, "\"outline_total\":0"));
     ASSERT_TRUE(strlen(inner) < 60000);
-    /* The last line must be absent (clipped), the first present. */
-    ASSERT_NOT_NULL(strstr(inner, "line_0000"));
+    ASSERT_NULL(strstr(inner, "\"source\""));
+    ASSERT_NULL(strstr(inner, "line_0000"));
     ASSERT_NULL(strstr(inner, "line_1999"));
     free(inner);
     free(resp);
@@ -3084,10 +3084,10 @@ TEST(tool_trace_port_mediated_does_not_silently_drop_ninth_port) {
         ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
     }
 
-    char *resp = cbm_mcp_handle_tool(
-        srv, "trace_call_path",
-        "{\"project\":\"dynports\",\"function_name\":\"dynports.Real.execute\","
-        "\"direction\":\"inbound\",\"include_tests\":true}");
+    char *resp =
+        cbm_mcp_handle_tool(srv, "trace_call_path",
+                            "{\"project\":\"dynports\",\"function_name\":\"dynports.Real.execute\","
+                            "\"direction\":\"inbound\",\"include_tests\":true}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     free(resp);
@@ -3137,8 +3137,7 @@ TEST(tool_trace_port_mediated_enforces_aggregate_safety_ceiling) {
         for (int caller_index = 0; caller_index < 2501; caller_index++) {
             char caller_name[48];
             char caller_qn[96];
-            snprintf(caller_name, sizeof(caller_name), "caller_%d_%d", port_index,
-                     caller_index);
+            snprintf(caller_name, sizeof(caller_name), "caller_%d_%d", port_index, caller_index);
             snprintf(caller_qn, sizeof(caller_qn), "dyncap.%s", caller_name);
             cbm_node_t caller = {.project = proj,
                                  .label = "Function",
@@ -3153,10 +3152,10 @@ TEST(tool_trace_port_mediated_enforces_aggregate_safety_ceiling) {
         }
     }
 
-    char *resp = cbm_mcp_handle_tool(
-        srv, "trace_call_path",
-        "{\"project\":\"dyncap\",\"function_name\":\"dyncap.Real.execute\","
-        "\"direction\":\"inbound\",\"include_tests\":true}");
+    char *resp =
+        cbm_mcp_handle_tool(srv, "trace_call_path",
+                            "{\"project\":\"dyncap\",\"function_name\":\"dyncap.Real.execute\","
+                            "\"direction\":\"inbound\",\"include_tests\":true}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     free(resp);
@@ -3705,9 +3704,8 @@ TEST(tool_trace_pagination_exactly_once) {
     /* Omitted direction canonically means "both". Cursor minting and replay
      * must hash that same default rather than minting an unusable token from
      * the raw NULL argument. */
-    resp = cbm_mcp_handle_tool(
-        srv, "trace_call_path",
-        "{\"project\":\"pageproj\",\"function_name\":\"hub\",\"limit\":5}");
+    resp = cbm_mcp_handle_tool(srv, "trace_call_path",
+                               "{\"project\":\"pageproj\",\"function_name\":\"hub\",\"limit\":5}");
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     free(resp);
@@ -3793,10 +3791,10 @@ TEST(tool_trace_rejects_reachable_set_beyond_safety_ceiling) {
         ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
     }
 
-    char *resp = cbm_mcp_handle_tool(
-        srv, "trace_call_path",
-        "{\"project\":\"trace-cap-proj\",\"function_name\":\"cap_hub\","
-        "\"direction\":\"outbound\",\"depth\":1,\"limit\":5000}");
+    char *resp =
+        cbm_mcp_handle_tool(srv, "trace_call_path",
+                            "{\"project\":\"trace-cap-proj\",\"function_name\":\"cap_hub\","
+                            "\"direction\":\"outbound\",\"depth\":1,\"limit\":5000}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     free(resp);
@@ -3850,8 +3848,7 @@ TEST(tool_trace_data_flow_uses_shortest_path_predecessor_edge_args) {
                      .source_id = a_id,
                      .target_id = b_id,
                      .type = "CALLS",
-                     .properties_json =
-                         "{\"args\":[{\"e\":\"left]right\\\"tail\"}]}"};
+                     .properties_json = "{\"args\":[{\"e\":\"left]right\\\"tail\"}]}"};
     ASSERT_GT(cbm_store_insert_edge(st, &bc), 0);
     ASSERT_GT(cbm_store_insert_edge(st, &ab), 0);
 
@@ -5223,10 +5220,8 @@ TEST(tool_trace_unattributed_pagination_exactly_once_and_budgeted) {
 
     const char *labels[] = {"Function", "File", "Function", "Module"};
     const char *names[] = {"up_real_a", "__file__", "up_real_b", "up_module"};
-    const char *qns[] = {"unattr-page-proj.src.up_real_a",
-                         "unattr-page-proj.src.lib.rs.__file__",
-                         "unattr-page-proj.src.up_real_b",
-                         "unattr-page-proj.src.up_module"};
+    const char *qns[] = {"unattr-page-proj.src.up_real_a", "unattr-page-proj.src.lib.rs.__file__",
+                         "unattr-page-proj.src.up_real_b", "unattr-page-proj.src.up_module"};
     for (int i = 0; i < 4; i++) {
         cbm_node_t caller = {.project = proj,
                              .label = labels[i],
@@ -5365,10 +5360,10 @@ TEST(tool_trace_unattributed_json_has_unique_directional_keys) {
     ASSERT_GT(cbm_store_insert_edge(st, &inbound), 0);
     ASSERT_GT(cbm_store_insert_edge(st, &outbound), 0);
 
-    char *resp = cbm_mcp_handle_tool(
-        srv, "trace_call_path",
-        "{\"project\":\"unattr-json-proj\",\"function_name\":\"uj_hub\","
-        "\"direction\":\"both\",\"include_tests\":true,\"format\":\"json\"}");
+    char *resp =
+        cbm_mcp_handle_tool(srv, "trace_call_path",
+                            "{\"project\":\"unattr-json-proj\",\"function_name\":\"uj_hub\","
+                            "\"direction\":\"both\",\"include_tests\":true,\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     free(resp);
@@ -9557,6 +9552,120 @@ static bool snippet_source_has_replacement(const char *json) {
     return found;
 }
 
+typedef struct {
+    cbm_mcp_server_t *srv;
+    char tmp[256];
+    char source_path[600];
+    char *source;
+    size_t source_len;
+} generated_snippet_t;
+
+static bool generated_snippet_setup(generated_snippet_t *fx, const char *label, const char *qn,
+                                    int line_count, int line_width, const char *declaration,
+                                    bool escaping_heavy, bool single_line) {
+    memset(fx, 0, sizeof(*fx));
+    snprintf(fx->tmp, sizeof(fx->tmp), "/tmp/cbm_generated_snippet_XXXXXX");
+    if (!cbm_mkdtemp(fx->tmp))
+        return false;
+    char project_dir[512];
+    snprintf(project_dir, sizeof(project_dir), "%s/project", fx->tmp);
+    if (cbm_mkdir(project_dir) != 0)
+        return false;
+    snprintf(fx->source_path, sizeof(fx->source_path), "%s/generated.py", project_dir);
+    FILE *fp = fopen(fx->source_path, "wb");
+    if (!fp)
+        return false;
+
+    size_t cap = (size_t)line_count * (size_t)(line_width + 64) + 64;
+    fx->source = malloc(cap);
+    if (!fx->source) {
+        fclose(fp);
+        return false;
+    }
+    size_t used = 0;
+    if (single_line) {
+        const char *prefix = declaration ? declaration : "def huge(): ";
+        size_t prefix_len = strlen(prefix);
+        memcpy(fx->source, prefix, prefix_len);
+        used = prefix_len;
+        while ((int)used < line_width) {
+            fx->source[used] = (used % 3 == 0) ? '\\' : 'x';
+            used++;
+        }
+    } else {
+        for (int line = 1; line <= line_count; line++) {
+            if (line == 1 && declaration) {
+                size_t n = strlen(declaration);
+                memcpy(fx->source + used, declaration, n);
+                used += n;
+            } else {
+                int n = snprintf(fx->source + used, cap - used, "line_%04d ", line);
+                used += (size_t)n;
+                while ((int)(used % (size_t)(line_width + 1)) < line_width && used + 2 < cap) {
+                    static const char escaped[] = {'"', '\\', '\t', 'q'};
+                    fx->source[used] = escaping_heavy ? escaped[used % 4] : (char)('a' + line % 26);
+                    used++;
+                }
+            }
+            fx->source[used++] = '\n';
+        }
+    }
+    fx->source[used] = '\0';
+    fx->source_len = used;
+    if (fwrite(fx->source, 1, used, fp) != used || fclose(fp) != 0)
+        return false;
+
+    fx->srv = cbm_mcp_server_new(NULL);
+    if (!fx->srv)
+        return false;
+    cbm_store_t *store = cbm_mcp_server_store(fx->srv);
+    cbm_mcp_server_set_project(fx->srv, "snippet-pages");
+    cbm_store_upsert_project(store, "snippet-pages", project_dir);
+    const char *name = strrchr(qn, '.');
+    cbm_node_t node = {0};
+    node.project = "snippet-pages";
+    node.label = label;
+    node.name = name ? name + 1 : qn;
+    node.qualified_name = qn;
+    node.file_path = "generated.py";
+    node.start_line = 1;
+    node.end_line = line_count;
+    node.properties_json = declaration ? "{\"signature\":\"def generated():\"}" : NULL;
+    return cbm_store_upsert_node(store, &node) > 0;
+}
+
+static void generated_snippet_cleanup(generated_snippet_t *fx) {
+    if (fx->srv)
+        cbm_mcp_server_free(fx->srv);
+    free(fx->source);
+    th_rmtree(fx->tmp);
+}
+
+static char *snippet_json_string(const char *json, const char *key) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    yyjson_val *value = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), key) : NULL;
+    const char *text = value && yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
+    char *copy = text ? strdup(text) : NULL;
+    yyjson_doc_free(doc);
+    return copy;
+}
+
+static long long snippet_json_int(const char *json, const char *key, long long fallback) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    yyjson_val *value = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), key) : NULL;
+    long long result = value && yyjson_is_int(value) ? yyjson_get_sint(value) : fallback;
+    yyjson_doc_free(doc);
+    return result;
+}
+
+static bool snippet_json_bool(const char *json, const char *key) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    yyjson_val *value = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), key) : NULL;
+    bool result = value && yyjson_is_bool(value) && yyjson_get_bool(value);
+    yyjson_doc_free(doc);
+    return result;
+}
+
 /* ── TestSnippet_ExactQN ──────────────────────────────────────── */
 
 TEST(snippet_exact_qn) {
@@ -9959,6 +10068,321 @@ TEST(snippet_source_invalid_utf8) {
     free(raw);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_budget_fitting_501_line_function_is_complete) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.FiveOhOne", 501,
+                                        12, "def FiveOhOne():", false, false));
+    char *response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "FiveOhOne\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(snippet_json_bool(response, "source_complete"));
+    ASSERT_EQ(snippet_json_int(response, "symbol_start_line", -1), 1);
+    ASSERT_EQ(snippet_json_int(response, "symbol_end_line", -1), 501);
+    char *source = snippet_json_string(response, "source");
+    ASSERT_NOT_NULL(source);
+    ASSERT_STR_EQ(source, fx.source);
+    ASSERT_NULL(strstr(response, "next_cursor"));
+    free(source);
+    free(response);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_2000_line_function_round_trips_across_byte_pages) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.Huge", 2000, 72,
+                                        "def Huge():", false, false));
+    char *rebuilt = malloc(fx.source_len + 1);
+    ASSERT_NOT_NULL(rebuilt);
+    size_t rebuilt_len = 0;
+    char *cursor = NULL;
+    int pages = 0;
+    do {
+        char args[1024];
+        if (cursor) {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages."
+                     "generated.Huge\",\"max_response_bytes\":4096,\"cursor\":\"%s\"}",
+                     cursor);
+        } else {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages."
+                     "generated.Huge\",\"max_response_bytes\":4096}");
+        }
+        char *response = call_snippet(fx.srv, args);
+        ASSERT_NOT_NULL(response);
+        ASSERT_EQ(snippet_json_int(response, "symbol_end_line", -1), 2000);
+        char *page = snippet_json_string(response, "source");
+        ASSERT_NOT_NULL(page);
+        size_t page_len = strlen(page);
+        ASSERT_GT(page_len, 0);
+        ASSERT_TRUE(rebuilt_len + page_len <= fx.source_len);
+        memcpy(rebuilt + rebuilt_len, page, page_len);
+        rebuilt_len += page_len;
+        bool complete = snippet_json_bool(response, "source_complete");
+        char *next = complete ? NULL : snippet_json_string(response, "next_cursor");
+        ASSERT_TRUE(complete || next != NULL);
+        free(cursor);
+        cursor = next;
+        free(page);
+        free(response);
+        pages++;
+        ASSERT_TRUE(pages < 200);
+    } while (cursor);
+    rebuilt[rebuilt_len] = '\0';
+    ASSERT_GT(pages, 1);
+    ASSERT_EQ(rebuilt_len, fx.source_len);
+    ASSERT_TRUE(memcmp(rebuilt, fx.source, fx.source_len) == 0);
+    free(rebuilt);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_focus_and_explicit_range_are_symbol_bounded) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.Focus", 300, 120,
+                                        "def Focus():", false, false));
+    char *response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "Focus\",\"max_response_bytes\":4096,\"focus_line\":120}");
+    ASSERT_NOT_NULL(response);
+    long long source_start = snippet_json_int(response, "source_start_line", -1);
+    long long source_end = snippet_json_int(response, "source_end_line", -1);
+    ASSERT_TRUE(source_start <= 120 && source_end >= 120);
+    char *source = snippet_json_string(response, "source");
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(strstr(source, "line_0120"));
+    free(source);
+    free(response);
+
+    response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "Focus\",\"start_line\":50,\"end_line\":55,\"max_response_bytes\":65536}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(snippet_json_bool(response, "source_complete"));
+    ASSERT_EQ(snippet_json_int(response, "source_start_line", -1), 50);
+    ASSERT_EQ(snippet_json_int(response, "source_end_line", -1), 55);
+    source = snippet_json_string(response, "source");
+    ASSERT_NOT_NULL(strstr(source, "line_0050"));
+    ASSERT_NOT_NULL(strstr(source, "line_0055"));
+    ASSERT_NULL(strstr(source, "line_0056"));
+    free(source);
+    free(response);
+
+    response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "Focus\",\"start_line\":301,\"end_line\":302}");
+    ASSERT_NOT_NULL(strstr(response, "outside resolved symbol"));
+    free(response);
+    response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "Focus\",\"max_response_bytes\":65537}");
+    ASSERT_NOT_NULL(strstr(response, "max_response_bytes"));
+    free(response);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_cursor_rejects_stale_source_and_mismatched_symbol) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.CursorA", 800,
+                                        100, "def CursorA():", false, false));
+    char *first = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "CursorA\",\"max_response_bytes\":4096}");
+    char *cursor = snippet_json_string(first, "next_cursor");
+    ASSERT_NOT_NULL(cursor);
+    cbm_node_t other = {0};
+    other.project = "snippet-pages";
+    other.label = "Function";
+    other.name = "CursorB";
+    other.qualified_name = "snippet-pages.generated.CursorB";
+    other.file_path = "generated.py";
+    other.start_line = 1;
+    other.end_line = 800;
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(fx.srv), &other), 0);
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+             "CursorB\",\"max_response_bytes\":4096,\"cursor\":\"%s\"}",
+             cursor);
+    char *response = call_snippet(fx.srv, args);
+    ASSERT_NOT_NULL(strstr(response, "cursor_mismatch"));
+    free(response);
+
+    FILE *fp = fopen(fx.source_path, "r+b");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fputc('X', fp), 'X');
+    ASSERT_EQ(fclose(fp), 0);
+    snprintf(args, sizeof(args),
+             "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+             "CursorA\",\"max_response_bytes\":4096,\"cursor\":\"%s\"}",
+             cursor);
+    response = call_snippet(fx.srv, args);
+    ASSERT_NOT_NULL(strstr(response, "stale_cursor"));
+    free(response);
+    free(cursor);
+    free(first);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_single_physical_line_larger_than_budget_is_fully_retrievable) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.OneLine", 1,
+                                        40000, "def OneLine(): ", false, true));
+    char *rebuilt = malloc(fx.source_len + 1);
+    ASSERT_NOT_NULL(rebuilt);
+    size_t used = 0;
+    char *cursor = NULL;
+    int pages = 0;
+    do {
+        char args[1024];
+        snprintf(args, sizeof(args),
+                 cursor ? "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages."
+                          "generated.OneLine\",\"max_response_bytes\":4096,\"cursor\":\"%s\"}"
+                        : "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages."
+                          "generated.OneLine\",\"max_response_bytes\":4096}",
+                 cursor ? cursor : "");
+        char *response = call_snippet(fx.srv, args);
+        char *page = snippet_json_string(response, "source");
+        ASSERT_NOT_NULL(page);
+        size_t n = strlen(page);
+        ASSERT_GT(n, 0);
+        memcpy(rebuilt + used, page, n);
+        used += n;
+        ASSERT_EQ(snippet_json_int(response, "source_start_line", -1), 1);
+        ASSERT_EQ(snippet_json_int(response, "source_end_line", -1), 1);
+        char *next = snippet_json_bool(response, "source_complete")
+                         ? NULL
+                         : snippet_json_string(response, "next_cursor");
+        free(cursor);
+        cursor = next;
+        free(page);
+        free(response);
+        ASSERT_TRUE(++pages < 100);
+    } while (cursor);
+    ASSERT_EQ(used, fx.source_len);
+    ASSERT_TRUE(memcmp(rebuilt, fx.source, used) == 0);
+    free(rebuilt);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_serialized_result_never_exceeds_escaping_heavy_budget) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.Escapes", 600,
+                                        100, "def Escapes():", true, false));
+    char *cursor = NULL;
+    int pages = 0;
+    do {
+        char args[1024];
+        snprintf(args, sizeof(args),
+                 cursor ? "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages."
+                          "generated.Escapes\",\"max_response_bytes\":4096,\"cursor\":\"%s\"}"
+                        : "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages."
+                          "generated.Escapes\",\"max_response_bytes\":4096}",
+                 cursor ? cursor : "");
+        char *raw = cbm_mcp_handle_tool(fx.srv, "get_code_snippet", args);
+        ASSERT_NOT_NULL(raw);
+        ASSERT_TRUE(strlen(raw) <= 4096);
+        char *response = extract_text_content(raw);
+        char *next = snippet_json_bool(response, "source_complete")
+                         ? NULL
+                         : snippet_json_string(response, "next_cursor");
+        free(cursor);
+        cursor = next;
+        free(response);
+        free(raw);
+        ASSERT_TRUE(++pages < 200);
+    } while (cursor);
+    ASSERT_GT(pages, 1);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_oversized_module_returns_bounded_exact_outline) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Module", "snippet-pages.generated", 1400, 100,
+                                        "ARBITRARY_PREFIX_MUST_NOT_ESCAPE", false, false));
+    cbm_store_t *store = cbm_mcp_server_store(fx.srv);
+    for (int i = 0; i < 100; i++) {
+        char name[32];
+        char qn[96];
+        snprintf(name, sizeof(name), "member_%03d", i);
+        snprintf(qn, sizeof(qn), "snippet-pages.generated.%s", name);
+        cbm_node_t child = {0};
+        child.project = "snippet-pages";
+        child.label = "Function";
+        child.name = name;
+        child.qualified_name = qn;
+        child.file_path = "generated.py";
+        child.start_line = 10 + i * 10;
+        child.end_line = child.start_line + 2;
+        ASSERT_GT(cbm_store_upsert_node(store, &child), 0);
+    }
+    char *raw = cbm_mcp_handle_tool(
+        fx.srv, "get_code_snippet",
+        "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated\","
+        "\"max_response_bytes\":4096}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_TRUE(strlen(raw) <= 4096);
+    char *response = extract_text_content(raw);
+    ASSERT_NOT_NULL(strstr(response, "\"mode\":\"outline\""));
+    ASSERT_EQ(snippet_json_int(response, "outline_total", -1), 100);
+    ASSERT_TRUE(snippet_json_int(response, "outline_returned", -1) < 100);
+    ASSERT_TRUE(snippet_json_bool(response, "outline_truncated"));
+    ASSERT_NOT_NULL(strstr(response, "member_000"));
+    ASSERT_NULL(strstr(response, "ARBITRARY_PREFIX_MUST_NOT_ESCAPE"));
+    ASSERT_NULL(strstr(response, "\"source\""));
+    free(response);
+    free(raw);
+
+    response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated\","
+                "\"start_line\":1,\"end_line\":2,\"max_response_bytes\":65536}");
+    ASSERT_NOT_NULL(strstr(response, "\"source\""));
+    ASSERT_NOT_NULL(strstr(response, "ARBITRARY_PREFIX_MUST_NOT_ESCAPE"));
+    ASSERT_NULL(strstr(response, "\"mode\":\"outline\""));
+    free(response);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_oversized_class_returns_declaration_and_member_outline) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Class", "snippet-pages.generated.LargeClass", 800,
+                                        100, "class LargeClass:", false, false));
+    cbm_store_t *store = cbm_mcp_server_store(fx.srv);
+    for (int i = 0; i < 12; i++) {
+        char name[32];
+        char qn[128];
+        snprintf(name, sizeof(name), "method_%02d", i);
+        snprintf(qn, sizeof(qn), "snippet-pages.generated.LargeClass.%s", name);
+        cbm_node_t method = {0};
+        method.project = "snippet-pages";
+        method.label = "Method";
+        method.name = name;
+        method.qualified_name = qn;
+        method.file_path = "generated.py";
+        method.start_line = 20 + i * 40;
+        method.end_line = method.start_line + 20;
+        ASSERT_GT(cbm_store_upsert_node(store, &method), 0);
+    }
+    char *response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "LargeClass\"}");
+    ASSERT_NOT_NULL(strstr(response, "\"mode\":\"outline\""));
+    ASSERT_NOT_NULL(strstr(response, "\"declaration\":\"class LargeClass:\""));
+    ASSERT_EQ(snippet_json_int(response, "outline_total", -1), 12);
+    ASSERT_NOT_NULL(strstr(response, "method_00"));
+    ASSERT_NULL(strstr(response, "line_0799"));
+    free(response);
+    generated_snippet_cleanup(&fx);
     PASS();
 }
 
@@ -12950,7 +13374,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
-    RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
+    RUN_TEST(tool_get_code_snippet_outlines_whole_file_node);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_detail_ids_hints_dropped_fields);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
@@ -13116,6 +13540,14 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
+    RUN_TEST(snippet_budget_fitting_501_line_function_is_complete);
+    RUN_TEST(snippet_2000_line_function_round_trips_across_byte_pages);
+    RUN_TEST(snippet_focus_and_explicit_range_are_symbol_bounded);
+    RUN_TEST(snippet_cursor_rejects_stale_source_and_mismatched_symbol);
+    RUN_TEST(snippet_single_physical_line_larger_than_budget_is_fully_retrievable);
+    RUN_TEST(snippet_serialized_result_never_exceeds_escaping_heavy_budget);
+    RUN_TEST(snippet_oversized_module_returns_bounded_exact_outline);
+    RUN_TEST(snippet_oversized_class_returns_declaration_and_member_outline);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
