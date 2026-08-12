@@ -9686,9 +9686,8 @@ TEST(snippet_exact_qn) {
      * fields=[...]. */
     ASSERT_NULL(strstr(resp, "\"signature\""));
     ASSERT_NULL(strstr(resp, "\"return_type\""));
-    /* Caller/callee counts: 0 callers, 2 callees */
-    ASSERT_NOT_NULL(strstr(resp, "\"callers\":0"));
-    ASSERT_NOT_NULL(strstr(resp, "\"callees\":2"));
+    ASSERT_NULL(strstr(resp, "\"callers\""));
+    ASSERT_NULL(strstr(resp, "\"callees\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -9993,12 +9992,11 @@ TEST(snippet_include_neighbors_default) {
         call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
                           "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    /* Without include_neighbors → NO caller_names/callee_names */
+    /* Call-graph data is opt-in: the default source response is graph-free. */
     ASSERT_NULL(strstr(resp, "\"caller_names\""));
     ASSERT_NULL(strstr(resp, "\"callee_names\""));
-    /* But should still have counts */
-    ASSERT_NOT_NULL(strstr(resp, "\"callers\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"callees\""));
+    ASSERT_NULL(strstr(resp, "\"callers\""));
+    ASSERT_NULL(strstr(resp, "\"callees\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -10018,6 +10016,8 @@ TEST(snippet_include_neighbors_enabled) {
                           "\"include_neighbors\":true,\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"callers\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"callees\""));
     /* HandleRequest has 0 callers → no caller_names array */
     ASSERT_NULL(strstr(resp, "\"caller_names\""));
     /* HandleRequest has 2 callees: ProcessOrder and Run */
@@ -10088,6 +10088,40 @@ TEST(snippet_budget_fitting_501_line_function_is_complete) {
     ASSERT_NULL(strstr(response, "next_cursor"));
     free(source);
     free(response);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_source_that_exactly_fits_serialized_budget_is_complete) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.ExactFit", 40,
+                                        80, "def ExactFit():", false, false));
+    const char *wide_args =
+        "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+        "ExactFit\",\"max_response_bytes\":65536}";
+    char *wide = cbm_mcp_handle_tool(fx.srv, "get_code_snippet", wide_args);
+    ASSERT_NOT_NULL(wide);
+    size_t exact_budget = strlen(wide);
+    ASSERT_TRUE(exact_budget >= 2048 && exact_budget <= 65536);
+    free(wide);
+
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+             "ExactFit\",\"max_response_bytes\":%zu}",
+             exact_budget);
+    char *raw = cbm_mcp_handle_tool(fx.srv, "get_code_snippet", args);
+    ASSERT_NOT_NULL(raw);
+    ASSERT_EQ(strlen(raw), exact_budget);
+    char *response = extract_text_content(raw);
+    ASSERT_TRUE(snippet_json_bool(response, "source_complete"));
+    char *source = snippet_json_string(response, "source");
+    ASSERT_NOT_NULL(source);
+    ASSERT_STR_EQ(source, fx.source);
+    ASSERT_NULL(strstr(response, "next_cursor"));
+    free(source);
+    free(response);
+    free(raw);
     generated_snippet_cleanup(&fx);
     PASS();
 }
@@ -10164,6 +10198,8 @@ TEST(snippet_focus_and_explicit_range_are_symbol_bounded) {
                 "Focus\",\"start_line\":50,\"end_line\":55,\"max_response_bytes\":65536}");
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(snippet_json_bool(response, "source_complete"));
+    ASSERT_EQ(snippet_json_int(response, "symbol_start_line", -1), 1);
+    ASSERT_EQ(snippet_json_int(response, "symbol_end_line", -1), 300);
     ASSERT_EQ(snippet_json_int(response, "source_start_line", -1), 50);
     ASSERT_EQ(snippet_json_int(response, "source_end_line", -1), 55);
     source = snippet_json_string(response, "source");
@@ -10182,6 +10218,61 @@ TEST(snippet_focus_and_explicit_range_are_symbol_bounded) {
         fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
                 "Focus\",\"max_response_bytes\":65537}");
     ASSERT_NOT_NULL(strstr(response, "max_response_bytes"));
+    free(response);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_focus_window_contains_focus_when_leading_line_exceeds_budget) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.FocusLead", 30,
+                                        40, "def FocusLead():", false, false));
+    FILE *fp = fopen(fx.source_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    for (int line = 1; line <= 30; line++) {
+        if (line == 15) {
+            ASSERT_EQ(fprintf(fp, "line_0015 "), 10);
+            for (int i = 0; i < 7000; i++) {
+                ASSERT_TRUE(fputc('x', fp) != EOF);
+            }
+            ASSERT_TRUE(fputc('\n', fp) != EOF);
+        } else {
+            ASSERT_GT(fprintf(fp, "line_%04d short\n", line), 0);
+        }
+    }
+    ASSERT_EQ(fclose(fp), 0);
+
+    char *response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "FocusLead\",\"max_response_bytes\":4096,\"focus_line\":20}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(snippet_json_int(response, "source_start_line", -1) <= 20);
+    ASSERT_TRUE(snippet_json_int(response, "source_end_line", -1) >= 20);
+    char *source = snippet_json_string(response, "source");
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(strstr(source, "line_0020"));
+    free(source);
+    free(response);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_explicit_range_rejects_stale_physical_lines_without_clamping) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.StaleRange", 100,
+                                        40, "def StaleRange():", false, false));
+    FILE *fp = fopen(fx.source_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_GT(fputs("def StaleRange():\n    return 1\n", fp), 0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    char *response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "StaleRange\",\"start_line\":90,\"end_line\":95}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "source"));
+    ASSERT_NOT_NULL(strstr(response, "stale"));
+    ASSERT_NULL(strstr(response, "\"source\":\"\""));
     free(response);
     generated_snippet_cleanup(&fx);
     PASS();
@@ -10224,6 +10315,48 @@ TEST(snippet_cursor_rejects_stale_source_and_mismatched_symbol) {
              cursor);
     response = call_snippet(fx.srv, args);
     ASSERT_NOT_NULL(strstr(response, "stale_cursor"));
+    free(response);
+    free(cursor);
+    free(first);
+    generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_cursor_rejects_malformed_and_offset_tampering) {
+    generated_snippet_t fx;
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.CursorGuard",
+                                        800, 100, "def CursorGuard():", false, false));
+    char *first = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "CursorGuard\",\"max_response_bytes\":4096}");
+    char *cursor = snippet_json_string(first, "next_cursor");
+    ASSERT_NOT_NULL(cursor);
+
+    char *last_colon = strrchr(cursor, ':');
+    ASSERT_NOT_NULL(last_colon);
+    char *previous_colon = last_colon - 1;
+    while (previous_colon > cursor && *previous_colon != ':') {
+        previous_colon--;
+    }
+    ASSERT_TRUE(previous_colon > cursor);
+    ASSERT_TRUE(previous_colon + 1 < last_colon);
+    previous_colon[1] = previous_colon[1] == '9' ? '8' : (char)(previous_colon[1] + 1);
+
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+             "CursorGuard\",\"max_response_bytes\":4096,\"cursor\":\"%s\"}",
+             cursor);
+    char *response = call_snippet(fx.srv, args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "tamper"));
+    free(response);
+
+    response = call_snippet(
+        fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
+                "CursorGuard\",\"cursor\":\"sn2:a\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "invalid_cursor"));
     free(response);
     free(cursor);
     free(first);
@@ -10302,6 +10435,40 @@ TEST(snippet_serialized_result_never_exceeds_escaping_heavy_budget) {
     } while (cursor);
     ASSERT_GT(pages, 1);
     generated_snippet_cleanup(&fx);
+    PASS();
+}
+
+TEST(snippet_ambiguous_suggestions_obey_serialized_result_budget) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    for (int i = 0; i < 120; i++) {
+        char qn[192];
+        snprintf(qn, sizeof(qn), "test-project.very_long_namespace_%03d.Duplicate", i);
+        cbm_node_t node = {0};
+        node.project = "test-project";
+        node.label = "Function";
+        node.name = "Duplicate";
+        node.qualified_name = qn;
+        node.file_path = "main.go";
+        node.start_line = 1;
+        node.end_line = 2;
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    char *raw = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"test-project\",\"qualified_name\":\"Duplicate\","
+        "\"max_response_bytes\":2048}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_TRUE(strlen(raw) <= 2048);
+    char *response = extract_text_content(raw);
+    ASSERT_EQ(snippet_json_int(response, "suggestions_total", -1), 120);
+    ASSERT_TRUE(snippet_json_bool(response, "suggestions_truncated"));
+    free(response);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
     PASS();
 }
 
@@ -13541,11 +13708,16 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(snippet_budget_fitting_501_line_function_is_complete);
+    RUN_TEST(snippet_source_that_exactly_fits_serialized_budget_is_complete);
     RUN_TEST(snippet_2000_line_function_round_trips_across_byte_pages);
     RUN_TEST(snippet_focus_and_explicit_range_are_symbol_bounded);
+    RUN_TEST(snippet_focus_window_contains_focus_when_leading_line_exceeds_budget);
+    RUN_TEST(snippet_explicit_range_rejects_stale_physical_lines_without_clamping);
     RUN_TEST(snippet_cursor_rejects_stale_source_and_mismatched_symbol);
+    RUN_TEST(snippet_cursor_rejects_malformed_and_offset_tampering);
     RUN_TEST(snippet_single_physical_line_larger_than_budget_is_fully_retrievable);
     RUN_TEST(snippet_serialized_result_never_exceeds_escaping_heavy_budget);
+    RUN_TEST(snippet_ambiguous_suggestions_obey_serialized_result_budget);
     RUN_TEST(snippet_oversized_module_returns_bounded_exact_outline);
     RUN_TEST(snippet_oversized_class_returns_declaration_and_member_outline);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
