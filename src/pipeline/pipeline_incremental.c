@@ -1235,8 +1235,7 @@ static CBMLSPDef *materialize_closure_definition_universe(
         return NULL;
     }
 #endif
-    CBMLSPDef *defs = (CBMLSPDef *)cbm_arena_alloc(
-        arena, (size_t)*out_count * sizeof(*defs));
+    CBMLSPDef *defs = (CBMLSPDef *)cbm_arena_alloc(arena, (size_t)*out_count * sizeof(*defs));
     if (!defs) {
         *out_count = 0;
         *out_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
@@ -1260,10 +1259,9 @@ bool cbm_pipeline_incremental_test_combined_definition_failure_is_typed(void) {
     cbm_arena_test_fail_after(&arena, 0);
     int count = -1;
     CBMPxcCollectStatus status = CBM_PXC_COLLECT_AVAILABLE;
-    CBMLSPDef *defs = materialize_closure_definition_universe(
-        &arena, &base, 1, &fresh, 1, &count, &status);
-    bool typed = defs == NULL && count == 0 &&
-                 status == CBM_PXC_COLLECT_ALLOCATION_FAILED;
+    CBMLSPDef *defs =
+        materialize_closure_definition_universe(&arena, &base, 1, &fresh, 1, &count, &status);
+    bool typed = defs == NULL && count == 0 && status == CBM_PXC_COLLECT_ALLOCATION_FAILED;
     cbm_arena_destroy(&arena);
     return typed;
 }
@@ -1395,8 +1393,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                 for (int i = 0; i < ci; i++) {
                     if (cache[i] && changed_files[i].language == CBM_LANG_RUST) {
                         cache[i]->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-                        cache[i]->rust_health.completed_routes &=
-                            ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+                        cache[i]->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
                         cbm_rust_health_record(&cache[i]->rust_health,
                                                CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
                     }
@@ -1444,8 +1441,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             if (definition_universe_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
                 for (int i = 0; i < ci; i++) {
                     if (cache[i] && changed_files[i].language == CBM_LANG_RUST &&
-                        cache[i]->rust_health
-                                .issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE]
+                        cache[i]->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE]
                                 .count == 0) {
                         cbm_rust_health_record(&cache[i]->rust_health,
                                                CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
@@ -2339,8 +2335,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                                  &rust_files_total);
     int cov_cap =
         old_cov_count + run_err_count + run_excluded_count + run_ignored_count + rust_cov_count;
-    bool coverage_rows_available =
-        cov_cap == 0 && cbm_pipeline_file_error_capture_complete(p);
+    bool coverage_rows_available = cov_cap == 0 && cbm_pipeline_file_error_capture_complete(p);
     if (cov_cap > 0) {
         cov = cbm_pipeline_alloc_coverage_rows(p, cov_cap);
         coverage_rows_available = cov != NULL && cbm_pipeline_file_error_capture_complete(p);
@@ -2565,13 +2560,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
         int discovered_rust_files = -1;
         cbm_pipeline_get_rust_health(p, NULL, NULL, NULL, &discovered_rust_files);
-        bool metadata_current = meta_rc == CBM_STORE_OK &&
-                                meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
-                                meta.hash_records_complete && meta.index_mode &&
-                                strcmp(meta.index_mode, mode_name) == 0 &&
-                                meta.rust_analysis_recording_status &&
-                                strcmp(meta.rust_analysis_recording_status, "complete") == 0 &&
-                                meta.rust_files_total >= 0;
+        bool metadata_current =
+            meta_rc == CBM_STORE_OK && meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
+            meta.hash_records_complete && meta.index_mode &&
+            strcmp(meta.index_mode, mode_name) == 0 && meta.rust_analysis_recording_status &&
+            strcmp(meta.rust_analysis_recording_status, "complete") == 0 &&
+            meta.rust_files_total >= 0;
         bool exact = metadata_current && meta.rust_files_total == discovered_rust_files &&
                      cbm_pipeline_semantic_manifests_equal(stored, stored_count, baseline_manifest,
                                                            baseline_count);

@@ -1138,7 +1138,8 @@ static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgma
     }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
-        if (complete) *complete = false;
+        if (complete)
+            *complete = false;
         return 0;
     }
     int parsed = 0;
@@ -1187,7 +1188,8 @@ static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgma
         int source_len = 0;
         char *source = pkgmap_read_file(abs_path, &source_len);
         if (!source) {
-            if (complete) *complete = false;
+            if (complete)
+                *complete = false;
             continue;
         }
         cb(name, rel_path, source, source_len, userdata);
@@ -1298,7 +1300,8 @@ static void pkg_members_cb(const char *basename, const char *rel_path, const cha
     cbm_pkg_entries_t tmp;
     cbm_pkg_entries_init(&tmp);
     cbm_pkgmap_try_parse(basename, rel_path, source, source_len, &tmp);
-    if (!tmp.complete) ((cbm_pkg_members_t *)userdata)->complete = false;
+    if (!tmp.complete)
+        ((cbm_pkg_members_t *)userdata)->complete = false;
     if (tmp.count > 0 && tmp.items[0].pkg_name && tmp.items[0].pkg_name[0]) {
         pkg_members_push((cbm_pkg_members_t *)userdata, path_dirname(rel_path),
                          strdup(tmp.items[0].pkg_name));
@@ -1310,8 +1313,8 @@ int cbm_pkgmap_collect_members(const char *repo_path, cbm_pkg_members_t *out) {
     if (!repo_path || !out) {
         return 0;
     }
-    int parsed = pkgmap_walk_manifests(repo_path, "", pkg_members_cb, out, 0, NULL, 0,
-                                       &out->complete);
+    int parsed =
+        pkgmap_walk_manifests(repo_path, "", pkg_members_cb, out, 0, NULL, 0, &out->complete);
     cbm_log_info("pkgmap.members", "manifests", pkgmap_itoa(parsed), "members",
                  pkgmap_itoa(out->count));
     return out->count;

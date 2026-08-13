@@ -46,7 +46,7 @@ extern char **environ;
 #endif
 
 extern void cbm_mcp_server_test_use_borrowed_store(cbm_mcp_server_t *srv, cbm_store_t *store,
-                                                    const char *project);
+                                                   const char *project);
 
 static bool mcp_response_has_exact_tool(const char *response, const char *expected_name) {
     yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
@@ -1181,7 +1181,8 @@ static int assert_oversized_result_fails_closed(const char *payload, bool input_
     ASSERT_EQ(measured_complete_bytes, uncapped_bytes);
     ASSERT_EQ(measured_limit_bytes, CBM_MCP_RESULT_MAX_BYTES);
     ASSERT_NOT_NULL(strstr(message, "Remedy: manage_adr use mode=sections"));
-    ASSERT_NOT_NULL(strstr(message, "choose bounded output, a narrower tool, or inspect source data"));
+    ASSERT_NOT_NULL(
+        strstr(message, "choose bounded output, a narrower tool, or inspect source data"));
     ASSERT_NULL(strstr(json, discarded_payload_marker));
 
     yyjson_val *structured = yyjson_obj_get(root, "structuredContent");
@@ -1266,12 +1267,10 @@ TEST(mcp_text_result_oversized_dynamic_error_is_hard_bounded) {
      * needs no JSON escaping, so the fixed envelope plus both copies gives an
      * independent exact byte count for the pre-substitution response. */
     ASSERT_TRUE(strlen(error) < CBM_MCP_RESULT_MAX_BYTES);
-    size_t uncapped_bytes =
-        strlen("{\"content\":[{\"type\":\"text\",\"text\":\"\"}],"
-               "\"structuredContent\":{\"error\":\"\"},\"isError\":true}") +
-        repeated * 2;
-    ASSERT_EQ(assert_oversized_result_fails_closed(error, true, uncapped_bytes,
-                                                   "eeeeeeeeeeeeeeee"),
+    size_t uncapped_bytes = strlen("{\"content\":[{\"type\":\"text\",\"text\":\"\"}],"
+                                   "\"structuredContent\":{\"error\":\"\"},\"isError\":true}") +
+                            repeated * 2;
+    ASSERT_EQ(assert_oversized_result_fails_closed(error, true, uncapped_bytes, "eeeeeeeeeeeeeeee"),
               0);
     free(error);
     PASS();
@@ -2582,11 +2581,11 @@ TEST(tool_query_graph_malformed_query_preserves_actionable_error) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":140,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"query_graph\","
-             "\"arguments\":{\"project\":\"test-project\","
-             "\"query\":\"MATCH (f RETURN f.name\"}}}");
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":140,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"query_graph\","
+                                   "\"arguments\":{\"project\":\"test-project\","
+                                   "\"query\":\"MATCH (f RETURN f.name\"}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_TRUE(strlen(resp) <= CBM_MCP_RESULT_MAX_BYTES);
     ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
@@ -2735,7 +2734,7 @@ TEST(tool_index_status_coverage_pagination_is_exact_bounded_and_generation_bound
     cbm_mcp_server_set_project(srv, project);
 
     char (*paths)[64] = calloc(ROW_COUNT, sizeof(*paths));
-    char(*details)[512] = calloc(ROW_COUNT, sizeof(*details));
+    char (*details)[512] = calloc(ROW_COUNT, sizeof(*details));
     cbm_coverage_row_t *rows = calloc(ROW_COUNT, sizeof(*rows));
     char *oversized = malloc(20001);
     ASSERT_NOT_NULL(paths);
@@ -2841,9 +2840,8 @@ TEST(tool_index_status_coverage_pagination_is_exact_bounded_and_generation_bound
         ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(skipped, "truncated")), skipped_returned < 133);
         ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(not_indexed, "truncated")),
                   dirs_returned < 132 || files_returned < 132);
-        emitted +=
-            index_status_mark_object_paths(parse_files, page_seen, UNIQUE_PATH_COUNT,
-                                           "parse_partial");
+        emitted += index_status_mark_object_paths(parse_files, page_seen, UNIQUE_PATH_COUNT,
+                                                  "parse_partial");
         emitted += index_status_mark_object_paths(index_status_page_files(root, "skipped"),
                                                   page_seen, UNIQUE_PATH_COUNT, "read");
         emitted += index_status_mark_dir_paths(yyjson_obj_get(not_indexed, "dirs"), page_seen,
@@ -2852,8 +2850,8 @@ TEST(tool_index_status_coverage_pagination_is_exact_bounded_and_generation_bound
                                                   UNIQUE_PATH_COUNT, "not_indexed_file");
         ASSERT_EQ(emitted, represented);
         bool expected_page[UNIQUE_PATH_COUNT][4] = {{false}};
-        for (int stream_ordinal = expected_start;
-             stream_ordinal < expected_start + represented; stream_ordinal++) {
+        for (int stream_ordinal = expected_start; stream_ordinal < expected_start + represented;
+             stream_ordinal++) {
             int path_ordinal;
             int kind_slot;
             if (stream_ordinal < UNIQUE_PATH_COUNT - 1) {
@@ -3249,8 +3247,7 @@ static void mcp_syntactic_replace_on_page(void *userdata) {
     hook->calls++;
     if (hook->calls == hook->replace_on_call) {
         hook->rc = cbm_store_coverage_replace_ex(hook->writer, hook->project, hook->replacement,
-                                                 hook->replacement_count,
-                                                 &hook->replacement_meta);
+                                                 hook->replacement_count, &hook->replacement_meta);
     }
 }
 
@@ -3275,8 +3272,8 @@ TEST(tool_index_status_syntactic_pages_hold_one_readonly_snapshot) {
 
     cbm_coverage_row_t *initial = calloc(ROW_COUNT, sizeof(*initial));
     cbm_coverage_row_t *replacement = calloc(ROW_COUNT, sizeof(*replacement));
-    char(*initial_paths)[32] = calloc(ROW_COUNT, sizeof(*initial_paths));
-    char(*replacement_paths)[32] = calloc(ROW_COUNT, sizeof(*replacement_paths));
+    char (*initial_paths)[32] = calloc(ROW_COUNT, sizeof(*initial_paths));
+    char (*replacement_paths)[32] = calloc(ROW_COUNT, sizeof(*replacement_paths));
     ASSERT_NOT_NULL(initial);
     ASSERT_NOT_NULL(replacement);
     ASSERT_NOT_NULL(initial_paths);
@@ -3284,18 +3281,16 @@ TEST(tool_index_status_syntactic_pages_hold_one_readonly_snapshot) {
     for (int i = 0; i < ROW_COUNT; i++) {
         snprintf(initial_paths[i], sizeof(initial_paths[i]), "old/%04d.c", i);
         snprintf(replacement_paths[i], sizeof(replacement_paths[i]), "new/%04d.c", i);
-        ASSERT_EQ(cbm_store_upsert_file_hash(writer, project, initial_paths[i], "fixture", i + 1,
-                                             1),
-                  CBM_STORE_OK);
+        ASSERT_EQ(
+            cbm_store_upsert_file_hash(writer, project, initial_paths[i], "fixture", i + 1, 1),
+            CBM_STORE_OK);
         ASSERT_EQ(cbm_store_upsert_file_hash(writer, project, replacement_paths[i], "fixture",
                                              ROW_COUNT + i + 1, 1),
                   CBM_STORE_OK);
-        initial[i] = (cbm_coverage_row_t){.rel_path = initial_paths[i],
-                                          .kind = "not_indexed_file",
-                                          .detail = "old"};
-        replacement[i] = (cbm_coverage_row_t){.rel_path = replacement_paths[i],
-                                              .kind = "not_indexed_file",
-                                              .detail = "new"};
+        initial[i] = (cbm_coverage_row_t){
+            .rel_path = initial_paths[i], .kind = "not_indexed_file", .detail = "old"};
+        replacement[i] = (cbm_coverage_row_t){
+            .rel_path = replacement_paths[i], .kind = "not_indexed_file", .detail = "new"};
     }
     cbm_coverage_meta_t initial_meta = {.generation = info.indexed_at,
                                         .index_mode = "fast",
@@ -3339,8 +3334,8 @@ TEST(tool_index_status_syntactic_pages_hold_one_readonly_snapshot) {
                              .coverage_version = 1,
                              .hash_records_complete = true},
     };
-    cbm_store_syntactic_coverage_test_set_after_totals_hook(
-        reader, mcp_syntactic_replace_on_page, &hook);
+    cbm_store_syntactic_coverage_test_set_after_totals_hook(reader, mcp_syntactic_replace_on_page,
+                                                            &hook);
     char args[1024];
     snprintf(args, sizeof(args),
              "{\"project\":\"mcp-syntactic-snapshot\",\"limit\":500,"
@@ -3355,9 +3350,9 @@ TEST(tool_index_status_syntactic_pages_hold_one_readonly_snapshot) {
     yyjson_val *root = yyjson_doc_get_root(doc);
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "coverage_page"), "total")),
               ROW_COUNT);
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "coverage_page"),
-                                           "start_ordinal")),
-              warm_end);
+    ASSERT_EQ(
+        yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "coverage_page"), "start_ordinal")),
+        warm_end);
     ASSERT_NOT_NULL(strstr(inner, "old/"));
     ASSERT_NULL(strstr(inner, "new/"));
     yyjson_doc_free(doc);
@@ -3414,8 +3409,8 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
 
     cbm_coverage_row_t *rows = calloc(ROW_COUNT, sizeof(*rows));
-    char(*paths)[32] = calloc(ROW_COUNT, sizeof(*paths));
-    char(*kinds)[32] = calloc(ROW_COUNT, sizeof(*kinds));
+    char (*paths)[32] = calloc(ROW_COUNT, sizeof(*paths));
+    char (*kinds)[32] = calloc(ROW_COUNT, sizeof(*kinds));
     char *oversized_kind = malloc(18001);
     char *delimited_kind = malloc(18003);
     char *budget_kind = malloc(701);
@@ -3439,9 +3434,8 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
         snprintf(paths[n], sizeof(paths[n]), "s/%04d.c", i);
         ASSERT_EQ(cbm_store_upsert_file_hash(store, project, paths[n], "fixture", i + 2, 1),
                   CBM_STORE_OK);
-        rows[n] = (cbm_coverage_row_t){.rel_path = paths[n],
-                                       .kind = "parse_partial",
-                                       .detail = i == 0 ? "1-999999" : "1"};
+        rows[n] = (cbm_coverage_row_t){
+            .rel_path = paths[n], .kind = "parse_partial", .detail = i == 0 ? "1-999999" : "1"};
     }
     for (int i = 0; i < SEMANTIC_ROWS; i++, n++) {
         snprintf(paths[n], sizeof(paths[n]), "s/%04d.c", i);
@@ -3451,33 +3445,23 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     }
     for (int i = 0; i < EXACT_PHASE_ROWS; i++, n++) {
         snprintf(kinds[n], sizeof(kinds[n]), "phase_%04d", i);
-        rows[n] = (cbm_coverage_row_t){.rel_path = "target.c",
-                                       .kind = kinds[n],
-                                       .detail = "phase"};
+        rows[n] = (cbm_coverage_row_t){.rel_path = "target.c", .kind = kinds[n], .detail = "phase"};
     }
-    rows[n++] = (cbm_coverage_row_t){.rel_path = "target.c",
-                                     .kind = "parse_partial",
-                                     .detail = target_detail};
-    rows[n++] = (cbm_coverage_row_t){.rel_path = "sx/a",
-                                     .kind = delimited_kind,
-                                     .detail = "prefix collision"};
-    rows[n++] = (cbm_coverage_row_t){.rel_path = "sx/a|b",
-                                     .kind = oversized_kind,
-                                     .detail = "prefix collision"};
-    rows[n++] = (cbm_coverage_row_t){.rel_path = "sy/a",
-                                     .kind = budget_kind,
-                                     .detail = "ordinary budget exhaustion"};
+    rows[n++] = (cbm_coverage_row_t){
+        .rel_path = "target.c", .kind = "parse_partial", .detail = target_detail};
+    rows[n++] = (cbm_coverage_row_t){
+        .rel_path = "sx/a", .kind = delimited_kind, .detail = "prefix collision"};
+    rows[n++] = (cbm_coverage_row_t){
+        .rel_path = "sx/a|b", .kind = oversized_kind, .detail = "prefix collision"};
+    rows[n++] = (cbm_coverage_row_t){
+        .rel_path = "sy/a", .kind = budget_kind, .detail = "ordinary budget exhaustion"};
     rows[n++] = (cbm_coverage_row_t){.rel_path = "sy/b",
                                      .kind = budget_kind,
                                      .detail = "ordinary budget exhaustion continuation"};
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sx/a", "fixture", 1, 1),
-              CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sx/a|b", "fixture", 1, 1),
-              CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sy/a", "fixture", 1, 1),
-              CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sy/b", "fixture", 1, 1),
-              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sx/a", "fixture", 1, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sx/a|b", "fixture", 1, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sy/a", "fixture", 1, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sy/b", "fixture", 1, 1), CBM_STORE_OK);
     ASSERT_EQ(n, ROW_COUNT);
     cbm_project_t project_info = {0};
     ASSERT_EQ(cbm_store_get_project(store, project, &project_info), CBM_STORE_OK);
@@ -3487,8 +3471,7 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
                                 .recording_status = "complete",
                                 .coverage_version = 1,
                                 .hash_records_complete = true};
-    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, rows, ROW_COUNT, &meta),
-              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, rows, ROW_COUNT, &meta), CBM_STORE_OK);
     cbm_project_free_fields(&project_info);
 
     int ordinal = 0;
@@ -3496,9 +3479,8 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     do {
         char args[1024];
         if (cursor) {
-            snprintf(args, sizeof(args),
-                     "{\"project\":\"%s\",\"limit\":500,\"cursor\":\"%s\"}", project,
-                     cursor);
+            snprintf(args, sizeof(args), "{\"project\":\"%s\",\"limit\":500,\"cursor\":\"%s\"}",
+                     project, cursor);
         } else {
             snprintf(args, sizeof(args), "{\"project\":\"%s\",\"limit\":500}", project);
         }
@@ -3528,9 +3510,9 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     } while (cursor);
     ASSERT_EQ(ordinal, SYNTACTIC_ROWS);
 
-    char *response = cbm_mcp_handle_tool(
-        srv, "check_index_coverage",
-        "{\"project\":\"syntactic-page-routes\",\"paths\":[\"target.c\"]}");
+    char *response =
+        cbm_mcp_handle_tool(srv, "check_index_coverage",
+                            "{\"project\":\"syntactic-page-routes\",\"paths\":[\"target.c\"]}");
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
     char *inner = extract_text_content(response);
@@ -3552,10 +3534,9 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     free(inner);
     free(response);
 
-    response = cbm_mcp_handle_tool(
-        srv, "check_index_coverage",
-        "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"s\"],"
-        "\"scope_limit\":300}");
+    response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                   "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"s\"],"
+                                   "\"scope_limit\":300}");
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
     inner = extract_text_content(response);
@@ -3572,10 +3553,9 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     free(inner);
     free(response);
 
-    response = cbm_mcp_handle_tool(
-        srv, "check_index_coverage",
-        "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"sx\"],"
-        "\"scope_limit\":1}");
+    response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                   "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"sx\"],"
+                                   "\"scope_limit\":1}");
     inner = extract_text_content(response);
     doc = yyjson_read(inner, strlen(inner), 0);
     scope = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "scopes"), 0);
@@ -3592,10 +3572,9 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     free(inner);
     free(response);
 
-    response = cbm_mcp_handle_tool(
-        srv, "check_index_coverage",
-        "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"sx\"],"
-        "\"scope_limit\":1,\"scope_offset\":1}");
+    response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                   "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"sx\"],"
+                                   "\"scope_limit\":1,\"scope_offset\":1}");
     inner = extract_text_content(response);
     doc = yyjson_read(inner, strlen(inner), 0);
     scope = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "scopes"), 0);
@@ -3637,21 +3616,20 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     yyjson_val *fanout_scope_results = yyjson_obj_get(root, "scopes");
     ASSERT_EQ(yyjson_arr_size(fanout_path_results), 128);
     ASSERT_EQ(yyjson_arr_size(fanout_scope_results), 32);
-    ASSERT_EQ(yyjson_get_uint(
-                  yyjson_obj_get(yyjson_arr_get(fanout_path_results, 127), "duplicate_of")),
-              0);
+    ASSERT_EQ(
+        yyjson_get_uint(yyjson_obj_get(yyjson_arr_get(fanout_path_results, 127), "duplicate_of")),
+        0);
     yyjson_val *fanout_first_scope = yyjson_arr_get(fanout_scope_results, 0);
     yyjson_val *fanout_first_entry =
         yyjson_arr_get(yyjson_obj_get(fanout_first_scope, "entries"), 0);
-    ASSERT_TRUE(
-        yyjson_get_bool(yyjson_obj_get(fanout_first_entry, "evidence_omitted_item")));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(fanout_first_entry, "evidence_omitted_item")));
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(fanout_first_entry, "omission_reason")),
                   "evidence_budget_exhausted");
     ASSERT_NOT_NULL(yyjson_get_str(yyjson_obj_get(fanout_first_entry, "identity_hash")));
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(fanout_first_scope, "next_offset")), 1);
-    ASSERT_EQ(yyjson_get_uint(
-                  yyjson_obj_get(yyjson_arr_get(fanout_scope_results, 31), "duplicate_of")),
-              0);
+    ASSERT_EQ(
+        yyjson_get_uint(yyjson_obj_get(yyjson_arr_get(fanout_scope_results, 31), "duplicate_of")),
+        0);
     yyjson_doc_free(doc);
     free(inner);
     free(response);
@@ -3710,10 +3688,9 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     syntactic_page_failure_hook_t hook = {.store = store, .fail_on_call = 2};
     cbm_store_syntactic_coverage_test_set_after_totals_hook(
         store, syntactic_page_fail_allocation_on_call, &hook);
-    response = cbm_mcp_handle_tool(
-        srv, "index_status",
-        "{\"project\":\"syntactic-page-routes\",\"limit\":500,"
-        "\"max_response_bytes\":65536}");
+    response = cbm_mcp_handle_tool(srv, "index_status",
+                                   "{\"project\":\"syntactic-page-routes\",\"limit\":500,"
+                                   "\"max_response_bytes\":65536}");
     ASSERT_NOT_NULL(strstr(response, "index_status failed to read a complete coverage snapshot"));
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
     free(response);
@@ -3721,9 +3698,9 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     cbm_store_syntactic_coverage_test_fail_alloc_after(store, -1);
     hook.calls = 0;
     hook.fail_on_call = 2;
-    response = cbm_mcp_handle_tool(
-        srv, "check_index_coverage",
-        "{\"project\":\"syntactic-page-routes\",\"paths\":[\"target.c\"]}");
+    response =
+        cbm_mcp_handle_tool(srv, "check_index_coverage",
+                            "{\"project\":\"syntactic-page-routes\",\"paths\":[\"target.c\"]}");
     ASSERT_NOT_NULL(strstr(response, "\"coverage_lookup\":\"error\""));
     ASSERT_NOT_NULL(strstr(response, "\"status\":\"coverage_unavailable\""));
     ASSERT_NOT_NULL(strstr(response, "\"coverage\":[]"));
@@ -3732,10 +3709,9 @@ TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
     cbm_store_syntactic_coverage_test_fail_alloc_after(store, -1);
     hook.calls = 0;
     hook.fail_on_call = 1;
-    response = cbm_mcp_handle_tool(
-        srv, "check_index_coverage",
-        "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"s\"],"
-        "\"scope_limit\":300}");
+    response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                   "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"s\"],"
+                                   "\"scope_limit\":300}");
     ASSERT_NOT_NULL(strstr(response, "\"coverage_lookup\":\"error\""));
     ASSERT_NOT_NULL(strstr(response, "\"status\":\"coverage_unavailable\""));
     ASSERT_NOT_NULL(strstr(response, "\"total\":600"));
@@ -3811,9 +3787,8 @@ static int write_rust_health_fixture(cbm_store_t *store, const char *project, in
         .rust_files_total = rust_files_total,
     };
     for (int i = 0; i < row_count; i++) {
-        if (rows[i].rel_path &&
-            cbm_store_upsert_file_hash(store, project, rows[i].rel_path, "fixture", i + 1, 1) !=
-                CBM_STORE_OK) {
+        if (rows[i].rel_path && cbm_store_upsert_file_hash(store, project, rows[i].rel_path,
+                                                           "fixture", i + 1, 1) != CBM_STORE_OK) {
             cbm_project_free_fields(&info);
             return CBM_STORE_ERR;
         }
@@ -3843,9 +3818,15 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     cbm_mcp_server_set_project(srv, project);
 
     cbm_coverage_row_t mixed[] = {
-        {.rel_path = "src/a.rs", .kind = "analysis_failed:rust", .detail = "{\"status\":\"failed\"}"},
-        {.rel_path = "src/a.rs", .kind = "analysis_partial:rust", .detail = "{\"status\":\"partial\"}"},
-        {.rel_path = "src/b.rs", .kind = "analysis_partial:rust", .detail = "{\"status\":\"partial\"}"},
+        {.rel_path = "src/a.rs",
+         .kind = "analysis_failed:rust",
+         .detail = "{\"status\":\"failed\"}"},
+        {.rel_path = "src/a.rs",
+         .kind = "analysis_partial:rust",
+         .detail = "{\"status\":\"partial\"}"},
+        {.rel_path = "src/b.rs",
+         .kind = "analysis_partial:rust",
+         .detail = "{\"status\":\"partial\"}"},
         {.rel_path = "src/b.rs", .kind = "parse_partial", .detail = "7-9"},
     };
     ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete", 4,
@@ -3862,8 +3843,7 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     char *response = NULL;
     char *inner = NULL;
     yyjson_doc *doc = mcp_tool_inner_doc(
-        srv, "index_status",
-        "{\"project\":\"rust-health-verdicts\",\"max_response_bytes\":65536}",
+        srv, "index_status", "{\"project\":\"rust-health-verdicts\",\"max_response_bytes\":65536}",
         &response, &inner);
     ASSERT_NOT_NULL(doc);
     yyjson_val *root = yyjson_doc_get_root(doc);
@@ -3903,13 +3883,12 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION - 1, "complete",
                                         4, mixed, 4),
               CBM_STORE_OK);
-    doc = mcp_tool_inner_doc(srv, "index_status",
-                             "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
+    doc = mcp_tool_inner_doc(srv, "index_status", "{\"project\":\"rust-health-verdicts\"}",
+                             &response, &inner);
     ASSERT_NOT_NULL(doc);
     health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")),
-                  "unsupported_coverage_version");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")), "unsupported_coverage_version");
     yyjson_doc_free(doc);
     free(inner);
     free(response);
@@ -3917,8 +3896,8 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete", 0,
                                         NULL, 0),
               CBM_STORE_OK);
-    doc = mcp_tool_inner_doc(srv, "index_status",
-                             "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
+    doc = mcp_tool_inner_doc(srv, "index_status", "{\"project\":\"rust-health-verdicts\"}",
+                             &response, &inner);
     ASSERT_NOT_NULL(doc);
     health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "not_applicable");
@@ -3929,8 +3908,8 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete", 2,
                                         NULL, 0),
               CBM_STORE_OK);
-    doc = mcp_tool_inner_doc(srv, "index_status",
-                             "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
+    doc = mcp_tool_inner_doc(srv, "index_status", "{\"project\":\"rust-health-verdicts\"}",
+                             &response, &inner);
     ASSERT_NOT_NULL(doc);
     health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "complete");
@@ -3941,8 +3920,8 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "unknown", 2,
                                         NULL, 0),
               CBM_STORE_OK);
-    doc = mcp_tool_inner_doc(srv, "index_status",
-                             "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
+    doc = mcp_tool_inner_doc(srv, "index_status", "{\"project\":\"rust-health-verdicts\"}",
+                             &response, &inner);
     ASSERT_NOT_NULL(doc);
     health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
@@ -3967,8 +3946,8 @@ TEST(tool_rust_analysis_evidence_has_independent_16k_budget) {
               CBM_STORE_OK);
     cbm_mcp_server_set_project(srv, project);
     cbm_coverage_row_t *rows = calloc(ROW_COUNT, sizeof(*rows));
-    char(*paths)[64] = calloc(ROW_COUNT, sizeof(*paths));
-    char(*details)[2048] = calloc(ROW_COUNT, sizeof(*details));
+    char (*paths)[64] = calloc(ROW_COUNT, sizeof(*paths));
+    char (*details)[2048] = calloc(ROW_COUNT, sizeof(*details));
     ASSERT_NOT_NULL(rows);
     ASSERT_NOT_NULL(paths);
     ASSERT_NOT_NULL(details);
@@ -4058,7 +4037,7 @@ TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contaminati
     cbm_mcp_server_set_project(srv, project);
 
     cbm_coverage_row_t *rows = calloc(ROW_COUNT, sizeof(*rows));
-    char(*paths)[32] = calloc(ROW_COUNT, sizeof(*paths));
+    char (*paths)[32] = calloc(ROW_COUNT, sizeof(*paths));
     ASSERT_NOT_NULL(rows);
     ASSERT_NOT_NULL(paths);
     for (int i = 0; i < SEMANTIC_ROWS; i++) {
@@ -4084,8 +4063,7 @@ TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contaminati
     char *inner = NULL;
     yyjson_doc *doc = mcp_tool_inner_doc(
         srv, "check_index_coverage",
-        "{\"project\":\"rust-health-paged-mixed\",\"paths\":[\"a0000\"]}",
-        &response, &inner);
+        "{\"project\":\"rust-health-paged-mixed\",\"paths\":[\"a0000\"]}", &response, &inner);
     ASSERT_NOT_NULL(doc);
     yyjson_val *health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
     ASSERT_NOT_NULL(health);
@@ -4113,11 +4091,10 @@ TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contaminati
     free(inner);
     free(response);
 
-    doc = mcp_tool_inner_doc(
-        srv, "index_status",
-        "{\"project\":\"rust-health-paged-mixed\",\"limit\":1,"
-        "\"max_response_bytes\":65536}",
-        &response, &inner);
+    doc = mcp_tool_inner_doc(srv, "index_status",
+                             "{\"project\":\"rust-health-paged-mixed\",\"limit\":1,"
+                             "\"max_response_bytes\":65536}",
+                             &response, &inner);
     ASSERT_NOT_NULL(doc);
     yyjson_val *root = yyjson_doc_get_root(doc);
     health = yyjson_obj_get(root, "rust_analysis");
@@ -4224,11 +4201,10 @@ TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contaminati
     /* Six metadata strings, one row array, then three strings per row exhaust
      * exactly after the first full store page; the next page must fail closed
      * without retaining the first page as apparently complete evidence. */
-    cbm_store_analysis_coverage_test_fail_alloc_after(
-        store, 7 + 3 * CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS);
-    doc = mcp_tool_inner_doc(
-        srv, "index_status", "{\"project\":\"rust-health-paged-mixed\"}",
-        &response, &inner);
+    cbm_store_analysis_coverage_test_fail_alloc_after(store,
+                                                      7 + 3 * CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS);
+    doc = mcp_tool_inner_doc(srv, "index_status", "{\"project\":\"rust-health-paged-mixed\"}",
+                             &response, &inner);
     ASSERT_NOT_NULL(doc);
     health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
@@ -4272,10 +4248,9 @@ TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contrac
     free(inner);
     free(response);
 
-    doc = mcp_tool_inner_doc(
-        srv, "check_index_coverage",
-        "{\"project\":\"rust-health-page-failure\",\"paths\":[\"src/a.rs\"]}",
-        &response, &inner);
+    doc = mcp_tool_inner_doc(srv, "check_index_coverage",
+                             "{\"project\":\"rust-health-page-failure\",\"paths\":[\"src/a.rs\"]}",
+                             &response, &inner);
     ASSERT_NOT_NULL(doc);
     yyjson_val *root = yyjson_doc_get_root(doc);
     health = yyjson_obj_get(root, "rust_analysis");
@@ -4292,11 +4267,11 @@ TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contrac
     free(response);
 
     cbm_store_analysis_coverage_test_fail_alloc_after(store, -1);
-    ASSERT_EQ(cbm_store_exec(store,
-                             "ALTER TABLE index_coverage_meta RENAME TO broken_coverage_meta;"),
-              CBM_STORE_OK);
-    doc = mcp_tool_inner_doc(srv, "index_status",
-                             "{\"project\":\"rust-health-page-failure\"}", &response, &inner);
+    ASSERT_EQ(
+        cbm_store_exec(store, "ALTER TABLE index_coverage_meta RENAME TO broken_coverage_meta;"),
+        CBM_STORE_OK);
+    doc = mcp_tool_inner_doc(srv, "index_status", "{\"project\":\"rust-health-page-failure\"}",
+                             &response, &inner);
     ASSERT_NULL(doc);
     ASSERT_NOT_NULL(strstr(response, "index_status failed to read a complete coverage snapshot"));
     free(inner);
@@ -4306,7 +4281,7 @@ TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contrac
     unsigned char *source = mcp_read_file_bytes("src/mcp/mcp.c", &source_len);
     ASSERT_NOT_NULL(source);
     ASSERT_NOT_NULL(strstr((const char *)source, "meta->coverage_version != "
-                                               "CBM_SEMANTIC_INDEX_VERSION"));
+                                                 "CBM_SEMANTIC_INDEX_VERSION"));
     ASSERT_NULL(strstr((const char *)source, "RUST_ANALYSIS_COVERAGE_VERSION"));
     free(source);
     cbm_mcp_server_free(srv);
@@ -4314,7 +4289,7 @@ TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contrac
 }
 
 static int index_repository_success_reports_large_semantic_health_corpus_check(const char *repo,
-                                                                                const char *cache) {
+                                                                               const char *cache) {
     enum { RUST_FILES = CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS * 4 + 1 };
     for (int i = 0; i < RUST_FILES; i++) {
         char path[512];
@@ -4353,8 +4328,7 @@ static int index_repository_success_reports_large_semantic_health_corpus_check(c
     ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(evidence, "truncated")));
     yyjson_val *items = yyjson_obj_get(evidence, "items");
     ASSERT_EQ(yyjson_arr_size(items), returned);
-    const char *first_detail =
-        yyjson_get_str(yyjson_obj_get(yyjson_arr_get(items, 0), "detail"));
+    const char *first_detail = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(items, 0), "detail"));
     ASSERT_TRUE(first_detail && first_detail[0]);
     for (int i = 0; i < returned; i++) {
         char expected[32];
@@ -5679,8 +5653,7 @@ TEST(tool_trace_legacy_wide_stream_requires_explicit_refinement) {
     cbm_store_t *st = cbm_mcp_server_store(srv);
     ASSERT_NOT_NULL(st);
     const char *project = "legacy-trace-refinement";
-    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/legacy-trace-refinement"),
-              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/legacy-trace-refinement"), CBM_STORE_OK);
     cbm_mcp_server_set_project(srv, project);
     cbm_node_t hub = {.project = project,
                       .label = "Function",
@@ -11369,9 +11342,12 @@ TEST(tool_detect_changes_default_adapts_oversized_shape_with_exact_totals) {
     ASSERT_EQ(th_write_file(seed_path, "int seed(void) { return 1; }\n"), 0);
     const char *const init_args[] = {"-c", "init.defaultBranch=main", "init", "-q", NULL};
     const char *const add_args[] = {"add", "seed.c", NULL};
-    const char *const commit_args[] = {
-        "-c",     "user.name=cbm-test", "-c", "user.email=cbm-test@example.invalid",
-        "-c",     "commit.gpgsign=false", "commit", "-q", "-m", "fixture", NULL};
+    const char *const commit_args[] = {"-c",     "user.name=cbm-test",
+                                       "-c",     "user.email=cbm-test@example.invalid",
+                                       "-c",     "commit.gpgsign=false",
+                                       "commit", "-q",
+                                       "-m",     "fixture",
+                                       NULL};
     ASSERT_EQ(mcp_test_git(repo, init_args), 0);
     ASSERT_EQ(mcp_test_git(repo, add_args), 0);
     ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
@@ -11509,10 +11485,9 @@ TEST(tool_detect_changes_default_adapts_oversized_shape_with_exact_totals) {
 
     /* Explicit row limits retain the same exact totals without triggering the
      * response-level refinement path. */
-    char *response = cbm_mcp_handle_tool(
-        srv, "detect_changes",
-        "{\"project\":\"detect-output-bounds\",\"since\":\"HEAD\","
-        "\"depth\":5,\"limit\":1,\"format\":\"json\"}");
+    char *response = cbm_mcp_handle_tool(srv, "detect_changes",
+                                         "{\"project\":\"detect-output-bounds\",\"since\":\"HEAD\","
+                                         "\"depth\":5,\"limit\":1,\"format\":\"json\"}");
     ASSERT_NOT_NULL(response);
     char *inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
@@ -11527,8 +11502,7 @@ TEST(tool_detect_changes_default_adapts_oversized_shape_with_exact_totals) {
     size_t limit_one_index, limit_one_max;
     yyjson_val *limit_one_entry;
     yyjson_arr_foreach(limit_one_rollup, limit_one_index, limit_one_max, limit_one_entry) {
-        limit_one_rollup_total +=
-            (int)yyjson_get_int(yyjson_obj_get(limit_one_entry, "count"));
+        limit_one_rollup_total += (int)yyjson_get_int(yyjson_obj_get(limit_one_entry, "count"));
     }
     ASSERT_EQ(limit_one_rollup_total, IMPACTED);
     yyjson_doc_free(doc);

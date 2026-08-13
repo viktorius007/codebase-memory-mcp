@@ -3175,8 +3175,8 @@ static char *coverage_strdup_alloc(cbm_store_t *s, const unsigned char *text,
 }
 
 static coverage_meta_status_t coverage_meta_get_alloc(cbm_store_t *s, const char *project,
-                                                       cbm_coverage_meta_t *out,
-                                                       coverage_alloc_fn alloc) {
+                                                      cbm_coverage_meta_t *out,
+                                                      coverage_alloc_fn alloc) {
     memset(out, 0, sizeof(*out));
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db,
@@ -3201,8 +3201,8 @@ static coverage_meta_status_t coverage_meta_get_alloc(cbm_store_t *s, const char
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
-        out->rust_analysis_recording_status = coverage_strdup_alloc(
-            s, sqlite3_column_text(stmt, 9), alloc);
+        out->rust_analysis_recording_status =
+            coverage_strdup_alloc(s, sqlite3_column_text(stmt, 9), alloc);
         out->rust_files_total = sqlite3_column_int(stmt, 10);
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
@@ -3228,8 +3228,7 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
     if (!s || !s->db || !project) {
         return CBM_STORE_ERR;
     }
-    coverage_meta_status_t status =
-        coverage_meta_get_alloc(s, project, out, coverage_plain_alloc);
+    coverage_meta_status_t status = coverage_meta_get_alloc(s, project, out, coverage_plain_alloc);
     if (status == COVERAGE_META_OK) {
         return CBM_STORE_OK;
     }
@@ -3262,8 +3261,7 @@ static cbm_analysis_coverage_status_t analysis_coverage_fail(
     return status;
 }
 
-static size_t analysis_coverage_utf8_prefix(const unsigned char *text, size_t bytes,
-                                            size_t limit) {
+static size_t analysis_coverage_utf8_prefix(const unsigned char *text, size_t bytes, size_t limit) {
     size_t prefix = bytes < limit ? bytes : limit;
     if (prefix == bytes) {
         return prefix;
@@ -3287,8 +3285,8 @@ static char *analysis_coverage_dup_bytes(cbm_store_t *s, const unsigned char *te
 }
 
 cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
-    cbm_store_t *s, const char *project, int64_t offset, int limit,
-    size_t detail_preview_bytes, cbm_analysis_coverage_page_t *out) {
+    cbm_store_t *s, const char *project, int64_t offset, int limit, size_t detail_preview_bytes,
+    cbm_analysis_coverage_page_t *out) {
     if (out) {
         memset(out, 0, sizeof(*out));
     }
@@ -3319,7 +3317,8 @@ cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
         " sum(kind != 'analysis_partial:rust' AND kind != 'analysis_failed:rust') AS unsupported_n,"
         " max(kind = 'analysis_partial:rust') AS has_partial,"
         " max(kind = 'analysis_failed:rust') AS has_failed,"
-        " max(kind != 'analysis_partial:rust' AND kind != 'analysis_failed:rust') AS has_unsupported"
+        " max(kind != 'analysis_partial:rust' AND kind != 'analysis_failed:rust') AS "
+        "has_unsupported"
         " FROM index_coverage WHERE project = ?1 AND substr(kind, 1, 9) = 'analysis_'"
         " GROUP BY rel_path)"
         " SELECT coalesce(sum(rows_n), 0), coalesce(sum(partial_n), 0),"
@@ -3388,15 +3387,14 @@ cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
         size_t path_bytes = (size_t)sqlite3_column_bytes(rows, 0);
         size_t kind_bytes = (size_t)sqlite3_column_bytes(rows, 1);
         size_t detail_bytes = (size_t)sqlite3_column_bytes(rows, 2);
-        size_t preview_bytes =
-            analysis_coverage_utf8_prefix(detail ? detail : (const unsigned char *)"",
-                                          detail_bytes, detail_preview_bytes);
-        row->rel_path = analysis_coverage_dup_bytes(
-            s, path ? path : (const unsigned char *)"", path_bytes);
-        row->kind = analysis_coverage_dup_bytes(
-            s, kind ? kind : (const unsigned char *)"", kind_bytes);
-        row->detail = analysis_coverage_dup_bytes(
-            s, detail ? detail : (const unsigned char *)"", preview_bytes);
+        size_t preview_bytes = analysis_coverage_utf8_prefix(
+            detail ? detail : (const unsigned char *)"", detail_bytes, detail_preview_bytes);
+        row->rel_path =
+            analysis_coverage_dup_bytes(s, path ? path : (const unsigned char *)"", path_bytes);
+        row->kind =
+            analysis_coverage_dup_bytes(s, kind ? kind : (const unsigned char *)"", kind_bytes);
+        row->detail = analysis_coverage_dup_bytes(s, detail ? detail : (const unsigned char *)"",
+                                                  preview_bytes);
         if (!row->rel_path || !row->kind || !row->detail) {
             free((char *)row->rel_path);
             free((char *)row->kind);
@@ -3441,8 +3439,7 @@ static void *syntactic_coverage_alloc(cbm_store_t *s, size_t size) {
     return malloc(size);
 }
 
-static char *syntactic_coverage_dup_bytes(cbm_store_t *s, const unsigned char *text,
-                                          size_t bytes) {
+static char *syntactic_coverage_dup_bytes(cbm_store_t *s, const unsigned char *text, size_t bytes) {
     char *copy = syntactic_coverage_alloc(s, bytes + 1U);
     if (!copy) {
         return NULL;
@@ -3474,8 +3471,7 @@ static void syntactic_coverage_snapshot_abort(cbm_store_t *s) {
 }
 
 static cbm_syntactic_coverage_status_t syntactic_coverage_fail(
-    cbm_store_t *s, cbm_syntactic_coverage_page_t *out,
-    cbm_syntactic_coverage_status_t status) {
+    cbm_store_t *s, cbm_syntactic_coverage_page_t *out, cbm_syntactic_coverage_status_t status) {
     cbm_store_syntactic_coverage_page_clear(out);
     syntactic_coverage_snapshot_abort(s);
     return status;
@@ -3505,12 +3501,12 @@ static const char *syntactic_coverage_sql(cbm_syntactic_coverage_mode_t mode) {
         " AND substr(?2, length(rel_path) + 1, 1) = '/'))"
         " ORDER BY rel_path COLLATE BINARY, kind COLLATE BINARY LIMIT ?3 OFFSET ?4;";
     switch (mode) {
-        case CBM_SYNTACTIC_COVERAGE_PROJECT:
-            return project_sql;
-        case CBM_SYNTACTIC_COVERAGE_EXACT_PATH:
-            return exact_path_sql;
-        case CBM_SYNTACTIC_COVERAGE_SCOPE:
-            return scope_sql;
+    case CBM_SYNTACTIC_COVERAGE_PROJECT:
+        return project_sql;
+    case CBM_SYNTACTIC_COVERAGE_EXACT_PATH:
+        return exact_path_sql;
+    case CBM_SYNTACTIC_COVERAGE_SCOPE:
+        return scope_sql;
     }
     return NULL;
 }
@@ -3531,8 +3527,8 @@ static bool syntactic_coverage_request_valid(const cbm_syntactic_coverage_reques
 }
 
 static int syntactic_coverage_prepare(cbm_store_t *s,
-                                      const cbm_syntactic_coverage_request_t *request,
-                                      int limit, int64_t offset, sqlite3_stmt **out) {
+                                      const cbm_syntactic_coverage_request_t *request, int limit,
+                                      int64_t offset, sqlite3_stmt **out) {
     const char *sql = syntactic_coverage_sql(request->mode);
     if (!sql || sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, out, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "syntactic coverage prepare");
@@ -3677,15 +3673,15 @@ cbm_syntactic_coverage_status_t cbm_store_syntactic_coverage_get_page(
         size_t path_bytes = (size_t)sqlite3_column_bytes(page_rows, 0);
         size_t kind_bytes = (size_t)sqlite3_column_bytes(page_rows, 1);
         size_t detail_bytes = (size_t)sqlite3_column_bytes(page_rows, 2);
-        size_t preview_bytes = analysis_coverage_utf8_prefix(
-            detail ? detail : (const unsigned char *)"", detail_bytes,
-            request->detail_preview_bytes);
-        row->rel_path = syntactic_coverage_dup_bytes(
-            s, path ? path : (const unsigned char *)"", path_bytes);
-        row->kind = syntactic_coverage_dup_bytes(
-            s, kind ? kind : (const unsigned char *)"", kind_bytes);
-        row->detail = syntactic_coverage_dup_bytes(
-            s, detail ? detail : (const unsigned char *)"", preview_bytes);
+        size_t preview_bytes =
+            analysis_coverage_utf8_prefix(detail ? detail : (const unsigned char *)"", detail_bytes,
+                                          request->detail_preview_bytes);
+        row->rel_path =
+            syntactic_coverage_dup_bytes(s, path ? path : (const unsigned char *)"", path_bytes);
+        row->kind =
+            syntactic_coverage_dup_bytes(s, kind ? kind : (const unsigned char *)"", kind_bytes);
+        row->detail = syntactic_coverage_dup_bytes(s, detail ? detail : (const unsigned char *)"",
+                                                   preview_bytes);
         if (!row->rel_path || !row->kind || !row->detail) {
             free((char *)row->rel_path);
             free((char *)row->kind);
@@ -3723,8 +3719,9 @@ void cbm_store_analysis_coverage_test_fail_alloc_after(cbm_store_t *s, int alloc
     }
 }
 
-void cbm_store_analysis_coverage_test_set_after_totals_hook(
-    cbm_store_t *s, cbm_analysis_coverage_test_hook_fn hook, void *userdata) {
+void cbm_store_analysis_coverage_test_set_after_totals_hook(cbm_store_t *s,
+                                                            cbm_analysis_coverage_test_hook_fn hook,
+                                                            void *userdata) {
     if (s) {
         s->analysis_after_totals_hook = hook;
         s->analysis_after_totals_userdata = userdata;

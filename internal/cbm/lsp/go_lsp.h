@@ -83,10 +83,10 @@ typedef struct {
     /* Rust-only authoritative Cargo crate-root QN. NULL when no manifest
      * member proves the crate boundary; callers must not infer one from QN
      * segment positions. */
-    const char* rust_crate_root_qn;
+    const char *rust_crate_root_qn;
     /* Rust-only module QN of the selected Cargo target source itself
      * (lib.rs, main.rs, or an explicit path). */
-    const char* rust_crate_source_module_qn;
+    const char *rust_crate_source_module_qn;
     const char* return_types;   // "|"-separated return type texts, e.g. "*File|error"
     const char* embedded_types; // "|"-separated embedded type QNs (for struct embedding)
     const char* field_defs;     // "|"-separated "name:type" pairs (for struct fields, e.g. "Binder:Binder|Name:string")

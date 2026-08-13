@@ -76,20 +76,19 @@ static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_
 #define RUST_LSP_MAX_MACRO_BINDINGS 32
 #define CBM_RUST_EVAL_STEP_CAP 200000
 
-static void rust_health_record_span(RustLSPContext *ctx, CBMRustHealthReason reason,
-                                    uint32_t start, uint32_t end) {
+static void rust_health_record_span(RustLSPContext *ctx, CBMRustHealthReason reason, uint32_t start,
+                                    uint32_t end) {
     if (!ctx || !ctx->health)
         return;
     cbm_rust_health_record(ctx->health, reason, start, end);
 }
 
-static void rust_health_record_node(RustLSPContext *ctx, CBMRustHealthReason reason,
-                                    TSNode node) {
+static void rust_health_record_node(RustLSPContext *ctx, CBMRustHealthReason reason, TSNode node) {
     uint32_t start = 0;
     uint32_t end = 0;
-    bool mapped = !ts_node_is_null(node) &&
-                  rust_map_source_range(ctx, ts_node_start_byte(node), ts_node_end_byte(node),
-                                        &start, &end);
+    bool mapped =
+        !ts_node_is_null(node) &&
+        rust_map_source_range(ctx, ts_node_start_byte(node), ts_node_end_byte(node), &start, &end);
     if (!mapped && ctx && ctx->macro_origin_valid) {
         start = ctx->macro_origin_byte;
         end = ctx->macro_origin_end_byte;
@@ -120,8 +119,8 @@ static void rust_health_record_parse_tree(CBMRustAnalysisHealth *health, TSNode 
     if (!health || ts_node_is_null(root) || !ts_node_has_error(root))
         return;
     TSNode error = rust_first_parse_error(root, 0);
-    cbm_rust_health_record(health, CBM_RUST_HEALTH_PARSER_PARSE_FAILED,
-                           ts_node_start_byte(error), ts_node_end_byte(error));
+    cbm_rust_health_record(health, CBM_RUST_HEALTH_PARSER_PARSE_FAILED, ts_node_start_byte(error),
+                           ts_node_end_byte(error));
 }
 
 static void rust_lsp_context_init_defaults(RustLSPContext *ctx) {
@@ -741,8 +740,8 @@ static size_t rust_workspace_member_qn_prefix_len(const char *module_qn,
     const char *module_tail = module_qn + project_len + 1;
     size_t best = 0;
     for (int i = 0; i < manifest->member_count; i++) {
-        size_t matched = rust_workspace_member_match_len(
-            manifest->members[i].member_path, module_tail);
+        size_t matched =
+            rust_workspace_member_match_len(manifest->members[i].member_path, module_tail);
         if (matched > best && (module_tail[matched] == '.' || module_tail[matched] == '\0')) {
             best = matched;
         }
@@ -757,9 +756,9 @@ static size_t rust_resolution_scope_prefix_len(const RustLSPContext *ctx) {
     }
     size_t prefix_len = rust_workspace_member_qn_prefix_len(
         module_qn, ctx ? (const CBMCargoManifest *)ctx->cargo_manifest : NULL);
-    const CBMCargoManifest *manifest =
-        ctx ? (const CBMCargoManifest *)ctx->cargo_manifest : NULL;
-    if (prefix_len == 0 && (!manifest || !manifest->is_workspace_root || manifest->member_count == 0)) {
+    const CBMCargoManifest *manifest = ctx ? (const CBMCargoManifest *)ctx->cargo_manifest : NULL;
+    if (prefix_len == 0 &&
+        (!manifest || !manifest->is_workspace_root || manifest->member_count == 0)) {
         prefix_len = rust_project_qn_prefix_len(module_qn);
     }
     return prefix_len;
@@ -788,21 +787,17 @@ static size_t rust_crate_path_prefix_len(const RustLSPContext *ctx) {
 }
 
 static const char *rust_canonicalize_rooted_path(CBMArena *arena, const char *path,
-                                                 const char *module_qn,
-                                                 const char *self_type_qn,
+                                                 const char *module_qn, const char *self_type_qn,
                                                  size_t crate_prefix_len) {
     if (strncmp(path, "Self::", 6) == 0 && self_type_qn) {
-        return cbm_arena_sprintf(arena, "%s.%s", self_type_qn,
-                                 convert_path_to_qn(arena, path + 6));
+        return cbm_arena_sprintf(arena, "%s.%s", self_type_qn, convert_path_to_qn(arena, path + 6));
     }
     if (strncmp(path, "self::", 6) == 0 && module_qn) {
-        return cbm_arena_sprintf(arena, "%s.%s", module_qn,
-                                 convert_path_to_qn(arena, path + 6));
+        return cbm_arena_sprintf(arena, "%s.%s", module_qn, convert_path_to_qn(arena, path + 6));
     }
     if (strncmp(path, "crate::", 7) == 0 && module_qn && crate_prefix_len > 0) {
         char *crate_qn = cbm_arena_strndup(arena, module_qn, crate_prefix_len);
-        return cbm_arena_sprintf(arena, "%s.%s", crate_qn,
-                                 convert_path_to_qn(arena, path + 7));
+        return cbm_arena_sprintf(arena, "%s.%s", crate_qn, convert_path_to_qn(arena, path + 7));
     }
     if (strncmp(path, "super::", 7) == 0 && module_qn) {
         const char *tail = path;
@@ -825,8 +820,7 @@ static const char *rust_canonicalize_rooted_path(CBMArena *arena, const char *pa
  * `self::` and `super::` retain their file-module meaning, while an available
  * target root prevents either form from escaping its crate. */
 static const char *rust_return_type_path_qn(CBMArena *arena, const char *path,
-                                            const char *module_qn,
-                                            const char *crate_root_qn,
+                                            const char *module_qn, const char *crate_root_qn,
                                             const char *crate_source_module_qn,
                                             const CBMTypeRegistry *registry) {
     const char *candidate = NULL;
@@ -834,15 +828,16 @@ static const char *rust_return_type_path_qn(CBMArena *arena, const char *path,
         if (!crate_root_qn) {
             return NULL;
         }
-        candidate = cbm_arena_sprintf(arena, "%s.%s", crate_root_qn,
-                                      convert_path_to_qn(arena, path + 7));
+        candidate =
+            cbm_arena_sprintf(arena, "%s.%s", crate_root_qn, convert_path_to_qn(arena, path + 7));
     } else {
         candidate = rust_canonicalize_rooted_path(arena, path, module_qn, NULL, 0);
         if (!candidate || !crate_root_qn) {
             return candidate ? candidate : convert_path_to_qn(arena, path);
         }
     }
-    if (!candidate) return NULL;
+    if (!candidate)
+        return NULL;
 
     size_t root_len = strlen(crate_root_qn);
     if (strncmp(candidate, crate_root_qn, root_len) != 0 ||
@@ -855,7 +850,8 @@ static const char *rust_return_type_path_qn(CBMArena *arena, const char *path,
 
     const char *source_candidate =
         cbm_arena_sprintf(arena, "%s%s", crate_source_module_qn, candidate + root_len);
-    if (!source_candidate) return NULL;
+    if (!source_candidate)
+        return NULL;
     bool root_exists = cbm_registry_lookup_type(registry, candidate) != NULL;
     bool source_exists = cbm_registry_lookup_type(registry, source_candidate) != NULL;
     if (root_exists == source_exists) {
@@ -865,7 +861,7 @@ static const char *rust_return_type_path_qn(CBMArena *arena, const char *path,
 }
 
 static bool rust_qn_is_within_resolution_scope(const RustLSPContext *ctx,
-                                                const char *candidate_qn) {
+                                               const char *candidate_qn) {
     const char *module_qn = ctx ? ctx->module_qn : NULL;
     if (!module_qn || !candidate_qn) {
         return false;
@@ -880,9 +876,10 @@ static bool rust_qn_is_within_resolution_scope(const RustLSPContext *ctx,
  * inherent method in the current crate. Macro-wrapped `use` items are opaque
  * token trees to tree-sitter; uniqueness preserves target authority without a
  * weak receiver guess. */
-static void rust_scan_explicit_receiver_methods(
-    const RustLSPContext *ctx, const CBMTypeRegistry *registry, const char *receiver_name,
-    const char *method_name, const CBMRegisteredFunc **unique, int *matches) {
+static void rust_scan_explicit_receiver_methods(const RustLSPContext *ctx,
+                                                const CBMTypeRegistry *registry,
+                                                const char *receiver_name, const char *method_name,
+                                                const CBMRegisteredFunc **unique, int *matches) {
     if (!ctx || !registry || !receiver_name || !method_name || !unique || !matches ||
         strchr(receiver_name, '.')) {
         return;
@@ -904,15 +901,16 @@ static void rust_scan_explicit_receiver_methods(
             (*matches)++;
         }
     }
-    rust_scan_explicit_receiver_methods(ctx, registry->fallback, receiver_name, method_name,
-                                        unique, matches);
+    rust_scan_explicit_receiver_methods(ctx, registry->fallback, receiver_name, method_name, unique,
+                                        matches);
 }
 
 static const CBMRegisteredFunc *rust_find_unique_explicit_receiver_method(
     const RustLSPContext *ctx, const CBMTypeRegistry *registry, const char *receiver_name,
     const char *method_name, int *matches) {
     const CBMRegisteredFunc *unique = NULL;
-    rust_scan_explicit_receiver_methods(ctx, registry, receiver_name, method_name, &unique, matches);
+    rust_scan_explicit_receiver_methods(ctx, registry, receiver_name, method_name, &unique,
+                                        matches);
     return matches && *matches == 1 ? unique : NULL;
 }
 
@@ -1306,8 +1304,7 @@ static const CBMType *rust_parse_type_node_inner(RustLSPContext *ctx, TSNode nod
  * without a parser. This is the same trade-off `cbm_rust_parse_return_type_text`
  * makes for Go. */
 static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *text,
-                                                  const char *module_qn,
-                                                  const char *crate_root_qn,
+                                                  const char *module_qn, const char *crate_root_qn,
                                                   const char *crate_source_module_qn,
                                                   const CBMTypeRegistry *registry,
                                                   const char **type_params) {
@@ -1368,9 +1365,8 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
         if (strncmp(p, "mut ", 4) == 0) {
             p += 4;
         }
-        const CBMType *elem =
-            parse_type_text_with_params(arena, p, module_qn, crate_root_qn,
-                                        crate_source_module_qn, registry, type_params);
+        const CBMType *elem = parse_type_text_with_params(
+            arena, p, module_qn, crate_root_qn, crate_source_module_qn, registry, type_params);
         return cbm_type_reference(arena, elem);
     }
 
@@ -1382,10 +1378,9 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
         } else if (strncmp(p, "mut ", 4) == 0) {
             p += 4;
         }
-        return cbm_type_pointer(arena,
-                                parse_type_text_with_params(
-                                    arena, p, module_qn, crate_root_qn, crate_source_module_qn,
-                                    registry, type_params));
+        return cbm_type_pointer(
+            arena, parse_type_text_with_params(arena, p, module_qn, crate_root_qn,
+                                               crate_source_module_qn, registry, type_params));
     }
 
     /* Slice: [T] */
@@ -1404,10 +1399,9 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
                 *q-- = '\0';
             }
         }
-        return cbm_type_slice(arena,
-                              parse_type_text_with_params(
-                                  arena, inner, module_qn, crate_root_qn, crate_source_module_qn,
-                                  registry, type_params));
+        return cbm_type_slice(
+            arena, parse_type_text_with_params(arena, inner, module_qn, crate_root_qn,
+                                               crate_source_module_qn, registry, type_params));
     }
 
     /* Unit / never */
@@ -1500,10 +1494,9 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
                         start++;
                     /* Skip lifetime args. */
                     if (*start != '\'' && *start && targ_count < 15) {
-                        targs[targ_count++] =
-                            parse_type_text_with_params(
-                                arena, start, module_qn, crate_root_qn, crate_source_module_qn,
-                                registry, type_params);
+                        targs[targ_count++] = parse_type_text_with_params(
+                            arena, start, module_qn, crate_root_qn, crate_source_module_qn,
+                            registry, type_params);
                     }
                     if (save == '\0')
                         break;
@@ -1545,8 +1538,8 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
     /* Has `::` → absolute path; treat dotted paths as already-qualified
      * QNs (cross-file callers pass module-qualified text directly). */
     if (strstr(text, "::")) {
-        const char *rooted = rust_return_type_path_qn(
-            arena, text, module_qn, crate_root_qn, crate_source_module_qn, registry);
+        const char *rooted = rust_return_type_path_qn(arena, text, module_qn, crate_root_qn,
+                                                      crate_source_module_qn, registry);
         return rooted ? cbm_type_named(arena, rooted) : cbm_type_unknown();
     }
     if (strchr(text, '.')) {
@@ -1557,8 +1550,7 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
 
 /* Public-ish helper used by the cross-file path. */
 static const CBMType *rust_parse_return_type_text(CBMArena *arena, const char *text,
-                                                  const char *module_qn,
-                                                  const char *crate_root_qn,
+                                                  const char *module_qn, const char *crate_root_qn,
                                                   const char *crate_source_module_qn,
                                                   const CBMTypeRegistry *registry) {
     return parse_type_text_with_params(arena, text, module_qn, crate_root_qn,
@@ -1576,10 +1568,9 @@ static const CBMType *rust_signature_param_type_adapter(CBMArena *arena, const c
                                                         void *parser_ctx) {
     const RustSignatureParamParserContext *ctx =
         (const RustSignatureParamParserContext *)parser_ctx;
-    return rust_parse_return_type_text(arena, text, ctx ? ctx->module_qn : NULL,
-                                       ctx ? ctx->crate_root_qn : NULL,
-                                       ctx ? ctx->crate_source_module_qn : NULL,
-                                       ctx ? ctx->registry : NULL);
+    return rust_parse_return_type_text(
+        arena, text, ctx ? ctx->module_qn : NULL, ctx ? ctx->crate_root_qn : NULL,
+        ctx ? ctx->crate_source_module_qn : NULL, ctx ? ctx->registry : NULL);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -1781,8 +1772,7 @@ static const CBMType *rust_substitute_self(CBMArena *arena, const CBMType *type,
     case CBM_TYPE_REFERENCE:
         return type->data.reference.elem
                    ? cbm_type_reference(
-                         arena,
-                         rust_substitute_self(arena, type->data.reference.elem, receiver_qn))
+                         arena, rust_substitute_self(arena, type->data.reference.elem, receiver_qn))
                    : type;
     case CBM_TYPE_POINTER:
         return type->data.pointer.elem
@@ -1791,8 +1781,8 @@ static const CBMType *rust_substitute_self(CBMArena *arena, const CBMType *type,
                    : type;
     case CBM_TYPE_SLICE:
         return type->data.slice.elem
-                   ? cbm_type_slice(
-                         arena, rust_substitute_self(arena, type->data.slice.elem, receiver_qn))
+                   ? cbm_type_slice(arena,
+                                    rust_substitute_self(arena, type->data.slice.elem, receiver_qn))
                    : type;
     case CBM_TYPE_TEMPLATE: {
         int count = type->data.template_type.arg_count;
@@ -1804,8 +1794,8 @@ static const CBMType *rust_substitute_self(CBMArena *arena, const CBMType *type,
         for (int i = 0; i < count; i++) {
             if (!type->data.template_type.template_args[i])
                 return type;
-            args[i] = rust_substitute_self(arena, type->data.template_type.template_args[i],
-                                           receiver_qn);
+            args[i] =
+                rust_substitute_self(arena, type->data.template_type.template_args[i], receiver_qn);
             if (!args[i])
                 return type;
         }
@@ -1821,8 +1811,7 @@ static const CBMType *rust_substitute_self(CBMArena *arena, const CBMType *type,
         for (int i = 0; i < count; i++) {
             if (!type->data.tuple.elems[i])
                 return type;
-            items[i] =
-                rust_substitute_self(arena, type->data.tuple.elems[i], receiver_qn);
+            items[i] = rust_substitute_self(arena, type->data.tuple.elems[i], receiver_qn);
             if (!items[i])
                 return type;
         }
@@ -2038,8 +2027,8 @@ static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node
                 char *explicit_receiver = NULL;
                 char *source_sep = strstr(path, "::");
                 if (source_sep && strstr(source_sep + 2, "::") == NULL) {
-                    explicit_receiver = cbm_arena_strndup(ctx->arena, path,
-                                                          (size_t)(source_sep - path));
+                    explicit_receiver =
+                        cbm_arena_strndup(ctx->arena, path, (size_t)(source_sep - path));
                 }
                 const char *qn = rust_resolve_path_expr(ctx, path);
                 if (qn) {
@@ -4040,8 +4029,8 @@ static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const
                 int after = macro_consume_balanced(xs, xs_len, xp + 1);
                 int body_end = after - 1;
                 /* Emit the body recursively substituted. */
-                char *inner = macro_substitute(arena, xs + body_start, body_end - body_start, env,
-                                               truncated);
+                char *inner =
+                    macro_substitute(arena, xs + body_start, body_end - body_start, env, truncated);
                 if (inner) {
                     int il = (int)strlen(inner);
                     if (op + il < cap) {
@@ -5054,8 +5043,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         char *explicit_receiver = NULL;
         char *source_sep = strstr(path, "::");
         if (source_sep && strstr(source_sep + 2, "::") == NULL) {
-            explicit_receiver = cbm_arena_strndup(ctx->arena, path,
-                                                  (size_t)(source_sep - path));
+            explicit_receiver = cbm_arena_strndup(ctx->arena, path, (size_t)(source_sep - path));
         }
 
         if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
@@ -5137,9 +5125,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             }
             if (!m) {
                 int matches = 0;
-                m = rust_find_unique_explicit_receiver_method(ctx, ctx->registry,
-                                                               explicit_receiver,
-                                                               short_name, &matches);
+                m = rust_find_unique_explicit_receiver_method(ctx, ctx->registry, explicit_receiver,
+                                                              short_name, &matches);
             }
             if (m) {
                 rust_emit_resolved_call(ctx, m->qualified_name,
@@ -5302,8 +5289,7 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
     /* Pathological-input guard: bail out once we've spent too many
      * eval steps on this file. Prevents hangs on adversarial input. */
     if (ctx->eval_step_count > ctx->max_eval_steps) {
-        if (!ctx->health ||
-            ctx->health->issues[CBM_RUST_HEALTH_WORK_LIMIT].count == 0) {
+        if (!ctx->health || ctx->health->issues[CBM_RUST_HEALTH_WORK_LIMIT].count == 0) {
             rust_health_record_node(ctx, CBM_RUST_HEALTH_WORK_LIMIT, node);
         }
         return;
@@ -6322,9 +6308,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                         return;
                     }
                     for (int j = 0; j < count; j++) {
-                        ret_types[j] =
-                            rust_parse_return_type_text(arena, d->return_types[j], module_qn,
-                                                        NULL, NULL, NULL);
+                        ret_types[j] = rust_parse_return_type_text(arena, d->return_types[j],
+                                                                   module_qn, NULL, NULL, NULL);
                     }
                     ret_types[count] = NULL;
                 }
@@ -6336,17 +6321,16 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     return;
                 }
                 ret_types[0] =
-                    rust_parse_return_type_text(arena, d->return_type, module_qn, NULL, NULL,
-                                                NULL);
+                    rust_parse_return_type_text(arena, d->return_type, module_qn, NULL, NULL, NULL);
                 ret_types[1] = NULL;
             }
             const CBMType **param_types = NULL;
             const char **param_names = d->param_names;
             if (d->signature_param_types || d->signature_param_count > 0) {
                 RustSignatureParamParserContext parser_ctx = {.module_qn = module_qn,
-                                                               .crate_root_qn = NULL,
-                                                               .crate_source_module_qn = NULL,
-                                                               .registry = reg};
+                                                              .crate_root_qn = NULL,
+                                                              .crate_source_module_qn = NULL,
+                                                              .registry = reg};
                 param_types = cbm_type_materialize_signature_params(
                     arena, d->signature_param_types, d->signature_param_count,
                     rust_signature_param_type_adapter, &parser_ctx);
@@ -6359,9 +6343,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     param_types = (const CBMType **)cbm_arena_alloc(
                         arena, (count + 1) * sizeof(const CBMType *));
                     for (int j = 0; j < count; j++) {
-                        param_types[j] =
-                            rust_parse_return_type_text(arena, d->param_types[j], module_qn,
-                                                        NULL, NULL, reg);
+                        param_types[j] = rust_parse_return_type_text(arena, d->param_types[j],
+                                                                     module_qn, NULL, NULL, reg);
                     }
                     param_types[count] = NULL;
                 }
@@ -6545,8 +6528,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 if (strcmp(rf->qualified_name, fn_qn) != 0)
                     continue;
                 const CBMType **ret_arr = (const CBMType **)cbm_arena_alloc_class(
-                    arena, 2 * sizeof(const CBMType *),
-                    CBM_ARENA_ALLOCATION_RUST_AST_RETURN_PATCH);
+                    arena, 2 * sizeof(const CBMType *), CBM_ARENA_ALLOCATION_RUST_AST_RETURN_PATCH);
                 if (!ret_arr) {
                     return;
                 }
@@ -6818,10 +6800,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                         continue;
                     if (strcmp(rf->short_name, mname) != 0)
                         continue;
-                    const CBMType **ret_arr =
-                        (const CBMType **)cbm_arena_alloc_class(
-                            arena, 2 * sizeof(const CBMType *),
-                            CBM_ARENA_ALLOCATION_RUST_IMPL_RETURN);
+                    const CBMType **ret_arr = (const CBMType **)cbm_arena_alloc_class(
+                        arena, 2 * sizeof(const CBMType *), CBM_ARENA_ALLOCATION_RUST_IMPL_RETURN);
                     if (!ret_arr) {
                         return;
                     }
@@ -7039,16 +7019,15 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                     if (*p == '|')
                         count++;
                 }
-                ret_types =
-                    (const CBMType **)cbm_arena_alloc_class(
-                        arena, (size_t)(count + 1) * sizeof(const CBMType *),
-                        CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_ARRAY);
+                ret_types = (const CBMType **)cbm_arena_alloc_class(
+                    arena, (size_t)(count + 1) * sizeof(const CBMType *),
+                    CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_ARRAY);
                 if (!ret_types) {
                     return;
                 }
                 int idx = 0;
-                char *buf = cbm_arena_strdup_class(
-                    arena, d->return_types, CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_BUFFER);
+                char *buf = cbm_arena_strdup_class(arena, d->return_types,
+                                                   CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_BUFFER);
                 if (!buf) {
                     return;
                 }
@@ -7058,9 +7037,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                         char save = *p;
                         *p = '\0';
                         if (start[0]) {
-                            ret_types[idx++] = rust_parse_return_type_text(
-                                arena, start, def_mod, d->crate_root_qn,
-                                d->crate_source_module_qn, reg);
+                            ret_types[idx++] =
+                                rust_parse_return_type_text(arena, start, def_mod, d->crate_root_qn,
+                                                            d->crate_source_module_qn, reg);
                         }
                         if (save == '\0')
                             break;
@@ -7069,11 +7048,11 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                 }
                 ret_types[idx] = NULL;
             }
-            RustSignatureParamParserContext parser_ctx = {
-                .module_qn = def_mod,
-                .crate_root_qn = d->crate_root_qn,
-                .crate_source_module_qn = d->crate_source_module_qn,
-                .registry = reg};
+            RustSignatureParamParserContext parser_ctx = {.module_qn = def_mod,
+                                                          .crate_root_qn = d->crate_root_qn,
+                                                          .crate_source_module_qn =
+                                                              d->crate_source_module_qn,
+                                                          .registry = reg};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 rust_signature_param_type_adapter, &parser_ctx);
@@ -7122,8 +7101,7 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSNode root,
                                           const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out,
-                                          CBMCallArray *synthetic_calls,
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
                                           CBMRustAnalysisHealth *health) {
     RustLSPContext ctx;
     rust_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
@@ -7184,11 +7162,13 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
 
 /* Cross-file Rust resolve using a pre-built shared registry (Tier-2). Skips the
  * per-file registry build; just parse + resolve. Mirrors cbm_run_c_lsp_cross_with_registry. */
-void cbm_run_rust_lsp_cross_with_registry(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
-    int import_count, TSTree *cached_tree, const struct CBMCargoManifest *manifest,
-    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health) {
+void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, const CBMTypeRegistry *reg,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          const struct CBMCargoManifest *manifest,
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMRustAnalysisHealth *health) {
     if (health)
         health->required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
     if (!source || source_len <= 0) {
@@ -7231,11 +7211,13 @@ void cbm_run_rust_lsp_cross_with_registry(
     }
 }
 
-void cbm_run_rust_lsp_cross_with_manifest(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    CBMRustLSPDef *defs, int def_count, const char **import_names, const char **import_qns,
-    int import_count, TSTree *cached_tree, const struct CBMCargoManifest *manifest,
-    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health) {
+void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, CBMRustLSPDef *defs, int def_count,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          const struct CBMCargoManifest *manifest,
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMRustAnalysisHealth *health) {
     if (health)
         health->required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
     if (!source || source_len <= 0) {

@@ -138,8 +138,8 @@ TEST(extract_string_allocation_failure_is_sticky_at_file_boundary) {
 }
 
 TEST(extract_node_stack_growth_reports_whole_subtree_loss) {
-    CBMFileResult *parsed = extract("const a = 1;\nconst b = 2;\n", CBM_LANG_JAVASCRIPT,
-                                    "test", "src/two.js");
+    CBMFileResult *parsed =
+        extract("const a = 1;\nconst b = 2;\n", CBM_LANG_JAVASCRIPT, "test", "src/two.js");
     ASSERT_NOT_NULL(parsed);
     ASSERT_NOT_NULL(parsed->cached_tree);
     TSNode root = ts_tree_root_node(parsed->cached_tree);
@@ -843,23 +843,22 @@ TEST(rust_struct) {
 }
 
 TEST(rust_nested_associated_call_preserves_each_exact_carrier) {
-    const char *source =
-        "struct Builder;\n"
-        "impl Builder {\n"
-        "    fn new_multi_thread() -> Builder { Builder }\n"
-        "    fn enable_all(&mut self) -> &mut Self { self }\n"
-        "    fn build(&mut self) {}\n"
-        "}\n"
-        "fn exact() { Builder::new_multi_thread().enable_all().build(); }\n";
+    const char *source = "struct Builder;\n"
+                         "impl Builder {\n"
+                         "    fn new_multi_thread() -> Builder { Builder }\n"
+                         "    fn enable_all(&mut self) -> &mut Self { self }\n"
+                         "    fn build(&mut self) {}\n"
+                         "}\n"
+                         "fn exact() { Builder::new_multi_thread().enable_all().build(); }\n";
     CBMFileResult *r = extract(source, CBM_LANG_RUST, "test", "src/lib.rs");
     ASSERT_NOT_NULL(r);
 
-    const char *expected_names[] = {
-        "Builder::new_multi_thread", "Builder::new_multi_thread().enable_all",
-        "Builder::new_multi_thread().enable_all().build"};
-    const char *expected_sites[] = {
-        "Builder::new_multi_thread()", "Builder::new_multi_thread().enable_all()",
-        "Builder::new_multi_thread().enable_all().build()"};
+    const char *expected_names[] = {"Builder::new_multi_thread",
+                                    "Builder::new_multi_thread().enable_all",
+                                    "Builder::new_multi_thread().enable_all().build"};
+    const char *expected_sites[] = {"Builder::new_multi_thread()",
+                                    "Builder::new_multi_thread().enable_all()",
+                                    "Builder::new_multi_thread().enable_all().build()"};
     for (int expected = 0; expected < 3; expected++) {
         int count = 0;
         for (int i = 0; i < r->calls.count; i++) {

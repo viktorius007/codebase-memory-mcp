@@ -2685,8 +2685,9 @@ static char *format_cypher_diagnostic(const char *query, const cbm_cypher_diagno
         } else {
             snprintf(unexpected, sizeof(unexpected), "byte 0x%02X", diagnostic->unexpected_byte);
         }
-        snprintf(summary, sizeof(summary), "Invalid Cypher query: unsupported character %s at byte %d",
-                 unexpected, diagnostic->byte_position);
+        snprintf(summary, sizeof(summary),
+                 "Invalid Cypher query: unsupported character %s at byte %d", unexpected,
+                 diagnostic->byte_position);
         snprintf(remedy, sizeof(remedy),
                  "Remedy: remove the unsupported character and retry with read-only Cypher; for "
                  "example, MATCH (n:Function) RETURN n.name LIMIT 10.");

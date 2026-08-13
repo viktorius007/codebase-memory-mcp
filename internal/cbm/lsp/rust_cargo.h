@@ -45,12 +45,12 @@ typedef enum {
 
 typedef struct {
     CBMCargoTargetKind kind;
-    const char* name;       /* explicit target name; NULL for defaults */
-    const char* package_dir; /* repository-relative owning package directory */
-    const char* blocker_root; /* unsupported target module subtree, if any */
+    const char *name;         /* explicit target name; NULL for defaults */
+    const char *package_dir;  /* repository-relative owning package directory */
+    const char *blocker_root; /* unsupported target module subtree, if any */
     /* Parser output is package-relative. The pipeline manifest builder rebases
      * these to repository-relative paths before the manifest reaches routing. */
-    const char* source_path;
+    const char *source_path;
 } CBMCargoTarget;
 
 typedef struct CBMCargoManifest {
@@ -70,9 +70,9 @@ typedef struct CBMCargoManifest {
     bool autobins;
     bool auto_build;
     bool has_lib_table;
-    const char* build_path;
+    const char *build_path;
 
-    CBMCargoTarget* targets;
+    CBMCargoTarget *targets;
     int target_count;
     int target_cap;
     bool targets_complete;
@@ -88,13 +88,13 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     CBMCargoManifest* out);
 
 /* Append one typed target path. Arena growth preserves every prior entry. */
-bool cbm_cargo_add_target(CBMArena* arena, CBMCargoManifest* manifest,
-    CBMCargoTargetKind kind, const char* source_path);
-bool cbm_cargo_add_named_target(CBMArena* arena, CBMCargoManifest* manifest,
-    CBMCargoTargetKind kind, const char* name, const char* source_path);
-bool cbm_cargo_add_routed_target(CBMArena* arena, CBMCargoManifest* manifest,
-    CBMCargoTargetKind kind, const char* name, const char* package_dir,
-    const char* source_path, const char* blocker_root);
+bool cbm_cargo_add_target(CBMArena *arena, CBMCargoManifest *manifest, CBMCargoTargetKind kind,
+                          const char *source_path);
+bool cbm_cargo_add_named_target(CBMArena *arena, CBMCargoManifest *manifest,
+                                CBMCargoTargetKind kind, const char *name, const char *source_path);
+bool cbm_cargo_add_routed_target(CBMArena *arena, CBMCargoManifest *manifest,
+                                 CBMCargoTargetKind kind, const char *name, const char *package_dir,
+                                 const char *source_path, const char *blocker_root);
 
 /* Convenience: does a given path-prefix look like one of the listed
  * dependency names? Used by the resolver to recognise external crate

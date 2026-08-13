@@ -331,8 +331,8 @@ typedef struct {
 } PxcRustTargetRoute;
 
 static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *project_name,
-                                                 const char *rel_path,
-                                                 const CBMCargoManifest *manifest) {
+                                                const char *rel_path,
+                                                const CBMCargoManifest *manifest) {
     PxcRustTargetRoute route = {0};
     if (!arena || !project_name || !rel_path || !manifest || !manifest->targets ||
         !manifest->targets_complete) {
@@ -344,16 +344,17 @@ static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *pro
     for (int i = 0; i < manifest->target_count; i++) {
         const CBMCargoTarget *target = &manifest->targets[i];
         const char *source = target->source_path;
-        if (!source) continue;
+        if (!source)
+            continue;
         bool exact = strcmp(rel_path, source) == 0;
-        bool production = target->kind == CBM_CARGO_TARGET_LIB ||
-                          target->kind == CBM_CARGO_TARGET_BIN;
+        bool production =
+            target->kind == CBM_CARGO_TARGET_LIB || target->kind == CBM_CARGO_TARGET_BIN;
         const char *owner_root = production ? target->package_dir : target->blocker_root;
         size_t owner_len = owner_root ? strlen(owner_root) : 0;
-        bool contained = owner_root &&
-                         ((owner_len == 0) ||
-                          (owner_len > 0 && strncmp(rel_path, owner_root, owner_len) == 0 &&
-                           rel_path[owner_len] == '/'));
+        bool contained =
+            owner_root &&
+            ((owner_len == 0) || (owner_len > 0 && strncmp(rel_path, owner_root, owner_len) == 0 &&
+                                  rel_path[owner_len] == '/'));
         if (contained && production) {
             for (int j = 0; j < manifest->target_count; j++) {
                 const char *nested = manifest->targets[j].package_dir;
@@ -369,7 +370,8 @@ static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *pro
             selected = target;
             exact_matches++;
         } else if (contained) {
-            if (exact_matches == 0) selected = target;
+            if (exact_matches == 0)
+                selected = target;
             contained_matches++;
         }
     }
@@ -386,9 +388,8 @@ static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *pro
         route.allocation_failed = true;
         return route;
     }
-    char *root = pxc_test_fail_target_route_alloc()
-                     ? NULL
-                     : cbm_pipeline_fqn_module(project_name, root_rel);
+    char *root =
+        pxc_test_fail_target_route_alloc() ? NULL : cbm_pipeline_fqn_module(project_name, root_rel);
     char *source_module = cbm_pipeline_fqn_module(project_name, selected_source);
     if (!root || !source_module) {
         free(root);
@@ -482,8 +483,7 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count, CBMPxcCollectStatus *out_status,
-                                    int *out_def_starts,
-                                    const CBMCargoManifest *rust_manifest) {
+                                    int *out_def_starts, const CBMCargoManifest *rust_manifest) {
     *out_status = CBM_PXC_COLLECT_EMPTY;
     int total = 0;
     for (int i = 0; i < file_count; i++) {
@@ -531,8 +531,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         const char *namespace_name = cache[fi]->namespace_name;
         PxcRustTargetRoute rust_route = {0};
         if (files[fi].language == CBM_LANG_RUST) {
-            rust_route = pxc_rust_target_route(&cache[fi]->arena, project_name,
-                                                files[fi].rel_path, rust_manifest);
+            rust_route = pxc_rust_target_route(&cache[fi]->arena, project_name, files[fi].rel_path,
+                                               rust_manifest);
             if (rust_route.allocation_failed) {
                 materialization_failed = true;
                 break;
@@ -554,9 +554,9 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         }
         if (files[fi].language == CBM_LANG_RUST) {
             for (int ii = 0; ii < cache[fi]->impl_traits.count; ii++) {
-                if (pxc_build_rust_impl_relation(
-                        &cache[fi]->arena, &cache[fi]->impl_traits.items[ii], def_modules[fi],
-                        rust_route, &defs[idx]) == 0) {
+                if (pxc_build_rust_impl_relation(&cache[fi]->arena,
+                                                 &cache[fi]->impl_traits.items[ii], def_modules[fi],
+                                                 rust_route, &defs[idx]) == 0) {
                     idx++;
                 }
             }
@@ -882,9 +882,8 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     }
 }
 
-bool cbm_pxc_collection_requires_abort(CBMFileResult *const *cache,
-                                       const cbm_file_info_t *files, int file_count,
-                                       CBMPxcCollectStatus status) {
+bool cbm_pxc_collection_requires_abort(CBMFileResult *const *cache, const cbm_file_info_t *files,
+                                       int file_count, CBMPxcCollectStatus status) {
     if (status != CBM_PXC_COLLECT_ALLOCATION_FAILED) {
         return false;
     }
@@ -997,8 +996,7 @@ static PxcAppendStatus pxc_append_results(CBMArena *dst_arena, CBMResolvedCallAr
                 goto done;
             }
             void *prior = cbm_ht_get(seen, k);
-            if (!prior || rc->confidence >
-                              dst_calls->items[(int)(uintptr_t)prior - 1].confidence) {
+            if (!prior || rc->confidence > dst_calls->items[(int)(uintptr_t)prior - 1].confidence) {
                 const char *stored = cbm_ht_get_key(seen, k);
                 void *expected = (void *)(uintptr_t)(i + 1);
                 cbm_ht_set(seen, stored ? stored : k, expected);
@@ -1128,17 +1126,13 @@ static bool pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
         if (!pxc_copy_destination_string(dst_arena, src->callee_name, &dst.callee_name) ||
             !pxc_copy_destination_string(dst_arena, src->enclosing_func_qn,
                                          &dst.enclosing_func_qn) ||
-            !pxc_copy_destination_string(dst_arena, src->first_string_arg,
-                                         &dst.first_string_arg) ||
-            !pxc_copy_destination_string(dst_arena, src->second_arg_name,
-                                         &dst.second_arg_name)) {
+            !pxc_copy_destination_string(dst_arena, src->first_string_arg, &dst.first_string_arg) ||
+            !pxc_copy_destination_string(dst_arena, src->second_arg_name, &dst.second_arg_name)) {
             goto done;
         }
         for (int ai = 0; ai < CBM_MAX_CALL_ARGS; ai++) {
-            if (!pxc_copy_destination_string(dst_arena, src->args[ai].expr,
-                                             &dst.args[ai].expr) ||
-                !pxc_copy_destination_string(dst_arena, src->args[ai].value,
-                                             &dst.args[ai].value) ||
+            if (!pxc_copy_destination_string(dst_arena, src->args[ai].expr, &dst.args[ai].expr) ||
+                !pxc_copy_destination_string(dst_arena, src->args[ai].value, &dst.args[ai].value) ||
                 !pxc_copy_destination_string(dst_arena, src->args[ai].keyword,
                                              &dst.args[ai].keyword)) {
                 goto done;
@@ -1165,15 +1159,15 @@ static uint32_t pxc_saturating_add(uint32_t left, uint32_t right) {
 }
 
 static CBMPxcDispatchStatus pxc_destination_status(CBMLanguage lang, CBMFileResult *result,
-                                                    CBMPxcDispatchStatus status) {
+                                                   CBMPxcDispatchStatus status) {
     if (cbm_file_result_status(result) == CBM_FILE_STATUS_COMPLETE &&
         status == CBM_PXC_DISPATCH_COMPLETE) {
         return status;
     }
     if (lang == CBM_LANG_RUST) {
         if (result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count == 0) {
-            cbm_rust_health_record(&result->rust_health,
-                                   CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+            cbm_rust_health_record(&result->rust_health, CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0,
+                                   0);
         }
         result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
     }
@@ -1186,8 +1180,7 @@ bool cbm_pxc_test_non_rust_destination_failure_is_typed(void) {
     cbm_arena_init(&result.arena);
     cbm_arena_test_fail_after(&result.arena, 0);
     (void)cbm_arena_alloc(&result.arena, 1);
-    bool typed = pxc_destination_status(CBM_LANG_PYTHON, &result,
-                                        CBM_PXC_DISPATCH_COMPLETE) ==
+    bool typed = pxc_destination_status(CBM_LANG_PYTHON, &result, CBM_PXC_DISPATCH_COMPLETE) ==
                  CBM_PXC_DISPATCH_ALLOCATION_FAILED;
     cbm_arena_destroy(&result.arena);
     return typed;
@@ -1196,8 +1189,8 @@ bool cbm_pxc_test_non_rust_destination_failure_is_typed(void) {
 
 static void pxc_finalize_rust_publication(CBMFileResult *result, uint32_t resolved_before,
                                           uint32_t unresolved_before,
-                                          PxcAppendStatus resolved_status,
-                                          bool synthetic_complete, bool scratch_complete) {
+                                          PxcAppendStatus resolved_status, bool synthetic_complete,
+                                          bool scratch_complete) {
     result->rust_health.resolved_emitted =
         pxc_saturating_add(resolved_before, resolved_status.resolved_emitted);
     result->rust_health.unresolved_emitted =
@@ -1209,8 +1202,7 @@ static void pxc_finalize_rust_publication(CBMFileResult *result, uint32_t resolv
 }
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-bool cbm_pxc_test_append_results(CBMFileResult *destination,
-                                 const CBMResolvedCallArray *source) {
+bool cbm_pxc_test_append_results(CBMFileResult *destination, const CBMResolvedCallArray *source) {
     uint32_t resolved_before = destination->rust_health.resolved_emitted;
     uint32_t unresolved_before = destination->rust_health.unresolved_emitted;
     PxcAppendStatus status =
@@ -1220,13 +1212,11 @@ bool cbm_pxc_test_append_results(CBMFileResult *destination,
     return status.complete;
 }
 
-bool cbm_pxc_test_append_synthetic_calls(CBMFileResult *destination,
-                                         const CBMCallArray *source) {
-    bool complete =
-        pxc_append_synthetic_calls(&destination->arena, &destination->calls, source);
+bool cbm_pxc_test_append_synthetic_calls(CBMFileResult *destination, const CBMCallArray *source) {
+    bool complete = pxc_append_synthetic_calls(&destination->arena, &destination->calls, source);
     if (!complete) {
-        cbm_rust_health_record(&destination->rust_health,
-                               CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+        cbm_rust_health_record(&destination->rust_health, CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0,
+                               0);
     }
     return complete;
 }
@@ -1273,10 +1263,11 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * 1100-file repo before this fix). Output gets copied into the file's own
  * arena and merged into result->resolved_calls. */
 static CBMPxcDispatchStatus pxc_run_one_with_manifest(CBMLanguage lang, CBMFileResult *r,
-                                      const char *source,
-                                      int source_len, const char *module_qn, CBMLSPDef *defs,
-                                      int def_count, const char **imp_names, const char **imp_qns,
-                                      int imp_count, const CBMCargoManifest *rust_manifest) {
+                                                      const char *source, int source_len,
+                                                      const char *module_qn, CBMLSPDef *defs,
+                                                      int def_count, const char **imp_names,
+                                                      const char **imp_qns, int imp_count,
+                                                      const CBMCargoManifest *rust_manifest) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -1328,10 +1319,9 @@ static CBMPxcDispatchStatus pxc_run_one_with_manifest(CBMLanguage lang, CBMFileR
          * workspace manifest (set once by the sequential driver) lets
          * `crate_a::foo` route across the crate boundary (#56). */
         CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
-        cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
-                                             def_count, imp_names, imp_qns, imp_count, tree,
-                                             rust_manifest, &out, &synthetic_calls,
-                                             &r->rust_health);
+        cbm_run_rust_lsp_cross_with_manifest(
+            &scratch, source, source_len, module_qn, rdefs, def_count, imp_names, imp_qns,
+            imp_count, tree, rust_manifest, &out, &synthetic_calls, &r->rust_health);
         break;
     }
     default:
@@ -1339,13 +1329,11 @@ static CBMPxcDispatchStatus pxc_run_one_with_manifest(CBMLanguage lang, CBMFileR
     }
 
     PxcAppendStatus resolved_status = pxc_append_results(&r->arena, &r->resolved_calls, &out);
-    bool synthetic_complete =
-        pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
+    bool synthetic_complete = pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
     bool scratch_complete = cbm_arena_status(&scratch) == CBM_ARENA_STATUS_AVAILABLE;
     if (lang == CBM_LANG_RUST) {
-        pxc_finalize_rust_publication(
-            r, rust_resolved_before, rust_unresolved_before, resolved_status, synthetic_complete,
-            scratch_complete);
+        pxc_finalize_rust_publication(r, rust_resolved_before, rust_unresolved_before,
+                                      resolved_status, synthetic_complete, scratch_complete);
     }
     cbm_arena_destroy(&scratch);
     return resolved_status.complete && synthetic_complete && scratch_complete
@@ -1362,11 +1350,12 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
 
 /* Variant of cbm_pxc_run_one for TS/JS/JSX/TSX with explicit dialect
  * flags. Same scratch-arena lifecycle as cbm_pxc_run_one. */
-static CBMPxcDispatchStatus pxc_run_one_ts_status(
-                        CBMFileResult *r, const char *source, int source_len, const char *module_qn,
-                        CBMLSPDef *defs, int def_count, const char **imp_names,
-                        const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
-                        bool dts_mode) {
+static CBMPxcDispatchStatus pxc_run_one_ts_status(CBMFileResult *r, const char *source,
+                                                  int source_len, const char *module_qn,
+                                                  CBMLSPDef *defs, int def_count,
+                                                  const char **imp_names, const char **imp_qns,
+                                                  int imp_count, bool js_mode, bool jsx_mode,
+                                                  bool dts_mode) {
     CBMArena scratch;
     cbm_arena_init(&scratch);
     CBMResolvedCallArray out;
@@ -1409,14 +1398,13 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * `rust_shared_get` supplies the lazily-built shared Rust all-defs registry
  * (the parallel resolver owns its once-guard); NULL means "no shared rust
  * registry available" and rust NULL-filter files take the per-file build. */
-CBMPxcDispatchStatus cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result,
-                           const char *source,
-                           int source_len, const char *rel, const char *def_module,
-                           const CBMCrossLspRegistries *cross_registries,
-                           const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
-                           int all_def_count, const char **imp_keys, const char **imp_vals,
-                           int imp_count, const CBMCargoManifest *rust_manifest,
-                           CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx) {
+CBMPxcDispatchStatus cbm_pxc_dispatch_file(
+    CBMLanguage lang, CBMFileResult *result, const char *source, int source_len, const char *rel,
+    const char *def_module, const CBMCrossLspRegistries *cross_registries,
+    const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs, int all_def_count,
+    const char **imp_keys, const char **imp_vals, int imp_count,
+    const CBMCargoManifest *rust_manifest, CBMTypeRegistry *(*rust_shared_get)(void *),
+    void *rust_shared_ctx) {
     if (!result) {
         return CBM_PXC_DISPATCH_COMPLETE;
     }
@@ -1544,23 +1532,22 @@ CBMPxcDispatchStatus cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *resu
             CBMCallArray synthetic_calls = {0};
             uint32_t rust_resolved_before = result->rust_health.resolved_emitted;
             uint32_t rust_unresolved_before = result->rust_health.unresolved_emitted;
-            cbm_run_rust_lsp_cross_with_registry(&scratch, source, source_len, def_module, shared,
-                                                 imp_keys, imp_vals, imp_count, result->cached_tree,
-                                                 rust_manifest, &out, &synthetic_calls,
-                                                 &result->rust_health);
+            cbm_run_rust_lsp_cross_with_registry(
+                &scratch, source, source_len, def_module, shared, imp_keys, imp_vals, imp_count,
+                result->cached_tree, rust_manifest, &out, &synthetic_calls, &result->rust_health);
             PxcAppendStatus resolved_status =
                 pxc_append_results(&result->arena, &result->resolved_calls, &out);
-            bool synthetic_complete = pxc_append_synthetic_calls(
-                &result->arena, &result->calls, &synthetic_calls);
-            pxc_finalize_rust_publication(
-                result, rust_resolved_before, rust_unresolved_before, resolved_status,
-                synthetic_complete, cbm_arena_status(&scratch) == CBM_ARENA_STATUS_AVAILABLE);
+            bool synthetic_complete =
+                pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
+            pxc_finalize_rust_publication(result, rust_resolved_before, rust_unresolved_before,
+                                          resolved_status, synthetic_complete,
+                                          cbm_arena_status(&scratch) == CBM_ARENA_STATUS_AVAILABLE);
             cbm_arena_destroy(&scratch);
-            publication_status = resolved_status.complete && synthetic_complete &&
-                                         cbm_arena_status(&result->arena) ==
-                                             CBM_ARENA_STATUS_AVAILABLE
-                                     ? CBM_PXC_DISPATCH_COMPLETE
-                                     : CBM_PXC_DISPATCH_ALLOCATION_FAILED;
+            publication_status =
+                resolved_status.complete && synthetic_complete &&
+                        cbm_arena_status(&result->arena) == CBM_ARENA_STATUS_AVAILABLE
+                    ? CBM_PXC_DISPATCH_COMPLETE
+                    : CBM_PXC_DISPATCH_ALLOCATION_FAILED;
         } else {
             publication_status = pxc_run_one_with_manifest(
                 lang, result, source, source_len, def_module, file_defs, file_def_count, imp_keys,
@@ -1571,29 +1558,30 @@ CBMPxcDispatchStatus cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *resu
         bool jsx;
         bool dts;
         cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
-        publication_status = pxc_run_one_ts_status(result, source, source_len, def_module,
-                                                    file_defs, file_def_count, imp_keys, imp_vals,
-                                                    imp_count, js, jsx, dts);
+        publication_status =
+            pxc_run_one_ts_status(result, source, source_len, def_module, file_defs, file_def_count,
+                                  imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
-        publication_status = pxc_run_one_with_manifest(
-            lang, result, source, source_len, def_module, file_defs, file_def_count, imp_keys,
-            imp_vals, imp_count, rust_manifest);
+        publication_status =
+            pxc_run_one_with_manifest(lang, result, source, source_len, def_module, file_defs,
+                                      file_def_count, imp_keys, imp_vals, imp_count, rust_manifest);
     }
     free(filtered);
     return pxc_destination_status(lang, result, publication_status);
 }
 
 static bool pxc_cargo_append_existing_target(const char *repo_path, const char *member_dir,
-                                             const char *package_relative,
-                                             CBMCargoTargetKind kind, const char *name,
-                                             CBMArena *arena,
+                                             const char *package_relative, CBMCargoTargetKind kind,
+                                             const char *name, CBMArena *arena,
                                              CBMCargoManifest *manifest) {
-    if (!repo_path || !package_relative || !arena || !manifest) return false;
+    if (!repo_path || !package_relative || !arena || !manifest)
+        return false;
     char candidate[CBM_SZ_4K];
     int n = snprintf(candidate, sizeof(candidate), "%s/%s%s%s", repo_path,
                      member_dir && member_dir[0] ? member_dir : "",
                      member_dir && member_dir[0] ? "/" : "", package_relative);
-    if (n <= 0 || (size_t)n >= sizeof(candidate)) return false;
+    if (n <= 0 || (size_t)n >= sizeof(candidate))
+        return false;
     char canonical_repo[CBM_SZ_4K];
     char canonical_target[CBM_SZ_4K];
     if (!cbm_canonical_path(repo_path, canonical_repo, sizeof(canonical_repo)) ||
@@ -1620,20 +1608,22 @@ static bool pxc_cargo_append_existing_target(const char *repo_path, const char *
             blocker_root = blocker;
         }
     }
-    return cbm_cargo_add_routed_target(arena, manifest, kind, name,
-                                       member_dir ? member_dir : "", rel, blocker_root);
+    return cbm_cargo_add_routed_target(arena, manifest, kind, name, member_dir ? member_dir : "",
+                                       rel, blocker_root);
 }
 
 static bool pxc_cargo_has_explicit_bin(const CBMCargoManifest *manifest, const char *name) {
     for (int i = 0; manifest && name && i < manifest->target_count; i++) {
         if (manifest->targets[i].kind == CBM_CARGO_TARGET_BIN && manifest->targets[i].name &&
-            strcmp(manifest->targets[i].name, name) == 0) return true;
+            strcmp(manifest->targets[i].name, name) == 0)
+            return true;
     }
     return false;
 }
 
 static void pxc_cargo_normalize_relative(char *path) {
-    if (!path) return;
+    if (!path)
+        return;
     cbm_normalize_path_sep(path);
     char normalized[CBM_SZ_4K];
     size_t marks[CBM_SZ_4K / 2];
@@ -1641,16 +1631,21 @@ static void pxc_cargo_normalize_relative(char *path) {
     int depth = 0;
     const char *p = path;
     while (*p) {
-        while (*p == '/') p++;
+        while (*p == '/')
+            p++;
         const char *start = p;
-        while (*p && *p != '/') p++;
+        while (*p && *p != '/')
+            p++;
         size_t len = (size_t)(p - start);
-        if (len == 0 || (len == 1 && start[0] == '.')) continue;
+        if (len == 0 || (len == 1 && start[0] == '.'))
+            continue;
         if (len == 2 && start[0] == '.' && start[1] == '.') {
-            if (depth > 0) out = marks[--depth];
+            if (depth > 0)
+                out = marks[--depth];
             continue;
         }
-        if (out && out + 1 < sizeof(normalized)) normalized[out++] = '/';
+        if (out && out + 1 < sizeof(normalized))
+            normalized[out++] = '/';
         if (out + len >= sizeof(normalized) || depth >= (int)(sizeof(marks) / sizeof(marks[0]))) {
             return;
         }
@@ -1662,19 +1657,17 @@ static void pxc_cargo_normalize_relative(char *path) {
     memcpy(path, normalized, out + 1);
 }
 
-static bool pxc_cargo_has_explicit_bin_path(const CBMCargoManifest *manifest,
-                                             const char *path) {
+static bool pxc_cargo_has_explicit_bin_path(const CBMCargoManifest *manifest, const char *path) {
     char normalized_path[CBM_SZ_4K];
     snprintf(normalized_path, sizeof(normalized_path), "%s", path ? path : "");
     pxc_cargo_normalize_relative(normalized_path);
     for (int i = 0; manifest && path && i < manifest->target_count; i++) {
-        if (manifest->targets[i].kind == CBM_CARGO_TARGET_BIN &&
-            manifest->targets[i].source_path) {
+        if (manifest->targets[i].kind == CBM_CARGO_TARGET_BIN && manifest->targets[i].source_path) {
             char explicit_path[CBM_SZ_4K];
-            snprintf(explicit_path, sizeof(explicit_path), "%s",
-                     manifest->targets[i].source_path);
+            snprintf(explicit_path, sizeof(explicit_path), "%s", manifest->targets[i].source_path);
             pxc_cargo_normalize_relative(explicit_path);
-            if (strcmp(explicit_path, normalized_path) == 0) return true;
+            if (strcmp(explicit_path, normalized_path) == 0)
+                return true;
         }
     }
     return false;
@@ -1687,8 +1680,8 @@ static bool pxc_cargo_relative_is_file(const char *repo_path, const char *member
                      member_dir && member_dir[0] ? member_dir : "",
                      member_dir && member_dir[0] ? "/" : "", rel);
     cbm_path_info_t info;
-    return n > 0 && (size_t)n < sizeof(absolute) &&
-           cbm_path_info_utf8(absolute, &info) == 0 && info.is_regular;
+    return n > 0 && (size_t)n < sizeof(absolute) && cbm_path_info_utf8(absolute, &info) == 0 &&
+           info.is_regular;
 }
 
 static bool pxc_cargo_relative_path_eq(const char *left, const char *right) {
@@ -1707,12 +1700,15 @@ static void pxc_cargo_collect_auto_bins(const char *repo_path, const char *membe
     int n = snprintf(bin_dir, sizeof(bin_dir), "%s/%s%ssrc/bin", repo_path,
                      member_dir && member_dir[0] ? member_dir : "",
                      member_dir && member_dir[0] ? "/" : "");
-    if (n <= 0 || (size_t)n >= sizeof(bin_dir)) return;
+    if (n <= 0 || (size_t)n >= sizeof(bin_dir))
+        return;
     cbm_dir_t *dir = cbm_opendir(bin_dir);
-    if (!dir) return;
+    if (!dir)
+        return;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(dir)) != NULL) {
-        if (ent->name[0] == '.') continue;
+        if (ent->name[0] == '.')
+            continue;
         char rel[CBM_SZ_4K];
         char name[CBM_DIRENT_NAME_MAX];
         if (ent->is_dir) {
@@ -1720,32 +1716,36 @@ static void pxc_cargo_collect_auto_bins(const char *repo_path, const char *membe
             snprintf(rel, sizeof(rel), "src/bin/%s/main.rs", ent->name);
         } else {
             size_t len = strlen(ent->name);
-            if (len <= 3 || strcmp(ent->name + len - 3, ".rs") != 0) continue;
+            if (len <= 3 || strcmp(ent->name + len - 3, ".rs") != 0)
+                continue;
             snprintf(name, sizeof(name), "%.*s", (int)(len - 3), ent->name);
             snprintf(rel, sizeof(rel), "src/bin/%s", ent->name);
         }
         if (!pxc_cargo_has_explicit_bin(package, name) &&
             !pxc_cargo_has_explicit_bin_path(package, rel)) {
-            pxc_cargo_append_existing_target(repo_path, member_dir, rel, CBM_CARGO_TARGET_BIN,
-                                             name, arena, root);
+            pxc_cargo_append_existing_target(repo_path, member_dir, rel, CBM_CARGO_TARGET_BIN, name,
+                                             arena, root);
         }
     }
     cbm_closedir(dir);
 }
 
 static void pxc_cargo_collect_blocker_dir(const char *repo_path, const char *member_dir,
-                                           const char *dirname, CBMCargoTargetKind kind,
-                                           CBMArena *arena, CBMCargoManifest *root) {
+                                          const char *dirname, CBMCargoTargetKind kind,
+                                          CBMArena *arena, CBMCargoManifest *root) {
     char dir_path[CBM_SZ_4K];
     int n = snprintf(dir_path, sizeof(dir_path), "%s/%s%s%s", repo_path,
                      member_dir && member_dir[0] ? member_dir : "",
                      member_dir && member_dir[0] ? "/" : "", dirname);
-    if (n <= 0 || (size_t)n >= sizeof(dir_path)) return;
+    if (n <= 0 || (size_t)n >= sizeof(dir_path))
+        return;
     cbm_dir_t *dir = cbm_opendir(dir_path);
-    if (!dir) return;
+    if (!dir)
+        return;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(dir)) != NULL) {
-        if (ent->name[0] == '.') continue;
+        if (ent->name[0] == '.')
+            continue;
         char rel[CBM_SZ_4K];
         char name[CBM_DIRENT_NAME_MAX];
         if (ent->is_dir) {
@@ -1753,7 +1753,8 @@ static void pxc_cargo_collect_blocker_dir(const char *repo_path, const char *mem
             snprintf(rel, sizeof(rel), "%s/%s/main.rs", dirname, ent->name);
         } else {
             size_t len = strlen(ent->name);
-            if (len <= 3 || strcmp(ent->name + len - 3, ".rs") != 0) continue;
+            if (len <= 3 || strcmp(ent->name + len - 3, ".rs") != 0)
+                continue;
             snprintf(name, sizeof(name), "%.*s", (int)(len - 3), ent->name);
             snprintf(rel, sizeof(rel), "%s/%s", dirname, ent->name);
         }
@@ -1763,13 +1764,13 @@ static void pxc_cargo_collect_blocker_dir(const char *repo_path, const char *mem
 }
 
 static bool pxc_cargo_collect_package_targets(const char *repo_path, const char *member_dir,
-                                              CBMArena *arena,
-                                              CBMCargoManifest *root_manifest) {
+                                              CBMArena *arena, CBMCargoManifest *root_manifest) {
     char manifest_path[CBM_SZ_4K];
     int n = snprintf(manifest_path, sizeof(manifest_path), "%s/%s%sCargo.toml", repo_path,
                      member_dir && member_dir[0] ? member_dir : "",
                      member_dir && member_dir[0] ? "/" : "");
-    if (n <= 0 || (size_t)n >= sizeof(manifest_path)) return false;
+    if (n <= 0 || (size_t)n >= sizeof(manifest_path))
+        return false;
     int source_len = 0;
     char *source = pxc_read_file(manifest_path, &source_len);
     if (!source || source_len <= 0) {
@@ -1779,7 +1780,8 @@ static bool pxc_cargo_collect_package_targets(const char *repo_path, const char 
     CBMCargoManifest package_manifest;
     cbm_cargo_parse(arena, source, source_len, &package_manifest);
     free(source);
-    if (!package_manifest.package_name || !package_manifest.targets_complete) return false;
+    if (!package_manifest.package_name || !package_manifest.targets_complete)
+        return false;
 
     bool has_explicit_lib = package_manifest.has_lib_table;
     bool has_explicit_lib_target = false;
@@ -1809,8 +1811,8 @@ static bool pxc_cargo_collect_package_targets(const char *repo_path, const char 
                                pxc_cargo_relative_is_file(repo_path, member_dir, main_path);
             bool flat_exists = pxc_cargo_relative_is_file(repo_path, member_dir, flat);
             bool nested_exists = pxc_cargo_relative_is_file(repo_path, member_dir, nested);
-            int inferred_count = (main_exists ? 1 : 0) + (flat_exists ? 1 : 0) +
-                                 (nested_exists ? 1 : 0);
+            int inferred_count =
+                (main_exists ? 1 : 0) + (flat_exists ? 1 : 0) + (nested_exists ? 1 : 0);
             if (inferred_count == 1) {
                 snprintf(inferred, sizeof(inferred), "%s",
                          main_exists ? main_path : (flat_exists ? flat : nested));
@@ -1825,63 +1827,65 @@ static bool pxc_cargo_collect_package_targets(const char *repo_path, const char 
         }
     }
     if (package_manifest.autolib && !has_explicit_lib) {
-        pxc_cargo_append_existing_target(repo_path, member_dir, "src/lib.rs",
-                                         CBM_CARGO_TARGET_LIB, package_manifest.package_name,
-                                         arena, root_manifest);
+        pxc_cargo_append_existing_target(repo_path, member_dir, "src/lib.rs", CBM_CARGO_TARGET_LIB,
+                                         package_manifest.package_name, arena, root_manifest);
     }
     if (package_manifest.has_lib_table && !has_explicit_lib_target) {
-        pxc_cargo_append_existing_target(repo_path, member_dir, "src/lib.rs",
-                                         CBM_CARGO_TARGET_LIB, package_manifest.package_name,
-                                         arena, root_manifest);
+        pxc_cargo_append_existing_target(repo_path, member_dir, "src/lib.rs", CBM_CARGO_TARGET_LIB,
+                                         package_manifest.package_name, arena, root_manifest);
     }
     if (package_manifest.autobins && !has_explicit_main &&
         !pxc_cargo_has_explicit_bin(&package_manifest, package_manifest.package_name) &&
         !pxc_cargo_has_explicit_bin_path(&package_manifest, "src/main.rs")) {
-        pxc_cargo_append_existing_target(repo_path, member_dir, "src/main.rs",
-                                         CBM_CARGO_TARGET_BIN, package_manifest.package_name,
-                                         arena, root_manifest);
+        pxc_cargo_append_existing_target(repo_path, member_dir, "src/main.rs", CBM_CARGO_TARGET_BIN,
+                                         package_manifest.package_name, arena, root_manifest);
     }
     if (package_manifest.autobins) {
-        pxc_cargo_collect_auto_bins(repo_path, member_dir, &package_manifest, arena,
-                                    root_manifest);
+        pxc_cargo_collect_auto_bins(repo_path, member_dir, &package_manifest, arena, root_manifest);
     }
     if (package_manifest.build_path) {
         pxc_cargo_append_existing_target(repo_path, member_dir, package_manifest.build_path,
                                          CBM_CARGO_TARGET_BUILD, NULL, arena, root_manifest);
     } else if (package_manifest.auto_build) {
-        pxc_cargo_append_existing_target(repo_path, member_dir, "build.rs",
-                                         CBM_CARGO_TARGET_BUILD, NULL, arena, root_manifest);
+        pxc_cargo_append_existing_target(repo_path, member_dir, "build.rs", CBM_CARGO_TARGET_BUILD,
+                                         NULL, arena, root_manifest);
     }
-    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "examples",
-                                  CBM_CARGO_TARGET_EXAMPLE, arena, root_manifest);
-    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "tests", CBM_CARGO_TARGET_TEST,
+    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "examples", CBM_CARGO_TARGET_EXAMPLE,
                                   arena, root_manifest);
-    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "benches", CBM_CARGO_TARGET_BENCH,
-                                  arena, root_manifest);
+    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "tests", CBM_CARGO_TARGET_TEST, arena,
+                                  root_manifest);
+    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "benches", CBM_CARGO_TARGET_BENCH, arena,
+                                  root_manifest);
     return root_manifest->targets_complete;
 }
 
 static bool pxc_cargo_glob_match(const char *pattern, const char *text) {
-    if (!pattern || !text) return false;
-    if (*pattern == '\0') return *text == '\0';
+    if (!pattern || !text)
+        return false;
+    if (*pattern == '\0')
+        return *text == '\0';
     if (pattern[0] == '*' && pattern[1] == '*') {
         pattern += 2;
         if (*pattern == '/') {
             pattern++;
-            if (pxc_cargo_glob_match(pattern, text)) return true;
+            if (pxc_cargo_glob_match(pattern, text))
+                return true;
             while (*text) {
-                if (*text++ == '/' && pxc_cargo_glob_match(pattern, text)) return true;
+                if (*text++ == '/' && pxc_cargo_glob_match(pattern, text))
+                    return true;
             }
             return false;
         }
         do {
-            if (pxc_cargo_glob_match(pattern, text)) return true;
+            if (pxc_cargo_glob_match(pattern, text))
+                return true;
         } while (*text++);
         return false;
     }
     if (*pattern == '*') {
         do {
-            if (pxc_cargo_glob_match(pattern + 1, text)) return true;
+            if (pxc_cargo_glob_match(pattern + 1, text))
+                return true;
         } while (*text && *text++ != '/');
         return false;
     }
@@ -1891,30 +1895,37 @@ static bool pxc_cargo_glob_match(const char *pattern, const char *text) {
     if (*pattern == '[') {
         const char *p = pattern + 1;
         bool negate = *p == '!' || *p == '^';
-        if (negate) p++;
+        if (negate)
+            p++;
         bool matched = false;
         char c = *text;
         while (*p && *p != ']') {
             if (p[1] == '-' && p[2] && p[2] != ']') {
-                if (c >= p[0] && c <= p[2]) matched = true;
+                if (c >= p[0] && c <= p[2])
+                    matched = true;
                 p += 3;
             } else {
-                if (c == *p) matched = true;
+                if (c == *p)
+                    matched = true;
                 p++;
             }
         }
-        if (*p != ']' || !c || c == '/' || matched == negate) return false;
+        if (*p != ']' || !c || c == '/' || matched == negate)
+            return false;
         return pxc_cargo_glob_match(p + 1, text + 1);
     }
     return *pattern == *text && pxc_cargo_glob_match(pattern + 1, text + 1);
 }
 
 static void pxc_cargo_normalize_glob(char *s) {
-    if (!s) return;
+    if (!s)
+        return;
     cbm_normalize_path_sep(s);
-    while (s[0] == '.' && s[1] == '/') memmove(s, s + 2, strlen(s + 2) + 1);
+    while (s[0] == '.' && s[1] == '/')
+        memmove(s, s + 2, strlen(s + 2) + 1);
     size_t n = strlen(s);
-    while (n > 0 && s[n - 1] == '/') s[--n] = '\0';
+    while (n > 0 && s[n - 1] == '/')
+        s[--n] = '\0';
 }
 
 static bool pxc_cargo_pattern_has_meta(const char *s) {
@@ -1925,9 +1936,11 @@ static bool pxc_cargo_excludes_dir(const char *pattern, const char *dir) {
     char prefix[CBM_SZ_4K];
     snprintf(prefix, sizeof(prefix), "%s", dir);
     do {
-        if (pxc_cargo_glob_match(pattern, prefix)) return true;
+        if (pxc_cargo_glob_match(pattern, prefix))
+            return true;
         char *slash = strrchr(prefix, '/');
-        if (!slash) break;
+        if (!slash)
+            break;
         *slash = '\0';
     } while (true);
     return false;
@@ -1950,18 +1963,19 @@ static bool pxc_cargo_member_declared(const CBMCargoManifest *manifest, const ch
             }
         }
     }
-    if (!included || exact_member) return included;
+    if (!included || exact_member)
+        return included;
     for (int i = 0; i < manifest->exclude_count; i++) {
         char pattern[CBM_SZ_4K];
         snprintf(pattern, sizeof(pattern), "%s", manifest->excludes[i].member_path);
         pxc_cargo_normalize_glob(pattern);
-        if (pxc_cargo_excludes_dir(pattern, normalized_dir)) return false;
+        if (pxc_cargo_excludes_dir(pattern, normalized_dir))
+            return false;
     }
     return true;
 }
 
-bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena,
-                                 CBMCargoManifest *out_m) {
+bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena, CBMCargoManifest *out_m) {
     if (!out_m) {
         return false;
     }
@@ -2011,7 +2025,8 @@ bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena,
     cbm_pkg_members_t packages;
     cbm_pkg_members_init(&packages);
     cbm_pkgmap_collect_members(repo_path, &packages);
-    if (!packages.complete) out_m->targets_complete = false;
+    if (!packages.complete)
+        out_m->targets_complete = false;
     for (int i = 0; i < packages.count; i++) {
         const char *member = packages.items[i].dir;
         if (member && member[0] && pxc_cargo_member_declared(out_m, member)) {
@@ -2056,8 +2071,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     const CBMCargoManifest *rust_manifest = NULL;
     if (have_rust) {
         cbm_arena_init(&cargo_arena);
-        have_manifest =
-            cbm_pxc_build_rust_manifest(ctx->repo_path, &cargo_arena, &cargo_manifest);
+        have_manifest = cbm_pxc_build_rust_manifest(ctx->repo_path, &cargo_arena, &cargo_manifest);
         rust_manifest = have_manifest ? &cargo_manifest : NULL;
     }
 
@@ -2066,10 +2080,9 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     int def_count = 0;
     CBMPxcCollectStatus collect_status = CBM_PXC_COLLECT_EMPTY;
     int *def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
-    CBMLSPDef *all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
-                                                   def_modules, &def_count, &collect_status,
-                                                   def_starts,
-                                                   rust_manifest);
+    CBMLSPDef *all_defs =
+        cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name, def_modules,
+                                 &def_count, &collect_status, def_starts, rust_manifest);
     if (collect_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
         for (int i = 0; i < file_count; i++) {
             if (cache[i] && files[i].language == CBM_LANG_RUST) {
@@ -2132,8 +2145,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     int skipped_no_lsp = 0;
     int skipped_no_source = 0;
     int per_lang_calls = 0;
-    dispatch_failed = dispatch_failed || cbm_pxc_collection_requires_abort(
-                                              cache, files, file_count, collect_status);
+    dispatch_failed = dispatch_failed ||
+                      cbm_pxc_collection_requires_abort(cache, files, file_count, collect_status);
 
     for (int i = 0; i < file_count; i++) {
         if (!cache[i])
@@ -2153,8 +2166,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
             free(source);
             if (lang == CBM_LANG_RUST) {
                 cache[i]->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-                cbm_rust_health_record(&cache[i]->rust_health,
-                                       CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
+                cbm_rust_health_record(&cache[i]->rust_health, CBM_RUST_HEALTH_SOURCE_UNAVAILABLE,
+                                       0, 0);
             }
             skipped_no_source++;
             continue;
@@ -2177,8 +2190,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cbm_index_mark_start(files[i].rel_path);
         CBMPxcDispatchStatus dispatch_status = cbm_pxc_dispatch_file(
             lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
-            &cross_registries, module_def_index, all_defs, def_count, imp_keys, imp_vals,
-            imp_count, rust_manifest, NULL, NULL);
+            &cross_registries, module_def_index, all_defs, def_count, imp_keys, imp_vals, imp_count,
+            rust_manifest, NULL, NULL);
         if (dispatch_status == CBM_PXC_DISPATCH_ALLOCATION_FAILED && lang != CBM_LANG_RUST) {
             dispatch_failed = true;
         }

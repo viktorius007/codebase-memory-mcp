@@ -710,8 +710,8 @@ void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
  * from SQLite/argument failures. `out` must be zero-initialized before its
  * first call and cleared before reuse. */
 cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
-    cbm_store_t *s, const char *project, int64_t offset, int limit,
-    size_t detail_preview_bytes, cbm_analysis_coverage_page_t *out);
+    cbm_store_t *s, const char *project, int64_t offset, int limit, size_t detail_preview_bytes,
+    cbm_analysis_coverage_page_t *out);
 void cbm_store_analysis_coverage_page_clear(cbm_analysis_coverage_page_t *page);
 
 /* Read one bounded canonical syntactic page plus exact category totals,
@@ -726,8 +726,9 @@ void cbm_store_syntactic_coverage_page_clear(cbm_syntactic_coverage_page_t *page
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 typedef void (*cbm_analysis_coverage_test_hook_fn)(void *userdata);
 void cbm_store_analysis_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations);
-void cbm_store_analysis_coverage_test_set_after_totals_hook(
-    cbm_store_t *s, cbm_analysis_coverage_test_hook_fn hook, void *userdata);
+void cbm_store_analysis_coverage_test_set_after_totals_hook(cbm_store_t *s,
+                                                            cbm_analysis_coverage_test_hook_fn hook,
+                                                            void *userdata);
 typedef void (*cbm_syntactic_coverage_test_hook_fn)(void *userdata);
 void cbm_store_syntactic_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations);
 void cbm_store_syntactic_coverage_test_set_after_totals_hook(

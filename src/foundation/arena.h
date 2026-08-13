@@ -68,8 +68,7 @@ void *cbm_arena_calloc(CBMArena *a, size_t n);
 
 /* Duplicate a NUL-terminated string. */
 char *cbm_arena_strdup(CBMArena *a, const char *s);
-char *cbm_arena_strdup_class(CBMArena *a, const char *s,
-                             CBMArenaAllocationClass allocation_class);
+char *cbm_arena_strdup_class(CBMArena *a, const char *s, CBMArenaAllocationClass allocation_class);
 
 /* Duplicate a string of known length, NUL-terminate. */
 char *cbm_arena_strndup(CBMArena *a, const char *s, size_t len);

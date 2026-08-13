@@ -995,28 +995,25 @@ TEST(daemon_application_oversize_tool_result_reports_cause_and_remedy) {
     yyjson_val *root_value = response_doc ? yyjson_doc_get_root(response_doc) : NULL;
     yyjson_val *content = yyjson_is_obj(root_value) ? yyjson_obj_get(root_value, "content") : NULL;
     yyjson_val *item = yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
-    const char *message = yyjson_is_obj(item)
-                              ? yyjson_get_str(yyjson_obj_get(item, "text"))
-                              : NULL;
+    const char *message = yyjson_is_obj(item) ? yyjson_get_str(yyjson_obj_get(item, "text")) : NULL;
     yyjson_val *structured =
         yyjson_is_obj(root_value) ? yyjson_obj_get(root_value, "structuredContent") : NULL;
-    const char *structured_error = yyjson_is_obj(structured)
-                                       ? yyjson_get_str(yyjson_obj_get(structured, "error"))
-                                       : NULL;
-    bool flagged_error = yyjson_is_obj(root_value) &&
-                         yyjson_get_bool(yyjson_obj_get(root_value, "isError"));
+    const char *structured_error =
+        yyjson_is_obj(structured) ? yyjson_get_str(yyjson_obj_get(structured, "error")) : NULL;
+    bool flagged_error =
+        yyjson_is_obj(root_value) && yyjson_get_bool(yyjson_obj_get(root_value, "isError"));
     bool consistent_fields = message && structured_error && strcmp(message, structured_error) == 0;
-    bool names_cause = message && strstr(message, "result exceeds safe response envelope") != NULL &&
+    bool names_cause = message &&
+                       strstr(message, "result exceeds safe response envelope") != NULL &&
                        strstr(message, "no partial result returned") != NULL;
     size_t measured_complete_bytes = 0;
     unsigned measured_limit_bytes = 0;
     const char *measurements = message ? strstr(message, "complete_response_bytes=") : NULL;
-    bool states_real_limit =
-        measurements &&
-        sscanf(measurements, "complete_response_bytes=%zu limit_bytes=%u",
-               &measured_complete_bytes, &measured_limit_bytes) == 2 &&
-        measured_complete_bytes > CBM_MCP_RESULT_MAX_BYTES &&
-        measured_limit_bytes == CBM_MCP_RESULT_MAX_BYTES;
+    bool states_real_limit = measurements &&
+                             sscanf(measurements, "complete_response_bytes=%zu limit_bytes=%u",
+                                    &measured_complete_bytes, &measured_limit_bytes) == 2 &&
+                             measured_complete_bytes > CBM_MCP_RESULT_MAX_BYTES &&
+                             measured_limit_bytes == CBM_MCP_RESULT_MAX_BYTES;
     bool gives_remedy = message && strstr(message, "manage_adr use mode=sections") != NULL;
     /* The bulk payload itself must NOT have been smuggled through. */
     bool payload_withheld = sendable && strstr(text, "AAAAAAAAAAAAAAAA") == NULL;

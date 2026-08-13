@@ -587,8 +587,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                           * the existing cbm_run_X_lsp_cross signatures the resolve
                           * worker forwards them to). Pass NULL/0/NULL to skip. */
                          CBMLSPDef *all_defs, int def_count,
-                         CBMPxcCollectStatus definition_universe_status,
-                         char *const *def_modules,
+                         CBMPxcCollectStatus definition_universe_status, char *const *def_modules,
                          /* Optional inverted index module_qn → defs[] — fallback
                           * path when there's no pre-built registry for this lang. */
                          struct CBMModuleDefIndex *module_def_index,

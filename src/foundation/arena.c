@@ -124,8 +124,7 @@ void *cbm_arena_calloc(CBMArena *a, size_t n) {
     return p;
 }
 
-char *cbm_arena_strdup_class(CBMArena *a, const char *s,
-                             CBMArenaAllocationClass allocation_class) {
+char *cbm_arena_strdup_class(CBMArena *a, const char *s, CBMArenaAllocationClass allocation_class) {
     if (!s) {
         return NULL;
     }
@@ -215,7 +214,6 @@ void cbm_arena_test_fail_after(CBMArena *a, size_t successful_allocations) {
     a->test_successes_before_failure = successful_allocations;
     a->test_failure_enabled = 1;
 }
-
 
 void cbm_arena_test_fail_class(CBMArena *a, CBMArenaAllocationClass allocation_class) {
     if (!a || allocation_class == CBM_ARENA_ALLOCATION_GENERAL) {

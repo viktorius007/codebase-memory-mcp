@@ -4187,8 +4187,8 @@ static uint64_t index_status_coverage_hash(const char rows_sha256[65]) {
     uint64_t hash = 0;
     for (int i = 0; i < 16; i++) {
         unsigned char c = (unsigned char)rows_sha256[i];
-        unsigned int digit = c >= '0' && c <= '9' ? (unsigned int)(c - '0')
-                                                    : (unsigned int)(c - 'a' + 10);
+        unsigned int digit =
+            c >= '0' && c <= '9' ? (unsigned int)(c - '0') : (unsigned int)(c - 'a' + 10);
         hash = (hash << 4) | digit;
     }
     return hash;
@@ -4357,8 +4357,7 @@ static void index_status_add_detail(yyjson_mut_doc *doc, yyjson_mut_val *item, c
 static void index_status_add_syntactic_detail(yyjson_mut_doc *doc, yyjson_mut_val *item,
                                               const char *key,
                                               const cbm_syntactic_coverage_row_t *row,
-                                              bool bound_detail,
-                                              size_t detail_preview_bytes) {
+                                              bool bound_detail, size_t detail_preview_bytes) {
     if (!row->detail_truncated) {
         index_status_add_detail(doc, item, key, row->detail, bound_detail, detail_preview_bytes);
         return;
@@ -4520,8 +4519,7 @@ static cbm_syntactic_coverage_status_t syntactic_coverage_window_extend(
                 cbm_store_syntactic_coverage_page_clear(&page);
                 return CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED;
             }
-            cbm_syntactic_coverage_row_t *grown =
-                realloc(window->rows, new_count * sizeof(*grown));
+            cbm_syntactic_coverage_row_t *grown = realloc(window->rows, new_count * sizeof(*grown));
             if (!grown) {
                 cbm_store_syntactic_coverage_page_clear(&page);
                 return CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED;
@@ -4617,8 +4615,7 @@ static bool rust_analysis_meta_same(const cbm_analysis_coverage_page_t *page,
 
 static bool rust_analysis_totals_same(const cbm_analysis_coverage_totals_t *left,
                                       const cbm_analysis_coverage_totals_t *right) {
-    return left->rows_total == right->rows_total &&
-           left->partial_rows == right->partial_rows &&
+    return left->rows_total == right->rows_total && left->partial_rows == right->partial_rows &&
            left->failed_rows == right->failed_rows &&
            left->unsupported_rows == right->unsupported_rows &&
            left->degraded_files_total == right->degraded_files_total &&
@@ -4719,7 +4716,7 @@ static void rust_analysis_add_path(yyjson_mut_doc *doc, yyjson_mut_val *item, co
 }
 
 static yyjson_mut_val *rust_analysis_evidence_item(yyjson_mut_doc *doc,
-                                                    const cbm_analysis_coverage_row_t *row) {
+                                                   const cbm_analysis_coverage_row_t *row) {
     yyjson_mut_val *item = yyjson_mut_obj(doc);
     rust_analysis_add_path(doc, item, row->rel_path);
     yyjson_mut_obj_add_strcpy(doc, item, "kind", row->kind ? row->kind : "");
@@ -4735,8 +4732,8 @@ static yyjson_mut_val *rust_analysis_evidence_item(yyjson_mut_doc *doc,
 }
 
 static yyjson_mut_val *rust_analysis_evidence(yyjson_mut_doc *doc,
-                                               const cbm_analysis_coverage_row_t *rows, int count,
-                                               int returned, int64_t rows_total) {
+                                              const cbm_analysis_coverage_row_t *rows, int count,
+                                              int returned, int64_t rows_total) {
     yyjson_mut_val *evidence = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, evidence, "scope", "first_page_summary");
     yyjson_mut_obj_add_int(doc, evidence, "total", rows_total);
@@ -4771,7 +4768,7 @@ static size_t rust_analysis_evidence_item_size(const cbm_analysis_coverage_row_t
 }
 
 static int rust_analysis_evidence_fit_count(const cbm_analysis_coverage_row_t *rows, int row_count,
-                                             int64_t rows_total, size_t budget) {
+                                            int64_t rows_total, size_t budget) {
     size_t items_bytes = 0;
     int returned = 0;
     for (int i = 0; i < row_count; i++) {
@@ -4882,10 +4879,12 @@ static bool mcp_doc_envelope_fits(yyjson_mut_doc *doc, size_t budget) {
     return fits;
 }
 
-static void add_rust_analysis_report_envelope_bounded(
-    yyjson_mut_doc *doc, yyjson_mut_val *root, const rust_analysis_snapshot_t *snapshot,
-    bool generation_matches, size_t evidence_budget, size_t envelope_budget,
-    bool include_evidence_items) {
+static void add_rust_analysis_report_envelope_bounded(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                                      const rust_analysis_snapshot_t *snapshot,
+                                                      bool generation_matches,
+                                                      size_t evidence_budget,
+                                                      size_t envelope_budget,
+                                                      bool include_evidence_items) {
     size_t budget = evidence_budget;
     for (;;) {
         add_rust_analysis_report(doc, root, snapshot, generation_matches, budget,
@@ -4901,10 +4900,10 @@ static void add_rust_analysis_report_envelope_bounded(
 static void add_coverage_report_page(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                      const cbm_syntactic_coverage_row_t *rows, int64_t count,
                                      size_t start, int represented,
-                                     const index_status_totals_t *totals,
-                                     const char *generation, uint64_t query_hash,
-                                     uint64_t coverage_hash, bool identity_marker,
-                                     bool bound_detail, size_t detail_preview_bytes) {
+                                     const index_status_totals_t *totals, const char *generation,
+                                     uint64_t query_hash, uint64_t coverage_hash,
+                                     bool identity_marker, bool bound_detail,
+                                     size_t detail_preview_bytes) {
     yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
     yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_dirs = yyjson_mut_arr(doc);
@@ -4996,8 +4995,8 @@ static void add_coverage_report_page(yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_val *marker = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_uint(doc, marker, "ordinal", start);
         size_t kind_bytes = strlen(kind);
-        size_t kind_preview = index_status_utf8_preview_length(
-            kind, INDEX_STATUS_IDENTITY_KIND_PREVIEW_BYTES);
+        size_t kind_preview =
+            index_status_utf8_preview_length(kind, INDEX_STATUS_IDENTITY_KIND_PREVIEW_BYTES);
         char *kind_text = malloc(kind_preview + 1U);
         if (kind_text) {
             memcpy(kind_text, kind, kind_preview);
@@ -5226,7 +5225,7 @@ static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
     if (requested_path) {
         yyjson_mut_obj_add_str(doc, item, "match",
                                row->match == CBM_SYNTACTIC_COVERAGE_MATCH_EXACT ? "exact"
-                                                                               : "ancestor");
+                                                                                : "ancestor");
     }
     if (!row->detail_truncated && row->kind && strcmp(row->kind, "parse_partial") == 0) {
         coverage_add_ranges(doc, item, row->detail);
@@ -5268,8 +5267,7 @@ static void coverage_add_identity_marker(yyjson_mut_doc *doc, yyjson_mut_val *ar
     identity_hash = cursor_fnv1a64(length, identity_hash);
     identity_hash = cursor_fnv1a64(kind, identity_hash);
     char identity[32];
-    snprintf(identity, sizeof(identity), "fnv1a64:%016llx",
-             (unsigned long long)identity_hash);
+    snprintf(identity, sizeof(identity), "fnv1a64:%016llx", (unsigned long long)identity_hash);
     yyjson_mut_obj_add_strcpy(doc, marker, "identity_hash", identity);
     if (oversized_item) {
         yyjson_mut_obj_add_int(doc, marker, "detail_complete_bytes", row->detail_complete_bytes);
@@ -5304,13 +5302,11 @@ static int coverage_add_rows_bounded(yyjson_mut_doc *doc, yyjson_mut_val *array,
         size_t item_bytes = coverage_row_json_size(&rows[i], requested_path);
         bool item_too_large =
             item_bytes == SIZE_MAX || item_bytes > COVERAGE_QUERY_EVIDENCE_MAX_BYTES;
-        bool budget_exhausted =
-            !item_too_large &&
-            (item_bytes > evidence_limit || *evidence_bytes > evidence_limit - item_bytes);
+        bool budget_exhausted = !item_too_large && (item_bytes > evidence_limit ||
+                                                    *evidence_bytes > evidence_limit - item_bytes);
         if (item_too_large || budget_exhausted) {
             if (emitted == 0 && count > 0 && requested_path == NULL) {
-                size_t marker_bytes =
-                    coverage_identity_marker_size(&rows[i], item_too_large);
+                size_t marker_bytes = coverage_identity_marker_size(&rows[i], item_too_large);
                 if (marker_bytes != SIZE_MAX && marker_bytes <= evidence_limit &&
                     *evidence_bytes <= evidence_limit - marker_bytes) {
                     coverage_add_identity_marker(doc, array, &rows[i], item_too_large);
@@ -5333,10 +5329,10 @@ static const char *coverage_status(const syntactic_coverage_window_t *coverage,
     if (!lookup_ok) {
         return "coverage_unavailable";
     }
-    bool parse_partial = coverage->exact_seen ? coverage->exact_parse_partial
-                                              : coverage->any_parse_partial;
-    bool not_indexed = coverage->exact_seen ? coverage->exact_not_indexed
-                                            : coverage->any_not_indexed;
+    bool parse_partial =
+        coverage->exact_seen ? coverage->exact_parse_partial : coverage->any_parse_partial;
+    bool not_indexed =
+        coverage->exact_seen ? coverage->exact_not_indexed : coverage->any_not_indexed;
     bool other = coverage->exact_seen ? coverage->exact_other : coverage->any_other;
     if (parse_partial) {
         return "partial";
@@ -5416,8 +5412,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             bool duplicate = false;
             for (size_t prior = 0; prior < query_index; prior++) {
                 yyjson_val *prior_value = yyjson_arr_get(array, prior);
-                if (yyjson_is_str(prior_value) &&
-                    strcmp(query, yyjson_get_str(prior_value)) == 0) {
+                if (yyjson_is_str(prior_value) && strcmp(query, yyjson_get_str(prior_value)) == 0) {
                     duplicate = true;
                     break;
                 }
@@ -5440,8 +5435,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     if (cbm_store_begin(store) != CBM_STORE_OK) {
         yyjson_doc_free(adoc);
         free(project);
-        return cbm_mcp_text_result(
-            "check_index_coverage could not open a consistent read snapshot", true);
+        return cbm_mcp_text_result("check_index_coverage could not open a consistent read snapshot",
+                                   true);
     }
 
     cbm_project_t proj = {0};
@@ -5452,12 +5447,12 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     rust_analysis_snapshot_t health = {0};
     bool health_available = rust_analysis_read_snapshot(store, project, &health);
     health.available = health_available;
-    bool syntactic_generation_matches =
-        have_project && have_syntactic_meta && proj.indexed_at && syntactic_meta.generation &&
-        strcmp(proj.indexed_at, syntactic_meta.generation) == 0;
-    bool health_generation_matches =
-        have_project && health.have_meta && proj.indexed_at && health.meta.generation &&
-        strcmp(proj.indexed_at, health.meta.generation) == 0;
+    bool syntactic_generation_matches = have_project && have_syntactic_meta && proj.indexed_at &&
+                                        syntactic_meta.generation &&
+                                        strcmp(proj.indexed_at, syntactic_meta.generation) == 0;
+    bool health_generation_matches = have_project && health.have_meta && proj.indexed_at &&
+                                     health.meta.generation &&
+                                     strcmp(proj.indexed_at, health.meta.generation) == 0;
     const char *recording_status = have_syntactic_meta && syntactic_meta.recording_status
                                        ? syntactic_meta.recording_status
                                        : "unknown";
@@ -5471,18 +5466,15 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                               have_project && proj.indexed_at ? proj.indexed_at : "");
 
     yyjson_mut_val *meta_obj = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_strcpy(doc, meta_obj, "generation",
-                              have_syntactic_meta && syntactic_meta.generation
-                                  ? syntactic_meta.generation
-                                  : "");
-    yyjson_mut_obj_add_strcpy(doc, meta_obj, "index_mode",
-                              have_syntactic_meta && syntactic_meta.index_mode
-                                  ? syntactic_meta.index_mode
-                                  : "unknown");
-    yyjson_mut_obj_add_strcpy(doc, meta_obj, "recorded_at",
-                              have_syntactic_meta && syntactic_meta.recorded_at
-                                  ? syntactic_meta.recorded_at
-                                  : "");
+    yyjson_mut_obj_add_strcpy(
+        doc, meta_obj, "generation",
+        have_syntactic_meta && syntactic_meta.generation ? syntactic_meta.generation : "");
+    yyjson_mut_obj_add_strcpy(
+        doc, meta_obj, "index_mode",
+        have_syntactic_meta && syntactic_meta.index_mode ? syntactic_meta.index_mode : "unknown");
+    yyjson_mut_obj_add_strcpy(
+        doc, meta_obj, "recorded_at",
+        have_syntactic_meta && syntactic_meta.recorded_at ? syntactic_meta.recorded_at : "");
     yyjson_mut_obj_add_strcpy(doc, meta_obj, "recording_status", recording_status);
     yyjson_mut_obj_add_int(doc, meta_obj, "ignored_files_stored",
                            have_syntactic_meta ? syntactic_meta.ignored_files_stored : 0);
@@ -5500,9 +5492,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     size_t scope_marker_reserve = scope_count * 256U;
     size_t coverage_evidence_limit = COVERAGE_QUERY_EVIDENCE_MAX_BYTES - scope_marker_reserve;
     size_t query_count = path_count + scope_count;
-    int evidence_share = query_count > 0U
-                             ? COVERAGE_QUERY_EVIDENCE_MAX_ROWS / (int)query_count
-                             : COVERAGE_QUERY_EVIDENCE_MAX_ROWS;
+    int evidence_share = query_count > 0U ? COVERAGE_QUERY_EVIDENCE_MAX_ROWS / (int)query_count
+                                          : COVERAGE_QUERY_EVIDENCE_MAX_ROWS;
     if (evidence_share < 1) {
         evidence_share = 1;
     }
@@ -5517,8 +5508,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             bool duplicate = false;
             for (size_t prior = 0; input && prior < idx; prior++) {
                 yyjson_val *prior_value = yyjson_arr_get(paths, prior);
-                if (yyjson_is_str(prior_value) &&
-                    strcmp(input, yyjson_get_str(prior_value)) == 0) {
+                if (yyjson_is_str(prior_value) && strcmp(input, yyjson_get_str(prior_value)) == 0) {
                     yyjson_mut_obj_add_uint(doc, item, "duplicate_of", prior);
                     duplicate = true;
                     break;
@@ -5568,9 +5558,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                     &coverage_evidence_bytes, coverage_evidence_limit);
             }
             yyjson_mut_obj_add_val(doc, item, "coverage", coverage);
-            int64_t coverage_total = coverage_window.initialized
-                                         ? coverage_window.totals.rows_total
-                                         : 0;
+            int64_t coverage_total =
+                coverage_window.initialized ? coverage_window.totals.rows_total : 0;
             if (coverage_returned < coverage_total) {
                 yyjson_mut_obj_add_int(doc, item, "coverage_total", coverage_total);
                 yyjson_mut_obj_add_int(doc, item, "coverage_returned", coverage_returned);
@@ -5602,8 +5591,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             bool duplicate = false;
             for (size_t prior = 0; input && prior < idx; prior++) {
                 yyjson_val *prior_value = yyjson_arr_get(scopes, prior);
-                if (yyjson_is_str(prior_value) &&
-                    strcmp(input, yyjson_get_str(prior_value)) == 0) {
+                if (yyjson_is_str(prior_value) && strcmp(input, yyjson_get_str(prior_value)) == 0) {
                     yyjson_mut_obj_add_uint(doc, item, "duplicate_of", prior);
                     duplicate = true;
                     break;
@@ -5633,9 +5621,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             if (!lookup_ok) {
                 yyjson_mut_obj_add_str(doc, item, "coverage_lookup", "error");
             }
-            int64_t syntactic_count = coverage_window.initialized
-                                          ? coverage_window.totals.rows_total
-                                          : 0;
+            int64_t syntactic_count =
+                coverage_window.initialized ? coverage_window.totals.rows_total : 0;
             yyjson_mut_obj_add_int(doc, item, "total", syntactic_count);
             int64_t start = scope_offset < syntactic_count ? scope_offset : syntactic_count;
             yyjson_mut_val *entries = yyjson_mut_arr(doc);
@@ -5651,12 +5638,11 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             if (lookup_ok && end < syntactic_count) {
                 yyjson_mut_obj_add_int(doc, item, "next_offset", end);
             }
-            const char *scope_status = !lookup_ok || !syntactic_generation_matches
-                                           ? "coverage_unavailable"
-                                       : syntactic_count > 0             ? "known_gaps"
-                                       : strcmp(recording_status, "complete") == 0
-                                           ? "no_recorded_issue"
-                                           : "coverage_unavailable";
+            const char *scope_status =
+                !lookup_ok || !syntactic_generation_matches ? "coverage_unavailable"
+                : syntactic_count > 0                       ? "known_gaps"
+                : strcmp(recording_status, "complete") == 0 ? "no_recorded_issue"
+                                                            : "coverage_unavailable";
             yyjson_mut_obj_add_str(doc, item, "status", scope_status);
             syntactic_coverage_window_clear(&coverage_window);
             yyjson_mut_arr_add_val(scope_results, item);
@@ -5667,9 +5653,9 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
         doc, root, "caveat",
         "Best-effort signal only. No recorded issue does not prove graph or source completeness; "
         "read flagged source and qualify claims when metadata is changed or unavailable.");
-    add_rust_analysis_report_envelope_bounded(
-        doc, root, &health, health_generation_matches, RUST_ANALYSIS_EVIDENCE_MAX_BYTES,
-        CBM_MCP_RESULT_MAX_BYTES, true);
+    add_rust_analysis_report_envelope_bounded(doc, root, &health, health_generation_matches,
+                                              RUST_ANALYSIS_EVIDENCE_MAX_BYTES,
+                                              CBM_MCP_RESULT_MAX_BYTES, true);
     bool response_fits = mcp_doc_envelope_fits(doc, CBM_MCP_RESULT_MAX_BYTES);
 
     if (cbm_store_commit(store) != CBM_STORE_OK) {
@@ -5711,12 +5697,11 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
 
 static char *index_status_build_candidate(
     const char *project, int nodes, int edges, const cbm_project_t *project_info, bool have_project,
-    const cbm_syntactic_coverage_row_t *rows, int available_rows, int64_t total_rows,
-    size_t start, int represented,
-    const index_status_totals_t *totals, const index_status_options_t *options,
+    const cbm_syntactic_coverage_row_t *rows, int available_rows, int64_t total_rows, size_t start,
+    int represented, const index_status_totals_t *totals, const index_status_options_t *options,
     const char *generation, uint64_t query_hash, uint64_t coverage_hash, bool bound_detail,
-    size_t detail_preview_bytes, bool identity_marker,
-    const rust_analysis_snapshot_t *health, bool health_generation_matches) {
+    size_t detail_preview_bytes, bool identity_marker, const rust_analysis_snapshot_t *health,
+    bool health_generation_matches) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -5772,16 +5757,12 @@ static char *index_status_error_result(const char *message, const index_status_o
     return NULL;
 }
 
-static char *index_status_build_bounded(const char *project, int nodes, int edges,
-                                        const cbm_project_t *project_info, bool have_project,
-                                        const cbm_syntactic_coverage_row_t *rows,
-                                        int available_rows, int64_t total_rows, size_t start,
-                                        const index_status_totals_t *totals,
-                                        const index_status_options_t *options,
-                                        const char *generation, uint64_t query_hash,
-                                        uint64_t coverage_hash, int *represented_out,
-                                        const rust_analysis_snapshot_t *health,
-                                        bool health_generation_matches) {
+static char *index_status_build_bounded(
+    const char *project, int nodes, int edges, const cbm_project_t *project_info, bool have_project,
+    const cbm_syntactic_coverage_row_t *rows, int available_rows, int64_t total_rows, size_t start,
+    const index_status_totals_t *totals, const index_status_options_t *options,
+    const char *generation, uint64_t query_hash, uint64_t coverage_hash, int *represented_out,
+    const rust_analysis_snapshot_t *health, bool health_generation_matches) {
     int requested = available_rows < options->limit ? available_rows : options->limit;
     char *candidate = index_status_build_candidate(
         project, nodes, edges, project_info, have_project, rows, available_rows, total_rows, start,
@@ -5850,10 +5831,10 @@ static char *index_status_build_bounded(const char *project, int nodes, int edge
         *represented_out = 1;
         return best;
     }
-    candidate = index_status_build_candidate(
-        project, nodes, edges, project_info, have_project, rows, available_rows, total_rows, start,
-        1, totals, options, generation, query_hash, coverage_hash, false, 0, true, health,
-        health_generation_matches);
+    candidate = index_status_build_candidate(project, nodes, edges, project_info, have_project,
+                                             rows, available_rows, total_rows, start, 1, totals,
+                                             options, generation, query_hash, coverage_hash, false,
+                                             0, true, health, health_generation_matches);
     if (index_status_candidate_fits(candidate, options)) {
         *represented_out = 1;
         return candidate;
@@ -5908,8 +5889,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         options.cursor ? 0 : CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES, false, &coverage);
     if (generation_rc != CBM_STORE_OK || coverage_rc != CBM_SYNTACTIC_COVERAGE_OK ||
         coverage.totals.rows_total > INT_MAX || coverage.totals.parse_partial_rows > INT_MAX ||
-        coverage.totals.skipped_rows > INT_MAX ||
-        coverage.totals.not_indexed_dir_rows > INT_MAX ||
+        coverage.totals.skipped_rows > INT_MAX || coverage.totals.not_indexed_dir_rows > INT_MAX ||
         coverage.totals.not_indexed_file_rows > INT_MAX) {
         (void)cbm_store_rollback(store);
         syntactic_coverage_window_clear(&coverage);
@@ -5944,12 +5924,10 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     size_t start = 0;
     if (options.cursor) {
         index_status_cursor_t cursor = {0};
-        const char *cursor_error =
-            index_status_cursor_decode(options.cursor, generation, query_hash, coverage_hash,
-                                       &cursor);
+        const char *cursor_error = index_status_cursor_decode(options.cursor, generation,
+                                                              query_hash, coverage_hash, &cursor);
         if (!cursor_error &&
-            (cursor.next_ordinal > INT64_MAX ||
-             (int64_t)cursor.next_ordinal >= syntactic_count)) {
+            (cursor.next_ordinal > INT64_MAX || (int64_t)cursor.next_ordinal >= syntactic_count)) {
             cursor_error =
                 "invalid_cursor: index_status cursor ordinal is outside the coverage stream";
         }
@@ -5992,9 +5970,9 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     options.cursor = NULL;
 
     index_status_totals_t totals = index_status_count_categories(&coverage.totals);
-    bool health_generation_matches =
-        have_project && health.have_meta && project_info.indexed_at && health.meta.generation &&
-        strcmp(project_info.indexed_at, health.meta.generation) == 0;
+    bool health_generation_matches = have_project && health.have_meta && project_info.indexed_at &&
+                                     health.meta.generation &&
+                                     strcmp(project_info.indexed_at, health.meta.generation) == 0;
     int represented = 0;
     char *result = index_status_build_bounded(
         project, nodes, edges, &project_info, have_project, coverage.rows, coverage.row_count,
@@ -6005,8 +5983,8 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         free(result);
         int additional = options.limit - coverage.row_count;
         coverage_rc = syntactic_coverage_window_extend(
-            store, project, CBM_SYNTACTIC_COVERAGE_PROJECT, NULL, coverage.next_offset,
-            additional, CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES, false, &coverage);
+            store, project, CBM_SYNTACTIC_COVERAGE_PROJECT, NULL, coverage.next_offset, additional,
+            CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES, false, &coverage);
         if (coverage_rc == CBM_SYNTACTIC_COVERAGE_OK) {
             result = index_status_build_bounded(
                 project, nodes, edges, &project_info, have_project, coverage.rows,
@@ -6016,8 +5994,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             result = NULL;
         }
     }
-    if (strcmp(generation, "legacy") == 0 &&
-        (int64_t)start + represented < syntactic_count) {
+    if (strcmp(generation, "legacy") == 0 && (int64_t)start + represented < syntactic_count) {
         free(result);
         result = index_status_error_result(
             "cursor_unsupported: this project's index predates generation tracking; re-index "
@@ -9606,10 +9583,9 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
         (void)cbm_store_rollback(store);
         health.available = false;
     }
-    bool health_generation_matches =
-        have_health_project && health.have_meta && health_project.indexed_at &&
-        health.meta.generation &&
-        strcmp(health_project.indexed_at, health.meta.generation) == 0;
+    bool health_generation_matches = have_health_project && health.have_meta &&
+                                     health_project.indexed_at && health.meta.generation &&
+                                     strcmp(health_project.indexed_at, health.meta.generation) == 0;
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
     add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
     add_parse_partial_summary(doc, root, file_errors, file_error_count);
@@ -9695,9 +9671,9 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     }
 
     /* The caller appends the final status field after this helper returns. */
-    add_rust_analysis_report_envelope_bounded(
-        doc, root, &health, health_generation_matches, RUST_ANALYSIS_EVIDENCE_MAX_BYTES,
-        CBM_MCP_RESULT_MAX_BYTES - 512U, true);
+    add_rust_analysis_report_envelope_bounded(doc, root, &health, health_generation_matches,
+                                              RUST_ANALYSIS_EVIDENCE_MAX_BYTES,
+                                              CBM_MCP_RESULT_MAX_BYTES - 512U, true);
 
     rust_analysis_snapshot_clear(&health);
     if (have_health_project) {
@@ -10800,18 +10776,17 @@ static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_
                                "Coverage lookup unavailable; treat graph completeness as unknown.");
     } else if (partial && !partial->detail_truncated) {
         char note[CBM_SZ_1K];
-        snprintf(
-            note, sizeof(note),
-            source_in_response
-                ? "This file was only PARTIALLY indexed — line range(s) %s could not be "
-                  "parsed, so constructs there may be missing from the graph (callers/callees "
-                  "and search results can under-report this file). The source above is ground "
-                  "truth. (best-effort signal)"
-                : "This file was only PARTIALLY indexed — line range(s) %s could not be "
-                  "parsed, so this graph-only outline may omit constructs. Request a raw "
-                  "source range with start_line/end_line and use that source as ground truth. "
-                  "(best-effort signal)",
-            partial->detail && partial->detail[0] ? partial->detail : "?");
+        snprintf(note, sizeof(note),
+                 source_in_response
+                     ? "This file was only PARTIALLY indexed — line range(s) %s could not be "
+                       "parsed, so constructs there may be missing from the graph (callers/callees "
+                       "and search results can under-report this file). The source above is ground "
+                       "truth. (best-effort signal)"
+                     : "This file was only PARTIALLY indexed — line range(s) %s could not be "
+                       "parsed, so this graph-only outline may omit constructs. Request a raw "
+                       "source range with start_line/end_line and use that source as ground truth. "
+                       "(best-effort signal)",
+                 partial->detail && partial->detail[0] ? partial->detail : "?");
         yyjson_mut_obj_add_strcpy(doc, root_obj, "coverage_note", note);
     } else if (coverage.exact_parse_partial) {
         yyjson_mut_obj_add_str(
@@ -13647,15 +13622,16 @@ static void detect_emit_impacted_tree(cbm_sb_t *sb, cbm_traverse_result_t *tr, i
  * file/symbol rows are adaptively reduced until the complete MCP envelope
  * fits. This is deliberately tool-specific; the universal envelope remains a
  * fail-closed last line of defence for output shapes without such a summary. */
-static char *detect_build_refinement_result(
-    const char *base_branch, const char *merge_base, const char *direction, const char *scope,
-    int depth, char **files, int file_count, int seed_count, cbm_traverse_result_t *impact,
-    bool bfs_truncated, int requested_impact_limit, bool legacy_json, size_t complete_bytes,
-    char mods[][CBM_SZ_128], int *mcnt, int module_count, int module_overflow) {
+static char *detect_build_refinement_result(const char *base_branch, const char *merge_base,
+                                            const char *direction, const char *scope, int depth,
+                                            char **files, int file_count, int seed_count,
+                                            cbm_traverse_result_t *impact, bool bfs_truncated,
+                                            int requested_impact_limit, bool legacy_json,
+                                            size_t complete_bytes, char mods[][CBM_SZ_128],
+                                            int *mcnt, int module_count, int module_overflow) {
     int changed_shown = file_count < 32 ? file_count : 32;
-    int impacted_shown = impact->visited_count < requested_impact_limit
-                             ? impact->visited_count
-                             : requested_impact_limit;
+    int impacted_shown = impact->visited_count < requested_impact_limit ? impact->visited_count
+                                                                        : requested_impact_limit;
     if (impacted_shown > 32) {
         impacted_shown = 32;
     }
@@ -13752,9 +13728,8 @@ static char *detect_build_refinement_result(
             for (int i = 0; i < impacted_shown; i++) {
                 const cbm_node_hop_t *row = &impact->visited[i];
                 yyjson_mut_val *entry = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_strcpy(
-                    doc, entry, "qn",
-                    row->node.qualified_name ? row->node.qualified_name : "");
+                yyjson_mut_obj_add_strcpy(doc, entry, "qn",
+                                          row->node.qualified_name ? row->node.qualified_name : "");
                 yyjson_mut_obj_add_strcpy(doc, entry, "label",
                                           row->node.label ? row->node.label : "");
                 yyjson_mut_obj_add_strcpy(doc, entry, "file",
@@ -14190,7 +14165,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                                   MCP_BFS_LIMIT_MAX, &impact, &truncated);
     }
 
-    char(*impact_mods)[CBM_SZ_128] = NULL;
+    char (*impact_mods)[CBM_SZ_128] = NULL;
     int *impact_mcnt = NULL;
     int impact_module_count = 0;
     int impact_module_overflow = 0;
@@ -14224,8 +14199,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                 "could not be built; no partial result returned",
                 true);
         }
-        impact_module_count = detect_module_rollup(&impact, impact_mods, impact_mcnt,
-                                                   &impact_module_overflow);
+        impact_module_count =
+            detect_module_rollup(&impact, impact_mods, impact_mcnt, &impact_module_overflow);
     }
 
     bool is_error = (git_status != 0 && file_count == 0);

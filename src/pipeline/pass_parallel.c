@@ -345,10 +345,10 @@ static bool pp_err_add(pp_err_list_t *list, const char *path, const char *reason
     }
     if (list->count >= list->cap) {
         int ncap = list->cap ? list->cap * 2 : 8;
-        cbm_file_error_t *grown = pp_err_test_allows_alloc()
-                                      ? (cbm_file_error_t *)realloc(
-                                            list->items, (size_t)ncap * sizeof(*grown))
-                                      : NULL;
+        cbm_file_error_t *grown =
+            pp_err_test_allows_alloc()
+                ? (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown))
+                : NULL;
         if (!grown) {
             free(path_copy);
             free(reason_copy);
@@ -2943,8 +2943,7 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
         return NULL;
     cbm_mutex_lock(&rc->rust_shared_mu);
     p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_relaxed);
-    if (!p && !atomic_load_explicit(&rc->rust_shared_allocation_failed,
-                                    memory_order_relaxed)) {
+    if (!p && !atomic_load_explicit(&rc->rust_shared_allocation_failed, memory_order_relaxed)) {
         cbm_arena_init(&rc->rust_shared_arena);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
         size_t fail_after = atomic_exchange(&g_pp_test_rust_registry_fail_after, SIZE_MAX);
@@ -2962,8 +2961,7 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
 #endif
         if (cbm_arena_status(&rc->rust_shared_arena) != CBM_ARENA_STATUS_AVAILABLE) {
             p = NULL;
-            atomic_store_explicit(&rc->rust_shared_allocation_failed, true,
-                                  memory_order_release);
+            atomic_store_explicit(&rc->rust_shared_allocation_failed, true, memory_order_release);
         } else if (p) {
             char sb[96];
             snprintf(sb, sizeof(sb), "types=%d funcs=%d", p->type_count, p->func_count);
@@ -2984,10 +2982,16 @@ static CBMTypeRegistry *pp_rust_shared_registry_get(void *ctx) {
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 bool cbm_parallel_test_rust_registry_failure_is_rejected(size_t successful_allocations) {
     CBMLSPDef defs[2] = {
-        {.qualified_name = "test.demo.Type", .short_name = "Type", .label = "Type",
-         .def_module_qn = "test.demo", .lang = CBM_LANG_RUST},
-        {.qualified_name = "test.demo.Type.call", .short_name = "call", .label = "Method",
-         .receiver_type = "test.demo.Type", .def_module_qn = "test.demo",
+        {.qualified_name = "test.demo.Type",
+         .short_name = "Type",
+         .label = "Type",
+         .def_module_qn = "test.demo",
+         .lang = CBM_LANG_RUST},
+        {.qualified_name = "test.demo.Type.call",
+         .short_name = "call",
+         .label = "Method",
+         .receiver_type = "test.demo.Type",
+         .def_module_qn = "test.demo",
          .lang = CBM_LANG_RUST},
     };
     resolve_ctx_t rc = {.all_defs = defs, .def_count = 2};
@@ -2997,8 +3001,7 @@ bool cbm_parallel_test_rust_registry_failure_is_rejected(size_t successful_alloc
     cbm_parallel_test_fail_rust_registry_after(successful_allocations);
     CBMTypeRegistry *registry = pp_rust_shared_registry(&rc);
     bool rejected = registry == NULL &&
-                    atomic_load_explicit(&rc.rust_shared_allocation_failed,
-                                         memory_order_acquire);
+                    atomic_load_explicit(&rc.rust_shared_allocation_failed, memory_order_acquire);
     if (rc.rust_shared_arena_live) {
         cbm_arena_destroy(&rc.rust_shared_arena);
     }
@@ -3257,10 +3260,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
                 CBMPxcDispatchStatus dispatch_status = cbm_pxc_dispatch_file(
-                    lang, result, lsp_source, lsp_source_len, rel, def_module,
-                    rc->cross_registries, rc->module_def_index, rc->all_defs, rc->def_count,
-                    imp_keys, imp_vals, imp_count, rc->rust_manifest,
-                    pp_rust_shared_registry_get, rc);
+                    lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
+                    rc->module_def_index, rc->all_defs, rc->def_count, imp_keys, imp_vals,
+                    imp_count, rc->rust_manifest, pp_rust_shared_registry_get, rc);
                 if (dispatch_status == CBM_PXC_DISPATCH_ALLOCATION_FAILED &&
                     lang != CBM_LANG_RUST) {
                     atomic_store_explicit(&rc->dispatch_allocation_failed, true,
@@ -3304,8 +3306,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 atomic_fetch_add_explicit(&rc->lsp_cross_skipped_no_source, SKIP_ONE,
                                           memory_order_relaxed);
                 if (lang == CBM_LANG_RUST) {
-                    cbm_rust_health_record(&result->rust_health,
-                                           CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
+                    cbm_rust_health_record(&result->rust_health, CBM_RUST_HEALTH_SOURCE_UNAVAILABLE,
+                                           0, 0);
                 }
             }
         }
@@ -3367,16 +3369,15 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count, CBMLSPDef *all_defs, int def_count,
-                         CBMPxcCollectStatus definition_universe_status,
-                         char *const *def_modules, struct CBMModuleDefIndex *module_def_index,
-                         void *cross_registries_v) {
+                         CBMPxcCollectStatus definition_universe_status, char *const *def_modules,
+                         struct CBMModuleDefIndex *module_def_index, void *cross_registries_v) {
     /* See header: typed as void* across the TU boundary; cast back here. */
     CBMCrossLspRegistries *cross_registries = (CBMCrossLspRegistries *)cross_registries_v;
     if (file_count == 0) {
         return 0;
     }
     if (cbm_pxc_collection_requires_abort(result_cache, files, file_count,
-                                           definition_universe_status)) {
+                                          definition_universe_status)) {
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 

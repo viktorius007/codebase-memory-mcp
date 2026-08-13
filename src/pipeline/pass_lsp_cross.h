@@ -41,9 +41,8 @@
 
 /* True iff this language has a cbm_run_X_lsp_cross resolver wired up. */
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
-bool cbm_pxc_collection_requires_abort(CBMFileResult *const *cache,
-                                       const cbm_file_info_t *files, int file_count,
-                                       CBMPxcCollectStatus status);
+bool cbm_pxc_collection_requires_abort(CBMFileResult *const *cache, const cbm_file_info_t *files,
+                                       int file_count, CBMPxcCollectStatus status);
 
 typedef enum {
     CBM_PXC_DISPATCH_COMPLETE = 0,
@@ -58,11 +57,10 @@ typedef enum {
  * use. Returns the malloc'd array (free() it) and writes the entry
  * count to *out_count and the disjoint outcome to *out_status. An empty
  * universe and allocation failure both return NULL/write 0, but can never be
- * confused through the typed status. out_def_starts (optional, file_count + 1 entries, caller-owned)
- * receives per-file prefix offsets: file i's defs occupy
- * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
- * needs the per-file slices, which the flat array does not otherwise
- * record. */
+ * confused through the typed status. out_def_starts (optional, file_count + 1 entries,
+ * caller-owned) receives per-file prefix offsets: file i's defs occupy [out_def_starts[i],
+ * out_def_starts[i+1]) — the LSP-surface serializer needs the per-file slices, which the flat array
+ * does not otherwise record. */
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count, CBMPxcCollectStatus *out_status,
@@ -76,10 +74,8 @@ void cbm_pxc_test_fail_collect_alloc_once(void);
 void cbm_pxc_test_fail_target_route_alloc_once(void);
 void cbm_pxc_test_poison_non_rust_registry_once(void);
 void cbm_pxc_test_fail_destination_copy_at(int copy_position);
-bool cbm_pxc_test_append_results(CBMFileResult *destination,
-                                 const CBMResolvedCallArray *source);
-bool cbm_pxc_test_append_synthetic_calls(CBMFileResult *destination,
-                                         const CBMCallArray *source);
+bool cbm_pxc_test_append_results(CBMFileResult *destination, const CBMResolvedCallArray *source);
+bool cbm_pxc_test_append_synthetic_calls(CBMFileResult *destination, const CBMCallArray *source);
 bool cbm_pxc_test_non_rust_destination_failure_is_typed(void);
 #endif
 
@@ -214,13 +210,12 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * per-file fallback with FILTERED defs for languages without a shared
  * variant. rust_shared_get (nullable) supplies the lazily-built shared Rust
  * registry for NULL-filter rust files. */
-CBMPxcDispatchStatus cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result,
-                           const char *source,
-                           int source_len, const char *rel, const char *def_module,
-                           const CBMCrossLspRegistries *cross_registries,
-                           const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
-                           int all_def_count, const char **imp_keys, const char **imp_vals,
-                           int imp_count, const struct CBMCargoManifest *rust_manifest,
-                           CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx);
+CBMPxcDispatchStatus cbm_pxc_dispatch_file(
+    CBMLanguage lang, CBMFileResult *result, const char *source, int source_len, const char *rel,
+    const char *def_module, const CBMCrossLspRegistries *cross_registries,
+    const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs, int all_def_count,
+    const char **imp_keys, const char **imp_vals, int imp_count,
+    const struct CBMCargoManifest *rust_manifest, CBMTypeRegistry *(*rust_shared_get)(void *),
+    void *rust_shared_ctx);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

@@ -445,8 +445,7 @@ void cbm_pipeline_capture_rust_health(cbm_pipeline_t *p, const char *rel_path,
     } else {
         cbm_rust_health_record(&health, CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
     }
-    health.required_routes |=
-        CBM_RUST_HEALTH_ROUTE_SINGLE_FILE | CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+    health.required_routes |= CBM_RUST_HEALTH_ROUTE_SINGLE_FILE | CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
     p->rust_files_captured++;
     CBMRustAnalysisStatus status = cbm_rust_health_status(&health);
     if (status == CBM_RUST_ANALYSIS_COMPLETE) {
@@ -454,8 +453,7 @@ void cbm_pipeline_capture_rust_health(cbm_pipeline_t *p, const char *rel_path,
     }
     if (p->rust_health_row_count >= p->rust_health_row_cap) {
         int next = p->rust_health_row_cap ? p->rust_health_row_cap * 2 : 16;
-        cbm_coverage_row_t *grown =
-            realloc(p->rust_health_rows, (size_t)next * sizeof(*grown));
+        cbm_coverage_row_t *grown = realloc(p->rust_health_rows, (size_t)next * sizeof(*grown));
         if (!grown) {
             p->rust_health_capture_failed = true;
             return;
@@ -473,8 +471,8 @@ void cbm_pipeline_capture_rust_health(cbm_pipeline_t *p, const char *rel_path,
     }
     p->rust_health_rows[p->rust_health_row_count++] = (cbm_coverage_row_t){
         .rel_path = path,
-        .kind = status == CBM_RUST_ANALYSIS_PARTIAL ? "analysis_partial:rust"
-                                                    : "analysis_failed:rust",
+        .kind =
+            status == CBM_RUST_ANALYSIS_PARTIAL ? "analysis_partial:rust" : "analysis_failed:rust",
         .detail = detail,
     };
 }
@@ -659,8 +657,7 @@ static char *fe_strdup(const char *s) {
 
 static bool pipeline_file_error_test_allows_alloc(cbm_pipeline_t *p) {
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    if (p && p->test_file_error_alloc_position > 0 &&
-        --p->test_file_error_alloc_position == 0) {
+    if (p && p->test_file_error_alloc_position > 0 && --p->test_file_error_alloc_position == 0) {
         return false;
     }
 #else
@@ -692,10 +689,10 @@ bool cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char
     }
     if (p->file_errors_count >= p->file_errors_cap) {
         int ncap = p->file_errors_cap ? p->file_errors_cap * 2 : 16;
-        cbm_file_error_t *grown = pipeline_file_error_test_allows_alloc(p)
-                                      ? (cbm_file_error_t *)realloc(
-                                            p->file_errors, (size_t)ncap * sizeof(*grown))
-                                      : NULL;
+        cbm_file_error_t *grown =
+            pipeline_file_error_test_allows_alloc(p)
+                ? (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown))
+                : NULL;
         if (!grown) {
             free(path_copy);
             free(reason_copy);
@@ -1709,8 +1706,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         if (def_modules) {
             all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
                                                 def_modules, &def_count, &def_collect_status,
-                                                def_starts,
-                                                rust_collect_manifest_ptr);
+                                                def_starts, rust_collect_manifest_ptr);
         } else {
             def_collect_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
         }
@@ -2433,8 +2429,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
     int rust_files_total = -1;
     cbm_pipeline_get_rust_health(p, &rust_cov, &rust_cov_count, &rust_recording_status,
                                  &rust_files_total);
-    int cov_total =
-        p->file_errors_count + p->excluded_count + p->ignored_count + rust_cov_count;
+    int cov_total = p->file_errors_count + p->excluded_count + p->ignored_count + rust_cov_count;
     cbm_coverage_row_t *cov = NULL;
     int cov_count = 0;
     bool coverage_rows_available = cov_total == 0 && !p->file_error_capture_failed;
