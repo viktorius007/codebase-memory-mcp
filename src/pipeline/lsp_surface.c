@@ -25,7 +25,7 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 1 };
+enum { SURFACE_CODEC_VERSION = 2 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -87,6 +87,8 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         add_str_or_null(doc, o, "lb", d->label);
         add_str_or_null(doc, o, "rt", d->receiver_type);
         add_str_or_null(doc, o, "dm", d->def_module_qn);
+        add_str_or_null(doc, o, "rcr", d->rust_crate_root_qn);
+        add_str_or_null(doc, o, "rcs", d->rust_crate_source_module_qn);
         add_str_or_null(doc, o, "ret", d->return_types);
         add_str_or_null(doc, o, "emb", d->embedded_types);
         add_str_or_null(doc, o, "fd", d->field_defs);
@@ -242,6 +244,8 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->label = arena_str_or_null(arena, yyjson_obj_get(o, "lb"));
         d->receiver_type = arena_str_or_null(arena, yyjson_obj_get(o, "rt"));
         d->def_module_qn = arena_str_or_null(arena, yyjson_obj_get(o, "dm"));
+        d->rust_crate_root_qn = arena_str_or_null(arena, yyjson_obj_get(o, "rcr"));
+        d->rust_crate_source_module_qn = arena_str_or_null(arena, yyjson_obj_get(o, "rcs"));
         d->return_types = arena_str_or_null(arena, yyjson_obj_get(o, "ret"));
         d->embedded_types = arena_str_or_null(arena, yyjson_obj_get(o, "emb"));
         d->field_defs = arena_str_or_null(arena, yyjson_obj_get(o, "fd"));

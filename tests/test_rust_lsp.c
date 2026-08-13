@@ -823,6 +823,277 @@ TEST(rustlsp_crossfile_relative_use_roots_canonicalize) {
     PASS();
 }
 
+TEST(rustlsp_crossfile_rooted_impl_returns_require_authoritative_crate_root) {
+    const char *alpha_root = "project.crates.alpha.src";
+    const char *alpha_source = "project.crates.alpha.src.lib";
+    CBMLSPDef defs[20] = {0};
+    defs[0] = (CBMLSPDef){.qualified_name = "project.crates.alpha.src.factory.deep.Factory",
+                          .short_name = "Factory",
+                          .label = "Type",
+                          .def_module_qn = "project.crates.alpha.src.factory.deep",
+                          .rust_crate_root_qn = alpha_root,
+                          .rust_crate_source_module_qn = alpha_source,
+                          .lang = CBM_LANG_RUST};
+    const char *factory_methods[] = {"make_crate", "make_self", "make_super", "make_self_kw"};
+    const char *factory_method_qns[] = {
+        "project.crates.alpha.src.factory.deep.Factory.make_crate",
+        "project.crates.alpha.src.factory.deep.Factory.make_self",
+        "project.crates.alpha.src.factory.deep.Factory.make_super",
+        "project.crates.alpha.src.factory.deep.Factory.make_self_kw"};
+    const char *factory_returns[] = {"crate::domain::CrateRunner", "self::SelfRunner",
+                                     "super::super::domain::SuperRunner", "Self"};
+    for (int i = 0; i < 4; i++) {
+        defs[1 + i] =
+            (CBMLSPDef){.qualified_name = factory_method_qns[i],
+                        .short_name = factory_methods[i],
+                        .label = "Method",
+                        .receiver_type = "project.crates.alpha.src.factory.deep.Factory",
+                        .def_module_qn = "project.crates.alpha.src.factory.deep",
+                        .rust_crate_root_qn = alpha_root,
+                        .rust_crate_source_module_qn = alpha_source,
+                        .return_types = factory_returns[i],
+                        .lang = CBM_LANG_RUST};
+    }
+    const char *runner_qns[] = {"project.crates.alpha.src.domain.CrateRunner",
+                                "project.crates.alpha.src.factory.deep.SelfRunner",
+                                "project.crates.alpha.src.domain.SuperRunner"};
+    const char *runner_names[] = {"CrateRunner", "SelfRunner", "SuperRunner"};
+    const char *runner_method_qns[] = {"project.crates.alpha.src.domain.CrateRunner.dry_run",
+                                       "project.crates.alpha.src.factory.deep.SelfRunner.dry_run",
+                                       "project.crates.alpha.src.domain.SuperRunner.dry_run"};
+    for (int i = 0; i < 3; i++) {
+        defs[5 + (i * 2)] = (CBMLSPDef){.qualified_name = runner_qns[i],
+                                        .short_name = runner_names[i],
+                                        .label = "Type",
+                                        .def_module_qn = i == 1
+                                                             ? "project.crates.alpha.src.factory.deep"
+                                                             : "project.crates.alpha.src.domain",
+                                        .rust_crate_root_qn = alpha_root,
+                                        .rust_crate_source_module_qn = alpha_source,
+                                        .lang = CBM_LANG_RUST};
+        defs[6 + (i * 2)] =
+            (CBMLSPDef){.qualified_name = runner_method_qns[i],
+                        .short_name = "dry_run",
+                        .label = "Method",
+                        .receiver_type = runner_qns[i],
+                        .def_module_qn = i == 1 ? "project.crates.alpha.src.factory.deep"
+                                                : "project.crates.alpha.src.domain",
+                        .rust_crate_root_qn = alpha_root,
+                        .rust_crate_source_module_qn = alpha_source,
+                        .lang = CBM_LANG_RUST};
+    }
+    defs[11] = (CBMLSPDef){.qualified_name = "project.crates.alpha.src.factory.deep.Factory.dry_run",
+                           .short_name = "dry_run",
+                           .label = "Method",
+                           .receiver_type = "project.crates.alpha.src.factory.deep.Factory",
+                           .def_module_qn = "project.crates.alpha.src.factory.deep",
+                           .rust_crate_root_qn = alpha_root,
+                           .rust_crate_source_module_qn = alpha_source,
+                           .lang = CBM_LANG_RUST};
+
+    /* No authoritative root: the old positional rule minted project.crates.*
+     * and could bind this same-named non-member decoy. The carrier must leave
+     * crate:: unqualified and the chain unresolved instead. */
+    defs[12] = (CBMLSPDef){.qualified_name = "project.crates.alpha.src.factory.deep.MissingFactory",
+                           .short_name = "MissingFactory",
+                           .label = "Type",
+                           .def_module_qn = "project.crates.alpha.src.factory.deep",
+                           .lang = CBM_LANG_RUST};
+    defs[13] = (CBMLSPDef){.qualified_name =
+                               "project.crates.alpha.src.factory.deep.MissingFactory.make_missing",
+                           .short_name = "make_missing",
+                           .label = "Method",
+                           .receiver_type = "project.crates.alpha.src.factory.deep.MissingFactory",
+                           .def_module_qn = "project.crates.alpha.src.factory.deep",
+                           .return_types = "crate::domain::CrateRunner",
+                           .lang = CBM_LANG_RUST};
+    defs[14] = (CBMLSPDef){.qualified_name = "project.crates.domain.CrateRunner.dry_run",
+                           .short_name = "dry_run",
+                           .label = "Method",
+                           .receiver_type = "project.crates.domain.CrateRunner",
+                           .def_module_qn = "project.crates.domain",
+                           .lang = CBM_LANG_RUST};
+    defs[15] = (CBMLSPDef){
+        .qualified_name = "project.crates.alpha.src.factory.deep.Factory.make_root_item",
+        .short_name = "make_root_item", .label = "Method",
+        .receiver_type = "project.crates.alpha.src.factory.deep.Factory",
+        .def_module_qn = "project.crates.alpha.src.factory.deep",
+        .rust_crate_root_qn = alpha_root,
+        .rust_crate_source_module_qn = alpha_source,
+        .return_types = "crate::RootRunner", .lang = CBM_LANG_RUST};
+    defs[16] = (CBMLSPDef){.qualified_name = "project.crates.alpha.src.lib.RootRunner",
+                           .short_name = "RootRunner", .label = "Type",
+                           .def_module_qn = alpha_source,
+                           .rust_crate_root_qn = alpha_root,
+                           .rust_crate_source_module_qn = alpha_source,
+                           .lang = CBM_LANG_RUST};
+    defs[17] = (CBMLSPDef){.qualified_name =
+                               "project.crates.alpha.src.lib.RootRunner.dry_run",
+                           .short_name = "dry_run", .label = "Method",
+                           .receiver_type = "project.crates.alpha.src.lib.RootRunner",
+                           .def_module_qn = alpha_source,
+                           .rust_crate_root_qn = alpha_root,
+                           .rust_crate_source_module_qn = alpha_source,
+                           .lang = CBM_LANG_RUST};
+    /* A literal `crate.*` registry identity must not make missing Cargo
+     * metadata resolvable. */
+    defs[18] = (CBMLSPDef){.qualified_name = "crate.domain.CrateRunner",
+                           .short_name = "CrateRunner", .label = "Type",
+                           .def_module_qn = "crate.domain", .lang = CBM_LANG_RUST};
+    defs[19] = (CBMLSPDef){.qualified_name = "crate.domain.CrateRunner.dry_run",
+                           .short_name = "dry_run", .label = "Method",
+                           .receiver_type = "crate.domain.CrateRunner",
+                           .def_module_qn = "crate.domain", .lang = CBM_LANG_RUST};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 20);
+    ASSERT_NOT_NULL(registry);
+    for (int i = 0; i < 3; i++) {
+        const CBMRegisteredFunc *method =
+            cbm_registry_lookup_func(registry, defs[1 + i].qualified_name);
+        ASSERT_NOT_NULL(method);
+        ASSERT_NOT_NULL(method->signature);
+        ASSERT_NOT_NULL(method->signature->data.func.return_types);
+        const CBMType *ret = method->signature->data.func.return_types[0];
+        ASSERT_NOT_NULL(ret);
+        ASSERT_EQ(ret->kind, CBM_TYPE_NAMED);
+        ASSERT_STR_EQ(ret->data.named.qualified_name, runner_qns[i]);
+    }
+    const CBMRegisteredFunc *self_method = cbm_registry_lookup_func(registry, defs[4].qualified_name);
+    ASSERT_NOT_NULL(self_method);
+    ASSERT_STR_EQ(self_method->signature->data.func.return_types[0]->data.named.qualified_name,
+                  "Self");
+    const CBMRegisteredFunc *root_item_factory =
+        cbm_registry_lookup_func(registry, defs[15].qualified_name);
+    ASSERT_NOT_NULL(root_item_factory);
+    ASSERT_STR_EQ(root_item_factory->signature->data.func.return_types[0]->data.named.qualified_name,
+                  "project.crates.alpha.src.lib.RootRunner");
+
+    const char *source =
+        "fn rooted_returns() {\n"
+        "    Factory::make_crate().dry_run();\n"
+        "    Factory::make_self().dry_run();\n"
+        "    Factory::make_super().dry_run();\n"
+        "    Factory::make_self_kw().dry_run();\n"
+        "    Factory::make_root_item().dry_run();\n"
+        "    MissingFactory::make_missing().dry_run();\n"
+        "}\n";
+    const char *import_names[] = {"Factory", "MissingFactory"};
+    const char *import_qns[] = {"project::crates::alpha::src::factory::deep::Factory",
+                                "project::crates::alpha::src::factory::deep::MissingFactory"};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "project.crates.alpha.src.caller", registry,
+        import_names, import_qns, 2, NULL, NULL, &out, NULL, NULL);
+    int exact[5] = {0};
+    int positional_decoy = 0;
+    for (int i = 0; i < out.count; i++) {
+        const CBMResolvedCall *call = &out.items[i];
+        if (!call->caller_qn || !call->callee_qn ||
+            strcmp(call->caller_qn, "project.crates.alpha.src.caller.rooted_returns") != 0) {
+            continue;
+        }
+        for (int j = 0; j < 3; j++) {
+            if (strcmp(call->callee_qn, runner_method_qns[j]) == 0) {
+                exact[j]++;
+            }
+        }
+        if (strcmp(call->callee_qn,
+                   "project.crates.alpha.src.factory.deep.Factory.dry_run") == 0) {
+            exact[3]++;
+        }
+        if (strcmp(call->callee_qn,
+                   "project.crates.alpha.src.lib.RootRunner.dry_run") == 0) {
+            exact[4]++;
+        }
+        if (strcmp(call->callee_qn, "project.crates.domain.CrateRunner.dry_run") == 0) {
+            positional_decoy++;
+        }
+    }
+    for (int i = 0; i < 5; i++) {
+        ASSERT_EQ(exact[i], 1);
+    }
+    ASSERT_EQ(positional_decoy, 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_manifest_free_self_super_returns_preserve_module_semantics) {
+    CBMLSPDef defs[] = {
+        {.qualified_name = "project.group.factory.deep.Factory",
+         .short_name = "Factory", .label = "Type",
+         .def_module_qn = "project.group.factory.deep", .lang = CBM_LANG_RUST},
+        {.qualified_name = "project.group.factory.deep.Factory.make_self",
+         .short_name = "make_self", .label = "Method",
+         .receiver_type = "project.group.factory.deep.Factory",
+         .def_module_qn = "project.group.factory.deep", .return_types = "self::SelfRunner",
+         .lang = CBM_LANG_RUST},
+        {.qualified_name = "project.group.factory.deep.Factory.make_super",
+         .short_name = "make_super", .label = "Method",
+         .receiver_type = "project.group.factory.deep.Factory",
+         .def_module_qn = "project.group.factory.deep",
+         .return_types = "super::super::domain::SuperRunner", .lang = CBM_LANG_RUST},
+        {.qualified_name = "project.group.factory.deep.SelfRunner",
+         .short_name = "SelfRunner", .label = "Type",
+         .def_module_qn = "project.group.factory.deep", .lang = CBM_LANG_RUST},
+        {.qualified_name = "project.group.factory.deep.SelfRunner.dry_run",
+         .short_name = "dry_run", .label = "Method",
+         .receiver_type = "project.group.factory.deep.SelfRunner",
+         .def_module_qn = "project.group.factory.deep", .lang = CBM_LANG_RUST},
+        {.qualified_name = "project.group.domain.SuperRunner",
+         .short_name = "SuperRunner", .label = "Type",
+         .def_module_qn = "project.group.domain", .lang = CBM_LANG_RUST},
+        {.qualified_name = "project.group.domain.SuperRunner.dry_run",
+         .short_name = "dry_run", .label = "Method",
+         .receiver_type = "project.group.domain.SuperRunner",
+         .def_module_qn = "project.group.domain", .lang = CBM_LANG_RUST},
+        /* Same leaves outside the module-relative identities are decoys. */
+        {.qualified_name = "project.other.SelfRunner.dry_run", .short_name = "dry_run",
+         .label = "Method", .receiver_type = "project.other.SelfRunner",
+         .def_module_qn = "project.other", .lang = CBM_LANG_RUST},
+        {.qualified_name = "project.other.SuperRunner.dry_run", .short_name = "dry_run",
+         .label = "Method", .receiver_type = "project.other.SuperRunner",
+         .def_module_qn = "project.other", .lang = CBM_LANG_RUST},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(
+        &arena, defs, (int)(sizeof(defs) / sizeof(defs[0])));
+    ASSERT_NOT_NULL(registry);
+    const CBMRegisteredFunc *self_factory = cbm_registry_lookup_func(registry, defs[1].qualified_name);
+    const CBMRegisteredFunc *super_factory = cbm_registry_lookup_func(registry, defs[2].qualified_name);
+    ASSERT_NOT_NULL(self_factory);
+    ASSERT_NOT_NULL(super_factory);
+    ASSERT_STR_EQ(self_factory->signature->data.func.return_types[0]->data.named.qualified_name,
+                  "project.group.factory.deep.SelfRunner");
+    ASSERT_STR_EQ(super_factory->signature->data.func.return_types[0]->data.named.qualified_name,
+                  "project.group.domain.SuperRunner");
+    const char *source = "fn run() { Factory::make_self().dry_run(); "
+                         "Factory::make_super().dry_run(); }\n";
+    const char *names[] = {"Factory"};
+    const char *qns[] = {"project::group::factory::deep::Factory"};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source),
+                                         "project.group.caller", registry, names, qns, 1, NULL,
+                                         NULL, &out, NULL, NULL);
+    int self_hit = 0;
+    int super_hit = 0;
+    int decoy_hit = 0;
+    for (int i = 0; i < out.count; i++) {
+        const char *qn = out.items[i].callee_qn;
+        if (!qn) continue;
+        if (strcmp(qn, "project.group.factory.deep.SelfRunner.dry_run") == 0) self_hit++;
+        if (strcmp(qn, "project.group.domain.SuperRunner.dry_run") == 0) super_hit++;
+        if (strncmp(qn, "project.other.", 14) == 0) decoy_hit++;
+    }
+    ASSERT_EQ(self_hit, 1);
+    ASSERT_EQ(super_hit, 1);
+    ASSERT_EQ(decoy_hit, 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* F4 Tier-2: the build-once shared registry path (cbm_rust_build_cross_registry +
  * cbm_run_rust_lsp_cross_with_registry) must resolve IDENTICALLY to the per-file
  * cbm_run_rust_lsp_cross — same fixture as rustlsp_crossfile_method_dispatch. Also
@@ -6844,6 +7115,45 @@ TEST(rustlsp_partial_cargo_parses_workspace) {
     PASS();
 }
 
+TEST(rustlsp_cargo_parses_typed_explicit_targets) {
+    const char *toml =
+        "[package]\nname = \"routes\"\nversion = \"0.1.0\"\n"
+        "[lib]\npath = \"engine/lib_entry.rs\"\n"
+        "[[bin]]\nname = \"worker\"\npath = \"apps/worker_entry.rs\"\n"
+        "[[bin]]\nname = \"admin\"\npath = \"apps/admin_entry.rs\"\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+    ASSERT_EQ(manifest.target_count, 3);
+    ASSERT_EQ(manifest.targets[0].kind, CBM_CARGO_TARGET_LIB);
+    ASSERT_STR_EQ(manifest.targets[0].source_path, "engine/lib_entry.rs");
+    ASSERT_EQ(manifest.targets[1].kind, CBM_CARGO_TARGET_BIN);
+    ASSERT_STR_EQ(manifest.targets[1].source_path, "apps/worker_entry.rs");
+    ASSERT_EQ(manifest.targets[2].kind, CBM_CARGO_TARGET_BIN);
+    ASSERT_STR_EQ(manifest.targets[2].source_path, "apps/admin_entry.rs");
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_target_allocation_failure_marks_inventory_incomplete) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    size_t saved_used = arena.used;
+    int saved_nblocks = arena.nblocks;
+    arena.used = arena.block_size;
+    arena.nblocks = CBM_ARENA_MAX_BLOCKS;
+    CBMCargoManifest manifest = {.targets_complete = true};
+    ASSERT_FALSE(cbm_cargo_add_routed_target(&arena, &manifest, CBM_CARGO_TARGET_LIB,
+                                             "broken", "pkg", "pkg/src/lib.rs", NULL));
+    ASSERT_FALSE(manifest.targets_complete);
+    ASSERT_EQ(manifest.target_count, 0);
+    arena.used = saved_used;
+    arena.nblocks = saved_nblocks;
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(rustlsp_partial_cargo_handles_comments_and_quirks) {
     CBMArena a; cbm_arena_init(&a);
     const char *toml =
@@ -7654,6 +7964,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_method_dispatch);
     RUN_TEST(rustlsp_crossfile_crate_import_factory_chain_exact_site);
     RUN_TEST(rustlsp_crossfile_relative_use_roots_canonicalize);
+    RUN_TEST(rustlsp_crossfile_rooted_impl_returns_require_authoritative_crate_root);
+    RUN_TEST(rustlsp_manifest_free_self_super_returns_preserve_module_semantics);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_relative_type_requires_declared_module);
     RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);
@@ -8216,6 +8528,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_partial_hrtb_stripped);
     RUN_TEST(rustlsp_partial_cargo_parses_simple);
     RUN_TEST(rustlsp_partial_cargo_parses_workspace);
+    RUN_TEST(rustlsp_cargo_parses_typed_explicit_targets);
+    RUN_TEST(rustlsp_cargo_target_allocation_failure_marks_inventory_incomplete);
     RUN_TEST(rustlsp_partial_cargo_handles_comments_and_quirks);
     RUN_TEST(rustlsp_health_status_is_derived_from_routes_and_issues);
     RUN_TEST(rustlsp_health_healthy_file_completes_and_counts_emissions);

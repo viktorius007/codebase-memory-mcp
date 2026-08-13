@@ -32,6 +32,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -257,11 +258,89 @@ static const char *pxc_qn_leaf(const char *name) {
     return leaf;
 }
 
+typedef struct {
+    const char *root_qn;
+    const char *source_module_qn;
+} PxcRustTargetRoute;
+
+static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *project_name,
+                                                 const char *rel_path,
+                                                 const CBMCargoManifest *manifest) {
+    PxcRustTargetRoute route = {0};
+    if (!arena || !project_name || !rel_path || !manifest || !manifest->targets ||
+        !manifest->targets_complete) {
+        return route;
+    }
+    const CBMCargoTarget *selected = NULL;
+    int exact_matches = 0;
+    int contained_matches = 0;
+    for (int i = 0; i < manifest->target_count; i++) {
+        const CBMCargoTarget *target = &manifest->targets[i];
+        const char *source = target->source_path;
+        if (!source) continue;
+        bool exact = strcmp(rel_path, source) == 0;
+        bool production = target->kind == CBM_CARGO_TARGET_LIB ||
+                          target->kind == CBM_CARGO_TARGET_BIN;
+        const char *owner_root = production ? target->package_dir : target->blocker_root;
+        size_t owner_len = owner_root ? strlen(owner_root) : 0;
+        bool contained = owner_root &&
+                         ((owner_len == 0) ||
+                          (owner_len > 0 && strncmp(rel_path, owner_root, owner_len) == 0 &&
+                           rel_path[owner_len] == '/'));
+        if (contained && production) {
+            for (int j = 0; j < manifest->target_count; j++) {
+                const char *nested = manifest->targets[j].package_dir;
+                size_t nested_len = nested ? strlen(nested) : 0;
+                if (nested_len > owner_len && strncmp(rel_path, nested, nested_len) == 0 &&
+                    rel_path[nested_len] == '/') {
+                    contained = false;
+                    break;
+                }
+            }
+        }
+        if (exact) {
+            selected = target;
+            exact_matches++;
+        } else if (contained) {
+            if (exact_matches == 0) selected = target;
+            contained_matches++;
+        }
+    }
+    if ((exact_matches > 0 ? exact_matches : contained_matches) != 1 || !selected ||
+        (selected->kind != CBM_CARGO_TARGET_LIB && selected->kind != CBM_CARGO_TARGET_BIN)) {
+        return route;
+    }
+    const char *selected_source = selected->source_path;
+    const char *slash = strrchr(selected_source, '/');
+    char *root_rel =
+        slash ? cbm_arena_strndup(arena, selected_source, (size_t)(slash - selected_source))
+              : cbm_arena_strdup(arena, "");
+    if (!root_rel) return route;
+    char *root = cbm_pipeline_fqn_module(project_name, root_rel);
+    char *source_module = cbm_pipeline_fqn_module(project_name, selected_source);
+    if (!root || !source_module) {
+        free(root);
+        free(source_module);
+        return route;
+    }
+    const char *owned_root = cbm_arena_strdup(arena, root);
+    const char *owned_source = cbm_arena_strdup(arena, source_module);
+    free(root);
+    free(source_module);
+    if (!owned_root || !owned_source) {
+        return route;
+    }
+    route.root_qn = owned_root;
+    route.source_module_qn = owned_source;
+    return route;
+}
+
 /* Convert one CBMDefinition into a CBMLSPDef. Returns 0 on success, -1
  * to skip (unsupported label or missing required field). dst gets borrowed
  * pointers into src and into `arena` for synthesised composites. */
 static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const char *module_qn,
-                             const char *namespace_name, CBMLanguage lang, CBMLSPDef *dst) {
+                             const char *namespace_name, CBMLanguage lang,
+                             PxcRustTargetRoute rust_route, CBMLSPDef *dst) {
     const char *label = pxc_map_label(src->label);
     if (!label || !src->qualified_name || !src->name)
         return -1;
@@ -276,6 +355,8 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     dst->short_name = src->name;
     dst->label = label;
     dst->def_module_qn = module_qn;
+    dst->rust_crate_root_qn = rust_route.root_qn;
+    dst->rust_crate_source_module_qn = rust_route.source_module_qn;
     dst->namespace_name = namespace_name;
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     /* Single return-type string. The per-language registrars split on '|'
@@ -301,8 +382,8 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
  * empty (the trait may provide defaults), so attaching the relation only to
  * concrete method records is lossy. */
 static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *impl,
-                                        const char *project_name, const char *rel_path,
-                                        const char *module_qn, CBMLSPDef *dst) {
+                                        const char *module_qn, PxcRustTargetRoute rust_route,
+                                        CBMLSPDef *dst) {
     if (!arena || !impl || !impl->trait_name || !impl->struct_name || !impl->struct_qn) {
         return -1;
     }
@@ -313,6 +394,8 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
     dst->label = "RustImpl";
     dst->receiver_type = receiver_qn;
     dst->def_module_qn = module_qn;
+    dst->rust_crate_root_qn = rust_route.root_qn;
+    dst->rust_crate_source_module_qn = rust_route.source_module_qn;
     dst->trait_qn = impl->trait_name; /* raw; canonicalized by Rust registry */
     dst->lang = CBM_LANG_RUST;
     dst->is_rust_impl_relation = true;
@@ -324,7 +407,8 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
  * borrowed from cache[i]->arena and from def_modules[i] (also borrowed). */
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
-                                    int *out_count, int *out_def_starts) {
+                                    int *out_count, int *out_def_starts,
+                                    const CBMCargoManifest *rust_manifest) {
     int total = 0;
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
@@ -361,6 +445,11 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
                                                           pxc_module_is_dir(files[fi].language));
         }
         const char *namespace_name = cache[fi]->namespace_name;
+        PxcRustTargetRoute rust_route = {0};
+        if (files[fi].language == CBM_LANG_RUST) {
+            rust_route = pxc_rust_target_route(&cache[fi]->arena, project_name,
+                                                files[fi].rel_path, rust_manifest);
+        }
         if ((!namespace_name || !namespace_name[0]) && files[fi].rel_path) {
             namespace_name =
                 pxc_infer_jvm_namespace(&cache[fi]->arena, files[fi].rel_path, files[fi].language);
@@ -370,15 +459,16 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         }
         for (int di = 0; di < cache[fi]->defs.count; di++) {
             if (pxc_build_lsp_def(&cache[fi]->arena, &cache[fi]->defs.items[di], def_modules[fi],
-                                  namespace_name, files[fi].language, &defs[idx]) == 0) {
+                                  namespace_name, files[fi].language, rust_route,
+                                  &defs[idx]) == 0) {
                 idx++;
             }
         }
         if (files[fi].language == CBM_LANG_RUST) {
             for (int ii = 0; ii < cache[fi]->impl_traits.count; ii++) {
                 if (pxc_build_rust_impl_relation(
-                        &cache[fi]->arena, &cache[fi]->impl_traits.items[ii], project_name,
-                        files[fi].rel_path, def_modules[fi], &defs[idx]) == 0) {
+                        &cache[fi]->arena, &cache[fi]->impl_traits.items[ii], def_modules[fi],
+                        rust_route, &defs[idx]) == 0) {
                     idx++;
                 }
             }
@@ -856,6 +946,8 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].label = defs[i].label;
         out[i].receiver_type = defs[i].receiver_type;
         out[i].def_module_qn = defs[i].def_module_qn;
+        out[i].crate_root_qn = defs[i].rust_crate_root_qn;
+        out[i].crate_source_module_qn = defs[i].rust_crate_source_module_qn;
         out[i].return_types = defs[i].return_types;
         out[i].embedded_types = defs[i].embedded_types;
         out[i].field_defs = defs[i].field_defs;
@@ -1022,7 +1114,6 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             cbm_arena_destroy(&scratch);
             used_prebuilt = true;
-            break;
         }
         case CBM_LANG_C:
         case CBM_LANG_CPP:
@@ -1133,6 +1224,383 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     free(filtered);
 }
 
+static bool pxc_cargo_append_existing_target(const char *repo_path, const char *member_dir,
+                                             const char *package_relative,
+                                             CBMCargoTargetKind kind, const char *name,
+                                             CBMArena *arena,
+                                             CBMCargoManifest *manifest) {
+    if (!repo_path || !package_relative || !arena || !manifest) return false;
+    char candidate[CBM_SZ_4K];
+    int n = snprintf(candidate, sizeof(candidate), "%s/%s%s%s", repo_path,
+                     member_dir && member_dir[0] ? member_dir : "",
+                     member_dir && member_dir[0] ? "/" : "", package_relative);
+    if (n <= 0 || (size_t)n >= sizeof(candidate)) return false;
+    char canonical_repo[CBM_SZ_4K];
+    char canonical_target[CBM_SZ_4K];
+    if (!cbm_canonical_path(repo_path, canonical_repo, sizeof(canonical_repo)) ||
+        !cbm_canonical_path(candidate, canonical_target, sizeof(canonical_target))) {
+        return false;
+    }
+    cbm_normalize_path_sep(canonical_repo);
+    cbm_normalize_path_sep(canonical_target);
+    size_t repo_len = strlen(canonical_repo);
+    if (strncmp(canonical_target, canonical_repo, repo_len) != 0 ||
+        canonical_target[repo_len] != '/') {
+        return false;
+    }
+    const char *rel = canonical_target + repo_len + 1;
+    char blocker[CBM_SZ_4K];
+    const char *blocker_root = NULL;
+    if (kind != CBM_CARGO_TARGET_LIB && kind != CBM_CARGO_TARGET_BIN) {
+        blocker_root = "";
+        const char *slash = strrchr(rel, '/');
+        size_t blocker_len = slash ? (size_t)(slash - rel) : 0;
+        if (blocker_len > 0 && blocker_len < sizeof(blocker)) {
+            memcpy(blocker, rel, blocker_len);
+            blocker[blocker_len] = '\0';
+            blocker_root = blocker;
+        }
+    }
+    return cbm_cargo_add_routed_target(arena, manifest, kind, name,
+                                       member_dir ? member_dir : "", rel, blocker_root);
+}
+
+static bool pxc_cargo_has_explicit_bin(const CBMCargoManifest *manifest, const char *name) {
+    for (int i = 0; manifest && name && i < manifest->target_count; i++) {
+        if (manifest->targets[i].kind == CBM_CARGO_TARGET_BIN && manifest->targets[i].name &&
+            strcmp(manifest->targets[i].name, name) == 0) return true;
+    }
+    return false;
+}
+
+static void pxc_cargo_normalize_relative(char *path) {
+    if (!path) return;
+    cbm_normalize_path_sep(path);
+    char normalized[CBM_SZ_4K];
+    size_t marks[CBM_SZ_4K / 2];
+    size_t out = 0;
+    int depth = 0;
+    const char *p = path;
+    while (*p) {
+        while (*p == '/') p++;
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0 || (len == 1 && start[0] == '.')) continue;
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (depth > 0) out = marks[--depth];
+            continue;
+        }
+        if (out && out + 1 < sizeof(normalized)) normalized[out++] = '/';
+        if (out + len >= sizeof(normalized) || depth >= (int)(sizeof(marks) / sizeof(marks[0]))) {
+            return;
+        }
+        marks[depth++] = out ? out - 1 : 0;
+        memcpy(normalized + out, start, len);
+        out += len;
+    }
+    normalized[out] = '\0';
+    memcpy(path, normalized, out + 1);
+}
+
+static bool pxc_cargo_has_explicit_bin_path(const CBMCargoManifest *manifest,
+                                             const char *path) {
+    char normalized_path[CBM_SZ_4K];
+    snprintf(normalized_path, sizeof(normalized_path), "%s", path ? path : "");
+    pxc_cargo_normalize_relative(normalized_path);
+    for (int i = 0; manifest && path && i < manifest->target_count; i++) {
+        if (manifest->targets[i].kind == CBM_CARGO_TARGET_BIN &&
+            manifest->targets[i].source_path) {
+            char explicit_path[CBM_SZ_4K];
+            snprintf(explicit_path, sizeof(explicit_path), "%s",
+                     manifest->targets[i].source_path);
+            pxc_cargo_normalize_relative(explicit_path);
+            if (strcmp(explicit_path, normalized_path) == 0) return true;
+        }
+    }
+    return false;
+}
+
+static bool pxc_cargo_relative_is_file(const char *repo_path, const char *member_dir,
+                                       const char *rel) {
+    char absolute[CBM_SZ_4K];
+    int n = snprintf(absolute, sizeof(absolute), "%s/%s%s%s", repo_path,
+                     member_dir && member_dir[0] ? member_dir : "",
+                     member_dir && member_dir[0] ? "/" : "", rel);
+    cbm_path_info_t info;
+    return n > 0 && (size_t)n < sizeof(absolute) &&
+           cbm_path_info_utf8(absolute, &info) == 0 && info.is_regular;
+}
+
+static bool pxc_cargo_relative_path_eq(const char *left, const char *right) {
+    char a[CBM_SZ_4K], b[CBM_SZ_4K];
+    snprintf(a, sizeof(a), "%s", left ? left : "");
+    snprintf(b, sizeof(b), "%s", right ? right : "");
+    pxc_cargo_normalize_relative(a);
+    pxc_cargo_normalize_relative(b);
+    return strcmp(a, b) == 0;
+}
+
+static void pxc_cargo_collect_auto_bins(const char *repo_path, const char *member_dir,
+                                        const CBMCargoManifest *package, CBMArena *arena,
+                                        CBMCargoManifest *root) {
+    char bin_dir[CBM_SZ_4K];
+    int n = snprintf(bin_dir, sizeof(bin_dir), "%s/%s%ssrc/bin", repo_path,
+                     member_dir && member_dir[0] ? member_dir : "",
+                     member_dir && member_dir[0] ? "/" : "");
+    if (n <= 0 || (size_t)n >= sizeof(bin_dir)) return;
+    cbm_dir_t *dir = cbm_opendir(bin_dir);
+    if (!dir) return;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(dir)) != NULL) {
+        if (ent->name[0] == '.') continue;
+        char rel[CBM_SZ_4K];
+        char name[CBM_DIRENT_NAME_MAX];
+        if (ent->is_dir) {
+            snprintf(name, sizeof(name), "%s", ent->name);
+            snprintf(rel, sizeof(rel), "src/bin/%s/main.rs", ent->name);
+        } else {
+            size_t len = strlen(ent->name);
+            if (len <= 3 || strcmp(ent->name + len - 3, ".rs") != 0) continue;
+            snprintf(name, sizeof(name), "%.*s", (int)(len - 3), ent->name);
+            snprintf(rel, sizeof(rel), "src/bin/%s", ent->name);
+        }
+        if (!pxc_cargo_has_explicit_bin(package, name) &&
+            !pxc_cargo_has_explicit_bin_path(package, rel)) {
+            pxc_cargo_append_existing_target(repo_path, member_dir, rel, CBM_CARGO_TARGET_BIN,
+                                             name, arena, root);
+        }
+    }
+    cbm_closedir(dir);
+}
+
+static void pxc_cargo_collect_blocker_dir(const char *repo_path, const char *member_dir,
+                                           const char *dirname, CBMCargoTargetKind kind,
+                                           CBMArena *arena, CBMCargoManifest *root) {
+    char dir_path[CBM_SZ_4K];
+    int n = snprintf(dir_path, sizeof(dir_path), "%s/%s%s%s", repo_path,
+                     member_dir && member_dir[0] ? member_dir : "",
+                     member_dir && member_dir[0] ? "/" : "", dirname);
+    if (n <= 0 || (size_t)n >= sizeof(dir_path)) return;
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) return;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(dir)) != NULL) {
+        if (ent->name[0] == '.') continue;
+        char rel[CBM_SZ_4K];
+        char name[CBM_DIRENT_NAME_MAX];
+        if (ent->is_dir) {
+            snprintf(name, sizeof(name), "%s", ent->name);
+            snprintf(rel, sizeof(rel), "%s/%s/main.rs", dirname, ent->name);
+        } else {
+            size_t len = strlen(ent->name);
+            if (len <= 3 || strcmp(ent->name + len - 3, ".rs") != 0) continue;
+            snprintf(name, sizeof(name), "%.*s", (int)(len - 3), ent->name);
+            snprintf(rel, sizeof(rel), "%s/%s", dirname, ent->name);
+        }
+        pxc_cargo_append_existing_target(repo_path, member_dir, rel, kind, name, arena, root);
+    }
+    cbm_closedir(dir);
+}
+
+static bool pxc_cargo_collect_package_targets(const char *repo_path, const char *member_dir,
+                                              CBMArena *arena,
+                                              CBMCargoManifest *root_manifest) {
+    char manifest_path[CBM_SZ_4K];
+    int n = snprintf(manifest_path, sizeof(manifest_path), "%s/%s%sCargo.toml", repo_path,
+                     member_dir && member_dir[0] ? member_dir : "",
+                     member_dir && member_dir[0] ? "/" : "");
+    if (n <= 0 || (size_t)n >= sizeof(manifest_path)) return false;
+    int source_len = 0;
+    char *source = pxc_read_file(manifest_path, &source_len);
+    if (!source || source_len <= 0) {
+        free(source);
+        return false;
+    }
+    CBMCargoManifest package_manifest;
+    cbm_cargo_parse(arena, source, source_len, &package_manifest);
+    free(source);
+    if (!package_manifest.package_name || !package_manifest.targets_complete) return false;
+
+    bool has_explicit_lib = package_manifest.has_lib_table;
+    bool has_explicit_lib_target = false;
+    bool has_explicit_main = false;
+    for (int i = 0; i < package_manifest.target_count; i++) {
+        if (package_manifest.targets[i].kind == CBM_CARGO_TARGET_LIB) {
+            has_explicit_lib = true;
+            has_explicit_lib_target = true;
+        } else if (package_manifest.targets[i].kind == CBM_CARGO_TARGET_BIN &&
+                   package_manifest.targets[i].source_path &&
+                   pxc_cargo_relative_path_eq(package_manifest.targets[i].source_path,
+                                              "src/main.rs")) {
+            has_explicit_main = true;
+        }
+        const CBMCargoTarget *target = &package_manifest.targets[i];
+        const char *path = target->source_path;
+        char inferred[CBM_SZ_4K];
+        if (!path && target->kind == CBM_CARGO_TARGET_LIB) {
+            snprintf(inferred, sizeof(inferred), "src/lib.rs");
+            path = inferred;
+        } else if (!path && target->kind == CBM_CARGO_TARGET_BIN && target->name) {
+            char main_path[CBM_SZ_4K], flat[CBM_SZ_4K], nested[CBM_SZ_4K];
+            snprintf(main_path, sizeof(main_path), "src/main.rs");
+            snprintf(flat, sizeof(flat), "src/bin/%s.rs", target->name);
+            snprintf(nested, sizeof(nested), "src/bin/%s/main.rs", target->name);
+            bool main_exists = strcmp(target->name, package_manifest.package_name) == 0 &&
+                               pxc_cargo_relative_is_file(repo_path, member_dir, main_path);
+            bool flat_exists = pxc_cargo_relative_is_file(repo_path, member_dir, flat);
+            bool nested_exists = pxc_cargo_relative_is_file(repo_path, member_dir, nested);
+            int inferred_count = (main_exists ? 1 : 0) + (flat_exists ? 1 : 0) +
+                                 (nested_exists ? 1 : 0);
+            if (inferred_count == 1) {
+                snprintf(inferred, sizeof(inferred), "%s",
+                         main_exists ? main_path : (flat_exists ? flat : nested));
+                path = inferred;
+            } else {
+                root_manifest->targets_complete = false;
+            }
+        }
+        if (path) {
+            pxc_cargo_append_existing_target(repo_path, member_dir, path, target->kind,
+                                             target->name, arena, root_manifest);
+        }
+    }
+    if (package_manifest.autolib && !has_explicit_lib) {
+        pxc_cargo_append_existing_target(repo_path, member_dir, "src/lib.rs",
+                                         CBM_CARGO_TARGET_LIB, package_manifest.package_name,
+                                         arena, root_manifest);
+    }
+    if (package_manifest.has_lib_table && !has_explicit_lib_target) {
+        pxc_cargo_append_existing_target(repo_path, member_dir, "src/lib.rs",
+                                         CBM_CARGO_TARGET_LIB, package_manifest.package_name,
+                                         arena, root_manifest);
+    }
+    if (package_manifest.autobins && !has_explicit_main &&
+        !pxc_cargo_has_explicit_bin(&package_manifest, package_manifest.package_name) &&
+        !pxc_cargo_has_explicit_bin_path(&package_manifest, "src/main.rs")) {
+        pxc_cargo_append_existing_target(repo_path, member_dir, "src/main.rs",
+                                         CBM_CARGO_TARGET_BIN, package_manifest.package_name,
+                                         arena, root_manifest);
+    }
+    if (package_manifest.autobins) {
+        pxc_cargo_collect_auto_bins(repo_path, member_dir, &package_manifest, arena,
+                                    root_manifest);
+    }
+    if (package_manifest.build_path) {
+        pxc_cargo_append_existing_target(repo_path, member_dir, package_manifest.build_path,
+                                         CBM_CARGO_TARGET_BUILD, NULL, arena, root_manifest);
+    } else if (package_manifest.auto_build) {
+        pxc_cargo_append_existing_target(repo_path, member_dir, "build.rs",
+                                         CBM_CARGO_TARGET_BUILD, NULL, arena, root_manifest);
+    }
+    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "examples",
+                                  CBM_CARGO_TARGET_EXAMPLE, arena, root_manifest);
+    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "tests", CBM_CARGO_TARGET_TEST,
+                                  arena, root_manifest);
+    pxc_cargo_collect_blocker_dir(repo_path, member_dir, "benches", CBM_CARGO_TARGET_BENCH,
+                                  arena, root_manifest);
+    return root_manifest->targets_complete;
+}
+
+static bool pxc_cargo_glob_match(const char *pattern, const char *text) {
+    if (!pattern || !text) return false;
+    if (*pattern == '\0') return *text == '\0';
+    if (pattern[0] == '*' && pattern[1] == '*') {
+        pattern += 2;
+        if (*pattern == '/') {
+            pattern++;
+            if (pxc_cargo_glob_match(pattern, text)) return true;
+            while (*text) {
+                if (*text++ == '/' && pxc_cargo_glob_match(pattern, text)) return true;
+            }
+            return false;
+        }
+        do {
+            if (pxc_cargo_glob_match(pattern, text)) return true;
+        } while (*text++);
+        return false;
+    }
+    if (*pattern == '*') {
+        do {
+            if (pxc_cargo_glob_match(pattern + 1, text)) return true;
+        } while (*text && *text++ != '/');
+        return false;
+    }
+    if (*pattern == '?') {
+        return *text && *text != '/' && pxc_cargo_glob_match(pattern + 1, text + 1);
+    }
+    if (*pattern == '[') {
+        const char *p = pattern + 1;
+        bool negate = *p == '!' || *p == '^';
+        if (negate) p++;
+        bool matched = false;
+        char c = *text;
+        while (*p && *p != ']') {
+            if (p[1] == '-' && p[2] && p[2] != ']') {
+                if (c >= p[0] && c <= p[2]) matched = true;
+                p += 3;
+            } else {
+                if (c == *p) matched = true;
+                p++;
+            }
+        }
+        if (*p != ']' || !c || c == '/' || matched == negate) return false;
+        return pxc_cargo_glob_match(p + 1, text + 1);
+    }
+    return *pattern == *text && pxc_cargo_glob_match(pattern + 1, text + 1);
+}
+
+static void pxc_cargo_normalize_glob(char *s) {
+    if (!s) return;
+    cbm_normalize_path_sep(s);
+    while (s[0] == '.' && s[1] == '/') memmove(s, s + 2, strlen(s + 2) + 1);
+    size_t n = strlen(s);
+    while (n > 0 && s[n - 1] == '/') s[--n] = '\0';
+}
+
+static bool pxc_cargo_pattern_has_meta(const char *s) {
+    return s && strpbrk(s, "*?[") != NULL;
+}
+
+static bool pxc_cargo_excludes_dir(const char *pattern, const char *dir) {
+    char prefix[CBM_SZ_4K];
+    snprintf(prefix, sizeof(prefix), "%s", dir);
+    do {
+        if (pxc_cargo_glob_match(pattern, prefix)) return true;
+        char *slash = strrchr(prefix, '/');
+        if (!slash) break;
+        *slash = '\0';
+    } while (true);
+    return false;
+}
+
+static bool pxc_cargo_member_declared(const CBMCargoManifest *manifest, const char *dir) {
+    char normalized_dir[CBM_SZ_4K];
+    snprintf(normalized_dir, sizeof(normalized_dir), "%s", dir ? dir : "");
+    pxc_cargo_normalize_glob(normalized_dir);
+    bool included = false;
+    bool exact_member = false;
+    for (int i = 0; manifest && i < manifest->member_count; i++) {
+        char pattern[CBM_SZ_4K];
+        snprintf(pattern, sizeof(pattern), "%s", manifest->members[i].member_path);
+        pxc_cargo_normalize_glob(pattern);
+        if (pxc_cargo_glob_match(pattern, normalized_dir)) {
+            included = true;
+            if (!pxc_cargo_pattern_has_meta(pattern) && strcmp(pattern, normalized_dir) == 0) {
+                exact_member = true;
+            }
+        }
+    }
+    if (!included || exact_member) return included;
+    for (int i = 0; i < manifest->exclude_count; i++) {
+        char pattern[CBM_SZ_4K];
+        snprintf(pattern, sizeof(pattern), "%s", manifest->excludes[i].member_path);
+        pxc_cargo_normalize_glob(pattern);
+        if (pxc_cargo_excludes_dir(pattern, normalized_dir)) return false;
+    }
+    return true;
+}
+
 bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena,
                                  CBMCargoManifest *out_m) {
     if (!out_m) {
@@ -1167,6 +1635,33 @@ bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena,
     }
     cbm_cargo_parse(marena, toml, toml_len, out_m);
     free(toml); /* cargo parser copies into marena */
+    /* Parser targets are package-relative staging data. Rebuild the routed
+     * inventory from every admitted package, including the root, exactly
+     * once; retaining these entries would duplicate root explicit targets. */
+    out_m->targets = NULL;
+    out_m->target_count = 0;
+    out_m->target_cap = 0;
+    /* Only Cargo's root package and explicitly declared workspace members are
+     * target authorities. A recursive manifest walk would incorrectly admit
+     * excluded, vendored, or otherwise unrelated nested packages. */
+    if (out_m->package_name) {
+        if (!pxc_cargo_collect_package_targets(repo_path, "", marena, out_m)) {
+            out_m->targets_complete = false;
+        }
+    }
+    cbm_pkg_members_t packages;
+    cbm_pkg_members_init(&packages);
+    cbm_pkgmap_collect_members(repo_path, &packages);
+    if (!packages.complete) out_m->targets_complete = false;
+    for (int i = 0; i < packages.count; i++) {
+        const char *member = packages.items[i].dir;
+        if (member && member[0] && pxc_cargo_member_declared(out_m, member)) {
+            if (!pxc_cargo_collect_package_targets(repo_path, member, marena, out_m)) {
+                out_m->targets_complete = false;
+            }
+        }
+    }
+    cbm_pkg_members_free(&packages);
     return true;
 }
 
@@ -1212,7 +1707,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     int def_count = 0;
     int *def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
     CBMLSPDef *all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
-                                                   def_modules, &def_count, def_starts);
+                                                   def_modules, &def_count, def_starts,
+                                                   rust_manifest);
     /* Same seam as the parallel driver: serialize per-file surfaces while the
      * result cache is alive. Failure only degrades to a full rebuild on the
      * next incremental run. */

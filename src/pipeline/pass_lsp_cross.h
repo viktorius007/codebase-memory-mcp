@@ -56,7 +56,8 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * record. */
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
-                                    int *out_count, int *out_def_starts);
+                                    int *out_count, int *out_def_starts,
+                                    const struct CBMCargoManifest *rust_manifest);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,

@@ -99,6 +99,7 @@ void cbm_pkg_entries_init(cbm_pkg_entries_t *e) {
     e->items = NULL;
     e->count = 0;
     e->cap = 0;
+    e->complete = true;
 }
 
 static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_rel) {
@@ -108,6 +109,7 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
         if (!tmp) {
             free(pkg_name);
             free(entry_rel);
+            e->complete = false;
             return;
         }
         e->items = tmp;
@@ -1129,13 +1131,14 @@ typedef void (*pkgmap_manifest_cb)(const char *basename, const char *rel_path, c
  * safety logic. Returns the number of manifest files dispatched to `cb`. */
 static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgmap_manifest_cb cb,
                                  void *userdata, int depth, char **excluded_dirs,
-                                 int excluded_count) {
+                                 int excluded_count, bool *complete) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
         cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
         return 0;
     }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
+        if (complete) *complete = false;
         return 0;
     }
     int parsed = 0;
@@ -1172,7 +1175,7 @@ static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgma
             }
 #endif
             parsed += pkgmap_walk_manifests(abs_path, rel_path, cb, userdata, depth + 1,
-                                            excluded_dirs, excluded_count);
+                                            excluded_dirs, excluded_count, complete);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
@@ -1184,6 +1187,7 @@ static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgma
         int source_len = 0;
         char *source = pkgmap_read_file(abs_path, &source_len);
         if (!source) {
+            if (complete) *complete = false;
             continue;
         }
         cb(name, rel_path, source, source_len, userdata);
@@ -1203,7 +1207,7 @@ static void pkgmap_entries_cb(const char *basename, const char *rel_path, const 
 static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
                            int depth, char **excluded_dirs, int excluded_count) {
     return pkgmap_walk_manifests(abs_dir, rel_dir, pkgmap_entries_cb, entries, depth, excluded_dirs,
-                                 excluded_count);
+                                 excluded_count, &entries->complete);
 }
 
 /* Scan a repository for package manifest files via the filesystem
@@ -1233,6 +1237,7 @@ void cbm_pkg_members_init(cbm_pkg_members_t *m) {
     m->items = NULL;
     m->count = 0;
     m->cap = 0;
+    m->complete = true;
 }
 
 void cbm_pkg_members_free(cbm_pkg_members_t *m) {
@@ -1250,6 +1255,12 @@ void cbm_pkg_members_free(cbm_pkg_members_t *m) {
 }
 
 static void pkg_members_push(cbm_pkg_members_t *m, char *dir, char *name) {
+    if (!dir || !name) {
+        free(dir);
+        free(name);
+        m->complete = false;
+        return;
+    }
     /* First manifest to claim a directory wins — a polyglot dir with two
      * manifests keeps a single stable name. */
     for (int i = 0; i < m->count; i++) {
@@ -1265,6 +1276,7 @@ static void pkg_members_push(cbm_pkg_members_t *m, char *dir, char *name) {
         if (!tmp) {
             free(dir);
             free(name);
+            m->complete = false;
             return;
         }
         m->items = tmp;
@@ -1286,6 +1298,7 @@ static void pkg_members_cb(const char *basename, const char *rel_path, const cha
     cbm_pkg_entries_t tmp;
     cbm_pkg_entries_init(&tmp);
     cbm_pkgmap_try_parse(basename, rel_path, source, source_len, &tmp);
+    if (!tmp.complete) ((cbm_pkg_members_t *)userdata)->complete = false;
     if (tmp.count > 0 && tmp.items[0].pkg_name && tmp.items[0].pkg_name[0]) {
         pkg_members_push((cbm_pkg_members_t *)userdata, path_dirname(rel_path),
                          strdup(tmp.items[0].pkg_name));
@@ -1297,7 +1310,8 @@ int cbm_pkgmap_collect_members(const char *repo_path, cbm_pkg_members_t *out) {
     if (!repo_path || !out) {
         return 0;
     }
-    int parsed = pkgmap_walk_manifests(repo_path, "", pkg_members_cb, out, 0, NULL, 0);
+    int parsed = pkgmap_walk_manifests(repo_path, "", pkg_members_cb, out, 0, NULL, 0,
+                                       &out->complete);
     cbm_log_info("pkgmap.members", "manifests", pkgmap_itoa(parsed), "members",
                  pkgmap_itoa(out->count));
     return out->count;

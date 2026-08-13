@@ -15,6 +15,54 @@
 #include <string.h>
 #include <ctype.h>
 
+bool cbm_cargo_add_target(CBMArena* arena, CBMCargoManifest* manifest,
+    CBMCargoTargetKind kind, const char* source_path) {
+    return cbm_cargo_add_named_target(arena, manifest, kind, NULL, source_path);
+}
+
+bool cbm_cargo_add_named_target(CBMArena* arena, CBMCargoManifest* manifest,
+    CBMCargoTargetKind kind, const char* name, const char* source_path) {
+    return cbm_cargo_add_routed_target(arena, manifest, kind, name, NULL, source_path, NULL);
+}
+
+bool cbm_cargo_add_routed_target(CBMArena* arena, CBMCargoManifest* manifest,
+    CBMCargoTargetKind kind, const char* name, const char* package_dir,
+    const char* source_path, const char* blocker_root) {
+    if (!arena || !manifest || ((!source_path || !source_path[0]) && (!name || !name[0])) ||
+        (kind < CBM_CARGO_TARGET_LIB || kind > CBM_CARGO_TARGET_BUILD)) {
+        if (manifest) manifest->targets_complete = false;
+        return false;
+    }
+    if (manifest->target_count == manifest->target_cap) {
+        int next_cap = manifest->target_cap > 0 ? manifest->target_cap * 2 : 4;
+        CBMCargoTarget* next = cbm_arena_alloc(
+            arena, (size_t)next_cap * sizeof(CBMCargoTarget));
+        if (!next) {
+            manifest->targets_complete = false;
+            return false;
+        }
+        if (manifest->targets && manifest->target_count > 0) {
+            memcpy(next, manifest->targets,
+                   (size_t)manifest->target_count * sizeof(CBMCargoTarget));
+        }
+        manifest->targets = next;
+        manifest->target_cap = next_cap;
+    }
+    const char *owned_path = source_path ? cbm_arena_strdup(arena, source_path) : NULL;
+    const char *owned_name = name ? cbm_arena_strdup(arena, name) : NULL;
+    const char *owned_package = package_dir ? cbm_arena_strdup(arena, package_dir) : NULL;
+    const char *owned_blocker = blocker_root ? cbm_arena_strdup(arena, blocker_root) : NULL;
+    if ((source_path && !owned_path) || (name && !owned_name) ||
+        (package_dir && !owned_package) || (blocker_root && !owned_blocker)) {
+        manifest->targets_complete = false;
+        return false;
+    }
+    manifest->targets[manifest->target_count++] =
+        (CBMCargoTarget){.kind = kind, .name = owned_name, .package_dir = owned_package,
+                         .blocker_root = owned_blocker, .source_path = owned_path};
+    return true;
+}
+
 /* ── Tiny tokenizer ──────────────────────────────────────────── */
 
 static void cargo_record(CBMCargoManifest* out, CBMRustHealthReason reason,
@@ -260,7 +308,34 @@ static int parse_package_kv(CBMArena* a, const char* s, int len, int from,
                      entry_start, from);
         return skip_value(s, len, from, out);
     }
-    if (key && strcmp(key, "name") == 0) {
+    if (key && (strcmp(key, "autolib") == 0 || strcmp(key, "autobins") == 0)) {
+        bool *flag = strcmp(key, "autolib") == 0 ? &out->autolib : &out->autobins;
+        if (from + 4 <= len && strncmp(s + from, "true", 4) == 0) {
+            *flag = true;
+            from += 4;
+        } else if (from + 5 <= len && strncmp(s + from, "false", 5) == 0) {
+            *flag = false;
+            from += 5;
+        } else {
+            cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL, from, from + 1);
+            from = skip_value(s, len, from, out);
+        }
+    } else if (key && strcmp(key, "build") == 0) {
+        if (from + 5 <= len && strncmp(s + from, "false", 5) == 0) {
+            out->auto_build = false;
+            from += 5;
+        } else {
+            int value_start = from;
+            from = parse_string(a, s, len, from, &out->build_path, out);
+            if (from == value_start) {
+                cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL,
+                             value_start, value_start + 1);
+                from = skip_value(s, len, from, out);
+            } else {
+                out->auto_build = false;
+            }
+        }
+    } else if (key && strcmp(key, "name") == 0) {
         int value_start = from;
         from = parse_string(a, s, len, from, &out->package_name, out);
         if (from == value_start) {
@@ -275,6 +350,35 @@ static int parse_package_kv(CBMArena* a, const char* s, int len, int from,
             cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL,
                          value_start, value_start + 1);
             from = skip_value(s, len, from, out);
+        }
+    } else if (key && strcmp(key, "version") != 0) {
+        from = skip_value(s, len, from, out);
+    }
+    return from;
+}
+
+static int parse_target_kv(CBMArena* a, const char* s, int len, int from,
+    CBMCargoManifest* out, const char** target_name, const char** target_path) {
+    from = skip_ws_and_comment(s, len, from);
+    if (from >= len || s[from] == '[') return from;
+    int entry_start = from;
+    const char* key = NULL;
+    from = parse_key(a, s, len, from, &key);
+    from = skip_ws_and_comment(s, len, from);
+    if (from >= len || s[from] != '=') {
+        cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL,
+                     entry_start, from);
+        return skip_value(s, len, from, out);
+    }
+    from = skip_ws_and_comment(s, len, from + 1);
+    if (key && (strcmp(key, "path") == 0 || strcmp(key, "name") == 0)) {
+        const char** dst = strcmp(key, "path") == 0 ? target_path : target_name;
+        int value_start = from;
+        from = parse_string(a, s, len, from, dst, out);
+        if (from == value_start || !*dst) {
+            cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL,
+                         value_start, from > value_start ? from : value_start + 1);
+            if (from == value_start) from = skip_value(s, len, from, out);
         }
     } else {
         from = skip_value(s, len, from, out);
@@ -299,7 +403,9 @@ static int parse_workspace_kv(CBMArena* a, const char* s, int len, int from,
                      entry_start, from);
         return skip_value(s, len, from, out);
     }
-    if (key && strcmp(key, "members") == 0 && from < len && s[from] == '[') {
+    bool is_members = key && strcmp(key, "members") == 0;
+    bool is_exclude = key && strcmp(key, "exclude") == 0;
+    if ((is_members || is_exclude) && from < len && s[from] == '[') {
         from++;
         while (from < len && s[from] != ']') {
             int member_item_start = from;
@@ -309,15 +415,17 @@ static int parse_workspace_kv(CBMArena* a, const char* s, int len, int from,
                 const char* mem = NULL;
                 from = parse_string(a, s, len, from, &mem, out);
                 if (mem) {
-                    if (out->member_count < CBM_CARGO_MAX_MEMBERS) {
+                    int *count = is_members ? &out->member_count : &out->exclude_count;
+                    CBMCargoMember *items = is_members ? out->members : out->excludes;
+                    if (*count < CBM_CARGO_MAX_MEMBERS) {
                         /* Derive a member NAME from the path's last segment. */
                         const char* last = mem;
                         for (const char* p = mem; *p; p++) {
                             if (*p == '/') last = p + 1;
                         }
-                        out->members[out->member_count].member_name = last;
-                        out->members[out->member_count].member_path = mem;
-                        out->member_count++;
+                        items[*count].member_name = last;
+                        items[*count].member_path = mem;
+                        (*count)++;
                     } else {
                         cargo_record(out, CBM_RUST_HEALTH_MANIFEST_MEMBER_LIMIT,
                                      member_start, from);
@@ -351,6 +459,10 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     CBMCargoManifest* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
+    out->autolib = true;
+    out->autobins = true;
+    out->auto_build = true;
+    out->targets_complete = true;
     if (!arena || !src) {
         cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL, 0, 0);
         return;
@@ -360,19 +472,45 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     int from = 0;
     /* Default: pre-header content treated as [package]. */
     const char* section = "package";
+    CBMCargoTargetKind target_kind = 0;
+    const char* target_name = NULL;
+    const char* target_path = NULL;
 
     while (from < src_len) {
         from = skip_ws_and_comment(src, src_len, from);
         if (from >= src_len) break;
         int item_start = from;
         if (src[from] == '[') {
+            if (target_kind != 0 && (target_name || target_path)) {
+                if (!cbm_cargo_add_named_target(arena, out, target_kind, target_name,
+                                                target_path)) {
+                    cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL, item_start,
+                                 item_start + 1);
+                }
+            }
+            target_kind = 0;
+            target_name = NULL;
+            target_path = NULL;
             const char* hdr = NULL;
             from = parse_section(arena, src, src_len, from, &hdr, out);
             section = hdr ? hdr : "";
+            if (strcmp(section, "lib") == 0) {
+                target_kind = CBM_CARGO_TARGET_LIB;
+                out->has_lib_table = true;
+            }
+            if (strcmp(section, "bin") == 0) target_kind = CBM_CARGO_TARGET_BIN;
+            if (strcmp(section, "example") == 0) target_kind = CBM_CARGO_TARGET_EXAMPLE;
+            if (strcmp(section, "test") == 0) target_kind = CBM_CARGO_TARGET_TEST;
+            if (strcmp(section, "bench") == 0) target_kind = CBM_CARGO_TARGET_BENCH;
         } else if (!section) {
             from = skip_value(src, src_len, from, out);
         } else if (strcmp(section, "package") == 0) {
             from = parse_package_kv(arena, src, src_len, from, out);
+        } else if (strcmp(section, "lib") == 0) {
+            from = parse_target_kv(arena, src, src_len, from, out, &target_name, &target_path);
+        } else if (strcmp(section, "bin") == 0 || strcmp(section, "example") == 0 ||
+                   strcmp(section, "test") == 0 || strcmp(section, "bench") == 0) {
+            from = parse_target_kv(arena, src, src_len, from, out, &target_name, &target_path);
         } else if (strcmp(section, "workspace") == 0) {
             from = parse_workspace_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "dependencies") == 0 ||
@@ -391,6 +529,10 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
                          item_start, item_start + 1);
             from = item_start + 1;
         }
+    }
+    if (target_kind != 0 && (target_name || target_path) &&
+        !cbm_cargo_add_named_target(arena, out, target_kind, target_name, target_path)) {
+        cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL, src_len, src_len);
     }
 }
 

@@ -35,6 +35,25 @@ typedef struct {
     const char* member_path;   /* relative path inside workspace root */
 } CBMCargoMember;
 
+typedef enum {
+    CBM_CARGO_TARGET_LIB = 1,
+    CBM_CARGO_TARGET_BIN = 2,
+    CBM_CARGO_TARGET_EXAMPLE = 3,
+    CBM_CARGO_TARGET_TEST = 4,
+    CBM_CARGO_TARGET_BENCH = 5,
+    CBM_CARGO_TARGET_BUILD = 6,
+} CBMCargoTargetKind;
+
+typedef struct {
+    CBMCargoTargetKind kind;
+    const char* name;       /* explicit target name; NULL for defaults */
+    const char* package_dir; /* repository-relative owning package directory */
+    const char* blocker_root; /* unsupported target module subtree, if any */
+    /* Parser output is package-relative. The pipeline manifest builder rebases
+     * these to repository-relative paths before the manifest reaches routing. */
+    const char* source_path;
+} CBMCargoTarget;
+
 typedef struct CBMCargoManifest {
     const char* package_name;    /* [package].name, NULL if missing */
     const char* package_version; /* [package].version, NULL if missing */
@@ -45,6 +64,19 @@ typedef struct CBMCargoManifest {
 
     CBMCargoMember members[CBM_CARGO_MAX_MEMBERS];
     int member_count;
+    CBMCargoMember excludes[CBM_CARGO_MAX_MEMBERS];
+    int exclude_count;
+
+    bool autolib;
+    bool autobins;
+    bool auto_build;
+    bool has_lib_table;
+    const char* build_path;
+
+    CBMCargoTarget* targets;
+    int target_count;
+    int target_cap;
+    bool targets_complete;
 
     /* Parser/cap health is part of the manifest result so diagnostics survive
      * independently of arena allocation and without a parallel log. */
@@ -55,6 +87,15 @@ typedef struct CBMCargoManifest {
  * arena-allocated (so the caller doesn't need to keep `src` alive). */
 void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     CBMCargoManifest* out);
+
+/* Append one typed target path. Arena growth preserves every prior entry. */
+bool cbm_cargo_add_target(CBMArena* arena, CBMCargoManifest* manifest,
+    CBMCargoTargetKind kind, const char* source_path);
+bool cbm_cargo_add_named_target(CBMArena* arena, CBMCargoManifest* manifest,
+    CBMCargoTargetKind kind, const char* name, const char* source_path);
+bool cbm_cargo_add_routed_target(CBMArena* arena, CBMCargoManifest* manifest,
+    CBMCargoTargetKind kind, const char* name, const char* package_dir,
+    const char* source_path, const char* blocker_root);
 
 /* Convenience: does a given path-prefix look like one of the listed
  * dependency names? Used by the resolver to recognise external crate

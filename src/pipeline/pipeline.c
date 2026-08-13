@@ -1639,13 +1639,32 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     int def_count = 0;
     CBMLSPDef *all_defs = NULL;
     int *def_starts = NULL;
+    CBMArena rust_collect_manifest_arena;
+    CBMCargoManifest rust_collect_manifest;
+    const CBMCargoManifest *rust_collect_manifest_ptr = NULL;
+    bool rust_collect_manifest_arena_live = false;
     if (run_cross_lsp) {
+        for (int i = 0; i < file_count; i++) {
+            if (cache[i] && files[i].language == CBM_LANG_RUST) {
+                cbm_arena_init(&rust_collect_manifest_arena);
+                rust_collect_manifest_arena_live = true;
+                if (cbm_pxc_build_rust_manifest(ctx->repo_path, &rust_collect_manifest_arena,
+                                                &rust_collect_manifest)) {
+                    rust_collect_manifest_ptr = &rust_collect_manifest;
+                }
+                break;
+            }
+        }
         def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
         def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
         all_defs = def_modules
                        ? cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
-                                                  def_modules, &def_count, def_starts)
+                                                  def_modules, &def_count, def_starts,
+                                                  rust_collect_manifest_ptr)
                        : NULL;
+    }
+    if (rust_collect_manifest_arena_live) {
+        cbm_arena_destroy(&rust_collect_manifest_arena);
     }
     /* Serialize per-file LSP surfaces NOW — the result cache dies with this
      * pass, and the rows are what lets an incremental run detect body-only

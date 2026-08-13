@@ -338,6 +338,8 @@ typedef struct {
     const char *label;            /* "Function", "Method", "Type", "Trait" */
     const char *receiver_type;    /* for methods: receiver type QN (NULL for free fns) */
     const char *def_module_qn;    /* module QN where this def lives */
+    const char *crate_root_qn;    /* authoritative Cargo member root; NULL if unproven */
+    const char *crate_source_module_qn; /* exact module QN of selected target source */
     const char *return_types;     /* "|"-separated return type texts          */
     const char *embedded_types;   /* "|"-separated embedded type QNs          */
     const char *field_defs;       /* "|"-separated "name:type" pairs          */

@@ -76,6 +76,7 @@ typedef struct {
     cbm_pkg_entry_t *items;
     int count;
     int cap;
+    bool complete;
 } cbm_pkg_entries_t;
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
@@ -96,6 +97,7 @@ typedef struct {
     cbm_pkg_member_t *items;
     int count;
     int cap;
+    bool complete;
 } cbm_pkg_members_t;
 
 void cbm_pkg_members_init(cbm_pkg_members_t *m);

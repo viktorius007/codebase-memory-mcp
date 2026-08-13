@@ -11,7 +11,9 @@
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "pipeline/artifact.h"
+#include "lsp/rust_cargo.h"
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
@@ -12163,7 +12165,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":1") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":2") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -12260,11 +12262,526 @@ TEST(pipeline_rust_cross_file_factory_chains_exact_targets) {
               0);
     cbm_store_close(store);
     cbm_pipeline_free(pipeline);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets) {
+    const char *alpha_factory_source =
+        "pub struct SelfRunner;\n"
+        "impl SelfRunner { pub fn dry_run(&self) {} }\n"
+        "pub struct Factory;\n"
+        "impl Factory {\n"
+        "  pub fn make_crate() -> crate::domain::CrateRunner { crate::domain::CrateRunner }\n"
+        "  pub fn make_self() -> self::SelfRunner { SelfRunner }\n"
+        "  pub fn make_super() -> super::super::domain::SuperRunner { "
+        "super::super::domain::SuperRunner }\n"
+        "  pub fn make_root() -> crate::RootRunner { crate::RootRunner }\n"
+        "}\n";
+    const char *beta_factory_source =
+        "pub struct BetaFactory; impl BetaFactory { pub fn make() -> crate::domain::BinRunner "
+        "{ crate::domain::BinRunner } pub fn make_root() -> crate::BinRootRunner "
+        "{ crate::BinRootRunner } }\n";
+    const char *gamma_factory_source =
+        "pub struct GammaFactory; impl GammaFactory { pub fn make() -> "
+        "crate::domain::ExplicitRunner { crate::domain::ExplicitRunner } "
+        "pub fn make_root() -> crate::ExplicitRootRunner { crate::ExplicitRootRunner } }\n";
+    const char *delta_factory_source =
+        "pub struct DeltaFactory; impl DeltaFactory { pub fn make() -> "
+        "crate::domain::AmbiguousRunner { crate::domain::AmbiguousRunner } }\n";
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_rooted_returns_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha/src/factory")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha/examples")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha/tests")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha/benches")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha/custom")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha/build")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/beta/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/gamma/engine")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/gamma/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/delta/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/domain/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/epsilon/src/tools")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/rogue/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/zeta/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/eta/src/bin")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/eta/custom")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/theta/src/bin/nested")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/theta/custom")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "groups/one/member/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "special/kept/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/kappa/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/lambda/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/mu/src/bin")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"rootpkg\"\nversion = \"0.1.0\"\n"
+                    "[lib]\npath = \"root_entry.rs\"\n"
+                    "[workspace]\nmembers = [\"./crates/[a-z]*/\", "
+                    "\"groups/**/member\", \"special/kept\"]\n"
+                    "exclude = [\"crates/rogue/\", \"special\"]\nresolver = \"2\"\n");
+    write_temp_file(tmp, "root_entry.rs", "pub struct RootPackage;\n");
+    write_temp_file(tmp, "root_domain.rs", "pub struct RootSibling;\n");
+    write_temp_file(tmp, "groups/one/member/Cargo.toml",
+                    "[package]\nname = \"nested-member\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "groups/one/member/src/lib.rs", "pub struct NestedMember;\n");
+    write_temp_file(tmp, "special/kept/Cargo.toml",
+                    "[package]\nname = \"exact-over-exclude\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "special/kept/src/lib.rs", "pub struct ExactMember;\n");
+    write_temp_file(tmp, "crates/kappa/Cargo.toml",
+                    "[package]\nname = \"kappa\"\nversion = \"0.1.0\"\n"
+                    "[[example]]\nname = \"inside-src\"\npath = \"src/example_entry.rs\"\n");
+    write_temp_file(tmp, "crates/kappa/src/lib.rs", "pub struct Kappa;\n");
+    write_temp_file(tmp, "crates/kappa/src/example_entry.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/kappa/src/example_child.rs", "pub struct Child;\n");
+    write_temp_file(tmp, "crates/lambda/Cargo.toml",
+                    "[package]\nname = \"lambda\"\nversion = \"0.1.0\"\nautolib = false\n"
+                    "[lib]\n");
+    write_temp_file(tmp, "crates/lambda/src/lib.rs", "pub struct EmptyLibTable;\n");
+    write_temp_file(tmp, "crates/mu/Cargo.toml",
+                    "[package]\nname = \"mu\"\nversion = \"0.1.0\"\nautolib = false\n"
+                    "autobins = false\n[[bin]]\nname = \"mu\"\n");
+    write_temp_file(tmp, "crates/mu/src/bin/mu.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/alpha/Cargo.toml",
+                    "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "build = \"build/build.rs\"\n"
+                    "[[example]]\nname = \"custom\"\npath = \"custom/example_entry.rs\"\n");
+    write_temp_file(tmp, "crates/alpha/custom/example_entry.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/alpha/examples/auto.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/alpha/examples/.hidden.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/alpha/tests/auto.rs", "#[test] fn works() {}\n");
+    write_temp_file(tmp, "crates/alpha/benches/auto.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/alpha/build/build.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/beta/Cargo.toml",
+                    "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "crates/gamma/Cargo.toml",
+                    "[package]\nname = \"gamma\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "[lib]\npath = \"engine/entry.rs\"\n");
+    write_temp_file(tmp, "crates/delta/Cargo.toml",
+                    "[package]\nname = \"delta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "crates/domain/Cargo.toml",
+                    "[package]\nname = \"domain\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "crates/epsilon/Cargo.toml",
+                    "[package]\nname = \"epsilon\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "[[bin]]\nname = \"nested\"\npath = \"src/tools/main.rs\"\n");
+    /* Existing nested Cargo package not declared by the workspace is not a
+     * target authority. */
+    write_temp_file(tmp, "crates/rogue/Cargo.toml",
+                    "[package]\nname = \"rogue\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "crates/rogue/src/lib.rs", "pub struct Rogue;\n");
+    write_temp_file(tmp, "crates/zeta/Cargo.toml",
+                    "[package]\nname = \"zeta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "[[bin]]\nname = \"one\"\npath = \"src/entry.rs\"\n"
+                    "[[bin]]\nname = \"two\"\npath = \"src/entry.rs\"\n");
+    write_temp_file(tmp, "crates/zeta/src/entry.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/eta/Cargo.toml",
+                    "[package]\nname = \"eta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "autolib = false\nautobins = false\n"
+                    "[[bin]]\nname = \"eta-explicit\"\npath = \"custom/entry.rs\"\n"
+                    "[[bin]]\nname = \"eta-tool\"\n");
+    write_temp_file(tmp, "crates/eta/src/lib.rs", "pub struct DisabledLib;\n");
+    write_temp_file(tmp, "crates/eta/src/main.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/eta/src/bin/ghost.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/eta/src/bin/eta-tool.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/eta/custom/entry.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/theta/Cargo.toml",
+                    "[package]\nname = \"theta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "[[bin]]\nname = \"auto\"\npath = \"custom/auto.rs\"\n"
+                    "[[bin]]\nname = \"nested-explicit\"\n"
+                    "[[bin]]\nname = \"aliased-other\"\npath = \"./src/bin/other.rs\"\n");
+    write_temp_file(tmp, "crates/theta/src/lib.rs", "pub struct Theta;\n");
+    write_temp_file(tmp, "crates/theta/src/main.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/theta/src/bin/auto.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/theta/src/bin/other.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/theta/src/bin/.hidden.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/theta/src/bin/nested/main.rs", "fn main() {}\n");
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/theta/src/bin/nested-explicit")), 0);
+    write_temp_file(tmp, "crates/theta/src/bin/nested-explicit/main.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/theta/custom/auto.rs", "fn main() {}\n");
+    write_temp_file(tmp, "crates/alpha/src/lib.rs",
+                    "pub mod domain;\npub mod factory;\npub mod caller;\n"
+                    "pub struct RootRunner; impl RootRunner { pub fn dry_run(&self) {} }\n");
+    write_temp_file(tmp, "crates/alpha/src/domain.rs",
+                    "pub struct CrateRunner;\n"
+                    "impl CrateRunner { pub fn dry_run(&self) {} }\n"
+                    "pub struct SuperRunner;\n"
+                    "impl SuperRunner { pub fn dry_run(&self) {} }\n");
+    write_temp_file(tmp, "crates/alpha/src/factory.rs", "pub mod deep;\n");
+    write_temp_file(tmp, "crates/alpha/src/factory/deep.rs", alpha_factory_source);
+    write_temp_file(tmp, "crates/alpha/src/caller.rs",
+                    "use super::factory::deep::Factory;\n"
+                    "pub fn rh021_rooted_factory_chain() {\n"
+                    "  Factory::make_crate().dry_run();\n"
+                    "  Factory::make_self().dry_run();\n"
+                    "  Factory::make_super().dry_run();\n"
+                    "  Factory::make_root().dry_run();\n"
+                    "}\n");
+    write_temp_file(tmp, "crates/beta/src/main.rs",
+                    "mod domain; mod factory; mod caller;\n"
+                    "pub struct BinRootRunner; impl BinRootRunner { pub fn dry_run(&self) {} }\n"
+                    "fn main() { caller::rh021_bin_chain(); }\n");
+    write_temp_file(tmp, "crates/beta/src/domain.rs",
+                    "pub struct BinRunner; impl BinRunner { pub fn dry_run(&self) {} }\n");
+    write_temp_file(tmp, "crates/beta/src/factory.rs", beta_factory_source);
+    write_temp_file(tmp, "crates/beta/src/caller.rs",
+                    "use super::factory::BetaFactory;\n"
+                    "pub fn rh021_bin_chain() { BetaFactory::make().dry_run(); "
+                    "BetaFactory::make_root().dry_run(); }\n");
+    write_temp_file(tmp, "crates/gamma/engine/entry.rs",
+                    "mod domain; mod factory; mod caller;\n"
+                    "pub struct ExplicitRootRunner; impl ExplicitRootRunner { "
+                    "pub fn dry_run(&self) {} }\n");
+    write_temp_file(tmp, "crates/gamma/engine/domain.rs",
+                    "pub struct ExplicitRunner; impl ExplicitRunner { pub fn dry_run(&self) {} }\n");
+    write_temp_file(tmp, "crates/gamma/engine/factory.rs", gamma_factory_source);
+    write_temp_file(tmp, "crates/gamma/engine/caller.rs",
+                    "use super::factory::GammaFactory;\n"
+                    "pub fn rh021_explicit_chain() { GammaFactory::make().dry_run(); "
+                    "GammaFactory::make_root().dry_run(); }\n");
+    /* `[lib].path` replaces Cargo's default lib target. Keep a fully valid
+     * same-named default-path tree as a decoy: routing must not mint a crate
+     * root for files Cargo does not compile into this target. */
+    write_temp_file(tmp, "crates/gamma/src/lib.rs",
+                    "mod domain; mod factory; mod caller;\n");
+    write_temp_file(tmp, "crates/gamma/src/domain.rs",
+                    "pub struct ExplicitRunner; impl ExplicitRunner { "
+                    "pub fn dry_run(&self) {} }\n");
+    write_temp_file(tmp, "crates/gamma/src/factory.rs", gamma_factory_source);
+    write_temp_file(tmp, "crates/gamma/src/caller.rs",
+                    "use super::factory::GammaFactory;\n"
+                    "pub fn rh021_explicit_default_decoy_chain() { "
+                    "GammaFactory::make().dry_run(); }\n");
+    write_temp_file(tmp, "crates/delta/src/lib.rs", "mod domain; mod factory; mod caller;\n");
+    write_temp_file(tmp, "crates/delta/src/main.rs",
+                    "mod domain; mod factory; mod caller;\n"
+                    "fn main() { caller::rh021_ambiguous_chain(); }\n");
+    write_temp_file(tmp, "crates/delta/src/domain.rs",
+                    "pub struct AmbiguousRunner; impl AmbiguousRunner { pub fn dry_run(&self) {} }\n");
+    write_temp_file(tmp, "crates/delta/src/factory.rs", delta_factory_source);
+    write_temp_file(tmp, "crates/delta/src/caller.rs",
+                    "use super::factory::DeltaFactory;\n"
+                    "pub fn rh021_ambiguous_chain() { DeltaFactory::make().dry_run(); }\n");
+    write_temp_file(tmp, "crates/domain/src/lib.rs",
+                    "pub struct CrateRunner; impl CrateRunner { pub fn dry_run(&self) {} }\n");
+    write_temp_file(tmp, "crates/epsilon/src/lib.rs", "pub mod tools;\n");
+    write_temp_file(tmp, "crates/epsilon/src/tools.rs", "pub mod shared;\n");
+    write_temp_file(tmp, "crates/epsilon/src/tools/main.rs", "mod shared; fn main() {}\n");
+    write_temp_file(tmp, "crates/epsilon/src/tools/shared.rs", "pub struct Shared;\n");
+
+    CBMArena manifest_arena;
+    cbm_arena_init(&manifest_arena);
+    CBMCargoManifest manifest;
+    ASSERT_TRUE(cbm_pxc_build_rust_manifest(tmp, &manifest_arena, &manifest));
+    const char *expected_target_paths[] = {
+        "crates/alpha/src/lib.rs", "crates/beta/src/main.rs",
+        "crates/gamma/engine/entry.rs", "crates/delta/src/lib.rs",
+        "crates/delta/src/main.rs", "crates/domain/src/lib.rs",
+        "crates/epsilon/src/tools/main.rs", "crates/epsilon/src/lib.rs",
+        "crates/zeta/src/entry.rs", "crates/zeta/src/entry.rs",
+        "crates/theta/custom/auto.rs", "crates/theta/src/lib.rs",
+        "crates/theta/src/main.rs", "crates/theta/src/bin/other.rs",
+        "crates/theta/src/bin/nested/main.rs",
+        "crates/eta/custom/entry.rs", "root_entry.rs",
+        "crates/eta/src/bin/eta-tool.rs", "crates/theta/src/bin/nested-explicit/main.rs",
+        "crates/alpha/custom/example_entry.rs", "crates/alpha/examples/auto.rs",
+        "crates/alpha/tests/auto.rs", "crates/alpha/benches/auto.rs",
+        "crates/alpha/build/build.rs", "groups/one/member/src/lib.rs",
+        "special/kept/src/lib.rs",
+        "crates/kappa/src/lib.rs", "crates/kappa/src/example_entry.rs",
+        "crates/lambda/src/lib.rs", "crates/mu/src/bin/mu.rs",
+    };
+    const CBMCargoTargetKind expected_target_kinds[] = {
+        CBM_CARGO_TARGET_LIB, CBM_CARGO_TARGET_BIN, CBM_CARGO_TARGET_LIB,
+        CBM_CARGO_TARGET_LIB, CBM_CARGO_TARGET_BIN, CBM_CARGO_TARGET_LIB,
+        CBM_CARGO_TARGET_BIN, CBM_CARGO_TARGET_LIB,
+        CBM_CARGO_TARGET_BIN, CBM_CARGO_TARGET_BIN,
+        CBM_CARGO_TARGET_BIN, CBM_CARGO_TARGET_LIB, CBM_CARGO_TARGET_BIN,
+        CBM_CARGO_TARGET_BIN, CBM_CARGO_TARGET_BIN,
+        CBM_CARGO_TARGET_BIN, CBM_CARGO_TARGET_LIB, CBM_CARGO_TARGET_BIN,
+        CBM_CARGO_TARGET_BIN, CBM_CARGO_TARGET_EXAMPLE, CBM_CARGO_TARGET_EXAMPLE,
+        CBM_CARGO_TARGET_TEST, CBM_CARGO_TARGET_BENCH, CBM_CARGO_TARGET_BUILD,
+        CBM_CARGO_TARGET_LIB, CBM_CARGO_TARGET_LIB, CBM_CARGO_TARGET_LIB,
+        CBM_CARGO_TARGET_EXAMPLE,
+        CBM_CARGO_TARGET_LIB,
+        CBM_CARGO_TARGET_BIN,
+    };
+    ASSERT_EQ(manifest.target_count, 30);
+    for (int expected = 0; expected < 30; expected++) {
+        int matches = 0;
+        for (int actual = 0; actual < manifest.target_count; actual++) {
+            if (manifest.targets[actual].kind == expected_target_kinds[expected] &&
+                strcmp(manifest.targets[actual].source_path,
+                       expected_target_paths[expected]) == 0) {
+                matches++;
+            }
+        }
+        ASSERT_EQ(matches, expected == 8 || expected == 9 ? 2 : 1);
+    }
+
+    const char *carrier_sources[] = {alpha_factory_source, beta_factory_source,
+                                     gamma_factory_source, delta_factory_source,
+                                     "pub struct Shared;\n", "fn main() {}\n",
+                                     "fn main() {}\n", "fn main() {}\n", "fn main() {}\n",
+                                     "pub struct Theta;\n", "fn main() {}\n",
+                                     "pub struct RootSibling;\n", "pub struct Child;\n"};
+    const char *carrier_paths[] = {"crates/alpha/src/factory/deep.rs",
+                                   "crates/beta/src/factory.rs",
+                                   "crates/gamma/engine/factory.rs",
+                                   "crates/delta/src/factory.rs",
+                                   "crates/epsilon/src/tools/shared.rs",
+                                   "crates/zeta/src/entry.rs",
+                                   "crates/alpha/custom/example_entry.rs",
+                                   "crates/alpha/examples/auto.rs", "crates/alpha/build/build.rs",
+                                   "crates/theta/src/lib.rs", "crates/kappa/src/example_entry.rs",
+                                   "root_domain.rs", "crates/kappa/src/example_child.rs"};
+    const char *carrier_method_names[] = {"make_crate", "make", "make", "make", "Shared",
+                                          "main", "main", "main", "main", "Theta", "main",
+                                          "RootSibling", "Child"};
+    const char *expected_crate_roots[] = {"rooted.crates.alpha.src",
+                                          "rooted.crates.beta.src",
+                                          "rooted.crates.gamma.engine", NULL, NULL, NULL,
+                                          NULL, NULL, NULL, "rooted.crates.theta.src", NULL,
+                                          "rooted", NULL};
+    const char *expected_source_modules[] = {"rooted.crates.alpha.src.lib",
+                                             "rooted.crates.beta.src.main",
+                                             "rooted.crates.gamma.engine.entry", NULL, NULL,
+                                             NULL, NULL, NULL, NULL,
+                                             "rooted.crates.theta.src.lib", NULL,
+                                             "rooted.root_entry", NULL};
+    cbm_file_info_t carrier_files[13] = {0};
+    CBMFileResult *carrier_cache[13] = {0};
+    char *carrier_modules[13] = {0};
+    int carrier_starts[14] = {0};
+    for (int i = 0; i < 13; i++) {
+        carrier_files[i].rel_path = (char *)carrier_paths[i];
+        carrier_files[i].language = CBM_LANG_RUST;
+        carrier_cache[i] =
+            cbm_extract_file(carrier_sources[i], (int)strlen(carrier_sources[i]),
+                             CBM_LANG_RUST, "rooted", carrier_paths[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(carrier_cache[i]);
+    }
+    int carrier_def_count = 0;
+    CBMLSPDef *carrier_defs = cbm_pxc_collect_all_defs(
+        carrier_cache, carrier_files, 13, "rooted", carrier_modules, &carrier_def_count,
+        carrier_starts, &manifest);
+    ASSERT_NOT_NULL(carrier_defs);
+    /* Carrier roots must be owned by the per-file result arenas: manifest
+     * routing is a construction-time oracle and its arena may die before
+     * surface serialization or registry population consumes the defs. */
+    cbm_arena_destroy(&manifest_arena);
+    for (int fi = 0; fi < 13; fi++) {
+        int matching_methods = 0;
+        for (int di = carrier_starts[fi]; di < carrier_starts[fi + 1]; di++) {
+            if (!carrier_defs[di].short_name ||
+                strcmp(carrier_defs[di].short_name, carrier_method_names[fi]) != 0) {
+                continue;
+            }
+            matching_methods++;
+            if (expected_crate_roots[fi]) {
+                ASSERT_NOT_NULL(carrier_defs[di].rust_crate_root_qn);
+                ASSERT_STR_EQ(carrier_defs[di].rust_crate_root_qn, expected_crate_roots[fi]);
+                ASSERT_STR_EQ(carrier_defs[di].rust_crate_source_module_qn,
+                              expected_source_modules[fi]);
+            } else {
+                ASSERT_NULL(carrier_defs[di].rust_crate_root_qn);
+                ASSERT_NULL(carrier_defs[di].rust_crate_source_module_qn);
+            }
+        }
+        ASSERT_EQ(matching_methods, 1);
+    }
+    free(carrier_defs);
+    CBMArena oom_manifest_arena;
+    CBMCargoManifest oom_manifest;
+    cbm_arena_init(&oom_manifest_arena);
+    ASSERT_TRUE(cbm_pxc_build_rust_manifest(tmp, &oom_manifest_arena, &oom_manifest));
+    size_t saved_used = carrier_cache[0]->arena.used;
+    int saved_nblocks = carrier_cache[0]->arena.nblocks;
+    carrier_cache[0]->arena.used = carrier_cache[0]->arena.block_size;
+    carrier_cache[0]->arena.nblocks = CBM_ARENA_MAX_BLOCKS;
+    CBMFileResult *oom_cache[] = {carrier_cache[0]};
+    cbm_file_info_t oom_files[] = {carrier_files[0]};
+    char *oom_modules[] = {NULL};
+    int oom_starts[2] = {0};
+    int oom_count = 0;
+    CBMLSPDef *oom_defs = cbm_pxc_collect_all_defs(
+        oom_cache, oom_files, 1, "rooted", oom_modules, &oom_count, oom_starts, &oom_manifest);
+    ASSERT_NOT_NULL(oom_defs);
+    for (int i = 0; i < oom_count; i++) {
+        ASSERT_NULL(oom_defs[i].rust_crate_root_qn);
+        ASSERT_NULL(oom_defs[i].rust_crate_source_module_qn);
+    }
+    carrier_cache[0]->arena.nblocks = saved_nblocks;
+    carrier_cache[0]->arena.used = saved_used;
+    free(oom_modules[0]);
+    free(oom_defs);
+    cbm_arena_destroy(&oom_manifest_arena);
+    for (int i = 0; i < 13; i++) {
+        free(carrier_modules[i]);
+        cbm_free_result(carrier_cache[i]);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rooted.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh021_rooted_factory_chain",
+                                       "dry_run", "crates/alpha/src/domain.rs"),
+              2);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh021_rooted_factory_chain",
+                                       "dry_run", "crates/alpha/src/factory/deep.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh021_rooted_factory_chain",
+                                       "dry_run", "crates/beta/src/lib.rs"),
+              0);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh021_rooted_factory_chain",
+                                       "dry_run", "crates/domain/src/lib.rs"),
+              0);
+    char crate_runner_qn[512];
+    char self_runner_qn[512];
+    char super_runner_qn[512];
+    snprintf(crate_runner_qn, sizeof(crate_runner_qn),
+             "%s.crates.alpha.src.domain.CrateRunner.dry_run", project);
+    snprintf(self_runner_qn, sizeof(self_runner_qn),
+             "%s.crates.alpha.src.factory.deep.SelfRunner.dry_run", project);
+    snprintf(super_runner_qn, sizeof(super_runner_qn),
+             "%s.crates.alpha.src.domain.SuperRunner.dry_run", project);
+    char root_runner_qn[512];
+    snprintf(root_runner_qn, sizeof(root_runner_qn),
+             "%s.crates.alpha.src.lib.RootRunner.dry_run", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh021_rooted_factory_chain",
+                                     crate_runner_qn),
+              1);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh021_rooted_factory_chain",
+                                     self_runner_qn),
+              1);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh021_rooted_factory_chain",
+                                     super_runner_qn),
+              1);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh021_rooted_factory_chain",
+                                     root_runner_qn),
+              1);
+    char bin_qn[512];
+    char explicit_qn[512];
+    snprintf(bin_qn, sizeof(bin_qn), "%s.crates.beta.src.domain.BinRunner.dry_run", project);
+    snprintf(explicit_qn, sizeof(explicit_qn),
+             "%s.crates.gamma.engine.domain.ExplicitRunner.dry_run", project);
+    char bin_root_qn[512];
+    char explicit_root_qn[512];
+    snprintf(bin_root_qn, sizeof(bin_root_qn),
+             "%s.crates.beta.src.main.BinRootRunner.dry_run", project);
+    snprintf(explicit_root_qn, sizeof(explicit_root_qn),
+             "%s.crates.gamma.engine.entry.ExplicitRootRunner.dry_run", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh021_bin_chain", bin_qn), 1);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh021_explicit_chain",
+                                     explicit_qn),
+              1);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh021_bin_chain", bin_root_qn),
+              1);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh021_explicit_chain",
+                                     explicit_root_qn),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS",
+                                       "rh021_explicit_default_decoy_chain", "dry_run",
+                                       "crates/gamma/src/domain.rs"),
+              0);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh021_ambiguous_chain",
+                                       "dry_run", "crates/delta/src/domain.rs"),
+              0);
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+
+    /* A body-only edit takes the incremental surface route. The persisted
+     * rcr/rcs carrier must rehydrate with owned strings and preserve the exact
+     * target-source root-item identity under ASan. */
+    write_temp_file(tmp, "crates/alpha/src/caller.rs",
+                    "use super::factory::deep::Factory;\n"
+                    "pub fn rh021_rooted_factory_chain() {\n"
+                    "  Factory::make_crate().dry_run(); Factory::make_self().dry_run();\n"
+                    "  Factory::make_super().dry_run(); Factory::make_root().dry_run();\n"
+                    "}\n");
+    pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(named_edge_to_qn_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                     "rh021_rooted_factory_chain", root_runner_qn),
+              1);
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    /* Cargo cannot authoritatively infer a pathless explicit bin when both
+     * conventional locations exist, or when neither does. Do not guess. */
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "pathless-negative/src/bin/both")), 0);
+    write_temp_file(tmp, "pathless-negative/Cargo.toml",
+                    "[package]\nname = \"pathless-negative\"\nversion = \"0.1.0\"\n"
+                    "autolib = false\nautobins = false\n"
+                    "[[bin]]\nname = \"both\"\n[[bin]]\nname = \"neither\"\n");
+    write_temp_file(tmp, "pathless-negative/src/bin/both.rs", "fn main() {}\n");
+    write_temp_file(tmp, "pathless-negative/src/bin/both/main.rs", "fn main() {}\n");
+    CBMArena negative_arena;
+    CBMCargoManifest negative_manifest;
+    cbm_arena_init(&negative_arena);
+    ASSERT_TRUE(cbm_pxc_build_rust_manifest(TH_PATH(tmp, "pathless-negative"),
+                                            &negative_arena, &negative_manifest));
+    ASSERT_EQ(negative_manifest.target_count, 0);
+    ASSERT_FALSE(negative_manifest.targets_complete);
+    cbm_arena_destroy(&negative_arena);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "root-blocker/src")), 0);
+    write_temp_file(tmp, "root-blocker/Cargo.toml",
+                    "[package]\nname = \"root-blocker\"\nversion = \"0.1.0\"\n"
+                    "[[example]]\nname = \"root-example\"\npath = \"example.rs\"\n");
+    write_temp_file(tmp, "root-blocker/src/lib.rs", "pub struct Lib;\n");
+    write_temp_file(tmp, "root-blocker/example.rs", "fn main() {}\n");
+    CBMArena blocker_arena;
+    CBMCargoManifest blocker_manifest;
+    cbm_arena_init(&blocker_arena);
+    ASSERT_TRUE(cbm_pxc_build_rust_manifest(TH_PATH(tmp, "root-blocker"), &blocker_arena,
+                                            &blocker_manifest));
+    ASSERT_EQ(blocker_manifest.target_count, 2);
+    int empty_blockers = 0;
+    for (int i = 0; i < blocker_manifest.target_count; i++) {
+        if (blocker_manifest.targets[i].kind == CBM_CARGO_TARGET_EXAMPLE &&
+            blocker_manifest.targets[i].blocker_root &&
+            blocker_manifest.targets[i].blocker_root[0] == '\0') empty_blockers++;
+    }
+    ASSERT_EQ(empty_blockers, 1);
+    cbm_arena_destroy(&blocker_arena);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "normalized-main/src/dir")), 0);
+    write_temp_file(tmp, "normalized-main/Cargo.toml",
+                    "[package]\nname = \"normalized-main\"\nversion = \"0.1.0\"\n"
+                    "autolib = false\n[[bin]]\nname = \"renamed\"\n"
+                    "path = \"src/dir/../main.rs\"\n");
+    write_temp_file(tmp, "normalized-main/src/main.rs", "fn main() {}\n");
+    CBMArena main_arena;
+    CBMCargoManifest main_manifest;
+    cbm_arena_init(&main_arena);
+    ASSERT_TRUE(cbm_pxc_build_rust_manifest(TH_PATH(tmp, "normalized-main"), &main_arena,
+                                            &main_manifest));
+    ASSERT_EQ(main_manifest.target_count, 1);
+    cbm_arena_destroy(&main_arena);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "incomplete-member/broken")), 0);
+    write_temp_file(tmp, "incomplete-member/Cargo.toml",
+                    "[workspace]\nmembers = [\"broken\"]\n");
+    write_temp_file(tmp, "incomplete-member/broken/Cargo.toml", "");
+    CBMArena incomplete_arena;
+    CBMCargoManifest incomplete_manifest;
+    cbm_arena_init(&incomplete_arena);
+    ASSERT_TRUE(cbm_pxc_build_rust_manifest(TH_PATH(tmp, "incomplete-member"),
+                                            &incomplete_arena, &incomplete_manifest));
+    ASSERT_FALSE(incomplete_manifest.targets_complete);
+    cbm_arena_destroy(&incomplete_arena);
     th_rmtree(tmp);
     PASS();
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets);
     RUN_TEST(pipeline_rust_cross_file_factory_chains_exact_targets);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */

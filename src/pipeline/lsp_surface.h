@@ -10,7 +10,7 @@
  * unchanged — a body edit — and skip recomputing its dependents, and
  * (b) rehydrate the cross registries for files it does not re-parse.
  *
- * The JSON is a versioned object {"v":1,"lsp":[...],"reg":[...]}. Field
+ * The JSON is a versioned object {"v":2,"lsp":[...],"reg":[...]}. Field
  * order and array order are fixed by the writer, so byte equality of the
  * serialization is surface equality; the sha256 of these bytes is the
  * stored surface_sha. Rows written by a different codec version fail the

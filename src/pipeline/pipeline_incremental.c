@@ -18,6 +18,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/artifact.h"
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "lsp/rust_cargo.h"
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
 #include "pipeline/pipeline_internal.h"
@@ -1298,11 +1299,30 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             def_modules = (char **)calloc((size_t)ci, sizeof(char *));
             int *def_starts = (int *)calloc((size_t)ci + 1, sizeof(int));
             int fresh_count = 0;
+            CBMArena rust_manifest_arena;
+            CBMCargoManifest rust_manifest;
+            const CBMCargoManifest *rust_manifest_ptr = NULL;
+            bool rust_manifest_arena_live = false;
+            for (int i = 0; i < ci; i++) {
+                if (cache[i] && changed_files[i].language == CBM_LANG_RUST) {
+                    cbm_arena_init(&rust_manifest_arena);
+                    rust_manifest_arena_live = true;
+                    if (cbm_pxc_build_rust_manifest(ctx->repo_path, &rust_manifest_arena,
+                                                    &rust_manifest)) {
+                        rust_manifest_ptr = &rust_manifest;
+                    }
+                    break;
+                }
+            }
             CBMLSPDef *fresh_defs =
                 def_modules && def_starts
                     ? cbm_pxc_collect_all_defs(cache, changed_files, ci, ctx->project_name,
-                                               def_modules, &fresh_count, def_starts)
+                                               def_modules, &fresh_count, def_starts,
+                                               rust_manifest_ptr)
                     : NULL;
+            if (rust_manifest_arena_live) {
+                cbm_arena_destroy(&rust_manifest_arena);
+            }
             if ((fresh_defs || fresh_count == 0) && def_starts &&
                 cbm_lsp_surface_build_rows(ctx->project_name, cache, changed_files, ci, fresh_defs,
                                            def_starts, &closure->fresh_rows,
@@ -1581,13 +1601,31 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
         int *def_starts = (int *)calloc((size_t)probe_count + 1, sizeof(int));
         int def_count = 0;
         CBMLSPDef *defs = NULL;
+        CBMArena rust_manifest_arena;
+        CBMCargoManifest rust_manifest;
+        const CBMCargoManifest *rust_manifest_ptr = NULL;
+        bool rust_manifest_arena_live = false;
+        for (int i = 0; i < probe_count; i++) {
+            if (cache[i] && probe_files[i].language == CBM_LANG_RUST) {
+                cbm_arena_init(&rust_manifest_arena);
+                rust_manifest_arena_live = true;
+                if (cbm_pxc_build_rust_manifest(cbm_pipeline_repo_path(p), &rust_manifest_arena,
+                                                &rust_manifest)) {
+                    rust_manifest_ptr = &rust_manifest;
+                }
+                break;
+            }
+        }
         if (def_modules && def_starts) {
             defs = cbm_pxc_collect_all_defs(cache, probe_files, probe_count, project, def_modules,
-                                            &def_count, def_starts);
+                                            &def_count, def_starts, rust_manifest_ptr);
             rc = cbm_lsp_surface_build_rows(project, cache, probe_files, probe_count, defs,
                                             def_starts, out_rows, out_count);
         } else {
             rc = -1;
+        }
+        if (rust_manifest_arena_live) {
+            cbm_arena_destroy(&rust_manifest_arena);
         }
         free(defs);
         free(def_starts);
