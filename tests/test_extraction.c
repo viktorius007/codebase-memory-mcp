@@ -842,6 +842,42 @@ TEST(rust_struct) {
     PASS();
 }
 
+TEST(rust_nested_associated_call_preserves_each_exact_carrier) {
+    const char *source =
+        "struct Builder;\n"
+        "impl Builder {\n"
+        "    fn new_multi_thread() -> Builder { Builder }\n"
+        "    fn enable_all(&mut self) -> &mut Self { self }\n"
+        "    fn build(&mut self) {}\n"
+        "}\n"
+        "fn exact() { Builder::new_multi_thread().enable_all().build(); }\n";
+    CBMFileResult *r = extract(source, CBM_LANG_RUST, "test", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+
+    const char *expected_names[] = {
+        "Builder::new_multi_thread", "Builder::new_multi_thread().enable_all",
+        "Builder::new_multi_thread().enable_all().build"};
+    const char *expected_sites[] = {
+        "Builder::new_multi_thread()", "Builder::new_multi_thread().enable_all()",
+        "Builder::new_multi_thread().enable_all().build()"};
+    for (int expected = 0; expected < 3; expected++) {
+        int count = 0;
+        for (int i = 0; i < r->calls.count; i++) {
+            const CBMCall *call = &r->calls.items[i];
+            size_t site_len = call->site_end_byte - call->site_start_byte;
+            if (call->callee_name && strcmp(call->callee_name, expected_names[expected]) == 0 &&
+                strlen(expected_sites[expected]) == site_len &&
+                strncmp(source + call->site_start_byte, expected_sites[expected], site_len) == 0) {
+                count++;
+            }
+        }
+        ASSERT_EQ(count, 1);
+    }
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Go --- */
 TEST(go_function) {
     CBMFileResult *r = extract("package main\nfunc Greet(name string) string { return \"Hello, \" "
@@ -5651,6 +5687,7 @@ SUITE(extraction) {
     /* Systems */
     RUN_TEST(rust_function);
     RUN_TEST(rust_struct);
+    RUN_TEST(rust_nested_associated_call_preserves_each_exact_carrier);
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
     RUN_TEST(go_interface);

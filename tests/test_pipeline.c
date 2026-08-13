@@ -12652,6 +12652,78 @@ TEST(pipeline_rust_cross_file_factory_chains_exact_targets) {
     PASS();
 }
 
+TEST(pipeline_rust_cargo_tokio_nested_calls_exact_targets) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_nested_calls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"rust-nested-calls\"\nversion = \"0.1.0\"\n"
+                    "edition = \"2021\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "type CargoResult<T> = Result<T, ()>;\n"
+        "struct BuildRunner<'a>(&'a ());\n"
+        "impl<'a> BuildRunner<'a> {\n"
+        "    fn new(value: &'a ()) -> CargoResult<Self> { Ok(Self(value)) }\n"
+        "    fn dry_run(mut self) -> CargoResult<()> { self.prepare()?; Ok(()) }\n"
+        "    fn compile(self, _exec: ()) -> CargoResult<()> { Ok(()) }\n"
+        "    fn prepare(&mut self) -> CargoResult<()> { Ok(()) }\n"
+        "}\n"
+        "fn compile_ws(value: &()) -> CargoResult<()> {\n"
+        "    let build_runner = BuildRunner::new(value)?;\n"
+        "    if true { build_runner.dry_run() } else { build_runner.compile(()) }\n"
+        "}\n"
+        "struct Builder;\n"
+        "impl Builder {\n"
+        "    #[cfg(feature = \"rt-multi-thread\")]\n"
+        "    #[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
+        "    fn new_multi_thread() -> Builder { Builder }\n"
+        "    fn enable_all(&mut self) -> &mut Self { self }\n"
+        "    fn build(&mut self) -> Result<(), ()> { Ok(()) }\n"
+        "}\n"
+        "struct Runtime;\n"
+        "impl Runtime {\n"
+        "    #[cfg(feature = \"rt-multi-thread\")]\n"
+        "    #[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
+        "    fn new() -> Result<(), ()> {\n"
+        "        Builder::new_multi_thread().enable_all().build()\n"
+        "    }\n"
+        "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nested.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.src.lib.BuildRunner.dry_run", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "compile_ws", qn), 1);
+    snprintf(qn, sizeof(qn), "%s.src.lib.BuildRunner.compile", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "compile_ws", qn), 1);
+    snprintf(qn, sizeof(qn), "%s.src.lib.BuildRunner.prepare", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "dry_run", qn), 1);
+
+    snprintf(qn, sizeof(qn),
+             "%s.src.lib.Builder.new_multi_thread#cfg(feature=rt-multi-thread)"
+             "#cfg(feature=rt-multi-thread)",
+             project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "new", qn), 1);
+    snprintf(qn, sizeof(qn), "%s.src.lib.Builder.enable_all", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "new", qn), 1);
+    snprintf(qn, sizeof(qn), "%s.src.lib.Builder.build", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "new", qn), 1);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets) {
     const char *alpha_factory_source =
         "pub struct SelfRunner;\n"
@@ -13169,6 +13241,7 @@ TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets) {
 SUITE(pipeline) {
     RUN_TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets);
     RUN_TEST(pipeline_rust_cross_file_factory_chains_exact_targets);
+    RUN_TEST(pipeline_rust_cargo_tokio_nested_calls_exact_targets);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);

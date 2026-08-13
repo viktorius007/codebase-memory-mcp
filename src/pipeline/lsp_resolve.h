@@ -340,6 +340,19 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
         return true;
     }
 
+    /* Rust cfg-disambiguated definitions append one or more `#cfg(...)`
+     * suffixes to the callable QN. The parser carrier necessarily retains the
+     * source spelling without those synthetic suffixes. At the same exact
+     * source occurrence, join that canonical target to its raw spelling; a
+     * legacy/no-site carrier remains fail-closed below. */
+    if (site_rank == 2 && resolved_leaf && call_leaf) {
+        size_t call_len = strlen(call_leaf);
+        if (strncmp(resolved_leaf, call_leaf, call_len) == 0 &&
+            strncmp(resolved_leaf + call_len, "#cfg(", 5) == 0) {
+            return true;
+        }
+    }
+
     /* Destructors intentionally join by their exact delete-expression
      * occurrence because the parser carrier starts as a neutral "~" marker. */
     if (site_rank == 2 && call->requires_lsp_resolution && resolved->strategy &&

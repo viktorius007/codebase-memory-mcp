@@ -2237,6 +2237,255 @@ TEST(rustlsp_chained_method_calls) {
     PASS();
 }
 
+TEST(rustlsp_cargo_value_receiver_generic_impl_exact_sites) {
+    const char *impl_source =
+        "struct BuildRunner<'a>(&'a ());\n"
+        "impl<'a> BuildRunner<'a> {\n"
+        "    fn dry_run(mut self) -> Result<(), ()> { self.prepare()?; Ok(()) }\n"
+        "    fn prepare(&mut self) -> Result<(), ()> { Ok(()) }\n"
+        "}\n";
+    CBMFileResult *impl_result = extract_rust(impl_source);
+    ASSERT_NOT_NULL(impl_result);
+    ASSERT_EQ(1, count_resolved_exact(impl_result, "test.src.main.BuildRunner.dry_run",
+                                      "test.src.main.BuildRunner.prepare"));
+    cbm_free_result(impl_result);
+
+    const char *caller =
+        "fn compile_ws(value: &()) -> Result<(), ()> {\n"
+        "    let build_runner = BuildRunner::new(value)?;\n"
+        "    build_runner.borrow()?.prepare()?;\n"
+        "    if true { build_runner.dry_run() } else { build_runner.compile(()) }\n"
+        "}\n";
+    CBMRustLSPDef defs[6] = {
+        {.qualified_name = "test.src.compile.BuildRunner",
+         .short_name = "BuildRunner",
+         .label = "Type",
+         .def_module_qn = "test.src.compile"},
+        {.qualified_name = "test.src.compile.BuildRunner.new",
+         .short_name = "new",
+         .label = "Method",
+         .receiver_type = "test.src.compile.BuildRunner",
+         .def_module_qn = "test.src.compile",
+         .return_types = "CargoResult<Self>"},
+        {.qualified_name = "test.src.compile.BuildRunner.dry_run",
+         .short_name = "dry_run",
+         .label = "Method",
+         .receiver_type = "test.src.compile.BuildRunner",
+         .def_module_qn = "test.src.compile"},
+        {.qualified_name = "test.src.compile.BuildRunner.compile",
+         .short_name = "compile",
+         .label = "Method",
+         .receiver_type = "test.src.compile.BuildRunner",
+         .def_module_qn = "test.src.compile"},
+        {.qualified_name = "test.src.compile.BuildRunner.borrow",
+         .short_name = "borrow",
+         .label = "Method",
+         .receiver_type = "test.src.compile.BuildRunner",
+         .def_module_qn = "test.src.compile",
+         .return_types = "CargoResult<&Self>"},
+        {.qualified_name = "test.src.compile.BuildRunner.prepare",
+         .short_name = "prepare",
+         .label = "Method",
+         .receiver_type = "test.src.compile.BuildRunner",
+         .def_module_qn = "test.src.compile"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller), "test.src.compile", defs, 6,
+                           NULL, NULL, 0, NULL, &out, NULL);
+    uint32_t dry_start = (uint32_t)(strstr(caller, "build_runner.dry_run()") - caller);
+    uint32_t compile_start = (uint32_t)(strstr(caller, "build_runner.compile(())") - caller);
+    int dry_count = 0;
+    int compile_count = 0;
+    int prepare_count = 0;
+    for (int i = 0; i < out.count; i++) {
+        const CBMResolvedCall *call = &out.items[i];
+        if (!call->caller_qn || !call->callee_qn ||
+            strcmp(call->caller_qn, "test.src.compile.compile_ws") != 0)
+            continue;
+        if (strcmp(call->callee_qn, "test.src.compile.BuildRunner.dry_run") == 0 &&
+            call->site_start_byte == dry_start &&
+            call->site_end_byte ==
+                dry_start + (uint32_t)strlen("build_runner.dry_run()"))
+            dry_count++;
+        if (strcmp(call->callee_qn, "test.src.compile.BuildRunner.compile") == 0 &&
+            call->site_start_byte == compile_start &&
+            call->site_end_byte ==
+                compile_start + (uint32_t)strlen("build_runner.compile(())"))
+            compile_count++;
+        if (strcmp(call->callee_qn, "test.src.compile.BuildRunner.prepare") == 0)
+            prepare_count++;
+    }
+    ASSERT_EQ(dry_count, 1);
+    ASSERT_EQ(compile_count, 1);
+    ASSERT_EQ(prepare_count, 1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_tokio_cfg_chain_exact_sites) {
+    const char *source =
+        "struct Builder;\n"
+        "impl Builder {\n"
+        "    #[cfg(feature = \"rt-multi-thread\")]\n"
+        "    #[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
+        "    fn new_multi_thread() -> Builder { Builder }\n"
+        "    fn enable_all(&mut self) -> &mut Self { self }\n"
+        "    fn build(&mut self) -> Result<(), ()> { Ok(()) }\n"
+        "}\n"
+        "struct Runtime;\n"
+        "impl Runtime {\n"
+        "    #[cfg(feature = \"rt-multi-thread\")]\n"
+        "    #[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
+        "    fn new() -> Result<(), ()> {\n"
+        "        Builder::new_multi_thread().enable_all().build()\n"
+        "    }\n"
+        "}\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    const char *caller =
+        "test.src.main.Runtime.new#cfg(feature=rt-multi-thread)#cfg(feature=rt-multi-thread)";
+    const char *new_multi =
+        "test.src.main.Builder.new_multi_thread#cfg(feature=rt-multi-thread)"
+        "#cfg(feature=rt-multi-thread)";
+    const char *new_site = strstr(source, "Builder::new_multi_thread()");
+    const char *enable_site = strstr(source, "Builder::new_multi_thread().enable_all()");
+    const char *build_site =
+        strstr(source, "Builder::new_multi_thread().enable_all().build()");
+    ASSERT_NOT_NULL(new_site);
+    ASSERT_NOT_NULL(enable_site);
+    ASSERT_NOT_NULL(build_site);
+    int exact_new = 0;
+    int exact_enable = 0;
+    int exact_build = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &result->resolved_calls.items[i];
+        if (!call->caller_qn || !call->callee_qn || strcmp(call->caller_qn, caller) != 0)
+            continue;
+        if (strcmp(call->callee_qn, new_multi) == 0 &&
+            call->site_start_byte == (uint32_t)(new_site - source) &&
+            call->site_end_byte ==
+                (uint32_t)(new_site - source + strlen("Builder::new_multi_thread()")))
+            exact_new++;
+        if (strcmp(call->callee_qn, "test.src.main.Builder.enable_all") == 0 &&
+            call->site_start_byte == (uint32_t)(enable_site - source) &&
+            call->site_end_byte ==
+                (uint32_t)(enable_site - source +
+                           strlen("Builder::new_multi_thread().enable_all()")))
+            exact_enable++;
+        if (strcmp(call->callee_qn, "test.src.main.Builder.build") == 0 &&
+            call->site_start_byte == (uint32_t)(build_site - source) &&
+            call->site_end_byte ==
+                (uint32_t)(build_site - source +
+                           strlen("Builder::new_multi_thread().enable_all().build()")))
+            exact_build++;
+    }
+    ASSERT_EQ(exact_new, 1);
+    ASSERT_EQ(exact_enable, 1);
+    ASSERT_EQ(exact_build, 1);
+
+    const CBMCall *new_carrier = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->site_start_byte == (uint32_t)(new_site - source) &&
+            call->site_end_byte ==
+                (uint32_t)(new_site - source + strlen("Builder::new_multi_thread()"))) {
+            new_carrier = call;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(new_carrier);
+    const CBMResolvedCall *joined =
+        cbm_pipeline_find_lsp_resolution(&result->resolved_calls, new_carrier, false);
+    ASSERT_NOT_NULL(joined);
+    ASSERT_STR_EQ(joined->callee_qn, new_multi);
+
+    /* Mechanism-impossible control: the cfg suffix may be ignored only for the
+     * exact source occurrence, never by a nearby/legacy name-only join. */
+    CBMCall wrong_site = *new_carrier;
+    wrong_site.site_end_byte++;
+    ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, &wrong_site, false));
+
+    cbm_free_result(result);
+
+    /* Tokio imports Builder through a project macro, so tree-sitter exposes no
+     * use_declaration. The explicit receiver plus one current-crate target is
+     * still authoritative; a second same-leaf receiver makes it impossible. */
+    const char *cross_source =
+        "cfg_rt_multi_thread! { use crate::runtime::Builder; }\n"
+        "struct Runtime;\n"
+        "impl Runtime {\n"
+        "#[cfg(feature = \"rt-multi-thread\")]\n"
+        "#[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
+        "fn new() -> Result<(), ()> {\n"
+        "Builder::new_multi_thread().enable_all().build()\n"
+        "}\n}\n";
+    CBMRustLSPDef cross_defs[4] = {
+        {.qualified_name = new_multi,
+         .short_name = "new_multi_thread",
+         .label = "Method",
+         .receiver_type = "test.src.builder.Builder",
+         .def_module_qn = "test.src.builder",
+         .return_types = "Builder"},
+        {.qualified_name = "test.src.builder.Builder.enable_all",
+         .short_name = "enable_all",
+         .label = "Method",
+         .receiver_type = "test.src.builder.Builder",
+         .def_module_qn = "test.src.builder",
+         .return_types = "&mut Self"},
+        {.qualified_name = "test.src.builder.Builder.build",
+         .short_name = "build",
+         .label = "Method",
+         .receiver_type = "test.src.builder.Builder",
+         .def_module_qn = "test.src.builder"},
+        {.qualified_name = "test.src.builder.Builder",
+         .short_name = "Builder",
+         .label = "Type",
+         .def_module_qn = "test.src.builder"},
+    };
+    /* Replace local-test QNs with the cross-file identities used above. */
+    cross_defs[0].qualified_name =
+        "test.src.builder.Builder.new_multi_thread#cfg(feature=rt-multi-thread)"
+        "#cfg(feature=rt-multi-thread)";
+    CBMArena cross_arena;
+    cbm_arena_init(&cross_arena);
+    CBMResolvedCallArray cross_out = {0};
+    cbm_run_rust_lsp_cross(&cross_arena, cross_source, (int)strlen(cross_source),
+                           "test.src.runtime", cross_defs, 4, NULL, NULL, 0, NULL, &cross_out,
+                           NULL);
+    CBMFileResult cross_result = {.resolved_calls = cross_out};
+    ASSERT_EQ(count_resolved_exact(&cross_result,
+                                   "test.src.runtime.Runtime.new#cfg(feature=rt-multi-thread)"
+                                   "#cfg(feature=rt-multi-thread)",
+                                   cross_defs[0].qualified_name), 1);
+    cbm_arena_destroy(&cross_arena);
+
+    CBMRustLSPDef ambiguous_defs[5];
+    memcpy(ambiguous_defs, cross_defs, sizeof(cross_defs));
+    ambiguous_defs[4] = (CBMRustLSPDef){
+        .qualified_name =
+            "test.src.other.Builder.new_multi_thread#cfg(feature=rt-multi-thread)",
+        .short_name = "new_multi_thread",
+        .label = "Method",
+        .receiver_type = "test.src.other.Builder",
+        .def_module_qn = "test.src.other",
+        .return_types = "Builder"};
+    CBMArena ambiguous_arena;
+    cbm_arena_init(&ambiguous_arena);
+    CBMResolvedCallArray ambiguous_out = {0};
+    cbm_run_rust_lsp_cross(&ambiguous_arena, cross_source, (int)strlen(cross_source),
+                           "test.src.runtime", ambiguous_defs, 5, NULL, NULL, 0, NULL,
+                           &ambiguous_out, NULL);
+    CBMFileResult ambiguous_result = {.resolved_calls = ambiguous_out};
+    ASSERT_EQ(count_resolved_exact(&ambiguous_result,
+                                   "test.src.runtime.Runtime.new#cfg(feature=rt-multi-thread)"
+                                   "#cfg(feature=rt-multi-thread)",
+                                   cross_defs[0].qualified_name), 0);
+    cbm_arena_destroy(&ambiguous_arena);
+    PASS();
+}
+
 TEST(rustlsp_box_constructor) {
     CBMFileResult *r = extract_rust(
         "fn run() {\n"
@@ -7178,6 +7427,213 @@ TEST(rustlsp_partial_cargo_handles_comments_and_quirks) {
     PASS();
 }
 
+TEST(rustlsp_cargo_accepts_rust_analyzer_inline_boolean_fixture) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *toml =
+        "[workspace.dependencies]\n"
+        "ra-ap-rustc_lexer = { version = \"0.166\", default-features = false }\n"
+        "ra-ap-rustc_parse_format = { version = \"0.166\", default-features = false }\n"
+        "salsa = { version = \"0.28.2\", default-features = false, features = [\n"
+        "    \"rayon\",\n"
+        "    \"macros\",\n"
+        "] }\n";
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+
+    ASSERT_EQ(3, manifest.dep_count);
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "ra-ap-rustc_lexer"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "ra-ap-rustc_parse_format"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "salsa"));
+    ASSERT_EQ(0, manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL].count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&manifest.health));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_accepts_cargo_dotted_key_and_multiline_string_fixture) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *toml =
+        "[ \"package\" ]\n"
+        "name = \"cargo-\\x66ixture\"\n"
+        "edition.workspace = true\n"
+        "license.workspace = true\n"
+        "description = \"\"\"\n"
+        "Cargo, a package manager for Rust.\n"
+        "\"\"\"\n"
+        "[ workspace ]\n"
+        "members = [\"crates/\\u0061\", \"crates/\\e\", \"crates/\\xE9\"]\n"
+        "[package.metadata.\"x]................................................"
+        ".................................................................%%%\"]\n"
+        "ignored = true\n"
+        "[ \"dependencies\" ]\n"
+        "\"serde\\u005fjson\" = \"1\"\n"
+        "[ \"dependencies.fake\" ]\n"
+        "path = \"../must-not-route\"\n"
+        "[dependencies.local-subtable]\n"
+        "path = \"../local\"\n"
+        "[dev-dependencies]\n"
+        "ordinary-dev = \"1\"\n"
+        "[dev-dependencies.dev-subtable]\n"
+        "path = \"../dev-subtable\"\n"
+        "[build-dependencies.build-subtable]\n"
+        "path = \"../build-subtable\"\n"
+        "[ workspace . dependencies . workspace-subtable ]\n"
+        "path = \"../workspace-subtable\"\n"
+        "[ target . 'cfg(unix)' . dev-dependencies ]\n"
+        "libc.workspace = true\n"
+        "[target.'cfg(target_os = \"linux\")'.dependencies]\n"
+        "cargo-credential-libsecret.workspace = true\n"
+        "[target.'cfg(windows)'.dependencies.windows-sys]\n"
+        "workspace = true\n"
+        "features = [\"Win32_Foundation\"]\n"
+        "[target.x86_64-pc-windows-msvc.build-dependencies]\n"
+        "target-build-only = \"1\"\n"
+        "[target.x86_64-pc-windows-msvc.dev-dependencies.target-dev-subtable]\n"
+        "path = \"../target-dev-subtable\"\n"
+        "[target.x86_64-pc-windows-msvc.build-dependencies.target-build-subtable]\n"
+        "path = \"../target-build-subtable\"\n"
+        "[build-dependencies]\n"
+        "build-only = \"1\"\n"
+        "[[ example ]]\n"
+        "name = \"escaped-fixture\"\n"
+        "path = \"examples/escaped.rs\"\n"
+        "[[test]]\n"
+        "name = \"integration\"\n"
+        "path = \"tests/integration.rs\"\n"
+        "[[bench]]\n"
+        "name = \"speed\"\n"
+        "path = \"benches/speed.rs\"\n";
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+
+    ASSERT_STR_EQ("cargo-fixture", manifest.package_name);
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "libc"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "cargo-credential-libsecret"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "windows-sys"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "serde_json"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "workspace-subtable"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "target-build-only"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "build-only"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "ordinary-dev"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "dev-subtable"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "build-subtable"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "target-dev-subtable"));
+    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "target-build-subtable"));
+    ASSERT_FALSE(cbm_cargo_is_known_dep(&manifest, "fake"));
+    ASSERT_EQ(3, manifest.member_count);
+    ASSERT_STR_EQ("crates/a", manifest.members[0].member_path);
+    ASSERT_STR_EQ("crates/\x1b", manifest.members[1].member_path);
+    ASSERT_STR_EQ("crates/\xC3\xA9", manifest.members[2].member_path);
+    ASSERT_EQ(3, manifest.target_count);
+    ASSERT_EQ(CBM_CARGO_TARGET_EXAMPLE, manifest.targets[0].kind);
+    ASSERT_EQ(CBM_CARGO_TARGET_TEST, manifest.targets[1].kind);
+    ASSERT_EQ(CBM_CARGO_TARGET_BENCH, manifest.targets[2].kind);
+    bool found_local_path = false;
+    for (int i = 0; i < manifest.dep_count; i++) {
+        if (manifest.deps[i].name &&
+            strcmp(manifest.deps[i].name, "local-subtable") == 0 &&
+            manifest.deps[i].path && strcmp(manifest.deps[i].path, "../local") == 0) {
+            found_local_path = true;
+        }
+    }
+    ASSERT_TRUE(found_local_path);
+    ASSERT_EQ(0, manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL].count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&manifest.health));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_unterminated_inline_table_remains_partial) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *toml =
+        "[dependencies]\n"
+        "broken = { version = \"1\", default-features = false\n";
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+
+    const CBMRustHealthIssue *issue =
+        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL];
+    ASSERT_EQ(1, issue->count);
+    ASSERT_EQ((uint32_t)(strstr(toml, "broken") - toml), issue->first_start_byte);
+    ASSERT_EQ((uint32_t)strlen(toml), issue->first_end_byte);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_malformed_header_and_inline_field_remain_partial) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *toml =
+        "[dependencies\n"
+        "later = [\"not-a-header-close\"]\n"
+        "[dependencies]\n"
+        "broken = { path \"../local\" }\n";
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+
+    const CBMRustHealthIssue *issue =
+        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL];
+    ASSERT_GTE(issue->count, 2);
+    ASSERT_EQ(0, issue->first_start_byte);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_parser_allocation_loss_is_not_complete) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_arena_test_fail_after(&arena, 0);
+    const char *toml = "[package]\nname = \"lost\"\n[dependencies]\nserde = \"1\"\n";
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+
+    ASSERT_EQ(CBM_ARENA_STATUS_ALLOCATION_UNAVAILABLE, cbm_arena_status(&arena));
+    ASSERT_EQ(1, manifest.health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
+    ASSERT_FALSE(manifest.targets_complete);
+    ASSERT_TRUE(cbm_rust_health_status(&manifest.health) != CBM_RUST_ANALYSIS_COMPLETE);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_rejects_newline_assignment_and_invalid_unicode) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *toml =
+        "[dependencies]\n"
+        "serde\n"
+        "= \"1\"\n"
+        "\"bad\\uD800\" = \"1\"\n";
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+
+    ASSERT_FALSE(cbm_cargo_is_known_dep(&manifest, "serde"));
+    ASSERT_GTE(manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL].count, 2);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_ignored_section_rejects_newline_assignment) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *toml =
+        "[package.metadata.tool]\n"
+        "key\n"
+        "= \"value\"\n";
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+
+    ASSERT_GTE(manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL].count, 1);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(rustlsp_health_status_is_derived_from_routes_and_issues) {
     CBMRustAnalysisHealth health = {0};
     health.required_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE |
@@ -8145,6 +8601,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_disambiguates_two_impls_same_method);
     RUN_TEST(rustlsp_method_after_string_from);
     RUN_TEST(rustlsp_chained_method_calls);
+    RUN_TEST(rustlsp_cargo_value_receiver_generic_impl_exact_sites);
+    RUN_TEST(rustlsp_tokio_cfg_chain_exact_sites);
     RUN_TEST(rustlsp_box_constructor);
     RUN_TEST(rustlsp_arc_clone);
     RUN_TEST(rustlsp_iterator_filter_collect);
@@ -8677,6 +9135,13 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cargo_parses_typed_explicit_targets);
     RUN_TEST(rustlsp_cargo_target_allocation_failure_marks_inventory_incomplete);
     RUN_TEST(rustlsp_partial_cargo_handles_comments_and_quirks);
+    RUN_TEST(rustlsp_cargo_accepts_rust_analyzer_inline_boolean_fixture);
+    RUN_TEST(rustlsp_cargo_accepts_cargo_dotted_key_and_multiline_string_fixture);
+    RUN_TEST(rustlsp_cargo_unterminated_inline_table_remains_partial);
+    RUN_TEST(rustlsp_cargo_malformed_header_and_inline_field_remain_partial);
+    RUN_TEST(rustlsp_cargo_parser_allocation_loss_is_not_complete);
+    RUN_TEST(rustlsp_cargo_rejects_newline_assignment_and_invalid_unicode);
+    RUN_TEST(rustlsp_cargo_ignored_section_rejects_newline_assignment);
     RUN_TEST(rustlsp_health_status_is_derived_from_routes_and_issues);
     RUN_TEST(rustlsp_allocation_loss_reason_is_stable_and_route_incomplete);
     RUN_TEST(rustlsp_impl_return_allocation_fails_inside_resolver_without_crash);

@@ -875,6 +875,47 @@ static bool rust_qn_is_within_resolution_scope(const RustLSPContext *ctx,
            (candidate_qn[prefix_len] == '.' || candidate_qn[prefix_len] == '\0');
 }
 
+/* Resolve an unimported associated call such as `Builder::new_multi_thread`
+ * only when its explicit receiver spelling and method name identify one
+ * inherent method in the current crate. Macro-wrapped `use` items are opaque
+ * token trees to tree-sitter; uniqueness preserves target authority without a
+ * weak receiver guess. */
+static void rust_scan_explicit_receiver_methods(
+    const RustLSPContext *ctx, const CBMTypeRegistry *registry, const char *receiver_name,
+    const char *method_name, const CBMRegisteredFunc **unique, int *matches) {
+    if (!ctx || !registry || !receiver_name || !method_name || !unique || !matches ||
+        strchr(receiver_name, '.')) {
+        return;
+    }
+    for (int i = 0; i < registry->func_count; i++) {
+        const CBMRegisteredFunc *candidate = &registry->funcs[i];
+        if (!candidate->receiver_type || !candidate->short_name ||
+            strcmp(candidate->short_name, method_name) != 0 ||
+            (candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0 ||
+            !rust_qn_is_within_resolution_scope(ctx, candidate->qualified_name)) {
+            continue;
+        }
+        const char *receiver_leaf = strrchr(candidate->receiver_type, '.');
+        receiver_leaf = receiver_leaf ? receiver_leaf + 1 : candidate->receiver_type;
+        if (strcmp(receiver_leaf, receiver_name) != 0)
+            continue;
+        if (!*unique || strcmp((*unique)->qualified_name, candidate->qualified_name) != 0) {
+            *unique = candidate;
+            (*matches)++;
+        }
+    }
+    rust_scan_explicit_receiver_methods(ctx, registry->fallback, receiver_name, method_name,
+                                        unique, matches);
+}
+
+static const CBMRegisteredFunc *rust_find_unique_explicit_receiver_method(
+    const RustLSPContext *ctx, const CBMTypeRegistry *registry, const char *receiver_name,
+    const char *method_name, int *matches) {
+    const CBMRegisteredFunc *unique = NULL;
+    rust_scan_explicit_receiver_methods(ctx, registry, receiver_name, method_name, &unique, matches);
+    return matches && *matches == 1 ? unique : NULL;
+}
+
 /* Resolve an otherwise-relative multi-segment type only when its head is an
  * explicit top-level `mod head;` declaration and exactly one graph-qualified
  * candidate exists. Rust filename-stem QNs do not encode whether a source is
@@ -1723,6 +1764,76 @@ static const CBMType *rust_apply_subst(CBMArena *arena, const CBMType *t, const 
     }
 }
 
+/* Replace Rust's receiver-relative `Self`, including inside generic result
+ * wrappers such as `CargoResult<Self>`. Returning that raw wrapper leaves a
+ * following `?` typed as `Self`, so an otherwise exact value-receiver call is
+ * unresolved even though the defining method is in the registry. */
+static const CBMType *rust_substitute_self(CBMArena *arena, const CBMType *type,
+                                           const char *receiver_qn) {
+    if (!type || !receiver_qn)
+        return type;
+    switch (type->kind) {
+    case CBM_TYPE_NAMED:
+        return type->data.named.qualified_name &&
+                       strcmp(type->data.named.qualified_name, "Self") == 0
+                   ? cbm_type_named(arena, receiver_qn)
+                   : type;
+    case CBM_TYPE_REFERENCE:
+        return type->data.reference.elem
+                   ? cbm_type_reference(
+                         arena,
+                         rust_substitute_self(arena, type->data.reference.elem, receiver_qn))
+                   : type;
+    case CBM_TYPE_POINTER:
+        return type->data.pointer.elem
+                   ? cbm_type_pointer(
+                         arena, rust_substitute_self(arena, type->data.pointer.elem, receiver_qn))
+                   : type;
+    case CBM_TYPE_SLICE:
+        return type->data.slice.elem
+                   ? cbm_type_slice(
+                         arena, rust_substitute_self(arena, type->data.slice.elem, receiver_qn))
+                   : type;
+    case CBM_TYPE_TEMPLATE: {
+        int count = type->data.template_type.arg_count;
+        if (!type->data.template_type.template_name || !type->data.template_type.template_args ||
+            count <= 0 || count > 16) {
+            return type;
+        }
+        const CBMType *args[16];
+        for (int i = 0; i < count; i++) {
+            if (!type->data.template_type.template_args[i])
+                return type;
+            args[i] = rust_substitute_self(arena, type->data.template_type.template_args[i],
+                                           receiver_qn);
+            if (!args[i])
+                return type;
+        }
+        const CBMType *substituted =
+            cbm_type_template(arena, type->data.template_type.template_name, args, count);
+        return substituted ? substituted : type;
+    }
+    case CBM_TYPE_TUPLE: {
+        int count = type->data.tuple.count;
+        if (!type->data.tuple.elems || count <= 0 || count > 16)
+            return type;
+        const CBMType *items[16];
+        for (int i = 0; i < count; i++) {
+            if (!type->data.tuple.elems[i])
+                return type;
+            items[i] =
+                rust_substitute_self(arena, type->data.tuple.elems[i], receiver_qn);
+            if (!items[i])
+                return type;
+        }
+        const CBMType *substituted = cbm_type_tuple(arena, items, count);
+        return substituted ? substituted : type;
+    }
+    default:
+        return type;
+    }
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 6. Expression evaluator
  * ════════════════════════════════════════════════════════════════════ */
@@ -1924,6 +2035,12 @@ static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node
                  * ignores explicit type arguments — handles forms like
                  * `Vec::<i32>::new` and `parse::<u32>`. */
                 rust_strip_turbofish(path);
+                char *explicit_receiver = NULL;
+                char *source_sep = strstr(path, "::");
+                if (source_sep && strstr(source_sep + 2, "::") == NULL) {
+                    explicit_receiver = cbm_arena_strndup(ctx->arena, path,
+                                                          (size_t)(source_sep - path));
+                }
                 const char *qn = rust_resolve_path_expr(ctx, path);
                 if (qn) {
                     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
@@ -1980,12 +2097,9 @@ static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node
                                 }
                                 return cbm_type_named(ctx->arena, f->receiver_type);
                             }
-                            /* Self -> receiver_type substitution. */
-                            if (f->receiver_type && ret->kind == CBM_TYPE_NAMED &&
-                                strcmp(ret->data.named.qualified_name, "Self") == 0) {
-                                return cbm_type_named(ctx->arena, f->receiver_type);
-                            }
-                            return ret;
+                            return f->receiver_type
+                                       ? rust_substitute_self(ctx->arena, ret, f->receiver_type)
+                                       : ret;
                         }
                     }
                     /* UFCS path lookup: split off short name and try
@@ -2004,16 +2118,19 @@ static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node
                             if (m)
                                 head = (char *)full_head;
                         }
+                        if (!m) {
+                            int matches = 0;
+                            m = rust_find_unique_explicit_receiver_method(
+                                ctx, ctx->registry, explicit_receiver, short_name, &matches);
+                            if (m)
+                                head = (char *)m->receiver_type;
+                        }
                         if (m && m->signature && m->signature->kind == CBM_TYPE_FUNC &&
                             m->signature->data.func.return_types &&
                             m->signature->data.func.return_types[0]) {
                             const CBMType *ret = m->signature->data.func.return_types[0];
                             /* Substitute Self / unknown returns with the
                              * receiver type so chained calls keep typing. */
-                            if (ret->kind == CBM_TYPE_NAMED &&
-                                strcmp(ret->data.named.qualified_name, "Self") == 0) {
-                                return cbm_type_named(ctx->arena, head);
-                            }
                             if (cbm_type_is_unknown(ret) &&
                                 (strcmp(short_name, "new") == 0 ||
                                  strcmp(short_name, "default") == 0 ||
@@ -2035,7 +2152,7 @@ static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node
                                 }
                                 return cbm_type_named(ctx->arena, head);
                             }
-                            return ret;
+                            return rust_substitute_self(ctx->arena, ret, head);
                         }
                     }
                 }
@@ -2251,17 +2368,16 @@ static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node
                     if (t && t->kind == CBM_TYPE_FUNC && t->data.func.return_types &&
                         t->data.func.return_types[0]) {
                         const CBMType *ret = t->data.func.return_types[0];
-                        /* Self -> receiver. */
-                        if (ret->kind == CBM_TYPE_NAMED &&
-                            strcmp(ret->data.named.qualified_name, "Self") == 0) {
-                            const CBMType *rb = recv;
-                            while (rb && rb->kind == CBM_TYPE_REFERENCE)
-                                rb = rb->data.reference.elem;
-                            if (rb && rb->kind == CBM_TYPE_NAMED) {
-                                return cbm_type_named(ctx->arena, rb->data.named.qualified_name);
-                            }
-                        }
-                        return ret;
+                        const CBMType *rb = recv;
+                        while (rb && rb->kind == CBM_TYPE_REFERENCE)
+                            rb = rb->data.reference.elem;
+                        const char *receiver_qn = NULL;
+                        if (rb && rb->kind == CBM_TYPE_NAMED)
+                            receiver_qn = rb->data.named.qualified_name;
+                        else if (rb && rb->kind == CBM_TYPE_TEMPLATE)
+                            receiver_qn = rb->data.template_type.template_name;
+                        return receiver_qn ? rust_substitute_self(ctx->arena, ret, receiver_qn)
+                                           : ret;
                     }
                     return t;
                 }
@@ -2799,14 +2915,20 @@ static const CBMRegisteredFunc *rust_registry_lookup_inherent_method(const CBMTy
         return NULL;
     }
     int best_index = -1;
+    const char *matched_qn = NULL;
     CBMMethodIter it;
     cbm_registry_methods(reg, receiver_qn, method_name, &it);
     for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
         const CBMRegisteredFunc *candidate = &reg->funcs[index];
-        if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 &&
-            (best_index < 0 || index < best_index)) {
+        if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0)
+            continue;
+        if (matched_qn && candidate->qualified_name &&
+            strcmp(matched_qn, candidate->qualified_name) != 0)
+            return NULL; /* cfg twins are unresolved until one branch is proven active */
+        if (!matched_qn)
+            matched_qn = candidate->qualified_name;
+        if (best_index < 0 || index < best_index)
             best_index = index;
-        }
     }
     if (best_index >= 0) {
         return &reg->funcs[best_index];
@@ -4929,6 +5051,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             return;
         /* Strip ALL turbofish (`Vec::<i32>::new` → `Vec::new`). */
         rust_strip_turbofish(path);
+        char *explicit_receiver = NULL;
+        char *source_sep = strstr(path, "::");
+        if (source_sep && strstr(source_sep + 2, "::") == NULL) {
+            explicit_receiver = cbm_arena_strndup(ctx->arena, path,
+                                                  (size_t)(source_sep - path));
+        }
 
         if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
             const char *alias_target = cbm_scope_lookup_callable(ctx->current_scope, path);
@@ -5006,6 +5134,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 const char *full_head =
                     cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
                 m = cbm_registry_lookup_method_aliased(ctx->registry, full_head, short_name);
+            }
+            if (!m) {
+                int matches = 0;
+                m = rust_find_unique_explicit_receiver_method(ctx, ctx->registry,
+                                                               explicit_receiver,
+                                                               short_name, &matches);
             }
             if (m) {
                 rust_emit_resolved_call(ctx, m->qualified_name,
@@ -5814,6 +5948,10 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     char *type_text = rust_node_text(ctx, type_node);
     if (!type_text)
         return;
+    /* Definitions canonicalize `impl<'a> BuildRunner<'a>` to BuildRunner.
+     * The call walk must use the same receiver identity or calls inside the
+     * impl are emitted from/to QNs that have no graph node. */
+    cbm_strip_generic_args(type_text);
 
     /* Detect blanket impl: `impl<T: Trait> ForeignTrait for T { ... }`
      * where type_text is a name that appears in the impl's type
