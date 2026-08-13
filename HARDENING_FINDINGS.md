@@ -1,0 +1,29 @@
+# Hardening findings
+
+This is the canonical ledger for independently confirmed medium-or-higher findings from the Rust scanner hardening work. Derive totals from the rows; do not store a separate count that can drift.
+
+Counting rules:
+
+- One row represents one independently reproducible incorrect behaviour or production-safety gap, not one affected repository or one code location.
+- `fixed` requires a fixing commit and a regression test that fails when the defect is restored.
+- `open` requires direct source evidence or a reproducible corpus/test case; hypotheses remain outside this ledger.
+- Severity follows impact on agent accuracy, bounded operation, diagnostic truthfulness, or scanner availability.
+
+| ID | Severity | Status | Finding | Evidence | Fix and regression proof |
+|---|---|---|---|---|---|
+| RH-001 | high | fixed | An unmatched `macro_rules!` invocation expanded an unmatched arm and fabricated call edges. | Exact no-match fixture emitted its arm-only sentinel call under the original implementation. | `6df86da4`; `rustlsp_gap_macro_no_match_is_fail_closed`; restoring the fallback makes the test fail. |
+| RH-002 | high | fixed | Rust macro invocation arguments were not found in the grammar's unnamed `token_tree`, so a valid later arm could be missed. | Exact two-arm fixture failed to emit the later arm's unique call under the original implementation. | `6df86da4`; `rustlsp_gap_macro_later_matching_arm_only`; restoring the original lookup makes the test fail. |
+| RH-003 | critical | fixed | Most MCP tools had no complete serialized response limit and could exhaust an agent's context with multi-megabyte output. | Adversarial structured, escape-heavy, and dynamic-error envelopes exceed 65,536 bytes without final enforcement. | `f1e273a3`; `mcp_text_result_complete_envelope_is_hard_bounded` and `mcp_text_result_oversized_dynamic_error_is_hard_bounded`; removing enforcement makes both fail. |
+| RH-004 | high | open | Parallel and production incremental Rust resolution do not receive Cargo metadata because the manifest is thread-local to the sequential coordinator. | Worker dispatch reads an unset thread-local pointer; exact route-convergence regression is being added. | Pending. |
+| RH-005 | high | open | Sequential Cargo-manifest setup has an allocation-return path that can leave a dangling thread-local pointer and leak its arena. | Direct lifetime/control-flow inspection of the manifest setup and early return. | Pending removal of thread-local state. |
+| RH-006 | high | open | The fallback described as crate-scoped actually scopes only to the project prefix and can bind an unrelated same-name Rust function. | Direct inspection of the prefix derivation and high-confidence unique-name promotion. | Pending exact decoy regression and fix. |
+| RH-007 | high | open | Rust semantic omissions and cap hits are not persisted or exposed, so missing graph facts are indistinguishable from genuine absence. | Depth/work/macro/Cargo/parser early exits have no durable health record; successful indexing status remains possible. | Pending typed health counters and generation-atomic coverage persistence. |
+| RH-008 | high | open | Allocation failures can silently drop extracted results and even the diagnostic intended to report the loss. | Result-array, registry, and file-error append paths return without a durable failure signal. | Pending fail-loud allocation propagation tests and fix. |
+| RH-009 | high | open | Source-confirmed call edges are missing on large cleanly indexed Rust corpora, including Tokio, Serde, Cargo, and rustc samples. | Pinned-corpus source oracles disagree with returned caller/callee sets even where no parse gap is recorded. | Pending per-call-site minimized regressions and resolver fixes; one row avoids counting the same unresolved defect class once per corpus. |
+| RH-010 | medium | open | The new universal output guard is fail-safe but non-shape-aware tools cannot resume an oversized result losslessly. | Final responses are bounded, while architecture, query, coverage, changes, project/schema, and ADR producers lack generation-bound continuation. | Pending shape-aware pagination with exact totals and stale/mismatched cursor rejection. |
+
+Suggested summary command:
+
+```sh
+awk -F'|' '/^\| RH-[0-9]+ / {gsub(/^ +| +$/, "", $3); gsub(/^ +| +$/, "", $4); print $3, $4}' HARDENING_FINDINGS.md | sort | uniq -c
+```
