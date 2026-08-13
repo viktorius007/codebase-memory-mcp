@@ -694,11 +694,21 @@ static const tool_def_t TOOLS[] = {
      "signal only marks what the indexer can detect. For structural queries over the misses use "
      "query_graph(graph=\"missed\"). The report also carries 'not_indexed' — files/dirs excluded "
      "BY DESIGN (gitignore/.cbmignore/skip-lists): deliberate and deterministic, not failures; "
-     "change the ignore rules and re-index to include them.",
+     "change the ignore rules and re-index to include them. Coverage rows are paged in canonical "
+     "(rel_path, kind) order. Exact totals repeat on every page; follow next_cursor with otherwise "
+     "identical effective arguments until the final page omits it.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"verbose\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Include the git "
      "context block (worktree/shadow path variants). Only needed when debugging where an index "
-     "lives — omitted by default to keep the status lean.\"}},\"required\":["
+     "lives — omitted by default to keep the status lean.\"},"
+     "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":500,\"default\":500,"
+     "\"description\":\"Maximum whole coverage rows represented on one page.\"},"
+     "\"max_response_bytes\":{\"type\":\"integer\",\"minimum\":2048,\"maximum\":65536,"
+     "\"default\":65536,\"description\":\"Hard ceiling for the complete serialized MCP tool "
+     "result; invalid values are rejected, never clamped.\"},"
+     "\"cursor\":{\"type\":\"string\",\"description\":\"Opaque next_cursor from the previous "
+     "page. Pass it with otherwise identical effective arguments; re-indexing makes it stale.\"}"
+     "},\"required\":["
      "\"project\"]}"},
 
     {"check_index_coverage", "Check index coverage",
@@ -4041,17 +4051,300 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     return res;
 }
 
-/* Indexing-coverage report (#963), attached to index_status: the best-effort
- * signal from the separate index_coverage table (coverage is metadata ABOUT
- * the graph, stored outside it). Full per-project list, capped generously. */
-enum { COVERAGE_FILE_CAP = 500 };
+/* Indexing-coverage report (#963), attached to index_status. The store owns the
+ * canonical unique (rel_path, kind) order; this layer only slices that stream
+ * into whole represented rows and partitions the page into the established
+ * response categories. */
+enum {
+    INDEX_STATUS_DEFAULT_LIMIT = 500,
+    INDEX_STATUS_MAX_LIMIT = 500,
+    INDEX_STATUS_DEFAULT_BYTES = 65536,
+    INDEX_STATUS_MIN_BYTES = 2048,
+};
 
-static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
-                                const char *project) {
-    cbm_coverage_row_t *rows = NULL;
-    int count = 0;
-    (void)cbm_store_coverage_get(store, project, &rows, &count);
+static uint64_t cursor_fnv1a64(const char *s, uint64_t h); /* pagination helper below */
 
+typedef struct {
+    int limit;
+    int max_response_bytes;
+    bool verbose;
+    char *cursor;
+} index_status_options_t;
+
+typedef struct {
+    int parse_partial;
+    int skipped;
+    int not_indexed_dirs;
+    int not_indexed_files;
+} index_status_totals_t;
+
+typedef struct {
+    char generation[96];
+    uint64_t query_hash;
+    uint64_t coverage_hash;
+    size_t next_ordinal;
+    uint64_t integrity;
+} index_status_cursor_t;
+
+static char *index_status_parse_options(const char *args, index_status_options_t *options) {
+    memset(options, 0, sizeof(*options));
+    options->limit = INDEX_STATUS_DEFAULT_LIMIT;
+    options->max_response_bytes = INDEX_STATUS_DEFAULT_BYTES;
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return heap_strdup("arguments must be a JSON object");
+    }
+    yyjson_val *limit = yyjson_obj_get(root, "limit");
+    if (limit) {
+        if (!yyjson_is_int(limit) || yyjson_get_sint(limit) < 1 ||
+            yyjson_get_sint(limit) > INDEX_STATUS_MAX_LIMIT) {
+            yyjson_doc_free(doc);
+            return heap_strdup(
+                "limit must be an integer between 1 and 500; values are not clamped");
+        }
+        options->limit = (int)yyjson_get_sint(limit);
+    }
+    yyjson_val *budget = yyjson_obj_get(root, "max_response_bytes");
+    if (budget) {
+        if (!yyjson_is_int(budget) || yyjson_get_sint(budget) < INDEX_STATUS_MIN_BYTES ||
+            yyjson_get_sint(budget) > INDEX_STATUS_DEFAULT_BYTES) {
+            yyjson_doc_free(doc);
+            return heap_strdup("max_response_bytes must be an integer between 2048 and 65536; "
+                               "values are not clamped");
+        }
+        options->max_response_bytes = (int)yyjson_get_sint(budget);
+    }
+    yyjson_val *verbose = yyjson_obj_get(root, "verbose");
+    if (verbose && !yyjson_is_bool(verbose)) {
+        yyjson_doc_free(doc);
+        return heap_strdup("verbose must be a boolean");
+    }
+    options->verbose = verbose && yyjson_get_bool(verbose);
+    yyjson_val *cursor = yyjson_obj_get(root, "cursor");
+    if (cursor) {
+        if (!yyjson_is_str(cursor) || !yyjson_get_str(cursor)[0]) {
+            yyjson_doc_free(doc);
+            return heap_strdup("cursor must be a non-empty string");
+        }
+        options->cursor = heap_strdup(yyjson_get_str(cursor));
+        if (!options->cursor) {
+            yyjson_doc_free(doc);
+            return heap_strdup("out of memory");
+        }
+    }
+    yyjson_doc_free(doc);
+    return NULL;
+}
+
+static uint64_t index_status_query_hash(const char *project,
+                                        const index_status_options_t *options) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    hash = cursor_fnv1a64("index_status|", hash);
+    hash = cursor_fnv1a64(project ? project : "", hash);
+    char effective[96];
+    snprintf(effective, sizeof(effective), "|verbose=%d|limit=%d|max_response_bytes=%d",
+             options->verbose ? 1 : 0, options->limit, options->max_response_bytes);
+    return cursor_fnv1a64(effective, hash);
+}
+
+static uint64_t index_status_coverage_hash(const cbm_coverage_row_t *rows, int count) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    char length[96];
+    snprintf(length, sizeof(length), "rows=%d|", count);
+    hash = cursor_fnv1a64(length, hash);
+    for (int i = 0; i < count; i++) {
+        const char *path = rows[i].rel_path ? rows[i].rel_path : "";
+        const char *kind = rows[i].kind ? rows[i].kind : "";
+        const char *detail = rows[i].detail ? rows[i].detail : "";
+        snprintf(length, sizeof(length), "%zu:", strlen(path));
+        hash = cursor_fnv1a64(length, hash);
+        hash = cursor_fnv1a64(path, hash);
+        snprintf(length, sizeof(length), "|%zu:", strlen(kind));
+        hash = cursor_fnv1a64(length, hash);
+        hash = cursor_fnv1a64(kind, hash);
+        snprintf(length, sizeof(length), "|%zu:", strlen(detail));
+        hash = cursor_fnv1a64(length, hash);
+        hash = cursor_fnv1a64(detail, hash);
+        hash = cursor_fnv1a64("|", hash);
+    }
+    return hash;
+}
+
+static uint64_t index_status_cursor_integrity(const char *generation, uint64_t query_hash,
+                                              uint64_t coverage_hash, size_t next_ordinal) {
+    char canonical[CBM_SZ_256];
+    int written =
+        snprintf(canonical, sizeof(canonical), "is2:%s:%016llx:%016llx:%zu", generation,
+                 (unsigned long long)query_hash, (unsigned long long)coverage_hash, next_ordinal);
+    return written > 0 && (size_t)written < sizeof(canonical)
+               ? cursor_fnv1a64(canonical, 0xcbf29ce484222325ULL)
+               : 0;
+}
+
+static void index_status_cursor_encode(const char *generation, uint64_t query_hash,
+                                       uint64_t coverage_hash, size_t next_ordinal, char *buffer,
+                                       size_t buffer_size) {
+    uint64_t integrity =
+        index_status_cursor_integrity(generation, query_hash, coverage_hash, next_ordinal);
+    snprintf(buffer, buffer_size, "is2:%s:%016llx:%016llx:%zu:%016llx", generation,
+             (unsigned long long)query_hash, (unsigned long long)coverage_hash, next_ordinal,
+             (unsigned long long)integrity);
+}
+
+static bool index_status_cursor_hex16(const char **input, char terminator, uint64_t *out) {
+    const char *p = *input;
+    if (strlen(p) < 16U) {
+        return false;
+    }
+    uint64_t value = 0;
+    for (int i = 0; i < 16; i++) {
+        unsigned char c = (unsigned char)p[i];
+        unsigned int digit;
+        if (c >= '0' && c <= '9') {
+            digit = (unsigned int)(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = (unsigned int)(c - 'a' + 10);
+        } else {
+            return false;
+        }
+        value = (value << 4) | digit;
+    }
+    if (p[16] != terminator) {
+        return false;
+    }
+    *out = value;
+    *input = p + 16 + (terminator ? 1 : 0);
+    return true;
+}
+
+static bool index_status_cursor_ordinal(const char **input, size_t *out) {
+    const char *p = *input;
+    if (*p < '0' || *p > '9' || (*p == '0' && p[1] >= '0' && p[1] <= '9')) {
+        return false;
+    }
+    size_t value = 0;
+    do {
+        unsigned int digit = (unsigned int)(*p - '0');
+        if (value > (SIZE_MAX - digit) / 10U) {
+            return false;
+        }
+        value = value * 10U + digit;
+        p++;
+    } while (*p >= '0' && *p <= '9');
+    if (*p != ':') {
+        return false;
+    }
+    *out = value;
+    *input = p + 1;
+    return true;
+}
+
+static const char *index_status_cursor_decode(const char *token, const char *generation,
+                                              uint64_t query_hash, uint64_t coverage_hash,
+                                              index_status_cursor_t *cursor) {
+    memset(cursor, 0, sizeof(*cursor));
+    if (!token || strncmp(token, "is2:", 4) != 0) {
+        return "invalid_cursor: malformed index_status cursor; restart without cursor";
+    }
+    const char *p = token + 4;
+    const char *generation_end = strchr(p, ':');
+    if (!generation_end || generation_end == p ||
+        (size_t)(generation_end - p) >= sizeof(cursor->generation)) {
+        return "invalid_cursor: malformed index_status cursor; restart without cursor";
+    }
+    memcpy(cursor->generation, p, (size_t)(generation_end - p));
+    cursor->generation[generation_end - p] = '\0';
+    p = generation_end + 1;
+    if (!index_status_cursor_hex16(&p, ':', &cursor->query_hash) ||
+        !index_status_cursor_hex16(&p, ':', &cursor->coverage_hash) ||
+        !index_status_cursor_ordinal(&p, &cursor->next_ordinal) ||
+        !index_status_cursor_hex16(&p, '\0', &cursor->integrity)) {
+        return "invalid_cursor: malformed index_status cursor; restart without cursor";
+    }
+    uint64_t expected = index_status_cursor_integrity(cursor->generation, cursor->query_hash,
+                                                      cursor->coverage_hash, cursor->next_ordinal);
+    if (cursor->integrity != expected) {
+        return "tampered_cursor: index_status cursor integrity check failed; restart without "
+               "cursor";
+    }
+    if (strcmp(cursor->generation, generation) != 0) {
+        return "stale_cursor: the project index changed after this index_status cursor was issued; "
+               "restart without cursor";
+    }
+    if (cursor->coverage_hash != coverage_hash) {
+        return "stale_cursor: index_status coverage changed after this cursor was issued; restart "
+               "without cursor";
+    }
+    if (cursor->query_hash != query_hash) {
+        return "cursor_params_mismatch: pass the index_status cursor with otherwise identical "
+               "effective arguments";
+    }
+    return NULL;
+}
+
+static index_status_totals_t index_status_count_categories(const cbm_coverage_row_t *rows,
+                                                           int count) {
+    index_status_totals_t totals = {0};
+    for (int i = 0; i < count; i++) {
+        const char *kind = rows[i].kind ? rows[i].kind : "";
+        if (strcmp(kind, "parse_partial") == 0) {
+            totals.parse_partial++;
+        } else if (strcmp(kind, "not_indexed_dir") == 0) {
+            totals.not_indexed_dirs++;
+        } else if (strcmp(kind, "not_indexed_file") == 0) {
+            totals.not_indexed_files++;
+        } else {
+            totals.skipped++;
+        }
+    }
+    return totals;
+}
+
+static size_t index_status_utf8_preview_length(const char *text, size_t limit) {
+    size_t length = strlen(text ? text : "");
+    if (length <= limit) {
+        return length;
+    }
+    size_t preview = limit;
+    while (preview > 0 && (((unsigned char)text[preview] & 0xc0U) == 0x80U)) {
+        preview--;
+    }
+    return preview;
+}
+
+static void index_status_add_detail(yyjson_mut_doc *doc, yyjson_mut_val *item, const char *key,
+                                    const char *detail, bool bound_detail,
+                                    size_t detail_preview_bytes) {
+    const char *source = detail ? detail : "";
+    size_t complete_bytes = strlen(source);
+    if (!bound_detail || complete_bytes <= detail_preview_bytes) {
+        yyjson_mut_obj_add_strcpy(doc, item, key, source);
+        return;
+    }
+    size_t preview_bytes = index_status_utf8_preview_length(source, detail_preview_bytes);
+    char *preview = malloc(preview_bytes + 1U);
+    if (preview) {
+        memcpy(preview, source, preview_bytes);
+        preview[preview_bytes] = '\0';
+    }
+    yyjson_mut_obj_add_strcpy(doc, item, key, preview ? preview : "");
+    free(preview);
+    yyjson_mut_obj_add_bool(doc, item, "detail_truncated", true);
+    yyjson_mut_obj_add_uint(doc, item, "detail_complete_bytes", complete_bytes);
+    uint64_t hash = cursor_fnv1a64(source, 0xcbf29ce484222325ULL);
+    char hash_text[32];
+    snprintf(hash_text, sizeof(hash_text), "fnv1a64:%016llx", (unsigned long long)hash);
+    yyjson_mut_obj_add_strcpy(doc, item, "detail_hash", hash_text);
+}
+
+static void add_coverage_report_page(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                     const cbm_coverage_row_t *rows, int count, size_t start,
+                                     int represented, const index_status_totals_t *totals,
+                                     const char *generation, uint64_t query_hash,
+                                     uint64_t coverage_hash, bool identity_marker,
+                                     bool bound_detail, size_t detail_preview_bytes) {
     yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
     yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_dirs = yyjson_mut_arr(doc);
@@ -4060,53 +4353,49 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     int sk_n = 0;
     int ni_dir_n = 0;
     int ni_file_n = 0;
-    for (int i = 0; i < count; i++) {
+    size_t end = start + (size_t)represented;
+    for (size_t i = start; !identity_marker && i < end; i++) {
         const char *kind = rows[i].kind ? rows[i].kind : "";
         if (strcmp(kind, "parse_partial") == 0) {
-            if (pp_n < COVERAGE_FILE_CAP) {
-                yyjson_mut_val *fe = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
-                yyjson_mut_obj_add_strcpy(doc, fe, "error_ranges",
-                                          rows[i].detail ? rows[i].detail : "");
-                yyjson_mut_arr_add_val(pp_files, fe);
-            }
+            yyjson_mut_val *fe = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+            index_status_add_detail(doc, fe, "error_ranges", rows[i].detail, bound_detail,
+                                    detail_preview_bytes);
+            yyjson_mut_arr_add_val(pp_files, fe);
             pp_n++;
         } else if (strcmp(kind, "not_indexed_dir") == 0) {
-            if (ni_dir_n < COVERAGE_FILE_CAP) {
-                yyjson_mut_arr_add_strcpy(doc, ni_dirs, rows[i].rel_path);
-            }
+            yyjson_mut_arr_add_strcpy(doc, ni_dirs, rows[i].rel_path);
             ni_dir_n++;
         } else if (strcmp(kind, "not_indexed_file") == 0) {
-            if (ni_file_n < COVERAGE_FILE_CAP) {
-                yyjson_mut_val *fe = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
-                yyjson_mut_obj_add_strcpy(doc, fe, "reason", rows[i].detail ? rows[i].detail : "");
-                yyjson_mut_arr_add_val(ni_files, fe);
-            }
+            yyjson_mut_val *fe = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+            index_status_add_detail(doc, fe, "reason", rows[i].detail, bound_detail,
+                                    detail_preview_bytes);
+            yyjson_mut_arr_add_val(ni_files, fe);
             ni_file_n++;
         } else {
-            if (sk_n < COVERAGE_FILE_CAP) {
-                yyjson_mut_val *fe = yyjson_mut_obj(doc);
-                yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
-                yyjson_mut_obj_add_strcpy(doc, fe, "reason", rows[i].detail ? rows[i].detail : "");
-                yyjson_mut_obj_add_strcpy(doc, fe, "phase", rows[i].kind ? rows[i].kind : "");
-                yyjson_mut_arr_add_val(sk_files, fe);
-            }
+            yyjson_mut_val *fe = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+            index_status_add_detail(doc, fe, "reason", rows[i].detail, bound_detail,
+                                    detail_preview_bytes);
+            yyjson_mut_obj_add_strcpy(doc, fe, "phase", rows[i].kind ? rows[i].kind : "");
+            yyjson_mut_arr_add_val(sk_files, fe);
             sk_n++;
         }
     }
-    cbm_store_free_coverage(rows, count);
 
     yyjson_mut_val *pp = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, pp, "files", pp_files);
-    yyjson_mut_obj_add_int(doc, pp, "count", pp_n);
-    yyjson_mut_obj_add_bool(doc, pp, "truncated", pp_n > COVERAGE_FILE_CAP);
+    yyjson_mut_obj_add_int(doc, pp, "count", totals->parse_partial);
+    yyjson_mut_obj_add_int(doc, pp, "returned", pp_n);
+    yyjson_mut_obj_add_bool(doc, pp, "truncated", pp_n < totals->parse_partial);
     yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
 
     yyjson_mut_val *sk = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, sk, "files", sk_files);
-    yyjson_mut_obj_add_int(doc, sk, "count", sk_n);
-    yyjson_mut_obj_add_bool(doc, sk, "truncated", sk_n > COVERAGE_FILE_CAP);
+    yyjson_mut_obj_add_int(doc, sk, "count", totals->skipped);
+    yyjson_mut_obj_add_int(doc, sk, "returned", sk_n);
+    yyjson_mut_obj_add_bool(doc, sk, "truncated", sk_n < totals->skipped);
     yyjson_mut_obj_add_val(doc, root, "skipped", sk);
 
     /* By-design exclusions (#963 "purposely not indexed"): a deliberate,
@@ -4115,12 +4404,15 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
      * truncation explicit. */
     yyjson_mut_val *ni = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, ni, "dirs", ni_dirs);
-    yyjson_mut_obj_add_int(doc, ni, "dirs_count", ni_dir_n);
+    yyjson_mut_obj_add_int(doc, ni, "dirs_count", totals->not_indexed_dirs);
+    yyjson_mut_obj_add_int(doc, ni, "dirs_returned", ni_dir_n);
     yyjson_mut_obj_add_val(doc, ni, "files", ni_files);
-    yyjson_mut_obj_add_int(doc, ni, "files_count", ni_file_n);
+    yyjson_mut_obj_add_int(doc, ni, "files_count", totals->not_indexed_files);
+    yyjson_mut_obj_add_int(doc, ni, "files_returned", ni_file_n);
     yyjson_mut_obj_add_bool(doc, ni, "truncated",
-                            ni_dir_n > COVERAGE_FILE_CAP || ni_file_n > COVERAGE_FILE_CAP);
-    if (ni_dir_n > 0 || ni_file_n > 0) {
+                            ni_dir_n < totals->not_indexed_dirs ||
+                                ni_file_n < totals->not_indexed_files);
+    if (totals->not_indexed_dirs > 0 || totals->not_indexed_files > 0) {
         yyjson_mut_obj_add_str(doc, ni, "note",
                                "Purposely not indexed — excluded BY DESIGN via "
                                "gitignore/.cbmignore/skip-lists (see each file's reason). Not an "
@@ -4128,7 +4420,41 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     }
     yyjson_mut_obj_add_val(doc, root, "not_indexed", ni);
 
-    if (pp_n > 0 || sk_n > 0) {
+    if (identity_marker && represented == 1) {
+        const char *path = rows[start].rel_path ? rows[start].rel_path : "";
+        const char *kind = rows[start].kind ? rows[start].kind : "";
+        uint64_t identity_hash = cursor_fnv1a64(path, 0xcbf29ce484222325ULL);
+        identity_hash = cursor_fnv1a64("|", identity_hash);
+        identity_hash = cursor_fnv1a64(kind, identity_hash);
+        char hash_text[32];
+        snprintf(hash_text, sizeof(hash_text), "fnv1a64:%016llx",
+                 (unsigned long long)identity_hash);
+        yyjson_mut_val *marker = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_uint(doc, marker, "ordinal", start);
+        yyjson_mut_obj_add_strcpy(doc, marker, "kind", kind);
+        yyjson_mut_obj_add_uint(doc, marker, "identity_complete_bytes",
+                                strlen(path) + strlen(kind));
+        yyjson_mut_obj_add_strcpy(doc, marker, "identity_hash", hash_text);
+        yyjson_mut_obj_add_uint(doc, marker, "detail_complete_bytes",
+                                strlen(rows[start].detail ? rows[start].detail : ""));
+        yyjson_mut_obj_add_val(doc, root, "oversized_item", marker);
+    }
+
+    yyjson_mut_val *page = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, page, "start_ordinal", start);
+    yyjson_mut_obj_add_int(doc, page, "returned", represented);
+    yyjson_mut_obj_add_int(doc, page, "total", count);
+    bool truncated = end < (size_t)count;
+    yyjson_mut_obj_add_bool(doc, page, "truncated", truncated);
+    yyjson_mut_obj_add_val(doc, root, "coverage_page", page);
+    if (truncated) {
+        char cursor[CBM_SZ_256];
+        index_status_cursor_encode(generation, query_hash, coverage_hash, end, cursor,
+                                   sizeof(cursor));
+        yyjson_mut_obj_add_strcpy(doc, root, "next_cursor", cursor);
+    }
+
+    if (!identity_marker && (totals->parse_partial > 0 || totals->skipped > 0)) {
         yyjson_mut_obj_add_str(
             doc, root, "coverage_note",
             "Best-effort signal, not a completeness guarantee: parse_partial files WERE indexed, "
@@ -4566,53 +4892,253 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     return result;
 }
 
-static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
-    char *project = get_project_arg(args);
-    cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
-    /* The git context block (worktree/shadow path variants) only matters when
-     * debugging index-location issues — gate it so the common status call
-     * stays lean. */
-    bool verbose = cbm_mcp_get_bool_arg(args, "verbose");
-
+static char *index_status_build_candidate(
+    const char *project, int nodes, int edges, const cbm_project_t *project_info, bool have_project,
+    const cbm_coverage_row_t *rows, int row_count, size_t start, int represented,
+    const index_status_totals_t *totals, const index_status_options_t *options,
+    const char *generation, uint64_t query_hash, uint64_t coverage_hash, bool bound_detail,
+    size_t detail_preview_bytes, bool identity_marker) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-
-    if (project) {
-        int nodes = cbm_store_count_nodes(store, project);
-        int edges = cbm_store_count_edges(store, project);
-        yyjson_mut_obj_add_str(doc, root, "project", project);
-        yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
-        yyjson_mut_obj_add_int(doc, root, "edges", edges);
-        yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
-        cbm_project_t proj_info = {0};
-        if (cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK) {
-            yyjson_mut_obj_add_strcpy(doc, root, "root_path",
-                                      proj_info.root_path ? proj_info.root_path : "");
-            if (verbose) {
-                add_git_context_json(doc, root, proj_info.root_path);
-            }
-            safe_str_free(&proj_info.name);
-            safe_str_free(&proj_info.indexed_at);
-            safe_str_free(&proj_info.root_path);
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project);
+    yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
+    yyjson_mut_obj_add_int(doc, root, "edges", edges);
+    yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+    if (have_project) {
+        yyjson_mut_obj_add_strcpy(doc, root, "root_path",
+                                  project_info->root_path ? project_info->root_path : "");
+        if (options->verbose) {
+            add_git_context_json(doc, root, project_info->root_path);
         }
-        add_coverage_report(doc, root, store, project);
-        if (nodes == 0) {
-            yyjson_mut_obj_add_str(
-                doc, root, "hint",
-                "Project is empty. Re-run index_repository(repo_path=...) to populate.");
-        }
-    } else {
-        yyjson_mut_obj_add_str(doc, root, "status", "no_project");
+    }
+    add_coverage_report_page(doc, root, rows, row_count, start, represented, totals, generation,
+                             query_hash, coverage_hash, identity_marker, bound_detail,
+                             detail_preview_bytes);
+    if (nodes == 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "hint",
+            "Project is empty. Re-run index_repository(repo_path=...) to populate.");
     }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    char *result = json ? mcp_text_result_serialize(json, false) : NULL;
+    free(json);
+    return result;
+}
+
+static bool index_status_candidate_fits(const char *candidate,
+                                        const index_status_options_t *options) {
+    return candidate && strlen(candidate) <= (size_t)options->max_response_bytes &&
+           strlen(candidate) <= CBM_MCP_RESULT_MAX_BYTES;
+}
+
+static char *index_status_error_result(const char *message, const index_status_options_t *options) {
+    char *result = mcp_text_result_serialize(message, true);
+    if (index_status_candidate_fits(result, options)) {
+        return result;
+    }
+    free(result);
+    result = mcp_text_result_serialize("index_status error: response exceeds requested byte budget",
+                                       true);
+    if (index_status_candidate_fits(result, options)) {
+        return result;
+    }
+    free(result);
+    return NULL;
+}
+
+static char *index_status_build_bounded(const char *project, int nodes, int edges,
+                                        const cbm_project_t *project_info, bool have_project,
+                                        const cbm_coverage_row_t *rows, int row_count, size_t start,
+                                        const index_status_totals_t *totals,
+                                        const index_status_options_t *options,
+                                        const char *generation, uint64_t query_hash,
+                                        uint64_t coverage_hash, int *represented_out) {
+    size_t remaining = (size_t)row_count - start;
+    int requested = remaining < (size_t)options->limit ? (int)remaining : options->limit;
+    char *candidate = index_status_build_candidate(
+        project, nodes, edges, project_info, have_project, rows, row_count, start, requested,
+        totals, options, generation, query_hash, coverage_hash, false, 0, false);
+    if (index_status_candidate_fits(candidate, options)) {
+        *represented_out = requested;
+        return candidate;
+    }
+    free(candidate);
+
+    char *best = NULL;
+    int best_represented = 0;
+    int low = 1;
+    int high = requested - 1;
+    while (low <= high) {
+        int represented = low + (high - low) / 2;
+        candidate = index_status_build_candidate(
+            project, nodes, edges, project_info, have_project, rows, row_count, start, represented,
+            totals, options, generation, query_hash, coverage_hash, false, 0, false);
+        if (index_status_candidate_fits(candidate, options)) {
+            free(best);
+            best = candidate;
+            best_represented = represented;
+            low = represented + 1;
+        } else {
+            free(candidate);
+            high = represented - 1;
+        }
+    }
+    if (best) {
+        *represented_out = best_represented;
+        return best;
+    }
+    if (requested == 0) {
+        return index_status_error_result(
+            "max_response_bytes is too small for index_status page metadata", options);
+    }
+
+    /* A single detail can be larger than the complete response budget. Keep
+     * the row identity, advance by exactly that represented row, and choose
+     * the largest UTF-8-safe preview whose duplicated MCP envelope still fits. */
+    const char *detail = rows[start].detail ? rows[start].detail : "";
+    size_t preview_low = 0;
+    size_t preview_high = strlen(detail);
+    while (preview_low <= preview_high) {
+        size_t preview = preview_low + (preview_high - preview_low) / 2U;
+        candidate = index_status_build_candidate(
+            project, nodes, edges, project_info, have_project, rows, row_count, start, 1, totals,
+            options, generation, query_hash, coverage_hash, true, preview, false);
+        if (index_status_candidate_fits(candidate, options)) {
+            free(best);
+            best = candidate;
+            preview_low = preview + 1U;
+        } else {
+            free(candidate);
+            if (preview == 0) {
+                break;
+            }
+            preview_high = preview - 1U;
+        }
+    }
+    if (best) {
+        *represented_out = 1;
+        return best;
+    }
+    candidate = index_status_build_candidate(project, nodes, edges, project_info, have_project,
+                                             rows, row_count, start, 1, totals, options, generation,
+                                             query_hash, coverage_hash, false, 0, true);
+    if (index_status_candidate_fits(candidate, options)) {
+        *represented_out = 1;
+        return candidate;
+    }
+    free(candidate);
+    return index_status_error_result(
+        "oversized_item: one index_status coverage row marker cannot fit the requested byte budget",
+        options);
+}
+
+static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
+    index_status_options_t options;
+    char *options_error = index_status_parse_options(args, &options);
+    if (options_error) {
+        char *result = cbm_mcp_text_result(options_error, true);
+        free(options_error);
+        return result;
+    }
+    char *project = get_project_arg(args);
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        char *error = build_no_store_error(project);
+        char *result = index_status_error_result(error, &options);
+        free(error);
+        free(project);
+        free(options.cursor);
+        return result;
+    }
+
+    if (cbm_store_begin(store) != CBM_STORE_OK) {
+        free(project);
+        free(options.cursor);
+        return index_status_error_result("index_status could not open a consistent read snapshot",
+                                         &options);
+    }
+    char generation[96];
+    int generation_rc = cbm_store_generation(store, generation, sizeof(generation));
+    int nodes = cbm_store_count_nodes(store, project);
+    int edges = cbm_store_count_edges(store, project);
+    cbm_project_t project_info = {0};
+    bool have_project = cbm_store_get_project(store, project, &project_info) == CBM_STORE_OK;
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    int coverage_rc = cbm_store_coverage_get(store, project, &rows, &row_count);
+    int commit_rc = cbm_store_commit(store);
+    if (generation_rc != CBM_STORE_OK || coverage_rc != CBM_STORE_OK || commit_rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(store);
+        cbm_store_free_coverage(rows, row_count);
+        if (have_project) {
+            cbm_project_free_fields(&project_info);
+        }
+        free(project);
+        free(options.cursor);
+        return index_status_error_result("index_status failed to read a complete coverage snapshot",
+                                         &options);
+    }
+
+    if (strcmp(generation, "legacy") == 0 && options.cursor) {
+        cbm_store_free_coverage(rows, row_count);
+        if (have_project) {
+            cbm_project_free_fields(&project_info);
+        }
+        free(project);
+        free(options.cursor);
+        return index_status_error_result(
+            "cursor_unsupported: this project's index predates generation tracking; re-index "
+            "before resuming index_status coverage pages",
+            &options);
+    }
+
+    uint64_t query_hash = index_status_query_hash(project, &options);
+    uint64_t coverage_hash = index_status_coverage_hash(rows, row_count);
+    size_t start = 0;
+    if (options.cursor) {
+        index_status_cursor_t cursor = {0};
+        const char *cursor_error =
+            index_status_cursor_decode(options.cursor, generation, query_hash, coverage_hash,
+                                       &cursor);
+        if (!cursor_error && cursor.next_ordinal >= (size_t)row_count) {
+            cursor_error =
+                "invalid_cursor: index_status cursor ordinal is outside the coverage stream";
+        }
+        if (cursor_error) {
+            cbm_store_free_coverage(rows, row_count);
+            if (have_project) {
+                cbm_project_free_fields(&project_info);
+            }
+            free(project);
+            free(options.cursor);
+            return index_status_error_result(cursor_error, &options);
+        }
+        start = cursor.next_ordinal;
+    }
+    free(options.cursor);
+
+    index_status_totals_t totals = index_status_count_categories(rows, row_count);
+    int represented = 0;
+    char *result = index_status_build_bounded(
+        project, nodes, edges, &project_info, have_project, rows, row_count, start, &totals,
+        &options, generation, query_hash, coverage_hash, &represented);
+    if (strcmp(generation, "legacy") == 0 &&
+        start + (size_t)represented < (size_t)row_count) {
+        free(result);
+        result = index_status_error_result(
+            "cursor_unsupported: this project's index predates generation tracking; re-index "
+            "before resuming index_status coverage pages",
+            &options);
+    }
+    cbm_store_free_coverage(rows, row_count);
+    if (have_project) {
+        cbm_project_free_fields(&project_info);
+    }
     free(project);
 
-    char *result = cbm_mcp_text_result(json, false);
-    free(json);
     return result;
 }
 
