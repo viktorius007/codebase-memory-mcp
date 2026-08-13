@@ -3324,7 +3324,7 @@ TEST(pipeline_rust_health_sequential_persists_exact_rows_and_cargo_health) {
               1);
     cbm_coverage_meta_t meta = {0};
     ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
-    ASSERT_EQ(meta.coverage_version, 4);
+    ASSERT_EQ(meta.coverage_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_STR_EQ(meta.rust_analysis_recording_status, "complete");
     ASSERT_EQ(meta.rust_files_total, 2);
     cbm_store_coverage_meta_clear(&meta);

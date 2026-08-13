@@ -712,10 +712,6 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
 int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
                                                cbm_file_hash_t **out, int *out_count);
 
-/* Compatibility contract persisted in coverage metadata. Increment when a
- * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 4 };
-
 typedef struct {
     cbm_gbuf_t *gbuf;
     const char *final_db_path;

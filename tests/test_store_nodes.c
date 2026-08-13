@@ -5,8 +5,10 @@
  * TestNodeDedup, TestProjectCRUD, TestUpsertNodeBatch, etc.)
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <store/store.h>
 #include <foundation/constants.h>
+#include <foundation/compat.h>
 #include <cbm.h>
 #include <sqlite3.h>
 #include <string.h>
@@ -2229,6 +2231,349 @@ TEST(store_analysis_rows_do_not_rebuild_or_materialize_missed_graph) {
     PASS();
 }
 
+TEST(store_analysis_coverage_page_empty_current_meta_and_contract) {
+    ASSERT_EQ(CBM_SEMANTIC_INDEX_VERSION, 4);
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "analysis-empty", "/tmp/analysis-empty"),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {
+        .generation = "generation-empty",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 0,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "analysis-empty", NULL, 0, &meta), CBM_STORE_OK);
+
+    cbm_analysis_coverage_page_t page = {0};
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(s, "analysis-empty", 0, 1, 32, &page),
+              CBM_ANALYSIS_COVERAGE_OK);
+    ASSERT_TRUE(page.has_meta);
+    ASSERT_EQ(page.meta.coverage_version, CBM_SEMANTIC_INDEX_VERSION);
+    ASSERT_STR_EQ(page.meta.generation, "generation-empty");
+    ASSERT_EQ(page.totals.rows_total, 0);
+    ASSERT_EQ(page.totals.degraded_files_total, 0);
+    ASSERT_EQ(page.returned, 0);
+    ASSERT_FALSE(page.has_more);
+    ASSERT_EQ(page.next_offset, 0);
+    cbm_store_analysis_coverage_page_clear(&page);
+
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(
+                  s, "analysis-empty", -1, 1, 32, &page),
+              CBM_ANALYSIS_COVERAGE_INVALID_ARGUMENT);
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(
+                  s, "analysis-empty", 0, CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS + 1, 32, &page),
+              CBM_ANALYSIS_COVERAGE_INVALID_ARGUMENT);
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(
+                  s, "analysis-empty", 0, 1,
+                  CBM_ANALYSIS_COVERAGE_DETAIL_MAX_BYTES + 1U, &page),
+              CBM_ANALYSIS_COVERAGE_INVALID_ARGUMENT);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_analysis_coverage_page_filters_orders_and_bounds_thousands) {
+    enum {
+        SYNTACTIC_ROWS = 3000,
+        FAILED_FILES = 100,
+        PARTIAL_ONLY_FILES = 100,
+        UNSUPPORTED_FILES = 1,
+        SEMANTIC_ROWS = FAILED_FILES * 2 + PARTIAL_ONLY_FILES + UNSUPPORTED_FILES,
+        ALL_ROWS = SYNTACTIC_ROWS + SEMANTIC_ROWS,
+        PATH_BYTES = 48,
+        DETAIL_BYTES = 8192,
+    };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "analysis-bulk", "/tmp/analysis-bulk"), CBM_STORE_OK);
+    cbm_coverage_row_t *rows = calloc(ALL_ROWS, sizeof(*rows));
+    char(*paths)[PATH_BYTES] = calloc(ALL_ROWS, sizeof(*paths));
+    char *detail = malloc(DETAIL_BYTES);
+    ASSERT_NOT_NULL(rows);
+    ASSERT_NOT_NULL(paths);
+    ASSERT_NOT_NULL(detail);
+    memset(detail, 'x', DETAIL_BYTES - 1);
+    memset(detail, 'a', 30);
+    detail[30] = (char)0xe2;
+    detail[31] = (char)0x82;
+    detail[32] = (char)0xac;
+    detail[DETAIL_BYTES - 1] = '\0';
+
+    int n = 0;
+    for (int i = 0; i < SYNTACTIC_ROWS; i++) {
+        snprintf(paths[n], PATH_BYTES, "syntactic/%04d.txt", i);
+        rows[n] = (cbm_coverage_row_t){
+            .rel_path = paths[n], .kind = "not_indexed_file", .detail = detail};
+        n++;
+    }
+    for (int i = 0; i < FAILED_FILES + PARTIAL_ONLY_FILES + UNSUPPORTED_FILES; i++) {
+        char live_path[PATH_BYTES];
+        snprintf(live_path, sizeof(live_path), "rust/r%04d.rs", i);
+        ASSERT_EQ(cbm_store_upsert_file_hash(s, "analysis-bulk", live_path, "", i + 1, 1),
+                  CBM_STORE_OK);
+        if (i < FAILED_FILES) {
+            snprintf(paths[n], PATH_BYTES, "%s", live_path);
+            rows[n] = (cbm_coverage_row_t){
+                .rel_path = paths[n], .kind = "analysis_failed:rust", .detail = detail};
+            n++;
+        }
+        snprintf(paths[n], PATH_BYTES, "%s", live_path);
+        rows[n] = (cbm_coverage_row_t){
+            .rel_path = paths[n],
+            .kind = i < FAILED_FILES + PARTIAL_ONLY_FILES ? "analysis_partial:rust"
+                                                         : "analysis_future:rust",
+            .detail = detail};
+        n++;
+    }
+    ASSERT_EQ(n, ALL_ROWS);
+    cbm_coverage_meta_t meta = {
+        .generation = "generation-bulk",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = FAILED_FILES + PARTIAL_ONLY_FILES + UNSUPPORTED_FILES,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "analysis-bulk", rows, ALL_ROWS, &meta),
+              CBM_STORE_OK);
+
+    int64_t offset = 0;
+    int observed = 0;
+    do {
+        cbm_analysis_coverage_page_t page = {0};
+        ASSERT_EQ(cbm_store_analysis_coverage_get_page(s, "analysis-bulk", offset, 64, 31, &page),
+                  CBM_ANALYSIS_COVERAGE_OK);
+        ASSERT_TRUE(page.has_meta);
+        ASSERT_EQ(page.totals.rows_total, SEMANTIC_ROWS);
+        ASSERT_EQ(page.totals.partial_rows, FAILED_FILES + PARTIAL_ONLY_FILES);
+        ASSERT_EQ(page.totals.failed_rows, FAILED_FILES);
+        ASSERT_EQ(page.totals.unsupported_rows, UNSUPPORTED_FILES);
+        ASSERT_EQ(page.totals.degraded_files_total,
+                  FAILED_FILES + PARTIAL_ONLY_FILES + UNSUPPORTED_FILES);
+        ASSERT_EQ(page.totals.failed_files, FAILED_FILES);
+        ASSERT_EQ(page.totals.partial_files, PARTIAL_ONLY_FILES);
+        ASSERT_EQ(page.totals.unsupported_files, UNSUPPORTED_FILES);
+        for (int i = 0; i < page.returned; i++, observed++) {
+            const cbm_analysis_coverage_row_t *row = &page.rows[i];
+            char expected_path[PATH_BYTES];
+            const char *expected_kind = NULL;
+            if (observed < FAILED_FILES * 2) {
+                snprintf(expected_path, sizeof(expected_path), "rust/r%04d.rs", observed / 2);
+                expected_kind = observed % 2 == 0 ? "analysis_failed:rust"
+                                                  : "analysis_partial:rust";
+            } else if (observed < FAILED_FILES * 2 + PARTIAL_ONLY_FILES) {
+                snprintf(expected_path, sizeof(expected_path), "rust/r%04d.rs",
+                         observed - FAILED_FILES);
+                expected_kind = "analysis_partial:rust";
+            } else {
+                snprintf(expected_path, sizeof(expected_path), "rust/r%04d.rs",
+                         FAILED_FILES + PARTIAL_ONLY_FILES);
+                expected_kind = "analysis_future:rust";
+            }
+            ASSERT_STR_EQ(row->rel_path, expected_path);
+            ASSERT_STR_EQ(row->kind, expected_kind);
+            ASSERT_EQ(strlen(row->detail), 30);
+            ASSERT_EQ(row->detail_complete_bytes, DETAIL_BYTES - 1);
+            ASSERT_TRUE(row->detail_truncated);
+            ASSERT_EQ(strlen(row->detail_sha256), 64);
+        }
+        ASSERT_EQ(page.next_offset, offset + page.returned);
+        bool has_more = page.has_more;
+        offset = page.next_offset;
+        cbm_store_analysis_coverage_page_clear(&page);
+        if (!has_more) {
+            break;
+        }
+    } while (true);
+    ASSERT_EQ(observed, SEMANTIC_ROWS);
+    ASSERT_EQ(offset, SEMANTIC_ROWS);
+
+    free(detail);
+    free(paths);
+    free(rows);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_analysis_coverage_page_reports_allocation_and_store_errors) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "analysis-errors", "/tmp/analysis-errors"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "analysis-errors", "one.rs", "", 1, 1),
+              CBM_STORE_OK);
+    cbm_coverage_row_t row = {
+        .rel_path = "one.rs", .kind = "analysis_partial:rust", .detail = "health"};
+    cbm_coverage_meta_t meta = {
+        .generation = "generation-errors",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 1,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "analysis-errors", &row, 1, &meta), CBM_STORE_OK);
+
+    cbm_analysis_coverage_page_t page = {0};
+    cbm_store_analysis_coverage_test_fail_alloc_after(s, 0);
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(s, "analysis-errors", 0, 1, 32, &page),
+              CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED);
+    ASSERT_NULL(page.rows);
+    ASSERT_FALSE(page.has_meta);
+    cbm_store_analysis_coverage_test_fail_alloc_after(s, 6);
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(s, "analysis-errors", 0, 1, 32, &page),
+              CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED);
+    ASSERT_NULL(page.rows);
+    cbm_store_analysis_coverage_test_fail_alloc_after(s, 9);
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(s, "analysis-errors", 0, 1, 32, &page),
+              CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED);
+    ASSERT_NULL(page.rows);
+    cbm_store_analysis_coverage_test_fail_alloc_after(s, -1);
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(s, "analysis-errors", 0, 1, 32, &page),
+              CBM_ANALYSIS_COVERAGE_OK);
+    ASSERT_EQ(page.returned, 1);
+    cbm_store_analysis_coverage_page_clear(&page);
+
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE index_coverage;"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(s, "analysis-errors", 0, 1, 32, &page),
+              CBM_ANALYSIS_COVERAGE_STORE_ERROR);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_analysis_coverage_file_totals_use_exclusive_severity_precedence) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "analysis-precedence", "/tmp/analysis-precedence"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "analysis-precedence", "failed.rs", "", 1, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "analysis-precedence", "partial.rs", "", 2, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "analysis-precedence", "future.rs", "", 3, 1),
+              CBM_STORE_OK);
+    const cbm_coverage_row_t rows[] = {
+        {.rel_path = "failed.rs", .kind = "analysis_failed:rust", .detail = "failed"},
+        {.rel_path = "failed.rs", .kind = "analysis_future:rust", .detail = "future"},
+        {.rel_path = "partial.rs", .kind = "analysis_partial:rust", .detail = "partial"},
+        {.rel_path = "partial.rs", .kind = "analysis_future:rust", .detail = "future"},
+        {.rel_path = "future.rs", .kind = "analysis_future:rust", .detail = "future"},
+    };
+    cbm_coverage_meta_t meta = {
+        .generation = "generation-precedence",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 3,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "analysis-precedence", rows, 5, &meta),
+              CBM_STORE_OK);
+
+    cbm_analysis_coverage_page_t page = {0};
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(
+                  s, "analysis-precedence", 0, 8, 32, &page),
+              CBM_ANALYSIS_COVERAGE_OK);
+    ASSERT_EQ(page.totals.rows_total, 5);
+    ASSERT_EQ(page.totals.failed_files, 1);
+    ASSERT_EQ(page.totals.partial_files, 1);
+    ASSERT_EQ(page.totals.unsupported_files, 1);
+    ASSERT_EQ(page.totals.failed_files + page.totals.partial_files +
+                  page.totals.unsupported_files,
+              page.totals.degraded_files_total);
+    cbm_store_analysis_coverage_page_clear(&page);
+    cbm_store_close(s);
+    PASS();
+}
+
+typedef struct {
+    cbm_store_t *writer;
+    int rc;
+} analysis_snapshot_hook_ctx_t;
+
+static void analysis_snapshot_replace_after_totals(void *userdata) {
+    analysis_snapshot_hook_ctx_t *ctx = userdata;
+    cbm_coverage_row_t replacement = {
+        .rel_path = "new.rs", .kind = "analysis_failed:rust", .detail = "new-health"};
+    cbm_coverage_meta_t replacement_meta = {
+        .generation = "generation-new",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 1,
+    };
+    ctx->rc = cbm_store_coverage_replace_ex(ctx->writer, "analysis-snapshot", &replacement, 1,
+                                            &replacement_meta);
+}
+
+TEST(store_analysis_coverage_page_is_transaction_consistent) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_analysis_snapshot_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    cbm_store_t *writer = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_upsert_project(writer, "analysis-snapshot", tmp), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(writer, "analysis-snapshot", "old.rs", "", 1, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(writer, "analysis-snapshot", "new.rs", "", 1, 1),
+              CBM_STORE_OK);
+    cbm_coverage_row_t initial = {
+        .rel_path = "old.rs", .kind = "analysis_partial:rust", .detail = "old-health"};
+    cbm_coverage_meta_t initial_meta = {
+        .generation = "generation-old",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 1,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(writer, "analysis-snapshot", &initial, 1,
+                                            &initial_meta),
+              CBM_STORE_OK);
+    cbm_store_t *reader = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(reader);
+    analysis_snapshot_hook_ctx_t hook_ctx = {.writer = writer, .rc = CBM_STORE_ERR};
+    cbm_store_analysis_coverage_test_set_after_totals_hook(
+        reader, analysis_snapshot_replace_after_totals, &hook_ctx);
+
+    cbm_analysis_coverage_page_t page = {0};
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(
+                  reader, "analysis-snapshot", 0, 8, 64, &page),
+              CBM_ANALYSIS_COVERAGE_OK);
+    ASSERT_EQ(hook_ctx.rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(page.meta.generation, "generation-old");
+    ASSERT_EQ(page.totals.rows_total, 1);
+    ASSERT_EQ(page.returned, 1);
+    ASSERT_STR_EQ(page.rows[0].rel_path, "old.rs");
+    cbm_store_analysis_coverage_page_clear(&page);
+
+    cbm_store_analysis_coverage_test_set_after_totals_hook(reader, NULL, NULL);
+    ASSERT_EQ(cbm_store_analysis_coverage_get_page(
+                  reader, "analysis-snapshot", 0, 8, 64, &page),
+              CBM_ANALYSIS_COVERAGE_OK);
+    ASSERT_STR_EQ(page.meta.generation, "generation-new");
+    ASSERT_EQ(page.totals.rows_total, 1);
+    ASSERT_EQ(page.returned, 1);
+    ASSERT_STR_EQ(page.rows[0].rel_path, "new.rs");
+    cbm_store_analysis_coverage_page_clear(&page);
+
+    cbm_store_close(reader);
+    cbm_store_close(writer);
+    th_rmtree(tmp);
+    PASS();
+}
+
 SUITE(store_nodes) {
     RUN_TEST(store_coverage_roundtrip_prune_shadow);
     RUN_TEST(store_coverage_targeted_path_and_scope_lookup);
@@ -2236,6 +2581,11 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
     RUN_TEST(store_analysis_rows_do_not_rebuild_or_materialize_missed_graph);
+    RUN_TEST(store_analysis_coverage_page_empty_current_meta_and_contract);
+    RUN_TEST(store_analysis_coverage_page_filters_orders_and_bounds_thousands);
+    RUN_TEST(store_analysis_coverage_page_reports_allocation_and_store_errors);
+    RUN_TEST(store_analysis_coverage_file_totals_use_exclusive_severity_precedence);
+    RUN_TEST(store_analysis_coverage_page_is_transaction_consistent);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);

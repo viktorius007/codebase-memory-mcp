@@ -147,7 +147,20 @@ struct cbm_store {
     sqlite3_stmt *stmt_get_file_hashes;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    int analysis_alloc_fail_after;
+    cbm_analysis_coverage_test_hook_fn analysis_after_totals_hook;
+    void *analysis_after_totals_userdata;
+#endif
 };
+
+static void store_init_test_seams(cbm_store_t *s) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    s->analysis_alloc_fail_after = CBM_NOT_FOUND;
+#else
+    (void)s;
+#endif
+}
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -683,6 +696,7 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
     if (!s) {
         return NULL;
     }
+    store_init_test_seams(s);
 
     int flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
     if (in_memory) {
@@ -845,6 +859,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     if (!s) {
         return NULL;
     }
+    store_init_test_seams(s);
 
     /* Query tools open the project DB READ-ONLY: a read query must never
      * mutate the DB (the previous READWRITE open + WAL write-pragmas did),
@@ -3116,14 +3131,49 @@ void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
     memset(meta, 0, sizeof(*meta));
 }
 
-int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out) {
-    if (!out) {
-        return CBM_STORE_ERR;
+typedef void *(*coverage_alloc_fn)(cbm_store_t *s, size_t size);
+
+typedef enum {
+    COVERAGE_META_OK = 0,
+    COVERAGE_META_NOT_FOUND,
+    COVERAGE_META_STORE_ERROR,
+    COVERAGE_META_ALLOCATION_FAILED,
+} coverage_meta_status_t;
+
+static void *coverage_plain_alloc(cbm_store_t *s, size_t size) {
+    (void)s;
+    return malloc(size);
+}
+
+static void *analysis_coverage_alloc(cbm_store_t *s, size_t size) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (s->analysis_alloc_fail_after == 0) {
+        return NULL;
     }
+    if (s->analysis_alloc_fail_after > 0) {
+        s->analysis_alloc_fail_after--;
+    }
+#endif
+    return malloc(size);
+}
+
+static char *coverage_strdup_alloc(cbm_store_t *s, const unsigned char *text,
+                                   coverage_alloc_fn alloc) {
+    if (!text) {
+        return NULL;
+    }
+    size_t len = strlen((const char *)text);
+    char *copy = alloc(s, len + 1U);
+    if (copy) {
+        memcpy(copy, text, len + 1U);
+    }
+    return copy;
+}
+
+static coverage_meta_status_t coverage_meta_get_alloc(cbm_store_t *s, const char *project,
+                                                       cbm_coverage_meta_t *out,
+                                                       coverage_alloc_fn alloc) {
     memset(out, 0, sizeof(*out));
-    if (!s || !s->db || !project) {
-        return CBM_STORE_ERR;
-    }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db,
                            "SELECT project, generation, index_mode, recorded_at, recording_status, "
@@ -3132,38 +3182,264 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
                            "rust_files_total FROM index_coverage_meta WHERE project = ?1;",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage meta get prepare");
-        return CBM_STORE_ERR;
+        return COVERAGE_META_STORE_ERROR;
     }
     bind_text(stmt, SKIP_ONE, project);
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
-        out->project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        out->generation = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        out->index_mode = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
-        out->recorded_at = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
-        out->recording_status = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
+        out->project = coverage_strdup_alloc(s, sqlite3_column_text(stmt, 0), alloc);
+        out->generation = coverage_strdup_alloc(s, sqlite3_column_text(stmt, SKIP_ONE), alloc);
+        out->index_mode = coverage_strdup_alloc(s, sqlite3_column_text(stmt, ST_COL_2), alloc);
+        out->recorded_at = coverage_strdup_alloc(s, sqlite3_column_text(stmt, ST_COL_3), alloc);
+        out->recording_status =
+            coverage_strdup_alloc(s, sqlite3_column_text(stmt, CBM_SZ_4), alloc);
         out->ignored_files_stored = sqlite3_column_int(stmt, CBM_SZ_5);
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
-        out->rust_analysis_recording_status =
-            heap_strdup((const char *)sqlite3_column_text(stmt, 9));
+        out->rust_analysis_recording_status = coverage_strdup_alloc(
+            s, sqlite3_column_text(stmt, 9), alloc);
         out->rust_files_total = sqlite3_column_int(stmt, 10);
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
             !out->recording_status || !out->rust_analysis_recording_status) {
             cbm_store_coverage_meta_clear(out);
-            return CBM_STORE_ERR;
+            return COVERAGE_META_ALLOCATION_FAILED;
         }
-        return CBM_STORE_OK;
+        return COVERAGE_META_OK;
     }
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "coverage meta get");
+        return COVERAGE_META_STORE_ERROR;
+    }
+    return COVERAGE_META_NOT_FOUND;
+}
+
+int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out) {
+    if (!out) {
         return CBM_STORE_ERR;
     }
-    return CBM_STORE_NOT_FOUND;
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    coverage_meta_status_t status =
+        coverage_meta_get_alloc(s, project, out, coverage_plain_alloc);
+    if (status == COVERAGE_META_OK) {
+        return CBM_STORE_OK;
+    }
+    return status == COVERAGE_META_NOT_FOUND ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
 }
+
+void cbm_store_analysis_coverage_page_clear(cbm_analysis_coverage_page_t *page) {
+    if (!page) {
+        return;
+    }
+    for (int i = 0; i < page->returned; i++) {
+        free((char *)page->rows[i].rel_path);
+        free((char *)page->rows[i].kind);
+        free((char *)page->rows[i].detail);
+    }
+    free(page->rows);
+    cbm_store_coverage_meta_clear(&page->meta);
+    memset(page, 0, sizeof(*page));
+}
+
+static void analysis_coverage_snapshot_abort(cbm_store_t *s) {
+    (void)sqlite3_exec(s->db, "ROLLBACK TO cbm_analysis_coverage_page;", NULL, NULL, NULL);
+    (void)sqlite3_exec(s->db, "RELEASE cbm_analysis_coverage_page;", NULL, NULL, NULL);
+}
+
+static cbm_analysis_coverage_status_t analysis_coverage_fail(
+    cbm_store_t *s, cbm_analysis_coverage_page_t *out, cbm_analysis_coverage_status_t status) {
+    cbm_store_analysis_coverage_page_clear(out);
+    analysis_coverage_snapshot_abort(s);
+    return status;
+}
+
+static size_t analysis_coverage_utf8_prefix(const unsigned char *text, size_t bytes,
+                                            size_t limit) {
+    size_t prefix = bytes < limit ? bytes : limit;
+    if (prefix == bytes) {
+        return prefix;
+    }
+    while (prefix > 0 && (text[prefix] & 0xc0U) == 0x80U) {
+        prefix--;
+    }
+    return prefix;
+}
+
+static char *analysis_coverage_dup_bytes(cbm_store_t *s, const unsigned char *text, size_t bytes) {
+    char *copy = analysis_coverage_alloc(s, bytes + 1U);
+    if (!copy) {
+        return NULL;
+    }
+    if (bytes > 0) {
+        memcpy(copy, text, bytes);
+    }
+    copy[bytes] = '\0';
+    return copy;
+}
+
+cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
+    cbm_store_t *s, const char *project, int64_t offset, int limit,
+    size_t detail_preview_bytes, cbm_analysis_coverage_page_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!s || !s->db || !project || !out || offset < 0 || limit <= 0 ||
+        limit > CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS ||
+        detail_preview_bytes > CBM_ANALYSIS_COVERAGE_DETAIL_MAX_BYTES) {
+        return CBM_ANALYSIS_COVERAGE_INVALID_ARGUMENT;
+    }
+    if (exec_sql(s, "SAVEPOINT cbm_analysis_coverage_page;") != CBM_STORE_OK) {
+        return CBM_ANALYSIS_COVERAGE_STORE_ERROR;
+    }
+
+    coverage_meta_status_t meta_status =
+        coverage_meta_get_alloc(s, project, &out->meta, analysis_coverage_alloc);
+    if (meta_status == COVERAGE_META_ALLOCATION_FAILED) {
+        return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED);
+    }
+    if (meta_status == COVERAGE_META_STORE_ERROR) {
+        return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_STORE_ERROR);
+    }
+    out->has_meta = meta_status == COVERAGE_META_OK;
+
+    static const char totals_sql[] =
+        "WITH per_path AS ("
+        " SELECT rel_path, count(*) AS rows_n,"
+        " sum(kind = 'analysis_partial:rust') AS partial_n,"
+        " sum(kind = 'analysis_failed:rust') AS failed_n,"
+        " sum(kind != 'analysis_partial:rust' AND kind != 'analysis_failed:rust') AS unsupported_n,"
+        " max(kind = 'analysis_partial:rust') AS has_partial,"
+        " max(kind = 'analysis_failed:rust') AS has_failed,"
+        " max(kind != 'analysis_partial:rust' AND kind != 'analysis_failed:rust') AS has_unsupported"
+        " FROM index_coverage WHERE project = ?1 AND substr(kind, 1, 9) = 'analysis_'"
+        " GROUP BY rel_path)"
+        " SELECT coalesce(sum(rows_n), 0), coalesce(sum(partial_n), 0),"
+        " coalesce(sum(failed_n), 0), coalesce(sum(unsupported_n), 0), count(*),"
+        " coalesce(sum(has_failed = 0 AND has_partial != 0), 0),"
+        " coalesce(sum(has_failed != 0), 0),"
+        " coalesce(sum(has_failed = 0 AND has_partial = 0 AND has_unsupported != 0), 0)"
+        " FROM per_path;";
+    sqlite3_stmt *totals = NULL;
+    if (sqlite3_prepare_v2(s->db, totals_sql, CBM_NOT_FOUND, &totals, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "analysis coverage totals prepare");
+        return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_STORE_ERROR);
+    }
+    bind_text(totals, SKIP_ONE, project);
+    int totals_rc = sqlite3_step(totals);
+    if (totals_rc == SQLITE_ROW) {
+        out->totals.rows_total = sqlite3_column_int64(totals, 0);
+        out->totals.partial_rows = sqlite3_column_int64(totals, 1);
+        out->totals.failed_rows = sqlite3_column_int64(totals, 2);
+        out->totals.unsupported_rows = sqlite3_column_int64(totals, 3);
+        out->totals.degraded_files_total = sqlite3_column_int64(totals, 4);
+        out->totals.partial_files = sqlite3_column_int64(totals, 5);
+        out->totals.failed_files = sqlite3_column_int64(totals, 6);
+        out->totals.unsupported_files = sqlite3_column_int64(totals, 7);
+    }
+    sqlite3_finalize(totals);
+    if (totals_rc != SQLITE_ROW) {
+        store_set_error_sqlite(s, "analysis coverage totals");
+        return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_STORE_ERROR);
+    }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (s->analysis_after_totals_hook) {
+        s->analysis_after_totals_hook(s->analysis_after_totals_userdata);
+    }
+#endif
+
+    int64_t remaining = out->totals.rows_total - offset;
+    int wanted = remaining > 0 ? (remaining < limit ? (int)remaining : limit) : 0;
+    if (wanted > 0) {
+        out->rows = analysis_coverage_alloc(s, (size_t)wanted * sizeof(*out->rows));
+        if (!out->rows) {
+            return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED);
+        }
+        memset(out->rows, 0, (size_t)wanted * sizeof(*out->rows));
+    }
+
+    static const char rows_sql[] =
+        "SELECT rel_path, kind, detail FROM index_coverage"
+        " WHERE project = ?1 AND substr(kind, 1, 9) = 'analysis_'"
+        " ORDER BY rel_path COLLATE BINARY, kind COLLATE BINARY LIMIT ?2 OFFSET ?3;";
+    sqlite3_stmt *rows = NULL;
+    if (sqlite3_prepare_v2(s->db, rows_sql, CBM_NOT_FOUND, &rows, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "analysis coverage rows prepare");
+        return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_STORE_ERROR);
+    }
+    bind_text(rows, SKIP_ONE, project);
+    sqlite3_bind_int(rows, ST_COL_2, limit);
+    sqlite3_bind_int64(rows, ST_COL_3, offset);
+    int scan_rc = SQLITE_DONE;
+    while (out->returned < wanted && (scan_rc = sqlite3_step(rows)) == SQLITE_ROW) {
+        cbm_analysis_coverage_row_t *row = &out->rows[out->returned];
+        const unsigned char *path = sqlite3_column_text(rows, 0);
+        const unsigned char *kind = sqlite3_column_text(rows, 1);
+        const unsigned char *detail = sqlite3_column_text(rows, 2);
+        size_t path_bytes = (size_t)sqlite3_column_bytes(rows, 0);
+        size_t kind_bytes = (size_t)sqlite3_column_bytes(rows, 1);
+        size_t detail_bytes = (size_t)sqlite3_column_bytes(rows, 2);
+        size_t preview_bytes =
+            analysis_coverage_utf8_prefix(detail ? detail : (const unsigned char *)"",
+                                          detail_bytes, detail_preview_bytes);
+        row->rel_path = analysis_coverage_dup_bytes(
+            s, path ? path : (const unsigned char *)"", path_bytes);
+        row->kind = analysis_coverage_dup_bytes(
+            s, kind ? kind : (const unsigned char *)"", kind_bytes);
+        row->detail = analysis_coverage_dup_bytes(
+            s, detail ? detail : (const unsigned char *)"", preview_bytes);
+        if (!row->rel_path || !row->kind || !row->detail) {
+            free((char *)row->rel_path);
+            free((char *)row->kind);
+            free((char *)row->detail);
+            memset(row, 0, sizeof(*row));
+            sqlite3_finalize(rows);
+            return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED);
+        }
+        row->detail_complete_bytes = (int64_t)detail_bytes;
+        row->detail_truncated = preview_bytes < detail_bytes;
+        if (row->detail_truncated) {
+            cbm_sha256_hex(detail ? detail : (const unsigned char *)"", detail_bytes,
+                           row->detail_sha256);
+        }
+        out->returned++;
+    }
+    if (scan_rc == SQLITE_ROW && out->returned == wanted) {
+        scan_rc = SQLITE_DONE;
+    }
+    sqlite3_finalize(rows);
+    if (scan_rc != SQLITE_DONE || out->returned != wanted) {
+        store_set_error(s, "analysis coverage snapshot changed during page read");
+        return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_STORE_ERROR);
+    }
+    out->next_offset = offset + out->returned;
+    out->has_more = out->next_offset < out->totals.rows_total;
+    if (exec_sql(s, "RELEASE cbm_analysis_coverage_page;") != CBM_STORE_OK) {
+        return analysis_coverage_fail(s, out, CBM_ANALYSIS_COVERAGE_STORE_ERROR);
+    }
+    return CBM_ANALYSIS_COVERAGE_OK;
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+void cbm_store_analysis_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations) {
+    if (s) {
+        s->analysis_alloc_fail_after = allocations;
+    }
+}
+
+void cbm_store_analysis_coverage_test_set_after_totals_hook(
+    cbm_store_t *s, cbm_analysis_coverage_test_hook_fn hook, void *userdata) {
+    if (s) {
+        s->analysis_after_totals_hook = hook;
+        s->analysis_after_totals_userdata = userdata;
+    }
+}
+#endif
 
 int cbm_store_coverage_get(cbm_store_t *s, const char *project, cbm_coverage_row_t **out,
                            int *count) {

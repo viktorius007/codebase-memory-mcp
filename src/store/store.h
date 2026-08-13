@@ -522,6 +522,15 @@ int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
 
 /* ── Index coverage (#963) ──────────────────────────────────────── */
 
+/* One shared compatibility contract for every coverage writer and reader.
+ * Bump only when the persisted semantic coverage meaning or metadata contract
+ * changes; old/missing versions must be treated as unknown. */
+enum {
+    CBM_SEMANTIC_INDEX_VERSION = 4,
+    CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS = 256,
+    CBM_ANALYSIS_COVERAGE_DETAIL_MAX_BYTES = 4096,
+};
+
 /* One best-effort coverage row: a file the indexer could not fully cover.
  * kind "parse_partial" = indexed but the parse tree had ERROR/MISSING regions
  * (detail = 1-based line ranges "12-40,88-90"); skip kinds "read"/"extract"/
@@ -555,6 +564,48 @@ typedef struct {
     int rust_files_total;
 } cbm_coverage_meta_t;
 
+/* Bounded semantic-analysis coverage page. Only `analysis_*` rows participate;
+ * syntactic coverage rows and their details are never materialized. Metadata,
+ * exact totals, and rows are read from one SQLite snapshot. Page identity is
+ * the stable binary order (rel_path, kind). A truncated detail retains its
+ * exact byte length and SHA-256 so callers can report the omission explicitly. */
+typedef struct {
+    const char *rel_path;
+    const char *kind;
+    const char *detail;
+    int64_t detail_complete_bytes;
+    bool detail_truncated;
+    char detail_sha256[65];
+} cbm_analysis_coverage_row_t;
+
+typedef struct {
+    int64_t rows_total;
+    int64_t partial_rows;
+    int64_t failed_rows;
+    int64_t unsupported_rows;
+    int64_t degraded_files_total;
+    int64_t partial_files;
+    int64_t failed_files;
+    int64_t unsupported_files;
+} cbm_analysis_coverage_totals_t;
+
+typedef struct {
+    bool has_meta;
+    cbm_coverage_meta_t meta;
+    cbm_analysis_coverage_totals_t totals;
+    cbm_analysis_coverage_row_t *rows;
+    int returned;
+    int64_t next_offset;
+    bool has_more;
+} cbm_analysis_coverage_page_t;
+
+typedef enum {
+    CBM_ANALYSIS_COVERAGE_OK = 0,
+    CBM_ANALYSIS_COVERAGE_INVALID_ARGUMENT,
+    CBM_ANALYSIS_COVERAGE_STORE_ERROR,
+    CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED,
+} cbm_analysis_coverage_status_t;
+
 /* Replace the project's coverage rows in one transaction, then prune rows for
  * files absent from file_hashes (deleted from the repo). Call AFTER hashes
  * were persisted for the run. */
@@ -585,6 +636,25 @@ int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char
 /* Fetch/free the metadata paired with the current coverage row set. */
 int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out);
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
+
+/* Read one bounded semantic-analysis page plus exact totals/current metadata.
+ * offset is a row ordinal in stable (rel_path, kind) order. limit must be
+ * 1..CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS; detail_preview_bytes must be at most
+ * CBM_ANALYSIS_COVERAGE_DETAIL_MAX_BYTES. Empty/current generations succeed
+ * with zero totals and has_meta=true. Allocation failure is distinguishable
+ * from SQLite/argument failures. `out` must be zero-initialized before its
+ * first call and cleared before reuse. */
+cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
+    cbm_store_t *s, const char *project, int64_t offset, int limit,
+    size_t detail_preview_bytes, cbm_analysis_coverage_page_t *out);
+void cbm_store_analysis_coverage_page_clear(cbm_analysis_coverage_page_t *page);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+typedef void (*cbm_analysis_coverage_test_hook_fn)(void *userdata);
+void cbm_store_analysis_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations);
+void cbm_store_analysis_coverage_test_set_after_totals_hook(
+    cbm_store_t *s, cbm_analysis_coverage_test_hook_fn hook, void *userdata);
+#endif
 
 /* Name of the derived miss-graph shadow project ("<project>::missed").
  * cbm_store_coverage_replace materializes the coverage rows as a file-
