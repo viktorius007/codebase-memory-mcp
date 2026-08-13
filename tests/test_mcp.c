@@ -3154,6 +3154,252 @@ static int write_coverage_meta(cbm_store_t *store, const char *generation,
     return cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta);
 }
 
+static int write_rust_health_fixture(cbm_store_t *store, const char *project, int version,
+                                     const char *rust_recording, int rust_files_total,
+                                     const cbm_coverage_row_t *rows, int row_count) {
+    cbm_project_t info = {0};
+    if (cbm_store_get_project(store, project, &info) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    cbm_coverage_meta_t meta = {
+        .generation = info.indexed_at,
+        .index_mode = "fast",
+        .recorded_at = "2026-08-13T00:00:00Z",
+        .recording_status = "complete",
+        .ignored_files_stored = 0,
+        .ignored_files_total = 0,
+        .coverage_version = version,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = rust_recording,
+        .rust_files_total = rust_files_total,
+    };
+    for (int i = 0; i < row_count; i++) {
+        if (rows[i].rel_path &&
+            cbm_store_upsert_file_hash(store, project, rows[i].rel_path, "fixture", i + 1, 1) !=
+                CBM_STORE_OK) {
+            cbm_project_free_fields(&info);
+            return CBM_STORE_ERR;
+        }
+    }
+    int rc = cbm_store_coverage_replace_ex(store, project, rows, row_count, &meta);
+    cbm_project_free_fields(&info);
+    return rc;
+}
+
+static yyjson_doc *mcp_tool_inner_doc(cbm_mcp_server_t *srv, const char *tool, const char *args,
+                                      char **response_out, char **inner_out) {
+    *response_out = cbm_mcp_handle_tool(srv, tool, args);
+    if (!*response_out) {
+        return NULL;
+    }
+    *inner_out = extract_text_content(*response_out);
+    return *inner_out ? yyjson_read(*inner_out, strlen(*inner_out), 0) : NULL;
+}
+
+TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
+    const char *project = "rust-health-verdicts";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/rust-health-verdicts"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_coverage_row_t mixed[] = {
+        {.rel_path = "src/a.rs", .kind = "analysis_failed:rust", .detail = "{\"status\":\"failed\"}"},
+        {.rel_path = "src/a.rs", .kind = "analysis_partial:rust", .detail = "{\"status\":\"partial\"}"},
+        {.rel_path = "src/b.rs", .kind = "analysis_partial:rust", .detail = "{\"status\":\"partial\"}"},
+        {.rel_path = "src/b.rs", .kind = "parse_partial", .detail = "7-9"},
+    };
+    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "complete", 4, mixed, 4),
+              CBM_STORE_OK);
+    cbm_coverage_row_t *stored_rows = NULL;
+    int stored_row_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, project, &stored_rows, &stored_row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(stored_row_count, 4);
+    ASSERT_STR_EQ(stored_rows[0].kind, "analysis_failed:rust");
+    cbm_store_free_coverage(stored_rows, stored_row_count);
+
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_doc *doc = mcp_tool_inner_doc(
+        srv, "index_status",
+        "{\"project\":\"rust-health-verdicts\",\"max_response_bytes\":65536}",
+        &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *health = yyjson_obj_get(root, "rust_analysis");
+    ASSERT_NOT_NULL(health);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "failed");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_total")), 4);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_complete")), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_partial")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_failed")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "degraded_files_total")), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "partial_rows")), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "failed_rows")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "coverage_page"), "total")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "skipped"), "count")), 0);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    doc = mcp_tool_inner_doc(
+        srv, "check_index_coverage",
+        "{\"project\":\"rust-health-verdicts\",\"paths\":[\"src/a.rs\"],\"scopes\":[\".\"]}",
+        &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    health = yyjson_obj_get(root, "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "failed");
+    yyjson_val *path = yyjson_arr_get(yyjson_obj_get(root, "paths"), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "status")), "no_recorded_issue");
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(path, "coverage")), 0);
+    yyjson_val *scope = yyjson_arr_get(yyjson_obj_get(root, "scopes"), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(scope, "total")), 1);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    ASSERT_EQ(write_rust_health_fixture(store, project, 3, "complete", 4, mixed, 4),
+              CBM_STORE_OK);
+    doc = mcp_tool_inner_doc(srv, "index_status",
+                             "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")),
+                  "unsupported_coverage_version");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "complete", 0, NULL, 0), CBM_STORE_OK);
+    doc = mcp_tool_inner_doc(srv, "index_status",
+                             "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "not_applicable");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "complete", 2, NULL, 0), CBM_STORE_OK);
+    doc = mcp_tool_inner_doc(srv, "index_status",
+                             "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "complete");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "unknown", 2, NULL, 0), CBM_STORE_OK);
+    doc = mcp_tool_inner_doc(srv, "index_status",
+                             "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")),
+                  "rust_analysis_recording_unavailable");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_rust_analysis_evidence_has_independent_16k_budget) {
+    enum { ROW_COUNT = 768 };
+    const char *project = "rust-health-evidence-budget";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/rust-health-evidence-budget"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_coverage_row_t *rows = calloc(ROW_COUNT, sizeof(*rows));
+    char(*paths)[64] = calloc(ROW_COUNT, sizeof(*paths));
+    char(*details)[2048] = calloc(ROW_COUNT, sizeof(*details));
+    ASSERT_NOT_NULL(rows);
+    ASSERT_NOT_NULL(paths);
+    ASSERT_NOT_NULL(details);
+    for (int i = 0; i < ROW_COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "src/health-%03d.rs", i);
+        for (int j = 0; j < 2046; j++) {
+            details[i][j] = "\\\"\n\tabcdef"[j % 10];
+        }
+        details[i][2046] = '\0';
+        rows[i].rel_path = paths[i];
+        rows[i].kind = "analysis_partial:rust";
+        rows[i].detail = details[i];
+    }
+    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "complete", ROW_COUNT, rows,
+                                        ROW_COUNT),
+              CBM_STORE_OK);
+    free(details);
+    free(paths);
+    free(rows);
+
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_doc *doc = mcp_tool_inner_doc(
+        srv, "check_index_coverage",
+        "{\"project\":\"rust-health-evidence-budget\",\"paths\":[\"src/health-000.rs\"]}",
+        &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_TRUE(strlen(response) <= 65536);
+    yyjson_val *health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "partial");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_partial")), ROW_COUNT);
+    yyjson_val *evidence = yyjson_obj_get(health, "evidence");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(evidence, "truncated")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(evidence, "total")), ROW_COUNT);
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(evidence, "returned")) < ROW_COUNT);
+    yyjson_mut_doc *evidence_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_doc_set_root(evidence_doc, yyjson_val_mut_copy(evidence_doc, evidence));
+    char *evidence_json = yyjson_mut_write(evidence_doc, 0, NULL);
+    ASSERT_NOT_NULL(evidence_json);
+    ASSERT_TRUE(strlen(evidence_json) <= 16384);
+    free(evidence_json);
+    yyjson_mut_doc_free(evidence_doc);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    /* Max accepted path/scope fan-out must still leave the full MCP envelope bounded. */
+    yyjson_mut_doc *max_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *max_root = yyjson_mut_obj(max_doc);
+    yyjson_mut_doc_set_root(max_doc, max_root);
+    yyjson_mut_obj_add_str(max_doc, max_root, "project", project);
+    yyjson_mut_val *max_paths = yyjson_mut_arr(max_doc);
+    for (int i = 0; i < 128; i++) {
+        yyjson_mut_arr_add_str(max_doc, max_paths, "src/health-000.rs");
+    }
+    yyjson_mut_obj_add_val(max_doc, max_root, "paths", max_paths);
+    yyjson_mut_val *max_scopes = yyjson_mut_arr(max_doc);
+    for (int i = 0; i < 32; i++) {
+        yyjson_mut_arr_add_str(max_doc, max_scopes, ".");
+    }
+    yyjson_mut_obj_add_val(max_doc, max_root, "scopes", max_scopes);
+    char *max_args = yyjson_mut_write(max_doc, 0, NULL);
+    ASSERT_NOT_NULL(max_args);
+    yyjson_mut_doc_free(max_doc);
+    doc = mcp_tool_inner_doc(srv, "check_index_coverage", max_args, &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_TRUE(strlen(response) <= 65536);
+    ASSERT_NOT_NULL(yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    free(max_args);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_check_index_coverage_rejects_stale_generation) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -9418,6 +9664,8 @@ TEST(tool_index_repository_reports_store_backed_adr) {
     char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
     ASSERT_NOT_NULL(resp);
     ASSERT(response_contains_json_fragment(resp, "\"status\":\"indexed\""));
+    ASSERT(response_contains_json_fragment(resp, "\"rust_analysis\":{"));
+    ASSERT(response_contains_json_fragment(resp, "\"verdict\":\"not_applicable\""));
     free(resp);
 
     char update_args[2048];
@@ -14624,6 +14872,8 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
+    RUN_TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact);
+    RUN_TEST(tool_rust_analysis_evidence_has_independent_16k_budget);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
