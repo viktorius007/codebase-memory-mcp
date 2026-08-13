@@ -1158,6 +1158,50 @@ void cbm_rust_health_record(CBMRustAnalysisHealth *health, CBMRustHealthReason r
     }
 }
 
+void cbm_rust_health_merge(CBMRustAnalysisHealth *dst, const CBMRustAnalysisHealth *src) {
+    if (!dst || !src) {
+        return;
+    }
+    dst->required_routes |= src->required_routes;
+    dst->completed_routes |= src->completed_routes;
+    dst->resolved_emitted =
+        UINT32_MAX - dst->resolved_emitted < src->resolved_emitted
+            ? UINT32_MAX
+            : dst->resolved_emitted + src->resolved_emitted;
+    dst->unresolved_emitted =
+        UINT32_MAX - dst->unresolved_emitted < src->unresolved_emitted
+            ? UINT32_MAX
+            : dst->unresolved_emitted + src->unresolved_emitted;
+    for (int reason = 0; reason < CBM_RUST_HEALTH_REASON_COUNT; reason++) {
+        const CBMRustHealthIssue *from = &src->issues[reason];
+        CBMRustHealthIssue *to = &dst->issues[reason];
+        if (from->count == 0) {
+            continue;
+        }
+        if (to->count == 0) {
+            to->first_start_byte = from->first_start_byte;
+            to->first_end_byte = from->first_end_byte;
+        }
+        to->count = UINT32_MAX - to->count < from->count ? UINT32_MAX : to->count + from->count;
+    }
+}
+
+const char *cbm_rust_health_reason_name(CBMRustHealthReason reason) {
+    static const char *const names[CBM_RUST_HEALTH_REASON_COUNT] = {
+        "manifest_read_failed",       "manifest_parse_partial",
+        "manifest_dep_limit",         "manifest_member_limit",
+        "source_unavailable",         "parser_create_failed",
+        "parser_parse_failed",        "macro_no_rule_match",
+        "macro_depth_limit",          "macro_binding_limit",
+        "macro_repetition_limit",     "macro_parse_failed",
+        "type_depth_limit",           "eval_depth_limit",
+        "walk_depth_limit",           "work_limit",
+        "proc_macro_unsupported",      "rustdoc_unavailable",
+        "macro_substitution_limit",
+    };
+    return reason >= 0 && reason < CBM_RUST_HEALTH_REASON_COUNT ? names[reason] : "unknown";
+}
+
 CBMRustAnalysisStatus cbm_rust_health_status(const CBMRustAnalysisHealth *health) {
     if (!health) {
         return CBM_RUST_ANALYSIS_FAILED;

@@ -714,7 +714,7 @@ int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
  * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 4 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -793,6 +793,19 @@ int cbm_pipeline_refresh_artifact(cbm_pipeline_t *p, const char *db_path);
  * Takes ownership; dump_and_persist_hashes writes them into the staging
  * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
 void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
+void cbm_pipeline_begin_rust_health_capture(cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                            int count, bool whole_generation);
+void cbm_pipeline_capture_rust_health(cbm_pipeline_t *p, const char *rel_path,
+                                      const CBMRustAnalysisHealth *health);
+void cbm_pipeline_capture_rust_cache(cbm_pipeline_t *p, const cbm_file_info_t *files, int count,
+                                     CBMFileResult *const *cache);
+void cbm_pipeline_get_rust_health(const cbm_pipeline_t *p, const cbm_coverage_row_t **rows,
+                                  int *row_count, const char **recording_status,
+                                  int *rust_files_total);
+cbm_coverage_row_t *cbm_pipeline_alloc_coverage_rows(cbm_pipeline_t *p, int count);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+void cbm_pipeline_test_fail_coverage_alloc(cbm_pipeline_t *p, bool fail);
+#endif
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);

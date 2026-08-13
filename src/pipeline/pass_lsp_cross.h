@@ -162,7 +162,7 @@ struct CBMCargoManifest;
 /* Parse the repository root Cargo.toml into caller-owned arena storage. The
  * immutable result may be borrowed by every Rust cross-LSP dispatch until the
  * caller destroys `arena`. False means no readable root manifest. */
-bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *arena,
                                  struct CBMCargoManifest *out_manifest);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends

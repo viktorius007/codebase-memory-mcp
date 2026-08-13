@@ -1217,6 +1217,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                                closure_resolve_t *closure) {
     struct timespec t;
 
+    cbm_pipeline_begin_rust_health_capture(ctx->pipeline, changed_files, ci, false);
+
     /* Per-file LSP always runs (every mode). Cross-file LSP: the legacy
      * partial route still skips it (NULL cross_registries below); the
      * closure-repair route rebuilds the registries from persisted surfaces +
@@ -1369,6 +1371,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
         cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
+        cbm_pipeline_capture_rust_cache(ctx->pipeline, changed_files, ci, cache);
         free_incremental_result_cache(cache, ci);
         return rc;
     } else {
@@ -1413,6 +1416,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         if (rc == 0) {
             rc = cbm_pipeline_check_cancel(ctx);
         }
+        cbm_pipeline_capture_rust_cache(ctx->pipeline, changed_files, ci, cache);
         if (owns_cache) {
             free_incremental_result_cache(cache, ci);
             ctx->result_cache = prior_cache;
@@ -2197,10 +2201,17 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int run_ignored_count = 0;
     int run_ignored_total = 0;
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
-    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
+    const cbm_coverage_row_t *rust_cov = NULL;
+    int rust_cov_count = 0;
+    const char *rust_recording_status = NULL;
+    int rust_files_total = -1;
+    cbm_pipeline_get_rust_health(p, &rust_cov, &rust_cov_count, &rust_recording_status,
+                                 &rust_files_total);
+    int cov_cap =
+        old_cov_count + run_err_count + run_excluded_count + run_ignored_count + rust_cov_count;
     bool coverage_rows_available = cov_cap == 0;
     if (cov_cap > 0) {
-        cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
+        cov = cbm_pipeline_alloc_coverage_rows(p, cov_cap);
         coverage_rows_available = cov != NULL;
     }
     if (cov) {
@@ -2228,6 +2239,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             cov[cov_n].kind = "not_indexed_file";
             cov[cov_n].detail = run_ignored[i].reason;
             cov_n++;
+        }
+        for (int i = 0; i < rust_cov_count; i++) {
+            cov[cov_n++] = rust_cov[i];
         }
     }
 
@@ -2302,6 +2316,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                     .ignored_files_total = run_ignored_total,
                     .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
                     .hash_records_complete = true,
+                    .rust_analysis_recording_status =
+                        coverage_rows_available ? rust_recording_status : "unknown",
+                    .rust_files_total = rust_files_total,
                 },
             .surface_rows = NULL,
             .surface_row_count = 0,
@@ -2415,11 +2432,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_coverage_meta_t meta = {0};
         int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
         const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
+        int discovered_rust_files = -1;
+        cbm_pipeline_get_rust_health(p, NULL, NULL, NULL, &discovered_rust_files);
         bool metadata_current = meta_rc == CBM_STORE_OK &&
                                 meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
                                 meta.hash_records_complete && meta.index_mode &&
-                                strcmp(meta.index_mode, mode_name) == 0;
-        bool exact = metadata_current &&
+                                strcmp(meta.index_mode, mode_name) == 0 &&
+                                meta.rust_analysis_recording_status &&
+                                strcmp(meta.rust_analysis_recording_status, "complete") == 0 &&
+                                meta.rust_files_total >= 0;
+        bool exact = metadata_current && meta.rust_files_total == discovered_rust_files &&
                      cbm_pipeline_semantic_manifests_equal(stored, stored_count, baseline_manifest,
                                                            baseline_count);
         cbm_store_coverage_meta_clear(&meta);
@@ -2761,9 +2783,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
-    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
+    const cbm_coverage_row_t *rust_cov = NULL;
+    int rust_cov_count = 0;
+    const char *rust_recording_status = NULL;
+    int rust_files_total = -1;
+    cbm_pipeline_get_rust_health(p, &rust_cov, &rust_cov_count, &rust_recording_status,
+                                 &rust_files_total);
+    int cov_cap =
+        old_cov_count + run_err_count + run_excluded_count + run_ignored_count + rust_cov_count;
     if (cov_cap > 0) {
-        cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
+        cov = cbm_pipeline_alloc_coverage_rows(p, cov_cap);
     }
     bool coverage_rows_available = cov_cap == 0 || cov != NULL;
     if (cov) {
@@ -2796,6 +2825,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cov[cov_n].kind = "not_indexed_file";
             cov[cov_n].detail = run_ignored[i].reason;
             cov_n++;
+        }
+        for (int i = 0; i < rust_cov_count; i++) {
+            cov[cov_n++] = rust_cov[i];
         }
     }
 
@@ -2849,6 +2881,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .ignored_files_total = run_ignored_total,
         .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
         .hash_records_complete = true,
+        .rust_analysis_recording_status =
+            coverage_rows_available ? rust_recording_status : "unknown",
+        .rust_files_total = rust_files_total,
     };
     /* Publish surfaces: the surviving previous rows plus this run's fresh
      * ones (closure route). The legacy test route publishes none — its

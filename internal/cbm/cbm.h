@@ -540,6 +540,8 @@ typedef struct {
 
 void cbm_rust_health_record(CBMRustAnalysisHealth *health, CBMRustHealthReason reason,
                             uint32_t start_byte, uint32_t end_byte);
+void cbm_rust_health_merge(CBMRustAnalysisHealth *dst, const CBMRustAnalysisHealth *src);
+const char *cbm_rust_health_reason_name(CBMRustHealthReason reason);
 CBMRustAnalysisStatus cbm_rust_health_status(const CBMRustAnalysisHealth *health);
 
 // Full extraction result for one file.

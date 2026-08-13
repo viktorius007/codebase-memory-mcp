@@ -3016,6 +3016,18 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
              (semantic_sites > 0 || pending_lsp_site) &&
              (jvm_cross_lsp || pending_lsp_site || qualified_lsp_sites < semantic_sites) &&
              !is_generated);
+        if (lang == CBM_LANG_RUST) {
+            result->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+            /* No pending semantic site is a completed no-op route: the
+             * single-file resolver already covered every eligible site. A
+             * missing project definition universe is not complete. */
+            bool no_semantic_sites = semantic_sites == 0 && !pending_lsp_site;
+            bool definition_universe_available = rc->all_defs && rc->def_count > 0;
+            if (!cross_lsp_eligible && !is_generated &&
+                (no_semantic_sites || definition_universe_available)) {
+                result->rust_health.completed_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+            }
+        }
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
@@ -3140,6 +3152,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * Track C's real crash-attribution signal; leave it unwired. */
                 atomic_fetch_add_explicit(&rc->lsp_cross_skipped_no_source, SKIP_ONE,
                                           memory_order_relaxed);
+                if (lang == CBM_LANG_RUST) {
+                    cbm_rust_health_record(&result->rust_health,
+                                           CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
+                }
             }
         }
 
@@ -3230,7 +3246,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     const CBMCargoManifest *rust_manifest = NULL;
     if (have_rust) {
         cbm_arena_init(&cargo_arena);
-        if (cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest)) {
+        if (cbm_pxc_build_rust_manifest(ctx->repo_path, &cargo_arena, &cargo_manifest)) {
             rust_manifest = &cargo_manifest;
         }
     }

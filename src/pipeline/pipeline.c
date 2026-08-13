@@ -20,6 +20,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/worker_pool.h"
+#include "lsp/rust_cargo.h"
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
 #include "store/store.h"
@@ -203,6 +204,19 @@ struct cbm_pipeline {
     cbm_lsp_surface_row_t *surface_rows;
     int surface_row_count;
 
+    /* Generation-owned Rust semantic health, captured while result arenas are
+     * still alive and published with the graph/manifest in the same stage. */
+    cbm_coverage_row_t *rust_health_rows;
+    int rust_health_row_count;
+    int rust_health_row_cap;
+    int rust_files_total;
+    int rust_files_capture_expected;
+    int rust_files_captured;
+    bool rust_health_capture_failed;
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    bool test_fail_coverage_alloc;
+#endif
+
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
     void (*before_publish_hook)(cbm_pipeline_t *, const char *, void *);
@@ -333,6 +347,205 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
     p->surface_row_count = count;
 }
 
+static void pipeline_clear_rust_health_rows(cbm_pipeline_t *p) {
+    if (!p) {
+        return;
+    }
+    for (int i = 0; i < p->rust_health_row_count; i++) {
+        free((char *)p->rust_health_rows[i].rel_path);
+        free((char *)p->rust_health_rows[i].detail);
+    }
+    free(p->rust_health_rows);
+    p->rust_health_rows = NULL;
+    p->rust_health_row_count = 0;
+    p->rust_health_row_cap = 0;
+    p->rust_files_captured = 0;
+    p->rust_health_capture_failed = false;
+}
+
+static int pipeline_count_rust_files(const cbm_file_info_t *files, int count) {
+    int total = 0;
+    for (int i = 0; files && i < count; i++) {
+        total += files[i].language == CBM_LANG_RUST;
+    }
+    return total;
+}
+
+void cbm_pipeline_begin_rust_health_capture(cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                            int count, bool whole_generation) {
+    if (!p) {
+        return;
+    }
+    pipeline_clear_rust_health_rows(p);
+    p->rust_files_capture_expected = pipeline_count_rust_files(files, count);
+    if (whole_generation) {
+        p->rust_files_total = p->rust_files_capture_expected;
+    }
+}
+
+static const char *rust_status_name(CBMRustAnalysisStatus status) {
+    switch (status) {
+    case CBM_RUST_ANALYSIS_COMPLETE:
+        return "complete";
+    case CBM_RUST_ANALYSIS_PARTIAL:
+        return "partial";
+    case CBM_RUST_ANALYSIS_FAILED:
+        return "failed";
+    }
+    return "failed";
+}
+
+static char *pipeline_rust_health_json(const CBMRustAnalysisHealth *health,
+                                       CBMRustAnalysisStatus status) {
+    char buf[CBM_SZ_4K];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"version\":1,\"status\":\"%s\",\"required_routes\":%u,"
+                     "\"completed_routes\":%u,\"resolved_emitted\":%u,"
+                     "\"unresolved_emitted\":%u,\"issues\":[",
+                     rust_status_name(status), health->required_routes, health->completed_routes,
+                     health->resolved_emitted, health->unresolved_emitted);
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
+        return NULL;
+    }
+    size_t used = (size_t)n;
+    bool comma = false;
+    for (int reason = 0; reason < CBM_RUST_HEALTH_REASON_COUNT; reason++) {
+        const CBMRustHealthIssue *issue = &health->issues[reason];
+        if (issue->count == 0) {
+            continue;
+        }
+        n = snprintf(buf + used, sizeof(buf) - used,
+                     "%s{\"reason\":\"%s\",\"count\":%u,\"first_start_byte\":%u,"
+                     "\"first_end_byte\":%u}",
+                     comma ? "," : "", cbm_rust_health_reason_name((CBMRustHealthReason)reason),
+                     issue->count, issue->first_start_byte, issue->first_end_byte);
+        if (n < 0 || (size_t)n >= sizeof(buf) - used) {
+            return NULL;
+        }
+        used += (size_t)n;
+        comma = true;
+    }
+    if (used + 3 > sizeof(buf)) {
+        return NULL;
+    }
+    memcpy(buf + used, "]}", 3);
+    return strdup(buf);
+}
+
+void cbm_pipeline_capture_rust_health(cbm_pipeline_t *p, const char *rel_path,
+                                      const CBMRustAnalysisHealth *source_health) {
+    if (!p || !rel_path) {
+        return;
+    }
+    CBMRustAnalysisHealth health = {0};
+    if (source_health) {
+        health = *source_health;
+    } else {
+        cbm_rust_health_record(&health, CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
+    }
+    health.required_routes |=
+        CBM_RUST_HEALTH_ROUTE_SINGLE_FILE | CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+    p->rust_files_captured++;
+    CBMRustAnalysisStatus status = cbm_rust_health_status(&health);
+    if (status == CBM_RUST_ANALYSIS_COMPLETE) {
+        return;
+    }
+    if (p->rust_health_row_count >= p->rust_health_row_cap) {
+        int next = p->rust_health_row_cap ? p->rust_health_row_cap * 2 : 16;
+        cbm_coverage_row_t *grown =
+            realloc(p->rust_health_rows, (size_t)next * sizeof(*grown));
+        if (!grown) {
+            p->rust_health_capture_failed = true;
+            return;
+        }
+        p->rust_health_rows = grown;
+        p->rust_health_row_cap = next;
+    }
+    char *path = strdup(rel_path);
+    char *detail = pipeline_rust_health_json(&health, status);
+    if (!path || !detail) {
+        free(path);
+        free(detail);
+        p->rust_health_capture_failed = true;
+        return;
+    }
+    p->rust_health_rows[p->rust_health_row_count++] = (cbm_coverage_row_t){
+        .rel_path = path,
+        .kind = status == CBM_RUST_ANALYSIS_PARTIAL ? "analysis_partial:rust"
+                                                    : "analysis_failed:rust",
+        .detail = detail,
+    };
+}
+
+void cbm_pipeline_capture_rust_cache(cbm_pipeline_t *p, const cbm_file_info_t *files, int count,
+                                     CBMFileResult *const *cache) {
+    CBMRustAnalysisHealth manifest_health = {0};
+    if (p && pipeline_count_rust_files(files, count) > 0) {
+        CBMArena cargo_arena;
+        CBMCargoManifest cargo_manifest;
+        cbm_arena_init(&cargo_arena);
+        (void)cbm_pxc_build_rust_manifest(p->repo_path, &cargo_arena, &cargo_manifest);
+        manifest_health = cargo_manifest.health;
+        cbm_arena_destroy(&cargo_arena);
+    }
+    for (int i = 0; p && files && i < count; i++) {
+        if (files[i].language == CBM_LANG_RUST) {
+            CBMRustAnalysisHealth health = {0};
+            if (cache && cache[i]) {
+                health = cache[i]->rust_health;
+            } else if (files[i].size == 0) {
+                health.required_routes =
+                    CBM_RUST_HEALTH_ROUTE_SINGLE_FILE | CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+                health.completed_routes = health.required_routes;
+            } else {
+                cbm_rust_health_record(&health, CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
+            }
+            cbm_rust_health_merge(&health, &manifest_health);
+            cbm_pipeline_capture_rust_health(p, files[i].rel_path, &health);
+        }
+    }
+}
+
+cbm_coverage_row_t *cbm_pipeline_alloc_coverage_rows(cbm_pipeline_t *p, int count) {
+    if (!p || count <= 0) {
+        return NULL;
+    }
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (p->test_fail_coverage_alloc) {
+        return NULL;
+    }
+#endif
+    return malloc((size_t)count * sizeof(cbm_coverage_row_t));
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+void cbm_pipeline_test_fail_coverage_alloc(cbm_pipeline_t *p, bool fail) {
+    if (p) {
+        p->test_fail_coverage_alloc = fail;
+    }
+}
+#endif
+
+void cbm_pipeline_get_rust_health(const cbm_pipeline_t *p, const cbm_coverage_row_t **rows,
+                                  int *row_count, const char **recording_status,
+                                  int *rust_files_total) {
+    if (rows) {
+        *rows = p ? p->rust_health_rows : NULL;
+    }
+    if (row_count) {
+        *row_count = p ? p->rust_health_row_count : 0;
+    }
+    if (recording_status) {
+        *recording_status = p && !p->rust_health_capture_failed &&
+                                    p->rust_files_captured == p->rust_files_capture_expected
+                                ? "complete"
+                                : "unknown";
+    }
+    if (rust_files_total) {
+        *rust_files_total = p ? p->rust_files_total : -1;
+    }
+}
+
 void cbm_pipeline_free(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -363,6 +576,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     cbm_store_free_lsp_surfaces(p->surface_rows, p->surface_row_count);
     p->surface_rows = NULL;
     p->surface_row_count = 0;
+    pipeline_clear_rust_health_rows(p);
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
@@ -1295,6 +1509,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cbm_pipeline_propagate_cfg_test_modules(p->gbuf, files, seq_cache, file_count);
     }
     if (seq_cache) {
+        cbm_pipeline_capture_rust_cache(p, files, file_count, seq_cache);
         for (int i = 0; i < file_count; i++) {
             if (seq_cache[i]) {
                 cbm_free_result(seq_cache[i]);
@@ -1496,6 +1711,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
     cbm_pipeline_propagate_cfg_test_modules(p->gbuf, files, cache, file_count);
+    cbm_pipeline_capture_rust_cache(p, files, file_count, cache);
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
             cbm_free_result(cache[i]);
@@ -2121,12 +2337,19 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
-    int cov_total = p->file_errors_count + p->excluded_count + p->ignored_count;
+    const cbm_coverage_row_t *rust_cov = NULL;
+    int rust_cov_count = 0;
+    const char *rust_recording_status = NULL;
+    int rust_files_total = -1;
+    cbm_pipeline_get_rust_health(p, &rust_cov, &rust_cov_count, &rust_recording_status,
+                                 &rust_files_total);
+    int cov_total =
+        p->file_errors_count + p->excluded_count + p->ignored_count + rust_cov_count;
     cbm_coverage_row_t *cov = NULL;
     int cov_count = 0;
     bool coverage_rows_available = cov_total == 0;
     if (cov_total > 0) {
-        cov = malloc((size_t)cov_total * sizeof(*cov));
+        cov = cbm_pipeline_alloc_coverage_rows(p, cov_total);
         if (cov) {
             coverage_rows_available = true;
             for (int i = 0; i < p->file_errors_count; i++) {
@@ -2143,6 +2366,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
                 cov[cov_count++] = (cbm_coverage_row_t){.rel_path = p->ignored_files[i].rel_path,
                                                         .kind = "not_indexed_file",
                                                         .detail = p->ignored_files[i].reason};
+            }
+            for (int i = 0; i < rust_cov_count; i++) {
+                cov[cov_count++] = rust_cov[i];
             }
         }
     }
@@ -2167,6 +2393,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
                 .ignored_files_total = p->ignored_total,
                 .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
                 .hash_records_complete = true,
+                .rust_analysis_recording_status =
+                    coverage_rows_available ? rust_recording_status : "unknown",
+                .rust_files_total = rust_files_total,
             },
         .surface_rows = p->surface_rows,
         .surface_row_count = p->surface_row_count,
@@ -2305,6 +2534,7 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 /* Run structure + extraction passes (parallel or sequential). */
 static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                 const cbm_file_info_t *files, int file_count) {
+    cbm_pipeline_begin_rust_health_capture(p, files, file_count, true);
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     CBM_PROF_START(t_struct);
@@ -2393,6 +2623,9 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
         rc = CBM_NOT_FOUND;
         goto cleanup;
     }
+    /* Discovery owns the exact generation-wide Rust denominator even when an
+     * incremental route later re-analyzes only a changed subset. */
+    cbm_pipeline_begin_rust_health_capture(p, files, file_count, true);
 
     /* Snapshot every semantic input once before routing/extraction. The same
      * bytes drive exact no-op comparison and are checked against a fresh

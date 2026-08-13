@@ -3210,6 +3210,302 @@ TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation
     PASS();
 }
 
+static int rust_analysis_row_count(cbm_store_t *store, const char *project, const char *path,
+                                   const char *kind, const char *reason) {
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    if (cbm_store_coverage_get_path(store, project, path, &rows, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < count; i++) {
+        if (rows[i].kind && strncmp(rows[i].kind, "analysis_", 9) == 0 &&
+            (!kind || strcmp(rows[i].kind, kind) == 0) &&
+            (!reason || (rows[i].detail && strstr(rows[i].detail, reason)))) {
+            matches++;
+        }
+    }
+    cbm_store_free_coverage(rows, count);
+    return matches;
+}
+
+TEST(pipeline_rust_health_incomplete_cross_route_is_failed_and_bounded) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/rust-health-unit", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_file_info_t file = {.rel_path = "src/lib.rs", .language = CBM_LANG_RUST};
+    cbm_pipeline_begin_rust_health_capture(p, &file, 1, true);
+    CBMRustAnalysisHealth health = {
+        .required_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE,
+        .completed_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE,
+        .resolved_emitted = 7,
+    };
+    cbm_pipeline_capture_rust_health(p, file.rel_path, &health);
+    const cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    const char *recording = NULL;
+    int total = -1;
+    cbm_pipeline_get_rust_health(p, &rows, &count, &recording, &total);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].kind, "analysis_failed:rust");
+    ASSERT_NOT_NULL(strstr(rows[0].detail, "\"version\":1"));
+    ASSERT_NOT_NULL(strstr(rows[0].detail, "\"required_routes\":3"));
+    ASSERT_NOT_NULL(strstr(rows[0].detail, "\"completed_routes\":1"));
+    ASSERT_TRUE(strlen(rows[0].detail) < CBM_SZ_4K);
+    ASSERT_STR_EQ(recording, "complete");
+    ASSERT_EQ(total, 1);
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_rust_health_sequential_persists_exact_rows_and_cargo_health) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_health_seq_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"health\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "good.rs", "fn good() {}\n");
+    write_temp_file(tmp, "bad.rs", "fn bad() { let = ; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/health.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_EQ(rust_analysis_row_count(store, project, "good.rs", NULL, NULL), 0);
+    ASSERT_EQ(rust_analysis_row_count(store, project, "bad.rs", "analysis_partial:rust",
+                                      "parser_parse_failed"),
+              1);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_EQ(meta.coverage_version, 4);
+    ASSERT_STR_EQ(meta.rust_analysis_recording_status, "complete");
+    ASSERT_EQ(meta.rust_files_total, 2);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_health_parallel_is_exact_and_manifest_health_merges_once) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_health_par_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"unterminated\n");
+    for (int i = 0; i < 51; i++) {
+        char name[32];
+        char source[96];
+        snprintf(name, sizeof(name), "file_%02d.rs", i);
+        snprintf(source, sizeof(source), "fn rust_health_%02d() {}\n", i);
+        write_temp_file(tmp, name, source);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/health.db", tmp);
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_WORKERS", "4", 1), 0);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved_workers);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, project, &rows, &count), CBM_STORE_OK);
+    int analysis = 0;
+    for (int i = 0; i < count; i++) {
+        if (rows[i].kind && strcmp(rows[i].kind, "analysis_partial:rust") == 0) {
+            analysis++;
+            ASSERT_NOT_NULL(strstr(rows[i].detail, "manifest_parse_partial"));
+            ASSERT_NOT_NULL(strstr(rows[i].detail, "\"count\":1"));
+        }
+    }
+    ASSERT_EQ(analysis, 51);
+    cbm_store_free_coverage(rows, count);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.rust_analysis_recording_status, "complete");
+    ASSERT_EQ(meta.rust_files_total, 51);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_health_empty_standalone_and_optional_manifest_are_exact) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_health_empty_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "empty.rs", "");
+    write_temp_file(tmp, "standalone.rs", "fn standalone() {}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/health.db", tmp);
+
+    cbm_pipeline_t *without_cargo = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(without_cargo);
+    ASSERT_EQ(cbm_pipeline_run(without_cargo), 0);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(without_cargo));
+    ASSERT_EQ(rust_analysis_row_count(store, project, "empty.rs", NULL, NULL), 0);
+    ASSERT_EQ(rust_analysis_row_count(store, project, "standalone.rs", NULL, NULL), 0);
+    cbm_store_close(store);
+    cbm_pipeline_free(without_cargo);
+
+    /* An unreadable semantic input is applied even to the benign empty-file
+     * cache slot, without fabricating a source failure. */
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"unterminated\n");
+    cbm_pipeline_t *with_bad_cargo = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(with_bad_cargo);
+    ASSERT_EQ(cbm_pipeline_run(with_bad_cargo), 0);
+    store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(store, project, "empty.rs", &rows, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].kind, "analysis_partial:rust");
+    ASSERT_NOT_NULL(strstr(rows[0].detail, "manifest_parse_partial"));
+    ASSERT_NULL(strstr(rows[0].detail, "source_unavailable"));
+    cbm_store_free_coverage(rows, count);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.rust_analysis_recording_status, "complete");
+    ASSERT_EQ(meta.rust_files_total, 2);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    cbm_pipeline_free(with_bad_cargo);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_health_parallel_zero_definition_route_is_complete) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_health_zero_defs_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    for (int i = 0; i < 51; i++) {
+        char name[32];
+        char source[64];
+        snprintf(name, sizeof(name), "comment_%02d.rs", i);
+        snprintf(source, sizeof(source), "// no definitions %02d\n", i);
+        write_temp_file(tmp, name, source);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/health.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, cbm_pipeline_project_name(p), &rows, &count),
+              CBM_STORE_OK);
+    for (int i = 0; i < count; i++) {
+        ASSERT_TRUE(!rows[i].kind || strncmp(rows[i].kind, "analysis_", 9) != 0);
+    }
+    cbm_store_free_coverage(rows, count);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, cbm_pipeline_project_name(p), &meta),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.rust_analysis_recording_status, "complete");
+    ASSERT_EQ(meta.rust_files_total, 51);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_health_coverage_allocation_failure_stays_unknown) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_health_alloc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "bad.rs", "fn bad() { let = ; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/health.db", tmp);
+    cbm_pipeline_t *failed_recording = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(failed_recording);
+    cbm_pipeline_test_fail_coverage_alloc(failed_recording, true);
+    ASSERT_EQ(cbm_pipeline_run(failed_recording), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(failed_recording));
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.recording_status, "unavailable");
+    ASSERT_STR_EQ(meta.rust_analysis_recording_status, "unknown");
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    cbm_pipeline_free(failed_recording);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(retry);
+    ASSERT_EQ(cbm_pipeline_run(retry), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(rust_analysis_row_count(store, project, "bad.rs", "analysis_partial:rust",
+                                      "parser_parse_failed"),
+              1);
+    cbm_store_close(store);
+    cbm_pipeline_free(retry);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_health_incremental_replaces_carries_and_prunes_rows) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_health_incr_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"health\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "repair.rs", "fn repair() { let = ; }\n");
+    write_temp_file(tmp, "carry.rs", "fn carry() { let = ; }\n");
+    write_temp_file(tmp, "delete.rs", "fn gone() { let = ; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/health.db", tmp);
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    cbm_pipeline_free(first);
+
+    write_temp_file(tmp, "repair.rs", "fn repair() { let _value = 1; }\n");
+    char deleted[512];
+    snprintf(deleted, sizeof(deleted), "%s/delete.rs", tmp);
+    ASSERT_EQ(cbm_unlink(deleted), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *second = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    ASSERT_EQ(cbm_pipeline_run(second), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(second);
+    ASSERT_EQ(rust_analysis_row_count(store, project, "repair.rs", NULL, NULL), 0);
+    ASSERT_EQ(rust_analysis_row_count(store, project, "carry.rs", "analysis_partial:rust",
+                                      "parser_parse_failed"),
+              1);
+    ASSERT_EQ(rust_analysis_row_count(store, project, "delete.rs", NULL, NULL), 0);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.rust_analysis_recording_status, "complete");
+    ASSERT_EQ(meta.rust_files_total, 2);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    cbm_pipeline_free(second);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Metadata participates in exact-input compatibility. Old coverage schema or
  * an upgrade to a more comprehensive discovery/index mode must force a
  * complete replacement even when every semantic-input byte is unchanged; the
@@ -12170,6 +12466,13 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
+    RUN_TEST(pipeline_rust_health_incomplete_cross_route_is_failed_and_bounded);
+    RUN_TEST(pipeline_rust_health_sequential_persists_exact_rows_and_cargo_health);
+    RUN_TEST(pipeline_rust_health_parallel_is_exact_and_manifest_health_merges_once);
+    RUN_TEST(pipeline_rust_health_empty_standalone_and_optional_manifest_are_exact);
+    RUN_TEST(pipeline_rust_health_parallel_zero_definition_route_is_complete);
+    RUN_TEST(pipeline_rust_health_coverage_allocation_failure_stays_unknown);
+    RUN_TEST(pipeline_rust_health_incremental_replaces_carries_and_prunes_rows);
     RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
     RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);

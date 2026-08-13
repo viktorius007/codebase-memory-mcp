@@ -548,6 +548,11 @@ typedef struct {
     int ignored_files_total;
     int coverage_version;
     bool hash_records_complete;
+    /* "complete" only when every discovered Rust file in this generation
+     * was captured after all required analysis routes. "unknown" is the
+     * conservative value for old/missing metadata. */
+    const char *rust_analysis_recording_status;
+    int rust_files_total;
 } cbm_coverage_meta_t;
 
 /* Replace the project's coverage rows in one transaction, then prune rows for

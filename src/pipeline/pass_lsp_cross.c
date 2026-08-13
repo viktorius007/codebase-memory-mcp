@@ -1133,21 +1133,38 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     free(filtered);
 }
 
-bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
+bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena,
                                  CBMCargoManifest *out_m) {
-    if (!ctx || !ctx->repo_path || !marena || !out_m)
+    if (!out_m) {
         return false;
+    }
+    memset(out_m, 0, sizeof(*out_m));
+    if (!repo_path || !marena) {
+        cbm_rust_health_record(&out_m->health, CBM_RUST_HEALTH_MANIFEST_READ_FAILED, 0, 0);
+        return false;
+    }
     char path[1024];
-    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->repo_path);
-    if (n <= 0 || (size_t)n >= sizeof(path))
+    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", repo_path);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        cbm_rust_health_record(&out_m->health, CBM_RUST_HEALTH_MANIFEST_READ_FAILED, 0, 0);
         return false;
+    }
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(path, &info) != 0) {
+        /* Cargo context is optional for standalone Rust sources. */
+        return false;
+    }
+    if (!info.is_regular || info.size <= 0) {
+        cbm_rust_health_record(&out_m->health, CBM_RUST_HEALTH_MANIFEST_READ_FAILED, 0, 0);
+        return false;
+    }
     int toml_len = 0;
     char *toml = pxc_read_file(path, &toml_len);
     if (!toml || toml_len <= 0) {
         free(toml);
+        cbm_rust_health_record(&out_m->health, CBM_RUST_HEALTH_MANIFEST_READ_FAILED, 0, 0);
         return false;
     }
-    memset(out_m, 0, sizeof(*out_m));
     cbm_cargo_parse(marena, toml, toml_len, out_m);
     free(toml); /* cargo parser copies into marena */
     return true;
@@ -1185,7 +1202,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     const CBMCargoManifest *rust_manifest = NULL;
     if (have_rust) {
         cbm_arena_init(&cargo_arena);
-        have_manifest = cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
+        have_manifest =
+            cbm_pxc_build_rust_manifest(ctx->repo_path, &cargo_arena, &cargo_manifest);
         rust_manifest = have_manifest ? &cargo_manifest : NULL;
     }
 
@@ -1252,6 +1270,11 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         char *source = pxc_read_file(files[i].path, &source_len);
         if (!source || source_len <= 0) {
             free(source);
+            if (lang == CBM_LANG_RUST) {
+                cache[i]->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+                cbm_rust_health_record(&cache[i]->rust_health,
+                                       CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
+            }
             skipped_no_source++;
             continue;
         }

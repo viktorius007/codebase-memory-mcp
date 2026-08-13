@@ -1851,6 +1851,9 @@ TEST(store_coverage_roundtrip_prune_shadow) {
 
     cbm_coverage_row_t rows[] = {
         {.rel_path = "src/a.py", .kind = "parse_partial", .detail = "4-7"},
+        {.rel_path = "src/a.py",
+         .kind = "analysis_partial:rust",
+         .detail = "{\"version\":1,\"status\":\"partial\"}"},
         {.rel_path = "gone.py", .kind = "oversized", .detail = "too big"},
         /* By-design rows (#963): neither has a file_hashes row, yet both must
          * SURVIVE the deleted-file prune (deliberately-unindexed paths never
@@ -1858,13 +1861,14 @@ TEST(store_coverage_roundtrip_prune_shadow) {
         {.rel_path = "secret.py", .kind = "not_indexed_file", .detail = "gitignore"},
         {.rel_path = "generated", .kind = "not_indexed_dir", .detail = "excluded subtree"},
     };
-    ASSERT_EQ(cbm_store_coverage_replace(s, "test", rows, 4), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_replace(s, "test", rows, 5), CBM_STORE_OK);
 
     cbm_coverage_row_t *got = NULL;
     int n = 0;
     ASSERT_EQ(cbm_store_coverage_get(s, "test", &got, &n), CBM_STORE_OK);
-    ASSERT_EQ(n, 3); /* gone.py pruned — no file_hashes row; by-design rows kept */
+    ASSERT_EQ(n, 4); /* gone.py pruned; syntactic + semantic rows coexist */
     int saw_partial = 0;
+    int saw_analysis = 0;
     int saw_by_design = 0;
     for (int i = 0; i < n; i++) {
         if (strcmp(got[i].kind, "parse_partial") == 0) {
@@ -1873,8 +1877,12 @@ TEST(store_coverage_roundtrip_prune_shadow) {
         if (strncmp(got[i].kind, "not_indexed", 11) == 0) {
             saw_by_design++;
         }
+        if (strcmp(got[i].kind, "analysis_partial:rust") == 0) {
+            saw_analysis++;
+        }
     }
     ASSERT_EQ(saw_partial, 1);
+    ASSERT_EQ(saw_analysis, 1);
     ASSERT_EQ(saw_by_design, 2);
     cbm_store_free_coverage(got, n);
 
@@ -2020,6 +2028,8 @@ TEST(store_coverage_meta_zero_row_truncation_and_delete) {
         .ignored_files_total = 2501,
         .coverage_version = 1,
         .hash_records_complete = false,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 37,
     };
     /* Metadata is meaningful even when the authoritative miss set is empty. */
     ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-meta", NULL, 0, &write_meta),
@@ -2042,12 +2052,15 @@ TEST(store_coverage_meta_zero_row_truncation_and_delete) {
     ASSERT_EQ(got.ignored_files_total, 2501);
     ASSERT_EQ(got.coverage_version, 1);
     ASSERT_FALSE(got.hash_records_complete);
+    ASSERT_STR_EQ(got.rust_analysis_recording_status, "complete");
+    ASSERT_EQ(got.rust_files_total, 37);
     cbm_store_coverage_meta_clear(&got);
     ASSERT_NULL(got.project);
     ASSERT_NULL(got.generation);
     ASSERT_NULL(got.recorded_at);
     ASSERT_NULL(got.index_mode);
     ASSERT_NULL(got.recording_status);
+    ASSERT_NULL(got.rust_analysis_recording_status);
 
     /* Replacing through the compatibility wrapper clears possibly-stale meta. */
     ASSERT_EQ(cbm_store_coverage_replace(s, "coverage-meta", NULL, 0), CBM_STORE_OK);
@@ -2170,12 +2183,59 @@ TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails) {
     PASS();
 }
 
+TEST(store_analysis_rows_do_not_rebuild_or_materialize_missed_graph) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-analysis", "/tmp/coverage-analysis"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-analysis", "same.rs", "", 1, 1),
+              CBM_STORE_OK);
+    cbm_coverage_row_t initial[] = {
+        {.rel_path = "same.rs", .kind = "parse_partial", .detail = "2-3"},
+        {.rel_path = "same.rs", .kind = "analysis_partial:rust", .detail = "health-a"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, "coverage-analysis", initial, 2), CBM_STORE_OK);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "coverage-analysis::missed", "File", &nodes,
+                                            &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"kind\":\"parse_partial\""));
+    ASSERT_NULL(strstr(nodes[0].properties_json, "analysis_partial"));
+    cbm_store_free_nodes(nodes, count);
+
+    /* If the semantic row contaminated the missed fingerprint this changed
+     * detail would attempt a rebuild and the trigger would abort it. */
+    ASSERT_EQ(cbm_store_exec(s, "CREATE TRIGGER reject_analysis_shadow BEFORE INSERT ON nodes "
+                                "WHEN NEW.project = 'coverage-analysis::missed' "
+                                "BEGIN SELECT RAISE(ABORT, 'unexpected rebuild'); END;"),
+              CBM_STORE_OK);
+    cbm_coverage_row_t changed[] = {
+        {.rel_path = "same.rs", .kind = "parse_partial", .detail = "2-3"},
+        {.rel_path = "same.rs", .kind = "analysis_failed:rust", .detail = "health-b"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, "coverage-analysis", changed, 2), CBM_STORE_OK);
+    nodes = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "coverage-analysis::missed", "File", &nodes,
+                                            &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"detail\":\"2-3\""));
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_nodes) {
     RUN_TEST(store_coverage_roundtrip_prune_shadow);
     RUN_TEST(store_coverage_targeted_path_and_scope_lookup);
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
+    RUN_TEST(store_analysis_rows_do_not_rebuild_or_materialize_missed_graph);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);

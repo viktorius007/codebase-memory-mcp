@@ -321,7 +321,9 @@ static int init_schema(cbm_store_t *s) {
         "  ignored_files_stored INTEGER NOT NULL DEFAULT 0,"
         "  ignored_files_total INTEGER NOT NULL DEFAULT 0,"
         "  coverage_version INTEGER NOT NULL DEFAULT 1,"
-        "  hash_records_complete INTEGER NOT NULL DEFAULT 0"
+        "  hash_records_complete INTEGER NOT NULL DEFAULT 0,"
+        "  rust_analysis_recording_status TEXT NOT NULL DEFAULT 'unknown',"
+        "  rust_files_total INTEGER NOT NULL DEFAULT -1"
         ");";
 
     int rc = exec_sql(s, ddl);
@@ -2649,7 +2651,8 @@ static void cov_failure_fingerprint(const cbm_coverage_row_t *rows, int count,
     cbm_sha256_ctx sha;
     cbm_sha256_init(&sha);
     for (int i = 0; i < count; i++) {
-        if (!rows[i].kind || strncmp(rows[i].kind, "not_indexed", 11) == 0) {
+        if (!rows[i].kind || strncmp(rows[i].kind, "not_indexed", 11) == 0 ||
+            strncmp(rows[i].kind, "analysis_", 9) == 0) {
             continue;
         }
         const char *rel = rows[i].rel_path ? rows[i].rel_path : "";
@@ -2738,7 +2741,8 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
      * even a bare root node). */
     int failure_count = 0;
     for (int i = 0; i < count; i++) {
-        if (!rows[i].kind || strncmp(rows[i].kind, "not_indexed", 11) != 0) {
+        if (rows[i].kind && strncmp(rows[i].kind, "not_indexed", 11) != 0 &&
+            strncmp(rows[i].kind, "analysis_", 9) != 0) {
             failure_count++;
         }
     }
@@ -2774,7 +2778,8 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
         /* The missed graph shows FAILURES ("we did not manage") only —
          * by-design not_indexed_* rows stay out of it, so the UI's
          * report-an-edge-case callout never fires for gitignored paths. */
-        if (rows[i].kind && strncmp(rows[i].kind, "not_indexed", 11) == 0) {
+        if (rows[i].kind && (strncmp(rows[i].kind, "not_indexed", 11) == 0 ||
+                             strncmp(rows[i].kind, "analysis_", 9) == 0)) {
             continue;
         }
         char pathbuf[CBM_SZ_1K];
@@ -2946,6 +2951,11 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         int ignored_stored = meta->ignored_files_stored > 0 ? meta->ignored_files_stored : 0;
         int ignored_total = meta->ignored_files_total > 0 ? meta->ignored_files_total : 0;
         int coverage_version = meta->coverage_version > 0 ? meta->coverage_version : 1;
+        const char *rust_recording =
+            meta->rust_analysis_recording_status && meta->rust_analysis_recording_status[0]
+                ? meta->rust_analysis_recording_status
+                : "unknown";
+        int rust_files_total = meta->rust_files_total >= 0 ? meta->rust_files_total : -1;
 
         sqlite3_stmt *up_meta = NULL;
         if (sqlite3_prepare_v2(
@@ -2953,11 +2963,12 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                 "INSERT INTO index_coverage_meta "
                 "(project, generation, index_mode, recorded_at, recording_status, "
                 " ignored_files_stored, ignored_files_total, coverage_version, "
-                " hash_records_complete) "
-                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
+                " hash_records_complete, rust_analysis_recording_status, rust_files_total) "
+                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) "
                 "ON CONFLICT(project) DO UPDATE SET generation=?2, index_mode=?3, "
                 "recorded_at=?4, recording_status=?5, ignored_files_stored=?6, "
-                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9;",
+                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9, "
+                "rust_analysis_recording_status=?10, rust_files_total=?11;",
                 CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
             store_set_error_sqlite(s, "coverage meta upsert prepare");
             (void)exec_sql(s, "ROLLBACK;");
@@ -2972,6 +2983,8 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         sqlite3_bind_int(up_meta, 7, ignored_total);
         sqlite3_bind_int(up_meta, 8, coverage_version);
         sqlite3_bind_int(up_meta, 9, meta->hash_records_complete ? 1 : 0);
+        bind_text(up_meta, 10, rust_recording);
+        sqlite3_bind_int(up_meta, 11, rust_files_total);
         int meta_rc = sqlite3_step(up_meta);
         sqlite3_finalize(up_meta);
         if (meta_rc != SQLITE_DONE) {
@@ -3099,6 +3112,7 @@ void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
     free((char *)meta->index_mode);
     free((char *)meta->recorded_at);
     free((char *)meta->recording_status);
+    free((char *)meta->rust_analysis_recording_status);
     memset(meta, 0, sizeof(*meta));
 }
 
@@ -3114,7 +3128,8 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
     if (sqlite3_prepare_v2(s->db,
                            "SELECT project, generation, index_mode, recorded_at, recording_status, "
                            "ignored_files_stored, ignored_files_total, coverage_version, "
-                           "hash_records_complete FROM index_coverage_meta WHERE project = ?1;",
+                           "hash_records_complete, rust_analysis_recording_status, "
+                           "rust_files_total FROM index_coverage_meta WHERE project = ?1;",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage meta get prepare");
         return CBM_STORE_ERR;
@@ -3131,9 +3146,12 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
+        out->rust_analysis_recording_status =
+            heap_strdup((const char *)sqlite3_column_text(stmt, 9));
+        out->rust_files_total = sqlite3_column_int(stmt, 10);
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
-            !out->recording_status) {
+            !out->recording_status || !out->rust_analysis_recording_status) {
             cbm_store_coverage_meta_clear(out);
             return CBM_STORE_ERR;
         }
