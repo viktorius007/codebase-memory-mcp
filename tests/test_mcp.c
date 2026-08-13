@@ -35,6 +35,7 @@
 #ifdef __APPLE__
 #include <libproc.h>
 #endif
+
 #include <spawn.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -43,6 +44,9 @@
 #define cbm_getcwd getcwd
 extern char **environ;
 #endif
+
+extern void cbm_mcp_server_test_use_borrowed_store(cbm_mcp_server_t *srv, cbm_store_t *store,
+                                                    const char *project);
 
 static bool mcp_response_has_exact_tool(const char *response, const char *expected_name) {
     yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
@@ -2781,6 +2785,7 @@ TEST(tool_index_status_coverage_pagination_is_exact_bounded_and_generation_bound
         ASSERT_EQ(yyjson_get_int(yyjson_obj_get(not_indexed, "dirs_count")), 132);
         ASSERT_EQ(yyjson_get_int(yyjson_obj_get(not_indexed, "files_count")), 132);
         int emitted = 0;
+        bool page_seen[UNIQUE_PATH_COUNT][4] = {{false}};
         yyjson_val *parse_files = index_status_page_files(root, "parse_partial");
         int parse_returned = (int)yyjson_arr_size(parse_files);
         int skipped_returned = (int)yyjson_arr_size(index_status_page_files(root, "skipped"));
@@ -2796,14 +2801,39 @@ TEST(tool_index_status_coverage_pagination_is_exact_bounded_and_generation_bound
         ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(not_indexed, "truncated")),
                   dirs_returned < 132 || files_returned < 132);
         emitted +=
-            index_status_mark_object_paths(parse_files, seen, UNIQUE_PATH_COUNT, "parse_partial");
-        emitted += index_status_mark_object_paths(index_status_page_files(root, "skipped"), seen,
-                                                  UNIQUE_PATH_COUNT, "read");
-        emitted += index_status_mark_dir_paths(yyjson_obj_get(not_indexed, "dirs"), seen,
+            index_status_mark_object_paths(parse_files, page_seen, UNIQUE_PATH_COUNT,
+                                           "parse_partial");
+        emitted += index_status_mark_object_paths(index_status_page_files(root, "skipped"),
+                                                  page_seen, UNIQUE_PATH_COUNT, "read");
+        emitted += index_status_mark_dir_paths(yyjson_obj_get(not_indexed, "dirs"), page_seen,
                                                UNIQUE_PATH_COUNT);
-        emitted += index_status_mark_object_paths(yyjson_obj_get(not_indexed, "files"), seen,
+        emitted += index_status_mark_object_paths(yyjson_obj_get(not_indexed, "files"), page_seen,
                                                   UNIQUE_PATH_COUNT, "not_indexed_file");
         ASSERT_EQ(emitted, represented);
+        bool expected_page[UNIQUE_PATH_COUNT][4] = {{false}};
+        for (int stream_ordinal = expected_start;
+             stream_ordinal < expected_start + represented; stream_ordinal++) {
+            int path_ordinal;
+            int kind_slot;
+            if (stream_ordinal < UNIQUE_PATH_COUNT - 1) {
+                path_ordinal = stream_ordinal;
+                kind_slot = stream_ordinal % 4;
+            } else {
+                path_ordinal = UNIQUE_PATH_COUNT - 1;
+                kind_slot = stream_ordinal == UNIQUE_PATH_COUNT - 1 ? 0 : 1;
+            }
+            expected_page[path_ordinal][kind_slot] = true;
+        }
+        for (int path_ordinal = 0; path_ordinal < UNIQUE_PATH_COUNT; path_ordinal++) {
+            for (int kind_slot = 0; kind_slot < 4; kind_slot++) {
+                ASSERT_EQ(page_seen[path_ordinal][kind_slot],
+                          expected_page[path_ordinal][kind_slot]);
+                if (page_seen[path_ordinal][kind_slot]) {
+                    ASSERT_FALSE(seen[path_ordinal][kind_slot]);
+                    seen[path_ordinal][kind_slot] = true;
+                }
+            }
+        }
         expected_start += represented;
 
         if (page_count == 0) {
@@ -2812,7 +2842,7 @@ TEST(tool_index_status_coverage_pagination_is_exact_bounded_and_generation_bound
             ASSERT_EQ(yyjson_get_uint(yyjson_obj_get(first, "detail_complete_bytes")), 20000);
             yyjson_val *hash = yyjson_obj_get(first, "detail_hash");
             ASSERT_TRUE(hash && yyjson_is_str(hash) &&
-                        strncmp(yyjson_get_str(hash), "fnv1a64:", 8) == 0);
+                        strncmp(yyjson_get_str(hash), "sha256:", 7) == 0);
             saw_oversized_preview = true;
         }
 
@@ -2975,7 +3005,11 @@ TEST(tool_index_status_oversized_identity_marker_advances) {
     memcpy(path, "src/", 4);
     memset(path + 4, 'p', 5994);
     memcpy(path + 5998, ".c", 3);
-    cbm_coverage_row_t row = {.rel_path = path, .kind = "parse_partial", .detail = "1-2"};
+    char *kind = malloc(6001);
+    ASSERT_NOT_NULL(kind);
+    memset(kind, 'k', 6000);
+    kind[6000] = '\0';
+    cbm_coverage_row_t row = {.rel_path = path, .kind = kind, .detail = "1-2"};
     ASSERT_EQ(cbm_store_upsert_file_hash(store, project, path, "fixture", 1, 1), CBM_STORE_OK);
     ASSERT_EQ(cbm_store_coverage_replace(store, project, &row, 1), CBM_STORE_OK);
 
@@ -2991,8 +3025,11 @@ TEST(tool_index_status_oversized_identity_marker_advances) {
     ASSERT_NOT_NULL(marker);
     ASSERT_EQ(yyjson_get_uint(yyjson_obj_get(marker, "ordinal")), 0);
     ASSERT_EQ(yyjson_get_uint(yyjson_obj_get(marker, "identity_complete_bytes")),
-              strlen(path) + strlen("parse_partial"));
+              strlen(path) + strlen(kind));
     ASSERT_NOT_NULL(yyjson_obj_get(marker, "identity_hash"));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(marker, "kind_truncated")));
+    ASSERT_EQ(yyjson_get_uint(yyjson_obj_get(marker, "kind_complete_bytes")), strlen(kind));
+    ASSERT_EQ(strlen(yyjson_get_str(yyjson_obj_get(marker, "kind"))), 128);
     yyjson_val *page = yyjson_obj_get(root, "coverage_page");
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(page, "returned")), 1);
     ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(page, "truncated")));
@@ -3002,6 +3039,7 @@ TEST(tool_index_status_oversized_identity_marker_advances) {
     free(inner);
     free(result);
     free(path);
+    free(kind);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -3137,6 +3175,563 @@ TEST(tool_check_index_coverage_preserves_multiple_scope_labels) {
     free(coverage);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+typedef struct {
+    cbm_store_t *store;
+    int calls;
+    int fail_on_call;
+} syntactic_page_failure_hook_t;
+
+static void syntactic_page_fail_allocation_on_call(void *userdata) {
+    syntactic_page_failure_hook_t *hook = userdata;
+    hook->calls++;
+    if (hook->calls == hook->fail_on_call) {
+        cbm_store_syntactic_coverage_test_fail_alloc_after(hook->store, 0);
+    }
+}
+
+typedef struct {
+    cbm_store_t *writer;
+    const char *project;
+    int calls;
+    int replace_on_call;
+    int rc;
+    cbm_coverage_row_t *replacement;
+    int replacement_count;
+    cbm_coverage_meta_t replacement_meta;
+} mcp_syntactic_replacement_hook_t;
+
+static void mcp_syntactic_replace_on_page(void *userdata) {
+    mcp_syntactic_replacement_hook_t *hook = userdata;
+    hook->calls++;
+    if (hook->calls == hook->replace_on_call) {
+        hook->rc = cbm_store_coverage_replace_ex(hook->writer, hook->project, hook->replacement,
+                                                 hook->replacement_count,
+                                                 &hook->replacement_meta);
+    }
+}
+
+TEST(tool_index_status_syntactic_pages_hold_one_readonly_snapshot) {
+    enum { ROW_COUNT = 1100 };
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-syntactic-snapshot-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "mcp-syntactic-snapshot";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *writer = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_upsert_project(writer, project, "/tmp/mcp-syntactic-snapshot"),
+              CBM_STORE_OK);
+    cbm_project_t info = {0};
+    ASSERT_EQ(cbm_store_get_project(writer, project, &info), CBM_STORE_OK);
+
+    cbm_coverage_row_t *initial = calloc(ROW_COUNT, sizeof(*initial));
+    cbm_coverage_row_t *replacement = calloc(ROW_COUNT, sizeof(*replacement));
+    char(*initial_paths)[32] = calloc(ROW_COUNT, sizeof(*initial_paths));
+    char(*replacement_paths)[32] = calloc(ROW_COUNT, sizeof(*replacement_paths));
+    ASSERT_NOT_NULL(initial);
+    ASSERT_NOT_NULL(replacement);
+    ASSERT_NOT_NULL(initial_paths);
+    ASSERT_NOT_NULL(replacement_paths);
+    for (int i = 0; i < ROW_COUNT; i++) {
+        snprintf(initial_paths[i], sizeof(initial_paths[i]), "old/%04d.c", i);
+        snprintf(replacement_paths[i], sizeof(replacement_paths[i]), "new/%04d.c", i);
+        ASSERT_EQ(cbm_store_upsert_file_hash(writer, project, initial_paths[i], "fixture", i + 1,
+                                             1),
+                  CBM_STORE_OK);
+        ASSERT_EQ(cbm_store_upsert_file_hash(writer, project, replacement_paths[i], "fixture",
+                                             ROW_COUNT + i + 1, 1),
+                  CBM_STORE_OK);
+        initial[i] = (cbm_coverage_row_t){.rel_path = initial_paths[i],
+                                          .kind = "not_indexed_file",
+                                          .detail = "old"};
+        replacement[i] = (cbm_coverage_row_t){.rel_path = replacement_paths[i],
+                                              .kind = "not_indexed_file",
+                                              .detail = "new"};
+    }
+    cbm_coverage_meta_t initial_meta = {.generation = info.indexed_at,
+                                        .index_mode = "fast",
+                                        .recording_status = "complete",
+                                        .coverage_version = 1,
+                                        .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(writer, project, initial, ROW_COUNT, &initial_meta),
+              CBM_STORE_OK);
+    cbm_project_free_fields(&info);
+
+    cbm_store_t *reader = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(reader);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_test_use_borrowed_store(srv, reader, project);
+    char *warm = cbm_mcp_handle_tool(srv, "index_status",
+                                     "{\"project\":\"mcp-syntactic-snapshot\",\"limit\":500}");
+    ASSERT_NOT_NULL(warm);
+    char *warm_inner = extract_text_content(warm);
+    yyjson_doc *warm_doc = yyjson_read(warm_inner, strlen(warm_inner), 0);
+    yyjson_val *warm_root = yyjson_doc_get_root(warm_doc);
+    yyjson_val *warm_page = yyjson_obj_get(warm_root, "coverage_page");
+    int64_t warm_end = yyjson_get_int(yyjson_obj_get(warm_page, "start_ordinal")) +
+                       yyjson_get_int(yyjson_obj_get(warm_page, "returned"));
+    yyjson_val *warm_cursor = yyjson_obj_get(warm_root, "next_cursor");
+    ASSERT_TRUE(warm_cursor && yyjson_is_str(warm_cursor));
+    char *cursor = strdup(yyjson_get_str(warm_cursor));
+    yyjson_doc_free(warm_doc);
+    free(warm_inner);
+    free(warm);
+    mcp_syntactic_replacement_hook_t hook = {
+        .writer = writer,
+        .project = project,
+        .replace_on_call = 2,
+        .rc = CBM_STORE_ERR,
+        .replacement = replacement,
+        .replacement_count = ROW_COUNT,
+        .replacement_meta = {.generation = "replacement-generation",
+                             .index_mode = "full",
+                             .recording_status = "complete",
+                             .coverage_version = 1,
+                             .hash_records_complete = true},
+    };
+    cbm_store_syntactic_coverage_test_set_after_totals_hook(
+        reader, mcp_syntactic_replace_on_page, &hook);
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"mcp-syntactic-snapshot\",\"limit\":500,"
+             "\"max_response_bytes\":65536,\"cursor\":\"%s\"}",
+             cursor);
+    char *response = cbm_mcp_handle_tool(srv, "index_status", args);
+    ASSERT_EQ(hook.rc, CBM_STORE_OK);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "failed to read a complete coverage snapshot"));
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "coverage_page"), "total")),
+              ROW_COUNT);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "coverage_page"),
+                                           "start_ordinal")),
+              warm_end);
+    ASSERT_NOT_NULL(strstr(inner, "old/"));
+    ASSERT_NULL(strstr(inner, "new/"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    free(cursor);
+
+    cbm_store_syntactic_coverage_test_set_after_totals_hook(reader, NULL, NULL);
+    cbm_mcp_server_free(srv);
+    cbm_store_close(reader);
+    cbm_store_close(writer);
+    free(replacement_paths);
+    free(initial_paths);
+    free(replacement);
+    free(initial);
+    cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    PASS();
+}
+
+TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed) {
+    enum {
+        SCOPE_ROWS = 600,
+        SEMANTIC_ROWS = 600,
+        EXACT_PHASE_ROWS = 300,
+        SYNTACTIC_ROWS = SCOPE_ROWS + EXACT_PHASE_ROWS + 5,
+        ROW_COUNT = SCOPE_ROWS + SEMANTIC_ROWS + EXACT_PHASE_ROWS + 5,
+    };
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-mcp-syntactic-pages-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char target_path[512];
+    snprintf(target_path, sizeof(target_path), "%s/target.c", repo);
+    ASSERT_EQ(th_write_file(target_path, "int target(void) { return 1; }\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "syntactic-page-routes";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "target.c", "fixture", 1, 31),
+              CBM_STORE_OK);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "target",
+                       .qualified_name = "syntactic-page-routes.target",
+                       .file_path = "target.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+
+    cbm_coverage_row_t *rows = calloc(ROW_COUNT, sizeof(*rows));
+    char(*paths)[32] = calloc(ROW_COUNT, sizeof(*paths));
+    char(*kinds)[32] = calloc(ROW_COUNT, sizeof(*kinds));
+    char *oversized_kind = malloc(18001);
+    char *delimited_kind = malloc(18003);
+    char *budget_kind = malloc(701);
+    ASSERT_NOT_NULL(oversized_kind);
+    ASSERT_NOT_NULL(delimited_kind);
+    ASSERT_NOT_NULL(budget_kind);
+    memset(oversized_kind, 'q', 18000);
+    oversized_kind[18000] = '\0';
+    memcpy(delimited_kind, "b|", 2);
+    memcpy(delimited_kind + 2, oversized_kind, 18001);
+    memset(budget_kind, 'r', 700);
+    budget_kind[700] = '\0';
+    char target_detail[300];
+    memset(target_detail, ' ', sizeof(target_detail));
+    memcpy(target_detail + sizeof(target_detail) - 7, "123456", 7);
+    ASSERT_NOT_NULL(rows);
+    ASSERT_NOT_NULL(paths);
+    ASSERT_NOT_NULL(kinds);
+    int n = 0;
+    for (int i = 0; i < SCOPE_ROWS; i++, n++) {
+        snprintf(paths[n], sizeof(paths[n]), "s/%04d.c", i);
+        ASSERT_EQ(cbm_store_upsert_file_hash(store, project, paths[n], "fixture", i + 2, 1),
+                  CBM_STORE_OK);
+        rows[n] = (cbm_coverage_row_t){.rel_path = paths[n],
+                                       .kind = "parse_partial",
+                                       .detail = i == 0 ? "1-999999" : "1"};
+    }
+    for (int i = 0; i < SEMANTIC_ROWS; i++, n++) {
+        snprintf(paths[n], sizeof(paths[n]), "s/%04d.c", i);
+        rows[n] = (cbm_coverage_row_t){.rel_path = paths[n],
+                                       .kind = "analysis_partial:rust",
+                                       .detail = "semantic-must-not-leak"};
+    }
+    for (int i = 0; i < EXACT_PHASE_ROWS; i++, n++) {
+        snprintf(kinds[n], sizeof(kinds[n]), "phase_%04d", i);
+        rows[n] = (cbm_coverage_row_t){.rel_path = "target.c",
+                                       .kind = kinds[n],
+                                       .detail = "phase"};
+    }
+    rows[n++] = (cbm_coverage_row_t){.rel_path = "target.c",
+                                     .kind = "parse_partial",
+                                     .detail = target_detail};
+    rows[n++] = (cbm_coverage_row_t){.rel_path = "sx/a",
+                                     .kind = delimited_kind,
+                                     .detail = "prefix collision"};
+    rows[n++] = (cbm_coverage_row_t){.rel_path = "sx/a|b",
+                                     .kind = oversized_kind,
+                                     .detail = "prefix collision"};
+    rows[n++] = (cbm_coverage_row_t){.rel_path = "sy/a",
+                                     .kind = budget_kind,
+                                     .detail = "ordinary budget exhaustion"};
+    rows[n++] = (cbm_coverage_row_t){.rel_path = "sy/b",
+                                     .kind = budget_kind,
+                                     .detail = "ordinary budget exhaustion continuation"};
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sx/a", "fixture", 1, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sx/a|b", "fixture", 1, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sy/a", "fixture", 1, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "sy/b", "fixture", 1, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(n, ROW_COUNT);
+    cbm_project_t project_info = {0};
+    ASSERT_EQ(cbm_store_get_project(store, project, &project_info), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {.generation = project_info.indexed_at,
+                                .index_mode = "fast",
+                                .recorded_at = "2026-08-14T00:00:00Z",
+                                .recording_status = "complete",
+                                .coverage_version = 1,
+                                .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, rows, ROW_COUNT, &meta),
+              CBM_STORE_OK);
+    cbm_project_free_fields(&project_info);
+
+    int ordinal = 0;
+    char *cursor = NULL;
+    do {
+        char args[1024];
+        if (cursor) {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"%s\",\"limit\":500,\"cursor\":\"%s\"}", project,
+                     cursor);
+        } else {
+            snprintf(args, sizeof(args), "{\"project\":\"%s\",\"limit\":500}", project);
+        }
+        char *response = cbm_mcp_handle_tool(srv, "index_status", args);
+        ASSERT_NOT_NULL(response);
+        ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
+        char *inner = extract_text_content(response);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        yyjson_val *page = yyjson_obj_get(root, "coverage_page");
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(page, "total")), SYNTACTIC_ROWS);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(page, "start_ordinal")), ordinal);
+        ordinal += (int)yyjson_get_int(yyjson_obj_get(page, "returned"));
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "parse_partial"), "count")),
+                  SCOPE_ROWS + 1);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "skipped"), "count")),
+                  EXACT_PHASE_ROWS + 4);
+        yyjson_val *not_indexed = yyjson_obj_get(root, "not_indexed");
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(not_indexed, "files_count")), 0);
+        yyjson_val *next = yyjson_obj_get(root, "next_cursor");
+        char *next_cursor = next ? strdup(yyjson_get_str(next)) : NULL;
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+        free(cursor);
+        cursor = next_cursor;
+    } while (cursor);
+    ASSERT_EQ(ordinal, SYNTACTIC_ROWS);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"syntactic-page-routes\",\"paths\":[\"target.c\"]}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *path = yyjson_arr_get(yyjson_obj_get(root, "paths"), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "status")), "partial");
+    int path_returned = (int)yyjson_arr_size(yyjson_obj_get(path, "coverage"));
+    ASSERT_TRUE(path_returned > 0 && path_returned < EXACT_PHASE_ROWS + 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(path, "coverage_total")), EXACT_PHASE_ROWS + 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(path, "coverage_returned")), path_returned);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(path, "coverage_truncated")));
+    yyjson_val *coverage_items = yyjson_obj_get(path, "coverage");
+    yyjson_val *partial_item = yyjson_arr_get(coverage_items, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(partial_item, "kind")), "parse_partial");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(partial_item, "detail_truncated")));
+    ASSERT_NULL(yyjson_obj_get(partial_item, "ranges"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"s\"],"
+        "\"scope_limit\":300}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
+    inner = extract_text_content(response);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    root = yyjson_doc_get_root(doc);
+    yyjson_val *scope = yyjson_arr_get(yyjson_obj_get(root, "scopes"), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(scope, "total")), SCOPE_ROWS);
+    int scope_returned = (int)yyjson_arr_size(yyjson_obj_get(scope, "entries"));
+    ASSERT_TRUE(scope_returned > 0 && scope_returned < 300);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(scope, "has_more")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(scope, "next_offset")), scope_returned);
+    ASSERT_NULL(strstr(inner, "sx/a"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"sx\"],"
+        "\"scope_limit\":1}");
+    inner = extract_text_content(response);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    scope = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "scopes"), 0);
+    yyjson_val *oversized_entries = yyjson_obj_get(scope, "entries");
+    ASSERT_EQ(yyjson_arr_size(oversized_entries), 1);
+    yyjson_val *first_marker = yyjson_arr_get(oversized_entries, 0);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(first_marker, "oversized_item")));
+    const char *first_hash = yyjson_get_str(yyjson_obj_get(first_marker, "identity_hash"));
+    ASSERT_NOT_NULL(first_hash);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(scope, "has_more")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(scope, "next_offset")), 1);
+    char *first_hash_copy = strdup(first_hash);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"sx\"],"
+        "\"scope_limit\":1,\"scope_offset\":1}");
+    inner = extract_text_content(response);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    scope = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "scopes"), 0);
+    yyjson_val *second_marker = yyjson_arr_get(yyjson_obj_get(scope, "entries"), 0);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(second_marker, "oversized_item")));
+    ASSERT_TRUE(strcmp(yyjson_get_str(yyjson_obj_get(second_marker, "identity_hash")),
+                       first_hash_copy) != 0);
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(scope, "has_more")));
+    free(first_hash_copy);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    yyjson_mut_doc *fanout_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *fanout_root = yyjson_mut_obj(fanout_doc);
+    yyjson_mut_doc_set_root(fanout_doc, fanout_root);
+    yyjson_mut_obj_add_str(fanout_doc, fanout_root, "project", project);
+    yyjson_mut_val *fanout_paths = yyjson_mut_arr(fanout_doc);
+    for (int i = 0; i < 128; i++) {
+        yyjson_mut_arr_add_str(fanout_doc, fanout_paths, "target.c");
+    }
+    yyjson_mut_obj_add_val(fanout_doc, fanout_root, "paths", fanout_paths);
+    yyjson_mut_val *fanout_scopes = yyjson_mut_arr(fanout_doc);
+    for (int i = 0; i < 32; i++) {
+        yyjson_mut_arr_add_str(fanout_doc, fanout_scopes, "sy");
+    }
+    yyjson_mut_obj_add_val(fanout_doc, fanout_root, "scopes", fanout_scopes);
+    yyjson_mut_obj_add_int(fanout_doc, fanout_root, "scope_limit", 1);
+    char *fanout_args = yyjson_mut_write(fanout_doc, 0, NULL);
+    yyjson_mut_doc_free(fanout_doc);
+    ASSERT_NOT_NULL(fanout_args);
+    response = cbm_mcp_handle_tool(srv, "check_index_coverage", fanout_args);
+    ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
+    inner = extract_text_content(response);
+    doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    yyjson_val *fanout_path_results = yyjson_obj_get(root, "paths");
+    yyjson_val *fanout_scope_results = yyjson_obj_get(root, "scopes");
+    ASSERT_EQ(yyjson_arr_size(fanout_path_results), 128);
+    ASSERT_EQ(yyjson_arr_size(fanout_scope_results), 32);
+    ASSERT_EQ(yyjson_get_uint(
+                  yyjson_obj_get(yyjson_arr_get(fanout_path_results, 127), "duplicate_of")),
+              0);
+    yyjson_val *fanout_first_scope = yyjson_arr_get(fanout_scope_results, 0);
+    yyjson_val *fanout_first_entry =
+        yyjson_arr_get(yyjson_obj_get(fanout_first_scope, "entries"), 0);
+    ASSERT_TRUE(
+        yyjson_get_bool(yyjson_obj_get(fanout_first_entry, "evidence_omitted_item")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(fanout_first_entry, "omission_reason")),
+                  "evidence_budget_exhausted");
+    ASSERT_NOT_NULL(yyjson_get_str(yyjson_obj_get(fanout_first_entry, "identity_hash")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(fanout_first_scope, "next_offset")), 1);
+    ASSERT_EQ(yyjson_get_uint(
+                  yyjson_obj_get(yyjson_arr_get(fanout_scope_results, 31), "duplicate_of")),
+              0);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    free(fanout_args);
+
+    yyjson_mut_doc *too_wide_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *too_wide_root = yyjson_mut_obj(too_wide_doc);
+    yyjson_mut_doc_set_root(too_wide_doc, too_wide_root);
+    yyjson_mut_obj_add_str(too_wide_doc, too_wide_root, "project", project);
+    yyjson_mut_val *too_wide_paths = yyjson_mut_arr(too_wide_doc);
+    for (int i = 0; i < 65; i++) {
+        char distinct_path[64];
+        snprintf(distinct_path, sizeof(distinct_path), "distinct/%02d.c", i);
+        yyjson_mut_arr_add_strcpy(too_wide_doc, too_wide_paths, distinct_path);
+    }
+    yyjson_mut_obj_add_val(too_wide_doc, too_wide_root, "paths", too_wide_paths);
+    char *too_wide_args = yyjson_mut_write(too_wide_doc, 0, NULL);
+    yyjson_mut_doc_free(too_wide_doc);
+    response = cbm_mcp_handle_tool(srv, "check_index_coverage", too_wide_args);
+    ASSERT_NOT_NULL(strstr(response, "cannot fit a truthful bounded response"));
+    ASSERT_NULL(strstr(response, "safe response envelope exceeded"));
+    free(response);
+    free(too_wide_args);
+
+    char *long_duplicate = malloc(4096);
+    ASSERT_NOT_NULL(long_duplicate);
+    memset(long_duplicate, 'd', 4095);
+    long_duplicate[4095] = '\0';
+    yyjson_mut_doc *duplicate_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *duplicate_root = yyjson_mut_obj(duplicate_doc);
+    yyjson_mut_doc_set_root(duplicate_doc, duplicate_root);
+    yyjson_mut_obj_add_str(duplicate_doc, duplicate_root, "project", project);
+    yyjson_mut_val *duplicate_paths = yyjson_mut_arr(duplicate_doc);
+    for (int i = 0; i < 3; i++) {
+        yyjson_mut_arr_add_strcpy(duplicate_doc, duplicate_paths, long_duplicate);
+    }
+    yyjson_mut_obj_add_val(duplicate_doc, duplicate_root, "paths", duplicate_paths);
+    char *duplicate_args = yyjson_mut_write(duplicate_doc, 0, NULL);
+    yyjson_mut_doc_free(duplicate_doc);
+    response = cbm_mcp_handle_tool(srv, "check_index_coverage", duplicate_args);
+    ASSERT_NOT_NULL(strstr(response, "cannot fit a truthful bounded response"));
+    ASSERT_NULL(strstr(response, "safe response envelope exceeded"));
+    free(response);
+    free(duplicate_args);
+    free(long_duplicate);
+
+    response = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"syntactic-page-routes\","
+        "\"qualified_name\":\"syntactic-page-routes.target\",\"max_response_bytes\":65536}");
+    ASSERT_NOT_NULL(strstr(response, "PARTIALLY indexed"));
+    ASSERT_NOT_NULL(strstr(response, "too large to include exactly"));
+    ASSERT_NULL(strstr(response, "line range(s)"));
+    free(response);
+
+    syntactic_page_failure_hook_t hook = {.store = store, .fail_on_call = 2};
+    cbm_store_syntactic_coverage_test_set_after_totals_hook(
+        store, syntactic_page_fail_allocation_on_call, &hook);
+    response = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"syntactic-page-routes\",\"limit\":500,"
+        "\"max_response_bytes\":65536}");
+    ASSERT_NOT_NULL(strstr(response, "index_status failed to read a complete coverage snapshot"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    free(response);
+
+    cbm_store_syntactic_coverage_test_fail_alloc_after(store, -1);
+    hook.calls = 0;
+    hook.fail_on_call = 2;
+    response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"syntactic-page-routes\",\"paths\":[\"target.c\"]}");
+    ASSERT_NOT_NULL(strstr(response, "\"coverage_lookup\":\"error\""));
+    ASSERT_NOT_NULL(strstr(response, "\"status\":\"coverage_unavailable\""));
+    ASSERT_NOT_NULL(strstr(response, "\"coverage\":[]"));
+    free(response);
+
+    cbm_store_syntactic_coverage_test_fail_alloc_after(store, -1);
+    hook.calls = 0;
+    hook.fail_on_call = 1;
+    response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"syntactic-page-routes\",\"scopes\":[\"s\"],"
+        "\"scope_limit\":300}");
+    ASSERT_NOT_NULL(strstr(response, "\"coverage_lookup\":\"error\""));
+    ASSERT_NOT_NULL(strstr(response, "\"status\":\"coverage_unavailable\""));
+    ASSERT_NOT_NULL(strstr(response, "\"total\":600"));
+    ASSERT_NOT_NULL(strstr(response, "\"entries\":[]"));
+    free(response);
+
+    cbm_store_syntactic_coverage_test_fail_alloc_after(store, -1);
+    hook.calls = 0;
+    hook.fail_on_call = 2;
+    response = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"syntactic-page-routes\","
+        "\"qualified_name\":\"syntactic-page-routes.target\",\"max_response_bytes\":65536}");
+    ASSERT_NOT_NULL(strstr(response, "Coverage lookup unavailable"));
+    free(response);
+    cbm_store_syntactic_coverage_test_set_after_totals_hook(store, NULL, NULL);
+    cbm_store_syntactic_coverage_test_fail_alloc_after(store, -1);
+
+    long source_len = 0;
+    unsigned char *source = mcp_read_file_bytes("src/mcp/mcp.c", &source_len);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NULL(strstr((const char *)source, "cbm_store_coverage_get(store"));
+    ASSERT_NULL(strstr((const char *)source, "cbm_store_coverage_get_path("));
+    ASSERT_NULL(strstr((const char *)source, "cbm_store_coverage_get_scope("));
+    ASSERT_NOT_NULL(strstr((const char *)source, "CBM_SYNTACTIC_COVERAGE_PROJECT"));
+    ASSERT_NOT_NULL(strstr((const char *)source, "CBM_SYNTACTIC_COVERAGE_EXACT_PATH"));
+    ASSERT_NOT_NULL(strstr((const char *)source, "CBM_SYNTACTIC_COVERAGE_SCOPE"));
+    free(source);
+
+    free(budget_kind);
+    free(kinds);
+    free(paths);
+    free(rows);
+    free(delimited_kind);
+    free(oversized_kind);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
     PASS();
 }
 
@@ -3583,12 +4178,8 @@ TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contrac
               CBM_STORE_OK);
     doc = mcp_tool_inner_doc(srv, "index_status",
                              "{\"project\":\"rust-health-page-failure\"}", &response, &inner);
-    ASSERT_NOT_NULL(doc);
-    health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")),
-                  "analysis_evidence_unavailable");
-    yyjson_doc_free(doc);
+    ASSERT_NULL(doc);
+    ASSERT_NOT_NULL(strstr(response, "index_status failed to read a complete coverage snapshot"));
     free(inner);
     free(response);
 
@@ -15172,6 +15763,8 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
     RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
     RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
+    RUN_TEST(tool_index_status_syntactic_pages_hold_one_readonly_snapshot);
+    RUN_TEST(tool_syntactic_coverage_routes_page_typed_rows_and_fail_closed);
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);

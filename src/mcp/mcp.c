@@ -1713,6 +1713,22 @@ cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv) {
     return srv ? srv->store : NULL;
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+void cbm_mcp_server_test_use_borrowed_store(cbm_mcp_server_t *srv, cbm_store_t *store,
+                                            const char *project) {
+    if (!srv) {
+        return;
+    }
+    if (srv->owns_store && srv->store) {
+        cbm_store_close(srv->store);
+    }
+    srv->store = store;
+    srv->owns_store = false;
+    free(srv->current_project);
+    srv->current_project = heap_strdup(project ? project : "");
+}
+#endif
+
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     if (!srv) {
         return;
@@ -4060,14 +4076,17 @@ enum {
     INDEX_STATUS_MAX_LIMIT = 500,
     INDEX_STATUS_DEFAULT_BYTES = 65536,
     INDEX_STATUS_MIN_BYTES = 2048,
+    INDEX_STATUS_IDENTITY_KIND_PREVIEW_BYTES = 128,
     RUST_ANALYSIS_EVIDENCE_MAX_BYTES = 16384,
     RUST_ANALYSIS_EVIDENCE_DETAIL_BYTES = 1024,
     RUST_ANALYSIS_EVIDENCE_PATH_BYTES = 512,
     RUST_ANALYSIS_EVIDENCE_MAX_ROWS = RUST_ANALYSIS_EVIDENCE_MAX_BYTES / 16,
+    COVERAGE_QUERY_EVIDENCE_MAX_ROWS = 192,
+    COVERAGE_QUERY_DETAIL_PREVIEW_BYTES = 128,
+    COVERAGE_QUERY_EVIDENCE_MAX_BYTES = 8192,
 };
 
 static uint64_t cursor_fnv1a64(const char *s, uint64_t h); /* pagination helper below */
-static bool coverage_kind_is_semantic(const char *kind);
 
 typedef struct {
     int limit;
@@ -4154,25 +4173,13 @@ static uint64_t index_status_query_hash(const char *project,
     return cursor_fnv1a64(effective, hash);
 }
 
-static uint64_t index_status_coverage_hash(const cbm_coverage_row_t *rows, int count) {
-    uint64_t hash = 0xcbf29ce484222325ULL;
-    char length[96];
-    snprintf(length, sizeof(length), "rows=%d|", count);
-    hash = cursor_fnv1a64(length, hash);
-    for (int i = 0; i < count; i++) {
-        const char *path = rows[i].rel_path ? rows[i].rel_path : "";
-        const char *kind = rows[i].kind ? rows[i].kind : "";
-        const char *detail = rows[i].detail ? rows[i].detail : "";
-        snprintf(length, sizeof(length), "%zu:", strlen(path));
-        hash = cursor_fnv1a64(length, hash);
-        hash = cursor_fnv1a64(path, hash);
-        snprintf(length, sizeof(length), "|%zu:", strlen(kind));
-        hash = cursor_fnv1a64(length, hash);
-        hash = cursor_fnv1a64(kind, hash);
-        snprintf(length, sizeof(length), "|%zu:", strlen(detail));
-        hash = cursor_fnv1a64(length, hash);
-        hash = cursor_fnv1a64(detail, hash);
-        hash = cursor_fnv1a64("|", hash);
+static uint64_t index_status_coverage_hash(const char rows_sha256[65]) {
+    uint64_t hash = 0;
+    for (int i = 0; i < 16; i++) {
+        unsigned char c = (unsigned char)rows_sha256[i];
+        unsigned int digit = c >= '0' && c <= '9' ? (unsigned int)(c - '0')
+                                                    : (unsigned int)(c - 'a' + 10);
+        hash = (hash << 4) | digit;
     }
     return hash;
 }
@@ -4289,23 +4296,14 @@ static const char *index_status_cursor_decode(const char *token, const char *gen
     return NULL;
 }
 
-static index_status_totals_t index_status_count_categories(const cbm_coverage_row_t *rows,
-                                                           int count) {
-    index_status_totals_t totals = {0};
-    for (int i = 0; i < count; i++) {
-        const char *kind = rows[i].kind ? rows[i].kind : "";
-        if (coverage_kind_is_semantic(kind)) {
-            continue;
-        } else if (strcmp(kind, "parse_partial") == 0) {
-            totals.parse_partial++;
-        } else if (strcmp(kind, "not_indexed_dir") == 0) {
-            totals.not_indexed_dirs++;
-        } else if (strcmp(kind, "not_indexed_file") == 0) {
-            totals.not_indexed_files++;
-        } else {
-            totals.skipped++;
-        }
-    }
+static index_status_totals_t index_status_count_categories(
+    const cbm_syntactic_coverage_totals_t *stored) {
+    index_status_totals_t totals = {
+        .parse_partial = (int)stored->parse_partial_rows,
+        .skipped = (int)stored->skipped_rows,
+        .not_indexed_dirs = (int)stored->not_indexed_dir_rows,
+        .not_indexed_files = (int)stored->not_indexed_file_rows,
+    };
     return totals;
 }
 
@@ -4346,8 +4344,201 @@ static void index_status_add_detail(yyjson_mut_doc *doc, yyjson_mut_val *item, c
     yyjson_mut_obj_add_strcpy(doc, item, "detail_hash", hash_text);
 }
 
-static bool coverage_kind_is_semantic(const char *kind) {
-    return kind && strncmp(kind, "analysis_", 9) == 0;
+static void index_status_add_syntactic_detail(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                              const char *key,
+                                              const cbm_syntactic_coverage_row_t *row,
+                                              bool bound_detail,
+                                              size_t detail_preview_bytes) {
+    if (!row->detail_truncated) {
+        index_status_add_detail(doc, item, key, row->detail, bound_detail, detail_preview_bytes);
+        return;
+    }
+    const char *source = row->detail ? row->detail : "";
+    size_t available = strlen(source);
+    size_t shown = available;
+    if (bound_detail && shown > detail_preview_bytes) {
+        shown = index_status_utf8_preview_length(source, detail_preview_bytes);
+    }
+    char *preview = malloc(shown + 1U);
+    if (preview) {
+        memcpy(preview, source, shown);
+        preview[shown] = '\0';
+    }
+    yyjson_mut_obj_add_strcpy(doc, item, key, preview ? preview : "");
+    free(preview);
+    yyjson_mut_obj_add_bool(doc, item, "detail_truncated", true);
+    yyjson_mut_obj_add_int(doc, item, "detail_complete_bytes", row->detail_complete_bytes);
+    char hash[80];
+    snprintf(hash, sizeof(hash), "sha256:%s", row->detail_sha256);
+    yyjson_mut_obj_add_strcpy(doc, item, "detail_hash", hash);
+}
+
+typedef struct {
+    bool initialized;
+    bool has_meta;
+    cbm_coverage_meta_t meta;
+    cbm_syntactic_coverage_totals_t totals;
+    char rows_sha256[65];
+    cbm_syntactic_coverage_row_t *rows;
+    int row_count;
+    int64_t next_offset;
+    bool has_more;
+    bool exact_seen;
+    bool exact_parse_partial;
+    bool exact_not_indexed;
+    bool exact_other;
+    bool any_parse_partial;
+    bool any_not_indexed;
+    bool any_other;
+} syntactic_coverage_window_t;
+
+static void syntactic_coverage_window_clear(syntactic_coverage_window_t *window) {
+    if (!window) {
+        return;
+    }
+    for (int i = 0; i < window->row_count; i++) {
+        free((char *)window->rows[i].rel_path);
+        free((char *)window->rows[i].kind);
+        free((char *)window->rows[i].detail);
+    }
+    free(window->rows);
+    cbm_store_coverage_meta_clear(&window->meta);
+    memset(window, 0, sizeof(*window));
+}
+
+static bool coverage_meta_text_same(const char *left, const char *right) {
+    return strcmp(left ? left : "", right ? right : "") == 0;
+}
+
+static bool syntactic_coverage_meta_same(const cbm_syntactic_coverage_page_t *page,
+                                         const syntactic_coverage_window_t *window) {
+    if (page->has_meta != window->has_meta) {
+        return false;
+    }
+    if (!page->has_meta) {
+        return true;
+    }
+    return page->meta.coverage_version == window->meta.coverage_version &&
+           page->meta.ignored_files_stored == window->meta.ignored_files_stored &&
+           page->meta.ignored_files_total == window->meta.ignored_files_total &&
+           page->meta.hash_records_complete == window->meta.hash_records_complete &&
+           page->meta.rust_files_total == window->meta.rust_files_total &&
+           coverage_meta_text_same(page->meta.generation, window->meta.generation) &&
+           coverage_meta_text_same(page->meta.index_mode, window->meta.index_mode) &&
+           coverage_meta_text_same(page->meta.recorded_at, window->meta.recorded_at) &&
+           coverage_meta_text_same(page->meta.recording_status, window->meta.recording_status) &&
+           coverage_meta_text_same(page->meta.rust_analysis_recording_status,
+                                   window->meta.rust_analysis_recording_status);
+}
+
+static bool syntactic_coverage_totals_same(const cbm_syntactic_coverage_totals_t *left,
+                                           const cbm_syntactic_coverage_totals_t *right) {
+    return left->rows_total == right->rows_total &&
+           left->parse_partial_rows == right->parse_partial_rows &&
+           left->skipped_rows == right->skipped_rows &&
+           left->not_indexed_dir_rows == right->not_indexed_dir_rows &&
+           left->not_indexed_file_rows == right->not_indexed_file_rows;
+}
+
+static cbm_syntactic_coverage_status_t syntactic_coverage_window_extend(
+    cbm_store_t *store, const char *project, cbm_syntactic_coverage_mode_t mode,
+    const char *selector, int64_t offset, int retain_limit, size_t detail_preview_bytes,
+    bool scan_all, syntactic_coverage_window_t *window) {
+    int retained = 0;
+    for (;;) {
+        int request_limit = CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS;
+        if (!scan_all && retain_limit - retained < request_limit) {
+            request_limit = retain_limit - retained;
+        }
+        if (request_limit <= 0) {
+            return CBM_SYNTACTIC_COVERAGE_OK;
+        }
+        cbm_syntactic_coverage_request_t request = {
+            .project = project,
+            .mode = mode,
+            .selector = selector,
+            .offset = offset,
+            .limit = request_limit,
+            .detail_preview_bytes = detail_preview_bytes,
+        };
+        cbm_syntactic_coverage_page_t page = {0};
+        cbm_syntactic_coverage_status_t status =
+            cbm_store_syntactic_coverage_get_page(store, &request, &page);
+        if (status != CBM_SYNTACTIC_COVERAGE_OK) {
+            cbm_store_syntactic_coverage_page_clear(&page);
+            return status;
+        }
+        if (!window->initialized) {
+            window->initialized = true;
+            window->has_meta = page.has_meta;
+            window->meta = page.meta;
+            memset(&page.meta, 0, sizeof(page.meta));
+            window->totals = page.totals;
+            memcpy(window->rows_sha256, page.rows_sha256, sizeof(window->rows_sha256));
+        } else if (!syntactic_coverage_meta_same(&page, window) ||
+                   !syntactic_coverage_totals_same(&page.totals, &window->totals) ||
+                   strcmp(page.rows_sha256, window->rows_sha256) != 0) {
+            cbm_store_syntactic_coverage_page_clear(&page);
+            return CBM_SYNTACTIC_COVERAGE_STORE_ERROR;
+        }
+        int returned = page.returned;
+        int64_t next_offset = page.next_offset;
+        bool has_more = page.has_more;
+        for (int i = 0; i < returned; i++) {
+            const char *kind = page.rows[i].kind ? page.rows[i].kind : "";
+            bool exact = page.rows[i].match == CBM_SYNTACTIC_COVERAGE_MATCH_EXACT;
+            window->exact_seen |= exact;
+            if (strcmp(kind, "parse_partial") == 0) {
+                window->any_parse_partial = true;
+                window->exact_parse_partial |= exact;
+            } else if (strncmp(kind, "not_indexed", 11) == 0) {
+                window->any_not_indexed = true;
+                window->exact_not_indexed |= exact;
+            } else if (kind[0]) {
+                window->any_other = true;
+                window->exact_other |= exact;
+            }
+        }
+        int retain = returned;
+        if (retain > retain_limit - retained) {
+            retain = retain_limit - retained;
+        }
+        if (retain > 0) {
+            size_t old_count = (size_t)window->row_count;
+            size_t new_count = old_count + (size_t)retain;
+            if (new_count > INT_MAX || new_count > SIZE_MAX / sizeof(*window->rows)) {
+                cbm_store_syntactic_coverage_page_clear(&page);
+                return CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED;
+            }
+            cbm_syntactic_coverage_row_t *grown =
+                realloc(window->rows, new_count * sizeof(*grown));
+            if (!grown) {
+                cbm_store_syntactic_coverage_page_clear(&page);
+                return CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED;
+            }
+            window->rows = grown;
+            memcpy(window->rows + old_count, page.rows, (size_t)retain * sizeof(*page.rows));
+            for (int i = 0; i < retain; i++) {
+                memset(&page.rows[i], 0, sizeof(page.rows[i]));
+            }
+            window->row_count = (int)new_count;
+            retained += retain;
+        }
+        cbm_store_syntactic_coverage_page_clear(&page);
+        window->next_offset = next_offset;
+        window->has_more = has_more;
+        if (!has_more) {
+            return CBM_SYNTACTIC_COVERAGE_OK;
+        }
+        if (returned <= 0 || next_offset <= offset) {
+            return CBM_SYNTACTIC_COVERAGE_STORE_ERROR;
+        }
+        offset = next_offset;
+        if (!scan_all && retained >= retain_limit) {
+            return CBM_SYNTACTIC_COVERAGE_OK;
+        }
+    }
+    return CBM_SYNTACTIC_COVERAGE_OK;
 }
 
 typedef struct {
@@ -4689,8 +4880,9 @@ static void add_rust_analysis_report_envelope_bounded(
 }
 
 static void add_coverage_report_page(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                     const cbm_coverage_row_t *rows, int count, size_t start,
-                                     int represented, const index_status_totals_t *totals,
+                                     const cbm_syntactic_coverage_row_t *rows, int64_t count,
+                                     size_t start, int represented,
+                                     const index_status_totals_t *totals,
                                      const char *generation, uint64_t query_hash,
                                      uint64_t coverage_hash, bool identity_marker,
                                      bool bound_detail, size_t detail_preview_bytes) {
@@ -4703,13 +4895,13 @@ static void add_coverage_report_page(yyjson_mut_doc *doc, yyjson_mut_val *root,
     int ni_dir_n = 0;
     int ni_file_n = 0;
     size_t end = start + (size_t)represented;
-    for (size_t i = start; !identity_marker && i < end; i++) {
+    for (int i = 0; !identity_marker && i < represented; i++) {
         const char *kind = rows[i].kind ? rows[i].kind : "";
         if (strcmp(kind, "parse_partial") == 0) {
             yyjson_mut_val *fe = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
-            index_status_add_detail(doc, fe, "error_ranges", rows[i].detail, bound_detail,
-                                    detail_preview_bytes);
+            index_status_add_syntactic_detail(doc, fe, "error_ranges", &rows[i], bound_detail,
+                                              detail_preview_bytes);
             yyjson_mut_arr_add_val(pp_files, fe);
             pp_n++;
         } else if (strcmp(kind, "not_indexed_dir") == 0) {
@@ -4718,15 +4910,15 @@ static void add_coverage_report_page(yyjson_mut_doc *doc, yyjson_mut_val *root,
         } else if (strcmp(kind, "not_indexed_file") == 0) {
             yyjson_mut_val *fe = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
-            index_status_add_detail(doc, fe, "reason", rows[i].detail, bound_detail,
-                                    detail_preview_bytes);
+            index_status_add_syntactic_detail(doc, fe, "reason", &rows[i], bound_detail,
+                                              detail_preview_bytes);
             yyjson_mut_arr_add_val(ni_files, fe);
             ni_file_n++;
         } else {
             yyjson_mut_val *fe = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
-            index_status_add_detail(doc, fe, "reason", rows[i].detail, bound_detail,
-                                    detail_preview_bytes);
+            index_status_add_syntactic_detail(doc, fe, "reason", &rows[i], bound_detail,
+                                              detail_preview_bytes);
             yyjson_mut_obj_add_strcpy(doc, fe, "phase", rows[i].kind ? rows[i].kind : "");
             yyjson_mut_arr_add_val(sk_files, fe);
             sk_n++;
@@ -4770,22 +4962,39 @@ static void add_coverage_report_page(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "not_indexed", ni);
 
     if (identity_marker && represented == 1) {
-        const char *path = rows[start].rel_path ? rows[start].rel_path : "";
-        const char *kind = rows[start].kind ? rows[start].kind : "";
-        uint64_t identity_hash = cursor_fnv1a64(path, 0xcbf29ce484222325ULL);
-        identity_hash = cursor_fnv1a64("|", identity_hash);
+        const char *path = rows[0].rel_path ? rows[0].rel_path : "";
+        const char *kind = rows[0].kind ? rows[0].kind : "";
+        char framed_length[96];
+        snprintf(framed_length, sizeof(framed_length), "P%zu:", strlen(path));
+        uint64_t identity_hash = cursor_fnv1a64(framed_length, 0xcbf29ce484222325ULL);
+        identity_hash = cursor_fnv1a64(path, identity_hash);
+        snprintf(framed_length, sizeof(framed_length), "K%zu:", strlen(kind));
+        identity_hash = cursor_fnv1a64(framed_length, identity_hash);
         identity_hash = cursor_fnv1a64(kind, identity_hash);
         char hash_text[32];
         snprintf(hash_text, sizeof(hash_text), "fnv1a64:%016llx",
                  (unsigned long long)identity_hash);
         yyjson_mut_val *marker = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_uint(doc, marker, "ordinal", start);
-        yyjson_mut_obj_add_strcpy(doc, marker, "kind", kind);
+        size_t kind_bytes = strlen(kind);
+        size_t kind_preview = index_status_utf8_preview_length(
+            kind, INDEX_STATUS_IDENTITY_KIND_PREVIEW_BYTES);
+        char *kind_text = malloc(kind_preview + 1U);
+        if (kind_text) {
+            memcpy(kind_text, kind, kind_preview);
+            kind_text[kind_preview] = '\0';
+        }
+        yyjson_mut_obj_add_strcpy(doc, marker, "kind", kind_text ? kind_text : "");
+        free(kind_text);
+        if (kind_preview < kind_bytes) {
+            yyjson_mut_obj_add_bool(doc, marker, "kind_truncated", true);
+            yyjson_mut_obj_add_uint(doc, marker, "kind_complete_bytes", kind_bytes);
+        }
         yyjson_mut_obj_add_uint(doc, marker, "identity_complete_bytes",
                                 strlen(path) + strlen(kind));
         yyjson_mut_obj_add_strcpy(doc, marker, "identity_hash", hash_text);
         yyjson_mut_obj_add_uint(doc, marker, "detail_complete_bytes",
-                                strlen(rows[start].detail ? rows[start].detail : ""));
+                                rows[0].detail_complete_bytes);
         yyjson_mut_obj_add_val(doc, root, "oversized_item", marker);
     }
 
@@ -4820,6 +5029,8 @@ enum {
     COVERAGE_SCOPE_MAX = 32,
     COVERAGE_SCOPE_DEFAULT_LIMIT = 200,
     COVERAGE_SCOPE_MAX_LIMIT = 1000,
+    COVERAGE_QUERY_MAX_UNIQUE = 64,
+    COVERAGE_QUERY_MAX_IDENTITY_BYTES = 8192,
     COVERAGE_RANGE_MAX = 128,
 };
 
@@ -4980,57 +5191,142 @@ static void coverage_add_ranges(yyjson_mut_doc *doc, yyjson_mut_val *row, const 
 }
 
 static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
-                                  const cbm_coverage_row_t *row, const char *requested_path) {
+                                  const cbm_syntactic_coverage_row_t *row,
+                                  const char *requested_path) {
     yyjson_mut_val *item = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, item, "path", row->rel_path ? row->rel_path : "");
     yyjson_mut_obj_add_strcpy(doc, item, "kind", row->kind ? row->kind : "");
     yyjson_mut_obj_add_strcpy(doc, item, "detail", row->detail ? row->detail : "");
-    if (requested_path) {
-        yyjson_mut_obj_add_str(
-            doc, item, "match",
-            row->rel_path && strcmp(row->rel_path, requested_path) == 0 ? "exact" : "ancestor");
+    if (row->detail_truncated) {
+        yyjson_mut_obj_add_bool(doc, item, "detail_truncated", true);
+        yyjson_mut_obj_add_int(doc, item, "detail_complete_bytes", row->detail_complete_bytes);
+        char hash[80];
+        snprintf(hash, sizeof(hash), "sha256:%s", row->detail_sha256);
+        yyjson_mut_obj_add_strcpy(doc, item, "detail_hash", hash);
     }
-    if (row->kind && strcmp(row->kind, "parse_partial") == 0) {
+    if (requested_path) {
+        yyjson_mut_obj_add_str(doc, item, "match",
+                               row->match == CBM_SYNTACTIC_COVERAGE_MATCH_EXACT ? "exact"
+                                                                               : "ancestor");
+    }
+    if (!row->detail_truncated && row->kind && strcmp(row->kind, "parse_partial") == 0) {
         coverage_add_ranges(doc, item, row->detail);
     }
     yyjson_mut_arr_add_val(array, item);
 }
 
-static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
-                                   const char *requested_path, const char *recording_status,
-                                   bool generation_matches, bool lookup_ok) {
+static size_t coverage_row_json_size(const cbm_syntactic_coverage_row_t *row,
+                                     const char *requested_path) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *array = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, array);
+    coverage_add_row_json(doc, array, row, requested_path);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    size_t size = json ? strlen(json) : SIZE_MAX;
+    free(json);
+    return size;
+}
+
+static void coverage_add_identity_marker(yyjson_mut_doc *doc, yyjson_mut_val *array,
+                                         const cbm_syntactic_coverage_row_t *row,
+                                         bool oversized_item) {
+    yyjson_mut_val *marker = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, marker,
+                            oversized_item ? "oversized_item" : "evidence_omitted_item", true);
+    if (!oversized_item) {
+        yyjson_mut_obj_add_str(doc, marker, "omission_reason", "evidence_budget_exhausted");
+    }
+    const char *path = row->rel_path ? row->rel_path : "";
+    const char *kind = row->kind ? row->kind : "";
+    yyjson_mut_obj_add_int(doc, marker, "identity_complete_bytes",
+                           (int64_t)strlen(path) + (int64_t)strlen(kind));
+    char length[96];
+    snprintf(length, sizeof(length), "P%zu:", strlen(path));
+    uint64_t identity_hash = cursor_fnv1a64(length, 0xcbf29ce484222325ULL);
+    identity_hash = cursor_fnv1a64(path, identity_hash);
+    snprintf(length, sizeof(length), "K%zu:", strlen(kind));
+    identity_hash = cursor_fnv1a64(length, identity_hash);
+    identity_hash = cursor_fnv1a64(kind, identity_hash);
+    char identity[32];
+    snprintf(identity, sizeof(identity), "fnv1a64:%016llx",
+             (unsigned long long)identity_hash);
+    yyjson_mut_obj_add_strcpy(doc, marker, "identity_hash", identity);
+    if (oversized_item) {
+        yyjson_mut_obj_add_int(doc, marker, "detail_complete_bytes", row->detail_complete_bytes);
+        if (row->detail_truncated) {
+            char hash[80];
+            snprintf(hash, sizeof(hash), "sha256:%s", row->detail_sha256);
+            yyjson_mut_obj_add_strcpy(doc, marker, "detail_hash", hash);
+        }
+    }
+    yyjson_mut_arr_add_val(array, marker);
+}
+
+static size_t coverage_identity_marker_size(const cbm_syntactic_coverage_row_t *row,
+                                            bool oversized_item) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *array = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, array);
+    coverage_add_identity_marker(doc, array, row, oversized_item);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    size_t size = json ? strlen(json) : SIZE_MAX;
+    free(json);
+    return size;
+}
+
+static int coverage_add_rows_bounded(yyjson_mut_doc *doc, yyjson_mut_val *array,
+                                     const cbm_syntactic_coverage_row_t *rows, int count,
+                                     const char *requested_path, size_t *evidence_bytes,
+                                     size_t evidence_limit) {
+    int emitted = 0;
+    for (int i = 0; i < count; i++) {
+        size_t item_bytes = coverage_row_json_size(&rows[i], requested_path);
+        bool item_too_large =
+            item_bytes == SIZE_MAX || item_bytes > COVERAGE_QUERY_EVIDENCE_MAX_BYTES;
+        bool budget_exhausted =
+            !item_too_large &&
+            (item_bytes > evidence_limit || *evidence_bytes > evidence_limit - item_bytes);
+        if (item_too_large || budget_exhausted) {
+            if (emitted == 0 && count > 0 && requested_path == NULL) {
+                size_t marker_bytes =
+                    coverage_identity_marker_size(&rows[i], item_too_large);
+                if (marker_bytes != SIZE_MAX && marker_bytes <= evidence_limit &&
+                    *evidence_bytes <= evidence_limit - marker_bytes) {
+                    coverage_add_identity_marker(doc, array, &rows[i], item_too_large);
+                    *evidence_bytes += marker_bytes;
+                    emitted = 1;
+                }
+            }
+            break;
+        }
+        coverage_add_row_json(doc, array, &rows[i], requested_path);
+        *evidence_bytes += item_bytes;
+        emitted++;
+    }
+    return emitted;
+}
+
+static const char *coverage_status(const syntactic_coverage_window_t *coverage,
+                                   const char *recording_status, bool generation_matches,
+                                   bool lookup_ok) {
     if (!lookup_ok) {
         return "coverage_unavailable";
     }
-    bool exact = false;
-    for (int i = 0; i < count; i++) {
-        if (coverage_kind_is_semantic(rows[i].kind)) {
-            continue;
-        }
-        if (rows[i].rel_path && strcmp(rows[i].rel_path, requested_path) == 0) {
-            exact = true;
-            break;
-        }
+    bool parse_partial = coverage->exact_seen ? coverage->exact_parse_partial
+                                              : coverage->any_parse_partial;
+    bool not_indexed = coverage->exact_seen ? coverage->exact_not_indexed
+                                            : coverage->any_not_indexed;
+    bool other = coverage->exact_seen ? coverage->exact_other : coverage->any_other;
+    if (parse_partial) {
+        return "partial";
     }
-    for (int pass = 0; pass < 3; pass++) {
-        for (int i = 0; i < count; i++) {
-            if (coverage_kind_is_semantic(rows[i].kind)) {
-                continue;
-            }
-            if (exact && (!rows[i].rel_path || strcmp(rows[i].rel_path, requested_path) != 0)) {
-                continue;
-            }
-            const char *kind = rows[i].kind ? rows[i].kind : "";
-            if (pass == 0 && strcmp(kind, "parse_partial") == 0) {
-                return "partial";
-            }
-            if (pass == 1 && strncmp(kind, "not_indexed", 11) == 0) {
-                return "excluded";
-            }
-            if (pass == 2 && kind[0]) {
-                return "skipped";
-            }
-        }
+    if (not_indexed) {
+        return "excluded";
+    }
+    if (other) {
+        return "skipped";
     }
     if (!generation_matches || !recording_status || strcmp(recording_status, "complete") != 0) {
         return "coverage_unavailable";
@@ -5077,6 +5373,49 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
         free(project);
         return cbm_mcp_text_result(
             "paths or scopes is required (arrays; max 128 paths and 32 scopes)", true);
+    }
+
+    size_t unique_queries = 0;
+    size_t echoed_identity_bytes = 0;
+    yyjson_val *query_arrays[] = {paths, scopes};
+    for (size_t array_index = 0; array_index < 2U; array_index++) {
+        yyjson_val *array = query_arrays[array_index];
+        size_t query_index, query_max;
+        yyjson_val *query_value;
+        if (!array) {
+            continue;
+        }
+        yyjson_arr_foreach(array, query_index, query_max, query_value) {
+            const char *query = yyjson_is_str(query_value) ? yyjson_get_str(query_value) : "";
+            size_t query_bytes = strlen(query);
+            if (query_bytes > COVERAGE_QUERY_MAX_IDENTITY_BYTES ||
+                echoed_identity_bytes > COVERAGE_QUERY_MAX_IDENTITY_BYTES - query_bytes) {
+                echoed_identity_bytes = COVERAGE_QUERY_MAX_IDENTITY_BYTES + 1U;
+            } else {
+                echoed_identity_bytes += query_bytes;
+            }
+            bool duplicate = false;
+            for (size_t prior = 0; prior < query_index; prior++) {
+                yyjson_val *prior_value = yyjson_arr_get(array, prior);
+                if (yyjson_is_str(prior_value) &&
+                    strcmp(query, yyjson_get_str(prior_value)) == 0) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                unique_queries++;
+            }
+        }
+    }
+    if (unique_queries > COVERAGE_QUERY_MAX_UNIQUE ||
+        echoed_identity_bytes > COVERAGE_QUERY_MAX_IDENTITY_BYTES) {
+        yyjson_doc_free(adoc);
+        free(project);
+        return cbm_mcp_text_result(
+            "check_index_coverage request cannot fit a truthful bounded response: narrow paths "
+            "and scopes (at most 64 distinct queries and 8192 total identity bytes)",
+            true);
     }
 
     if (cbm_store_begin(store) != CBM_STORE_OK) {
@@ -5138,6 +5477,16 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     yyjson_mut_obj_add_val(doc, root, "metadata", meta_obj);
 
     yyjson_mut_val *path_results = yyjson_mut_arr(doc);
+    size_t coverage_evidence_bytes = 0;
+    size_t scope_marker_reserve = scope_count * 256U;
+    size_t coverage_evidence_limit = COVERAGE_QUERY_EVIDENCE_MAX_BYTES - scope_marker_reserve;
+    size_t query_count = path_count + scope_count;
+    int evidence_share = query_count > 0U
+                             ? COVERAGE_QUERY_EVIDENCE_MAX_ROWS / (int)query_count
+                             : COVERAGE_QUERY_EVIDENCE_MAX_ROWS;
+    if (evidence_share < 1) {
+        evidence_share = 1;
+    }
     size_t idx;
     size_t max;
     yyjson_val *value;
@@ -5146,6 +5495,20 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             yyjson_mut_val *item = yyjson_mut_obj(doc);
             const char *input = yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
             yyjson_mut_obj_add_strcpy(doc, item, "requested_path", input ? input : "");
+            bool duplicate = false;
+            for (size_t prior = 0; input && prior < idx; prior++) {
+                yyjson_val *prior_value = yyjson_arr_get(paths, prior);
+                if (yyjson_is_str(prior_value) &&
+                    strcmp(input, yyjson_get_str(prior_value)) == 0) {
+                    yyjson_mut_obj_add_uint(doc, item, "duplicate_of", prior);
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                yyjson_mut_arr_add_val(path_results, item);
+                continue;
+            }
             char rel[CBM_SZ_4K];
             coverage_path_result_t normalized =
                 coverage_normalize_rel(input, false, rel, sizeof(rel));
@@ -5160,32 +5523,41 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                 continue;
             }
             yyjson_mut_obj_add_strcpy(doc, item, "path", rel);
-            cbm_coverage_row_t *rows = NULL;
-            int row_count = 0;
-            int cov_rc = cbm_store_coverage_get_path(store, project, rel, &rows, &row_count);
-            bool lookup_ok = cov_rc == CBM_STORE_OK || cov_rc == CBM_STORE_NOT_FOUND;
+            syntactic_coverage_window_t coverage_window = {0};
+            cbm_syntactic_coverage_status_t cov_rc = syntactic_coverage_window_extend(
+                store, project, CBM_SYNTACTIC_COVERAGE_EXACT_PATH, rel, 0, evidence_share,
+                COVERAGE_QUERY_DETAIL_PREVIEW_BYTES, true, &coverage_window);
+            bool lookup_ok = cov_rc == CBM_SYNTACTIC_COVERAGE_OK;
             if (!lookup_ok) {
-                row_count = 0;
                 yyjson_mut_obj_add_str(doc, item, "coverage_lookup", "error");
             }
             bool outside = false;
             const char *freshness = coverage_path_freshness(
                 store, project, have_project ? proj.root_path : NULL, rel, &outside);
             const char *status = outside ? "outside_project"
-                                         : coverage_status(rows, row_count, rel, recording_status,
+                                         : coverage_status(&coverage_window, recording_status,
                                                            syntactic_generation_matches, lookup_ok);
             yyjson_mut_obj_add_strcpy(doc, item, "status", status);
             yyjson_mut_obj_add_strcpy(doc, item, "freshness", freshness);
             yyjson_mut_obj_add_strcpy(doc, item, "recommended_action",
                                       coverage_recommended_action(status, freshness));
             yyjson_mut_val *coverage = yyjson_mut_arr(doc);
-            for (int i = 0; i < row_count; i++) {
-                if (!coverage_kind_is_semantic(rows[i].kind)) {
-                    coverage_add_row_json(doc, coverage, &rows[i], rel);
-                }
+            int coverage_returned = 0;
+            if (lookup_ok) {
+                coverage_returned = coverage_add_rows_bounded(
+                    doc, coverage, coverage_window.rows, coverage_window.row_count, rel,
+                    &coverage_evidence_bytes, coverage_evidence_limit);
             }
             yyjson_mut_obj_add_val(doc, item, "coverage", coverage);
-            cbm_store_free_coverage(rows, row_count);
+            int64_t coverage_total = coverage_window.initialized
+                                         ? coverage_window.totals.rows_total
+                                         : 0;
+            if (coverage_returned < coverage_total) {
+                yyjson_mut_obj_add_int(doc, item, "coverage_total", coverage_total);
+                yyjson_mut_obj_add_int(doc, item, "coverage_returned", coverage_returned);
+                yyjson_mut_obj_add_bool(doc, item, "coverage_truncated", lookup_ok);
+            }
+            syntactic_coverage_window_clear(&coverage_window);
             yyjson_mut_arr_add_val(path_results, item);
         }
     }
@@ -5204,9 +5576,24 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     yyjson_mut_val *scope_results = yyjson_mut_arr(doc);
     if (scopes) {
         yyjson_arr_foreach(scopes, idx, max, value) {
+            coverage_evidence_limit += 256U;
             yyjson_mut_val *item = yyjson_mut_obj(doc);
             const char *input = yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
             yyjson_mut_obj_add_strcpy(doc, item, "requested_scope", input ? input : "");
+            bool duplicate = false;
+            for (size_t prior = 0; input && prior < idx; prior++) {
+                yyjson_val *prior_value = yyjson_arr_get(scopes, prior);
+                if (yyjson_is_str(prior_value) &&
+                    strcmp(input, yyjson_get_str(prior_value)) == 0) {
+                    yyjson_mut_obj_add_uint(doc, item, "duplicate_of", prior);
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                yyjson_mut_arr_add_val(scope_results, item);
+                continue;
+            }
             char scope[CBM_SZ_4K];
             coverage_path_result_t normalized =
                 coverage_normalize_rel(input, true, scope, sizeof(scope));
@@ -5218,37 +5605,33 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                 continue;
             }
             yyjson_mut_obj_add_strcpy(doc, item, "scope", scope[0] ? scope : ".");
-            cbm_coverage_row_t *rows = NULL;
-            int row_count = 0;
-            int cov_rc = cbm_store_coverage_get_scope(store, project, scope, &rows, &row_count);
-            bool lookup_ok = cov_rc == CBM_STORE_OK || cov_rc == CBM_STORE_NOT_FOUND;
+            syntactic_coverage_window_t coverage_window = {0};
+            int retained_limit = scope_limit < evidence_share ? scope_limit : evidence_share;
+            cbm_syntactic_coverage_status_t cov_rc = syntactic_coverage_window_extend(
+                store, project, CBM_SYNTACTIC_COVERAGE_SCOPE, scope, scope_offset, retained_limit,
+                COVERAGE_QUERY_DETAIL_PREVIEW_BYTES, false, &coverage_window);
+            bool lookup_ok = cov_rc == CBM_SYNTACTIC_COVERAGE_OK;
             if (!lookup_ok) {
-                row_count = 0;
                 yyjson_mut_obj_add_str(doc, item, "coverage_lookup", "error");
             }
-            int syntactic_count = 0;
-            for (int i = 0; i < row_count; i++) {
-                syntactic_count += !coverage_kind_is_semantic(rows[i].kind);
-            }
+            int64_t syntactic_count = coverage_window.initialized
+                                          ? coverage_window.totals.rows_total
+                                          : 0;
             yyjson_mut_obj_add_int(doc, item, "total", syntactic_count);
-            int start = scope_offset < syntactic_count ? scope_offset : syntactic_count;
-            int end = start + scope_limit < syntactic_count ? start + scope_limit : syntactic_count;
-            yyjson_mut_obj_add_bool(doc, item, "has_more", end < syntactic_count);
-            if (end < syntactic_count) {
-                yyjson_mut_obj_add_int(doc, item, "next_offset", end);
-            }
+            int64_t start = scope_offset < syntactic_count ? scope_offset : syntactic_count;
             yyjson_mut_val *entries = yyjson_mut_arr(doc);
-            int ordinal = 0;
-            for (int i = 0; i < row_count; i++) {
-                if (coverage_kind_is_semantic(rows[i].kind)) {
-                    continue;
-                }
-                if (ordinal >= start && ordinal < end) {
-                    coverage_add_row_json(doc, entries, &rows[i], NULL);
-                }
-                ordinal++;
+            int entries_returned = 0;
+            if (lookup_ok) {
+                entries_returned = coverage_add_rows_bounded(
+                    doc, entries, coverage_window.rows, coverage_window.row_count, NULL,
+                    &coverage_evidence_bytes, coverage_evidence_limit);
             }
             yyjson_mut_obj_add_val(doc, item, "entries", entries);
+            int64_t end = start + entries_returned;
+            yyjson_mut_obj_add_bool(doc, item, "has_more", lookup_ok && end < syntactic_count);
+            if (lookup_ok && end < syntactic_count) {
+                yyjson_mut_obj_add_int(doc, item, "next_offset", end);
+            }
             const char *scope_status = !lookup_ok || !syntactic_generation_matches
                                            ? "coverage_unavailable"
                                        : syntactic_count > 0             ? "known_gaps"
@@ -5256,7 +5639,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                                            ? "no_recorded_issue"
                                            : "coverage_unavailable";
             yyjson_mut_obj_add_str(doc, item, "status", scope_status);
-            cbm_store_free_coverage(rows, row_count);
+            syntactic_coverage_window_clear(&coverage_window);
             yyjson_mut_arr_add_val(scope_results, item);
         }
     }
@@ -5268,6 +5651,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     add_rust_analysis_report_envelope_bounded(
         doc, root, &health, health_generation_matches, RUST_ANALYSIS_EVIDENCE_MAX_BYTES,
         CBM_MCP_RESULT_MAX_BYTES);
+    bool response_fits = mcp_doc_envelope_fits(doc, CBM_MCP_RESULT_MAX_BYTES);
 
     if (cbm_store_commit(store) != CBM_STORE_OK) {
         (void)cbm_store_rollback(store);
@@ -5294,6 +5678,13 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
         safe_str_free(&proj.root_path);
     }
     free(project);
+    if (!response_fits) {
+        free(json);
+        return cbm_mcp_text_result(
+            "check_index_coverage request cannot fit a truthful bounded response: narrow paths "
+            "and scopes",
+            true);
+    }
     char *result = cbm_mcp_text_result(json, false);
     free(json);
     return result;
@@ -5301,7 +5692,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
 
 static char *index_status_build_candidate(
     const char *project, int nodes, int edges, const cbm_project_t *project_info, bool have_project,
-    const cbm_coverage_row_t *rows, int row_count, size_t start, int represented,
+    const cbm_syntactic_coverage_row_t *rows, int available_rows, int64_t total_rows,
+    size_t start, int represented,
     const index_status_totals_t *totals, const index_status_options_t *options,
     const char *generation, uint64_t query_hash, uint64_t coverage_hash, bool bound_detail,
     size_t detail_preview_bytes, bool identity_marker,
@@ -5322,7 +5714,8 @@ static char *index_status_build_candidate(
             add_git_context_json(doc, root, project_info->root_path);
         }
     }
-    add_coverage_report_page(doc, root, rows, row_count, start, represented, totals, generation,
+    (void)available_rows;
+    add_coverage_report_page(doc, root, rows, total_rows, start, represented, totals, generation,
                              query_hash, coverage_hash, identity_marker, bound_detail,
                              detail_preview_bytes);
     if (nodes == 0) {
@@ -5361,18 +5754,18 @@ static char *index_status_error_result(const char *message, const index_status_o
 
 static char *index_status_build_bounded(const char *project, int nodes, int edges,
                                         const cbm_project_t *project_info, bool have_project,
-                                        const cbm_coverage_row_t *rows, int row_count, size_t start,
+                                        const cbm_syntactic_coverage_row_t *rows,
+                                        int available_rows, int64_t total_rows, size_t start,
                                         const index_status_totals_t *totals,
                                         const index_status_options_t *options,
                                         const char *generation, uint64_t query_hash,
                                         uint64_t coverage_hash, int *represented_out,
                                         const rust_analysis_snapshot_t *health,
                                         bool health_generation_matches) {
-    size_t remaining = (size_t)row_count - start;
-    int requested = remaining < (size_t)options->limit ? (int)remaining : options->limit;
+    int requested = available_rows < options->limit ? available_rows : options->limit;
     char *candidate = index_status_build_candidate(
-        project, nodes, edges, project_info, have_project, rows, row_count, start, requested,
-        totals, options, generation, query_hash, coverage_hash, false, 0, false, health,
+        project, nodes, edges, project_info, have_project, rows, available_rows, total_rows, start,
+        requested, totals, options, generation, query_hash, coverage_hash, false, 0, false, health,
         health_generation_matches);
     if (index_status_candidate_fits(candidate, options)) {
         *represented_out = requested;
@@ -5387,9 +5780,9 @@ static char *index_status_build_bounded(const char *project, int nodes, int edge
     while (low <= high) {
         int represented = low + (high - low) / 2;
         candidate = index_status_build_candidate(
-            project, nodes, edges, project_info, have_project, rows, row_count, start, represented,
-            totals, options, generation, query_hash, coverage_hash, false, 0, false, health,
-            health_generation_matches);
+            project, nodes, edges, project_info, have_project, rows, available_rows, total_rows,
+            start, represented, totals, options, generation, query_hash, coverage_hash, false, 0,
+            false, health, health_generation_matches);
         if (index_status_candidate_fits(candidate, options)) {
             free(best);
             best = candidate;
@@ -5412,15 +5805,15 @@ static char *index_status_build_bounded(const char *project, int nodes, int edge
     /* A single detail can be larger than the complete response budget. Keep
      * the row identity, advance by exactly that represented row, and choose
      * the largest UTF-8-safe preview whose duplicated MCP envelope still fits. */
-    const char *detail = rows[start].detail ? rows[start].detail : "";
+    const char *detail = rows[0].detail ? rows[0].detail : "";
     size_t preview_low = 0;
     size_t preview_high = strlen(detail);
     while (preview_low <= preview_high) {
         size_t preview = preview_low + (preview_high - preview_low) / 2U;
         candidate = index_status_build_candidate(
-            project, nodes, edges, project_info, have_project, rows, row_count, start, 1, totals,
-            options, generation, query_hash, coverage_hash, true, preview, false, health,
-            health_generation_matches);
+            project, nodes, edges, project_info, have_project, rows, available_rows, total_rows,
+            start, 1, totals, options, generation, query_hash, coverage_hash, true, preview, false,
+            health, health_generation_matches);
         if (index_status_candidate_fits(candidate, options)) {
             free(best);
             best = candidate;
@@ -5437,10 +5830,10 @@ static char *index_status_build_bounded(const char *project, int nodes, int edge
         *represented_out = 1;
         return best;
     }
-    candidate = index_status_build_candidate(project, nodes, edges, project_info, have_project,
-                                             rows, row_count, start, 1, totals, options, generation,
-                                             query_hash, coverage_hash, false, 0, true, health,
-                                             health_generation_matches);
+    candidate = index_status_build_candidate(
+        project, nodes, edges, project_info, have_project, rows, available_rows, total_rows, start,
+        1, totals, options, generation, query_hash, coverage_hash, false, 0, true, health,
+        health_generation_matches);
     if (index_status_candidate_fits(candidate, options)) {
         *represented_out = 1;
         return candidate;
@@ -5485,13 +5878,21 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     rust_analysis_snapshot_t health = {0};
     bool health_available = rust_analysis_read_snapshot(store, project, &health);
     health.available = health_available;
-    cbm_coverage_row_t *rows = NULL;
-    int row_count = 0;
-    int coverage_rc = cbm_store_coverage_get(store, project, &rows, &row_count);
-    int commit_rc = cbm_store_commit(store);
-    if (generation_rc != CBM_STORE_OK || coverage_rc != CBM_STORE_OK || commit_rc != CBM_STORE_OK) {
+    syntactic_coverage_window_t coverage = {0};
+    int initial_rows = options.cursor ? 1 : options.limit;
+    if (initial_rows > CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS) {
+        initial_rows = CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS;
+    }
+    cbm_syntactic_coverage_status_t coverage_rc = syntactic_coverage_window_extend(
+        store, project, CBM_SYNTACTIC_COVERAGE_PROJECT, NULL, 0, initial_rows,
+        options.cursor ? 0 : CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES, false, &coverage);
+    if (generation_rc != CBM_STORE_OK || coverage_rc != CBM_SYNTACTIC_COVERAGE_OK ||
+        coverage.totals.rows_total > INT_MAX || coverage.totals.parse_partial_rows > INT_MAX ||
+        coverage.totals.skipped_rows > INT_MAX ||
+        coverage.totals.not_indexed_dir_rows > INT_MAX ||
+        coverage.totals.not_indexed_file_rows > INT_MAX) {
         (void)cbm_store_rollback(store);
-        cbm_store_free_coverage(rows, row_count);
+        syntactic_coverage_window_clear(&coverage);
         if (have_project) {
             cbm_project_free_fields(&project_info);
         }
@@ -5502,8 +5903,12 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                                          &options);
     }
 
+    uint64_t query_hash = index_status_query_hash(project, &options);
+    uint64_t coverage_hash = index_status_coverage_hash(coverage.rows_sha256);
+    int64_t syntactic_count = coverage.totals.rows_total;
     if (strcmp(generation, "legacy") == 0 && options.cursor) {
-        cbm_store_free_coverage(rows, row_count);
+        (void)cbm_store_rollback(store);
+        syntactic_coverage_window_clear(&coverage);
         if (have_project) {
             cbm_project_free_fields(&project_info);
         }
@@ -5516,39 +5921,21 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             &options);
     }
 
-    uint64_t query_hash = index_status_query_hash(project, &options);
-    uint64_t coverage_hash = index_status_coverage_hash(rows, row_count);
-    cbm_coverage_row_t *syntactic_rows = calloc((size_t)(row_count > 0 ? row_count : 1),
-                                                sizeof(*syntactic_rows));
-    if (!syntactic_rows) {
-        cbm_store_free_coverage(rows, row_count);
-        if (have_project) {
-            cbm_project_free_fields(&project_info);
-        }
-        rust_analysis_snapshot_clear(&health);
-        free(project);
-        free(options.cursor);
-        return index_status_error_result("out of memory", &options);
-    }
-    int syntactic_count = 0;
-    for (int i = 0; i < row_count; i++) {
-        if (!coverage_kind_is_semantic(rows[i].kind)) {
-            syntactic_rows[syntactic_count++] = rows[i];
-        }
-    }
     size_t start = 0;
     if (options.cursor) {
         index_status_cursor_t cursor = {0};
         const char *cursor_error =
             index_status_cursor_decode(options.cursor, generation, query_hash, coverage_hash,
                                        &cursor);
-        if (!cursor_error && cursor.next_ordinal >= (size_t)syntactic_count) {
+        if (!cursor_error &&
+            (cursor.next_ordinal > INT64_MAX ||
+             (int64_t)cursor.next_ordinal >= syntactic_count)) {
             cursor_error =
                 "invalid_cursor: index_status cursor ordinal is outside the coverage stream";
         }
         if (cursor_error) {
-            cbm_store_free_coverage(rows, row_count);
-            free(syntactic_rows);
+            (void)cbm_store_rollback(store);
+            syntactic_coverage_window_clear(&coverage);
             if (have_project) {
                 cbm_project_free_fields(&project_info);
             }
@@ -5558,28 +5945,73 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             return index_status_error_result(cursor_error, &options);
         }
         start = cursor.next_ordinal;
+        syntactic_coverage_window_clear(&coverage);
+        initial_rows = options.limit;
+        if (initial_rows > CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS) {
+            initial_rows = CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS;
+        }
+        coverage_rc = syntactic_coverage_window_extend(
+            store, project, CBM_SYNTACTIC_COVERAGE_PROJECT, NULL, (int64_t)start, initial_rows,
+            CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES, false, &coverage);
+        if (coverage_rc != CBM_SYNTACTIC_COVERAGE_OK ||
+            coverage.totals.rows_total != syntactic_count ||
+            index_status_coverage_hash(coverage.rows_sha256) != coverage_hash) {
+            (void)cbm_store_rollback(store);
+            syntactic_coverage_window_clear(&coverage);
+            if (have_project) {
+                cbm_project_free_fields(&project_info);
+            }
+            rust_analysis_snapshot_clear(&health);
+            free(project);
+            free(options.cursor);
+            return index_status_error_result(
+                "index_status failed to read a complete coverage snapshot", &options);
+        }
     }
     free(options.cursor);
+    options.cursor = NULL;
 
-    index_status_totals_t totals = index_status_count_categories(syntactic_rows, syntactic_count);
+    index_status_totals_t totals = index_status_count_categories(&coverage.totals);
     bool health_generation_matches =
         have_project && health.have_meta && project_info.indexed_at && health.meta.generation &&
         strcmp(project_info.indexed_at, health.meta.generation) == 0;
     int represented = 0;
     char *result = index_status_build_bounded(
-        project, nodes, edges, &project_info, have_project, syntactic_rows, syntactic_count, start,
-        &totals, &options, generation, query_hash, coverage_hash, &represented, &health,
-        health_generation_matches);
+        project, nodes, edges, &project_info, have_project, coverage.rows, coverage.row_count,
+        syntactic_count, start, &totals, &options, generation, query_hash, coverage_hash,
+        &represented, &health, health_generation_matches);
+    if (represented == coverage.row_count && coverage.row_count < options.limit &&
+        coverage.has_more) {
+        free(result);
+        int additional = options.limit - coverage.row_count;
+        coverage_rc = syntactic_coverage_window_extend(
+            store, project, CBM_SYNTACTIC_COVERAGE_PROJECT, NULL, coverage.next_offset,
+            additional, CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES, false, &coverage);
+        if (coverage_rc == CBM_SYNTACTIC_COVERAGE_OK) {
+            result = index_status_build_bounded(
+                project, nodes, edges, &project_info, have_project, coverage.rows,
+                coverage.row_count, syntactic_count, start, &totals, &options, generation,
+                query_hash, coverage_hash, &represented, &health, health_generation_matches);
+        } else {
+            result = NULL;
+        }
+    }
     if (strcmp(generation, "legacy") == 0 &&
-        start + (size_t)represented < (size_t)syntactic_count) {
+        (int64_t)start + represented < syntactic_count) {
         free(result);
         result = index_status_error_result(
             "cursor_unsupported: this project's index predates generation tracking; re-index "
             "before resuming index_status coverage pages",
             &options);
     }
-    free(syntactic_rows);
-    cbm_store_free_coverage(rows, row_count);
+    int commit_rc = result ? cbm_store_commit(store) : CBM_STORE_ERR;
+    if (commit_rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(store);
+        free(result);
+        result = index_status_error_result(
+            "index_status failed to read a complete coverage snapshot", &options);
+    }
+    syntactic_coverage_window_clear(&coverage);
     if (have_project) {
         cbm_project_free_fields(&project_info);
     }
@@ -10296,33 +10728,57 @@ static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_
     if (!node->file_path || !node->file_path[0] || !node->project) {
         return;
     }
-    cbm_coverage_row_t *rows = NULL;
-    int count = 0;
-    if (cbm_store_coverage_get_path(store, node->project, node->file_path, &rows, &count) !=
-        CBM_STORE_OK) {
+    if (cbm_store_begin(store) != CBM_STORE_OK) {
+        yyjson_mut_obj_add_str(doc, root_obj, "coverage_note",
+                               "Coverage lookup unavailable; treat graph completeness as unknown.");
         return;
     }
-    for (int i = 0; i < count; i++) {
-        if (rows[i].rel_path && strcmp(rows[i].rel_path, node->file_path) == 0 && rows[i].kind &&
-            strcmp(rows[i].kind, "parse_partial") == 0) {
-            char note[CBM_SZ_1K];
-            snprintf(
-                note, sizeof(note),
-                source_in_response
-                    ? "This file was only PARTIALLY indexed — line range(s) %s could not be "
-                      "parsed, so constructs there may be missing from the graph (callers/callees "
-                      "and search results can under-report this file). The source above is ground "
-                      "truth. (best-effort signal)"
-                    : "This file was only PARTIALLY indexed — line range(s) %s could not be "
-                      "parsed, so this graph-only outline may omit constructs. Request a raw "
-                      "source range with start_line/end_line and use that source as ground truth. "
-                      "(best-effort signal)",
-                rows[i].detail && rows[i].detail[0] ? rows[i].detail : "?");
-            yyjson_mut_obj_add_strcpy(doc, root_obj, "coverage_note", note);
-            break;
+    syntactic_coverage_window_t coverage = {0};
+    cbm_syntactic_coverage_status_t status = syntactic_coverage_window_extend(
+        store, node->project, CBM_SYNTACTIC_COVERAGE_EXACT_PATH, node->file_path, 0,
+        COVERAGE_QUERY_EVIDENCE_MAX_ROWS, COVERAGE_QUERY_DETAIL_PREVIEW_BYTES, true, &coverage);
+    const cbm_syntactic_coverage_row_t *partial = NULL;
+    if (status == CBM_SYNTACTIC_COVERAGE_OK) {
+        for (int i = 0; i < coverage.row_count; i++) {
+            if (coverage.rows[i].match == CBM_SYNTACTIC_COVERAGE_MATCH_EXACT &&
+                coverage.rows[i].kind && strcmp(coverage.rows[i].kind, "parse_partial") == 0) {
+                partial = &coverage.rows[i];
+                break;
+            }
         }
     }
-    cbm_store_free_coverage(rows, count);
+    int commit_rc = status == CBM_SYNTACTIC_COVERAGE_OK ? cbm_store_commit(store) : CBM_STORE_ERR;
+    if (commit_rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(store);
+        yyjson_mut_obj_add_str(doc, root_obj, "coverage_note",
+                               "Coverage lookup unavailable; treat graph completeness as unknown.");
+    } else if (partial && !partial->detail_truncated) {
+        char note[CBM_SZ_1K];
+        snprintf(
+            note, sizeof(note),
+            source_in_response
+                ? "This file was only PARTIALLY indexed — line range(s) %s could not be "
+                  "parsed, so constructs there may be missing from the graph (callers/callees "
+                  "and search results can under-report this file). The source above is ground "
+                  "truth. (best-effort signal)"
+                : "This file was only PARTIALLY indexed — line range(s) %s could not be "
+                  "parsed, so this graph-only outline may omit constructs. Request a raw "
+                  "source range with start_line/end_line and use that source as ground truth. "
+                  "(best-effort signal)",
+            partial->detail && partial->detail[0] ? partial->detail : "?");
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "coverage_note", note);
+    } else if (coverage.exact_parse_partial) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "coverage_note",
+            source_in_response
+                ? "This file was only PARTIALLY indexed; stored line-range evidence was too "
+                  "large to include exactly. Constructs may be missing from the graph, and the "
+                  "source above is ground truth. (best-effort signal)"
+                : "This file was only PARTIALLY indexed; stored line-range evidence was too "
+                  "large to include exactly. This graph-only outline may omit constructs; "
+                  "request raw source and use it as ground truth. (best-effort signal)");
+    }
+    syntactic_coverage_window_clear(&coverage);
 }
 
 typedef struct {
