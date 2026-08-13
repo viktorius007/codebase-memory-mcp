@@ -839,27 +839,6 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
     cbm_arena_destroy(&keys);
 }
 
-/* ── Rust workspace manifest (Cargo.toml) for cross-CRATE resolution ──
- *
- * cbm_pxc_run_one's signature is shared with the parallel pass
- * (pass_parallel.c) and cannot grow a manifest parameter without touching
- * that file. We therefore pass the parsed workspace manifest to the Rust
- * cross-file resolver through a file-static borrowed pointer that the
- * sequential driver (cbm_pipeline_pass_lsp_cross, below) sets up once per
- * pass run from the project's root Cargo.toml. The manifest's strings are
- * owned by `g_pxc_rust_manifest_arena`; the pointer is borrowed (NULL when
- * the project has no Cargo.toml — single-crate / non-workspace projects,
- * where in-file resolution needs no workspace metadata). */
-static _Thread_local const CBMCargoManifest *g_pxc_rust_manifest = NULL;
-
-void cbm_pxc_set_rust_manifest(const CBMCargoManifest *m) {
-    g_pxc_rust_manifest = m;
-}
-
-const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void) {
-    return g_pxc_rust_manifest;
-}
-
 /* Convert a CBMLSPDef array (the pipeline's lingua franca, go_lsp.h:73)
  * into a CBMRustLSPDef array (rust_lsp.h) inside `arena`. The two structs
  * have similar fields but different layouts; CBMLSPDef adds
@@ -898,9 +877,10 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * directly across N files (test_incremental.c saw 3.5 GB peak on a
  * 1100-file repo before this fix). Output gets copied into the file's own
  * arena and merged into result->resolved_calls. */
-void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
-                     const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
-                     const char **imp_qns, int imp_count) {
+static void pxc_run_one_with_manifest(CBMLanguage lang, CBMFileResult *r, const char *source,
+                                      int source_len, const char *module_qn, CBMLSPDef *defs,
+                                      int def_count, const char **imp_names, const char **imp_qns,
+                                      int imp_count, const CBMCargoManifest *rust_manifest) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -952,7 +932,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
         cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
                                              def_count, imp_names, imp_qns, imp_count, tree,
-                                             g_pxc_rust_manifest, &out, &synthetic_calls);
+                                             rust_manifest, &out, &synthetic_calls);
         break;
     }
     default:
@@ -962,6 +942,13 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
     cbm_arena_destroy(&scratch);
+}
+
+void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
+                     const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
+                     const char **imp_qns, int imp_count) {
+    pxc_run_one_with_manifest(lang, r, source, source_len, module_qn, defs, def_count, imp_names,
+                              imp_qns, imp_count, NULL);
 }
 
 /* Variant of cbm_pxc_run_one for TS/JS/JSX/TSX with explicit dialect
@@ -1006,8 +993,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            const CBMCrossLspRegistries *cross_registries,
                            const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
                            int all_def_count, const char **imp_keys, const char **imp_vals,
-                           int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
-                           void *rust_shared_ctx) {
+                           int imp_count, const CBMCargoManifest *rust_manifest,
+                           CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx) {
     if (!result) {
         return;
     }
@@ -1120,15 +1107,15 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_arena_init(&scratch);
             CBMResolvedCallArray out = {0};
             CBMCallArray synthetic_calls = {0};
-            cbm_run_rust_lsp_cross_with_registry(
-                &scratch, source, source_len, def_module, shared, imp_keys, imp_vals, imp_count,
-                result->cached_tree, cbm_pxc_get_rust_manifest(), &out, &synthetic_calls);
+            cbm_run_rust_lsp_cross_with_registry(&scratch, source, source_len, def_module, shared,
+                                                 imp_keys, imp_vals, imp_count, result->cached_tree,
+                                                 rust_manifest, &out, &synthetic_calls);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             cbm_arena_destroy(&scratch);
         } else {
-            cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                            imp_keys, imp_vals, imp_count);
+            pxc_run_one_with_manifest(lang, result, source, source_len, def_module, file_defs,
+                                      file_def_count, imp_keys, imp_vals, imp_count, rust_manifest);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
@@ -1138,14 +1125,14 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         cbm_pxc_run_one_ts(result, source, source_len, def_module, file_defs, file_def_count,
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
-        cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                        imp_keys, imp_vals, imp_count);
+        pxc_run_one_with_manifest(lang, result, source, source_len, def_module, file_defs,
+                                  file_def_count, imp_keys, imp_vals, imp_count, rust_manifest);
     }
     free(filtered);
 }
 
-static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
-                                    CBMCargoManifest *out_m) {
+bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
+                                 CBMCargoManifest *out_m) {
     if (!ctx || !ctx->repo_path || !marena || !out_m)
         return false;
     char path[1024];
@@ -1171,10 +1158,18 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
 
     cbm_log_info("pass.start", "pass", "lsp_cross", "files", itoa_buf(file_count));
 
+    /* Allocate the only early-return resource before creating the manifest
+     * snapshot. Once the snapshot exists, this function has one cleanup tail. */
+    char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
+    if (!def_modules) {
+        cbm_log_error("pass.err", "pass", "lsp_cross", "phase", "alloc");
+        return 0;
+    }
+
     /* Build the Rust workspace manifest once (only when the project has at
      * least one Rust file, to avoid an unconditional Cargo.toml read).
      * The manifest's strings live in `cargo_arena`; the resolver borrows
-     * the pointer through the file-static set below. */
+     * one immutable pointer for the duration of this pass. */
     bool have_rust = false;
     for (int i = 0; i < file_count; i++) {
         if (cache[i] && files[i].language == CBM_LANG_RUST) {
@@ -1185,20 +1180,15 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     CBMArena cargo_arena;
     CBMCargoManifest cargo_manifest;
     bool have_manifest = false;
+    const CBMCargoManifest *rust_manifest = NULL;
     if (have_rust) {
         cbm_arena_init(&cargo_arena);
-        have_manifest = pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
-        cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
+        have_manifest = cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
+        rust_manifest = have_manifest ? &cargo_manifest : NULL;
     }
 
     /* Per-file module QN cache so we don't recompute it once per def + once
      * per call. cbm_pipeline_fqn_module mallocs; freed at end. */
-    char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
-    if (!def_modules) {
-        cbm_log_error("pass.err", "pass", "lsp_cross", "phase", "alloc");
-        return 0;
-    }
-
     int def_count = 0;
     int *def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
     CBMLSPDef *all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
@@ -1281,7 +1271,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cbm_index_mark_start(files[i].rel_path);
         cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
                               &cross_registries, module_def_index, all_defs, def_count, imp_keys,
-                              imp_vals, imp_count, NULL, NULL);
+                              imp_vals, imp_count, rust_manifest, NULL, NULL);
         cbm_index_mark_done(files[i].rel_path);
         per_lang_calls++;
         processed++;
@@ -1301,13 +1291,10 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     ctx->seq_cross_def_modules = def_modules;
     ctx->seq_cross_def_module_count = file_count;
 
-    /* Drop the borrowed manifest pointer before its arena dies, so a later
-     * pass (or a stale thread-local) can never read freed manifest memory. */
+    /* All dispatches have returned; no borrowed manifest pointer escapes. */
     if (have_rust) {
-        cbm_pxc_set_rust_manifest(NULL);
         cbm_arena_destroy(&cargo_arena);
     }
-    (void)have_manifest;
 
     cbm_log_info("pass.done", "pass", "lsp_cross", "files_processed", itoa_buf(processed),
                  "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_skipped_no_source",

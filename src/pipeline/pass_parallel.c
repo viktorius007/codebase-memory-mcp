@@ -70,6 +70,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/lsp_resolve.h"
+#include "lsp/rust_cargo.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "pipeline/worker_pool.h"
 #include "foundation/compat.h"
@@ -1383,6 +1384,9 @@ typedef struct {
      * cbm_run_X_lsp_cross_with_registry — skip per-file build entirely.
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
+    /* Immutable Cargo snapshot owned by cbm_parallel_resolve and borrowed by
+     * every Rust dispatch. Worker threads never consult ambient state. */
+    const CBMCargoManifest *rust_manifest;
 
     /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
      * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
@@ -3105,7 +3109,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
                                       rc->cross_registries, rc->module_def_index, rc->all_defs,
                                       rc->def_count, imp_keys, imp_vals, imp_count,
-                                      pp_rust_shared_registry_get, rc);
+                                      rc->rust_manifest, pp_rust_shared_registry_get, rc);
                 cbm_index_mark_done(rel);
                 /* Free the on-demand re-read (no-op when source was retained). */
                 free_source(lsp_source_owned);
@@ -3214,6 +3218,23 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     }
     memset(workers, 0, (size_t)worker_count * sizeof(resolve_worker_state_t));
 
+    bool have_rust = false;
+    for (int i = 0; i < file_count; i++) {
+        if (result_cache[i] && files[i].language == CBM_LANG_RUST) {
+            have_rust = true;
+            break;
+        }
+    }
+    CBMArena cargo_arena;
+    CBMCargoManifest cargo_manifest;
+    const CBMCargoManifest *rust_manifest = NULL;
+    if (have_rust) {
+        cbm_arena_init(&cargo_arena);
+        if (cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest)) {
+            rust_manifest = &cargo_manifest;
+        }
+    }
+
     resolve_ctx_t rc = {
         .files = files,
         .file_count = file_count,
@@ -3231,6 +3252,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .def_modules = def_modules,
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
+        .rust_manifest = rust_manifest,
     };
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
@@ -3254,6 +3276,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         rc.rust_shared_arena_live = false;
     }
     cbm_mutex_destroy(&rc.rust_shared_mu);
+    if (have_rust) {
+        cbm_arena_destroy(&cargo_arena);
+    }
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
     CBM_PROF_START(t_resolve_merge);

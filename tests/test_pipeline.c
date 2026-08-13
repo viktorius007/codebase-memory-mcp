@@ -4678,6 +4678,136 @@ TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier) {
     PASS();
 }
 
+typedef struct {
+    int run_rc;
+    bool store_opened;
+    int alpha_target_calls;
+    int alpha_decoy_calls;
+    int gamma_target_calls;
+    int gamma_decoy_calls;
+} RustCargoRouteObservation;
+
+static int setup_rust_cargo_route_repo(const char *tmp) {
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/beta/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/gamma/src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\n"
+                    "members = [\"crates/alpha\", \"crates/beta\", \"crates/gamma\"]\n"
+                    "resolver = \"2\"\n");
+    write_temp_file(tmp, "crates/alpha/src/lib.rs",
+                    "pub fn alphaCargoRouteTarget() -> u8 { 1 }\n");
+    write_temp_file(tmp, "crates/gamma/src/lib.rs",
+                    "pub fn gammaCargoRouteTarget() -> u8 { 2 }\n");
+    write_temp_file(tmp, "crates/beta/src/local.rs",
+                    "pub fn alphaCargoRouteTarget() -> u8 { 91 }\n"
+                    "pub fn gammaCargoRouteTarget() -> u8 { 92 }\n");
+    write_temp_file(tmp, "crates/beta/src/lib.rs",
+                    "mod local;\n"
+                    "pub fn cargoRouteCaller() -> u8 {\n"
+                    "    alpha::alphaCargoRouteTarget() + gamma::gammaCargoRouteTarget()\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "rust_cargo_pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_cargo_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    return 0;
+}
+
+static RustCargoRouteObservation observe_rust_cargo_route(const char *tmp, const char *db_name) {
+    RustCargoRouteObservation observation = {.run_rc = -1};
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", tmp, db_name);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    if (!pipeline)
+        return observation;
+    observation.run_rc = cbm_pipeline_run(pipeline);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    observation.store_opened = store != NULL;
+    if (store && project) {
+        observation.alpha_target_calls = named_edge_to_file_count(
+            store, project, "CALLS", "cargoRouteCaller", "alphaCargoRouteTarget",
+            "crates/alpha/src/lib.rs");
+        observation.alpha_decoy_calls = named_edge_to_file_count(
+            store, project, "CALLS", "cargoRouteCaller", "alphaCargoRouteTarget",
+            "crates/beta/src/local.rs");
+        observation.gamma_target_calls = named_edge_to_file_count(
+            store, project, "CALLS", "cargoRouteCaller", "gammaCargoRouteTarget",
+            "crates/gamma/src/lib.rs");
+        observation.gamma_decoy_calls = named_edge_to_file_count(
+            store, project, "CALLS", "cargoRouteCaller", "gammaCargoRouteTarget",
+            "crates/beta/src/local.rs");
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return observation;
+}
+
+static int assert_rust_cargo_route(const RustCargoRouteObservation *observation) {
+    ASSERT_EQ(observation->run_rc, 0);
+    ASSERT_TRUE(observation->store_opened);
+    ASSERT_EQ(observation->alpha_target_calls, 1);
+    ASSERT_EQ(observation->alpha_decoy_calls, 0);
+    ASSERT_EQ(observation->gamma_target_calls, 1);
+    ASSERT_EQ(observation->gamma_decoy_calls, 0);
+    return 0;
+}
+
+TEST(pipeline_rust_cargo_manifest_converges_across_routes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_cargo_routes_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(setup_rust_cargo_route_repo(tmp), 0);
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    RustCargoRouteObservation sequential =
+        observe_rust_cargo_route(tmp, "rust_cargo_sequential.db");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    RustCargoRouteObservation parallel =
+        observe_rust_cargo_route(tmp, "rust_cargo_parallel.db");
+
+    write_temp_file(tmp, "crates/beta/src/lib.rs",
+                    "mod local;\n"
+                    "pub fn cargoRouteCaller() -> u8 {\n"
+                    "    let route_marker = 0;\n"
+                    "    route_marker + alpha::alphaCargoRouteTarget()\n"
+                    "        + gamma::gammaCargoRouteTarget()\n"
+                    "}\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    RustCargoRouteObservation incremental =
+        observe_rust_cargo_route(tmp, "rust_cargo_parallel.db");
+    cbm_incremental_route_t incremental_route = cbm_pipeline_incremental_test_last_route();
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(assert_rust_cargo_route(&sequential), 0);
+    ASSERT_EQ(assert_rust_cargo_route(&parallel), 0);
+    ASSERT_EQ(incremental_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(assert_rust_cargo_route(&incremental), 0);
+    PASS();
+}
+
 /* Native `fetch()` (#856), sequential path (< 50 files → pass_calls.c). A bare
  * unqualified call to the global fetch API has no import and no local
  * definition anywhere in this project, so registry resolution comes back
@@ -11761,6 +11891,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
+    RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);

@@ -157,11 +157,13 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     }
 }
 
-/* Borrow the (thread-local) Rust Cargo manifest the cross-file LSP pass set for
- * cross-crate (#56) routing. The Tier-2 prebuilt Rust resolve reads it so it sees
- * exactly what the per-file fallback (cbm_pxc_run_one) would on the same thread. */
 struct CBMCargoManifest;
-const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
+
+/* Parse the repository root Cargo.toml into caller-owned arena storage. The
+ * immutable result may be borrowed by every Rust cross-LSP dispatch until the
+ * caller destroys `arena`. False means no readable root manifest. */
+bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                 struct CBMCargoManifest *out_manifest);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
@@ -189,7 +191,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            const CBMCrossLspRegistries *cross_registries,
                            const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
                            int all_def_count, const char **imp_keys, const char **imp_vals,
-                           int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
-                           void *rust_shared_ctx);
+                           int imp_count, const struct CBMCargoManifest *rust_manifest,
+                           CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */
