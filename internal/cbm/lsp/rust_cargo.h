@@ -10,11 +10,10 @@
  * module QN, and to mark calls into known external deps as "external,
  * not local" rather than fully unresolved.
  *
- * The parser is a tiny hand-written TOML subset: handles `[section]`
- * headers, `key = "value"`, `key = { path = "...", … }` (the relevant
- * subset for our needs), arrays `members = ["a", "b"]`. It IGNORES
- * everything it doesn't understand — that's safe because Cargo.toml
- * is much richer than what we use. */
+ * The parser is a small hand-written TOML scanner. It captures Cargo package,
+ * workspace, target, and dependency routing data, including dotted keys,
+ * target-conditioned dependencies, and dependency subtables. Values outside
+ * that routing subset are structurally scanned but not interpreted. */
 
 #ifndef CBM_LSP_RUST_CARGO_H
 #define CBM_LSP_RUST_CARGO_H
