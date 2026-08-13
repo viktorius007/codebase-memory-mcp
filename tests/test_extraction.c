@@ -756,6 +756,19 @@ TEST(rust_struct) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Struct", "Point"));
     ASSERT(has_def(r, "Method", "new"));
+    const CBMDefinition *constructor = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Method") == 0 &&
+            strcmp(r->defs.items[i].name, "new") == 0) {
+            constructor = &r->defs.items[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(constructor);
+    ASSERT_STR_EQ(constructor->return_type, "Self");
+    ASSERT_NOT_NULL(constructor->return_types);
+    ASSERT_STR_EQ(constructor->return_types[0], "Self");
+    ASSERT_NULL(constructor->return_types[1]);
     cbm_free_result(r);
     PASS();
 }

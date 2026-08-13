@@ -787,6 +787,38 @@ static size_t rust_crate_path_prefix_len(const RustLSPContext *ctx) {
     return second_dot ? (size_t)(second_dot - module_qn) : strlen(module_qn);
 }
 
+static const char *rust_canonicalize_rooted_path(CBMArena *arena, const char *path,
+                                                 const char *module_qn,
+                                                 const char *self_type_qn,
+                                                 size_t crate_prefix_len) {
+    if (strncmp(path, "Self::", 6) == 0 && self_type_qn) {
+        return cbm_arena_sprintf(arena, "%s.%s", self_type_qn,
+                                 convert_path_to_qn(arena, path + 6));
+    }
+    if (strncmp(path, "self::", 6) == 0 && module_qn) {
+        return cbm_arena_sprintf(arena, "%s.%s", module_qn,
+                                 convert_path_to_qn(arena, path + 6));
+    }
+    if (strncmp(path, "crate::", 7) == 0 && module_qn && crate_prefix_len > 0) {
+        char *crate_qn = cbm_arena_strndup(arena, module_qn, crate_prefix_len);
+        return cbm_arena_sprintf(arena, "%s.%s", crate_qn,
+                                 convert_path_to_qn(arena, path + 7));
+    }
+    if (strncmp(path, "super::", 7) == 0 && module_qn) {
+        const char *tail = path;
+        const char *base = module_qn;
+        while (strncmp(tail, "super::", 7) == 0) {
+            const char *dot = strrchr(base, '.');
+            if (!dot)
+                return NULL;
+            base = cbm_arena_strndup(arena, base, (size_t)(dot - base));
+            tail += 7;
+        }
+        return cbm_arena_sprintf(arena, "%s.%s", base, convert_path_to_qn(arena, tail));
+    }
+    return NULL;
+}
+
 static bool rust_qn_is_within_resolution_scope(const RustLSPContext *ctx,
                                                 const char *candidate_qn) {
     const char *module_qn = ctx ? ctx->module_qn : NULL;
@@ -836,46 +868,37 @@ static const char *rust_registered_relative_path(RustLSPContext *ctx, const char
  *
  *   1.  `Self::X` → `<self_type_qn>.X`
  *   2.  `crate::a::b` → `<root_module_qn>.a.b`
- *   3.  `super::a` → strip last segment of `module_qn` and prepend
+ *   3.  Each `super::` → strip one segment of `module_qn` and prepend
  *   4.  Single-segment + matches a `use` local-name → `<full path>.X`
  *   5.  Multi-segment whose first segment is a `use` local → splice
  *   6.  Falls through unchanged (caller decides what to do).
  *
  * The returned string is arena-owned; in case (6) we return the input
  * with `::` already converted to `.`. */
+/* Canonicalize relative roots before consulting the registry. Import targets
+ * can retain `crate::`, `super::`, or `self::`; source expressions can also
+ * start with `Self::`. Replacing separators alone would mint `crate.foo` QNs
+ * that cannot match the project-qualified registry. */
+static const char *rust_resolve_use_target(RustLSPContext *ctx, const char *target) {
+    const char *rooted = rust_canonicalize_rooted_path(
+        ctx->arena, target, ctx->module_qn, ctx->self_type_qn, rust_crate_path_prefix_len(ctx));
+    if (rooted)
+        return rooted;
+    return convert_path_to_qn(ctx->arena, target);
+}
+
 static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path) {
     if (!ctx || !path || !path[0]) {
         return path;
     }
 
-    /* Self:: handling — we treat the receiver type's QN as the head. */
-    if (strncmp(path, "Self::", 6) == 0 && ctx->self_type_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->self_type_qn,
-                                 convert_path_to_qn(ctx->arena, path + 6));
-    }
+    const char *rooted = rust_canonicalize_rooted_path(
+        ctx->arena, path, ctx->module_qn, ctx->self_type_qn, rust_crate_path_prefix_len(ctx));
+    if (rooted)
+        return rooted;
+
     if (strcmp(path, "Self") == 0 && ctx->self_type_qn) {
         return ctx->self_type_qn;
-    }
-
-    /* crate:: → <root>. A Cargo workspace member path is authoritative;
-     * otherwise approximate the crate root as the first dotted path segment
-     * after the project prefix, preserving the established flat-repo policy. */
-    if (strncmp(path, "crate::", 7) == 0 && ctx->module_qn) {
-        size_t crate_len = rust_crate_path_prefix_len(ctx);
-        char *crate_buf = cbm_arena_strndup(ctx->arena, ctx->module_qn, crate_len);
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", crate_buf,
-                                 convert_path_to_qn(ctx->arena, path + 7));
-    }
-
-    /* super:: → drop last segment of module_qn. */
-    if (strncmp(path, "super::", 7) == 0 && ctx->module_qn) {
-        const char *dot = strrchr(ctx->module_qn, '.');
-        if (dot) {
-            char *parent =
-                cbm_arena_strndup(ctx->arena, ctx->module_qn, (size_t)(dot - ctx->module_qn));
-            return cbm_arena_sprintf(ctx->arena, "%s.%s", parent,
-                                     convert_path_to_qn(ctx->arena, path + 7));
-        }
     }
 
     /* Find first "::" — split into head + tail. */
@@ -883,7 +906,7 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
     if (!sep) {
         const char *full = rust_resolve_use(ctx, path);
         if (full) {
-            return convert_path_to_qn(ctx->arena, full);
+            return rust_resolve_use_target(ctx, full);
         }
         /* Prelude name (e.g. `String`, `Vec`)? */
         const char *prelude = rust_lookup_prelude(path);
@@ -904,7 +927,7 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
     if (full) {
         /* The use-map's full path already includes `head` as the last
          * segment; concat its parent with the rest. */
-        const char *full_dotted = convert_path_to_qn(ctx->arena, full);
+        const char *full_dotted = rust_resolve_use_target(ctx, full);
         const char *tail_dotted = convert_path_to_qn(ctx->arena, tail);
         return cbm_arena_sprintf(ctx->arena, "%s.%s", full_dotted, tail_dotted);
     }

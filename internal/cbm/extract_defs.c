@@ -5039,6 +5039,12 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                 a, params, ctx->source, ctx->language, true, &def.signature_param_count);
         }
 
+        TSNode return_type = ts_node_child_by_field_name(child, TS_FIELD("return_type"));
+        if (!ts_node_is_null(return_type)) {
+            def.return_type = cbm_node_text(a, return_type, ctx->source);
+            def.return_types = extract_return_types(a, return_type, ctx->source, ctx->language);
+        }
+
         if (spec->branching_node_types && spec->branching_node_types[0]) {
             set_def_complexity(&def, child, spec);
         }

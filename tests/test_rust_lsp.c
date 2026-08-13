@@ -667,6 +667,162 @@ TEST(rustlsp_crossfile_method_dispatch) {
     PASS();
 }
 
+TEST(rustlsp_crossfile_crate_import_factory_chain_exact_site) {
+    const char *caller =
+        "fn imported_free_factory() { make_runner().dry_run(); }\n"
+        "trait DryRun { fn dry_run(&self); }\n"
+        "fn weak_receiver<T: DryRun>(value: T) { value.dry_run(); }\n";
+    const char *site = strstr(caller, "make_runner().dry_run()");
+    ASSERT_NOT_NULL(site);
+    uint32_t expected_start = (uint32_t)(site - caller);
+    uint32_t expected_end = expected_start + (uint32_t)strlen("make_runner().dry_run()");
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.src.runner.BuildRunner";
+    defs[0].short_name = "BuildRunner";
+    defs[0].label = "Type";
+    defs[0].def_module_qn = "test.src.runner";
+    defs[1].qualified_name = "test.src.runner.make_runner";
+    defs[1].short_name = "make_runner";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "test.src.runner";
+    defs[1].return_types = "test.src.runner.BuildRunner";
+    defs[2].qualified_name = "test.src.runner.BuildRunner.dry_run";
+    defs[2].short_name = "dry_run";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "test.src.runner.BuildRunner";
+    defs[2].def_module_qn = "test.src.runner";
+
+    const char *imp_names[] = {"make_runner"};
+    const char *imp_qns[] = {"crate::runner::make_runner"};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller), "test.src.compile", defs, 3,
+                           imp_names, imp_qns, 1, NULL, &out, NULL);
+
+    int exact = 0;
+    int weak_stolen = 0;
+    for (int i = 0; i < out.count; i++) {
+        const CBMResolvedCall *call = &out.items[i];
+        if (call->caller_qn && call->callee_qn &&
+            strcmp(call->caller_qn, "test.src.compile.imported_free_factory") == 0 &&
+            strcmp(call->callee_qn, "test.src.runner.BuildRunner.dry_run") == 0 &&
+            call->site_start_byte == expected_start && call->site_end_byte == expected_end) {
+            exact++;
+        }
+        if (call->caller_qn && call->callee_qn &&
+            strcmp(call->caller_qn, "test.src.compile.weak_receiver") == 0 &&
+            strcmp(call->callee_qn, "test.src.runner.BuildRunner.dry_run") == 0) {
+            weak_stolen++;
+        }
+    }
+    ASSERT_EQ(exact, 1);
+    ASSERT_EQ(weak_stolen, 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_crossfile_relative_use_roots_canonicalize) {
+    const char *caller = "fn via_self() { make_local().dry_run(); }\n"
+                         "fn via_super() { make_parent().dry_run(); }\n"
+                         "fn via_self_type() { LocalRunner::new().dry_run(); }\n"
+                         "fn via_super_type() { BuildRunner::new().dry_run(); }\n"
+                         "fn via_nested_super() { make_grand().dry_run(); }\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustLSPDef defs[9];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.src.group.runner.BuildRunner";
+    defs[0].short_name = "BuildRunner";
+    defs[0].label = "Type";
+    defs[0].def_module_qn = "test.src.group.runner";
+    defs[1].qualified_name = "test.src.group.runner.BuildRunner.dry_run";
+    defs[1].short_name = "dry_run";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.src.group.runner.BuildRunner";
+    defs[1].def_module_qn = "test.src.group.runner";
+    defs[2].qualified_name = "test.src.group.compile.local.make_local";
+    defs[2].short_name = "make_local";
+    defs[2].label = "Function";
+    defs[2].def_module_qn = "test.src.group.compile.local";
+    defs[2].return_types = "test.src.group.runner.BuildRunner";
+    defs[3].qualified_name = "test.src.group.runner.make_parent";
+    defs[3].short_name = "make_parent";
+    defs[3].label = "Function";
+    defs[3].def_module_qn = "test.src.group.runner";
+    defs[3].return_types = "test.src.group.runner.BuildRunner";
+    defs[4].qualified_name = "test.src.group.runner.BuildRunner.new";
+    defs[4].short_name = "new";
+    defs[4].label = "Method";
+    defs[4].receiver_type = "test.src.group.runner.BuildRunner";
+    defs[4].def_module_qn = "test.src.group.runner";
+    defs[4].return_types = "Self";
+    defs[5].qualified_name = "test.src.group.compile.local.LocalRunner";
+    defs[5].short_name = "LocalRunner";
+    defs[5].label = "Type";
+    defs[5].def_module_qn = "test.src.group.compile.local";
+    defs[6].qualified_name = "test.src.group.compile.local.LocalRunner.new";
+    defs[6].short_name = "new";
+    defs[6].label = "Method";
+    defs[6].receiver_type = "test.src.group.compile.local.LocalRunner";
+    defs[6].def_module_qn = "test.src.group.compile.local";
+    defs[6].return_types = "Self";
+    defs[7].qualified_name = "test.src.group.compile.local.LocalRunner.dry_run";
+    defs[7].short_name = "dry_run";
+    defs[7].label = "Method";
+    defs[7].receiver_type = "test.src.group.compile.local.LocalRunner";
+    defs[7].def_module_qn = "test.src.group.compile.local";
+    defs[8].qualified_name = "test.src.runner.make_grand";
+    defs[8].short_name = "make_grand";
+    defs[8].label = "Function";
+    defs[8].def_module_qn = "test.src.runner";
+    defs[8].return_types = "test.src.group.runner.BuildRunner";
+
+    const char *imp_names[] = {"make_local", "make_parent", "LocalRunner", "BuildRunner",
+                               "make_grand"};
+    const char *imp_qns[] = {"self::local::make_local", "super::runner::make_parent",
+                             "self::local::LocalRunner", "super::runner::BuildRunner",
+                             "super::super::runner::make_grand"};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller), "test.src.group.compile", defs, 9,
+                           imp_names, imp_qns, 5, NULL, &out, NULL);
+    int local = 0;
+    int parent = 0;
+    int local_type = 0;
+    int parent_type = 0;
+    int grandparent = 0;
+    for (int i = 0; i < out.count; i++) {
+        const CBMResolvedCall *call = &out.items[i];
+        if (!call->caller_qn || !call->callee_qn) {
+            continue;
+        }
+        if (strcmp(call->callee_qn, "test.src.group.runner.BuildRunner.dry_run") == 0 &&
+            strcmp(call->caller_qn, "test.src.group.compile.via_self") == 0)
+            local++;
+        if (strcmp(call->callee_qn, "test.src.group.runner.BuildRunner.dry_run") == 0 &&
+            strcmp(call->caller_qn, "test.src.group.compile.via_super") == 0)
+            parent++;
+        if (strcmp(call->callee_qn, "test.src.group.compile.local.LocalRunner.dry_run") == 0 &&
+            strcmp(call->caller_qn, "test.src.group.compile.via_self_type") == 0)
+            local_type++;
+        if (strcmp(call->callee_qn, "test.src.group.runner.BuildRunner.dry_run") == 0 &&
+            strcmp(call->caller_qn, "test.src.group.compile.via_super_type") == 0)
+            parent_type++;
+        if (strcmp(call->callee_qn, "test.src.group.runner.BuildRunner.dry_run") == 0 &&
+            strcmp(call->caller_qn, "test.src.group.compile.via_nested_super") == 0)
+            grandparent++;
+    }
+    ASSERT_EQ(local, 1);
+    ASSERT_EQ(parent, 1);
+    ASSERT_EQ(local_type, 1);
+    ASSERT_EQ(parent_type, 1);
+    ASSERT_EQ(grandparent, 1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* F4 Tier-2: the build-once shared registry path (cbm_rust_build_cross_registry +
  * cbm_run_rust_lsp_cross_with_registry) must resolve IDENTICALLY to the per-file
  * cbm_run_rust_lsp_cross — same fixture as rustlsp_crossfile_method_dispatch. Also
@@ -7496,6 +7652,8 @@ void suite_rust_lsp(void) {
 
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
+    RUN_TEST(rustlsp_crossfile_crate_import_factory_chain_exact_site);
+    RUN_TEST(rustlsp_crossfile_relative_use_roots_canonicalize);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_relative_type_requires_declared_module);
     RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);

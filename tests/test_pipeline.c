@@ -1152,6 +1152,52 @@ static int named_edge_to_file_count(cbm_store_t *s, const char *project, const c
     return matches;
 }
 
+static int named_edge_to_qn_count(cbm_store_t *s, const char *project, const char *edge_type,
+                                  const char *source_name, const char *target_qn) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            strcmp(source.name, source_name) == 0 && strcmp(target.qualified_name, target_qn) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return matches;
+}
+
+static int named_source_edge_count(cbm_store_t *s, const char *project, const char *edge_type,
+                                   const char *source_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK &&
+            source.name && strcmp(source.name, source_name) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return matches;
+}
+
 /* Count exact-name nodes without depending on project-prefixed qualified names.
  * Export-XML relationship tests use this as an anti-vacuous guard: the
  * transcoded methods must exist even when their extracted relationships were
@@ -12131,7 +12177,95 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
     PASS();
 }
 
+TEST(pipeline_rust_cross_file_factory_chains_exact_targets) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_factory_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"rust-factory\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod runner;\nmod compile;\nmod contract;\n");
+    write_temp_file(tmp, "src/runner.rs",
+                    "pub struct BuildRunner;\n"
+                    "impl BuildRunner {\n"
+                    "    pub fn new() -> Self { Self }\n"
+                    "    pub fn dry_run(&self) {}\n"
+                    "}\n"
+                    "pub fn make_runner() -> BuildRunner { BuildRunner::new() }\n"
+                    "pub fn rh009_same_file_control() { BuildRunner::new().dry_run(); }\n");
+    const char *compile_source =
+        "use crate::runner::BuildRunner;\n"
+        "use crate::runner::make_runner;\n"
+        "pub fn compile_ws() {\n"
+        "    let build_runner = BuildRunner::new();\n"
+        "    build_runner.dry_run();\n"
+        "}\n"
+        "pub fn rh009_absolute_factory() {\n"
+        "    crate::runner::BuildRunner::new().dry_run();\n"
+        "}\n"
+        "pub fn rh009_imported_free_factory() {\n"
+        "    make_runner().dry_run();\n"
+        "}\n";
+    write_temp_file(tmp, "src/compile.rs", compile_source);
+    write_temp_file(tmp, "src/contract.rs",
+                    "use crate::runner::BuildRunner;\n"
+                    "pub trait DryRun { fn dry_run(&self); }\n"
+                    "impl DryRun for BuildRunner { fn dry_run(&self) {} }\n"
+                    "pub struct OtherRunner;\n"
+                    "impl DryRun for OtherRunner { fn dry_run(&self) {} }\n"
+                    "pub fn rh009_weak_receiver<T: DryRun>(value: &T) { value.dry_run(); }\n");
+    ASSERT_EQ((int)(strstr(compile_source, "build_runner.dry_run()") - compile_source), 133);
+    ASSERT_EQ((int)(strstr(compile_source, "crate::runner::BuildRunner::new().dry_run()") -
+                    compile_source),
+              197);
+    ASSERT_EQ((int)(strstr(compile_source, "make_runner().dry_run()") - compile_source), 287);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/factory.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "compile_ws", "dry_run",
+                                       "src/runner.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh009_absolute_factory",
+                                       "dry_run", "src/runner.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh009_imported_free_factory",
+                                       "dry_run", "src/runner.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh009_same_file_control",
+                                       "dry_run", "src/runner.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "rh009_weak_receiver",
+                                       "dry_run", "src/runner.rs"),
+              0);
+    char trait_qn[512];
+    char build_impl_qn[512];
+    char other_impl_qn[512];
+    snprintf(trait_qn, sizeof(trait_qn), "%s.src.contract.DryRun.dry_run", project);
+    snprintf(build_impl_qn, sizeof(build_impl_qn), "%s.src.contract.BuildRunner.dry_run", project);
+    snprintf(other_impl_qn, sizeof(other_impl_qn), "%s.src.contract.OtherRunner.dry_run", project);
+    ASSERT_EQ(named_source_edge_count(store, project, "CALLS", "rh009_weak_receiver"), 0);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh009_weak_receiver", trait_qn),
+              0);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh009_weak_receiver",
+                                     build_impl_qn),
+              0);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "rh009_weak_receiver",
+                                     other_impl_qn),
+              0);
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_rust_cross_file_factory_chains_exact_targets);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
