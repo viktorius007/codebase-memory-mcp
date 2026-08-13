@@ -1,0 +1,8 @@
+diff --git a/internal/cbm/extract_defs.c b/internal/cbm/extract_defs.c
+--- a/internal/cbm/extract_defs.c
++++ b/internal/cbm/extract_defs.c
+@@ -5040,3 +5040,3 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
+         TSNode return_type = ts_node_child_by_field_name(child, TS_FIELD("return_type"));
+-        if (!ts_node_is_null(return_type)) {
++        if (false && !ts_node_is_null(return_type)) {
+             def.return_type = cbm_node_text(a, return_type, ctx->source);

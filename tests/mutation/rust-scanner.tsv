@@ -1,0 +1,9 @@
+# id<TAB>patch<TAB>suite<TAB>required behavioral failure regex
+macro-fail-open	tests/mutation/patches/macro-fail-open.patch	rust_lsp	rustlsp_gap_macro_no_match_is_fail_closed.*unmatched_arm_sentinel.*== 1, expected 0 == 0
+macro-wrong-arm	tests/mutation/patches/macro-wrong-arm.patch	rust_lsp	rustlsp_gap_macro_later_matching_arm_only.*selected_later_arm.*== 0, expected 1 == 1
+crate-scope-leak	tests/mutation/patches/crate-scope-leak.patch	rust_lsp	rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy.*wrong_target == 1, expected 0 == 0
+cargo-parallel-manifest-loss	tests/mutation/patches/cargo-parallel-manifest-loss.patch	pipeline	assert_rust_cargo_route\(&parallel\) == 1, expected 0 == 0
+cargo-incremental-manifest-loss	tests/mutation/patches/cargo-incremental-manifest-loss.patch	pipeline	assert_rust_cargo_route\(&incremental\) == 1, expected 0 == 0
+health-cap-silence	tests/mutation/patches/health-cap-silence.patch	rust_lsp	rustlsp_health_walk_and_work_limits_report_omitted_subtrees.*1 == 1, expected work->count == 0
+impl-return-loss	tests/mutation/patches/impl-return-loss.patch	extraction	rust_struct.*"\(null\)" != "Self"
+import-root-literal	tests/mutation/patches/import-root-literal.patch	rust_lsp	rustlsp_crossfile_crate_import_factory_chain_exact_site.*exact == 0, expected 1 == 1

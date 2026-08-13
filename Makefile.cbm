@@ -731,7 +731,8 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 # ── Targets ──────────────────────────────────────────────────────
 
 .PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke \
-	coverage-rust coverage-rust-contract cbm cbm-with-ui frontend embed clean-c \
+	coverage-rust coverage-rust-contract mutation-rust mutation-rust-contract \
+	cbm cbm-with-ui frontend embed clean-c \
 	lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
@@ -908,6 +909,12 @@ coverage-rust-contract:
 
 coverage-rust:
 	@bash scripts/rust-scanner-coverage.sh
+
+mutation-rust-contract:
+	@bash tests/test_rust_scanner_mutation.sh
+
+mutation-rust:
+	@bash scripts/rust-scanner-mutation.sh
 
 # ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
