@@ -307,13 +307,32 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
             yyjson_doc_free(structured_doc);
         }
     }
-    if (!has_structured_content) {
-        /* Every advertised MCP tool has an object outputSchema, so even compact
-         * TOON/plain-text and error results must carry a conforming structured
-         * object. Keep the text Content block above for model visibility and
-         * backwards compatibility. */
+    if (!has_structured_content && is_error) {
+        /* structuredContent has now been wrong in both directions, so the rule
+         * is spelled out here in full:
+         *
+         *   - JSON-object payload  -> structuredContent = the PARSED object
+         *     (the branch above; the spec's structured+serialized pattern).
+         *   - error                -> structuredContent = {"error": <text>} —
+         *     bounded, small, and the only machine-readable failure form.
+         *   - anything else       -> NO structuredContent key at all.
+         *
+         * Pre-#1488 the "anything else" case duplicated the payload verbatim
+         * ({"text": <payload>} beside an identical content[0].text — 2.05x the
+         * bytes on a 20k-node query_graph, #1375). #1488 replaced that with an
+         * EMPTY object on the theory that it "still satisfies outputSchema" —
+         * but clients that honor a declared outputSchema treat structuredContent
+         * as THE authoritative result, so every tree-format reply rendered as
+         * literally "{}" in Claude Code and friends (#1522). An empty object
+         * beside a non-empty payload is not conservative; it is a wrong answer.
+         *
+         * The key is therefore OMITTED for text-shaped payloads, and no tool
+         * declares an outputSchema anymore (see mcp_add_tool_def): output is
+         * format-parameter-polymorphic, so a static schema was never truthful.
+         * tests/test_mcp.c binds all three branches; scripts/smoke-test.sh
+         * asserts the same contract on the shipped binary. */
         yyjson_mut_val *structured = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, structured, is_error ? "error" : "text", text ? text : "");
+        yyjson_mut_obj_add_str(doc, structured, "error", text ? text : "");
         yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
     }
     yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
@@ -663,16 +682,19 @@ static const tool_def_t TOOLS[] = {
      "use scopes before negative/exhaustive claims because fully skipped files cannot appear in "
      "normal graph results. Returns coverage status separately from filesystem metadata freshness, "
      "plus structured parse-error ranges and direct-source fallback actions. The signal is "
-     "best-effort: indexed_no_recorded_gap is not a completeness guarantee.",
+     "best-effort: indexed_no_recorded_gap is not a completeness guarantee. At least one of "
+     "'paths' or 'scopes' is required; the call is rejected at runtime if both are omitted.",
      "{\"type\":\"object\",\"properties\":{"
      "\"project\":{\"type\":\"string\"},"
      "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":128,"
-     "\"description\":\"Repository-relative files to check exactly.\"},"
+     "\"description\":\"Repository-relative files to check exactly. Required if 'scopes' is "
+     "omitted.\"},"
      "\"scopes\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":32,"
-     "\"description\":\"Repository-relative path prefixes; use . for the project root.\"},"
+     "\"description\":\"Repository-relative path prefixes; use . for the project root. Required "
+     "if 'paths' is omitted.\"},"
      "\"scope_limit\":{\"type\":\"integer\",\"default\":200,\"minimum\":1,\"maximum\":1000},"
      "\"scope_offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0}},"
-     "\"required\":[\"project\"],\"anyOf\":[{\"required\":[\"paths\"]},{\"required\":[\"scopes\"]}]"
+     "\"required\":[\"project\"]"
      "}"},
 
     {"detect_changes", "Detect changes",
@@ -719,8 +741,6 @@ static const tool_def_t TOOLS[] = {
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
-
-static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
 
 typedef struct {
     const char *name;
@@ -779,7 +799,13 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
     yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
 
     mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
-    mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
+    /* Deliberately NO outputSchema. Tool output is format-parameter-polymorphic
+     * (tree text by default, a JSON object under format:"json"), so no static
+     * schema is truthful — and a declared schema makes spec-honoring clients
+     * read structuredContent as the authoritative result, which is exactly how
+     * the empty-object regression rendered every tree reply as "{}" (#1522).
+     * The blanket {"type":"object","additionalProperties":true} it replaced
+     * validated anything and informed nobody. */
 
     const tool_annotation_def_t *def = mcp_tool_annotations(TOOLS[i].name);
     yyjson_mut_val *annotations = yyjson_mut_obj(doc);
@@ -2193,9 +2219,34 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
             }
 
             /* The lease may have waited behind a publisher. Re-open and trust
-             * only the current generation, never the stale pre-wait verdict. */
+             * only the current generation, never the stale pre-wait verdict.
+             * Use the verdict API here — this is the point that decides whether
+             * a healthy DB gets quarantined. The plain bool check cannot tell
+             * corruption from a transient SQLITE_BUSY race (#1206: concurrent
+             * instances quarantining each other's DBs) and does not run
+             * quick_check, so page-torn DBs with an intact projects table sail
+             * through (#1037). Only a confirmed CORRUPT verdict is quarantined;
+             * TRANSIENT (lock/IO) falls through and retries on next access. */
             srv->store = cbm_store_open_path_query(path);
-            bool current_valid = srv->store && cbm_store_check_integrity(srv->store);
+            cbm_integrity_verdict_t verdict = srv->store
+                                                  ? cbm_store_check_integrity_verdict(srv->store)
+                                                  : CBM_INTEGRITY_TRANSIENT;
+            bool current_valid = (verdict == CBM_INTEGRITY_OK);
+            if (verdict == CBM_INTEGRITY_TRANSIENT) {
+                /* The DB could not be conclusively evaluated (lock contention,
+                 * busy writer, IO hiccup). Do NOT quarantine — close and let
+                 * the next resolve retry. A spurious quarantine here is exactly
+                 * what destroys healthy DBs under concurrent access. */
+                cbm_store_close(srv->store);
+                srv->store = NULL;
+                if (recovery_status) {
+                    *recovery_status = STORE_RECOVERY_BUSY;
+                }
+                if (!mutation_already_held) {
+                    mcp_project_mutation_end(srv, project);
+                }
+                return NULL;
+            }
             if (!current_valid) {
                 cbm_store_close(srv->store);
                 srv->store = NULL;
@@ -6413,13 +6464,22 @@ static const char *trace_cursor_decode(const char *token, const char *current_ge
  * output — {cols, groups:[{qn_prefix, rows:[[name,hop,...]]}]}. Optional
  * risk/args columns mirror the flags. */
 static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result_t *tr,
-                                        bool risk_labels, bool include_tests, bool data_flow) {
+                                        bool risk_labels, bool include_tests, bool data_flow,
+                                        bool include_evidence) {
     yyjson_mut_val *leg = yyjson_mut_obj(doc);
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
     yyjson_mut_arr_add_str(doc, cols, "name");
     yyjson_mut_arr_add_str(doc, cols, "hop");
     if (risk_labels) {
         yyjson_mut_arr_add_str(doc, cols, "risk");
+    }
+    /* #1542: include_evidence was implemented on the tree path only, so
+     * format:"json" silently returned cols ["name","hop"] while the schema and
+     * --help promised two more. A structured caller — the one most likely to
+     * ask for json — got no error, just missing fields. */
+    if (include_evidence) {
+        yyjson_mut_arr_add_str(doc, cols, "strategy");
+        yyjson_mut_arr_add_str(doc, cols, "confidence");
     }
     if (data_flow) {
         yyjson_mut_arr_add_str(doc, cols, "args");
@@ -6453,6 +6513,25 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
         yyjson_mut_arr_add_int(doc, row, tr->visited[i].hop);
         if (risk_labels) {
             yyjson_mut_arr_add_str(doc, row, cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)));
+        }
+        if (include_evidence) {
+            const char *ev_class = NULL;
+            double ev_conf = -1.0;
+            if (bfs_edge_evidence_for_hop(tr, tr->visited[i].node.id, &ev_class, &ev_conf)) {
+                yyjson_mut_arr_add_strcpy(doc, row, ev_class ? ev_class : "");
+                if (ev_conf >= 0.0) {
+                    yyjson_mut_arr_add_real(doc, row, ev_conf);
+                } else {
+                    yyjson_mut_arr_add_null(doc, row);
+                }
+            } else {
+                /* The root hop has no inbound edge and non-CALLS edges record
+                 * no strategy. The tree path emits "-" placeholders to keep the
+                 * column count fixed; json says null, which is the same promise
+                 * in a form a structured caller can test. */
+                yyjson_mut_arr_add_null(doc, row);
+                yyjson_mut_arr_add_null(doc, row);
+            }
         }
         if (data_flow) {
             char *ea = bfs_edge_args_for_hop(tr, &tr->visited[i]);
@@ -7400,28 +7479,32 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_int(doc, root, out_total_key, out_total);
             yyjson_mut_obj_add_val(
                 doc, root, out_key,
-                bfs_to_tree_json(doc, &view_out, risk_labels, include_tests, data_flow));
+                bfs_to_tree_json(doc, &view_out, risk_labels, include_tests, data_flow,
+                                 include_evidence));
             if (unattr_out_total > 0) {
                 yyjson_mut_obj_add_int(doc, root, "unattributed_outbound_total", unattr_out_total);
                 yyjson_mut_obj_add_str(doc, root, "unattributed_outbound_note",
                                        TRACE_UNATTRIBUTED_OUT_NOTE);
                 yyjson_mut_obj_add_val(
                     doc, root, "unattributed_outbound",
-                    bfs_to_tree_json(doc, &unattr_out, risk_labels, include_tests, data_flow));
+                    bfs_to_tree_json(doc, &unattr_out, risk_labels, include_tests, data_flow,
+                                     include_evidence));
             }
         }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, in_total_key, in_total);
             yyjson_mut_obj_add_val(
                 doc, root, in_key,
-                bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow));
+                bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow,
+                                 include_evidence));
             if (unattr_in_total > 0) {
                 yyjson_mut_obj_add_int(doc, root, "unattributed_inbound_total", unattr_in_total);
                 yyjson_mut_obj_add_str(doc, root, "unattributed_inbound_note",
                                        TRACE_UNATTRIBUTED_IN_NOTE);
                 yyjson_mut_obj_add_val(
                     doc, root, "unattributed_inbound",
-                    bfs_to_tree_json(doc, &unattr_in, risk_labels, include_tests, data_flow));
+                    bfs_to_tree_json(doc, &unattr_in, risk_labels, include_tests, data_flow,
+                                     include_evidence));
             }
             /* Inferred, never merged with the exact set above (shape C). */
             if (via_port_total > 0 || via_port_unattr_total > 0) {
@@ -7445,17 +7528,19 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                     if (port_views[p].visited_count > 0) {
                         yyjson_mut_obj_add_val(doc, pe, "callers",
                                                bfs_to_tree_json(doc, &port_views[p], risk_labels,
-                                                                include_tests, data_flow));
+                                                                include_tests, data_flow,
+                                                                include_evidence));
                     }
                     if (port_unattr[p].visited_count > 0) {
                         yyjson_mut_obj_add_val(doc, pe, "unattributed",
                                                bfs_to_tree_json(doc, &port_unattr[p], risk_labels,
-                                                                include_tests, data_flow));
+                                                                include_tests, data_flow,
+                                                                include_evidence));
                     }
-                    yyjson_mut_arr_add_val(pa, pe);
-                }
-                yyjson_mut_obj_add_val(doc, root, "via_port", pa);
+                yyjson_mut_arr_add_val(pa, pe);
             }
+            yyjson_mut_obj_add_val(doc, root, "via_port", pa);
+        }
         }
         if (more_rows) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);

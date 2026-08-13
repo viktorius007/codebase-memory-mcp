@@ -230,6 +230,24 @@ bash "$ROOT/tests/test_parallel_harness_contract.sh"
 echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
 
+echo "=== Step 0k: spawn console-window contract (#1427) ==="
+bash "$ROOT/tests/test_spawn_no_window_contract.sh"
+
+echo "=== Step 0l: release archive extractor contract ==="
+bash "$ROOT/tests/test_release_archive_extractor_contract.sh"
+
+echo "=== Step 0m: VirusTotal release-notes + evidence contract ==="
+bash "$ROOT/tests/test_vt_release_notes_contract.sh"
+
+echo "=== Step 0n: VirusTotal gate policy contract ==="
+bash "$ROOT/tests/test_vt_gate_policy_contract.sh"
+
+echo "=== Step 0o: MCPB bundle contract (#1246) ==="
+bash "$ROOT/tests/test_mcpb_bundle_contract.sh"
+
+echo "=== Step 0p: MCPB registry entries contract (#1246) ==="
+bash "$ROOT/tests/test_mcpb_registry_entries_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
