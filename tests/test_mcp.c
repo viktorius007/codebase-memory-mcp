@@ -415,7 +415,7 @@ static unsigned char *mcp_read_file_bytes(const char *path, long *out_len) {
         fclose(fp);
         return NULL;
     }
-    unsigned char *bytes = malloc(size > 0 ? (size_t)size : 1);
+    unsigned char *bytes = malloc((size_t)size + 1U);
     if (!bytes) {
         fclose(fp);
         return NULL;
@@ -426,6 +426,7 @@ static unsigned char *mcp_read_file_bytes(const char *path, long *out_len) {
         free(bytes);
         return NULL;
     }
+    bytes[size] = '\0';
     *out_len = size;
     return bytes;
 }
@@ -3211,7 +3212,8 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
         {.rel_path = "src/b.rs", .kind = "analysis_partial:rust", .detail = "{\"status\":\"partial\"}"},
         {.rel_path = "src/b.rs", .kind = "parse_partial", .detail = "7-9"},
     };
-    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "complete", 4, mixed, 4),
+    ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete", 4,
+                                        mixed, 4),
               CBM_STORE_OK);
     cbm_coverage_row_t *stored_rows = NULL;
     int stored_row_count = 0;
@@ -3262,7 +3264,8 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     free(inner);
     free(response);
 
-    ASSERT_EQ(write_rust_health_fixture(store, project, 3, "complete", 4, mixed, 4),
+    ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION - 1, "complete",
+                                        4, mixed, 4),
               CBM_STORE_OK);
     doc = mcp_tool_inner_doc(srv, "index_status",
                              "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
@@ -3275,7 +3278,9 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     free(inner);
     free(response);
 
-    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "complete", 0, NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete", 0,
+                                        NULL, 0),
+              CBM_STORE_OK);
     doc = mcp_tool_inner_doc(srv, "index_status",
                              "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
     ASSERT_NOT_NULL(doc);
@@ -3285,7 +3290,9 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     free(inner);
     free(response);
 
-    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "complete", 2, NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete", 2,
+                                        NULL, 0),
+              CBM_STORE_OK);
     doc = mcp_tool_inner_doc(srv, "index_status",
                              "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
     ASSERT_NOT_NULL(doc);
@@ -3295,7 +3302,9 @@ TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact) {
     free(inner);
     free(response);
 
-    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "unknown", 2, NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "unknown", 2,
+                                        NULL, 0),
+              CBM_STORE_OK);
     doc = mcp_tool_inner_doc(srv, "index_status",
                              "{\"project\":\"rust-health-verdicts\"}", &response, &inner);
     ASSERT_NOT_NULL(doc);
@@ -3337,8 +3346,8 @@ TEST(tool_rust_analysis_evidence_has_independent_16k_budget) {
         rows[i].kind = "analysis_partial:rust";
         rows[i].detail = details[i];
     }
-    ASSERT_EQ(write_rust_health_fixture(store, project, 4, "complete", ROW_COUNT, rows,
-                                        ROW_COUNT),
+    ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete",
+                                        ROW_COUNT, rows, ROW_COUNT),
               CBM_STORE_OK);
     free(details);
     free(paths);
@@ -3396,6 +3405,200 @@ TEST(tool_rust_analysis_evidence_has_independent_16k_budget) {
     free(inner);
     free(response);
     free(max_args);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contamination) {
+    enum { SEMANTIC_ROWS = 1200, SYNTACTIC_ROWS = 2000, ROW_COUNT = 3200 };
+    const char *project = "rust-health-paged-mixed";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/rust-health-paged-mixed"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_coverage_row_t *rows = calloc(ROW_COUNT, sizeof(*rows));
+    char(*paths)[32] = calloc(ROW_COUNT, sizeof(*paths));
+    ASSERT_NOT_NULL(rows);
+    ASSERT_NOT_NULL(paths);
+    for (int i = 0; i < SEMANTIC_ROWS; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "a%04d", i);
+        rows[i].rel_path = paths[i];
+        rows[i].kind = i % 7 == 0 ? "analysis_failed:rust" : "analysis_partial:rust";
+        rows[i].detail = "";
+    }
+    for (int i = 0; i < SYNTACTIC_ROWS; i++) {
+        int row = SEMANTIC_ROWS + i;
+        snprintf(paths[row], sizeof(paths[row]), "z%04d.c", i);
+        rows[row].rel_path = paths[row];
+        rows[row].kind = "parse_partial";
+        rows[row].detail = "1";
+    }
+    ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete",
+                                        SEMANTIC_ROWS, rows, ROW_COUNT),
+              CBM_STORE_OK);
+    free(paths);
+    free(rows);
+
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_doc *doc = mcp_tool_inner_doc(
+        srv, "check_index_coverage",
+        "{\"project\":\"rust-health-paged-mixed\",\"paths\":[\"a0000\"]}",
+        &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_NOT_NULL(health);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "failed");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "degraded_files_total")), SEMANTIC_ROWS);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "partial_rows")), SEMANTIC_ROWS - 172);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "failed_rows")), 172);
+    yyjson_val *evidence = yyjson_obj_get(health, "evidence");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(evidence, "total")), SEMANTIC_ROWS);
+    int returned = (int)yyjson_get_int(yyjson_obj_get(evidence, "returned"));
+    ASSERT_TRUE(returned > CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS);
+    yyjson_val *items = yyjson_obj_get(evidence, "items");
+    ASSERT_EQ(yyjson_arr_size(items), returned);
+    for (int i = 0; i < returned; i++) {
+        char expected[16];
+        snprintf(expected, sizeof(expected), "a%04d", i);
+        yyjson_val *item = yyjson_arr_get(items, i);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item, "path")), expected);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item, "kind")),
+                      i % 7 == 0 ? "analysis_failed:rust" : "analysis_partial:rust");
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item, "detail")), "");
+    }
+    ASSERT_NULL(strstr(inner, "z0000.c"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    doc = mcp_tool_inner_doc(
+        srv, "index_status",
+        "{\"project\":\"rust-health-paged-mixed\",\"limit\":1,"
+        "\"max_response_bytes\":65536}",
+        &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    health = yyjson_obj_get(root, "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "failed");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "degraded_files_total")), SEMANTIC_ROWS);
+    evidence = yyjson_obj_get(health, "evidence");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(evidence, "total")), SEMANTIC_ROWS);
+    returned = (int)yyjson_get_int(yyjson_obj_get(evidence, "returned"));
+    ASSERT_TRUE(returned > CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS);
+    items = yyjson_obj_get(evidence, "items");
+    ASSERT_EQ(yyjson_arr_size(items), returned);
+    for (int i = 0; i < returned; i++) {
+        char expected[16];
+        snprintf(expected, sizeof(expected), "a%04d", i);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(items, i), "path")), expected);
+    }
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "coverage_page"), "total")),
+              SYNTACTIC_ROWS);
+    yyjson_val *parse_files = yyjson_obj_get(yyjson_obj_get(root, "parse_partial"), "files");
+    ASSERT_EQ(yyjson_arr_size(parse_files), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(parse_files, 0), "path")),
+                  "z0000.c");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    /* Six metadata strings, one row array, then three strings per row exhaust
+     * exactly after the first full store page; the next page must fail closed
+     * without retaining the first page as apparently complete evidence. */
+    cbm_store_analysis_coverage_test_fail_alloc_after(
+        store, 7 + 3 * CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS);
+    doc = mcp_tool_inner_doc(
+        srv, "index_status", "{\"project\":\"rust-health-paged-mixed\"}",
+        &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")),
+                  "analysis_evidence_unavailable");
+    ASSERT_NULL(yyjson_obj_get(health, "evidence"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_store_analysis_coverage_test_fail_alloc_after(store, -1);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contract) {
+    const char *project = "rust-health-page-failure";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/rust-health-page-failure"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_coverage_row_t row = {
+        .rel_path = "src/a.rs", .kind = "analysis_partial:rust", .detail = "{}"};
+    ASSERT_EQ(write_rust_health_fixture(store, project, CBM_SEMANTIC_INDEX_VERSION, "complete", 1,
+                                        &row, 1),
+              CBM_STORE_OK);
+
+    cbm_store_analysis_coverage_test_fail_alloc_after(store, 0);
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_doc *doc = mcp_tool_inner_doc(
+        srv, "index_status", "{\"project\":\"rust-health-page-failure\"}", &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")),
+                  "analysis_evidence_unavailable");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    doc = mcp_tool_inner_doc(
+        srv, "check_index_coverage",
+        "{\"project\":\"rust-health-page-failure\",\"paths\":[\"src/a.rs\"]}",
+        &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    health = yyjson_obj_get(root, "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")),
+                  "analysis_evidence_unavailable");
+    yyjson_val *metadata = yyjson_obj_get(root, "metadata");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(metadata, "recording_status")), "complete");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(metadata, "generation_matches")));
+    yyjson_val *path = yyjson_arr_get(yyjson_obj_get(root, "paths"), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "status")), "no_recorded_issue");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    cbm_store_analysis_coverage_test_fail_alloc_after(store, -1);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "ALTER TABLE index_coverage_meta RENAME TO broken_coverage_meta;"),
+              CBM_STORE_OK);
+    doc = mcp_tool_inner_doc(srv, "index_status",
+                             "{\"project\":\"rust-health-page-failure\"}", &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    health = yyjson_obj_get(yyjson_doc_get_root(doc), "rust_analysis");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "unknown");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "reason")),
+                  "analysis_evidence_unavailable");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    long source_len = 0;
+    unsigned char *source = mcp_read_file_bytes("src/mcp/mcp.c", &source_len);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(strstr((const char *)source, "meta->coverage_version != "
+                                               "CBM_SEMANTIC_INDEX_VERSION"));
+    ASSERT_NULL(strstr((const char *)source, "RUST_ANALYSIS_COVERAGE_VERSION"));
+    free(source);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -14874,6 +15077,8 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_rust_analysis_health_verdicts_are_metadata_gated_and_exact);
     RUN_TEST(tool_rust_analysis_evidence_has_independent_16k_budget);
+    RUN_TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contamination);
+    RUN_TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contract);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
