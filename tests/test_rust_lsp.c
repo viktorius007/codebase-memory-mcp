@@ -857,7 +857,7 @@ TEST(rustlsp_shared_dispatch_merges_existing_exact_occurrence) {
 
     cbm_pxc_dispatch_file(CBM_LANG_RUST, result, source, (int)strlen(source), "src/main.rs",
                           result->module_qn, NULL, NULL, defs, 2, imp_names, imp_qns, 1,
-                          rustlsp_return_shared_registry, shared);
+                          NULL, rustlsp_return_shared_registry, shared);
 
     int local_after = 0;
     int render_semantics = 0;
@@ -1453,6 +1453,116 @@ TEST(rustlsp_crossfile_free_function) {
 }
 
 /* ── Category 11: Robustness / regressions ────────────────────── */
+
+TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy) {
+    const char *caller = "fn caller() { alien::dispatch(); }\n";
+    const char *requested = "alien::dispatch()";
+    const char *site = strstr(caller, requested);
+    ASSERT_NOT_NULL(site);
+    uint32_t expected_start = (uint32_t)(site - caller);
+    uint32_t expected_end = expected_start + (uint32_t)strlen(requested);
+
+    CBMRustLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "project.other_crate.handlers.dispatch";
+    defs[0].short_name = "dispatch";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "project.other_crate.handlers";
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller),
+                           "project.caller_crate.main", defs, 1, NULL, NULL, 0, NULL, &out);
+
+    int wrong_target = 0;
+    int exact_unresolved = 0;
+    bool exact_requested_spelling = false;
+    for (int i = 0; i < out.count; i++) {
+        const CBMResolvedCall *call = &out.items[i];
+        if (!call->caller_qn || strcmp(call->caller_qn, "project.caller_crate.main.caller") != 0 ||
+            call->site_start_byte != expected_start || call->site_end_byte != expected_end) {
+            continue;
+        }
+        exact_requested_spelling =
+            (size_t)(call->site_end_byte - call->site_start_byte) == strlen(requested) &&
+            strncmp(caller + call->site_start_byte, requested, strlen(requested)) == 0;
+        if (call->callee_qn &&
+            strcmp(call->callee_qn, "project.other_crate.handlers.dispatch") == 0) {
+            wrong_target++;
+        }
+        if (call->callee_qn && strcmp(call->callee_qn, "alien.dispatch") == 0 && call->reason &&
+            strcmp(call->reason, "function_not_in_registry") == 0) {
+            exact_unresolved++;
+        }
+    }
+    cbm_arena_destroy(&arena);
+
+    ASSERT_TRUE(exact_requested_spelling);
+    ASSERT_EQ(wrong_target, 0);
+    ASSERT_EQ(exact_unresolved, 1);
+    PASS();
+}
+
+TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy) {
+    const char *caller = "fn caller() { unknown::dispatch(); }\n";
+    const char *requested = "unknown::dispatch()";
+    const char *site = strstr(caller, requested);
+    ASSERT_NOT_NULL(site);
+    uint32_t expected_start = (uint32_t)(site - caller);
+    uint32_t expected_end = expected_start + (uint32_t)strlen(requested);
+
+    CBMRustLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "project.caller_crate.handlers.dispatch";
+    defs[0].short_name = "dispatch";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "project.caller_crate.handlers";
+    defs[1].qualified_name = "project.other_crate.handlers.dispatch";
+    defs[1].short_name = "dispatch";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "project.other_crate.handlers";
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller),
+                           "project.caller_crate.main", defs, 2, NULL, NULL, 0, NULL, &out);
+
+    int exact_target = 0;
+    int wrong_target = 0;
+    int unresolved = 0;
+    bool exact_requested_spelling = false;
+    for (int i = 0; i < out.count; i++) {
+        const CBMResolvedCall *call = &out.items[i];
+        if (!call->caller_qn || strcmp(call->caller_qn, "project.caller_crate.main.caller") != 0 ||
+            call->site_start_byte != expected_start || call->site_end_byte != expected_end) {
+            continue;
+        }
+        exact_requested_spelling =
+            (size_t)(call->site_end_byte - call->site_start_byte) == strlen(requested) &&
+            strncmp(caller + call->site_start_byte, requested, strlen(requested)) == 0;
+        if (call->callee_qn &&
+            strcmp(call->callee_qn, "project.caller_crate.handlers.dispatch") == 0 &&
+            call->strategy && strcmp(call->strategy, "lsp_short_name_unique") == 0) {
+            exact_target++;
+        }
+        if (call->callee_qn &&
+            strcmp(call->callee_qn, "project.other_crate.handlers.dispatch") == 0) {
+            wrong_target++;
+        }
+        if (call->callee_qn && strcmp(call->callee_qn, "unknown.dispatch") == 0 && call->reason) {
+            unresolved++;
+        }
+    }
+    cbm_arena_destroy(&arena);
+
+    ASSERT_TRUE(exact_requested_spelling);
+    ASSERT_EQ(exact_target, 1);
+    ASSERT_EQ(wrong_target, 0);
+    ASSERT_EQ(unresolved, 0);
+    PASS();
+}
 
 TEST(rustlsp_handles_empty_file) {
     CBMFileResult *r = extract_rust("// nothing here\n");
@@ -6910,6 +7020,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_nested_macro_rules_call_does_not_inherit_outer_site_map);
     RUN_TEST(rustlsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(rustlsp_crossfile_free_function);
+    RUN_TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy);
+    RUN_TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy);
 
     /* Robustness */
     RUN_TEST(rustlsp_handles_empty_file);

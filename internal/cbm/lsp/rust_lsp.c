@@ -580,6 +580,31 @@ static const char *skip_ref_prefix(const char *text) {
     return text;
 }
 
+/* The pipeline forms module QNs as
+ * `<project>.<crate>.<relative-module-segments>`. Keep project + crate as the
+ * resolution boundary: a project prefix alone admits unrelated workspace
+ * members that happen to contain a same-named function. */
+static size_t rust_crate_qn_prefix_len(const char *module_qn) {
+    if (!module_qn) {
+        return 0;
+    }
+    const char *first_dot = strchr(module_qn, '.');
+    if (!first_dot) {
+        return strlen(module_qn);
+    }
+    const char *second_dot = strchr(first_dot + 1, '.');
+    return second_dot ? (size_t)(second_dot - module_qn) : strlen(module_qn);
+}
+
+static bool rust_qn_is_within_crate(const char *module_qn, const char *candidate_qn) {
+    if (!module_qn || !candidate_qn) {
+        return false;
+    }
+    size_t prefix_len = rust_crate_qn_prefix_len(module_qn);
+    return prefix_len > 0 && strncmp(candidate_qn, module_qn, prefix_len) == 0 &&
+           (candidate_qn[prefix_len] == '.' || candidate_qn[prefix_len] == '\0');
+}
+
 /* Resolve an otherwise-relative multi-segment type only when its head is an
  * explicit top-level `mod head;` declaration and exactly one graph-qualified
  * candidate exists. Rust filename-stem QNs do not encode whether a source is
@@ -644,19 +669,7 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
      * forms `module_qn` as `<project>.<crate>.<rel-path-segments>`, so
      * the first two segments are project + crate root. */
     if (strncmp(path, "crate::", 7) == 0 && ctx->module_qn) {
-        const char *p = ctx->module_qn;
-        int dots = 0;
-        const char *second_dot = NULL;
-        for (; *p; p++) {
-            if (*p == '.') {
-                if (++dots == 2) {
-                    second_dot = p;
-                    break;
-                }
-            }
-        }
-        size_t crate_len =
-            second_dot ? (size_t)(second_dot - ctx->module_qn) : strlen(ctx->module_qn);
+        size_t crate_len = rust_crate_qn_prefix_len(ctx->module_qn);
         char *crate_buf = cbm_arena_strndup(ctx->arena, ctx->module_qn, crate_len);
         return cbm_arena_sprintf(ctx->arena, "%s.%s", crate_buf,
                                  convert_path_to_qn(ctx->arena, path + 7));
@@ -4604,12 +4617,6 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
          * intermediate module wasn't tracked through an explicit
          * use-map entry. */
         if (tail && *tail && ctx->module_qn) {
-            /* Crate prefix is the first dotted segment of module_qn after
-             * the project name, but for simplicity we just match on
-             * "starts with first dot-segment". */
-            const char *first_dot = strchr(ctx->module_qn, '.');
-            size_t crate_len =
-                first_dot ? (size_t)(first_dot - ctx->module_qn) : strlen(ctx->module_qn);
             const CBMRegisteredFunc *unique = NULL;
             int matches = 0;
             /* Iterate only free funcs whose short_name == tail via the index; the
@@ -4624,8 +4631,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                     continue; /* free functions only */
                 if (strcmp(f->short_name, tail) != 0)
                     continue;
-                /* Crate-scoped: QN must start with the same prefix. */
-                if (strncmp(f->qualified_name, ctx->module_qn, crate_len) != 0)
+                /* Crate-scoped: QN must share the complete project + crate
+                 * boundary, not merely the project-name segment. */
+                if (!rust_qn_is_within_crate(ctx->module_qn, f->qualified_name))
                     continue;
                 matches++;
                 if (matches == 1)
