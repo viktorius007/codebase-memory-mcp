@@ -24,6 +24,7 @@
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
 #endif
 #include <stdint.h> // uint32_t, uint64_t, int64_t
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -110,10 +111,18 @@ void cbm_reset_profile(void) {
 #define GROW_ARRAY(arr, arena)                                                                   \
     do {                                                                                         \
         if ((arr)->count >= (arr)->cap) {                                                        \
+            if ((arr)->cap > INT_MAX / PAIR_LEN) {                                               \
+                (void)cbm_arena_alloc((arena), SIZE_MAX);                                        \
+                return false;                                                                    \
+            }                                                                                    \
             int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                   \
+            if ((size_t)new_cap > SIZE_MAX / sizeof(*(arr)->items)) {                            \
+                (void)cbm_arena_alloc((arena), SIZE_MAX);                                        \
+                return false;                                                                    \
+            }                                                                                    \
             void *new_items = cbm_arena_alloc((arena), (size_t)new_cap * sizeof(*(arr)->items)); \
             if (!new_items)                                                                      \
-                return;                                                                          \
+                return false;                                                                    \
             if ((arr)->items && (arr)->count > 0) {                                              \
                 memcpy(new_items, (arr)->items, (size_t)(arr)->count * sizeof(*(arr)->items));   \
             }                                                                                    \
@@ -122,79 +131,94 @@ void cbm_reset_profile(void) {
         }                                                                                        \
     } while (0)
 
-void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def) {
+bool cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = def;
+    return true;
 }
 
-void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call) {
+bool cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = call;
+    return true;
 }
 
-void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp) {
+bool cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = imp;
+    return true;
 }
 
-void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage) {
+bool cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = usage;
+    return true;
 }
 
-void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr) {
+bool cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = thr;
+    return true;
 }
 
-void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw) {
+bool cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = rw;
+    return true;
 }
 
-void cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr) {
+bool cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = tr;
+    return true;
 }
 
-void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea) {
+bool cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = ea;
+    return true;
 }
 
-void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta) {
+bool cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = ta;
+    return true;
 }
 
-void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr) {
+bool cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = sr;
+    return true;
 }
 
-void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib) {
+bool cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = ib;
+    return true;
 }
 
-void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it) {
+bool cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = it;
+    return true;
 }
 
-void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc) {
+bool cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = rc;
+    return true;
 }
 
-void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
+bool cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = ch;
+    return true;
 }
 
-void cbm_moddecls_push(CBMModDeclArray *arr, CBMArena *a, CBMModDecl md) {
+bool cbm_moddecls_push(CBMModDeclArray *arr, CBMArena *a, CBMModDecl md) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = md;
+    return true;
 }
 
 // --- String input reader (for parse_with_options) ---
@@ -1197,7 +1221,7 @@ const char *cbm_rust_health_reason_name(CBMRustHealthReason reason) {
         "type_depth_limit",           "eval_depth_limit",
         "walk_depth_limit",           "work_limit",
         "proc_macro_unsupported",      "rustdoc_unavailable",
-        "macro_substitution_limit",
+        "macro_substitution_limit",    "allocation_unavailable",
     };
     return reason >= 0 && reason < CBM_RUST_HEALTH_REASON_COUNT ? names[reason] : "unknown";
 }
@@ -1216,6 +1240,31 @@ CBMRustAnalysisStatus cbm_rust_health_status(const CBMRustAnalysisHealth *health
     }
     return CBM_RUST_ANALYSIS_COMPLETE;
 }
+
+CBMFileStatus cbm_file_result_status(const CBMFileResult *result) {
+    return result && cbm_arena_status(&result->arena) == CBM_ARENA_STATUS_AVAILABLE
+               ? CBM_FILE_STATUS_COMPLETE
+               : CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE;
+}
+
+static void cbm_file_result_finalize_allocation(CBMFileResult *result, CBMLanguage language) {
+    if (!result || cbm_file_result_status(result) == CBM_FILE_STATUS_COMPLETE) {
+        return;
+    }
+    if (language == CBM_LANG_RUST) {
+        if (result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count == 0) {
+            cbm_rust_health_record(&result->rust_health, CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0,
+                                   0);
+        }
+        result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_file_result_test_finalize_allocation(CBMFileResult *result, CBMLanguage language) {
+    cbm_file_result_finalize_allocation(result, language);
+}
+#endif
 
 CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
                                    const char *project, const char *rel_path,
@@ -1240,6 +1289,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
      * marker so quarantined files never overwrite it — the marker keeps pointing
      * at the real (non-quarantined) file being processed when a crash hits. */
     if (cbm_index_is_quarantined(rel_path)) {
+        cbm_file_result_finalize_allocation(result, language);
         return result;
     }
 
@@ -1254,6 +1304,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "unsupported language");
         cbm_index_mark_done(rel_path);
+        cbm_file_result_finalize_allocation(result, language);
         return result;
     }
 
@@ -1263,6 +1314,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
         cbm_index_mark_done(rel_path);
+        cbm_file_result_finalize_allocation(result, language);
         return result;
     }
 
@@ -1274,6 +1326,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         cbm_source_nesting_exceeds(source, source_len, CBM_PERL_MAX_PARSE_NESTING)) {
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "perl source nesting too deep; skipped");
+        cbm_file_result_finalize_allocation(result, language);
         return result;
     }
 
@@ -1283,6 +1336,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "parser alloc failed");
         cbm_index_mark_done(rel_path);
+        cbm_file_result_finalize_allocation(result, language);
         return result;
     }
 
@@ -1316,6 +1370,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         result->error_msg =
             cbm_arena_strdup(a, timeout_micros > 0 ? "parse timeout" : "parse failed");
         cbm_index_mark_done(rel_path);
+        cbm_file_result_finalize_allocation(result, language);
         return result;
     }
 
@@ -1686,6 +1741,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     result->cached_tree = tree;
     result->cached_lang = language;
     cbm_index_mark_done(rel_path);
+    cbm_file_result_finalize_allocation(result, language);
     return result;
 }
 

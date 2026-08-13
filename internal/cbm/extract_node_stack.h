@@ -14,6 +14,9 @@
 
 #include "arena.h"
 #include "tree_sitter/api.h"
+#include <stdbool.h>
+#include <limits.h>
+#include <stdint.h>
 #include <string.h> /* memcpy */
 
 typedef struct {
@@ -23,19 +26,28 @@ typedef struct {
 } TSNodeStack;
 
 /* Initialize a stack with the given initial capacity, arena-allocated. */
-static inline void ts_nstack_init(TSNodeStack *s, CBMArena *arena, int initial_cap) {
+static inline bool ts_nstack_init(TSNodeStack *s, CBMArena *arena, int initial_cap) {
     s->items = (TSNode *)cbm_arena_alloc(arena, (size_t)initial_cap * sizeof(TSNode));
     s->count = 0;
     s->cap = s->items ? initial_cap : 0;
+    return s->items != NULL;
 }
 
 /* Push a node onto the stack, growing 2x if needed. */
-static inline void ts_nstack_push(TSNodeStack *s, CBMArena *arena, TSNode node) {
+static inline bool ts_nstack_push(TSNodeStack *s, CBMArena *arena, TSNode node) {
     if (s->count >= s->cap) {
+        if (s->cap > INT_MAX / 2) {
+            (void)cbm_arena_alloc(arena, SIZE_MAX);
+            return false;
+        }
         int new_cap = s->cap ? s->cap * 2 : 512;
+        if ((size_t)new_cap > SIZE_MAX / sizeof(TSNode)) {
+            (void)cbm_arena_alloc(arena, SIZE_MAX);
+            return false;
+        }
         TSNode *new_items = (TSNode *)cbm_arena_alloc(arena, (size_t)new_cap * sizeof(TSNode));
         if (!new_items)
-            return; /* OOM: best-effort, stop growing */
+            return false;
         if (s->items && s->count > 0) {
             memcpy(new_items, s->items, (size_t)s->count * sizeof(TSNode));
         }
@@ -44,6 +56,7 @@ static inline void ts_nstack_push(TSNodeStack *s, CBMArena *arena, TSNode node) 
         s->cap = new_cap;
     }
     s->items[s->count++] = node;
+    return true;
 }
 
 /* Pop a node from the stack. Caller must check s->count > 0. */
@@ -63,15 +76,24 @@ static inline TSNode ts_nstack_pop(TSNodeStack *s) {
  * files). This helper enumerates children in a single O(N) cursor pass, then
  * reverses the just-pushed segment so pop order is identical to the old idiom.
  */
-static inline void ts_nstack_push_children(TSNodeStack *s, CBMArena *arena, TSNode node) {
+static inline bool ts_nstack_push_children(TSNodeStack *s, CBMArena *arena, TSNode node) {
     int base = s->count;
+    bool complete = true;
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
         do {
-            ts_nstack_push(s, arena, ts_tree_cursor_current_node(&cursor));
+            if (!ts_nstack_push(s, arena, ts_tree_cursor_current_node(&cursor))) {
+                complete = false;
+                break;
+            }
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
     ts_tree_cursor_delete(&cursor);
+    if (!complete) {
+        /* Never process a prefix while silently omitting the rest of a subtree. */
+        s->count = base;
+        return false;
+    }
     /* Reverse [base, count) so the first child pops first (forward order). */
     int lo = base, hi = s->count - 1;
     while (lo < hi) {
@@ -81,6 +103,7 @@ static inline void ts_nstack_push_children(TSNodeStack *s, CBMArena *arena, TSNo
         lo++;
         hi--;
     }
+    return true;
 }
 
 #endif /* CBM_EXTRACT_NODE_STACK_H */

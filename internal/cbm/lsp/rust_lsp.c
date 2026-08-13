@@ -6177,8 +6177,12 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 while (d->return_types[count])
                     count++;
                 if (count > 0) {
-                    ret_types = (const CBMType **)cbm_arena_alloc(
-                        arena, (count + 1) * sizeof(const CBMType *));
+                    ret_types = (const CBMType **)cbm_arena_alloc_class(
+                        arena, (size_t)(count + 1) * sizeof(const CBMType *),
+                        CBM_ARENA_ALLOCATION_RUST_DEFINITION_RETURN);
+                    if (!ret_types) {
+                        return;
+                    }
                     for (int j = 0; j < count; j++) {
                         ret_types[j] =
                             rust_parse_return_type_text(arena, d->return_types[j], module_qn,
@@ -6187,7 +6191,12 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     ret_types[count] = NULL;
                 }
             } else if (d->return_type && d->return_type[0]) {
-                ret_types = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+                ret_types = (const CBMType **)cbm_arena_alloc_class(
+                    arena, 2 * sizeof(const CBMType *),
+                    CBM_ARENA_ALLOCATION_RUST_DEFINITION_RETURN);
+                if (!ret_types) {
+                    return;
+                }
                 ret_types[0] =
                     rust_parse_return_type_text(arena, d->return_type, module_qn, NULL, NULL,
                                                 NULL);
@@ -6397,8 +6406,12 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     continue; /* free fns only */
                 if (strcmp(rf->qualified_name, fn_qn) != 0)
                     continue;
-                const CBMType **ret_arr =
-                    (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+                const CBMType **ret_arr = (const CBMType **)cbm_arena_alloc_class(
+                    arena, 2 * sizeof(const CBMType *),
+                    CBM_ARENA_ALLOCATION_RUST_AST_RETURN_PATCH);
+                if (!ret_arr) {
+                    return;
+                }
                 ret_arr[0] = ret;
                 ret_arr[1] = NULL;
                 rf->signature = cbm_type_func_replace_returns(arena, rf->signature, ret_arr);
@@ -6550,8 +6563,12 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                             while (rt->embedded_types[existing])
                                 existing++;
                         }
-                        const char **new_arr = (const char **)cbm_arena_alloc(
-                            arena, (existing + 2) * sizeof(const char *));
+                        const char **new_arr = (const char **)cbm_arena_alloc_class(
+                            arena, (size_t)(existing + 2) * sizeof(const char *),
+                            CBM_ARENA_ALLOCATION_RUST_DERIVE_EMBEDDED);
+                        if (!new_arr) {
+                            return;
+                        }
                         for (int k = 0; k < existing; k++) {
                             new_arr[k] = rt->embedded_types[k];
                         }
@@ -6586,8 +6603,12 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                                 /* `default()`, `parse()` return Self. */
                                 ret_t = cbm_type_named(arena, d->qualified_name);
                             }
-                            const CBMType **ra = (const CBMType **)cbm_arena_alloc(
-                                arena, 2 * sizeof(const CBMType *));
+                            const CBMType **ra = (const CBMType **)cbm_arena_alloc_class(
+                                arena, 2 * sizeof(const CBMType *),
+                                CBM_ARENA_ALLOCATION_RUST_DERIVE_RETURN);
+                            if (!ra) {
+                                return;
+                            }
                             ra[0] = ret_t;
                             ra[1] = NULL;
                             rf.signature = cbm_type_func(arena, NULL, NULL, ra);
@@ -6660,7 +6681,12 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     if (strcmp(rf->short_name, mname) != 0)
                         continue;
                     const CBMType **ret_arr =
-                        (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+                        (const CBMType **)cbm_arena_alloc_class(
+                            arena, 2 * sizeof(const CBMType *),
+                            CBM_ARENA_ALLOCATION_RUST_IMPL_RETURN);
+                    if (!ret_arr) {
+                        return;
+                    }
                     ret_arr[0] = ret;
                     ret_arr[1] = NULL;
                     rf->signature = cbm_type_func_replace_returns(arena, rf->signature, ret_arr);
@@ -6746,7 +6772,15 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
     }
 
     rust_lsp_process_file(&ctx, root);
-    result->rust_health.completed_routes |= CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+    if (cbm_arena_status(arena) == CBM_ARENA_STATUS_AVAILABLE) {
+        result->rust_health.completed_routes |= CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+    } else {
+        if (result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count == 0) {
+            cbm_rust_health_record(&result->rust_health, CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0,
+                                   0);
+        }
+        result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+    }
 }
 
 void cbm_run_rust_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
@@ -6868,9 +6902,18 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                         count++;
                 }
                 ret_types =
-                    (const CBMType **)cbm_arena_alloc(arena, (count + 1) * sizeof(const CBMType *));
+                    (const CBMType **)cbm_arena_alloc_class(
+                        arena, (size_t)(count + 1) * sizeof(const CBMType *),
+                        CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_ARRAY);
+                if (!ret_types) {
+                    return;
+                }
                 int idx = 0;
-                char *buf = cbm_arena_strdup(arena, d->return_types);
+                char *buf = cbm_arena_strdup_class(
+                    arena, d->return_types, CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_BUFFER);
+                if (!buf) {
+                    return;
+                }
                 char *start = buf;
                 for (char *p = buf;; p++) {
                     if (*p == '|' || *p == '\0') {

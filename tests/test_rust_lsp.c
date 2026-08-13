@@ -7195,6 +7195,152 @@ TEST(rustlsp_health_status_is_derived_from_routes_and_issues) {
     PASS();
 }
 
+TEST(rustlsp_allocation_loss_reason_is_stable_and_route_incomplete) {
+    const char *source = "fn target() {}\nfn run() { target(); }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(result->cached_tree);
+    TSNode root = ts_tree_root_node(result->cached_tree);
+    memset(&result->rust_health, 0, sizeof(result->rust_health));
+
+    cbm_arena_test_fail_after(&result->arena, 0);
+    ASSERT_NULL(cbm_arena_strdup(&result->arena, "force allocation loss"));
+    cbm_run_rust_lsp(&result->arena, result, source, (int)strlen(source), root);
+
+    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(result));
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.required_routes);
+    ASSERT_EQ(0, result->rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_SINGLE_FILE);
+    ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
+    ASSERT_STR_EQ("allocation_unavailable",
+                  cbm_rust_health_reason_name(CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE));
+    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&result->rust_health));
+
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(rustlsp_impl_return_allocation_fails_inside_resolver_without_crash) {
+    const char *source =
+        "struct Builder;\n"
+        "impl Builder { fn make() -> Self { Builder } }\n"
+        "fn run() { Builder::make(); }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(result->cached_tree);
+    TSNode root = ts_tree_root_node(result->cached_tree);
+    memset(&result->rust_health, 0, sizeof(result->rust_health));
+
+    cbm_arena_test_fail_class(&result->arena, CBM_ARENA_ALLOCATION_RUST_IMPL_RETURN);
+    cbm_run_rust_lsp(&result->arena, result, source, (int)strlen(source), root);
+
+    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(result));
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.required_routes);
+    ASSERT_EQ(0, result->rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_SINGLE_FILE);
+    ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&result->rust_health));
+
+    cbm_free_result(result);
+    PASS();
+}
+
+static int assert_rustlsp_local_registry_allocation_class_fails(
+    const char *source, CBMArenaAllocationClass allocation_class) {
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(result->cached_tree);
+    TSNode root = ts_tree_root_node(result->cached_tree);
+    memset(&result->rust_health, 0, sizeof(result->rust_health));
+
+    cbm_arena_test_fail_class(&result->arena, allocation_class);
+    cbm_run_rust_lsp(&result->arena, result, source, (int)strlen(source), root);
+
+    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(result));
+    ASSERT_EQ(0, result->rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_SINGLE_FILE);
+    ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
+    cbm_free_result(result);
+    return 0;
+}
+
+TEST(rustlsp_definition_return_allocation_fails_without_null_dereference) {
+    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
+        "struct Builder;\nfn make() -> Builder { Builder }\nfn run() { make(); }\n",
+        CBM_ARENA_ALLOCATION_RUST_DEFINITION_RETURN));
+    PASS();
+}
+
+TEST(rustlsp_ast_return_patch_allocation_fails_without_null_dereference) {
+    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
+        "struct Builder;\nfn make() -> Builder { Builder }\nfn run() { make(); }\n",
+        CBM_ARENA_ALLOCATION_RUST_AST_RETURN_PATCH));
+    PASS();
+}
+
+TEST(rustlsp_derive_embedded_allocation_fails_without_null_dereference) {
+    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
+        "#[derive(Clone)]\nstruct Builder;\nfn run(b: Builder) { b.clone(); }\n",
+        CBM_ARENA_ALLOCATION_RUST_DERIVE_EMBEDDED));
+    PASS();
+}
+
+TEST(rustlsp_derive_return_allocation_fails_without_null_dereference) {
+    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
+        "#[derive(Clone)]\nstruct Builder;\nfn run(b: Builder) { b.clone(); }\n",
+        CBM_ARENA_ALLOCATION_RUST_DERIVE_RETURN));
+    PASS();
+}
+
+static int assert_rustlsp_cross_return_allocation_fails_without_null_dereference(
+    CBMArenaAllocationClass allocation_class) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef def = {
+        .qualified_name = "test.lib.make",
+        .short_name = "make",
+        .label = "Function",
+        .def_module_qn = "test.lib",
+        .return_types = "test.lib.Builder",
+    };
+
+    cbm_arena_test_fail_class(&arena, allocation_class);
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, &def, 1);
+
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(CBM_ARENA_STATUS_ALLOCATION_UNAVAILABLE, cbm_arena_status(&arena));
+
+    cbm_arena_destroy(&arena);
+    return 0;
+}
+
+TEST(rustlsp_cross_return_array_allocation_fails_without_null_dereference) {
+    ASSERT_EQ(0, assert_rustlsp_cross_return_allocation_fails_without_null_dereference(
+                     CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_ARRAY));
+    PASS();
+}
+
+TEST(rustlsp_cross_return_buffer_allocation_fails_without_null_dereference) {
+    ASSERT_EQ(0, assert_rustlsp_cross_return_allocation_fails_without_null_dereference(
+                     CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_BUFFER));
+    PASS();
+}
+
+TEST(rustlsp_late_allocation_loss_revokes_completed_route_at_file_boundary) {
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    result.rust_health.required_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+    result.rust_health.completed_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+
+    cbm_arena_test_fail_after(&result.arena, 0);
+    ASSERT_NULL(cbm_arena_strdup(&result.arena, "late loss"));
+    cbm_file_result_test_finalize_allocation(&result, CBM_LANG_RUST);
+
+    ASSERT_EQ(0, result.rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_SINGLE_FILE);
+    ASSERT_EQ(1, result.rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&result.rust_health));
+
+    cbm_arena_destroy(&result.arena);
+    PASS();
+}
+
 TEST(rustlsp_health_healthy_file_completes_and_counts_emissions) {
     CBMFileResult *result = extract_rust(
         "fn target() {}\n"
@@ -8532,6 +8678,15 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cargo_target_allocation_failure_marks_inventory_incomplete);
     RUN_TEST(rustlsp_partial_cargo_handles_comments_and_quirks);
     RUN_TEST(rustlsp_health_status_is_derived_from_routes_and_issues);
+    RUN_TEST(rustlsp_allocation_loss_reason_is_stable_and_route_incomplete);
+    RUN_TEST(rustlsp_impl_return_allocation_fails_inside_resolver_without_crash);
+    RUN_TEST(rustlsp_definition_return_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_ast_return_patch_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_derive_embedded_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_derive_return_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_cross_return_array_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_cross_return_buffer_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_late_allocation_loss_revokes_completed_route_at_file_boundary);
     RUN_TEST(rustlsp_health_healthy_file_completes_and_counts_emissions);
     RUN_TEST(rustlsp_health_parse_error_is_partial_with_first_parser_span);
     RUN_TEST(rustlsp_health_walk_and_work_limits_report_omitted_subtrees);

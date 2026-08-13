@@ -510,7 +510,8 @@ typedef enum {
     CBM_RUST_HEALTH_PROC_MACRO_UNSUPPORTED = 16,
     CBM_RUST_HEALTH_RUSTDOC_UNAVAILABLE = 17,
     CBM_RUST_HEALTH_MACRO_SUBSTITUTION_LIMIT = 18,
-    CBM_RUST_HEALTH_REASON_COUNT = 19,
+    CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE = 19,
+    CBM_RUST_HEALTH_REASON_COUNT = 20,
 } CBMRustHealthReason;
 
 typedef enum {
@@ -543,6 +544,11 @@ void cbm_rust_health_record(CBMRustAnalysisHealth *health, CBMRustHealthReason r
 void cbm_rust_health_merge(CBMRustAnalysisHealth *dst, const CBMRustAnalysisHealth *src);
 const char *cbm_rust_health_reason_name(CBMRustHealthReason reason);
 CBMRustAnalysisStatus cbm_rust_health_status(const CBMRustAnalysisHealth *health);
+
+typedef enum {
+    CBM_FILE_STATUS_COMPLETE = 0,
+    CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE = 1,
+} CBMFileStatus;
 
 // Full extraction result for one file.
 typedef struct CBMFileResult {
@@ -739,6 +745,17 @@ void cbm_free_tree(CBMFileResult *result);
 // Free a standalone TSTree pointer (for Go layer cleanup).
 void cbm_free_tree_ptr(TSTree *tree);
 
+/* Allocation status for every language. Derived from the result arena so a
+ * failed grow, string copy, or traversal stack allocation cannot be hidden by
+ * a caller that only observes the completed per-file result. */
+CBMFileStatus cbm_file_result_status(const CBMFileResult *result);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Exercise the exact allocation-to-file/Rust boundary without relying on the
+ * host allocator to exhaust memory. */
+void cbm_file_result_test_finalize_allocation(CBMFileResult *result, CBMLanguage language);
+#endif
+
 // Reset the thread-local parser's internal state, releasing slab-allocated
 // subtrees. Must be called BEFORE cbm_slab_reset_thread() so the slab rebuild
 // doesn't corrupt live parser state.
@@ -786,21 +803,21 @@ int cbm_macro_extraction_enabled(void);
 // --- Internal helpers used by extractors ---
 
 // Growable array push functions (arena-allocated, no individual free needed).
-void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
-void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
-void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
-void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
-void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
-void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
-void cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
-void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
-void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
-void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
-void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
-void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
-void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
-void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
-void cbm_moddecls_push(CBMModDeclArray *arr, CBMArena *a, CBMModDecl md);
+bool cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
+bool cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
+bool cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
+bool cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
+bool cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
+bool cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
+bool cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
+bool cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
+bool cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
+bool cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
+bool cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
+bool cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
+bool cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
+bool cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
+bool cbm_moddecls_push(CBMModDeclArray *arr, CBMArena *a, CBMModDecl md);
 
 // --- Sub-extractor entry points ---
 

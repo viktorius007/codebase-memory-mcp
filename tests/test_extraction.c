@@ -13,6 +13,7 @@
 #include <time.h>
 #include "macro_table.h"
 #include "iris_export_xml.h"
+#include "extract_node_stack.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -88,6 +89,74 @@ static CBMFileResult *extract_with_macros(const char *src, CBMLanguage lang, con
     CBMFileResult *r =
         cbm_extract_file_ex(src, (int)strlen(src), lang, proj, path, 0, NULL, NULL, mt, NULL);
     return r;
+}
+
+TEST(extract_result_growth_allocation_status_has_exact_32_item_control) {
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_arena_test_fail_after(&result.arena, 1);
+
+    CBMDefinition def = {0};
+    for (int i = 0; i < 32; i++) {
+        ASSERT_TRUE(cbm_defs_push(&result.defs, &result.arena, def));
+    }
+    ASSERT_EQ(32, result.defs.count);
+    ASSERT_EQ(CBM_FILE_STATUS_COMPLETE, cbm_file_result_status(&result));
+
+    cbm_arena_destroy(&result.arena);
+    PASS();
+}
+
+TEST(extract_result_growth_allocation_status_fails_exact_33rd_item) {
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_arena_test_fail_after(&result.arena, 1);
+
+    CBMDefinition def = {0};
+    for (int i = 0; i < 32; i++) {
+        ASSERT_TRUE(cbm_defs_push(&result.defs, &result.arena, def));
+    }
+    ASSERT_FALSE(cbm_defs_push(&result.defs, &result.arena, def));
+    ASSERT_EQ(32, result.defs.count);
+    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(&result));
+
+    cbm_arena_destroy(&result.arena);
+    PASS();
+}
+
+TEST(extract_string_allocation_failure_is_sticky_at_file_boundary) {
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_arena_test_fail_after(&result.arena, 0);
+
+    ASSERT_NULL(cbm_arena_strdup(&result.arena, "lost"));
+    ASSERT_NOT_NULL(cbm_arena_strdup(&result.arena, "later allocation succeeds"));
+    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(&result));
+
+    cbm_arena_destroy(&result.arena);
+    PASS();
+}
+
+TEST(extract_node_stack_growth_reports_whole_subtree_loss) {
+    CBMFileResult *parsed = extract("const a = 1;\nconst b = 2;\n", CBM_LANG_JAVASCRIPT,
+                                    "test", "src/two.js");
+    ASSERT_NOT_NULL(parsed);
+    ASSERT_NOT_NULL(parsed->cached_tree);
+    TSNode root = ts_tree_root_node(parsed->cached_tree);
+    ASSERT_GTE(ts_node_child_count(root), 2);
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_arena_test_fail_after(&arena, 1);
+    TSNodeStack stack;
+    ASSERT_TRUE(ts_nstack_init(&stack, &arena, 1));
+    ASSERT_FALSE(ts_nstack_push_children(&stack, &arena, root));
+    ASSERT_EQ(0, stack.count);
+    ASSERT_EQ(CBM_ARENA_STATUS_ALLOCATION_UNAVAILABLE, cbm_arena_status(&arena));
+
+    cbm_arena_destroy(&arena);
+    cbm_free_result(parsed);
+    PASS();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -5485,6 +5554,11 @@ TEST(iris_export_xml_multi_class) {
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
+
+    RUN_TEST(extract_result_growth_allocation_status_has_exact_32_item_control);
+    RUN_TEST(extract_result_growth_allocation_status_fails_exact_33rd_item);
+    RUN_TEST(extract_string_allocation_failure_is_sticky_at_file_boundary);
+    RUN_TEST(extract_node_stack_growth_reports_whole_subtree_loss);
 
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);
