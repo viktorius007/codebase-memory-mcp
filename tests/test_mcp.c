@@ -3603,6 +3603,106 @@ TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contrac
     PASS();
 }
 
+static int index_repository_success_reports_large_semantic_health_corpus_check(const char *repo,
+                                                                                const char *cache) {
+    enum { RUST_FILES = CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS * 4 + 1 };
+    for (int i = 0; i < RUST_FILES; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/r%04d.rs", repo, i);
+        ASSERT_EQ(th_write_file(path, "fn broken( {\n"), 0);
+    }
+
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[512];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo);
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_doc *doc = mcp_tool_inner_doc(srv, "index_repository", args, &response, &inner);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_TRUE(strlen(response) <= 65536);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "status")), "indexed");
+    yyjson_val *health = yyjson_obj_get(root, "rust_analysis");
+    ASSERT_NOT_NULL(health);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "partial");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_total")), RUST_FILES);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_complete")), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_partial")), RUST_FILES);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_failed")), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "degraded_files_total")), RUST_FILES);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "partial_rows")), RUST_FILES);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "failed_rows")), 0);
+    yyjson_val *evidence = yyjson_obj_get(health, "evidence");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(evidence, "total")), RUST_FILES);
+    int returned = (int)yyjson_get_int(yyjson_obj_get(evidence, "returned"));
+    ASSERT_TRUE(returned > 0 && returned < RUST_FILES);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(evidence, "truncated")));
+    yyjson_val *items = yyjson_obj_get(evidence, "items");
+    ASSERT_EQ(yyjson_arr_size(items), returned);
+    const char *first_detail =
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get(items, 0), "detail"));
+    ASSERT_TRUE(first_detail && first_detail[0]);
+    for (int i = 0; i < returned; i++) {
+        char expected[32];
+        snprintf(expected, sizeof(expected), "r%04d.rs", i);
+        yyjson_val *item = yyjson_arr_get(items, i);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item, "path")), expected);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item, "kind")), "analysis_partial:rust");
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(item, "detail")), first_detail);
+    }
+    yyjson_mut_doc *evidence_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_doc_set_root(evidence_doc, yyjson_val_mut_copy(evidence_doc, evidence));
+    char *evidence_json = yyjson_mut_write(evidence_doc, 0, NULL);
+    ASSERT_NOT_NULL(evidence_json);
+    ASSERT_TRUE(strlen(evidence_json) <= 16384);
+
+    free(evidence_json);
+    yyjson_mut_doc_free(evidence_doc);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    return 0;
+}
+
+TEST(tool_index_repository_success_reports_large_semantic_health_corpus) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX fork harness required for failure-isolated environment and cleanup");
+#else
+    char repo[256];
+    char cache[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-mcp-index-rust-pages-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-index-rust-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    if (!cbm_mkdtemp(cache)) {
+        th_rmtree(repo);
+        FAIL("cbm_mkdtemp cache failed");
+    }
+
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(index_repository_success_reports_large_semantic_health_corpus_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = pid > 0 && waitpid(pid, &status, 0) == pid;
+    char *project = cbm_project_name_from_path(repo);
+    cleanup_project_db(cache, project);
+    free(project);
+    th_rmtree(cache);
+    th_rmtree(repo);
+    ASSERT_TRUE(waited);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
 TEST(tool_check_index_coverage_rejects_stale_generation) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -15079,6 +15179,7 @@ SUITE(mcp) {
     RUN_TEST(tool_rust_analysis_evidence_has_independent_16k_budget);
     RUN_TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contamination);
     RUN_TEST(tool_rust_analysis_page_failures_are_unknown_and_use_shared_version_contract);
+    RUN_TEST(tool_index_repository_success_reports_large_semantic_health_corpus);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
