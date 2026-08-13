@@ -346,15 +346,15 @@ if ! cmp -s "$SOURCE_HASH_BEFORE" "$SOURCE_HASH_AFTER"; then
     exit 1
 fi
 
-# These floors are rounded down to one decimal place from the lower of two
-# byte-identical native runs at scanner commit fccfd8e0.  The margin avoids
+# These floors are rounded down to one decimal place from two byte-identical
+# native runs at scanner commit e6ca3209.  The margin avoids
 # display-rounding noise while still rejecting a meaningful regression.
 # Per-file floors prevent the larger LSP scanner from hiding a test loss in
 # either Cargo or rustdoc adapters.
-LSP_LINE_FLOOR="${CBM_COVERAGE_RUST_LSP_LINE_FLOOR:-76.6}"
-LSP_BRANCH_FLOOR="${CBM_COVERAGE_RUST_LSP_BRANCH_FLOOR:-59.0}"
-CARGO_LINE_FLOOR="${CBM_COVERAGE_RUST_CARGO_LINE_FLOOR:-79.1}"
-CARGO_BRANCH_FLOOR="${CBM_COVERAGE_RUST_CARGO_BRANCH_FLOOR:-58.0}"
+LSP_LINE_FLOOR="${CBM_COVERAGE_RUST_LSP_LINE_FLOOR:-77.0}"
+LSP_BRANCH_FLOOR="${CBM_COVERAGE_RUST_LSP_BRANCH_FLOOR:-59.3}"
+CARGO_LINE_FLOOR="${CBM_COVERAGE_RUST_CARGO_LINE_FLOOR:-78.5}"
+CARGO_BRANCH_FLOOR="${CBM_COVERAGE_RUST_CARGO_BRANCH_FLOOR:-63.0}"
 RUSTDOC_LINE_FLOOR="${CBM_COVERAGE_RUST_RUSTDOC_LINE_FLOOR:-64.0}"
 RUSTDOC_BRANCH_FLOOR="${CBM_COVERAGE_RUST_RUSTDOC_BRANCH_FLOOR:-37.6}"
 
