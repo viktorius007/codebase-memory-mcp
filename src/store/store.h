@@ -529,6 +529,8 @@ enum {
     CBM_SEMANTIC_INDEX_VERSION = 4,
     CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS = 256,
     CBM_ANALYSIS_COVERAGE_DETAIL_MAX_BYTES = 4096,
+    CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS = 256,
+    CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES = 4096,
 };
 
 /* One best-effort coverage row: a file the indexer could not fully cover.
@@ -606,6 +608,69 @@ typedef enum {
     CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED,
 } cbm_analysis_coverage_status_t;
 
+/* One typed syntactic-coverage request avoids selector ambiguity across the
+ * three authoritative lookup shapes. PROJECT requires selector == NULL;
+ * EXACT_PATH requires a non-empty repository-relative selector; SCOPE accepts
+ * an empty selector for the project root. Every mode excludes `analysis_*`
+ * rows in SQL before totals, hashing, or row materialization. */
+typedef enum {
+    CBM_SYNTACTIC_COVERAGE_PROJECT = 0,
+    CBM_SYNTACTIC_COVERAGE_EXACT_PATH,
+    CBM_SYNTACTIC_COVERAGE_SCOPE,
+} cbm_syntactic_coverage_mode_t;
+
+typedef struct {
+    const char *project;
+    cbm_syntactic_coverage_mode_t mode;
+    const char *selector;
+    int64_t offset;
+    int limit;
+    size_t detail_preview_bytes;
+} cbm_syntactic_coverage_request_t;
+
+typedef enum {
+    CBM_SYNTACTIC_COVERAGE_MATCH_PROJECT = 0,
+    CBM_SYNTACTIC_COVERAGE_MATCH_EXACT,
+    CBM_SYNTACTIC_COVERAGE_MATCH_ANCESTOR,
+    CBM_SYNTACTIC_COVERAGE_MATCH_DESCENDANT,
+} cbm_syntactic_coverage_match_t;
+
+typedef struct {
+    const char *rel_path;
+    const char *kind;
+    const char *detail;
+    int64_t detail_complete_bytes;
+    bool detail_truncated;
+    char detail_sha256[65];
+    cbm_syntactic_coverage_match_t match;
+} cbm_syntactic_coverage_row_t;
+
+typedef struct {
+    int64_t rows_total;
+    int64_t parse_partial_rows;
+    int64_t skipped_rows;
+    int64_t not_indexed_dir_rows;
+    int64_t not_indexed_file_rows;
+} cbm_syntactic_coverage_totals_t;
+
+typedef struct {
+    bool has_meta;
+    cbm_coverage_meta_t meta;
+    cbm_syntactic_coverage_totals_t totals;
+    char rows_sha256[65];
+    cbm_syntactic_coverage_row_t *rows;
+    int returned;
+    int64_t next_offset;
+    bool has_more;
+} cbm_syntactic_coverage_page_t;
+
+typedef enum {
+    CBM_SYNTACTIC_COVERAGE_OK = 0,
+    CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT,
+    CBM_SYNTACTIC_COVERAGE_STORE_ERROR,
+    CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED,
+} cbm_syntactic_coverage_status_t;
+
 /* Replace the project's coverage rows in one transaction, then prune rows for
  * files absent from file_hashes (deleted from the repo). Call AFTER hashes
  * were persisted for the run. */
@@ -649,11 +714,24 @@ cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
     size_t detail_preview_bytes, cbm_analysis_coverage_page_t *out);
 void cbm_store_analysis_coverage_page_clear(cbm_analysis_coverage_page_t *page);
 
+/* Read one bounded canonical syntactic page plus exact category totals,
+ * current metadata, and a SHA-256 of every selected full row in stable binary
+ * (rel_path, kind) order. offset is a row ordinal in that stream. The output
+ * must be zero-initialized before its first call and cleared before reuse. */
+cbm_syntactic_coverage_status_t cbm_store_syntactic_coverage_get_page(
+    cbm_store_t *s, const cbm_syntactic_coverage_request_t *request,
+    cbm_syntactic_coverage_page_t *out);
+void cbm_store_syntactic_coverage_page_clear(cbm_syntactic_coverage_page_t *page);
+
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 typedef void (*cbm_analysis_coverage_test_hook_fn)(void *userdata);
 void cbm_store_analysis_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations);
 void cbm_store_analysis_coverage_test_set_after_totals_hook(
     cbm_store_t *s, cbm_analysis_coverage_test_hook_fn hook, void *userdata);
+typedef void (*cbm_syntactic_coverage_test_hook_fn)(void *userdata);
+void cbm_store_syntactic_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations);
+void cbm_store_syntactic_coverage_test_set_after_totals_hook(
+    cbm_store_t *s, cbm_syntactic_coverage_test_hook_fn hook, void *userdata);
 #endif
 
 /* Name of the derived miss-graph shadow project ("<project>::missed").

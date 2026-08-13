@@ -151,12 +151,16 @@ struct cbm_store {
     int analysis_alloc_fail_after;
     cbm_analysis_coverage_test_hook_fn analysis_after_totals_hook;
     void *analysis_after_totals_userdata;
+    int syntactic_alloc_fail_after;
+    cbm_syntactic_coverage_test_hook_fn syntactic_after_totals_hook;
+    void *syntactic_after_totals_userdata;
 #endif
 };
 
 static void store_init_test_seams(cbm_store_t *s) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     s->analysis_alloc_fail_after = CBM_NOT_FOUND;
+    s->syntactic_alloc_fail_after = CBM_NOT_FOUND;
 #else
     (void)s;
 #endif
@@ -3425,6 +3429,293 @@ cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
     return CBM_ANALYSIS_COVERAGE_OK;
 }
 
+static void *syntactic_coverage_alloc(cbm_store_t *s, size_t size) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (s->syntactic_alloc_fail_after == 0) {
+        return NULL;
+    }
+    if (s->syntactic_alloc_fail_after > 0) {
+        s->syntactic_alloc_fail_after--;
+    }
+#endif
+    return malloc(size);
+}
+
+static char *syntactic_coverage_dup_bytes(cbm_store_t *s, const unsigned char *text,
+                                          size_t bytes) {
+    char *copy = syntactic_coverage_alloc(s, bytes + 1U);
+    if (!copy) {
+        return NULL;
+    }
+    if (bytes > 0) {
+        memcpy(copy, text, bytes);
+    }
+    copy[bytes] = '\0';
+    return copy;
+}
+
+void cbm_store_syntactic_coverage_page_clear(cbm_syntactic_coverage_page_t *page) {
+    if (!page) {
+        return;
+    }
+    for (int i = 0; i < page->returned; i++) {
+        free((char *)page->rows[i].rel_path);
+        free((char *)page->rows[i].kind);
+        free((char *)page->rows[i].detail);
+    }
+    free(page->rows);
+    cbm_store_coverage_meta_clear(&page->meta);
+    memset(page, 0, sizeof(*page));
+}
+
+static void syntactic_coverage_snapshot_abort(cbm_store_t *s) {
+    (void)sqlite3_exec(s->db, "ROLLBACK TO cbm_syntactic_coverage_page;", NULL, NULL, NULL);
+    (void)sqlite3_exec(s->db, "RELEASE cbm_syntactic_coverage_page;", NULL, NULL, NULL);
+}
+
+static cbm_syntactic_coverage_status_t syntactic_coverage_fail(
+    cbm_store_t *s, cbm_syntactic_coverage_page_t *out,
+    cbm_syntactic_coverage_status_t status) {
+    cbm_store_syntactic_coverage_page_clear(out);
+    syntactic_coverage_snapshot_abort(s);
+    return status;
+}
+
+static const char *syntactic_coverage_sql(cbm_syntactic_coverage_mode_t mode) {
+    static const char project_sql[] =
+        "SELECT rel_path, kind, detail FROM index_coverage"
+        " WHERE project = ?1 AND ?2 = ''"
+        " AND substr(kind, 1, 9) != 'analysis_'"
+        " ORDER BY rel_path COLLATE BINARY, kind COLLATE BINARY LIMIT ?3 OFFSET ?4;";
+    static const char exact_path_sql[] =
+        "SELECT rel_path, kind, detail FROM index_coverage"
+        " WHERE project = ?1 AND substr(kind, 1, 9) != 'analysis_' AND (rel_path = ?2 OR"
+        " (kind = 'not_indexed_dir' AND length(rel_path) < length(?2)"
+        " AND substr(?2, 1, length(rel_path)) = rel_path"
+        " AND substr(?2, length(rel_path) + 1, 1) = '/'))"
+        " ORDER BY rel_path COLLATE BINARY, kind COLLATE BINARY LIMIT ?3 OFFSET ?4;";
+    static const char scope_sql[] =
+        "SELECT rel_path, kind, detail FROM index_coverage"
+        " WHERE project = ?1 AND substr(kind, 1, 9) != 'analysis_' AND (length(?2) = 0 OR"
+        " rel_path = ?2 OR (length(rel_path) > length(?2)"
+        " AND substr(rel_path, 1, length(?2)) = ?2"
+        " AND substr(rel_path, length(?2) + 1, 1) = '/') OR"
+        " (kind = 'not_indexed_dir' AND length(rel_path) < length(?2)"
+        " AND substr(?2, 1, length(rel_path)) = rel_path"
+        " AND substr(?2, length(rel_path) + 1, 1) = '/'))"
+        " ORDER BY rel_path COLLATE BINARY, kind COLLATE BINARY LIMIT ?3 OFFSET ?4;";
+    switch (mode) {
+        case CBM_SYNTACTIC_COVERAGE_PROJECT:
+            return project_sql;
+        case CBM_SYNTACTIC_COVERAGE_EXACT_PATH:
+            return exact_path_sql;
+        case CBM_SYNTACTIC_COVERAGE_SCOPE:
+            return scope_sql;
+    }
+    return NULL;
+}
+
+static bool syntactic_coverage_request_valid(const cbm_syntactic_coverage_request_t *request) {
+    if (!request || !request->project || request->offset < 0 || request->limit <= 0 ||
+        request->limit > CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS ||
+        request->detail_preview_bytes > CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES) {
+        return false;
+    }
+    if (request->mode == CBM_SYNTACTIC_COVERAGE_PROJECT) {
+        return request->selector == NULL;
+    }
+    if (request->mode == CBM_SYNTACTIC_COVERAGE_EXACT_PATH) {
+        return request->selector && request->selector[0] != '\0';
+    }
+    return request->mode == CBM_SYNTACTIC_COVERAGE_SCOPE && request->selector;
+}
+
+static int syntactic_coverage_prepare(cbm_store_t *s,
+                                      const cbm_syntactic_coverage_request_t *request,
+                                      int limit, int64_t offset, sqlite3_stmt **out) {
+    const char *sql = syntactic_coverage_sql(request->mode);
+    if (!sql || sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, out, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "syntactic coverage prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(*out, SKIP_ONE, request->project);
+    bind_text(*out, ST_COL_2, request->selector ? request->selector : "");
+    sqlite3_bind_int(*out, ST_COL_3, limit);
+    sqlite3_bind_int64(*out, ST_COL_4, offset);
+    return CBM_STORE_OK;
+}
+
+static void syntactic_coverage_digest_hex(cbm_sha256_ctx *sha, char out[65]) {
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(sha, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static void syntactic_coverage_digest_field(cbm_sha256_ctx *sha, unsigned char tag,
+                                            const unsigned char *bytes, size_t length) {
+    unsigned char framed[9];
+    framed[0] = tag;
+    uint64_t n = (uint64_t)length;
+    for (int i = 0; i < 8; i++) {
+        framed[8 - i] = (unsigned char)(n & 0xffU);
+        n >>= 8;
+    }
+    cbm_sha256_update(sha, framed, sizeof(framed));
+    cbm_sha256_update(sha, bytes ? bytes : (const unsigned char *)"", length);
+}
+
+static cbm_syntactic_coverage_match_t syntactic_coverage_match(
+    const cbm_syntactic_coverage_request_t *request, const char *rel_path) {
+    if (request->mode == CBM_SYNTACTIC_COVERAGE_PROJECT) {
+        return CBM_SYNTACTIC_COVERAGE_MATCH_PROJECT;
+    }
+    if (strcmp(rel_path, request->selector) == 0) {
+        return CBM_SYNTACTIC_COVERAGE_MATCH_EXACT;
+    }
+    size_t path_len = strlen(rel_path);
+    size_t selector_len = strlen(request->selector);
+    return path_len < selector_len ? CBM_SYNTACTIC_COVERAGE_MATCH_ANCESTOR
+                                   : CBM_SYNTACTIC_COVERAGE_MATCH_DESCENDANT;
+}
+
+cbm_syntactic_coverage_status_t cbm_store_syntactic_coverage_get_page(
+    cbm_store_t *s, const cbm_syntactic_coverage_request_t *request,
+    cbm_syntactic_coverage_page_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!s || !s->db || !out || !syntactic_coverage_request_valid(request)) {
+        return CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT;
+    }
+    if (exec_sql(s, "SAVEPOINT cbm_syntactic_coverage_page;") != CBM_STORE_OK) {
+        return CBM_SYNTACTIC_COVERAGE_STORE_ERROR;
+    }
+
+    coverage_meta_status_t meta_status =
+        coverage_meta_get_alloc(s, request->project, &out->meta, syntactic_coverage_alloc);
+    if (meta_status == COVERAGE_META_ALLOCATION_FAILED) {
+        return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED);
+    }
+    if (meta_status == COVERAGE_META_STORE_ERROR) {
+        return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_STORE_ERROR);
+    }
+    out->has_meta = meta_status == COVERAGE_META_OK;
+
+    sqlite3_stmt *all_rows = NULL;
+    if (syntactic_coverage_prepare(s, request, CBM_NOT_FOUND, 0, &all_rows) != CBM_STORE_OK) {
+        return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_STORE_ERROR);
+    }
+    cbm_sha256_ctx sha;
+    cbm_sha256_init(&sha);
+    int scan_rc;
+    while ((scan_rc = sqlite3_step(all_rows)) == SQLITE_ROW) {
+        const unsigned char *path = sqlite3_column_text(all_rows, 0);
+        const unsigned char *kind = sqlite3_column_text(all_rows, 1);
+        const unsigned char *detail = sqlite3_column_text(all_rows, 2);
+        int path_bytes = sqlite3_column_bytes(all_rows, 0);
+        int kind_bytes = sqlite3_column_bytes(all_rows, 1);
+        int detail_bytes = sqlite3_column_bytes(all_rows, 2);
+        syntactic_coverage_digest_field(&sha, 'P', path, (size_t)path_bytes);
+        syntactic_coverage_digest_field(&sha, 'K', kind, (size_t)kind_bytes);
+        syntactic_coverage_digest_field(&sha, 'D', detail, (size_t)detail_bytes);
+        out->totals.rows_total++;
+        const char *kind_text = kind ? (const char *)kind : "";
+        if (strcmp(kind_text, "parse_partial") == 0) {
+            out->totals.parse_partial_rows++;
+        } else if (strcmp(kind_text, "not_indexed_dir") == 0) {
+            out->totals.not_indexed_dir_rows++;
+        } else if (strcmp(kind_text, "not_indexed_file") == 0) {
+            out->totals.not_indexed_file_rows++;
+        } else {
+            out->totals.skipped_rows++;
+        }
+    }
+    sqlite3_finalize(all_rows);
+    if (scan_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "syntactic coverage totals scan");
+        return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_STORE_ERROR);
+    }
+    syntactic_coverage_digest_hex(&sha, out->rows_sha256);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (s->syntactic_after_totals_hook) {
+        s->syntactic_after_totals_hook(s->syntactic_after_totals_userdata);
+    }
+#endif
+
+    int64_t remaining = out->totals.rows_total - request->offset;
+    int wanted = remaining > 0 ? (remaining < request->limit ? (int)remaining : request->limit) : 0;
+    if (wanted > 0) {
+        out->rows = syntactic_coverage_alloc(s, (size_t)wanted * sizeof(*out->rows));
+        if (!out->rows) {
+            return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED);
+        }
+        memset(out->rows, 0, (size_t)wanted * sizeof(*out->rows));
+    }
+
+    sqlite3_stmt *page_rows = NULL;
+    if (syntactic_coverage_prepare(s, request, request->limit, request->offset, &page_rows) !=
+        CBM_STORE_OK) {
+        return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_STORE_ERROR);
+    }
+    int page_rc = SQLITE_DONE;
+    while ((page_rc = sqlite3_step(page_rows)) == SQLITE_ROW) {
+        if (out->returned >= wanted) {
+            sqlite3_finalize(page_rows);
+            store_set_error(s, "syntactic coverage page exceeded snapshot total");
+            return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_STORE_ERROR);
+        }
+        cbm_syntactic_coverage_row_t *row = &out->rows[out->returned];
+        const unsigned char *path = sqlite3_column_text(page_rows, 0);
+        const unsigned char *kind = sqlite3_column_text(page_rows, 1);
+        const unsigned char *detail = sqlite3_column_text(page_rows, 2);
+        size_t path_bytes = (size_t)sqlite3_column_bytes(page_rows, 0);
+        size_t kind_bytes = (size_t)sqlite3_column_bytes(page_rows, 1);
+        size_t detail_bytes = (size_t)sqlite3_column_bytes(page_rows, 2);
+        size_t preview_bytes = analysis_coverage_utf8_prefix(
+            detail ? detail : (const unsigned char *)"", detail_bytes,
+            request->detail_preview_bytes);
+        row->rel_path = syntactic_coverage_dup_bytes(
+            s, path ? path : (const unsigned char *)"", path_bytes);
+        row->kind = syntactic_coverage_dup_bytes(
+            s, kind ? kind : (const unsigned char *)"", kind_bytes);
+        row->detail = syntactic_coverage_dup_bytes(
+            s, detail ? detail : (const unsigned char *)"", preview_bytes);
+        if (!row->rel_path || !row->kind || !row->detail) {
+            free((char *)row->rel_path);
+            free((char *)row->kind);
+            free((char *)row->detail);
+            memset(row, 0, sizeof(*row));
+            sqlite3_finalize(page_rows);
+            return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED);
+        }
+        row->detail_complete_bytes = (int64_t)detail_bytes;
+        row->detail_truncated = preview_bytes < detail_bytes;
+        if (row->detail_truncated) {
+            cbm_sha256_hex(detail ? detail : (const unsigned char *)"", detail_bytes,
+                           row->detail_sha256);
+        }
+        row->match = syntactic_coverage_match(request, row->rel_path);
+        out->returned++;
+    }
+    sqlite3_finalize(page_rows);
+    if (page_rc != SQLITE_DONE || out->returned != wanted) {
+        store_set_error(s, "syntactic coverage snapshot changed during page read");
+        return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_STORE_ERROR);
+    }
+    out->next_offset = request->offset + out->returned;
+    out->has_more = out->next_offset < out->totals.rows_total;
+    if (exec_sql(s, "RELEASE cbm_syntactic_coverage_page;") != CBM_STORE_OK) {
+        return syntactic_coverage_fail(s, out, CBM_SYNTACTIC_COVERAGE_STORE_ERROR);
+    }
+    return CBM_SYNTACTIC_COVERAGE_OK;
+}
+
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 void cbm_store_analysis_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations) {
     if (s) {
@@ -3437,6 +3728,20 @@ void cbm_store_analysis_coverage_test_set_after_totals_hook(
     if (s) {
         s->analysis_after_totals_hook = hook;
         s->analysis_after_totals_userdata = userdata;
+    }
+}
+
+void cbm_store_syntactic_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations) {
+    if (s) {
+        s->syntactic_alloc_fail_after = allocations;
+    }
+}
+
+void cbm_store_syntactic_coverage_test_set_after_totals_hook(
+    cbm_store_t *s, cbm_syntactic_coverage_test_hook_fn hook, void *userdata) {
+    if (s) {
+        s->syntactic_after_totals_hook = hook;
+        s->syntactic_after_totals_userdata = userdata;
     }
 }
 #endif

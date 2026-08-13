@@ -9,6 +9,7 @@
 #include <store/store.h>
 #include <foundation/constants.h>
 #include <foundation/compat.h>
+#include <foundation/sha256.h>
 #include <cbm.h>
 #include <sqlite3.h>
 #include <string.h>
@@ -2231,6 +2232,498 @@ TEST(store_analysis_rows_do_not_rebuild_or_materialize_missed_graph) {
     PASS();
 }
 
+static void store_test_sha256_final_hex(cbm_sha256_ctx *sha, char out[65]) {
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(sha, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static void store_test_sha256_coverage_row(cbm_sha256_ctx *sha, const char *path,
+                                           const char *kind, const char *detail) {
+    const char *fields[] = {path, kind, detail};
+    const unsigned char tags[] = {'P', 'K', 'D'};
+    for (int field = 0; field < 3; field++) {
+        uint64_t length = strlen(fields[field]);
+        unsigned char framed[9] = {tags[field]};
+        uint64_t n = length;
+        for (int i = 0; i < 8; i++) {
+            framed[8 - i] = (unsigned char)(n & 0xffU);
+            n >>= 8;
+        }
+        cbm_sha256_update(sha, framed, sizeof(framed));
+        cbm_sha256_update(sha, fields[field], (size_t)length);
+    }
+}
+
+TEST(store_syntactic_coverage_project_pages_filter_order_digest_and_bound_thousands) {
+    enum {
+        FILES = 1200,
+        SYNTACTIC_ROWS = FILES + 1,
+        SEMANTIC_ROWS = FILES,
+        ALL_ROWS = SYNTACTIC_ROWS + SEMANTIC_ROWS,
+        PATH_BYTES = 48,
+        LONG_DETAIL_BYTES = 8192,
+    };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "syntactic-bulk", "/tmp/syntactic-bulk"),
+              CBM_STORE_OK);
+    cbm_coverage_row_t *rows = calloc(ALL_ROWS, sizeof(*rows));
+    char(*paths)[PATH_BYTES] = calloc(ALL_ROWS, sizeof(*paths));
+    char *long_detail = malloc(LONG_DETAIL_BYTES);
+    ASSERT_NOT_NULL(rows);
+    ASSERT_NOT_NULL(paths);
+    ASSERT_NOT_NULL(long_detail);
+    memset(long_detail, 'x', LONG_DETAIL_BYTES - 1);
+    memset(long_detail, 'a', 30);
+    long_detail[30] = (char)0xe2;
+    long_detail[31] = (char)0x82;
+    long_detail[32] = (char)0xac;
+    long_detail[LONG_DETAIL_BYTES - 1] = '\0';
+
+    int n = 0;
+    for (int i = 0; i < FILES; i++) {
+        char live_path[PATH_BYTES];
+        snprintf(live_path, sizeof(live_path), "src/file%04d.rs", i);
+        ASSERT_EQ(cbm_store_upsert_file_hash(s, "syntactic-bulk", live_path, "", i + 1, 1),
+                  CBM_STORE_OK);
+        snprintf(paths[n], PATH_BYTES, "%s", live_path);
+        rows[n] = (cbm_coverage_row_t){
+            .rel_path = paths[n],
+            .kind = i % 2 == 0 ? "parse_partial" : "read",
+            .detail = i == 0 ? long_detail : (i % 2 == 0 ? "pp" : "skip"),
+        };
+        n++;
+        snprintf(paths[n], PATH_BYTES, "%s", live_path);
+        rows[n] = (cbm_coverage_row_t){
+            .rel_path = paths[n], .kind = "analysis_partial:rust", .detail = "semantic"};
+        n++;
+    }
+    snprintf(paths[n], PATH_BYTES, "src/file0000.rs");
+    rows[n] = (cbm_coverage_row_t){
+        .rel_path = paths[n], .kind = "read", .detail = "duplicate-kind"};
+    n++;
+    ASSERT_EQ(n, ALL_ROWS);
+    cbm_coverage_meta_t meta = {
+        .generation = "generation-syntactic-bulk",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = FILES,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "syntactic-bulk", rows, ALL_ROWS, &meta),
+              CBM_STORE_OK);
+
+    cbm_sha256_ctx expected_sha;
+    cbm_sha256_init(&expected_sha);
+    for (int i = 0; i < FILES; i++) {
+        char path[PATH_BYTES];
+        snprintf(path, sizeof(path), "src/file%04d.rs", i);
+        const char *kind = i % 2 == 0 ? "parse_partial" : "read";
+        const char *detail = i == 0 ? long_detail : (i % 2 == 0 ? "pp" : "skip");
+        store_test_sha256_coverage_row(&expected_sha, path, kind, detail);
+        if (i == 0) {
+            store_test_sha256_coverage_row(&expected_sha, path, "read", "duplicate-kind");
+        }
+    }
+    char expected_digest[65];
+    store_test_sha256_final_hex(&expected_sha, expected_digest);
+    char expected_detail_digest[65];
+    cbm_sha256_hex(long_detail, strlen(long_detail), expected_detail_digest);
+
+    cbm_syntactic_coverage_request_t request = {
+        .project = "syntactic-bulk",
+        .mode = CBM_SYNTACTIC_COVERAGE_PROJECT,
+        .selector = NULL,
+        .offset = 0,
+        .limit = 37,
+        .detail_preview_bytes = 31,
+    };
+    int observed = 0;
+    do {
+        cbm_syntactic_coverage_page_t page = {0};
+        ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+                  CBM_SYNTACTIC_COVERAGE_OK);
+        ASSERT_TRUE(page.has_meta);
+        ASSERT_STR_EQ(page.meta.generation, "generation-syntactic-bulk");
+        ASSERT_EQ(page.totals.rows_total, SYNTACTIC_ROWS);
+        ASSERT_EQ(page.totals.parse_partial_rows, FILES / 2);
+        ASSERT_EQ(page.totals.skipped_rows, FILES / 2 + 1);
+        ASSERT_EQ(page.totals.not_indexed_dir_rows, 0);
+        ASSERT_EQ(page.totals.not_indexed_file_rows, 0);
+        ASSERT_STR_EQ(page.rows_sha256, expected_digest);
+        ASSERT_TRUE(page.returned > 0);
+        ASSERT_TRUE(page.returned <= request.limit);
+        for (int i = 0; i < page.returned; i++, observed++) {
+            int file_index = observed == 0 ? 0 : observed - 1;
+            if (observed > 1) {
+                file_index = observed - 1;
+            }
+            char expected_path[PATH_BYTES];
+            snprintf(expected_path, sizeof(expected_path), "src/file%04d.rs", file_index);
+            ASSERT_STR_EQ(page.rows[i].rel_path, expected_path);
+            ASSERT_EQ(page.rows[i].match, CBM_SYNTACTIC_COVERAGE_MATCH_PROJECT);
+            if (observed == 0) {
+                ASSERT_STR_EQ(page.rows[i].kind, "parse_partial");
+                ASSERT_EQ(strlen(page.rows[i].detail), 30);
+                ASSERT_EQ(page.rows[i].detail_complete_bytes, LONG_DETAIL_BYTES - 1);
+                ASSERT_TRUE(page.rows[i].detail_truncated);
+                ASSERT_STR_EQ(page.rows[i].detail_sha256, expected_detail_digest);
+            } else if (observed == 1) {
+                ASSERT_STR_EQ(page.rows[i].kind, "read");
+                ASSERT_STR_EQ(page.rows[i].detail, "duplicate-kind");
+            } else {
+                const char *expected_kind = file_index % 2 == 0 ? "parse_partial" : "read";
+                ASSERT_STR_EQ(page.rows[i].kind, expected_kind);
+            }
+        }
+        ASSERT_EQ(page.next_offset, request.offset + page.returned);
+        bool has_more = page.has_more;
+        request.offset = page.next_offset;
+        cbm_store_syntactic_coverage_page_clear(&page);
+        if (!has_more) {
+            break;
+        }
+    } while (true);
+    ASSERT_EQ(observed, SYNTACTIC_ROWS);
+    ASSERT_EQ(request.offset, SYNTACTIC_ROWS);
+
+    free(long_detail);
+    free(paths);
+    free(rows);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_syntactic_coverage_exact_and_scope_use_segment_safe_ancestors) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "syntactic-targeted", "/tmp/syntactic-targeted"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(
+                  s, "syntactic-targeted", "generated/nested", "", 1, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(
+                  s, "syntactic-targeted", "generated/nested/a.rs", "", 2, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(
+                  s, "syntactic-targeted", "generated2/nested/a.rs", "", 3, 1),
+              CBM_STORE_OK);
+    const cbm_coverage_row_t rows[] = {
+        {.rel_path = "gen", .kind = "not_indexed_dir", .detail = "collision"},
+        {.rel_path = "generated", .kind = "not_indexed_dir", .detail = "ancestor"},
+        {.rel_path = "generated/nested", .kind = "parse_partial", .detail = "exact"},
+        {.rel_path = "generated/nested/a.rs", .kind = "read", .detail = "child-a"},
+        {.rel_path = "generated/nested/a.rs", .kind = "oversized", .detail = "child-b"},
+        {.rel_path = "generated/nested/deeper/b.rs", .kind = "not_indexed_file", .detail = "b"},
+        {.rel_path = "generated2/nested/a.rs", .kind = "read", .detail = "sibling"},
+        {.rel_path = "generated/nested/a.rs", .kind = "analysis_failed:rust", .detail = "sem"},
+    };
+    cbm_coverage_meta_t meta = {
+        .generation = "generation-targeted",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 1,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "syntactic-targeted", rows, 8, &meta),
+              CBM_STORE_OK);
+
+    cbm_syntactic_coverage_request_t exact = {
+        .project = "syntactic-targeted",
+        .mode = CBM_SYNTACTIC_COVERAGE_EXACT_PATH,
+        .selector = "generated/nested/a.rs",
+        .offset = 0,
+        .limit = 8,
+        .detail_preview_bytes = 64,
+    };
+    cbm_syntactic_coverage_page_t page = {0};
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &exact, &page),
+              CBM_SYNTACTIC_COVERAGE_OK);
+    ASSERT_EQ(page.totals.rows_total, 3);
+    ASSERT_STR_EQ(page.rows[0].rel_path, "generated");
+    ASSERT_EQ(page.rows[0].match, CBM_SYNTACTIC_COVERAGE_MATCH_ANCESTOR);
+    ASSERT_STR_EQ(page.rows[1].kind, "oversized");
+    ASSERT_STR_EQ(page.rows[2].kind, "read");
+    ASSERT_EQ(page.rows[1].match, CBM_SYNTACTIC_COVERAGE_MATCH_EXACT);
+    ASSERT_EQ(page.rows[2].match, CBM_SYNTACTIC_COVERAGE_MATCH_EXACT);
+    cbm_store_syntactic_coverage_page_clear(&page);
+
+    cbm_syntactic_coverage_request_t scope = {
+        .project = "syntactic-targeted",
+        .mode = CBM_SYNTACTIC_COVERAGE_SCOPE,
+        .selector = "generated/nested",
+        .offset = 0,
+        .limit = 8,
+        .detail_preview_bytes = 64,
+    };
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &scope, &page),
+              CBM_SYNTACTIC_COVERAGE_OK);
+    ASSERT_EQ(page.totals.rows_total, 5);
+    ASSERT_STR_EQ(page.rows[0].rel_path, "generated");
+    ASSERT_EQ(page.rows[0].match, CBM_SYNTACTIC_COVERAGE_MATCH_ANCESTOR);
+    ASSERT_STR_EQ(page.rows[1].rel_path, "generated/nested");
+    ASSERT_EQ(page.rows[1].match, CBM_SYNTACTIC_COVERAGE_MATCH_EXACT);
+    ASSERT_STR_EQ(page.rows[4].rel_path, "generated/nested/deeper/b.rs");
+    ASSERT_EQ(page.rows[4].match, CBM_SYNTACTIC_COVERAGE_MATCH_DESCENDANT);
+    cbm_store_syntactic_coverage_page_clear(&page);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_syntactic_coverage_empty_meta_invalid_and_allocation_statuses) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "syntactic-status", "/tmp/syntactic-status"),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {
+        .generation = "generation-status",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 0,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "syntactic-status", NULL, 0, &meta),
+              CBM_STORE_OK);
+    cbm_syntactic_coverage_request_t request = {
+        .project = "syntactic-status",
+        .mode = CBM_SYNTACTIC_COVERAGE_PROJECT,
+        .selector = NULL,
+        .offset = 0,
+        .limit = 1,
+        .detail_preview_bytes = 32,
+    };
+    cbm_syntactic_coverage_page_t page = {0};
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_OK);
+    ASSERT_TRUE(page.has_meta);
+    ASSERT_STR_EQ(page.meta.generation, "generation-status");
+    ASSERT_EQ(page.totals.rows_total, 0);
+    ASSERT_EQ(page.returned, 0);
+    ASSERT_FALSE(page.has_more);
+    ASSERT_EQ(strlen(page.rows_sha256), 64);
+    cbm_store_syntactic_coverage_page_clear(&page);
+
+    request.selector = "ambiguous";
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT);
+    request.selector = NULL;
+    request.offset = -1;
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT);
+    request.offset = 0;
+    request.limit = CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS + 1;
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT);
+    request.limit = 1;
+    request.detail_preview_bytes = CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES + 1U;
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT);
+    request.detail_preview_bytes = 32;
+    request.mode = CBM_SYNTACTIC_COVERAGE_EXACT_PATH;
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT);
+    request.mode = CBM_SYNTACTIC_COVERAGE_SCOPE;
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT);
+
+    cbm_coverage_row_t row = {
+        .rel_path = "excluded.rs", .kind = "not_indexed_file", .detail = "excluded"};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "syntactic-status", &row, 1, &meta),
+              CBM_STORE_OK);
+    request.mode = CBM_SYNTACTIC_COVERAGE_PROJECT;
+    request.selector = NULL;
+    cbm_store_syntactic_coverage_test_fail_alloc_after(s, 0);
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED);
+    ASSERT_NULL(page.rows);
+    ASSERT_FALSE(page.has_meta);
+    cbm_store_syntactic_coverage_test_fail_alloc_after(s, 6);
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED);
+    ASSERT_NULL(page.rows);
+    cbm_store_syntactic_coverage_test_fail_alloc_after(s, 9);
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED);
+    ASSERT_NULL(page.rows);
+    cbm_store_syntactic_coverage_test_fail_alloc_after(s, -1);
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_OK);
+    ASSERT_EQ(page.returned, 1);
+    cbm_store_syntactic_coverage_page_clear(&page);
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE index_coverage;"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_STORE_ERROR);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_syntactic_coverage_digest_frames_embedded_nul_fields) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "syntactic-nul", "/tmp/syntactic-nul"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(
+                  s,
+                  "INSERT INTO index_coverage(project,rel_path,kind,detail) VALUES"
+                  "('syntactic-nul',CAST(X'610062' AS TEXT),'c','d');"),
+              CBM_STORE_OK);
+
+    const unsigned char path[] = {'a', 0, 'b'};
+    cbm_sha256_ctx expected_sha;
+    cbm_sha256_init(&expected_sha);
+    const unsigned char *fields[] = {path, (const unsigned char *)"c",
+                                     (const unsigned char *)"d"};
+    const size_t lengths[] = {sizeof(path), 1, 1};
+    const unsigned char tags[] = {'P', 'K', 'D'};
+    for (int field = 0; field < 3; field++) {
+        unsigned char framed[9] = {tags[field]};
+        uint64_t n = lengths[field];
+        for (int i = 0; i < 8; i++) {
+            framed[8 - i] = (unsigned char)(n & 0xffU);
+            n >>= 8;
+        }
+        cbm_sha256_update(&expected_sha, framed, sizeof(framed));
+        cbm_sha256_update(&expected_sha, fields[field], lengths[field]);
+    }
+    char expected_digest[65];
+    store_test_sha256_final_hex(&expected_sha, expected_digest);
+
+    cbm_syntactic_coverage_request_t request = {
+        .project = "syntactic-nul",
+        .mode = CBM_SYNTACTIC_COVERAGE_PROJECT,
+        .selector = NULL,
+        .offset = 0,
+        .limit = 1,
+        .detail_preview_bytes = 8,
+    };
+    cbm_syntactic_coverage_page_t page = {0};
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(s, &request, &page),
+              CBM_SYNTACTIC_COVERAGE_OK);
+    ASSERT_EQ(page.totals.rows_total, 1);
+    ASSERT_STR_EQ(page.rows_sha256, expected_digest);
+    cbm_store_syntactic_coverage_page_clear(&page);
+    cbm_store_close(s);
+    PASS();
+}
+
+typedef struct {
+    cbm_store_t *writer;
+    int rc;
+} syntactic_snapshot_hook_ctx_t;
+
+static void syntactic_snapshot_replace_after_totals(void *userdata) {
+    syntactic_snapshot_hook_ctx_t *ctx = userdata;
+    const cbm_coverage_row_t replacement[] = {
+        {.rel_path = "new-a.rs", .kind = "not_indexed_file", .detail = "new-a"},
+        {.rel_path = "new-b.rs", .kind = "not_indexed_file", .detail = "new-b"},
+        {.rel_path = "new-b.rs", .kind = "analysis_failed:rust", .detail = "semantic"},
+    };
+    cbm_coverage_meta_t replacement_meta = {
+        .generation = "generation-syntactic-new",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 1,
+    };
+    ctx->rc = cbm_store_coverage_replace_ex(ctx->writer, "syntactic-snapshot", replacement, 3,
+                                             &replacement_meta);
+}
+
+TEST(store_syntactic_coverage_pages_share_outer_transaction_snapshot) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_syntactic_snapshot_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    cbm_store_t *writer = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_upsert_project(writer, "syntactic-snapshot", tmp), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(writer, "syntactic-snapshot", "new-b.rs", "", 1, 1),
+              CBM_STORE_OK);
+    const cbm_coverage_row_t initial[] = {
+        {.rel_path = "old-a.rs", .kind = "not_indexed_file", .detail = "old-a"},
+        {.rel_path = "old-b.rs", .kind = "not_indexed_file", .detail = "old-b"},
+    };
+    cbm_coverage_meta_t initial_meta = {
+        .generation = "generation-syntactic-old",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
+        .hash_records_complete = true,
+        .rust_analysis_recording_status = "complete",
+        .rust_files_total = 0,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(writer, "syntactic-snapshot", initial, 2,
+                                             &initial_meta),
+              CBM_STORE_OK);
+    cbm_store_t *reader = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(reader);
+    ASSERT_EQ(cbm_store_begin(reader), CBM_STORE_OK);
+    syntactic_snapshot_hook_ctx_t hook = {.writer = writer, .rc = CBM_STORE_ERR};
+    cbm_store_syntactic_coverage_test_set_after_totals_hook(
+        reader, syntactic_snapshot_replace_after_totals, &hook);
+    cbm_syntactic_coverage_request_t request = {
+        .project = "syntactic-snapshot",
+        .mode = CBM_SYNTACTIC_COVERAGE_PROJECT,
+        .selector = NULL,
+        .offset = 0,
+        .limit = 1,
+        .detail_preview_bytes = 32,
+    };
+    cbm_syntactic_coverage_page_t first = {0};
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(reader, &request, &first),
+              CBM_SYNTACTIC_COVERAGE_OK);
+    ASSERT_EQ(hook.rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(first.meta.generation, "generation-syntactic-old");
+    ASSERT_EQ(first.totals.rows_total, 2);
+    ASSERT_STR_EQ(first.rows[0].rel_path, "old-a.rs");
+    ASSERT_TRUE(first.has_more);
+    char old_digest[65];
+    snprintf(old_digest, sizeof(old_digest), "%s", first.rows_sha256);
+    request.offset = first.next_offset;
+    cbm_store_syntactic_coverage_page_clear(&first);
+
+    cbm_store_syntactic_coverage_test_set_after_totals_hook(reader, NULL, NULL);
+    cbm_syntactic_coverage_page_t second = {0};
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(reader, &request, &second),
+              CBM_SYNTACTIC_COVERAGE_OK);
+    ASSERT_STR_EQ(second.meta.generation, "generation-syntactic-old");
+    ASSERT_STR_EQ(second.rows_sha256, old_digest);
+    ASSERT_STR_EQ(second.rows[0].rel_path, "old-b.rs");
+    ASSERT_FALSE(second.has_more);
+    cbm_store_syntactic_coverage_page_clear(&second);
+    ASSERT_EQ(cbm_store_commit(reader), CBM_STORE_OK);
+
+    request.offset = 0;
+    request.limit = 8;
+    cbm_syntactic_coverage_page_t current = {0};
+    ASSERT_EQ(cbm_store_syntactic_coverage_get_page(reader, &request, &current),
+              CBM_SYNTACTIC_COVERAGE_OK);
+    ASSERT_STR_EQ(current.meta.generation, "generation-syntactic-new");
+    ASSERT_EQ(current.totals.rows_total, 2);
+    ASSERT_STR_EQ(current.rows[0].rel_path, "new-a.rs");
+    ASSERT_STR_EQ(current.rows[1].rel_path, "new-b.rs");
+    cbm_store_syntactic_coverage_page_clear(&current);
+    cbm_store_close(reader);
+    cbm_store_close(writer);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(store_analysis_coverage_page_empty_current_meta_and_contract) {
     ASSERT_EQ(CBM_SEMANTIC_INDEX_VERSION, 4);
     cbm_store_t *s = cbm_store_open_memory();
@@ -2581,6 +3074,11 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
     RUN_TEST(store_analysis_rows_do_not_rebuild_or_materialize_missed_graph);
+    RUN_TEST(store_syntactic_coverage_project_pages_filter_order_digest_and_bound_thousands);
+    RUN_TEST(store_syntactic_coverage_exact_and_scope_use_segment_safe_ancestors);
+    RUN_TEST(store_syntactic_coverage_empty_meta_invalid_and_allocation_statuses);
+    RUN_TEST(store_syntactic_coverage_digest_frames_embedded_nul_fields);
+    RUN_TEST(store_syntactic_coverage_pages_share_outer_transaction_snapshot);
     RUN_TEST(store_analysis_coverage_page_empty_current_meta_and_contract);
     RUN_TEST(store_analysis_coverage_page_filters_orders_and_bounds_thousands);
     RUN_TEST(store_analysis_coverage_page_reports_allocation_and_store_errors);
