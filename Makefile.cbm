@@ -58,6 +58,16 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
                   -I$(CBM_DIR) -I$(TS_INCLUDE)
 
+# Native source coverage is opt-in and orthogonal to the sanitizer and
+# production feature sets.  Keeping the instrumentation in one variable makes
+# every test translation unit (including C++, the grammar objects, and the LSP
+# unity object) use the same mapping format and puts the matching runtime on the
+# test link.  Production flags intentionally never reference this variable.
+COVERAGE_FLAGS :=
+ifeq ($(COVERAGE),1)
+COVERAGE_FLAGS := -fprofile-instr-generate -fcoverage-mapping -fno-omit-frame-pointer
+endif
+
 # Test seams are OPT-IN, never opt-out. Some suites drive behaviour that only a
 # test should be able to ask for (fork an orphan the watchdog must reap, publish
 # a lease-ownership marker). That code has no production caller and reads exactly
@@ -101,8 +111,9 @@ CALL_REFERENCE_LOOKUP_TEST_DEFINE = -DCBM_CALL_REFERENCE_LOOKUP_TEST_API=1
 INCREMENTAL_TEST_DEFINE = -DCBM_INCREMENTAL_TEST_API=1
 CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) \
 	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
-	$(INCREMENTAL_TEST_DEFINE) -g -O1 $(SANITIZE)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(CXX_STDLIB_FLAGS)
+	$(INCREMENTAL_TEST_DEFINE) -g -O1 $(SANITIZE) $(COVERAGE_FLAGS)
+CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) \
+	$(COVERAGE_FLAGS) $(CXX_STDLIB_FLAGS)
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
@@ -188,7 +199,8 @@ endif
 CXX_STDLIB ?= -lstdc++
 CXX_STDLIB_FLAGS ?=
 LDFLAGS = -lm $(CXX_STDLIB) -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
-LDFLAGS_TEST = -lm $(CXX_STDLIB) -lpthread -lz $(SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS_TEST = -lm $(CXX_STDLIB) -lpthread -lz $(SANITIZE) $(COVERAGE_FLAGS) \
+	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 LDFLAGS_TSAN = -lm $(CXX_STDLIB) -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 
 # ── Source files ─────────────────────────────────────────────────
@@ -436,7 +448,7 @@ MIMALLOC_CFLAGS = -std=c11 -O2 -w \
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
-                       -DMI_OVERRIDE=0
+                       -DMI_OVERRIDE=0 $(COVERAGE_FLAGS)
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
@@ -454,7 +466,7 @@ SQLITE3_SRC = vendored/sqlite3/sqlite3.c
 SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
                  $(SQLITE3_OMIT_FLAGS)
 SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
-                      $(SQLITE3_OMIT_FLAGS)
+                      $(SQLITE3_OMIT_FLAGS) $(COVERAGE_FLAGS)
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
@@ -702,7 +714,7 @@ BUILD_DIR = build/c
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O3 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      $(SANITIZE)
+                      $(SANITIZE) $(COVERAGE_FLAGS)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       $(TSAN_SANITIZE)
 
@@ -718,7 +730,9 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke \
+	coverage-rust coverage-rust-contract cbm cbm-with-ui frontend embed clean-c \
+	lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -829,9 +843,9 @@ endif
 LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
 LZ4_OBJ_TSAN = $(BUILD_DIR)/tsan_lz4.o $(BUILD_DIR)/tsan_lz4hc.o
 $(BUILD_DIR)/test_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(COVERAGE_FLAGS) -w -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/test_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(COVERAGE_FLAGS) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 $(BUILD_DIR)/tsan_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/tsan_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
@@ -849,7 +863,7 @@ $(BUILD_DIR)/tsan_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
 ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
 ZSTD_OBJ_TSAN = $(BUILD_DIR)/tsan_zstd.o
 $(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(ZSTD_EXTRA_CFLAGS) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(COVERAGE_FLAGS) $(ZSTD_EXTRA_CFLAGS) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 $(BUILD_DIR)/tsan_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
@@ -884,6 +898,16 @@ test-focused: $(BUILD_DIR)/test-runner
 	@test -n "$(strip $(TEST_SUITES))" || \
 		(echo "TEST_SUITES is required for test-focused"; exit 2)
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
+
+# Deterministic Apple LLVM coverage for the Rust scanner.  The harness creates
+# a collision-safe build/profile directory, verifies that compiler and coverage
+# tools use the same mapping major, and keeps the full build/test/report logs in
+# that directory while printing only a bounded verdict for agent consumers.
+coverage-rust-contract:
+	@bash tests/test_rust_scanner_coverage.sh
+
+coverage-rust:
+	@bash scripts/rust-scanner-coverage.sh
 
 # ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
