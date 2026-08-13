@@ -53,7 +53,12 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 
 /* ── MCP protocol helpers ─────────────────────────────────────── */
 
-/* Format an MCP tool result with text content. Returns heap-allocated JSON. */
+/* Complete serialized CallToolResult ceiling, including structuredContent. */
+#define CBM_MCP_RESULT_MAX_BYTES 65536U
+
+/* Format an MCP tool result with text content. Returns heap-allocated JSON.
+ * Oversize results fail closed as an explicit bounded error; no partial
+ * payload is returned. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
 /* Return true when notifications/cancelled params target the active request. */

@@ -1143,6 +1143,120 @@ TEST(mcp_text_result_error) {
     PASS();
 }
 
+static int assert_oversized_result_fails_closed(const char *payload, bool input_is_error,
+                                                size_t uncapped_bytes,
+                                                const char *discarded_payload_marker) {
+    ASSERT_TRUE(uncapped_bytes > CBM_MCP_RESULT_MAX_BYTES);
+
+    char *json = cbm_mcp_text_result(payload, input_is_error);
+    ASSERT_NOT_NULL(json);
+    ASSERT_TRUE(strlen(json) <= CBM_MCP_RESULT_MAX_BYTES);
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_is_obj(root));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "isError")));
+
+    yyjson_val *content = yyjson_obj_get(root, "content");
+    ASSERT_TRUE(yyjson_is_arr(content));
+    ASSERT_EQ(yyjson_arr_size(content), 1);
+    yyjson_val *item = yyjson_arr_get_first(content);
+    const char *message = yyjson_get_str(yyjson_obj_get(item, "text"));
+    ASSERT_NOT_NULL(message);
+    ASSERT_TRUE(strncmp(message, "ERROR: safe response envelope exceeded", 38) == 0);
+    ASSERT_NOT_NULL(strstr(message, "no partial result was returned"));
+    ASSERT_NOT_NULL(strstr(message, "complete_response_bytes="));
+    ASSERT_NOT_NULL(strstr(message, "limit_bytes=65536"));
+    ASSERT_NULL(strstr(json, discarded_payload_marker));
+
+    yyjson_val *structured = yyjson_obj_get(root, "structuredContent");
+    ASSERT_TRUE(yyjson_is_obj(structured));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(structured, "error")), message);
+    yyjson_doc_free(doc);
+    free(json);
+    PASS();
+}
+
+static char *build_unbounded_structured_result_for_test(const char *payload) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *content = yyjson_mut_arr(doc);
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "type", "text");
+    yyjson_mut_obj_add_str(doc, item, "text", payload);
+    yyjson_mut_arr_add_val(content, item);
+    yyjson_mut_obj_add_val(doc, root, "content", content);
+    yyjson_doc *payload_doc = yyjson_read(payload, strlen(payload), 0);
+    if (!payload_doc) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_obj_add_val(doc, root, "structuredContent",
+                           yyjson_val_mut_copy(doc, yyjson_doc_get_root(payload_doc)));
+    yyjson_mut_obj_add_bool(doc, root, "isError", false);
+    char *uncapped = yyjson_mut_write(doc, 0, NULL);
+    yyjson_doc_free(payload_doc);
+    yyjson_mut_doc_free(doc);
+    return uncapped;
+}
+
+TEST(mcp_text_result_complete_envelope_is_hard_bounded) {
+    const size_t repeated = 40000;
+    const size_t capacity = repeated + 64;
+    char *structured = malloc(capacity);
+    ASSERT_NOT_NULL(structured);
+    int prefix = snprintf(structured, capacity, "{\"data\":\"");
+    ASSERT_TRUE(prefix > 0);
+    memset(structured + prefix, 's', repeated);
+    snprintf(structured + prefix + repeated, capacity - (size_t)prefix - repeated, "\"}");
+
+    /* The former envelope carried the JSON object twice: escaped in text and
+     * parsed in structuredContent. Construct that old protocol shape
+     * independently, proving the complete response (not merely its input)
+     * exceeded the ceiling. */
+    char *uncapped = build_unbounded_structured_result_for_test(structured);
+    ASSERT_NOT_NULL(uncapped);
+    ASSERT_EQ(assert_oversized_result_fails_closed(structured, false, strlen(uncapped),
+                                                   "ssssssssssssssss"),
+              0);
+    free(uncapped);
+    free(structured);
+
+    /* Escaping can make a raw payload below the limit exceed the complete
+     * envelope once serialized. */
+    char *escape_heavy = malloc(repeated + 1);
+    ASSERT_NOT_NULL(escape_heavy);
+    memset(escape_heavy, '\\', repeated);
+    escape_heavy[repeated] = '\0';
+    ASSERT_TRUE(strlen(escape_heavy) < CBM_MCP_RESULT_MAX_BYTES);
+    size_t escaped_uncapped_bytes =
+        strlen("{\"content\":[{\"type\":\"text\",\"text\":\"\"}],\"isError\":false}") +
+        repeated * 2;
+    ASSERT_EQ(assert_oversized_result_fails_closed(escape_heavy, false, escaped_uncapped_bytes,
+                                                   "\\\\\\\\"),
+              0);
+    free(escape_heavy);
+    PASS();
+}
+
+TEST(mcp_text_result_oversized_dynamic_error_is_hard_bounded) {
+    const size_t repeated = 40000;
+    char *error = malloc(repeated + 1);
+    ASSERT_NOT_NULL(error);
+    memset(error, 'e', repeated);
+    error[repeated] = '\0';
+
+    /* Error text was present in content and structuredContent. This exact
+     * lower bound alone is already beyond the complete-response ceiling. */
+    ASSERT_TRUE(strlen(error) < CBM_MCP_RESULT_MAX_BYTES);
+    ASSERT_EQ(assert_oversized_result_fails_closed(error, true, repeated * 2, "eeeeeeeeeeeeeeee"),
+              0);
+    free(error);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  ARGUMENT EXTRACTION
  * ══════════════════════════════════════════════════════════════════ */
@@ -10890,9 +11004,13 @@ TEST(snippet_ambiguous_suggestions_obey_serialized_result_budget) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     cbm_store_t *store = cbm_mcp_server_store(srv);
-    for (int i = 0; i < 120; i++) {
-        char qn[192];
-        snprintf(qn, sizeof(qn), "test-project.very_long_namespace_%03d.Duplicate", i);
+    enum { AMBIGUOUS_MATCHES = 400 };
+    char namespace_padding[321];
+    memset(namespace_padding, 'x', sizeof(namespace_padding) - 1);
+    namespace_padding[sizeof(namespace_padding) - 1] = '\0';
+    for (int i = 0; i < AMBIGUOUS_MATCHES; i++) {
+        char qn[512];
+        snprintf(qn, sizeof(qn), "test-project.%s_%03d.Duplicate", namespace_padding, i);
         cbm_node_t node = {0};
         node.project = "test-project";
         node.label = "Function";
@@ -10903,14 +11021,14 @@ TEST(snippet_ambiguous_suggestions_obey_serialized_result_budget) {
         node.end_line = 2;
         ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
     }
-    char *raw = cbm_mcp_handle_tool(
-        srv, "get_code_snippet",
-        "{\"project\":\"test-project\",\"qualified_name\":\"Duplicate\","
-        "\"max_response_bytes\":2048}");
+    char *raw =
+        cbm_mcp_handle_tool(srv, "get_code_snippet",
+                            "{\"project\":\"test-project\",\"qualified_name\":\"Duplicate\","
+                            "\"max_response_bytes\":2048}");
     ASSERT_NOT_NULL(raw);
     ASSERT_TRUE(strlen(raw) <= 2048);
     char *response = extract_text_content(raw);
-    ASSERT_EQ(snippet_json_int(response, "suggestions_total", -1), 120);
+    ASSERT_EQ(snippet_json_int(response, "suggestions_total", -1), AMBIGUOUS_MATCHES);
     ASSERT_TRUE(snippet_json_bool(response, "suggestions_truncated"));
     free(response);
     free(raw);
@@ -14002,6 +14120,8 @@ SUITE(mcp) {
     RUN_TEST(mcp_every_tool_result_is_duplication_free);
     RUN_TEST(mcp_cancel_matches_request_id);
     RUN_TEST(mcp_text_result_error);
+    RUN_TEST(mcp_text_result_complete_envelope_is_hard_bounded);
+    RUN_TEST(mcp_text_result_oversized_dynamic_error_is_hard_bounded);
 
     /* Argument extraction */
     RUN_TEST(mcp_get_tool_name);

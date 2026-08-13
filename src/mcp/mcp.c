@@ -280,7 +280,7 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message) {
  *  MCP PROTOCOL HELPERS
  * ══════════════════════════════════════════════════════════════════ */
 
-char *cbm_mcp_text_result(const char *text, bool is_error) {
+static char *mcp_text_result_serialize(const char *text, bool is_error) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -340,6 +340,31 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return out;
+}
+
+static char *mcp_result_enforce_limit(char *out) {
+    if (!out || strlen(out) <= CBM_MCP_RESULT_MAX_BYTES) {
+        return out;
+    }
+
+    size_t complete_bytes = strlen(out);
+    free(out);
+
+    char diagnostic[CBM_SZ_256];
+    snprintf(diagnostic, sizeof(diagnostic),
+             "ERROR: safe response envelope exceeded; no partial result was returned. "
+             "complete_response_bytes=%zu limit_bytes=%u",
+             complete_bytes, CBM_MCP_RESULT_MAX_BYTES);
+    out = mcp_text_result_serialize(diagnostic, true);
+    if (out && strlen(out) > CBM_MCP_RESULT_MAX_BYTES) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+char *cbm_mcp_text_result(const char *text, bool is_error) {
+    return mcp_result_enforce_limit(mcp_text_result_serialize(text, is_error));
 }
 
 bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
@@ -9066,13 +9091,14 @@ static char *snippet_suggestions_result(const char *input, cbm_node_t *nodes, in
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
 
-    char *result = cbm_mcp_text_result(json, false);
+    /* Callers either enforce the global cap or measure and shrink this candidate. */
+    char *result = mcp_text_result_serialize(json, false);
     free(json);
     return result;
 }
 
 static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count) {
-    return snippet_suggestions_result(input, nodes, count, count, false);
+    return mcp_result_enforce_limit(snippet_suggestions_result(input, nodes, count, count, false));
 }
 
 static char *snippet_suggestions_bounded(const char *input, cbm_node_t *nodes, int count,
@@ -9707,7 +9733,10 @@ static char *snippet_source_result(cbm_mcp_server_t *srv, cbm_node_t *node,
     }
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    char *result = cbm_mcp_text_result(json, false);
+    /* build_snippet_response measures and shrinks this candidate before it
+     * can escape. Using the hard-capped public boundary here would turn an
+     * oversize probe into a small error that falsely appears to fit. */
+    char *result = mcp_text_result_serialize(json, false);
     free(json);
     return result;
 }
@@ -9792,7 +9821,9 @@ static char *snippet_outline_result(cbm_mcp_server_t *srv, cbm_node_t *node,
         "Pass start_line/end_line within symbol_start_line..symbol_end_line for raw source.");
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    char *result = cbm_mcp_text_result(json, false);
+    /* build_snippet_response measures and shrinks this candidate before it
+     * can escape. */
+    char *result = mcp_text_result_serialize(json, false);
     free(json);
     return result;
 }
@@ -10671,7 +10702,7 @@ static char *assemble_search_output_toon(search_result_t *results, int result_co
         if (!candidate) {
             return NULL;
         }
-        char *serialized = cbm_mcp_text_result(candidate, false);
+        char *serialized = mcp_text_result_serialize(candidate, false);
         bool fits = serialized && strlen(serialized) <= SEARCH_MAX_RESPONSE_BYTES;
         free(serialized);
         if (fits) {
@@ -10821,7 +10852,8 @@ static char *assemble_search_output_once(search_result_t *results, int result_co
     }
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    char *response = cbm_mcp_text_result(json, false);
+    /* The caller measures and shrinks this candidate before it can escape. */
+    char *response = mcp_text_result_serialize(json, false);
     free(json);
     return response;
 }
