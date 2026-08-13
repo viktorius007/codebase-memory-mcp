@@ -443,6 +443,214 @@ TEST(cypher_parse_error) {
     PASS();
 }
 
+static int assert_actionable_cypher_error(const char *query, const char *expected_error) {
+    cbm_query_t *parsed = NULL;
+    char *error = NULL;
+    int rc = cbm_cypher_parse(query, &parsed, &error);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NULL(parsed);
+    ASSERT_NOT_NULL(error);
+    ASSERT_STR_EQ(error, expected_error);
+    ASSERT_NULL(strstr(error, "token type"));
+    free(error);
+    return 0;
+}
+
+TEST(cypher_error_unexpected_token_is_actionable) {
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (f RETURN f.name",
+                  "Invalid Cypher query: expected ')' but found RETURN at byte 9. Context: "
+                  "\"MATCH (f RETURN f.name\". Remedy: close the node pattern before RETURN; "
+                  "for example, MATCH (n:Function) RETURN n.name LIMIT 10."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_unterminated_string_is_actionable) {
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (f) WHERE f.name = \"unterminated",
+                  "Invalid Cypher query: unterminated double-quoted string at byte 25. Context: "
+                  "\"MATCH (f) WHERE f.name = \\\"unterminated\". Remedy: close the string with "
+                  "a double quote, or escape an internal quote as \\\"; then retry the query."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_invalid_relationship_is_actionable) {
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (a)-[:]->(b) RETURN a",
+                  "Invalid Cypher query: expected an identifier but found ']' at byte 12. Context: "
+                  "\"MATCH (a)-[:]->(b) RETURN a\". Remedy: name the relationship type after ':'; "
+                  "for example, MATCH (a)-[:CALLS]->(b) RETURN a, b LIMIT 10."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_trailing_junk_is_actionable) {
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (f) RETURN f.name LIMIT 2 SKIP 1",
+                  "Invalid Cypher query: unexpected SKIP at byte 32 after the query was complete. "
+                  "Context: \"MATCH (f) RETURN f.name LIMIT 2 SKIP 1\". Remedy: use clause order "
+                  "MATCH, WHERE, RETURN, ORDER BY, SKIP, LIMIT; for example, MATCH (n:Function) "
+                  "RETURN n.name SKIP 1 LIMIT 2."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_missing_function_delimiter_is_rejected) {
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (n) RETURN count(n",
+                  "Invalid Cypher query: expected ')' but found end of input at byte 24. Context: "
+                  "\"MATCH (n) RETURN count(n\". Remedy: supply the expected syntax, or retry "
+                  "with a narrower query such as MATCH (n:Function) RETURN n.name LIMIT 10."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_unknown_character_is_rejected_at_source_byte) {
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (n) RETURN n @",
+                  "Invalid Cypher query: unsupported character '@' at byte 19. Context: "
+                  "\"MATCH (n) RETURN n @\". Remedy: remove the unsupported character and "
+                  "retry with read-only Cypher; for example, MATCH (n:Function) RETURN n.name "
+                  "LIMIT 10."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_keeps_first_lexical_failure) {
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (n) RETURN n @ \"unterminated",
+                  "Invalid Cypher query: unsupported character '@' at byte 19. Context: "
+                  "\"MATCH (n) RETURN n @ \\\"unterminated\". Remedy: remove the unsupported "
+                  "character and retry with read-only Cypher; for example, MATCH (n:Function) "
+                  "RETURN n.name LIMIT 10."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_node_pattern_remedy_names_actual_clause) {
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (n WHERE n.name = \"x\"",
+                  "Invalid Cypher query: expected ')' but found WHERE at byte 9. Context: "
+                  "\"MATCH (n WHERE n.name = \\\"x\\\"\". Remedy: close the node pattern "
+                  "before WHERE; for example, MATCH (n:Function) RETURN n.name LIMIT 10."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_ad_hoc_parser_failure_retains_typed_position) {
+    cbm_lex_result_t lexed = {0};
+    ASSERT_EQ(cbm_lex("MATCH (n) WHERE n.name", &lexed), 0);
+    ASSERT_NULL(lexed.error);
+
+    cbm_parse_result_t parsed = {0};
+    ASSERT_EQ(cbm_parse(lexed.tokens, lexed.count, &parsed), -1);
+    ASSERT_EQ(parsed.diagnostic.kind, CBM_CYPHER_DIAGNOSTIC_SYNTAX);
+    ASSERT_EQ(parsed.diagnostic.actual, TOK_EOF);
+    ASSERT_EQ(parsed.diagnostic.byte_position, 22);
+    cbm_parse_free(&parsed);
+    cbm_lex_free(&lexed);
+
+    ASSERT_EQ(assert_actionable_cypher_error(
+                  "MATCH (n) WHERE n.name",
+                  "Invalid Cypher query: expected an operator after the expression; found end "
+                  "of input at byte 22. Context: \"MATCH (n) WHERE n.name\". Remedy: supply the "
+                  "missing syntax, or retry with a narrower query such as MATCH (n:Function) "
+                  "RETURN n.name LIMIT 10."),
+              0);
+    PASS();
+}
+
+TEST(cypher_error_remedy_uses_parser_context_not_string_contents) {
+    const char *query = "MATCH (n) WHERE n.name = '[x:' AND n.";
+    cbm_query_t *parsed = NULL;
+    char *error = NULL;
+    ASSERT_EQ(cbm_cypher_parse(query, &parsed, &error), -1);
+    ASSERT_NULL(parsed);
+    ASSERT_NOT_NULL(error);
+    ASSERT_STR_EQ(error,
+                  "Invalid Cypher query: expected an identifier but found end of input at byte "
+                  "37. Context: \"MATCH (n) WHERE n.name = '[x:' AND n.\". Remedy: supply the "
+                  "expected syntax, or retry with a narrower query such as MATCH (n:Function) "
+                  "RETURN n.name LIMIT 10.");
+    ASSERT_NULL(strstr(error, "relationship type"));
+    free(error);
+    PASS();
+}
+
+TEST(cypher_error_escape_heavy_context_is_safe_and_bounded) {
+    enum { REPEATS = 3000 };
+    size_t prefix_len = strlen("MATCH (");
+    size_t query_cap = prefix_len + (size_t)REPEATS * 3 + strlen("RETURN f") + 1;
+    char *query = malloc(query_cap);
+    ASSERT_NOT_NULL(query);
+    memcpy(query, "MATCH (", prefix_len);
+    size_t used = prefix_len;
+    for (int i = 0; i < REPEATS; i++) {
+        query[used++] = '\\';
+        query[used++] = '\n';
+        query[used++] = '\x01';
+    }
+    memcpy(query + used, "RETURN f", strlen("RETURN f") + 1);
+
+    cbm_query_t *parsed = NULL;
+    char *error = NULL;
+    int rc = cbm_cypher_parse(query, &parsed, &error);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NULL(parsed);
+    ASSERT_NOT_NULL(error);
+    ASSERT_TRUE(strncmp(error, "Invalid Cypher query:", strlen("Invalid Cypher query:")) == 0);
+    ASSERT_TRUE(strlen(error) < 768);
+    ASSERT_NOT_NULL(strstr(error, "unsupported character '\\' at byte 7"));
+    ASSERT_NOT_NULL(strstr(error, "Context: \"MATCH ("));
+    ASSERT_NOT_NULL(strstr(error, "...\". Remedy:"));
+    ASSERT_NOT_NULL(strstr(error, "\\\\"));
+    ASSERT_NOT_NULL(strstr(error, "\\n"));
+    ASSERT_NOT_NULL(strstr(error, "\\x01"));
+    ASSERT_NULL(strchr(error, '\n'));
+    ASSERT_NULL(strchr(error, '\x01'));
+    ASSERT_NULL(strstr(error, "token type"));
+    ASSERT_NOT_NULL(strstr(error, "Remedy:"));
+
+    free(error);
+    free(query);
+    PASS();
+}
+
+TEST(cypher_structured_diagnostic_survives_parser_boundary) {
+    cbm_lex_result_t lexed = {0};
+    ASSERT_EQ(cbm_lex("MATCH (a)-[:]->(b) RETURN a", &lexed), 0);
+    ASSERT_NULL(lexed.error);
+
+    cbm_parse_result_t parsed = {0};
+    ASSERT_EQ(cbm_parse(lexed.tokens, lexed.count, &parsed), -1);
+    ASSERT_EQ(parsed.diagnostic.kind, CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_TOKEN);
+    ASSERT_EQ(parsed.diagnostic.expected, TOK_IDENT);
+    ASSERT_EQ(parsed.diagnostic.actual, TOK_RBRACKET);
+    ASSERT_EQ(parsed.diagnostic.byte_position, 12);
+    cbm_parse_free(&parsed);
+    cbm_lex_free(&lexed);
+
+    memset(&lexed, 0, sizeof(lexed));
+    ASSERT_EQ(cbm_lex("MATCH (f) WHERE f.name = 'unterminated", &lexed), 0);
+    ASSERT_NOT_NULL(lexed.error);
+    ASSERT_EQ(lexed.diagnostic.kind, CBM_CYPHER_DIAGNOSTIC_UNTERMINATED_STRING);
+    ASSERT_EQ(lexed.diagnostic.expected, TOK_STRING);
+    ASSERT_EQ(lexed.diagnostic.actual, TOK_EOF);
+    ASSERT_EQ(lexed.diagnostic.byte_position, 25);
+    cbm_lex_free(&lexed);
+
+    memset(&lexed, 0, sizeof(lexed));
+    ASSERT_EQ(cbm_lex("MATCH (n) RETURN n @", &lexed), 0);
+    ASSERT_NOT_NULL(lexed.error);
+    ASSERT_EQ(lexed.diagnostic.kind, CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_CHARACTER);
+    ASSERT_EQ(lexed.diagnostic.unexpected_byte, '@');
+    ASSERT_EQ(lexed.diagnostic.byte_position, 19);
+    cbm_lex_free(&lexed);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  EXECUTION TESTS (end-to-end against store)
  * ══════════════════════════════════════════════════════════════════ */
@@ -4703,6 +4911,18 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_return_distinct);
     RUN_TEST(cypher_parse_inline_props);
     RUN_TEST(cypher_parse_error);
+    RUN_TEST(cypher_error_unexpected_token_is_actionable);
+    RUN_TEST(cypher_error_unterminated_string_is_actionable);
+    RUN_TEST(cypher_error_invalid_relationship_is_actionable);
+    RUN_TEST(cypher_error_trailing_junk_is_actionable);
+    RUN_TEST(cypher_error_missing_function_delimiter_is_rejected);
+    RUN_TEST(cypher_error_unknown_character_is_rejected_at_source_byte);
+    RUN_TEST(cypher_error_keeps_first_lexical_failure);
+    RUN_TEST(cypher_error_node_pattern_remedy_names_actual_clause);
+    RUN_TEST(cypher_error_ad_hoc_parser_failure_retains_typed_position);
+    RUN_TEST(cypher_error_remedy_uses_parser_context_not_string_contents);
+    RUN_TEST(cypher_error_escape_heavy_context_is_safe_and_bounded);
+    RUN_TEST(cypher_structured_diagnostic_survives_parser_boundary);
     /* Execution */
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);

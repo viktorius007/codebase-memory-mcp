@@ -127,6 +127,14 @@ static void lex_string_literal(const char *input, int len, int *pos, char quote,
     buf[blen] = '\0';
     if (*pos < len) {
         (*pos)++; /* skip closing quote */
+    } else if (!out->error) {
+        out->diagnostic = (cbm_cypher_diagnostic_t){
+            .kind = CBM_CYPHER_DIAGNOSTIC_UNTERMINATED_STRING,
+            .expected = TOK_STRING,
+            .actual = TOK_EOF,
+            .byte_position = start - SKIP_ONE,
+        };
+        out->error = heap_strdup("unterminated string literal");
     }
     lex_push(out, TOK_STRING, buf, start - SKIP_ONE);
 }
@@ -408,7 +416,17 @@ int cbm_lex(const char *input, cbm_lex_result_t *out) {
             continue;
         }
 
-        /* Unknown character — skip */
+        /* Reject unknown input rather than silently deleting it and executing a
+         * different query. Keep scanning only to preserve lexer ownership and
+         * the terminating EOF token for direct callers. */
+        if (!out->error) {
+            out->diagnostic = (cbm_cypher_diagnostic_t){
+                .kind = CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_CHARACTER,
+                .unexpected_byte = (unsigned char)c,
+                .byte_position = i,
+            };
+            out->error = heap_strdup("unsupported character");
+        }
         i++;
     }
 
@@ -439,12 +457,116 @@ void cbm_lex_free(cbm_lex_result_t *r) {
  * any hand-written or generated query while leaving the stack untouched. */
 enum { CYPHER_MAX_PARSE_DEPTH = 256 };
 
+/* Indexed by cbm_token_type_t so adding a token without a human name is visible
+ * beside the enum. The formatter still has an explicit numeric fallback for a
+ * corrupt/out-of-range token, but a numeric code is never the whole remedy. */
+static const char *const cypher_token_names[TOK_COUNT_TYPES] = {
+    [TOK_MATCH] = "MATCH",
+    [TOK_WHERE] = "WHERE",
+    [TOK_RETURN] = "RETURN",
+    [TOK_ORDER] = "ORDER",
+    [TOK_BY] = "BY",
+    [TOK_LIMIT] = "LIMIT",
+    [TOK_AND] = "AND",
+    [TOK_OR] = "OR",
+    [TOK_AS] = "AS",
+    [TOK_DISTINCT] = "DISTINCT",
+    [TOK_COUNT] = "COUNT",
+    [TOK_CONTAINS] = "CONTAINS",
+    [TOK_STARTS] = "STARTS",
+    [TOK_WITH] = "WITH",
+    [TOK_NOT] = "NOT",
+    [TOK_ASC] = "ASC",
+    [TOK_DESC] = "DESC",
+    [TOK_NEQ] = "'!=' or '<>'",
+    [TOK_ENDS] = "ENDS",
+    [TOK_IN] = "IN",
+    [TOK_IS] = "IS",
+    [TOK_NULL_KW] = "NULL",
+    [TOK_XOR] = "XOR",
+    [TOK_SKIP] = "SKIP",
+    [TOK_UNION] = "UNION",
+    [TOK_UNWIND] = "UNWIND",
+    [TOK_SUM] = "SUM",
+    [TOK_AVG] = "AVG",
+    [TOK_MIN_KW] = "MIN",
+    [TOK_MAX_KW] = "MAX",
+    [TOK_COLLECT] = "COLLECT",
+    [TOK_TOLOWER] = "toLower",
+    [TOK_TOUPPER] = "toUpper",
+    [TOK_TOSTRING] = "toString",
+    [TOK_CASE] = "CASE",
+    [TOK_WHEN] = "WHEN",
+    [TOK_THEN] = "THEN",
+    [TOK_ELSE] = "ELSE",
+    [TOK_END] = "END",
+    [TOK_CREATE] = "CREATE",
+    [TOK_DELETE] = "DELETE",
+    [TOK_DETACH] = "DETACH",
+    [TOK_SET] = "SET",
+    [TOK_REMOVE] = "REMOVE",
+    [TOK_MERGE] = "MERGE",
+    [TOK_OPTIONAL] = "OPTIONAL",
+    [TOK_YIELD] = "YIELD",
+    [TOK_CALL] = "CALL",
+    [TOK_ALL] = "ALL",
+    [TOK_TRUE] = "TRUE",
+    [TOK_FALSE] = "FALSE",
+    [TOK_EXISTS] = "EXISTS",
+    [TOK_MANDATORY] = "MANDATORY",
+    [TOK_FOREACH] = "FOREACH",
+    [TOK_ON] = "ON",
+    [TOK_ADD] = "ADD",
+    [TOK_CONSTRAINT] = "CONSTRAINT",
+    [TOK_DO] = "DO",
+    [TOK_DROP] = "DROP",
+    [TOK_FOR] = "FOR",
+    [TOK_FROM] = "FROM",
+    [TOK_GRAPH] = "GRAPH",
+    [TOK_OF] = "OF",
+    [TOK_REQUIRE] = "REQUIRE",
+    [TOK_SCALAR] = "SCALAR",
+    [TOK_UNIQUE] = "UNIQUE",
+    [TOK_LPAREN] = "'('",
+    [TOK_RPAREN] = "')'",
+    [TOK_LBRACKET] = "'['",
+    [TOK_RBRACKET] = "']'",
+    [TOK_DASH] = "'-'",
+    [TOK_GT] = "'>'",
+    [TOK_LT] = "'<'",
+    [TOK_COLON] = "':'",
+    [TOK_DOT] = "'.'",
+    [TOK_LBRACE] = "'{'",
+    [TOK_RBRACE] = "'}'",
+    [TOK_STAR] = "'*'",
+    [TOK_COMMA] = "','",
+    [TOK_EQ] = "'='",
+    [TOK_EQTILDE] = "'=~'",
+    [TOK_GTE] = "'>='",
+    [TOK_LTE] = "'<='",
+    [TOK_PIPE] = "'|'",
+    [TOK_DOTDOT] = "'..'",
+    [TOK_IDENT] = "an identifier",
+    [TOK_STRING] = "a string literal",
+    [TOK_NUMBER] = "a number",
+    [TOK_EOF] = "end of input",
+};
+
+static const char *cypher_token_name(cbm_token_type_t type, char *fallback, size_t fallback_size) {
+    if (type >= 0 && type < TOK_COUNT_TYPES && cypher_token_names[type]) {
+        return cypher_token_names[type];
+    }
+    snprintf(fallback, fallback_size, "unknown token (internal code %d)", (int)type);
+    return fallback;
+}
+
 typedef struct {
     const cbm_token_t *tokens;
     int count;
     int pos;
     int depth; /* current recursive-descent depth; see CYPHER_MAX_PARSE_DEPTH */
     char error[CBM_SZ_512];
+    cbm_cypher_diagnostic_t diagnostic;
 } parser_t;
 
 /* Enter one level of recursive descent. Returns false when the cap is hit, in
@@ -470,6 +592,29 @@ static const cbm_token_t *peek(parser_t *p) {
     return &p->tokens[p->pos];
 }
 
+static void parser_set_unexpected_token(parser_t *p, cbm_token_type_t expected) {
+    if (p->diagnostic.kind != CBM_CYPHER_DIAGNOSTIC_NONE) {
+        return;
+    }
+    p->diagnostic = (cbm_cypher_diagnostic_t){
+        .kind = CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_TOKEN,
+        .expected = expected,
+        .actual = peek(p)->type,
+        .byte_position = peek(p)->pos,
+    };
+}
+
+static void parser_ensure_syntax_diagnostic(parser_t *p) {
+    if (p->diagnostic.kind != CBM_CYPHER_DIAGNOSTIC_NONE) {
+        return;
+    }
+    p->diagnostic = (cbm_cypher_diagnostic_t){
+        .kind = CBM_CYPHER_DIAGNOSTIC_SYNTAX,
+        .actual = peek(p)->type,
+        .byte_position = peek(p)->pos,
+    };
+}
+
 static const cbm_token_t *advance(parser_t *p) {
     if (p->pos >= p->count) {
         return &p->tokens[p->count - SKIP_ONE];
@@ -493,8 +638,13 @@ static const cbm_token_t *expect(parser_t *p, cbm_token_type_t type) {
     if (check(p, type)) {
         return advance(p);
     }
-    snprintf(p->error, sizeof(p->error), "expected token type %d, got %d at pos %d", type,
-             peek(p)->type, peek(p)->pos);
+    parser_set_unexpected_token(p, type);
+    char expected_fallback[CBM_SZ_64];
+    char actual_fallback[CBM_SZ_64];
+    snprintf(p->error, sizeof(p->error), "expected %s, found %s at byte %d",
+             cypher_token_name(type, expected_fallback, sizeof(expected_fallback)),
+             cypher_token_name(peek(p)->type, actual_fallback, sizeof(actual_fallback)),
+             peek(p)->pos);
     return NULL;
 }
 
@@ -529,8 +679,11 @@ static const cbm_token_t *expect_property_name(parser_t *p) {
     if (is_word_token(peek(p)->type)) {
         return advance(p);
     }
-    snprintf(p->error, sizeof(p->error), "expected a property name after '.', got '%s' at pos %d",
-             peek(p)->text, peek(p)->pos);
+    parser_set_unexpected_token(p, TOK_IDENT);
+    char actual_fallback[CBM_SZ_64];
+    snprintf(p->error, sizeof(p->error), "expected a property name after '.', found %s at byte %d",
+             cypher_token_name(peek(p)->type, actual_fallback, sizeof(actual_fallback)),
+             peek(p)->pos);
     return NULL;
 }
 
@@ -597,7 +750,14 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
 
         match(p, TOK_COMMA); /* optional comma */
     }
-    expect(p, TOK_RBRACE);
+    if (!expect(p, TOK_RBRACE)) {
+        for (int i = 0; i < n; i++) {
+            safe_str_free(&arr[i].key);
+            safe_str_free(&arr[i].value);
+        }
+        free(arr);
+        return CBM_NOT_FOUND;
+    }
 
     *out = arr;
     *count = n;
@@ -652,6 +812,7 @@ static int parse_node(parser_t *p, cbm_node_pattern_t *out) {
     }
 
     if (!expect(p, TOK_RPAREN)) {
+        p->diagnostic.context = CBM_CYPHER_CONTEXT_NODE_PATTERN;
         return CBM_NOT_FOUND;
     }
     return 0;
@@ -693,6 +854,7 @@ static int parse_rel_types(parser_t *p, cbm_rel_pattern_t *out) {
 
     const cbm_token_t *t = expect(p, TOK_IDENT);
     if (!t) {
+        p->diagnostic.context = CBM_CYPHER_CONTEXT_RELATIONSHIP_TYPE;
         free(types);
         return CBM_NOT_FOUND;
     }
@@ -706,6 +868,7 @@ static int parse_rel_types(parser_t *p, cbm_rel_pattern_t *out) {
     while (match(p, TOK_PIPE)) {
         t = expect(p, TOK_IDENT);
         if (!t) {
+            p->diagnostic.context = CBM_CYPHER_CONTEXT_RELATIONSHIP_TYPE;
             for (int i = 0; i < n; i++) {
                 safe_str_free(&types[i]);
             }
@@ -1000,7 +1163,16 @@ static cbm_expr_t *parse_in_list(parser_t *p, cbm_condition_t *c) {
             break;
         }
     }
-    expect(p, TOK_RBRACKET);
+    if (!expect(p, TOK_RBRACKET)) {
+        for (int i = 0; i < vn; i++) {
+            safe_str_free(&vals[i]);
+        }
+        free(vals);
+        safe_str_free(&c->variable);
+        safe_str_free(&c->property);
+        safe_str_free(&c->op);
+        return NULL;
+    }
     c->in_values = vals;
     c->in_value_count = vn;
     return expr_leaf(*c);
@@ -1035,12 +1207,16 @@ static char *parse_comparison_op(parser_t *p) {
     }
     if (check(p, TOK_STARTS)) {
         advance(p);
-        expect(p, TOK_WITH);
+        if (!expect(p, TOK_WITH)) {
+            return NULL;
+        }
         return heap_strdup("STARTS WITH");
     }
     if (check(p, TOK_ENDS)) {
         advance(p);
-        expect(p, TOK_WITH);
+        if (!expect(p, TOK_WITH)) {
+            return NULL;
+        }
         return heap_strdup("ENDS WITH");
     }
     return NULL;
@@ -1077,7 +1253,8 @@ static void free_one_rel_pattern(cbm_rel_pattern_t *r) {
 static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     advance(p); /* EXISTS */
     if (!match(p, TOK_LBRACE)) {
-        snprintf(p->error, sizeof(p->error), "expected '{' after EXISTS at pos %d", peek(p)->pos);
+        parser_set_unexpected_token(p, TOK_LBRACE);
+        snprintf(p->error, sizeof(p->error), "expected '{' after EXISTS");
         return NULL;
     }
     cbm_node_pattern_t anchor = {0};
@@ -1092,7 +1269,12 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
                  "'(var)-[:TYPE]->()' is supported");
         return NULL;
     }
-    expect(p, TOK_RBRACE);
+    if (!expect(p, TOK_RBRACE)) {
+        free_one_node_pattern(&anchor);
+        free_one_rel_pattern(&rel);
+        free_one_node_pattern(&far_node);
+        return NULL;
+    }
 
     cbm_condition_t c = {0};
     c.negated = negated;
@@ -1117,10 +1299,24 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
         advance(p);
         if (match(p, TOK_NOT)) {
             c->op = heap_strdup("IS NOT NULL");
-            expect(p, TOK_NULL_KW);
+            if (!expect(p, TOK_NULL_KW)) {
+                cond_func_fields_free(c);
+                safe_str_free(&c->variable);
+                safe_str_free(&c->property);
+                safe_str_free(&c->op);
+                safe_str_free(&c->coalesce_default);
+                return NULL;
+            }
         } else {
-            expect(p, TOK_NULL_KW);
             c->op = heap_strdup("IS NULL");
+            if (!expect(p, TOK_NULL_KW)) {
+                cond_func_fields_free(c);
+                safe_str_free(&c->variable);
+                safe_str_free(&c->property);
+                safe_str_free(&c->op);
+                safe_str_free(&c->coalesce_default);
+                return NULL;
+            }
         }
         return expr_leaf(*c);
     }
@@ -1137,7 +1333,9 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
     /* Standard operators */
     c->op = parse_comparison_op(p);
     if (!c->op) {
-        snprintf(p->error, sizeof(p->error), "unexpected operator at pos %d", peek(p)->pos);
+        if (!p->error[0]) {
+            snprintf(p->error, sizeof(p->error), "expected an operator after the expression");
+        }
         cond_func_fields_free(c);
         safe_str_free(&c->variable);
         safe_str_free(&c->property);
@@ -1155,7 +1353,7 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
         advance(p);
         c->value = heap_strdup("false");
     } else {
-        snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
+        snprintf(p->error, sizeof(p->error), "expected a value after the operator");
         cond_func_fields_free(c);
         safe_str_free(&c->variable);
         safe_str_free(&c->property);
@@ -1268,7 +1466,10 @@ static cbm_expr_t *parse_atom_expr(parser_t *p) { // NOLINT(misc-no-recursion)
         }
         cbm_expr_t *e = parse_or_expr(p);
         parse_depth_leave(p);
-        expect(p, TOK_RPAREN);
+        if (!expect(p, TOK_RPAREN)) {
+            expr_free(e);
+            return NULL;
+        }
         return e;
     }
     return parse_condition_expr(p);
@@ -1476,8 +1677,22 @@ static cbm_case_expr_t *parse_case_expr(parser_t *p) {
     if (match(p, TOK_ELSE)) {
         kase->else_val = parse_value_literal(p);
     }
-    expect(p, TOK_END);
+    if (!expect(p, TOK_END)) {
+        return kase;
+    }
     return kase;
+}
+
+static void free_case_expr(cbm_case_expr_t *k); /* defined with the query free helpers */
+
+static void free_return_item_fields(cbm_return_item_t *item) {
+    safe_str_free(&item->variable);
+    safe_str_free(&item->property);
+    safe_str_free(&item->alias);
+    safe_str_free(&item->func);
+    free_case_expr(item->kase);
+    func_args_free(item->args, item->arg_count);
+    memset(item, 0, sizeof(*item));
 }
 
 /* Parse a single RETURN/WITH item (aggregate, string func, CASE, or plain var.prop).
@@ -1554,11 +1769,15 @@ static bool is_named_func_call(parser_t *p) {
 static int parse_named_func_item(parser_t *p, cbm_return_item_t *item) {
     const char *canon = scalar_func_canonical(peek(p)->text);
     advance(p); /* consume the function name */
-    expect(p, TOK_LPAREN);
+    if (!expect(p, TOK_LPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     if (parse_var_dot_prop(p, item) < 0) {
         return CBM_NOT_FOUND;
     }
-    expect(p, TOK_RPAREN);
+    if (!expect(p, TOK_RPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     item->func = heap_strdup(canon);
     return 0;
 }
@@ -1612,7 +1831,9 @@ static int parse_func_arg(parser_t *p, cbm_func_arg_t *arg) {
 static int parse_multiarg_func_item(parser_t *p, cbm_return_item_t *item) {
     const char *canon = multiarg_func_canonical(peek(p)->text);
     advance(p); /* function name */
-    expect(p, TOK_LPAREN);
+    if (!expect(p, TOK_LPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     int cap = CYP_INIT_CAP4;
     item->args = malloc((size_t)cap * sizeof(cbm_func_arg_t));
     item->arg_count = 0;
@@ -1629,7 +1850,9 @@ static int parse_multiarg_func_item(parser_t *p, cbm_return_item_t *item) {
         }
         item->arg_count++;
     }
-    expect(p, TOK_RPAREN);
+    if (!expect(p, TOK_RPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     item->func = heap_strdup(canon);
     /* Surface the first variable arg as variable/property for column naming. */
     if (item->arg_count > 0 && item->args[0].variable) {
@@ -1645,7 +1868,9 @@ static int parse_multiarg_func_item(parser_t *p, cbm_return_item_t *item) {
 static int parse_aggregate_item(parser_t *p, cbm_return_item_t *item) {
     cbm_token_type_t ft = peek(p)->type;
     advance(p);
-    expect(p, TOK_LPAREN);
+    if (!expect(p, TOK_LPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     /* Optional DISTINCT inside the call: COUNT(DISTINCT x) (#239). */
     item->distinct = match(p, TOK_DISTINCT);
     if (match(p, TOK_STAR)) {
@@ -1655,7 +1880,9 @@ static int parse_aggregate_item(parser_t *p, cbm_return_item_t *item) {
             return CBM_NOT_FOUND;
         }
     }
-    expect(p, TOK_RPAREN);
+    if (!expect(p, TOK_RPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     item->func = heap_strdup(agg_func_name(ft));
     return 0;
 }
@@ -1664,11 +1891,15 @@ static int parse_aggregate_item(parser_t *p, cbm_return_item_t *item) {
 static int parse_string_func_item(parser_t *p, cbm_return_item_t *item) {
     cbm_token_type_t ft = peek(p)->type;
     advance(p);
-    expect(p, TOK_LPAREN);
+    if (!expect(p, TOK_LPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     if (parse_var_dot_prop(p, item) < 0) {
         return CBM_NOT_FOUND;
     }
-    expect(p, TOK_RPAREN);
+    if (!expect(p, TOK_RPAREN)) {
+        return CBM_NOT_FOUND;
+    }
     item->func = heap_strdup(str_func_name(ft));
     return 0;
 }
@@ -1680,6 +1911,10 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
         advance(p);
         item->kase = parse_case_expr(p);
         item->variable = heap_strdup("CASE");
+        if (p->error[0]) {
+            free_return_item_fields(item);
+            return CBM_NOT_FOUND;
+        }
     } else if (is_aggregate_tok(peek(p)->type)) {
         rc = parse_aggregate_item(p, item);
     } else if (is_string_func_tok(peek(p)->type)) {
@@ -1692,6 +1927,7 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
         rc = parse_var_dot_prop(p, item);
     }
     if (rc < 0) {
+        free_return_item_fields(item);
         return CBM_NOT_FOUND;
     }
     /* A bare identifier followed by '(' is a function we don't recognise
@@ -1711,16 +1947,17 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
             snprintf(p->error, sizeof(p->error),
                      "unsupported expression: list indexing/slicing '[...]' is not supported");
         }
-        safe_str_free(&item->variable);
-        safe_str_free(&item->property);
+        free_return_item_fields(item);
         return CBM_NOT_FOUND;
     }
     /* Optional AS alias */
     if (match(p, TOK_AS)) {
         const cbm_token_t *alias = expect(p, TOK_IDENT);
-        if (alias) {
-            item->alias = heap_strdup(alias->text);
+        if (!alias) {
+            free_return_item_fields(item);
+            return CBM_NOT_FOUND;
         }
+        item->alias = heap_strdup(alias->text);
     }
     return 0;
 }
@@ -1891,17 +2128,21 @@ tail:
     /* Optional SKIP */
     if (match(p, TOK_SKIP)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     /* Optional LIMIT */
     if (match(p, TOK_LIMIT)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     *out = r;
@@ -1914,6 +2155,8 @@ static int parse_return(parser_t *p, cbm_return_clause_t **out) {
 }
 
 /* Parse a single MATCH pattern into pat */
+static void free_pattern(cbm_pattern_t *pat); /* defined with the query free helpers */
+
 static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     memset(pat, 0, sizeof(*pat));
     int node_cap = CYP_INIT_CAP4;
@@ -1921,29 +2164,35 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     pat->nodes = malloc(node_cap * sizeof(cbm_node_pattern_t));
     pat->rels = calloc(rel_cap, sizeof(cbm_rel_pattern_t));
 
+    pat->node_count = SKIP_ONE;
     if (parse_node(p, &pat->nodes[0]) < 0) {
+        free_pattern(pat);
+        memset(pat, 0, sizeof(*pat));
         return CBM_NOT_FOUND;
     }
-    pat->node_count = SKIP_ONE;
 
     while (check(p, TOK_DASH) || check(p, TOK_LT)) {
         if (pat->rel_count >= rel_cap) {
             rel_cap *= PAIR_LEN;
             pat->rels = safe_realloc(pat->rels, rel_cap * sizeof(cbm_rel_pattern_t));
         }
-        if (parse_rel(p, &pat->rels[pat->rel_count]) < 0) {
+        int rel_index = pat->rel_count++;
+        if (parse_rel(p, &pat->rels[rel_index]) < 0) {
+            free_pattern(pat);
+            memset(pat, 0, sizeof(*pat));
             return CBM_NOT_FOUND;
         }
-        pat->rel_count++;
 
         if (pat->node_count >= node_cap) {
             node_cap *= PAIR_LEN;
             pat->nodes = safe_realloc(pat->nodes, node_cap * sizeof(cbm_node_pattern_t));
         }
-        if (parse_node(p, &pat->nodes[pat->node_count]) < 0) {
+        int node_index = pat->node_count++;
+        if (parse_node(p, &pat->nodes[node_index]) < 0) {
+            free_pattern(pat);
+            memset(pat, 0, sizeof(*pat));
             return CBM_NOT_FOUND;
         }
-        pat->node_count++;
     }
     return 0;
 }
@@ -1985,25 +2234,34 @@ static char *parse_unwind_literal_list(parser_t *p) {
         }
         match(p, TOK_COMMA);
     }
-    expect(p, TOK_RBRACKET);
+    if (!expect(p, TOK_RBRACKET)) {
+        return NULL;
+    }
     buf[blen] = ']';
     buf[blen + SKIP_ONE] = '\0';
     return heap_strdup(buf);
 }
 
 /* Parse UNWIND [...] AS var clause into query */
-static void parse_unwind_clause(parser_t *p, cbm_query_t *q) {
+static int parse_unwind_clause(parser_t *p, cbm_query_t *q) {
     advance(p);
     if (check(p, TOK_LBRACKET)) {
         q->unwind_expr = parse_unwind_literal_list(p);
+        if (!q->unwind_expr) {
+            return CBM_NOT_FOUND;
+        }
     } else if (check(p, TOK_IDENT)) {
         q->unwind_expr = heap_strdup(advance(p)->text);
     }
-    expect(p, TOK_AS);
-    const cbm_token_t *alias = expect(p, TOK_IDENT);
-    if (alias) {
-        q->unwind_alias = heap_strdup(alias->text);
+    if (!expect(p, TOK_AS)) {
+        return CBM_NOT_FOUND;
     }
+    const cbm_token_t *alias = expect(p, TOK_IDENT);
+    if (!alias) {
+        return CBM_NOT_FOUND;
+    }
+    q->unwind_alias = heap_strdup(alias->text);
+    return 0;
 }
 
 /* Parse a chain of MATCH / OPTIONAL MATCH patterns into query.
@@ -2016,7 +2274,7 @@ static int parse_match_chain(parser_t *p, cbm_query_t *q, int *pat_cap) {
             opt = true;
         }
         if (!expect(p, TOK_MATCH)) {
-            break;
+            return CBM_NOT_FOUND;
         }
         if (q->pattern_count >= *pat_cap) {
             *pat_cap *= PAIR_LEN;
@@ -2068,6 +2326,7 @@ static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recur
             if (sub.error) {
                 snprintf(p->error, sizeof(p->error), "%s", sub.error);
             }
+            p->diagnostic = sub.diagnostic;
             cbm_parse_free(&sub);
             return CBM_NOT_FOUND;
         }
@@ -2091,13 +2350,21 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
     const char *unsup = unsupported_clause_error(peek(&p)->type);
     if (unsup) {
         out->error = heap_strdup(unsup);
+        parser_ensure_syntax_diagnostic(&p);
+        out->diagnostic = p.diagnostic;
         return CBM_NOT_FOUND;
     }
 
     cbm_query_t *q = calloc(CBM_ALLOC_ONE, sizeof(cbm_query_t));
 
     if (check(&p, TOK_UNWIND)) {
-        parse_unwind_clause(&p, q);
+        if (parse_unwind_clause(&p, q) < 0) {
+            parser_ensure_syntax_diagnostic(&p);
+            out->error = heap_strdup(p.error[0] ? p.error : "failed to parse UNWIND");
+            out->diagnostic = p.diagnostic;
+            cbm_query_free(q);
+            return CBM_NOT_FOUND;
+        }
     }
 
     bool first_optional = false;
@@ -2106,7 +2373,9 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
         first_optional = true;
     }
     if (!expect(&p, TOK_MATCH)) {
+        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "expected MATCH");
+        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -2116,7 +2385,9 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
     q->pattern_optional = malloc(pat_cap * sizeof(bool));
 
     if (parse_match_pattern(&p, &q->patterns[0]) < 0) {
+        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse pattern");
+        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -2124,19 +2395,36 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
     q->pattern_count = SKIP_ONE;
 
     if (parse_match_chain(&p, q, &pat_cap) < 0) {
+        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse additional pattern");
+        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
 
     if (parse_where(&p, &q->where) < 0) {
+        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse WHERE");
+        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
 
     if (parse_post_where(&p, q, &pat_cap) < 0) {
+        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse query");
+        out->diagnostic = p.diagnostic;
+        cbm_query_free(q);
+        return CBM_NOT_FOUND;
+    }
+
+    /* A required token is never optional just because a narrow parser helper
+     * ignored expect()'s return value. Reject the first recorded mismatch even
+     * if later parsing happened to consume the rest of the query. */
+    if (p.error[0]) {
+        parser_ensure_syntax_diagnostic(&p);
+        out->error = heap_strdup(p.error);
+        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -2146,8 +2434,18 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
      * a SKIP after LIMIT) — surface it as an error instead of honoring a partial
      * query whose LIMIT/SKIP was quietly discarded. */
     if (!check(&p, TOK_EOF)) {
-        snprintf(p.error, sizeof(p.error), "unexpected trailing tokens at pos %d", peek(&p)->pos);
+        p.diagnostic = (cbm_cypher_diagnostic_t){
+            .kind = CBM_CYPHER_DIAGNOSTIC_TRAILING_TOKEN,
+            .expected = TOK_EOF,
+            .actual = peek(&p)->type,
+            .byte_position = peek(&p)->pos,
+        };
+        char actual_fallback[CBM_SZ_64];
+        snprintf(p.error, sizeof(p.error), "unexpected %s at byte %d after the query was complete",
+                 cypher_token_name(peek(&p)->type, actual_fallback, sizeof(actual_fallback)),
+                 peek(&p)->pos);
         out->error = heap_strdup(p.error);
+        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -2231,17 +2529,7 @@ static void free_return_clause(cbm_return_clause_t *r) {
         return;
     }
     for (int i = 0; i < r->count; i++) {
-        safe_str_free(&r->items[i].variable);
-        safe_str_free(&r->items[i].property);
-        safe_str_free(&r->items[i].alias);
-        safe_str_free(&r->items[i].func);
-        free_case_expr(r->items[i].kase);
-        for (int j = 0; j < r->items[i].arg_count; j++) {
-            safe_str_free(&r->items[i].args[j].variable);
-            safe_str_free(&r->items[i].args[j].property);
-            safe_str_free(&r->items[i].args[j].literal);
-        }
-        free(r->items[i].args);
+        free_return_item_fields(&r->items[i]);
     }
     free(r->items);
     for (int i = 0; i < r->order_key_count; i++) {
@@ -2272,20 +2560,202 @@ void cbm_query_free(cbm_query_t *q) {
 
 /* ── Convenience: lex + parse ───────────────────────────────────── */
 
+static void diagnostic_append(char **cursor, size_t *remaining, const char *text) {
+    if (*remaining == 0) {
+        return;
+    }
+    int written = snprintf(*cursor, *remaining, "%s", text);
+    if (written < 0) {
+        return;
+    }
+    size_t consumed = (size_t)written < *remaining ? (size_t)written : *remaining - SKIP_ONE;
+    *cursor += consumed;
+    *remaining -= consumed;
+}
+
+/* Copy a bounded window around the failure and escape anything that could make
+ * an MCP error multi-line, ambiguous, or terminal-active. */
+static void cypher_diagnostic_context(const char *query, int byte_position, char *out,
+                                      size_t out_size) {
+    enum { SOURCE_WINDOW_BYTES = 64, SOURCE_WINDOW_BEFORE = 32 };
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!query) {
+        return;
+    }
+
+    size_t query_len = strlen(query);
+    size_t position = byte_position < 0 ? 0 : (size_t)byte_position;
+    if (position > query_len) {
+        position = query_len;
+    }
+    size_t start = 0;
+    if (query_len > SOURCE_WINDOW_BYTES) {
+        start = position > SOURCE_WINDOW_BEFORE ? position - SOURCE_WINDOW_BEFORE : 0;
+        if (start + SOURCE_WINDOW_BYTES > query_len) {
+            start = query_len - SOURCE_WINDOW_BYTES;
+        }
+    }
+    size_t end = query_len < start + SOURCE_WINDOW_BYTES ? query_len : start + SOURCE_WINDOW_BYTES;
+
+    char *cursor = out;
+    size_t remaining = out_size;
+    if (start > 0) {
+        diagnostic_append(&cursor, &remaining, "...");
+    }
+    for (size_t i = start; i < end && remaining > SKIP_ONE; i++) {
+        unsigned char c = (unsigned char)query[i];
+        char escaped[CYP_BUF_8];
+        const char *piece = escaped;
+        switch (c) {
+        case '\\':
+            piece = "\\\\";
+            break;
+        case '"':
+            piece = "\\\"";
+            break;
+        case '\n':
+            piece = "\\n";
+            break;
+        case '\r':
+            piece = "\\r";
+            break;
+        case '\t':
+            piece = "\\t";
+            break;
+        default:
+            if (c >= 0x20 && c <= 0x7e) {
+                escaped[0] = (char)c;
+                escaped[1] = '\0';
+            } else {
+                snprintf(escaped, sizeof(escaped), "\\x%02X", c);
+            }
+            break;
+        }
+        diagnostic_append(&cursor, &remaining, piece);
+    }
+    if (end < query_len) {
+        diagnostic_append(&cursor, &remaining, "...");
+    }
+}
+
+static char *format_cypher_diagnostic(const char *query, const cbm_cypher_diagnostic_t *diagnostic,
+                                      const char *detail) {
+    char expected_fallback[CBM_SZ_64];
+    char actual_fallback[CBM_SZ_64];
+    char summary[CBM_SZ_256];
+    char remedy[CBM_SZ_512];
+    char context[CBM_SZ_512];
+    cypher_diagnostic_context(query, diagnostic->byte_position, context, sizeof(context));
+
+    switch (diagnostic->kind) {
+    case CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_TOKEN:
+        snprintf(
+            summary, sizeof(summary), "Invalid Cypher query: expected %s but found %s at byte %d",
+            cypher_token_name(diagnostic->expected, expected_fallback, sizeof(expected_fallback)),
+            cypher_token_name(diagnostic->actual, actual_fallback, sizeof(actual_fallback)),
+            diagnostic->byte_position);
+        if (diagnostic->context == CBM_CYPHER_CONTEXT_NODE_PATTERN) {
+            const char *following =
+                cypher_token_name(diagnostic->actual, actual_fallback, sizeof(actual_fallback));
+            snprintf(remedy, sizeof(remedy),
+                     "Remedy: close the node pattern before %s; for example, MATCH "
+                     "(n:Function) RETURN n.name LIMIT 10.",
+                     following);
+        } else if (diagnostic->context == CBM_CYPHER_CONTEXT_RELATIONSHIP_TYPE) {
+            snprintf(remedy, sizeof(remedy),
+                     "Remedy: name the relationship type after ':'; for example, MATCH "
+                     "(a)-[:CALLS]->(b) RETURN a, b LIMIT 10.");
+        } else if (diagnostic->expected == TOK_MATCH) {
+            snprintf(remedy, sizeof(remedy),
+                     "Remedy: start with MATCH and use read-only clause order; for example, MATCH "
+                     "(n:Function) RETURN n.name LIMIT 10.");
+        } else {
+            snprintf(remedy, sizeof(remedy),
+                     "Remedy: supply the expected syntax, or retry with a narrower query such as "
+                     "MATCH (n:Function) RETURN n.name LIMIT 10.");
+        }
+        break;
+    case CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_CHARACTER: {
+        char unexpected[CBM_SZ_16];
+        if (diagnostic->unexpected_byte >= 0x20 && diagnostic->unexpected_byte <= 0x7e) {
+            snprintf(unexpected, sizeof(unexpected), "'%c'", diagnostic->unexpected_byte);
+        } else {
+            snprintf(unexpected, sizeof(unexpected), "byte 0x%02X", diagnostic->unexpected_byte);
+        }
+        snprintf(summary, sizeof(summary), "Invalid Cypher query: unsupported character %s at byte %d",
+                 unexpected, diagnostic->byte_position);
+        snprintf(remedy, sizeof(remedy),
+                 "Remedy: remove the unsupported character and retry with read-only Cypher; for "
+                 "example, MATCH (n:Function) RETURN n.name LIMIT 10.");
+        break;
+    }
+    case CBM_CYPHER_DIAGNOSTIC_UNTERMINATED_STRING: {
+        size_t query_len = query ? strlen(query) : 0;
+        bool single_quote = query && diagnostic->byte_position >= 0 &&
+                            (size_t)diagnostic->byte_position < query_len &&
+                            query[diagnostic->byte_position] == '\'';
+        snprintf(summary, sizeof(summary),
+                 "Invalid Cypher query: unterminated %s-quoted string at byte %d",
+                 single_quote ? "single" : "double", diagnostic->byte_position);
+        snprintf(remedy, sizeof(remedy),
+                 single_quote
+                     ? "Remedy: close the string with a single quote, or escape an internal quote; "
+                       "then retry the query."
+                     : "Remedy: close the string with a double quote, or escape an internal quote "
+                       "as \\\"; then retry the query.");
+        break;
+    }
+    case CBM_CYPHER_DIAGNOSTIC_TRAILING_TOKEN:
+        snprintf(summary, sizeof(summary),
+                 "Invalid Cypher query: unexpected %s at byte %d after the query was complete",
+                 cypher_token_name(diagnostic->actual, actual_fallback, sizeof(actual_fallback)),
+                 diagnostic->byte_position);
+        snprintf(remedy, sizeof(remedy),
+                 "Remedy: use clause order MATCH, WHERE, RETURN, ORDER BY, SKIP, LIMIT; for "
+                 "example, MATCH (n:Function) RETURN n.name SKIP 1 LIMIT 2.");
+        break;
+    case CBM_CYPHER_DIAGNOSTIC_SYNTAX:
+        snprintf(summary, sizeof(summary), "Invalid Cypher query: %s; found %s at byte %d",
+                 detail ? detail : "syntax error",
+                 cypher_token_name(diagnostic->actual, actual_fallback, sizeof(actual_fallback)),
+                 diagnostic->byte_position);
+        snprintf(remedy, sizeof(remedy),
+                 "Remedy: supply the missing syntax, or retry with a narrower query such as MATCH "
+                 "(n:Function) RETURN n.name LIMIT 10.");
+        break;
+    case CBM_CYPHER_DIAGNOSTIC_NONE:
+    default:
+        snprintf(summary, sizeof(summary), "Invalid Cypher query: %s",
+                 detail ? detail : "syntax error");
+        snprintf(remedy, sizeof(remedy),
+                 "Remedy: retry with supported read-only syntax, starting from a narrower query "
+                 "such as MATCH (n:Function) RETURN n.name LIMIT 10.");
+        break;
+    }
+
+    char message[CBM_SZ_2K];
+    snprintf(message, sizeof(message), "%s. Context: \"%s\". %s", summary, context, remedy);
+    return heap_strdup(message);
+}
+
 int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error) {
     *out = NULL;
     *error = NULL;
 
     cbm_lex_result_t lr = {0};
     if (cbm_lex(query, &lr) < 0 || lr.error) {
-        *error = heap_strdup(lr.error ? lr.error : "lex error");
+        *error = format_cypher_diagnostic(query, &lr.diagnostic, lr.error ? lr.error : "lex error");
         cbm_lex_free(&lr);
         return CBM_NOT_FOUND;
     }
 
     cbm_parse_result_t pr = {0};
     if (cbm_parse(lr.tokens, lr.count, &pr) < 0) {
-        *error = heap_strdup(pr.error ? pr.error : "parse error");
+        *error =
+            format_cypher_diagnostic(query, &pr.diagnostic, pr.error ? pr.error : "parse error");
         cbm_parse_free(&pr);
         cbm_lex_free(&lr);
         return CBM_NOT_FOUND;

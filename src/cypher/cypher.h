@@ -133,6 +133,31 @@ typedef struct {
     int pos;          /* byte offset in source */
 } cbm_token_t;
 
+/* Machine-readable syntax failure retained alongside the human message. */
+typedef enum {
+    CBM_CYPHER_DIAGNOSTIC_NONE,
+    CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_TOKEN,
+    CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_CHARACTER,
+    CBM_CYPHER_DIAGNOSTIC_UNTERMINATED_STRING,
+    CBM_CYPHER_DIAGNOSTIC_TRAILING_TOKEN,
+    CBM_CYPHER_DIAGNOSTIC_SYNTAX,
+} cbm_cypher_diagnostic_kind_t;
+
+typedef enum {
+    CBM_CYPHER_CONTEXT_NONE,
+    CBM_CYPHER_CONTEXT_NODE_PATTERN,
+    CBM_CYPHER_CONTEXT_RELATIONSHIP_TYPE,
+} cbm_cypher_diagnostic_context_t;
+
+typedef struct {
+    cbm_cypher_diagnostic_kind_t kind;
+    cbm_cypher_diagnostic_context_t context;
+    cbm_token_type_t expected;
+    cbm_token_type_t actual;
+    unsigned char unexpected_byte;
+    int byte_position;
+} cbm_cypher_diagnostic_t;
+
 /* ── Lexer ──────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -140,6 +165,7 @@ typedef struct {
     int count;
     int capacity;
     char *error; /* NULL if no error */
+    cbm_cypher_diagnostic_t diagnostic;
 } cbm_lex_result_t;
 
 /* Tokenize a Cypher query string. Caller must call cbm_lex_free(). */
@@ -306,6 +332,7 @@ struct cbm_query {
 typedef struct {
     cbm_query_t *query;
     char *error; /* NULL if no error */
+    cbm_cypher_diagnostic_t diagnostic;
 } cbm_parse_result_t;
 
 /* Parse tokens into AST. Caller must call cbm_parse_free(). */
