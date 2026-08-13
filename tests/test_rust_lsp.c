@@ -6565,6 +6565,106 @@ TEST(rustlsp_partial_cargo_handles_comments_and_quirks) {
     PASS();
 }
 
+TEST(rustlsp_health_status_is_derived_from_routes_and_issues) {
+    CBMRustAnalysisHealth health = {0};
+    health.required_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE |
+                             CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&health));
+
+    health.completed_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&health));
+
+    health.completed_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&health));
+
+    cbm_rust_health_record(&health, CBM_RUST_HEALTH_WORK_LIMIT, 41, 73);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&health));
+    PASS();
+}
+
+TEST(rustlsp_health_record_retains_first_span_and_saturates) {
+    CBMRustAnalysisHealth health = {0};
+    cbm_rust_health_record(&health, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, 12, 19);
+    cbm_rust_health_record(&health, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, 50, 61);
+    ASSERT_EQ(2, health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].count);
+    ASSERT_EQ(12, health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].first_start_byte);
+    ASSERT_EQ(19, health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].first_end_byte);
+
+    health.issues[CBM_RUST_HEALTH_WORK_LIMIT].count = UINT32_MAX;
+    cbm_rust_health_record(&health, CBM_RUST_HEALTH_WORK_LIMIT, 70, 80);
+    ASSERT_EQ(UINT32_MAX, health.issues[CBM_RUST_HEALTH_WORK_LIMIT].count);
+    PASS();
+}
+
+TEST(rustlsp_cargo_malformed_input_records_first_exact_span) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *toml = "[package]\nname = \"unterminated";
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
+
+    const CBMRustHealthIssue *issue =
+        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL];
+    const char *quote = strchr(toml, '"');
+    ASSERT_NOT_NULL(quote);
+    ASSERT_EQ(1, issue->count);
+    ASSERT_EQ((uint32_t)(quote - toml), issue->first_start_byte);
+    ASSERT_EQ((uint32_t)strlen(toml), issue->first_end_byte);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_dependency_cap_records_each_dropped_entry) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    char toml[16384];
+    int used = snprintf(toml, sizeof(toml), "[dependencies]\n");
+    uint32_t first_dropped = 0;
+    for (int i = 0; i < CBM_CARGO_MAX_DEPS + 2; i++) {
+        if (i == CBM_CARGO_MAX_DEPS) first_dropped = (uint32_t)used;
+        used += snprintf(toml + used, sizeof(toml) - (size_t)used,
+                         "dep_%03d = \"1\"\n", i);
+    }
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, used, &manifest);
+
+    const CBMRustHealthIssue *issue =
+        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_DEP_LIMIT];
+    ASSERT_EQ(CBM_CARGO_MAX_DEPS, manifest.dep_count);
+    ASSERT_EQ(2, issue->count);
+    ASSERT_EQ(first_dropped, issue->first_start_byte);
+    ASSERT_TRUE(issue->first_end_byte > issue->first_start_byte);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_member_cap_records_each_dropped_entry) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    char toml[8192];
+    int used = snprintf(toml, sizeof(toml), "[workspace]\nmembers = [");
+    uint32_t first_dropped = 0;
+    for (int i = 0; i < CBM_CARGO_MAX_MEMBERS + 2; i++) {
+        if (i > 0) used += snprintf(toml + used, sizeof(toml) - (size_t)used, ", ");
+        if (i == CBM_CARGO_MAX_MEMBERS) first_dropped = (uint32_t)used;
+        used += snprintf(toml + used, sizeof(toml) - (size_t)used,
+                         "\"crates/member_%03d\"", i);
+    }
+    used += snprintf(toml + used, sizeof(toml) - (size_t)used, "]\n");
+    CBMCargoManifest manifest;
+    cbm_cargo_parse(&arena, toml, used, &manifest);
+
+    const CBMRustHealthIssue *issue =
+        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_MEMBER_LIMIT];
+    ASSERT_EQ(CBM_CARGO_MAX_MEMBERS, manifest.member_count);
+    ASSERT_EQ(2, issue->count);
+    ASSERT_EQ(first_dropped, issue->first_start_byte);
+    ASSERT_TRUE(issue->first_end_byte > issue->first_start_byte);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* Chalk-lite: T: Clone bound dispatch. */
 TEST(rustlsp_partial_chalk_lite_clone_bound) {
     /* This was an aspirational test before; now it should pass via
@@ -7565,6 +7665,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_partial_cargo_parses_simple);
     RUN_TEST(rustlsp_partial_cargo_parses_workspace);
     RUN_TEST(rustlsp_partial_cargo_handles_comments_and_quirks);
+    RUN_TEST(rustlsp_health_status_is_derived_from_routes_and_issues);
+    RUN_TEST(rustlsp_health_record_retains_first_span_and_saturates);
+    RUN_TEST(rustlsp_cargo_malformed_input_records_first_exact_span);
+    RUN_TEST(rustlsp_cargo_dependency_cap_records_each_dropped_entry);
+    RUN_TEST(rustlsp_cargo_member_cap_records_each_dropped_entry);
     RUN_TEST(rustlsp_partial_chalk_lite_clone_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_display_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_multi_bound);

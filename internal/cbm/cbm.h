@@ -486,6 +486,61 @@ typedef struct {
     int cap;
 } CBMModDeclArray;
 
+/* Allocation-independent Rust semantic-analysis health. Reason values are a
+ * persisted-data contract: append new reasons before _COUNT, never renumber an
+ * existing value. Issue slots are addressed directly by reason, so recording a
+ * cap/failure cannot itself fail because diagnostic storage is unavailable. */
+typedef enum {
+    CBM_RUST_HEALTH_MANIFEST_READ_FAILED = 0,
+    CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL = 1,
+    CBM_RUST_HEALTH_MANIFEST_DEP_LIMIT = 2,
+    CBM_RUST_HEALTH_MANIFEST_MEMBER_LIMIT = 3,
+    CBM_RUST_HEALTH_SOURCE_UNAVAILABLE = 4,
+    CBM_RUST_HEALTH_PARSER_CREATE_FAILED = 5,
+    CBM_RUST_HEALTH_PARSER_PARSE_FAILED = 6,
+    CBM_RUST_HEALTH_MACRO_NO_RULE_MATCH = 7,
+    CBM_RUST_HEALTH_MACRO_DEPTH_LIMIT = 8,
+    CBM_RUST_HEALTH_MACRO_BINDING_LIMIT = 9,
+    CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT = 10,
+    CBM_RUST_HEALTH_MACRO_PARSE_FAILED = 11,
+    CBM_RUST_HEALTH_TYPE_DEPTH_LIMIT = 12,
+    CBM_RUST_HEALTH_EVAL_DEPTH_LIMIT = 13,
+    CBM_RUST_HEALTH_WALK_DEPTH_LIMIT = 14,
+    CBM_RUST_HEALTH_WORK_LIMIT = 15,
+    CBM_RUST_HEALTH_PROC_MACRO_UNSUPPORTED = 16,
+    CBM_RUST_HEALTH_RUSTDOC_UNAVAILABLE = 17,
+    CBM_RUST_HEALTH_REASON_COUNT = 18,
+} CBMRustHealthReason;
+
+typedef enum {
+    CBM_RUST_ANALYSIS_COMPLETE = 0,
+    CBM_RUST_ANALYSIS_PARTIAL = 1,
+    CBM_RUST_ANALYSIS_FAILED = 2,
+} CBMRustAnalysisStatus;
+
+typedef enum {
+    CBM_RUST_HEALTH_ROUTE_SINGLE_FILE = 1U << 0,
+    CBM_RUST_HEALTH_ROUTE_CROSS_FILE = 1U << 1,
+} CBMRustHealthRoute;
+
+typedef struct {
+    uint32_t count;
+    uint32_t first_start_byte;
+    uint32_t first_end_byte;
+} CBMRustHealthIssue;
+
+typedef struct {
+    uint32_t required_routes;
+    uint32_t completed_routes;
+    uint32_t resolved_emitted;
+    uint32_t unresolved_emitted;
+    CBMRustHealthIssue issues[CBM_RUST_HEALTH_REASON_COUNT];
+} CBMRustAnalysisHealth;
+
+void cbm_rust_health_record(CBMRustAnalysisHealth *health, CBMRustHealthReason reason,
+                            uint32_t start_byte, uint32_t end_byte);
+CBMRustAnalysisStatus cbm_rust_health_status(const CBMRustAnalysisHealth *health);
+
 // Full extraction result for one file.
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
@@ -505,6 +560,7 @@ typedef struct CBMFileResult {
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
     CBMModDeclArray mod_decls;           // Rust: bodyless `mod NAME;` child declarations
+    CBMRustAnalysisHealth rust_health;   // fixed-size Rust semantic degradation report
 
     const char *module_qn;      // module qualified name
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none

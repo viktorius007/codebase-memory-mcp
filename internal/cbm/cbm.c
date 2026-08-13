@@ -1143,6 +1143,36 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     return r;
 }
 
+void cbm_rust_health_record(CBMRustAnalysisHealth *health, CBMRustHealthReason reason,
+                            uint32_t start_byte, uint32_t end_byte) {
+    if (!health || reason < 0 || reason >= CBM_RUST_HEALTH_REASON_COUNT) {
+        return;
+    }
+    CBMRustHealthIssue *issue = &health->issues[reason];
+    if (issue->count == 0) {
+        issue->first_start_byte = start_byte;
+        issue->first_end_byte = end_byte;
+    }
+    if (issue->count < UINT32_MAX) {
+        issue->count++;
+    }
+}
+
+CBMRustAnalysisStatus cbm_rust_health_status(const CBMRustAnalysisHealth *health) {
+    if (!health) {
+        return CBM_RUST_ANALYSIS_FAILED;
+    }
+    if ((health->completed_routes & health->required_routes) != health->required_routes) {
+        return CBM_RUST_ANALYSIS_FAILED;
+    }
+    for (int reason = 0; reason < CBM_RUST_HEALTH_REASON_COUNT; reason++) {
+        if (health->issues[reason].count > 0) {
+            return CBM_RUST_ANALYSIS_PARTIAL;
+        }
+    }
+    return CBM_RUST_ANALYSIS_COMPLETE;
+}
+
 CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
                                    const char *project, const char *rel_path,
                                    int64_t timeout_micros, const char **extra_defines,

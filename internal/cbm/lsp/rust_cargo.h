@@ -19,7 +19,7 @@
 #ifndef CBM_LSP_RUST_CARGO_H
 #define CBM_LSP_RUST_CARGO_H
 
-#include "../arena.h"
+#include "../cbm.h"
 #include <stdbool.h>
 
 #define CBM_CARGO_MAX_DEPS    256
@@ -45,6 +45,10 @@ typedef struct CBMCargoManifest {
 
     CBMCargoMember members[CBM_CARGO_MAX_MEMBERS];
     int member_count;
+
+    /* Parser/cap health is part of the manifest result so diagnostics survive
+     * independently of arena allocation and without a parallel log. */
+    CBMRustAnalysisHealth health;
 } CBMCargoManifest;
 
 /* Parse a Cargo.toml-formatted string. The output strings are
