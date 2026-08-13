@@ -3573,6 +3573,16 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     int inv_args_len = 0;
     if (!ts_node_is_null(invocation)) {
         TSNode args_tt = ts_node_child_by_field_name(invocation, "arguments", 9);
+        if (ts_node_is_null(args_tt)) {
+            uint32_t child_count = ts_node_child_count(invocation);
+            for (uint32_t i = 0; i < child_count; i++) {
+                TSNode child = ts_node_child(invocation, i);
+                if (!ts_node_is_null(child) && strcmp(ts_node_type(child), "token_tree") == 0) {
+                    args_tt = child;
+                    break;
+                }
+            }
+        }
         if (!ts_node_is_null(args_tt)) {
             char *at = cbm_node_text(ctx->arena, args_tt, ctx->source);
             if (at) {
@@ -3595,10 +3605,6 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             hit = r;
             break;
         }
-        /* Fall back to first-rule match without arg substitution if
-         * the pattern doesn't match — still expand to walk the body. */
-        if (!hit)
-            hit = r;
     }
     if (!hit || !hit->transcriber_text || hit->transcriber_len <= 0)
         return;
