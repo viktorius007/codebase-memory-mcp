@@ -1169,10 +1169,19 @@ static int assert_oversized_result_fails_closed(const char *payload, bool input_
     yyjson_val *item = yyjson_arr_get_first(content);
     const char *message = yyjson_get_str(yyjson_obj_get(item, "text"));
     ASSERT_NOT_NULL(message);
-    ASSERT_TRUE(strncmp(message, "ERROR: safe response envelope exceeded", 38) == 0);
-    ASSERT_NOT_NULL(strstr(message, "no partial result was returned"));
-    ASSERT_NOT_NULL(strstr(message, "complete_response_bytes="));
-    ASSERT_NOT_NULL(strstr(message, "limit_bytes=65536"));
+    ASSERT_TRUE(strncmp(message, "ERROR: result exceeds safe response envelope", 44) == 0);
+    ASSERT_NOT_NULL(strstr(message, "no partial result returned"));
+    const char *measurements = strstr(message, "complete_response_bytes=");
+    ASSERT_NOT_NULL(measurements);
+    size_t measured_complete_bytes = 0;
+    unsigned measured_limit_bytes = 0;
+    ASSERT_EQ(sscanf(measurements, "complete_response_bytes=%zu limit_bytes=%u",
+                     &measured_complete_bytes, &measured_limit_bytes),
+              2);
+    ASSERT_EQ(measured_complete_bytes, uncapped_bytes);
+    ASSERT_EQ(measured_limit_bytes, CBM_MCP_RESULT_MAX_BYTES);
+    ASSERT_NOT_NULL(strstr(message, "Remedy: manage_adr use mode=sections"));
+    ASSERT_NOT_NULL(strstr(message, "choose bounded output, a narrower tool, or inspect source data"));
     ASSERT_NULL(strstr(json, discarded_payload_marker));
 
     yyjson_val *structured = yyjson_obj_get(root, "structuredContent");
@@ -1253,10 +1262,16 @@ TEST(mcp_text_result_oversized_dynamic_error_is_hard_bounded) {
     memset(error, 'e', repeated);
     error[repeated] = '\0';
 
-    /* Error text was present in content and structuredContent. This exact
-     * lower bound alone is already beyond the complete-response ceiling. */
+    /* Error text is present in content and structuredContent. This payload
+     * needs no JSON escaping, so the fixed envelope plus both copies gives an
+     * independent exact byte count for the pre-substitution response. */
     ASSERT_TRUE(strlen(error) < CBM_MCP_RESULT_MAX_BYTES);
-    ASSERT_EQ(assert_oversized_result_fails_closed(error, true, repeated * 2, "eeeeeeeeeeeeeeee"),
+    size_t uncapped_bytes =
+        strlen("{\"content\":[{\"type\":\"text\",\"text\":\"\"}],"
+               "\"structuredContent\":{\"error\":\"\"},\"isError\":true}") +
+        repeated * 2;
+    ASSERT_EQ(assert_oversized_result_fails_closed(error, true, uncapped_bytes,
+                                                   "eeeeeeeeeeeeeeee"),
               0);
     free(error);
     PASS();

@@ -352,8 +352,9 @@ static char *mcp_result_enforce_limit(char *out) {
 
     char diagnostic[CBM_SZ_256];
     snprintf(diagnostic, sizeof(diagnostic),
-             "ERROR: safe response envelope exceeded; no partial result was returned. "
-             "complete_response_bytes=%zu limit_bytes=%u",
+             "ERROR: result exceeds safe response envelope; no partial result returned. "
+             "complete_response_bytes=%zu limit_bytes=%u. Remedy: manage_adr use mode=sections; "
+             "otherwise choose bounded output, a narrower tool, or inspect source data.",
              complete_bytes, CBM_MCP_RESULT_MAX_BYTES);
     out = mcp_text_result_serialize(diagnostic, true);
     if (out && strlen(out) > CBM_MCP_RESULT_MAX_BYTES) {

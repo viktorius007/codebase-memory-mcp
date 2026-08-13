@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <yyjson/yyjson.h>
 
 /* Observation-wait budget. This is a HANG DETECTOR, not a latency
  * assertion: every waiter returns the moment its condition holds, so green
@@ -984,22 +985,43 @@ TEST(daemon_application_oversize_tool_result_reports_cause_and_remedy) {
                                &response_length)
             : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
 
-    /* The substituted envelope must be a well-formed, sendable MCP error that
-     * names the cause, states the REAL limit, and says what to change. */
-    char limit_text[64];
-    (void)snprintf(limit_text, sizeof(limit_text), "%u",
-                   (unsigned)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX);
+    /* The universal MCP envelope limit is lower than the daemon frame limit,
+     * so it must fail closed before the daemon's transport fallback. Assert
+     * the stable structured error contract rather than either layer's prose. */
     const char *text = response ? (const char *)response : "";
     bool sendable = response && response_length > 0 &&
                     response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX;
-    bool flagged_error = sendable && strstr(text, "\"isError\":true") != NULL;
-    bool names_cause = sendable && strstr(text, "result too large to return") != NULL &&
-                       strstr(text, "manage_adr") != NULL;
-    bool states_real_limit = sendable && strstr(text, limit_text) != NULL;
-    bool gives_remedy = sendable && strstr(text, "Narrow it and retry") != NULL;
+    yyjson_doc *response_doc = sendable ? yyjson_read(text, response_length, 0) : NULL;
+    yyjson_val *root_value = response_doc ? yyjson_doc_get_root(response_doc) : NULL;
+    yyjson_val *content = yyjson_is_obj(root_value) ? yyjson_obj_get(root_value, "content") : NULL;
+    yyjson_val *item = yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
+    const char *message = yyjson_is_obj(item)
+                              ? yyjson_get_str(yyjson_obj_get(item, "text"))
+                              : NULL;
+    yyjson_val *structured =
+        yyjson_is_obj(root_value) ? yyjson_obj_get(root_value, "structuredContent") : NULL;
+    const char *structured_error = yyjson_is_obj(structured)
+                                       ? yyjson_get_str(yyjson_obj_get(structured, "error"))
+                                       : NULL;
+    bool flagged_error = yyjson_is_obj(root_value) &&
+                         yyjson_get_bool(yyjson_obj_get(root_value, "isError"));
+    bool consistent_fields = message && structured_error && strcmp(message, structured_error) == 0;
+    bool names_cause = message && strstr(message, "result exceeds safe response envelope") != NULL &&
+                       strstr(message, "no partial result returned") != NULL;
+    size_t measured_complete_bytes = 0;
+    unsigned measured_limit_bytes = 0;
+    const char *measurements = message ? strstr(message, "complete_response_bytes=") : NULL;
+    bool states_real_limit =
+        measurements &&
+        sscanf(measurements, "complete_response_bytes=%zu limit_bytes=%u",
+               &measured_complete_bytes, &measured_limit_bytes) == 2 &&
+        measured_complete_bytes > CBM_MCP_RESULT_MAX_BYTES &&
+        measured_limit_bytes == CBM_MCP_RESULT_MAX_BYTES;
+    bool gives_remedy = message && strstr(message, "manage_adr use mode=sections") != NULL;
     /* The bulk payload itself must NOT have been smuggled through. */
     bool payload_withheld = sendable && strstr(text, "AAAAAAAAAAAAAAAA") == NULL;
 
+    yyjson_doc_free(response_doc);
     free(response);
     free(context);
     free(adr_tool);
@@ -1036,6 +1058,7 @@ TEST(daemon_application_oversize_tool_result_reports_cause_and_remedy) {
     ASSERT_EQ(adr_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
     ASSERT_TRUE(sendable);
     ASSERT_TRUE(flagged_error);
+    ASSERT_TRUE(consistent_fields);
     ASSERT_TRUE(names_cause);
     ASSERT_TRUE(states_real_limit);
     ASSERT_TRUE(gives_remedy);
