@@ -265,6 +265,7 @@ LSP_SRCS = $(CBM_DIR)/lsp_all.c
 # an ODR mismatch that under-reads the by-value struct copy. Explicit because this
 # Makefile does not use compiler auto-dependency (-MMD) generation.
 LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
+                 src/foundation/arena.h \
                  $(wildcard $(CBM_DIR)/lsp/*.c $(CBM_DIR)/lsp/*.h \
                             $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h)
 

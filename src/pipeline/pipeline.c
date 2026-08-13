@@ -182,6 +182,7 @@ struct cbm_pipeline {
     cbm_file_error_t *file_errors;
     int file_errors_count;
     int file_errors_cap;
+    bool file_error_capture_failed;
 
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
@@ -215,6 +216,7 @@ struct cbm_pipeline {
     bool rust_health_capture_failed;
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     bool test_fail_coverage_alloc;
+    int test_file_error_alloc_position;
 #endif
 
     /* Deterministic test-only seam at the final publication boundary. Kept
@@ -655,28 +657,70 @@ static char *fe_strdup(const char *s) {
     return d;
 }
 
-void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+static bool pipeline_file_error_test_allows_alloc(cbm_pipeline_t *p) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (p && p->test_file_error_alloc_position > 0 &&
+        --p->test_file_error_alloc_position == 0) {
+        return false;
+    }
+#else
+    (void)p;
+#endif
+    return true;
+}
+
+void cbm_pipeline_mark_file_error_capture_failed(cbm_pipeline_t *p) {
+    if (p) {
+        p->file_error_capture_failed = true;
+    }
+}
+
+bool cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
                                  const char *phase) {
     if (!p) {
-        return;
+        return false;
+    }
+    char *path_copy = pipeline_file_error_test_allows_alloc(p) ? fe_strdup(path) : NULL;
+    char *reason_copy = pipeline_file_error_test_allows_alloc(p) ? fe_strdup(reason) : NULL;
+    char *phase_copy = pipeline_file_error_test_allows_alloc(p) ? fe_strdup(phase) : NULL;
+    if ((path && !path_copy) || (reason && !reason_copy) || (phase && !phase_copy)) {
+        free(path_copy);
+        free(reason_copy);
+        free(phase_copy);
+        p->file_error_capture_failed = true;
+        return false;
     }
     if (p->file_errors_count >= p->file_errors_cap) {
         int ncap = p->file_errors_cap ? p->file_errors_cap * 2 : 16;
-        cbm_file_error_t *grown =
-            (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown));
+        cbm_file_error_t *grown = pipeline_file_error_test_allows_alloc(p)
+                                      ? (cbm_file_error_t *)realloc(
+                                            p->file_errors, (size_t)ncap * sizeof(*grown))
+                                      : NULL;
         if (!grown) {
-            /* Never abort indexing just to record a skip — drop this record. */
-            return;
+            free(path_copy);
+            free(reason_copy);
+            free(phase_copy);
+            p->file_error_capture_failed = true;
+            return false;
         }
         p->file_errors = grown;
         p->file_errors_cap = ncap;
     }
     cbm_file_error_t *e = &p->file_errors[p->file_errors_count];
-    e->path = fe_strdup(path);
-    e->reason = fe_strdup(reason);
-    e->phase = fe_strdup(phase);
+    e->path = path_copy;
+    e->reason = reason_copy;
+    e->phase = phase_copy;
     p->file_errors_count++;
+    return true;
 }
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+void cbm_pipeline_test_fail_file_error_alloc_at(cbm_pipeline_t *p, int position) {
+    if (p) {
+        p->test_file_error_alloc_position = position;
+    }
+}
+#endif
 
 void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count) {
     if (out) {
@@ -685,6 +729,10 @@ void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **ou
     if (count) {
         *count = p ? p->file_errors_count : 0;
     }
+}
+
+bool cbm_pipeline_file_error_capture_complete(const cbm_pipeline_t *p) {
+    return p && !p->file_error_capture_failed;
 }
 
 void cbm_pipeline_get_ignored(const cbm_pipeline_t *p, cbm_ignored_file_t **out, int *count,
@@ -1481,7 +1529,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     } seq_passes[] = {
         {cbm_pipeline_pass_definitions, "definitions", false},
         {cbm_pipeline_pass_k8s, "k8s", true},
-        {seq_pass_lsp_cross_dispatch, "lsp_cross", true},
+        {seq_pass_lsp_cross_dispatch, "lsp_cross", false},
         {cbm_pipeline_pass_calls, "calls", false},
         {cbm_pipeline_pass_usages, "usages", false},
         {cbm_pipeline_pass_semantic, "semantic", false},
@@ -1637,6 +1685,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     char **def_modules = NULL;
     int def_count = 0;
+    CBMPxcCollectStatus def_collect_status = CBM_PXC_COLLECT_EMPTY;
     CBMLSPDef *all_defs = NULL;
     int *def_starts = NULL;
     CBMArena rust_collect_manifest_arena;
@@ -1657,14 +1706,27 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
         def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
         def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
-        all_defs = def_modules
-                       ? cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
-                                                  def_modules, &def_count, def_starts,
-                                                  rust_collect_manifest_ptr)
-                       : NULL;
+        if (def_modules) {
+            all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
+                                                def_modules, &def_count, &def_collect_status,
+                                                def_starts,
+                                                rust_collect_manifest_ptr);
+        } else {
+            def_collect_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
+        }
     }
     if (rust_collect_manifest_arena_live) {
         cbm_arena_destroy(&rust_collect_manifest_arena);
+    }
+    if (def_collect_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
+        for (int i = 0; i < file_count; i++) {
+            if (cache[i] && files[i].language == CBM_LANG_RUST) {
+                cache[i]->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+                cache[i]->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+                cbm_rust_health_record(&cache[i]->rust_health,
+                                       CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+            }
+        }
     }
     /* Serialize per-file LSP surfaces NOW — the result cache dies with this
      * pass, and the rows are what lets an incremental run detect body-only
@@ -1708,12 +1770,21 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
          * first NULL-filter rust file (the amplifier files) inside cbm_parallel_resolve
          * — repos whose rust files all filter to subsets never pay the build/RSS. */
     }
+    cbm_pxc_test_poison_non_rust_registry(&cross_lsp_arena);
+    bool non_rust_registry_failed =
+        cbm_arena_status(&cross_lsp_arena) != CBM_ARENA_STATUS_AVAILABLE;
+    if (cbm_arena_status(&cross_lsp_arena) != CBM_ARENA_STATUS_AVAILABLE) {
+        memset(&cross_registries, 0, sizeof(cross_registries));
+    }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("lsp_cross_prepare");
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
-                              def_count, def_modules, module_def_index, &cross_registries);
+    rc = non_rust_registry_failed
+             ? CBM_NOT_FOUND
+             : cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count,
+                                    all_defs, def_count, def_collect_status, def_modules,
+                                    module_def_index, &cross_registries);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("parallel_resolve");
@@ -2366,11 +2437,11 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         p->file_errors_count + p->excluded_count + p->ignored_count + rust_cov_count;
     cbm_coverage_row_t *cov = NULL;
     int cov_count = 0;
-    bool coverage_rows_available = cov_total == 0;
+    bool coverage_rows_available = cov_total == 0 && !p->file_error_capture_failed;
     if (cov_total > 0) {
         cov = cbm_pipeline_alloc_coverage_rows(p, cov_total);
         if (cov) {
-            coverage_rows_available = true;
+            coverage_rows_available = !p->file_error_capture_failed;
             for (int i = 0; i < p->file_errors_count; i++) {
                 cov[cov_count++] = (cbm_coverage_row_t){.rel_path = p->file_errors[i].path,
                                                         .kind = p->file_errors[i].phase,

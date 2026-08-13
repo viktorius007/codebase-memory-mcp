@@ -3277,6 +3277,24 @@ static int rust_analysis_row_count(cbm_store_t *store, const char *project, cons
     return matches;
 }
 
+static int rust_analysis_detail_count(cbm_store_t *store, const char *project, const char *path,
+                                      const char *reason, const char *count_fragment) {
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    if (cbm_store_coverage_get_path(store, project, path, &rows, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < count; i++) {
+        if (rows[i].kind && strncmp(rows[i].kind, "analysis_", 9) == 0 && rows[i].detail &&
+            strstr(rows[i].detail, reason) && strstr(rows[i].detail, count_fragment)) {
+            matches++;
+        }
+    }
+    cbm_store_free_coverage(rows, count);
+    return matches;
+}
+
 TEST(pipeline_rust_health_incomplete_cross_route_is_failed_and_bounded) {
     cbm_pipeline_t *p = cbm_pipeline_new("/tmp/rust-health-unit", NULL, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
@@ -3304,6 +3322,373 @@ TEST(pipeline_rust_health_incomplete_cross_route_is_failed_and_bounded) {
     cbm_pipeline_free(p);
     PASS();
 }
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+TEST(pipeline_collect_all_defs_distinguishes_empty_available_and_allocation_failed) {
+    ASSERT_TRUE(cbm_pipeline_incremental_test_combined_definition_failure_is_typed());
+    ASSERT_TRUE(cbm_parallel_test_collect_failure_does_not_duplicate_health());
+    const char *sources[] = {"pub fn target() {}\n", "fn caller() { target(); }\n"};
+    const char *paths[] = {"src/lib.rs", "src/caller.rs"};
+    CBMFileResult *cache[2] = {0};
+    cbm_file_info_t files[2] = {0};
+    char *modules[2] = {0};
+    int starts[3] = {0};
+    for (int i = 0; i < 2; i++) {
+        files[i].rel_path = (char *)paths[i];
+        files[i].language = CBM_LANG_RUST;
+        cache[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_RUST,
+                                    "allocation-contract", paths[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(cache[i]);
+    }
+    int count = 0;
+    CBMPxcCollectStatus status = CBM_PXC_COLLECT_EMPTY;
+    CBMLSPDef *defs = cbm_pxc_collect_all_defs(cache, files, 2, "allocation-contract", modules,
+                                               &count, &status, starts, NULL);
+    ASSERT_EQ(status, CBM_PXC_COLLECT_AVAILABLE);
+    ASSERT_NOT_NULL(defs);
+    ASSERT_TRUE(count > 0);
+    free(defs);
+    for (int i = 0; i < 2; i++) {
+        free(modules[i]);
+        modules[i] = NULL;
+    }
+
+    CBMCargoTarget target = {.kind = CBM_CARGO_TARGET_LIB,
+                             .package_dir = "",
+                             .source_path = "src/lib.rs"};
+    CBMCargoManifest manifest = {
+        .targets = &target, .target_count = 1, .targets_complete = true};
+    cbm_pxc_test_fail_target_route_alloc_once();
+    defs = cbm_pxc_collect_all_defs(cache, files, 2, "allocation-contract", modules, &count,
+                                    &status, starts, &manifest);
+    ASSERT_NULL(defs);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(status, CBM_PXC_COLLECT_ALLOCATION_FAILED);
+    for (int i = 0; i < 2; i++) {
+        free(modules[i]);
+        modules[i] = NULL;
+    }
+
+    cbm_pxc_test_fail_collect_alloc_once();
+    defs = cbm_pxc_collect_all_defs(cache, files, 2, "allocation-contract", modules, &count,
+                                    &status, starts, NULL);
+    ASSERT_NULL(defs);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(status, CBM_PXC_COLLECT_ALLOCATION_FAILED);
+
+    CBMFileResult empty_a = {0};
+    CBMFileResult empty_b = {0};
+    CBMFileResult *empty_cache[] = {&empty_a, &empty_b};
+    defs = cbm_pxc_collect_all_defs(empty_cache, files, 2, "allocation-contract", modules, &count,
+                                    &status, starts, NULL);
+    ASSERT_NULL(defs);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(status, CBM_PXC_COLLECT_EMPTY);
+
+    for (int i = 0; i < 2; i++) {
+        free(modules[i]);
+        cbm_free_result(cache[i]);
+    }
+    PASS();
+}
+
+TEST(pipeline_non_rust_collect_failure_aborts_sequential_and_parallel) {
+    char sequential[256];
+    snprintf(sequential, sizeof(sequential), "/tmp/cbm_collect_py_seq_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(sequential));
+    write_temp_file(sequential, "target.py", "def target():\n    return 1\n");
+    write_temp_file(sequential, "caller.py",
+                    "from target import target\ndef caller():\n    return target()\n");
+    cbm_pxc_test_fail_collect_alloc_once();
+    cbm_pipeline_t *p = cbm_pipeline_new(sequential, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    cbm_pipeline_free(p);
+    cbm_pxc_test_fail_destination_copy_at(1);
+    p = cbm_pipeline_new(sequential, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    cbm_pipeline_free(p);
+    cbm_pxc_test_poison_non_rust_registry_once();
+    p = cbm_pipeline_new(sequential, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    cbm_pipeline_free(p);
+    th_rmtree(sequential);
+
+    char parallel[256];
+    snprintf(parallel, sizeof(parallel), "/tmp/cbm_collect_py_par_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(parallel));
+    for (int i = 0; i < 52; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "mod_%02d.py", i);
+        write_temp_file(parallel, name,
+                        i == 0 ? "def target():\n    return 1\n"
+                               : "from mod_00 import target\ndef caller():\n    return target()\n");
+    }
+    cbm_pxc_test_fail_collect_alloc_once();
+    p = cbm_pipeline_new(parallel, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    cbm_pipeline_free(p);
+    cbm_pxc_test_fail_destination_copy_at(1);
+    p = cbm_pipeline_new(parallel, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    cbm_pipeline_free(p);
+    cbm_pxc_test_poison_non_rust_registry_once();
+    p = cbm_pipeline_new(parallel, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    cbm_pipeline_free(p);
+    th_rmtree(parallel);
+    PASS();
+}
+
+TEST(pipeline_cross_publication_rows_are_atomic_at_every_string_copy) {
+    ASSERT_TRUE(cbm_pxc_test_non_rust_destination_failure_is_typed());
+    ASSERT_TRUE(cbm_parallel_test_rust_registry_failure_is_rejected(SIZE_MAX - 1));
+
+    CBMResolvedCall resolved = {.caller_qn = "project.caller",
+                                .callee_qn = "project.callee",
+                                .strategy = "lsp_type_dispatch",
+                                .confidence = 0.95f,
+                                .reason = "diagnostic",
+                                .site_start_byte = 1,
+                                .site_end_byte = 2};
+    CBMResolvedCallArray resolved_source = {.items = &resolved, .count = 1, .cap = 1};
+    for (int position = 1; position <= 4; position++) {
+        CBMFileResult destination = {0};
+        cbm_arena_init(&destination.arena);
+        cbm_pxc_test_fail_destination_copy_at(position);
+        ASSERT_FALSE(cbm_pxc_test_append_results(&destination, &resolved_source));
+        ASSERT_EQ(destination.resolved_calls.count, 0);
+        ASSERT_EQ(destination.rust_health.resolved_emitted, 0);
+        ASSERT_EQ(destination.rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count, 1);
+        cbm_arena_destroy(&destination.arena);
+    }
+
+    CBMResolvedCall lower = resolved;
+    lower.caller_qn = "old.caller";
+    lower.callee_qn = "old.callee";
+    lower.confidence = 0.5f;
+    CBMResolvedCall replacement = resolved;
+    replacement.confidence = 0.99f;
+    replacement.strategy = "replacement_strategy";
+    replacement.reason = "replacement_reason";
+    CBMResolvedCallArray lower_source = {.items = &lower, .count = 1, .cap = 1};
+    CBMResolvedCallArray replacement_source = {.items = &replacement, .count = 1, .cap = 1};
+    for (int position = 1; position <= 4; position++) {
+        CBMFileResult destination = {0};
+        cbm_arena_init(&destination.arena);
+        ASSERT_TRUE(cbm_pxc_test_append_results(&destination, &lower_source));
+        /* Match the existing identity while changing the replaceable fields. */
+        replacement.kind = lower.kind;
+        replacement.site_start_byte = lower.site_start_byte;
+        replacement.site_end_byte = lower.site_end_byte;
+        replacement.source_origin = lower.source_origin;
+        replacement.caller_qn = lower.caller_qn;
+        replacement.callee_qn = lower.callee_qn;
+        cbm_pxc_test_fail_destination_copy_at(position);
+        ASSERT_FALSE(cbm_pxc_test_append_results(&destination, &replacement_source));
+        ASSERT_EQ(destination.resolved_calls.count, 1);
+        ASSERT_EQ(destination.rust_health.resolved_emitted, 1);
+        ASSERT_STR_EQ(destination.resolved_calls.items[0].strategy, lower.strategy);
+        ASSERT_TRUE(destination.resolved_calls.items[0].confidence == lower.confidence);
+        cbm_arena_destroy(&destination.arena);
+    }
+
+    CBMCall synthetic = {.callee_name = "project.callee",
+                         .enclosing_func_qn = "project.caller",
+                         .first_string_arg = "first",
+                         .second_arg_name = "second",
+                         .requires_lsp_resolution = true,
+                         .site_start_byte = 1,
+                         .site_end_byte = 2};
+    for (int i = 0; i < CBM_MAX_CALL_ARGS; i++) {
+        synthetic.args[i].expr = "expr";
+        synthetic.args[i].value = "value";
+        synthetic.args[i].keyword = "keyword";
+    }
+    CBMCallArray synthetic_source = {.items = &synthetic, .count = 1, .cap = 1};
+    for (int position = 1; position <= 4 + CBM_MAX_CALL_ARGS * 3; position++) {
+        CBMFileResult destination = {0};
+        cbm_arena_init(&destination.arena);
+        cbm_pxc_test_fail_destination_copy_at(position);
+        ASSERT_FALSE(cbm_pxc_test_append_synthetic_calls(&destination, &synthetic_source));
+        ASSERT_EQ(destination.calls.count, 0);
+        ASSERT_EQ(destination.rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count, 1);
+        cbm_arena_destroy(&destination.arena);
+    }
+
+    CBMFileResult success = {0};
+    cbm_arena_init(&success.arena);
+    ASSERT_TRUE(cbm_pxc_test_append_results(&success, &resolved_source));
+    ASSERT_TRUE(cbm_pxc_test_append_synthetic_calls(&success, &synthetic_source));
+    ASSERT_EQ(success.resolved_calls.count, 1);
+    ASSERT_EQ(success.rust_health.resolved_emitted, 1);
+    ASSERT_EQ(success.calls.count, 1);
+    ASSERT_STR_EQ(success.resolved_calls.items[0].callee_qn, "project.callee");
+    ASSERT_STR_EQ(success.calls.items[0].args[CBM_MAX_CALL_ARGS - 1].keyword, "keyword");
+    cbm_arena_destroy(&success.arena);
+    PASS();
+}
+
+TEST(pipeline_diagnostic_rows_are_atomic_and_capture_loss_is_unavailable) {
+    for (int position = 1; position <= 4; position++) {
+        ASSERT_TRUE(cbm_parallel_test_error_add_is_atomic(position));
+        cbm_pipeline_t *p = cbm_pipeline_new("/tmp/file-error-atomic", NULL, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        cbm_pipeline_test_fail_file_error_alloc_at(p, position);
+        ASSERT_FALSE(cbm_pipeline_add_file_error(p, "broken.rs", "extract failed", "extract"));
+        cbm_file_error_t *errors = NULL;
+        int count = -1;
+        cbm_pipeline_get_file_errors(p, &errors, &count);
+        ASSERT_EQ(count, 0);
+        ASSERT_FALSE(cbm_pipeline_file_error_capture_complete(p));
+        cbm_pipeline_free(p);
+    }
+
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_file_error_capture_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db[512];
+    snprintf(db, sizeof(db), "%s/capture.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_add_file_error(p, "retained.c", "known skip", "read"));
+    cbm_pipeline_test_fail_file_error_alloc_at(p, 1);
+    ASSERT_FALSE(cbm_pipeline_add_file_error(p, "lost.c", "read failed", "read"));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, cbm_pipeline_project_name(p), &meta),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.recording_status, "unavailable");
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_small_rust_collect_allocation_failure_cannot_complete_cross_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_collect_alloc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"alloc\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod caller; pub fn target() {}\n");
+    write_temp_file(tmp, "src/caller.rs", "pub fn caller() { crate::target(); }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/alloc.db", tmp);
+    cbm_pxc_test_fail_collect_alloc_once();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(rust_analysis_row_count(store, cbm_pipeline_project_name(p), "src/caller.rs",
+                                      "analysis_failed:rust", "allocation_unavailable"),
+              1);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_incremental_combined_universe_allocation_records_one_failure) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_combined_alloc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"combined\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod caller; pub fn target() {}\n");
+    write_temp_file(tmp, "src/caller.rs", "pub fn caller() { crate::target(); }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/combined.db", tmp);
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    cbm_pipeline_free(first);
+
+    write_temp_file(tmp, "src/caller.rs",
+                    "pub fn caller() { let _changed = 1; crate::target(); }\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_fail_combined_definition_alloc_once();
+    cbm_pipeline_t *second = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    ASSERT_EQ(cbm_pipeline_run(second), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(second);
+    ASSERT_EQ(rust_analysis_detail_count(store, project, "src/caller.rs",
+                                         "allocation_unavailable", "\"count\":1"),
+              1);
+    ASSERT_EQ(rust_analysis_detail_count(store, project, "src/caller.rs",
+                                         "allocation_unavailable", "\"count\":2"),
+              0);
+    cbm_store_close(store);
+    cbm_pipeline_free(second);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_incremental_non_rust_registry_poison_preserves_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_registry_incr_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    for (int i = 0; i < 30; i++) {
+        char name[32];
+        char source[160];
+        snprintf(name, sizeof(name), "mod_%02d.py", i);
+        snprintf(source, sizeof(source),
+                 "def helper_%02d():\n    return %d\ndef caller_%02d():\n    return helper_%02d()\n",
+                 i, i, i, i);
+        write_temp_file(tmp, name, source);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/registry.db", tmp);
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(first));
+    cbm_pipeline_free(first);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    int nodes_before = cbm_store_count_nodes(store, project);
+    ASSERT_TRUE(nodes_before > 0);
+    cbm_store_close(store);
+
+    for (int i = 0; i < 9; i++) {
+        char name[32];
+        char source[180];
+        snprintf(name, sizeof(name), "mod_%02d.py", i);
+        snprintf(source, sizeof(source),
+                 "def helper_%02d():\n    return %d\ndef caller_%02d():\n    changed = 1\n    return helper_%02d()\n",
+                 i, i, i, i);
+        write_temp_file(tmp, name, source);
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pxc_test_poison_non_rust_registry_once();
+    cbm_pipeline_t *second = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    ASSERT_TRUE(cbm_pipeline_run(second) != 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    cbm_pipeline_free(second);
+    store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_nodes(store, project), nodes_before);
+    cbm_store_close(store);
+    th_rmtree(tmp);
+    PASS();
+}
+#endif
 
 TEST(pipeline_rust_health_sequential_persists_exact_rows_and_cargo_health) {
     char tmp[256];
@@ -12563,9 +12948,10 @@ TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets) {
         ASSERT_NOT_NULL(carrier_cache[i]);
     }
     int carrier_def_count = 0;
+    CBMPxcCollectStatus carrier_status = CBM_PXC_COLLECT_EMPTY;
     CBMLSPDef *carrier_defs = cbm_pxc_collect_all_defs(
         carrier_cache, carrier_files, 13, "rooted", carrier_modules, &carrier_def_count,
-        carrier_starts, &manifest);
+        &carrier_status, carrier_starts, &manifest);
     ASSERT_NOT_NULL(carrier_defs);
     /* Carrier roots must be owned by the per-file result arenas: manifest
      * routing is a construction-time oracle and its arena may die before
@@ -12605,13 +12991,13 @@ TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets) {
     char *oom_modules[] = {NULL};
     int oom_starts[2] = {0};
     int oom_count = 0;
+    CBMPxcCollectStatus oom_status = CBM_PXC_COLLECT_EMPTY;
     CBMLSPDef *oom_defs = cbm_pxc_collect_all_defs(
-        oom_cache, oom_files, 1, "rooted", oom_modules, &oom_count, oom_starts, &oom_manifest);
-    ASSERT_NOT_NULL(oom_defs);
-    for (int i = 0; i < oom_count; i++) {
-        ASSERT_NULL(oom_defs[i].rust_crate_root_qn);
-        ASSERT_NULL(oom_defs[i].rust_crate_source_module_qn);
-    }
+        oom_cache, oom_files, 1, "rooted", oom_modules, &oom_count, &oom_status, oom_starts,
+        &oom_manifest);
+    ASSERT_NULL(oom_defs);
+    ASSERT_EQ(oom_count, 0);
+    ASSERT_EQ(oom_status, CBM_PXC_COLLECT_ALLOCATION_FAILED);
     carrier_cache[0]->arena.nblocks = saved_nblocks;
     carrier_cache[0]->arena.used = saved_used;
     free(oom_modules[0]);
@@ -13102,6 +13488,15 @@ SUITE(pipeline) {
  * broad pipeline suite so RED/GREEN iterations exercise only this boundary;
  * the default all-suite run still executes it. */
 SUITE(pipeline_semantic_manifest_repro) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    RUN_TEST(pipeline_collect_all_defs_distinguishes_empty_available_and_allocation_failed);
+    RUN_TEST(pipeline_non_rust_collect_failure_aborts_sequential_and_parallel);
+    RUN_TEST(pipeline_cross_publication_rows_are_atomic_at_every_string_copy);
+    RUN_TEST(pipeline_diagnostic_rows_are_atomic_and_capture_loss_is_unavailable);
+    RUN_TEST(pipeline_small_rust_collect_allocation_failure_cannot_complete_cross_route);
+    RUN_TEST(pipeline_incremental_combined_universe_allocation_records_one_failure);
+    RUN_TEST(pipeline_incremental_non_rust_registry_poison_preserves_generation);
+#endif
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
     RUN_TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full);

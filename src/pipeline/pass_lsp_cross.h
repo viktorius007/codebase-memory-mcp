@@ -41,6 +41,14 @@
 
 /* True iff this language has a cbm_run_X_lsp_cross resolver wired up. */
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
+bool cbm_pxc_collection_requires_abort(CBMFileResult *const *cache,
+                                       const cbm_file_info_t *files, int file_count,
+                                       CBMPxcCollectStatus status);
+
+typedef enum {
+    CBM_PXC_DISPATCH_COMPLETE = 0,
+    CBM_PXC_DISPATCH_ALLOCATION_FAILED = 1,
+} CBMPxcDispatchStatus;
 
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the
@@ -48,16 +56,35 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * returned CBMLSPDef[] are borrowed from cache[i]->arena and from
  * def_modules[i] — caller must keep both alive while the array is in
  * use. Returns the malloc'd array (free() it) and writes the entry
- * count to *out_count. Returns NULL on alloc failure or when no defs
- * exist. out_def_starts (optional, file_count + 1 entries, caller-owned)
+ * count to *out_count and the disjoint outcome to *out_status. An empty
+ * universe and allocation failure both return NULL/write 0, but can never be
+ * confused through the typed status. out_def_starts (optional, file_count + 1 entries, caller-owned)
  * receives per-file prefix offsets: file i's defs occupy
  * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
  * needs the per-file slices, which the flat array does not otherwise
  * record. */
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
-                                    int *out_count, int *out_def_starts,
+                                    int *out_count, CBMPxcCollectStatus *out_status,
+                                    int *out_def_starts,
                                     const struct CBMCargoManifest *rust_manifest);
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+/* Deterministic one-shot allocation seams local to the cross-LSP publication
+ * boundary. `copy_position` is 1-based across required/optional string fields. */
+void cbm_pxc_test_fail_collect_alloc_once(void);
+void cbm_pxc_test_fail_target_route_alloc_once(void);
+void cbm_pxc_test_poison_non_rust_registry_once(void);
+void cbm_pxc_test_fail_destination_copy_at(int copy_position);
+bool cbm_pxc_test_append_results(CBMFileResult *destination,
+                                 const CBMResolvedCallArray *source);
+bool cbm_pxc_test_append_synthetic_calls(CBMFileResult *destination,
+                                         const CBMCallArray *source);
+bool cbm_pxc_test_non_rust_destination_failure_is_typed(void);
+#endif
+
+/* Production call sites invoke this unconditionally; non-test builds are a no-op. */
+void cbm_pxc_test_poison_non_rust_registry(CBMArena *arena);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
@@ -187,7 +214,8 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * per-file fallback with FILTERED defs for languages without a shared
  * variant. rust_shared_get (nullable) supplies the lazily-built shared Rust
  * registry for NULL-filter rust files. */
-void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
+CBMPxcDispatchStatus cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result,
+                           const char *source,
                            int source_len, const char *rel, const char *def_module,
                            const CBMCrossLspRegistries *cross_registries,
                            const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,

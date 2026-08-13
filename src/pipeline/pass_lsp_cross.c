@@ -38,6 +38,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
@@ -45,6 +46,71 @@ enum {
     PXC_MAX_FILE_BYTES_FACTOR = 100, /* same cap pass_calls.c uses for source size */
     PXC_ITOA_BUF = 16,
 };
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static atomic_bool g_pxc_test_fail_collect_alloc = false;
+static atomic_bool g_pxc_test_fail_target_route_alloc = false;
+static atomic_bool g_pxc_test_poison_non_rust_registry = false;
+static atomic_int g_pxc_test_destination_copy_position = 0;
+
+void cbm_pxc_test_fail_collect_alloc_once(void) {
+    atomic_store(&g_pxc_test_fail_collect_alloc, true);
+}
+
+void cbm_pxc_test_fail_target_route_alloc_once(void) {
+    atomic_store(&g_pxc_test_fail_target_route_alloc, true);
+}
+
+void cbm_pxc_test_poison_non_rust_registry_once(void) {
+    atomic_store(&g_pxc_test_poison_non_rust_registry, true);
+}
+
+void cbm_pxc_test_poison_non_rust_registry(CBMArena *arena) {
+    if (atomic_exchange(&g_pxc_test_poison_non_rust_registry, false)) {
+        cbm_arena_test_fail_after(arena, 0);
+        (void)cbm_arena_alloc(arena, 1);
+    }
+}
+
+void cbm_pxc_test_fail_destination_copy_at(int copy_position) {
+    atomic_store(&g_pxc_test_destination_copy_position, copy_position);
+}
+
+static bool pxc_test_fail_collect_alloc(void) {
+    return atomic_exchange(&g_pxc_test_fail_collect_alloc, false);
+}
+
+static bool pxc_test_fail_target_route_alloc(void) {
+    return atomic_exchange(&g_pxc_test_fail_target_route_alloc, false);
+}
+
+static bool pxc_test_fail_destination_copy(void) {
+    int position = atomic_load(&g_pxc_test_destination_copy_position);
+    while (position > 0) {
+        if (atomic_compare_exchange_weak(&g_pxc_test_destination_copy_position, &position,
+                                         position - 1)) {
+            return position == 1;
+        }
+    }
+    return false;
+}
+#else
+static bool pxc_test_fail_collect_alloc(void) {
+    return false;
+}
+
+static bool pxc_test_fail_target_route_alloc(void) {
+    return false;
+}
+
+void cbm_pxc_test_poison_non_rust_registry(CBMArena *arena) {
+    (void)arena;
+}
+
+static bool pxc_test_fail_destination_copy(void) {
+    return false;
+}
+#endif
 
 /* Format an int into a thread-local rotating buffer for log key=value emission.
  * Mirrors the itoa_log helper in pass_calls.c — kept local so passes don't
@@ -261,6 +327,7 @@ static const char *pxc_qn_leaf(const char *name) {
 typedef struct {
     const char *root_qn;
     const char *source_module_qn;
+    bool allocation_failed;
 } PxcRustTargetRoute;
 
 static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *project_name,
@@ -315,12 +382,18 @@ static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *pro
     char *root_rel =
         slash ? cbm_arena_strndup(arena, selected_source, (size_t)(slash - selected_source))
               : cbm_arena_strdup(arena, "");
-    if (!root_rel) return route;
-    char *root = cbm_pipeline_fqn_module(project_name, root_rel);
+    if (!root_rel) {
+        route.allocation_failed = true;
+        return route;
+    }
+    char *root = pxc_test_fail_target_route_alloc()
+                     ? NULL
+                     : cbm_pipeline_fqn_module(project_name, root_rel);
     char *source_module = cbm_pipeline_fqn_module(project_name, selected_source);
     if (!root || !source_module) {
         free(root);
         free(source_module);
+        route.allocation_failed = true;
         return route;
     }
     const char *owned_root = cbm_arena_strdup(arena, root);
@@ -328,6 +401,7 @@ static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *pro
     free(root);
     free(source_module);
     if (!owned_root || !owned_source) {
+        route.allocation_failed = true;
         return route;
     }
     route.root_qn = owned_root;
@@ -407,8 +481,10 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
  * borrowed from cache[i]->arena and from def_modules[i] (also borrowed). */
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
-                                    int *out_count, int *out_def_starts,
+                                    int *out_count, CBMPxcCollectStatus *out_status,
+                                    int *out_def_starts,
                                     const CBMCargoManifest *rust_manifest) {
+    *out_status = CBM_PXC_COLLECT_EMPTY;
     int total = 0;
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
@@ -425,15 +501,19 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         }
         return NULL;
     }
-    CBMLSPDef *defs = (CBMLSPDef *)calloc((size_t)total, sizeof(CBMLSPDef));
+    CBMLSPDef *defs = pxc_test_fail_collect_alloc()
+                          ? NULL
+                          : (CBMLSPDef *)calloc((size_t)total, sizeof(CBMLSPDef));
     if (!defs) {
         *out_count = 0;
+        *out_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
         if (out_def_starts) {
             memset(out_def_starts, 0, (size_t)(file_count + 1) * sizeof(int));
         }
         return NULL;
     }
     int idx = 0;
+    bool materialization_failed = false;
     for (int fi = 0; fi < file_count; fi++) {
         if (out_def_starts) {
             out_def_starts[fi] = idx;
@@ -443,12 +523,20 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         if (!def_modules[fi]) {
             def_modules[fi] = cbm_pipeline_fqn_module_dir(project_name, files[fi].rel_path,
                                                           pxc_module_is_dir(files[fi].language));
+            if (!def_modules[fi]) {
+                materialization_failed = true;
+                break;
+            }
         }
         const char *namespace_name = cache[fi]->namespace_name;
         PxcRustTargetRoute rust_route = {0};
         if (files[fi].language == CBM_LANG_RUST) {
             rust_route = pxc_rust_target_route(&cache[fi]->arena, project_name,
                                                 files[fi].rel_path, rust_manifest);
+            if (rust_route.allocation_failed) {
+                materialization_failed = true;
+                break;
+            }
         }
         if ((!namespace_name || !namespace_name[0]) && files[fi].rel_path) {
             namespace_name =
@@ -473,11 +561,25 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
                 }
             }
         }
+        if (cbm_arena_status(&cache[fi]->arena) != CBM_ARENA_STATUS_AVAILABLE) {
+            materialization_failed = true;
+            break;
+        }
+    }
+    if (materialization_failed) {
+        free(defs);
+        *out_count = 0;
+        *out_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
+        if (out_def_starts) {
+            memset(out_def_starts, 0, (size_t)(file_count + 1) * sizeof(int));
+        }
+        return NULL;
     }
     if (out_def_starts) {
         out_def_starts[file_count] = idx;
     }
     *out_count = idx;
+    *out_status = CBM_PXC_COLLECT_AVAILABLE;
     return defs;
 }
 
@@ -780,6 +882,21 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     }
 }
 
+bool cbm_pxc_collection_requires_abort(CBMFileResult *const *cache,
+                                       const cbm_file_info_t *files, int file_count,
+                                       CBMPxcCollectStatus status) {
+    if (status != CBM_PXC_COLLECT_ALLOCATION_FAILED) {
+        return false;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (cache[i] && files[i].language != CBM_LANG_RUST &&
+            cbm_pxc_has_cross_lsp(files[i].language)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Append cross-file results from `src_out` (allocated in a scratch arena
  * about to be destroyed) into `dst_calls` (lives in cache_entry->arena),
  * copying every string field into dst_arena. Skips entries whose
@@ -795,14 +912,80 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
  * resolved very many cross-calls turned the whole append into O(n^2) and could
  * peg a core for minutes (observed: an index hung in pxc_append_results/strcmp).
  * The key strings live in a scratch arena that is destroyed after the table. */
-static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
-                               const CBMResolvedCallArray *src_out) {
+typedef struct {
+    bool complete;
+    uint32_t resolved_emitted;
+    uint32_t unresolved_emitted;
+} PxcAppendStatus;
+
+static bool pxc_copy_destination_string(CBMArena *arena, const char *source, const char **out) {
+    *out = NULL;
+    if (!source) {
+        return true;
+    }
+    if (pxc_test_fail_destination_copy()) {
+        return false;
+    }
+    *out = cbm_arena_strdup(arena, source);
+    return *out != NULL;
+}
+
+static bool pxc_resolved_reserve_one(CBMArena *arena, CBMResolvedCallArray *calls) {
+    if (calls->count < calls->cap) {
+        return true;
+    }
+    int next = calls->cap == 0 ? CBM_SZ_32 : calls->cap * 2;
+    CBMResolvedCall *items =
+        (CBMResolvedCall *)cbm_arena_alloc(arena, (size_t)next * sizeof(*items));
+    if (!items) {
+        return false;
+    }
+    if (calls->items && calls->count > 0) {
+        memcpy(items, calls->items, (size_t)calls->count * sizeof(*items));
+    }
+    calls->items = items;
+    calls->cap = next;
+    return true;
+}
+
+static bool pxc_calls_reserve_one(CBMArena *arena, CBMCallArray *calls) {
+    if (calls->count < calls->cap) {
+        return true;
+    }
+    int next = calls->cap == 0 ? CBM_SZ_32 : calls->cap * 2;
+    CBMCall *items = (CBMCall *)cbm_arena_alloc(arena, (size_t)next * sizeof(*items));
+    if (!items) {
+        return false;
+    }
+    if (calls->items && calls->count > 0) {
+        memcpy(items, calls->items, (size_t)calls->count * sizeof(*items));
+    }
+    calls->items = items;
+    calls->cap = next;
+    return true;
+}
+
+static void pxc_append_count(PxcAppendStatus *status, const CBMResolvedCall *call) {
+    if (call->reason && call->confidence <= 0.0f) {
+        status->unresolved_emitted++;
+    } else {
+        status->resolved_emitted++;
+    }
+}
+
+static PxcAppendStatus pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
+                                          const CBMResolvedCallArray *src_out) {
+    PxcAppendStatus status = {.complete = false};
     if (!dst_calls || !src_out)
-        return;
+        return status;
 
     CBMArena keys;
     cbm_arena_init(&keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_out->count + 1));
+    if (!seen) {
+        cbm_arena_destroy(&keys);
+        return status;
+    }
 
     for (int i = 0; i < dst_calls->count; i++) {
         const CBMResolvedCall *rc = &dst_calls->items[i];
@@ -810,12 +993,17 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
             char *k = cbm_arena_sprintf(&keys, "%u\x1f%s\x1f%s\x1f%u:%u\x1f%u", (unsigned)rc->kind,
                                         rc->caller_qn, rc->callee_qn, rc->site_start_byte,
                                         rc->site_end_byte, (unsigned)rc->source_origin);
-            if (k) {
-                void *prior = cbm_ht_get(seen, k);
-                if (!prior ||
-                    rc->confidence > dst_calls->items[(int)(uintptr_t)prior - 1].confidence) {
-                    const char *stored = cbm_ht_get_key(seen, k);
-                    cbm_ht_set(seen, stored ? stored : k, (void *)(uintptr_t)(i + 1));
+            if (!k) {
+                goto done;
+            }
+            void *prior = cbm_ht_get(seen, k);
+            if (!prior || rc->confidence >
+                              dst_calls->items[(int)(uintptr_t)prior - 1].confidence) {
+                const char *stored = cbm_ht_get_key(seen, k);
+                void *expected = (void *)(uintptr_t)(i + 1);
+                cbm_ht_set(seen, stored ? stored : k, expected);
+                if (cbm_ht_get(seen, stored ? stored : k) != expected) {
+                    goto done;
                 }
             }
         }
@@ -828,40 +1016,52 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         char *k = cbm_arena_sprintf(&keys, "%u\x1f%s\x1f%s\x1f%u:%u\x1f%u", (unsigned)src->kind,
                                     src->caller_qn, src->callee_qn, src->site_start_byte,
                                     src->site_end_byte, (unsigned)src->source_origin);
+        if (!k) {
+            goto done;
+        }
         void *prior = k ? cbm_ht_get(seen, k) : NULL;
         if (prior) {
             CBMResolvedCall *dst = &dst_calls->items[(int)(uintptr_t)prior - 1];
             if (src->confidence > dst->confidence) {
-                dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
-                dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
-                dst->strategy = src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
-                dst->confidence = src->confidence;
-                dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
-                dst->kind = src->kind;
-                dst->site_start_byte = src->site_start_byte;
-                dst->site_end_byte = src->site_end_byte;
-                dst->source_origin = src->source_origin;
+                CBMResolvedCall materialized = *src;
+                if (!pxc_copy_destination_string(dst_arena, src->caller_qn,
+                                                 &materialized.caller_qn) ||
+                    !pxc_copy_destination_string(dst_arena, src->callee_qn,
+                                                 &materialized.callee_qn) ||
+                    !pxc_copy_destination_string(dst_arena, src->strategy,
+                                                 &materialized.strategy) ||
+                    !pxc_copy_destination_string(dst_arena, src->reason, &materialized.reason)) {
+                    goto done;
+                }
+                *dst = materialized;
             }
             continue;
         }
-        CBMResolvedCall dst = {0};
-        dst.caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
-        dst.callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
-        dst.strategy = src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
-        dst.confidence = src->confidence;
-        dst.reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
-        dst.kind = src->kind;
-        dst.site_start_byte = src->site_start_byte;
-        dst.site_end_byte = src->site_end_byte;
-        dst.source_origin = src->source_origin;
-        cbm_resolvedcall_push(dst_calls, dst_arena, dst);
+        if (!pxc_resolved_reserve_one(dst_arena, dst_calls)) {
+            goto done;
+        }
+        CBMResolvedCall dst = *src;
+        if (!pxc_copy_destination_string(dst_arena, src->caller_qn, &dst.caller_qn) ||
+            !pxc_copy_destination_string(dst_arena, src->callee_qn, &dst.callee_qn) ||
+            !pxc_copy_destination_string(dst_arena, src->strategy, &dst.strategy) ||
+            !pxc_copy_destination_string(dst_arena, src->reason, &dst.reason)) {
+            goto done;
+        }
+        dst_calls->items[dst_calls->count++] = dst;
+        pxc_append_count(&status, src);
         if (k) {
-            cbm_ht_set(seen, k, (void *)(uintptr_t)dst_calls->count);
+            void *expected = (void *)(uintptr_t)dst_calls->count;
+            cbm_ht_set(seen, k, expected);
+            if (cbm_ht_get(seen, k) != expected) {
+                goto done;
+            }
         }
     }
-
+    status.complete = true;
+done:
     cbm_ht_free(seen);
     cbm_arena_destroy(&keys);
+    return status;
 }
 
 /* Merge exact synthetic call carriers produced by a cross-LSP resolver. The
@@ -869,14 +1069,19 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
  * arena, so every pointer-bearing field is copied explicitly. Invalid/legacy
  * zero-span carriers are rejected: a requires-LSP carrier is safe only when it
  * can join the semantic record for the same source occurrence. */
-static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_calls,
+static bool pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_calls,
                                        const CBMCallArray *src_calls) {
     if (!dst_arena || !dst_calls || !src_calls || src_calls->count <= 0)
-        return;
+        return dst_arena && dst_calls && src_calls;
 
     CBMArena keys;
     cbm_arena_init(&keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_calls->count + 1));
+    if (!seen) {
+        cbm_arena_destroy(&keys);
+        return false;
+    }
+    bool complete = false;
 
     for (int i = 0; i < dst_calls->count; i++) {
         const CBMCall *call = &dst_calls->items[i];
@@ -888,8 +1093,16 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
             &keys, "%s\x1f%s\x1f%u:%u\x1f%u\x1f%d:%d", call->enclosing_func_qn, call->callee_name,
             call->site_start_byte, call->site_end_byte, (unsigned)call->source_origin,
             call->requires_lsp_resolution ? 1 : 0, call->is_method ? 1 : 0);
-        if (key && !cbm_ht_get(seen, key))
-            cbm_ht_set(seen, key, (void *)(uintptr_t)(i + 1));
+        if (!key) {
+            goto done;
+        }
+        if (!cbm_ht_get(seen, key)) {
+            void *expected = (void *)(uintptr_t)(i + 1);
+            cbm_ht_set(seen, key, expected);
+            if (cbm_ht_get(seen, key) != expected) {
+                goto done;
+            }
+        }
     }
 
     for (int i = 0; i < src_calls->count; i++) {
@@ -902,32 +1115,122 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
             &keys, "%s\x1f%s\x1f%u:%u\x1f%u\x1f%d:%d", src->enclosing_func_qn, src->callee_name,
             src->site_start_byte, src->site_end_byte, (unsigned)src->source_origin,
             src->requires_lsp_resolution ? 1 : 0, src->is_method ? 1 : 0);
+        if (!key) {
+            goto done;
+        }
         if (key && cbm_ht_get(seen, key))
             continue;
 
-        CBMCall dst = *src;
-        dst.callee_name = cbm_arena_strdup(dst_arena, src->callee_name);
-        dst.enclosing_func_qn = cbm_arena_strdup(dst_arena, src->enclosing_func_qn);
-        dst.first_string_arg =
-            src->first_string_arg ? cbm_arena_strdup(dst_arena, src->first_string_arg) : NULL;
-        dst.second_arg_name =
-            src->second_arg_name ? cbm_arena_strdup(dst_arena, src->second_arg_name) : NULL;
-        for (int ai = 0; ai < CBM_MAX_CALL_ARGS; ai++) {
-            dst.args[ai].expr =
-                src->args[ai].expr ? cbm_arena_strdup(dst_arena, src->args[ai].expr) : NULL;
-            dst.args[ai].value =
-                src->args[ai].value ? cbm_arena_strdup(dst_arena, src->args[ai].value) : NULL;
-            dst.args[ai].keyword =
-                src->args[ai].keyword ? cbm_arena_strdup(dst_arena, src->args[ai].keyword) : NULL;
+        if (!pxc_calls_reserve_one(dst_arena, dst_calls)) {
+            goto done;
         }
-        cbm_calls_push(dst_calls, dst_arena, dst);
-        if (key)
-            cbm_ht_set(seen, key, (void *)(uintptr_t)dst_calls->count);
+        CBMCall dst = *src;
+        if (!pxc_copy_destination_string(dst_arena, src->callee_name, &dst.callee_name) ||
+            !pxc_copy_destination_string(dst_arena, src->enclosing_func_qn,
+                                         &dst.enclosing_func_qn) ||
+            !pxc_copy_destination_string(dst_arena, src->first_string_arg,
+                                         &dst.first_string_arg) ||
+            !pxc_copy_destination_string(dst_arena, src->second_arg_name,
+                                         &dst.second_arg_name)) {
+            goto done;
+        }
+        for (int ai = 0; ai < CBM_MAX_CALL_ARGS; ai++) {
+            if (!pxc_copy_destination_string(dst_arena, src->args[ai].expr,
+                                             &dst.args[ai].expr) ||
+                !pxc_copy_destination_string(dst_arena, src->args[ai].value,
+                                             &dst.args[ai].value) ||
+                !pxc_copy_destination_string(dst_arena, src->args[ai].keyword,
+                                             &dst.args[ai].keyword)) {
+                goto done;
+            }
+        }
+        dst_calls->items[dst_calls->count++] = dst;
+        if (key) {
+            void *expected = (void *)(uintptr_t)dst_calls->count;
+            cbm_ht_set(seen, key, expected);
+            if (cbm_ht_get(seen, key) != expected) {
+                goto done;
+            }
+        }
     }
-
+    complete = true;
+done:
     cbm_ht_free(seen);
     cbm_arena_destroy(&keys);
+    return complete;
 }
+
+static uint32_t pxc_saturating_add(uint32_t left, uint32_t right) {
+    return UINT32_MAX - left < right ? UINT32_MAX : left + right;
+}
+
+static CBMPxcDispatchStatus pxc_destination_status(CBMLanguage lang, CBMFileResult *result,
+                                                    CBMPxcDispatchStatus status) {
+    if (cbm_file_result_status(result) == CBM_FILE_STATUS_COMPLETE &&
+        status == CBM_PXC_DISPATCH_COMPLETE) {
+        return status;
+    }
+    if (lang == CBM_LANG_RUST) {
+        if (result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count == 0) {
+            cbm_rust_health_record(&result->rust_health,
+                                   CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+        }
+        result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+    }
+    return CBM_PXC_DISPATCH_ALLOCATION_FAILED;
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+bool cbm_pxc_test_non_rust_destination_failure_is_typed(void) {
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_arena_test_fail_after(&result.arena, 0);
+    (void)cbm_arena_alloc(&result.arena, 1);
+    bool typed = pxc_destination_status(CBM_LANG_PYTHON, &result,
+                                        CBM_PXC_DISPATCH_COMPLETE) ==
+                 CBM_PXC_DISPATCH_ALLOCATION_FAILED;
+    cbm_arena_destroy(&result.arena);
+    return typed;
+}
+#endif
+
+static void pxc_finalize_rust_publication(CBMFileResult *result, uint32_t resolved_before,
+                                          uint32_t unresolved_before,
+                                          PxcAppendStatus resolved_status,
+                                          bool synthetic_complete, bool scratch_complete) {
+    result->rust_health.resolved_emitted =
+        pxc_saturating_add(resolved_before, resolved_status.resolved_emitted);
+    result->rust_health.unresolved_emitted =
+        pxc_saturating_add(unresolved_before, resolved_status.unresolved_emitted);
+    if (!resolved_status.complete || !synthetic_complete || !scratch_complete) {
+        cbm_rust_health_record(&result->rust_health, CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+        result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+    }
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+bool cbm_pxc_test_append_results(CBMFileResult *destination,
+                                 const CBMResolvedCallArray *source) {
+    uint32_t resolved_before = destination->rust_health.resolved_emitted;
+    uint32_t unresolved_before = destination->rust_health.unresolved_emitted;
+    PxcAppendStatus status =
+        pxc_append_results(&destination->arena, &destination->resolved_calls, source);
+    pxc_finalize_rust_publication(destination, resolved_before, unresolved_before, status, true,
+                                  true);
+    return status.complete;
+}
+
+bool cbm_pxc_test_append_synthetic_calls(CBMFileResult *destination,
+                                         const CBMCallArray *source) {
+    bool complete =
+        pxc_append_synthetic_calls(&destination->arena, &destination->calls, source);
+    if (!complete) {
+        cbm_rust_health_record(&destination->rust_health,
+                               CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+    }
+    return complete;
+}
+#endif
 
 /* Convert a CBMLSPDef array (the pipeline's lingua franca, go_lsp.h:73)
  * into a CBMRustLSPDef array (rust_lsp.h) inside `arena`. The two structs
@@ -969,7 +1272,8 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * directly across N files (test_incremental.c saw 3.5 GB peak on a
  * 1100-file repo before this fix). Output gets copied into the file's own
  * arena and merged into result->resolved_calls. */
-static void pxc_run_one_with_manifest(CBMLanguage lang, CBMFileResult *r, const char *source,
+static CBMPxcDispatchStatus pxc_run_one_with_manifest(CBMLanguage lang, CBMFileResult *r,
+                                      const char *source,
                                       int source_len, const char *module_qn, CBMLSPDef *defs,
                                       int def_count, const char **imp_names, const char **imp_qns,
                                       int imp_count, const CBMCargoManifest *rust_manifest) {
@@ -981,6 +1285,8 @@ static void pxc_run_one_with_manifest(CBMLanguage lang, CBMFileResult *r, const 
     memset(&out, 0, sizeof(out));
     CBMCallArray synthetic_calls;
     memset(&synthetic_calls, 0, sizeof(synthetic_calls));
+    uint32_t rust_resolved_before = r->rust_health.resolved_emitted;
+    uint32_t rust_unresolved_before = r->rust_health.unresolved_emitted;
 
     switch (lang) {
     case CBM_LANG_GO:
@@ -1032,9 +1338,19 @@ static void pxc_run_one_with_manifest(CBMLanguage lang, CBMFileResult *r, const 
         break;
     }
 
-    pxc_append_results(&r->arena, &r->resolved_calls, &out);
-    pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
+    PxcAppendStatus resolved_status = pxc_append_results(&r->arena, &r->resolved_calls, &out);
+    bool synthetic_complete =
+        pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
+    bool scratch_complete = cbm_arena_status(&scratch) == CBM_ARENA_STATUS_AVAILABLE;
+    if (lang == CBM_LANG_RUST) {
+        pxc_finalize_rust_publication(
+            r, rust_resolved_before, rust_unresolved_before, resolved_status, synthetic_complete,
+            scratch_complete);
+    }
     cbm_arena_destroy(&scratch);
+    return resolved_status.complete && synthetic_complete && scratch_complete
+               ? CBM_PXC_DISPATCH_COMPLETE
+               : CBM_PXC_DISPATCH_ALLOCATION_FAILED;
 }
 
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
@@ -1046,7 +1362,8 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
 
 /* Variant of cbm_pxc_run_one for TS/JS/JSX/TSX with explicit dialect
  * flags. Same scratch-arena lifecycle as cbm_pxc_run_one. */
-void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
+static CBMPxcDispatchStatus pxc_run_one_ts_status(
+                        CBMFileResult *r, const char *source, int source_len, const char *module_qn,
                         CBMLSPDef *defs, int def_count, const char **imp_names,
                         const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode) {
@@ -1058,8 +1375,19 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
     cbm_run_ts_lsp_cross(&scratch, source, source_len, module_qn, js_mode, jsx_mode, dts_mode, defs,
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
-    pxc_append_results(&r->arena, &r->resolved_calls, &out);
+    PxcAppendStatus status = pxc_append_results(&r->arena, &r->resolved_calls, &out);
+    bool scratch_complete = cbm_arena_status(&scratch) == CBM_ARENA_STATUS_AVAILABLE;
     cbm_arena_destroy(&scratch);
+    return status.complete && scratch_complete ? CBM_PXC_DISPATCH_COMPLETE
+                                               : CBM_PXC_DISPATCH_ALLOCATION_FAILED;
+}
+
+void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
+                        CBMLSPDef *defs, int def_count, const char **imp_names,
+                        const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
+                        bool dts_mode) {
+    (void)pxc_run_one_ts_status(r, source, source_len, module_qn, defs, def_count, imp_names,
+                                imp_qns, imp_count, js_mode, jsx_mode, dts_mode);
 }
 
 /* Parse the project's root Cargo.toml (if present) into `out_m`, using
@@ -1081,7 +1409,8 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * `rust_shared_get` supplies the lazily-built shared Rust all-defs registry
  * (the parallel resolver owns its once-guard); NULL means "no shared rust
  * registry available" and rust NULL-filter files take the per-file build. */
-void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
+CBMPxcDispatchStatus cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result,
+                           const char *source,
                            int source_len, const char *rel, const char *def_module,
                            const CBMCrossLspRegistries *cross_registries,
                            const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
@@ -1089,9 +1418,10 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            int imp_count, const CBMCargoManifest *rust_manifest,
                            CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx) {
     if (!result) {
-        return;
+        return CBM_PXC_DISPATCH_COMPLETE;
     }
     bool used_prebuilt = false;
+    CBMPxcDispatchStatus publication_status = CBM_PXC_DISPATCH_COMPLETE;
     CBMTypeRegistry *prebuilt =
         cross_registries ? cbm_pxc_registry_for_lang(cross_registries, lang) : NULL;
     if (prebuilt) {
@@ -1110,10 +1440,17 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_run_py_lsp_cross_with_registry(&scratch, source, source_len, def_module, prebuilt,
                                                imp_keys, imp_vals, imp_count, result->cached_tree,
                                                &out, &synthetic_calls);
-            pxc_append_results(&result->arena, &result->resolved_calls, &out);
-            pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
+            PxcAppendStatus resolved_status =
+                pxc_append_results(&result->arena, &result->resolved_calls, &out);
+            bool synthetic_complete =
+                pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
+            if (!resolved_status.complete || !synthetic_complete ||
+                cbm_arena_status(&scratch) != CBM_ARENA_STATUS_AVAILABLE) {
+                publication_status = CBM_PXC_DISPATCH_ALLOCATION_FAILED;
+            }
             cbm_arena_destroy(&scratch);
             used_prebuilt = true;
+            break;
         }
         case CBM_LANG_C:
         case CBM_LANG_CPP:
@@ -1122,12 +1459,16 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                 &result->arena, source, source_len, def_module, (lang != CBM_LANG_C), prebuilt,
                 imp_keys, imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
             used_prebuilt = true;
+            if (cbm_arena_status(&result->arena) != CBM_ARENA_STATUS_AVAILABLE)
+                publication_status = CBM_PXC_DISPATCH_ALLOCATION_FAILED;
             break;
         case CBM_LANG_CSHARP:
             cbm_run_cs_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
                                                prebuilt, imp_vals, imp_count, result->cached_tree,
                                                &result->resolved_calls);
             used_prebuilt = true;
+            if (cbm_arena_status(&result->arena) != CBM_ARENA_STATUS_AVAILABLE)
+                publication_status = CBM_PXC_DISPATCH_ALLOCATION_FAILED;
             break;
         case CBM_LANG_JAVASCRIPT:
         case CBM_LANG_TYPESCRIPT:
@@ -1159,6 +1500,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                                                &result->resolved_calls);
             free(ts_filtered);
             used_prebuilt = true;
+            if (cbm_arena_status(&result->arena) != CBM_ARENA_STATUS_AVAILABLE)
+                publication_status = CBM_PXC_DISPATCH_ALLOCATION_FAILED;
             break;
         }
         /* PHP falls through to the per-file build path below until its
@@ -1169,7 +1512,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     }
 
     if (used_prebuilt) {
-        return;
+        return pxc_destination_status(lang, result, publication_status);
     }
     /* Fallback: gopls per-file filter + per-file registry build. RUST is
      * exempt from the module filter: its resolution is Cargo-manifest-aware
@@ -1199,29 +1542,45 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_arena_init(&scratch);
             CBMResolvedCallArray out = {0};
             CBMCallArray synthetic_calls = {0};
+            uint32_t rust_resolved_before = result->rust_health.resolved_emitted;
+            uint32_t rust_unresolved_before = result->rust_health.unresolved_emitted;
             cbm_run_rust_lsp_cross_with_registry(&scratch, source, source_len, def_module, shared,
                                                  imp_keys, imp_vals, imp_count, result->cached_tree,
                                                  rust_manifest, &out, &synthetic_calls,
                                                  &result->rust_health);
-            pxc_append_results(&result->arena, &result->resolved_calls, &out);
-            pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
+            PxcAppendStatus resolved_status =
+                pxc_append_results(&result->arena, &result->resolved_calls, &out);
+            bool synthetic_complete = pxc_append_synthetic_calls(
+                &result->arena, &result->calls, &synthetic_calls);
+            pxc_finalize_rust_publication(
+                result, rust_resolved_before, rust_unresolved_before, resolved_status,
+                synthetic_complete, cbm_arena_status(&scratch) == CBM_ARENA_STATUS_AVAILABLE);
             cbm_arena_destroy(&scratch);
+            publication_status = resolved_status.complete && synthetic_complete &&
+                                         cbm_arena_status(&result->arena) ==
+                                             CBM_ARENA_STATUS_AVAILABLE
+                                     ? CBM_PXC_DISPATCH_COMPLETE
+                                     : CBM_PXC_DISPATCH_ALLOCATION_FAILED;
         } else {
-            pxc_run_one_with_manifest(lang, result, source, source_len, def_module, file_defs,
-                                      file_def_count, imp_keys, imp_vals, imp_count, rust_manifest);
+            publication_status = pxc_run_one_with_manifest(
+                lang, result, source, source_len, def_module, file_defs, file_def_count, imp_keys,
+                imp_vals, imp_count, rust_manifest);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
         bool jsx;
         bool dts;
         cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
-        cbm_pxc_run_one_ts(result, source, source_len, def_module, file_defs, file_def_count,
-                           imp_keys, imp_vals, imp_count, js, jsx, dts);
+        publication_status = pxc_run_one_ts_status(result, source, source_len, def_module,
+                                                    file_defs, file_def_count, imp_keys, imp_vals,
+                                                    imp_count, js, jsx, dts);
     } else {
-        pxc_run_one_with_manifest(lang, result, source, source_len, def_module, file_defs,
-                                  file_def_count, imp_keys, imp_vals, imp_count, rust_manifest);
+        publication_status = pxc_run_one_with_manifest(
+            lang, result, source, source_len, def_module, file_defs, file_def_count, imp_keys,
+            imp_vals, imp_count, rust_manifest);
     }
     free(filtered);
+    return pxc_destination_status(lang, result, publication_status);
 }
 
 static bool pxc_cargo_append_existing_target(const char *repo_path, const char *member_dir,
@@ -1705,10 +2064,22 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     /* Per-file module QN cache so we don't recompute it once per def + once
      * per call. cbm_pipeline_fqn_module mallocs; freed at end. */
     int def_count = 0;
+    CBMPxcCollectStatus collect_status = CBM_PXC_COLLECT_EMPTY;
     int *def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
     CBMLSPDef *all_defs = cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
-                                                   def_modules, &def_count, def_starts,
+                                                   def_modules, &def_count, &collect_status,
+                                                   def_starts,
                                                    rust_manifest);
+    if (collect_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
+        for (int i = 0; i < file_count; i++) {
+            if (cache[i] && files[i].language == CBM_LANG_RUST) {
+                cache[i]->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+                cache[i]->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+                cbm_rust_health_record(&cache[i]->rust_health,
+                                       CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+            }
+        }
+    }
     /* Same seam as the parallel driver: serialize per-file surfaces while the
      * result cache is alive. Failure only degrades to a full rebuild on the
      * next incremental run. */
@@ -1748,15 +2119,29 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
     }
 
+    bool dispatch_failed = false;
+    cbm_pxc_test_poison_non_rust_registry(&ctx->seq_cross_arena);
+
+    if (ctx->seq_cross_arena_live &&
+        cbm_arena_status(&ctx->seq_cross_arena) != CBM_ARENA_STATUS_AVAILABLE) {
+        memset(&cross_registries, 0, sizeof(cross_registries));
+        dispatch_failed = true;
+    }
+
     int processed = 0;
     int skipped_no_lsp = 0;
     int skipped_no_source = 0;
     int per_lang_calls = 0;
+    dispatch_failed = dispatch_failed || cbm_pxc_collection_requires_abort(
+                                              cache, files, file_count, collect_status);
 
     for (int i = 0; i < file_count; i++) {
         if (!cache[i])
             continue;
         CBMLanguage lang = files[i].language;
+        if (collect_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
+            continue;
+        }
         if (!cbm_pxc_has_cross_lsp(lang)) {
             skipped_no_lsp++;
             continue;
@@ -1790,9 +2175,13 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
          * file, not to a stale extraction marker (the innocent-quarantine
          * failure mode). */
         cbm_index_mark_start(files[i].rel_path);
-        cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
-                              &cross_registries, module_def_index, all_defs, def_count, imp_keys,
-                              imp_vals, imp_count, rust_manifest, NULL, NULL);
+        CBMPxcDispatchStatus dispatch_status = cbm_pxc_dispatch_file(
+            lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
+            &cross_registries, module_def_index, all_defs, def_count, imp_keys, imp_vals,
+            imp_count, rust_manifest, NULL, NULL);
+        if (dispatch_status == CBM_PXC_DISPATCH_ALLOCATION_FAILED && lang != CBM_LANG_RUST) {
+            dispatch_failed = true;
+        }
         cbm_index_mark_done(files[i].rel_path);
         per_lang_calls++;
         processed++;
@@ -1821,7 +2210,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
                  "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_skipped_no_source",
                  itoa_buf(skipped_no_source), "defs_total", itoa_buf(def_count), "lsp_calls",
                  itoa_buf(per_lang_calls));
-    return 0;
+    return dispatch_failed ? CBM_NOT_FOUND : 0;
 }
 
 /* ── Per-module def index (gopls "package summary" pattern) ──── */

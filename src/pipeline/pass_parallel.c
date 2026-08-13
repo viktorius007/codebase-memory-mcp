@@ -283,7 +283,37 @@ typedef struct {
     cbm_file_error_t *items;
     int count;
     int cap;
+    bool capture_failed;
 } pp_err_list_t;
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static atomic_int g_pp_test_error_alloc_position = 0;
+static atomic_size_t g_pp_test_rust_registry_fail_after = SIZE_MAX;
+#define PP_TEST_POISON_REGISTRY_AFTER_BUILD (SIZE_MAX - 1)
+
+void cbm_parallel_test_fail_error_alloc_at(int position) {
+    atomic_store(&g_pp_test_error_alloc_position, position);
+}
+
+void cbm_parallel_test_fail_rust_registry_after(size_t successful_allocations) {
+    atomic_store(&g_pp_test_rust_registry_fail_after, successful_allocations);
+}
+
+static bool pp_err_test_allows_alloc(void) {
+    int position = atomic_load(&g_pp_test_error_alloc_position);
+    while (position > 0) {
+        if (atomic_compare_exchange_weak(&g_pp_test_error_alloc_position, &position,
+                                         position - 1)) {
+            return position != 1;
+        }
+    }
+    return true;
+}
+#else
+static bool pp_err_test_allows_alloc(void) {
+    return true;
+}
+#endif
 
 /* NULL-safe heap strdup. */
 static char *pp_err_dup(const char *s) {
@@ -291,33 +321,67 @@ static char *pp_err_dup(const char *s) {
         return NULL;
     }
     size_t n = strlen(s) + 1;
-    char *d = (char *)malloc(n);
+    char *d = pp_err_test_allows_alloc() ? (char *)malloc(n) : NULL;
     if (d) {
         memcpy(d, s, n);
     }
     return d;
 }
 
-static void pp_err_add(pp_err_list_t *list, const char *path, const char *reason,
+static bool pp_err_add(pp_err_list_t *list, const char *path, const char *reason,
                        const char *phase) {
     if (!list) {
-        return;
+        return false;
+    }
+    char *path_copy = pp_err_dup(path);
+    char *reason_copy = pp_err_dup(reason);
+    char *phase_copy = pp_err_dup(phase);
+    if ((path && !path_copy) || (reason && !reason_copy) || (phase && !phase_copy)) {
+        free(path_copy);
+        free(reason_copy);
+        free(phase_copy);
+        list->capture_failed = true;
+        return false;
     }
     if (list->count >= list->cap) {
         int ncap = list->cap ? list->cap * 2 : 8;
-        cbm_file_error_t *grown =
-            (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown));
+        cbm_file_error_t *grown = pp_err_test_allows_alloc()
+                                      ? (cbm_file_error_t *)realloc(
+                                            list->items, (size_t)ncap * sizeof(*grown))
+                                      : NULL;
         if (!grown) {
-            return; /* drop on OOM — never fail extraction to record a skip */
+            free(path_copy);
+            free(reason_copy);
+            free(phase_copy);
+            list->capture_failed = true;
+            return false;
         }
         list->items = grown;
         list->cap = ncap;
     }
-    list->items[list->count].path = pp_err_dup(path);
-    list->items[list->count].reason = pp_err_dup(reason);
-    list->items[list->count].phase = pp_err_dup(phase);
+    list->items[list->count].path = path_copy;
+    list->items[list->count].reason = reason_copy;
+    list->items[list->count].phase = phase_copy;
     list->count++;
+    return true;
 }
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+bool cbm_parallel_test_error_add_is_atomic(int allocation_position) {
+    pp_err_list_t list = {0};
+    cbm_parallel_test_fail_error_alloc_at(allocation_position);
+    bool added = pp_err_add(&list, "broken.rs", "extract failed", "extract");
+    bool atomic = !added && list.count == 0 && list.capture_failed;
+    for (int i = 0; i < list.count; i++) {
+        free(list.items[i].path);
+        free(list.items[i].reason);
+        free(list.items[i].phase);
+    }
+    free(list.items);
+    cbm_parallel_test_fail_error_alloc_at(0);
+    return atomic;
+}
+#endif
 
 /* Free source buffer. */
 static void free_source(char *buf) {
@@ -1012,7 +1076,6 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     if (file_count == 0) {
         return 0;
     }
-
     cbm_log_info("parallel.extract.start", "files", itoa_log(file_count), "workers",
                  itoa_log(worker_count));
     {
@@ -1079,6 +1142,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     /* Per-worker skip lists (separate allocation; merged into the pipeline in the
      * sequential merge loop below). */
     pp_err_list_t *err_lists = calloc((size_t)worker_count, sizeof(pp_err_list_t));
+    if (!err_lists) {
+        cbm_pipeline_mark_file_error_capture_failed(ctx->pipeline);
+    }
 
     /* ObjectScript macro table (NULL when no .inc include files present). */
     CBMMacroTable *pp_macro_table =
@@ -1135,6 +1201,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
      * failed still surfaces its skips. */
     if (err_lists) {
         for (int i = 0; i < worker_count; i++) {
+            if (err_lists[i].capture_failed) {
+                cbm_pipeline_mark_file_error_capture_failed(ctx->pipeline);
+            }
             for (int j = 0; j < err_lists[i].count; j++) {
                 cbm_pipeline_add_file_error(ctx->pipeline, err_lists[i].items[j].path,
                                             err_lists[i].items[j].reason,
@@ -1373,6 +1442,7 @@ typedef struct {
      * worker forwards them to). NULL/0 → cross-LSP no-ops. */
     CBMLSPDef *all_defs;
     int def_count;
+    CBMPxcCollectStatus definition_universe_status;
     char *const *def_modules; /* per-file module QN; def_modules[i] for files[i] */
     /* Optional inverted index for per-file def filtering (gopls pattern).
      * When non-NULL, the fused worker calls cbm_pxc_filter_defs_for_file
@@ -1394,6 +1464,8 @@ typedef struct {
      * under rust_shared_mu into rust_shared_arena, published via rust_shared_reg;
      * torn down after the worker dispatch. */
     _Atomic(CBMTypeRegistry *) rust_shared_reg;
+    _Atomic bool rust_shared_allocation_failed;
+    _Atomic bool dispatch_allocation_failed;
     cbm_mutex_t rust_shared_mu;
     CBMArena rust_shared_arena;
     bool rust_shared_arena_live;
@@ -2865,15 +2937,34 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
     CBMTypeRegistry *p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_acquire);
     if (p)
         return p;
+    if (atomic_load_explicit(&rc->rust_shared_allocation_failed, memory_order_acquire))
+        return NULL;
     if (!rc->all_defs || rc->def_count <= 0)
         return NULL;
     cbm_mutex_lock(&rc->rust_shared_mu);
     p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_relaxed);
-    if (!p) {
+    if (!p && !atomic_load_explicit(&rc->rust_shared_allocation_failed,
+                                    memory_order_relaxed)) {
         cbm_arena_init(&rc->rust_shared_arena);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        size_t fail_after = atomic_exchange(&g_pp_test_rust_registry_fail_after, SIZE_MAX);
+        if (fail_after != SIZE_MAX && fail_after != PP_TEST_POISON_REGISTRY_AFTER_BUILD) {
+            cbm_arena_test_fail_after(&rc->rust_shared_arena, fail_after);
+        }
+#endif
         rc->rust_shared_arena_live = true;
         p = cbm_rust_build_cross_registry(&rc->rust_shared_arena, rc->all_defs, rc->def_count);
-        if (p) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        if (fail_after == PP_TEST_POISON_REGISTRY_AFTER_BUILD) {
+            cbm_arena_test_fail_after(&rc->rust_shared_arena, 0);
+            (void)cbm_arena_alloc(&rc->rust_shared_arena, 1);
+        }
+#endif
+        if (cbm_arena_status(&rc->rust_shared_arena) != CBM_ARENA_STATUS_AVAILABLE) {
+            p = NULL;
+            atomic_store_explicit(&rc->rust_shared_allocation_failed, true,
+                                  memory_order_release);
+        } else if (p) {
             char sb[96];
             snprintf(sb, sizeof(sb), "types=%d funcs=%d", p->type_count, p->func_count);
             cbm_log_info("cross_lsp.rust_registry", "scale", sb);
@@ -2889,6 +2980,32 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
 static CBMTypeRegistry *pp_rust_shared_registry_get(void *ctx) {
     return pp_rust_shared_registry((resolve_ctx_t *)ctx);
 }
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+bool cbm_parallel_test_rust_registry_failure_is_rejected(size_t successful_allocations) {
+    CBMLSPDef defs[2] = {
+        {.qualified_name = "test.demo.Type", .short_name = "Type", .label = "Type",
+         .def_module_qn = "test.demo", .lang = CBM_LANG_RUST},
+        {.qualified_name = "test.demo.Type.call", .short_name = "call", .label = "Method",
+         .receiver_type = "test.demo.Type", .def_module_qn = "test.demo",
+         .lang = CBM_LANG_RUST},
+    };
+    resolve_ctx_t rc = {.all_defs = defs, .def_count = 2};
+    atomic_init(&rc.rust_shared_reg, NULL);
+    atomic_init(&rc.rust_shared_allocation_failed, false);
+    cbm_mutex_init(&rc.rust_shared_mu);
+    cbm_parallel_test_fail_rust_registry_after(successful_allocations);
+    CBMTypeRegistry *registry = pp_rust_shared_registry(&rc);
+    bool rejected = registry == NULL &&
+                    atomic_load_explicit(&rc.rust_shared_allocation_failed,
+                                         memory_order_acquire);
+    if (rc.rust_shared_arena_live) {
+        cbm_arena_destroy(&rc.rust_shared_arena);
+    }
+    cbm_mutex_destroy(&rc.rust_shared_mu);
+    return rejected;
+}
+#endif
 
 static int pp_call_reference_site_count(const CBMFileResult *result, CBMLanguage lang) {
     int count = 0;
@@ -2913,6 +3030,25 @@ static int pp_qualified_lsp_site_count(const CBMFileResult *result) {
     }
     return count;
 }
+
+static void pp_apply_rust_definition_universe_status(
+    CBMFileResult *result, CBMPxcCollectStatus definition_universe_status) {
+    result->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+    if (definition_universe_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
+        result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+    }
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+bool cbm_parallel_test_collect_failure_does_not_duplicate_health(void) {
+    CBMFileResult result = {0};
+    cbm_rust_health_record(&result.rust_health, CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+    pp_apply_rust_definition_universe_status(&result, CBM_PXC_COLLECT_ALLOCATION_FAILED);
+    return result.rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count == 1 &&
+           (result.rust_health.required_routes & CBM_RUST_HEALTH_ROUTE_CROSS_FILE) != 0 &&
+           (result.rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_CROSS_FILE) == 0;
+}
+#endif
 
 /* A per-file semantic walk can discover a faithful source occurrence that the
  * syntax extractor cannot represent as a CBMCall yet: Python operators and
@@ -3011,19 +3147,21 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         int semantic_sites = result->calls.count + call_reference_sites;
         int qualified_lsp_sites = pp_qualified_lsp_site_count(result);
         bool pending_lsp_site = pp_has_pending_lsp_site(result);
+        CBMPxcCollectStatus definition_universe_status = rc->definition_universe_status;
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
              (semantic_sites > 0 || pending_lsp_site) &&
              (jvm_cross_lsp || pending_lsp_site || qualified_lsp_sites < semantic_sites) &&
              !is_generated);
         if (lang == CBM_LANG_RUST) {
-            result->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+            pp_apply_rust_definition_universe_status(result, definition_universe_status);
             /* No pending semantic site is a completed no-op route: the
              * single-file resolver already covered every eligible site. A
              * missing project definition universe is not complete. */
             bool no_semantic_sites = semantic_sites == 0 && !pending_lsp_site;
             bool definition_universe_available = rc->all_defs && rc->def_count > 0;
-            if (!cross_lsp_eligible && !is_generated &&
+            if (definition_universe_status != CBM_PXC_COLLECT_ALLOCATION_FAILED &&
+                !cross_lsp_eligible && !is_generated &&
                 (no_semantic_sites || definition_universe_available)) {
                 result->rust_health.completed_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
             }
@@ -3118,10 +3256,23 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * file around the resolve so a hang HERE is attributed to
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
-                cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
-                                      rc->cross_registries, rc->module_def_index, rc->all_defs,
-                                      rc->def_count, imp_keys, imp_vals, imp_count,
-                                      rc->rust_manifest, pp_rust_shared_registry_get, rc);
+                CBMPxcDispatchStatus dispatch_status = cbm_pxc_dispatch_file(
+                    lang, result, lsp_source, lsp_source_len, rel, def_module,
+                    rc->cross_registries, rc->module_def_index, rc->all_defs, rc->def_count,
+                    imp_keys, imp_vals, imp_count, rc->rust_manifest,
+                    pp_rust_shared_registry_get, rc);
+                if (dispatch_status == CBM_PXC_DISPATCH_ALLOCATION_FAILED &&
+                    lang != CBM_LANG_RUST) {
+                    atomic_store_explicit(&rc->dispatch_allocation_failed, true,
+                                          memory_order_release);
+                }
+                if (lang == CBM_LANG_RUST &&
+                    atomic_load_explicit(&rc->rust_shared_allocation_failed,
+                                         memory_order_acquire)) {
+                    cbm_rust_health_record(&result->rust_health,
+                                           CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+                    result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
+                }
                 cbm_index_mark_done(rel);
                 /* Free the on-demand re-read (no-op when source was retained). */
                 free_source(lsp_source_owned);
@@ -3216,12 +3367,17 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count, CBMLSPDef *all_defs, int def_count,
+                         CBMPxcCollectStatus definition_universe_status,
                          char *const *def_modules, struct CBMModuleDefIndex *module_def_index,
                          void *cross_registries_v) {
     /* See header: typed as void* across the TU boundary; cast back here. */
     CBMCrossLspRegistries *cross_registries = (CBMCrossLspRegistries *)cross_registries_v;
     if (file_count == 0) {
         return 0;
+    }
+    if (cbm_pxc_collection_requires_abort(result_cache, files, file_count,
+                                           definition_universe_status)) {
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
     cbm_log_info("parallel.resolve.start", "files", itoa_log(file_count), "workers",
@@ -3265,6 +3421,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .cancelled = ctx->cancelled,
         .all_defs = all_defs,
         .def_count = def_count,
+        .definition_universe_status = definition_universe_status,
         .def_modules = def_modules,
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
@@ -3275,6 +3432,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     atomic_init(&rc.lsp_cross_skipped_no_source, 0);
     /* F4 lazy shared Rust registry: mutex up before workers spawn. */
     atomic_init(&rc.rust_shared_reg, NULL);
+    atomic_init(&rc.rust_shared_allocation_failed, false);
+    atomic_init(&rc.dispatch_allocation_failed, false);
     cbm_mutex_init(&rc.rust_shared_mu);
     rc.rust_shared_arena_live = false;
 
@@ -3324,8 +3483,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
      * sequential pipeline runs — the two venues must emit identical graphs). */
     total_lsp_overrides += cbm_pipeline_override_explicit(ctx);
 
-    if (atomic_load(ctx->cancelled)) {
-        return CBM_NOT_FOUND;
+    if (atomic_load(ctx->cancelled) ||
+        atomic_load_explicit(&rc.dispatch_allocation_failed, memory_order_acquire)) {
+        return atomic_load(ctx->cancelled) ? CBM_NOT_FOUND : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
     /* Summary metric that replaces the removed `pass.timing pass=lsp_cross`

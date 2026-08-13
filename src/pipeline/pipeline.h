@@ -129,7 +129,7 @@ typedef struct {
  * NOT thread-safe: call it from the sequential extraction pass, or from the
  * parallel merge step (never from inside a parallel worker — workers collect
  * into per-worker lists and merge sequentially). */
-void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+bool cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
                                  const char *phase);
 
 /* Borrowed accessor for the recorded skips (owned by the pipeline, valid until

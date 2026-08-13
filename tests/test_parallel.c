@@ -323,15 +323,16 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
      * cbm_pxc_run_one(_ts) per file BEFORE materializing CALLS edges. */
     char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
     int def_count = 0;
+    CBMPxcCollectStatus collect_status = CBM_PXC_COLLECT_EMPTY;
     CBMLSPDef *all_defs =
         def_modules ? cbm_pxc_collect_all_defs(result_cache, files, file_count, ctx.project_name,
-                                               def_modules, &def_count, NULL, NULL)
+                                               def_modules, &def_count, &collect_status, NULL, NULL)
                     : NULL;
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
 
     cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
-                         def_count, def_modules, module_def_index,
+                         def_count, collect_status, def_modules, module_def_index,
                          NULL /* cross_registries — tests use per-file path */);
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 

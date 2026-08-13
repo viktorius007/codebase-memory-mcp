@@ -21,6 +21,12 @@
 #include <stdatomic.h>
 #include <string.h>
 
+typedef enum {
+    CBM_PXC_COLLECT_ALLOCATION_FAILED = -1,
+    CBM_PXC_COLLECT_EMPTY = 0,
+    CBM_PXC_COLLECT_AVAILABLE = 1,
+} CBMPxcCollectStatus;
+
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
 /* Maximum byte budget for tree-sitter extraction per file */
@@ -580,7 +586,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                           * shared read-only across workers (typed non-const to match
                           * the existing cbm_run_X_lsp_cross signatures the resolve
                           * worker forwards them to). Pass NULL/0/NULL to skip. */
-                         CBMLSPDef *all_defs, int def_count, char *const *def_modules,
+                         CBMLSPDef *all_defs, int def_count,
+                         CBMPxcCollectStatus definition_universe_status,
+                         char *const *def_modules,
                          /* Optional inverted index module_qn → defs[] — fallback
                           * path when there's no pre-built registry for this lang. */
                          struct CBMModuleDefIndex *module_def_index,
@@ -801,8 +809,11 @@ void cbm_pipeline_get_rust_health(const cbm_pipeline_t *p, const cbm_coverage_ro
                                   int *row_count, const char **recording_status,
                                   int *rust_files_total);
 cbm_coverage_row_t *cbm_pipeline_alloc_coverage_rows(cbm_pipeline_t *p, int count);
+void cbm_pipeline_mark_file_error_capture_failed(cbm_pipeline_t *p);
+bool cbm_pipeline_file_error_capture_complete(const cbm_pipeline_t *p);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 void cbm_pipeline_test_fail_coverage_alloc(cbm_pipeline_t *p, bool fail);
+void cbm_pipeline_test_fail_file_error_alloc_at(cbm_pipeline_t *p, int position);
 #endif
 
 /* Pipeline accessors for incremental use */
@@ -867,6 +878,13 @@ typedef enum {
 /* Deterministic one-shot fault injection for the incremental-parallel result
  * cache allocation. Reset explicitly so one test cannot affect another. */
 void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void);
+void cbm_pipeline_incremental_test_fail_combined_definition_alloc_once(void);
+void cbm_parallel_test_fail_error_alloc_at(int position);
+bool cbm_parallel_test_error_add_is_atomic(int allocation_position);
+void cbm_parallel_test_fail_rust_registry_after(size_t successful_allocations);
+bool cbm_parallel_test_rust_registry_failure_is_rejected(size_t successful_allocations);
+bool cbm_pipeline_incremental_test_combined_definition_failure_is_typed(void);
+bool cbm_parallel_test_collect_failure_does_not_duplicate_health(void);
 void cbm_pipeline_incremental_test_force_legacy_partial_once(void);
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_predump_once(void);
