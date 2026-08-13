@@ -1,12 +1,11 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -5089,10 +5089,6 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
+@@ -5289,9 +5289,6 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
      /* Pathological-input guard: bail out once we've spent too many
       * eval steps on this file. Prevents hangs on adversarial input. */
      if (ctx->eval_step_count > ctx->max_eval_steps) {
--        if (!ctx->health ||
--            ctx->health->issues[CBM_RUST_HEALTH_WORK_LIMIT].count == 0) {
+-        if (!ctx->health || ctx->health->issues[CBM_RUST_HEALTH_WORK_LIMIT].count == 0) {
 -            rust_health_record_node(ctx, CBM_RUST_HEALTH_WORK_LIMIT, node);
 -        }
          return;

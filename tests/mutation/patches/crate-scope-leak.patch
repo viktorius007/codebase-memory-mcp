@@ -1,13 +1,13 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -755,8 +755,7 @@ static size_t rust_resolution_scope_prefix_len(const RustLSPContext *ctx) {
+@@ -757,8 +757,7 @@ static size_t rust_resolution_scope_prefix_len(const RustLSPContext *ctx) {
      if (!module_qn) {
          return 0;
      }
 -    size_t prefix_len = rust_workspace_member_qn_prefix_len(
 -        module_qn, ctx ? (const CBMCargoManifest *)ctx->cargo_manifest : NULL);
 +    size_t prefix_len = rust_project_qn_prefix_len(module_qn);
-     const CBMCargoManifest *manifest =
-         ctx ? (const CBMCargoManifest *)ctx->cargo_manifest : NULL;
-     if (prefix_len == 0 && (!manifest || !manifest->is_workspace_root || manifest->member_count == 0)) {
+     const CBMCargoManifest *manifest = ctx ? (const CBMCargoManifest *)ctx->cargo_manifest : NULL;
+     if (prefix_len == 0 &&
+         (!manifest || !manifest->is_workspace_root || manifest->member_count == 0)) {
