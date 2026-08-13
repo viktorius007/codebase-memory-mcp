@@ -49,4 +49,10 @@ bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
 bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *hunks,
                               int hunk_count, const char *file);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Deterministic allocation-loss seam for detect_changes' oversized-response
+ * refinement rollup. Production builds do not contain this symbol. */
+void cbm_mcp_test_detect_refinement_fail_rollup_alloc(bool fail);
+#endif
+
 #endif

@@ -2577,6 +2577,32 @@ TEST(tool_query_graph_basic) {
     PASS();
 }
 
+TEST(tool_query_graph_malformed_query_preserves_actionable_error) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":140,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"test-project\","
+             "\"query\":\"MATCH (f RETURN f.name\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strlen(resp) <= CBM_MCP_RESULT_MAX_BYTES);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "Invalid Cypher query:"));
+    ASSERT_NOT_NULL(strstr(resp, "expected ')' but found RETURN at byte 9"));
+    ASSERT_NOT_NULL(strstr(resp, "Context:"));
+    ASSERT_NOT_NULL(strstr(resp, "Remedy: close the node pattern before RETURN"));
+    ASSERT_NOT_NULL(strstr(resp, "MATCH (n:Function) RETURN n.name LIMIT 10"));
+    ASSERT_NULL(strstr(resp, "token type"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(tool_index_status_no_project) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -3975,6 +4001,7 @@ TEST(tool_rust_analysis_evidence_has_independent_16k_budget) {
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "partial");
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "files_partial")), ROW_COUNT);
     yyjson_val *evidence = yyjson_obj_get(health, "evidence");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(evidence, "scope")), "first_page_summary");
     ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(evidence, "truncated")));
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(evidence, "total")), ROW_COUNT);
     ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(evidence, "returned")) < ROW_COUNT);
@@ -4097,6 +4124,7 @@ TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contaminati
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "verdict")), "failed");
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "degraded_files_total")), SEMANTIC_ROWS);
     evidence = yyjson_obj_get(health, "evidence");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(evidence, "scope")), "first_page_summary");
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(evidence, "total")), SEMANTIC_ROWS);
     returned = (int)yyjson_get_int(yyjson_obj_get(evidence, "returned"));
     ASSERT_TRUE(returned > CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS);
@@ -4116,6 +4144,82 @@ TEST(tool_rust_analysis_pages_mixed_corpus_without_gaps_or_syntactic_contaminati
     yyjson_doc_free(doc);
     free(inner);
     free(response);
+
+    /* Rust evidence is intentionally a summary, not a second paginated stream.
+     * It appears once, while every later syntactic page retains exact health
+     * aggregates and says explicitly where the evidence lives. Reconstruct 20
+     * coverage pages and measure the context avoided by not repeating it. */
+    char *cursor = NULL;
+    size_t first_evidence_bytes = 0;
+    size_t later_summary_bytes = 0;
+    size_t measured_saved_bytes = 0;
+    int coverage_pages = 0;
+    do {
+        char args[1024];
+        if (cursor) {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"rust-health-paged-mixed\",\"limit\":100,"
+                     "\"max_response_bytes\":65536,\"cursor\":\"%s\"}",
+                     cursor);
+        } else {
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"rust-health-paged-mixed\",\"limit\":100,"
+                     "\"max_response_bytes\":65536}");
+        }
+        doc = mcp_tool_inner_doc(srv, "index_status", args, &response, &inner);
+        ASSERT_NOT_NULL(doc);
+        ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
+        root = yyjson_doc_get_root(doc);
+        health = yyjson_obj_get(root, "rust_analysis");
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "degraded_files_total")), SEMANTIC_ROWS);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "partial_rows")), SEMANTIC_ROWS - 172);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "failed_rows")), 172);
+        yyjson_val *page_evidence = yyjson_obj_get(health, "evidence");
+        if (coverage_pages == 0) {
+            ASSERT_NOT_NULL(page_evidence);
+            yyjson_mut_doc *copy = yyjson_mut_doc_new(NULL);
+            yyjson_mut_doc_set_root(copy, yyjson_val_mut_copy(copy, page_evidence));
+            char *serialized = yyjson_mut_write(copy, 0, NULL);
+            ASSERT_NOT_NULL(serialized);
+            first_evidence_bytes = strlen(serialized);
+            free(serialized);
+            yyjson_mut_doc_free(copy);
+        } else {
+            ASSERT_NULL(page_evidence);
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(health, "evidence_scope")),
+                          "first_page_summary");
+            ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "evidence_total")), SEMANTIC_ROWS);
+            ASSERT_EQ(yyjson_get_int(yyjson_obj_get(health, "evidence_returned")), 0);
+            ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(health, "evidence_truncated")));
+            if (later_summary_bytes == 0) {
+                yyjson_mut_doc *copy = yyjson_mut_doc_new(NULL);
+                yyjson_mut_val *summary = yyjson_mut_obj(copy);
+                yyjson_mut_doc_set_root(copy, summary);
+                yyjson_mut_obj_add_str(copy, summary, "evidence_scope", "first_page_summary");
+                yyjson_mut_obj_add_int(copy, summary, "evidence_total", SEMANTIC_ROWS);
+                yyjson_mut_obj_add_int(copy, summary, "evidence_returned", 0);
+                yyjson_mut_obj_add_bool(copy, summary, "evidence_truncated", true);
+                char *serialized = yyjson_mut_write(copy, 0, NULL);
+                ASSERT_NOT_NULL(serialized);
+                later_summary_bytes = strlen(serialized);
+                free(serialized);
+                yyjson_mut_doc_free(copy);
+            }
+            ASSERT_TRUE(first_evidence_bytes > later_summary_bytes);
+            measured_saved_bytes += first_evidence_bytes - later_summary_bytes;
+        }
+        yyjson_val *next = yyjson_obj_get(root, "next_cursor");
+        char *next_cursor = next ? strdup(yyjson_get_str(next)) : NULL;
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+        free(cursor);
+        cursor = next_cursor;
+        coverage_pages++;
+        ASSERT_TRUE(coverage_pages <= 20);
+    } while (cursor);
+    ASSERT_EQ(coverage_pages, 20);
+    ASSERT_EQ(measured_saved_bytes, (first_evidence_bytes - later_summary_bytes) * 19U);
 
     /* Six metadata strings, one row array, then three strings per row exhaust
      * exactly after the first full store page; the next page must fail closed
@@ -5562,6 +5666,84 @@ TEST(tool_trace_pagination_exactly_once) {
     ASSERT_NOT_NULL(strstr(inner, "stale_cursor"));
     free(inner);
 
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Pre-generation stores cannot prove cursor freshness. A wide trace on one
+ * must therefore return no relationship rows at all: either the caller raises
+ * the limit/narrows the traversal, or re-indexing enables lossless cursors. */
+TEST(tool_trace_legacy_wide_stream_requires_explicit_refinement) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "legacy-trace-refinement";
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/legacy-trace-refinement"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_node_t hub = {.project = project,
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "legacy-trace-refinement.hub",
+                      .file_path = "hub.c",
+                      .start_line = 1,
+                      .end_line = 2};
+    int64_t hub_id = cbm_store_upsert_node(st, &hub);
+    ASSERT_GT(hub_id, 0);
+    enum { CALLERS = 203 };
+    for (int i = 0; i < CALLERS; i++) {
+        char name[32];
+        char qn[96];
+        snprintf(name, sizeof(name), "caller_%03d", i);
+        snprintf(qn, sizeof(qn), "legacy-trace-refinement.callers.%s", name);
+        cbm_node_t caller = {.project = project,
+                             .label = "Function",
+                             .name = name,
+                             .qualified_name = qn,
+                             .file_path = "callers.c",
+                             .start_line = i + 1,
+                             .end_line = i + 1};
+        int64_t caller_id = cbm_store_upsert_node(st, &caller);
+        ASSERT_GT(caller_id, 0);
+        cbm_edge_t edge = {
+            .project = project, .source_id = caller_id, .target_id = hub_id, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(st, "DROP TABLE store_meta;"), CBM_STORE_OK);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"legacy-trace-refinement\",\"function_name\":\"hub\","
+        "\"direction\":\"inbound\",\"depth\":2,\"limit\":100,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
+    ASSERT_NOT_NULL(strstr(response, "trace_refinement_required"));
+    ASSERT_NOT_NULL(strstr(response, "203 visible relationship rows exceed limit=100"));
+    ASSERT_NOT_NULL(strstr(response, "No partial rows were returned"));
+    ASSERT_NOT_NULL(strstr(response, "re-index the project"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NULL(strstr(response, "caller_000"));
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "trace_call_path",
+        "{\"project\":\"legacy-trace-refinement\",\"function_name\":\"hub\","
+        "\"direction\":\"inbound\",\"depth\":2,\"limit\":203,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callers_total")), CALLERS);
+    ASSERT_NULL(yyjson_obj_get(root, "truncated"));
+    ASSERT_NULL(yyjson_obj_get(root, "next"));
+    ASSERT_NOT_NULL(strstr(inner, "caller_000"));
+    ASSERT_NOT_NULL(strstr(inner, "caller_202"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -11170,6 +11352,220 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     PASS();
 }
 
+/* The production regression was a 78,531-byte default detect_changes payload
+ * that the universal envelope replaced with a generic error after doing all
+ * the useful work. This local fixture makes both encodings larger than that
+ * without cloning a network corpus: one changed seed has 256 long-named
+ * callers spread across distinct module buckets. The response must retain
+ * exact accounting and a useful bounded sample, not require callers to know
+ * that limit:1 is an accidental workaround. */
+TEST(tool_detect_changes_default_adapts_oversized_shape_with_exact_totals) {
+    char repo[CBM_SZ_1K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-output-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+
+    char seed_path[CBM_SZ_2K];
+    snprintf(seed_path, sizeof(seed_path), "%s/seed.c", repo);
+    ASSERT_EQ(th_write_file(seed_path, "int seed(void) { return 1; }\n"), 0);
+    const char *const init_args[] = {"-c", "init.defaultBranch=main", "init", "-q", NULL};
+    const char *const add_args[] = {"add", "seed.c", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test", "-c", "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false", "commit", "-q", "-m", "fixture", NULL};
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+    ASSERT_EQ(th_write_file(seed_path, "int seed(void) { return 2; }\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-output-bounds";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_node_t seed = {.project = project,
+                       .label = "Function",
+                       .name = "seed",
+                       .qualified_name = "detect-output-bounds.seed",
+                       .file_path = "seed.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    int64_t seed_id = cbm_store_upsert_node(store, &seed);
+    ASSERT_GT(seed_id, 0);
+
+    enum { IMPACTED = 256 };
+    int64_t caller_ids[IMPACTED];
+    for (int i = 0; i < IMPACTED; i++) {
+        char name[32];
+        char qn[800];
+        char file[CBM_SZ_256];
+        snprintf(name, sizeof(name), "caller_%03d", i);
+        int prefix = snprintf(qn, sizeof(qn), "detect-output-bounds.%s.module_%03d.",
+                              i < 40 ? "z_near" : "a_far", i);
+        ASSERT_GT(prefix, 0);
+        memset(qn + prefix, 'q', sizeof(qn) - (size_t)prefix - 16U);
+        snprintf(qn + sizeof(qn) - 16U, 16U, ".%s", name);
+        memset(file, 'm', 88U);
+        file[88] = '/';
+        snprintf(file + 89, sizeof(file) - 89U,
+                 "module_%03d_with_a_deliberately_long_identity/caller.c", i);
+        cbm_node_t caller = {.project = project,
+                             .label = "Function",
+                             .name = name,
+                             .qualified_name = qn,
+                             .file_path = file,
+                             .start_line = 1,
+                             .end_line = 1};
+        caller_ids[i] = cbm_store_upsert_node(store, &caller);
+        ASSERT_GT(caller_ids[i], 0);
+    }
+    for (int i = 0; i < IMPACTED; i++) {
+        /* Forty nearest callers and 216 two-hop callers make row ordering
+         * observable: the bounded default must not replace near evidence with
+         * lexically earlier but farther rows. */
+        cbm_edge_t edge = {.project = project,
+                           .source_id = caller_ids[i],
+                           .target_id = i < 40 ? seed_id : caller_ids[0],
+                           .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+    }
+
+    const char *formats[] = {"tree", "json"};
+    for (size_t format_index = 0; format_index < 2U; format_index++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"since\":\"HEAD\","
+                 "\"base_branch\":\"does-not-exist\",\"depth\":5,\"format\":\"%s\"}",
+                 project, formats[format_index]);
+        char *response = cbm_mcp_handle_tool(srv, "detect_changes", args);
+        ASSERT_NOT_NULL(response);
+        ASSERT_TRUE(strlen(response) <= CBM_MCP_RESULT_MAX_BYTES);
+        ASSERT_NOT_NULL(strstr(response, "refinement_required"));
+        ASSERT_NOT_NULL(strstr(response, "output_truncated"));
+        ASSERT_NOT_NULL(strstr(response, "continuation_supported"));
+        ASSERT_NOT_NULL(strstr(response, "complete_response_bytes"));
+        ASSERT_NOT_NULL(strstr(response, "impacted_modules"));
+        ASSERT_NOT_NULL(strstr(response, "seed_symbols"));
+        ASSERT_NOT_NULL(strstr(response, "impacted_total"));
+        ASSERT_NOT_NULL(strstr(response, "depth"));
+        ASSERT_NOT_NULL(strstr(response, "HEAD"));
+        ASSERT_NULL(strstr(response, "does-not-exist"));
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":false"));
+
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        if (format_index == 0U) {
+            const char *bytes = strstr(inner, "complete_response_bytes: ");
+            ASSERT_NOT_NULL(bytes);
+            ASSERT_GT(strtoull(bytes + strlen("complete_response_bytes: "), NULL, 10), 78000U);
+            ASSERT_NOT_NULL(strstr(inner, "changed_files: 2\n"));
+            ASSERT_NOT_NULL(strstr(inner, "seed_symbols: 1\n"));
+            ASSERT_NOT_NULL(strstr(inner, "impacted_total: 256\n"));
+            ASSERT_NOT_NULL(strstr(inner, "depth: 5\n"));
+            char *impacted_rows = strstr(inner, "impacted: (rows:");
+            char *module_rows = strstr(inner, "impacted_modules:");
+            ASSERT_NOT_NULL(impacted_rows);
+            ASSERT_NOT_NULL(module_rows);
+            char saved_module = *module_rows;
+            *module_rows = '\0';
+            ASSERT_NOT_NULL(strstr(impacted_rows, "caller.c 1\n"));
+            ASSERT_NULL(strstr(impacted_rows, "caller.c 2\n"));
+            *module_rows = saved_module;
+        } else {
+            yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+            ASSERT_NOT_NULL(doc);
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            ASSERT_GT(yyjson_get_uint(yyjson_obj_get(root, "complete_response_bytes")), 78000U);
+            ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "changed_files_total")), 2);
+            ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_symbols")), 1);
+            ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "impacted_total")), IMPACTED);
+            ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "depth")), 5);
+            ASSERT_LT(yyjson_get_int(yyjson_obj_get(root, "impacted_shown")), IMPACTED);
+            yyjson_val *impacted = yyjson_obj_get(root, "impacted");
+            size_t impacted_index, impacted_max;
+            yyjson_val *impacted_entry;
+            yyjson_arr_foreach(impacted, impacted_index, impacted_max, impacted_entry) {
+                ASSERT_EQ(yyjson_get_int(yyjson_obj_get(impacted_entry, "hop")), 1);
+            }
+            int rollup_total = 0;
+            bool found_other = false;
+            yyjson_val *rollup = yyjson_obj_get(root, "impacted_modules");
+            size_t index, max;
+            yyjson_val *entry;
+            yyjson_arr_foreach(rollup, index, max, entry) {
+                rollup_total += (int)yyjson_get_int(yyjson_obj_get(entry, "count"));
+                const char *module = yyjson_get_str(yyjson_obj_get(entry, "module"));
+                found_other = found_other || (module && strcmp(module, "(other)") == 0);
+            }
+            ASSERT_EQ(rollup_total, IMPACTED);
+            ASSERT_TRUE(found_other);
+            ASSERT_TRUE(yyjson_arr_size(rollup) < IMPACTED);
+            yyjson_doc_free(doc);
+        }
+        free(inner);
+        free(response);
+    }
+
+    /* Explicit row limits retain the same exact totals without triggering the
+     * response-level refinement path. */
+    char *response = cbm_mcp_handle_tool(
+        srv, "detect_changes",
+        "{\"project\":\"detect-output-bounds\",\"since\":\"HEAD\","
+        "\"depth\":5,\"limit\":1,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "impacted_total")), IMPACTED);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "impacted_shown")), 1);
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(root, "impacted")), 1U);
+    int limit_one_rollup_total = 0;
+    yyjson_val *limit_one_rollup = yyjson_obj_get(root, "impacted_modules");
+    size_t limit_one_index, limit_one_max;
+    yyjson_val *limit_one_entry;
+    yyjson_arr_foreach(limit_one_rollup, limit_one_index, limit_one_max, limit_one_entry) {
+        limit_one_rollup_total +=
+            (int)yyjson_get_int(yyjson_obj_get(limit_one_entry, "count"));
+    }
+    ASSERT_EQ(limit_one_rollup_total, IMPACTED);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "detect_changes",
+        "{\"project\":\"detect-output-bounds\",\"cursor\":\"stale-worktree-token\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "detect_changes_cursor_unverifiable"));
+    ASSERT_NOT_NULL(strstr(response, "live worktree"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    free(response);
+
+    for (size_t format_index = 0; format_index < 2U; format_index++) {
+        char allocation_args[256];
+        snprintf(allocation_args, sizeof(allocation_args),
+                 "{\"project\":\"detect-output-bounds\",\"since\":\"HEAD\","
+                 "\"format\":\"%s\"}",
+                 formats[format_index]);
+        cbm_mcp_test_detect_refinement_fail_rollup_alloc(true);
+        response = cbm_mcp_handle_tool(srv, "detect_changes", allocation_args);
+        cbm_mcp_test_detect_refinement_fail_rollup_alloc(false);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "detect_changes_refinement_allocation_unavailable"));
+        ASSERT_NOT_NULL(strstr(response, "no partial result returned"));
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        ASSERT_NULL(strstr(response, "caller_000"));
+        free(response);
+    }
+
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
 /* Regression test for issue #1363: detect_changes seeded every definition in
  * a changed file instead of just the ones whose line range overlaps the diff
  * hunk. cbm_detect_node_in_hunks is the overlap primitive; this exercises it
@@ -15771,6 +16167,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
+    RUN_TEST(tool_query_graph_malformed_query_preserves_actionable_error);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_coverage_pagination_is_exact_bounded_and_generation_bound);
     RUN_TEST(tool_index_status_rejects_invalid_pagination_arguments);
@@ -15804,6 +16201,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_sections_do_not_claim_untraversed_relationship);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
     RUN_TEST(tool_trace_pagination_exactly_once);
+    RUN_TEST(tool_trace_legacy_wide_stream_requires_explicit_refinement);
     RUN_TEST(tool_trace_rejects_reachable_set_beyond_safety_ceiling);
     RUN_TEST(tool_trace_data_flow_uses_shortest_path_predecessor_edge_args);
     RUN_TEST(tool_trace_rejects_unimplemented_parameter_filter);
@@ -15894,6 +16292,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
     RUN_TEST(tool_detect_changes_not_found_rich_error);
     RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
+    RUN_TEST(tool_detect_changes_default_adapts_oversized_shape_with_exact_totals);
     RUN_TEST(detect_changes_node_in_hunks_overlap_issue1363);
     RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
     RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);

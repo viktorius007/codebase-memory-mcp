@@ -552,7 +552,9 @@ static const tool_def_t TOOLS[] = {
      "stay true. Such rows consume the same page budget and cursor stream as callable rows and "
      "appear under `unattributed_inbound` / `unattributed_outbound` with directional totals: a "
      "call exists at each listed structural node, but its call site is unresolved. "
-     "`truncated: true` + `next` = more rows — pass next back as cursor. "
+     "`truncated: true` + `next` = more rows — pass next back as cursor. If a legacy index cannot "
+     "mint generation-bound cursors, a trace wider than limit fails with "
+     "`trace_refinement_required`; raise limit or narrow depth/edge_types. "
      "format=\"json\" returns the SAME tree model as structured JSON.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
@@ -695,7 +697,9 @@ static const tool_def_t TOOLS[] = {
      "signal only marks what the indexer can detect. For structural queries over the misses use "
      "query_graph(graph=\"missed\"). The report also carries 'not_indexed' — files/dirs excluded "
      "BY DESIGN (gitignore/.cbmignore/skip-lists): deliberate and deterministic, not failures; "
-     "change the ignore rules and re-index to include them. Coverage rows are paged in canonical "
+     "change the ignore rules and re-index to include them. Rust-health evidence is a capped "
+     "first-page summary: exact aggregate counts repeat on later pages, while evidence items do "
+     "not. Coverage rows are paged in canonical "
      "(rel_path, kind) order. Exact totals repeat on every page; follow next_cursor with otherwise "
      "identical effective arguments until the final page omits it.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
@@ -738,8 +742,13 @@ static const tool_def_t TOOLS[] = {
      "runs ONE multi-source graph traversal to the transitive impact set. RESPONSE: base + "
      "merge_base SHA, changed_files list, then impacted = prefix-grouped tree rows (name label "
      "hop; "
-     "full qn = group prefix + dot + name) + an impacted_modules rollup; impacted_total + "
-     "truncated are exact. Seeds (the changed symbols) are excluded from impacted; a changed file "
+     "full qn = group prefix + dot + name) + exact impacted_modules accounting (bounded output "
+     "may aggregate omitted module identities as other); impacted_total + "
+     "truncated are exact. If the complete response exceeds the safe envelope, verdict="
+     "refinement_required preserves exact totals and the complete module rollup while bounding "
+     "file/symbol rows. Because the diff includes a live worktree, continuation cursors are "
+     "rejected; narrow base_branch/since, scope, depth, or limit instead. Seeds (the changed "
+     "symbols) are excluded from impacted; a changed file "
      "reached from another changed file is not counted as extra impact. format=\"json\" returns "
      "the "
      "same model as structured JSON.",
@@ -4729,6 +4738,7 @@ static yyjson_mut_val *rust_analysis_evidence(yyjson_mut_doc *doc,
                                                const cbm_analysis_coverage_row_t *rows, int count,
                                                int returned, int64_t rows_total) {
     yyjson_mut_val *evidence = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, evidence, "scope", "first_page_summary");
     yyjson_mut_obj_add_int(doc, evidence, "total", rows_total);
     yyjson_mut_obj_add_int(doc, evidence, "returned", returned);
     yyjson_mut_obj_add_bool(doc, evidence, "truncated", returned < rows_total);
@@ -4783,7 +4793,8 @@ static int rust_analysis_evidence_fit_count(const cbm_analysis_coverage_row_t *r
 
 static void add_rust_analysis_report(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                      const rust_analysis_snapshot_t *snapshot,
-                                     bool generation_matches, size_t evidence_budget) {
+                                     bool generation_matches, size_t evidence_budget,
+                                     bool include_evidence_items) {
     const cbm_coverage_meta_t *meta = &snapshot->meta;
     const cbm_analysis_coverage_totals_t *stats = &snapshot->totals;
     const char *verdict = "unknown";
@@ -4843,7 +4854,7 @@ static void add_rust_analysis_report(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_int(doc, report, "partial_rows", stats->partial_rows);
     yyjson_mut_obj_add_int(doc, report, "failed_rows", stats->failed_rows);
 
-    if (stats->rows_total > 0) {
+    if (stats->rows_total > 0 && include_evidence_items) {
         size_t budget = evidence_budget < RUST_ANALYSIS_EVIDENCE_MAX_BYTES
                             ? evidence_budget
                             : RUST_ANALYSIS_EVIDENCE_MAX_BYTES;
@@ -4853,6 +4864,11 @@ static void add_rust_analysis_report(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                rust_analysis_evidence(doc, snapshot->evidence_rows,
                                                       snapshot->evidence_count, returned,
                                                       stats->rows_total));
+    } else if (stats->rows_total > 0) {
+        yyjson_mut_obj_add_str(doc, report, "evidence_scope", "first_page_summary");
+        yyjson_mut_obj_add_int(doc, report, "evidence_total", stats->rows_total);
+        yyjson_mut_obj_add_int(doc, report, "evidence_returned", 0);
+        yyjson_mut_obj_add_bool(doc, report, "evidence_truncated", true);
     }
     yyjson_mut_obj_add_val(doc, root, "rust_analysis", report);
 }
@@ -4868,10 +4884,12 @@ static bool mcp_doc_envelope_fits(yyjson_mut_doc *doc, size_t budget) {
 
 static void add_rust_analysis_report_envelope_bounded(
     yyjson_mut_doc *doc, yyjson_mut_val *root, const rust_analysis_snapshot_t *snapshot,
-    bool generation_matches, size_t evidence_budget, size_t envelope_budget) {
+    bool generation_matches, size_t evidence_budget, size_t envelope_budget,
+    bool include_evidence_items) {
     size_t budget = evidence_budget;
     for (;;) {
-        add_rust_analysis_report(doc, root, snapshot, generation_matches, budget);
+        add_rust_analysis_report(doc, root, snapshot, generation_matches, budget,
+                                 include_evidence_items);
         if (mcp_doc_envelope_fits(doc, envelope_budget) || budget == 0) {
             return;
         }
@@ -5651,7 +5669,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
         "read flagged source and qualify claims when metadata is changed or unavailable.");
     add_rust_analysis_report_envelope_bounded(
         doc, root, &health, health_generation_matches, RUST_ANALYSIS_EVIDENCE_MAX_BYTES,
-        CBM_MCP_RESULT_MAX_BYTES);
+        CBM_MCP_RESULT_MAX_BYTES, true);
     bool response_fits = mcp_doc_envelope_fits(doc, CBM_MCP_RESULT_MAX_BYTES);
 
     if (cbm_store_commit(store) != CBM_STORE_OK) {
@@ -5707,7 +5725,8 @@ static char *index_status_build_candidate(
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
     yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
     size_t health_budget = (size_t)options->max_response_bytes / 4U;
-    add_rust_analysis_report(doc, root, health, health_generation_matches, health_budget);
+    add_rust_analysis_report(doc, root, health, health_generation_matches, health_budget,
+                             start == 0);
     if (have_project) {
         yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                   project_info->root_path ? project_info->root_path : "");
@@ -8631,6 +8650,32 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         page_len = trace_limit;
     }
     bool more_rows = page_start + page_len < stream_count;
+    if (more_rows && gen_legacy) {
+        free(stream);
+        if (do_outbound) {
+            cbm_store_traverse_free(&tr_out);
+        }
+        if (do_inbound) {
+            cbm_store_traverse_free(&tr_in);
+        }
+        free_port_mediated(ports, port_count);
+        cbm_store_free_nodes(nodes, node_count);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        if (et_doc_keep) {
+            yyjson_doc_free(et_doc_keep);
+        }
+        char refinement[CBM_SZ_512];
+        snprintf(refinement, sizeof(refinement),
+                 "trace_refinement_required: %d visible relationship rows exceed limit=%d, but "
+                 "this legacy index cannot mint generation-bound cursors. No partial rows were "
+                 "returned. Re-call with limit at least %d, narrow depth/edge_types, or re-index "
+                 "the project to enable lossless pagination.",
+                 stream_count, trace_limit, stream_count);
+        return cbm_mcp_text_result(refinement, true);
+    }
     char next_tok[192] = "";
     if (more_rows && !gen_legacy) {
         trace_cursor_t nc = {0};
@@ -9652,7 +9697,7 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     /* The caller appends the final status field after this helper returns. */
     add_rust_analysis_report_envelope_bounded(
         doc, root, &health, health_generation_matches, RUST_ANALYSIS_EVIDENCE_MAX_BYTES,
-        CBM_MCP_RESULT_MAX_BYTES - 512U);
+        CBM_MCP_RESULT_MAX_BYTES - 512U, true);
 
     rust_analysis_snapshot_clear(&health);
     if (have_health_project) {
@@ -13514,6 +13559,14 @@ static void detect_module_of(const char *file, char *out, size_t outsz) {
  * tree and json emitters so both encodings carry the same model. */
 enum { DETECT_MODCAP = 256 };
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static bool detect_refinement_fail_rollup_alloc;
+
+void cbm_mcp_test_detect_refinement_fail_rollup_alloc(bool fail) {
+    detect_refinement_fail_rollup_alloc = fail;
+}
+#endif
+
 static int detect_module_rollup(const cbm_traverse_result_t *impact, char mods[][CBM_SZ_128],
                                 int *mcnt, int *overflow) {
     int nmods = 0;
@@ -13550,18 +13603,15 @@ static int detect_module_rollup(const cbm_traverse_result_t *impact, char mods[]
 static void detect_emit_impacted_tree(cbm_sb_t *sb, cbm_traverse_result_t *tr, int limit) {
     cbm_tree_scalar_int(sb, "impacted_total", tr->visited_count);
     int shown = tr->visited_count < limit ? tr->visited_count : limit;
-    /* qn order for stable grouping, but keep hop-closeness: sort by (hop) is
-     * lost under qn sort, so group AFTER selecting the nearest `shown` rows —
-     * the visited array is already (hop,id)-ordered from the BFS. */
+    /* Keep the BFS's stable (hop,id) order. A previous qn sort mutated the
+     * selected prefix in place; if the complete response later needed output
+     * refinement, that mutation could let farther rows displace nearer ones. */
     char hdr[CBM_SZ_128];
     snprintf(hdr, sizeof(hdr),
              "impacted_shown: %d\nimpacted: %d  (rows: name label hop; qn = group prefix + \".\" "
              "+ name; nearest hops first)\n",
              shown, shown);
     cbm_sb_append(sb, hdr);
-    if (shown > 1) {
-        qsort(tr->visited, (size_t)shown, sizeof(cbm_node_hop_t), tree_hop_cmp_qn);
-    }
     char cur_group[CBM_SZ_1K] = "";
     for (int i = 0; i < shown; i++) {
         const char *qn =
@@ -13590,6 +13640,188 @@ static void detect_emit_impacted_tree(cbm_sb_t *sb, cbm_traverse_result_t *tr, i
     }
 }
 
+/* detect_changes reads a live worktree, so a multi-call cursor cannot promise
+ * a stable snapshot without copying the entire diff. When the complete useful
+ * response is too large, return a bounded refinement result instead: exact
+ * totals and the complete module quotient remain available, while concrete
+ * file/symbol rows are adaptively reduced until the complete MCP envelope
+ * fits. This is deliberately tool-specific; the universal envelope remains a
+ * fail-closed last line of defence for output shapes without such a summary. */
+static char *detect_build_refinement_result(
+    const char *base_branch, const char *merge_base, const char *direction, const char *scope,
+    int depth, char **files, int file_count, int seed_count, cbm_traverse_result_t *impact,
+    bool bfs_truncated, int requested_impact_limit, bool legacy_json, size_t complete_bytes,
+    char mods[][CBM_SZ_128], int *mcnt, int module_count, int module_overflow) {
+    int changed_shown = file_count < 32 ? file_count : 32;
+    int impacted_shown = impact->visited_count < requested_impact_limit
+                             ? impact->visited_count
+                             : requested_impact_limit;
+    if (impacted_shown > 32) {
+        impacted_shown = 32;
+    }
+
+    int modules_shown = module_count < 32 ? module_count : 32;
+
+    for (;;) {
+        char *payload = NULL;
+        if (!legacy_json) {
+            cbm_sb_t sb;
+            cbm_sb_init(&sb);
+            cbm_tree_scalar_str(&sb, "verdict", "refinement_required");
+            cbm_tree_scalar_str(&sb, "base", base_branch);
+            if (merge_base[0]) {
+                cbm_tree_scalar_str(&sb, "merge_base", merge_base);
+            }
+            cbm_tree_scalar_str(&sb, "direction", direction);
+            cbm_tree_scalar_str(&sb, "scope", scope ? scope : "impact");
+            cbm_tree_scalar_int(&sb, "depth", depth);
+            cbm_tree_scalar_int(&sb, "complete_response_bytes", (int64_t)complete_bytes);
+            cbm_tree_scalar_int(&sb, "changed_files", file_count);
+            cbm_tree_scalar_int(&sb, "changed_files_shown", changed_shown);
+            cbm_sb_append(&sb, "changed_file_rows:\n");
+            for (int i = 0; i < changed_shown; i++) {
+                cbm_sb_append(&sb, "  ");
+                cbm_sb_append(&sb, files[i]);
+                cbm_sb_append(&sb, "\n");
+            }
+            cbm_tree_scalar_int(&sb, "seed_symbols", seed_count);
+            cbm_tree_scalar_int(&sb, "impacted_total", impact->visited_count);
+            cbm_tree_scalar_int(&sb, "impacted_shown", impacted_shown);
+            cbm_sb_append(&sb, "impacted: (rows: qn label file hop)\n");
+            for (int i = 0; i < impacted_shown; i++) {
+                const cbm_node_hop_t *row = &impact->visited[i];
+                char line[CBM_SZ_4K];
+                snprintf(line, sizeof(line), "  %s %s %s %d\n",
+                         row->node.qualified_name ? row->node.qualified_name : "",
+                         row->node.label ? row->node.label : "",
+                         row->node.file_path ? row->node.file_path : "", row->hop);
+                cbm_sb_append(&sb, line);
+            }
+            if (impact->visited_count > 0) {
+                cbm_sb_append(&sb, "impacted_modules: (rows: module count; exact accounting)\n");
+                int other = module_overflow;
+                for (int j = 0; j < module_count; j++) {
+                    if (j < modules_shown) {
+                        char line[CBM_SZ_256];
+                        snprintf(line, sizeof(line), "  %s %d\n", mods[j], mcnt[j]);
+                        cbm_sb_append(&sb, line);
+                    } else {
+                        other += mcnt[j];
+                    }
+                }
+                if (other > 0) {
+                    char line[CBM_SZ_64];
+                    snprintf(line, sizeof(line), "  (other) %d\n", other);
+                    cbm_sb_append(&sb, line);
+                }
+            }
+            cbm_tree_scalar_bool(&sb, "truncated", bfs_truncated);
+            cbm_tree_scalar_bool(&sb, "output_truncated", true);
+            cbm_tree_scalar_bool(&sb, "continuation_supported", false);
+            cbm_tree_scalar_str(
+                &sb, "refinement_reason",
+                "detect_changes reads a live worktree, so stable continuation is unavailable");
+            cbm_tree_scalar_str(
+                &sb, "hint",
+                "narrow base_branch/since, scope, depth, or limit and re-run without a cursor");
+            payload = cbm_sb_finish(&sb);
+        } else {
+            yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+            yyjson_mut_val *root = yyjson_mut_obj(doc);
+            yyjson_mut_doc_set_root(doc, root);
+            yyjson_mut_obj_add_str(doc, root, "verdict", "refinement_required");
+            yyjson_mut_obj_add_strcpy(doc, root, "base", base_branch);
+            if (merge_base[0]) {
+                yyjson_mut_obj_add_strcpy(doc, root, "merge_base", merge_base);
+            }
+            yyjson_mut_obj_add_strcpy(doc, root, "direction", direction);
+            yyjson_mut_obj_add_strcpy(doc, root, "scope", scope ? scope : "impact");
+            yyjson_mut_obj_add_int(doc, root, "depth", depth);
+            yyjson_mut_obj_add_uint(doc, root, "complete_response_bytes", complete_bytes);
+            yyjson_mut_obj_add_int(doc, root, "changed_files_total", file_count);
+            yyjson_mut_obj_add_int(doc, root, "changed_files_shown", changed_shown);
+            yyjson_mut_val *changed = yyjson_mut_arr(doc);
+            for (int i = 0; i < changed_shown; i++) {
+                yyjson_mut_arr_add_strcpy(doc, changed, files[i]);
+            }
+            yyjson_mut_obj_add_val(doc, root, "changed_files", changed);
+            yyjson_mut_obj_add_int(doc, root, "seed_symbols", seed_count);
+            yyjson_mut_obj_add_int(doc, root, "impacted_total", impact->visited_count);
+            yyjson_mut_obj_add_int(doc, root, "impacted_shown", impacted_shown);
+            yyjson_mut_val *impacted = yyjson_mut_arr(doc);
+            for (int i = 0; i < impacted_shown; i++) {
+                const cbm_node_hop_t *row = &impact->visited[i];
+                yyjson_mut_val *entry = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(
+                    doc, entry, "qn",
+                    row->node.qualified_name ? row->node.qualified_name : "");
+                yyjson_mut_obj_add_strcpy(doc, entry, "label",
+                                          row->node.label ? row->node.label : "");
+                yyjson_mut_obj_add_strcpy(doc, entry, "file",
+                                          row->node.file_path ? row->node.file_path : "");
+                yyjson_mut_obj_add_int(doc, entry, "hop", row->hop);
+                yyjson_mut_arr_add_val(impacted, entry);
+            }
+            yyjson_mut_obj_add_val(doc, root, "impacted", impacted);
+            if (impact->visited_count > 0) {
+                yyjson_mut_val *rollup = yyjson_mut_arr(doc);
+                int other = module_overflow;
+                for (int j = 0; j < module_count; j++) {
+                    if (j < modules_shown) {
+                        yyjson_mut_val *entry = yyjson_mut_obj(doc);
+                        yyjson_mut_obj_add_strcpy(doc, entry, "module", mods[j]);
+                        yyjson_mut_obj_add_int(doc, entry, "count", mcnt[j]);
+                        yyjson_mut_arr_add_val(rollup, entry);
+                    } else {
+                        other += mcnt[j];
+                    }
+                }
+                if (other > 0) {
+                    yyjson_mut_val *entry = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, entry, "module", "(other)");
+                    yyjson_mut_obj_add_int(doc, entry, "count", other);
+                    yyjson_mut_arr_add_val(rollup, entry);
+                }
+                yyjson_mut_obj_add_val(doc, root, "impacted_modules", rollup);
+            }
+            yyjson_mut_obj_add_bool(doc, root, "truncated", bfs_truncated);
+            yyjson_mut_obj_add_bool(doc, root, "output_truncated", true);
+            yyjson_mut_obj_add_bool(doc, root, "continuation_supported", false);
+            yyjson_mut_obj_add_str(
+                doc, root, "refinement_reason",
+                "detect_changes reads a live worktree, so stable continuation is unavailable");
+            yyjson_mut_obj_add_str(
+                doc, root, "hint",
+                "narrow base_branch/since, scope, depth, or limit and re-run without a cursor");
+            payload = yy_doc_to_str(doc);
+            yyjson_mut_doc_free(doc);
+        }
+
+        char *response = mcp_text_result_serialize(payload, false);
+        free(payload);
+        if (response && strlen(response) <= CBM_MCP_RESULT_MAX_BYTES) {
+            return response;
+        }
+        free(response);
+
+        /* An individual row can itself be unusually large. Dropping at least
+         * one row on every iteration guarantees progress without skipping or
+         * pretending that the bounded sample is complete. */
+        if (modules_shown > 0) {
+            modules_shown /= 2;
+        } else if (impacted_shown > 0) {
+            impacted_shown /= 2;
+        } else if (changed_shown > 0) {
+            changed_shown /= 2;
+        } else {
+            return cbm_mcp_text_result(
+                "detect_changes refinement metadata exceeds the safe response envelope; narrow "
+                "base_branch/since, scope, or depth",
+                true);
+        }
+    }
+}
+
 static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *base_branch = cbm_mcp_get_string_arg(args, "base_branch");
@@ -13597,6 +13829,20 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     char *scope = cbm_mcp_get_string_arg(args, "scope");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_BFS_DEPTH);
     depth = clamp_mcp_depth(depth, "detect_changes");
+
+    char *cursor = cbm_mcp_get_string_arg(args, "cursor");
+    if (cursor) {
+        free(cursor);
+        free(project);
+        free(base_branch);
+        free(since);
+        free(scope);
+        return cbm_mcp_text_result(
+            "detect_changes_cursor_unverifiable: detect_changes reads a live worktree, so a "
+            "continuation cursor cannot be validated against a stable snapshot. Re-run without "
+            "cursor and narrow base_branch/since, scope, depth, or limit.",
+            true);
+    }
 
     /* scope: "files" = just changed files, "symbols" = files + symbols (default) */
     bool want_symbols = !scope || strcmp(scope, "symbols") == 0 || strcmp(scope, "impact") == 0;
@@ -13880,6 +14126,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     (void)fclose(fp);
     (void)cbm_unlink(output_path);
     int git_status = git_result.exit_code;
+    if (file_count > 1) {
+        qsort(files, (size_t)file_count, sizeof(*files), cross_repo_project_key_compare);
+    }
 
     /* merge-base SHA: the exact commit the diff is measured against, so the
      * result is reproducible even as base_branch advances. Best-effort. */
@@ -13941,17 +14190,60 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                                   MCP_BFS_LIMIT_MAX, &impact, &truncated);
     }
 
+    char(*impact_mods)[CBM_SZ_128] = NULL;
+    int *impact_mcnt = NULL;
+    int impact_module_count = 0;
+    int impact_module_overflow = 0;
+    if (impact.visited_count > 0) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        bool force_rollup_alloc_failure = detect_refinement_fail_rollup_alloc;
+#else
+        bool force_rollup_alloc_failure = false;
+#endif
+        if (!force_rollup_alloc_failure) {
+            impact_mods = malloc(DETECT_MODCAP * CBM_SZ_128);
+            impact_mcnt = malloc(DETECT_MODCAP * sizeof(int));
+        }
+        if (!impact_mods || !impact_mcnt) {
+            free(impact_mods);
+            free(impact_mcnt);
+            cbm_store_traverse_free(&impact);
+            for (int i = 0; i < file_count; i++) {
+                free(files[i]);
+            }
+            free(files);
+            free(seeds);
+            free(hunks);
+            free(direction);
+            free(root_path);
+            free(project);
+            free(base_branch);
+            free(scope);
+            return cbm_mcp_text_result(
+                "detect_changes_refinement_allocation_unavailable: exact module accounting "
+                "could not be built; no partial result returned",
+                true);
+        }
+        impact_module_count = detect_module_rollup(&impact, impact_mods, impact_mcnt,
+                                                   &impact_module_overflow);
+    }
+
     bool is_error = (git_status != 0 && file_count == 0);
     char *out_str = NULL;
 
     if (!legacy_json) {
         cbm_sb_t sb;
         cbm_sb_init(&sb);
+        cbm_tree_scalar_str(&sb, "verdict",
+                            is_error ? "git_diff_error"
+                                     : (truncated ? "impact_safety_ceiling" : "complete"));
         cbm_tree_scalar_str(&sb, "base", base_branch);
         if (merge_base[0]) {
             cbm_tree_scalar_str(&sb, "merge_base", merge_base);
         }
         cbm_tree_scalar_str(&sb, "direction", direction);
+        cbm_tree_scalar_str(&sb, "scope", scope ? scope : "impact");
+        cbm_tree_scalar_int(&sb, "depth", depth);
         if (is_error) {
             char hint_buf[CBM_SZ_256];
             snprintf(hint_buf, sizeof(hint_buf),
@@ -13974,24 +14266,16 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             /* module rollup: a quotient view of the blast radius */
             if (impact.visited_count > 0) {
                 cbm_sb_append(&sb, "impacted_modules: (rows: module count)\n");
-                char (*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
-                int *mcnt = malloc(DETECT_MODCAP * sizeof(int));
-                if (mods && mcnt) {
-                    int overflow = 0;
-                    int nmods = detect_module_rollup(&impact, mods, mcnt, &overflow);
-                    for (int j = 0; j < nmods; j++) {
-                        char mrow[CBM_SZ_256];
-                        snprintf(mrow, sizeof(mrow), "  %s %d\n", mods[j], mcnt[j]);
-                        cbm_sb_append(&sb, mrow);
-                    }
-                    if (overflow > 0) {
-                        char orow[CBM_SZ_128];
-                        snprintf(orow, sizeof(orow), "  (other) %d\n", overflow);
-                        cbm_sb_append(&sb, orow);
-                    }
+                for (int j = 0; j < impact_module_count; j++) {
+                    char mrow[CBM_SZ_256];
+                    snprintf(mrow, sizeof(mrow), "  %s %d\n", impact_mods[j], impact_mcnt[j]);
+                    cbm_sb_append(&sb, mrow);
                 }
-                free(mods);
-                free(mcnt);
+                if (impact_module_overflow > 0) {
+                    char orow[CBM_SZ_128];
+                    snprintf(orow, sizeof(orow), "  (other) %d\n", impact_module_overflow);
+                    cbm_sb_append(&sb, orow);
+                }
             }
             if (truncated) {
                 cbm_tree_scalar_bool(&sb, "truncated", true);
@@ -14006,11 +14290,16 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
         yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
         yyjson_mut_doc_set_root(doc, root_obj);
+        yyjson_mut_obj_add_str(doc, root_obj, "verdict",
+                               is_error ? "git_diff_error"
+                                        : (truncated ? "impact_safety_ceiling" : "complete"));
         yyjson_mut_obj_add_strcpy(doc, root_obj, "base", base_branch);
         if (merge_base[0]) {
             yyjson_mut_obj_add_strcpy(doc, root_obj, "merge_base", merge_base);
         }
         yyjson_mut_obj_add_strcpy(doc, root_obj, "direction", direction);
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "scope", scope ? scope : "impact");
+        yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
         yyjson_mut_val *cf = yyjson_mut_arr(doc);
         for (int i = 0; i < file_count; i++) {
             yyjson_mut_arr_add_strcpy(doc, cf, files[i]);
@@ -14037,28 +14326,20 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root_obj, "impacted", imp);
         /* Model parity with the tree encoding: the complete module rollup. */
         if (impact.visited_count > 0) {
-            char (*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
-            int *mcnt = malloc(DETECT_MODCAP * sizeof(int));
-            if (mods && mcnt) {
-                int overflow = 0;
-                int nmods = detect_module_rollup(&impact, mods, mcnt, &overflow);
-                yyjson_mut_val *rollup = yyjson_mut_arr(doc);
-                for (int j = 0; j < nmods; j++) {
-                    yyjson_mut_val *o = yyjson_mut_obj(doc);
-                    yyjson_mut_obj_add_strcpy(doc, o, "module", mods[j]);
-                    yyjson_mut_obj_add_int(doc, o, "count", mcnt[j]);
-                    yyjson_mut_arr_add_val(rollup, o);
-                }
-                if (overflow > 0) {
-                    yyjson_mut_val *o = yyjson_mut_obj(doc);
-                    yyjson_mut_obj_add_strcpy(doc, o, "module", "(other)");
-                    yyjson_mut_obj_add_int(doc, o, "count", overflow);
-                    yyjson_mut_arr_add_val(rollup, o);
-                }
-                yyjson_mut_obj_add_val(doc, root_obj, "impacted_modules", rollup);
+            yyjson_mut_val *rollup = yyjson_mut_arr(doc);
+            for (int j = 0; j < impact_module_count; j++) {
+                yyjson_mut_val *o = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, o, "module", impact_mods[j]);
+                yyjson_mut_obj_add_int(doc, o, "count", impact_mcnt[j]);
+                yyjson_mut_arr_add_val(rollup, o);
             }
-            free(mods);
-            free(mcnt);
+            if (impact_module_overflow > 0) {
+                yyjson_mut_val *o = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, o, "module", "(other)");
+                yyjson_mut_obj_add_int(doc, o, "count", impact_module_overflow);
+                yyjson_mut_arr_add_val(rollup, o);
+            }
+            yyjson_mut_obj_add_val(doc, root_obj, "impacted_modules", rollup);
         }
         yyjson_mut_obj_add_bool(doc, root_obj, "truncated", truncated);
         if (is_error) {
@@ -14072,7 +14353,21 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_doc_free(doc);
     }
 
+    char *result = mcp_text_result_serialize(out_str, is_error);
+    if (!is_error && result && strlen(result) > CBM_MCP_RESULT_MAX_BYTES) {
+        size_t complete_bytes = strlen(result);
+        free(result);
+        result = detect_build_refinement_result(
+            base_branch, merge_base, direction, scope, depth, files, file_count, seed_count,
+            &impact, truncated, imp_limit, legacy_json, complete_bytes, impact_mods, impact_mcnt,
+            impact_module_count, impact_module_overflow);
+    } else {
+        result = mcp_result_enforce_limit(result);
+    }
+
     cbm_store_traverse_free(&impact);
+    free(impact_mods);
+    free(impact_mcnt);
     for (int i = 0; i < file_count; i++) {
         free(files[i]);
     }
@@ -14085,7 +14380,6 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     free(base_branch);
     free(scope);
 
-    char *result = cbm_mcp_text_result(out_str, is_error);
     free(out_str);
     return result;
 }
