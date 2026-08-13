@@ -19,6 +19,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "lsp/rust_cargo.h"
 #include "lsp/rust_lsp.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
@@ -28,6 +29,45 @@
 static CBMFileResult *extract_rust(const char *source) {
     return cbm_extract_file(source, (int)strlen(source), CBM_LANG_RUST,
                             "test", "src/main.rs", 0, NULL, NULL);
+}
+
+static CBMFileResult *extract_rust_with_limits(const char *source, int max_type_depth,
+                                               int max_eval_depth, int max_walk_depth,
+                                               int max_eval_steps, int max_macro_depth,
+                                               int max_macro_bindings) {
+    CBMFileResult *result = extract_rust(source);
+    if (!result || !result->cached_tree)
+        return result;
+
+    memset(&result->resolved_calls, 0, sizeof(result->resolved_calls));
+    memset(&result->rust_health, 0, sizeof(result->rust_health));
+    result->rust_health.required_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+
+    TSNode root = ts_tree_root_node(result->cached_tree);
+    CBMTypeRegistry registry;
+    cbm_rust_build_local_registry(&result->arena, &registry, result, result->module_qn, root,
+                                  source);
+    cbm_registry_finalize(&registry);
+
+    RustLSPContext context;
+    rust_lsp_init(&context, &result->arena, source, (int)strlen(source), &registry,
+                  result->module_qn, &result->resolved_calls);
+    context.health = &result->rust_health;
+    if (max_type_depth >= 0)
+        context.max_type_depth = max_type_depth;
+    if (max_eval_depth >= 0)
+        context.max_eval_depth = max_eval_depth;
+    if (max_walk_depth >= 0)
+        context.max_walk_depth = max_walk_depth;
+    if (max_eval_steps >= 0)
+        context.max_eval_steps = max_eval_steps;
+    if (max_macro_depth >= 0)
+        context.max_macro_depth = max_macro_depth;
+    if (max_macro_bindings >= 0)
+        context.max_macro_bindings = max_macro_bindings;
+    rust_lsp_process_file(&context, root);
+    result->rust_health.completed_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
+    return result;
 }
 
 static CBMTypeRegistry *rustlsp_return_shared_registry(void *ctx) {
@@ -619,7 +659,7 @@ TEST(rustlsp_crossfile_method_dispatch) {
                            "test.caller",
                            defs, 2,
                            imp_names, imp_qns, 1,
-                           NULL, &out);
+                           NULL, &out, NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
 
@@ -660,7 +700,7 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     memset(&out, 0, sizeof(out));
     cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller", reg,
                                          imp_names, imp_qns, 1, NULL, /*manifest=*/NULL, &out,
-                                         /*synthetic_calls=*/NULL);
+                                         /*synthetic_calls=*/NULL, /*health=*/NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
 
@@ -711,7 +751,7 @@ TEST(rustlsp_relative_type_requires_declared_module) {
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
-                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL, NULL);
     int stolen = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(stolen, 0);
@@ -727,7 +767,7 @@ TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed) {
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
-                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL, NULL);
     int guessed = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(guessed, 0);
@@ -761,7 +801,8 @@ TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier) {
 
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          reg, imp_names, imp_qns, 1, NULL, /*manifest=*/NULL,
-                                         &result.resolved_calls, &result.calls);
+                                         &result.resolved_calls, &result.calls,
+                                         &result.rust_health);
 
     int resolved = find_confident(&result.resolved_calls, "hidden", "lib.render");
     int carriers = 0;
@@ -997,7 +1038,8 @@ TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact) {
     ASSERT_NOT_NULL(reg);
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          reg, imp_names, imp_qns, 2, NULL, /*manifest=*/NULL,
-                                         &result.resolved_calls, &result.calls);
+                                         &result.resolved_calls, &result.calls,
+                                         &result.rust_health);
 
     const char *a_site = strstr(caller, "a::render()");
     const char *b_site = strstr(caller, "b::render()");
@@ -1444,7 +1486,7 @@ TEST(rustlsp_crossfile_free_function) {
     memset(&out, 0, sizeof(out));
 
     cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.main",
-                           defs, 1, imp_names, imp_qns, 1, NULL, &out);
+                           defs, 1, imp_names, imp_qns, 1, NULL, &out, NULL);
 
     ASSERT_GTE(find_confident(&out, "main", "utils.greet"), 0);
 
@@ -1471,9 +1513,17 @@ TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy) {
 
     CBMArena arena;
     cbm_arena_init(&arena);
+    CBMCargoManifest manifest = {0};
+    manifest.is_workspace_root = true;
+    manifest.members[0] =
+        (CBMCargoMember){.member_name = "caller_crate", .member_path = "caller_crate"};
+    manifest.members[1] =
+        (CBMCargoMember){.member_name = "other_crate", .member_path = "other_crate"};
+    manifest.member_count = 2;
     CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller),
-                           "project.caller_crate.main", defs, 1, NULL, NULL, 0, NULL, &out);
+    cbm_run_rust_lsp_cross_with_manifest(
+        &arena, caller, (int)strlen(caller), "project.caller_crate.main", defs, 1, NULL, NULL, 0,
+        NULL, &manifest, &out, NULL, NULL);
 
     int wrong_target = 0;
     int exact_unresolved = 0;
@@ -1514,20 +1564,28 @@ TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy) {
 
     CBMRustLSPDef defs[2];
     memset(defs, 0, sizeof(defs));
-    defs[0].qualified_name = "project.caller_crate.handlers.dispatch";
+    defs[0].qualified_name = "project.crates.caller_crate.handlers.dispatch";
     defs[0].short_name = "dispatch";
     defs[0].label = "Function";
-    defs[0].def_module_qn = "project.caller_crate.handlers";
-    defs[1].qualified_name = "project.other_crate.handlers.dispatch";
+    defs[0].def_module_qn = "project.crates.caller_crate.handlers";
+    defs[1].qualified_name = "project.crates.other_crate.handlers.dispatch";
     defs[1].short_name = "dispatch";
     defs[1].label = "Function";
-    defs[1].def_module_qn = "project.other_crate.handlers";
+    defs[1].def_module_qn = "project.crates.other_crate.handlers";
 
     CBMArena arena;
     cbm_arena_init(&arena);
+    CBMCargoManifest manifest = {0};
+    manifest.is_workspace_root = true;
+    manifest.members[0] =
+        (CBMCargoMember){.member_name = "caller_crate", .member_path = "crates/caller_crate"};
+    manifest.members[1] =
+        (CBMCargoMember){.member_name = "other_crate", .member_path = "crates/other_crate"};
+    manifest.member_count = 2;
     CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller),
-                           "project.caller_crate.main", defs, 2, NULL, NULL, 0, NULL, &out);
+    cbm_run_rust_lsp_cross_with_manifest(
+        &arena, caller, (int)strlen(caller), "project.crates.caller_crate.main", defs, 2, NULL,
+        NULL, 0, NULL, &manifest, &out, NULL, NULL);
 
     int exact_target = 0;
     int wrong_target = 0;
@@ -1535,7 +1593,8 @@ TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy) {
     bool exact_requested_spelling = false;
     for (int i = 0; i < out.count; i++) {
         const CBMResolvedCall *call = &out.items[i];
-        if (!call->caller_qn || strcmp(call->caller_qn, "project.caller_crate.main.caller") != 0 ||
+        if (!call->caller_qn ||
+            strcmp(call->caller_qn, "project.crates.caller_crate.main.caller") != 0 ||
             call->site_start_byte != expected_start || call->site_end_byte != expected_end) {
             continue;
         }
@@ -1543,12 +1602,12 @@ TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy) {
             (size_t)(call->site_end_byte - call->site_start_byte) == strlen(requested) &&
             strncmp(caller + call->site_start_byte, requested, strlen(requested)) == 0;
         if (call->callee_qn &&
-            strcmp(call->callee_qn, "project.caller_crate.handlers.dispatch") == 0 &&
+            strcmp(call->callee_qn, "project.crates.caller_crate.handlers.dispatch") == 0 &&
             call->strategy && strcmp(call->strategy, "lsp_short_name_unique") == 0) {
             exact_target++;
         }
         if (call->callee_qn &&
-            strcmp(call->callee_qn, "project.other_crate.handlers.dispatch") == 0) {
+            strcmp(call->callee_qn, "project.crates.other_crate.handlers.dispatch") == 0) {
             wrong_target++;
         }
         if (call->callee_qn && strcmp(call->callee_qn, "unknown.dispatch") == 0 && call->reason) {
@@ -1561,6 +1620,72 @@ TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy) {
     ASSERT_EQ(exact_target, 1);
     ASSERT_EQ(wrong_target, 0);
     ASSERT_EQ(unresolved, 0);
+    PASS();
+}
+
+TEST(rustlsp_crossfile_workspace_member_patterns_stay_crate_scoped) {
+    const char *caller = "fn caller() { unknown::dispatch(); }\n";
+    const char *member_patterns[] = {"crates/*", "crates/caller_crate/"};
+    for (int pattern_index = 0; pattern_index < 2; pattern_index++) {
+        CBMCargoManifest manifest = {0};
+        manifest.is_workspace_root = true;
+        manifest.members[0] = (CBMCargoMember){.member_name = "caller_crate",
+                                               .member_path = member_patterns[pattern_index]};
+        manifest.member_count = 1;
+        if (pattern_index == 1) {
+            manifest.members[1] = (CBMCargoMember){.member_name = "other_crate",
+                                                   .member_path = "crates/other_crate/"};
+            manifest.member_count = 2;
+        }
+
+        CBMRustLSPDef defs[2] = {0};
+        defs[0].qualified_name = "project.crates.caller_crate.handlers.dispatch";
+        defs[0].short_name = "dispatch";
+        defs[0].label = "Function";
+        defs[0].def_module_qn = "project.crates.caller_crate.handlers";
+        defs[1].qualified_name = "project.crates.other_crate.handlers.dispatch";
+        defs[1].short_name = "dispatch";
+        defs[1].label = "Function";
+        defs[1].def_module_qn = "project.crates.other_crate.handlers";
+
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMResolvedCallArray out = {0};
+        cbm_run_rust_lsp_cross_with_manifest(
+            &arena, caller, (int)strlen(caller), "project.crates.caller_crate.main", defs, 2,
+            NULL, NULL, 0, NULL, &manifest, &out, NULL, NULL);
+        int exact_target = 0;
+        int wrong_target = 0;
+        for (int i = 0; i < out.count; i++) {
+            const char *target = out.items[i].callee_qn;
+            if (target && strcmp(target, defs[0].qualified_name) == 0) {
+                exact_target++;
+            } else if (target && strcmp(target, defs[1].qualified_name) == 0) {
+                wrong_target++;
+            }
+        }
+        ASSERT_EQ(1, exact_target);
+        ASSERT_EQ(0, wrong_target);
+
+        memset(&out, 0, sizeof(out));
+        cbm_run_rust_lsp_cross_with_manifest(
+            &arena, caller, (int)strlen(caller), "project.crates.caller_crate.main", &defs[1], 1,
+            NULL, NULL, 0, NULL, &manifest, &out, NULL, NULL);
+        int unresolved = 0;
+        wrong_target = 0;
+        for (int i = 0; i < out.count; i++) {
+            const CBMResolvedCall *call = &out.items[i];
+            if (call->callee_qn && strcmp(call->callee_qn, defs[1].qualified_name) == 0) {
+                wrong_target++;
+            }
+            if (call->reason && strcmp(call->reason, "function_not_in_registry") == 0) {
+                unresolved++;
+            }
+        }
+        ASSERT_EQ(0, wrong_target);
+        ASSERT_EQ(1, unresolved);
+        cbm_arena_destroy(&arena);
+    }
     PASS();
 }
 
@@ -4598,7 +4723,7 @@ TEST(rustlsp_cov_xf_two_methods) {
     defs[2].short_name = "beta";  defs[2].label = "Method"; defs[2].receiver_type = "p.demo.Thing"; defs[2].def_module_qn = "p.demo";
     const char *imp_n[] = {"demo"}; const char *imp_q[] = {"p::demo"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out, NULL);
     ASSERT_GTE(find_confident(&out, "run", "Thing.alpha"), 0);
     ASSERT_GTE(find_confident(&out, "run", "Thing.beta"), 0);
     cbm_arena_destroy(&a); PASS();
@@ -4618,7 +4743,7 @@ TEST(rustlsp_cov_xf_trait_impl) {
     defs[2].def_module_qn = "p.demo";
     const char *imp_n[] = {"demo"}; const char *imp_q[] = {"p::demo"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out, NULL);
     ASSERT_GTE(find_confident(&out, "run", "Foo.beep"), 0);
     cbm_arena_destroy(&a); PASS();
 }
@@ -4632,7 +4757,7 @@ TEST(rustlsp_cov_xf_free_function_chain) {
     defs[0].return_types = "alloc.string.String";
     const char *imp_n[] = {"util"}; const char *imp_q[] = {"p::util"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out, NULL);
     ASSERT_GTE(find_confident(&out, "run", "util.make"), 0);
     cbm_arena_destroy(&a); PASS();
 }
@@ -4654,7 +4779,7 @@ TEST(rustlsp_cov_xf_empty_defs) {
     const char *src = "fn run() {}\n";
     CBMArena a; cbm_arena_init(&a);
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", NULL, 0, NULL, NULL, 0, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", NULL, 0, NULL, NULL, 0, NULL, &out, NULL);
     cbm_arena_destroy(&a); PASS();
 }
 TEST(rustlsp_cov_xf_nested_modules) {
@@ -4665,7 +4790,7 @@ TEST(rustlsp_cov_xf_nested_modules) {
     defs[0].qualified_name = "p.a.b.c.deep";
     defs[0].short_name = "deep"; defs[0].label = "Function"; defs[0].def_module_qn = "p.a.b.c";
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, NULL, NULL, 0, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, NULL, NULL, 0, NULL, &out, NULL);
     cbm_arena_destroy(&a); PASS();
 }
 TEST(rustlsp_cov_xf_with_stdlib_chain) {
@@ -4681,7 +4806,7 @@ TEST(rustlsp_cov_xf_with_stdlib_chain) {
     defs[0].field_defs = "contents:String";
     const char *imp_n[] = {"demo"}; const char *imp_q[] = {"p::demo"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out, NULL);
     cbm_arena_destroy(&a); PASS();
 }
 TEST(rustlsp_cov_xf_with_def_and_method) {
@@ -4694,7 +4819,7 @@ TEST(rustlsp_cov_xf_with_def_and_method) {
     defs[0].return_types = "()";
     const char *imp_n[] = {"utils"}; const char *imp_q[] = {"p::utils"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out, NULL);
     ASSERT_GTE(find_confident(&out, "run", "utils.work"), 0);
     cbm_arena_destroy(&a); PASS();
 }
@@ -4712,7 +4837,7 @@ TEST(rustlsp_cov_xf_caller_with_let) {
     defs[2].short_name = "use_it"; defs[2].label = "Method"; defs[2].receiver_type = "p.util.Thing"; defs[2].def_module_qn = "p.util";
     const char *imp_n[] = {"util"}; const char *imp_q[] = {"p::util"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out, NULL);
     ASSERT_GTE(find_confident(&out, "run", "make_thing"), 0);
     ASSERT_GTE(find_confident(&out, "run", "Thing.use_it"), 0);
     cbm_arena_destroy(&a); PASS();
@@ -4721,7 +4846,7 @@ TEST(rustlsp_cov_xf_no_imports) {
     const char *src = "fn run() {}\n";
     CBMArena a; cbm_arena_init(&a);
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", NULL, 0, NULL, NULL, 0, NULL, &out);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", NULL, 0, NULL, NULL, 0, NULL, &out, NULL);
     cbm_arena_destroy(&a); PASS();
 }
 
@@ -5799,14 +5924,36 @@ TEST(rustlsp_gap_macro_with_ty_and_expr) {
 }
 
 TEST(rustlsp_gap_macro_no_match_is_fail_closed) {
-    CBMFileResult *r = extract_rust(
+    const char *source =
         "fn unmatched_arm_sentinel() {}\n"
         "macro_rules! one_arm { (expected) => { unmatched_arm_sentinel() } }\n"
-        "fn run() { one_arm!(unexpected); }\n");
+        "fn run() { one_arm!(unexpected); }\n";
+    CBMFileResult *r = extract_rust(source);
     ASSERT_NOT_NULL(r);
     ASSERT_EQ(count_resolved_exact(r, "test.src.main.run",
                                    "test.src.main.unmatched_arm_sentinel"),
               0);
+    const char *site = strstr(source, "one_arm!(unexpected)");
+    ASSERT_NOT_NULL(site);
+    const CBMRustHealthIssue *issue =
+        &r->rust_health.issues[CBM_RUST_HEALTH_MACRO_NO_RULE_MATCH];
+    ASSERT_EQ(1, issue->count);
+    ASSERT_EQ((uint32_t)(site - source), issue->first_start_byte);
+    ASSERT_EQ((uint32_t)(site - source + strlen("one_arm!(unexpected)")),
+              issue->first_end_byte);
+    ASSERT_EQ(1, r->rust_health.unresolved_emitted);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&r->rust_health));
+    bool exact_unresolved = false;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        if (call->callee_qn && strcmp(call->callee_qn, "one_arm") == 0 && call->reason &&
+            strcmp(call->reason, "macro_no_rule_match") == 0 && call->confidence == 0.0f &&
+            call->site_start_byte == issue->first_start_byte &&
+            call->site_end_byte == issue->first_end_byte) {
+            exact_unresolved = true;
+        }
+    }
+    ASSERT_TRUE(exact_unresolved);
     cbm_free_result(r); PASS();
 }
 
@@ -6582,6 +6729,252 @@ TEST(rustlsp_health_status_is_derived_from_routes_and_issues) {
     PASS();
 }
 
+TEST(rustlsp_health_healthy_file_completes_and_counts_emissions) {
+    CBMFileResult *result = extract_rust(
+        "fn target() {}\n"
+        "fn run() { target(); missing(); }\n");
+    ASSERT_NOT_NULL(result);
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.required_routes);
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.completed_routes);
+    ASSERT_EQ(1, result->rust_health.resolved_emitted);
+    ASSERT_EQ(1, result->rust_health.unresolved_emitted);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&result->rust_health));
+    for (int reason = 0; reason < CBM_RUST_HEALTH_REASON_COUNT; reason++) {
+        ASSERT_EQ(0, result->rust_health.issues[reason].count);
+    }
+    ASSERT_EQ(1, count_resolved_exact(result, "test.src.main.run", "test.src.main.target"));
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(rustlsp_health_parse_error_is_partial_with_first_parser_span) {
+    const char *source = "fn ok() {}\nfn broken( {\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    const CBMRustHealthIssue *issue =
+        &result->rust_health.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED];
+    ASSERT_EQ(1, issue->count);
+    ASSERT_EQ((uint32_t)(strstr(source, "fn broken") - source), issue->first_start_byte);
+    ASSERT_EQ((uint32_t)strlen(source) - 1U, issue->first_end_byte);
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.completed_routes);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&result->rust_health));
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(rustlsp_health_walk_and_work_limits_report_omitted_subtrees) {
+    const char *source = "fn target() {}\nfn run() { target(); }\n";
+    CBMFileResult *shallow = extract_rust_with_limits(source, -1, -1, 1, -1, -1, -1);
+    ASSERT_NOT_NULL(shallow);
+    const CBMRustHealthIssue *walk =
+        &shallow->rust_health.issues[CBM_RUST_HEALTH_WALK_DEPTH_LIMIT];
+    ASSERT_TRUE(walk->count > 0);
+    ASSERT_TRUE(walk->first_end_byte > walk->first_start_byte);
+    ASSERT_EQ(0, count_resolved_exact(shallow, "test.src.main.run", "test.src.main.target"));
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&shallow->rust_health));
+    cbm_free_result(shallow);
+
+    CBMFileResult *deep = extract_rust_with_limits(source, -1, -1, 64, -1, -1, -1);
+    ASSERT_NOT_NULL(deep);
+    ASSERT_EQ(0, deep->rust_health.issues[CBM_RUST_HEALTH_WALK_DEPTH_LIMIT].count);
+    ASSERT_EQ(1, count_resolved_exact(deep, "test.src.main.run", "test.src.main.target"));
+    cbm_free_result(deep);
+
+    CBMFileResult *starved = extract_rust_with_limits(source, -1, -1, -1, 0, -1, -1);
+    ASSERT_NOT_NULL(starved);
+    const CBMRustHealthIssue *work =
+        &starved->rust_health.issues[CBM_RUST_HEALTH_WORK_LIMIT];
+    ASSERT_EQ(1, work->count);
+    ASSERT_TRUE(work->first_end_byte > work->first_start_byte);
+    ASSERT_EQ(0, count_resolved_exact(starved, "test.src.main.run", "test.src.main.target"));
+    cbm_free_result(starved);
+
+    CBMFileResult *funded = extract_rust_with_limits(source, -1, -1, -1, 100, -1, -1);
+    ASSERT_NOT_NULL(funded);
+    ASSERT_EQ(0, funded->rust_health.issues[CBM_RUST_HEALTH_WORK_LIMIT].count);
+    ASSERT_EQ(1, count_resolved_exact(funded, "test.src.main.run", "test.src.main.target"));
+    cbm_free_result(funded);
+    PASS();
+}
+
+TEST(rustlsp_health_type_and_eval_limits_report_exact_omissions) {
+    const char *source = "fn run(value: String) { value.len(); }\n";
+    CBMFileResult *limited = extract_rust_with_limits(source, 0, 0, -1, -1, -1, -1);
+    ASSERT_NOT_NULL(limited);
+    const CBMRustHealthIssue *type_issue =
+        &limited->rust_health.issues[CBM_RUST_HEALTH_TYPE_DEPTH_LIMIT];
+    const CBMRustHealthIssue *eval_issue =
+        &limited->rust_health.issues[CBM_RUST_HEALTH_EVAL_DEPTH_LIMIT];
+    ASSERT_TRUE(type_issue->count > 0);
+    ASSERT_TRUE(type_issue->first_end_byte > type_issue->first_start_byte);
+    ASSERT_TRUE(eval_issue->count > 0);
+    ASSERT_TRUE(eval_issue->first_end_byte > eval_issue->first_start_byte);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&limited->rust_health));
+    cbm_free_result(limited);
+
+    CBMFileResult *control = extract_rust_with_limits(source, 64, 64, -1, -1, -1, -1);
+    ASSERT_NOT_NULL(control);
+    ASSERT_EQ(0, control->rust_health.issues[CBM_RUST_HEALTH_TYPE_DEPTH_LIMIT].count);
+    ASSERT_EQ(0, control->rust_health.issues[CBM_RUST_HEALTH_EVAL_DEPTH_LIMIT].count);
+    ASSERT_TRUE(find_resolved(control, "run", "String.len") >= 0 ||
+                find_resolved(control, "run", "len") >= 0);
+    cbm_free_result(control);
+    PASS();
+}
+
+TEST(rustlsp_health_macro_binding_and_repetition_caps_are_occurrence_scoped) {
+    const char *depth_source =
+        "fn depth_sentinel() {}\n"
+        "macro_rules! invoke { () => { depth_sentinel() } }\n"
+        "fn run() { invoke!(); }\n";
+    CBMFileResult *depth_limited =
+        extract_rust_with_limits(depth_source, -1, -1, -1, -1, 0, -1);
+    ASSERT_NOT_NULL(depth_limited);
+    const char *depth_site = strstr(depth_source, "invoke!()");
+    ASSERT_NOT_NULL(depth_site);
+    const CBMRustHealthIssue *depth_issue =
+        &depth_limited->rust_health.issues[CBM_RUST_HEALTH_MACRO_DEPTH_LIMIT];
+    ASSERT_EQ(1, depth_issue->count);
+    ASSERT_EQ((uint32_t)(depth_site - depth_source), depth_issue->first_start_byte);
+    ASSERT_EQ(0, count_resolved_exact(depth_limited, "test.src.main.run",
+                                      "test.src.main.depth_sentinel"));
+    cbm_free_result(depth_limited);
+
+    CBMFileResult *depth_control =
+        extract_rust_with_limits(depth_source, -1, -1, -1, -1, 8, -1);
+    ASSERT_NOT_NULL(depth_control);
+    ASSERT_EQ(0, depth_control->rust_health.issues[CBM_RUST_HEALTH_MACRO_DEPTH_LIMIT].count);
+    ASSERT_EQ(1, count_resolved_exact(depth_control, "test.src.main.run",
+                                      "test.src.main.depth_sentinel"));
+    cbm_free_result(depth_control);
+
+    const char *parse_source =
+        "macro_rules! broken { () => { let = ; } }\n"
+        "fn run() { broken!(); }\n";
+    CBMFileResult *parse_failed = extract_rust(parse_source);
+    ASSERT_NOT_NULL(parse_failed);
+    const char *parse_site = strstr(parse_source, "broken!()");
+    ASSERT_NOT_NULL(parse_site);
+    const CBMRustHealthIssue *parse_issue =
+        &parse_failed->rust_health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED];
+    ASSERT_EQ(1, parse_issue->count);
+    ASSERT_EQ((uint32_t)(parse_site - parse_source), parse_issue->first_start_byte);
+    ASSERT_EQ((uint32_t)(parse_site - parse_source + strlen("broken!()")),
+              parse_issue->first_end_byte);
+    cbm_free_result(parse_failed);
+
+    const char *binding_source =
+        "fn sentinel() {}\n"
+        "macro_rules! pair { ($a:expr, $b:expr) => { sentinel() } }\n"
+        "fn run() { pair!(1, 2); }\n";
+    CBMFileResult *binding =
+        extract_rust_with_limits(binding_source, -1, -1, -1, -1, -1, 1);
+    ASSERT_NOT_NULL(binding);
+    const char *binding_site = strstr(binding_source, "pair!(1, 2)");
+    ASSERT_NOT_NULL(binding_site);
+    const CBMRustHealthIssue *binding_issue =
+        &binding->rust_health.issues[CBM_RUST_HEALTH_MACRO_BINDING_LIMIT];
+    ASSERT_EQ(1, binding_issue->count);
+    ASSERT_EQ((uint32_t)(binding_site - binding_source), binding_issue->first_start_byte);
+    ASSERT_EQ(0, count_resolved_exact(binding, "test.src.main.run", "test.src.main.sentinel"));
+    cbm_free_result(binding);
+
+    const char *repeat_source =
+        "macro_rules! many { ($($x:expr),*) => { $(consume($x);)* } }\n"
+        "fn consume(_: i32) {}\n"
+        "fn run() { many!(1, 2); }\n";
+    CBMFileResult *repeat = extract_rust(repeat_source);
+    ASSERT_NOT_NULL(repeat);
+    const char *repeat_site = strstr(repeat_source, "many!(1, 2)");
+    ASSERT_NOT_NULL(repeat_site);
+    const CBMRustHealthIssue *repeat_issue =
+        &repeat->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT];
+    ASSERT_EQ(1, repeat_issue->count);
+    ASSERT_EQ((uint32_t)(repeat_site - repeat_source), repeat_issue->first_start_byte);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&repeat->rust_health));
+    cbm_free_result(repeat);
+    PASS();
+}
+
+TEST(rustlsp_health_macro_repetition_and_substitution_reasons_are_truthful) {
+    const char *literal_source =
+        "fn consume() {}\n"
+        "macro_rules! literal { () => {{ let _ = \"$(\"; /* $( is data */ consume() }} }\n"
+        "fn run() { literal!(); }\n";
+    CBMFileResult *literal = extract_rust(literal_source);
+    ASSERT_NOT_NULL(literal);
+    ASSERT_EQ(0, literal->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT].count);
+    ASSERT_EQ(0, literal->rust_health.issues[CBM_RUST_HEALTH_MACRO_SUBSTITUTION_LIMIT].count);
+    ASSERT_EQ(0, literal->rust_health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&literal->rust_health));
+    cbm_free_result(literal);
+
+    const char *prefix =
+        "fn consume(_: &str) {}\n"
+        "macro_rules! pass { ($x:expr) => { consume($x) } }\n"
+        "fn run() { pass!(\"";
+    const char *suffix = "\"); }\n";
+    size_t payload_len = 6000;
+    size_t source_len = strlen(prefix) + payload_len + strlen(suffix);
+    char *source = (char *)malloc(source_len + 1);
+    ASSERT_NOT_NULL(source);
+    size_t used = strlen(prefix);
+    memcpy(source, prefix, used);
+    memset(source + used, 'x', payload_len);
+    used += payload_len;
+    memcpy(source + used, suffix, strlen(suffix) + 1);
+
+    CBMFileResult *truncated = extract_rust(source);
+    ASSERT_NOT_NULL(truncated);
+    const char *site = strstr(source, "pass!(");
+    ASSERT_NOT_NULL(site);
+    const CBMRustHealthIssue *substitution =
+        &truncated->rust_health.issues[CBM_RUST_HEALTH_MACRO_SUBSTITUTION_LIMIT];
+    ASSERT_EQ(1, substitution->count);
+    ASSERT_EQ((uint32_t)(site - source), substitution->first_start_byte);
+    ASSERT_EQ(0,
+              truncated->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT].count);
+    cbm_free_result(truncated);
+    free(source);
+    PASS();
+}
+
+TEST(rustlsp_cross_health_is_explicit_and_survives_parse_degradation) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray output = {0};
+    CBMRustAnalysisHealth health = {0};
+    const char *source = "fn broken( {\n";
+    cbm_run_rust_lsp_cross_with_manifest(
+        &arena, source, (int)strlen(source), "test.main", NULL, 0, NULL, NULL, 0, NULL,
+        NULL, &output, NULL, &health);
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.required_routes);
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.completed_routes);
+    ASSERT_EQ(1, health.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&health));
+
+    memset(&output, 0, sizeof(output));
+    memset(&health, 0, sizeof(health));
+    const char *healthy_source = "fn run() {}\n";
+    cbm_run_rust_lsp_cross_with_manifest(
+        &arena, healthy_source, (int)strlen(healthy_source), "test.main", NULL, 0, NULL, NULL,
+        0, NULL, NULL, &output, NULL, &health);
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.required_routes);
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.completed_routes);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&health));
+
+    memset(&health, 0, sizeof(health));
+    cbm_run_rust_lsp_cross_with_manifest(
+        &arena, NULL, 0, "test.main", NULL, 0, NULL, NULL, 0, NULL, NULL, &output, NULL,
+        &health);
+    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.required_routes);
+    ASSERT_EQ(0, health.completed_routes);
+    ASSERT_EQ(1, health.issues[CBM_RUST_HEALTH_SOURCE_UNAVAILABLE].count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&health));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(rustlsp_health_record_retains_first_span_and_saturates) {
     CBMRustAnalysisHealth health = {0};
     cbm_rust_health_record(&health, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, 12, 19);
@@ -7122,6 +7515,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_free_function);
     RUN_TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy);
     RUN_TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy);
+    RUN_TEST(rustlsp_crossfile_workspace_member_patterns_stay_crate_scoped);
 
     /* Robustness */
     RUN_TEST(rustlsp_handles_empty_file);
@@ -7666,6 +8060,13 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_partial_cargo_parses_workspace);
     RUN_TEST(rustlsp_partial_cargo_handles_comments_and_quirks);
     RUN_TEST(rustlsp_health_status_is_derived_from_routes_and_issues);
+    RUN_TEST(rustlsp_health_healthy_file_completes_and_counts_emissions);
+    RUN_TEST(rustlsp_health_parse_error_is_partial_with_first_parser_span);
+    RUN_TEST(rustlsp_health_walk_and_work_limits_report_omitted_subtrees);
+    RUN_TEST(rustlsp_health_type_and_eval_limits_report_exact_omissions);
+    RUN_TEST(rustlsp_health_macro_binding_and_repetition_caps_are_occurrence_scoped);
+    RUN_TEST(rustlsp_health_macro_repetition_and_substitution_reasons_are_truthful);
+    RUN_TEST(rustlsp_cross_health_is_explicit_and_survives_parse_degradation);
     RUN_TEST(rustlsp_health_record_retains_first_span_and_saturates);
     RUN_TEST(rustlsp_cargo_malformed_input_records_first_exact_span);
     RUN_TEST(rustlsp_cargo_dependency_cap_records_each_dropped_entry);

@@ -932,7 +932,8 @@ static void pxc_run_one_with_manifest(CBMLanguage lang, CBMFileResult *r, const 
         CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
         cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
                                              def_count, imp_names, imp_qns, imp_count, tree,
-                                             rust_manifest, &out, &synthetic_calls);
+                                             rust_manifest, &out, &synthetic_calls,
+                                             &r->rust_health);
         break;
     }
     default:
@@ -1109,7 +1110,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             CBMCallArray synthetic_calls = {0};
             cbm_run_rust_lsp_cross_with_registry(&scratch, source, source_len, def_module, shared,
                                                  imp_keys, imp_vals, imp_count, result->cached_tree,
-                                                 rust_manifest, &out, &synthetic_calls);
+                                                 rust_manifest, &out, &synthetic_calls,
+                                                 &result->rust_health);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             cbm_arena_destroy(&scratch);

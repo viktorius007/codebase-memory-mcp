@@ -121,6 +121,7 @@ typedef struct {
      * synthetic transcriber buffer, so their tree-sitter offsets cannot be
      * used to decide which source-level macro_rules! definition is visible. */
     uint32_t macro_origin_byte;
+    uint32_t macro_origin_end_byte;
     bool macro_origin_valid;
 
     /* Recursion guard for macro expansion. Real macro_rules! can be
@@ -170,6 +171,11 @@ typedef struct {
     /* Output: resolved (and unresolved-with-reason) calls accumulate here. */
     CBMResolvedCallArray *resolved_calls;
 
+    /* Borrowed, allocation-independent semantic degradation sink. A NULL sink
+     * preserves the public low-level context API for callers that do not own a
+     * CBMFileResult; production single-file extraction always supplies one. */
+    CBMRustAnalysisHealth *health;
+
     /* Syntactic-call list (result->calls), borrowed from the per-file
      * extraction result. The downstream pipeline only turns a resolved_call
      * into a CALLS edge when a *syntactic* CBMCall with the same
@@ -199,6 +205,15 @@ typedef struct {
     int type_depth;
     int eval_depth;
     int walk_depth;
+
+    /* Per-context ceilings make the production limits explicit and let tests
+     * exercise both sides of each boundary without pathological fixtures. */
+    int max_type_depth;
+    int max_eval_depth;
+    int max_walk_depth;
+    int max_eval_steps;
+    int max_macro_depth;
+    int max_macro_bindings;
 
     /* Current invocation occurrence in ORIGINAL-file coordinates. Ordinary
      * source calls use their tree-sitter node directly. Calls recovered by
@@ -339,7 +354,8 @@ typedef struct {
 void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMRustLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
-                            TSTree *cached_tree, CBMResolvedCallArray *out);
+                            TSTree *cached_tree, CBMResolvedCallArray *out,
+                            CBMRustAnalysisHealth *health);
 
 /* Same as `cbm_run_rust_lsp_cross`, plus an optional parsed Cargo manifest
  * (NULL = manifest-free behaviour). The manifest lets call paths whose head
@@ -352,7 +368,8 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMRustAnalysisHealth *health);
 
 /* Tier-2: build the project-wide Rust cross registry ONCE from all defs, finalize,
  * and seal read-only. Shared across every Rust file's resolve (mirrors C/py/cs/ts).
@@ -370,7 +387,8 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMRustAnalysisHealth *health);
 
 /* Per-file input for batch cross-file Rust LSP processing. */
 typedef struct {
@@ -383,6 +401,7 @@ typedef struct {
     const char **import_names;
     const char **import_qns;
     int import_count;
+    CBMRustAnalysisHealth *health;
 } CBMBatchRustLSPFile;
 
 /* Process several files in one CGo call (per-file arenas, result copy). */

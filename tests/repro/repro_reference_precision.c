@@ -762,7 +762,7 @@ TEST(repro_rust_direct_scoped_function_value_is_exact_reference) {
     defs[2].label = "Function";
     defs[2].def_module_qn = "repro.main";
     cbm_run_rust_lsp_cross(&raw->arena, source, (int)strlen(source), "repro.main", defs, 3, NULL,
-                           NULL, 0, NULL, &raw->resolved_calls);
+                           NULL, 0, NULL, &raw->resolved_calls, NULL);
 
     const char *site = strstr(source, "target::handler");
     ASSERT_NOT_NULL(site);
