@@ -2297,6 +2297,33 @@ static bool lsp_idx_insert_leaf(CBMHashTable *index, CBMResolvedCall *candidate,
     return inserted;
 }
 
+/* Rust cfg-disambiguated method QNs append `#cfg(...)` to the source leaf.
+ * The raw carrier retains only the Rust spelling. Mirror the authoritative
+ * exact-site matcher by indexing that spelling as an alias; the shared key's
+ * ambiguity tombstone still fails closed if two cfg targets claim one site. */
+static bool lsp_idx_insert_cfg_leaf_alias(CBMHashTable *index, CBMResolvedCall *candidate,
+                                          const char *leaf, const cbm_gbuf_t *gbuf,
+                                          const char *project_name, bool allow_tail_match) {
+    if (!leaf) {
+        return true;
+    }
+    const char *cfg = strstr(leaf, "#cfg(");
+    if (!cfg || cfg == leaf) {
+        return true;
+    }
+    size_t bare_len = (size_t)(cfg - leaf);
+    char *bare = (char *)malloc(bare_len + 1);
+    if (!bare) {
+        return false;
+    }
+    memcpy(bare, leaf, bare_len);
+    bare[bare_len] = '\0';
+    bool inserted =
+        lsp_idx_insert_leaf(index, candidate, bare, true, gbuf, project_name, allow_tail_match);
+    free(bare);
+    return inserted;
+}
+
 static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CBMCall *call,
                                              bool exact_site, bool *key_built, bool *ambiguous) {
     if (key_built) {
@@ -2380,15 +2407,20 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     continue;
                 }
                 CBMHashTable *index = exact_site ? lsp_exact_idx : lsp_legacy_idx;
-                bool inserted =
-                    lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->callee_qn),
-                                        exact_site, rc->main_gbuf, rc->project_name, allow_tail);
+                const char *callee_leaf = cbm_lsp_bare_segment(rc_e->callee_qn);
+                bool inserted = lsp_idx_insert_leaf(index, rc_e, callee_leaf, exact_site,
+                                                    rc->main_gbuf, rc->project_name, allow_tail);
                 if (!inserted) {
                     if (exact_site) {
                         lsp_exact_idx_complete = false;
                     } else {
                         lsp_legacy_idx_complete = false;
                     }
+                }
+                if (exact_site &&
+                    !lsp_idx_insert_cfg_leaf_alias(index, rc_e, callee_leaf, rc->main_gbuf,
+                                                   rc->project_name, allow_tail)) {
+                    lsp_exact_idx_complete = false;
                 }
                 if (rc_e->reason && cbm_pipeline_invocation_reason_join_strategy(rc_e->strategy)) {
                     inserted = lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->reason),

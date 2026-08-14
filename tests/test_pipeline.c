@@ -12714,6 +12714,77 @@ TEST(pipeline_rust_cargo_tokio_nested_calls_exact_targets) {
     PASS();
 }
 
+TEST(pipeline_rust_tokio_cfg_crossfile_parallel_exact_target) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_tokio_parallel_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "src/runtime")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"tokio-parallel\"\nversion = \"0.1.0\"\n"
+                    "edition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod runtime;\n");
+    write_temp_file(tmp, "src/runtime/mod.rs",
+                    "mod builder;\nmod runtime;\npub use builder::Builder;\n");
+    write_temp_file(tmp, "src/runtime/builder.rs",
+                    "pub struct Builder;\n"
+                    "impl Builder {\n"
+                    "#[cfg(feature = \"rt-multi-thread\")]\n"
+                    "#[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
+                    "pub fn new_multi_thread() -> Builder { Builder }\n"
+                    "pub fn new_current_thread() -> Builder { Builder }\n"
+                    "pub fn enable_all(&mut self) -> &mut Self { self }\n"
+                    "pub fn build(&mut self) -> Result<(), ()> { Ok(()) }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/runtime/runtime.rs",
+                    "cfg_rt_multi_thread! { use crate::runtime::Builder; }\n"
+                    "pub struct Runtime;\n"
+                    "impl Runtime {\n"
+                    "#[cfg(feature = \"rt-multi-thread\")]\n"
+                    "#[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
+                    "pub fn new() -> Result<(), ()> {\n"
+                    "Builder::new_multi_thread().enable_all().build()\n"
+                    "}\n"
+                    "pub fn new_current() -> Result<(), ()> {\n"
+                    "Builder::new_current_thread().enable_all().build()\n"
+                    "}\n}\n");
+    for (int i = 0; i < 48; i++) {
+        char rel[64];
+        snprintf(rel, sizeof(rel), "src/filler_%02d.rs", i);
+        write_temp_file(tmp, rel, "pub fn filler() {}\n");
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_WORKERS", "4", 1), 0);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/tokio.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int pipeline_rc = cbm_pipeline_run(pipeline);
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved_workers);
+    ASSERT_EQ(pipeline_rc, 0);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+
+    char qn[512];
+    snprintf(qn, sizeof(qn),
+             "%s.src.runtime.builder.Builder.new_multi_thread#cfg(feature=rt-multi-thread)"
+             "#cfg(feature=rt-multi-thread)",
+             project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "new", qn), 1);
+    /* Mechanism-impossible control: the otherwise-identical non-cfg leaf does
+     * not need an alias key and must remain independently joined. */
+    snprintf(qn, sizeof(qn), "%s.src.runtime.builder.Builder.new_current_thread", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "new_current", qn), 1);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets) {
     const char *alpha_factory_source =
         "pub struct SelfRunner;\n"
@@ -13255,6 +13326,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets);
     RUN_TEST(pipeline_rust_cross_file_factory_chains_exact_targets);
     RUN_TEST(pipeline_rust_cargo_tokio_nested_calls_exact_targets);
+    RUN_TEST(pipeline_rust_tokio_cfg_crossfile_parallel_exact_target);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
