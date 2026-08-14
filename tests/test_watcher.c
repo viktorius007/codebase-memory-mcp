@@ -1976,9 +1976,13 @@ TEST(watcher_baseline_dirty_repo) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 0); /* baseline never triggers */
 
-    /* First real poll — should detect the pre-existing dirty state */
-    cbm_watcher_touch(w, "bld-repo");
-    cbm_watcher_poll_once(w);
+    /* A transient Git-command failure is deliberately retryable: committed
+     * watcher baselines stay unchanged, so the next poll must still detect
+     * the pre-existing dirty state. Bound the test to that one retry. */
+    for (int attempt = 0; attempt < 2 && index_call_count == 0; attempt++) {
+        cbm_watcher_touch(w, "bld-repo");
+        cbm_watcher_poll_once(w);
+    }
     ASSERT_EQ(index_call_count, 1);
 
     cbm_watcher_free(w);
