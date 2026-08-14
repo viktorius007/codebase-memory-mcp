@@ -144,7 +144,7 @@ static char *append_array(char *dst, const char *key, const char *const *values)
 }
 
 cbm_def_properties_status_t cbm_def_properties_build(const CBMDefinition *def,
-                                                      cbm_def_properties_t *out) {
+                                                     cbm_def_properties_t *out) {
     if (!def || !out) {
         return CBM_DEF_PROPERTIES_INVALID;
     }
@@ -159,9 +159,8 @@ cbm_def_properties_status_t cbm_def_properties_build(const CBMDefinition *def,
         "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
         "\"unguarded_recursion\":%s,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
         "\"is_entry_point\":%s";
-    const char *other_format =
-        "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
-        "\"is_entry_point\":%s";
+    const char *other_format = "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
+                               "\"is_entry_point\":%s";
     int prefix_length =
         is_function
             ? snprintf(NULL, 0, function_format, def->complexity, def->cognitive, def->loop_count,

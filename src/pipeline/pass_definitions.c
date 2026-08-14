@@ -565,8 +565,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
                                                            rel, ctx->macro_table, NULL)
                 : cbm_extract_file_ex(
-                       source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
-                       NULL /* no extra defines or include paths */, ctx->macro_table, NULL);
+                      source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
+                      NULL /* no extra defines or include paths */, ctx->macro_table, NULL);
         free(source);
 
         if (!result) {

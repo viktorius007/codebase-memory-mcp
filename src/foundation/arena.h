@@ -39,9 +39,9 @@ typedef struct {
     char *blocks[CBM_ARENA_MAX_BLOCKS];
     size_t block_sizes[CBM_ARENA_MAX_BLOCKS]; /* per-block sizes (for stats) */
     int nblocks;
-    size_t block_size;  /* current block capacity */
-    size_t used;        /* bytes used in current block */
-    size_t total_alloc; /* cumulative bytes allocated (for stats) */
+    size_t block_size;     /* current block capacity */
+    size_t used;           /* bytes used in current block */
+    size_t total_alloc;    /* cumulative bytes allocated (for stats) */
     CBMArenaStatus status; /* sticky: never returns to AVAILABLE after allocation loss */
     /* ABI-stable seam state: the mutator remains test-build-only, but unity
      * objects compiled without that define must retain the identical layout. */

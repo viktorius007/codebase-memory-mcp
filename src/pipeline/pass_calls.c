@@ -641,8 +641,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * READS/WRITES resolution. They are never callable; a textual name match
      * must not turn member access into a CALLS edge. */
     if (target_node->label &&
-        (strcmp(target_node->label, "Field") == 0 ||
-         strcmp(target_node->label, "Variable") == 0)) {
+        (strcmp(target_node->label, "Field") == 0 || strcmp(target_node->label, "Variable") == 0)) {
         return 0;
     }
     bool rust_drop_plain_call = cbm_rust_suppress_weak_receiver_match(

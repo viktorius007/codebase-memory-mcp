@@ -23,7 +23,7 @@ typedef struct {
 } cbm_def_properties_t;
 
 cbm_def_properties_status_t cbm_def_properties_build(const CBMDefinition *def,
-                                                      cbm_def_properties_t *out);
+                                                     cbm_def_properties_t *out);
 void cbm_def_properties_destroy(cbm_def_properties_t *properties);
 const char *cbm_def_properties_status_name(cbm_def_properties_status_t status);
 

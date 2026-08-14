@@ -612,7 +612,7 @@ typedef struct CBMFileResult {
     CBMModDeclArray mod_decls;           // Rust: bodyless `mod NAME;` child declarations
     CBMRustCarrierStatus rust_imports_status;
     CBMRustCarrierStatus rust_mod_decls_status;
-    CBMRustAnalysisHealth rust_health;   // fixed-size Rust semantic degradation report
+    CBMRustAnalysisHealth rust_health; // fixed-size Rust semantic degradation report
 
     const char *module_qn;      // module qualified name
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none

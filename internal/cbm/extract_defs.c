@@ -3852,8 +3852,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into the QN so both branches survive the graph upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = cbm_rust_callable_qualified_name(
-            a, ctx->project, ctx->rel_path, ctx->module_qn, node, ctx->source);
+        def.qualified_name = cbm_rust_callable_qualified_name(a, ctx->project, ctx->rel_path,
+                                                              ctx->module_qn, node, ctx->source);
         def.is_test = rust_def_is_test(def.decorators);
     }
 
@@ -7398,8 +7398,7 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
 /* extract_rust_impl emits the direct methods itself. Walk only those methods'
  * bodies so lexically nested `fn` items are also emitted without duplicating
  * each direct method as a top-level Function. */
-static void push_rust_impl_method_bodies(TSNode impl_node, const CBMLangSpec *spec,
-                                         wd_stack_t *s) {
+static void push_rust_impl_method_bodies(TSNode impl_node, const CBMLangSpec *spec, wd_stack_t *s) {
     TSNode body = ts_node_child_by_field_name(impl_node, TS_FIELD("body"));
     if (ts_node_is_null(body)) {
         return;

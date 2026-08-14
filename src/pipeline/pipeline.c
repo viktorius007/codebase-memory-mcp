@@ -2268,8 +2268,9 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
         cbm_project_free_fields(&project_info);
         memset(&project_info, 0, sizeof(project_info));
         char published_generation[96];
-        ok = ok && cbm_store_generation(store, published_generation,
-                                        sizeof(published_generation)) == CBM_STORE_OK &&
+        ok = ok &&
+             cbm_store_generation(store, published_generation, sizeof(published_generation)) ==
+                 CBM_STORE_OK &&
              strcmp(published_generation, "legacy") != 0 &&
              strcmp(published_generation, previous_generation) != 0;
         have_project_info =

@@ -2502,9 +2502,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         /* Field/Variable entries exist in the registry for usage edges, not as
          * legal CALLS targets. Keep sequential and parallel behavior identical. */
-        if (target_node->label &&
-            (strcmp(target_node->label, "Field") == 0 ||
-             strcmp(target_node->label, "Variable") == 0)) {
+        if (target_node->label && (strcmp(target_node->label, "Field") == 0 ||
+                                   strcmp(target_node->label, "Variable") == 0)) {
             continue;
         }
         bool rust_drop_plain_call = cbm_rust_suppress_weak_receiver_match(

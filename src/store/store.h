@@ -192,7 +192,7 @@ typedef struct {
 
 typedef struct {
     cbm_node_t node;
-    int hop; /* BFS depth from root */
+    int hop;                     /* BFS depth from root */
     int64_t predecessor_edge_id; /* deterministic shortest-path edge from hop-1 */
 } cbm_node_hop_t;
 

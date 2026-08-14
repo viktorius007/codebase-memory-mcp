@@ -300,10 +300,9 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * same-crate `Mode::empty` collisions) and unique matches across Cargo package
  * boundaries. Preserve same-package unique fallback while cross-file typing is
  * incomplete, plus all LSP/import/same-module/qualified matches. */
-bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver,
-                                           const char *callee_name, const char *strategy,
-                                           const char *source_file, const char *target_file,
-                                           const char *target_qn);
+bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver, const char *callee_name,
+                                           const char *strategy, const char *source_file,
+                                           const char *target_file, const char *target_qn);
 
 /* Decide whether a resolved TS/JS/TSX member-call edge is weak-strategy noise to
  * drop (#592/#606): true only for TS/JS, only for a member call with a

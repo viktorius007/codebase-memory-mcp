@@ -8930,34 +8930,31 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         }
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, out_total_key, out_total);
-            yyjson_mut_obj_add_val(
-                doc, root, out_key,
-                bfs_to_tree_json(doc, &view_out, risk_labels, include_tests, data_flow,
-                                 include_evidence));
+            yyjson_mut_obj_add_val(doc, root, out_key,
+                                   bfs_to_tree_json(doc, &view_out, risk_labels, include_tests,
+                                                    data_flow, include_evidence));
             if (unattr_out_total > 0) {
                 yyjson_mut_obj_add_int(doc, root, "unattributed_outbound_total", unattr_out_total);
                 yyjson_mut_obj_add_str(doc, root, "unattributed_outbound_note",
                                        TRACE_UNATTRIBUTED_OUT_NOTE);
-                yyjson_mut_obj_add_val(
-                    doc, root, "unattributed_outbound",
-                    bfs_to_tree_json(doc, &unattr_out, risk_labels, include_tests, data_flow,
-                                     include_evidence));
+                yyjson_mut_obj_add_val(doc, root, "unattributed_outbound",
+                                       bfs_to_tree_json(doc, &unattr_out, risk_labels,
+                                                        include_tests, data_flow,
+                                                        include_evidence));
             }
         }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, in_total_key, in_total);
-            yyjson_mut_obj_add_val(
-                doc, root, in_key,
-                bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow,
-                                 include_evidence));
+            yyjson_mut_obj_add_val(doc, root, in_key,
+                                   bfs_to_tree_json(doc, &view_in, risk_labels, include_tests,
+                                                    data_flow, include_evidence));
             if (unattr_in_total > 0) {
                 yyjson_mut_obj_add_int(doc, root, "unattributed_inbound_total", unattr_in_total);
                 yyjson_mut_obj_add_str(doc, root, "unattributed_inbound_note",
                                        TRACE_UNATTRIBUTED_IN_NOTE);
-                yyjson_mut_obj_add_val(
-                    doc, root, "unattributed_inbound",
-                    bfs_to_tree_json(doc, &unattr_in, risk_labels, include_tests, data_flow,
-                                     include_evidence));
+                yyjson_mut_obj_add_val(doc, root, "unattributed_inbound",
+                                       bfs_to_tree_json(doc, &unattr_in, risk_labels, include_tests,
+                                                        data_flow, include_evidence));
             }
             /* Inferred, never merged with the exact set above (shape C). */
             if (via_port_total > 0 || via_port_unattr_total > 0) {
@@ -8990,10 +8987,10 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                                                                 include_tests, data_flow,
                                                                 include_evidence));
                     }
-                yyjson_mut_arr_add_val(pa, pe);
+                    yyjson_mut_arr_add_val(pa, pe);
+                }
+                yyjson_mut_obj_add_val(doc, root, "via_port", pa);
             }
-            yyjson_mut_obj_add_val(doc, root, "via_port", pa);
-        }
         }
         if (more_rows) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
@@ -11009,12 +11006,12 @@ static uint64_t snippet_query_hash(const cbm_node_t *node) {
     return cursor_fnv1a64(lines, hash);
 }
 
-static uint64_t snippet_cursor_integrity(uint64_t query_hash, uint64_t source_hash,
-                                         size_t start, size_t end) {
+static uint64_t snippet_cursor_integrity(uint64_t query_hash, uint64_t source_hash, size_t start,
+                                         size_t end) {
     char canonical[CBM_SZ_256];
-    int written = snprintf(canonical, sizeof(canonical), "sn2:%016llx:%016llx:%zu:%zu",
-                           (unsigned long long)query_hash, (unsigned long long)source_hash, start,
-                           end);
+    int written =
+        snprintf(canonical, sizeof(canonical), "sn2:%016llx:%016llx:%zu:%zu",
+                 (unsigned long long)query_hash, (unsigned long long)source_hash, start, end);
     return written > 0 && (size_t)written < sizeof(canonical)
                ? snippet_hash_bytes(canonical, (size_t)written)
                : 0;
@@ -11084,8 +11081,7 @@ static bool snippet_cursor_decode(const char *token, snippet_cursor_t *out) {
     const char *p = token + 4;
     return snippet_cursor_hex16(&p, ':', &out->query_hash) &&
            snippet_cursor_hex16(&p, ':', &out->source_hash) &&
-           snippet_cursor_size(&p, ':', &out->start) &&
-           snippet_cursor_size(&p, ':', &out->end) &&
+           snippet_cursor_size(&p, ':', &out->start) && snippet_cursor_size(&p, ':', &out->end) &&
            snippet_cursor_hex16(&p, '\0', &out->integrity);
 }
 
@@ -11116,9 +11112,9 @@ static void snippet_graph_context_init(cbm_mcp_server_t *srv, const cbm_node_t *
     }
     context->included = true;
     cbm_store_node_degree(srv->store, node->id, &context->callers, &context->callees);
-    cbm_store_node_neighbor_names(srv->store, node->id, MCP_DEFAULT_LIMIT,
-                                  &context->caller_names, &context->caller_name_count,
-                                  &context->callee_names, &context->callee_name_count);
+    cbm_store_node_neighbor_names(srv->store, node->id, MCP_DEFAULT_LIMIT, &context->caller_names,
+                                  &context->caller_name_count, &context->callee_names,
+                                  &context->callee_name_count);
 }
 
 static void snippet_graph_context_free(snippet_graph_context_t *context) {
@@ -11625,8 +11621,8 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             free(project);
             return result;
         }
-        char *result = snippet_suggestions_bounded(qn, suffix_nodes, suffix_count,
-                                                   options.max_response_bytes);
+        char *result =
+            snippet_suggestions_bounded(qn, suffix_nodes, suffix_count, options.max_response_bytes);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
         free(options.cursor);
         free(qn);
@@ -12460,10 +12456,10 @@ static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
         if (nodes[j].start_line <= line && nodes[j].end_line >= line) {
             int span = nodes[j].end_line - nodes[j].start_line;
             int rank = search_label_rank(nodes[j].label ? nodes[j].label : "");
-            int best_rank = best >= 0 ? search_label_rank(nodes[best].label ? nodes[best].label : "")
-                                      : CBM_NOT_FOUND;
-            const char *qualified_name =
-                nodes[j].qualified_name ? nodes[j].qualified_name : "";
+            int best_rank = best >= 0
+                                ? search_label_rank(nodes[best].label ? nodes[best].label : "")
+                                : CBM_NOT_FOUND;
+            const char *qualified_name = nodes[j].qualified_name ? nodes[j].qualified_name : "";
             const char *best_qualified_name =
                 best >= 0 && nodes[best].qualified_name ? nodes[best].qualified_name : "";
             if (span < best_span ||

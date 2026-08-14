@@ -1157,8 +1157,7 @@ const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode
     const char **predicates = NULL;
     int count = 0;
     int cap = 0;
-    for (TSNode subject = func_node; !ts_node_is_null(subject);
-         subject = ts_node_parent(subject)) {
+    for (TSNode subject = func_node; !ts_node_is_null(subject); subject = ts_node_parent(subject)) {
         const char *kind = ts_node_type(subject);
         bool cfg_scope = strcmp(kind, "function_item") == 0 || strcmp(kind, "impl_item") == 0 ||
                          strcmp(kind, "mod_item") == 0 || strcmp(kind, "trait_item") == 0 ||
@@ -1202,9 +1201,9 @@ const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode
     return qualified_name;
 }
 
-const char *cbm_rust_callable_qualified_name(CBMArena *a, const char *project,
-                                             const char *rel_path, const char *module_qn,
-                                             TSNode func_node, const char *source) {
+const char *cbm_rust_callable_qualified_name(CBMArena *a, const char *project, const char *rel_path,
+                                             const char *module_qn, TSNode func_node,
+                                             const char *source) {
     if (!a || !project || !rel_path || !module_qn || ts_node_is_null(func_node) || !source) {
         return module_qn;
     }
@@ -1244,8 +1243,7 @@ const char *cbm_rust_callable_qualified_name(CBMArena *a, const char *project,
     const char *qualified_name = module_qn;
     if (!ts_node_is_null(impl_node)) {
         TSNode type_node = ts_node_child_by_field_name(impl_node, TS_FIELD("type"));
-        char *type_name =
-            ts_node_is_null(type_node) ? NULL : cbm_node_text(a, type_node, source);
+        char *type_name = ts_node_is_null(type_node) ? NULL : cbm_node_text(a, type_node, source);
         if (type_name && type_name[0]) {
             cbm_strip_generic_args(type_name);
             qualified_name = cbm_fqn_compute(a, project, rel_path, type_name);
@@ -1304,8 +1302,8 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         }
         if (class_chain) {
             const char *class_qn = cbm_fqn_compute(a, project, rel_path, class_chain);
-            return cbm_rust_cfg_qualified_name(
-                a, cbm_arena_sprintf(a, "%s.%s", class_qn, name), func_node, source, lang);
+            return cbm_rust_cfg_qualified_name(a, cbm_arena_sprintf(a, "%s.%s", class_qn, name),
+                                               func_node, source, lang);
         }
     }
 

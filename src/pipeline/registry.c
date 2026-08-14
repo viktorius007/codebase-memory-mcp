@@ -546,18 +546,16 @@ static bool rust_package_name(const char *file_path, char *out, size_t cap) {
     return true;
 }
 
-bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver,
-                                           const char *callee_name, const char *strategy,
-                                           const char *source_file, const char *target_file,
-                                           const char *target_qn) {
+bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver, const char *callee_name,
+                                           const char *strategy, const char *source_file,
+                                           const char *target_file, const char *target_qn) {
     if (!is_rust || !has_receiver || !strategy || !strategy[0]) {
         return false;
     }
     bool ambiguous = strcmp(strategy, "suffix_match") == 0 ||
-                     strcmp(strategy, "fuzzy_multi") == 0 ||
-                     strcmp(strategy, "fuzzy") == 0;
-    bool unique_text = strcmp(strategy, "unique_name") == 0 ||
-                       strcmp(strategy, "fuzzy_single") == 0;
+                     strcmp(strategy, "fuzzy_multi") == 0 || strcmp(strategy, "fuzzy") == 0;
+    bool unique_text =
+        strcmp(strategy, "unique_name") == 0 || strcmp(strategy, "fuzzy_single") == 0;
     if (!ambiguous && !unique_text) {
         return false; /* LSP/import/same-module/field-type evidence is authoritative. */
     }

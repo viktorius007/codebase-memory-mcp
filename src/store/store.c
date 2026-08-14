@@ -5124,8 +5124,7 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
         edges[en].confidence = (double)SKIP_ONE;
         edges[en].source_id = sqlite3_column_int64(estmt, ST_COL_4);
         edges[en].target_id = sqlite3_column_int64(estmt, CBM_SZ_5);
-        edges[en].properties_json =
-            heap_strdup((const char *)sqlite3_column_text(estmt, ST_COL_6));
+        edges[en].properties_json = heap_strdup((const char *)sqlite3_column_text(estmt, ST_COL_6));
         en++;
     }
     if (scan_rc14 != SQLITE_DONE) { /* SCANCHK:14:estmt */
@@ -5159,8 +5158,7 @@ static int bfs_node_ref_cmp(const void *left, const void *right) {
 
 static bfs_node_ref_t *bfs_node_ref_find(bfs_node_ref_t *refs, int count, int64_t id) {
     bfs_node_ref_t key = {.id = id};
-    return (bfs_node_ref_t *)bsearch(&key, refs, (size_t)count, sizeof(*refs),
-                                     bfs_node_ref_cmp);
+    return (bfs_node_ref_t *)bsearch(&key, refs, (size_t)count, sizeof(*refs), bfs_node_ref_cmp);
 }
 
 static void bfs_assign_predecessor_edges(cbm_traverse_result_t *tr, const char *direction) {
@@ -5193,13 +5191,11 @@ static void bfs_assign_predecessor_edges(cbm_traverse_result_t *tr, const char *
             continue;
         }
         cbm_node_hop_t *row = reached->row;
-        int type_cmp = reached->best_type
-                           ? strcmp(edge->type ? edge->type : "", reached->best_type)
-                           : -1;
+        int type_cmp =
+            reached->best_type ? strcmp(edge->type ? edge->type : "", reached->best_type) : -1;
         if (reached->best_edge_id == 0 || other_id < reached->best_other ||
             (other_id == reached->best_other &&
-             (type_cmp < 0 ||
-              (type_cmp == 0 && edge->edge_id < reached->best_edge_id)))) {
+             (type_cmp < 0 || (type_cmp == 0 && edge->edge_id < reached->best_edge_id)))) {
             reached->best_other = other_id;
             reached->best_type = edge->type ? edge->type : "";
             reached->best_edge_id = edge->edge_id;
