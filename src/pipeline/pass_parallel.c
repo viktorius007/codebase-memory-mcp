@@ -1262,6 +1262,9 @@ typedef struct {
     int max_workers;
 
     CBMFileResult **result_cache;
+    const cbm_file_info_t *rust_authority_files;
+    CBMFileResult *const *rust_authority_cache;
+    int rust_authority_count;
     const cbm_gbuf_t *main_gbuf;    /* READ-ONLY during Phase 4 */
     const cbm_registry_t *registry; /* READ-ONLY during Phase 4 */
     _Atomic int64_t *shared_ids;
@@ -3046,10 +3049,13 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * step below AND the resolve_file_* chain — no duplicate build. */
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
+        CBMRustImportScope *rust_import_scopes = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang, result, &imp_keys,
-                                 &imp_vals, &imp_count);
+        CBMPxcImportMapStatus import_status = cbm_pxc_build_import_map_with_rust_authority(
+            rc->main_gbuf, rc->project_name, rel, lang, result, rc->rust_authority_files,
+            rc->rust_authority_cache, rc->rust_authority_count, rc->rust_manifest, &imp_keys,
+            &imp_vals, &rust_import_scopes, &imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
 
@@ -3101,7 +3107,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * which allocates through this worker's TLS slab. Reclaiming
          * here keeps the slab high-water bounded as the resolve phase
          * walks across thousands of files in a single worker thread. */
-        if (cross_lsp_eligible) {
+        if (cross_lsp_eligible &&
+            (lang != CBM_LANG_RUST || import_status == CBM_PXC_IMPORT_MAP_COMPLETE)) {
             char *lsp_source_owned = NULL;
             const char *lsp_source = result->source;
             int lsp_source_len = result->source_len;
@@ -3126,7 +3133,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 CBMPxcDispatchStatus dispatch_status = cbm_pxc_dispatch_file(
                     lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
                     rc->module_def_index, rc->all_defs, rc->def_count, imp_keys, imp_vals,
-                    imp_count, rc->rust_manifest, pp_rust_shared_registry_get, rc);
+                    rust_import_scopes, imp_count, rc->rust_manifest, pp_rust_shared_registry_get,
+                    rc);
                 if (dispatch_status == CBM_PXC_DISPATCH_ALLOCATION_FAILED &&
                     lang != CBM_LANG_RUST) {
                     atomic_store_explicit(&rc->dispatch_allocation_failed, true,
@@ -3215,6 +3223,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         free(module_qn);
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        free(rust_import_scopes);
 
         atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                   memory_order_relaxed);
@@ -3232,7 +3241,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
-                         int worker_count, CBMLSPDef *all_defs, int def_count,
+                         int worker_count, const cbm_file_info_t *rust_authority_files,
+                         CBMFileResult *const *rust_authority_cache, int rust_authority_count,
+                         CBMLSPDef *all_defs, int def_count,
                          CBMPxcCollectStatus definition_universe_status, char *const *def_modules,
                          struct CBMModuleDefIndex *module_def_index, void *cross_registries_v) {
     /* See header: typed as void* across the TU boundary; cast back here. */
@@ -3280,6 +3291,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .workers = workers,
         .max_workers = worker_count,
         .result_cache = result_cache,
+        .rust_authority_files = rust_authority_files,
+        .rust_authority_cache = rust_authority_cache,
+        .rust_authority_count = rust_authority_count,
         .main_gbuf = ctx->gbuf,
         .registry = ctx->registry,
         .shared_ids = shared_ids,

@@ -10,7 +10,7 @@
  * unchanged — a body edit — and skip recomputing its dependents, and
  * (b) rehydrate the cross registries for files it does not re-parse.
  *
- * The JSON is a versioned object {"v":2,"lsp":[...],"reg":[...]}. Field
+ * The JSON is a versioned object {"v":5,"lsp":[...],"reg":[...],"rust":...}. Field
  * order and array order are fixed by the writer, so byte equality of the
  * serialization is surface equality; the sha256 of these bytes is the
  * stored surface_sha. Rows written by a different codec version fail the
@@ -39,5 +39,11 @@ int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
  * 0 for an empty surface, or -1 when the JSON is missing, malformed, or a
  * different codec version — callers route that to a full rebuild. */
 int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLSPDef **out_defs);
+
+/* Rehydrate the exact Rust import/module carrier stored beside the defs.
+ * Returns 1 for a Rust row, 0 for a non-Rust row, or -1 for malformed/old data.
+ * `out` borrows all decoded storage from `arena`. */
+int cbm_lsp_surface_rust_carrier_from_json(CBMArena *arena, const char *defs_json,
+                                           CBMFileResult *out);
 
 #endif /* CBM_PIPELINE_LSP_SURFACE_H */

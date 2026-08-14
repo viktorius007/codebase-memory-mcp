@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 
 bool cbm_cargo_add_target(CBMArena *arena, CBMCargoManifest *manifest, CBMCargoTargetKind kind,
                           const char *source_path) {
@@ -64,6 +65,49 @@ bool cbm_cargo_add_routed_target(CBMArena *arena, CBMCargoManifest *manifest,
                                                                    .package_dir = owned_package,
                                                                    .blocker_root = owned_blocker,
                                                                    .source_path = owned_path};
+    return true;
+}
+
+bool cbm_cargo_add_dependency_route(CBMArena *arena, CBMCargoManifest *manifest,
+                                    const char *package_dir, const char *name,
+                                    const char *target_name, const char *target_package_dir) {
+    if (!arena || !manifest || !package_dir || !name || !name[0] || !target_name ||
+        !target_name[0]) {
+        if (manifest)
+            manifest->targets_complete = false;
+        return false;
+    }
+    if (manifest->dependency_route_count == manifest->dependency_route_cap) {
+        if (manifest->dependency_route_cap > INT_MAX / 2) {
+            manifest->targets_complete = false;
+            return false;
+        }
+        int next_cap = manifest->dependency_route_cap > 0 ? manifest->dependency_route_cap * 2 : 8;
+        CBMCargoDependencyRoute *next = cbm_arena_alloc(arena, (size_t)next_cap * sizeof(*next));
+        if (!next) {
+            manifest->targets_complete = false;
+            return false;
+        }
+        if (manifest->dependency_routes && manifest->dependency_route_count > 0)
+            memcpy(next, manifest->dependency_routes,
+                   (size_t)manifest->dependency_route_count * sizeof(*next));
+        manifest->dependency_routes = next;
+        manifest->dependency_route_cap = next_cap;
+    }
+    const char *owned_dir = cbm_arena_strdup(arena, package_dir);
+    const char *owned_name = cbm_arena_strdup(arena, name);
+    const char *owned_target = cbm_arena_strdup(arena, target_name);
+    const char *owned_target_dir =
+        target_package_dir ? cbm_arena_strdup(arena, target_package_dir) : NULL;
+    if (!owned_dir || !owned_name || !owned_target || (target_package_dir && !owned_target_dir)) {
+        manifest->targets_complete = false;
+        return false;
+    }
+    manifest->dependency_routes[manifest->dependency_route_count++] =
+        (CBMCargoDependencyRoute){.package_dir = owned_dir,
+                                  .name = owned_name,
+                                  .target_name = owned_target,
+                                  .target_package_dir = owned_target_dir};
     return true;
 }
 
@@ -525,7 +569,7 @@ static int parse_section(CBMArena *a, const char *s, int len, int from, const ch
  * shapes — only the key (crate name) and optional `path = "..."` field
  * matter for us. */
 static CBMCargoDep *add_dependency(CBMCargoManifest *out, const char *name, const char *path,
-                                   int start, int end) {
+                                   const char *package, int start, int end) {
     if (!name)
         return NULL;
     if (out->dep_count >= CBM_CARGO_MAX_DEPS) {
@@ -535,6 +579,7 @@ static CBMCargoDep *add_dependency(CBMCargoManifest *out, const char *name, cons
     CBMCargoDep *dep = &out->deps[out->dep_count++];
     dep->name = name;
     dep->path = path;
+    dep->package = package;
     return dep;
 }
 
@@ -554,6 +599,8 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
         return skip_value(s, len, from, out);
     }
     const char* path_val = NULL;
+    const char *package_val = NULL;
+    bool inherits_workspace = false;
     if (from < len && s[from] == '{') {
         /* Inline table — scan for `path = "..."`. */
         int depth = 1;
@@ -577,8 +624,14 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
                 from = skip_value(s, len, from, out);
                 continue;
             }
-            if (sub_key && strcmp(sub_key, "path") == 0) {
-                from = parse_string(a, s, len, from, &path_val, out);
+            if (sub_key && strcmp(sub_key, "workspace") == 0 && from + 4 <= len &&
+                strncmp(s + from, "true", 4) == 0) {
+                inherits_workspace = true;
+                from += 4;
+            } else if (sub_key &&
+                       (strcmp(sub_key, "path") == 0 || strcmp(sub_key, "package") == 0)) {
+                const char **value = strcmp(sub_key, "path") == 0 ? &path_val : &package_val;
+                from = parse_string(a, s, len, from, value, out);
             } else {
                 from = skip_value(s, len, from, out);
             }
@@ -591,10 +644,15 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
         if (depth > 0) {
             cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL, entry_start, len);
         }
+    } else if (from + 4 <= len && strncmp(s + from, "true", 4) == 0) {
+        inherits_workspace = true;
+        from += 4;
     } else {
         from = skip_value(s, len, from, out);
     }
-    add_dependency(out, key, path_val, entry_start, from);
+    CBMCargoDep *dep = add_dependency(out, key, path_val, package_val, entry_start, from);
+    if (dep)
+        dep->inherits_workspace = inherits_workspace;
     return from;
 }
 
@@ -612,15 +670,23 @@ static int parse_dep_table_kv(CBMArena *a, const char *s, int len, int from, CBM
         return skip_value(s, len, from, out);
     }
     from = skip_horizontal_ws(s, len, from + 1);
-    if (key && strcmp(key, "path") == 0) {
-        const char *path = NULL;
+    if (key && strcmp(key, "workspace") == 0 && from + 4 <= len &&
+        strncmp(s + from, "true", 4) == 0) {
+        if (dep)
+            dep->inherits_workspace = true;
+        from += 4;
+    } else if (key && (strcmp(key, "path") == 0 || strcmp(key, "package") == 0)) {
+        const char *value = NULL;
         int value_start = from;
-        from = parse_string(a, s, len, from, &path, out);
+        from = parse_string(a, s, len, from, &value, out);
         if (from == value_start) {
             cargo_record(out, CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL, value_start, value_start + 1);
             from = skip_value(s, len, from, out);
-        } else if (dep && path) {
-            dep->path = path;
+        } else if (dep && value) {
+            if (strcmp(key, "path") == 0)
+                dep->path = value;
+            else
+                dep->package = value;
         }
     } else {
         from = skip_value(s, len, from, out);
@@ -885,7 +951,11 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
             if (dependency_key) {
                 const char *dependency_name = NULL;
                 parse_key(arena, dependency_key, (int)strlen(dependency_key), 0, &dependency_name);
-                dependency_table = add_dependency(out, dependency_name, NULL, item_start, from);
+                dependency_table =
+                    add_dependency(out, dependency_name, NULL, NULL, item_start, from);
+                if (dependency_table && strncmp(section, "workspace.dependencies.",
+                                                strlen("workspace.dependencies.")) == 0)
+                    dependency_table->workspace_source = true;
             }
             if (strcmp(section, "lib") == 0) {
                 target_kind = CBM_CARGO_TARGET_LIB;
@@ -911,7 +981,12 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
         } else if (strcmp(section, "workspace") == 0) {
             from = parse_workspace_kv(arena, src, src_len, from, out);
         } else if (is_dependency_section(section)) {
+            int dep_count_before = out->dep_count;
             from = parse_dep_entry(arena, src, src_len, from, out);
+            if (strcmp(section, "workspace.dependencies") == 0) {
+                for (int i = dep_count_before; i < out->dep_count; i++)
+                    out->deps[i].workspace_source = true;
+            }
         } else if (dependency_table) {
             from = parse_dep_table_kv(arena, src, src_len, from, out, dependency_table);
         } else {

@@ -1778,9 +1778,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = non_rust_registry_failed
              ? CBM_NOT_FOUND
-             : cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count,
-                                    all_defs, def_count, def_collect_status, def_modules,
-                                    module_def_index, &cross_registries);
+             : cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, files,
+                                    cache, file_count, all_defs, def_count, def_collect_status,
+                                    def_modules, module_def_index, &cross_registries);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("parallel_resolve");

@@ -12,6 +12,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/lsp_surface.h"
 #include "pipeline/artifact.h"
 #include "lsp/rust_cargo.h"
 #include "mcp/mcp.h"
@@ -12274,6 +12275,153 @@ static const cbm_node_t *find_node_named(cbm_node_t *funcs, int count, const cha
     return NULL;
 }
 
+static cbm_gbuf_t *complexity_order_graph(const char *project, bool reverse_cycle_order) {
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, "/tmp");
+    if (!gb)
+        return NULL;
+
+    char qn_a[128], qn_b[128], qn_self[128], qn_leaf[128], qn_caller[128];
+    snprintf(qn_a, sizeof(qn_a), "%s.cycle_a", project);
+    snprintf(qn_b, sizeof(qn_b), "%s.cycle_b", project);
+    snprintf(qn_self, sizeof(qn_self), "%s.self_loop", project);
+    snprintf(qn_leaf, sizeof(qn_leaf), "%s.leaf", project);
+    snprintf(qn_caller, sizeof(qn_caller), "%s.caller", project);
+
+    int64_t a = 0, b = 0;
+    if (reverse_cycle_order) {
+        b = cbm_gbuf_upsert_node(gb, "Function", "cycle_b", qn_b, "cycle.c", 5, 7,
+                                 "{\"loop_depth\":2,\"self_recursive\":false}");
+        a = cbm_gbuf_upsert_node(gb, "Function", "cycle_a", qn_a, "cycle.c", 1, 3,
+                                 "{\"loop_depth\":1,\"self_recursive\":false}");
+    } else {
+        a = cbm_gbuf_upsert_node(gb, "Function", "cycle_a", qn_a, "cycle.c", 1, 3,
+                                 "{\"loop_depth\":1,\"self_recursive\":false}");
+        b = cbm_gbuf_upsert_node(gb, "Function", "cycle_b", qn_b, "cycle.c", 5, 7,
+                                 "{\"loop_depth\":2,\"self_recursive\":false}");
+    }
+    int64_t self_loop = cbm_gbuf_upsert_node(gb, "Function", "self_loop", qn_self, "cycle.c", 9, 11,
+                                             "{\"loop_depth\":0,\"self_recursive\":false}");
+    int64_t leaf = cbm_gbuf_upsert_node(gb, "Function", "leaf", qn_leaf, "cycle.c", 13, 17,
+                                        "{\"loop_depth\":2,\"self_recursive\":false}");
+    int64_t caller = cbm_gbuf_upsert_node(gb, "Function", "caller", qn_caller, "cycle.c", 19, 23,
+                                          "{\"loop_depth\":1,\"self_recursive\":false}");
+    if (a <= 0 || b <= 0 || self_loop <= 0 || leaf <= 0 || caller <= 0) {
+        cbm_gbuf_free(gb);
+        return NULL;
+    }
+
+    if (cbm_gbuf_insert_edge(gb, a, b, "CALLS", "{}") <= 0 ||
+        cbm_gbuf_insert_edge(gb, b, a, "CALLS", "{}") <= 0 ||
+        cbm_gbuf_insert_edge(gb, self_loop, self_loop, "CALLS", "{}") <= 0 ||
+        cbm_gbuf_insert_edge(gb, caller, leaf, "CALLS", "{}") <= 0) {
+        cbm_gbuf_free(gb);
+        return NULL;
+    }
+    return gb;
+}
+
+static const cbm_gbuf_node_t *find_gbuf_function(cbm_gbuf_t *gb, const char *name) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Function", &nodes, &count) != 0)
+        return NULL;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(nodes[i]->name, name) == 0)
+            return nodes[i];
+    }
+    return NULL;
+}
+
+/* Project labels and insertion order may change temporary node IDs, but neither
+ * changes CALLS SCC membership. Every member of a cyclic SCC must be recursive;
+ * a leaf with no outbound CALLS edge is the mechanism-impossible control. */
+TEST(pipeline_complexity_scc_order_invariant) {
+    cbm_gbuf_t *forward = complexity_order_graph("short", false);
+    cbm_gbuf_t *reverse = complexity_order_graph("many-prefix-tokens-change-node-order", true);
+    ASSERT_NOT_NULL(forward);
+    ASSERT_NOT_NULL(reverse);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t forward_ctx = {
+        .project_name = "short", .repo_path = "/tmp", .gbuf = forward, .cancelled = &cancelled};
+    cbm_pipeline_ctx_t reverse_ctx = {.project_name = "many-prefix-tokens-change-node-order",
+                                      .repo_path = "/tmp",
+                                      .gbuf = reverse,
+                                      .cancelled = &cancelled};
+    cbm_pipeline_pass_complexity(&forward_ctx);
+    cbm_pipeline_pass_complexity(&reverse_ctx);
+
+    const char *names[] = {"cycle_a", "cycle_b", "self_loop"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const cbm_gbuf_node_t *f = find_gbuf_function(forward, names[i]);
+        const cbm_gbuf_node_t *r = find_gbuf_function(reverse, names[i]);
+        ASSERT_NOT_NULL(f);
+        ASSERT_NOT_NULL(r);
+        ASSERT_TRUE(strstr(f->properties_json, "\"recursive\":true") != NULL);
+        ASSERT_TRUE(strstr(r->properties_json, "\"recursive\":true") != NULL);
+        if (strcmp(names[i], "self_loop") != 0) {
+            ASSERT_TRUE(strstr(f->properties_json, "\"transitive_loop_depth\":2") != NULL);
+            ASSERT_TRUE(strstr(r->properties_json, "\"transitive_loop_depth\":2") != NULL);
+        } else {
+            ASSERT_TRUE(strstr(f->properties_json, "\"transitive_loop_depth\":0") != NULL);
+            ASSERT_TRUE(strstr(r->properties_json, "\"transitive_loop_depth\":0") != NULL);
+        }
+        ASSERT_STR_EQ(f->properties_json, r->properties_json);
+    }
+
+    const cbm_gbuf_node_t *forward_leaf = find_gbuf_function(forward, "leaf");
+    const cbm_gbuf_node_t *reverse_leaf = find_gbuf_function(reverse, "leaf");
+    const cbm_gbuf_node_t *forward_caller = find_gbuf_function(forward, "caller");
+    const cbm_gbuf_node_t *reverse_caller = find_gbuf_function(reverse, "caller");
+    ASSERT_NOT_NULL(forward_leaf);
+    ASSERT_NOT_NULL(reverse_leaf);
+    ASSERT_NOT_NULL(forward_caller);
+    ASSERT_NOT_NULL(reverse_caller);
+    ASSERT_TRUE(strstr(forward_leaf->properties_json, "\"recursive\":false") != NULL);
+    ASSERT_TRUE(strstr(reverse_leaf->properties_json, "\"recursive\":false") != NULL);
+    ASSERT_TRUE(strstr(forward_caller->properties_json, "\"recursive\":false") != NULL);
+    ASSERT_TRUE(strstr(reverse_caller->properties_json, "\"recursive\":false") != NULL);
+    ASSERT_TRUE(strstr(forward_leaf->properties_json, "\"transitive_loop_depth\":2") != NULL);
+    ASSERT_TRUE(strstr(reverse_leaf->properties_json, "\"transitive_loop_depth\":2") != NULL);
+    ASSERT_TRUE(strstr(forward_caller->properties_json, "\"transitive_loop_depth\":3") != NULL);
+    ASSERT_TRUE(strstr(reverse_caller->properties_json, "\"transitive_loop_depth\":3") != NULL);
+    ASSERT_STR_EQ(forward_leaf->properties_json, reverse_leaf->properties_json);
+    ASSERT_STR_EQ(forward_caller->properties_json, reverse_caller->properties_json);
+
+    cbm_gbuf_free(forward);
+    cbm_gbuf_free(reverse);
+    PASS();
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+extern void cbm_pipeline_complexity_test_fail_analysis_allocation_once(void);
+
+TEST(pipeline_complexity_analysis_allocation_failure_suppresses_derived_properties) {
+    cbm_gbuf_t *gb = complexity_order_graph("allocation-control", false);
+    ASSERT_NOT_NULL(gb);
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {.project_name = "allocation-control",
+                              .repo_path = "/tmp",
+                              .gbuf = gb,
+                              .cancelled = &cancelled};
+
+    cbm_pipeline_complexity_test_fail_analysis_allocation_once();
+    cbm_pipeline_pass_complexity(&ctx);
+
+    const char *names[] = {"cycle_a", "cycle_b", "self_loop", "leaf", "caller"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const cbm_gbuf_node_t *node = find_gbuf_function(gb, names[i]);
+        ASSERT_NOT_NULL(node);
+        ASSERT_TRUE(strstr(node->properties_json, "\"loop_depth\":") != NULL);
+        ASSERT_TRUE(strstr(node->properties_json, "\"recursive\":") == NULL);
+        ASSERT_TRUE(strstr(node->properties_json, "\"transitive_loop_depth\":") == NULL);
+    }
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+#endif
+
 /* The complexity pass propagates loop_depth along CALLS edges into
  * transitive_loop_depth and flags call-graph cycles as recursive. Caller and
  * callee live in one file so the calls resolve intra-file (most reliable). */
@@ -12747,7 +12895,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":2") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -12757,6 +12905,440 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
         cbm_store_free_lsp_surfaces(rows, row_count);
     }
     (void)json_probe;
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_surface_carrier_rejects_corrupt_authority) {
+    const char *valid = "{\"v\":5,\"rust\":{\"m\":\"project.src.lib\",\"is\":1,\"ms\":1,"
+                        "\"i\":[{\"n\":\"Thing\",\"p\":\"crate::state::Thing\",\"ds\":0,\"de\":20,"
+                        "\"ss\":15,\"se\":20,\"xs\":0,\"xe\":30,\"om\":\"\",\"md\":true,"
+                        "\"pr\":1,\"vi\":2}],"
+                        "\"d\":[{\"n\":\"state\",\"pp\":\"\",\"p\":null,\"vi\":2,\"in\":false,"
+                        "\"t\":false}]}}";
+    const char *invalid[] = {
+        /* Missing exact provenance cannot become import authority. */
+        ("{\"v\":5,\"rust\":{\"m\":\"project.src.lib\",\"is\":1,\"ms\":1,"
+         "\"i\":[{\"n\":\"Thing\",\"p\":\"crate::state::Thing\",\"ds\":0,\"de\":20,"
+         "\"ss\":15,\"se\":20,\"xs\":0,\"xe\":30,\"om\":\"\",\"md\":true,"
+         "\"pr\":0,\"vi\":2}],\"d\":[]}}"),
+        /* An empty/out-of-declaration site cannot identify a use-tree leaf. */
+        ("{\"v\":5,\"rust\":{\"m\":\"project.src.lib\",\"is\":1,\"ms\":1,"
+         "\"i\":[{\"n\":\"Thing\",\"p\":\"crate::state::Thing\",\"ds\":0,\"de\":20,"
+         "\"ss\":20,\"se\":20,\"xs\":0,\"xe\":30,\"om\":\"\",\"md\":true,"
+         "\"pr\":1,\"vi\":2}],\"d\":[]}}"),
+        /* Module-declaration metadata must retain its exact JSON types. */
+        ("{\"v\":5,\"rust\":{\"m\":\"project.src.lib\",\"is\":1,\"ms\":1,"
+         "\"i\":[],\"d\":[{\"n\":\"state\",\"pp\":\"\",\"p\":7,"
+         "\"vi\":2,\"in\":false,\"t\":false}]}}"),
+    };
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMFileResult carrier = {0};
+    ASSERT_EQ(cbm_lsp_surface_rust_carrier_from_json(&arena, valid, &carrier), 1);
+    ASSERT_EQ(carrier.imports.count, 1);
+    ASSERT_EQ(carrier.mod_decls.count, 1);
+    ASSERT_STR_EQ(carrier.imports.items[0].module_path, "crate::state::Thing");
+    ASSERT_EQ(CBM_RUST_IMPORT_VIS_PUBLIC, carrier.mod_decls.items[0].rust_visibility);
+    cbm_arena_destroy(&arena);
+
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        cbm_arena_init(&arena);
+        memset(&carrier, 0, sizeof(carrier));
+        ASSERT_EQ(cbm_lsp_surface_rust_carrier_from_json(&arena, invalid[i], &carrier), -1);
+        cbm_arena_destroy(&arena);
+    }
+    PASS();
+}
+
+TEST(pipeline_lsp_surface_rejects_oversized_rows_and_collections) {
+    enum { TOO_MANY = 131073, TOO_LONG = 8 * 1024 * 1024 + 1 };
+    CBMArena arena;
+    CBMLSPDef *defs = NULL;
+    CBMFileResult carrier = {0};
+
+    const char *row_prefix = "{\"v\":5,\"lsp\":[{\"qn\":\"";
+    const char *row_suffix = "\",\"sn\":\"s\",\"lb\":\"Type\"}],\"reg\":[],\"rust\":null}";
+    size_t oversized_cap = strlen(row_prefix) + (size_t)TOO_LONG + strlen(row_suffix) + 1U;
+    char *oversized = malloc(oversized_cap);
+    ASSERT_NOT_NULL(oversized);
+    size_t oversized_used = 0;
+    memcpy(oversized + oversized_used, row_prefix, strlen(row_prefix));
+    oversized_used += strlen(row_prefix);
+    memset(oversized + oversized_used, 'q', (size_t)TOO_LONG);
+    oversized_used += (size_t)TOO_LONG;
+    memcpy(oversized + oversized_used, row_suffix, strlen(row_suffix) + 1U);
+    cbm_arena_init(&arena);
+    ASSERT_EQ(-1, cbm_lsp_surface_defs_from_json(&arena, oversized, &defs));
+    ASSERT_EQ(-1, cbm_lsp_surface_rust_carrier_from_json(&arena, oversized, &carrier));
+    cbm_arena_destroy(&arena);
+    free(oversized);
+
+    const char *prefix = "{\"v\":5,\"lsp\":[";
+    const char *suffix = "],\"reg\":[],\"rust\":null}";
+    const char *valid_def = "{\"qn\":\"q\",\"sn\":\"s\",\"lb\":\"Type\"}";
+    size_t cap = strlen(prefix) + (size_t)TOO_MANY * (strlen(valid_def) + 1U) + strlen(suffix) + 1U;
+    char *many = malloc(cap);
+    ASSERT_NOT_NULL(many);
+    size_t used = 0;
+    memcpy(many + used, prefix, strlen(prefix));
+    used += strlen(prefix);
+    for (int i = 0; i < TOO_MANY; i++) {
+        if (i > 0)
+            many[used++] = ',';
+        memcpy(many + used, valid_def, strlen(valid_def));
+        used += strlen(valid_def);
+    }
+    memcpy(many + used, suffix, strlen(suffix) + 1U);
+    cbm_arena_init(&arena);
+    ASSERT_EQ(-1, cbm_lsp_surface_defs_from_json(&arena, many, &defs));
+    cbm_arena_destroy(&arena);
+    free(many);
+
+    const char *empty = "{\"v\":5,\"lsp\":[],\"reg\":[],\"rust\":null}";
+    cbm_arena_init(&arena);
+    ASSERT_EQ(0, cbm_lsp_surface_defs_from_json(&arena, empty, &defs));
+    ASSERT_EQ(0, cbm_lsp_surface_rust_carrier_from_json(&arena, empty, &carrier));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(pipeline_rust_authoritative_grouped_reexports_and_auth_shadow) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_authority_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "app/src/compiler/build_runner")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "config/src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"config\"]\n");
+    write_temp_file(tmp, "app/Cargo.toml",
+                    "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[dependencies]\ncodex-config={path=\"../config\"}\n");
+    write_temp_file(tmp, "config/Cargo.toml",
+                    "[package]\nname=\"codex-config\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "config/src/lib.rs", "mod state;\npub use state::LoaderOverrides;\n");
+    write_temp_file(tmp, "config/src/state.rs",
+                    "pub struct LoaderOverrides;\nimpl LoaderOverrides {\n"
+                    " pub fn with_managed_config_path_for_tests() {}\n}\n");
+    write_temp_file(
+        tmp, "app/src/lib.rs",
+        "pub mod compiler;\nmod compile;\nmod first;\nmod second;\n"
+        "use codex_config::LoaderOverrides;\n"
+        "#[cfg(feature=\"one\")] use crate::first::Conflict;\n"
+        "#[cfg(not(feature=\"one\"))] use crate::second::Conflict;\n"
+        "fn consume(_: fn()) {}\n"
+        "pub fn loader_run() { consume(LoaderOverrides::with_managed_config_path_for_tests); }\n"
+        "struct Auth; impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
+        "struct Args { auth: Auth }\nfn unknown<T>() -> T { panic!() }\n"
+        "pub fn auth_run() -> Result<(), ()> { let Args { auth } = unknown(); "
+        "let auth = auth.try_into_settings()?; Ok(auth) }\n"
+        "pub fn cfg_ambiguous() { Conflict::new(); }\n");
+    write_temp_file(tmp, "app/src/first.rs",
+                    "pub struct Conflict; impl Conflict { pub fn new() -> Self { Self } }\n");
+    write_temp_file(tmp, "app/src/second.rs",
+                    "pub struct Conflict; impl Conflict { pub fn new() -> Self { Self } }\n");
+    write_temp_file(tmp, "app/src/compiler/mod.rs",
+                    "mod build_runner;\npub use self::build_runner::{BuildRunner, Other};\n");
+    write_temp_file(tmp, "app/src/compiler/build_runner/mod.rs",
+                    "pub struct BuildRunner; pub struct Other;\nimpl BuildRunner {\n"
+                    " pub fn new() -> Result<Self, ()> { Ok(Self) }\n"
+                    " pub fn dry_run(self) -> Result<(), ()> { Ok(()) }\n"
+                    " pub fn compile(self, _: ()) -> Result<(), ()> { Ok(()) }\n}\n");
+    write_temp_file(
+        tmp, "app/src/compile.rs",
+        "use crate::compiler::{Other, BuildRunner};\n"
+        "pub fn compile_ws() -> Result<(), ()> { let build_runner = BuildRunner::new()?; "
+        "if true { build_runner.dry_run() } else { build_runner.compile(()) } }\n");
+    /* Indexed but neither a Cargo target nor a declared module: structurally
+     * impossible for the authoritative resolver, available to graph guesses. */
+    write_temp_file(tmp, "vendor_decoy.rs",
+                    "pub struct LoaderOverrides; impl LoaderOverrides { "
+                    "pub fn with_managed_config_path_for_tests() {} }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/authority.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "compile_ws", "dry_run",
+                                       "app/src/compiler/build_runner/mod.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "compile_ws", "compile",
+                                       "app/src/compiler/build_runner/mod.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALL_REFERENCE", "loader_run",
+                                       "with_managed_config_path_for_tests", "config/src/state.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALL_REFERENCE", "loader_run",
+                                       "with_managed_config_path_for_tests", "vendor_decoy.rs"),
+              0);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "auth_run", "try_into_settings",
+                                       "app/src/lib.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "cfg_ambiguous", "new",
+                                       "app/src/first.rs"),
+              0);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "cfg_ambiguous", "new",
+                                       "app/src/second.rs"),
+              0);
+    char exact_qn[512];
+    snprintf(exact_qn, sizeof(exact_qn), "%s.app.src.compiler.build_runner.mod.BuildRunner.dry_run",
+             project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "compile_ws", exact_qn), 1);
+    snprintf(exact_qn, sizeof(exact_qn), "%s.app.src.compiler.build_runner.mod.BuildRunner.compile",
+             project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "compile_ws", exact_qn), 1);
+    snprintf(exact_qn, sizeof(exact_qn),
+             "%s.config.src.state.LoaderOverrides.with_managed_config_path_for_tests", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALL_REFERENCE", "loader_run", exact_qn), 1);
+    snprintf(exact_qn, sizeof(exact_qn), "%s.app.src.lib.Auth.try_into_settings", project);
+    ASSERT_EQ(named_edge_to_qn_count(store, project, "CALLS", "auth_run", exact_qn), 1);
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_manifest_free_nested_import_retains_scope_authority) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_manifest_free_scope_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "standalone.rs",
+                    "struct A; impl A { fn new() -> Self { Self } }\n"
+                    "mod m { use super::A as SuperThing; use crate::A as CrateThing; "
+                    "pub fn run_super() { let _ = SuperThing::new(); } "
+                    "pub fn run_crate() { let _ = CrateThing::new(); } }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/standalone.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(0, cbm_pipeline_run(pipeline));
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(
+        1, named_edge_to_file_count(store, project, "CALLS", "run_super", "new", "standalone.rs"));
+    ASSERT_EQ(
+        1, named_edge_to_file_count(store, project, "CALLS", "run_crate", "new", "standalone.rs"));
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_outside_path_dependency_does_not_poison_local_authority) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_outside_path_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "repo/app/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "repo/deps/helper/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "outside/src")), 0);
+    write_temp_file(tmp, "repo/Cargo.toml",
+                    "[workspace]\nresolver=\"2\"\nmembers=[\"app\"]\n"
+                    "exclude=[\"deps/helper\"]\n");
+    write_temp_file(tmp, "repo/app/Cargo.toml",
+                    "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[dependencies]\nhelper={path=\"../deps/helper\"}\n"
+                    "shared={path=\"../../outside\"}\n");
+    write_temp_file(tmp, "repo/deps/helper/Cargo.toml",
+                    "[package]\nname=\"helper\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "repo/deps/helper/src/lib.rs",
+                    "pub struct Helper; impl Helper { pub fn make() {} }\n");
+    write_temp_file(tmp, "repo/app/src/lib.rs",
+                    "use helper::Helper; pub fn local_run() { Helper::make(); }\n");
+    write_temp_file(tmp, "outside/Cargo.toml",
+                    "[package]\nname=\"shared\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "outside/src/lib.rs", "pub fn external_only() {}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/outside-path.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(TH_PATH(tmp, "repo"), db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(0, cbm_pipeline_run(pipeline));
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "local_run", "make",
+                                          "deps/helper/src/lib.rs"));
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_authority_dependency_visibility_nested_and_lexical_controls) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_authority_controls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "app/src/nested/outer")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "app/src/nested")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "config/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "renamed/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "local-serde/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "deps/helper/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "nodep/src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nresolver=\"2\"\n"
+                    "members=[\"app\",\"config\",\"renamed\",\"local-serde\",\"nodep\"]\n"
+                    "exclude=[\"deps/helper\"]\n"
+                    "[workspace.dependencies]\n"
+                    "foo={package=\"renamed-config\",path=\"renamed\"}\n");
+    write_temp_file(tmp, "app/Cargo.toml",
+                    "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[dependencies]\ncodex-config={path=\"../config\"}\n"
+                    "foo.workspace=true\nhelper={path=\"../deps/helper\"}\nserde=\"1\"\n");
+    write_temp_file(tmp, "config/Cargo.toml",
+                    "[package]\nname=\"codex-config\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "nodep/Cargo.toml",
+                    "[package]\nname=\"nodep\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "renamed/Cargo.toml",
+                    "[package]\nname=\"renamed-config\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[lib]\nname=\"renamed_core\"\npath=\"src/lib.rs\"\n");
+    write_temp_file(tmp, "renamed/src/lib.rs",
+                    "pub struct RenamedLoader; impl RenamedLoader { pub fn make() {} }\n");
+    write_temp_file(tmp, "local-serde/Cargo.toml",
+                    "[package]\nname=\"serde\"\nversion=\"1.0.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "local-serde/src/lib.rs",
+                    "pub struct LocalDecoy; impl LocalDecoy { pub fn make() {} }\n");
+    write_temp_file(tmp, "deps/helper/Cargo.toml",
+                    "[package]\nname=\"helper\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "deps/helper/src/lib.rs",
+                    "pub struct Helper; impl Helper { pub fn make() {} }\n");
+    write_temp_file(tmp, "config/src/lib.rs",
+                    "mod state; mod intermediate; pub mod public_state;\n"
+                    "pub use state::LoaderOverrides;\n"
+                    "#[cfg(any())] pub use state::PrivateLoader;\n"
+                    "#[cfg(any())] pub use intermediate::RestrictedLoader;\n");
+    write_temp_file(tmp, "config/src/state.rs",
+                    "pub struct LoaderOverrides; impl LoaderOverrides { pub fn make() {} }\n"
+                    "struct PrivateLoader; impl PrivateLoader { pub fn make() {} }\n"
+                    "pub struct RestrictedLoader; impl RestrictedLoader { pub fn make() {} }\n");
+    write_temp_file(tmp, "config/src/intermediate.rs",
+                    "pub(crate) use crate::state::RestrictedLoader;\n");
+    write_temp_file(tmp, "config/src/public_state.rs",
+                    "pub struct PublicLoader; impl PublicLoader { pub fn make() {} }\n");
+    write_temp_file(
+        tmp, "app/src/lib.rs",
+        "mod nested; mod one; mod two; mod scoped;\n"
+        "use codex_config::LoaderOverrides;\n"
+        "use foo::RenamedLoader;\n"
+        "use helper::Helper;\n"
+        "use codex_config::public_state::PublicLoader;\n"
+        "use crate::one::Thing as OuterThing;\n"
+        "use crate::two::Thing as BlockOuterThing;\n"
+        "#[cfg(any())] use serde::LocalDecoy;\n"
+        "#[cfg(any())] use codex_config::state::LoaderOverrides as DirectPrivateModule;\n"
+        "use crate::nested::outer::child::Deep;\n"
+        "pub fn positive_loader() { LoaderOverrides::make(); }\n"
+        "pub fn renamed_loader() { RenamedLoader::make(); }\n"
+        "pub fn path_loader() { Helper::make(); }\n"
+        "pub fn public_module_run() { PublicLoader::make(); }\n"
+        "#[cfg(any())] pub fn registry_decoy() { LocalDecoy::make(); }\n"
+        "#[cfg(any())] pub fn private_module_run() { DirectPrivateModule::make(); }\n"
+        "#[cfg(any())] pub mod leaked_child { pub fn outer_import_leak() { "
+        "OuterThing::new(); } }\n"
+        "pub fn block_module_host() { "
+        "mod local_valid { use crate::RawA as Thing; "
+        "pub fn block_local_valid() { Thing::new(); } } "
+        "mod local_leak { pub struct BlockOuterThing; impl BlockOuterThing { "
+        "pub fn new() -> Self { Self } } "
+        "pub fn block_local_outer_leak() { BlockOuterThing::new(); } } "
+        "local_valid::block_local_valid(); local_leak::block_local_outer_leak(); }\n"
+        "pub struct RawA; impl RawA { pub fn new() -> Self { Self } }\n"
+        "pub struct RawB; impl RawB { pub fn new() -> Self { Self } }\n"
+        "pub mod raw_left { use crate::RawA as Thing; "
+        "pub fn raw_left_run() { Thing::new(); } }\n"
+        "pub mod raw_right { use crate::RawB as Thing; "
+        "pub fn raw_right_run() { Thing::new(); } }\n"
+        "pub fn deep_run() { Deep::new(); }\n"
+        "#[cfg(any())] use codex_config::{PrivateLoader, RestrictedLoader};\n"
+        "#[cfg(any())] pub fn private_run() { PrivateLoader::make(); }\n"
+        "#[cfg(any())] pub fn restricted_run() { RestrictedLoader::make(); }\n");
+    write_temp_file(tmp, "app/src/nested.rs", "pub mod outer { pub mod child; }\n");
+    write_temp_file(tmp, "app/src/nested/outer/child.rs",
+                    "pub struct Deep; impl Deep { pub fn new() -> Self { Self } }\n");
+    /* Same-name indexed file is not declared below `outer`; flattened module
+     * traversal would incorrectly select it. */
+    write_temp_file(tmp, "app/src/nested/child.rs",
+                    "pub struct Deep; impl Deep { pub fn new() -> Self { Self } }\n");
+    write_temp_file(tmp, "app/src/one.rs",
+                    "pub struct Thing; impl Thing { pub fn new() -> Self { Self } }\n");
+    write_temp_file(tmp, "app/src/two.rs",
+                    "pub struct Thing; impl Thing { pub fn new() -> Self { Self } }\n");
+    write_temp_file(
+        tmp, "app/src/scoped.rs",
+        "pub mod left { use crate::one::Thing; pub fn left_run() { Thing::new(); } }\n"
+        "pub mod right { use crate::two::Thing; pub fn right_run() { Thing::new(); } }\n"
+        "pub mod deep_outer { pub mod deep_inner { use crate::one::Thing; "
+        "pub fn deep_inline_run() { Thing::new(); } } }\n"
+        "#[cfg(any())] pub fn sibling_run() { Thing::new(); }\n"
+        "pub fn block_run() { { use crate::one::Thing; Thing::new(); } "
+        "#[cfg(any())] { Thing::new(); } }\n");
+    write_temp_file(tmp, "nodep/src/lib.rs",
+                    "#[cfg(any())] use codex_config::LoaderOverrides;\n"
+                    "#[cfg(any())] pub fn nodep_run() { LoaderOverrides::make(); }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/authority-controls.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(0, cbm_pipeline_run(pipeline));
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "positive_loader", "make",
+                                          "config/src/state.rs"));
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "renamed_loader", "make",
+                                          "renamed/src/lib.rs"));
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "path_loader", "make",
+                                          "deps/helper/src/lib.rs"));
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "public_module_run", "make",
+                                          "config/src/public_state.rs"));
+    ASSERT_EQ(0, named_edge_to_file_count(store, project, "CALLS", "registry_decoy", "make",
+                                          "local-serde/src/lib.rs"));
+    ASSERT_EQ(0, named_source_edge_count(store, project, "CALLS", "private_module_run"));
+    ASSERT_EQ(0, named_source_edge_count(store, project, "CALLS", "outer_import_leak"));
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "block_local_valid", "new",
+                                          "app/src/lib.rs"));
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "block_local_outer_leak", "new",
+                                          "app/src/lib.rs"));
+    ASSERT_EQ(0, named_edge_to_file_count(store, project, "CALLS", "block_local_outer_leak", "new",
+                                          "app/src/two.rs"));
+    ASSERT_EQ(0, named_source_edge_count(store, project, "CALLS", "nodep_run"));
+    ASSERT_EQ(0, named_source_edge_count(store, project, "CALLS", "private_run"));
+    ASSERT_EQ(0, named_source_edge_count(store, project, "CALLS", "restricted_run"));
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "deep_run", "new",
+                                          "app/src/nested/outer/child.rs"));
+    ASSERT_EQ(0, named_edge_to_file_count(store, project, "CALLS", "deep_run", "new",
+                                          "app/src/nested/child.rs"));
+    ASSERT_EQ(
+        1, named_edge_to_file_count(store, project, "CALLS", "left_run", "new", "app/src/one.rs"));
+    ASSERT_EQ(
+        0, named_edge_to_file_count(store, project, "CALLS", "left_run", "new", "app/src/two.rs"));
+    ASSERT_EQ(
+        1, named_edge_to_file_count(store, project, "CALLS", "right_run", "new", "app/src/two.rs"));
+    ASSERT_EQ(
+        0, named_edge_to_file_count(store, project, "CALLS", "right_run", "new", "app/src/one.rs"));
+    char raw_qn[512];
+    snprintf(raw_qn, sizeof(raw_qn), "%s.app.src.lib.RawA.new", project);
+    ASSERT_EQ(1, named_edge_to_qn_count(store, project, "CALLS", "raw_left_run", raw_qn));
+    ASSERT_EQ(0, named_edge_to_qn_count(store, project, "CALLS", "raw_right_run", raw_qn));
+    snprintf(raw_qn, sizeof(raw_qn), "%s.app.src.lib.RawB.new", project);
+    ASSERT_EQ(1, named_edge_to_qn_count(store, project, "CALLS", "raw_right_run", raw_qn));
+    ASSERT_EQ(0, named_edge_to_qn_count(store, project, "CALLS", "raw_left_run", raw_qn));
+    ASSERT_EQ(1, named_edge_to_file_count(store, project, "CALLS", "deep_inline_run", "new",
+                                          "app/src/one.rs"));
+    ASSERT_EQ(0, named_source_edge_count(store, project, "CALLS", "sibling_run"));
+    ASSERT_EQ(
+        1, named_edge_to_file_count(store, project, "CALLS", "block_run", "new", "app/src/one.rs"));
+    ASSERT_EQ(1, named_source_edge_count(store, project, "CALLS", "block_run"));
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
     th_rmtree(tmp);
     PASS();
 }
@@ -13527,10 +14109,16 @@ TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets) {
 
 SUITE(pipeline) {
     RUN_TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets);
+    RUN_TEST(pipeline_rust_authoritative_grouped_reexports_and_auth_shadow);
+    RUN_TEST(pipeline_rust_manifest_free_nested_import_retains_scope_authority);
+    RUN_TEST(pipeline_rust_outside_path_dependency_does_not_poison_local_authority);
+    RUN_TEST(pipeline_rust_authority_dependency_visibility_nested_and_lexical_controls);
     RUN_TEST(pipeline_rust_cross_file_factory_chains_exact_targets);
     RUN_TEST(pipeline_rust_cargo_tokio_nested_calls_exact_targets);
     RUN_TEST(pipeline_rust_tokio_cfg_crossfile_parallel_exact_target);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
+    RUN_TEST(pipeline_rust_surface_carrier_rejects_corrupt_authority);
+    RUN_TEST(pipeline_lsp_surface_rejects_oversized_rows_and_collections);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
     RUN_TEST(pipeline_lock_blocking);
@@ -13566,6 +14154,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_edge_props_valid_json);
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
+    RUN_TEST(pipeline_complexity_scc_order_invariant);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pipeline_complexity_analysis_allocation_failure_suppresses_derived_properties);
+#endif
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);

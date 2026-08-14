@@ -18,6 +18,7 @@
  */
 #include "pipeline/lsp_surface.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,7 +26,11 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 2 };
+enum {
+    SURFACE_CODEC_VERSION = 5,
+    SURFACE_MAX_JSON_BYTES = 8 * 1024 * 1024,
+    SURFACE_MAX_ENTRIES = 131072,
+};
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -68,8 +73,15 @@ static void add_str_array_or_null(yyjson_mut_doc *doc, yyjson_mut_val *obj, cons
 
 /* Serialize one file's surface: its slice of all_defs plus the registry-only
  * symbols from its raw extraction defs. Returns a malloc'd JSON string. */
-static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *defs,
-                                  int def_count) {
+static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *defs, int def_count,
+                                  bool is_rust) {
+    if (def_count < 0 || def_count > SURFACE_MAX_ENTRIES ||
+        (result &&
+         (result->defs.count < 0 || result->defs.count > SURFACE_MAX_ENTRIES ||
+          result->imports.count < 0 || result->imports.count > SURFACE_MAX_ENTRIES ||
+          result->mod_decls.count < 0 || result->mod_decls.count > SURFACE_MAX_ENTRIES))) {
+        return NULL;
+    }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return NULL;
@@ -121,8 +133,55 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
     }
     yyjson_mut_obj_add_val(doc, root, "reg", reg);
 
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    if (!is_rust) {
+        yyjson_mut_obj_add_null(doc, root, "rust");
+    } else {
+        yyjson_mut_val *rust = yyjson_mut_obj(doc);
+        add_str_or_null(doc, rust, "m", result ? result->module_qn : NULL);
+        yyjson_mut_obj_add_int(doc, rust, "is", result ? result->rust_imports_status : 0);
+        yyjson_mut_obj_add_int(doc, rust, "ms", result ? result->rust_mod_decls_status : 0);
+        yyjson_mut_val *imports = yyjson_mut_arr(doc);
+        for (int i = 0; result && i < result->imports.count; i++) {
+            const CBMImport *imp = &result->imports.items[i];
+            yyjson_mut_val *o = yyjson_mut_obj(doc);
+            add_str_or_null(doc, o, "n", imp->local_name);
+            add_str_or_null(doc, o, "p", imp->module_path);
+            yyjson_mut_obj_add_uint(doc, o, "ds", imp->declaration_start_byte);
+            yyjson_mut_obj_add_uint(doc, o, "de", imp->declaration_end_byte);
+            yyjson_mut_obj_add_uint(doc, o, "ss", imp->site_start_byte);
+            yyjson_mut_obj_add_uint(doc, o, "se", imp->site_end_byte);
+            yyjson_mut_obj_add_uint(doc, o, "xs", imp->scope_start_byte);
+            yyjson_mut_obj_add_uint(doc, o, "xe", imp->scope_end_byte);
+            add_str_or_null(doc, o, "om", imp->owner_module_path);
+            yyjson_mut_obj_add_bool(doc, o, "md", imp->rust_module_scope);
+            yyjson_mut_obj_add_uint(doc, o, "pr", imp->rust_provenance);
+            yyjson_mut_obj_add_uint(doc, o, "vi", imp->rust_visibility);
+            yyjson_mut_arr_add_val(imports, o);
+        }
+        yyjson_mut_obj_add_val(doc, rust, "i", imports);
+        yyjson_mut_val *mods = yyjson_mut_arr(doc);
+        for (int i = 0; result && i < result->mod_decls.count; i++) {
+            const CBMModDecl *decl = &result->mod_decls.items[i];
+            yyjson_mut_val *o = yyjson_mut_obj(doc);
+            add_str_or_null(doc, o, "n", decl->child_name);
+            add_str_or_null(doc, o, "pp", decl->parent_path);
+            add_str_or_null(doc, o, "p", decl->path_override);
+            yyjson_mut_obj_add_uint(doc, o, "vi", decl->rust_visibility);
+            yyjson_mut_obj_add_bool(doc, o, "in", decl->is_inline);
+            yyjson_mut_obj_add_bool(doc, o, "t", decl->is_cfg_test_gated);
+            yyjson_mut_arr_add_val(mods, o);
+        }
+        yyjson_mut_obj_add_val(doc, rust, "d", mods);
+        yyjson_mut_obj_add_val(doc, root, "rust", rust);
+    }
+
+    size_t json_len = 0;
+    char *json = yyjson_mut_write(doc, 0, &json_len);
     yyjson_mut_doc_free(doc);
+    if (json_len > SURFACE_MAX_JSON_BYTES) {
+        free(json);
+        return NULL;
+    }
     return json;
 }
 
@@ -150,8 +209,8 @@ int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
         }
         int start = def_starts ? def_starts[i] : 0;
         int end = def_starts ? def_starts[i + 1] : 0;
-        char *json =
-            surface_file_to_json(cache[i], all_defs ? all_defs + start : NULL, end - start);
+        char *json = surface_file_to_json(cache[i], all_defs ? all_defs + start : NULL, end - start,
+                                          files[i].language == CBM_LANG_RUST);
         if (!json) {
             cbm_store_free_lsp_surfaces(rows, n);
             return -1;
@@ -211,10 +270,13 @@ static const char **arena_str_array(CBMArena *arena, yyjson_val *arr, bool null_
 
 int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLSPDef **out_defs) {
     *out_defs = NULL;
-    if (!defs_json) {
+    if (!arena || !defs_json) {
         return -1;
     }
-    yyjson_doc *doc = yyjson_read(defs_json, strlen(defs_json), 0);
+    size_t json_len = strnlen(defs_json, SURFACE_MAX_JSON_BYTES + 1U);
+    if (json_len > SURFACE_MAX_JSON_BYTES)
+        return -1;
+    yyjson_doc *doc = yyjson_read(defs_json, json_len, 0);
     if (!doc) {
         return -1;
     }
@@ -225,7 +287,13 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         yyjson_doc_free(doc);
         return -1;
     }
-    int count = (int)yyjson_arr_size(lsp);
+    size_t lsp_size = yyjson_arr_size(lsp);
+    if (lsp_size > SURFACE_MAX_ENTRIES || lsp_size > INT_MAX ||
+        lsp_size > SIZE_MAX / sizeof(CBMLSPDef)) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    int count = (int)lsp_size;
     if (count == 0) {
         yyjson_doc_free(doc);
         return 0;
@@ -270,4 +338,156 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
     yyjson_doc_free(doc);
     *out_defs = defs;
     return count;
+}
+
+int cbm_lsp_surface_rust_carrier_from_json(CBMArena *arena, const char *defs_json,
+                                           CBMFileResult *out) {
+    if (!arena || !defs_json || !out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    size_t json_len = strnlen(defs_json, SURFACE_MAX_JSON_BYTES + 1U);
+    if (json_len > SURFACE_MAX_JSON_BYTES)
+        return -1;
+    yyjson_doc *doc = yyjson_read(defs_json, json_len, 0);
+    if (!doc)
+        return -1;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *ver = root ? yyjson_obj_get(root, "v") : NULL;
+    yyjson_val *rust = root ? yyjson_obj_get(root, "rust") : NULL;
+    if (!ver || yyjson_get_int(ver) != SURFACE_CODEC_VERSION || !rust) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    if (yyjson_is_null(rust)) {
+        yyjson_doc_free(doc);
+        return 0;
+    }
+    if (!yyjson_is_obj(rust)) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    yyjson_val *imports = yyjson_obj_get(rust, "i");
+    yyjson_val *mods = yyjson_obj_get(rust, "d");
+    yyjson_val *import_status_value = yyjson_obj_get(rust, "is");
+    yyjson_val *mod_status_value = yyjson_obj_get(rust, "ms");
+    int import_status = (int)yyjson_get_int(import_status_value);
+    int mod_status = (int)yyjson_get_int(mod_status_value);
+    const char *module = yyjson_get_str(yyjson_obj_get(rust, "m"));
+    if (!module || !imports || !yyjson_is_arr(imports) || !mods || !yyjson_is_arr(mods) ||
+        !yyjson_is_int(import_status_value) || !yyjson_is_int(mod_status_value) ||
+        import_status < CBM_RUST_CARRIER_COMPLETE || import_status > CBM_RUST_CARRIER_PARTIAL ||
+        mod_status < CBM_RUST_CARRIER_COMPLETE || mod_status > CBM_RUST_CARRIER_PARTIAL) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    out->module_qn = cbm_arena_strdup(arena, module);
+    out->rust_imports_status = (CBMRustCarrierStatus)import_status;
+    out->rust_mod_decls_status = (CBMRustCarrierStatus)mod_status;
+    size_t import_size = yyjson_arr_size(imports);
+    if (import_size > SURFACE_MAX_ENTRIES || import_size > INT_MAX ||
+        import_size > SIZE_MAX / sizeof(CBMImport)) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    int import_count = (int)import_size;
+    if (import_count > 0) {
+        out->imports.items = cbm_arena_alloc(arena, (size_t)import_count * sizeof(CBMImport));
+        if (!out->imports.items) {
+            yyjson_doc_free(doc);
+            return -1;
+        }
+        memset(out->imports.items, 0, (size_t)import_count * sizeof(CBMImport));
+        out->imports.cap = import_count;
+        for (int i = 0; i < import_count; i++) {
+            yyjson_val *o = yyjson_arr_get(imports, (size_t)i);
+            yyjson_val *ds = yyjson_obj_get(o, "ds");
+            yyjson_val *de = yyjson_obj_get(o, "de");
+            yyjson_val *ss = yyjson_obj_get(o, "ss");
+            yyjson_val *se = yyjson_obj_get(o, "se");
+            yyjson_val *xs = yyjson_obj_get(o, "xs");
+            yyjson_val *xe = yyjson_obj_get(o, "xe");
+            yyjson_val *owner_module = yyjson_obj_get(o, "om");
+            yyjson_val *module_scope = yyjson_obj_get(o, "md");
+            yyjson_val *pr = yyjson_obj_get(o, "pr");
+            yyjson_val *vi = yyjson_obj_get(o, "vi");
+            uint64_t ds_u = yyjson_get_uint(ds);
+            uint64_t de_u = yyjson_get_uint(de);
+            uint64_t ss_u = yyjson_get_uint(ss);
+            uint64_t se_u = yyjson_get_uint(se);
+            uint64_t xs_u = yyjson_get_uint(xs);
+            uint64_t xe_u = yyjson_get_uint(xe);
+            uint64_t pr_u = yyjson_get_uint(pr);
+            uint64_t vi_u = yyjson_get_uint(vi);
+            CBMImport *imp = &out->imports.items[i];
+            imp->local_name = arena_str_or_null(arena, yyjson_obj_get(o, "n"));
+            imp->module_path = arena_str_or_null(arena, yyjson_obj_get(o, "p"));
+            imp->owner_module_path = arena_str_or_null(arena, owner_module);
+            if (!imp->local_name || !imp->module_path || !yyjson_is_uint(ds) ||
+                !yyjson_is_uint(de) || !yyjson_is_uint(ss) || !yyjson_is_uint(se) ||
+                !imp->owner_module_path || !yyjson_is_uint(xs) || !yyjson_is_uint(xe) ||
+                !yyjson_is_bool(module_scope) || !yyjson_is_uint(pr) || !yyjson_is_uint(vi) ||
+                ds_u > UINT32_MAX || de_u > UINT32_MAX || ss_u > UINT32_MAX || se_u > UINT32_MAX ||
+                xs_u > UINT32_MAX || xe_u > UINT32_MAX || ds_u > de_u || xs_u >= xe_u ||
+                ss_u >= se_u || ss_u < ds_u || se_u > de_u || ds_u < xs_u || de_u > xe_u ||
+                (pr_u != CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT &&
+                 pr_u != CBM_RUST_IMPORT_PROVENANCE_GLOB_EXACT) ||
+                vi_u > CBM_RUST_IMPORT_VIS_PUBLIC) {
+                yyjson_doc_free(doc);
+                return -1;
+            }
+            imp->declaration_start_byte = (uint32_t)ds_u;
+            imp->declaration_end_byte = (uint32_t)de_u;
+            imp->site_start_byte = (uint32_t)ss_u;
+            imp->site_end_byte = (uint32_t)se_u;
+            imp->scope_start_byte = (uint32_t)xs_u;
+            imp->scope_end_byte = (uint32_t)xe_u;
+            imp->rust_module_scope = yyjson_get_bool(module_scope);
+            imp->rust_provenance = (uint8_t)pr_u;
+            imp->rust_visibility = (uint8_t)vi_u;
+        }
+        out->imports.count = import_count;
+    }
+    size_t mod_size = yyjson_arr_size(mods);
+    if (mod_size > SURFACE_MAX_ENTRIES || mod_size > INT_MAX ||
+        mod_size > SIZE_MAX / sizeof(CBMModDecl)) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    int mod_count = (int)mod_size;
+    if (mod_count > 0) {
+        out->mod_decls.items = cbm_arena_alloc(arena, (size_t)mod_count * sizeof(CBMModDecl));
+        if (!out->mod_decls.items) {
+            yyjson_doc_free(doc);
+            return -1;
+        }
+        memset(out->mod_decls.items, 0, (size_t)mod_count * sizeof(CBMModDecl));
+        out->mod_decls.cap = mod_count;
+        for (int i = 0; i < mod_count; i++) {
+            yyjson_val *o = yyjson_arr_get(mods, (size_t)i);
+            yyjson_val *path = yyjson_obj_get(o, "p");
+            yyjson_val *parent = yyjson_obj_get(o, "pp");
+            yyjson_val *visibility = yyjson_obj_get(o, "vi");
+            yyjson_val *is_inline = yyjson_obj_get(o, "in");
+            yyjson_val *test_gated = yyjson_obj_get(o, "t");
+            CBMModDecl *decl = &out->mod_decls.items[i];
+            decl->child_name = arena_str_or_null(arena, yyjson_obj_get(o, "n"));
+            decl->parent_path = arena_str_or_null(arena, parent);
+            decl->path_override = arena_str_or_null(arena, path);
+            uint64_t visibility_u = yyjson_get_uint(visibility);
+            decl->rust_visibility = (uint8_t)visibility_u;
+            decl->is_inline = yyjson_get_bool(is_inline);
+            decl->is_cfg_test_gated = yyjson_get_bool(test_gated);
+            if (!decl->child_name || !decl->parent_path || !yyjson_is_str(parent) ||
+                (!yyjson_is_null(path) && !yyjson_is_str(path)) || !yyjson_is_bool(is_inline) ||
+                !yyjson_is_bool(test_gated) || !yyjson_is_uint(visibility) ||
+                visibility_u > CBM_RUST_IMPORT_VIS_PUBLIC) {
+                yyjson_doc_free(doc);
+                return -1;
+            }
+        }
+        out->mod_decls.count = mod_count;
+    }
+    bool ok = out->module_qn && cbm_arena_status(arena) == CBM_ARENA_STATUS_AVAILABLE;
+    yyjson_doc_free(doc);
+    return ok ? 1 : -1;
 }

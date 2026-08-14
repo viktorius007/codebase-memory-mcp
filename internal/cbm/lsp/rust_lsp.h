@@ -56,6 +56,7 @@ typedef struct {
     const char *source;
     int source_len;
     const char *root_source; /* immutable original file buffer */
+    TSNode root;             /* exact current-file AST for cfg-safe local authority */
 
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
@@ -74,7 +75,13 @@ typedef struct {
      * `crate::foo::Bar`). Glob imports go in `glob_module_qns` instead. */
     const char **use_local_names;
     const char **use_module_paths;
+    bool *use_authoritative;
+    uint32_t *use_scope_starts;
+    uint32_t *use_scope_ends;
+    const char **use_owner_module_paths;
     int use_count;
+    uint32_t lookup_site_byte;
+    const char *current_module_path;
 
     const char **glob_module_qns;
     int glob_count;
@@ -254,6 +261,9 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
  * full `module_path` is stored verbatim (e.g. `std::collections::HashMap`).
  * Glob imports (`use foo::*`) go through `rust_lsp_add_glob` instead. */
 void rust_lsp_add_use(RustLSPContext *ctx, const char *local_name, const char *module_path);
+void rust_lsp_add_authoritative_use(RustLSPContext *ctx, const char *local_name,
+                                    const char *module_path, uint32_t scope_start,
+                                    uint32_t scope_end, const char *owner_module_path);
 void rust_lsp_add_glob(RustLSPContext *ctx, const char *module_qn);
 
 /* Process every function/method in the file, walking statements and
@@ -373,6 +383,13 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
                                           CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
                                           CBMRustAnalysisHealth *health);
 
+void cbm_run_rust_lsp_cross_scoped_with_manifest(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
+    int def_count, const char **import_names, const char **import_qns,
+    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health);
+
 /* Tier-2: build the project-wide Rust cross registry ONCE from all defs, finalize,
  * and seal read-only. Shared across every Rust file's resolve (mirrors C/py/cs/ts).
  * Def-driven → byte-identical entries to the per-file build. */
@@ -391,6 +408,13 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
                                           const struct CBMCargoManifest *manifest,
                                           CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
                                           CBMRustAnalysisHealth *health);
+
+void cbm_run_rust_lsp_cross_scoped_with_registry(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
+    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health);
 
 /* Per-file input for batch cross-file Rust LSP processing. */
 typedef struct {

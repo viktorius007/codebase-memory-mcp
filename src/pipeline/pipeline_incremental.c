@@ -1116,6 +1116,9 @@ typedef struct {
      * the arenas live exactly as long as cr.arena itself. */
     CBMArena *rehydrate_arenas;
     int rehydrate_arena_count;
+    cbm_file_info_t *base_authority_files;
+    CBMFileResult **base_authority_cache;
+    int base_authority_count;
 } closure_resolve_t;
 
 typedef struct {
@@ -1459,10 +1462,46 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                          "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        rc = cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count,
-                                  all_defs, all_def_count, definition_universe_status,
-                                  closure ? closure->def_modules : NULL, module_def_index,
-                                  registries_arg);
+        cbm_file_info_t *authority_files = NULL;
+        CBMFileResult **authority_cache = NULL;
+        int authority_count = 0;
+        if (closure) {
+            int rust_changed = 0;
+            for (int i = 0; i < ci; i++)
+                if (cache[i] && changed_files[i].language == CBM_LANG_RUST)
+                    rust_changed++;
+            int authority_capacity = closure->base_authority_count + rust_changed;
+            if (authority_capacity > 0) {
+                authority_files =
+                    (cbm_file_info_t *)calloc((size_t)authority_capacity, sizeof(*authority_files));
+                authority_cache =
+                    (CBMFileResult **)calloc((size_t)authority_capacity, sizeof(*authority_cache));
+            }
+            if (authority_capacity > 0 && (!authority_files || !authority_cache)) {
+                rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+            } else {
+                for (int i = 0; i < closure->base_authority_count; i++) {
+                    authority_files[authority_count] = closure->base_authority_files[i];
+                    authority_cache[authority_count++] = closure->base_authority_cache[i];
+                }
+                for (int i = 0; i < ci; i++) {
+                    if (!cache[i] || changed_files[i].language != CBM_LANG_RUST)
+                        continue;
+                    authority_files[authority_count] = changed_files[i];
+                    authority_cache[authority_count++] = cache[i];
+                }
+            }
+        }
+        if (rc == 0) {
+            rc = cbm_parallel_resolve(
+                ctx, changed_files, ci, cache, &shared_ids, worker_count,
+                closure ? authority_files : changed_files,
+                closure ? authority_cache : (CBMFileResult *const *)cache,
+                closure ? authority_count : ci, all_defs, all_def_count, definition_universe_status,
+                closure ? closure->def_modules : NULL, module_def_index, registries_arg);
+        }
+        free(authority_files);
+        free(authority_cache);
         if (module_def_index) {
             cbm_pxc_free_module_def_index(module_def_index);
         }
@@ -1625,6 +1664,8 @@ typedef struct {
     CBMArena *arena;      /* this worker's arena (owned by cr) */
     CBMLSPDef **row_defs; /* per-row result pointers */
     int *row_counts;      /* per-row def counts; -1 = decode failure */
+    CBMFileResult **row_carriers;
+    int *row_carrier_status; /* 1 Rust, 0 non-Rust, -1 corrupt */
 } rehydrate_worker_t;
 
 static void *rehydrate_worker(void *arg) {
@@ -1634,6 +1675,27 @@ static void *rehydrate_worker(void *arg) {
         int count = cbm_lsp_surface_defs_from_json(w->arena, w->rows[i]->defs_json, &defs);
         w->row_defs[i] = defs;
         w->row_counts[i] = count;
+        CBMFileResult *carrier = cbm_arena_alloc(w->arena, sizeof(*carrier));
+        int carrier_status =
+            carrier
+                ? cbm_lsp_surface_rust_carrier_from_json(w->arena, w->rows[i]->defs_json, carrier)
+                : -1;
+        if (carrier_status == 1 && count >= 0 && count > 0) {
+            carrier->defs.items = cbm_arena_alloc(w->arena, (size_t)count * sizeof(CBMDefinition));
+            if (!carrier->defs.items) {
+                carrier_status = -1;
+            } else {
+                memset(carrier->defs.items, 0, (size_t)count * sizeof(CBMDefinition));
+                carrier->defs.count = count;
+                carrier->defs.cap = count;
+                for (int d = 0; d < count; d++)
+                    carrier->defs.items[d].qualified_name = defs[d].qualified_name;
+            }
+        }
+        w->row_carriers[i] = carrier_status == 1 ? carrier : NULL;
+        w->row_carrier_status[i] = carrier_status;
+        if (carrier_status < 0)
+            w->row_counts[i] = -1;
     }
     return NULL;
 }
@@ -2175,13 +2237,20 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         CBMLSPDef **row_defs =
             (CBMLSPDef **)calloc((size_t)(elig_count ? elig_count : 1), sizeof(*row_defs));
         int *row_counts = (int *)calloc((size_t)(elig_count ? elig_count : 1), sizeof(int));
+        CBMFileResult **row_carriers =
+            (CBMFileResult **)calloc((size_t)(elig_count ? elig_count : 1), sizeof(*row_carriers));
+        int *row_carrier_status =
+            (int *)calloc((size_t)(elig_count ? elig_count : 1), sizeof(*row_carrier_status));
         cr.rehydrate_arenas = (CBMArena *)calloc((size_t)workers, sizeof(CBMArena));
         cbm_thread_t *threads = (cbm_thread_t *)calloc((size_t)workers, sizeof(cbm_thread_t));
         rehydrate_worker_t *wargs = (rehydrate_worker_t *)calloc((size_t)workers, sizeof(*wargs));
-        if (!row_defs || !row_counts || !cr.rehydrate_arenas || !threads || !wargs) {
+        if (!row_defs || !row_counts || !row_carriers || !row_carrier_status ||
+            !cr.rehydrate_arenas || !threads || !wargs) {
             free(elig);
             free(row_defs);
             free(row_counts);
+            free(row_carriers);
+            free(row_carrier_status);
             free(threads);
             free(wargs);
             goto out;
@@ -2198,7 +2267,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                                             .worker_count = workers,
                                             .arena = &cr.rehydrate_arenas[w],
                                             .row_defs = row_defs,
-                                            .row_counts = row_counts};
+                                            .row_counts = row_counts,
+                                            .row_carriers = row_carriers,
+                                            .row_carrier_status = row_carrier_status};
             if (cbm_thread_create(&threads[w], 0, rehydrate_worker, &wargs[w]) != 0) {
                 break;
             }
@@ -2237,9 +2308,35 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                 }
             }
         }
+        if (decode_ok) {
+            int rust_rows = 0;
+            for (int i = 0; i < elig_count; i++)
+                if (row_carrier_status[i] == 1)
+                    rust_rows++;
+            if (rust_rows > 0) {
+                cr.base_authority_files =
+                    (cbm_file_info_t *)calloc((size_t)rust_rows, sizeof(cbm_file_info_t));
+                cr.base_authority_cache =
+                    (CBMFileResult **)calloc((size_t)rust_rows, sizeof(CBMFileResult *));
+                if (!cr.base_authority_files || !cr.base_authority_cache) {
+                    decode_ok = false;
+                } else {
+                    for (int i = 0; i < elig_count; i++) {
+                        if (row_carrier_status[i] != 1)
+                            continue;
+                        int a = cr.base_authority_count++;
+                        cr.base_authority_files[a].rel_path = (char *)elig[i]->rel_path;
+                        cr.base_authority_files[a].language = CBM_LANG_RUST;
+                        cr.base_authority_cache[a] = row_carriers[i];
+                    }
+                }
+            }
+        }
         free(elig);
         free(row_defs);
         free(row_counts);
+        free(row_carriers);
+        free(row_carrier_status);
         if (!decode_ok) {
             goto out;
         }
@@ -2485,6 +2582,8 @@ out:
             cbm_arena_destroy(&cr.rehydrate_arenas[i]);
         }
         free(cr.rehydrate_arenas);
+        free(cr.base_authority_files);
+        free(cr.base_authority_cache);
         cbm_arena_destroy(&cr.arena);
     }
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);

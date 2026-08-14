@@ -27,6 +27,9 @@
 typedef struct {
     const char* name;       /* declared dependency name */
     const char* path;       /* path = "../foo" if local, else NULL */
+    const char *package;    /* package = "real-name" when `name` is an alias */
+    bool inherits_workspace; /* member declaration delegates to workspace dependency */
+    bool workspace_source;   /* declaration originates in [workspace.dependencies] */
 } CBMCargoDep;
 
 typedef struct {
@@ -53,6 +56,13 @@ typedef struct {
     const char *source_path;
 } CBMCargoTarget;
 
+typedef struct {
+    const char *package_dir;        /* repository-relative caller package, "" for root */
+    const char *name;               /* source-level dependency alias */
+    const char *target_name;        /* declared package/library name */
+    const char *target_package_dir; /* exact admitted local package, NULL for registry deps */
+} CBMCargoDependencyRoute;
+
 typedef struct CBMCargoManifest {
     const char* package_name;    /* [package].name, NULL if missing */
     const char* package_version; /* [package].version, NULL if missing */
@@ -76,6 +86,9 @@ typedef struct CBMCargoManifest {
     int target_count;
     int target_cap;
     bool targets_complete;
+    CBMCargoDependencyRoute *dependency_routes;
+    int dependency_route_count;
+    int dependency_route_cap;
 
     /* Parser/cap health is part of the manifest result so diagnostics survive
      * independently of arena allocation and without a parallel log. */
@@ -95,6 +108,9 @@ bool cbm_cargo_add_named_target(CBMArena *arena, CBMCargoManifest *manifest,
 bool cbm_cargo_add_routed_target(CBMArena *arena, CBMCargoManifest *manifest,
                                  CBMCargoTargetKind kind, const char *name, const char *package_dir,
                                  const char *source_path, const char *blocker_root);
+bool cbm_cargo_add_dependency_route(CBMArena *arena, CBMCargoManifest *manifest,
+                                    const char *package_dir, const char *name,
+                                    const char *target_name, const char *target_package_dir);
 
 /* Convenience: does a given path-prefix look like one of the listed
  * dependency names? Used by the resolver to recognise external crate

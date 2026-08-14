@@ -267,7 +267,43 @@ typedef struct {
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
+    /* Rust use-tree leaves are an extraction authority, not a later graph
+     * guess. Zero keeps every non-Rust/legacy initializer source-compatible. */
+    uint32_t declaration_start_byte;
+    uint32_t declaration_end_byte;
+    uint32_t site_start_byte;
+    uint32_t site_end_byte;
+    uint32_t scope_start_byte;     // lexical/module scope containing this exact use leaf
+    uint32_t scope_end_byte;       // exclusive; a site outside this range cannot consume the alias
+    const char *owner_module_path; // inline-module path relative to the declaring file, or ""
+    bool rust_module_scope;        // true only for a use declared directly in a module namespace
+    uint8_t rust_provenance;
+    uint8_t rust_visibility;
 } CBMImport;
+
+typedef enum {
+    CBM_RUST_IMPORT_PROVENANCE_NONE = 0,
+    CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT = 1,
+    CBM_RUST_IMPORT_PROVENANCE_GLOB_EXACT = 2,
+} CBMRustImportProvenance;
+
+typedef enum {
+    CBM_RUST_IMPORT_VIS_PRIVATE = 0,
+    CBM_RUST_IMPORT_VIS_RESTRICTED = 1,
+    CBM_RUST_IMPORT_VIS_PUBLIC = 2,
+} CBMRustImportVisibility;
+
+typedef enum {
+    CBM_RUST_CARRIER_NOT_RUN = 0,
+    CBM_RUST_CARRIER_COMPLETE = 1,
+    CBM_RUST_CARRIER_PARTIAL = 2,
+} CBMRustCarrierStatus;
+
+typedef struct {
+    uint32_t start_byte;
+    uint32_t end_byte;
+    const char *owner_module_path;
+} CBMRustImportScope;
 
 typedef enum {
     CBM_USAGE_VALUE = 0,
@@ -372,8 +408,11 @@ typedef struct {
 // module's own file (and transitively to its descendants).
 typedef struct {
     const char *child_name;    // module name in `mod NAME;`
+    const char *parent_path;   // inline parent path (`outer::inner`) or "" at file root
     const char *path_override; // `#[path = "..."]` value, relative to the
                                // declaring file's directory; NULL if absent
+    uint8_t rust_visibility;   // CBMRustImportVisibility of the mod item
+    bool is_inline;            // module body is in the declaring file
     bool is_cfg_test_gated;    // declaration carries a cfg(test)-style gate
 } CBMModDecl;
 
@@ -569,6 +608,8 @@ typedef struct CBMFileResult {
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
     CBMModDeclArray mod_decls;           // Rust: bodyless `mod NAME;` child declarations
+    CBMRustCarrierStatus rust_imports_status;
+    CBMRustCarrierStatus rust_mod_decls_status;
     CBMRustAnalysisHealth rust_health;   // fixed-size Rust semantic degradation report
 
     const char *module_qn;      // module qualified name
@@ -823,6 +864,7 @@ bool cbm_moddecls_push(CBMModDeclArray *arr, CBMArena *a, CBMModDecl md);
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
+void cbm_rust_imports_mark_semantic_calls(CBMFileResult *result);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
 void cbm_extract_type_refs(CBMExtractCtx *ctx);

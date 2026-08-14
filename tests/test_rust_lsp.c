@@ -99,6 +99,31 @@ static int count_resolved_exact(const CBMFileResult *r, const char *caller_qn,
     return count;
 }
 
+static int count_resolved_array_exact(const CBMResolvedCallArray *calls, const char *caller_qn,
+                                      const char *callee_qn) {
+    int count = 0;
+    for (int i = 0; calls && i < calls->count; i++) {
+        const CBMResolvedCall *call = &calls->items[i];
+        if (call->caller_qn && call->callee_qn && strcmp(call->caller_qn, caller_qn) == 0 &&
+            strcmp(call->callee_qn, callee_qn) == 0)
+            count++;
+    }
+    return count;
+}
+
+static int count_resolved_exact_site(const CBMFileResult *result, const char *caller_qn,
+                                     const char *callee_qn, uint32_t start, uint32_t end) {
+    int count = 0;
+    for (int i = 0; result && i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &result->resolved_calls.items[i];
+        if (call->caller_qn && call->callee_qn && strcmp(call->caller_qn, caller_qn) == 0 &&
+            strcmp(call->callee_qn, callee_qn) == 0 && call->site_start_byte == start &&
+            call->site_end_byte == end)
+            count++;
+    }
+    return count;
+}
+
 static int require_resolved(const CBMFileResult *r, const char *callerSub,
                             const char *calleeSub) {
     int idx = find_resolved(r, callerSub, calleeSub);
@@ -1351,7 +1376,7 @@ TEST(rustlsp_shared_dispatch_merges_existing_exact_occurrence) {
     const char *imp_qns[] = {"test::lib"};
 
     cbm_pxc_dispatch_file(CBM_LANG_RUST, result, source, (int)strlen(source), "src/main.rs",
-                          result->module_qn, NULL, NULL, defs, 2, imp_names, imp_qns, 1, NULL,
+                          result->module_qn, NULL, NULL, defs, 2, imp_names, imp_qns, NULL, 1, NULL,
                           rustlsp_return_shared_registry, shared);
 
     int local_after = 0;
@@ -2503,6 +2528,167 @@ TEST(rustlsp_tokio_cfg_chain_exact_sites) {
                                    cross_defs[0].qualified_name),
               0);
     cbm_arena_destroy(&ambiguous_arena);
+    PASS();
+}
+
+TEST(rustlsp_auth_shadow_initializer_precedes_binding_with_explicit_pattern_type) {
+    const char *source = "struct Auth;\n"
+                         "impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
+                         "struct AppServerArgs { auth: Auth }\n"
+                         "fn unknown<T>() -> T { panic!() }\n"
+                         "fn run() -> Result<(), ()> {\n"
+                         "  let AppServerArgs { auth } = unknown();\n"
+                         "  let auth = auth.try_into_settings()?;\n"
+                         "  Ok(auth)\n"
+                         "}\n";
+    CBMFileResult *r = extract_rust(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(1,
+              count_resolved_exact(r, "test.src.main.run", "test.src.main.Auth.try_into_settings"));
+    const char *auth_site = strstr(source, "auth.try_into_settings()");
+    ASSERT_NOT_NULL(auth_site);
+    ASSERT_EQ(1, count_resolved_exact_site(
+                     r, "test.src.main.run", "test.src.main.Auth.try_into_settings",
+                     (uint32_t)(auth_site - source),
+                     (uint32_t)(auth_site - source + strlen("auth.try_into_settings()"))));
+    cbm_free_result(r);
+
+    const char *typed_shadow =
+        "struct Auth;\n"
+        "impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
+        "fn unknown<T>() -> T { panic!() }\n"
+        "fn run() -> Result<(), ()> {\n"
+        "  let auth: Auth = unknown();\n"
+        "  let auth = auth.try_into_settings()?;\n"
+        "  Ok(auth)\n"
+        "}\n";
+    r = extract_rust(typed_shadow);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(1,
+              count_resolved_exact(r, "test.src.main.run", "test.src.main.Auth.try_into_settings"));
+    cbm_free_result(r);
+
+    const char *pattern_without_shadow =
+        "struct Auth;\n"
+        "impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
+        "struct AppServerArgs { auth: Auth }\n"
+        "fn unknown<T>() -> T { panic!() }\n"
+        "fn run() -> Result<(), ()> {\n"
+        "  let AppServerArgs { auth } = unknown();\n"
+        "  let settings = auth.try_into_settings()?;\n"
+        "  Ok(settings)\n"
+        "}\n";
+    r = extract_rust(pattern_without_shadow);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(1,
+              count_resolved_exact(r, "test.src.main.run", "test.src.main.Auth.try_into_settings"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_let_else_alternative_uses_outer_binding) {
+    const char *source = "struct Auth;\n"
+                         "impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
+                         "struct Other;\n"
+                         "fn none<T>() -> Option<T> { None }\n"
+                         "fn run(auth: Auth) -> Result<(), ()> {\n"
+                         "  let Some(auth): Option<Other> = none() else {\n"
+                         "    auth.try_into_settings()?;\n"
+                         "    return Ok(());\n"
+                         "  };\n"
+                         "  Ok(())\n"
+                         "}\n";
+    CBMFileResult *r = extract_rust(source);
+    ASSERT_NOT_NULL(r);
+    const char *site = strstr(source, "auth.try_into_settings()");
+    ASSERT_NOT_NULL(site);
+    ASSERT_EQ(1, count_resolved_exact_site(
+                     r, "test.src.main.run", "test.src.main.Auth.try_into_settings",
+                     (uint32_t)(site - source),
+                     (uint32_t)(site - source + strlen("auth.try_into_settings()"))));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_cfg_twin_local_struct_fields_block_registry_in_both_routes) {
+    const char *source = "struct Good; impl Good { fn convert(self) {} }\n"
+                         "struct Bad; impl Bad { fn convert(self) {} }\n"
+                         "#[cfg(feature = \"a\")] struct Args { auth: Good }\n"
+                         "#[cfg(not(feature = \"a\"))] struct Args { auth: Bad }\n"
+                         "fn unknown<T>() -> T { panic!() }\n"
+                         "fn run() { let Args { auth } = unknown(); auth.convert(); }\n";
+    CBMFileResult *single = extract_rust(source);
+    ASSERT_NOT_NULL(single);
+    ASSERT_EQ(0, count_resolved_exact(single, "test.src.main.run", "test.src.main.Good.convert"));
+    ASSERT_EQ(0, count_resolved_exact(single, "test.src.main.run", "test.src.main.Bad.convert"));
+    cbm_free_result(single);
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustLSPDef defs[6] = {
+        {.qualified_name = "test.src.main.Good",
+         .short_name = "Good",
+         .label = "Type",
+         .def_module_qn = "test.src.main"},
+        {.qualified_name = "test.src.main.Good.convert",
+         .short_name = "convert",
+         .label = "Method",
+         .receiver_type = "test.src.main.Good",
+         .def_module_qn = "test.src.main"},
+        {.qualified_name = "test.src.main.Bad",
+         .short_name = "Bad",
+         .label = "Type",
+         .def_module_qn = "test.src.main"},
+        {.qualified_name = "test.src.main.Bad.convert",
+         .short_name = "convert",
+         .label = "Method",
+         .receiver_type = "test.src.main.Bad",
+         .def_module_qn = "test.src.main"},
+        {.qualified_name = "test.src.main.Args",
+         .short_name = "Args",
+         .label = "Type",
+         .def_module_qn = "test.src.main",
+         .field_defs = "auth:Good"},
+        {.qualified_name = "test.src.main.unknown",
+         .short_name = "unknown",
+         .label = "Function",
+         .def_module_qn = "test.src.main",
+         .return_types = "T"},
+    };
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&arena, source, (int)strlen(source), "test.src.main", defs, 6, NULL,
+                           NULL, 0, NULL, &out, NULL);
+    ASSERT_EQ(0,
+              count_resolved_array_exact(&out, "test.src.main.run", "test.src.main.Good.convert"));
+    ASSERT_EQ(0,
+              count_resolved_array_exact(&out, "test.src.main.run", "test.src.main.Bad.convert"));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_exact_associated_callable_value_accepts_receiver_and_rejects_decoy) {
+    const char *source =
+        "struct LoaderOverrides;\n"
+        "impl LoaderOverrides { fn with_managed_config_path_for_tests() {} }\n"
+        "struct Decoy; impl Decoy { fn with_managed_config_path_for_tests() {} }\n"
+        "fn consume(_: fn()) {}\n"
+        "fn run() { consume(LoaderOverrides::with_managed_config_path_for_tests); }\n";
+    CBMFileResult *r = extract_rust(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(1, count_resolved_exact(
+                     r, "test.src.main.run",
+                     "test.src.main.LoaderOverrides.with_managed_config_path_for_tests"));
+    const char *loader_site = strstr(source, "LoaderOverrides::with_managed_config_path_for_tests");
+    ASSERT_NOT_NULL(loader_site);
+    ASSERT_EQ(1, count_resolved_exact_site(
+                     r, "test.src.main.run",
+                     "test.src.main.LoaderOverrides.with_managed_config_path_for_tests",
+                     (uint32_t)(loader_site - source),
+                     (uint32_t)(loader_site - source +
+                                strlen("LoaderOverrides::with_managed_config_path_for_tests"))));
+    ASSERT_EQ(0, count_resolved_exact(r, "test.src.main.run",
+                                      "test.src.main.Decoy.with_managed_config_path_for_tests"));
+    cbm_free_result(r);
     PASS();
 }
 
@@ -7736,6 +7922,24 @@ TEST(rustlsp_definition_return_allocation_fails_without_null_dereference) {
     PASS();
 }
 
+TEST(rustlsp_grouped_use_prefix_allocation_fails_without_null_dereference) {
+    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
+                     "pub struct A; pub struct B;\n"
+                     "use crate::{A, B};\n"
+                     "fn run() {}\n",
+                     CBM_ARENA_ALLOCATION_RUST_GROUPED_USE_PREFIX));
+    PASS();
+}
+
+TEST(rustlsp_grouped_use_body_allocation_fails_without_null_dereference) {
+    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
+                     "pub struct A; pub struct B;\n"
+                     "use crate::{A, B};\n"
+                     "fn run() {}\n",
+                     CBM_ARENA_ALLOCATION_RUST_GROUPED_USE_BODY));
+    PASS();
+}
+
 TEST(rustlsp_ast_return_patch_allocation_fails_without_null_dereference) {
     ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
                      "struct Builder;\nfn make() -> Builder { Builder }\nfn run() { make(); }\n",
@@ -8601,6 +8805,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_chained_method_calls);
     RUN_TEST(rustlsp_cargo_value_receiver_generic_impl_exact_sites);
     RUN_TEST(rustlsp_tokio_cfg_chain_exact_sites);
+    RUN_TEST(rustlsp_auth_shadow_initializer_precedes_binding_with_explicit_pattern_type);
+    RUN_TEST(rustlsp_let_else_alternative_uses_outer_binding);
+    RUN_TEST(rustlsp_cfg_twin_local_struct_fields_block_registry_in_both_routes);
+    RUN_TEST(rustlsp_exact_associated_callable_value_accepts_receiver_and_rejects_decoy);
     RUN_TEST(rustlsp_box_constructor);
     RUN_TEST(rustlsp_arc_clone);
     RUN_TEST(rustlsp_iterator_filter_collect);
@@ -9144,6 +9352,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_allocation_loss_reason_is_stable_and_route_incomplete);
     RUN_TEST(rustlsp_impl_return_allocation_fails_inside_resolver_without_crash);
     RUN_TEST(rustlsp_definition_return_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_grouped_use_prefix_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_grouped_use_body_allocation_fails_without_null_dereference);
     RUN_TEST(rustlsp_ast_return_patch_allocation_fails_without_null_dereference);
     RUN_TEST(rustlsp_derive_embedded_allocation_fails_without_null_dereference);
     RUN_TEST(rustlsp_derive_return_allocation_fails_without_null_dereference);

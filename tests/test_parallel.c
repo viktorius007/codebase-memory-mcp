@@ -331,9 +331,9 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
 
-    cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
-                         def_count, collect_status, def_modules, module_def_index,
-                         NULL /* cross_registries — tests use per-file path */);
+    cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, files,
+                         result_cache, file_count, all_defs, def_count, collect_status, def_modules,
+                         module_def_index, NULL /* cross_registries — tests use per-file path */);
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_pxc_free_module_def_index(module_def_index);

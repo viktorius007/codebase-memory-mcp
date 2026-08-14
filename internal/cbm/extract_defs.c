@@ -2141,6 +2141,22 @@ static bool rust_def_is_test(const char *const *decorators) {
     return false;
 }
 
+/* Only unrestricted `pub` is callable/importable from another crate.
+ * `pub(crate)`, `pub(super)` and `pub(in ...)` remain valid within the crate,
+ * but cannot establish external authority. */
+static bool rust_item_is_public(TSNode node, const char *source) {
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(child), "visibility_modifier") != 0)
+            continue;
+        uint32_t start = ts_node_start_byte(child);
+        uint32_t end = ts_node_end_byte(child);
+        return end - start == 3 && memcmp(source + start, "pub", 3) == 0;
+    }
+    return false;
+}
+
 // Extract base class name text from a single base_class child node.
 static char *extract_cpp_base_text(CBMArena *a, TSNode bc, const char *source) {
     const char *bk = ts_node_type(bc);
@@ -3739,6 +3755,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
+    if (ctx->language == CBM_LANG_RUST)
+        def.is_exported = rust_item_is_public(node, ctx->source);
     if (ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(node), "function_signature_item") == 0) {
         def.is_abstract = true;
@@ -4466,6 +4484,8 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
+    if (ctx->language == CBM_LANG_RUST)
+        def.is_exported = rust_item_is_public(node, ctx->source);
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
@@ -4763,6 +4783,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
+    if (ctx->language == CBM_LANG_RUST)
+        def.is_exported = rust_item_is_public(child, ctx->source);
     if (ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(child), "function_signature_item") == 0) {
         def.is_abstract = true;
@@ -7700,37 +7722,88 @@ static void collect_mod_decls_rust(CBMExtractCtx *ctx) {
     typedef struct {
         TSNode node;
         bool inherited_gated;
+        const char *parent_path;
     } frame_t;
-    frame_t stack[CBM_WALK_DEFS_STACK_CAP];
+    int capacity = 256;
+    frame_t *stack = (frame_t *)malloc((size_t)capacity * sizeof(*stack));
     int top = 0;
-    stack[top++] = (frame_t){ctx->root, false};
+    bool complete = true;
+    ctx->result->rust_mod_decls_status = CBM_RUST_CARRIER_COMPLETE;
+    if (!stack) {
+        ctx->result->rust_mod_decls_status = CBM_RUST_CARRIER_PARTIAL;
+        return;
+    }
+    stack[top++] = (frame_t){ctx->root, false, ""};
     while (top > 0) {
         frame_t frame = stack[--top];
         TSNode node = frame.node;
         bool child_gated = frame.inherited_gated;
+        const char *child_parent_path = frame.parent_path;
         if (strcmp(ts_node_type(node), "mod_item") == 0) {
             bool gated = frame.inherited_gated || rust_mod_is_cfg_test_gated(node, ctx->source);
-            if (rust_mod_item_is_bodyless(node)) {
-                TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
-                if (!ts_node_is_null(name)) {
-                    CBMModDecl md;
-                    md.child_name = cbm_node_text(ctx->arena, name, ctx->source);
-                    md.path_override = rust_mod_path_override(ctx->arena, node, ctx->source);
-                    md.is_cfg_test_gated = gated;
-                    if (md.child_name && md.child_name[0]) {
-                        cbm_moddecls_push(&ctx->result->mod_decls, ctx->arena, md);
+            bool bodyless = rust_mod_item_is_bodyless(node);
+            TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            if (!ts_node_is_null(name)) {
+                CBMModDecl md = {0};
+                uint32_t named = ts_node_named_child_count(node);
+                for (uint32_t i = 0; i < named; i++) {
+                    TSNode child = ts_node_named_child(node, i);
+                    if (strcmp(ts_node_type(child), "visibility_modifier") == 0) {
+                        char *visibility = cbm_node_text(ctx->arena, child, ctx->source);
+                        md.rust_visibility = visibility && strcmp(visibility, "pub") == 0
+                                                 ? CBM_RUST_IMPORT_VIS_PUBLIC
+                                                 : CBM_RUST_IMPORT_VIS_RESTRICTED;
+                        break;
                     }
                 }
+                md.child_name = cbm_node_text(ctx->arena, name, ctx->source);
+                md.parent_path = cbm_arena_strdup(ctx->arena, frame.parent_path ?: "");
+                md.path_override = rust_mod_path_override(ctx->arena, node, ctx->source);
+                md.is_inline = !bodyless;
+                md.is_cfg_test_gated = gated;
+                if (!md.child_name || !md.parent_path || !md.child_name[0] ||
+                    !cbm_moddecls_push(&ctx->result->mod_decls, ctx->arena, md)) {
+                    complete = false;
+                }
+                if (!bodyless)
+                    child_parent_path = frame.parent_path && frame.parent_path[0]
+                                            ? cbm_arena_sprintf(ctx->arena, "%s::%s",
+                                                                frame.parent_path, md.child_name)
+                                            : cbm_arena_strdup(ctx->arena, md.child_name);
+            }
+            if (bodyless) {
                 continue; // bodyless mod has no descendants to walk
             }
             // Inline mod with a body: its descendants inherit this mod's gating.
             child_gated = gated;
         }
         uint32_t nc = ts_node_child_count(node);
-        for (int i = (int)nc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-            stack[top++] = (frame_t){ts_node_child(node, (uint32_t)i), child_gated};
+        for (int i = (int)nc - SKIP_CHAR; i >= 0; i--) {
+            if (top >= capacity) {
+                if (capacity > INT_MAX / 2 || (size_t)(capacity * 2) > SIZE_MAX / sizeof(*stack)) {
+                    complete = false;
+                    top = 0;
+                    break;
+                }
+                int next_capacity = capacity * 2;
+                frame_t *grown =
+                    (frame_t *)safe_realloc(stack, (size_t)next_capacity * sizeof(*stack));
+                if (!grown) {
+                    stack = NULL;
+                    complete = false;
+                    top = 0;
+                    break;
+                }
+                stack = grown;
+                capacity = next_capacity;
+            }
+            stack[top++] =
+                (frame_t){ts_node_child(node, (uint32_t)i), child_gated, child_parent_path ?: ""};
         }
     }
+    free(stack);
+    if (!complete || cbm_arena_status(ctx->arena) != CBM_ARENA_STATUS_AVAILABLE)
+        ctx->result->rust_mod_decls_status = CBM_RUST_CARRIER_PARTIAL;
 }
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {

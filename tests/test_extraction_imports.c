@@ -1220,6 +1220,121 @@ TEST(rust_local_name_last_segment) {
     PASS();
 }
 
+TEST(rust_grouped_imports_are_exact_status_bearing_leaves) {
+    const char *source = "use crate::compiler::{BuildConfig, BuildRunner, Other as Alias};\n"
+                         "pub use self::state::{self, LoaderOverrides};\n";
+    CBMFileResult *r = do_extract(source, CBM_LANG_RUST, "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->rust_imports_status, CBM_RUST_CARRIER_COMPLETE);
+    ASSERT_EQ(r->imports.count, 5);
+    const char *names[] = {"BuildConfig", "BuildRunner", "Alias", "state", "LoaderOverrides"};
+    const char *paths[] = {"crate::compiler::BuildConfig", "crate::compiler::BuildRunner",
+                           "crate::compiler::Other", "self::state", "self::state::LoaderOverrides"};
+    for (int expected = 0; expected < 5; expected++) {
+        const CBMImport *found = NULL;
+        for (int i = 0; i < r->imports.count; i++) {
+            if (strcmp(r->imports.items[i].local_name, names[expected]) == 0)
+                found = &r->imports.items[i];
+        }
+        ASSERT_NOT_NULL(found);
+        ASSERT_STR_EQ(found->module_path, paths[expected]);
+        ASSERT_EQ(found->rust_provenance, CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT);
+        ASSERT_TRUE(found->site_end_byte > found->site_start_byte);
+        ASSERT_TRUE(found->declaration_end_byte > found->declaration_start_byte);
+        ASSERT_EQ(found->rust_visibility,
+                  expected < 3 ? CBM_RUST_IMPORT_VIS_PRIVATE : CBM_RUST_IMPORT_VIS_PUBLIC);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_nested_imports_retain_lexical_and_module_scope) {
+    const char *source = "use crate::root::Root;\n"
+                         "mod left { use crate::one::Thing; fn run() { { use crate::two::Inner; "
+                         "Inner::new(); } } }\n";
+    CBMFileResult *r = do_extract(source, CBM_LANG_RUST, "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(CBM_RUST_CARRIER_COMPLETE, r->rust_imports_status);
+    ASSERT_EQ(3, r->imports.count);
+    const CBMImport *root = NULL;
+    const CBMImport *thing = NULL;
+    const CBMImport *inner = NULL;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (strcmp(imp->local_name, "Root") == 0)
+            root = imp;
+        else if (strcmp(imp->local_name, "Thing") == 0)
+            thing = imp;
+        else if (strcmp(imp->local_name, "Inner") == 0)
+            inner = imp;
+    }
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(thing);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_TRUE(root->rust_module_scope);
+    ASSERT_STR_EQ("", root->owner_module_path);
+    ASSERT_TRUE(thing->rust_module_scope);
+    ASSERT_STR_EQ("left", thing->owner_module_path);
+    ASSERT_FALSE(inner->rust_module_scope);
+    ASSERT_STR_EQ("left", inner->owner_module_path);
+    ASSERT_TRUE(inner->scope_start_byte > thing->scope_start_byte);
+    ASSERT_TRUE(inner->scope_end_byte < thing->scope_end_byte);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_module_declarations_retain_exact_visibility) {
+    CBMFileResult *r =
+        do_extract("pub mod public_child;\npub(crate) mod restricted_child;\nmod private_child;\n",
+                   CBM_LANG_RUST, "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(CBM_RUST_CARRIER_COMPLETE, r->rust_mod_decls_status);
+    ASSERT_EQ(3, r->mod_decls.count);
+    bool saw_public = false;
+    bool saw_restricted = false;
+    bool saw_private = false;
+    for (int i = 0; i < r->mod_decls.count; i++) {
+        const CBMModDecl *decl = &r->mod_decls.items[i];
+        if (strcmp(decl->child_name, "public_child") == 0) {
+            ASSERT_EQ(CBM_RUST_IMPORT_VIS_PUBLIC, decl->rust_visibility);
+            saw_public = true;
+        } else if (strcmp(decl->child_name, "restricted_child") == 0) {
+            ASSERT_EQ(CBM_RUST_IMPORT_VIS_RESTRICTED, decl->rust_visibility);
+            saw_restricted = true;
+        } else if (strcmp(decl->child_name, "private_child") == 0) {
+            ASSERT_EQ(CBM_RUST_IMPORT_VIS_PRIVATE, decl->rust_visibility);
+            saw_private = true;
+        }
+    }
+    ASSERT_TRUE(saw_public);
+    ASSERT_TRUE(saw_restricted);
+    ASSERT_TRUE(saw_private);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_module_declaration_carrier_grows_past_former_fixed_stack) {
+    enum { DECLARATIONS = 5000, BYTES_PER_DECL = 24 };
+    char *source = (char *)malloc((size_t)DECLARATIONS * BYTES_PER_DECL + 1);
+    ASSERT_NOT_NULL(source);
+    size_t used = 0;
+    for (int i = 0; i < DECLARATIONS; i++) {
+        int written = snprintf(source + used, (size_t)DECLARATIONS * BYTES_PER_DECL + 1 - used,
+                               "mod module_%04d;\n", i);
+        ASSERT_GT(written, 0);
+        used += (size_t)written;
+    }
+    CBMFileResult *r = do_extract(source, CBM_LANG_RUST, "lib.rs");
+    free(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(CBM_RUST_CARRIER_COMPLETE, r->rust_mod_decls_status);
+    ASSERT_EQ(DECLARATIONS, r->mod_decls.count);
+    ASSERT_STR_EQ("module_0000", r->mod_decls.items[0].child_name);
+    ASSERT_STR_EQ("module_4999", r->mod_decls.items[DECLARATIONS - 1].child_name);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Java: local_name field spot-check (last dot-component)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1292,6 +1407,10 @@ SUITE(extraction_imports) {
 
     /* Local-name field spot-checks */
     RUN_TEST(rust_local_name_last_segment);
+    RUN_TEST(rust_grouped_imports_are_exact_status_bearing_leaves);
+    RUN_TEST(rust_nested_imports_retain_lexical_and_module_scope);
+    RUN_TEST(rust_module_declarations_retain_exact_visibility);
+    RUN_TEST(rust_module_declaration_carrier_grows_past_former_fixed_stack);
     RUN_TEST(java_local_name_last_segment);
     RUN_TEST(csharp_local_name_last_segment);
 }

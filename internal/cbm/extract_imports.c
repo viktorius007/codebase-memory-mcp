@@ -585,39 +585,218 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 }
 
 // --- Rust imports ---
-// use_declaration -> use_list or scoped_use_list
+// Flatten each use-tree member while its exact AST role is still available.
+
+static char *rust_import_join(CBMArena *a, const char *prefix, const char *path) {
+    if (!path || !path[0])
+        return prefix ? cbm_arena_strdup(a, prefix) : NULL;
+    if (!prefix || !prefix[0] || path[0] == ':')
+        return cbm_arena_strdup(a, path);
+    return cbm_arena_sprintf(a, "%s::%s", prefix, path);
+}
+
+static bool rust_import_emit(CBMExtractCtx *ctx, TSNode declaration, TSNode member,
+                             const char *path, const char *local,
+                             CBMRustImportProvenance provenance, CBMRustImportVisibility visibility,
+                             uint32_t scope_start, uint32_t scope_end,
+                             const char *owner_module_path, bool module_scope) {
+    if (!path || !path[0] || !local || !local[0])
+        return false;
+    CBMImport imp = {.local_name = cbm_arena_strdup(ctx->arena, local),
+                     .module_path = cbm_arena_strdup(ctx->arena, path),
+                     .declaration_start_byte = ts_node_start_byte(declaration),
+                     .declaration_end_byte = ts_node_end_byte(declaration),
+                     .site_start_byte = ts_node_start_byte(member),
+                     .site_end_byte = ts_node_end_byte(member),
+                     .scope_start_byte = scope_start,
+                     .scope_end_byte = scope_end,
+                     .owner_module_path = cbm_arena_strdup(ctx->arena, owner_module_path ?: ""),
+                     .rust_module_scope = module_scope,
+                     .rust_provenance = (uint8_t)provenance,
+                     .rust_visibility = (uint8_t)visibility};
+    return imp.local_name && imp.module_path && imp.owner_module_path &&
+           cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
+static bool rust_flatten_use(CBMExtractCtx *ctx, TSNode declaration, TSNode node,
+                             const char *prefix, CBMRustImportVisibility visibility, int depth,
+                             uint32_t scope_start, uint32_t scope_end,
+                             const char *owner_module_path, bool module_scope) {
+    if (ts_node_is_null(node) || depth > 128)
+        return false;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "scoped_use_list") == 0) {
+        TSNode path_node = ts_node_child_by_field_name(node, TS_FIELD("path"));
+        TSNode list = ts_node_child_by_field_name(node, TS_FIELD("list"));
+        char *part = cbm_node_text(ctx->arena, path_node, ctx->source);
+        char *next = rust_import_join(ctx->arena, prefix, part);
+        if (!part || !next || ts_node_is_null(list))
+            return false;
+        uint32_t count = ts_node_named_child_count(list);
+        for (uint32_t i = 0; i < count; i++) {
+            if (!rust_flatten_use(ctx, declaration, ts_node_named_child(list, i), next, visibility,
+                                  depth + 1, scope_start, scope_end, owner_module_path,
+                                  module_scope))
+                return false;
+        }
+        return true;
+    }
+    if (strcmp(kind, "use_list") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            if (!rust_flatten_use(ctx, declaration, ts_node_named_child(node, i), prefix,
+                                  visibility, depth + 1, scope_start, scope_end, owner_module_path,
+                                  module_scope))
+                return false;
+        }
+        return true;
+    }
+    if (strcmp(kind, "use_as_clause") == 0) {
+        TSNode path_node = ts_node_child_by_field_name(node, TS_FIELD("path"));
+        TSNode alias_node = ts_node_child_by_field_name(node, TS_FIELD("alias"));
+        char *part = cbm_node_text(ctx->arena, path_node, ctx->source);
+        char *alias = cbm_node_text(ctx->arena, alias_node, ctx->source);
+        char *path = part && strcmp(part, "self") == 0
+                         ? cbm_arena_strdup(ctx->arena, prefix ? prefix : "self")
+                         : rust_import_join(ctx->arena, prefix, part);
+        return rust_import_emit(ctx, declaration, node, path, alias,
+                                CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT, visibility, scope_start,
+                                scope_end, owner_module_path, module_scope);
+    }
+    if (strcmp(kind, "use_wildcard") == 0) {
+        char *part = cbm_node_text(ctx->arena, node, ctx->source);
+        char *path = rust_import_join(ctx->arena, prefix, part);
+        return rust_import_emit(ctx, declaration, node, path, "*",
+                                CBM_RUST_IMPORT_PROVENANCE_GLOB_EXACT, visibility, scope_start,
+                                scope_end, owner_module_path, module_scope);
+    }
+    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "scoped_identifier") == 0 ||
+        strcmp(kind, "crate") == 0 || strcmp(kind, "super") == 0 || strcmp(kind, "self") == 0) {
+        char *part = cbm_node_text(ctx->arena, node, ctx->source);
+        char *path = part && strcmp(part, "self") == 0
+                         ? cbm_arena_strdup(ctx->arena, prefix ? prefix : "self")
+                         : rust_import_join(ctx->arena, prefix, part);
+        const char *local = part && strcmp(part, "self") == 0 ? path_last(ctx->arena, path)
+                                                              : path_last(ctx->arena, part);
+        return rust_import_emit(ctx, declaration, node, path, local,
+                                CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT, visibility, scope_start,
+                                scope_end, owner_module_path, module_scope);
+    }
+    return false;
+}
 
 static void parse_rust_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
-
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
-    if (!ts_tree_cursor_goto_first_child(&cursor)) {
-        ts_tree_cursor_delete(&cursor);
+    typedef struct {
+        TSNode node;
+        uint32_t scope_start;
+        uint32_t scope_end;
+        const char *owner_module_path;
+        bool module_scope;
+    } rust_use_frame_t;
+    ctx->result->rust_imports_status = CBM_RUST_CARRIER_COMPLETE;
+    int capacity = 256;
+    int top = 0;
+    rust_use_frame_t *stack = malloc((size_t)capacity * sizeof(*stack));
+    if (!stack) {
+        ctx->result->rust_imports_status = CBM_RUST_CARRIER_PARTIAL;
         return;
     }
-    do {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (strcmp(ts_node_type(node), "use_declaration") != 0) {
+    stack[top++] = (rust_use_frame_t){ctx->root, 0, (uint32_t)ctx->source_len, "", true};
+    while (top > 0) {
+        rust_use_frame_t frame = stack[--top];
+        TSNode node = frame.node;
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "use_declaration") == 0) {
+            CBMRustImportVisibility visibility = CBM_RUST_IMPORT_VIS_PRIVATE;
+            uint32_t named = ts_node_named_child_count(node);
+            for (uint32_t j = 0; j < named; j++) {
+                TSNode child = ts_node_named_child(node, j);
+                if (strcmp(ts_node_type(child), "visibility_modifier") == 0) {
+                    char *text = cbm_node_text(ctx->arena, child, ctx->source);
+                    visibility = text && strcmp(text, "pub") == 0 ? CBM_RUST_IMPORT_VIS_PUBLIC
+                                                                  : CBM_RUST_IMPORT_VIS_RESTRICTED;
+                }
+            }
+            TSNode argument = ts_node_child_by_field_name(node, TS_FIELD("argument"));
+            if (ts_node_is_null(argument) ||
+                !rust_flatten_use(ctx, node, argument, NULL, visibility, 0, frame.scope_start,
+                                  frame.scope_end, frame.owner_module_path, frame.module_scope)) {
+                ctx->result->rust_imports_status = CBM_RUST_CARRIER_PARTIAL;
+            }
             continue;
         }
 
-        char *full = cbm_node_text(a, node, ctx->source);
-        if (!full) {
-            continue;
+        uint32_t child_scope_start = frame.scope_start;
+        uint32_t child_scope_end = frame.scope_end;
+        const char *child_module_path = frame.owner_module_path;
+        bool child_module_scope = frame.module_scope;
+        if (strcmp(kind, "mod_item") == 0) {
+            TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+            TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            if (!ts_node_is_null(body) && !ts_node_is_null(name)) {
+                char *part = cbm_node_text(ctx->arena, name, ctx->source);
+                child_module_path = rust_import_join(ctx->arena, frame.owner_module_path, part);
+                child_scope_start = ts_node_start_byte(body);
+                child_scope_end = ts_node_end_byte(body);
+                child_module_scope = true;
+            }
+        } else if (strcmp(kind, "block") == 0) {
+            child_scope_start = ts_node_start_byte(node);
+            child_scope_end = ts_node_end_byte(node);
+            child_module_scope = false;
         }
-        // Strip "use " prefix and trailing ";"
-        if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
-            full += USE_PREFIX_LEN;
+        uint32_t count = ts_node_child_count(node);
+        for (int i = (int)count - 1; i >= 0; i--) {
+            if (top >= capacity) {
+                if (capacity > INT_MAX / 2 || (size_t)(capacity * 2) > SIZE_MAX / sizeof(*stack)) {
+                    ctx->result->rust_imports_status = CBM_RUST_CARRIER_PARTIAL;
+                    top = 0;
+                    break;
+                }
+                int next = capacity * 2;
+                rust_use_frame_t *grown = realloc(stack, (size_t)next * sizeof(*stack));
+                if (!grown) {
+                    ctx->result->rust_imports_status = CBM_RUST_CARRIER_PARTIAL;
+                    top = 0;
+                    break;
+                }
+                stack = grown;
+                capacity = next;
+            }
+            stack[top++] =
+                (rust_use_frame_t){ts_node_child(node, (uint32_t)i), child_scope_start,
+                                   child_scope_end, child_module_path ?: "", child_module_scope};
         }
-        size_t len = strlen(full);
-        if (len > 0 && full[len - SKIP_ONE] == ';') {
-            full[len - SKIP_ONE] = '\0';
-        }
+    }
+    free(stack);
+    if (cbm_arena_status(ctx->arena) != CBM_ARENA_STATUS_AVAILABLE)
+        ctx->result->rust_imports_status = CBM_RUST_CARRIER_PARTIAL;
+}
 
-        CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
-        cbm_imports_push(&ctx->result->imports, a, imp);
-    } while (ts_tree_cursor_goto_next_sibling(&cursor));
-    ts_tree_cursor_delete(&cursor);
+/* Exact Rust imports own resolution of calls headed by their local name.
+ * Run after the unified call extractor, before any manifest/LSP route can be
+ * skipped, so authority failure cannot fall through to a graph suffix guess. */
+void cbm_rust_imports_mark_semantic_calls(CBMFileResult *result) {
+    if (!result)
+        return;
+    for (int i = 0; i < result->calls.count; i++) {
+        CBMCall *call = &result->calls.items[i];
+        if (!call->callee_name || !call->callee_name[0])
+            continue;
+        for (int j = 0; j < result->imports.count; j++) {
+            const CBMImport *imp = &result->imports.items[j];
+            if (imp->rust_provenance != CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT ||
+                !imp->local_name || !imp->local_name[0])
+                continue;
+            size_t n = strlen(imp->local_name);
+            if (strncmp(call->callee_name, imp->local_name, n) == 0 &&
+                (call->callee_name[n] == '\0' ||
+                 (call->callee_name[n] == ':' && call->callee_name[n + 1] == ':'))) {
+                call->requires_lsp_resolution = true;
+                break;
+            }
+        }
+    }
 }
 
 // --- C/C++ imports ---

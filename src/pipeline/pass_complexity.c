@@ -99,63 +99,272 @@ static void append_complexity_props(cbm_gbuf_node_t *node, int tld, bool recursi
     node->properties_json = neu;
 }
 
-/* Memoized DFS: tld(id) = loop_depth(id) + max over CALLS-callees of tld(callee).
- * state: 0=unvisited, 1=in-progress (back-edge → cycle), 2=done. */
-static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int *tld, char *state,
-                   bool *recursive, int64_t maxid, int depth) {
-    if (id < 1 || id > maxid) {
-        return 0;
+typedef struct {
+    int node;
+    int parent;
+    const cbm_gbuf_edge_t **edges;
+    int edge_count;
+    int next_edge;
+} scc_frame_t;
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static int g_fail_call_analysis_allocation_after = -1;
+
+void cbm_pipeline_complexity_test_fail_analysis_allocation_once(void) {
+    g_fail_call_analysis_allocation_after = 1;
+}
+#endif
+
+static bool call_analysis_allocation_should_fail(void) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (g_fail_call_analysis_allocation_after == 0) {
+        g_fail_call_analysis_allocation_after = -1;
+        return true;
     }
-    if (state[id] == 2) {
-        return tld[id];
+    if (g_fail_call_analysis_allocation_after > 0) {
+        g_fail_call_analysis_allocation_after--;
     }
-    if (state[id] == 1) {
-        recursive[id] = true; /* back edge → call-graph cycle */
-        return 0;
+#endif
+    return false;
+}
+
+static void *call_analysis_malloc(size_t size) {
+    return call_analysis_allocation_should_fail() ? NULL : malloc(size);
+}
+
+static void *call_analysis_calloc(size_t count, size_t size) {
+    return call_analysis_allocation_should_fail() ? NULL : calloc(count, size);
+}
+
+static int dense_index_for_id(const int64_t *ids, int count, int64_t id) {
+    int lo = 0;
+    int hi = count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (ids[mid] < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < count && ids[lo] == id ? lo : -1;
+}
+
+static int component_tld_dfs(const cbm_gbuf_t *gb, const int64_t *ids, int callable_count,
+                             const int *component_of, const int *component_head,
+                             const int *next_member, const int *component_local_depth,
+                             int *component_tld, char *component_state, int component, int depth) {
+    if (component_state[component] == 2) {
+        return component_tld[component];
+    }
+    if (component_state[component] == 1) {
+        return 0; /* impossible in the condensed DAG; defensive cycle cut */
     }
     if (depth > CBM_TLD_MAX_DEPTH) {
-        return loop_depth[id];
+        return component_local_depth[component];
     }
-    state[id] = 1;
+    component_state[component] = 1;
     int best = 0;
-    const cbm_gbuf_edge_t **edges = NULL;
-    int ne = 0;
-    cbm_gbuf_find_edges_by_source_type(gb, id, "CALLS", &edges, &ne);
-    for (int i = 0; i < ne; i++) {
-        int64_t c = edges[i]->target_id;
-        if (c == id) {
-            recursive[id] = true; /* direct self-recursion */
+    for (int dense = component_head[component]; dense >= 0; dense = next_member[dense]) {
+        const cbm_gbuf_edge_t **edges = NULL;
+        int edge_count = 0;
+        cbm_gbuf_find_edges_by_source_type(gb, ids[dense], "CALLS", &edges, &edge_count);
+        for (int e = 0; e < edge_count; e++) {
+            int target = dense_index_for_id(ids, callable_count, edges[e]->target_id);
+            if (target < 0) {
+                continue;
+            }
+            int target_component = component_of[target];
+            if (target_component == component) {
+                continue;
+            }
+            int candidate = component_tld_dfs(gb, ids, callable_count, component_of, component_head,
+                                              next_member, component_local_depth, component_tld,
+                                              component_state, target_component, depth + 1);
+            if (candidate > best) {
+                best = candidate;
+            }
+        }
+    }
+    component_tld[component] = component_local_depth[component] + best;
+    component_state[component] = 2;
+    return component_tld[component];
+}
+
+/* Iterative Tarjan traversal over a dense callable-node index. Every member of
+ * a multi-node SCC is recursive; a one-node SCC is recursive only with a
+ * self-loop. TLD is then evaluated over the condensed SCC DAG: acyclic nodes
+ * keep the original recurrence, while a cyclic component has one deterministic
+ * local depth (the maximum local depth of its members). */
+static bool analyze_call_graph(const cbm_gbuf_t *gb, cbm_gbuf_node_t *const *nptr,
+                               const int *loop_depth, int *tld, bool *recursive, int64_t maxid,
+                               int callable_count) {
+    if (callable_count == 0) {
+        return true;
+    }
+
+    size_t dense_sz = (size_t)callable_count;
+    int64_t *ids = call_analysis_malloc(dense_sz * sizeof(int64_t));
+    int *index = call_analysis_malloc(dense_sz * sizeof(int));
+    int *low = call_analysis_malloc(dense_sz * sizeof(int));
+    bool *on_stack = call_analysis_calloc(dense_sz, sizeof(bool));
+    int *node_stack = call_analysis_malloc(dense_sz * sizeof(int));
+    int *component_scratch = call_analysis_malloc(dense_sz * sizeof(int));
+    int *component_of = call_analysis_malloc(dense_sz * sizeof(int));
+    int *component_head = call_analysis_malloc(dense_sz * sizeof(int));
+    int *next_member = call_analysis_malloc(dense_sz * sizeof(int));
+    int *component_local_depth = call_analysis_calloc(dense_sz, sizeof(int));
+    int *component_tld = call_analysis_calloc(dense_sz, sizeof(int));
+    char *component_state = call_analysis_calloc(dense_sz, sizeof(char));
+    scc_frame_t *frames = call_analysis_calloc(dense_sz, sizeof(scc_frame_t));
+    bool ok = ids && index && low && on_stack && node_stack && component_scratch && component_of &&
+              component_head && next_member && component_local_depth && component_tld &&
+              component_state && frames;
+    if (!ok) {
+        goto cleanup;
+    }
+
+    int dense_count = 0;
+    for (int64_t id = 1; id <= maxid; id++) {
+        if (nptr[id]) {
+            ids[dense_count++] = id;
+        }
+    }
+    if (dense_count != callable_count) {
+        ok = false;
+        goto cleanup;
+    }
+    for (int i = 0; i < callable_count; i++) {
+        index[i] = -1;
+        component_of[i] = -1;
+        component_head[i] = -1;
+    }
+
+    int next_index = 0;
+    int node_stack_count = 0;
+    int component_count = 0;
+    for (int root = 0; root < callable_count; root++) {
+        if (index[root] >= 0) {
             continue;
         }
-        int ct = tld_dfs(gb, c, loop_depth, tld, state, recursive, maxid, depth + 1);
-        if (ct > best) {
-            best = ct;
+        int frame_count = 1;
+        frames[0] = (scc_frame_t){.node = root, .parent = -1};
+        while (frame_count > 0) {
+            scc_frame_t *frame = &frames[frame_count - 1];
+            int node = frame->node;
+            if (index[node] < 0) {
+                index[node] = next_index;
+                low[node] = next_index;
+                next_index++;
+                node_stack[node_stack_count++] = node;
+                on_stack[node] = true;
+                cbm_gbuf_find_edges_by_source_type(gb, ids[node], "CALLS", &frame->edges,
+                                                   &frame->edge_count);
+            }
+
+            bool descended = false;
+            while (frame->next_edge < frame->edge_count) {
+                int target = dense_index_for_id(ids, callable_count,
+                                                frame->edges[frame->next_edge++]->target_id);
+                if (target < 0) {
+                    continue;
+                }
+                if (target == node) {
+                    recursive[ids[node]] = true;
+                    continue;
+                }
+                if (index[target] < 0) {
+                    frames[frame_count++] = (scc_frame_t){.node = target, .parent = node};
+                    descended = true;
+                    break;
+                }
+                if (on_stack[target] && index[target] < low[node]) {
+                    low[node] = index[target];
+                }
+            }
+            if (descended) {
+                continue;
+            }
+
+            int parent = frame->parent;
+            if (low[node] == index[node]) {
+                int member = -1;
+                int member_count = 0;
+                do {
+                    member = node_stack[--node_stack_count];
+                    on_stack[member] = false;
+                    component_of[member] = component_count;
+                    component_scratch[member_count++] = member;
+                } while (member != node);
+                if (member_count > 1) {
+                    for (int i = 0; i < member_count; i++) {
+                        recursive[ids[component_scratch[i]]] = true;
+                    }
+                }
+                component_count++;
+            }
+            frame_count--;
+            if (parent >= 0 && low[node] < low[parent]) {
+                low[parent] = low[node];
+            }
         }
     }
-    tld[id] = loop_depth[id] + best;
-    state[id] = 2;
-    return tld[id];
+
+    for (int dense = 0; dense < callable_count; dense++) {
+        int component = component_of[dense];
+        next_member[dense] = component_head[component];
+        component_head[component] = dense;
+        int local_depth = loop_depth[ids[dense]];
+        if (local_depth > component_local_depth[component]) {
+            component_local_depth[component] = local_depth;
+        }
+    }
+    for (int component = 0; component < component_count; component++) {
+        component_tld_dfs(gb, ids, callable_count, component_of, component_head, next_member,
+                          component_local_depth, component_tld, component_state, component, 0);
+    }
+    for (int dense = 0; dense < callable_count; dense++) {
+        tld[ids[dense]] = component_tld[component_of[dense]];
+    }
+
+cleanup:
+    free(ids);
+    free(index);
+    free(low);
+    free(on_stack);
+    free(node_stack);
+    free(component_scratch);
+    free(component_of);
+    free(component_head);
+    free(next_member);
+    free(component_local_depth);
+    free(component_tld);
+    free(component_state);
+    free(frames);
+    return ok;
 }
 
 /* Seed each Function/Method node's loop_depth and self_recursive flag, and
- * remember the node pointer for write-back. The self_recursive seed (set at
- * extraction) feeds the final recursive flag; tld_dfs additionally ORs in
- * mutual recursion discovered as a call-graph cycle. */
-static void seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_depth,
-                             bool *recursive, cbm_gbuf_node_t **nptr, int64_t maxid) {
+ * remember the node pointer for write-back. The extraction seed and the SCC
+ * pass jointly produce the final recursive flag. */
+static int seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_depth,
+                            bool *recursive, cbm_gbuf_node_t **nptr, int64_t maxid) {
     const cbm_gbuf_node_t **nodes = NULL;
     int count = 0;
     if (cbm_gbuf_find_by_label(gb, label, &nodes, &count) != 0) {
-        return;
+        return 0;
     }
+    int seeded = 0;
     for (int i = 0; i < count; i++) {
         const cbm_gbuf_node_t *n = nodes[i];
         if (n->id >= 1 && n->id <= maxid) {
             loop_depth[n->id] = json_get_int(n->properties_json, "loop_depth", 0);
             recursive[n->id] = json_get_bool(n->properties_json, "self_recursive");
             nptr[n->id] = (cbm_gbuf_node_t *)n;
+            seeded++;
         }
     }
+    return seeded;
 }
 
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
@@ -170,28 +379,31 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     size_t sz = (size_t)maxid + 1;
     int *loop_depth = calloc(sz, sizeof(int));
     int *tld = calloc(sz, sizeof(int));
-    char *state = calloc(sz, sizeof(char));
     bool *recursive = calloc(sz, sizeof(bool));
     cbm_gbuf_node_t **nptr = calloc(sz, sizeof(cbm_gbuf_node_t *));
-    if (!loop_depth || !tld || !state || !recursive || !nptr) {
+    if (!loop_depth || !tld || !recursive || !nptr) {
         free(loop_depth);
         free(tld);
-        free(state);
         free(recursive);
         free(nptr);
         return;
     }
 
-    seed_loop_depths(gb, "Function", loop_depth, recursive, nptr, maxid);
-    seed_loop_depths(gb, "Method", loop_depth, recursive, nptr, maxid);
+    int callable_count = seed_loop_depths(gb, "Function", loop_depth, recursive, nptr, maxid) +
+                         seed_loop_depths(gb, "Method", loop_depth, recursive, nptr, maxid);
+    if (!analyze_call_graph(gb, nptr, loop_depth, tld, recursive, maxid, callable_count)) {
+        cbm_log_warn("pass.complexity.failed", "reason", "allocation_unavailable");
+        free(loop_depth);
+        free(tld);
+        free(recursive);
+        free(nptr);
+        return;
+    }
 
     int updated = 0;
     for (int64_t id = 1; id <= maxid; id++) {
         if (!nptr[id]) {
             continue; /* only Function/Method nodes */
-        }
-        if (state[id] != 2) {
-            tld_dfs(gb, id, loop_depth, tld, state, recursive, maxid, 0);
         }
         append_complexity_props(nptr[id], tld[id], recursive[id]);
         updated++;
@@ -201,7 +413,6 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
 
     free(loop_depth);
     free(tld);
-    free(state);
     free(recursive);
     free(nptr);
 }

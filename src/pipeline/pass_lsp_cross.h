@@ -91,6 +91,17 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
  * metadata cannot diverge between pipelines. Values are owned by the returned
  * map (not borrowed from gbuf); release both arrays with
  * cbm_pxc_free_import_map(). */
+typedef enum {
+    CBM_PXC_IMPORT_MAP_COMPLETE = 0,
+    CBM_PXC_IMPORT_MAP_ALLOCATION_FAILED = 1,
+    CBM_PXC_IMPORT_MAP_AUTHORITY_UNAVAILABLE = 2,
+} CBMPxcImportMapStatus;
+
+CBMPxcImportMapStatus cbm_pxc_build_import_map_with_rust_authority(
+    const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path, CBMLanguage lang,
+    const CBMFileResult *result, const cbm_file_info_t *files, CBMFileResult *const *cache,
+    int file_count, const struct CBMCargoManifest *rust_manifest, const char ***out_keys,
+    const char ***out_vals, CBMRustImportScope **out_scopes, int *out_count);
 int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
                              CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count);
@@ -214,8 +225,8 @@ CBMPxcDispatchStatus cbm_pxc_dispatch_file(
     CBMLanguage lang, CBMFileResult *result, const char *source, int source_len, const char *rel,
     const char *def_module, const CBMCrossLspRegistries *cross_registries,
     const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs, int all_def_count,
-    const char **imp_keys, const char **imp_vals, int imp_count,
-    const struct CBMCargoManifest *rust_manifest, CBMTypeRegistry *(*rust_shared_get)(void *),
-    void *rust_shared_ctx);
+    const char **imp_keys, const char **imp_vals, const CBMRustImportScope *rust_import_scopes,
+    int imp_count, const struct CBMCargoManifest *rust_manifest,
+    CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

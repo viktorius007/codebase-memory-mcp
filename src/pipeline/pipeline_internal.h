@@ -581,7 +581,8 @@ struct CBMModuleDefIndex;
 
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
-                         int worker_count,
+                         int worker_count, const cbm_file_info_t *rust_authority_files,
+                         CBMFileResult *const *rust_authority_cache, int rust_authority_count,
                          /* Cross-file LSP inputs — pre-built once by the caller and
                           * shared read-only across workers (typed non-const to match
                           * the existing cbm_run_X_lsp_cross signatures the resolve

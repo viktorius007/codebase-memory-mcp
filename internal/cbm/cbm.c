@@ -1402,6 +1402,8 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     cbm_extract_definitions(&ctx);
     cbm_extract_imports(&ctx);
     cbm_extract_unified(&ctx);
+    if (language == CBM_LANG_RUST)
+        cbm_rust_imports_mark_semantic_calls(result);
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
     cbm_extract_channels(&ctx);

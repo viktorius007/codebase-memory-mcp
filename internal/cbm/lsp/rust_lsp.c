@@ -148,10 +148,13 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->module_qn = module_qn;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
+    ctx->current_module_path = "";
 }
 
 /* Doubling-array push of a `(local, full-path)` use entry. */
-void rust_lsp_add_use(RustLSPContext *ctx, const char *local_name, const char *module_path) {
+static void rust_lsp_add_use_kind(RustLSPContext *ctx, const char *local_name,
+                                  const char *module_path, bool authoritative, uint32_t scope_start,
+                                  uint32_t scope_end, const char *owner_module_path) {
     if (!ctx || !local_name || !module_path) {
         return;
     }
@@ -161,19 +164,53 @@ void rust_lsp_add_use(RustLSPContext *ctx, const char *local_name, const char *m
             (const char **)cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(char *));
         const char **np =
             (const char **)cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(char *));
-        if (!nl || !np) {
+        bool *na = (bool *)cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(bool));
+        uint32_t *ns = cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(uint32_t));
+        uint32_t *ne = cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(uint32_t));
+        const char **no =
+            (const char **)cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(char *));
+        if (!nl || !np || !na || !ns || !ne || !no) {
             return;
         }
         if (ctx->use_local_names && ctx->use_count > 0) {
             memcpy(nl, ctx->use_local_names, ctx->use_count * sizeof(char *));
             memcpy(np, ctx->use_module_paths, ctx->use_count * sizeof(char *));
+            memcpy(na, ctx->use_authoritative, ctx->use_count * sizeof(bool));
+            memcpy(ns, ctx->use_scope_starts, ctx->use_count * sizeof(uint32_t));
+            memcpy(ne, ctx->use_scope_ends, ctx->use_count * sizeof(uint32_t));
+            memcpy(no, ctx->use_owner_module_paths, ctx->use_count * sizeof(char *));
         }
         ctx->use_local_names = nl;
         ctx->use_module_paths = np;
+        ctx->use_authoritative = na;
+        ctx->use_scope_starts = ns;
+        ctx->use_scope_ends = ne;
+        ctx->use_owner_module_paths = no;
     }
-    ctx->use_local_names[ctx->use_count] = cbm_arena_strdup(ctx->arena, local_name);
-    ctx->use_module_paths[ctx->use_count] = cbm_arena_strdup(ctx->arena, module_path);
+    const char *owned_local = cbm_arena_strdup(ctx->arena, local_name);
+    const char *owned_path = cbm_arena_strdup(ctx->arena, module_path);
+    const char *owned_owner = cbm_arena_strdup(ctx->arena, owner_module_path ?: "");
+    if (!owned_local || !owned_path || !owned_owner)
+        return;
+    ctx->use_local_names[ctx->use_count] = owned_local;
+    ctx->use_module_paths[ctx->use_count] = owned_path;
+    ctx->use_authoritative[ctx->use_count] = authoritative;
+    ctx->use_scope_starts[ctx->use_count] = scope_start;
+    ctx->use_scope_ends[ctx->use_count] = scope_end;
+    ctx->use_owner_module_paths[ctx->use_count] = owned_owner;
     ctx->use_count++;
+}
+
+void rust_lsp_add_use(RustLSPContext *ctx, const char *local_name, const char *module_path) {
+    rust_lsp_add_use_kind(ctx, local_name, module_path, false, 0,
+                          ctx ? (uint32_t)ctx->source_len : 0, "");
+}
+
+void rust_lsp_add_authoritative_use(RustLSPContext *ctx, const char *local_name,
+                                    const char *module_path, uint32_t scope_start,
+                                    uint32_t scope_end, const char *owner_module_path) {
+    rust_lsp_add_use_kind(ctx, local_name, module_path ? module_path : "", true, scope_start,
+                          scope_end, owner_module_path);
 }
 
 void rust_lsp_add_glob(RustLSPContext *ctx, const char *module_qn) {
@@ -384,6 +421,40 @@ static const char *rust_resolve_use(RustLSPContext *ctx, const char *local_name)
     if (!ctx || !local_name) {
         return NULL;
     }
+    const char *authoritative = NULL;
+    bool saw_authoritative = false;
+    bool saw_authoritative_name = false;
+    uint32_t best_width = UINT32_MAX;
+    for (int i = 0; i < ctx->use_count; i++) {
+        if (!ctx->use_authoritative[i] || strcmp(ctx->use_local_names[i], local_name) != 0)
+            continue;
+        saw_authoritative_name = true;
+        if (ctx->lookup_site_byte < ctx->use_scope_starts[i] ||
+            ctx->lookup_site_byte >= ctx->use_scope_ends[i])
+            continue;
+        if (!ctx->use_owner_module_paths[i] || !ctx->current_module_path ||
+            strcmp(ctx->use_owner_module_paths[i], ctx->current_module_path) != 0)
+            continue;
+        uint32_t width = ctx->use_scope_ends[i] - ctx->use_scope_starts[i];
+        if (saw_authoritative && width > best_width)
+            continue;
+        if (saw_authoritative && width < best_width) {
+            authoritative = NULL;
+            saw_authoritative = false;
+        }
+        saw_authoritative = true;
+        best_width = width;
+        const char *candidate = ctx->use_module_paths[i];
+        if (!candidate || !candidate[0])
+            return NULL;
+        if (authoritative && strcmp(authoritative, candidate) != 0)
+            return NULL;
+        authoritative = candidate;
+    }
+    if (saw_authoritative)
+        return authoritative;
+    if (saw_authoritative_name)
+        return NULL;
     for (int i = 0; i < ctx->use_count; i++) {
         if (strcmp(ctx->use_local_names[i], local_name) == 0) {
             return ctx->use_module_paths[i];
@@ -1899,6 +1970,7 @@ static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
     }
+    ctx->lookup_site_byte = ts_node_start_byte(node);
     const char *kind = ts_node_type(node);
 
     /* Identifier: scope or registered symbol. */
@@ -4409,6 +4481,93 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation)
  * 9. Statement / pattern binding
  * ════════════════════════════════════════════════════════════════════ */
 
+typedef enum {
+    RUST_LOCAL_FIELD_ABSENT = 0,
+    RUST_LOCAL_FIELD_FOUND = 1,
+    RUST_LOCAL_FIELD_BLOCKED = 2,
+} RustLocalFieldStatus;
+
+/* A same-file declaration is stronger than the aggregate registry. In
+ * particular, cfg alternatives share a source spelling but cannot be chosen
+ * without evaluating cfg, so any duplicate declaration blocks fallback. */
+static RustLocalFieldStatus rust_lookup_local_struct_field(RustLSPContext *ctx, const char *type_qn,
+                                                           const char *field_name,
+                                                           const CBMType **out_type) {
+    if (out_type)
+        *out_type = NULL;
+    if (!ctx || !ctx->module_qn || !type_qn || !field_name || ts_node_is_null(ctx->root))
+        return RUST_LOCAL_FIELD_ABSENT;
+    size_t module_len = strlen(ctx->module_qn);
+    if (strncmp(type_qn, ctx->module_qn, module_len) != 0 || type_qn[module_len] != '.')
+        return RUST_LOCAL_FIELD_ABSENT;
+    const char *type_name = type_qn + module_len + 1;
+    if (!type_name[0] || strchr(type_name, '.') || strstr(type_name, "#cfg("))
+        return RUST_LOCAL_FIELD_ABSENT;
+
+    TSNode exact = (TSNode){0};
+    int declarations = 0;
+    uint32_t count = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(item), "struct_item") != 0)
+            continue;
+        TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
+        char *name = rust_node_text(ctx, name_node);
+        if (name && strcmp(name, type_name) == 0) {
+            exact = item;
+            declarations++;
+        }
+    }
+    if (declarations == 0)
+        return RUST_LOCAL_FIELD_ABSENT;
+    if (declarations != 1)
+        return RUST_LOCAL_FIELD_BLOCKED;
+
+    TSNode body = ts_node_child_by_field_name(exact, "body", 4);
+    int fields = 0;
+    TSNode field_type = (TSNode){0};
+    uint32_t field_count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < field_count; i++) {
+        TSNode field = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(field), "field_declaration") != 0)
+            continue;
+        TSNode name_node = ts_node_child_by_field_name(field, "name", 4);
+        char *name = rust_node_text(ctx, name_node);
+        if (name && strcmp(name, field_name) == 0) {
+            field_type = ts_node_child_by_field_name(field, "type", 4);
+            fields++;
+        }
+    }
+    if (fields != 1 || ts_node_is_null(field_type))
+        return RUST_LOCAL_FIELD_BLOCKED;
+    if (out_type)
+        *out_type = rust_parse_type_node(ctx, field_type);
+    return RUST_LOCAL_FIELD_FOUND;
+}
+
+static const CBMType *rust_lookup_pattern_field(RustLSPContext *ctx, const char *type_qn,
+                                                const char *field_name) {
+    const CBMType *local = NULL;
+    RustLocalFieldStatus status = rust_lookup_local_struct_field(ctx, type_qn, field_name, &local);
+    if (status == RUST_LOCAL_FIELD_FOUND)
+        return local ? local : cbm_type_unknown();
+    if (status == RUST_LOCAL_FIELD_BLOCKED)
+        return NULL;
+    return rust_lookup_field(ctx, type_qn, field_name, 0);
+}
+
+static const CBMType *rust_explicit_struct_pattern_type(RustLSPContext *ctx, TSNode pattern) {
+    if (ts_node_is_null(pattern) || strcmp(ts_node_type(pattern), "struct_pattern") != 0 ||
+        ts_node_named_child_count(pattern) == 0)
+        return NULL;
+    TSNode type_node = ts_node_named_child(pattern, 0);
+    const char *kind = ts_node_type(type_node);
+    if (strcmp(kind, "type_identifier") != 0 && strcmp(kind, "scoped_type_identifier") != 0 &&
+        strcmp(kind, "identifier") != 0 && strcmp(kind, "scoped_identifier") != 0)
+        return NULL;
+    return rust_parse_type_node(ctx, type_node);
+}
+
 /* Recursively bind every identifier inside a pattern node to the given
  * fallback type. Handles tuple_pattern, struct_pattern, tuple_struct_pattern,
  * ref_pattern, mut_pattern, captured_pattern, identifier. */
@@ -4499,7 +4658,7 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
                 if (!fname)
                     continue;
                 const CBMType *ft =
-                    type_qn ? rust_lookup_field(ctx, type_qn, fname, 0) : cbm_type_unknown();
+                    type_qn ? rust_lookup_pattern_field(ctx, type_qn, fname) : cbm_type_unknown();
                 if (!ft)
                     ft = cbm_type_unknown();
                 if (!ts_node_is_null(pat_node)) {
@@ -4511,8 +4670,8 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
                        strcmp(fk, "identifier") == 0) {
                 char *fname = rust_node_text(ctx, fp);
                 if (fname && strcmp(fname, "_") != 0) {
-                    const CBMType *ft =
-                        type_qn ? rust_lookup_field(ctx, type_qn, fname, 0) : cbm_type_unknown();
+                    const CBMType *ft = type_qn ? rust_lookup_pattern_field(ctx, type_qn, fname)
+                                                : cbm_type_unknown();
                     cbm_scope_bind(ctx->current_scope, fname, ft ? ft : cbm_type_unknown());
                 }
             }
@@ -4553,6 +4712,11 @@ void rust_process_statement(RustLSPContext *ctx, TSNode node) {
             annotated = rust_parse_type_node(ctx, tn);
         }
         const CBMType *let_type = annotated;
+        if ((!let_type || cbm_type_is_unknown(let_type)) && !ts_node_is_null(pat)) {
+            const CBMType *explicit_pattern = rust_explicit_struct_pattern_type(ctx, pat);
+            if (explicit_pattern && !cbm_type_is_unknown(explicit_pattern))
+                let_type = explicit_pattern;
+        }
         if ((!let_type || cbm_type_is_unknown(let_type)) && !ts_node_is_null(val)) {
             /* Synthesis: evaluate the RHS with the (possibly NULL)
              * annotated type as a hint. */
@@ -4781,7 +4945,10 @@ static const char *rust_resolve_callable_value(RustLSPContext *ctx, TSNode value
         function = cbm_registry_lookup_func(
             ctx->registry, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, resolved));
     }
-    if (function && !function->receiver_type) {
+    /* An exact scoped path (`Type::associated_fn`) is a valid Rust function
+     * item. The registry lookup above proves both receiver and member; the
+     * suffix fallback below remains free-function-only. */
+    if (function) {
         return function->qualified_name;
     }
     if (!strchr(resolved, '.')) {
@@ -5295,7 +5462,50 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
         return;
     }
     ctx->eval_step_count++;
+    ctx->lookup_site_byte = ts_node_start_byte(node);
     const char *kind = ts_node_type(node);
+
+    /* Item declarations are permitted inside blocks. An inline module still
+     * establishes its own import namespace there, so carry the same exact
+     * module path used for root/module-list walks while descending its body.
+     * On allocation failure NULL deliberately blocks every authoritative use
+     * match instead of leaking the enclosing module's imports. */
+    if (strcmp(kind, "mod_item") == 0 && ctx->enclosing_func_qn) {
+        TSNode body = ts_node_child_by_field_name(node, "body", 4);
+        TSNode name = ts_node_child_by_field_name(node, "name", 4);
+        if (!ts_node_is_null(body) && !ts_node_is_null(name)) {
+            char *part = rust_node_text(ctx, name);
+            const char *saved_module_path = ctx->current_module_path;
+            ctx->current_module_path =
+                saved_module_path && saved_module_path[0]
+                    ? cbm_arena_sprintf(ctx->arena, "%s::%s", saved_module_path, part)
+                    : cbm_arena_strdup(ctx->arena, part);
+            rust_resolve_calls_in_node(ctx, body);
+            ctx->current_module_path = saved_module_path;
+            return;
+        }
+    }
+
+    /* Rust bindings are not in scope in their own initializer. Resolve the
+     * value first, then publish the pattern, and avoid the generic recursion
+     * below from visiting the initializer a second time. */
+    if (strcmp(kind, "let_declaration") == 0) {
+        TSNode value = ts_node_child_by_field_name(node, "value", 5);
+        TSNode alternative = ts_node_child_by_field_name(node, "alternative", 11);
+        if (!ts_node_is_null(value))
+            rust_resolve_calls_in_node(ctx, value);
+        if (!ts_node_is_null(alternative))
+            rust_resolve_calls_in_node(ctx, alternative);
+        rust_process_statement(ctx, node);
+        uint32_t child_count = ts_node_child_count(node);
+        for (uint32_t i = 0; i < child_count; i++) {
+            TSNode child = ts_node_child(node, i);
+            if (!ts_node_is_null(child) && (ts_node_is_null(value) || !ts_node_eq(child, value)) &&
+                (ts_node_is_null(alternative) || !ts_node_eq(child, alternative)))
+                rust_resolve_calls_in_node(ctx, child);
+        }
+        return;
+    }
 
     /* A nested Rust `fn` is a distinct callable and cannot capture the outer
      * function. The definition/textual-call walks give it a lexical QN; the
@@ -6023,9 +6233,52 @@ static void rust_process_trait(RustLSPContext *ctx, TSNode trait_node) {
     ctx->self_trait_qn = saved_trait;
 }
 
+/* Process callable items in root and inline-module declaration lists. The
+ * depth cap makes the C recursion independent of adversarial module nesting;
+ * deeper items remain unresolved and the health record makes that omission
+ * explicit. */
+static void rust_process_item_list(RustLSPContext *ctx, TSNode list, uint32_t depth) {
+    if (depth >= ctx->max_walk_depth) {
+        rust_health_record_node(ctx, CBM_RUST_HEALTH_WALK_DEPTH_LIMIT, list);
+        return;
+    }
+    uint32_t count = ts_node_child_count(list);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_child(list, i);
+        if (ts_node_is_null(item))
+            continue;
+        const char *kind = ts_node_type(item);
+        if (strcmp(kind, "function_item") == 0) {
+            rust_process_function(ctx, item, NULL);
+        } else if (strcmp(kind, "impl_item") == 0) {
+            rust_process_impl(ctx, item);
+        } else if (strcmp(kind, "trait_item") == 0) {
+            rust_process_trait(ctx, item);
+        } else if (strcmp(kind, "mod_item") == 0) {
+            TSNode body = ts_node_child_by_field_name(item, "body", 4);
+            TSNode name = ts_node_child_by_field_name(item, "name", 4);
+            if (!ts_node_is_null(body) && !ts_node_is_null(name)) {
+                char *part = rust_node_text(ctx, name);
+                const char *saved_module_path = ctx->current_module_path;
+                ctx->current_module_path =
+                    saved_module_path && saved_module_path[0]
+                        ? cbm_arena_sprintf(ctx->arena, "%s::%s", saved_module_path, part)
+                        : cbm_arena_strdup(ctx->arena, part);
+                if (!ctx->current_module_path) {
+                    ctx->current_module_path = saved_module_path;
+                    return;
+                }
+                rust_process_item_list(ctx, body, depth + 1);
+                ctx->current_module_path = saved_module_path;
+            }
+        }
+    }
+}
+
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
     if (ts_node_is_null(root))
         return;
+    ctx->root = root;
 
     /* Pass 0: collect macro_rules! definitions before walking bodies so
      * macro_invocation handlers can expand user-defined macros. */
@@ -6082,39 +6335,9 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
         }
     }
 
-    /* Pass 2: walk every top-level item. */
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(root, i);
-        if (ts_node_is_null(c))
-            continue;
-        const char *ck = ts_node_type(c);
-        if (strcmp(ck, "function_item") == 0) {
-            rust_process_function(ctx, c, NULL);
-        } else if (strcmp(ck, "impl_item") == 0) {
-            rust_process_impl(ctx, c);
-        } else if (strcmp(ck, "trait_item") == 0) {
-            rust_process_trait(ctx, c);
-        } else if (strcmp(ck, "mod_item") == 0) {
-            /* Inline module — recurse into its declaration_list. */
-            TSNode body = ts_node_child_by_field_name(c, "body", 4);
-            if (!ts_node_is_null(body)) {
-                uint32_t mnc = ts_node_child_count(body);
-                for (uint32_t j = 0; j < mnc; j++) {
-                    TSNode mc = ts_node_child(body, j);
-                    if (ts_node_is_null(mc))
-                        continue;
-                    const char *mck = ts_node_type(mc);
-                    if (strcmp(mck, "function_item") == 0) {
-                        rust_process_function(ctx, mc, NULL);
-                    } else if (strcmp(mck, "impl_item") == 0) {
-                        rust_process_impl(ctx, mc);
-                    } else if (strcmp(mck, "trait_item") == 0) {
-                        rust_process_trait(ctx, mc);
-                    }
-                }
-            }
-        }
-    }
+    /* Pass 2: walk every callable item, including arbitrarily nested inline
+     * modules up to the explicit resolver depth bound. */
+    rust_process_item_list(ctx, root, 0);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -6127,19 +6350,14 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
  *   use_declaration → identifier | scoped_identifier | scoped_use_list |
  *                     use_list | use_as_clause | use_wildcard.
  *
- * We expand each of these into one or more (alias, full-path) entries. */
+ * We expand root-module declarations into one or more (alias, full-path)
+ * entries. Nested declarations are supplied later by the extracted,
+ * scope-bearing authority carrier; collecting them here would erase lexical
+ * ownership and can conflict with the exact cross-file result. */
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
-    /* Recursive walker. */
-    typedef struct stack_t {
-        TSNode node;
-        struct stack_t *prev;
-    } stack_t;
-    stack_t *top = (stack_t *)cbm_arena_alloc(ctx->arena, sizeof(stack_t));
-    top->node = root;
-    top->prev = NULL;
-    while (top) {
-        TSNode n = top->node;
-        top = top->prev;
+    uint32_t root_children = ts_node_child_count(root);
+    for (uint32_t root_index = 0; root_index < root_children; root_index++) {
+        TSNode n = ts_node_child(root, root_index);
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
@@ -6169,8 +6387,17 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
                                full[prefix_len - 2] == ':') {
                             prefix_len -= 2;
                         }
-                        char *prefix = cbm_arena_strndup(ctx->arena, full, prefix_len);
-                        char *body = cbm_arena_strdup(ctx->arena, lbr + 1);
+                        char *prefix =
+                            cbm_arena_alloc_class(ctx->arena, prefix_len + 1,
+                                                  CBM_ARENA_ALLOCATION_RUST_GROUPED_USE_PREFIX);
+                        if (!prefix)
+                            return;
+                        memcpy(prefix, full, prefix_len);
+                        prefix[prefix_len] = '\0';
+                        char *body = cbm_arena_strdup_class(
+                            ctx->arena, lbr + 1, CBM_ARENA_ALLOCATION_RUST_GROUPED_USE_BODY);
+                        if (!body)
+                            return;
                         size_t blen = strlen(body);
                         if (blen > 0 && body[blen - 1] == '}')
                             body[blen - 1] = '\0';
@@ -6221,20 +6448,6 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
                     }
                     rust_lsp_add_use(ctx, alias, path_part);
                 }
-            }
-        }
-        /* Recurse into mod_item bodies so nested uses are captured too. */
-        if (strcmp(k, "mod_item") == 0 || strcmp(k, "source_file") == 0 ||
-            strcmp(k, "declaration_list") == 0) {
-            uint32_t nc = ts_node_child_count(n);
-            for (uint32_t i = 0; i < nc; i++) {
-                TSNode c = ts_node_child(n, i);
-                if (ts_node_is_null(c))
-                    continue;
-                stack_t *nx = (stack_t *)cbm_arena_alloc(ctx->arena, sizeof(stack_t));
-                nx->node = c;
-                nx->prev = top;
-                top = nx;
             }
         }
     }
@@ -6881,14 +7094,6 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
     ctx.syn_calls = &result->calls;
 
     rust_collect_uses(&ctx, root);
-    /* Bridge any extracted CBMImports the unified extractor saw. */
-    for (int i = 0; i < result->imports.count; i++) {
-        CBMImport *imp = &result->imports.items[i];
-        if (imp->local_name && imp->module_path) {
-            rust_lsp_add_use(&ctx, imp->local_name, imp->module_path);
-        }
-    }
-
     rust_lsp_process_file(&ctx, root);
     if (cbm_arena_status(arena) == CBM_ARENA_STATUS_AVAILABLE) {
         result->rust_health.completed_routes |= CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
@@ -7099,8 +7304,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
 static void rust_resolve_against_registry(CBMArena *arena, const char *source, int source_len,
                                           const char *module_qn, const CBMTypeRegistry *reg,
                                           const char **import_names, const char **import_qns,
-                                          int import_count, TSNode root,
-                                          const struct CBMCargoManifest *manifest,
+                                          const CBMRustImportScope *import_scopes, int import_count,
+                                          TSNode root, const struct CBMCargoManifest *manifest,
                                           CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
                                           CBMRustAnalysisHealth *health) {
     RustLSPContext ctx;
@@ -7111,7 +7316,11 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
     rust_collect_uses(&ctx, root);
     for (int i = 0; i < import_count; i++) {
         if (import_names[i] && import_qns[i]) {
-            rust_lsp_add_use(&ctx, import_names[i], import_qns[i]);
+            uint32_t scope_start = import_scopes ? import_scopes[i].start_byte : 0;
+            uint32_t scope_end = import_scopes ? import_scopes[i].end_byte : (uint32_t)source_len;
+            rust_lsp_add_authoritative_use(&ctx, import_names[i], import_qns[i], scope_start,
+                                           scope_end,
+                                           import_scopes ? import_scopes[i].owner_module_path : "");
         }
     }
     rust_lsp_process_file(&ctx, root);
@@ -7162,13 +7371,12 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
 
 /* Cross-file Rust resolve using a pre-built shared registry (Tier-2). Skips the
  * per-file registry build; just parse + resolve. Mirrors cbm_run_c_lsp_cross_with_registry. */
-void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn, const CBMTypeRegistry *reg,
-                                          const char **import_names, const char **import_qns,
-                                          int import_count, TSTree *cached_tree,
-                                          const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
-                                          CBMRustAnalysisHealth *health) {
+void cbm_run_rust_lsp_cross_scoped_with_registry(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
+    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health) {
     if (health)
         health->required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
     if (!source || source_len <= 0) {
@@ -7202,8 +7410,8 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
     TSNode root = ts_tree_root_node(tree);
     rust_health_record_parse_tree(health, root);
     rust_resolve_against_registry(arena, source, source_len, module_qn, reg, import_names,
-                                  import_qns, import_count, root, manifest, out, synthetic_calls,
-                                  health);
+                                  import_qns, import_scopes, import_count, root, manifest, out,
+                                  synthetic_calls, health);
     if (owns_tree) {
         ts_tree_delete(tree);
         if (parser)
@@ -7211,13 +7419,24 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
     }
 }
 
-void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn, CBMRustLSPDef *defs, int def_count,
+void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, const CBMTypeRegistry *reg,
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
                                           CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
                                           CBMRustAnalysisHealth *health) {
+    cbm_run_rust_lsp_cross_scoped_with_registry(
+        arena, source, source_len, module_qn, reg, import_names, import_qns, NULL, import_count,
+        cached_tree, manifest, out, synthetic_calls, health);
+}
+
+void cbm_run_rust_lsp_cross_scoped_with_manifest(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
+    int def_count, const char **import_names, const char **import_qns,
+    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health) {
     if (health)
         health->required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
     if (!source || source_len <= 0) {
@@ -7257,14 +7476,26 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
     rust_populate_cross_registry(&reg, arena, defs, def_count, module_qn);
 
     rust_resolve_against_registry(arena, source, source_len, module_qn, &reg, import_names,
-                                  import_qns, import_count, root, manifest, out, synthetic_calls,
-                                  health);
+                                  import_qns, import_scopes, import_count, root, manifest, out,
+                                  synthetic_calls, health);
 
     if (owns_tree) {
         ts_tree_delete(tree);
         if (parser)
             ts_parser_delete(parser);
     }
+}
+
+void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, CBMRustLSPDef *defs, int def_count,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          const struct CBMCargoManifest *manifest,
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMRustAnalysisHealth *health) {
+    cbm_run_rust_lsp_cross_scoped_with_manifest(
+        arena, source, source_len, module_qn, defs, def_count, import_names, import_qns, NULL,
+        import_count, cached_tree, manifest, out, synthetic_calls, health);
 }
 
 /* Manifest-free entry point for direct scanner consumers. */
