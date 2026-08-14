@@ -14,6 +14,7 @@
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/artifact.h"
 #include "lsp/rust_cargo.h"
+#include "mcp/mcp.h"
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
@@ -33,6 +34,9 @@
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
 #include "sqlite3.h" /* vendored/sqlite3 — PRAGMA integrity_check on dumped DBs */
+
+extern void cbm_mcp_server_test_use_borrowed_store(cbm_mcp_server_t *srv, cbm_store_t *store,
+                                                   const char *project);
 
 /* ── Helper: create temp test repo with known layout ───────────── */
 
@@ -2882,6 +2886,190 @@ static int count_generation_stage_artifacts(const char *dir_path, const char *db
     return count;
 }
 
+/* A clean source generation has no missed-coverage rows to trigger the old
+ * incidental project upsert. Publication must still mint current store
+ * metadata, bind coverage metadata to that generation, and thereby enable
+ * lossless trace cursors for a relationship stream wider than one page. */
+TEST(pipeline_clean_generation_publishes_metadata_and_trace_cursor) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_clean_generation_metadata_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char source_path[512];
+    char db_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/wide.py", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    FILE *source = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(source);
+    ASSERT_GT(fprintf(source, "def hub():\n    return 1\n"), 0);
+    enum { CALLERS = 289 };
+    for (int i = 0; i < CALLERS; i++) {
+        ASSERT_GT(fprintf(source, "def caller_%03d():\n    return hub()\n", i), 0);
+    }
+    ASSERT_EQ(fclose(source), 0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    char generation[96];
+    ASSERT_EQ(cbm_store_generation(store, generation, sizeof(generation)), CBM_STORE_OK);
+    ASSERT_STR_NEQ(generation, "legacy");
+    cbm_project_t project_info = {0};
+    cbm_coverage_meta_t coverage_meta = {0};
+    ASSERT_EQ(cbm_store_get_project(store, project, &project_info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &coverage_meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(coverage_meta.generation, project_info.indexed_at);
+    char baseline_indexed_at[96];
+    char baseline_coverage_generation[96];
+    snprintf(baseline_indexed_at, sizeof(baseline_indexed_at), "%s", project_info.indexed_at);
+    snprintf(baseline_coverage_generation, sizeof(baseline_coverage_generation), "%s",
+             coverage_meta.generation);
+    cbm_coverage_row_t *coverage = NULL;
+    int coverage_count = -1;
+    ASSERT_EQ(cbm_store_coverage_get(store, project, &coverage, &coverage_count), CBM_STORE_OK);
+    ASSERT_EQ(coverage_count, 0);
+    cbm_store_free_coverage(coverage, coverage_count);
+    cbm_store_coverage_meta_clear(&coverage_meta);
+    cbm_project_free_fields(&project_info);
+
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    cbm_mcp_server_test_use_borrowed_store(server, store, project);
+    char args[768];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"function_name\":\"hub\","
+             "\"direction\":\"inbound\",\"depth\":2,\"limit\":100,\"format\":\"json\"}",
+             project);
+    char *response = cbm_mcp_handle_tool(server, "trace_path", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "trace_refinement_required"));
+    yyjson_doc *envelope = yyjson_read(response, strlen(response), 0);
+    ASSERT_NOT_NULL(envelope);
+    yyjson_val *content = yyjson_obj_get(yyjson_doc_get_root(envelope), "content");
+    yyjson_val *item = content && yyjson_is_arr(content) ? yyjson_arr_get(content, 0) : NULL;
+    yyjson_val *text = item ? yyjson_obj_get(item, "text") : NULL;
+    const char *inner_text = text && yyjson_is_str(text) ? yyjson_get_str(text) : NULL;
+    ASSERT_NOT_NULL(inner_text);
+    yyjson_doc *inner = yyjson_read(inner_text, strlen(inner_text), 0);
+    ASSERT_NOT_NULL(inner);
+    yyjson_val *trace = yyjson_doc_get_root(inner);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(trace, "callers_total")), CALLERS);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(trace, "truncated")));
+    yyjson_val *next = yyjson_obj_get(trace, "next");
+    ASSERT_TRUE(next && yyjson_is_str(next) && yyjson_get_len(next) > 0);
+    yyjson_doc_free(inner);
+    yyjson_doc_free(envelope);
+    free(response);
+    cbm_mcp_server_free(server);
+    ASSERT_EQ(cbm_store_exec(
+                  store,
+                  "CREATE TRIGGER deny_generation_advance BEFORE UPDATE ON store_meta "
+                  "WHEN OLD.k='mutation_gen' BEGIN SELECT RAISE(ABORT,'deny generation'); END;"),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+
+    /* Same exported surface, changed body: this takes the cloned incremental
+     * publication path, where a merely non-legacy pre-existing token is not
+     * enough. A blocked store_meta increment must fail the publication. */
+    source = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(source);
+    ASSERT_GT(fprintf(source, "def hub():\n    return 1\n"), 0);
+    for (int i = 0; i < CALLERS; i++) {
+        ASSERT_GT(fprintf(source, "def caller_%03d():\n    return hub()%s\n", i,
+                          i == 0 ? " + 0" : ""),
+                  0);
+    }
+    ASSERT_EQ(fclose(source), 0);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *blocked = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(blocked);
+    ASSERT_EQ(cbm_pipeline_run(blocked), CBM_PIPELINE_PERSIST_FAILED);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    cbm_pipeline_free(blocked);
+
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    char blocked_generation[96];
+    ASSERT_EQ(cbm_store_generation(store, blocked_generation, sizeof(blocked_generation)),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(blocked_generation, generation);
+    memset(&project_info, 0, sizeof(project_info));
+    memset(&coverage_meta, 0, sizeof(coverage_meta));
+    ASSERT_EQ(cbm_store_get_project(store, project, &project_info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &coverage_meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(project_info.indexed_at, baseline_indexed_at);
+    ASSERT_STR_EQ(coverage_meta.generation, baseline_coverage_generation);
+    cbm_store_coverage_meta_clear(&coverage_meta);
+    cbm_project_free_fields(&project_info);
+    ASSERT_EQ(cbm_store_exec(store, "DROP TRIGGER deny_generation_advance;"), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *repaired = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(repaired);
+    ASSERT_EQ(cbm_pipeline_run(repaired), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    cbm_pipeline_free(repaired);
+
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    char repaired_generation[96];
+    ASSERT_EQ(cbm_store_generation(store, repaired_generation, sizeof(repaired_generation)),
+              CBM_STORE_OK);
+    ASSERT_STR_NEQ(repaired_generation, generation);
+    memset(&project_info, 0, sizeof(project_info));
+    memset(&coverage_meta, 0, sizeof(coverage_meta));
+    ASSERT_EQ(cbm_store_get_project(store, project, &project_info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &coverage_meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(project_info.indexed_at, coverage_meta.generation);
+    snprintf(baseline_indexed_at, sizeof(baseline_indexed_at), "%s", project_info.indexed_at);
+    snprintf(baseline_coverage_generation, sizeof(baseline_coverage_generation), "%s",
+             coverage_meta.generation);
+    cbm_store_coverage_meta_clear(&coverage_meta);
+    cbm_project_free_fields(&project_info);
+    cbm_store_close(store);
+
+    source = cbm_fopen(source_path, "ab");
+    ASSERT_NOT_NULL(source);
+    ASSERT_GT(fprintf(source, "# late-cancelled generation\n"), 0);
+    ASSERT_EQ(fclose(source), 0);
+
+    /* The stage already contains the new project/coverage metadata when this
+     * hook cancels at the final commit boundary. It must remain invisible. */
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_cancel_after_destination_prepare_once();
+    cbm_pipeline_t *cancelled = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(cancelled);
+    ASSERT_EQ(cbm_pipeline_run(cancelled), CBM_PIPELINE_ABORT_PRESERVE_DB);
+    cbm_pipeline_free(cancelled);
+
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    char preserved_generation[96];
+    ASSERT_EQ(cbm_store_generation(store, preserved_generation, sizeof(preserved_generation)),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(preserved_generation, repaired_generation);
+    memset(&project_info, 0, sizeof(project_info));
+    memset(&coverage_meta, 0, sizeof(coverage_meta));
+    ASSERT_EQ(cbm_store_get_project(store, project, &project_info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &coverage_meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(project_info.indexed_at, baseline_indexed_at);
+    ASSERT_STR_EQ(coverage_meta.generation, baseline_coverage_generation);
+    cbm_store_coverage_meta_clear(&coverage_meta);
+    cbm_project_free_fields(&project_info);
+    cbm_store_close(store);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+    PASS();
+}
+
 typedef struct {
     const char *path;
     const char *replacement;
@@ -4254,6 +4442,13 @@ TEST(pipeline_full_persist_failure_after_stage_dump_preserves_previous_generatio
     char project[256];
     snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
     cbm_pipeline_free(baseline);
+    cbm_store_t *baseline_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(baseline_store);
+    char baseline_generation[96];
+    ASSERT_EQ(cbm_store_generation(baseline_store, baseline_generation,
+                                   sizeof(baseline_generation)),
+              CBM_STORE_OK);
+    cbm_store_close(baseline_store);
 
     write_temp_file(tmp, "generation.py",
                     "def AfterFullPersist():\n    return 2\n# changed generation\n");
@@ -4266,6 +4461,13 @@ TEST(pipeline_full_persist_failure_after_stage_dump_preserves_previous_generatio
     int faulted_after = -1;
     observe_named_generation(db_path, project, "BeforeFullPersist", "AfterFullPersist",
                              &faulted_before, &faulted_after);
+    cbm_store_t *faulted_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(faulted_store);
+    char faulted_generation[96];
+    ASSERT_EQ(cbm_store_generation(faulted_store, faulted_generation,
+                                   sizeof(faulted_generation)),
+              CBM_STORE_OK);
+    cbm_store_close(faulted_store);
     int faulted_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
 
     cbm_pipeline_incremental_test_reset_faults();
@@ -4284,6 +4486,7 @@ TEST(pipeline_full_persist_failure_after_stage_dump_preserves_previous_generatio
     ASSERT_EQ(faulted_rc, CBM_PIPELINE_PERSIST_FAILED);
     ASSERT_EQ(faulted_before, 1);
     ASSERT_EQ(faulted_after, 0);
+    ASSERT_STR_EQ(faulted_generation, baseline_generation);
     ASSERT_EQ(faulted_stage_count, 0);
     ASSERT_EQ(retry_rc, 0);
     ASSERT_EQ(retry_before, 0);
@@ -13667,6 +13870,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_git_context_change_forces_full_and_refreshes_branch);
     RUN_TEST(pipeline_global_extension_config_change_forces_full);
     RUN_TEST(pipeline_publication_never_uses_a_predictable_staging_path);
+    RUN_TEST(pipeline_clean_generation_publishes_metadata_and_trace_cursor);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);

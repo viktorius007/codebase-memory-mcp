@@ -2251,6 +2251,30 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     cbm_project_t project_info = {0};
     bool have_project_info =
         cbm_store_get_project(store, generation->project, &project_info) == CBM_STORE_OK;
+    /* The byte writer creates the projects row but intentionally does not
+     * create store_meta. Historically a later missed-coverage graph rebuild
+     * happened to call upsert_project, so clean generations (and generations
+     * containing only analysis_* health rows) stayed permanently "legacy"
+     * and could not mint resumable cursors. Make the current generation
+     * explicit in the sealed stage itself. A failed/cancelled stage is still
+     * discarded before the atomic rename, so live project and coverage
+     * metadata cannot advance independently. */
+    if (ok && have_project_info) {
+        char previous_generation[96];
+        ok = cbm_store_generation(store, previous_generation, sizeof(previous_generation)) ==
+             CBM_STORE_OK;
+        ok = ok && cbm_store_upsert_project(store, generation->project, project_info.root_path) ==
+                       CBM_STORE_OK;
+        cbm_project_free_fields(&project_info);
+        memset(&project_info, 0, sizeof(project_info));
+        char published_generation[96];
+        ok = ok && cbm_store_generation(store, published_generation,
+                                        sizeof(published_generation)) == CBM_STORE_OK &&
+             strcmp(published_generation, "legacy") != 0 &&
+             strcmp(published_generation, previous_generation) != 0;
+        have_project_info =
+            ok && cbm_store_get_project(store, generation->project, &project_info) == CBM_STORE_OK;
+    }
     cbm_log_info("publish.timing", "block", "get_project", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
@@ -2258,7 +2282,7 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     meta.generation = have_project_info ? project_info.indexed_at : NULL;
     meta.coverage_version = CBM_SEMANTIC_INDEX_VERSION;
     meta.hash_records_complete = true;
-    if (!have_project_info ||
+    if (!ok || !have_project_info ||
         cbm_store_coverage_replace_ex(store, generation->project, generation->coverage,
                                       generation->coverage_count, &meta) != CBM_STORE_OK) {
         ok = false;
