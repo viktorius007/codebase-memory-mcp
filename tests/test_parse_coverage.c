@@ -104,6 +104,33 @@ static const char *PY_CLEAN = "def ok():\n"
                               "def ok2():\n"
                               "    return 2\n";
 
+/* Rust 2024 permits item-level safety qualifiers inside an unsafe extern
+ * block. The upstream v0.24.2 grammar rejects these tokens even though rustc
+ * accepts them, which made real libm and panic_abort source regions partial. */
+static const char *RUST_2024_SAFE_FOREIGN_ITEMS =
+    "unsafe extern \"C\" {\n"
+    "    safe fn safe_foreign(value: i32) -> i32;\n"
+    "    unsafe fn unsafe_foreign();\n"
+    "    safe static SAFE_VALUE: i32;\n"
+    "    unsafe static mut UNSAFE_VALUE: i32;\n"
+    "}\n";
+
+/* Attributes on individual struct-pattern fields are compiler-valid and used
+ * by Codex's app-server argument destructuring. The old grammar places the
+ * attribute in an ERROR region even though the surrounding function recovers. */
+static const char *RUST_ATTRIBUTED_STRUCT_PATTERN =
+    "struct Auth;\n"
+    "struct Args { auth: Auth, debug_only: bool }\n"
+    "fn input() -> Args { panic!() }\n"
+    "fn run() {\n"
+    "    let Args {\n"
+    "        auth,\n"
+    "        #[cfg(debug_assertions)]\n"
+    "        debug_only,\n"
+    "    } = input();\n"
+    "    let _ = (auth, debug_only);\n"
+    "}\n";
+
 /* ── Tests ────────────────────────────────────────────────────────────────── */
 
 TEST(c_ifdef_split_brace_sets_parse_incomplete) {
@@ -245,6 +272,33 @@ TEST(c_trailing_recovered_defs_keep_flag) {
     PASS();
 }
 
+TEST(rust_2024_safe_foreign_items_parse_completely) {
+    CBMFileResult *r =
+        do_extract(RUST_2024_SAFE_FOREIGN_ITEMS, CBM_LANG_RUST, "src/foreign.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(0, r->error_region_count);
+    ASSERT_NULL(r->error_ranges);
+    ASSERT_TRUE(has_def(r, "safe_foreign"));
+    ASSERT_TRUE(has_def(r, "unsafe_foreign"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_attributed_struct_pattern_parses_completely) {
+    CBMFileResult *r =
+        do_extract(RUST_ATTRIBUTED_STRUCT_PATTERN, CBM_LANG_RUST, "src/main.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(0, r->error_region_count);
+    ASSERT_NULL(r->error_ranges);
+    ASSERT_TRUE(has_def(r, "run"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ────────────────────────────────────────────────────────────────── */
 
 SUITE(parse_coverage) {
@@ -257,4 +311,6 @@ SUITE(parse_coverage) {
     RUN_TEST(py_clean_file_not_flagged);
     RUN_TEST(error_region_cap_is_honored);
     RUN_TEST(c_trailing_recovered_defs_keep_flag);
+    RUN_TEST(rust_2024_safe_foreign_items_parse_completely);
+    RUN_TEST(rust_attributed_struct_pattern_parses_completely);
 }

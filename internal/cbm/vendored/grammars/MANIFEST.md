@@ -53,15 +53,16 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 
 ## Local source patches (applied atop pinned upstream)
 
-The grammars below carry a small local patch to their vendored `scanner.c`, on
-top of the pinned upstream commit recorded in the vendoring table below.
-Re-vendoring from upstream must re-apply these.
+The grammars below carry a small local source patch on top of the pinned
+upstream commit recorded in the vendoring table below. Re-vendoring from
+upstream must re-apply these.
 
 | grammar | location | patch | reason |
 |---|---|---|---|
 | crystal    | `crystal/scanner.c`, serialize    | guard `memcpy(&buffer[offset], state->literals.contents, literal_content_size)` with `if (literal_content_size > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source on the empty-state serialize round-trip (formal UB, harmless) |
 | rescript   | `rescript/scanner.c`, deserialize | guard `memcpy(state, buffer, n_bytes)` with `if (n_bytes > 0)` | UBSan: zero-length `memcpy` with a NULL `buffer` / `n_bytes == 0` on empty-state deserialize (formal UB, harmless). The sibling serialize copies a fixed `sizeof(ScannerState)` (always > 0, non-NULL src) and needs no guard. |
 | purescript | `purescript/scanner.c`, serialize | guard `memcpy(buffer, indents->data, to_copy)` with `if (to_copy > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source when the indent vector is empty (formal UB, harmless) |
+| rust | `rust/grammar.patch`, SHA-256 `49e90abe4cc013e7239348509c8c0c636b0c728964d300dd17a0617da6d1d42b` | apply to official `tree-sitter/tree-sitter-rust` `77a3747266f4d621d0757825e6b11edcbf991ca5`, then generate with `tree-sitter-cli 0.26.7 --abi 15` | Carries upstream PR #256's Rust 2024 foreign-item safety grammar and only PR #301's attributed struct-pattern-field hunk. The generated parser is reproducible with `scripts/vendor-grammar.sh`; no scanner or AST-contract redesign is included. |
 
 ## Vendored from verified upstream
 
@@ -173,7 +174,7 @@ Re-vendoring from upstream must re-apply these.
 | ron | 14 | tree-sitter-grammars/tree-sitter-ron | `78938553b930` | VERIFIED-BOTH | ✅ |
 | rst | 14 | stsewd/tree-sitter-rst | `4e562e1598b9` | VERIFIED-BOTH | ✅ |
 | ruby | 14 | tree-sitter/tree-sitter-ruby | `ad907a69da0c` | VERIFIED-BOTH | ✅ |
-| rust | 15 | tree-sitter/tree-sitter-rust | `77a3747266f4` | VERIFIED-BOTH | ✅ |
+| rust | 15 | tree-sitter/tree-sitter-rust | `77a3747266f4` | PINNED-PATCHED | ✅ |
 | scala | 15 | tree-sitter/tree-sitter-scala | `14c5cfd2b8e0` | VERIFIED-BOTH | ✅ |
 | scheme | 14 | 6cdh/tree-sitter-scheme | `c6cb7c7d7a04` | VERIFIED-BOTH | ✅ |
 | scss | 14 | serenadeai/tree-sitter-scss | `c478c6868648` | MISMATCH | ✅ |

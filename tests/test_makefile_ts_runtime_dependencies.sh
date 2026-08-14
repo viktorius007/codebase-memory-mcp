@@ -54,3 +54,40 @@ for dependency in "${DEPENDENCIES[@]}"; do
 done
 
 echo "PASS: all tree-sitter runtime unity objects track included sources and headers"
+
+GRAMMAR_DEPENDENCIES=(
+    internal/cbm/vendored/grammars/rust/parser.c
+    internal/cbm/vendored/grammars/rust/scanner.c
+    internal/cbm/vendored/grammars/rust/tree_sitter/parser.h
+)
+GRAMMAR_TARGETS=(
+    "$BUILD_DIR/grammar_rust.o"
+    "$BUILD_DIR/tsan_grammar_rust.o"
+    "$BUILD_DIR/prod_grammar_rust.o"
+)
+
+for dependency in "${GRAMMAR_DEPENDENCIES[@]}"; do
+    if [[ ! -f "$dependency" ]]; then
+        echo "FAIL: expected Rust grammar dependency is missing: $dependency"
+        exit 1
+    fi
+
+    for target in "${GRAMMAR_TARGETS[@]}"; do
+        touch "$target"
+
+        status=0
+        make -f Makefile.cbm -q -W "$dependency" \
+            BUILD_DIR="$BUILD_DIR" "$target" || status=$?
+
+        if [[ $status -eq 0 ]]; then
+            echo "FAIL: $target would stay stale after changing $dependency"
+            exit 1
+        fi
+        if [[ $status -ne 1 ]]; then
+            echo "FAIL: make dependency probe failed for $target and $dependency (exit $status)"
+            exit 1
+        fi
+    done
+done
+
+echo "PASS: all Rust grammar objects track their generated parser, scanner, and headers"

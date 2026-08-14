@@ -750,6 +750,29 @@ test-foundation: $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
+grammar_inputs = $(wildcard $(CBM_DIR)/vendored/grammars/$(1)/parser.c \
+                           $(CBM_DIR)/vendored/grammars/$(1)/scanner.c \
+                           $(CBM_DIR)/vendored/grammars/$(1)/scanner.cc \
+                           $(CBM_DIR)/vendored/grammars/$(1)/*.h \
+                           $(CBM_DIR)/vendored/grammars/$(1)/*.inc \
+                           $(CBM_DIR)/vendored/grammars/$(1)/tree_sitter/*.h \
+                           $(CBM_DIR)/vendored/grammars/$(1)/common/*.h)
+
+GRAMMAR_NAMES = $(patsubst $(CBM_DIR)/grammar_%.c,%,$(GRAMMAR_SRCS))
+
+define GRAMMAR_OBJECT_RULES
+$(BUILD_DIR)/grammar_$(1).o: $(CBM_DIR)/grammar_$(1).c $(call grammar_inputs,$(1)) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $$@ $$<
+
+$(BUILD_DIR)/tsan_grammar_$(1).o: $(CBM_DIR)/grammar_$(1).c $(call grammar_inputs,$(1)) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $$@ $$<
+
+$(BUILD_DIR)/prod_grammar_$(1).o: $(CBM_DIR)/grammar_$(1).c $(call grammar_inputs,$(1)) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS) -c -o $$@ $$<
+endef
+
+$(foreach grammar,$(GRAMMAR_NAMES),$(eval $(call GRAMMAR_OBJECT_RULES,$(grammar))))
+
 $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 

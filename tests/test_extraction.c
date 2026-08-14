@@ -819,8 +819,8 @@ TEST(rust_function) {
 
 TEST(rust_foreign_function_signatures_have_distinct_qns) {
     CBMFileResult *r = extract("unsafe extern \"C\" {\n"
-                               "    fn alpha();\n"
-                               "    fn beta();\n"
+                               "    safe fn alpha();\n"
+                               "    unsafe fn beta();\n"
                                "    #[cfg(unix)]\n"
                                "    fn platform();\n"
                                "    #[cfg(windows)]\n"
