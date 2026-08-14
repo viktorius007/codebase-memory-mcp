@@ -8269,6 +8269,65 @@ TEST(rustlsp_cross_health_is_explicit_and_survives_parse_degradation) {
     PASS();
 }
 
+TEST(rustlsp_parse_health_is_idempotent_across_single_and_cross_routes) {
+    const char *fixtures[] = {
+        "---\n"
+        "-\n"
+        "---\n"
+        "1\n",
+        "---cargo\n"
+        "//~^ ERROR: unclosed frontmatter\n"
+        "\n"
+        "//@ compile-flags: --crate-type lib\n"
+        "\n"
+        "#![feature(frontmatter)]\n"
+        "\n"
+        "fn foo(x: i32) -> i32 {\n"
+        "    ---x\n"
+        "     //~^ WARNING: use of a double negation [double_negations]\n"
+        "}\n"
+        "\n"
+        "// this test is for the weird case that valid Rust code can have three dashes\n"
+        "// within them and get treated as a frontmatter close.\n",
+        "----cargo\n"
+        "//~^ ERROR: unclosed frontmatter\n"
+        "//~| ERROR: frontmatters are experimental\n"
+        "\n"
+        "// Similarly, a use statement should allow for recovery as well (as\n"
+        "// per unclosed-1.rs)\n"
+        "\n"
+        "use std::env;\n"
+        "\n"
+        "fn main() {}\n",
+    };
+
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
+        const char *source = fixtures[i];
+        CBMFileResult *result = extract_rust(source);
+        ASSERT_NOT_NULL(result);
+        ASSERT_NOT_NULL(result->cached_tree);
+        ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count);
+
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMResolvedCallArray output = {0};
+        CBMRustAnalysisHealth cross_only = {0};
+        cbm_run_rust_lsp_cross_with_manifest(&arena, source, (int)strlen(source), "test.main", NULL,
+                                             0, NULL, NULL, 0, result->cached_tree, NULL, &output,
+                                             NULL, &cross_only);
+        ASSERT_EQ(1, cross_only.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count);
+
+        memset(&output, 0, sizeof(output));
+        cbm_run_rust_lsp_cross_with_manifest(&arena, source, (int)strlen(source), "test.main", NULL,
+                                             0, NULL, NULL, 0, result->cached_tree, NULL, &output,
+                                             NULL, &result->rust_health);
+        ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count);
+        cbm_arena_destroy(&arena);
+        cbm_free_result(result);
+    }
+    PASS();
+}
+
 TEST(rustlsp_health_record_retains_first_span_and_saturates) {
     CBMRustAnalysisHealth health = {0};
     cbm_rust_health_record(&health, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, 12, 19);
@@ -9395,6 +9454,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_health_macro_binding_and_repetition_caps_are_occurrence_scoped);
     RUN_TEST(rustlsp_health_macro_repetition_and_substitution_reasons_are_truthful);
     RUN_TEST(rustlsp_cross_health_is_explicit_and_survives_parse_degradation);
+    RUN_TEST(rustlsp_parse_health_is_idempotent_across_single_and_cross_routes);
     RUN_TEST(rustlsp_health_record_retains_first_span_and_saturates);
     RUN_TEST(rustlsp_cargo_malformed_input_records_first_exact_span);
     RUN_TEST(rustlsp_cargo_dependency_cap_records_each_dropped_entry);

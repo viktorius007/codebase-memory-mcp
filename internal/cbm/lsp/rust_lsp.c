@@ -118,6 +118,8 @@ static TSNode rust_first_parse_error(TSNode node, int depth) {
 static void rust_health_record_parse_tree(CBMRustAnalysisHealth *health, TSNode root) {
     if (!health || ts_node_is_null(root) || !ts_node_has_error(root))
         return;
+    if (health->issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count > 0)
+        return;
     TSNode error = rust_first_parse_error(root, 0);
     cbm_rust_health_record(health, CBM_RUST_HEALTH_PARSER_PARSE_FAILED, ts_node_start_byte(error),
                            ts_node_end_byte(error));
