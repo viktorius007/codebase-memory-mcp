@@ -7,13 +7,27 @@
 #include "test_framework.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_thread.h"
+#include "test_helpers.h"
+#include <pipeline/definition_properties.h>
+#include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h>
 #include <semantic/rotsq.h>
 #include <semantic/semantic.h>
+#include <simhash/minhash.h>
+#include <store/store.h>
+#include <sqlite3.h>
 
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+extern bool cbm_semantic_test_body_field_contains_token(const char *json, const char *expected);
+extern bool cbm_semantic_test_body_field_injects_token(const char *json, const char *expected);
+extern void cbm_parallel_test_property_serialization_failures_reset(void);
+extern long cbm_parallel_test_property_serialization_failures(void);
+#endif
 
 /* ── Tokenize ────────────────────────────────────────────────────── */
 
@@ -87,6 +101,387 @@ TEST(sem_tokenize_abbrev_expansion) {
     ASSERT_TRUE(has_ctx && has_context && has_err && has_error);
     for (int i = 0; i < n; i++)
         free(tokens[i]);
+    PASS();
+}
+
+static int write_project_identity_fixture(const char *path, const char *profile_record_name,
+                                          const char *profile_table_name) {
+    FILE *file = cbm_fopen(path, "wb");
+    if (!file) {
+        return -1;
+    }
+    int written = fprintf(file,
+                          "def sanitize(value: str) -> str:\n"
+                          "    return value.strip().lower()\n\n"
+                          "def lookup(table: dict, key: str) -> str:\n"
+                          "    return table.get(key, \"\")\n\n"
+                          "def audit_log(message: str) -> None:\n"
+                          "    print(message)\n\n"
+                          "def normalize_user_record(record: dict, table: dict) -> dict:\n"
+                          "    result = {}\n"
+                          "    name = sanitize(record.get(\"name\", \"\"))\n"
+                          "    email = sanitize(record.get(\"email\", \"\"))\n"
+                          "    role = lookup(table, name)\n"
+                          "    if name and email:\n"
+                          "        result[\"name\"] = name\n"
+                          "        result[\"email\"] = email\n"
+                          "        result[\"role\"] = role\n"
+                          "        audit_log(\"normalized user record\")\n"
+                          "    return result\n\n"
+                          "def normalize_account_record(record: dict, table: dict) -> dict:\n"
+                          "    result = {}\n"
+                          "    name = sanitize(record.get(\"name\", \"\"))\n"
+                          "    email = sanitize(record.get(\"email\", \"\"))\n"
+                          "    role = lookup(table, name)\n"
+                          "    while name and email:\n"
+                          "        result[\"name\"] = name\n"
+                          "        result[\"email\"] = email\n"
+                          "        result[\"role\"] = role\n"
+                          "        audit_log(\"normalized account record\")\n"
+                          "        break\n"
+                          "    return result\n\n"
+                          "def normalize_member_record(record: dict, table: dict) -> dict:\n"
+                          "    result = {}\n"
+                          "    name = sanitize(record.get(\"name\", \"\"))\n"
+                          "    email = sanitize(record.get(\"email\", \"\"))\n"
+                          "    role = lookup(table, name)\n"
+                          "    for _ in range(1):\n"
+                          "        if not (name and email):\n"
+                          "            continue\n"
+                          "        result[\"name\"] = name\n"
+                          "        result[\"email\"] = email\n"
+                          "        result[\"role\"] = role\n"
+                          "        audit_log(\"normalized member record\")\n"
+                          "    return result\n\n"
+                          "def normalize_profile_record(%s: dict, %s: dict) -> dict:\n"
+                          "    result = {}\n"
+                          "    name = sanitize(%s.get(\"name\", \"\"))\n"
+                          "    email = sanitize(%s.get(\"email\", \"\"))\n"
+                          "    role = lookup(%s, name)\n"
+                          "    try:\n"
+                          "        assert name and email\n"
+                          "        result[\"name\"] = name\n"
+                          "        result[\"email\"] = email\n"
+                          "        result[\"role\"] = role\n"
+                          "        audit_log(\"normalized profile record\")\n"
+                          "    except AssertionError:\n"
+                          "        audit_log(\"skipped profile record\")\n"
+                          "    return result\n",
+                          profile_record_name, profile_table_name, profile_record_name,
+                          profile_record_name, profile_table_name);
+    return fclose(file) == 0 && written > 0 ? 0 : -1;
+}
+
+static char *semantic_edge_fingerprint(const char *db_path, const char *project, int *edge_count) {
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return NULL;
+    }
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT substr(s.qualified_name, length(?1) + 2), "
+        "substr(t.qualified_name, length(?1) + 2), e.properties "
+        "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.project=?1 AND e.type='SEMANTICALLY_RELATED' ORDER BY 1,2,3";
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        cbm_store_close(store);
+        return NULL;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    size_t capacity = 4096;
+    size_t length = 0;
+    char *result = malloc(capacity);
+    if (!result) {
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+        return NULL;
+    }
+    result[0] = '\0';
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *source = (const char *)sqlite3_column_text(stmt, 0);
+        const char *target = (const char *)sqlite3_column_text(stmt, 1);
+        const char *properties = (const char *)sqlite3_column_text(stmt, 2);
+        source = source ? source : "";
+        target = target ? target : "";
+        properties = properties ? properties : "";
+        size_t needed = strlen(source) + strlen(target) + strlen(properties) + 4;
+        while (length + needed >= capacity) {
+            capacity *= 2;
+            char *grown = realloc(result, capacity);
+            if (!grown) {
+                free(result);
+                sqlite3_finalize(stmt);
+                cbm_store_close(store);
+                return NULL;
+            }
+            result = grown;
+        }
+        length += (size_t)snprintf(result + length, capacity - length, "%s|%s|%s\n", source, target,
+                                   properties);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    *edge_count = count;
+    return result;
+}
+
+static char *index_semantic_fixture(const char *repo_path, const char *db_path, const char *project,
+                                    int *edge_count) {
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FULL);
+    if (!pipeline || !cbm_pipeline_set_project_name(pipeline, project)) {
+        cbm_pipeline_free(pipeline);
+        return NULL;
+    }
+    int run_rc = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
+    return run_rc == 0 ? semantic_edge_fingerprint(db_path, project, edge_count) : NULL;
+}
+
+/* Project names are storage identities, not code. This exact pipeline fixture
+ * proves that renaming one project cannot change semantic edge identities,
+ * scores, or properties, while a real source-symbol change still can. */
+TEST(sem_project_identity_is_not_semantic_input) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_sem_project_identity_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512], source[512], db_a[512], db_b[512], db_changed[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(source, sizeof(source), "%s/records.py", repo);
+    snprintf(db_a, sizeof(db_a), "%s/alpha.db", tmp);
+    snprintf(db_b, sizeof(db_b), "%s/many.db", tmp);
+    snprintf(db_changed, sizeof(db_changed), "%s/changed.db", tmp);
+    ASSERT_EQ(cbm_mkdir(repo), 0);
+    ASSERT_EQ(write_project_identity_fixture(source, "record", "table"), 0);
+
+    const char *old_enabled = getenv("CBM_SEMANTIC_ENABLED");
+    char *saved_enabled = old_enabled ? strdup(old_enabled) : NULL;
+    const char *old_threshold = getenv("CBM_SEMANTIC_THRESHOLD");
+    char *saved_threshold = old_threshold ? strdup(old_threshold) : NULL;
+    cbm_setenv("CBM_SEMANTIC_ENABLED", "1", 1);
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.8395", 1);
+
+    int alpha_count = 0, renamed_count = 0, changed_count = 0;
+    char *alpha = index_semantic_fixture(repo, db_a, "alpha", &alpha_count);
+    char *renamed =
+        index_semantic_fixture(repo, db_b, "many-prefix-tokens-change-context", &renamed_count);
+    int content_write_rc =
+        write_project_identity_fixture(source, "archived_snapshot", "vault_catalog");
+    char *changed = content_write_rc == 0
+                        ? index_semantic_fixture(repo, db_changed, "alpha", &changed_count)
+                        : NULL;
+
+    if (saved_enabled) {
+        cbm_setenv("CBM_SEMANTIC_ENABLED", saved_enabled, 1);
+    } else {
+        cbm_unsetenv("CBM_SEMANTIC_ENABLED");
+    }
+    if (saved_threshold) {
+        cbm_setenv("CBM_SEMANTIC_THRESHOLD", saved_threshold, 1);
+    } else {
+        cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    }
+    free(saved_enabled);
+    free(saved_threshold);
+
+    bool project_invariant =
+        alpha && renamed && alpha_count > 0 && renamed_count > 0 && strcmp(alpha, renamed) == 0;
+    bool content_sensitive = alpha && changed && changed_count > 0 && strcmp(alpha, changed) != 0;
+    free(alpha);
+    free(renamed);
+    free(changed);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(project_invariant);
+    ASSERT_TRUE(content_sensitive);
+    PASS();
+}
+
+static void fill_body_tokens(char *tokens, size_t length) {
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz_";
+    for (size_t i = 0; i < length; i++) {
+        tokens[i] = alphabet[i % (sizeof(alphabet) - 1)];
+    }
+    tokens[length] = '\0';
+}
+
+/* Cargo's ManRenderer::push_man landed exactly on the old 2 KiB property
+ * boundary: a longer storage project prefix pushed its 1,020-byte body-token
+ * bag out of the node. The compact push_top_header carrier is the control arm
+ * where the old mechanism cannot fire. */
+TEST(sem_definition_properties_preserve_cargo_boundary) {
+    uint32_t fingerprint[CBM_MINHASH_K] = {0};
+    char push_man_tokens[1021];
+    char push_top_header_tokens[105];
+    fill_body_tokens(push_man_tokens, sizeof(push_man_tokens) - 1);
+    fill_body_tokens(push_top_header_tokens, sizeof(push_top_header_tokens) - 1);
+
+    CBMDefinition push_man = {
+        .name = "push_man",
+        .label = "Method",
+        .signature = "(&mut self)",
+        .return_type = "Result<(), Error>",
+        .parent_class = "a.crates.mdman.src.format.man.ManRenderer",
+        .complexity = 79,
+        .cognitive = 414,
+        .loop_count = 1,
+        .loop_depth = 1,
+        .param_count = 1,
+        .max_access_depth = 2,
+        .alloc_in_loop = 5,
+        .fingerprint = fingerprint,
+        .fingerprint_k = CBM_MINHASH_K,
+        .is_exported = true,
+        .structural_profile = "11,0,1,8,10,0,28,160,3,3,0,11,33,7,0,0,0,0,11,8,4,120,390,0,390",
+        .body_tokens = push_man_tokens,
+    };
+    cbm_def_properties_t short_props = {0}, long_props = {0};
+    ASSERT_EQ(cbm_def_properties_build(&push_man, &short_props), CBM_DEF_PROPERTIES_OK);
+    push_man.parent_class =
+        "many-prefix-tokens-change-context.crates.mdman.src.format.man.ManRenderer";
+    ASSERT_EQ(cbm_def_properties_build(&push_man, &long_props), CBM_DEF_PROPERTIES_OK);
+    ASSERT_EQ(short_props.length, 2025);
+    ASSERT_EQ(long_props.length, 2057);
+    ASSERT_NOT_NULL(strstr(short_props.json, "\"bt\":\""));
+    ASSERT_NOT_NULL(strstr(long_props.json, "\"bt\":\""));
+    ASSERT_NOT_NULL(strstr(short_props.json, push_man_tokens));
+    ASSERT_NOT_NULL(strstr(long_props.json, push_man_tokens));
+    cbm_def_properties_destroy(&short_props);
+    cbm_def_properties_destroy(&long_props);
+
+    CBMDefinition control = push_man;
+    control.name = "push_top_header";
+    control.parent_class = "a.crates.mdman.src.format.man.ManRenderer";
+    control.complexity = 0;
+    control.cognitive = 0;
+    control.loop_count = 0;
+    control.loop_depth = 0;
+    control.alloc_in_loop = 0;
+    control.structural_profile = "0,0,0,0,3,0,7,40,0,0,0,0,2,0,0,0,0,0,0,2,2,7,16,0,16";
+    control.body_tokens = push_top_header_tokens;
+    ASSERT_EQ(cbm_def_properties_build(&control, &short_props), CBM_DEF_PROPERTIES_OK);
+    control.parent_class =
+        "many-prefix-tokens-change-context.crates.mdman.src.format.man.ManRenderer";
+    ASSERT_EQ(cbm_def_properties_build(&control, &long_props), CBM_DEF_PROPERTIES_OK);
+    ASSERT_EQ(short_props.length, 1095);
+    ASSERT_EQ(long_props.length, 1127);
+    ASSERT_NOT_NULL(strstr(short_props.json, push_top_header_tokens));
+    ASSERT_NOT_NULL(strstr(long_props.json, push_top_header_tokens));
+    cbm_def_properties_destroy(&short_props);
+    cbm_def_properties_destroy(&long_props);
+    PASS();
+}
+
+/* The persisted body-token carrier is 2 KiB. The semantic consumer must not
+ * silently reduce that contract to 512 bytes: a source token near the tail is
+ * still content and must reach the exact production tokenizer. */
+TEST(sem_body_tokens_consume_complete_bounded_carrier) {
+    char json[CBM_SZ_2K];
+    size_t used = (size_t)snprintf(json, sizeof(json), "{\"bt\":\"");
+    int written = snprintf(json + used, sizeof(json) - used, "quoted\\\"identifier ");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(json) - used);
+    used += (size_t)written;
+    for (int i = 0; i < 80; i++) {
+        written = snprintf(json + used, sizeof(json) - used, "padding%02d ", i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(json) - used);
+        used += (size_t)written;
+    }
+    ASSERT_GT(used, CBM_SZ_512);
+    ASSERT_LT(snprintf(json + used, sizeof(json) - used, "semantic_tail_marker raise\"}"),
+              (int)(sizeof(json) - used));
+    ASSERT_TRUE(cbm_semantic_test_body_field_contains_token(json, "semantic"));
+    ASSERT_TRUE(cbm_semantic_test_body_field_contains_token(json, "tail"));
+    ASSERT_TRUE(cbm_semantic_test_body_field_contains_token(json, "marker"));
+    ASSERT_TRUE(cbm_semantic_test_body_field_injects_token(json, "throw"));
+    PASS();
+}
+
+TEST(sem_definition_properties_fail_closed) {
+    CBMDefinition def = {.name = "bounded", .label = "Function"};
+    cbm_def_properties_t props = {0};
+    cbm_def_properties_test_fail_allocation_once();
+    ASSERT_EQ(cbm_def_properties_build(&def, &props), CBM_DEF_PROPERTIES_ALLOCATION_UNAVAILABLE);
+    ASSERT_NULL(props.json);
+
+    char *oversized = malloc(CBM_DEF_PROPERTIES_MAX_BYTES + 1U);
+    ASSERT_NOT_NULL(oversized);
+    memset(oversized, 'x', CBM_DEF_PROPERTIES_MAX_BYTES);
+    oversized[CBM_DEF_PROPERTIES_MAX_BYTES] = '\0';
+    def.signature = oversized;
+    ASSERT_EQ(cbm_def_properties_build(&def, &props), CBM_DEF_PROPERTIES_OVERSIZE);
+    ASSERT_NULL(props.json);
+    free(oversized);
+
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_sem_props_fail_closed_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512], source[512], db[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(source, sizeof(source), "%s/simple.py", repo);
+    snprintf(db, sizeof(db), "%s/simple.db", tmp);
+    ASSERT_EQ(cbm_mkdir(repo), 0);
+    FILE *file = cbm_fopen(source, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_GT(fprintf(file, "def bounded(value):\n    return value\n"), 0);
+    ASSERT_EQ(fclose(file), 0);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_def_properties_test_fail_allocation_once();
+    ASSERT_EQ(cbm_pipeline_run(pipeline), CBM_PIPELINE_ABORT_PRESERVE_DB);
+    cbm_pipeline_free(pipeline);
+
+    /* Force the production parallel extraction route. One worker consumes the
+     * allocation fault; the shared latch must stop the generation and the
+     * pipeline must fail closed instead of publishing a partial index. */
+    for (int i = 0; i < 51; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/parallel_%02d.py", repo, i);
+        file = cbm_fopen(path, "wb");
+        ASSERT_NOT_NULL(file);
+        ASSERT_GT(fprintf(file, "def parallel_%02d(value):\n    return value + %d\n", i, i), 0);
+        ASSERT_EQ(fclose(file), 0);
+    }
+    char parallel_db[512];
+    snprintf(parallel_db, sizeof(parallel_db), "%s/parallel.db", tmp);
+    pipeline = cbm_pipeline_new(repo, parallel_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    const char *old_single_thread = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *saved_single_thread = old_single_thread ? strdup(old_single_thread) : NULL;
+    ASSERT_TRUE(!old_workers || saved_workers);
+    ASSERT_TRUE(!old_single_thread || saved_single_thread);
+    int set_workers_rc = cbm_setenv("CBM_WORKERS", "4", 1);
+    int unset_single_thread_rc = set_workers_rc == 0 ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : -1;
+    int parallel_rc = -1;
+    long parallel_failures = 0;
+    if (set_workers_rc == 0 && unset_single_thread_rc == 0) {
+        cbm_parallel_test_property_serialization_failures_reset();
+        cbm_def_properties_test_fail_allocation_once();
+        parallel_rc = cbm_pipeline_run(pipeline);
+        parallel_failures = cbm_parallel_test_property_serialization_failures();
+    }
+    cbm_pipeline_free(pipeline);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_thread_rc =
+        saved_single_thread ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single_thread, 1)
+                            : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single_thread);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(set_workers_rc, 0);
+    ASSERT_EQ(unset_single_thread_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_thread_rc, 0);
+    ASSERT_GT(parallel_failures, 0);
+    ASSERT_EQ(parallel_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
     PASS();
 }
 
@@ -480,6 +875,10 @@ SUITE(semantic) {
     RUN_TEST(sem_tokenize_null);
     RUN_TEST(sem_tokenize_max_out);
     RUN_TEST(sem_tokenize_abbrev_expansion);
+    RUN_TEST(sem_project_identity_is_not_semantic_input);
+    RUN_TEST(sem_definition_properties_preserve_cargo_boundary);
+    RUN_TEST(sem_body_tokens_consume_complete_bounded_carrier);
+    RUN_TEST(sem_definition_properties_fail_closed);
     RUN_TEST(sem_cosine_identical);
     RUN_TEST(sem_cosine_orthogonal);
     RUN_TEST(sem_cosine_zero_vector);
