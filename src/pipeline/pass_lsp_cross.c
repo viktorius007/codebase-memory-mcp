@@ -768,8 +768,7 @@ static bool pxc_rust_module_dir(const char *rel, char *out, size_t cap) {
 
 static int pxc_rust_target_source_count(const CBMCargoManifest *manifest, const char *rel_path) {
     int matches = 0;
-    for (int i = 0;
-         manifest && manifest->targets_complete && rel_path && i < manifest->target_count; i++) {
+    for (int i = 0; manifest && rel_path && i < manifest->target_count; i++) {
         if (manifest->targets[i].source_path &&
             strcmp(manifest->targets[i].source_path, rel_path) == 0)
             matches++;
@@ -895,12 +894,11 @@ static int pxc_rust_parent_file(const cbm_file_info_t *files, CBMFileResult *con
     return matches == 1 ? parent : (matches == 0 ? -1 : -2);
 }
 
-static int pxc_rust_manifest_free_crate_root(const cbm_file_info_t *files,
-                                             CBMFileResult *const *cache, int file_count,
-                                             int caller) {
+static int pxc_rust_crate_root(const cbm_file_info_t *files, CBMFileResult *const *cache,
+                               int file_count, int caller, const CBMCargoManifest *manifest) {
     int current = caller;
     for (int depth = 0; current >= 0 && depth <= file_count; depth++) {
-        int parent = pxc_rust_parent_file(files, cache, file_count, current, NULL, NULL, 0);
+        int parent = pxc_rust_parent_file(files, cache, file_count, current, manifest, NULL, 0);
         if (parent == -1)
             return current;
         if (parent < 0 || parent == current)
@@ -924,9 +922,73 @@ static bool pxc_rust_crate_name_eq(const char *cargo_name, const char *source_na
     return *cargo_name == '\0' && *source_name == '\0';
 }
 
+static const char *pxc_rust_caller_package_dir(const CBMCargoManifest *manifest,
+                                               const char *caller_rel) {
+    const char *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; manifest && caller_rel && i < manifest->target_count; i++) {
+        const char *dir = manifest->targets[i].package_dir;
+        if (!dir)
+            continue;
+        size_t len = strlen(dir);
+        bool owns = len == 0 || (strncmp(caller_rel, dir, len) == 0 && caller_rel[len] == '/');
+        if (!owns || (best && len < best_len))
+            continue;
+        if (best && len == best_len && strcmp(best, dir) != 0)
+            return NULL;
+        best = dir;
+        best_len = len;
+    }
+    return best;
+}
+
+static bool pxc_rust_package_lib_visible(int caller_root, int lib_root) {
+    return caller_root >= 0 && lib_root >= 0 && caller_root != lib_root;
+}
+
+static bool pxc_rust_package_lib_visible_for_caller(const cbm_file_info_t *files,
+                                                    CBMFileResult *const *cache, int file_count,
+                                                    int caller, const CBMCargoManifest *manifest,
+                                                    int lib_root) {
+    int caller_root = pxc_rust_crate_root(files, cache, file_count, caller, manifest);
+    return pxc_rust_package_lib_visible(caller_root, lib_root);
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+bool cbm_pxc_test_package_lib_visible(int caller_root, int lib_root) {
+    return pxc_rust_package_lib_visible(caller_root, lib_root);
+}
+
+bool cbm_pxc_test_package_lib_visible_for_caller(const cbm_file_info_t *files,
+                                                 CBMFileResult *const *cache, int file_count,
+                                                 int caller, const CBMCargoManifest *manifest,
+                                                 int lib_root) {
+    return pxc_rust_package_lib_visible_for_caller(files, cache, file_count, caller, manifest,
+                                                   lib_root);
+}
+#endif
+
 static int pxc_rust_external_root(const CBMCargoManifest *manifest, const cbm_file_info_t *files,
-                                  int file_count, const char *caller_package_dir,
-                                  const char *crate_name) {
+                                  CBMFileResult *const *cache, int file_count, int caller,
+                                  const char *caller_package_dir, const char *crate_name) {
+    int self_found = -1;
+    int self_matches = 0;
+    for (int i = 0; manifest && caller_package_dir && crate_name && i < manifest->target_count;
+         i++) {
+        const CBMCargoTarget *target = &manifest->targets[i];
+        if (target->kind != CBM_CARGO_TARGET_LIB || !target->name || !target->package_dir ||
+            !target->source_path || strcmp(target->package_dir, caller_package_dir) != 0 ||
+            !pxc_rust_crate_name_eq(target->name, crate_name))
+            continue;
+        self_found = pxc_rust_file_index(files, file_count, target->source_path);
+        if (pxc_rust_package_lib_visible_for_caller(files, cache, file_count, caller, manifest,
+                                                    self_found))
+            self_matches++;
+    }
+    if (self_matches == 1)
+        return self_found;
+    if (self_matches > 1)
+        return -1;
     int declared = 0;
     const char *target_package_dir = NULL;
     for (int i = 0;
@@ -944,7 +1006,7 @@ static int pxc_rust_external_root(const CBMCargoManifest *manifest, const cbm_fi
         return -1;
     int found = -1;
     int matches = 0;
-    for (int i = 0; manifest && manifest->targets_complete && i < manifest->target_count; i++) {
+    for (int i = 0; manifest && i < manifest->target_count; i++) {
         const CBMCargoTarget *target = &manifest->targets[i];
         if (target->kind != CBM_CARGO_TARGET_LIB || !target->source_path || !target->package_dir ||
             strcmp(target->package_dir, target_package_dir) != 0)
@@ -984,14 +1046,13 @@ static const char *pxc_rust_authority_resolve(
     bool require_public = inherited_public;
     bool require_public_ancestors = inherited_public_ancestors;
     if (strcmp(segments[0], "crate") == 0) {
-        if (manifest) {
+        current = pxc_rust_crate_root(files, cache, file_count, caller, NULL);
+        if (current < 0 && manifest) {
             PxcRustTargetRoute route =
                 pxc_rust_target_route(arena, project_name, caller_rel, manifest);
             current = route.target
                           ? pxc_rust_file_index(files, file_count, route.target->source_path)
                           : -1;
-        } else {
-            current = pxc_rust_manifest_free_crate_root(files, cache, file_count, caller);
         }
         inline_path[0] = '\0';
         pos = 1;
@@ -1015,13 +1076,11 @@ static const char *pxc_rust_authority_resolve(
             pos++;
         }
     } else {
-        PxcRustTargetRoute caller_route =
-            pxc_rust_target_route(arena, project_name, caller_rel, manifest);
-        int external =
-            caller_route.target
-                ? pxc_rust_external_root(manifest, files, file_count,
-                                         caller_route.target->package_dir ?: "", segments[0])
-                : -1;
+        const char *caller_package_dir = pxc_rust_caller_package_dir(manifest, caller_rel);
+        int external = caller_package_dir
+                           ? pxc_rust_external_root(manifest, files, cache, file_count, caller,
+                                                    caller_package_dir, segments[0])
+                           : -1;
         if (external >= 0) {
             current = external;
             inline_path[0] = '\0';
@@ -1033,12 +1092,47 @@ static const char *pxc_rust_authority_resolve(
     if (current < 0 || pos >= segment_count)
         return NULL;
     while (pos + 1 < segment_count) {
+        int owner = current;
+        const char *segment = segments[pos++];
         char next_inline[CBM_PATH_MAX];
-        current = pxc_rust_child_file(files, cache, file_count, current, inline_path,
-                                      segments[pos++], manifest, require_public_ancestors,
-                                      next_inline, sizeof(next_inline));
-        if (current < 0)
+        current =
+            pxc_rust_child_file(files, cache, file_count, owner, inline_path, segment, manifest,
+                                require_public_ancestors, next_inline, sizeof(next_inline));
+        if (current < 0) {
+            const CBMImport *module_reexport = NULL;
+            int reexports = 0;
+            CBMFileResult *owner_result = owner >= 0 ? cache[owner] : NULL;
+            for (int i = 0;
+                 owner_result && owner_result->rust_imports_status == CBM_RUST_CARRIER_COMPLETE &&
+                 i < owner_result->imports.count;
+                 i++) {
+                const CBMImport *imp = &owner_result->imports.items[i];
+                if (!imp->rust_module_scope ||
+                    imp->rust_provenance != CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT ||
+                    !imp->local_name || !imp->module_path || !imp->owner_module_path ||
+                    strcmp(imp->owner_module_path, inline_path) != 0 ||
+                    strcmp(imp->local_name, segment) != 0 ||
+                    (require_public && imp->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC))
+                    continue;
+                module_reexport = imp;
+                reexports++;
+            }
+            if (reexports == 1) {
+                char expanded[CBM_PATH_MAX];
+                int used = snprintf(expanded, sizeof(expanded), "%s", module_reexport->module_path);
+                for (int tail = pos;
+                     used >= 0 && (size_t)used < sizeof(expanded) && tail < segment_count; tail++)
+                    used += snprintf(expanded + used, sizeof(expanded) - (size_t)used, "::%s",
+                                     segments[tail]);
+                return used > 0 && (size_t)used < sizeof(expanded)
+                           ? pxc_rust_authority_resolve(arena, project_name, files[owner].rel_path,
+                                                        module_reexport->owner_module_path,
+                                                        expanded, files, cache, file_count,
+                                                        manifest, depth + 1, require_public, false)
+                           : NULL;
+            }
             return NULL;
+        }
         snprintf(inline_path, sizeof(inline_path), "%s", next_inline);
     }
     CBMFileResult *target = cache[current];
@@ -1111,8 +1205,6 @@ CBMPxcImportMapStatus cbm_pxc_build_import_map_with_rust_authority(
         int capacity = result->imports.count;
         if (capacity == 0)
             return CBM_PXC_IMPORT_MAP_COMPLETE;
-        if (rust_manifest && !rust_manifest->targets_complete)
-            return CBM_PXC_IMPORT_MAP_AUTHORITY_UNAVAILABLE;
         const char **keys = calloc((size_t)capacity, sizeof(*keys));
         const char **vals = calloc((size_t)capacity, sizeof(*vals));
         CBMRustImportScope *scopes = calloc((size_t)capacity, sizeof(*scopes));
@@ -1267,6 +1359,19 @@ CBMPxcImportMapStatus cbm_pxc_build_import_map_with_rust_authority(
     *out_vals = vals;
     *out_count = count;
     return CBM_PXC_IMPORT_MAP_COMPLETE;
+}
+
+void cbm_pxc_record_rust_authority_health(CBMFileResult *result, const CBMCargoManifest *manifest,
+                                          CBMPxcImportMapStatus import_status) {
+    if (!result)
+        return;
+    if (manifest && !manifest->targets_complete)
+        cbm_rust_health_record(&result->rust_health,
+                               CBM_RUST_HEALTH_MANIFEST_TARGET_AUTHORITY_UNAVAILABLE, 0, 0);
+    if (import_status == CBM_PXC_IMPORT_MAP_ALLOCATION_FAILED)
+        cbm_rust_health_record(&result->rust_health, CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
+    else if (import_status == CBM_PXC_IMPORT_MAP_AUTHORITY_UNAVAILABLE)
+        cbm_rust_health_record(&result->rust_health, CBM_RUST_HEALTH_IMPORT_CARRIER_PARTIAL, 0, 0);
 }
 
 int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
@@ -2241,7 +2346,7 @@ static PxcCargoDependencyPathStatus pxc_cargo_dependency_package_dir(const char 
                                                                      const char *base_dir,
                                                                      const char *dependency_path,
                                                                      char *out, size_t out_cap) {
-    if (!repo_path || !dependency_path || !dependency_path[0] || !out || out_cap == 0)
+    if (!repo_path || !dependency_path || !out || out_cap == 0)
         return PXC_CARGO_DEPENDENCY_PATH_INVALID;
     char candidate[CBM_SZ_4K];
     int n = snprintf(candidate, sizeof(candidate), "%s/%s%s%s", repo_path,
@@ -2527,6 +2632,87 @@ static bool pxc_cargo_package_already_admitted(const CBMCargoManifest *manifest,
     return false;
 }
 
+/* Repositories may contain one Cargo workspace below a non-Rust umbrella
+ * root (Codex keeps it in `codex-rs/`).  Derive that root from package
+ * manifests, then require it to be unique: merging unrelated workspaces would
+ * erase the package boundary that makes dependency routes authoritative. */
+static bool pxc_cargo_find_nested_workspace(const char *repo_path, char *out, size_t out_cap) {
+    cbm_pkg_members_t packages;
+    cbm_pkg_members_init(&packages);
+    cbm_pkgmap_collect_members(repo_path, &packages);
+    bool found = false;
+    bool ambiguous = false;
+    for (int i = 0; i < packages.count && !ambiguous; i++) {
+        char cursor[CBM_SZ_4K];
+        snprintf(cursor, sizeof(cursor), "%s", packages.items[i].dir ?: "");
+        while (cursor[0]) {
+            char manifest_path[CBM_SZ_4K];
+            int n = snprintf(manifest_path, sizeof(manifest_path), "%s/%s/Cargo.toml", repo_path,
+                             cursor);
+            int source_len = 0;
+            char *source = n > 0 && (size_t)n < sizeof(manifest_path)
+                               ? pxc_read_file(manifest_path, &source_len)
+                               : NULL;
+            if (source && source_len > 0) {
+                CBMArena arena;
+                CBMCargoManifest candidate;
+                cbm_arena_init(&arena);
+                cbm_cargo_parse(&arena, source, source_len, &candidate);
+                if (candidate.is_workspace_root) {
+                    if (!found) {
+                        int copied = snprintf(out, out_cap, "%s", cursor);
+                        found = copied >= 0 && (size_t)copied < out_cap;
+                    } else if (strcmp(out, cursor) != 0) {
+                        ambiguous = true;
+                    }
+                }
+                cbm_arena_destroy(&arena);
+            }
+            free(source);
+            char *slash = strrchr(cursor, '/');
+            if (slash)
+                *slash = '\0';
+            else
+                cursor[0] = '\0';
+        }
+    }
+    bool complete = packages.complete;
+    cbm_pkg_members_free(&packages);
+    return complete && found && !ambiguous;
+}
+
+static const char *pxc_cargo_rebase(CBMArena *arena, const char *prefix, const char *path) {
+    if (!path)
+        return NULL;
+    return path[0] ? cbm_arena_sprintf(arena, "%s/%s", prefix, path)
+                   : cbm_arena_strdup(arena, prefix);
+}
+
+static bool pxc_cargo_rebase_manifest(CBMArena *arena, CBMCargoManifest *manifest,
+                                      const char *prefix) {
+    if (!arena || !manifest || !prefix || !prefix[0])
+        return true;
+    for (int i = 0; i < manifest->target_count; i++) {
+        CBMCargoTarget *target = &manifest->targets[i];
+        target->package_dir = pxc_cargo_rebase(arena, prefix, target->package_dir ?: "");
+        target->source_path = pxc_cargo_rebase(arena, prefix, target->source_path);
+        if (target->blocker_root)
+            target->blocker_root = pxc_cargo_rebase(arena, prefix, target->blocker_root);
+        if (!target->package_dir || !target->source_path ||
+            (target->blocker_root && !target->blocker_root[0]))
+            return false;
+    }
+    for (int i = 0; i < manifest->dependency_route_count; i++) {
+        CBMCargoDependencyRoute *route = &manifest->dependency_routes[i];
+        route->package_dir = pxc_cargo_rebase(arena, prefix, route->package_dir ?: "");
+        if (route->target_package_dir)
+            route->target_package_dir = pxc_cargo_rebase(arena, prefix, route->target_package_dir);
+        if (!route->package_dir)
+            return false;
+    }
+    return cbm_arena_status(arena) == CBM_ARENA_STATUS_AVAILABLE;
+}
+
 bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena, CBMCargoManifest *out_m) {
     if (!out_m) {
         return false;
@@ -2536,16 +2722,25 @@ bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena, CBMCar
         cbm_rust_health_record(&out_m->health, CBM_RUST_HEALTH_MANIFEST_READ_FAILED, 0, 0);
         return false;
     }
-    char path[1024];
-    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", repo_path);
+    char workspace_prefix[CBM_SZ_4K] = {0};
+    char manifest_repo[CBM_SZ_4K];
+    snprintf(manifest_repo, sizeof(manifest_repo), "%s", repo_path);
+    char path[CBM_SZ_4K];
+    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", manifest_repo);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
         cbm_rust_health_record(&out_m->health, CBM_RUST_HEALTH_MANIFEST_READ_FAILED, 0, 0);
         return false;
     }
     cbm_path_info_t info;
     if (cbm_path_info_utf8(path, &info) != 0) {
-        /* Cargo context is optional for standalone Rust sources. */
-        return false;
+        if (!pxc_cargo_find_nested_workspace(repo_path, workspace_prefix, sizeof(workspace_prefix)))
+            return false;
+        n = snprintf(manifest_repo, sizeof(manifest_repo), "%s/%s", repo_path, workspace_prefix);
+        if (n <= 0 || (size_t)n >= sizeof(manifest_repo))
+            return false;
+        n = snprintf(path, sizeof(path), "%s/Cargo.toml", manifest_repo);
+        if (n <= 0 || (size_t)n >= sizeof(path) || cbm_path_info_utf8(path, &info) != 0)
+            return false;
     }
     if (!info.is_regular || info.size <= 0) {
         cbm_rust_health_record(&out_m->health, CBM_RUST_HEALTH_MANIFEST_READ_FAILED, 0, 0);
@@ -2570,19 +2765,19 @@ bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena, CBMCar
      * target authorities. A recursive manifest walk would incorrectly admit
      * excluded, vendored, or otherwise unrelated nested packages. */
     if (out_m->package_name) {
-        if (!pxc_cargo_collect_package_targets(repo_path, "", marena, out_m)) {
+        if (!pxc_cargo_collect_package_targets(manifest_repo, "", marena, out_m)) {
             out_m->targets_complete = false;
         }
     }
     cbm_pkg_members_t packages;
     cbm_pkg_members_init(&packages);
-    cbm_pkgmap_collect_members(repo_path, &packages);
+    cbm_pkgmap_collect_members(manifest_repo, &packages);
     if (!packages.complete)
         out_m->targets_complete = false;
     for (int i = 0; i < packages.count; i++) {
         const char *member = packages.items[i].dir;
         if (member && member[0] && pxc_cargo_member_declared(out_m, member)) {
-            if (!pxc_cargo_collect_package_targets(repo_path, member, marena, out_m)) {
+            if (!pxc_cargo_collect_package_targets(manifest_repo, member, marena, out_m)) {
                 out_m->targets_complete = false;
             }
         }
@@ -2599,9 +2794,11 @@ bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *marena, CBMCar
         if (!dependency_dir || !dependency_dir[0] ||
             pxc_cargo_package_already_admitted(out_m, dependency_dir, route_index))
             continue;
-        if (!pxc_cargo_collect_package_targets(repo_path, dependency_dir, marena, out_m))
+        if (!pxc_cargo_collect_package_targets(manifest_repo, dependency_dir, marena, out_m))
             out_m->targets_complete = false;
     }
+    if (!pxc_cargo_rebase_manifest(marena, out_m, workspace_prefix))
+        out_m->targets_complete = false;
     return true;
 }
 
@@ -2751,10 +2948,9 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         CBMPxcImportMapStatus import_status = cbm_pxc_build_import_map_with_rust_authority(
             ctx->gbuf, ctx->project_name, files[i].rel_path, lang, cache[i], files, cache,
             file_count, rust_manifest, &imp_keys, &imp_vals, &rust_import_scopes, &imp_count);
+        if (lang == CBM_LANG_RUST)
+            cbm_pxc_record_rust_authority_health(cache[i], rust_manifest, import_status);
         if (lang == CBM_LANG_RUST && import_status != CBM_PXC_IMPORT_MAP_COMPLETE) {
-            if (import_status == CBM_PXC_IMPORT_MAP_ALLOCATION_FAILED)
-                cbm_rust_health_record(&cache[i]->rust_health,
-                                       CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
             cache[i]->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
             free(source);
             free(rust_import_scopes);

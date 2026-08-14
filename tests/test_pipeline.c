@@ -3513,6 +3513,26 @@ TEST(pipeline_rust_health_incomplete_cross_route_is_failed_and_bounded) {
     PASS();
 }
 
+TEST(pipeline_rust_authority_health_records_both_incomplete_causes) {
+    CBMCargoManifest manifest = {.targets_complete = false};
+    CBMFileResult sequential = {0};
+    CBMFileResult parallel = {0};
+    cbm_pxc_record_rust_authority_health(&sequential, &manifest,
+                                         CBM_PXC_IMPORT_MAP_AUTHORITY_UNAVAILABLE);
+    cbm_pxc_record_rust_authority_health(&parallel, &manifest,
+                                         CBM_PXC_IMPORT_MAP_AUTHORITY_UNAVAILABLE);
+    ASSERT_EQ(
+        1,
+        sequential.rust_health.issues[CBM_RUST_HEALTH_MANIFEST_TARGET_AUTHORITY_UNAVAILABLE].count);
+    ASSERT_EQ(1, sequential.rust_health.issues[CBM_RUST_HEALTH_IMPORT_CARRIER_PARTIAL].count);
+    ASSERT_EQ(
+        sequential.rust_health.issues[CBM_RUST_HEALTH_MANIFEST_TARGET_AUTHORITY_UNAVAILABLE].count,
+        parallel.rust_health.issues[CBM_RUST_HEALTH_MANIFEST_TARGET_AUTHORITY_UNAVAILABLE].count);
+    ASSERT_EQ(sequential.rust_health.issues[CBM_RUST_HEALTH_IMPORT_CARRIER_PARTIAL].count,
+              parallel.rust_health.issues[CBM_RUST_HEALTH_IMPORT_CARRIER_PARTIAL].count);
+    PASS();
+}
+
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 TEST(pipeline_collect_all_defs_distinguishes_empty_available_and_allocation_failed) {
     ASSERT_TRUE(cbm_pipeline_incremental_test_combined_definition_failure_is_typed());
@@ -14107,9 +14127,189 @@ TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets) {
     PASS();
 }
 
+TEST(pipeline_rust_real_corpus_empty_path_and_nested_workspace_authority) {
+    char cargo_tmp[256];
+    snprintf(cargo_tmp, sizeof(cargo_tmp), "/tmp/cbm_rust_cargo_real_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cargo_tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(cargo_tmp, "src/compiler/build_runner")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(cargo_tmp, "helper/src")), 0);
+    write_temp_file(cargo_tmp, "Cargo.toml",
+                    "[package]\nname=\"cargo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[workspace]\nmembers=[\"helper\"]\n"
+                    "[workspace.dependencies]\ncargo={path=\"\"}\n");
+    write_temp_file(cargo_tmp, "helper/Cargo.toml",
+                    "[package]\nname=\"helper\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[dependencies]\ncargo.workspace=true\n");
+    write_temp_file(cargo_tmp, "helper/src/lib.rs", "pub fn helper() {}\n");
+    write_temp_file(cargo_tmp, "src/lib.rs", "pub mod compiler; mod compile;\n");
+    write_temp_file(cargo_tmp, "src/compiler/mod.rs",
+                    "mod build_runner; pub use build_runner::{BuildRunner, Other};\n");
+    write_temp_file(cargo_tmp, "src/compiler/build_runner/mod.rs",
+                    "pub struct BuildRunner; pub struct Other; impl BuildRunner {\n"
+                    "pub fn new<T>(_: &T) -> Result<Self, ()> { Ok(Self) }\n"
+                    "pub fn dry_run(&self) -> Result<(), ()> { Ok(()) }\n"
+                    "pub fn compile<T>(&self, _: T) -> Result<(), ()> { Ok(()) } }\n");
+    write_temp_file(cargo_tmp, "src/compile.rs",
+                    "use crate::compiler::{Other, BuildRunner};\n"
+                    "fn compile<T>(_: T) -> Result<(), ()> { Ok(()) }\n"
+                    "pub fn compile_ws<T>(bcx: T, exec: T) -> Result<(), ()> {\n"
+                    " let build_runner = BuildRunner::new(&bcx)?;\n"
+                    " if false { build_runner.dry_run() } else { build_runner.compile(exec) }\n"
+                    "}\n");
+    CBMArena cargo_manifest_arena;
+    CBMCargoManifest cargo_manifest;
+    cbm_arena_init(&cargo_manifest_arena);
+    ASSERT_TRUE(cbm_pxc_build_rust_manifest(cargo_tmp, &cargo_manifest_arena, &cargo_manifest));
+    ASSERT_TRUE(cargo_manifest.targets_complete);
+    ASSERT_EQ(cargo_manifest.target_count, 2);
+    cbm_arena_destroy(&cargo_manifest_arena);
+    char cargo_db[512];
+    snprintf(cargo_db, sizeof(cargo_db), "%s/cargo.db", cargo_tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(cargo_tmp, cargo_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(0, cbm_pipeline_run(pipeline));
+    const char *cargo_project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(cargo_db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(1, named_edge_to_file_count(store, cargo_project, "CALLS", "compile_ws", "dry_run",
+                                          "src/compiler/build_runner/mod.rs"));
+    ASSERT_EQ(1, named_edge_to_file_count(store, cargo_project, "CALLS", "compile_ws", "compile",
+                                          "src/compiler/build_runner/mod.rs"));
+    ASSERT_EQ(0, named_edge_to_file_count(store, cargo_project, "CALLS", "compile_ws", "compile",
+                                          "src/compile.rs"));
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(cargo_tmp);
+
+    char codex_tmp[256];
+    snprintf(codex_tmp, sizeof(codex_tmp), "/tmp/cbm_rust_codex_real_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(codex_tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(codex_tmp, "codex-rs/app/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(codex_tmp, "codex-rs/transport/src/transport")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(codex_tmp, "codex-rs/config/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(codex_tmp, "decoy/src")), 0);
+    write_temp_file(codex_tmp, "codex-rs/Cargo.toml",
+                    "[workspace]\nresolver=\"2\"\nmembers=[\"app\",\"transport\",\"config\"]\n");
+    write_temp_file(codex_tmp, "codex-rs/app/Cargo.toml",
+                    "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[[bin]]\nname=\"app\"\npath=\"src/main.rs\"\n"
+                    "[lib]\nname=\"codex_app_server\"\npath=\"src/lib.rs\"\n"
+                    "[dependencies]\ncodex-app-server-transport={path=\"../transport\"}\n"
+                    "codex-config={path=\"../config\"}\n");
+    write_temp_file(codex_tmp, "codex-rs/transport/Cargo.toml",
+                    "[package]\nname=\"codex-app-server-transport\"\nversion=\"0.1.0\"\n"
+                    "edition=\"2021\"\n");
+    write_temp_file(codex_tmp, "codex-rs/config/Cargo.toml",
+                    "[package]\nname=\"codex-config\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(codex_tmp, "codex-rs/app/src/lib.rs",
+                    "mod transport; pub use crate::transport::auth::AppServerWebsocketAuthArgs;\n"
+                    "pub mod nested { pub struct SelfOnly; impl SelfOnly { pub fn forbidden() {} "
+                    "} }\n"
+                    "use codex_app_server::nested::SelfOnly as ImportedSelfOnly;\n"
+                    "pub fn impossible_self_import() { ImportedSelfOnly::forbidden(); }\n");
+    write_temp_file(codex_tmp, "codex-rs/app/src/transport.rs",
+                    "pub use codex_app_server_transport::auth;\n");
+    write_temp_file(codex_tmp, "codex-rs/transport/src/lib.rs",
+                    "mod transport; pub use transport::auth;\n");
+    write_temp_file(codex_tmp, "codex-rs/transport/src/transport.rs", "pub mod auth;\n");
+    write_temp_file(codex_tmp, "codex-rs/transport/src/transport/auth.rs",
+                    "pub struct AppServerWebsocketAuthArgs; impl AppServerWebsocketAuthArgs { "
+                    "pub fn try_into_settings(self) -> "
+                    "Result<(), ()> { Ok(()) } }\n");
+    write_temp_file(codex_tmp, "codex-rs/config/src/lib.rs",
+                    "mod state; pub use state::LoaderOverrides;\n");
+    write_temp_file(codex_tmp, "codex-rs/config/src/state.rs",
+                    "pub struct LoaderOverrides; impl LoaderOverrides { pub fn "
+                    "with_managed_config_path_for_tests(_: String) -> Self { Self } }\n");
+    write_temp_file(codex_tmp, "codex-rs/app/src/main.rs",
+                    "use codex_app_server::AppServerWebsocketAuthArgs; use "
+                    "codex_config::LoaderOverrides;\n"
+                    "struct AppServerArgs { config_overrides: bool, listen: bool, "
+                    "session_source: bool, auth: AppServerWebsocketAuthArgs, "
+                    "strict_config: bool, disable_plugin_startup_tasks_for_tests: bool, "
+                    "remote_control: bool } impl AppServerArgs { fn parse() -> Self { "
+                    "panic!() } }\n"
+                    "pub fn main_run(path: Option<String>) -> Result<(), ()> {\n"
+                    " let AppServerArgs {\n"
+                    "  config_overrides,\n"
+                    "  listen,\n"
+                    "  session_source,\n"
+                    "  auth,\n"
+                    "  strict_config,\n"
+                    "  #[cfg(debug_assertions)]\n"
+                    "  disable_plugin_startup_tasks_for_tests,\n"
+                    "  remote_control,\n"
+                    " } = AppServerArgs::parse();\n"
+                    " let loader = path.map(LoaderOverrides::with_managed_config_path_for_tests);\n"
+                    " let auth = auth.try_into_settings()?; let _ = (config_overrides, listen, "
+                    "session_source, strict_config, disable_plugin_startup_tasks_for_tests, "
+                    "remote_control, loader, auth); Ok(()) }\n");
+    write_temp_file(codex_tmp, "decoy/Cargo.toml",
+                    "[package]\nname=\"decoy\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[lib]\nname=\"codex_app_server\"\npath=\"src/lib.rs\"\n");
+    write_temp_file(codex_tmp, "decoy/src/lib.rs",
+                    "pub struct AppServerWebsocketAuthArgs; impl AppServerWebsocketAuthArgs { "
+                    "pub fn try_into_settings(self) {} }\n");
+    char codex_db[512];
+    snprintf(codex_db, sizeof(codex_db), "%s/codex.db", codex_tmp);
+    pipeline = cbm_pipeline_new(codex_tmp, codex_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(0, cbm_pipeline_run(pipeline));
+    const char *codex_project = cbm_pipeline_project_name(pipeline);
+    store = cbm_store_open_path(codex_db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(1, named_edge_to_file_count(store, codex_project, "CALL_REFERENCE", "main_run",
+                                          "with_managed_config_path_for_tests",
+                                          "codex-rs/config/src/state.rs"));
+    ASSERT_EQ(1, named_edge_to_file_count(store, codex_project, "CALLS", "main_run",
+                                          "try_into_settings",
+                                          "codex-rs/transport/src/transport/auth.rs"));
+    ASSERT_EQ(0, named_edge_to_file_count(store, codex_project, "CALLS", "main_run",
+                                          "try_into_settings", "decoy/src/lib.rs"));
+    ASSERT_EQ(0, named_edge_to_file_count(store, codex_project, "CALLS", "impossible_self_import",
+                                          "forbidden", "codex-rs/app/src/lib.rs"));
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(codex_tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_package_lib_visibility_requires_distinct_crate_root) {
+    ASSERT_TRUE(cbm_pxc_test_package_lib_visible(7, 3));
+    ASSERT_FALSE(cbm_pxc_test_package_lib_visible(3, 3));
+    ASSERT_FALSE(cbm_pxc_test_package_lib_visible(-1, 3));
+    ASSERT_FALSE(cbm_pxc_test_package_lib_visible(7, -1));
+
+    const char *sources[] = {"pub mod child;\n", "pub fn child() {}\n", "fn main() {}\n"};
+    const char *paths[] = {"engine/lib_entry.rs", "engine/child.rs", "src/main.rs"};
+    cbm_file_info_t files[3] = {0};
+    CBMFileResult *cache[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        files[i].rel_path = (char *)paths[i];
+        files[i].language = CBM_LANG_RUST;
+        cache[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_RUST,
+                                    "custom-lib-root", paths[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(cache[i]);
+    }
+    CBMCargoTarget lib_target = {.name = "my_lib",
+                                 .kind = CBM_CARGO_TARGET_LIB,
+                                 .package_dir = "",
+                                 .source_path = "engine/lib_entry.rs"};
+    CBMCargoManifest manifest = {
+        .targets = &lib_target, .target_count = 1, .targets_complete = true};
+    ASSERT_FALSE(cbm_pxc_test_package_lib_visible_for_caller(files, cache, 3, 1, &manifest, 0));
+    ASSERT_TRUE(cbm_pxc_test_package_lib_visible_for_caller(files, cache, 3, 2, &manifest, 0));
+    ASSERT_FALSE(cbm_pxc_test_package_lib_visible_for_caller(files, cache, 3, -1, &manifest, 0));
+    for (int i = 0; i < 3; i++)
+        cbm_free_result(cache[i]);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_rust_workspace_rooted_impl_returns_exact_targets);
     RUN_TEST(pipeline_rust_authoritative_grouped_reexports_and_auth_shadow);
+    RUN_TEST(pipeline_rust_real_corpus_empty_path_and_nested_workspace_authority);
+    RUN_TEST(pipeline_rust_package_lib_visibility_requires_distinct_crate_root);
     RUN_TEST(pipeline_rust_manifest_free_nested_import_retains_scope_authority);
     RUN_TEST(pipeline_rust_outside_path_dependency_does_not_poison_local_authority);
     RUN_TEST(pipeline_rust_authority_dependency_visibility_nested_and_lexical_controls);
@@ -14467,6 +14667,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_rust_health_incomplete_cross_route_is_failed_and_bounded);
+    RUN_TEST(pipeline_rust_authority_health_records_both_incomplete_causes);
     RUN_TEST(pipeline_rust_health_sequential_persists_exact_rows_and_cargo_health);
     RUN_TEST(pipeline_rust_health_parallel_is_exact_and_manifest_health_merges_once);
     RUN_TEST(pipeline_rust_health_empty_standalone_and_optional_manifest_are_exact);

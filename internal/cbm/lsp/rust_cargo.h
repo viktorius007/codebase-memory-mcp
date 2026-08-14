@@ -21,8 +21,8 @@
 #include "../cbm.h"
 #include <stdbool.h>
 
-#define CBM_CARGO_MAX_DEPS    256
-#define CBM_CARGO_MAX_MEMBERS  64
+#define CBM_CARGO_MAX_DEPS 1024
+#define CBM_CARGO_MAX_MEMBERS 512
 
 typedef struct {
     const char* name;       /* declared dependency name */

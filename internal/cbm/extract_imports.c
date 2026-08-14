@@ -625,6 +625,8 @@ static bool rust_flatten_use(CBMExtractCtx *ctx, TSNode declaration, TSNode node
     if (ts_node_is_null(node) || depth > 128)
         return false;
     const char *kind = ts_node_type(node);
+    if (strcmp(kind, "line_comment") == 0 || strcmp(kind, "block_comment") == 0)
+        return true;
     if (strcmp(kind, "scoped_use_list") == 0) {
         TSNode path_node = ts_node_child_by_field_name(node, TS_FIELD("path"));
         TSNode list = ts_node_child_by_field_name(node, TS_FIELD("list"));

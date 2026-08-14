@@ -7940,6 +7940,30 @@ TEST(rustlsp_grouped_use_body_allocation_fails_without_null_dereference) {
     PASS();
 }
 
+TEST(rustlsp_grouped_use_inline_comment_preserves_complete_named_leaves) {
+    CBMFileResult *result = extract_rust(
+        "use crate::runtime::{Builder, /* keep the grouped carrier exact */ Runtime};\n");
+    ASSERT_NOT_NULL(result);
+    ASSERT_EQ(CBM_RUST_CARRIER_COMPLETE, result->rust_imports_status);
+    int builder = 0;
+    int runtime = 0;
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *import = &result->imports.items[i];
+        if (import->local_name && import->module_path &&
+            strcmp(import->local_name, "Builder") == 0 &&
+            strcmp(import->module_path, "crate::runtime::Builder") == 0)
+            builder++;
+        if (import->local_name && import->module_path &&
+            strcmp(import->local_name, "Runtime") == 0 &&
+            strcmp(import->module_path, "crate::runtime::Runtime") == 0)
+            runtime++;
+    }
+    ASSERT_EQ(1, builder);
+    ASSERT_EQ(1, runtime);
+    cbm_free_result(result);
+    PASS();
+}
+
 TEST(rustlsp_ast_return_patch_allocation_fails_without_null_dereference) {
     ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
                      "struct Builder;\nfn make() -> Builder { Builder }\nfn run() { make(); }\n",
@@ -8304,17 +8328,19 @@ TEST(rustlsp_cargo_dependency_cap_records_each_dropped_entry) {
 TEST(rustlsp_cargo_member_cap_records_each_dropped_entry) {
     CBMArena arena;
     cbm_arena_init(&arena);
-    char toml[8192];
-    int used = snprintf(toml, sizeof(toml), "[workspace]\nmembers = [");
+    size_t toml_cap = (size_t)(CBM_CARGO_MAX_MEMBERS + 2) * 32U + 64U;
+    char *toml = malloc(toml_cap);
+    ASSERT_NOT_NULL(toml);
+    int used = snprintf(toml, toml_cap, "[workspace]\nmembers = [");
     uint32_t first_dropped = 0;
     for (int i = 0; i < CBM_CARGO_MAX_MEMBERS + 2; i++) {
         if (i > 0)
-            used += snprintf(toml + used, sizeof(toml) - (size_t)used, ", ");
+            used += snprintf(toml + used, toml_cap - (size_t)used, ", ");
         if (i == CBM_CARGO_MAX_MEMBERS)
             first_dropped = (uint32_t)used;
-        used += snprintf(toml + used, sizeof(toml) - (size_t)used, "\"crates/member_%03d\"", i);
+        used += snprintf(toml + used, toml_cap - (size_t)used, "\"crates/member_%03d\"", i);
     }
-    used += snprintf(toml + used, sizeof(toml) - (size_t)used, "]\n");
+    used += snprintf(toml + used, toml_cap - (size_t)used, "]\n");
     CBMCargoManifest manifest;
     cbm_cargo_parse(&arena, toml, used, &manifest);
 
@@ -8324,6 +8350,7 @@ TEST(rustlsp_cargo_member_cap_records_each_dropped_entry) {
     ASSERT_EQ(2, issue->count);
     ASSERT_EQ(first_dropped, issue->first_start_byte);
     ASSERT_TRUE(issue->first_end_byte > issue->first_start_byte);
+    free(toml);
     cbm_arena_destroy(&arena);
     PASS();
 }
@@ -9354,6 +9381,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_definition_return_allocation_fails_without_null_dereference);
     RUN_TEST(rustlsp_grouped_use_prefix_allocation_fails_without_null_dereference);
     RUN_TEST(rustlsp_grouped_use_body_allocation_fails_without_null_dereference);
+    RUN_TEST(rustlsp_grouped_use_inline_comment_preserves_complete_named_leaves);
     RUN_TEST(rustlsp_ast_return_patch_allocation_fails_without_null_dereference);
     RUN_TEST(rustlsp_derive_embedded_allocation_fails_without_null_dereference);
     RUN_TEST(rustlsp_derive_return_allocation_fails_without_null_dereference);

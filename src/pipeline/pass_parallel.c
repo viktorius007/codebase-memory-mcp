@@ -3056,6 +3056,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             rc->main_gbuf, rc->project_name, rel, lang, result, rc->rust_authority_files,
             rc->rust_authority_cache, rc->rust_authority_count, rc->rust_manifest, &imp_keys,
             &imp_vals, &rust_import_scopes, &imp_count);
+        if (lang == CBM_LANG_RUST)
+            cbm_pxc_record_rust_authority_health(result, rc->rust_manifest, import_status);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
 

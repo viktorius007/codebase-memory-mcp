@@ -1210,16 +1210,28 @@ void cbm_rust_health_merge(CBMRustAnalysisHealth *dst, const CBMRustAnalysisHeal
 
 const char *cbm_rust_health_reason_name(CBMRustHealthReason reason) {
     static const char *const names[CBM_RUST_HEALTH_REASON_COUNT] = {
-        "manifest_read_failed",     "manifest_parse_partial",
-        "manifest_dep_limit",       "manifest_member_limit",
-        "source_unavailable",       "parser_create_failed",
-        "parser_parse_failed",      "macro_no_rule_match",
-        "macro_depth_limit",        "macro_binding_limit",
-        "macro_repetition_limit",   "macro_parse_failed",
-        "type_depth_limit",         "eval_depth_limit",
-        "walk_depth_limit",         "work_limit",
-        "proc_macro_unsupported",   "rustdoc_unavailable",
-        "macro_substitution_limit", "allocation_unavailable",
+        "manifest_read_failed",
+        "manifest_parse_partial",
+        "manifest_dep_limit",
+        "manifest_member_limit",
+        "source_unavailable",
+        "parser_create_failed",
+        "parser_parse_failed",
+        "macro_no_rule_match",
+        "macro_depth_limit",
+        "macro_binding_limit",
+        "macro_repetition_limit",
+        "macro_parse_failed",
+        "type_depth_limit",
+        "eval_depth_limit",
+        "walk_depth_limit",
+        "work_limit",
+        "proc_macro_unsupported",
+        "rustdoc_unavailable",
+        "macro_substitution_limit",
+        "allocation_unavailable",
+        "manifest_target_authority_unavailable",
+        "import_carrier_partial",
     };
     return reason >= 0 && reason < CBM_RUST_HEALTH_REASON_COUNT ? names[reason] : "unknown";
 }

@@ -77,6 +77,12 @@ void cbm_pxc_test_fail_destination_copy_at(int copy_position);
 bool cbm_pxc_test_append_results(CBMFileResult *destination, const CBMResolvedCallArray *source);
 bool cbm_pxc_test_append_synthetic_calls(CBMFileResult *destination, const CBMCallArray *source);
 bool cbm_pxc_test_non_rust_destination_failure_is_typed(void);
+bool cbm_pxc_test_package_lib_visible(int caller_root, int lib_root);
+bool cbm_pxc_test_package_lib_visible_for_caller(const cbm_file_info_t *files,
+                                                 CBMFileResult *const *cache, int file_count,
+                                                 int caller,
+                                                 const struct CBMCargoManifest *manifest,
+                                                 int lib_root);
 #endif
 
 /* Production call sites invoke this unconditionally; non-test builds are a no-op. */
@@ -102,6 +108,9 @@ CBMPxcImportMapStatus cbm_pxc_build_import_map_with_rust_authority(
     const CBMFileResult *result, const cbm_file_info_t *files, CBMFileResult *const *cache,
     int file_count, const struct CBMCargoManifest *rust_manifest, const char ***out_keys,
     const char ***out_vals, CBMRustImportScope **out_scopes, int *out_count);
+void cbm_pxc_record_rust_authority_health(CBMFileResult *result,
+                                          const struct CBMCargoManifest *manifest,
+                                          CBMPxcImportMapStatus import_status);
 int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
                              CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count);
