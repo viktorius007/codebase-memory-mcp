@@ -65,7 +65,9 @@ if [[ ! "${BUILD_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d)"
+tmpdir="$(mktemp -d /tmp/cbm-worker-watchdog-XXXXXX)"
+runtime_parent="${tmpdir}/runtime"
+mkdir -m 700 "${runtime_parent}"
 wrapper_pid=""
 cleanup() {
   if [[ -s "${tmpdir}/child.pid" ]]; then
@@ -109,6 +111,7 @@ CBM_BINARY="${BINARY}" BUILD_FINGERPRINT="${BUILD_FINGERPRINT}" TMPDIR_PATH="${t
   ARGS_JSON="{\"repo_path\":\"${tmpdir}/repo\"}" \
   CBM_TEST_HANG_ON=hang_me \
   CBM_TEST_WORKER_DESCENDANT_PID_FILE="${tmpdir}/descendant.pid" \
+  CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
   "${tmpdir}/wrapper.sh" &
 wrapper_pid=$!
 

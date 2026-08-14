@@ -35,9 +35,20 @@ if [[ ! "${BUILD_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d)"
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*)
+  tmpdir="$(mktemp -d)"
+  runtime_env=()
+  ;;
+*)
+  tmpdir="$(mktemp -d /tmp/cbm-worker-response-XXXXXX)"
+  runtime_parent="${tmpdir}/runtime"
+  mkdir -m 700 "${runtime_parent}"
+  runtime_env=(CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}")
+  ;;
+esac
 cleanup() {
-  CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
+  env "${runtime_env[@]}" CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
     "${BINARY}" daemon stop >/dev/null 2>&1 || true
   rm -rf "${tmpdir}"
 }
@@ -47,7 +58,7 @@ missing="${tmpdir}/repository-does-not-exist"
 response="${tmpdir}/worker.response"
 args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\"}"
 
-if ! CBM_CACHE_DIR="${tmpdir}/cache-worker" \
+if ! env "${runtime_env[@]}" CBM_CACHE_DIR="${tmpdir}/cache-worker" \
   "${BINARY}" cli --index-worker \
   --index-worker-build "${BUILD_FINGERPRINT}" \
   index_repository "${args}" \
@@ -64,7 +75,7 @@ if [[ ! -s "${response}" ]] || ! grep -q 'Pipeline failed' "${response}"; then
 fi
 
 set +e
-CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
+env "${runtime_env[@]}" CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
   "${BINARY}" cli index_repository --repo-path "${missing}" --mode fast \
   >"${tmpdir}/supervisor.out" 2>"${tmpdir}/supervisor.err"
 cli_rc=$?

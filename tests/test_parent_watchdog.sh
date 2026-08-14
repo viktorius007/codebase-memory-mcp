@@ -25,7 +25,9 @@ if [[ ! -x "${BINARY}" ]]; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d)"
+tmpdir="$(mktemp -d /tmp/cbm-parent-watchdog-XXXXXX)"
+runtime_parent="${tmpdir}/runtime"
+mkdir -m 700 "${runtime_parent}"
 wrapper_pid=""
 cleanup() {
   if [[ -s "${tmpdir}/child.pid" ]]; then
@@ -52,6 +54,7 @@ chmod +x "${tmpdir}/wrapper.sh"
 mkfifo "${tmpdir}/stdin"
 
 CBM_BINARY="${BINARY}" FIFO="${tmpdir}/stdin" TMPDIR_PATH="${tmpdir}" CBM_LOG_LEVEL=info \
+  CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
   "${tmpdir}/wrapper.sh" &
 wrapper_pid=$!
 
