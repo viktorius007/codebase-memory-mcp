@@ -1159,9 +1159,10 @@ const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode
     int cap = 0;
     for (TSNode subject = func_node; !ts_node_is_null(subject); subject = ts_node_parent(subject)) {
         const char *kind = ts_node_type(subject);
-        bool cfg_scope = strcmp(kind, "function_item") == 0 || strcmp(kind, "impl_item") == 0 ||
-                         strcmp(kind, "mod_item") == 0 || strcmp(kind, "trait_item") == 0 ||
-                         strcmp(kind, "foreign_mod_item") == 0;
+        bool cfg_scope = strcmp(kind, "function_item") == 0 ||
+                         strcmp(kind, "function_signature_item") == 0 ||
+                         strcmp(kind, "impl_item") == 0 || strcmp(kind, "mod_item") == 0 ||
+                         strcmp(kind, "trait_item") == 0 || strcmp(kind, "foreign_mod_item") == 0;
         if (!cfg_scope) {
             continue;
         }
@@ -1214,7 +1215,7 @@ const char *cbm_rust_callable_qualified_name(CBMArena *a, const char *project, c
     TSNode impl_node = {0};
     for (TSNode cur = func_node; !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
         const char *kind = ts_node_type(cur);
-        if (strcmp(kind, "function_item") == 0) {
+        if (strcmp(kind, "function_item") == 0 || strcmp(kind, "function_signature_item") == 0) {
             TSNode name_node = ts_node_child_by_field_name(cur, TS_FIELD("name"));
             char *name = ts_node_is_null(name_node) ? NULL : cbm_node_text(a, name_node, source);
             if (name && name[0]) {

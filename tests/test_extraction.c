@@ -817,6 +817,28 @@ TEST(rust_function) {
     PASS();
 }
 
+TEST(rust_foreign_function_signatures_have_distinct_qns) {
+    CBMFileResult *r = extract("unsafe extern \"C\" {\n"
+                               "    fn alpha();\n"
+                               "    fn beta();\n"
+                               "    #[cfg(unix)]\n"
+                               "    fn platform();\n"
+                               "    #[cfg(windows)]\n"
+                               "    fn platform();\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "src/ffi.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "alpha"));
+    ASSERT(has_def(r, "Function", "beta"));
+    ASSERT(has_def_qn(r, "t.src.ffi.alpha"));
+    ASSERT(has_def_qn(r, "t.src.ffi.beta"));
+    ASSERT(has_def_qn(r, "t.src.ffi.platform#cfg(unix)"));
+    ASSERT(has_def_qn(r, "t.src.ffi.platform#cfg(windows)"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_struct) {
     CBMFileResult *r = extract("pub struct Point { pub x: f64, pub y: f64 }\nimpl Point { pub fn "
                                "new(x: f64, y: f64) -> Self { Point { x, y } } }\n",
@@ -5685,6 +5707,7 @@ SUITE(extraction) {
 
     /* Systems */
     RUN_TEST(rust_function);
+    RUN_TEST(rust_foreign_function_signatures_have_distinct_qns);
     RUN_TEST(rust_struct);
     RUN_TEST(rust_nested_associated_call_preserves_each_exact_carrier);
     RUN_TEST(go_function);
