@@ -353,9 +353,8 @@ static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *pro
         const char *owner_root = production ? target->package_dir : target->blocker_root;
         size_t owner_len = owner_root ? strlen(owner_root) : 0;
         bool contained =
-            owner_root &&
-            ((owner_len == 0) || (owner_len > 0 && strncmp(rel_path, owner_root, owner_len) == 0 &&
-                                  rel_path[owner_len] == '/'));
+            owner_root && (owner_len == 0 || (strncmp(rel_path, owner_root, owner_len) == 0 &&
+                                              rel_path[owner_len] == '/'));
         if (contained && production) {
             for (int j = 0; j < manifest->target_count; j++) {
                 const char *nested = manifest->targets[j].package_dir;
@@ -390,6 +389,7 @@ static PxcRustTargetRoute pxc_rust_target_route(CBMArena *arena, const char *pro
         return route;
     }
     char *root =
+        /* cppcheck-suppress knownConditionTrueFalse -- true in allocation-fault tests. */
         pxc_test_fail_target_route_alloc() ? NULL : cbm_pipeline_fqn_module(project_name, root_rel);
     char *source_module = cbm_pipeline_fqn_module(project_name, selected_source);
     if (!root || !source_module) {
@@ -503,6 +503,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         }
         return NULL;
     }
+    /* cppcheck-suppress knownConditionTrueFalse -- true in allocation-fault tests. */
     CBMLSPDef *defs = pxc_test_fail_collect_alloc()
                           ? NULL
                           : (CBMLSPDef *)calloc((size_t)total, sizeof(CBMLSPDef));
@@ -806,8 +807,8 @@ static int pxc_rust_child_file(const cbm_file_info_t *files, CBMFileResult *cons
     }
     if (out_inline_path && out_inline_cap)
         out_inline_path[0] = '\0';
-    char candidate[CBM_PATH_MAX];
     if (decl->path_override && decl->path_override[0]) {
+        char candidate[CBM_PATH_MAX];
         const char *slash = strrchr(files[parent].rel_path, '/');
         char parent_dir[CBM_PATH_MAX] = {0};
         if (parent_path && parent_path[0]) {
@@ -1477,6 +1478,7 @@ static bool pxc_copy_destination_string(CBMArena *arena, const char *source, con
     if (!source) {
         return true;
     }
+    /* cppcheck-suppress knownConditionTrueFalse -- true in destination-copy fault tests. */
     if (pxc_test_fail_destination_copy()) {
         return false;
     }
@@ -2830,11 +2832,11 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     }
     CBMArena cargo_arena;
     CBMCargoManifest cargo_manifest;
-    bool have_manifest = false;
     const CBMCargoManifest *rust_manifest = NULL;
     if (have_rust) {
         cbm_arena_init(&cargo_arena);
-        have_manifest = cbm_pxc_build_rust_manifest(ctx->repo_path, &cargo_arena, &cargo_manifest);
+        bool have_manifest =
+            cbm_pxc_build_rust_manifest(ctx->repo_path, &cargo_arena, &cargo_manifest);
         rust_manifest = have_manifest ? &cargo_manifest : NULL;
     }
 

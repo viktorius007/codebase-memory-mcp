@@ -129,10 +129,12 @@ static bool call_analysis_allocation_should_fail(void) {
 }
 
 static void *call_analysis_malloc(size_t size) {
+    /* cppcheck-suppress knownConditionTrueFalse -- true in allocation-fault tests. */
     return call_analysis_allocation_should_fail() ? NULL : malloc(size);
 }
 
 static void *call_analysis_calloc(size_t count, size_t size) {
+    /* cppcheck-suppress knownConditionTrueFalse -- true in allocation-fault tests. */
     return call_analysis_allocation_should_fail() ? NULL : calloc(count, size);
 }
 

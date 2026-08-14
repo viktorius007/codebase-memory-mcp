@@ -3149,6 +3149,7 @@ static void *coverage_plain_alloc(cbm_store_t *s, size_t size) {
     return malloc(size);
 }
 
+/* cppcheck-suppress constParameterCallback -- test builds mutate the store fault counter. */
 static void *analysis_coverage_alloc(cbm_store_t *s, size_t size) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     if (s->analysis_alloc_fail_after == 0) {
@@ -3263,6 +3264,7 @@ static cbm_analysis_coverage_status_t analysis_coverage_fail(
 
 static size_t analysis_coverage_utf8_prefix(const unsigned char *text, size_t bytes, size_t limit) {
     size_t prefix = bytes < limit ? bytes : limit;
+    /* cppcheck-suppress knownConditionTrueFalse -- true whenever bytes is below the limit. */
     if (prefix == bytes) {
         return prefix;
     }
@@ -3427,6 +3429,7 @@ cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
     return CBM_ANALYSIS_COVERAGE_OK;
 }
 
+/* cppcheck-suppress constParameterCallback -- test builds mutate the store fault counter. */
 static void *syntactic_coverage_alloc(cbm_store_t *s, size_t size) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     if (s->syntactic_alloc_fail_after == 0) {

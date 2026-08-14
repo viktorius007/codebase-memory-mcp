@@ -1680,7 +1680,7 @@ static void *rehydrate_worker(void *arg) {
             carrier
                 ? cbm_lsp_surface_rust_carrier_from_json(w->arena, w->rows[i]->defs_json, carrier)
                 : -1;
-        if (carrier_status == 1 && count >= 0 && count > 0) {
+        if (carrier_status == 1 && count > 0) {
             carrier->defs.items = cbm_arena_alloc(w->arena, (size_t)count * sizeof(CBMDefinition));
             if (!carrier->defs.items) {
                 carrier_status = -1;

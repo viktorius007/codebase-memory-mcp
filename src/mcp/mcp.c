@@ -8528,9 +8528,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             if (do_outbound) {
                 cbm_store_traverse_free(&tr_out);
             }
-            if (do_inbound) {
-                cbm_store_traverse_free(&tr_in);
-            }
+            cbm_store_traverse_free(&tr_in);
             free_port_mediated(ports, port_count);
             cbm_store_free_nodes(nodes, node_count);
             free(func_name);
@@ -12089,6 +12087,7 @@ static void append_search_rollups_toon(cbm_sb_t *sb, const search_file_result_t 
     for (int i = shown; i < area_count; i++) {
         other += areas[i].matches;
     }
+    /* cppcheck-suppress knownConditionTrueFalse -- `shown` is capped below `area_count`. */
     int rows = shown + (area_count > shown ? 1 : 0);
     const char *area_cols[] = {"area", "matches"};
     cbm_tree_table_header(sb, "areas", rows, area_cols, 2);
@@ -13601,6 +13600,7 @@ static void detect_emit_impacted_tree(cbm_sb_t *sb, cbm_traverse_result_t *tr, i
                  tr->visited[i].node.label ? tr->visited[i].node.label : "", tr->visited[i].hop);
         cbm_sb_append(sb, row);
     }
+    /* cppcheck-suppress knownConditionTrueFalse -- `shown` is capped by caller-supplied limit. */
     if (shown < tr->visited_count) {
         char more[CBM_SZ_256];
         snprintf(more, sizeof(more),
@@ -14171,6 +14171,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 #else
         bool force_rollup_alloc_failure = false;
 #endif
+        /* cppcheck-suppress knownConditionTrueFalse -- enabled by the test-seam build. */
         if (!force_rollup_alloc_failure) {
             impact_mods = malloc(DETECT_MODCAP * CBM_SZ_128);
             impact_mcnt = malloc(DETECT_MODCAP * sizeof(int));

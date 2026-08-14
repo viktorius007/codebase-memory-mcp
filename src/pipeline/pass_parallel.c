@@ -315,6 +315,7 @@ static char *pp_err_dup(const char *s) {
         return NULL;
     }
     size_t n = strlen(s) + 1;
+    /* cppcheck-suppress knownConditionTrueFalse -- false in allocation-fault tests. */
     char *d = pp_err_test_allows_alloc() ? (char *)malloc(n) : NULL;
     if (d) {
         memcpy(d, s, n);
@@ -340,6 +341,7 @@ static bool pp_err_add(pp_err_list_t *list, const char *path, const char *reason
     if (list->count >= list->cap) {
         int ncap = list->cap ? list->cap * 2 : 8;
         cbm_file_error_t *grown =
+            /* cppcheck-suppress knownConditionTrueFalse -- false in allocation-fault tests. */
             pp_err_test_allows_alloc()
                 ? (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown))
                 : NULL;
