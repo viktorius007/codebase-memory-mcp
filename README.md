@@ -356,10 +356,15 @@ The `codebase-memory-mcp-bin` package is available at: https://aur.archlinux.org
 ### Install via Claude Code
 
 ```
-You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
+You: "Install this MCP server: https://github.com/viktorius007/codebase-memory-mcp"
 ```
 
 ### Build from Source
+
+Building from source uses this fork (`viktorius007`), which is where this
+tree's work lives. The prebuilt-download instructions above deliberately keep
+pointing at `DeusData`: that is the only repository publishing release
+archives, and this fork ships no binaries.
 
 <details>
 <summary>Prerequisites: C compiler + zlib</summary>
@@ -374,7 +379,7 @@ You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 </details>
 
 ```bash
-git clone https://github.com/DeusData/codebase-memory-mcp.git
+git clone https://github.com/viktorius007/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh --with-ui          # shipped binary (graph UI embedded)
 scripts/build.sh                    # without the UI (development only)

@@ -9,7 +9,7 @@ Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 **Prerequisites**: C compiler (gcc or clang), make, zlib, Git. Optional: Node.js 22+ (for graph UI).
 
 ```bash
-git clone https://github.com/DeusData/codebase-memory-mcp.git
+git clone https://github.com/viktorius007/codebase-memory-mcp.git
 cd codebase-memory-mcp
 git config core.hooksPath scripts/hooks  # activates pre-commit security checks
 scripts/build.sh
