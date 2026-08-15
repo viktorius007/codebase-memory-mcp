@@ -378,14 +378,13 @@ git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh --with-ui          # shipped binary (graph UI embedded)
 scripts/build.sh                    # without the UI (development only)
-scripts/build.sh --incremental --ccache --fast-grammars --quiet --jobs 16  # warm local rebuilds
-scripts/test.sh --incremental --ccache --fast-grammars --quiet --jobs 16 --parallel-suites  # warm local tests
+scripts/test.sh --suites <name>     # one suite, incremental — seconds
 # Binary at: build/c/codebase-memory-mcp   (codebase-memory-mcp.exe on Windows)
 ```
 
 Every platform ships **one self-contained executable**: the graph UI and the agent integration templates are linked into the binary, so an extracted archive is immediately complete.
 
-Run the test suite (6,768 tests across 120 suites):
+Run the test suite (`build/c/test-runner --list-suites` reports the current suite roster):
 
 ```bash
 scripts/test.sh                     # full: clean sanitizer build + all suites + guards
