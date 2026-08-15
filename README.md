@@ -378,7 +378,6 @@ git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh --with-ui          # shipped binary (graph UI embedded)
 scripts/build.sh                    # without the UI (development only)
-scripts/test.sh --suites <name>     # one suite, incremental — seconds
 # Binary at: build/c/codebase-memory-mcp   (codebase-memory-mcp.exe on Windows)
 ```
 
