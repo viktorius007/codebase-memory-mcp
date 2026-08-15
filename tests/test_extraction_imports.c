@@ -1248,6 +1248,31 @@ TEST(rust_grouped_imports_are_exact_status_bearing_leaves) {
     PASS();
 }
 
+TEST(rust_root_grouped_imports_preserve_absolute_paths) {
+    CBMFileResult *r =
+        do_extract("use ::{foo, bar::Baz};\nuse ::{};\n", CBM_LANG_RUST, "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(CBM_RUST_CARRIER_COMPLETE, r->rust_imports_status);
+    ASSERT_EQ(2, r->imports.count);
+
+    const CBMImport *foo = NULL;
+    const CBMImport *baz = NULL;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (strcmp(imp->local_name, "foo") == 0)
+            foo = imp;
+        else if (strcmp(imp->local_name, "Baz") == 0)
+            baz = imp;
+    }
+    ASSERT_NOT_NULL(foo);
+    ASSERT_NOT_NULL(baz);
+    ASSERT_STR_EQ("::foo", foo->module_path);
+    ASSERT_STR_EQ("::bar::Baz", baz->module_path);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_nested_imports_retain_lexical_and_module_scope) {
     const char *source = "use crate::root::Root;\n"
                          "mod left { use crate::one::Thing; fn run() { { use crate::two::Inner; "
@@ -1408,6 +1433,7 @@ SUITE(extraction_imports) {
     /* Local-name field spot-checks */
     RUN_TEST(rust_local_name_last_segment);
     RUN_TEST(rust_grouped_imports_are_exact_status_bearing_leaves);
+    RUN_TEST(rust_root_grouped_imports_preserve_absolute_paths);
     RUN_TEST(rust_nested_imports_retain_lexical_and_module_scope);
     RUN_TEST(rust_module_declarations_retain_exact_visibility);
     RUN_TEST(rust_module_declaration_carrier_grows_past_former_fixed_stack);

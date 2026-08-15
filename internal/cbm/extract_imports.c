@@ -592,6 +592,8 @@ static char *rust_import_join(CBMArena *a, const char *prefix, const char *path)
         return prefix ? cbm_arena_strdup(a, prefix) : NULL;
     if (!prefix || !prefix[0] || path[0] == ':')
         return cbm_arena_strdup(a, path);
+    if (strcmp(prefix, "::") == 0)
+        return cbm_arena_sprintf(a, "::%s", path);
     return cbm_arena_sprintf(a, "%s::%s", prefix, path);
 }
 
@@ -630,9 +632,12 @@ static bool rust_flatten_use(CBMExtractCtx *ctx, TSNode declaration, TSNode node
     if (strcmp(kind, "scoped_use_list") == 0) {
         TSNode path_node = ts_node_child_by_field_name(node, TS_FIELD("path"));
         TSNode list = ts_node_child_by_field_name(node, TS_FIELD("list"));
-        char *part = cbm_node_text(ctx->arena, path_node, ctx->source);
+        if (ts_node_is_null(list))
+            return false;
+        char *part = ts_node_is_null(path_node) ? cbm_arena_strdup(ctx->arena, "::")
+                                                : cbm_node_text(ctx->arena, path_node, ctx->source);
         char *next = rust_import_join(ctx->arena, prefix, part);
-        if (!part || !next || ts_node_is_null(list))
+        if (!part || !next)
             return false;
         uint32_t count = ts_node_named_child_count(list);
         for (uint32_t i = 0; i < count; i++) {
@@ -656,6 +661,8 @@ static bool rust_flatten_use(CBMExtractCtx *ctx, TSNode declaration, TSNode node
     if (strcmp(kind, "use_as_clause") == 0) {
         TSNode path_node = ts_node_child_by_field_name(node, TS_FIELD("path"));
         TSNode alias_node = ts_node_child_by_field_name(node, TS_FIELD("alias"));
+        if (ts_node_is_null(path_node) || ts_node_is_null(alias_node))
+            return false;
         char *part = cbm_node_text(ctx->arena, path_node, ctx->source);
         char *alias = cbm_node_text(ctx->arena, alias_node, ctx->source);
         char *path = part && strcmp(part, "self") == 0
