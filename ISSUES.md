@@ -5,7 +5,16 @@ second history; commit history carries the old investigations.
 
 ## Open
 
-No confirmed product defect is currently open.
+- `trace_path` and the CALLS/USAGE edge set miss callers reached through a
+  fn-pointer table or `dyn` dispatch. Observed 2026-08-24 in the
+  project-management repo: a control probe showed 0 callers for a symbol with
+  a plain direct call while a sibling in the same generation resolved; methods
+  reached only through `dyn` (`run_from_matches` x8) or a fn-pointer table
+  (xtask `which_sccache` family) have no inbound edge at all, so any
+  zero-caller list built from the graph reports them as dead. Candidate fix:
+  emit a USAGE edge for each fn-pointer-table entry and for trait-method
+  implementations reachable through `dyn`. Until then consumers must re-probe
+  zero-caller rows by grep before acting on them.
 
 ## Confirmed behavior
 
