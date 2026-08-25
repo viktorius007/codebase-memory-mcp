@@ -602,6 +602,24 @@ TEST(repro_lsp_py_builtin_method) {
     return assert_lsp_strategy("main.py", kPyBuiltinMethod, "lsp_builtin_method");
 }
 
+TEST(repro_lsp_py_builtins_are_exported) {
+    RFile file = {"main.py", kPyBuiltinMethod};
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, &file, 1);
+    ASSERT_NOT_NULL(store);
+
+    cbm_node_t upper;
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, project.project,
+                                        "builtins.str.upper", &upper),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(upper.properties_json);
+    ASSERT_NOT_NULL(strstr(upper.properties_json, "\"is_exported\":true"));
+    cbm_node_free_fields(&upper);
+
+    rh_cleanup(&project, store);
+    PASS();
+}
+
 TEST(repro_lsp_py_generic_method) {
     return assert_lsp_strategy("main.py", kPyGenericMethod, "lsp_generic_method");
 }
@@ -633,6 +651,7 @@ SUITE(repro_lsp_go_py) {
     RUN_TEST(repro_lsp_py_builtin);
     RUN_TEST(repro_lsp_py_builtin_constructor);
     RUN_TEST(repro_lsp_py_builtin_method);
+    RUN_TEST(repro_lsp_py_builtins_are_exported);
     RUN_TEST(repro_lsp_py_generic_method);
     RUN_TEST(repro_lsp_py_method_union);
 }

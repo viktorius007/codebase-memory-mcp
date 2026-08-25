@@ -65,9 +65,9 @@ static const PyBuiltinNode kPyBuiltinNodes[] = {
 
 /*
  * Inject the builtin definitions into result->defs so the pipeline mints them
- * as graph nodes. All fields beyond name/qn/label are left zero/NULL: builtins
- * have no body, so complexity/line-range/etc. are irrelevant, and a synthetic
- * file_path keeps them out of any real source file's def list.
+ * as graph nodes. Runtime-provided symbols are externally visible, so mark
+ * them exported; otherwise zero-caller builtins are misclassified as project
+ * dead code. A synthetic file_path keeps them out of real source-file defs.
  */
 static void py_builtins_inject_defs(CBMFileResult *result, CBMArena *arena) {
     if (!result || !arena) {
@@ -84,6 +84,7 @@ static void py_builtins_inject_defs(CBMFileResult *result, CBMArena *arena) {
         def.file_path = "<python-builtins>";
         def.start_line = 1;
         def.end_line = 1;
+        def.is_exported = true;
         cbm_defs_push(&result->defs, arena, def);
     }
 }
