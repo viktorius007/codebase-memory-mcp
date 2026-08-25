@@ -49,6 +49,10 @@ struct CBMCargoManifest;
 #define CBM_RUST_CONF_MACRO_KNOWN 0.85f /* known std macro mapped to fn */
 #define CBM_RUST_CONF_OPERATOR 0.88f    /* a+b → T::add (operator trait) */
 
+/* Return the byte after a Rust string, character literal, or comment beginning
+ * at `from`, or `from` when the source begins with an ordinary token. */
+int cbm_rust_macro_opaque_token_end(const char *text, int len, int from);
+
 /* Rust-flavoured LSP context: one per file, lifetime tied to a single
  * `cbm_extract_file()` invocation (or the cross-file caller's arena). */
 typedef struct {

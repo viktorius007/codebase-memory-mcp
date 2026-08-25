@@ -190,6 +190,10 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
          * only value use—not an occurrence-exact callable target. Emit USAGE in
          * that case; CALL_REFERENCE is reserved for the exact LSP join. */
         if (!tgt) {
+            /* Token-tree shape alone cannot prove what a macro does with this path. */
+            if (usage->is_macro_callable_value) {
+                continue;
+            }
             /* An occurrence-exact semantic record owns this reference even when
              * its target is not materialized in the graph (for example, a
              * Kotlin local function). Falling back by raw name here would bind

@@ -2571,6 +2571,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             }
         }
         if (!tgt) {
+            /* Token-tree shape alone cannot prove what a macro does with this path. */
+            if (usage->is_macro_callable_value) {
+                continue;
+            }
             /* Exact semantic ownership beats textual name fallback even when
              * the semantic target is not materialized in this graph. */
             if (semantic_reference) {

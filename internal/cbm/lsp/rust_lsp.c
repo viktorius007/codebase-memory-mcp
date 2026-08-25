@@ -4016,52 +4016,98 @@ static int macro_skip_raw_string(const char *text, int len, int from) {
     return len;
 }
 
-/* Return the end of a string/comment token that must remain opaque to macro
- * metasyntax, or `from` when ordinary token processing should continue. */
-static int macro_opaque_token_end(const char *text, int len, int from) {
-    int raw_end = macro_skip_raw_string(text, len, from);
-    if (raw_end != from) {
-        return raw_end;
-    }
+static int macro_skip_quoted_string(const char *text, int len, int from) {
     int quote = from;
     if (quote < len && text[quote] == 'b') {
         quote++;
     }
-    if (quote < len && text[quote] == '"') {
-        int pos = quote + 1;
-        while (pos < len) {
-            if (text[pos] == '\\' && pos + 1 < len) {
-                pos += 2;
-            } else if (text[pos++] == '"') {
-                break;
+    if (quote >= len || text[quote] != '"') {
+        return from;
+    }
+    int pos = quote + 1;
+    while (pos < len) {
+        if (text[pos] == '\\' && pos + 1 < len) {
+            pos += 2;
+        } else if (text[pos++] == '"') {
+            break;
+        }
+    }
+    return pos;
+}
+
+static int macro_skip_char_literal(const char *text, int len, int from) {
+    int quote = from;
+    if (quote < len && text[quote] == 'b') {
+        quote++;
+    }
+    if (quote >= len || text[quote] != '\'' || quote + 2 >= len) {
+        return from;
+    }
+    int pos = quote + 1;
+    if (text[pos] == '\\') {
+        pos += 2;
+        if (pos - 1 < len && text[pos - 1] == 'x') {
+            pos += 2;
+        } else if (pos - 1 < len && text[pos - 1] == 'u' && pos < len && text[pos] == '{') {
+            while (pos < len && text[pos] != '}') {
+                pos++;
+            }
+            if (pos < len) {
+                pos++;
             }
         }
-        return pos;
+    } else {
+        unsigned char lead = (unsigned char)text[pos];
+        int width = lead < 0x80 ? 1 : (lead < 0xE0 ? 2 : (lead < 0xF0 ? 3 : 4));
+        pos += width;
     }
-    if (from + 1 < len && text[from] == '/' && text[from + 1] == '/') {
+    return pos < len && text[pos] == '\'' ? pos + 1 : from;
+}
+
+static int macro_skip_comment(const char *text, int len, int from) {
+    if (from + 1 >= len || text[from] != '/') {
+        return from;
+    }
+    if (text[from + 1] == '/') {
         int pos = from + 2;
         while (pos < len && text[pos] != '\n') {
             pos++;
         }
         return pos;
     }
-    if (from + 1 < len && text[from] == '/' && text[from + 1] == '*') {
-        int depth = 1;
-        int pos = from + 2;
-        while (pos < len && depth > 0) {
-            if (pos + 1 < len && text[pos] == '/' && text[pos + 1] == '*') {
-                depth++;
-                pos += 2;
-            } else if (pos + 1 < len && text[pos] == '*' && text[pos + 1] == '/') {
-                depth--;
-                pos += 2;
-            } else {
-                pos++;
-            }
-        }
-        return pos;
+    if (text[from + 1] != '*') {
+        return from;
     }
-    return from;
+    int depth = 1;
+    int pos = from + 2;
+    while (pos < len && depth > 0) {
+        if (pos + 1 < len && text[pos] == '/' && text[pos + 1] == '*') {
+            depth++;
+            pos += 2;
+        } else if (pos + 1 < len && text[pos] == '*' && text[pos + 1] == '/') {
+            depth--;
+            pos += 2;
+        } else {
+            pos++;
+        }
+    }
+    return pos;
+}
+
+/* Return the end of a string/comment token that must remain opaque to macro
+ * metasyntax, or `from` when ordinary token processing should continue. */
+int cbm_rust_macro_opaque_token_end(const char *text, int len, int from) {
+    int end = macro_skip_raw_string(text, len, from);
+    if (end == from) {
+        end = macro_skip_quoted_string(text, len, from);
+    }
+    if (end == from) {
+        end = macro_skip_char_literal(text, len, from);
+    }
+    if (end == from) {
+        end = macro_skip_comment(text, len, from);
+    }
+    return end;
 }
 
 /* Substitute env bindings into the transcriber text. Allocates a
@@ -4082,7 +4128,7 @@ static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const
     int op = 0;
     int xp = 0;
     while (xp < xs_len) {
-        int opaque_end = macro_opaque_token_end(xs, xs_len, xp);
+        int opaque_end = cbm_rust_macro_opaque_token_end(xs, xs_len, xp);
         if (opaque_end != xp) {
             int opaque_len = opaque_end - xp;
             if (op + opaque_len < cap) {
@@ -4160,7 +4206,7 @@ static bool macro_contains_repetition_syntax(const char *text, int len) {
     if (!text || len < 2)
         return false;
     for (int i = 0; i + 1 < len;) {
-        int opaque_end = macro_opaque_token_end(text, len, i);
+        int opaque_end = cbm_rust_macro_opaque_token_end(text, len, i);
         if (opaque_end != i) {
             i = opaque_end;
             continue;

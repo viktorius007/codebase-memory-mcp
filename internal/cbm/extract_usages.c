@@ -5,6 +5,7 @@
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
+#include "lsp/rust_lsp.h"
 
 enum { LAST_IDX = 1 };
 #include <stdint.h> // uint32_t
@@ -2436,19 +2437,16 @@ static bool rust_macro_table_path(const char *text, size_t length) {
     if (length >= 2 && text[0] == ':' && text[1] == ':') {
         pos = 2;
     }
-    bool saw_component = false;
     while (pos < length) {
         if (!(isalpha((unsigned char)text[pos]) || text[pos] == '_')) {
             return false;
         }
         pos++;
-        while (pos < length &&
-               (isalnum((unsigned char)text[pos]) || text[pos] == '_')) {
+        while (pos < length && (isalnum((unsigned char)text[pos]) || text[pos] == '_')) {
             pos++;
         }
-        saw_component = true;
         if (pos == length) {
-            return saw_component;
+            return true;
         }
         if (pos + 1 >= length || text[pos] != ':' || text[pos + 1] != ':') {
             return false;
@@ -2458,9 +2456,34 @@ static bool rust_macro_table_path(const char *text, size_t length) {
     return false;
 }
 
+static void emit_rust_macro_table_value(CBMExtractCtx *ctx, const char *text,
+                                        uint32_t invocation_start, size_t value_start,
+                                        size_t value_end, const char *enclosing_func_qn,
+                                        uint32_t lexical_scope_id) {
+    while (value_end > value_start && isspace((unsigned char)text[value_end - 1])) {
+        value_end--;
+    }
+    if (!rust_macro_table_path(text + value_start, value_end - value_start)) {
+        return;
+    }
+    const char *name = cbm_arena_strndup(ctx->arena, text + value_start, value_end - value_start);
+    if (!name) {
+        return;
+    }
+    CBMUsage usage = {
+        .ref_name = name,
+        .enclosing_func_qn = enclosing_func_qn,
+        .kind = CBM_USAGE_VALUE,
+        .is_macro_callable_value = true,
+        .lexical_scope_id = lexical_scope_id,
+        .site_start_byte = invocation_start + (uint32_t)value_start,
+        .site_end_byte = invocation_start + (uint32_t)value_end,
+    };
+    cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+}
+
 static void emit_rust_macro_table_usages(CBMExtractCtx *ctx, TSNode invocation,
-                                         const char *enclosing_func_qn,
-                                         uint32_t lexical_scope_id) {
+                                         const char *enclosing_func_qn, uint32_t lexical_scope_id) {
     if (!ctx || ctx->language != CBM_LANG_RUST || !ctx->source || !enclosing_func_qn ||
         strcmp(ts_node_type(invocation), "macro_invocation") != 0) {
         return;
@@ -2479,8 +2502,7 @@ static void emit_rust_macro_table_usages(CBMExtractCtx *ctx, TSNode invocation,
     if (pos == length) {
         return;
     }
-    while (++pos < length && isspace((unsigned char)text[pos])) {
-    }
+    while (++pos < length && isspace((unsigned char)text[pos])) {}
     if (pos == length || (text[pos] != '{' && text[pos] != '(' && text[pos] != '[')) {
         return;
     }
@@ -2489,17 +2511,12 @@ static void emit_rust_macro_table_usages(CBMExtractCtx *ctx, TSNode invocation,
     int depth = 1;
     size_t entry_start = pos + 1;
     for (pos = entry_start; pos < length; pos++) {
-        char c = text[pos];
-        if (c == '"') {
-            pos++;
-            while (pos < length && text[pos] != '"') {
-                if (text[pos] == '\\' && pos + 1 < length) {
-                    pos++;
-                }
-                pos++;
-            }
+        int opaque_end = cbm_rust_macro_opaque_token_end(text, (int)length, (int)pos);
+        if (opaque_end != (int)pos) {
+            pos = (size_t)opaque_end - 1;
             continue;
         }
+        char c = text[pos];
         if (c == '{' || c == '(' || c == '[') {
             depth++;
             continue;
@@ -2525,26 +2542,8 @@ static void emit_rust_macro_table_usages(CBMExtractCtx *ctx, TSNode invocation,
         if (value_end == length) {
             return;
         }
-        while (value_end > value_start && isspace((unsigned char)text[value_end - 1])) {
-            value_end--;
-        }
-        if (rust_macro_table_path(text + value_start, value_end - value_start)) {
-            const char *name = cbm_arena_strndup(ctx->arena, text + value_start,
-                                                  value_end - value_start);
-            if (!name) {
-                return;
-            }
-            CBMUsage usage = {
-                .ref_name = name,
-                .enclosing_func_qn = enclosing_func_qn,
-                .kind = CBM_USAGE_VALUE,
-                .is_macro_callable_value = true,
-                .lexical_scope_id = lexical_scope_id,
-                .site_start_byte = start_byte + (uint32_t)value_start,
-                .site_end_byte = start_byte + (uint32_t)value_end,
-            };
-            cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
-        }
+        emit_rust_macro_table_value(ctx, text, start_byte, value_start, value_end,
+                                    enclosing_func_qn, lexical_scope_id);
         pos = value_end;
     }
 }

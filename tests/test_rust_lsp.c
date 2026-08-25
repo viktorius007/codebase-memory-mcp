@@ -597,7 +597,7 @@ TEST(rustlsp_static_macro_table_records_function_value_usage) {
         "        const TABLE: &[fn()] = &[$($run),+];\n"
         "    };\n"
         "}\n"
-        "table! { 1 => handler; }\n");
+        "table! { /* a delimiter in trivia: } */ '}' => handler; }\n");
     ASSERT_NOT_NULL(r);
     int matched = 0;
     for (int i = 0; i < r->usages.count; i++) {
@@ -610,6 +610,26 @@ TEST(rustlsp_static_macro_table_records_function_value_usage) {
         }
     }
     ASSERT_EQ(matched, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_macro_table_ignores_opaque_token_contents) {
+    CBMFileResult *r = extract_rust(
+        "fn handler() {}\n"
+        "macro_rules! passthrough { ($($token:tt)*) => {}; }\n"
+        "passthrough! { /* 1 => handler; */ }\n"
+        "passthrough! { r#\"2 => handler;\"# }\n");
+    ASSERT_NOT_NULL(r);
+    int matched = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *usage = &r->usages.items[i];
+        if (usage->is_macro_callable_value && usage->ref_name &&
+            strcmp(usage->ref_name, "handler") == 0) {
+            matched++;
+        }
+    }
+    ASSERT_EQ(matched, 0);
     cbm_free_result(r);
     PASS();
 }
@@ -8867,6 +8887,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_vec_macro_with_inner_call);
     RUN_TEST(rustlsp_format_returns_string);
     RUN_TEST(rustlsp_static_macro_table_records_function_value_usage);
+    RUN_TEST(rustlsp_macro_table_ignores_opaque_token_contents);
 
     /* Stdlib semantics */
     RUN_TEST(rustlsp_hashmap_insert_get);
