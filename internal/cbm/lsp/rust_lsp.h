@@ -178,6 +178,14 @@ typedef struct {
     /* Output: resolved (and unresolved-with-reason) calls accumulate here. */
     CBMResolvedCallArray *resolved_calls;
 
+    /* Optional resolver-proven value references. Single-file extraction owns
+     * this array; lower-level and cross-file callers may leave it NULL. */
+    CBMUsageArray *usages;
+
+    /* Storage for resolved usage target names. Cross-file resolution uses a
+     * temporary arena, so its annotations must instead belong to the result. */
+    CBMArena *usage_target_arena;
+
     /* Borrowed, allocation-independent semantic degradation sink. A NULL sink
      * preserves the public low-level context API for callers that do not own a
      * CBMFileResult; production single-file extraction always supplies one. */
@@ -390,6 +398,16 @@ void cbm_run_rust_lsp_cross_scoped_with_manifest(
     const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
     CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health);
 
+/* Cross-file variants that also annotate function-value usages. `usage_arena`
+ * owns those target QNs and must outlive the temporary resolver arena. */
+void cbm_run_rust_lsp_cross_scoped_with_manifest_and_usages(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
+    int def_count, const char **import_names, const char **import_qns,
+    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health, CBMUsageArray *usages,
+    CBMArena *usage_arena);
+
 /* Tier-2: build the project-wide Rust cross registry ONCE from all defs, finalize,
  * and seal read-only. Shared across every Rust file's resolve (mirrors C/py/cs/ts).
  * Def-driven → byte-identical entries to the per-file build. */
@@ -415,6 +433,14 @@ void cbm_run_rust_lsp_cross_scoped_with_registry(
     const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
     const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
     CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health);
+
+void cbm_run_rust_lsp_cross_scoped_with_registry_and_usages(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
+    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health, CBMUsageArray *usages,
+    CBMArena *usage_arena);
 
 /* Per-file input for batch cross-file Rust LSP processing. */
 typedef struct {

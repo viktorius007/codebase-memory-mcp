@@ -1875,10 +1875,10 @@ static CBMPxcDispatchStatus pxc_run_one_with_manifest(
          * workspace manifest (set once by the sequential driver) lets
          * `crate_a::foo` route across the crate boundary (#56). */
         CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
-        cbm_run_rust_lsp_cross_scoped_with_manifest(
+        cbm_run_rust_lsp_cross_scoped_with_manifest_and_usages(
             &scratch, source, source_len, module_qn, rdefs, def_count, imp_names, imp_qns,
             rust_import_scopes, imp_count, tree, rust_manifest, &out, &synthetic_calls,
-            &r->rust_health);
+            &r->rust_health, &r->usages, &r->arena);
         break;
     }
     default:
@@ -2089,10 +2089,10 @@ CBMPxcDispatchStatus cbm_pxc_dispatch_file(
             CBMCallArray synthetic_calls = {0};
             uint32_t rust_resolved_before = result->rust_health.resolved_emitted;
             uint32_t rust_unresolved_before = result->rust_health.unresolved_emitted;
-            cbm_run_rust_lsp_cross_scoped_with_registry(
+            cbm_run_rust_lsp_cross_scoped_with_registry_and_usages(
                 &scratch, source, source_len, def_module, shared, imp_keys, imp_vals,
                 rust_import_scopes, imp_count, result->cached_tree, rust_manifest, &out,
-                &synthetic_calls, &result->rust_health);
+                &synthetic_calls, &result->rust_health, &result->usages, &result->arena);
             PxcAppendStatus resolved_status =
                 pxc_append_results(&result->arena, &result->resolved_calls, &out);
             bool synthetic_complete =

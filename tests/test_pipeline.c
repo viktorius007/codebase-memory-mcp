@@ -6352,6 +6352,95 @@ TEST(usages_creates_edges) {
     PASS();
 }
 
+TEST(rust_macro_function_table_creates_usage_edge) {
+    /* The table's paths cross into a sibling module. A USAGE edge is the
+     * value-flow link; classifying it as CALLS would invent a direct call. */
+    if (setup_usages_repo("Cargo.toml", "[package]\nname = \"table\"\nversion = \"0.1.0\"\n",
+                          NULL, NULL) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_usages_tmpdir, "src/lib.rs",
+                    "pub mod commands;\n"
+                    "pub mod entity_runtime;\n");
+    write_temp_file(g_usages_tmpdir, "src/commands/mod.rs", "pub mod adr;\npub mod req;\n");
+    write_temp_file(g_usages_tmpdir, "src/commands/adr.rs",
+                    "pub fn run_from_matches() {}\n");
+    write_temp_file(g_usages_tmpdir, "src/commands/req.rs",
+                    "pub fn run_from_matches() {}\n");
+    write_temp_file(g_usages_tmpdir, "src/entity_runtime.rs",
+                    "pub struct Adapter { run: fn() }\n\n"
+                    "macro_rules! table {\n"
+                    "    ($($descriptor:expr => $run:path;)+) => {\n"
+                    "        pub const TABLE: &[Adapter] = &[$(Adapter { run: $run },)+];\n"
+                    "    };\n"
+                    "}\n\n"
+                    "table! {\n"
+                    "    1 => crate::commands::adr::run_from_matches;\n"
+                    "    2 => crate::commands::req::run_from_matches;\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_rust_macro_table.db", g_usages_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "USAGE", "src/entity_runtime.rs",
+                                       "run_from_matches", "src/commands/adr.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "USAGE", "src/entity_runtime.rs",
+                                       "run_from_matches", "src/commands/req.rs"),
+              1);
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "src/entity_runtime.rs", "run_from_matches"),
+              0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+
+    /* The parallel resolver has its own usage-edge materialization path. */
+    for (int i = 0; i < 50; i++) {
+        char file_name[64];
+        char filler[96];
+        snprintf(file_name, sizeof(file_name), "src/table_pad_%02d.rs", i);
+        snprintf(filler, sizeof(filler), "pub fn table_pad_%02d() {}\n", i);
+        write_temp_file(g_usages_tmpdir, file_name, filler);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    snprintf(db_path, sizeof(db_path), "%s/test_rust_macro_table_parallel.db", g_usages_tmpdir);
+    p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    project = cbm_pipeline_project_name(p);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "USAGE", "src/entity_runtime.rs",
+                                       "run_from_matches", "src/commands/adr.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "USAGE", "src/entity_runtime.rs",
+                                       "run_from_matches", "src/commands/req.rs"),
+              1);
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "src/entity_runtime.rs", "run_from_matches"),
+              0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    teardown_usages_repo();
+    PASS();
+}
+
 TEST(usages_no_duplicate_calls) {
     /* Port of TestPassUsagesDoesNotDuplicateCalls.
      * A direct function call should produce CALLS but not USAGE. */
@@ -14391,6 +14480,7 @@ SUITE(pipeline) {
     RUN_TEST(implements_no_match);
     /* Usages pass (full pipeline integration) */
     RUN_TEST(usages_creates_edges);
+    RUN_TEST(rust_macro_function_table_creates_usage_edge);
     RUN_TEST(usages_no_duplicate_calls);
     RUN_TEST(calls_edge_carries_call_site_line);
     RUN_TEST(usages_kotlin_creates_edges);

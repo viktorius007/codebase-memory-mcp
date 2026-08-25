@@ -312,9 +312,11 @@ typedef enum {
 
 typedef struct {
     const char *ref_name;            // referenced identifier
+    const char *resolved_target_qn;  // resolver-proven target; bypasses textual lookup when present
     const char *enclosing_func_qn;   // QN of enclosing function (or module QN)
     CBMUsageKind kind;               // ordinary USAGE or explicit callable reference
     bool may_be_call_reference;      // syntactic candidate; exact LSP proof may upgrade its edge
+    bool is_macro_callable_value;    // function value recovered from an opaque macro invocation
     bool semantic_reference_blocked; // lexical evidence blocks only unproven textual fallback
     bool semantic_reference_local_shadow; // blocker belongs to a non-module lexical scope
     uint32_t lexical_scope_id;            // extraction-local scope instance; never graph identity

@@ -4973,6 +4973,74 @@ static const char *rust_resolve_callable_value(RustLSPContext *ctx, TSNode value
     return matches == 1 && unique ? unique->qualified_name : NULL;
 }
 
+/* Extracted function-pointer table values can use `crate::` while the graph's
+ * file-derived QNs retain a source-root segment such as `.src`. The ordinary
+ * rooted lookup is still tried first. This fallback is intentionally limited
+ * to one free function inside the current Cargo member whose complete path
+ * after `crate::` matches exactly; it never crosses a crate boundary or
+ * selects an overloaded/ambiguous callable. */
+static const CBMRegisteredFunc *rust_lookup_crate_callable_suffix(RustLSPContext *ctx,
+                                                                   const char *path) {
+    if (!ctx || !ctx->registry || !ctx->module_qn || !path || strncmp(path, "crate::", 7) != 0) {
+        return NULL;
+    }
+    const char *suffix = convert_path_to_qn(ctx->arena, path + 7);
+    size_t crate_prefix_len = rust_crate_path_prefix_len(ctx);
+    if (!suffix || !suffix[0] || crate_prefix_len == 0) {
+        return NULL;
+    }
+    const char *crate_prefix = cbm_arena_strndup(ctx->arena, ctx->module_qn, crate_prefix_len);
+    if (!crate_prefix) {
+        return NULL;
+    }
+    const char *leaf = strrchr(suffix, '.');
+    leaf = leaf ? leaf + 1 : suffix;
+    const CBMRegisteredFunc *unique = NULL;
+    int matches = 0;
+    CBMFreeFuncIter iter;
+    cbm_registry_free_funcs_by_short_name(ctx->registry, leaf, &iter);
+    for (int index; matches < 2 && (index = cbm_free_func_iter_next(&iter)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &ctx->registry->funcs[index];
+        if (candidate->receiver_type || !candidate->qualified_name ||
+            strncmp(candidate->qualified_name, crate_prefix, crate_prefix_len) != 0 ||
+            candidate->qualified_name[crate_prefix_len] != '.' ||
+            !rust_qn_has_suffix(candidate->qualified_name, suffix)) {
+            continue;
+        }
+        unique = candidate;
+        matches++;
+    }
+    return matches == 1 ? unique : NULL;
+}
+
+static void rust_resolve_module_callable_usages(RustLSPContext *ctx) {
+    if (!ctx || !ctx->usages || !ctx->module_qn) {
+        return;
+    }
+    for (int i = 0; i < ctx->usages->count; i++) {
+        CBMUsage *usage = &ctx->usages->items[i];
+        if (!usage->is_macro_callable_value || !usage->ref_name || usage->resolved_target_qn ||
+            !usage->enclosing_func_qn ||
+            strcmp(usage->enclosing_func_qn, ctx->module_qn) != 0) {
+            continue;
+        }
+        const char *resolved = rust_resolve_path_expr(ctx, usage->ref_name);
+        const CBMRegisteredFunc *function =
+            resolved ? cbm_registry_lookup_func(ctx->registry, resolved) : NULL;
+        if (!function && resolved) {
+            function = cbm_registry_lookup_func(
+                ctx->registry, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, resolved));
+        }
+        if (!function) {
+            function = rust_lookup_crate_callable_suffix(ctx, usage->ref_name);
+        }
+        if (function) {
+            CBMArena *target_arena = ctx->usage_target_arena ? ctx->usage_target_arena : ctx->arena;
+            usage->resolved_target_qn = cbm_arena_strdup(target_arena, function->qualified_name);
+        }
+    }
+}
+
 static void rust_resolve_callable_argument_references(RustLSPContext *ctx, TSNode arguments) {
     if (ts_node_is_null(arguments)) {
         return;
@@ -5612,6 +5680,10 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
     /* Macro invocation: walk inner tokens for nested calls and try the
      * macro-as-function mapping. */
     if (strcmp(kind, "macro_invocation") == 0) {
+        const char *saved_macro_caller = ctx->enclosing_func_qn;
+        if (!ctx->enclosing_func_qn) {
+            ctx->enclosing_func_qn = ctx->module_qn;
+        }
         uint32_t saved_start = ctx->emit_site_start_byte;
         uint32_t saved_end = ctx->emit_site_end_byte;
         uint32_t mapped_start = 0;
@@ -5703,6 +5775,7 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
         ctx->macro_origin_valid = saved_macro_origin_valid;
         ctx->emit_site_start_byte = saved_start;
         ctx->emit_site_end_byte = saved_end;
+        ctx->enclosing_func_qn = saved_macro_caller;
         /* Don't recurse normally below — we already drilled into args. */
         return;
     }
@@ -6273,6 +6346,11 @@ static void rust_process_item_list(RustLSPContext *ctx, TSNode list, uint32_t de
                 rust_process_item_list(ctx, body, depth + 1);
                 ctx->current_module_path = saved_module_path;
             }
+        } else if (strcmp(kind, "macro_invocation") == 0) {
+            const char *saved_func_qn = ctx->enclosing_func_qn;
+            ctx->enclosing_func_qn = ctx->module_qn;
+            rust_resolve_calls_in_node(ctx, item);
+            ctx->enclosing_func_qn = saved_func_qn;
         }
     }
 }
@@ -7089,6 +7167,8 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
 
     RustLSPContext ctx;
     rust_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
+    ctx.usages = &result->usages;
+    ctx.usage_target_arena = arena;
     ctx.health = &result->rust_health;
     ctx.cargo_manifest = manifest;
     /* Let the resolver inject synthetic syntactic calls for operator/macro
@@ -7097,6 +7177,7 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
 
     rust_collect_uses(&ctx, root);
     rust_lsp_process_file(&ctx, root);
+    rust_resolve_module_callable_usages(&ctx);
     if (cbm_arena_status(arena) == CBM_ARENA_STATUS_AVAILABLE) {
         result->rust_health.completed_routes |= CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
     } else {
@@ -7309,9 +7390,12 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
                                           const CBMRustImportScope *import_scopes, int import_count,
                                           TSNode root, const struct CBMCargoManifest *manifest,
                                           CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
-                                          CBMRustAnalysisHealth *health) {
+                                          CBMRustAnalysisHealth *health, CBMUsageArray *usages,
+                                          CBMArena *usage_target_arena) {
     RustLSPContext ctx;
     rust_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
+    ctx.usages = usages;
+    ctx.usage_target_arena = usage_target_arena;
     ctx.health = health;
     ctx.cargo_manifest = manifest;
     ctx.syn_calls = synthetic_calls;
@@ -7326,6 +7410,7 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
         }
     }
     rust_lsp_process_file(&ctx, root);
+    rust_resolve_module_callable_usages(&ctx);
     if (health)
         health->completed_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
 }
@@ -7373,12 +7458,13 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
 
 /* Cross-file Rust resolve using a pre-built shared registry (Tier-2). Skips the
  * per-file registry build; just parse + resolve. Mirrors cbm_run_c_lsp_cross_with_registry. */
-void cbm_run_rust_lsp_cross_scoped_with_registry(
+void cbm_run_rust_lsp_cross_scoped_with_registry_and_usages(
     CBMArena *arena, const char *source, int source_len, const char *module_qn,
     const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
     const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
     const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
-    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health) {
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health, CBMUsageArray *usages,
+    CBMArena *usage_target_arena) {
     if (health)
         health->required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
     if (!source || source_len <= 0) {
@@ -7413,12 +7499,23 @@ void cbm_run_rust_lsp_cross_scoped_with_registry(
     rust_health_record_parse_tree(health, root);
     rust_resolve_against_registry(arena, source, source_len, module_qn, reg, import_names,
                                   import_qns, import_scopes, import_count, root, manifest, out,
-                                  synthetic_calls, health);
+                                  synthetic_calls, health, usages, usage_target_arena);
     if (owns_tree) {
         ts_tree_delete(tree);
         if (parser)
             ts_parser_delete(parser);
     }
+}
+
+void cbm_run_rust_lsp_cross_scoped_with_registry(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
+    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health) {
+    cbm_run_rust_lsp_cross_scoped_with_registry_and_usages(
+        arena, source, source_len, module_qn, reg, import_names, import_qns, import_scopes,
+        import_count, cached_tree, manifest, out, synthetic_calls, health, NULL, NULL);
 }
 
 void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
@@ -7433,12 +7530,13 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
         cached_tree, manifest, out, synthetic_calls, health);
 }
 
-void cbm_run_rust_lsp_cross_scoped_with_manifest(
+void cbm_run_rust_lsp_cross_scoped_with_manifest_and_usages(
     CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
     int def_count, const char **import_names, const char **import_qns,
     const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
     const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
-    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health) {
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health, CBMUsageArray *usages,
+    CBMArena *usage_target_arena) {
     if (health)
         health->required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
     if (!source || source_len <= 0) {
@@ -7479,13 +7577,25 @@ void cbm_run_rust_lsp_cross_scoped_with_manifest(
 
     rust_resolve_against_registry(arena, source, source_len, module_qn, &reg, import_names,
                                   import_qns, import_scopes, import_count, root, manifest, out,
-                                  synthetic_calls, health);
+                                  synthetic_calls, health, usages, usage_target_arena);
 
     if (owns_tree) {
         ts_tree_delete(tree);
         if (parser)
             ts_parser_delete(parser);
     }
+}
+
+void cbm_run_rust_lsp_cross_scoped_with_manifest(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
+    int def_count, const char **import_names, const char **import_qns,
+    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
+    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health) {
+    cbm_run_rust_lsp_cross_scoped_with_manifest_and_usages(
+        arena, source, source_len, module_qn, defs, def_count, import_names, import_qns,
+        import_scopes, import_count, cached_tree, manifest, out, synthetic_calls, health, NULL,
+        NULL);
 }
 
 void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,

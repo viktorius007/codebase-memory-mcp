@@ -2425,8 +2425,133 @@ static bool emit_direct_perl_coderef_usage(CBMExtractCtx *ctx, TSNode node,
     return true;
 }
 
+/* Rust macro_rules! dispatch tables commonly retain a callable as the value
+ * on the right side of `descriptor => path;`. tree-sitter deliberately keeps
+ * a macro invocation's token tree opaque, so ordinary reference extraction
+ * cannot see that function value. Record only an unambiguous Rust path in
+ * that precise table shape; the Rust cross-file resolver later proves the
+ * target before pass_usages materializes the USAGE edge. */
+static bool rust_macro_table_path(const char *text, size_t length) {
+    size_t pos = 0;
+    if (length >= 2 && text[0] == ':' && text[1] == ':') {
+        pos = 2;
+    }
+    bool saw_component = false;
+    while (pos < length) {
+        if (!(isalpha((unsigned char)text[pos]) || text[pos] == '_')) {
+            return false;
+        }
+        pos++;
+        while (pos < length &&
+               (isalnum((unsigned char)text[pos]) || text[pos] == '_')) {
+            pos++;
+        }
+        saw_component = true;
+        if (pos == length) {
+            return saw_component;
+        }
+        if (pos + 1 >= length || text[pos] != ':' || text[pos + 1] != ':') {
+            return false;
+        }
+        pos += 2;
+    }
+    return false;
+}
+
+static void emit_rust_macro_table_usages(CBMExtractCtx *ctx, TSNode invocation,
+                                         const char *enclosing_func_qn,
+                                         uint32_t lexical_scope_id) {
+    if (!ctx || ctx->language != CBM_LANG_RUST || !ctx->source || !enclosing_func_qn ||
+        strcmp(ts_node_type(invocation), "macro_invocation") != 0) {
+        return;
+    }
+    uint32_t start_byte = ts_node_start_byte(invocation);
+    uint32_t end_byte = ts_node_end_byte(invocation);
+    if (end_byte <= start_byte || end_byte > (uint32_t)ctx->source_len) {
+        return;
+    }
+    const char *text = ctx->source + start_byte;
+    size_t length = (size_t)(end_byte - start_byte);
+    size_t pos = 0;
+    while (pos < length && text[pos] != '!') {
+        pos++;
+    }
+    if (pos == length) {
+        return;
+    }
+    while (++pos < length && isspace((unsigned char)text[pos])) {
+    }
+    if (pos == length || (text[pos] != '{' && text[pos] != '(' && text[pos] != '[')) {
+        return;
+    }
+
+    char outer_close = text[pos] == '{' ? '}' : (text[pos] == '(' ? ')' : ']');
+    int depth = 1;
+    size_t entry_start = pos + 1;
+    for (pos = entry_start; pos < length; pos++) {
+        char c = text[pos];
+        if (c == '"') {
+            pos++;
+            while (pos < length && text[pos] != '"') {
+                if (text[pos] == '\\' && pos + 1 < length) {
+                    pos++;
+                }
+                pos++;
+            }
+            continue;
+        }
+        if (c == '{' || c == '(' || c == '[') {
+            depth++;
+            continue;
+        }
+        if (c == '}' || c == ')' || c == ']') {
+            if (--depth == 0 && c == outer_close) {
+                return;
+            }
+            continue;
+        }
+        if (depth != 1 || c != '=' || pos + 1 >= length || text[pos + 1] != '>') {
+            continue;
+        }
+
+        size_t value_start = pos + 2;
+        while (value_start < length && isspace((unsigned char)text[value_start])) {
+            value_start++;
+        }
+        size_t value_end = value_start;
+        while (value_end < length && text[value_end] != ';') {
+            value_end++;
+        }
+        if (value_end == length) {
+            return;
+        }
+        while (value_end > value_start && isspace((unsigned char)text[value_end - 1])) {
+            value_end--;
+        }
+        if (rust_macro_table_path(text + value_start, value_end - value_start)) {
+            const char *name = cbm_arena_strndup(ctx->arena, text + value_start,
+                                                  value_end - value_start);
+            if (!name) {
+                return;
+            }
+            CBMUsage usage = {
+                .ref_name = name,
+                .enclosing_func_qn = enclosing_func_qn,
+                .kind = CBM_USAGE_VALUE,
+                .is_macro_callable_value = true,
+                .lexical_scope_id = lexical_scope_id,
+                .site_start_byte = start_byte + (uint32_t)value_start,
+                .site_end_byte = start_byte + (uint32_t)value_end,
+            };
+            cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+        }
+        pos = value_end;
+    }
+}
+
 // Try to emit a usage for a reference node. Returns early if the node should be skipped.
 static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    emit_rust_macro_table_usages(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0);
     if (emit_direct_perl_coderef_usage(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0)) {
         return;
     }
@@ -2485,6 +2610,8 @@ void cbm_extract_usages(CBMExtractCtx *ctx) {
 // Uses WalkState flags instead of parent-chain walks for O(1) context checks.
 
 void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
+    emit_rust_macro_table_usages(ctx, node, state->enclosing_func_qn,
+                                 active_lexical_scope_id(state));
     if (emit_direct_perl_coderef_usage(ctx, node, state->enclosing_func_qn,
                                        active_lexical_scope_id(state))) {
         return;

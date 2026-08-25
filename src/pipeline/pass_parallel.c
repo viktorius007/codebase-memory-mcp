@@ -2550,7 +2550,12 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         const cbm_gbuf_node_t *tgt = NULL;
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
-        if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
+        if (usage->resolved_target_qn) {
+            tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, usage->resolved_target_qn);
+            if (!tgt) {
+                continue;
+            }
+        } else if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
             bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
             semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
                 &result->resolved_calls, reference_index_ready ? &reference_index : NULL, usage,

@@ -589,6 +589,31 @@ TEST(rustlsp_format_returns_string) {
     PASS();
 }
 
+TEST(rustlsp_static_macro_table_records_function_value_usage) {
+    CBMFileResult *r = extract_rust(
+        "fn handler() {}\n"
+        "macro_rules! table {\n"
+        "    ($($descriptor:expr => $run:path;)+) => {\n"
+        "        const TABLE: &[fn()] = &[$($run),+];\n"
+        "    };\n"
+        "}\n"
+        "table! { 1 => handler; }\n");
+    ASSERT_NOT_NULL(r);
+    int matched = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *usage = &r->usages.items[i];
+        if (usage->ref_name && usage->resolved_target_qn &&
+            strcmp(usage->ref_name, "handler") == 0 &&
+            strstr(usage->resolved_target_qn, ".handler") != NULL &&
+            usage->enclosing_func_qn && strcmp(usage->enclosing_func_qn, r->module_qn) == 0) {
+            matched++;
+        }
+    }
+    ASSERT_EQ(matched, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Category 8: Stdlib semantics ─────────────────────────────── */
 
 TEST(rustlsp_hashmap_insert_get) {
@@ -8841,6 +8866,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_println_macro);
     RUN_TEST(rustlsp_vec_macro_with_inner_call);
     RUN_TEST(rustlsp_format_returns_string);
+    RUN_TEST(rustlsp_static_macro_table_records_function_value_usage);
 
     /* Stdlib semantics */
     RUN_TEST(rustlsp_hashmap_insert_get);
