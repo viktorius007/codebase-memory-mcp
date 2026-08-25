@@ -842,7 +842,7 @@ TEST(mcp_tools_list_latest_metadata) {
      * family (for example DEFINES or CONTAINS_FILE). Keep the public contract
      * aligned with the store query. */
     ASSERT_NOT_NULL(strstr(json, "in/out = selected degree across CALLS, USAGE, CALL_REFERENCE, "
-                                 "INHERITS, and IMPLEMENTS"));
+                                 "INHERITS, IMPLEMENTS, and OVERRIDE"));
     ASSERT_NULL(strstr(json, "TOTAL degree across ALL edge types"));
     free(json);
     PASS();

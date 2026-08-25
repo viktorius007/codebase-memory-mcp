@@ -124,9 +124,9 @@ TEST(config_save_atomically_replaces_a_complete_generation) {
     char old_bytes[512] = {0};
 #ifdef _WIN32
     DWORD old_length = 0;
-    bool old_read = ReadFile(old_handle, old_bytes, (DWORD)sizeof(old_bytes) - 1U, &old_length,
-                             NULL) != 0 &&
-                    old_length > 0;
+    bool old_read =
+        ReadFile(old_handle, old_bytes, (DWORD)sizeof(old_bytes) - 1U, &old_length, NULL) != 0 &&
+        old_length > 0;
     bool old_closed = CloseHandle(old_handle) != 0;
 #else
     size_t old_length = fread(old_bytes, 1, sizeof(old_bytes) - 1, old_handle);
@@ -645,6 +645,18 @@ TEST(layout_dead_code_classification) {
                          .qualified_name = "dc::caller",
                          .file_path = "src/g.c",
                          .properties_json = "{}"};
+    cbm_node_t dyn_impl = {.project = "dc",
+                           .label = "Method",
+                           .name = "dynamic_impl",
+                           .qualified_name = "dc::RealPort::dynamic_impl",
+                           .file_path = "src/dyn.c",
+                           .properties_json = "{}"};
+    cbm_node_t dyn_port = {.project = "dc",
+                           .label = "Method",
+                           .name = "dynamic_port",
+                           .qualified_name = "dc::Port::dynamic_port",
+                           .file_path = "src/dyn.c",
+                           .properties_json = "{}"};
     /* A structural (non-Function) node is never a dead-code candidate. */
     cbm_node_t cls = {.project = "dc",
                       .label = "Class",
@@ -661,6 +673,8 @@ TEST(layout_dead_code_classification) {
     int64_t id_single = cbm_store_upsert_node(store, &single);
     int64_t id_norm = cbm_store_upsert_node(store, &norm);
     int64_t id_caller = cbm_store_upsert_node(store, &caller);
+    int64_t id_dyn_impl = cbm_store_upsert_node(store, &dyn_impl);
+    int64_t id_dyn_port = cbm_store_upsert_node(store, &dyn_port);
     cbm_store_upsert_node(store, &cls);
     ASSERT_GT(id_dead, 0);
 
@@ -673,6 +687,12 @@ TEST(layout_dead_code_classification) {
     cbm_store_insert_edge(store, &e1);
     cbm_store_insert_edge(store, &e2);
     cbm_store_insert_edge(store, &e3);
+    cbm_edge_t dynamic_call = {
+        .project = "dc", .source_id = id_caller, .target_id = id_dyn_port, .type = "CALLS"};
+    cbm_edge_t dynamic_override = {
+        .project = "dc", .source_id = id_dyn_impl, .target_id = id_dyn_port, .type = "OVERRIDE"};
+    cbm_store_insert_edge(store, &dynamic_call);
+    cbm_store_insert_edge(store, &dynamic_override);
 
     cbm_layout_result_t *r = cbm_layout_compute(store, "dc", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
     ASSERT_NOT_NULL(r);
@@ -709,6 +729,11 @@ TEST(layout_dead_code_classification) {
     ASSERT_NOT_NULL(ln);
     ASSERT_STR_EQ(ln->status, "normal");
     ASSERT_EQ(ln->in_calls, 2);
+
+    ln = find_layout_node(r, "dynamic_impl");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "normal");
+    ASSERT_EQ(ln->in_calls, 0);
 
     ln = find_layout_node(r, "SomeClass");
     ASSERT_NOT_NULL(ln);

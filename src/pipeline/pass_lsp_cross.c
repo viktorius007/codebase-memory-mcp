@@ -909,20 +909,6 @@ static int pxc_rust_crate_root(const cbm_file_info_t *files, CBMFileResult *cons
     return -1;
 }
 
-static bool pxc_rust_crate_name_eq(const char *cargo_name, const char *source_name) {
-    if (!cargo_name || !source_name)
-        return false;
-    while (*cargo_name && *source_name) {
-        char a = *cargo_name == '-' ? '_' : *cargo_name;
-        char b = *source_name == '-' ? '_' : *source_name;
-        if (a != b)
-            return false;
-        cargo_name++;
-        source_name++;
-    }
-    return *cargo_name == '\0' && *source_name == '\0';
-}
-
 static const char *pxc_rust_caller_package_dir(const CBMCargoManifest *manifest,
                                                const char *caller_rel) {
     const char *best = NULL;
@@ -979,7 +965,7 @@ static int pxc_rust_external_root(const CBMCargoManifest *manifest, const cbm_fi
         const CBMCargoTarget *target = &manifest->targets[i];
         if (target->kind != CBM_CARGO_TARGET_LIB || !target->name || !target->package_dir ||
             !target->source_path || strcmp(target->package_dir, caller_package_dir) != 0 ||
-            !pxc_rust_crate_name_eq(target->name, crate_name))
+            !cbm_cargo_crate_name_eq(target->name, crate_name))
             continue;
         self_found = pxc_rust_file_index(files, file_count, target->source_path);
         if (pxc_rust_package_lib_visible_for_caller(files, cache, file_count, caller, manifest,
@@ -998,7 +984,7 @@ static int pxc_rust_external_root(const CBMCargoManifest *manifest, const cbm_fi
         const CBMCargoDependencyRoute *route = &manifest->dependency_routes[i];
         if (route->package_dir && route->name &&
             strcmp(route->package_dir, caller_package_dir) == 0 &&
-            pxc_rust_crate_name_eq(route->name, crate_name)) {
+            cbm_cargo_crate_name_eq(route->name, crate_name)) {
             declared++;
             target_package_dir = route->target_package_dir;
         }
@@ -1140,6 +1126,13 @@ static const char *pxc_rust_authority_resolve(
     const char *leaf = segments[pos];
     if (!target || !target->module_qn)
         return NULL;
+    char leaf_inline[CBM_PATH_MAX];
+    int leaf_module =
+        pxc_rust_child_file(files, cache, file_count, current, inline_path, leaf, manifest,
+                            require_public_ancestors, leaf_inline, sizeof(leaf_inline));
+    if (leaf_module >= 0 && leaf_module != current && cache[leaf_module] &&
+        cache[leaf_module]->module_qn)
+        return cache[leaf_module]->module_qn;
     char inline_dotted[CBM_PATH_MAX];
     snprintf(inline_dotted, sizeof(inline_dotted), "%s", inline_path);
     for (char *p = inline_dotted; *p; p++)

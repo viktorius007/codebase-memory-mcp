@@ -1376,8 +1376,8 @@ static const char skill_content[] =
     "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n"
     "6. `ingest_traces` is a stub — accepts input, returns \"not yet implemented\", "
     "creates no edges. Don't rely on it.\n"
-    "7. Dead-code / `max_degree=0` results are CANDIDATES, not proof — trait impls, "
-    "test fixtures, and dynamic-dispatch targets show as zero-degree. Confirm with "
+    "7. Dead-code / `max_degree=0` results are CANDIDATES, not proof — reflection, "
+    "generated entry points, and test fixtures can still show as zero-degree. Confirm with "
     "grep before treating anything as unused.\n";
 
 static const char codex_instructions_content[] =

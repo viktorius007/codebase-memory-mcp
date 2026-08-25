@@ -309,6 +309,43 @@ TEST(store_search_degree_counts_inherits) {
     PASS();
 }
 
+TEST(store_search_degree_counts_override) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t implementation = {.project = "test",
+                                 .label = "Method",
+                                 .name = "implementation",
+                                 .qualified_name = "test.RealRunner.run"};
+    cbm_node_t port = {
+        .project = "test", .label = "Method", .name = "port", .qualified_name = "test.Runner.run"};
+    int64_t implementation_id = cbm_store_upsert_node(s, &implementation);
+    int64_t port_id = cbm_store_upsert_node(s, &port);
+    ASSERT_GT(implementation_id, 0);
+    ASSERT_GT(port_id, 0);
+
+    cbm_edge_t edge = {.project = "test",
+                       .source_id = implementation_id,
+                       .target_id = port_id,
+                       .type = "OVERRIDE"};
+    ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+
+    cbm_search_params_t params = {
+        .project = "test", .label = "Method", .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    int implementation_idx = search_result_index_by_name(&out, "implementation");
+    int port_idx = search_result_index_by_name(&out, "port");
+    ASSERT_GTE(implementation_idx, 0);
+    ASSERT_GTE(port_idx, 0);
+    ASSERT_EQ(out.results[implementation_idx].out_degree, 1);
+    ASSERT_EQ(out.results[port_idx].in_degree, 1);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_search_degree_calls_plus_inherits_no_double_count) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -1489,6 +1526,7 @@ SUITE(store_search) {
     RUN_TEST(store_search_pagination);
     RUN_TEST(store_search_degree_filter);
     RUN_TEST(store_search_degree_counts_inherits);
+    RUN_TEST(store_search_degree_counts_override);
     RUN_TEST(store_search_degree_calls_plus_inherits_no_double_count);
     RUN_TEST(store_search_min_degree_includes_inherits_only);
     RUN_TEST(store_search_isolated_node_zero_degree);

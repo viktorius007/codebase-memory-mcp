@@ -5441,24 +5441,33 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             tail = path;
         }
 
-        /* Cross-crate workspace-member resolution (#56): when the call
-         * path's head is a declared Cargo workspace member (e.g.
+        /* Cross-crate local-package resolution: when the call path's head is
+         * a workspace member or a routed local dependency (e.g.
          * `crate_a::helper` from inside crate_b) we cannot rely on the
          * caller-crate-scoped fallback below — that filters by the
          * CALLER's module prefix and would resolve to a same-named local
          * function instead. Route to the function defined inside the
-         * MEMBER crate by matching the registered QN's `.<member>.`
-         * path segment plus the call tail. Requires a parsed manifest
+         * target package by matching the registered QN's package-path
+         * segments plus the call tail. Requires a parsed manifest
          * (threaded through pass_lsp_cross.c); NULL manifest skips this. */
         if (ctx->cargo_manifest && tail && *tail) {
             const char *head_sep = strstr(path, "::");
             if (head_sep && head_sep > path) {
                 char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(head_sep - path));
                 const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
-                if (head && cbm_cargo_find_member(m, head)) {
-                    /* `.crate_a.` — the member directory appears as a dotted
-                     * QN segment for every def inside that crate. */
-                    char *needle = cbm_arena_sprintf(ctx->arena, ".%s.", head);
+                const CBMCargoMember *member = head ? cbm_cargo_find_member(m, head) : NULL;
+                const char *dependency_package =
+                    head ? cbm_cargo_find_local_dependency_package(m, head) : NULL;
+                if (member || dependency_package) {
+                    /* The package directory appears as dotted QN segments
+                     * for every definition inside that package. */
+                    char *needle = member
+                                       ? cbm_arena_sprintf(ctx->arena, ".%s.", member->member_name)
+                                       : cbm_arena_sprintf(ctx->arena, ".%s.", dependency_package);
+                    if (!member)
+                        for (char *p = needle; p && *p; p++)
+                            if (*p == '/' || *p == '\\')
+                                *p = '.';
                     const CBMRegisteredFunc *mem_unique = NULL;
                     int mem_matches = 0;
                     /* Iterate only free funcs whose short_name == tail via the index;
@@ -5474,7 +5483,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                         if (strcmp(f->short_name, tail) != 0)
                             continue;
                         if (!strstr(f->qualified_name, needle))
-                            continue; /* not defined in the member crate */
+                            continue; /* not defined in the target package */
                         mem_matches++;
                         if (mem_matches == 1)
                             mem_unique = f;

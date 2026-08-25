@@ -6355,18 +6355,16 @@ TEST(usages_creates_edges) {
 TEST(rust_macro_function_table_creates_usage_edge) {
     /* The table's paths cross into a sibling module. A USAGE edge is the
      * value-flow link; classifying it as CALLS would invent a direct call. */
-    if (setup_usages_repo("Cargo.toml", "[package]\nname = \"table\"\nversion = \"0.1.0\"\n",
-                          NULL, NULL) != 0) {
+    if (setup_usages_repo("Cargo.toml", "[package]\nname = \"table\"\nversion = \"0.1.0\"\n", NULL,
+                          NULL) != 0) {
         FAIL("failed to create temp dir");
     }
     write_temp_file(g_usages_tmpdir, "src/lib.rs",
                     "pub mod commands;\n"
                     "pub mod entity_runtime;\n");
     write_temp_file(g_usages_tmpdir, "src/commands/mod.rs", "pub mod adr;\npub mod req;\n");
-    write_temp_file(g_usages_tmpdir, "src/commands/adr.rs",
-                    "pub fn run_from_matches() {}\n");
-    write_temp_file(g_usages_tmpdir, "src/commands/req.rs",
-                    "pub fn run_from_matches() {}\n");
+    write_temp_file(g_usages_tmpdir, "src/commands/adr.rs", "pub fn run_from_matches() {}\n");
+    write_temp_file(g_usages_tmpdir, "src/commands/req.rs", "pub fn run_from_matches() {}\n");
     write_temp_file(g_usages_tmpdir, "src/entity_runtime.rs",
                     "pub struct Adapter { run: fn() }\n\n"
                     "macro_rules! table {\n"
@@ -6438,6 +6436,89 @@ TEST(rust_macro_function_table_creates_usage_edge) {
         cbm_unsetenv("CBM_WORKERS");
     }
     teardown_usages_repo();
+    PASS();
+}
+
+TEST(rust_serde_callable_hooks_create_usage_edges) {
+    if (setup_usages_repo("Cargo.toml", "[package]\nname = \"hooks\"\nversion = \"0.1.0\"\n", NULL,
+                          NULL) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(
+        g_usages_tmpdir, "src/lib.rs",
+        "fn default_value() -> String { String::new() }\n"
+        "fn omit_value(value: &String) -> bool { value.is_empty() }\n\n"
+        "#[derive(serde::Serialize, serde::Deserialize)]\n"
+        "struct Record {\n"
+        "    #[serde(default = \"default_value\", skip_serializing_if = \"omit_value\")]\n"
+        "    value: String,\n"
+        "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_rust_serde_hooks.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "src/lib.rs", "default_value"), 1);
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "src/lib.rs", "omit_value"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_usages_repo();
+    PASS();
+}
+
+TEST(rust_workspace_dependency_import_creates_cross_crate_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_cross_crate_call_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/pm-infra/src/sqlite")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "xtask/src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nmembers = [\"crates/*\", \"xtask\"]\n"
+                    "resolver = \"2\"\n");
+    write_temp_file(tmp, "crates/pm-infra/Cargo.toml",
+                    "[package]\nname = \"pm-infra\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "crates/pm-infra/src/lib.rs", "pub mod sqlite;\n");
+    write_temp_file(tmp, "crates/pm-infra/src/sqlite/mod.rs", "pub mod managed_schema;\n");
+    write_temp_file(tmp, "crates/pm-infra/src/sqlite/managed_schema.rs",
+                    "pub fn check_schema_sql_vs_migrations(_: &str) {}\n");
+    write_temp_file(tmp, "xtask/Cargo.toml",
+                    "[package]\nname = \"xtask\"\nversion = \"0.1.0\"\n"
+                    "[dependencies]\npm-infra = { path = \"../crates/pm-infra\" }\n");
+    write_temp_file(tmp, "xtask/src/lib.rs", "pub mod direct_gate;\npub mod schema_gate;\n");
+    write_temp_file(
+        tmp, "xtask/src/schema_gate.rs",
+        "use pm_infra::sqlite::managed_schema;\n"
+        "pub fn run() { managed_schema::check_schema_sql_vs_migrations(\"schema\"); }\n");
+    write_temp_file(tmp, "xtask/src/direct_gate.rs",
+                    "pub fn run_direct() { "
+                    "pm_infra::sqlite::managed_schema::check_schema_sql_vs_migrations(\"schema\"); "
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cross_crate.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS", "run",
+                                       "check_schema_sql_vs_migrations",
+                                       "crates/pm-infra/src/sqlite/managed_schema.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                       "run_direct", "check_schema_sql_vs_migrations",
+                                       "crates/pm-infra/src/sqlite/managed_schema.rs"),
+              1);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
     PASS();
 }
 
@@ -14481,6 +14562,8 @@ SUITE(pipeline) {
     /* Usages pass (full pipeline integration) */
     RUN_TEST(usages_creates_edges);
     RUN_TEST(rust_macro_function_table_creates_usage_edge);
+    RUN_TEST(rust_serde_callable_hooks_create_usage_edges);
+    RUN_TEST(rust_workspace_dependency_import_creates_cross_crate_call);
     RUN_TEST(usages_no_duplicate_calls);
     RUN_TEST(calls_edge_carries_call_site_line);
     RUN_TEST(usages_kotlin_creates_edges);

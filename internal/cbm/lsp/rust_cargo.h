@@ -112,6 +112,9 @@ bool cbm_cargo_add_dependency_route(CBMArena *arena, CBMCargoManifest *manifest,
                                     const char *package_dir, const char *name,
                                     const char *target_name, const char *target_package_dir);
 
+/* Cargo package names use '-', while Rust source addresses the crate with '_'. */
+bool cbm_cargo_crate_name_eq(const char *cargo_name, const char *source_name);
+
 /* Convenience: does a given path-prefix look like one of the listed
  * dependency names? Used by the resolver to recognise external crate
  * paths. */
@@ -119,6 +122,10 @@ bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head);
 
 /* Find a workspace member by crate name. Returns NULL if absent. */
 const CBMCargoMember* cbm_cargo_find_member(const CBMCargoManifest* m,
-    const char* name);
+                                             const char* name);
+
+/* Return the sole local package directory routed by this dependency name. */
+const char *cbm_cargo_find_local_dependency_package(const CBMCargoManifest *m,
+                                                    const char *name);
 
 #endif /* CBM_LSP_RUST_CARGO_H */

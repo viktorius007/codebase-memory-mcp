@@ -2456,6 +2456,82 @@ static bool rust_macro_table_path(const char *text, size_t length) {
     return false;
 }
 
+static void emit_rust_serde_hook_usages(CBMExtractCtx *ctx, TSNode attribute,
+                                        const char *enclosing_func_qn, uint32_t lexical_scope_id) {
+    static const char *keys[] = {"default", "skip_serializing_if", "serialize_with",
+                                 "deserialize_with"};
+    if (!ctx || ctx->language != CBM_LANG_RUST || !ctx->source || !enclosing_func_qn ||
+        strcmp(ts_node_type(attribute), "attribute_item") != 0) {
+        return;
+    }
+    uint32_t start_byte = ts_node_start_byte(attribute);
+    uint32_t end_byte = ts_node_end_byte(attribute);
+    if (end_byte <= start_byte || end_byte > (uint32_t)ctx->source_len) {
+        return;
+    }
+    const char *text = ctx->source + start_byte;
+    size_t length = (size_t)(end_byte - start_byte);
+    const char *attribute_end = text + length;
+    if (length < 2 || text[0] != '#' || text[1] != '[') {
+        return;
+    }
+    size_t head = 2;
+    while (head < length && isspace((unsigned char)text[head])) {
+        head++;
+    }
+    enum { SERDE_LENGTH = sizeof("serde") - 1 };
+    if (head + SERDE_LENGTH > length || strncmp(text + head, "serde", SERDE_LENGTH) != 0 ||
+        (head + SERDE_LENGTH < length && text[head + SERDE_LENGTH] != '(' &&
+         !isspace((unsigned char)text[head + SERDE_LENGTH]))) {
+        return;
+    }
+
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        size_t key_length = strlen(keys[k]);
+        const char *match = text;
+        while ((match = strstr(match, keys[k])) && match + key_length <= attribute_end) {
+            if (match > text && (isalnum((unsigned char)match[-1]) || match[-1] == '_')) {
+                match += key_length;
+                continue;
+            }
+            const char *cursor = match + key_length;
+            while (cursor < attribute_end && isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            if (cursor >= attribute_end || *cursor++ != '=') {
+                match += key_length;
+                continue;
+            }
+            while (cursor < attribute_end && isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            if (cursor >= attribute_end || *cursor++ != '"') {
+                match += key_length;
+                continue;
+            }
+            const char *path = cursor;
+            while (cursor < attribute_end && *cursor != '"' && *cursor != '\\') {
+                cursor++;
+            }
+            size_t path_length = (size_t)(cursor - path);
+            if (cursor < attribute_end && *cursor == '"' &&
+                rust_macro_table_path(path, path_length)) {
+                CBMUsage usage = {
+                    .ref_name = cbm_arena_strndup(ctx->arena, path, path_length),
+                    .enclosing_func_qn = enclosing_func_qn,
+                    .kind = CBM_USAGE_VALUE,
+                    .is_macro_callable_value = true,
+                    .lexical_scope_id = lexical_scope_id,
+                    .site_start_byte = start_byte + (uint32_t)(path - text),
+                    .site_end_byte = start_byte + (uint32_t)(cursor - text),
+                };
+                cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+            }
+            match += key_length;
+        }
+    }
+}
+
 static void emit_rust_macro_table_value(CBMExtractCtx *ctx, const char *text,
                                         uint32_t invocation_start, size_t value_start,
                                         size_t value_end, const char *enclosing_func_qn,
@@ -2550,6 +2626,7 @@ static void emit_rust_macro_table_usages(CBMExtractCtx *ctx, TSNode invocation,
 
 // Try to emit a usage for a reference node. Returns early if the node should be skipped.
 static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    emit_rust_serde_hook_usages(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0);
     emit_rust_macro_table_usages(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0);
     if (emit_direct_perl_coderef_usage(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0)) {
         return;
@@ -2609,6 +2686,8 @@ void cbm_extract_usages(CBMExtractCtx *ctx) {
 // Uses WalkState flags instead of parent-chain walks for O(1) context checks.
 
 void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
+    emit_rust_serde_hook_usages(ctx, node, state->enclosing_func_qn,
+                                active_lexical_scope_id(state));
     emit_rust_macro_table_usages(ctx, node, state->enclosing_func_qn,
                                  active_lexical_scope_id(state));
     if (emit_direct_perl_coderef_usage(ctx, node, state->enclosing_func_qn,

@@ -651,8 +651,10 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     int *in_calls = calloc((size_t)n, sizeof(int));
     int *in_usage = calloc((size_t)n, sizeof(int));
     int *in_call_reference = calloc((size_t)n, sizeof(int));
+    int *out_override = calloc((size_t)n, sizeof(int));
     int *deg_dummy = calloc((size_t)n, sizeof(int));
-    bool dead_degrees_valid = node_ids && in_calls && in_usage && in_call_reference && deg_dummy;
+    bool dead_degrees_valid =
+        node_ids && in_calls && in_usage && in_call_reference && out_override && deg_dummy;
     if (dead_degrees_valid) {
         for (int i = 0; i < n; i++)
             node_ids[i] = search_out.results[i].node.id;
@@ -664,7 +666,10 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                                               deg_dummy + off) != CBM_STORE_OK ||
                 cbm_store_batch_count_degrees(store, node_ids + off, cnt, "CALL_REFERENCE",
                                               in_call_reference + off,
-                                              deg_dummy + off) != CBM_STORE_OK) {
+                                              deg_dummy + off) != CBM_STORE_OK ||
+                cbm_store_batch_count_degrees(store, node_ids + off, cnt, "OVERRIDE",
+                                              deg_dummy + off,
+                                              out_override + off) != CBM_STORE_OK) {
                 dead_degrees_valid = false;
                 break;
             }
@@ -729,7 +734,8 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
             sn->label && (strcmp(sn->label, "Function") == 0 || strcmp(sn->label, "Method") == 0);
         bool testish = nf.is_test || (sn->file_path && cbm_is_test_file_path(sn->file_path));
         int ic = dead_degrees_valid ? in_calls[i] : 1;
-        int iu = dead_degrees_valid ? in_usage[i] + in_call_reference[i] : 1;
+        int reachable =
+            dead_degrees_valid ? in_usage[i] + in_call_reference[i] + out_override[i] : 1;
         const char *status;
         if (!is_fn)
             status = "structural";
@@ -739,7 +745,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
             status = "entry";
         else if (nf.is_exported)
             status = "exported";
-        else if (ic == 0 && iu == 0)
+        else if (ic == 0 && reachable == 0)
             status = "dead";
         else if (ic == 1)
             status = "single";
@@ -779,6 +785,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     free(in_calls);
     free(in_usage);
     free(in_call_reference);
+    free(out_override);
     free(deg_dummy);
     free_edge_array(all_edges, mapped);
     cbm_store_search_free(&search_out);

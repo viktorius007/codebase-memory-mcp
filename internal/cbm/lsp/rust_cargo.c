@@ -1019,16 +1019,29 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     }
 }
 
+bool cbm_cargo_crate_name_eq(const char *cargo_name, const char *source_name) {
+    if (!cargo_name || !source_name)
+        return false;
+    while (*cargo_name && *source_name) {
+        char cargo = *cargo_name == '-' ? '_' : *cargo_name;
+        char source = *source_name == '-' ? '_' : *source_name;
+        if (cargo != source)
+            return false;
+        cargo_name++;
+        source_name++;
+    }
+    return *cargo_name == '\0' && *source_name == '\0';
+}
+
 bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head) {
     if (!m || !head) return false;
     for (int i = 0; i < m->dep_count; i++) {
-        if (m->deps[i].name && strcmp(m->deps[i].name, head) == 0) {
+        if (cbm_cargo_crate_name_eq(m->deps[i].name, head)) {
             return true;
         }
     }
     for (int i = 0; i < m->member_count; i++) {
-        if (m->members[i].member_name &&
-            strcmp(m->members[i].member_name, head) == 0) {
+        if (cbm_cargo_crate_name_eq(m->members[i].member_name, head)) {
             return true;
         }
     }
@@ -1039,10 +1052,24 @@ const CBMCargoMember* cbm_cargo_find_member(const CBMCargoManifest* m,
     const char* name) {
     if (!m || !name) return NULL;
     for (int i = 0; i < m->member_count; i++) {
-        if (m->members[i].member_name &&
-            strcmp(m->members[i].member_name, name) == 0) {
+        if (cbm_cargo_crate_name_eq(m->members[i].member_name, name)) {
             return &m->members[i];
         }
     }
     return NULL;
+}
+
+const char *cbm_cargo_find_local_dependency_package(const CBMCargoManifest *m,
+                                                    const char *name) {
+    const char *found = NULL;
+    for (int i = 0; m && name && i < m->dependency_route_count; i++) {
+        const CBMCargoDependencyRoute *route = &m->dependency_routes[i];
+        if (!route->target_package_dir ||
+            !cbm_cargo_crate_name_eq(route->name, name))
+            continue;
+        if (found && strcmp(found, route->target_package_dir) != 0)
+            return NULL;
+        found = route->target_package_dir;
+    }
+    return found;
 }
