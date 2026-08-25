@@ -687,11 +687,8 @@ TEST(layout_dead_code_classification) {
     cbm_store_insert_edge(store, &e1);
     cbm_store_insert_edge(store, &e2);
     cbm_store_insert_edge(store, &e3);
-    cbm_edge_t dynamic_call = {
-        .project = "dc", .source_id = id_caller, .target_id = id_dyn_port, .type = "CALLS"};
     cbm_edge_t dynamic_override = {
         .project = "dc", .source_id = id_dyn_impl, .target_id = id_dyn_port, .type = "OVERRIDE"};
-    cbm_store_insert_edge(store, &dynamic_call);
     cbm_store_insert_edge(store, &dynamic_override);
 
     cbm_layout_result_t *r = cbm_layout_compute(store, "dc", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
@@ -731,6 +728,11 @@ TEST(layout_dead_code_classification) {
     ASSERT_EQ(ln->in_calls, 2);
 
     ln = find_layout_node(r, "dynamic_impl");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "normal");
+    ASSERT_EQ(ln->in_calls, 0);
+
+    ln = find_layout_node(r, "dynamic_port");
     ASSERT_NOT_NULL(ln);
     ASSERT_STR_EQ(ln->status, "normal");
     ASSERT_EQ(ln->in_calls, 0);

@@ -272,6 +272,38 @@ TEST(rustlsp_nested_function_owns_its_calls) {
     PASS();
 }
 
+TEST(rustlsp_nested_function_resolves_outer_call) {
+    CBMFileResult *r = extract_rust(
+        "fn outer() {\n"
+        "    fn walk(n: u32) { if n > 0 { walk(n - 1); } }\n"
+        "    walk(1);\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved_exact(r, "test.src.main.outer", "test.src.main.outer.walk"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_wildcard_let_retains_function_value) {
+    CBMFileResult *r = extract_rust(
+        "fn retain() { fn retained() {} let _ = retained; }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved_exact(r, "test.src.main.retain", "test.src.main.retain.retained"),
+              1);
+    int joined = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *usage = &r->usages.items[i];
+        if (usage->ref_name && strcmp(usage->ref_name, "retained") == 0 &&
+            cbm_pipeline_find_lsp_reference(&r->resolved_calls, usage, false)) {
+            ASSERT_TRUE(usage->may_be_call_reference);
+            joined++;
+        }
+    }
+    ASSERT_EQ(joined, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_trait_default_method_owns_its_calls) {
     CBMFileResult *r = extract_rust(
         "trait Port {\n"
@@ -1230,6 +1262,46 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
 
     cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_shared_registry_scoped_path_beats_local_same_name) {
+    const char *source = "mod helper;\n"
+                         "fn target() {}\n"
+                         "fn outer() { helper::target(); }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_EQ(count_resolved_exact(result, "test.src.main.outer", "test.src.main.target"), 0);
+
+    CBMLSPDef defs[2] = {0};
+    defs[0] = (CBMLSPDef){.qualified_name = "test.src.main.target",
+                          .short_name = "target",
+                          .label = "Function",
+                          .def_module_qn = "test.src.main",
+                          .lang = CBM_LANG_RUST};
+    defs[1] = (CBMLSPDef){.qualified_name = "test.src.helper.target",
+                          .short_name = "target",
+                          .label = "Function",
+                          .def_module_qn = "test.src.helper",
+                          .lang = CBM_LANG_RUST};
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&result->arena, defs, 2);
+    ASSERT_NOT_NULL(registry);
+    cbm_run_rust_lsp_cross_with_registry(
+        &result->arena, source, (int)strlen(source), result->module_qn, registry, NULL, NULL, 0,
+        NULL, NULL, &result->resolved_calls, NULL, &result->rust_health);
+    ASSERT_EQ(count_resolved_exact(result, "test.src.main.outer", "test.src.helper.target"), 1);
+
+    const CBMResolvedCall *joined = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->enclosing_func_qn && strcmp(call->enclosing_func_qn, "test.src.main.outer") == 0 &&
+            call->callee_name && strstr(call->callee_name, "target")) {
+            joined = cbm_pipeline_find_lsp_resolution(&result->resolved_calls, call, false);
+        }
+    }
+    ASSERT_NOT_NULL(joined);
+    ASSERT_STR_EQ(joined->callee_qn, "test.src.helper.target");
+    cbm_free_result(result);
     PASS();
 }
 
@@ -8853,6 +8925,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_two_free_functions);
     RUN_TEST(rustlsp_cfg_module_caller_qn_matches_extraction);
     RUN_TEST(rustlsp_nested_function_owns_its_calls);
+    RUN_TEST(rustlsp_nested_function_resolves_outer_call);
+    RUN_TEST(rustlsp_wildcard_let_retains_function_value);
     RUN_TEST(rustlsp_trait_default_method_owns_its_calls);
 
     /* Inherent impl */
@@ -8904,6 +8978,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_rooted_impl_returns_require_authoritative_crate_root);
     RUN_TEST(rustlsp_manifest_free_self_super_returns_preserve_module_semantics);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
+    RUN_TEST(rustlsp_shared_registry_scoped_path_beats_local_same_name);
     RUN_TEST(rustlsp_relative_type_requires_declared_module);
     RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);
     RUN_TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier);

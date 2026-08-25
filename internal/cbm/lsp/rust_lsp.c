@@ -4738,6 +4738,7 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
 
 static const char *rust_resolve_callable_value(RustLSPContext *ctx, TSNode value,
                                                const char **source_name);
+static void rust_emit_callable_value_reference(RustLSPContext *ctx, TSNode value);
 
 void rust_process_statement(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
@@ -4804,6 +4805,9 @@ void rust_process_statement(RustLSPContext *ctx, TSNode node) {
             if (binding_name && callable_qn) {
                 cbm_scope_bind_callable(ctx->current_scope, binding_name, let_type, callable_qn);
             }
+        }
+        if (!ts_node_is_null(val)) {
+            rust_emit_callable_value_reference(ctx, val);
         }
         return;
     }
@@ -4955,6 +4959,54 @@ static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
     rust_emit_resolved_call_reason(ctx, callee_qn, strategy, confidence, NULL);
 }
 
+/* Mutually exclusive cfg definitions share one Rust spelling but have distinct
+ * graph nodes. Preserve the conditional call to every definition instead of
+ * treating those nodes as an ordinary ambiguous overload. Synthetic carriers
+ * use each cfg-qualified leaf so the downstream exact-site join stays
+ * one-target-at-a-time and retains its normal ambiguity checks. */
+static bool rust_emit_cfg_free_function_variants(RustLSPContext *ctx, const char *name) {
+    if (!ctx || !ctx->module_qn || !name || !name[0]) {
+        return false;
+    }
+    const char *base = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    if (!base) {
+        return false;
+    }
+    size_t base_length = strlen(base);
+    int matches = 0;
+    CBMFreeFuncIter count_iter;
+    cbm_registry_free_funcs_by_short_name(ctx->registry, name, &count_iter);
+    for (int index; (index = cbm_free_func_iter_next(&count_iter)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &ctx->registry->funcs[index];
+        size_t qualified_length =
+            candidate->qualified_name ? strlen(candidate->qualified_name) : 0;
+        if (!candidate->receiver_type && qualified_length >= base_length + 5U &&
+            strncmp(candidate->qualified_name, base, base_length) == 0 &&
+            strncmp(candidate->qualified_name + base_length, "#cfg(", 5) == 0) {
+            matches++;
+        }
+    }
+    if (matches < 2) {
+        return false;
+    }
+    CBMFreeFuncIter emit_iter;
+    cbm_registry_free_funcs_by_short_name(ctx->registry, name, &emit_iter);
+    for (int index; (index = cbm_free_func_iter_next(&emit_iter)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &ctx->registry->funcs[index];
+        size_t qualified_length =
+            candidate->qualified_name ? strlen(candidate->qualified_name) : 0;
+        if (candidate->receiver_type || qualified_length < base_length + 5U ||
+            strncmp(candidate->qualified_name, base, base_length) != 0 ||
+            strncmp(candidate->qualified_name + base_length, "#cfg(", 5) != 0) {
+            continue;
+        }
+        rust_emit_resolved_call(ctx, candidate->qualified_name, "lsp_cfg_dispatch",
+                                CBM_RUST_CONF_DIRECT);
+        rust_inject_syn_call(ctx, candidate->qualified_name);
+    }
+    return true;
+}
+
 static bool rust_qn_has_suffix(const char *qualified_name, const char *suffix) {
     if (!qualified_name || !suffix) {
         return false;
@@ -4983,6 +5035,15 @@ static const char *rust_resolve_callable_value(RustLSPContext *ctx, TSNode value
     }
     if (strcmp(kind, "identifier") == 0 && cbm_scope_contains(ctx->current_scope, path)) {
         return cbm_scope_lookup_callable(ctx->current_scope, path);
+    }
+    if (strcmp(kind, "identifier") == 0 && ctx->enclosing_func_qn) {
+        const char *nested_qn =
+            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_func_qn, path);
+        const CBMRegisteredFunc *nested =
+            nested_qn ? cbm_registry_lookup_func(ctx->registry, nested_qn) : NULL;
+        if (nested) {
+            return nested->qualified_name;
+        }
     }
     const char *resolved = rust_resolve_path_expr(ctx, path);
     if (!resolved) {
@@ -5017,6 +5078,99 @@ static const char *rust_resolve_callable_value(RustLSPContext *ctx, TSNode value
         }
     }
     return matches == 1 && unique ? unique->qualified_name : NULL;
+}
+
+static const char *rust_resolve_scoped_free_call(RustLSPContext *ctx, TSNode value,
+                                                 bool *claimed, bool *defer_short_fallback) {
+    *claimed = false;
+    *defer_short_fallback = false;
+    char *path = rust_node_text(ctx, value);
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    const char *lexical_path = path;
+    while (strncmp(lexical_path, "self::", 6) == 0) {
+        lexical_path += 6;
+    }
+    while (strncmp(lexical_path, "super::", 7) == 0) {
+        lexical_path += 7;
+    }
+    if (strncmp(lexical_path, "crate::", 7) == 0) {
+        lexical_path += 7;
+    }
+    const char *head_end = strstr(lexical_path, "::");
+    char *head = head_end
+                     ? cbm_arena_strndup(ctx->arena, lexical_path,
+                                         (size_t)(head_end - lexical_path))
+                     : NULL;
+    const char *use_target = head ? rust_resolve_use(ctx, head) : NULL;
+    const char *canonical_use_target =
+        use_target ? rust_resolve_use_target(ctx, use_target) : NULL;
+    bool imported_type = canonical_use_target &&
+                         cbm_registry_lookup_type(ctx->registry, canonical_use_target) != NULL;
+    bool declared_module = head && cbm_idxmemo_get(&ctx->declared_modules, head) >= 0;
+    *defer_short_fallback = head && use_target && !imported_type;
+    const char *suffix = convert_path_to_qn(ctx->arena, lexical_path);
+    const char *tail = suffix ? strrchr(suffix, '.') : NULL;
+    tail = tail ? tail + 1 : NULL;
+    const CBMRegisteredFunc *unique = NULL;
+    int matches = 0;
+    if (tail) {
+        for (const CBMTypeRegistry *registry = ctx->registry; registry && matches < 2;
+             registry = registry->fallback) {
+            CBMFreeFuncIter iter;
+            cbm_registry_free_funcs_by_short_name(registry, tail, &iter);
+            for (int index; matches < 2 && (index = cbm_free_func_iter_next(&iter)) >= 0;) {
+                const CBMRegisteredFunc *candidate = &registry->funcs[index];
+                if (candidate->qualified_name && rust_qn_has_suffix(candidate->qualified_name,
+                                                                    suffix) &&
+                    (!unique || strcmp(unique->qualified_name, candidate->qualified_name) != 0)) {
+                    unique = candidate;
+                    matches++;
+                }
+            }
+        }
+    }
+    if (matches == 1) {
+        *claimed = true;
+        return unique->qualified_name;
+    }
+    *claimed = declared_module;
+    return NULL;
+}
+
+static void rust_emit_callable_value_reference(RustLSPContext *ctx, TSNode value) {
+    const char *source_name = NULL;
+    const char *target = rust_resolve_callable_value(ctx, value, &source_name);
+    uint32_t start = 0;
+    uint32_t end = 0;
+    if (!target || !rust_map_source_range(ctx, ts_node_start_byte(value), ts_node_end_byte(value),
+                                          &start, &end)) {
+        return;
+    }
+    const char *strategy = "lsp_callable_value_reference";
+    if (ctx->enclosing_func_qn && source_name) {
+        const char *nested_qn =
+            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_func_qn, source_name);
+        if (nested_qn && strcmp(nested_qn, target) == 0) {
+            strategy = "lsp_callable_alias";
+        }
+    }
+    CBMResolvedCall reference = {
+        .caller_qn = ctx->enclosing_func_qn,
+        .callee_qn = target,
+        .strategy = strategy,
+        .confidence = CBM_RUST_CONF_DIRECT,
+        .reason = source_name,
+        .kind = CBM_RESOLVED_CALL_REFERENCE,
+        .site_start_byte = start,
+        .site_end_byte = end,
+    };
+    int before = ctx->resolved_calls->count;
+    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, reference);
+    if (ctx->resolved_calls->count > before && ctx->health) {
+        rust_health_increment(&ctx->health->resolved_emitted);
+    }
 }
 
 /* Extracted function-pointer table values can use `crate::` while the graph's
@@ -5324,6 +5478,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         /* Strip ALL turbofish (`Vec::<i32>::new` → `Vec::new`). */
         rust_strip_turbofish(path);
         char *explicit_receiver = NULL;
+        bool defer_scoped_short_fallback = false;
         char *source_sep = strstr(path, "::");
         if (source_sep && strstr(source_sep + 2, "::") == NULL) {
             explicit_receiver = cbm_arena_strndup(ctx->arena, path, (size_t)(source_sep - path));
@@ -5337,6 +5492,31 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 return;
             }
             if (cbm_scope_contains(ctx->current_scope, path)) {
+                return;
+            }
+            if (ctx->enclosing_func_qn) {
+                const char *nested_qn =
+                    cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_func_qn, path);
+                const CBMRegisteredFunc *nested =
+                    nested_qn ? cbm_registry_lookup_func(ctx->registry, nested_qn) : NULL;
+                if (nested) {
+                    rust_emit_resolved_call(ctx, nested->qualified_name, "lsp_lexical_nested",
+                                            CBM_RUST_CONF_DIRECT);
+                    return;
+                }
+            }
+        }
+
+        if (strcmp(ts_node_type(actual_func), "scoped_identifier") == 0) {
+            bool claimed = false;
+            const char *target = rust_resolve_scoped_free_call(
+                ctx, actual_func, &claimed, &defer_scoped_short_fallback);
+            if (target) {
+                rust_emit_resolved_call(ctx, target, "lsp_qualified_path", CBM_RUST_CONF_DIRECT);
+                return;
+            }
+            if (claimed) {
+                rust_emit_unresolved_call(ctx, path, "scoped_module_pending");
                 return;
             }
         }
@@ -5358,6 +5538,10 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 rust_emit_resolved_call(ctx, full, "lsp_direct", CBM_RUST_CONF_DIRECT);
                 return;
             }
+        }
+        if (strcmp(ts_node_type(actual_func), "identifier") == 0 &&
+            rust_emit_cfg_free_function_variants(ctx, path)) {
+            return;
         }
 
         /* UFCS form: T::method or trait_qn::method. */
@@ -5495,6 +5679,11 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                     }
                 }
             }
+        }
+
+        if (defer_scoped_short_fallback) {
+            rust_emit_unresolved_call(ctx, path, "scoped_import_pending");
+            return;
         }
 
         /* Scoped short-name fallback: scan the registry for a unique

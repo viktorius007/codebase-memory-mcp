@@ -6522,6 +6522,75 @@ TEST(rust_workspace_dependency_import_creates_cross_crate_call) {
     PASS();
 }
 
+TEST(rust_nested_and_sibling_module_callers_are_reachable) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_local_callers_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "src/db")), 0);
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"local-callers\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub mod helper;\n"
+                    "pub mod db;\n"
+                    "pub fn outer() {\n"
+                    "    fn walk(n: u32) { if n > 0 { walk(n - 1); } }\n"
+                    "    walk(1);\n"
+                    "    helper::target();\n"
+                    "}\n"
+                    "pub trait Runner { fn run_it(&self); }\n"
+                    "pub struct RealRunner;\n"
+                    "impl Runner for RealRunner { fn run_it(&self) { helper::target(); } }\n"
+                    "fn target() { helper::target(); }\n"
+                    "fn retain() { const fn retained() {} let _ = retained; }\n"
+                    "fn call_platform(metadata: &std::fs::Metadata) { platform_check(metadata); }\n"
+                    "#[cfg(unix)]\n"
+                    "fn platform_check(metadata: &std::fs::Metadata) -> bool { metadata.is_file() }\n"
+                    "#[cfg(not(unix))]\n"
+                    "fn platform_check(_metadata: &std::fs::Metadata) -> bool { true }\n");
+    write_temp_file(tmp, "src/helper.rs", "pub fn target() {}\n");
+    write_temp_file(tmp, "src/db/mod.rs",
+                    "pub mod schema;\npub mod migrations;\nmod registry;\n"
+                    "pub mod public { pub fn call() { super::registry::target(); } }\n");
+    write_temp_file(tmp, "src/db/schema.rs", "pub fn target() {}\n");
+    write_temp_file(tmp, "src/db/registry.rs", "pub(super) fn target() {}\n");
+    write_temp_file(tmp, "src/db/migrations.rs",
+                    "use super::schema;\n"
+                    "pub fn target() { schema::target(); }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/local_callers.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "outer", "walk", "src/lib.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "outer", "target",
+                                       "src/helper.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "target", "target",
+                                       "src/db/schema.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "call", "target",
+                                       "src/db/registry.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALL_REFERENCE", "retain", "retained",
+                                       "src/lib.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "call_platform",
+                                       "platform_check", "src/lib.rs"),
+              2);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "target", "target",
+                                       "src/helper.rs"),
+              1);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(usages_no_duplicate_calls) {
     /* Port of TestPassUsagesDoesNotDuplicateCalls.
      * A direct function call should produce CALLS but not USAGE. */
@@ -14564,6 +14633,7 @@ SUITE(pipeline) {
     RUN_TEST(rust_macro_function_table_creates_usage_edge);
     RUN_TEST(rust_serde_callable_hooks_create_usage_edges);
     RUN_TEST(rust_workspace_dependency_import_creates_cross_crate_call);
+    RUN_TEST(rust_nested_and_sibling_module_callers_are_reachable);
     RUN_TEST(usages_no_duplicate_calls);
     RUN_TEST(calls_edge_carries_call_site_line);
     RUN_TEST(usages_kotlin_creates_edges);

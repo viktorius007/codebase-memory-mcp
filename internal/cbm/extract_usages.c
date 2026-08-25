@@ -1557,8 +1557,14 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
                    ? parent
                    : (TSNode){0};
     }
+    bool rust_let_value = false;
+    if (ctx->language == CBM_LANG_RUST && !ts_node_is_null(parent) &&
+        strcmp(ts_node_type(parent), "let_declaration") == 0) {
+        TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
+        rust_let_value = !ts_node_is_null(value) && ts_node_eq(value, node);
+    }
     if (ctx->language == CBM_LANG_RUST && strcmp(kind, "scoped_identifier") == 0) {
-        return is_direct_argument_value_walk(node, state) ? node : (TSNode){0};
+        return rust_let_value || is_direct_argument_value_walk(node, state) ? node : (TSNode){0};
     }
     if (ctx->language == CBM_LANG_CSHARP) {
         return csharp_callable_value_site(node);
@@ -1586,6 +1592,9 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         strcmp(ts_node_type(parent), "assignment") == 0) {
         TSNode right = ts_node_child_by_field_name(parent, TS_FIELD("right"));
         return !ts_node_is_null(right) && ts_node_eq(right, node) ? node : (TSNode){0};
+    }
+    if (rust_let_value) {
+        return node;
     }
     if (is_direct_argument_value_walk(node, state)) {
         return node;
