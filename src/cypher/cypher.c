@@ -3145,11 +3145,15 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
 
 /* Evaluate a comparison operator between actual and expected strings. */
 static bool eval_comparison_op(const char *op, const char *actual, const char *expected) {
+    bool boolean_equivalent = (strcmp(actual, "true") == 0 && strcmp(expected, "1") == 0) ||
+                              (strcmp(actual, "false") == 0 && strcmp(expected, "0") == 0) ||
+                              (strcmp(expected, "true") == 0 && strcmp(actual, "1") == 0) ||
+                              (strcmp(expected, "false") == 0 && strcmp(actual, "0") == 0);
     if (strcmp(op, "=") == 0) {
-        return strcmp(actual, expected) == 0;
+        return strcmp(actual, expected) == 0 || boolean_equivalent;
     }
     if (strcmp(op, "<>") == 0) {
-        return strcmp(actual, expected) != 0;
+        return strcmp(actual, expected) != 0 && !boolean_equivalent;
     }
     if (strcmp(op, "=~") == 0) {
         cbm_regex_t re;
@@ -5114,7 +5118,7 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
     if (ret->limit > 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
-        proj_cap = ret->limit;
+        proj_cap = ret->limit < max_rows ? ret->limit : max_rows;
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
         const char *vals[CBM_SZ_32];
@@ -5439,7 +5443,8 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         rb_apply_distinct(rb);
     }
     rb_apply_order_by(rb, ret);
-    rb_apply_skip_limit(rb, ret->skip, ret->limit >= 0 ? ret->limit : max_rows);
+    int result_limit = ret->limit >= 0 && ret->limit < max_rows ? ret->limit : max_rows;
+    rb_apply_skip_limit(rb, ret->skip, result_limit);
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
@@ -5449,7 +5454,8 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     /* Step 1: Scan initial nodes */
     cbm_node_t *scanned = NULL;
     int scan_count = 0;
-    scan_pattern_nodes(store, project, max_rows, &pat0->nodes[0], &scanned, &scan_count);
+    scan_pattern_nodes(store, project, CYPHER_RESULT_CEILING, &pat0->nodes[0], &scanned,
+                       &scan_count);
 
     /* Build initial bindings with early WHERE */
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
@@ -5477,7 +5483,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                         q->pattern_optional[0]);
 
     /* Step 2b: Additional patterns */
-    if (expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count,
+    if (expand_additional_patterns(store, q, project, CYPHER_RESULT_CEILING, &bindings, &bind_count,
                                    &bind_cap) != 0) {
         for (int bi = 0; bi < bind_count; bi++) {
             binding_free(&bindings[bi]);

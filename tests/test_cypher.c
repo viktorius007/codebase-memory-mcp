@@ -885,9 +885,12 @@ TEST(cypher_exec_optional_saturated_does_not_fabricate_no_match) {
     /* 3 Function nodes → scan_count = 3; max_rows = 3 → bind_cap = 3 and
      * max_new = 30. A alone exceeds that, so B and C are reached with the
      * budget already spent — the regime that produced the fabrication. */
-    cbm_node_t a = {.project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
-    cbm_node_t b = {.project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
-    cbm_node_t c = {.project = "test", .label = "Function", .name = "C", .qualified_name = "test.C"};
+    cbm_node_t a = {
+        .project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
+    cbm_node_t b = {
+        .project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
+    cbm_node_t c = {
+        .project = "test", .label = "Function", .name = "C", .qualified_name = "test.C"};
     int64_t a_id = cbm_store_upsert_node(s, &a);
     (void)cbm_store_upsert_node(s, &b); /* B: no outgoing CALLS at all */
     int64_t c_id = cbm_store_upsert_node(s, &c);
@@ -2518,11 +2521,11 @@ TEST(cypher_apply_limit) {
     ASSERT_EQ(r.row_count, 10);
     cbm_cypher_result_free(&r);
 
-    /* LIMIT above max_rows → explicit limit wins */
+    /* max_rows is an output ceiling even when the query asks for more. */
     memset(&r, 0, sizeof(r));
     rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 30", "lim", 10, &r);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(r.row_count, 30);
+    ASSERT_EQ(r.row_count, 10);
     cbm_cypher_result_free(&r);
 
     cbm_store_close(s);
@@ -2939,8 +2942,7 @@ TEST(cypher_exec_multikey_order_by_keeps_limit_issue1334) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
     /* start_lines: HandleOrder=10, ValidateOrder=5, SubmitOrder=0, LogError=0 */
-    int rc = cbm_cypher_execute(
-        s,
+    int rc = cbm_cypher_execute(s,
         "MATCH (f:Function) RETURN f.name, f.start_line "
         "ORDER BY f.start_line DESC, f.name ASC LIMIT 2",
         "test", 0, &r);
@@ -2959,8 +2961,7 @@ TEST(cypher_exec_multikey_order_by_tiebreak_issue1334) {
     cbm_cypher_result_t r = {0};
     /* start_line ASC puts the two 0-line functions first; name DESC breaks the
      * tie: SubmitOrder before LogError. */
-    int rc = cbm_cypher_execute(
-        s,
+    int rc = cbm_cypher_execute(s,
         "MATCH (f:Function) RETURN f.name, f.start_line "
         "ORDER BY f.start_line ASC, f.name DESC LIMIT 2",
         "test", 0, &r);
@@ -3288,8 +3289,7 @@ TEST(cypher_issue1111_with_type_count_group) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute(
-        s,
-        "MATCH (a)-[r]->(b) WITH type(r) AS t, count(*) AS n RETURN t, n ORDER BY n DESC",
+        s, "MATCH (a)-[r]->(b) WITH type(r) AS t, count(*) AS n RETURN t, n ORDER BY n DESC",
         "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 2);
@@ -3933,6 +3933,74 @@ TEST(cypher_multi_prop_projection_no_alias) {
     ASSERT_STR_EQ(r.rows[0][4], "10"); /* start_line (computed) */
     ASSERT_STR_EQ(r.rows[0][5], "42"); /* end_line (computed) — distinct from start_line */
     cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_max_rows_caps_matches_after_where_filtering) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    for (int i = 0; i < 30; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "%s-%02d", i < 20 ? "decoy" : "wanted", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "fixture.c"};
+        cbm_store_upsert_node(s, &n);
+    }
+
+    cbm_cypher_result_t r = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (n:Function) WHERE n.name STARTS WITH 'wanted' "
+                                 "RETURN n.name LIMIT 50",
+                                 "test", 3, &r),
+              0);
+    ASSERT_EQ(r.row_count, 3);
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_NOT_NULL(strstr(r.rows[i][0], "wanted-"));
+    }
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_boolean_properties_equal_numeric_boolean_literals) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t yes = {.project = "test",
+                      .label = "Function",
+                      .name = "yes",
+                      .qualified_name = "test.yes",
+                      .file_path = "fixture.c",
+                      .properties_json = "{\"is_entry_point\":true}"};
+    cbm_node_t no = {.project = "test",
+                     .label = "Function",
+                     .name = "no",
+                     .qualified_name = "test.no",
+                     .file_path = "fixture.c",
+                     .properties_json = "{\"is_entry_point\":false}"};
+    cbm_store_upsert_node(s, &yes);
+    cbm_store_upsert_node(s, &no);
+
+    cbm_cypher_result_t true_result = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (n:Function) WHERE n.is_entry_point = 1 RETURN n.name",
+                                 "test", 0, &true_result),
+              0);
+    ASSERT_EQ(true_result.row_count, 1);
+    ASSERT_STR_EQ(true_result.rows[0][0], "yes");
+    cbm_cypher_result_free(&true_result);
+
+    cbm_cypher_result_t false_result = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (n:Function) WHERE n.is_entry_point = 0 RETURN n.name",
+                                 "test", 0, &false_result),
+              0);
+    ASSERT_EQ(false_result.row_count, 1);
+    ASSERT_STR_EQ(false_result.rows[0][0], "no");
+    cbm_cypher_result_free(&false_result);
     cbm_store_close(s);
     PASS();
 }
@@ -4961,6 +5029,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue874_where_substring);
     RUN_TEST(cypher_issue874_where_unsupported_func_error);
     RUN_TEST(cypher_multi_prop_projection_no_alias);
+    RUN_TEST(cypher_max_rows_caps_matches_after_where_filtering);
+    RUN_TEST(cypher_boolean_properties_equal_numeric_boolean_literals);
     RUN_TEST(cypher_exists_no_callers);
     RUN_TEST(cypher_exists_has_outgoing_calls);
     RUN_TEST(cypher_exec_calls_relationship);
