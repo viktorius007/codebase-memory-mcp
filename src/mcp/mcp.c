@@ -6751,6 +6751,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         if (arch.entry_point_count > 0) {
             /* qn only — `name` is its last segment. */
             static const char *const ecols[] = {"qn", "file"};
+            cbm_tree_scalar_int(&sb, "entry_points_total", arch.entry_point_total);
+            cbm_tree_scalar_bool(&sb, "entry_points_truncated", arch.entry_points_truncated);
             cbm_tree_table_header(&sb, "entry_points", arch.entry_point_count, ecols, 2);
             for (int i = 0; i < arch.entry_point_count; i++) {
                 cbm_tree_row_begin(&sb);
@@ -7015,6 +7017,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     if (arch.entry_point_count > 0) {
         static const char *const ecols[] = {"qn", "file"};
+        yyjson_mut_obj_add_int(doc, root, "entry_points_total", arch.entry_point_total);
+        yyjson_mut_obj_add_bool(doc, root, "entry_points_truncated", arch.entry_points_truncated);
         yyjson_mut_val *rows = arch_json_section(doc, root, "entry_points", ecols, 2);
         for (int i = 0; i < arch.entry_point_count; i++) {
             yyjson_mut_val *row = yyjson_mut_arr(doc);

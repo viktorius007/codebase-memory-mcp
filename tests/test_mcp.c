@@ -6435,9 +6435,67 @@ TEST(tool_get_architecture_emits_populated_sections) {
      * is serialized — which is exactly what #281 wires up. */
     ASSERT_NOT_NULL(strstr(inner, "entry_points:"));
     ASSERT_NOT_NULL(strstr(inner, "main"));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points_total: 1"));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points_truncated: false"));
 
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_architecture_reports_entry_point_slice_metadata) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "arch-entry-total";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/arch-entry-total"), CBM_STORE_OK);
+    for (int i = 0; i < 21; i++) {
+        char name[32];
+        char qn[64];
+        char file[64];
+        snprintf(name, sizeof(name), "entry_%02d", i);
+        snprintf(qn, sizeof(qn), "arch-entry-total.cmd.%s", name);
+        snprintf(file, sizeof(file), "cmd/%s.c", name);
+        cbm_node_t node = {.project = proj,
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = file,
+                           .properties_json = "{\"is_entry_point\":true}"};
+        ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    }
+
+    char *tree_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-entry-total\","
+             "\"aspects\":[\"entry_points\"]}}}");
+    ASSERT_NOT_NULL(tree_resp);
+    char *tree = extract_text_content(tree_resp);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(strstr(tree, "entry_points_total: 21"));
+    ASSERT_NOT_NULL(strstr(tree, "entry_points_truncated: true"));
+    ASSERT_NOT_NULL(strstr(tree, "entry_points: 20"));
+    free(tree);
+    free(tree_resp);
+
+    char *json_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-entry-total\","
+             "\"aspects\":[\"entry_points\"],\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(json_resp);
+    char *json = extract_text_content(json_resp);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"entry_points_total\":21"));
+    ASSERT_NOT_NULL(strstr(json, "\"entry_points_truncated\":true"));
+    free(json);
+    free(json_resp);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -16188,6 +16246,7 @@ SUITE(mcp) {
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
+    RUN_TEST(tool_get_architecture_reports_entry_point_slice_metadata);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);

@@ -168,6 +168,42 @@ TEST(arch_entry_points_exclude_tests) {
         ASSERT_TRUE(strstr(info.entry_points[i].file, "test") == NULL);
     }
     ASSERT_EQ(info.entry_point_count, 2); /* main, HandleRequest */
+    ASSERT_EQ(info.entry_point_total, 2);
+    ASSERT_FALSE(info.entry_points_truncated);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_entry_points_report_exact_total_when_slice_is_truncated) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "entry-total", "/tmp/entry-total"), CBM_STORE_OK);
+
+    for (int i = 0; i < 21; i++) {
+        char name[32];
+        char qualified_name[64];
+        char file_path[64];
+        snprintf(name, sizeof(name), "entry_%02d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "entry-total.cmd.%s", name);
+        snprintf(file_path, sizeof(file_path), "cmd/%s.c", name);
+        cbm_node_t node = {.project = "entry-total",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = file_path,
+                           .properties_json = "{\"is_entry_point\":true}"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"entry_points"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "entry-total", NULL, aspects, 1, &info),
+              CBM_STORE_OK);
+    ASSERT_EQ(info.entry_point_count, 20);
+    ASSERT_EQ(info.entry_point_total, 21);
+    ASSERT_TRUE(info.entry_points_truncated);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -2094,6 +2130,7 @@ SUITE(store_arch) {
     /* Architecture */
     RUN_TEST(arch_get_all);
     RUN_TEST(arch_entry_points_exclude_tests);
+    RUN_TEST(arch_entry_points_report_exact_total_when_slice_is_truncated);
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
     RUN_TEST(arch_path_scoping);

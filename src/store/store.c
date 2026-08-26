@@ -6415,7 +6415,7 @@ static int arch_entry_points(cbm_store_t *s, const char *project, const char *pa
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char sqlbuf[ST_SQL_BUF];
-    const char *base = "SELECT name, qualified_name, file_path FROM nodes "
+    const char *base = "SELECT name, qualified_name, file_path, COUNT(*) OVER() FROM nodes "
                        "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1 "
                        "AND (json_extract(properties, '$.is_test') IS NULL OR "
                        "json_extract(properties, '$.is_test') != 1) "
@@ -6447,6 +6447,7 @@ static int arch_entry_points(cbm_store_t *s, const char *project, const char *pa
         arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         arr[n].qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         arr[n].file = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        out->entry_point_total = sqlite3_column_int(stmt, ST_COL_3);
         n++;
     }
     if (scan_rc21 != SQLITE_DONE) { /* SCANCHK:21:stmt */
@@ -6459,6 +6460,7 @@ static int arch_entry_points(cbm_store_t *s, const char *project, const char *pa
     sqlite3_finalize(stmt);
     out->entry_points = arr;
     out->entry_point_count = n;
+    out->entry_points_truncated = n < out->entry_point_total;
     return CBM_STORE_OK;
 }
 

@@ -7,16 +7,33 @@ second history; commit history carries the old investigations.
 
 ## Resolved during investigation
 
-- `search_graph` degree accounting once omitted `OVERRIDE` edges. The mechanism was
-  `cbm_store_search`'s two correlated edge-count subqueries: their `IN` lists produced
-  the reported `in_deg` and `out_deg` columns, and `search_apply_degree_filter` then
-  filtered those same aliases. Omitting `OVERRIDE` therefore both reported trait
-  implementations as degree zero and admitted them through `max_degree=0`. The
-  surgical resolution is to include `OVERRIDE` in both the inbound and outbound
-  subqueries. That production change was already present in baseline commit
-  `eb12be98`; the observed project graph came from a stale/pre-fix server build, while
-  current HEAD already contained the surgical fix. The focused store test now also
-  locks the filtered and reported results.
+### `search_graph` degree accounting omitted `OVERRIDE`
+
+The mechanism was `cbm_store_search`'s two correlated edge-count subqueries:
+their `IN` lists produced the reported `in_deg` and `out_deg` columns, and
+`search_apply_degree_filter` then filtered those same aliases. Omitting
+`OVERRIDE` therefore both reported trait implementations as degree zero and
+admitted them through `max_degree=0`.
+
+The surgical resolution is to include `OVERRIDE` in both the inbound and
+outbound subqueries. That production change was already present in baseline
+commit `eb12be98`; the observed project graph came from a stale/pre-fix server
+build, while current HEAD already contained the fix. The focused store test now
+also locks the filtered and reported results.
+
+### `get_architecture` hides entry-point truncation
+
+Root cause: `arch_entry_points` in `src/store/store.c` applies `LIMIT 20` to its
+only qualifying-node query. The store result therefore carries only the sliced
+row count, and both MCP encodings present that count without an exact population
+total or truncation signal. Large projects consequently make 20 returned entry
+points indistinguishable from exactly 20 matches.
+
+Surgical resolution: retain the bounded 20-row payload, derive the exact total
+in the same SQLite snapshot with `COUNT(*) OVER()`, and carry `entry_point_total`
+plus `entry_points_truncated` through the store result into both tree and JSON
+MCP responses. A 21-entry store fixture pins `shown = 20`, `total = 21`, and
+`truncated = true`; the existing two-entry fixture pins the non-truncated case.
 
 ## Confirmed behavior
 
