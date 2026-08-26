@@ -5621,9 +5621,8 @@ TEST(tool_trace_pagination_exactly_once) {
     ASSERT_NOT_NULL(strstr(inner, "c05"));
     free(inner);
 
-    /* Canonicalized params define cursor identity. An over-cap depth is
-     * clamped before traversal, so replaying the identical request must hash
-     * the same effective depth that was minted into the cursor. */
+    /* An over-cap depth is rejected instead of producing a cursor for a
+     * silently different traversal. */
     resp = cbm_mcp_handle_tool(
         srv, "trace_call_path",
         "{\"project\":\"pageproj\",\"function_name\":\"hub\",\"direction\":\"outbound\","
@@ -5632,28 +5631,8 @@ TEST(tool_trace_pagination_exactly_once) {
     inner = extract_text_content(resp);
     free(resp);
     ASSERT_NOT_NULL(inner);
-    const char *clamped_next = strstr(inner, "next: ");
-    ASSERT_NOT_NULL(clamped_next);
-    const char *clamped_end = strchr(clamped_next + 6, '\n');
-    size_t clamped_len =
-        clamped_end ? (size_t)(clamped_end - (clamped_next + 6)) : strlen(clamped_next + 6);
-    ASSERT_TRUE(clamped_len < sizeof(tok1));
-    memcpy(tok1, clamped_next + 6, clamped_len);
-    tok1[clamped_len] = '\0';
-    free(inner);
-    snprintf(req2, sizeof(req2),
-             "{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"tools/call\",\"params\":{"
-             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
-             "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,\"depth\":1000,"
-             "\"cursor\":\"%s\"}}}",
-             tok1);
-    resp = cbm_mcp_server_handle(srv, req2);
-    ASSERT_NOT_NULL(resp);
-    inner = extract_text_content(resp);
-    free(resp);
-    ASSERT_NOT_NULL(inner);
-    ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
-    ASSERT_NOT_NULL(strstr(inner, "c05"));
+    ASSERT_NOT_NULL(strstr(inner, "depth must be at most"));
+    ASSERT_NULL(strstr(inner, "next: "));
     free(inner);
 
     /* Omitted direction canonically means "both". Cursor minting and replay
@@ -6129,8 +6108,7 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
     ASSERT_NOT_NULL(strstr(ev_json_txt, "\"args\""));
     /* Column declarations are a positional contract: evidence precedes args,
      * so the target row must place the class/confidence before the edge args. */
-    ASSERT_NOT_NULL(strstr(ev_json_txt,
-                           "[\"target\",1,\"lsp\",0.95,[{\"e\":\"payload\"}]]"));
+    ASSERT_NOT_NULL(strstr(ev_json_txt, "[\"target\",1,\"lsp\",0.95,[{\"e\":\"payload\"}]]"));
     ASSERT_NULL(strstr(ev_json_txt, "lsp_trait_dispatch"));
     free(ev_json_txt);
     free(ev_json);
@@ -6147,7 +6125,7 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
  * reached but n16 is not (GREEN). Quoted tokens ("n15"/"n16") match only the
  * node-name field, never the qualified_name (preceded by '.'), so the boundary
  * check is exact. */
-TEST(tool_trace_call_path_depth_clamped) {
+TEST(tool_trace_call_path_depth_above_ceiling_is_rejected) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     cbm_store_t *st = cbm_mcp_server_store(srv);
     const char *proj = "depth-proj";
@@ -6176,21 +6154,28 @@ TEST(tool_trace_call_path_depth_clamped) {
         cbm_store_insert_edge(st, &e);
     }
 
-    char *resp = cbm_mcp_server_handle(
+    char *at_ceiling = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"n00\","
-             "\"project\":\"depth-proj\",\"direction\":\"outbound\",\"depth\":1000}}}");
-    ASSERT_NOT_NULL(resp);
-    char *inner = extract_text_content(resp);
-    ASSERT_NOT_NULL(inner);
+             "\"project\":\"depth-proj\",\"direction\":\"outbound\",\"depth\":15}}}");
+    ASSERT_NOT_NULL(at_ceiling);
+    char *ceiling_text = extract_text_content(at_ceiling);
+    ASSERT_NOT_NULL(ceiling_text);
+    ASSERT_NOT_NULL(strstr(ceiling_text, "n15"));
+    free(ceiling_text);
+    free(at_ceiling);
 
-    /* Reached within the ceiling (proves the traversal ran) but clamped at 15.
-     * TOON rows carry bare QNs, so match the names unquoted. */
-    ASSERT_NOT_NULL(strstr(inner, "n15"));
-    ASSERT_NULL(strstr(inner, "n16"));
-
-    free(inner);
-    free(resp);
+    char *above_ceiling = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"n00\","
+             "\"project\":\"depth-proj\",\"direction\":\"outbound\",\"depth\":16}}}");
+    ASSERT_NOT_NULL(above_ceiling);
+    char *above_text = extract_text_content(above_ceiling);
+    ASSERT_NOT_NULL(above_text);
+    ASSERT_NOT_NULL(strstr(above_text, "depth must be at most 15"));
+    ASSERT_NULL(strstr(above_text, "n15"));
+    free(above_text);
+    free(above_ceiling);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -12736,8 +12721,8 @@ TEST(snippet_budget_fitting_501_line_function_is_complete) {
 
 TEST(snippet_source_that_exactly_fits_serialized_budget_is_complete) {
     generated_snippet_t fx;
-    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.ExactFit", 40,
-                                        80, "def ExactFit():", false, false));
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.ExactFit", 40, 80,
+                                        "def ExactFit():", false, false));
     const char *wide_args =
         "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
         "ExactFit\",\"max_response_bytes\":65536}";
@@ -12966,8 +12951,8 @@ TEST(snippet_cursor_rejects_stale_source_and_mismatched_symbol) {
 
 TEST(snippet_cursor_rejects_malformed_and_offset_tampering) {
     generated_snippet_t fx;
-    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.CursorGuard",
-                                        800, 100, "def CursorGuard():", false, false));
+    ASSERT_TRUE(generated_snippet_setup(&fx, "Function", "snippet-pages.generated.CursorGuard", 800,
+                                        100, "def CursorGuard():", false, false));
     char *first = call_snippet(
         fx.srv, "{\"project\":\"snippet-pages\",\"qualified_name\":\"snippet-pages.generated."
                 "CursorGuard\",\"max_response_bytes\":4096}");
@@ -16306,7 +16291,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_prefers_definition);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
-    RUN_TEST(tool_trace_call_path_depth_clamped);
+    RUN_TEST(tool_trace_call_path_depth_above_ceiling_is_rejected);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);

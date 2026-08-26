@@ -8236,7 +8236,16 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *mode = cbm_mcp_get_string_arg(args, "mode");
     bool has_param_name = mcp_arg_present(args, "parameter_name");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH);
-    depth = clamp_mcp_depth(depth, "trace_call_path");
+    int depth_cap = cbm_mcp_max_depth();
+    if (depth > depth_cap) {
+        char error[CBM_SZ_128];
+        snprintf(error, sizeof(error), "depth must be at most %d (given %d)", depth_cap, depth);
+        free(func_name);
+        free(project);
+        free(direction);
+        free(mode);
+        return cbm_mcp_text_result(error, true);
+    }
     /* Per-direction node budget for the BFS working set. The old fixed
      * MCP_BFS_LIMIT silently truncated hub traces at 100 nodes with no
      * signal; now the limit is a documented parameter and hitting it emits
