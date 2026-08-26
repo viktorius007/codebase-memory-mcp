@@ -97,7 +97,7 @@ static cbm_store_t *setup_arch_test_store(void) {
                             .file_path = "internal/service/service.go"};
     int64_t id_helper = cbm_store_upsert_node(s, &fn_helper);
 
-    /* Test function (should be excluded) */
+    /* Test target entry point */
     cbm_node_t fn_test = {.project = "test",
                           .label = "Function",
                           .name = "TestHandleRequest",
@@ -105,6 +105,14 @@ static cbm_store_t *setup_arch_test_store(void) {
                           .file_path = "internal/handler/handler_test.go",
                           .properties_json = "{\"is_entry_point\":true}"};
     int64_t id_test = cbm_store_upsert_node(s, &fn_test);
+
+    cbm_node_t ui_main = {.project = "test",
+                          .label = "Function",
+                          .name = "main",
+                          .qualified_name = "test.tests.ui.pass.main",
+                          .file_path = "tests/ui/pass.rs",
+                          .properties_json = "{\"is_entry_point\":true,\"is_test\":true}"};
+    cbm_store_upsert_node(s, &ui_main);
 
     /* Route */
     cbm_node_t route = {
@@ -157,18 +165,22 @@ TEST(arch_get_all) {
     PASS();
 }
 
-TEST(arch_entry_points_exclude_tests) {
+TEST(arch_entry_points_include_test_targets) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"entry_points"};
     ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
+    bool found_ui_main = false;
     for (int i = 0; i < info.entry_point_count; i++) {
-        ASSERT_TRUE(strstr(info.entry_points[i].file, "test") == NULL);
+        if (strcmp(info.entry_points[i].file, "tests/ui/pass.rs") == 0) {
+            found_ui_main = true;
+        }
     }
-    ASSERT_EQ(info.entry_point_count, 2); /* main, HandleRequest */
-    ASSERT_EQ(info.entry_point_total, 2);
+    ASSERT_TRUE(found_ui_main);
+    ASSERT_EQ(info.entry_point_count, 4); /* production, test harness, and UI-target mains */
+    ASSERT_EQ(info.entry_point_total, 4);
     ASSERT_FALSE(info.entry_points_truncated);
 
     cbm_store_architecture_free(&info);
@@ -311,7 +323,8 @@ TEST(arch_path_scoping) {
     ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
     ASSERT_EQ(scoped_pkg_nodes, 1);
 
-    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") >
+                cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
 
     cbm_architecture_info_t scoped_slash;
     memset(&scoped_slash, 0, sizeof(scoped_slash));
@@ -481,8 +494,7 @@ TEST(arch_hotspots_exclude_low_confidence_name_collisions) {
                         .source_id = callers[i],
                         .target_id = id_collect,
                         .type = "CALLS",
-                        .properties_json =
-                            "{\"callee\":\"collect\",\"confidence\":0.375,"
+                        .properties_json = "{\"callee\":\"collect\",\"confidence\":0.375,"
                             "\"strategy\":\"unique_name\",\"candidates\":1}"};
         cbm_store_insert_edge(s, &e);
     }
@@ -614,8 +626,7 @@ TEST(arch_boundaries_exclude_low_confidence_name_collisions) {
                         .source_id = callers[i],
                         .target_id = id_collect,
                         .type = "CALLS",
-                        .properties_json =
-                            "{\"callee\":\"collect\",\"confidence\":0.375,"
+                        .properties_json = "{\"callee\":\"collect\",\"confidence\":0.375,"
                             "\"strategy\":\"unique_name\",\"candidates\":1}"};
         cbm_store_insert_edge(s, &e);
     }
@@ -2129,7 +2140,7 @@ TEST(search_case_sensitive_explicit) {
 SUITE(store_arch) {
     /* Architecture */
     RUN_TEST(arch_get_all);
-    RUN_TEST(arch_entry_points_exclude_tests);
+    RUN_TEST(arch_entry_points_include_test_targets);
     RUN_TEST(arch_entry_points_report_exact_total_when_slice_is_truncated);
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);

@@ -6416,10 +6416,7 @@ static int arch_entry_points(cbm_store_t *s, const char *project, const char *pa
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT name, qualified_name, file_path, COUNT(*) OVER() FROM nodes "
-                       "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1 "
-                       "AND (json_extract(properties, '$.is_test') IS NULL OR "
-                       "json_extract(properties, '$.is_test') != 1) "
-                       "AND file_path NOT LIKE '%test%'";
+                       "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1";
     if (scoped) {
         snprintf(sqlbuf, sizeof(sqlbuf), "%s%s LIMIT 20", base, arch_path_scope_sql());
     } else {
