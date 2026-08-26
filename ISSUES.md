@@ -5,7 +5,24 @@ second history; commit history carries the old investigations.
 
 ## Open
 
-## Resolved during investigation
+### Cross-crate CALLS edges still under-resolved after the authority fix
+
+Re-index of project-management with the 2026-08-26 07:27 binary (`eb12be98` /
+`535b1e59` fixes present). Sweep of 140 pm-core `pub fn` called from pm-cli /
+pm-infra: 66 have a cross-crate CALLS edge, 74 do not (46 unambiguous — the name
+is defined only in pm-core). Full-path calls resolve; `use`-imported bare calls,
+`Type::assoc()`, and method calls on pm-core types do not. `trace_path` reports
+`callers_total: 0` with no warning, and `check_index_coverage` is clean, so a
+function whose only caller is in another crate is indistinguishable from dead
+code. Distinct from the fn-pointer / `dyn` entry.
+
+May overlap the resolved "Rust authority gaps discard valid local Cargo
+dependency imports" entry, which notes a stale account daemon reindex is still
+required for an existing graph to receive that fix — confirm the sweeping binary
+was the post-fix daemon build before treating this as a fresh defect.
+
+Two adjacent observations from the same run: no `build=` line appears on stderr,
+and there is no `.__file__` node (querying it returns `symbol not found`, exit 1).
 
 ### Rust authority gaps discard valid local Cargo dependency imports
 
