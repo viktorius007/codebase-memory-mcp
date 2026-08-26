@@ -342,6 +342,25 @@ TEST(store_search_degree_counts_override) {
     ASSERT_EQ(out.results[port_idx].in_degree, 1);
     cbm_store_search_free(&out);
 
+    params.min_degree = -1;
+    params.max_degree = 0;
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 0);
+    cbm_store_search_free(&out);
+
+    params.min_degree = 1;
+    params.max_degree = -1;
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    implementation_idx = search_result_index_by_name(&out, "implementation");
+    port_idx = search_result_index_by_name(&out, "port");
+    ASSERT_GTE(implementation_idx, 0);
+    ASSERT_GTE(port_idx, 0);
+    ASSERT_EQ(out.results[implementation_idx].out_degree, 1);
+    ASSERT_EQ(out.results[implementation_idx].in_degree, 0);
+    ASSERT_EQ(out.results[port_idx].out_degree, 0);
+    ASSERT_EQ(out.results[port_idx].in_degree, 1);
+    cbm_store_search_free(&out);
+
     cbm_store_close(s);
     PASS();
 }
