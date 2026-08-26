@@ -1041,8 +1041,13 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
     }
     for (int i = SKIP_ONE; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
-            printf("codebase-memory-mcp %s\n", CBM_VERSION);
-            return 0;
+            if (!cbm_index_supervisor_capture_build_fingerprint()) {
+                (void)fprintf(stderr, "codebase-memory-mcp: cannot fingerprint this build\n");
+                return EXIT_FAILURE;
+            }
+            printf("codebase-memory-mcp %s build=%s\n", CBM_VERSION,
+                   cbm_index_supervisor_build_fingerprint());
+            return EXIT_SUCCESS;
         }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_help();
