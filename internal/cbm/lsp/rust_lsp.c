@@ -43,6 +43,7 @@
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
 static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node);
 static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const char *parent_qn);
+static void rust_process_item_list(RustLSPContext *ctx, TSNode list, uint32_t depth);
 static const CBMType *rust_parse_type_node_inner(RustLSPContext *ctx, TSNode node);
 static const CBMType *rust_eval_expr_type_inner(RustLSPContext *ctx, TSNode node);
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
@@ -4322,7 +4323,10 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     }
     cbm_negmemo_insert(&ctx->macro_memo, ctx->arena, mm_key);
 
-    /* Wrap and parse. */
+    /* Item-producing macros must be parsed as a source-file item list. Wrapping
+     * every transcriber in a synthetic function turns `impl` and `fn` items
+     * into body tokens: the call walker may see their bodies, but the
+     * definition extractor can never emit their callable nodes. */
     char *wrapped = cbm_arena_sprintf(ctx->arena, "fn __cbm_macro_expand() { %s; }\n", substituted);
     if (!wrapped)
         return;
@@ -4333,10 +4337,53 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         return;
     }
     ts_parser_set_language(parser, tree_sitter_rust());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, wrapped, (uint32_t)strlen(wrapped));
+    TSTree *item_tree =
+        ts_parser_parse_string(parser, NULL, substituted, (uint32_t)strlen(substituted));
+    bool has_item = false;
+    if (item_tree && !ts_node_has_error(ts_tree_root_node(item_tree))) {
+        TSNode item_root = ts_tree_root_node(item_tree);
+        uint32_t item_count = ts_node_child_count(item_root);
+        for (uint32_t i = 0; i < item_count; i++) {
+            const char *kind = ts_node_type(ts_node_child(item_root, i));
+            if (strcmp(kind, "function_item") == 0 || strcmp(kind, "impl_item") == 0 ||
+                strcmp(kind, "trait_item") == 0 || strcmp(kind, "mod_item") == 0) {
+                has_item = true;
+                break;
+            }
+        }
+    }
+    TSTree *tree = has_item ? item_tree
+                            : ts_parser_parse_string(parser, NULL, wrapped,
+                                                     (uint32_t)strlen(wrapped));
+    if (!has_item && item_tree)
+        ts_tree_delete(item_tree);
     if (tree && !ts_node_has_error(ts_tree_root_node(tree))) {
         ctx->macro_expand_depth++;
         TSNode root = ts_tree_root_node(tree);
+        if (has_item) {
+            const char *saved_source = ctx->source;
+            int saved_len = ctx->source_len;
+            bool saved_item_expansion = ctx->macro_item_expansion;
+            uint32_t saved_item_start_line = ctx->macro_item_start_line;
+            uint32_t saved_item_end_line = ctx->macro_item_end_line;
+            ctx->source = substituted;
+            ctx->source_len = (int)strlen(substituted);
+            ctx->macro_item_expansion = true;
+            ctx->macro_item_start_line = ts_node_start_point(invocation).row + 1;
+            ctx->macro_item_end_line = ts_node_end_point(invocation).row + 1;
+            ctx->inject_syn_calls++;
+            rust_process_item_list(ctx, root, 0);
+            ctx->inject_syn_calls--;
+            ctx->source = saved_source;
+            ctx->source_len = saved_len;
+            ctx->macro_item_expansion = saved_item_expansion;
+            ctx->macro_item_start_line = saved_item_start_line;
+            ctx->macro_item_end_line = saved_item_end_line;
+            ctx->macro_expand_depth--;
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
+            return;
+        }
         uint32_t rnc = ts_node_child_count(root);
         for (uint32_t i = 0; i < rnc; i++) {
             TSNode top = ts_node_child(root, i);
@@ -4949,7 +4996,8 @@ static void rust_emit_resolved_call_reason(RustLSPContext *ctx, const char *call
     if (ctx->resolved_calls->count > before && ctx->health) {
         rust_health_increment(&ctx->health->resolved_emitted);
     }
-    if (ctx->inject_syn_calls > 0 && ctx->emit_site_end_byte > ctx->emit_site_start_byte) {
+    if (ctx->inject_syn_calls > 0 &&
+        (ctx->emit_site_end_byte > ctx->emit_site_start_byte || ctx->macro_item_expansion)) {
         rust_inject_syn_call(ctx, callee_qn);
     }
 }
@@ -6212,6 +6260,29 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
     ctx->enclosing_func_qn = cbm_rust_cfg_qualified_name(
         ctx->arena, base_qn, func_node, ctx->source, CBM_LANG_RUST);
 
+    if (ctx->macro_item_expansion && ctx->defs) {
+        bool exists = false;
+        for (int i = 0; i < ctx->defs->count; i++) {
+            const CBMDefinition *definition = &ctx->defs->items[i];
+            if (definition->qualified_name &&
+                strcmp(definition->qualified_name, ctx->enclosing_func_qn) == 0) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            CBMDefinition definition = {0};
+            definition.name = cbm_arena_strdup(ctx->arena, name);
+            definition.qualified_name = ctx->enclosing_func_qn;
+            definition.label = parent_qn ? "Method" : "Function";
+            definition.parent_class = parent_qn;
+            definition.file_path = ctx->def_file_path;
+            definition.start_line = ctx->macro_item_start_line;
+            definition.end_line = ctx->macro_item_end_line;
+            cbm_defs_push(ctx->defs, ctx->arena, definition);
+        }
+    }
+
     CBMScope *saved = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
 
@@ -6590,7 +6661,8 @@ static void rust_process_item_list(RustLSPContext *ctx, TSNode list, uint32_t de
                 rust_process_item_list(ctx, body, depth + 1);
                 ctx->current_module_path = saved_module_path;
             }
-        } else if (strcmp(kind, "macro_invocation") == 0) {
+        } else if (strcmp(kind, "macro_invocation") == 0 ||
+                   strcmp(kind, "expression_statement") == 0) {
             const char *saved_func_qn = ctx->enclosing_func_qn;
             ctx->enclosing_func_qn = ctx->module_qn;
             rust_resolve_calls_in_node(ctx, item);
@@ -7415,6 +7487,8 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
     ctx.usage_target_arena = arena;
     ctx.health = &result->rust_health;
     ctx.cargo_manifest = manifest;
+    ctx.defs = &result->defs;
+    ctx.def_file_path = result->defs.count > 0 ? result->defs.items[0].file_path : NULL;
     /* Let the resolver inject synthetic syntactic calls for operator/macro
      * desugaring so those recovered calls reach the CALLS-edge pipeline. */
     ctx.syn_calls = &result->calls;

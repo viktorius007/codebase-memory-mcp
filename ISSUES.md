@@ -7,6 +7,27 @@ second history; commit history carries the old investigations.
 
 ## Resolved during investigation
 
+### Rust `macro_rules!` item expansions omitted callable nodes and calls
+
+Source-visible `macro_rules!` invocations that expand to item declarations such
+as `impl` blocks or free functions produced neither callable graph nodes nor
+joinable `CALLS` edges. The omission was not reported as partial coverage.
+
+Root cause: `rust_expand_user_macro` wrapped every substituted transcriber in a
+synthetic function and only walked that function body for calls. Module-scope
+macro invocations terminated by `;` also arrive as `expression_statement`
+nodes, which the item-list dispatcher ignored. Consequently generated items
+never reached the callable-item processor, and recovered calls had neither a
+generated caller definition nor a syntactic carrier.
+
+Resolution: item-shaped transcribers are now parsed as source-file item lists;
+their generated functions/methods are emitted at the invocation's source lines,
+their bodies are resolved under those callable qualified names, and synthetic
+call carriers make the semantic resolutions joinable by the graph pipeline.
+Expression-statement macro invocations now enter macro expansion as well. The
+focused Rust LSP regression asserts the generated node, exact resolved caller,
+and the carrier-to-resolution join.
+
 ### `search_graph` degree accounting omitted `OVERRIDE`
 
 The mechanism was `cbm_store_search`'s two correlated edge-count subqueries:

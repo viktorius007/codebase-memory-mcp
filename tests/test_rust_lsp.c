@@ -6763,6 +6763,39 @@ TEST(rustlsp_gap_macro_rule_with_call_inside) {
     cbm_free_result(r); PASS();
 }
 
+TEST(rustlsp_macro_item_expansion_emits_callable_and_call_edge) {
+    CBMFileResult *r = extract_rust(
+        "fn target() {}\n"
+        "macro_rules! define_callable { () => { fn generated() { target(); } } }\n"
+        "define_callable!();\n");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *generated = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name &&
+            strcmp(r->defs.items[i].qualified_name, "test.src.main.generated") == 0) {
+            generated = &r->defs.items[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(generated);
+    ASSERT_STR_EQ(generated->label, "Function");
+    ASSERT_EQ(count_resolved_exact(r, "test.src.main.generated", "test.src.main.target"), 1);
+
+    const CBMResolvedCall *edge = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->enclosing_func_qn &&
+            strcmp(call->enclosing_func_qn, "test.src.main.generated") == 0) {
+            edge = cbm_pipeline_find_lsp_resolution(&r->resolved_calls, call, false);
+            if (edge && strcmp(edge->callee_qn, "test.src.main.target") == 0)
+                break;
+            edge = NULL;
+        }
+    }
+    ASSERT_NOT_NULL(edge);
+    cbm_free_result(r); PASS();
+}
+
 TEST(rustlsp_gap_macro_substitute_call) {
     CBMFileResult *r = extract_rust(
         "fn target(x: i32) -> i32 { x }\n"
@@ -9439,6 +9472,7 @@ void suite_rust_lsp(void) {
     /* Cov §W: macro_rules! expander */
     RUN_TEST(rustlsp_gap_macro_simple_rule);
     RUN_TEST(rustlsp_gap_macro_rule_with_call_inside);
+    RUN_TEST(rustlsp_macro_item_expansion_emits_callable_and_call_edge);
     RUN_TEST(rustlsp_gap_macro_substitute_call);
     RUN_TEST(rustlsp_gap_macro_substitute_method_call);
     RUN_TEST(rustlsp_gap_macro_repetition);

@@ -182,6 +182,14 @@ typedef struct {
     /* Output: resolved (and unresolved-with-reason) calls accumulate here. */
     CBMResolvedCallArray *resolved_calls;
 
+    /* Generated callable definitions recovered from item-producing
+     * macro_rules! expansions. NULL for low-level/cross-file callers. */
+    CBMDefArray *defs;
+    const char *def_file_path;
+    bool macro_item_expansion;
+    uint32_t macro_item_start_line;
+    uint32_t macro_item_end_line;
+
     /* Optional resolver-proven value references. Single-file extraction owns
      * this array; lower-level and cross-file callers may leave it NULL. */
     CBMUsageArray *usages;
