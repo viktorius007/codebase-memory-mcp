@@ -2194,6 +2194,46 @@ TEST(rustlsp_cargo_route_rejects_ambiguous_complete_source_suffix) {
     PASS();
 }
 
+TEST(rustlsp_cargo_routed_syntactic_import_survives_authoritative_blocker) {
+    const char *caller =
+        "use pm_core::entity_model::{Other, EntityDescriptor};\n"
+        "use pm_core::port::error::{DomainError, Result, require_row_count_ceiling};\n"
+        "fn bare() { require_row_count_ceiling(1, 2, \"row\"); }\n"
+        "fn method(descriptor: &EntityDescriptor) { descriptor.projected_schema(); }\n";
+    CBMRustLSPDef defs[2] = {0};
+    defs[0].qualified_name = "project.crates.pm-core.src.port.error.require_row_count_ceiling";
+    defs[0].short_name = "require_row_count_ceiling";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "project.crates.pm-core.src.port.error";
+    defs[1].qualified_name =
+        "project.crates.pm-core.src.entity_model.EntityDescriptor.projected_schema";
+    defs[1].short_name = "projected_schema";
+    defs[1].label = "Method";
+    defs[1].def_module_qn = "project.crates.pm-core.src.entity_model";
+    defs[1].receiver_type = "project.crates.pm-core.src.entity_model.EntityDescriptor";
+
+    const char *import_names[] = {"require_row_count_ceiling", "EntityDescriptor"};
+    const char *blocked_targets[] = {"", ""};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMCargoManifest manifest = {0};
+    ASSERT_TRUE(cbm_cargo_add_dependency_route(&arena, &manifest, "crates/pm-infra", "pm-core",
+                                               "pm-core", "crates/pm-core"));
+    ASSERT_TRUE(cbm_cargo_add_dependency_route(&arena, &manifest, "crates/other", "pm-core",
+                                               "pm-core", "crates/decoy-core"));
+    ASSERT_TRUE(cbm_cargo_add_dependency_route(&arena, &manifest, "xtask", "pm-infra", "pm-infra",
+                                               "crates/pm-infra"));
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(&arena, caller, (int)strlen(caller),
+                                         "project.crates.pm-infra.src.adr", defs, 2, import_names,
+                                         blocked_targets, 2, NULL, &manifest, &out, NULL, NULL);
+
+    ASSERT_GTE(find_confident(&out, "bare", "require_row_count_ceiling"), 0);
+    ASSERT_GTE(find_confident(&out, "method", "EntityDescriptor.projected_schema"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Category 11: Robustness / regressions ────────────────────── */
 
 TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy) {
@@ -8438,14 +8478,25 @@ TEST(rustlsp_health_macro_binding_and_repetition_caps_are_occurrence_scoped) {
                                 "fn run() { many!(1, 2); }\n";
     CBMFileResult *repeat = extract_rust(repeat_source);
     ASSERT_NOT_NULL(repeat);
-    const char *repeat_site = strstr(repeat_source, "many!(1, 2)");
-    ASSERT_NOT_NULL(repeat_site);
     const CBMRustHealthIssue *repeat_issue =
         &repeat->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT];
-    ASSERT_EQ(1, repeat_issue->count);
-    ASSERT_EQ((uint32_t)(repeat_site - repeat_source), repeat_issue->first_start_byte);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&repeat->rust_health));
+    ASSERT_EQ(0, repeat_issue->count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&repeat->rust_health));
     cbm_free_result(repeat);
+    PASS();
+}
+
+TEST(rustlsp_complex_repetition_pattern_is_not_reported_as_unmatched_rust) {
+    const char *source = "macro_rules! declare { ($(#[$meta:meta])* $name:ident) => { "
+                         "$(#[$meta])* struct $name; } }\n"
+                         "declare! { #[derive(Clone)] Record }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_EQ(0, result->rust_health.issues[CBM_RUST_HEALTH_MACRO_NO_RULE_MATCH].count);
+    ASSERT_EQ(0, result->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT].count);
+    ASSERT_EQ(0, result->rust_health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].count);
+    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&result->rust_health));
+    cbm_free_result(result);
     PASS();
 }
 
@@ -9133,6 +9184,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_nested_macro_rules_call_does_not_inherit_outer_site_map);
     RUN_TEST(rustlsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(rustlsp_crossfile_free_function);
+    RUN_TEST(rustlsp_cargo_routed_syntactic_import_survives_authoritative_blocker);
     RUN_TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy);
     RUN_TEST(rustlsp_cargo_route_resolves_preserved_source_import);
     RUN_TEST(rustlsp_cargo_route_keeps_authoritative_empty_import_blocked);
@@ -9718,6 +9770,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_health_walk_and_work_limits_report_omitted_subtrees);
     RUN_TEST(rustlsp_health_type_and_eval_limits_report_exact_omissions);
     RUN_TEST(rustlsp_health_macro_binding_and_repetition_caps_are_occurrence_scoped);
+    RUN_TEST(rustlsp_complex_repetition_pattern_is_not_reported_as_unmatched_rust);
     RUN_TEST(rustlsp_health_macro_repetition_and_substitution_reasons_are_truthful);
     RUN_TEST(rustlsp_cross_health_is_explicit_and_survives_parse_degradation);
     RUN_TEST(rustlsp_parse_health_is_idempotent_across_single_and_cross_routes);

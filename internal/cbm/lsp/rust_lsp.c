@@ -466,6 +466,25 @@ static const char *rust_resolve_use(RustLSPContext *ctx, const char *local_name)
     return NULL;
 }
 
+/* Return a source-visible `use` target only when its spelling is unique. This
+ * is deliberately separate from rust_resolve_use: an authoritative empty
+ * target must still block ordinary name resolution, while Cargo-routed local
+ * dependency fallback may use the exact source import as its package address. */
+static const char *rust_unique_syntactic_use(RustLSPContext *ctx, const char *local_name) {
+    const char *unique = NULL;
+    for (int i = 0; ctx && local_name && i < ctx->use_count; i++) {
+        if (ctx->use_authoritative[i] || strcmp(ctx->use_local_names[i], local_name) != 0)
+            continue;
+        const char *candidate = ctx->use_module_paths[i];
+        if (!candidate || !candidate[0])
+            continue;
+        if (unique && strcmp(unique, candidate) != 0)
+            return NULL;
+        unique = candidate;
+    }
+    return unique;
+}
+
 /* The Rust prelude is auto-imported into every module. We map each name
  * to its canonical QN so bare references (`String`, `Vec::new`, …)
  * resolve without an explicit `use`. The list mirrors `core::prelude::v1`
@@ -986,6 +1005,111 @@ static const CBMRegisteredFunc *rust_find_unique_explicit_receiver_method(
     rust_scan_explicit_receiver_methods(ctx, registry, receiver_name, method_name, &unique,
                                         matches);
     return matches && *matches == 1 ? unique : NULL;
+}
+
+static bool rust_qn_has_suffix(const char *qualified_name, const char *suffix);
+
+/* A dependency's source name (`pm_core`) and graph QN package segment
+ * (`crates.pm-core`) intentionally use different namespaces.  Exact registry
+ * lookup therefore cannot join an imported dependency path to its definition.
+ * Admit that join only through Cargo's local dependency route, and only when a
+ * single function in the routed package matches the complete source suffix. */
+static const char *rust_local_dependency_package(RustLSPContext *ctx, const char *resolved_path) {
+    if (!ctx || !ctx->cargo_manifest || !resolved_path || !resolved_path[0])
+        return NULL;
+    const CBMCargoManifest *manifest = (const CBMCargoManifest *)ctx->cargo_manifest;
+    const char *head_end = strchr(resolved_path, '.');
+    char *head =
+        head_end ? cbm_arena_strndup(ctx->arena, resolved_path, (size_t)(head_end - resolved_path))
+                 : cbm_arena_strdup(ctx->arena, resolved_path);
+    const char *scoped_package = NULL;
+    for (int i = 0; i < manifest->dependency_route_count; i++) {
+        const CBMCargoDependencyRoute *route = &manifest->dependency_routes[i];
+        if (!route->target_package_dir || !route->package_dir || !route->package_dir[0] ||
+            !cbm_cargo_crate_name_eq(route->name, head))
+            continue;
+        char *caller_needle = cbm_arena_sprintf(ctx->arena, ".%s.", route->package_dir);
+        for (char *p = caller_needle; p && *p; p++)
+            if (*p == '/' || *p == '\\')
+                *p = '.';
+        if (!caller_needle || !ctx->module_qn || !strstr(ctx->module_qn, caller_needle))
+            continue;
+        if (scoped_package && strcmp(scoped_package, route->target_package_dir) != 0)
+            return NULL;
+        scoped_package = route->target_package_dir;
+    }
+    if (scoped_package)
+        return scoped_package;
+    const char *package = cbm_cargo_find_local_dependency_package(manifest, head);
+    if (package)
+        return package;
+    for (int i = 0; i < manifest->dependency_route_count; i++) {
+        const char *candidate = manifest->dependency_routes[i].target_package_dir;
+        if (!candidate)
+            continue;
+        char *needle = cbm_arena_sprintf(ctx->arena, ".%s.", candidate);
+        for (char *p = needle; p && *p; p++)
+            if (*p == '/' || *p == '\\')
+                *p = '.';
+        if (needle && strstr(resolved_path, needle) &&
+            (!ctx->module_qn || !strstr(ctx->module_qn, needle)))
+            return candidate;
+    }
+    return NULL;
+}
+
+static void rust_scan_local_dependency_callables(RustLSPContext *ctx,
+                                                 const CBMTypeRegistry *registry,
+                                                 const char *package, const char *resolved_path,
+                                                 const char *receiver_name, const char *method_name,
+                                                 const CBMRegisteredFunc **unique, int *matches) {
+    if (!registry || !package || !resolved_path || !method_name || *matches >= 2)
+        return;
+    char *needle = cbm_arena_sprintf(ctx->arena, ".%s.", package);
+    for (char *p = needle; p && *p; p++)
+        if (*p == '/' || *p == '\\')
+            *p = '.';
+    const char *source_suffix = strchr(resolved_path, '.');
+    source_suffix = source_suffix ? source_suffix + 1 : resolved_path;
+    for (int i = 0; i < registry->func_count && *matches < 2; i++) {
+        const CBMRegisteredFunc *candidate = &registry->funcs[i];
+        if (!candidate->qualified_name || !candidate->short_name ||
+            strcmp(candidate->short_name, method_name) != 0 ||
+            !strstr(candidate->qualified_name, needle))
+            continue;
+        if (receiver_name) {
+            if (!candidate->receiver_type)
+                continue;
+            const char *leaf = strrchr(candidate->receiver_type, '.');
+            leaf = leaf ? leaf + 1 : candidate->receiver_type;
+            if (strcmp(leaf, receiver_name) != 0)
+                continue;
+        } else if (candidate->receiver_type) {
+            continue;
+        }
+        if (!rust_qn_has_suffix(candidate->qualified_name, source_suffix) && receiver_name == NULL)
+            continue;
+        if (!*unique || strcmp((*unique)->qualified_name, candidate->qualified_name) != 0) {
+            *unique = candidate;
+            (*matches)++;
+        }
+    }
+    rust_scan_local_dependency_callables(ctx, registry->fallback, package, resolved_path,
+                                         receiver_name, method_name, unique, matches);
+}
+
+static const CBMRegisteredFunc *rust_find_local_dependency_callable(RustLSPContext *ctx,
+                                                                    const char *resolved_path,
+                                                                    const char *receiver_name,
+                                                                    const char *method_name) {
+    const char *package = rust_local_dependency_package(ctx, resolved_path);
+    if (!package)
+        return NULL;
+    const CBMRegisteredFunc *unique = NULL;
+    int matches = 0;
+    rust_scan_local_dependency_callables(ctx, ctx->registry, package, resolved_path, receiver_name,
+                                         method_name, &unique, &matches);
+    return matches == 1 ? unique : NULL;
 }
 
 /* Resolve an otherwise-relative multi-segment type only when its head is an
@@ -4334,6 +4458,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     MacroEnv env;
     memset(&env, 0, sizeof(env));
     bool binding_limit_hit = false;
+    bool repetition_pattern_present = false;
 
     /* Extract the invocation argument text. */
     const char *inv_args = NULL;
@@ -4367,6 +4492,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             continue;
         }
         memset(&env, 0, sizeof(env));
+        repetition_pattern_present =
+            repetition_pattern_present ||
+            macro_contains_repetition_syntax(r->pattern_text, r->pattern_len);
         if (r->pattern_text && inv_args &&
             macro_pattern_match(r->pattern_text, r->pattern_len, inv_args, inv_args_len, &env,
                                 ctx->max_macro_bindings, &binding_limit_hit)) {
@@ -4377,6 +4505,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     if (binding_limit_hit)
         rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_BINDING_LIMIT, invocation);
     if (!hit) {
+        if (repetition_pattern_present) {
+            return;
+        }
         rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_NO_RULE_MATCH, invocation);
         rust_emit_unresolved_call(ctx, mname, "macro_no_rule_match");
         return;
@@ -4387,13 +4518,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     }
     if (hit->transcriber_len <= 0)
         return;
-    bool repetition_degraded =
+    bool repetition_expansion =
         macro_contains_repetition_syntax(hit->pattern_text, hit->pattern_len) ||
         macro_contains_repetition_syntax(hit->transcriber_text, hit->transcriber_len);
-    if (repetition_degraded) {
-        rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT, invocation);
-    }
-
     /* Substitute the bound metavars into the transcriber body. */
     bool substitution_truncated = false;
     char *substituted = macro_substitute(ctx->arena, hit->transcriber_text, hit->transcriber_len,
@@ -4516,7 +4643,12 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             ctx->emit_site_end_byte = saved_emit_end;
         }
         ctx->macro_expand_depth--;
-    } else {
+    } else if (!repetition_expansion) {
+        /* A malformed ordinary expansion is lost analysis. Repetition is a
+         * different case: this bounded expander deliberately substitutes one
+         * representative body, which need not itself be valid Rust. The
+         * source-visible invocation expressions were already walked, so that
+         * unsupported synthetic form is not a parse failure in source. */
         rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, invocation);
     }
     if (tree)
@@ -4535,13 +4667,10 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
  * makes. We wrap the args in a block so each comma-separated argument parses
  * as its own statement; the current scope (params/locals) is preserved so
  * typed receivers still resolve. */
-static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation) {
+static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation,
+                                         bool expression_grammar_required) {
     if (!ctx || ts_node_is_null(invocation))
         return;
-    if (ctx->macro_expand_depth >= ctx->max_macro_depth) {
-        rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_DEPTH_LIMIT, invocation);
-        return;
-    }
 
     /* The grammar exposes the argument list as a `token_tree` child rather
      * than via an `arguments` field, so locate it by node type. */
@@ -4564,6 +4693,10 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation)
     rust_macro_strip_outer(at, (int)strlen(at), &inner, &inner_len);
     if (inner_len <= 0)
         return;
+    if (ctx->macro_expand_depth >= ctx->max_macro_depth) {
+        rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_DEPTH_LIMIT, invocation);
+        return;
+    }
     char *arg_text = cbm_arena_strndup(ctx->arena, inner, (size_t)inner_len);
     if (!arg_text)
         return;
@@ -4593,7 +4726,8 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation)
 
     TSParser *parser = ts_parser_new();
     if (!parser) {
-        rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, invocation);
+        if (expression_grammar_required)
+            rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, invocation);
         return;
     }
     ts_parser_set_language(parser, tree_sitter_rust());
@@ -4656,11 +4790,11 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation)
                 ctx->site_map_original_start_byte = saved_map_original_start;
             }
             ctx->macro_expand_depth--;
-        } else {
+        } else if (expression_grammar_required) {
             rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, invocation);
         }
         ts_tree_delete(tree);
-    } else {
+    } else if (expression_grammar_required) {
         rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, invocation);
     }
     ts_parser_delete(parser);
@@ -5120,8 +5254,7 @@ static bool rust_emit_cfg_free_function_variants(RustLSPContext *ctx, const char
     cbm_registry_free_funcs_by_short_name(ctx->registry, name, &count_iter);
     for (int index; (index = cbm_free_func_iter_next(&count_iter)) >= 0;) {
         const CBMRegisteredFunc *candidate = &ctx->registry->funcs[index];
-        size_t qualified_length =
-            candidate->qualified_name ? strlen(candidate->qualified_name) : 0;
+        size_t qualified_length = candidate->qualified_name ? strlen(candidate->qualified_name) : 0;
         if (!candidate->receiver_type && qualified_length >= base_length + 5U &&
             strncmp(candidate->qualified_name, base, base_length) == 0 &&
             strncmp(candidate->qualified_name + base_length, "#cfg(", 5) == 0) {
@@ -5135,8 +5268,7 @@ static bool rust_emit_cfg_free_function_variants(RustLSPContext *ctx, const char
     cbm_registry_free_funcs_by_short_name(ctx->registry, name, &emit_iter);
     for (int index; (index = cbm_free_func_iter_next(&emit_iter)) >= 0;) {
         const CBMRegisteredFunc *candidate = &ctx->registry->funcs[index];
-        size_t qualified_length =
-            candidate->qualified_name ? strlen(candidate->qualified_name) : 0;
+        size_t qualified_length = candidate->qualified_name ? strlen(candidate->qualified_name) : 0;
         if (candidate->receiver_type || qualified_length < base_length + 5U ||
             strncmp(candidate->qualified_name, base, base_length) != 0 ||
             strncmp(candidate->qualified_name + base_length, "#cfg(", 5) != 0) {
@@ -5222,8 +5354,8 @@ static const char *rust_resolve_callable_value(RustLSPContext *ctx, TSNode value
     return matches == 1 && unique ? unique->qualified_name : NULL;
 }
 
-static const char *rust_resolve_scoped_free_call(RustLSPContext *ctx, TSNode value,
-                                                 bool *claimed, bool *defer_short_fallback) {
+static const char *rust_resolve_scoped_free_call(RustLSPContext *ctx, TSNode value, bool *claimed,
+                                                 bool *defer_short_fallback) {
     *claimed = false;
     *defer_short_fallback = false;
     char *path = rust_node_text(ctx, value);
@@ -5241,13 +5373,11 @@ static const char *rust_resolve_scoped_free_call(RustLSPContext *ctx, TSNode val
         lexical_path += 7;
     }
     const char *head_end = strstr(lexical_path, "::");
-    char *head = head_end
-                     ? cbm_arena_strndup(ctx->arena, lexical_path,
-                                         (size_t)(head_end - lexical_path))
-                     : NULL;
+    char *head =
+        head_end ? cbm_arena_strndup(ctx->arena, lexical_path, (size_t)(head_end - lexical_path))
+                 : NULL;
     const char *use_target = head ? rust_resolve_use(ctx, head) : NULL;
-    const char *canonical_use_target =
-        use_target ? rust_resolve_use_target(ctx, use_target) : NULL;
+    const char *canonical_use_target = use_target ? rust_resolve_use_target(ctx, use_target) : NULL;
     bool imported_type = canonical_use_target &&
                          cbm_registry_lookup_type(ctx->registry, canonical_use_target) != NULL;
     bool declared_module = head && cbm_idxmemo_get(&ctx->declared_modules, head) >= 0;
@@ -5264,8 +5394,8 @@ static const char *rust_resolve_scoped_free_call(RustLSPContext *ctx, TSNode val
             cbm_registry_free_funcs_by_short_name(registry, tail, &iter);
             for (int index; matches < 2 && (index = cbm_free_func_iter_next(&iter)) >= 0;) {
                 const CBMRegisteredFunc *candidate = &registry->funcs[index];
-                if (candidate->qualified_name && rust_qn_has_suffix(candidate->qualified_name,
-                                                                    suffix) &&
+                if (candidate->qualified_name &&
+                    rust_qn_has_suffix(candidate->qualified_name, suffix) &&
                     (!unique || strcmp(unique->qualified_name, candidate->qualified_name) != 0)) {
                     unique = candidate;
                     matches++;
@@ -5322,7 +5452,7 @@ static void rust_emit_callable_value_reference(RustLSPContext *ctx, TSNode value
  * after `crate::` matches exactly; it never crosses a crate boundary or
  * selects an overloaded/ambiguous callable. */
 static const CBMRegisteredFunc *rust_lookup_crate_callable_suffix(RustLSPContext *ctx,
-                                                                   const char *path) {
+                                                                  const char *path) {
     if (!ctx || !ctx->registry || !ctx->module_qn || !path || strncmp(path, "crate::", 7) != 0) {
         return NULL;
     }
@@ -5362,8 +5492,7 @@ static void rust_resolve_module_callable_usages(RustLSPContext *ctx) {
     for (int i = 0; i < ctx->usages->count; i++) {
         CBMUsage *usage = &ctx->usages->items[i];
         if (!usage->is_macro_callable_value || !usage->ref_name || usage->resolved_target_qn ||
-            !usage->enclosing_func_qn ||
-            strcmp(usage->enclosing_func_qn, ctx->module_qn) != 0) {
+            !usage->enclosing_func_qn || strcmp(usage->enclosing_func_qn, ctx->module_qn) != 0) {
             continue;
         }
         const char *resolved = rust_resolve_path_expr(ctx, usage->ref_name);
@@ -5522,6 +5651,21 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 return;
             }
 
+            const char *receiver_leaf = strrchr(type_qn, '.');
+            receiver_leaf = receiver_leaf ? receiver_leaf + 1 : type_qn;
+            const char *dependency_type_qn = type_qn;
+            if (!rust_local_dependency_package(ctx, dependency_type_qn)) {
+                const char *syntactic_use = rust_unique_syntactic_use(ctx, receiver_leaf);
+                if (syntactic_use)
+                    dependency_type_qn = rust_resolve_use_target(ctx, syntactic_use);
+            }
+            m = rust_find_local_dependency_callable(ctx, dependency_type_qn, receiver_leaf, mname);
+            if (m) {
+                rust_emit_resolved_call(ctx, m->qualified_name, "lsp_cross_crate_method",
+                                        CBM_RUST_CONF_METHOD);
+                return;
+            }
+
             /* Walk the Deref chain — `Box<T>::method` may live on `T`,
              * `Rc<RefCell<T>>::method` peels two levels, etc. We bound
              * the chain at 8 hops to mirror the rust-analyzer cap. */
@@ -5651,8 +5795,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
 
         if (strcmp(ts_node_type(actual_func), "scoped_identifier") == 0) {
             bool claimed = false;
-            const char *target = rust_resolve_scoped_free_call(
-                ctx, actual_func, &claimed, &defer_scoped_short_fallback);
+            const char *target = rust_resolve_scoped_free_call(ctx, actual_func, &claimed,
+                                                               &defer_scoped_short_fallback);
             if (target) {
                 rust_emit_resolved_call(ctx, target, "lsp_qualified_path", CBM_RUST_CONF_DIRECT);
                 return;
@@ -5683,6 +5827,35 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                                         CBM_RUST_CONF_DIRECT);
                 return;
             }
+        }
+        const char *resolved_tail = strrchr(qn, '.');
+        resolved_tail = resolved_tail ? resolved_tail + 1 : qn;
+        const char *dependency_path = qn;
+        if (!explicit_receiver && strcmp(ts_node_type(actual_func), "identifier") == 0 &&
+            !rust_local_dependency_package(ctx, dependency_path)) {
+            const char *syntactic_use = rust_unique_syntactic_use(ctx, path);
+            if (syntactic_use)
+                dependency_path = rust_resolve_use_target(ctx, syntactic_use);
+        }
+        bool dependency_method = explicit_receiver != NULL;
+        const CBMRegisteredFunc *dependency_call = rust_find_local_dependency_callable(
+            ctx, dependency_path, explicit_receiver, resolved_tail);
+        if (!dependency_call && !explicit_receiver) {
+            const char *method_sep = strrchr(qn, '.');
+            if (method_sep && method_sep > qn) {
+                char *owner_path = cbm_arena_strndup(ctx->arena, qn, (size_t)(method_sep - qn));
+                const char *owner_leaf = owner_path ? strrchr(owner_path, '.') : NULL;
+                owner_leaf = owner_leaf ? owner_leaf + 1 : owner_path;
+                dependency_call =
+                    rust_find_local_dependency_callable(ctx, qn, owner_leaf, resolved_tail);
+                dependency_method = dependency_call != NULL;
+            }
+        }
+        if (dependency_call) {
+            rust_emit_resolved_call(ctx, dependency_call->qualified_name,
+                                    dependency_method ? "lsp_cross_crate_ufcs" : "lsp_cross_crate",
+                                    dependency_method ? CBM_RUST_CONF_UFCS : CBM_RUST_CONF_DIRECT);
+            return;
         }
         if (ctx->module_qn && strstr(qn, ".") == NULL) {
             const char *full = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn);
@@ -6109,6 +6282,11 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
                  * macros with the same name. Do this before applying any
                  * built-in argument grammar or canonical std path. */
                 if (rust_has_visible_macro_definition(ctx, mname, node)) {
+                    /* User macro token trees are arbitrary DSLs, not an
+                     * expression list. Walk expression-shaped arguments as a
+                     * best effort without treating a rejected synthetic wrap
+                     * as a parse failure in the valid source file. */
+                    rust_resolve_macro_arg_exprs(ctx, node, false);
                     rust_expand_user_macro(ctx, mname, node);
                 } else {
                     /* For known std macros emit a synthetic call under their
@@ -6128,7 +6306,7 @@ static void rust_resolve_calls_in_node_inner(RustLSPContext *ctx, TSNode node) {
                         strcmp(mname, "debug_assert_eq") == 0 ||
                         strcmp(mname, "debug_assert_ne") == 0 || strcmp(mname, "dbg") == 0;
                     if (expr_arg_macro) {
-                        rust_resolve_macro_arg_exprs(ctx, node);
+                        rust_resolve_macro_arg_exprs(ctx, node, true);
                     }
                     if (strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
                         strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
@@ -6361,8 +6539,8 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
         prefix = undecorated;
     }
     const char *base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
-    ctx->enclosing_func_qn = cbm_rust_cfg_qualified_name(
-        ctx->arena, base_qn, func_node, ctx->source, CBM_LANG_RUST);
+    ctx->enclosing_func_qn =
+        cbm_rust_cfg_qualified_name(ctx->arena, base_qn, func_node, ctx->source, CBM_LANG_RUST);
 
     if (ctx->macro_item_expansion && ctx->defs) {
         bool exists = false;
@@ -6707,8 +6885,8 @@ static void rust_process_trait(RustLSPContext *ctx, TSNode trait_node) {
         return;
 
     const char *trait_base = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
-    const char *trait_qn = cbm_rust_cfg_qualified_name(
-        ctx->arena, trait_base, trait_node, ctx->source, CBM_LANG_RUST);
+    const char *trait_qn =
+        cbm_rust_cfg_qualified_name(ctx->arena, trait_base, trait_node, ctx->source, CBM_LANG_RUST);
     const char *saved_self = ctx->self_type_qn;
     const char *saved_trait = ctx->self_trait_qn;
     ctx->self_type_qn = trait_qn;
@@ -7628,9 +7806,8 @@ extern const TSLanguage *tree_sitter_rust(void);
  * `module_qn` is ONLY the fallback used to qualify a def's return type when that def
  * carries no def_module_qn; pass NULL for the shared build (all_defs always carry
  * def_module_qn — verified: 0 NULL across the C + Rust kernel corpora). */
-static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
-                                         CBMRustLSPDef *defs, int def_count,
-                                         const char *module_qn) {
+static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena, CBMRustLSPDef *defs,
+                                         int def_count, const char *module_qn) {
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 

@@ -933,6 +933,36 @@ static const char *pxc_rust_caller_package_dir(const CBMCargoManifest *manifest,
     return best;
 }
 
+/* Preserve an exact source import when Cargo proves that its head names one
+ * local dependency of the caller. Duplicate dependency declarations are safe
+ * only when they route to the same package (for example dependencies plus
+ * dev-dependencies); conflicting routes remain blocked. */
+static bool pxc_rust_has_local_dependency_route(const CBMCargoManifest *manifest,
+                                                const char *caller_rel, const char *path) {
+    const char *caller_package_dir = pxc_rust_caller_package_dir(manifest, caller_rel);
+    const char *separator = path ? strstr(path, "::") : NULL;
+    if (!caller_package_dir || !path || !path[0])
+        return false;
+    size_t head_len = separator ? (size_t)(separator - path) : strlen(path);
+    if (head_len == 0 || head_len >= CBM_PATH_MAX)
+        return false;
+    char head[CBM_PATH_MAX];
+    memcpy(head, path, head_len);
+    head[head_len] = '\0';
+    const char *target_package_dir = NULL;
+    for (int i = 0; manifest && i < manifest->dependency_route_count; i++) {
+        const CBMCargoDependencyRoute *route = &manifest->dependency_routes[i];
+        if (!route->package_dir || !route->name || !route->target_package_dir ||
+            strcmp(route->package_dir, caller_package_dir) != 0 ||
+            !cbm_cargo_crate_name_eq(route->name, head))
+            continue;
+        if (target_package_dir && strcmp(target_package_dir, route->target_package_dir) != 0)
+            return false;
+        target_package_dir = route->target_package_dir;
+    }
+    return target_package_dir != NULL;
+}
+
 static bool pxc_rust_package_lib_visible(int caller_root, int lib_root) {
     return caller_root >= 0 && lib_root >= 0 && caller_root != lib_root;
 }
@@ -1009,30 +1039,11 @@ static int pxc_rust_external_root(const CBMCargoManifest *manifest, const cbm_fi
     return matches == 1 ? found : -1;
 }
 
-static bool pxc_rust_has_unique_source_dependency_route(const CBMCargoManifest *manifest,
-                                                        const cbm_file_info_t *files,
-                                                        CBMFileResult *const *cache, int file_count,
-                                                        const char *caller_rel, const char *path) {
-    const char *separator = path ? strstr(path, "::") : NULL;
-    const char *caller_package_dir = pxc_rust_caller_package_dir(manifest, caller_rel);
-    int caller = pxc_rust_file_index(files, file_count, caller_rel);
-    if (!separator || !caller_package_dir || caller < 0)
-        return false;
-    char crate_name[CBM_PATH_MAX];
-    size_t crate_len = (size_t)(separator - path);
-    if (crate_len == 0 || crate_len >= sizeof(crate_name))
-        return false;
-    memcpy(crate_name, path, crate_len);
-    crate_name[crate_len] = '\0';
-    return pxc_rust_external_root(manifest, files, cache, file_count, caller, caller_package_dir,
-                                  crate_name) >= 0;
-}
-
 static const char *pxc_rust_authority_resolve(
     CBMArena *arena, const char *project_name, const char *caller_rel,
     const char *caller_module_path, const char *path, const cbm_file_info_t *files,
     CBMFileResult *const *cache, int file_count, const CBMCargoManifest *manifest, int depth,
-    bool inherited_public, bool inherited_public_ancestors, bool *access_denied) {
+    bool inherited_public, bool inherited_public_ancestors, bool *denied) {
     if (!arena || !path || !path[0] || depth > 32)
         return NULL;
     char *copy = cbm_arena_strdup(arena, path);
@@ -1105,9 +1116,9 @@ static const char *pxc_rust_authority_resolve(
         int owner = current;
         const char *segment = segments[pos++];
         char next_inline[CBM_PATH_MAX];
-        current = pxc_rust_child_file(files, cache, file_count, owner, inline_path, segment,
-                                      manifest, require_public_ancestors, next_inline,
-                                      sizeof(next_inline), access_denied);
+        current =
+            pxc_rust_child_file(files, cache, file_count, owner, inline_path, segment, manifest,
+                                require_public_ancestors, next_inline, sizeof(next_inline), denied);
         if (current < 0) {
             const CBMImport *module_reexport = NULL;
             int reexports = 0;
@@ -1124,8 +1135,8 @@ static const char *pxc_rust_authority_resolve(
                     strcmp(imp->local_name, segment) != 0)
                     continue;
                 if (require_public && imp->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC) {
-                    if (access_denied)
-                        *access_denied = true;
+                    if (denied)
+                        *denied = true;
                     continue;
                 }
                 module_reexport = imp;
@@ -1139,11 +1150,10 @@ static const char *pxc_rust_authority_resolve(
                     used += snprintf(expanded + used, sizeof(expanded) - (size_t)used, "::%s",
                                      segments[tail]);
                 return used > 0 && (size_t)used < sizeof(expanded)
-                           ? pxc_rust_authority_resolve(arena, project_name, files[owner].rel_path,
-                                                        module_reexport->owner_module_path,
-                                                        expanded, files, cache, file_count,
-                                                        manifest, depth + 1, require_public, false,
-                                                        access_denied)
+                           ? pxc_rust_authority_resolve(
+                                 arena, project_name, files[owner].rel_path,
+                                 module_reexport->owner_module_path, expanded, files, cache,
+                                 file_count, manifest, depth + 1, require_public, false, denied)
                            : NULL;
             }
             return NULL;
@@ -1155,9 +1165,9 @@ static const char *pxc_rust_authority_resolve(
     if (!target || !target->module_qn)
         return NULL;
     char leaf_inline[CBM_PATH_MAX];
-    int leaf_module = pxc_rust_child_file(files, cache, file_count, current, inline_path, leaf,
-                                          manifest, require_public_ancestors, leaf_inline,
-                                          sizeof(leaf_inline), access_denied);
+    int leaf_module =
+        pxc_rust_child_file(files, cache, file_count, current, inline_path, leaf, manifest,
+                            require_public_ancestors, leaf_inline, sizeof(leaf_inline), denied);
     if (leaf_module >= 0 && leaf_module != current && cache[leaf_module] &&
         cache[leaf_module]->module_qn)
         return cache[leaf_module]->module_qn;
@@ -1184,11 +1194,12 @@ static const char *pxc_rust_authority_resolve(
         }
     }
     if (definitions == 1) {
-        if (!require_public || found_exported)
-            return found;
-        if (access_denied)
-            *access_denied = true;
-        return NULL;
+        if (require_public && !found_exported) {
+            if (denied)
+                *denied = true;
+            return NULL;
+        }
+        return found;
     }
     if (definitions > 1 || target->rust_imports_status != CBM_RUST_CARRIER_COMPLETE)
         return NULL;
@@ -1202,8 +1213,8 @@ static const char *pxc_rust_authority_resolve(
             strcmp(imp->local_name, leaf) != 0)
             continue;
         if (require_public && imp->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC) {
-            if (access_denied)
-                *access_denied = true;
+            if (denied)
+                *denied = true;
             continue;
         }
         reexport = imp;
@@ -1213,12 +1224,13 @@ static const char *pxc_rust_authority_resolve(
                ? pxc_rust_authority_resolve(arena, project_name, files[current].rel_path,
                                             reexport->owner_module_path, reexport->module_path,
                                             files, cache, file_count, manifest, depth + 1,
-                                            require_public, false, access_denied)
+                                            require_public, false, denied)
                : NULL;
 }
 
 /* Rust never consumes graph IMPORTS as semantic proof. Each exact extracted
- * local produces either a resolved QN or an authoritative empty blocker. */
+ * local produces a resolved QN, an exact Cargo-routed dependency address, or
+ * an authoritative empty blocker. */
 CBMPxcImportMapStatus cbm_pxc_build_import_map_with_rust_authority(
     const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path, CBMLanguage lang,
     const CBMFileResult *result, const cbm_file_info_t *files, CBMFileResult *const *cache,
@@ -1268,23 +1280,23 @@ CBMPxcImportMapStatus cbm_pxc_build_import_map_with_rust_authority(
             }
             if (already_emitted)
                 continue;
-            bool access_denied = false;
+            bool authority_denied = false;
             const char *resolved =
                 declarations == 1
                     ? pxc_rust_authority_resolve(&scratch, project_name, rel_path,
                                                  imp->owner_module_path, imp->module_path, files,
                                                  cache, file_count, rust_manifest, 0, false, false,
-                                                 &access_denied)
+                                                 &authority_denied)
                     : NULL;
-            const char *value = resolved ? resolved
-                                         : (!access_denied && declarations == 1 &&
-                                                    pxc_rust_has_unique_source_dependency_route(
-                                                        rust_manifest, files, cache, file_count,
-                                                        rel_path, imp->module_path)
-                                                ? imp->module_path
-                                                : "");
+            const char *authoritative =
+                resolved ? resolved
+                         : (declarations == 1 && !authority_denied &&
+                                    pxc_rust_has_local_dependency_route(rust_manifest, rel_path,
+                                                                        imp->module_path)
+                                ? imp->module_path
+                                : "");
             keys[count] = strdup(imp->local_name);
-            vals[count] = strdup(value);
+            vals[count] = strdup(authoritative);
             if (!keys[count] || !vals[count]) {
                 cbm_arena_destroy(&scratch);
                 cbm_pxc_free_import_map(keys, vals, count + 1);

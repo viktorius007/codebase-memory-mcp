@@ -6528,13 +6528,179 @@ TEST(rust_workspace_dependency_import_resolves_mod_endpoints_and_reexports) {
     PASS();
 }
 
+TEST(rust_nested_import_preserves_only_consistent_cargo_dependency_route) {
+    CBMImport import = {
+        .local_name = "collect_adr_read",
+        .module_path = "pm_core::port::scoped_mutation::collect_adr_read",
+        .owner_module_path = "tests",
+        .rust_module_scope = true,
+        .rust_provenance = CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT,
+        .scope_end_byte = 100,
+    };
+    CBMFileResult result = {
+        .imports = {.items = &import, .count = 1, .cap = 1},
+        .rust_imports_status = CBM_RUST_CARRIER_COMPLETE,
+    };
+    CBMCargoTarget caller = {.name = "pm_cli",
+                             .kind = CBM_CARGO_TARGET_LIB,
+                             .package_dir = "crates/pm-cli",
+                             .source_path = "crates/pm-cli/src/lib.rs"};
+    CBMCargoDependencyRoute routes[2] = {
+        {.package_dir = "crates/pm-cli",
+         .name = "pm_core",
+         .target_name = "pm_core",
+         .target_package_dir = "crates/pm-core"},
+        {.package_dir = "crates/pm-cli",
+         .name = "pm-core",
+         .target_name = "pm_core",
+         .target_package_dir = "crates/pm-core"},
+    };
+    CBMCargoManifest manifest = {.targets = &caller,
+                                 .target_count = 1,
+                                 .targets_complete = true,
+                                 .dependency_routes = routes,
+                                 .dependency_route_count = 2};
+    const char **keys = NULL;
+    const char **vals = NULL;
+    CBMRustImportScope *scopes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_pxc_build_import_map_with_rust_authority(
+                  NULL, "project", "crates/pm-cli/src/context.rs", CBM_LANG_RUST, &result, NULL,
+                  NULL, 0, &manifest, &keys, &vals, &scopes, &count),
+              CBM_PXC_IMPORT_MAP_COMPLETE);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(keys[0], "collect_adr_read");
+    ASSERT_STR_EQ(vals[0], "pm_core::port::scoped_mutation::collect_adr_read");
+    cbm_pxc_free_import_map(keys, vals, count);
+    free(scopes);
+
+    routes[1].target_package_dir = "crates/other-core";
+    ASSERT_EQ(cbm_pxc_build_import_map_with_rust_authority(
+                  NULL, "project", "crates/pm-cli/src/context.rs", CBM_LANG_RUST, &result, NULL,
+                  NULL, 0, &manifest, &keys, &vals, &scopes, &count),
+              CBM_PXC_IMPORT_MAP_COMPLETE);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(vals[0], "");
+    cbm_pxc_free_import_map(keys, vals, count);
+    free(scopes);
+    PASS();
+}
+
+TEST(rust_workspace_dependency_import_creates_cross_crate_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_cross_crate_call_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/pm-infra/src/sqlite")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/pm-core/src/port")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "xtask/src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nmembers = [\"crates/*\", \"xtask\"]\n"
+                    "resolver = \"2\"\n"
+                    "[workspace.dependencies]\npm-core = { path = \"crates/pm-core\" }\n");
+    write_temp_file(tmp, "crates/pm-infra/Cargo.toml",
+                    "[package]\nname = \"pm-infra\"\nversion = \"0.1.0\"\n"
+                    "[dependencies]\npm-core.workspace = true\n"
+                    "[dev-dependencies]\npm-core.workspace = true\n");
+    write_temp_file(tmp, "crates/pm-infra/src/lib.rs", "pub mod sqlite;\n");
+    write_temp_file(tmp, "crates/pm-infra/src/sqlite/mod.rs", "pub mod managed_schema;\n");
+    write_temp_file(
+        tmp, "crates/pm-infra/src/sqlite/managed_schema.rs",
+        "use pm_core::entity_model::EntityDescriptor;\n"
+        "use pm_core::port::error::{DomainError, require_row_count_ceiling};\n"
+        "pub fn check_schema_sql_vs_migrations(_: &str) {}\n"
+        "pub fn call_imported() -> Result<(), ()> { "
+        "require_row_count_ceiling(1, 2, \"row\")?; Ok(()) }\n"
+        "pub fn call_associated() { "
+        "pm_core::graph::StoreBackedGraphQuery::from_project_store(); }\n"
+        "pub fn call_method(descriptor: &EntityDescriptor) { descriptor.projected_schema(); }\n"
+        "mod nested {\n"
+        "    use pm_core::port::error::{DomainError, require_row_count_ceiling};\n"
+        "    pub fn call_nested() -> Result<(), ()> {\n"
+        "        require_row_count_ceiling(1, 2, \"row\")?; Ok(())\n"
+        "    }\n"
+        "}\n");
+    write_temp_file(tmp, "crates/pm-core/Cargo.toml",
+                    "[package]\nname = \"pm-core\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "crates/pm-core/src/lib.rs",
+                    "pub mod port;\npub mod graph;\npub mod entity_model;\n");
+    write_temp_file(tmp, "crates/pm-core/src/port/mod.rs", "pub mod error;\n");
+    write_temp_file(tmp, "crates/pm-core/src/port/error.rs",
+                    "pub fn require_row_count_ceiling(_: usize, _: usize, _: &str) "
+                    "-> Result<(), ()> { Ok(()) }\n");
+    write_temp_file(
+        tmp, "crates/pm-core/src/graph.rs",
+        "pub struct StoreBackedGraphQuery;\n"
+        "impl StoreBackedGraphQuery { pub fn from_project_store() -> Self { Self } }\n");
+    write_temp_file(tmp, "crates/pm-core/src/entity_model.rs",
+                    "pub struct EntityDescriptor;\n"
+                    "impl EntityDescriptor { pub fn projected_schema(&self) {} }\n");
+    write_temp_file(tmp, "xtask/Cargo.toml",
+                    "[package]\nname = \"xtask\"\nversion = \"0.1.0\"\n"
+                    "[dependencies]\npm-infra = { path = \"../crates/pm-infra\" }\n");
+    write_temp_file(tmp, "xtask/src/lib.rs", "pub mod direct_gate;\npub mod schema_gate;\n");
+    write_temp_file(
+        tmp, "xtask/src/schema_gate.rs",
+        "use pm_infra::sqlite::managed_schema;\n"
+        "pub fn run() { managed_schema::check_schema_sql_vs_migrations(\"schema\"); }\n");
+    write_temp_file(tmp, "xtask/src/direct_gate.rs",
+                    "pub fn run_direct() { "
+                    "pm_infra::sqlite::managed_schema::check_schema_sql_vs_migrations(\"schema\"); "
+                    "}\n");
+
+    CBMArena manifest_arena;
+    CBMCargoManifest manifest;
+    cbm_arena_init(&manifest_arena);
+    ASSERT_TRUE(cbm_pxc_build_rust_manifest(tmp, &manifest_arena, &manifest));
+    ASSERT_STR_EQ(cbm_cargo_find_local_dependency_package(&manifest, "pm_core"), "crates/pm-core");
+    cbm_arena_destroy(&manifest_arena);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cross_crate.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS", "run",
+                                       "check_schema_sql_vs_migrations",
+                                       "crates/pm-infra/src/sqlite/managed_schema.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                       "run_direct", "check_schema_sql_vs_migrations",
+                                       "crates/pm-infra/src/sqlite/managed_schema.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                       "call_imported", "require_row_count_ceiling",
+                                       "crates/pm-core/src/port/error.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                       "call_associated", "from_project_store",
+                                       "crates/pm-core/src/graph.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                       "call_method", "projected_schema",
+                                       "crates/pm-core/src/entity_model.rs"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                       "call_nested", "require_row_count_ceiling",
+                                       "crates/pm-core/src/port/error.rs"),
+              1);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(rust_nested_and_sibling_module_callers_are_reachable) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_local_callers_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "src/db")), 0);
-    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"local-callers\"\nversion = \"0.1.0\"\n");
-    write_temp_file(tmp, "src/lib.rs",
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"local-callers\"\nversion = \"0.1.0\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
                     "pub mod helper;\n"
                     "pub mod db;\n"
                     "pub fn outer() {\n"
@@ -6570,26 +6736,23 @@ TEST(rust_nested_and_sibling_module_callers_are_reachable) {
     cbm_store_t *store = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(store);
     const char *project = cbm_pipeline_project_name(pipeline);
-    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "outer", "walk", "src/lib.rs"),
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "outer", "walk", "src/lib.rs"), 1);
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "outer", "target", "src/helper.rs"),
               1);
-    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "outer", "target",
-                                       "src/helper.rs"),
+    ASSERT_EQ(
+        named_edge_to_file_count(store, project, "CALLS", "target", "target", "src/db/schema.rs"),
               1);
-    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "target", "target",
-                                       "src/db/schema.rs"),
-              1);
-    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "call", "target",
-                                       "src/db/registry.rs"),
+    ASSERT_EQ(
+        named_edge_to_file_count(store, project, "CALLS", "call", "target", "src/db/registry.rs"),
               1);
     ASSERT_EQ(named_edge_to_file_count(store, project, "CALL_REFERENCE", "retain", "retained",
                                        "src/lib.rs"),
               1);
-    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "call_platform",
-                                       "platform_check", "src/lib.rs"),
+    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "call_platform", "platform_check",
+                                       "src/lib.rs"),
               2);
-    ASSERT_EQ(named_edge_to_file_count(store, project, "CALLS", "target", "target",
-                                       "src/helper.rs"),
-              1);
+    ASSERT_EQ(
+        named_edge_to_file_count(store, project, "CALLS", "target", "target", "src/helper.rs"), 1);
 
     cbm_store_close(store);
     cbm_pipeline_free(pipeline);
@@ -14639,6 +14802,8 @@ SUITE(pipeline) {
     RUN_TEST(rust_macro_function_table_creates_usage_edge);
     RUN_TEST(rust_serde_callable_hooks_create_usage_edges);
     RUN_TEST(rust_workspace_dependency_import_resolves_mod_endpoints_and_reexports);
+    RUN_TEST(rust_nested_import_preserves_only_consistent_cargo_dependency_route);
+    RUN_TEST(rust_workspace_dependency_import_creates_cross_crate_call);
     RUN_TEST(rust_nested_and_sibling_module_callers_are_reachable);
     RUN_TEST(usages_no_duplicate_calls);
     RUN_TEST(calls_edge_carries_call_site_line);
