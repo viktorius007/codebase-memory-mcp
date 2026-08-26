@@ -3991,8 +3991,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         cypher_project = covproj;
     }
 
+    int execution_max_rows = max_rows > 0 && max_rows < INT_MAX ? max_rows + 1 : max_rows;
     cbm_cypher_result_t result = {0};
-    int rc = cbm_cypher_execute(store, query, cypher_project, max_rows, &result);
+    int rc = cbm_cypher_execute(store, query, cypher_project, execution_max_rows, &result);
 
     if (rc < 0) {
         char *err_msg = result.error ? result.error : "query execution failed";
@@ -4009,24 +4010,30 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     bool qg_legacy_json = qg_format && strcmp(qg_format, "json") == 0;
     free(qg_format);
 
+    bool truncated = max_rows > 0 && result.row_count > max_rows;
+    int returned_rows = truncated ? max_rows : result.row_count;
+
     char *json = NULL;
     if (!qg_legacy_json) {
         cbm_sb_t sb;
         cbm_sb_init(&sb);
-        cbm_tree_table_header(&sb, "rows", result.row_count, (const char *const *)result.columns,
+        cbm_tree_table_header(&sb, "rows", returned_rows, (const char *const *)result.columns,
                               result.col_count);
-        for (int r = 0; r < result.row_count; r++) {
+        for (int r = 0; r < returned_rows; r++) {
             cbm_tree_row_begin(&sb);
             for (int c = 0; c < result.col_count; c++) {
                 cbm_tree_cell_str(&sb, result.rows[r][c], c == 0);
             }
             cbm_tree_row_end(&sb);
         }
-        cbm_tree_scalar_int(&sb, "total", result.row_count);
+        cbm_tree_scalar_int(&sb, "total", returned_rows);
+        if (truncated) {
+            cbm_tree_scalar_bool(&sb, "truncated", true);
+        }
         if (result.warning) {
             cbm_tree_scalar_str(&sb, "warning", result.warning);
         }
-        if (result.row_count == 0) {
+        if (returned_rows == 0) {
             cbm_tree_scalar_str(&sb, "hint",
                                 "Query returned no results. Use get_graph_schema() to see "
                                 "available labels and edge types.");
@@ -4046,7 +4053,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 
         /* rows */
         yyjson_mut_val *rows = yyjson_mut_arr(doc);
-        for (int r = 0; r < result.row_count; r++) {
+        for (int r = 0; r < returned_rows; r++) {
             yyjson_mut_val *row = yyjson_mut_arr(doc);
             for (int c = 0; c < result.col_count; c++) {
                 yyjson_mut_arr_add_str(doc, row, result.rows[r][c]);
@@ -4054,12 +4061,15 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_arr_add_val(rows, row);
         }
         yyjson_mut_obj_add_val(doc, root, "rows", rows);
-        yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+        yyjson_mut_obj_add_int(doc, root, "total", returned_rows);
+        if (truncated) {
+            yyjson_mut_obj_add_bool(doc, root, "truncated", true);
+        }
         if (result.warning) {
             yyjson_mut_obj_add_str(doc, root, "warning", result.warning);
         }
 
-        if (result.row_count == 0) {
+        if (returned_rows == 0) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
                 "Query returned no results. Use get_graph_schema() to see available labels and "

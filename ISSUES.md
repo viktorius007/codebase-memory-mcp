@@ -35,6 +35,18 @@ plus `entry_points_truncated` through the store result into both tree and JSON
 MCP responses. A 21-entry store fixture pins `shown = 20`, `total = 21`, and
 `truncated = true`; the existing two-entry fixture pins the non-truncated case.
 
+### `query_graph` hid `max_rows` truncation
+
+`query_graph` treated `max_rows` as an executor projection limit. The Cypher
+projection freed every match beyond N before `handle_query_graph` received the
+result, so N+1 matches and exactly N matches both serialized as `total: N` with
+no completeness signal.
+
+The handler now executes for one sentinel row beyond a positive `max_rows`,
+serializes no more than N rows, and emits `truncated: true` only when that
+sentinel proves additional matches exist. This preserves `total` as the
+returned-row count while making the result's completeness truthful.
+
 ## Confirmed behavior
 
 Deliberate designs that have been mistaken for defects before. These are not

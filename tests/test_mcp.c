@@ -2576,6 +2576,70 @@ TEST(tool_query_graph_basic) {
     PASS();
 }
 
+TEST(tool_query_graph_max_rows_reports_truncation) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "truncation-test");
+    cbm_store_upsert_project(store, "truncation-test", "/tmp/truncation-test");
+    for (int i = 0; i < 4; i++) {
+        char name[CBM_SZ_32];
+        char qualified_name[CBM_SZ_64];
+        snprintf(name, sizeof(name), "function_%d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "truncation_test.function_%d", i);
+        cbm_node_t node = {.project = "truncation-test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "fixture.c"};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":141,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\",\"arguments\":{"
+             "\"project\":\"truncation-test\","
+             "\"query\":\"MATCH (f:Function) RETURN f.name\",\"max_rows\":3}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "total: 3"));
+    ASSERT_NOT_NULL(strstr(resp, "truncated: true"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_max_rows_exact_match_is_complete) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "complete-test");
+    cbm_store_upsert_project(store, "complete-test", "/tmp/complete-test");
+    for (int i = 0; i < 3; i++) {
+        char name[CBM_SZ_32];
+        char qualified_name[CBM_SZ_64];
+        snprintf(name, sizeof(name), "function_%d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "complete_test.function_%d", i);
+        cbm_node_t node = {.project = "complete-test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "fixture.c"};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":142,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\",\"arguments\":{"
+             "\"project\":\"complete-test\","
+             "\"query\":\"MATCH (f:Function) RETURN f.name\",\"max_rows\":3}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "total: 3"));
+    ASSERT_NULL(strstr(resp, "truncated: true"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_malformed_query_preserves_actionable_error) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -16199,6 +16263,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
+    RUN_TEST(tool_query_graph_max_rows_reports_truncation);
+    RUN_TEST(tool_query_graph_max_rows_exact_match_is_complete);
     RUN_TEST(tool_query_graph_malformed_query_preserves_actionable_error);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_coverage_pagination_is_exact_bounded_and_generation_bound);
