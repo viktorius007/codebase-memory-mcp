@@ -780,7 +780,8 @@ static int pxc_rust_target_source_count(const CBMCargoManifest *manifest, const 
 static int pxc_rust_child_file(const cbm_file_info_t *files, CBMFileResult *const *cache,
                                int file_count, int parent, const char *parent_path,
                                const char *name, const CBMCargoManifest *manifest,
-                               bool require_public, char *out_inline_path, size_t out_inline_cap) {
+                               bool require_public, char *out_inline_path, size_t out_inline_cap,
+                               bool *access_denied) {
     if (parent < 0 || !cache[parent] ||
         cache[parent]->rust_mod_decls_status != CBM_RUST_CARRIER_COMPLETE)
         return -1;
@@ -797,8 +798,11 @@ static int pxc_rust_child_file(const cbm_file_info_t *files, CBMFileResult *cons
     }
     if (matches != 1)
         return -1;
-    if (require_public && decl->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC)
+    if (require_public && decl->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC) {
+        if (access_denied)
+            *access_denied = true;
         return -1;
+    }
     if (decl->is_inline) {
         int n = parent_path && parent_path[0]
                     ? snprintf(out_inline_path, out_inline_cap, "%s::%s", parent_path, name)
@@ -884,7 +888,7 @@ static int pxc_rust_parent_file(const cbm_file_info_t *files, CBMFileResult *con
             char inline_path[CBM_PATH_MAX];
             if (!decl->is_inline && name && decl->parent_path &&
                 pxc_rust_child_file(files, cache, file_count, i, decl->parent_path, name, manifest,
-                                    false, inline_path, sizeof(inline_path)) == child) {
+                                    false, inline_path, sizeof(inline_path), NULL) == child) {
                 parent = i;
                 if (out_parent_path && out_parent_cap)
                     snprintf(out_parent_path, out_parent_cap, "%s", decl->parent_path);
@@ -1005,11 +1009,30 @@ static int pxc_rust_external_root(const CBMCargoManifest *manifest, const cbm_fi
     return matches == 1 ? found : -1;
 }
 
+static bool pxc_rust_has_unique_source_dependency_route(const CBMCargoManifest *manifest,
+                                                        const cbm_file_info_t *files,
+                                                        CBMFileResult *const *cache, int file_count,
+                                                        const char *caller_rel, const char *path) {
+    const char *separator = path ? strstr(path, "::") : NULL;
+    const char *caller_package_dir = pxc_rust_caller_package_dir(manifest, caller_rel);
+    int caller = pxc_rust_file_index(files, file_count, caller_rel);
+    if (!separator || !caller_package_dir || caller < 0)
+        return false;
+    char crate_name[CBM_PATH_MAX];
+    size_t crate_len = (size_t)(separator - path);
+    if (crate_len == 0 || crate_len >= sizeof(crate_name))
+        return false;
+    memcpy(crate_name, path, crate_len);
+    crate_name[crate_len] = '\0';
+    return pxc_rust_external_root(manifest, files, cache, file_count, caller, caller_package_dir,
+                                  crate_name) >= 0;
+}
+
 static const char *pxc_rust_authority_resolve(
     CBMArena *arena, const char *project_name, const char *caller_rel,
     const char *caller_module_path, const char *path, const cbm_file_info_t *files,
     CBMFileResult *const *cache, int file_count, const CBMCargoManifest *manifest, int depth,
-    bool inherited_public, bool inherited_public_ancestors) {
+    bool inherited_public, bool inherited_public_ancestors, bool *access_denied) {
     if (!arena || !path || !path[0] || depth > 32)
         return NULL;
     char *copy = cbm_arena_strdup(arena, path);
@@ -1082,9 +1105,9 @@ static const char *pxc_rust_authority_resolve(
         int owner = current;
         const char *segment = segments[pos++];
         char next_inline[CBM_PATH_MAX];
-        current =
-            pxc_rust_child_file(files, cache, file_count, owner, inline_path, segment, manifest,
-                                require_public_ancestors, next_inline, sizeof(next_inline));
+        current = pxc_rust_child_file(files, cache, file_count, owner, inline_path, segment,
+                                      manifest, require_public_ancestors, next_inline,
+                                      sizeof(next_inline), access_denied);
         if (current < 0) {
             const CBMImport *module_reexport = NULL;
             int reexports = 0;
@@ -1098,9 +1121,13 @@ static const char *pxc_rust_authority_resolve(
                     imp->rust_provenance != CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT ||
                     !imp->local_name || !imp->module_path || !imp->owner_module_path ||
                     strcmp(imp->owner_module_path, inline_path) != 0 ||
-                    strcmp(imp->local_name, segment) != 0 ||
-                    (require_public && imp->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC))
+                    strcmp(imp->local_name, segment) != 0)
                     continue;
+                if (require_public && imp->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC) {
+                    if (access_denied)
+                        *access_denied = true;
+                    continue;
+                }
                 module_reexport = imp;
                 reexports++;
             }
@@ -1115,7 +1142,8 @@ static const char *pxc_rust_authority_resolve(
                            ? pxc_rust_authority_resolve(arena, project_name, files[owner].rel_path,
                                                         module_reexport->owner_module_path,
                                                         expanded, files, cache, file_count,
-                                                        manifest, depth + 1, require_public, false)
+                                                        manifest, depth + 1, require_public, false,
+                                                        access_denied)
                            : NULL;
             }
             return NULL;
@@ -1127,9 +1155,9 @@ static const char *pxc_rust_authority_resolve(
     if (!target || !target->module_qn)
         return NULL;
     char leaf_inline[CBM_PATH_MAX];
-    int leaf_module =
-        pxc_rust_child_file(files, cache, file_count, current, inline_path, leaf, manifest,
-                            require_public_ancestors, leaf_inline, sizeof(leaf_inline));
+    int leaf_module = pxc_rust_child_file(files, cache, file_count, current, inline_path, leaf,
+                                          manifest, require_public_ancestors, leaf_inline,
+                                          sizeof(leaf_inline), access_denied);
     if (leaf_module >= 0 && leaf_module != current && cache[leaf_module] &&
         cache[leaf_module]->module_qn)
         return cache[leaf_module]->module_qn;
@@ -1155,8 +1183,13 @@ static const char *pxc_rust_authority_resolve(
             definitions++;
         }
     }
-    if (definitions == 1)
-        return !require_public || found_exported ? found : NULL;
+    if (definitions == 1) {
+        if (!require_public || found_exported)
+            return found;
+        if (access_denied)
+            *access_denied = true;
+        return NULL;
+    }
     if (definitions > 1 || target->rust_imports_status != CBM_RUST_CARRIER_COMPLETE)
         return NULL;
     const CBMImport *reexport = NULL;
@@ -1166,9 +1199,13 @@ static const char *pxc_rust_authority_resolve(
         if (!imp->rust_module_scope ||
             imp->rust_provenance != CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT || !imp->local_name ||
             !imp->owner_module_path || strcmp(imp->owner_module_path, inline_path) != 0 ||
-            strcmp(imp->local_name, leaf) != 0 ||
-            (require_public && imp->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC))
+            strcmp(imp->local_name, leaf) != 0)
             continue;
+        if (require_public && imp->rust_visibility != CBM_RUST_IMPORT_VIS_PUBLIC) {
+            if (access_denied)
+                *access_denied = true;
+            continue;
+        }
         reexport = imp;
         exports++;
     }
@@ -1176,7 +1213,7 @@ static const char *pxc_rust_authority_resolve(
                ? pxc_rust_authority_resolve(arena, project_name, files[current].rel_path,
                                             reexport->owner_module_path, reexport->module_path,
                                             files, cache, file_count, manifest, depth + 1,
-                                            require_public, false)
+                                            require_public, false, access_denied)
                : NULL;
 }
 
@@ -1231,14 +1268,23 @@ CBMPxcImportMapStatus cbm_pxc_build_import_map_with_rust_authority(
             }
             if (already_emitted)
                 continue;
+            bool access_denied = false;
             const char *resolved =
                 declarations == 1
                     ? pxc_rust_authority_resolve(&scratch, project_name, rel_path,
                                                  imp->owner_module_path, imp->module_path, files,
-                                                 cache, file_count, rust_manifest, 0, false, false)
+                                                 cache, file_count, rust_manifest, 0, false, false,
+                                                 &access_denied)
                     : NULL;
+            const char *value = resolved ? resolved
+                                         : (!access_denied && declarations == 1 &&
+                                                    pxc_rust_has_unique_source_dependency_route(
+                                                        rust_manifest, files, cache, file_count,
+                                                        rel_path, imp->module_path)
+                                                ? imp->module_path
+                                                : "");
             keys[count] = strdup(imp->local_name);
-            vals[count] = strdup(resolved ? resolved : "");
+            vals[count] = strdup(value);
             if (!keys[count] || !vals[count]) {
                 cbm_arena_destroy(&scratch);
                 cbm_pxc_free_import_map(keys, vals, count + 1);

@@ -2089,6 +2089,111 @@ TEST(rustlsp_crossfile_free_function) {
     PASS();
 }
 
+static int routed_named_import_result(CBMRustLSPDef *defs, int def_count, const char *import_qn,
+                                      CBMCargoDependencyRoute *routes, int route_count) {
+    const char *caller = "use pm_core::transport::{ParsedTransportPath, parse_transport_path};\n"
+                         "fn parse() { parse_transport_path(\"path\"); }\n";
+    const char *import_names[] = {"parse_transport_path"};
+    const char *import_qns[] = {import_qn};
+    CBMCargoManifest manifest = {.is_workspace_root = true,
+                                 .dependency_routes = routes,
+                                 .dependency_route_count = route_count};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(
+        &arena, caller, (int)strlen(caller), "project.crates.pm-infra.src.transport", defs,
+        def_count, import_names, import_qns, 1, NULL, &manifest, &out, NULL, NULL);
+    int result = find_confident(&out, "parse", defs[0].qualified_name);
+    cbm_arena_destroy(&arena);
+    return result;
+}
+
+TEST(rustlsp_cargo_route_resolves_preserved_source_import) {
+    CBMRustLSPDef defs[2] = {
+        {.qualified_name = "project.crates.pm-core.src.transport.mod.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-core.src.transport.mod"},
+        {.qualified_name = "project.crates.pm-infra.src.decoys.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
+    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
+                                     .target_name = "pm-core",
+                                     .target_package_dir = "crates/pm-core"};
+    ASSERT_GTE(routed_named_import_result(defs, 2,
+                                          "pm_core::transport::parse_transport_path", &route, 1),
+               0);
+    PASS();
+}
+
+TEST(rustlsp_cargo_route_keeps_authoritative_empty_import_blocked) {
+    CBMRustLSPDef defs[2] = {
+        {.qualified_name = "project.crates.pm-core.src.transport.mod.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-core.src.transport.mod"},
+        {.qualified_name = "project.crates.pm-infra.src.decoys.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
+    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
+                                     .target_name = "pm-core",
+                                     .target_package_dir = "crates/pm-core"};
+    ASSERT_EQ(routed_named_import_result(defs, 2, "", &route, 1), -1);
+    PASS();
+}
+
+TEST(rustlsp_cargo_route_rejects_conflicting_caller_routes) {
+    CBMRustLSPDef defs[2] = {
+        {.qualified_name = "project.crates.pm-core.src.transport.mod.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-core.src.transport.mod"},
+        {.qualified_name = "project.crates.pm-infra.src.decoys.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
+    CBMCargoDependencyRoute routes[2] = {
+        {.package_dir = "crates/pm-infra", .name = "pm_core", .target_name = "pm-core",
+         .target_package_dir = "crates/pm-core"},
+        {.package_dir = "crates/pm-infra", .name = "pm_core", .target_name = "pm-core-decoy",
+         .target_package_dir = "crates/pm-core-decoy"}};
+    ASSERT_EQ(routed_named_import_result(defs, 2,
+                                         "pm_core::transport::parse_transport_path", routes, 2),
+              -1);
+    PASS();
+}
+
+TEST(rustlsp_cargo_route_rejects_target_package_prefix_decoy) {
+    CBMRustLSPDef defs[2] = {
+        {.qualified_name = "project.crates.pm-core-decoy.src.transport.mod.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-core-decoy.src.transport.mod"},
+        {.qualified_name = "project.crates.pm-infra.src.decoys.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
+    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
+                                     .target_name = "pm-core",
+                                     .target_package_dir = "crates/pm-core"};
+    ASSERT_EQ(routed_named_import_result(defs, 2,
+                                         "pm_core::transport::parse_transport_path", &route, 1),
+              -1);
+    PASS();
+}
+
+TEST(rustlsp_cargo_route_rejects_ambiguous_complete_source_suffix) {
+    CBMRustLSPDef defs[2] = {
+        {.qualified_name = "project.crates.pm-core.src.transport.mod.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-core.src.transport.mod"},
+        {.qualified_name = "project.crates.pm-core.src.transport.parse_transport_path",
+         .short_name = "parse_transport_path", .label = "Function",
+         .def_module_qn = "project.crates.pm-core.src.transport"}};
+    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
+                                     .target_name = "pm-core",
+                                     .target_package_dir = "crates/pm-core"};
+    ASSERT_EQ(routed_named_import_result(defs, 2,
+                                         "pm_core::transport::parse_transport_path", &route, 1),
+              -1);
+    PASS();
+}
+
 /* ── Category 11: Robustness / regressions ────────────────────── */
 
 TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy) {
@@ -9029,6 +9134,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(rustlsp_crossfile_free_function);
     RUN_TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy);
+    RUN_TEST(rustlsp_cargo_route_resolves_preserved_source_import);
+    RUN_TEST(rustlsp_cargo_route_keeps_authoritative_empty_import_blocked);
+    RUN_TEST(rustlsp_cargo_route_rejects_conflicting_caller_routes);
+    RUN_TEST(rustlsp_cargo_route_rejects_target_package_prefix_decoy);
+    RUN_TEST(rustlsp_cargo_route_rejects_ambiguous_complete_source_suffix);
     RUN_TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy);
     RUN_TEST(rustlsp_crossfile_workspace_member_patterns_stay_crate_scoped);
 

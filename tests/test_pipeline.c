@@ -6472,34 +6472,41 @@ TEST(rust_serde_callable_hooks_create_usage_edges) {
     PASS();
 }
 
-TEST(rust_workspace_dependency_import_creates_cross_crate_call) {
+TEST(rust_workspace_dependency_import_resolves_mod_endpoints_and_reexports) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_cross_crate_call_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/pm-infra/src/sqlite")), 0);
-    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "xtask/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/pm-core/src/transport")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/pm-core/src/graph")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/pm-infra/src")), 0);
     write_temp_file(tmp, "Cargo.toml",
-                    "[workspace]\nmembers = [\"crates/*\", \"xtask\"]\n"
+                    "[workspace]\nmembers = [\"crates/*\"]\n"
                     "resolver = \"2\"\n");
+    write_temp_file(tmp, "crates/pm-core/Cargo.toml",
+                    "[package]\nname = \"pm-core\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "crates/pm-core/src/lib.rs", "pub mod graph;\npub mod transport;\n");
+    write_temp_file(tmp, "crates/pm-core/src/transport/mod.rs",
+                    "pub struct ParsedTransportPath;\n"
+                    "pub fn parse_transport_path(_: &str) {}\n");
+    write_temp_file(tmp, "crates/pm-core/src/graph/mod.rs",
+                    "mod dot;\npub struct Frame;\npub struct FrameSet;\n"
+                    "pub use dot::{produce_show_frame_dot};\n");
+    write_temp_file(tmp, "crates/pm-core/src/graph/dot.rs", "pub fn produce_show_frame_dot() {}\n");
+    write_temp_file(tmp, "crates/pm-infra/src/lib.rs",
+                    "pub mod decoys;\npub mod output;\npub mod transport;\n");
+    write_temp_file(tmp, "crates/pm-infra/src/decoys.rs",
+                    "pub fn parse_transport_path(_: &str) {}\n"
+                    "pub fn produce_show_frame_dot() {}\n");
+    write_temp_file(tmp, "crates/pm-infra/src/transport.rs",
+                    "use pm_core::transport::{ParsedTransportPath, parse_transport_path};\n"
+                    "pub struct Adapter;\n"
+                    "impl Adapter { pub fn parse(&self) { parse_transport_path(\"path\"); } }\n");
+    write_temp_file(tmp, "crates/pm-infra/src/output.rs",
+                    "use pm_core::graph::{Frame, FrameSet, produce_show_frame_dot};\n"
+                    "pub fn show<T>(_: &T) { produce_show_frame_dot(); }\n");
     write_temp_file(tmp, "crates/pm-infra/Cargo.toml",
-                    "[package]\nname = \"pm-infra\"\nversion = \"0.1.0\"\n");
-    write_temp_file(tmp, "crates/pm-infra/src/lib.rs", "pub mod sqlite;\n");
-    write_temp_file(tmp, "crates/pm-infra/src/sqlite/mod.rs", "pub mod managed_schema;\n");
-    write_temp_file(tmp, "crates/pm-infra/src/sqlite/managed_schema.rs",
-                    "pub fn check_schema_sql_vs_migrations(_: &str) {}\n");
-    write_temp_file(tmp, "xtask/Cargo.toml",
-                    "[package]\nname = \"xtask\"\nversion = \"0.1.0\"\n"
-                    "[dependencies]\npm-infra = { path = \"../crates/pm-infra\" }\n");
-    write_temp_file(tmp, "xtask/src/lib.rs", "pub mod direct_gate;\npub mod schema_gate;\n");
-    write_temp_file(
-        tmp, "xtask/src/schema_gate.rs",
-        "use pm_infra::sqlite::managed_schema;\n"
-        "pub fn run() { managed_schema::check_schema_sql_vs_migrations(\"schema\"); }\n");
-    write_temp_file(tmp, "xtask/src/direct_gate.rs",
-                    "pub fn run_direct() { "
-                    "pm_infra::sqlite::managed_schema::check_schema_sql_vs_migrations(\"schema\"); "
-                    "}\n");
-
+                    "[package]\nname = \"pm-infra\"\nversion = \"0.1.0\"\n"
+                    "[dependencies]\npm-core = { path = \"../pm-core\" }\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/cross_crate.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
@@ -6507,14 +6514,13 @@ TEST(rust_workspace_dependency_import_creates_cross_crate_call) {
     ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
     cbm_store_t *store = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(store);
-    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS", "run",
-                                       "check_schema_sql_vs_migrations",
-                                       "crates/pm-infra/src/sqlite/managed_schema.rs"),
-              1);
-    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
-                                       "run_direct", "check_schema_sql_vs_migrations",
-                                       "crates/pm-infra/src/sqlite/managed_schema.rs"),
-              1);
+    int mod_endpoint =
+        named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS", "parse",
+                                 "parse_transport_path", "crates/pm-core/src/transport/mod.rs");
+    int directory_reexport =
+        named_edge_to_file_count(store, cbm_pipeline_project_name(pipeline), "CALLS", "show",
+                                 "produce_show_frame_dot", "crates/pm-core/src/graph/dot.rs");
+    ASSERT_TRUE(mod_endpoint == 1 && directory_reexport == 1);
 
     cbm_store_close(store);
     cbm_pipeline_free(pipeline);
@@ -14632,7 +14638,7 @@ SUITE(pipeline) {
     RUN_TEST(usages_creates_edges);
     RUN_TEST(rust_macro_function_table_creates_usage_edge);
     RUN_TEST(rust_serde_callable_hooks_create_usage_edges);
-    RUN_TEST(rust_workspace_dependency_import_creates_cross_crate_call);
+    RUN_TEST(rust_workspace_dependency_import_resolves_mod_endpoints_and_reexports);
     RUN_TEST(rust_nested_and_sibling_module_callers_are_reachable);
     RUN_TEST(usages_no_duplicate_calls);
     RUN_TEST(calls_edge_carries_call_site_line);

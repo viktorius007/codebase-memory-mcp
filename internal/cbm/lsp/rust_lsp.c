@@ -1045,6 +1045,100 @@ static const char *rust_resolve_use_target(RustLSPContext *ctx, const char *targ
     return convert_path_to_qn(ctx->arena, target);
 }
 
+static const char *rust_qn_find_segment_path(const char *qualified_name, const char *path) {
+    const char *match = qualified_name;
+    size_t path_len = path ? strlen(path) : 0;
+    while (match && path_len > 0 && (match = strstr(match, path)) != NULL) {
+        bool starts_segment = match == qualified_name || match[-1] == '.';
+        bool ends_segment = match[path_len] == '\0' || match[path_len] == '.';
+        if (starts_segment && ends_segment)
+            return match;
+        match++;
+    }
+    return NULL;
+}
+
+static const CBMRegisteredFunc *rust_lookup_routed_imported_func(RustLSPContext *ctx,
+                                                                 const char *target) {
+    if (!ctx || !ctx->cargo_manifest || !ctx->module_qn || !ctx->registry || !target)
+        return NULL;
+    const char *separator = strstr(target, "::");
+    if (!separator)
+        return NULL;
+    char *crate_name = cbm_arena_strndup(ctx->arena, target, (size_t)(separator - target));
+    const char *source_tail = convert_path_to_qn(ctx->arena, separator + 2);
+    const char *leaf = source_tail ? strrchr(source_tail, '.') : NULL;
+    leaf = leaf ? leaf + 1 : source_tail;
+    if (!crate_name || !source_tail || !leaf)
+        return NULL;
+
+    const CBMCargoManifest *manifest = (const CBMCargoManifest *)ctx->cargo_manifest;
+    const char *target_dir = NULL;
+    int routes = 0;
+    for (int i = 0; i < manifest->dependency_route_count; i++) {
+        const CBMCargoDependencyRoute *route = &manifest->dependency_routes[i];
+        if (!route->package_dir || !route->name || !route->target_package_dir ||
+            !cbm_cargo_crate_name_eq(route->name, crate_name))
+            continue;
+        char *caller_dir = cbm_arena_strdup(ctx->arena, route->package_dir);
+        for (char *p = caller_dir; p && *p; p++)
+            if (*p == '/' || *p == '\\')
+                *p = '.';
+        if (!caller_dir || !rust_qn_find_segment_path(ctx->module_qn, caller_dir))
+            continue;
+        if (target_dir && strcmp(target_dir, route->target_package_dir) != 0)
+            return NULL;
+        target_dir = route->target_package_dir;
+        routes++;
+    }
+    if (routes == 0 || !target_dir)
+        return NULL;
+
+    char *target_marker = cbm_arena_strdup(ctx->arena, target_dir);
+    for (char *p = target_marker; p && *p; p++)
+        if (*p == '/' || *p == '\\')
+            *p = '.';
+    const CBMRegisteredFunc *unique = NULL;
+    int matches = 0;
+    for (const CBMTypeRegistry *registry = ctx->registry; registry && matches < 2;
+         registry = registry->fallback) {
+        CBMFreeFuncIter iter;
+        cbm_registry_free_funcs_by_short_name(registry, leaf, &iter);
+        for (int index; matches < 2 && (index = cbm_free_func_iter_next(&iter)) >= 0;) {
+            const CBMRegisteredFunc *candidate = &registry->funcs[index];
+            if (candidate->receiver_type || !candidate->qualified_name || !target_marker ||
+                !rust_qn_find_segment_path(candidate->qualified_name, target_marker))
+                continue;
+            const char *candidate_relative =
+                rust_qn_find_segment_path(candidate->qualified_name, target_marker);
+            candidate_relative =
+                candidate_relative ? candidate_relative + strlen(target_marker) : NULL;
+            char *relative = cbm_arena_strdup(ctx->arena, candidate_relative);
+            if (relative && strncmp(relative, ".src.", 5) == 0)
+                relative += 5;
+            char normalized[4096] = {0};
+            size_t used = 0;
+            for (char *save = NULL, *part = relative ? strtok_r(relative, ".", &save) : NULL; part;
+                 part = strtok_r(NULL, ".", &save)) {
+                if (strcmp(part, "mod") == 0)
+                    continue;
+                int n = snprintf(normalized + used, sizeof(normalized) - used, "%s%s",
+                                 used ? "." : "", part);
+                if (n < 0 || (size_t)n >= sizeof(normalized) - used) {
+                    used = sizeof(normalized);
+                    break;
+                }
+                used += (size_t)n;
+            }
+            if (used >= sizeof(normalized) || strcmp(normalized, source_tail) != 0)
+                continue;
+            unique = candidate;
+            matches++;
+        }
+    }
+    return matches == 1 ? unique : NULL;
+}
+
 static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path) {
     if (!ctx || !path || !path[0]) {
         return path;
@@ -5579,6 +5673,16 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         if (cbm_registry_lookup_func(ctx->registry, qn)) {
             rust_emit_resolved_call(ctx, qn, "lsp_direct", CBM_RUST_CONF_DIRECT);
             return;
+        }
+        if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
+            const char *import_target = rust_resolve_use(ctx, path);
+            const CBMRegisteredFunc *routed =
+                import_target ? rust_lookup_routed_imported_func(ctx, import_target) : NULL;
+            if (routed) {
+                rust_emit_resolved_call(ctx, routed->qualified_name, "lsp_cross_crate",
+                                        CBM_RUST_CONF_DIRECT);
+                return;
+            }
         }
         if (ctx->module_qn && strstr(qn, ".") == NULL) {
             const char *full = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn);

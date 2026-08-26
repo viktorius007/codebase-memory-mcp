@@ -7,6 +7,31 @@ second history; commit history carries the old investigations.
 
 ## Resolved during investigation
 
+### Rust authority gaps discard valid local Cargo dependency imports
+
+For a cross-crate Rust `use`, the pipeline's authority pass can fail to map the
+source spelling to a graph qualified name when the graph includes workspace
+package-directory segments. Directory `mod.rs` endpoints and public re-exports
+through one exposed this mismatch in project-management. The pass wrote the
+same authoritative empty string used for a private or ambiguous path. That
+empty value suppressed the syntactic import, while the Rust LSP Cargo fallback
+only handled scoped `crate::item()` calls, not an imported bare call.
+
+Authority resolution now reports access denial separately from an unresolved
+graph route. It preserves the exact source import only when there is one import
+declaration, no visibility denial, and exactly one caller-scoped local Cargo
+dependency route. The LSP then resolves that address within the routed target
+package by a segment-bounded package prefix and the complete normalized source
+suffix; zero or multiple matches remain unresolved. Regression controls cover
+private/empty authority, conflicting routes, package-prefix decoys, and
+same-suffix ambiguity, while the end-to-end fixture protects both the direct
+`mod.rs` endpoint and its public re-export shape.
+
+The original project-management graph also came from the stale account daemon
+build `c0cc131b...`, while the worktree binary was `349ad6d...`. Replacing that
+daemon and reindexing is still required for an existing graph to receive this
+source fix.
+
 ### Rust `macro_rules!` item expansions omitted callable nodes and calls
 
 Source-visible `macro_rules!` invocations that expand to item declarations such
