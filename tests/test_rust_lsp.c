@@ -2268,10 +2268,13 @@ TEST(rustlsp_cargo_route_resolves_reexported_bare_import) {
 }
 
 TEST(rustlsp_cargo_route_resolves_module_alias_qualified_call) {
-    /* `use pm_core::entity_shape as ext_shape;` then `ext_shape::append_event_sql()`.
-     * The alias head can't be matched lexically against the aliased module, so
-     * the alias fallback rebuilds the import target and routes it cross-crate. */
-    const char *caller = "use pm_core::entity_shape as ext_shape;\n"
+    /* `use pm_core::entity_shape::external_ref as ext_shape;` then
+     * `ext_shape::append_event_sql()`. The alias targets an inline `pub mod`
+     * whose submodule the indexer folds into the parent, so the definition QN is
+     * shallower (`entity_shape.append_event_sql`) than the aliased import path
+     * (`entity_shape.external_ref`). The alias fallback rebuilds the import
+     * target and the routed lookup matches across that folded submodule. */
+    const char *caller = "use pm_core::entity_shape::external_ref as ext_shape;\n"
                          "fn write() { ext_shape::append_event_sql(); }\n";
     CBMRustLSPDef defs[2] = {
         {.qualified_name = "project.crates.pm-core.src.entity_shape.append_event_sql",
@@ -2281,7 +2284,7 @@ TEST(rustlsp_cargo_route_resolves_module_alias_qualified_call) {
          .short_name = "append_event_sql", .label = "Function",
          .def_module_qn = "project.crates.pm-infra.src.decoys"}};
     const char *import_names[] = {"ext_shape"};
-    const char *import_qns[] = {"pm_core::entity_shape"};
+    const char *import_qns[] = {"pm_core::entity_shape::external_ref"};
     CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
                                      .target_name = "pm-core",
                                      .target_package_dir = "crates/pm-core"};
@@ -7047,6 +7050,42 @@ TEST(rustlsp_macro_single_level_repetition_expands_each_iteration) {
     cbm_free_result(r); PASS();
 }
 
+TEST(rustlsp_macro_repetition_two_metavars_with_inner_separator) {
+    /* Exact shape of impl_seq_addressed_transport_wire!: two metavars per
+     * iteration separated by a literal `=>`, with the second metavar used inside
+     * a path expression (`Kind::$kind`). */
+    CBMFileResult *r = extract_rust(
+        "enum Kind { Reason, Adr, Issue }\n"
+        "fn refuse(_k: Kind) {}\n"
+        "struct ReasonWire; struct AdrWire; struct IssueWire;\n"
+        "trait Wire { fn validate(&self); }\n"
+        "macro_rules! impl_wire {\n"
+        "    ($($t:ty => $k:ident),+ $(,)?) => {\n"
+        "        $(impl Wire for $t {\n"
+        "            fn validate(&self) { refuse(Kind::$k); }\n"
+        "        })+\n"
+        "    };\n"
+        "}\n"
+        "impl_wire!(ReasonWire => Reason, AdrWire => Adr, IssueWire => Issue,);\n");
+    ASSERT_NOT_NULL(r);
+    int validate_methods = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name &&
+            strstr(r->defs.items[i].qualified_name, ".validate") &&
+            r->defs.items[i].label && strcmp(r->defs.items[i].label, "Method") == 0)
+            validate_methods++;
+    }
+    ASSERT_GTE(validate_methods, 3);
+    int refuse_edges = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->callee_qn && strcmp(rc->callee_qn, "test.src.main.refuse") == 0)
+            refuse_edges++;
+    }
+    ASSERT_GTE(refuse_edges, 3);
+    cbm_free_result(r); PASS();
+}
+
 TEST(rustlsp_gap_macro_substitute_call) {
     CBMFileResult *r = extract_rust(
         "fn target(x: i32) -> i32 { x }\n"
@@ -9744,6 +9783,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_macro_rule_with_call_inside);
     RUN_TEST(rustlsp_macro_item_expansion_emits_callable_and_call_edge);
     RUN_TEST(rustlsp_macro_single_level_repetition_expands_each_iteration);
+    RUN_TEST(rustlsp_macro_repetition_two_metavars_with_inner_separator);
     RUN_TEST(rustlsp_gap_macro_substitute_call);
     RUN_TEST(rustlsp_gap_macro_substitute_method_call);
     RUN_TEST(rustlsp_gap_macro_repetition);

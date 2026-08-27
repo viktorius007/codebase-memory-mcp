@@ -1182,13 +1182,25 @@ static const char *rust_qn_find_segment_path(const char *qualified_name, const c
     return NULL;
 }
 
-/* A `pub use child::item;` re-export exposes `item` one module level up, so a
- * bare import of the re-exported name carries the ancestor module path while the
- * definition keeps the deeper one. Accept that: equal leaf, and the imported
- * source module a segment-prefix of the definition module. Exact equality (no
- * re-export) is the prefix's degenerate case. This never crosses the leaf and
- * never widens which crate is searched, so the caller's ambiguity guard (two
- * matches → NULL) and package-dir filter still reject every decoy. */
+/* Match a routed candidate's relative path against an imported source path when
+ * a module boundary shifts the two apart while the leaf and crate stay fixed.
+ * Two symmetric cases:
+ *   - `pub use child::item;` re-exports `item` one level up, so the import path
+ *     is shallower than the definition (source module a strict prefix of def).
+ *   - An inline `pub mod sub { pub fn item }` whose submodule the indexer folds
+ *     into the parent leaves the definition shallower than a `mod::sub`-aliased
+ *     import (def module a strict prefix of source).
+ * Accept equal leaf plus either module path a strict segment-prefix of the
+ * other; exact equality is the degenerate no-shift case. This never crosses the
+ * leaf and never widens which crate is searched, so the caller's ambiguity
+ * guard (two matches → NULL) and package-dir filter still reject every decoy. */
+static bool rust_module_prefix_or_equal(const char *shorter_mod, size_t shorter_len,
+                                        const char *longer_mod, size_t longer_len) {
+    if (shorter_len >= longer_len)
+        return false;
+    return strncmp(longer_mod, shorter_mod, shorter_len) == 0 && longer_mod[shorter_len] == '.';
+}
+
 static bool rust_reexport_source_matches(const char *def_relative, const char *source_tail) {
     if (!def_relative || !source_tail)
         return false;
@@ -1196,20 +1208,16 @@ static bool rust_reexport_source_matches(const char *def_relative, const char *s
         return true;
     const char *def_leaf = strrchr(def_relative, '.');
     const char *src_leaf = strrchr(source_tail, '.');
-    /* Both must have a module path before the leaf; a leaf-only source has no
-     * ancestor module to re-export from and falls back to exact equality. */
+    /* Both must have a module path before the leaf; a leaf-only side has no
+     * ancestor module to shift and falls back to exact equality. */
     if (!def_leaf || !src_leaf)
         return false;
     if (strcmp(def_leaf + 1, src_leaf + 1) != 0)
         return false;
     size_t src_mod_len = (size_t)(src_leaf - source_tail);
     size_t def_mod_len = (size_t)(def_leaf - def_relative);
-    /* source module must be a strict segment-prefix of the definition module:
-     * the re-exporting ancestor is shallower than the defining module. */
-    if (src_mod_len >= def_mod_len)
-        return false;
-    return strncmp(def_relative, source_tail, src_mod_len) == 0 &&
-           def_relative[src_mod_len] == '.';
+    return rust_module_prefix_or_equal(source_tail, src_mod_len, def_relative, def_mod_len) ||
+           rust_module_prefix_or_equal(def_relative, def_mod_len, source_tail, src_mod_len);
 }
 
 static const CBMRegisteredFunc *rust_lookup_routed_imported_func(RustLSPContext *ctx,
