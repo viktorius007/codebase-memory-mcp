@@ -98,6 +98,10 @@ daemon kept serving the old in-memory image (`build=c0cc131b…`) even after fix
 landed in source — `daemon stop` refuses while committed MCP clients from other
 sessions are live. An index built by the stale binary also cannot exercise a
 graph-construction fix after the binary is swapped; a reindex is required.
-Before recording any documented fix as broken, confirm the running binary
-carries it (`--version`, or grep its string table for a fix marker) and that the
-graph under test was indexed by that binary.
+`index_repository` alone is not enough: when git state is unchanged it takes the
+incremental path and returns the cached graph as a sub-second no-op (identical
+node/edge counts), so a graph-construction fix is not re-exercised. To verify one
+on an unchanged tree, `delete_project` then `index_repository --mode full`, and
+confirm the node/edge count moved. Before recording any documented fix as broken,
+confirm the running binary carries it (`--version`, or grep its string table for
+a fix marker) and that the graph under test was freshly built by that binary.
