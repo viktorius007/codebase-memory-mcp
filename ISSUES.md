@@ -45,7 +45,7 @@ bugs; do not "fix" them without changing the contract first.
 Removed from Open after live confirmation on the HEAD build; kept here only as a
 short ledger, to be pruned once the release ships them.
 
-- **Cross-file exported `macro_rules!` expansion** (pending commit): the project
+- **Cross-file exported `macro_rules!` expansion** (`4302d899`): the project
   macro pre-pass now records `#[macro_export]` patterns/transcribers by nearest
   Cargo package, and per-file Rust resolution imports only rules reached through
   that file's `use crate::…` bindings. The pipeline regression proves generated
