@@ -3,24 +3,16 @@
 This is the canonical backlog. Remove resolved items rather than retaining a
 second history; commit history carries the old investigations.
 
-Verified 2026-08-27 against a from-source HEAD build (`1f4e74e8`, version
-`dev build=e95e7503…`) serving a fresh index of project-management. The prior
+Verified 2026-08-27 against the installed from-source build containing
+`4302d899` (`dev build=bf6b3c2f8f32…`) serving a fresh full index of
+project-management. The prior
 round's "still open" verdicts were measured against a stale DeusData release
 binary (`build=c0cc131b…`) and its stale index; those are void. See the
 distribution note at the bottom.
 
 ## Open
 
-### `macro_rules!` derive-driven callables still omit
-
-`string_enum!`'s `token()` also comes from
-`#[derive(::pm_entity_derive::PmStringEnum)]`, a proc-macro expanded by rustc,
-not by `macro_rules!`. It is out of scope for the transcriber expander and needs
-a separate derive-aware pass. The `token()` written literally in the
-`string_enum!` transcriber body IS emitted (confirmed for the same-file
-`DemoStatus`); only derive-generated methods are absent. Calls made inside a
-still-unsupported macro body have no caller node, matching the long-standing
-"calls from inside a macro invocation body have no caller node" gap.
+_None._
 
 ## Confirmed behavior
 
