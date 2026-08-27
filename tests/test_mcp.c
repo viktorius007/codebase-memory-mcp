@@ -6549,6 +6549,86 @@ TEST(tool_get_architecture_reports_entry_point_slice_metadata) {
     PASS();
 }
 
+TEST(tool_get_architecture_reports_route_slice_metadata) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "arch-route-total";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/arch-route-total"), CBM_STORE_OK);
+
+    /* One CALLS edge so the schema carries a relationship pattern; the routes
+     * aspect gate requires rel_pattern_count > 0. */
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "arch-route-total.caller",
+                         .file_path = "src/lib.rs",
+                         .properties_json = "{}"};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "callee",
+                         .qualified_name = "arch-route-total.callee",
+                         .file_path = "src/lib.rs",
+                         .properties_json = "{}"};
+    int64_t id_caller = cbm_store_upsert_node(st, &caller);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_caller, 0);
+    ASSERT_GT(id_callee, 0);
+    cbm_edge_t call = {
+        .project = proj, .source_id = id_caller, .target_id = id_callee, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+
+    for (int i = 0; i < 21; i++) {
+        char name[32];
+        char qn[64];
+        char props[128];
+        snprintf(name, sizeof(name), "/api/r%02d", i);
+        snprintf(qn, sizeof(qn), "arch-route-total.route.%02d", i);
+        snprintf(props, sizeof(props),
+                 "{\"method\":\"GET\",\"path\":\"%s\",\"handler\":\"h%02d\"}", name, i);
+        cbm_node_t node = {.project = proj,
+                           .label = "Route",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "src/routes.rs",
+                           .properties_json = props};
+        ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    }
+
+    char *tree_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-route-total\","
+             "\"aspects\":[\"routes\"]}}}");
+    ASSERT_NOT_NULL(tree_resp);
+    char *tree = extract_text_content(tree_resp);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(strstr(tree, "routes_total: 21"));
+    ASSERT_NOT_NULL(strstr(tree, "routes_truncated: true"));
+    ASSERT_NOT_NULL(strstr(tree, "routes: 20"));
+    free(tree);
+    free(tree_resp);
+
+    char *json_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-route-total\","
+             "\"aspects\":[\"routes\"],\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(json_resp);
+    char *json = extract_text_content(json_resp);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"routes_total\":21"));
+    ASSERT_NOT_NULL(strstr(json, "\"routes_truncated\":true"));
+    free(json);
+    free(json_resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Distills PR #560 (overview subset): "overview" must expand to a compact
  * subset — every aspect EXCEPT file_tree. Before the fix, "overview" was not
  * registered in either aspect gate (want_aspect in store.c, aspect_wanted in
@@ -16298,6 +16378,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_reports_entry_point_slice_metadata);
+    RUN_TEST(tool_get_architecture_reports_route_slice_metadata);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);

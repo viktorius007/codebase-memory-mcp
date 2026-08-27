@@ -6491,7 +6491,7 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char sqlbuf[ST_SQL_BUF];
-    const char *base = "SELECT name, properties, COALESCE(file_path, '') FROM nodes "
+    const char *base = "SELECT name, properties, COALESCE(file_path, ''), COUNT(*) OVER() FROM nodes "
                        "WHERE project=?1 AND label='Route' "
                        "AND (json_extract(properties, '$.is_test') IS NULL OR "
                        "json_extract(properties, '$.is_test') != 1)";
@@ -6518,6 +6518,9 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
         const char *name = (const char *)sqlite3_column_text(stmt, 0);
         const char *props = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
         const char *fp = (const char *)sqlite3_column_text(stmt, CBM_SZ_2);
+        /* COUNT(*) OVER() is the pre-LIMIT SQL population; read it before the
+         * in-C test-path filter can `continue` past it. */
+        out->route_total = sqlite3_column_int(stmt, ST_COL_3);
         if (cbm_is_test_file_path(fp)) {
             continue;
         }
@@ -6558,6 +6561,10 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
     sqlite3_finalize(stmt);
     out->routes = arr;
     out->route_count = n;
+    /* The query is capped at 20 rows; the in-C test-path filter can drop `n`
+     * below that, so truncation is whether the SQL population exceeded the cap,
+     * not `n < route_total`. */
+    out->routes_truncated = out->route_total > 20;
     return CBM_STORE_OK;
 }
 

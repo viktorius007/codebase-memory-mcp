@@ -6773,6 +6773,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         }
         if (arch.route_count > 0) {
             static const char *const rcols[] = {"method", "path", "handler"};
+            cbm_tree_scalar_int(&sb, "routes_total", arch.route_total);
+            cbm_tree_scalar_bool(&sb, "routes_truncated", arch.routes_truncated);
             cbm_tree_table_header(&sb, "routes", arch.route_count, rcols, 3);
             for (int i = 0; i < arch.route_count; i++) {
                 cbm_tree_row_begin(&sb);
@@ -7043,6 +7045,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     if (arch.route_count > 0) {
         static const char *const rcols[] = {"method", "path", "handler"};
+        yyjson_mut_obj_add_int(doc, root, "routes_total", arch.route_total);
+        yyjson_mut_obj_add_bool(doc, root, "routes_truncated", arch.routes_truncated);
         yyjson_mut_val *rows = arch_json_section(doc, root, "routes", rcols, 3);
         for (int i = 0; i < arch.route_count; i++) {
             yyjson_mut_val *row = yyjson_mut_arr(doc);

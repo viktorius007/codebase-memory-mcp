@@ -397,6 +397,43 @@ TEST(arch_routes) {
     ASSERT_STR_EQ(info.routes[0].method, "POST");
     ASSERT_STR_EQ(info.routes[0].path, "/api/orders");
     ASSERT_STR_EQ(info.routes[0].handler, "HandleRequest");
+    ASSERT_EQ(info.route_total, 1);
+    ASSERT_FALSE(info.routes_truncated);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_routes_report_exact_total_when_slice_is_truncated) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "route-total", "/tmp/route-total"), CBM_STORE_OK);
+
+    for (int i = 0; i < 21; i++) {
+        char name[32];
+        char qualified_name[64];
+        char props[128];
+        snprintf(name, sizeof(name), "/api/r%02d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "route-total.route.%02d", i);
+        snprintf(props, sizeof(props),
+                 "{\"method\":\"GET\",\"path\":\"%s\",\"handler\":\"h%02d\"}", name, i);
+        cbm_node_t node = {.project = "route-total",
+                           .label = "Route",
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "src/routes.rs",
+                           .properties_json = props};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"routes"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "route-total", NULL, aspects, 1, &info),
+              CBM_STORE_OK);
+    ASSERT_EQ(info.route_count, 20);
+    ASSERT_EQ(info.route_total, 21);
+    ASSERT_TRUE(info.routes_truncated);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -2148,6 +2185,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
     RUN_TEST(arch_routes);
+    RUN_TEST(arch_routes_report_exact_total_when_slice_is_truncated);
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_hotspots_exclude_low_confidence_name_collisions);
     RUN_TEST(arch_boundaries_exclude_low_confidence_name_collisions);

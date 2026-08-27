@@ -904,6 +904,7 @@ typedef struct {
     int entry_point_count;
     int entry_point_total;
     int route_count;
+    int route_total;
     int hotspot_count;
     int boundary_count;
     int service_count;
@@ -911,6 +912,7 @@ typedef struct {
     int cluster_count;
     int file_tree_count;
     bool entry_points_truncated;
+    bool routes_truncated;
 } cbm_architecture_info_t;
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
