@@ -3,112 +3,37 @@
 This is the canonical backlog. Remove resolved items rather than retaining a
 second history; commit history carries the old investigations.
 
+Verified 2026-08-27 against a from-source HEAD build (`1f4e74e8`, version
+`dev build=e95e7503…`) serving a fresh index of project-management. The prior
+round's "still open" verdicts were measured against a stale DeusData release
+binary (`build=c0cc131b…`) and its stale index; those are void. See the
+distribution note at the bottom.
+
 ## Open
 
-### Cross-crate CALLS edges still under-resolved after the authority fix
+### `macro_rules!` nested-repetition and derive-driven callables still omit
 
-Re-index of project-management with the 2026-08-26 07:27 binary (`eb12be98` /
-`535b1e59` fixes present). Sweep of 140 pm-core `pub fn` called from pm-cli /
-pm-infra: 66 have a cross-crate CALLS edge, 74 do not (46 unambiguous — the name
-is defined only in pm-core). Full-path calls resolve; `use`-imported bare calls,
-`Type::assoc()`, and method calls on pm-core types do not. `trace_path` reports
-`callers_total: 0` with no warning, and `check_index_coverage` is clean, so a
-function whose only caller is in another crate is indistinguishable from dead
-code. Distinct from the fn-pointer / `dyn` entry.
+Single-level `$(...)<sep><kind>` repetition now binds and expands per iteration
+(see the fixed ledger), so `impl_seq_addressed_transport_wire!`
+(`crates/pm-core/src/transport/mod.rs:701`) emits all five `validate_decoded`
+methods and their `refuse_zero_seq_id` edges. Two macro shapes remain:
 
-May overlap the resolved "Rust authority gaps discard valid local Cargo
-dependency imports" entry, which notes a stale account daemon reindex is still
-required for an existing graph to receive that fix — confirm the sweeping binary
-was the post-fix daemon build before treating this as a fresh defect.
+- **Nested repetition.** `string_enum!`
+  (`crates/pm-core/src/entity/string_enum.rs:45`) uses a repetition inside a
+  repetition (`$( $variant => $canonical $( | $alias )* )+`) plus meta- and
+  vis-repetitions. The expander deliberately does not support a `$(` inside a
+  repetition inner pattern (`rust_lsp.c` "Repetitions inside repetitions are NOT
+  supported"); the matcher rolls that rule back to a wildcard, so the generated
+  `enum` and its `Display`/`FromStr` are not emitted. This degrades cleanly (no
+  false parse-failure health), but the callables are still absent.
+- **Derive-generated methods.** `string_enum!`'s `token()` comes from
+  `#[derive(::pm_entity_derive::PmStringEnum)]`, a proc-macro expanded by rustc,
+  not by `macro_rules!`. It is out of scope for the transcriber expander and
+  needs a separate derive-aware pass.
 
-Two adjacent observations from the same run: no `build=` line appears on stderr,
-and there is no `.__file__` node (querying it returns `symbol not found`, exit 1).
-
-### Rust authority gaps discard valid local Cargo dependency imports
-
-For a cross-crate Rust `use`, the pipeline's authority pass can fail to map the
-source spelling to a graph qualified name when the graph includes workspace
-package-directory segments. Directory `mod.rs` endpoints and public re-exports
-through one exposed this mismatch in project-management. The pass wrote the
-same authoritative empty string used for a private or ambiguous path. That
-empty value suppressed the syntactic import, while the Rust LSP Cargo fallback
-only handled scoped `crate::item()` calls, not an imported bare call.
-
-Authority resolution now reports access denial separately from an unresolved
-graph route. It preserves the exact source import only when there is one import
-declaration, no visibility denial, and exactly one caller-scoped local Cargo
-dependency route. The LSP then resolves that address within the routed target
-package by a segment-bounded package prefix and the complete normalized source
-suffix; zero or multiple matches remain unresolved. Regression controls cover
-private/empty authority, conflicting routes, package-prefix decoys, and
-same-suffix ambiguity, while the end-to-end fixture protects both the direct
-`mod.rs` endpoint and its public re-export shape.
-
-The original project-management graph also came from the stale account daemon
-build `c0cc131b...`, while the worktree binary was `349ad6d...`. Replacing that
-daemon and reindexing is still required for an existing graph to receive this
-source fix.
-
-### Rust `macro_rules!` item expansions omitted callable nodes and calls
-
-Source-visible `macro_rules!` invocations that expand to item declarations such
-as `impl` blocks or free functions produced neither callable graph nodes nor
-joinable `CALLS` edges. The omission was not reported as partial coverage.
-
-Root cause: `rust_expand_user_macro` wrapped every substituted transcriber in a
-synthetic function and only walked that function body for calls. Module-scope
-macro invocations terminated by `;` also arrive as `expression_statement`
-nodes, which the item-list dispatcher ignored. Consequently generated items
-never reached the callable-item processor, and recovered calls had neither a
-generated caller definition nor a syntactic carrier.
-
-Resolution: item-shaped transcribers are now parsed as source-file item lists;
-their generated functions/methods are emitted at the invocation's source lines,
-their bodies are resolved under those callable qualified names, and synthetic
-call carriers make the semantic resolutions joinable by the graph pipeline.
-Expression-statement macro invocations now enter macro expansion as well. The
-focused Rust LSP regression asserts the generated node, exact resolved caller,
-and the carrier-to-resolution join.
-
-### `search_graph` degree accounting omitted `OVERRIDE`
-
-The mechanism was `cbm_store_search`'s two correlated edge-count subqueries:
-their `IN` lists produced the reported `in_deg` and `out_deg` columns, and
-`search_apply_degree_filter` then filtered those same aliases. Omitting
-`OVERRIDE` therefore both reported trait implementations as degree zero and
-admitted them through `max_degree=0`.
-
-The surgical resolution is to include `OVERRIDE` in both the inbound and
-outbound subqueries. That production change was already present in baseline
-commit `eb12be98`; the observed project graph came from a stale/pre-fix server
-build, while current HEAD already contained the fix. The focused store test now
-also locks the filtered and reported results.
-
-### `get_architecture` hides entry-point truncation
-
-Root cause: `arch_entry_points` in `src/store/store.c` applies `LIMIT 20` to its
-only qualifying-node query. The store result therefore carries only the sliced
-row count, and both MCP encodings present that count without an exact population
-total or truncation signal. Large projects consequently make 20 returned entry
-points indistinguishable from exactly 20 matches.
-
-Surgical resolution: retain the bounded 20-row payload, derive the exact total
-in the same SQLite snapshot with `COUNT(*) OVER()`, and carry `entry_point_total`
-plus `entry_points_truncated` through the store result into both tree and JSON
-MCP responses. A 21-entry store fixture pins `shown = 20`, `total = 21`, and
-`truncated = true`; the existing two-entry fixture pins the non-truncated case.
-
-### `query_graph` hid `max_rows` truncation
-
-`query_graph` treated `max_rows` as an executor projection limit. The Cypher
-projection freed every match beyond N before `handle_query_graph` received the
-result, so N+1 matches and exactly N matches both serialized as `total: N` with
-no completeness signal.
-
-The handler now executes for one sentinel row beyond a positive `max_rows`,
-serializes no more than N rows, and emits `truncated: true` only when that
-sentinel proves additional matches exist. This preserves `total` as the
-returned-row count while making the result's completeness truthful.
+Calls made inside an unsupported macro body still have no caller node, matching
+the long-standing "calls from inside a macro invocation body have no caller
+node" gap for the shapes above.
 
 ## Confirmed behavior
 
@@ -124,3 +49,55 @@ bugs; do not "fix" them without changing the contract first.
 - Module CALLS edges can be real: Rust static/const initializers and top-level
   Python/shell bodies execute outside a callable. They remain in the graph as
   structural evidence and are intentionally reported separately from callers.
+- The bare project-root `.__file__` name is not resolvable
+  (`get_code_snippet … .__file__` returns `symbol not found`, exit 1); per-file
+  `__file__` nodes exist internally as `DEFINES` sources.
+
+## Fixed and verified on HEAD (2026-08-27)
+
+Removed from Open after live confirmation on the HEAD build; kept here only as a
+short ledger, to be pruned once the release ships them.
+
+- **Entry-point truncation disclosure** (`8eebc00e`): `entry_points_total` /
+  `entry_points_truncated` present and firing.
+- **Test-target entry points retained** (`629c89a9`): test `main` targets appear
+  in `entry_points`.
+- **`query_graph --max-rows` truncation disclosure** (`e21e48d5`): `truncated:
+  true` emitted when matches exceed the cap; absent otherwise.
+- **`search_graph` degree counts `OVERRIDE`** (`eb12be98` / `eb743fa0`): trait
+  implementations no longer report degree-0; degree-0 hits are genuine zero-edge
+  stubs.
+- **`trace_path`/`detect_changes` reject depth > 15** (`abbf1030`): `depth must
+  be at most 15 (given N)` instead of silent clamping.
+- **Exact build identifier** (`5d1e21a1`): `--version` prints `dev
+  build=<64-hex>` fingerprint.
+- **Route slice truncation disclosure** (`21d39bca`): `get_architecture` routes
+  aspect emits `routes_total` / `routes_truncated`, mirroring the entry-point
+  plumbing. Truncation is measured against the pre-LIMIT `COUNT(*) OVER()`
+  population read before the in-C test-path filter, so the test-path `continue`
+  cannot spoof a false negative.
+- **Re-exported bare and module-alias cross-crate CALLS** (`6fdb6efe`): a bare
+  call of a symbol `pub use`-re-exported through a directory module now resolves
+  via re-export-ancestor matching (`produce_show_frame_dot`), and a
+  module-alias-qualified associated call `alias::fn()` resolves by rebuilding the
+  import target from the aliased module (`ext_shape::append_event_sql`). Existing
+  decoy rejections (target-package prefix, ambiguous source suffix, conflicting
+  routes) still hold.
+- **Single-level macro repetition binding/expansion** (`b0852424`): a
+  `$(...)<sep><kind>` repetition binds each metavar's per-iteration values and
+  expands the transcriber body once per iteration, so item-producing repetition
+  macros emit every generated callable and the calls inside them
+  (`impl_seq_addressed_transport_wire!` now yields all five `validate_decoded`
+  methods). Nested repetition stays unsupported (see Open).
+
+## Distribution hazard (not a code defect)
+
+The binary a session actually runs can lag fork HEAD by a full fix wave. The
+shipped DeusData release trailed the `viktorius007` fork, and the stale account
+daemon kept serving the old in-memory image (`build=c0cc131b…`) even after fixes
+landed in source — `daemon stop` refuses while committed MCP clients from other
+sessions are live. An index built by the stale binary also cannot exercise a
+graph-construction fix after the binary is swapped; a reindex is required.
+Before recording any documented fix as broken, confirm the running binary
+carries it (`--version`, or grep its string table for a fix marker) and that the
+graph under test was indexed by that binary.
