@@ -13852,6 +13852,57 @@ TEST(pipeline_rust_cross_file_factory_chains_exact_targets) {
     PASS();
 }
 
+TEST(pipeline_rust_exported_macro_expands_in_importing_file_only_within_crate) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_exported_macro_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/core/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/other/src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nmembers = [\"crates/core\", \"crates/other\"]\n");
+    write_temp_file(tmp, "crates/core/Cargo.toml",
+                    "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "crates/core/src/lib.rs", "mod string_enum;\nmod adr;\n");
+    write_temp_file(tmp, "crates/core/src/string_enum.rs",
+                    "#[macro_export]\n"
+                    "macro_rules! string_enum {\n"
+                    "    ($vis:vis enum $name:ident) => {\n"
+                    "        $vis enum $name { Draft }\n"
+                    "        impl $name { pub fn token(&self) -> &'static str { \"draft\" } }\n"
+                    "    };\n"
+                    "}\n");
+    write_temp_file(tmp, "crates/core/src/adr.rs",
+                    "use crate::string_enum;\nstring_enum!(pub enum AdrStatus);\n");
+    write_temp_file(tmp, "crates/other/Cargo.toml",
+                    "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "crates/other/src/lib.rs",
+                    "use crate::string_enum;\nstring_enum!(pub enum OtherStatus);\n");
+    for (int i = 0; i < 50; i++) {
+        char path[64];
+        char source[64];
+        snprintf(path, sizeof(path), "crates/core/src/pad_%02d.rs", i);
+        snprintf(source, sizeof(source), "pub fn pad_%02d() {}\n", i);
+        write_temp_file(tmp, path, source);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/exported-macro.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    ASSERT_EQ(named_node_count(store, project, "AdrStatus"), 1);
+    ASSERT_EQ(named_node_count(store, project, "OtherStatus"), 0);
+    ASSERT_EQ(named_node_count(store, project, "token"), 1);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_rust_cargo_tokio_nested_calls_exact_targets) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_nested_calls_XXXXXX");
@@ -14718,6 +14769,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_outside_path_dependency_does_not_poison_local_authority);
     RUN_TEST(pipeline_rust_authority_dependency_visibility_nested_and_lexical_controls);
     RUN_TEST(pipeline_rust_cross_file_factory_chains_exact_targets);
+    RUN_TEST(pipeline_rust_exported_macro_expands_in_importing_file_only_within_crate);
     RUN_TEST(pipeline_rust_cargo_tokio_nested_calls_exact_targets);
     RUN_TEST(pipeline_rust_tokio_cfg_crossfile_parallel_exact_target);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);

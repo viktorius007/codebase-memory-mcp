@@ -21,6 +21,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/worker_pool.h"
 #include "lsp/rust_cargo.h"
+#include "lsp/rust_lsp.h"
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
 #include "store/store.h"
@@ -1437,23 +1438,74 @@ static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_i
     return cbm_pipeline_pass_lsp_cross(ctx, files, file_count, ctx->result_cache);
 }
 
-/* Run the sequential pipeline path: definitions, k8s, lsp_cross, calls, usages, semantic. */
-/* Build the ObjectScript $$$macro table from .inc include files in the repo.
- * Returns NULL (and does no work) when no ObjectScript include files exist.
- * Caller owns the returned heap table (free via cbm_macro_table_free). */
+static bool pipeline_macro_manifest_dir(const char *rel_path, char *dir, size_t capacity) {
+    const char *suffix = "Cargo.toml";
+    size_t path_len = rel_path ? strlen(rel_path) : 0;
+    size_t suffix_len = strlen(suffix);
+    if (path_len < suffix_len || strcmp(rel_path + path_len - suffix_len, suffix) != 0 ||
+        (path_len > suffix_len && rel_path[path_len - suffix_len - 1] != '/'))
+        return false;
+    size_t dir_len = path_len - suffix_len;
+    if (dir_len > 0 && rel_path[dir_len - 1] == '/')
+        dir_len--;
+    if (dir_len >= capacity)
+        return false;
+    memcpy(dir, rel_path, dir_len);
+    dir[dir_len] = '\0';
+    return true;
+}
+
+static char *pipeline_read_macro_source(const char *path, int *source_len) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file)
+        return NULL;
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    rewind(file);
+    char *source = size >= 0 ? malloc((size_t)size + 1) : NULL;
+    if (source) {
+        size_t read = fread(source, 1, (size_t)size, file);
+        source[read] = '\0';
+        *source_len = (int)read;
+    }
+    (void)fclose(file);
+    return source;
+}
+
+static void pipeline_collect_exported_rust_macros(CBMMacroTable *table,
+                                                  const cbm_file_info_t *files, int count) {
+    for (int i = 0; i < count; i++) {
+        if (files[i].language != CBM_LANG_RUST || !files[i].path || !files[i].rel_path)
+            continue;
+        int source_len = 0;
+        char *source = pipeline_read_macro_source(files[i].path, &source_len);
+        if (!source)
+            continue;
+        if (strstr(source, "macro_export")) {
+            const char *package_dir =
+                cbm_macro_table_rust_package_for_path(table, files[i].rel_path);
+            cbm_rust_collect_exported_macro_rules(table, source, source_len,
+                                                  package_dir ? package_dir : "");
+        }
+        free(source);
+    }
+}
+
+/* Build the project macro table used by ObjectScript and Rust extraction. */
 CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
                                                 const char *repo_path) {
     (void)repo_path;
     bool has_inc = false;
+    bool has_rust = false;
     for (int i = 0; i < count; i++) {
+        has_rust = has_rust || files[i].language == CBM_LANG_RUST;
         if (files[i].language == CBM_LANG_OBJECTSCRIPT_ROUTINE && files[i].path &&
             (strrchr(files[i].path, '.') != NULL &&
              strcmp(strrchr(files[i].path, '.'), ".inc") == 0)) {
             has_inc = true;
-            break;
         }
     }
-    if (!has_inc) {
+    if (!has_inc && !has_rust) {
         return NULL;
     }
 
@@ -1463,7 +1515,19 @@ CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, in
     }
 
     cbm_arena_init(&mt->arena);
-    cbm_macro_table_init_system(mt);
+    if (has_inc)
+        cbm_macro_table_init_system(mt);
+
+    for (int i = 0; i < count; i++) {
+        char package_dir[CBM_SZ_4K];
+        if (files[i].rel_path &&
+            pipeline_macro_manifest_dir(files[i].rel_path, package_dir, sizeof(package_dir)))
+            cbm_macro_table_add_rust_package(mt, package_dir);
+    }
+    if (has_rust && mt->rust_package_count == 0)
+        cbm_macro_table_add_rust_package(mt, "");
+    if (has_rust)
+        pipeline_collect_exported_rust_macros(mt, files, count);
 
     for (int i = 0; i < count; i++) {
         if (files[i].language != CBM_LANG_OBJECTSCRIPT_ROUTINE) {

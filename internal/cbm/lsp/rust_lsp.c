@@ -27,6 +27,7 @@
 
 #include "rust_lsp.h"
 #include "rust_cargo.h"
+#include "../macro_table.h"
 #include "../helpers.h"
 #include <ctype.h>
 #include <limits.h>
@@ -34,6 +35,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+extern const TSLanguage *tree_sitter_rust(void);
 
 /* ════════════════════════════════════════════════════════════════════
  * 1. Initialisation + arena helpers
@@ -3728,6 +3731,8 @@ typedef struct RustMacroRule {
     uint32_t definition_end_byte;
     uint32_t scope_start_byte;
     uint32_t scope_end_byte;
+    bool imported;
+    bool exported;
 } RustMacroRule;
 
 /* Strip a single outer pair of matching brackets from a token-tree
@@ -3769,6 +3774,18 @@ static void rust_record_macro_rule(RustLSPContext *ctx, const char *macro_name, 
     r->definition_end_byte = ts_node_end_byte(definition);
     r->scope_start_byte = ts_node_start_byte(scope);
     r->scope_end_byte = ts_node_end_byte(scope);
+    TSNode previous = ts_node_prev_sibling(definition);
+    while (!ts_node_is_null(previous)) {
+        const char *kind = ts_node_type(previous);
+        if (strcmp(kind, "attribute_item") == 0) {
+            char *attribute = cbm_node_text(ctx->arena, previous, ctx->source);
+            if (attribute && strstr(attribute, "macro_export"))
+                r->exported = true;
+        } else if (strcmp(kind, "line_comment") != 0 && strcmp(kind, "block_comment") != 0) {
+            break;
+        }
+        previous = ts_node_prev_sibling(previous);
+    }
 
     /* Cache pattern text for matching at invocation time. */
     if (!ts_node_is_null(pattern)) {
@@ -3831,6 +3848,92 @@ static void rust_collect_macro_rules(RustLSPContext *ctx, TSNode root) {
     }
 }
 
+bool cbm_rust_collect_exported_macro_rules(CBMMacroTable *table, const char *source, int source_len,
+                                           const char *package_dir) {
+    if (!table || !source || source_len < 0 || !package_dir)
+        return false;
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return false;
+    ts_parser_set_language(parser, tree_sitter_rust());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+    if (!tree) {
+        ts_parser_delete(parser);
+        return false;
+    }
+    TSNode root = ts_tree_root_node(tree);
+    RustLSPContext ctx;
+    rust_lsp_init(&ctx, &table->arena, source, source_len, NULL, "rust_macro_registry", NULL);
+    ctx.root = root;
+    rust_collect_macro_rules(&ctx, root);
+    bool complete = cbm_arena_status(&table->arena) == CBM_ARENA_STATUS_AVAILABLE;
+    for (int i = 0; complete && i < ctx.macro_rules_count; i++) {
+        const RustMacroRule *rule = ctx.macro_rules_arr[i];
+        if (!rule || !rule->exported)
+            continue;
+        complete = cbm_macro_table_add_rust_rule(table, rule->macro_name, rule->pattern_text,
+                                                 rule->pattern_len, rule->transcriber_text,
+                                                 rule->transcriber_len, package_dir);
+    }
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    return complete;
+}
+
+static bool rust_imported_macro_push(RustLSPContext *ctx, const char *local_name,
+                                     const CBMRustMacroRuleEntry *entry) {
+    if (ctx->macro_rules_count % 16 == 0) {
+        int cap = ctx->macro_rules_count + 16;
+        struct RustMacroRule **rules =
+            cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(struct RustMacroRule *));
+        if (!rules)
+            return false;
+        if (ctx->macro_rules_arr)
+            memcpy(rules, ctx->macro_rules_arr,
+                   (size_t)ctx->macro_rules_count * sizeof(struct RustMacroRule *));
+        ctx->macro_rules_arr = rules;
+    }
+    RustMacroRule *rule = cbm_arena_alloc(ctx->arena, sizeof(*rule));
+    if (!rule)
+        return false;
+    *rule = (RustMacroRule){
+        .macro_name = cbm_arena_strdup(ctx->arena, local_name),
+        .pattern_text = cbm_arena_strndup(ctx->arena, entry->pattern, (size_t)entry->pattern_len),
+        .pattern_len = entry->pattern_len,
+        .transcriber_text =
+            cbm_arena_strndup(ctx->arena, entry->transcriber, (size_t)entry->transcriber_len),
+        .transcriber_len = entry->transcriber_len,
+        .imported = true,
+        .exported = true};
+    if (!rule->macro_name || !rule->pattern_text || !rule->transcriber_text)
+        return false;
+    ctx->macro_rules_arr[ctx->macro_rules_count++] = rule;
+    return true;
+}
+
+static void rust_import_exported_macro_rules(RustLSPContext *ctx, const CBMMacroTable *table,
+                                             const char *rel_path) {
+    if (!ctx || !table || !rel_path)
+        return;
+    const char *package_dir = cbm_macro_table_rust_package_for_path(table, rel_path);
+    if (!package_dir)
+        return;
+    for (int rule_index = 0; rule_index < table->rust_rule_count; rule_index++) {
+        const CBMRustMacroRuleEntry *entry = &table->rust_rules[rule_index];
+        if (strcmp(entry->package_dir, package_dir) != 0)
+            continue;
+        for (int use_index = 0; use_index < ctx->use_count; use_index++) {
+            const char *path = ctx->use_module_paths[use_index];
+            if (!path || strncmp(path, "crate::", 7) != 0 ||
+                strcmp(path_last_segment(path), entry->name) != 0)
+                continue;
+            if (!rust_imported_macro_push(ctx, ctx->use_local_names[use_index], entry))
+                return;
+            break;
+        }
+    }
+}
+
 /* macro_rules! uses textual scope: a definition is visible only after its
  * declaration, inside the containing module. A nested module may shadow an
  * outer definition; within one scope the latest preceding definition wins.
@@ -3854,11 +3957,18 @@ static RustMacroRule *rust_visible_macro_definition(RustLSPContext *ctx, const c
         return NULL;
 
     RustMacroRule *best = NULL;
+    RustMacroRule *imported = NULL;
     uint32_t best_scope_width = UINT32_MAX;
     for (int i = 0; i < ctx->macro_rules_count; i++) {
         RustMacroRule *rule = ctx->macro_rules_arr[i];
-        if (!rule || !rule->macro_name || strcmp(rule->macro_name, macro_name) != 0 ||
-            position < rule->definition_end_byte || position < rule->scope_start_byte ||
+        if (!rule || !rule->macro_name || strcmp(rule->macro_name, macro_name) != 0)
+            continue;
+        if (rule->imported) {
+            if (!imported)
+                imported = rule;
+            continue;
+        }
+        if (position < rule->definition_end_byte || position < rule->scope_start_byte ||
             position > rule->scope_end_byte) {
             continue;
         }
@@ -3870,7 +3980,7 @@ static RustMacroRule *rust_visible_macro_definition(RustLSPContext *ctx, const c
             best_scope_width = scope_width;
         }
     }
-    return best;
+    return best ? best : imported;
 }
 
 static bool rust_has_visible_macro_definition(RustLSPContext *ctx, const char *macro_name,
@@ -4399,9 +4509,8 @@ static int macro_match_inner_once(CBMArena *arena, const char *pat, int pat_len,
             if (val_end <= val_start)
                 goto rollback;
             int trimmed = val_end;
-            while (trimmed > val_start &&
-                   (in[trimmed - 1] == ' ' || in[trimmed - 1] == '\t' ||
-                    in[trimmed - 1] == '\n' || in[trimmed - 1] == '\r'))
+            while (trimmed > val_start && (in[trimmed - 1] == ' ' || in[trimmed - 1] == '\t' ||
+                                           in[trimmed - 1] == '\n' || in[trimmed - 1] == '\r'))
                 trimmed--;
             if (!macro_rep_append(env, arena, pat + name_start, name_end - name_start,
                                   in + val_start, trimmed - val_start))
@@ -4546,9 +4655,8 @@ static bool macro_pattern_match(CBMArena *arena, const char *pat, int pat_len, c
                     /* Wildcard fallback: bind nothing, skip input to the next
                      * literal pattern char. */
                     int next_lit = pp;
-                    while (next_lit < pat_len &&
-                           (pat[next_lit] == ' ' || pat[next_lit] == '\t' ||
-                            pat[next_lit] == '\n' || pat[next_lit] == '\r')) {
+                    while (next_lit < pat_len && (pat[next_lit] == ' ' || pat[next_lit] == '\t' ||
+                                                  pat[next_lit] == '\n' || pat[next_lit] == '\r')) {
                         next_lit++;
                     }
                     if (next_lit >= pat_len) {
@@ -4588,8 +4696,8 @@ static bool macro_pattern_match(CBMArena *arena, const char *pat, int pat_len, c
                 /* `vis` legitimately matches the empty visibility (a private
                  * item): bind a zero-length value and carry on. */
                 if (strcmp(frag, "vis") == 0) {
-                    if (!macro_env_bind(env, max_bindings, pat + name_start,
-                                        name_end - name_start, in + val_start, 0)) {
+                    if (!macro_env_bind(env, max_bindings, pat + name_start, name_end - name_start,
+                                        in + val_start, 0)) {
                         if (binding_limit_hit)
                             *binding_limit_hit = true;
                         return false;
@@ -4807,8 +4915,8 @@ static char *macro_substitute_rep(CBMArena *arena, const char *xs, int xs_len, c
                 for (int it = 0; it < iters; it++) {
                     if (it > 0 && sep && op < cap)
                         out[op++] = sep;
-                    char *inner = macro_substitute_rep(arena, xs + body_start, body_len, env, it,
-                                                       truncated);
+                    char *inner =
+                        macro_substitute_rep(arena, xs + body_start, body_len, env, it, truncated);
                     if (inner) {
                         int il = (int)strlen(inner);
                         if (op + il < cap) {
@@ -4968,8 +5076,8 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             repetition_pattern_present ||
             macro_contains_repetition_syntax(r->pattern_text, r->pattern_len);
         if (r->pattern_text && inv_args &&
-            macro_pattern_match(ctx->arena, r->pattern_text, r->pattern_len, inv_args,
-                                inv_args_len, &env, ctx->max_macro_bindings, &binding_limit_hit)) {
+            macro_pattern_match(ctx->arena, r->pattern_text, r->pattern_len, inv_args, inv_args_len,
+                                &env, ctx->max_macro_bindings, &binding_limit_hit)) {
             hit = r;
             break;
         }
@@ -5045,9 +5153,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             }
         }
     }
-    TSTree *tree = has_item ? item_tree
-                            : ts_parser_parse_string(parser, NULL, wrapped,
-                                                     (uint32_t)strlen(wrapped));
+    TSTree *tree = has_item
+                       ? item_tree
+                       : ts_parser_parse_string(parser, NULL, wrapped, (uint32_t)strlen(wrapped));
     if (!has_item && item_tree)
         ts_tree_delete(item_tree);
     if (tree && !ts_node_has_error(ts_tree_root_node(tree))) {
@@ -6285,8 +6393,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
              * identifier form uses below. */
             const char *scoped_sep = strstr(path, "::");
             if (scoped_sep) {
-                char *alias_head =
-                    cbm_arena_strndup(ctx->arena, path, (size_t)(scoped_sep - path));
+                char *alias_head = cbm_arena_strndup(ctx->arena, path, (size_t)(scoped_sep - path));
                 const char *alias_module = alias_head ? rust_resolve_use(ctx, alias_head) : NULL;
                 if (alias_module && alias_module[0]) {
                     const char *routed_import =
@@ -8277,7 +8384,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
 
 void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, const char *source,
                                     int source_len, TSNode root,
-                                    const struct CBMCargoManifest *manifest) {
+                                    const struct CBMCargoManifest *manifest,
+                                    const CBMMacroTable *macro_table) {
     if (!result)
         return;
     result->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
@@ -8312,6 +8420,7 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
     ctx.syn_calls = &result->calls;
 
     rust_collect_uses(&ctx, root);
+    rust_import_exported_macro_rules(&ctx, macro_table, ctx.def_file_path);
     rust_lsp_process_file(&ctx, root);
     rust_resolve_module_callable_usages(&ctx);
     if (cbm_arena_status(arena) == CBM_ARENA_STATUS_AVAILABLE) {
@@ -8327,7 +8436,7 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
 
 void cbm_run_rust_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                       TSNode root) {
-    cbm_run_rust_lsp_with_manifest(arena, result, source, source_len, root, NULL);
+    cbm_run_rust_lsp_with_manifest(arena, result, source, source_len, root, NULL, NULL);
 }
 
 /* ════════════════════════════════════════════════════════════════════

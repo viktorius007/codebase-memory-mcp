@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
 #include "arena.h"
 
@@ -13,9 +14,24 @@ typedef struct {
     const char *resolved_callee;
 } CBMMacroEntry;
 
+typedef struct {
+    const char *name;
+    const char *pattern;
+    int pattern_len;
+    const char *transcriber;
+    int transcriber_len;
+    const char *package_dir;
+} CBMRustMacroRuleEntry;
+
 typedef struct CBMMacroTable {
     CBMMacroEntry entries[CBM_MACRO_TABLE_CAP];
     int count;
+    CBMRustMacroRuleEntry *rust_rules;
+    int rust_rule_count;
+    int rust_rule_cap;
+    const char **rust_package_dirs;
+    int rust_package_count;
+    int rust_package_cap;
     CBMArena arena;
 } CBMMacroTable;
 
@@ -42,6 +58,12 @@ char *cbm_macro_extract_callee(CBMArena *arena, const char *expansion);
 // Allocate and populate a new table with the hardcoded system macros.
 // Caller owns the table (stack or heap).
 void cbm_macro_table_init_system(CBMMacroTable *t);
+
+bool cbm_macro_table_add_rust_package(CBMMacroTable *t, const char *package_dir);
+bool cbm_macro_table_add_rust_rule(CBMMacroTable *t, const char *name, const char *pattern,
+                                   int pattern_len, const char *transcriber, int transcriber_len,
+                                   const char *package_dir);
+const char *cbm_macro_table_rust_package_for_path(const CBMMacroTable *t, const char *rel_path);
 
 // Destroy the arena inside t and free t itself. NULL-safe.
 void cbm_macro_table_free(CBMMacroTable *t);

@@ -9022,7 +9022,7 @@ TEST(rustlsp_extra_cargo_wires_workspace_member) {
     memset(&r->resolved_calls, 0, sizeof(r->resolved_calls));
     cbm_run_rust_lsp_with_manifest(&scratch, r, src, (int)strlen(src),
         r->cached_tree ? ts_tree_root_node(r->cached_tree) : (TSNode){0},
-        &m);
+        &m, NULL);
 
     /* engine::boot should resolve via the workspace member name. */
     bool found_engine_call = false;
@@ -9059,7 +9059,7 @@ TEST(rustlsp_extra_cargo_wires_external_dep) {
     memset(&r->resolved_calls, 0, sizeof(r->resolved_calls));
     cbm_run_rust_lsp_with_manifest(&scratch, r, src, (int)strlen(src),
         r->cached_tree ? ts_tree_root_node(r->cached_tree) : (TSNode){0},
-        &m);
+        &m, NULL);
 
     bool routed = false;
     for (int i = 0; i < r->resolved_calls.count; i++) {

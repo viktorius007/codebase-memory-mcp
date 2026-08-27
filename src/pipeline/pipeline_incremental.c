@@ -19,6 +19,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "lsp/rust_cargo.h"
+#include "macro_table.h"
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
 #include "pipeline/pipeline_internal.h"
@@ -2393,7 +2394,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         free((void *)ctx.return_type_table);
     }
     if (ctx.macro_table) {
-        free((void *)ctx.macro_table);
+        cbm_macro_table_free((CBMMacroTable *)ctx.macro_table);
     }
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
@@ -2964,7 +2965,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         ctx.return_type_table = NULL;
     }
     if (ctx.macro_table) {
-        free((void *)ctx.macro_table);
+        cbm_macro_table_free((CBMMacroTable *)ctx.macro_table);
         ctx.macro_table = NULL;
     }
 

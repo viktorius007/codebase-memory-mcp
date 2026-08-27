@@ -33,6 +33,8 @@ static const struct {
 void cbm_macro_table_free(CBMMacroTable *t) {
     if (!t)
         return;
+    free(t->rust_rules);
+    free(t->rust_package_dirs);
     cbm_arena_destroy(&t->arena);
     free(t);
 }
@@ -50,6 +52,77 @@ void cbm_macro_table_init_system(CBMMacroTable *t) {
         for (int p = 0; p < CBM_MACRO_MAX_PARAMS; p++)
             e->param_names[p] = NULL;
     }
+}
+
+bool cbm_macro_table_add_rust_package(CBMMacroTable *t, const char *package_dir) {
+    if (!t || !package_dir)
+        return false;
+    for (int i = 0; i < t->rust_package_count; i++) {
+        if (strcmp(t->rust_package_dirs[i], package_dir) == 0)
+            return true;
+    }
+    if (t->rust_package_count == t->rust_package_cap) {
+        int cap = t->rust_package_cap ? t->rust_package_cap * 2 : 8;
+        const char **dirs = realloc(t->rust_package_dirs, (size_t)cap * sizeof(*dirs));
+        if (!dirs)
+            return false;
+        t->rust_package_dirs = dirs;
+        t->rust_package_cap = cap;
+    }
+    const char *copy = cbm_arena_strdup(&t->arena, package_dir);
+    if (!copy)
+        return false;
+    t->rust_package_dirs[t->rust_package_count++] = copy;
+    return true;
+}
+
+bool cbm_macro_table_add_rust_rule(CBMMacroTable *t, const char *name, const char *pattern,
+                                   int pattern_len, const char *transcriber, int transcriber_len,
+                                   const char *package_dir) {
+    if (!t || !name || !pattern || !transcriber || !package_dir || pattern_len < 0 ||
+        transcriber_len < 0 || t->rust_rule_count >= CBM_MACRO_TABLE_CAP)
+        return false;
+    if (t->rust_rule_count == t->rust_rule_cap) {
+        int cap = t->rust_rule_cap ? t->rust_rule_cap * 2 : 16;
+        CBMRustMacroRuleEntry *rules = realloc(t->rust_rules, (size_t)cap * sizeof(*rules));
+        if (!rules)
+            return false;
+        t->rust_rules = rules;
+        t->rust_rule_cap = cap;
+    }
+    CBMRustMacroRuleEntry *entry = &t->rust_rules[t->rust_rule_count];
+    entry->name = cbm_arena_strdup(&t->arena, name);
+    entry->pattern = cbm_arena_strndup(&t->arena, pattern, (size_t)pattern_len);
+    entry->transcriber = cbm_arena_strndup(&t->arena, transcriber, (size_t)transcriber_len);
+    entry->package_dir = cbm_arena_strdup(&t->arena, package_dir);
+    if (!entry->name || !entry->pattern || !entry->transcriber || !entry->package_dir)
+        return false;
+    entry->pattern_len = pattern_len;
+    entry->transcriber_len = transcriber_len;
+    t->rust_rule_count++;
+    return true;
+}
+
+static bool rust_path_in_package(const char *rel_path, const char *package_dir) {
+    size_t dir_len = strlen(package_dir);
+    return dir_len == 0 ||
+           (strncmp(rel_path, package_dir, dir_len) == 0 && rel_path[dir_len] == '/');
+}
+
+const char *cbm_macro_table_rust_package_for_path(const CBMMacroTable *t, const char *rel_path) {
+    if (!t || !rel_path)
+        return NULL;
+    const char *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < t->rust_package_count; i++) {
+        const char *dir = t->rust_package_dirs[i];
+        size_t len = strlen(dir);
+        if (rust_path_in_package(rel_path, dir) && (!best || len > best_len)) {
+            best = dir;
+            best_len = len;
+        }
+    }
+    return best;
 }
 
 void cbm_macro_table_add(CBMMacroTable *t, CBMArena *arena, const char *name, int param_count,

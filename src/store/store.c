@@ -6491,10 +6491,11 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char sqlbuf[ST_SQL_BUF];
-    const char *base = "SELECT name, properties, COALESCE(file_path, ''), COUNT(*) OVER() FROM nodes "
-                       "WHERE project=?1 AND label='Route' "
-                       "AND (json_extract(properties, '$.is_test') IS NULL OR "
-                       "json_extract(properties, '$.is_test') != 1)";
+    const char *base =
+        "SELECT name, properties, COALESCE(file_path, ''), COUNT(*) OVER() FROM nodes "
+        "WHERE project=?1 AND label='Route' "
+        "AND (json_extract(properties, '$.is_test') IS NULL OR "
+        "json_extract(properties, '$.is_test') != 1)";
     if (scoped) {
         snprintf(sqlbuf, sizeof(sqlbuf), "%s%s LIMIT 20", base, arch_path_scope_sql());
     } else {

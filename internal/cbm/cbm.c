@@ -1475,7 +1475,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         cbm_run_kotlin_lsp(a, result, source, source_len, root);
     }
     if (language == CBM_LANG_RUST) {
-        cbm_run_rust_lsp(a, result, source, source_len, root);
+        cbm_run_rust_lsp_with_manifest(a, result, source, source_len, root, NULL, macro_table);
     }
     atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 

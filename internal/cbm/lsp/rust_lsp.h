@@ -35,6 +35,7 @@
  * here to avoid pulling rust_cargo.h into every consumer that only
  * needs the LSP API. */
 struct CBMCargoManifest;
+struct CBMMacroTable;
 
 /* Global confidence assigned to LSP-resolved call edges. The pipeline's
  * shared override resolver (`pipeline/lsp_resolve.h`) only admits entries
@@ -340,7 +341,11 @@ void cbm_run_rust_lsp(CBMArena *arena, CBMFileResult *result, const char *source
  * behaviour. */
 void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, const char *source,
                                     int source_len, TSNode root,
-                                    const struct CBMCargoManifest *manifest);
+                                    const struct CBMCargoManifest *manifest,
+                                    const struct CBMMacroTable *macro_table);
+
+bool cbm_rust_collect_exported_macro_rules(struct CBMMacroTable *table, const char *source,
+                                           int source_len, const char *package_dir);
 
 /* Register a curated subset of the Rust core/alloc/std prelude into the
  * given registry. The seed is intentionally compact (~150 types, ~600
@@ -365,21 +370,21 @@ void cbm_rust_crates_register(CBMTypeRegistry *reg, CBMArena *arena);
 typedef struct {
     const char *qualified_name;
     const char *short_name;
-    const char *label;            /* "Function", "Method", "Type", "Trait" */
-    const char *receiver_type;    /* for methods: receiver type QN (NULL for free fns) */
-    const char *def_module_qn;    /* module QN where this def lives */
-    const char *crate_root_qn;    /* authoritative Cargo member root; NULL if unproven */
+    const char *label;                  /* "Function", "Method", "Type", "Trait" */
+    const char *receiver_type;          /* for methods: receiver type QN (NULL for free fns) */
+    const char *def_module_qn;          /* module QN where this def lives */
+    const char *crate_root_qn;          /* authoritative Cargo member root; NULL if unproven */
     const char *crate_source_module_qn; /* exact module QN of selected target source */
-    const char *return_types;     /* "|"-separated return type texts          */
-    const char *embedded_types;   /* "|"-separated embedded type QNs          */
-    const char *field_defs;       /* "|"-separated "name:type" pairs          */
-    const char *method_names_str; /* "|"-separated method names for traits   */
+    const char *return_types;           /* "|"-separated return type texts          */
+    const char *embedded_types;         /* "|"-separated embedded type QNs          */
+    const char *field_defs;             /* "|"-separated "name:type" pairs          */
+    const char *method_names_str;       /* "|"-separated method names for traits   */
     const char **signature_param_types; /* borrowed ordered parameter texts    */
     int signature_param_count;          /* positional entries; "?" is unknown */
     const char *trait_qn;               /* raw impl-trait spelling; uniquely canonicalized */
-    bool is_interface;            /* true for traits                          */
-    bool is_rust_impl_relation;   /* independent type-level impl record       */
-    bool is_abstract;             /* required trait declaration (no default)  */
+    bool is_interface;                  /* true for traits                          */
+    bool is_rust_impl_relation;         /* independent type-level impl record       */
+    bool is_abstract;                   /* required trait declaration (no default)  */
 } CBMRustLSPDef;
 
 /* Run cross-file resolution on a single file. */
