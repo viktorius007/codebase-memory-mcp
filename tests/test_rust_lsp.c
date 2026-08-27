@@ -7006,6 +7006,47 @@ TEST(rustlsp_macro_item_expansion_emits_callable_and_call_edge) {
     cbm_free_result(r); PASS();
 }
 
+TEST(rustlsp_macro_single_level_repetition_expands_each_iteration) {
+    /* Single-level `$(...)+` producing one impl per iteration, each with a
+     * method calling a shared free function. Mirrors the real
+     * impl_seq_addressed_transport_wire! shape. Before repetition binding, the
+     * body expanded once (or not at all) and the per-iteration methods and
+     * their call edges were absent. */
+    CBMFileResult *r = extract_rust(
+        "fn refuse() {}\n"
+        "struct Alpha; struct Beta; struct Gamma;\n"
+        "trait Wire { fn check(&self); }\n"
+        "macro_rules! impl_wire {\n"
+        "    ($($t:ty),+ $(,)?) => {\n"
+        "        $(impl Wire for $t {\n"
+        "            fn check(&self) { refuse(); }\n"
+        "        })+\n"
+        "    };\n"
+        "}\n"
+        "impl_wire!(Alpha, Beta, Gamma);\n");
+    ASSERT_NOT_NULL(r);
+
+    /* Each generated `check` method must exist as a callable and carry a CALLS
+     * edge to `refuse`. */
+    int check_methods = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name &&
+            strstr(r->defs.items[i].qualified_name, ".check") &&
+            r->defs.items[i].label && strcmp(r->defs.items[i].label, "Method") == 0)
+            check_methods++;
+    }
+    ASSERT_GTE(check_methods, 3);
+
+    int refuse_edges = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->callee_qn && strcmp(rc->callee_qn, "test.src.main.refuse") == 0)
+            refuse_edges++;
+    }
+    ASSERT_GTE(refuse_edges, 3);
+    cbm_free_result(r); PASS();
+}
+
 TEST(rustlsp_gap_macro_substitute_call) {
     CBMFileResult *r = extract_rust(
         "fn target(x: i32) -> i32 { x }\n"
@@ -9702,6 +9743,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_macro_simple_rule);
     RUN_TEST(rustlsp_gap_macro_rule_with_call_inside);
     RUN_TEST(rustlsp_macro_item_expansion_emits_callable_and_call_edge);
+    RUN_TEST(rustlsp_macro_single_level_repetition_expands_each_iteration);
     RUN_TEST(rustlsp_gap_macro_substitute_call);
     RUN_TEST(rustlsp_gap_macro_substitute_method_call);
     RUN_TEST(rustlsp_gap_macro_repetition);

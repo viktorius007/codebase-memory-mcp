@@ -4130,11 +4130,216 @@ static const MacroBinding *macro_env_lookup(const MacroEnv *env, const char *nam
     return NULL;
 }
 
+/* Repetition bindings. A single-level `$(...)<sep><kind>` group collects, per
+ * metavar named inside it, one value per iteration. Nested repetition (a `$(`
+ * inside the inner pattern) is not supported and is rejected by the matcher. */
+#define RUST_MACRO_MAX_REP_VALUES 256
+
+static int macro_rep_slot(MacroEnv *env, CBMArena *arena, const char *name, int name_len) {
+    if (!arena || name_len <= 0 || name_len >= 32)
+        return -1;
+    for (int i = 0; i < env->rep_count; i++) {
+        if ((int)strlen(env->reps[i].name) == name_len &&
+            strncmp(env->reps[i].name, name, (size_t)name_len) == 0)
+            return i;
+    }
+    if (env->rep_count >= RUST_MACRO_MAX_REPS)
+        return -1;
+    int idx = env->rep_count;
+    memcpy(env->reps[idx].name, name, (size_t)name_len);
+    env->reps[idx].name[name_len] = '\0';
+    env->reps[idx].values =
+        (const char **)cbm_arena_alloc(arena, sizeof(char *) * RUST_MACRO_MAX_REP_VALUES);
+    env->reps[idx].lengths = (int *)cbm_arena_alloc(arena, sizeof(int) * RUST_MACRO_MAX_REP_VALUES);
+    if (!env->reps[idx].values || !env->reps[idx].lengths)
+        return -1;
+    env->reps[idx].count = 0;
+    env->rep_count++;
+    return idx;
+}
+
+static bool macro_rep_append(MacroEnv *env, CBMArena *arena, const char *name, int name_len,
+                             const char *val, int val_len) {
+    int idx = macro_rep_slot(env, arena, name, name_len);
+    if (idx < 0)
+        return false;
+    if (env->reps[idx].count >= RUST_MACRO_MAX_REP_VALUES)
+        return false;
+    int c = env->reps[idx].count;
+    env->reps[idx].values[c] = val;
+    env->reps[idx].lengths[c] = val_len;
+    env->reps[idx].count++;
+    return true;
+}
+
+static const char *macro_rep_value(const MacroEnv *env, const char *name, int index, int *out_len) {
+    for (int i = 0; i < env->rep_count; i++) {
+        if (strcmp(env->reps[i].name, name) == 0) {
+            if (index < 0 || index >= env->reps[i].count)
+                return NULL;
+            if (out_len)
+                *out_len = env->reps[i].lengths[index];
+            return env->reps[i].values[index];
+        }
+    }
+    return NULL;
+}
+
+/* Scan input from `from` to the next top-level occurrence of `delim` (or end),
+ * skipping balanced brackets and string/char literals. Used to bound a greedy
+ * repetition-metavar value at the separator that follows it in the pattern,
+ * e.g. `$wire:ty => …` stops the `ty` value before `=>`. */
+static int macro_scan_to_delim(const char *s, int len, int from, char delim) {
+    int depth = 0;
+    int p = from;
+    while (p < len) {
+        char c = s[p];
+        if (c == '"' || c == '\'') {
+            int q = macro_consume_fragment(s, len, p, "literal");
+            if (q > p) {
+                p = q;
+                continue;
+            }
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            depth++;
+            p++;
+            continue;
+        }
+        if (c == ')' || c == ']' || c == '}') {
+            if (depth == 0)
+                break;
+            depth--;
+            p++;
+            continue;
+        }
+        if (depth == 0 && c == delim)
+            break;
+        p++;
+    }
+    return p;
+}
+
+/* Match the inner pattern of a single-level repetition against the input once
+ * starting at `ip`, appending each metavar value to its rep array. Returns the
+ * input position after this iteration, or -1 on failure (rolling back any
+ * values appended during the attempt). Rejects a nested `$(` in the inner
+ * pattern by returning -1. */
+static int macro_match_inner_once(CBMArena *arena, const char *pat, int pat_len, const char *in,
+                                  int in_len, int ip, MacroEnv *env) {
+    int saved_rep_count = env->rep_count;
+    int saved_counts[RUST_MACRO_MAX_REPS];
+    for (int i = 0; i < env->rep_count; i++)
+        saved_counts[i] = env->reps[i].count;
+
+    int pp = 0;
+    while (pp < pat_len) {
+        pp = macro_skip_ws(pat, pat_len, pp);
+        if (pp >= pat_len)
+            break;
+        char pc = pat[pp];
+        if (pc == '$') {
+            pp++;
+            pp = macro_skip_ws(pat, pat_len, pp);
+            if (pp < pat_len && pat[pp] == '(')
+                goto rollback; /* nested repetition unsupported */
+            int name_start = pp;
+            pp = macro_consume_ident(pat, pat_len, pp);
+            int name_end = pp;
+            if (name_end == name_start)
+                goto rollback;
+            const char *frag = "tt";
+            static char frag_buf[16];
+            if (pp < pat_len && pat[pp] == ':') {
+                pp++;
+                int fs = pp;
+                pp = macro_consume_ident(pat, pat_len, pp);
+                int fl = pp - fs;
+                if (fl > 0 && fl < (int)sizeof(frag_buf)) {
+                    memcpy(frag_buf, pat + fs, (size_t)fl);
+                    frag_buf[fl] = '\0';
+                    frag = frag_buf;
+                }
+            }
+            /* If a literal delimiter follows this metavar in the pattern, bound
+             * the value at that delimiter rather than the fragment's own greedy
+             * span, so `ty`/`expr` values do not swallow the separator. */
+            int look = macro_skip_ws(pat, pat_len, pp);
+            char delim = (look < pat_len && pat[look] != '$') ? pat[look] : '\0';
+            ip = macro_skip_ws(in, in_len, ip);
+            int val_start = ip;
+            int val_end = delim ? macro_scan_to_delim(in, in_len, ip, delim)
+                                : macro_consume_fragment(in, in_len, ip, frag);
+            if (val_end <= val_start)
+                goto rollback;
+            int trimmed = val_end;
+            while (trimmed > val_start &&
+                   (in[trimmed - 1] == ' ' || in[trimmed - 1] == '\t' ||
+                    in[trimmed - 1] == '\n' || in[trimmed - 1] == '\r'))
+                trimmed--;
+            if (!macro_rep_append(env, arena, pat + name_start, name_end - name_start,
+                                  in + val_start, trimmed - val_start))
+                goto rollback;
+            ip = val_end;
+            continue;
+        }
+        ip = macro_skip_ws(in, in_len, ip);
+        if (ip >= in_len || in[ip] != pc)
+            goto rollback;
+        pp++;
+        ip++;
+    }
+    return ip;
+
+rollback:
+    env->rep_count = saved_rep_count;
+    for (int i = 0; i < saved_rep_count; i++)
+        env->reps[i].count = saved_counts[i];
+    return -1;
+}
+
+/* Iteration count for a repetition transcriber body: the greatest bound-value
+ * count among the rep metavars it references. A body referencing no rep metavar
+ * expands once (best-effort). */
+static int macro_rep_iteration_count(const MacroEnv *env, const char *body, int len) {
+    int best = 0;
+    bool found = false;
+    for (int i = 0; i + 1 < len;) {
+        int opaque = cbm_rust_macro_opaque_token_end(body, len, i);
+        if (opaque != i) {
+            i = opaque;
+            continue;
+        }
+        if (body[i] == '$') {
+            int ns = i + 1;
+            int ne = macro_consume_ident(body, len, ns);
+            int nl = ne - ns;
+            if (nl > 0 && nl < 32) {
+                char nb[32];
+                memcpy(nb, body + ns, (size_t)nl);
+                nb[nl] = '\0';
+                for (int k = 0; k < env->rep_count; k++) {
+                    if (strcmp(env->reps[k].name, nb) == 0) {
+                        if (env->reps[k].count > best)
+                            best = env->reps[k].count;
+                        found = true;
+                    }
+                }
+                i = ne;
+                continue;
+            }
+        }
+        i++;
+    }
+    return found ? best : 1;
+}
+
 /* Match a pattern against an input. Pattern fragments like `$x:expr`
  * bind into `env`. Returns true if the pattern matches the whole input
  * (or up to the end of pattern, with trailing whitespace in input). */
-static bool macro_pattern_match(const char *pat, int pat_len, const char *in, int in_len,
-                                MacroEnv *env, int max_bindings, bool *binding_limit_hit) {
+static bool macro_pattern_match(CBMArena *arena, const char *pat, int pat_len, const char *in,
+                                int in_len, MacroEnv *env, int max_bindings,
+                                bool *binding_limit_hit) {
     int pp = 0; /* pattern pos */
     int ip = 0; /* input pos */
 
@@ -4149,33 +4354,72 @@ static bool macro_pattern_match(const char *pat, int pat_len, const char *in, in
         /* Metavar: $name:frag or $name */
         if (pc == '$') {
             pp++;
-            /* Repetition group `$( ... )<sep><kind>` — for now we
-             * treat any rep group as a wildcard accepting the rest of
-             * the input (best-effort). We bind no names inside reps. */
+            /* Repetition group `$( <inner> )<sep><kind>`. Match the inner
+             * pattern against the input as many times as it consumes,
+             * separated by an optional single-char separator, binding each
+             * metavar's per-iteration values into the rep arrays. Falls back to
+             * the historical wildcard skip (bind nothing) when the arena is
+             * absent or the inner pattern is unsupported (e.g. nested `$(`). */
             pp = macro_skip_ws(pat, pat_len, pp);
             if (pp < pat_len && pat[pp] == '(') {
+                int group_open = pp;
                 int after = macro_consume_balanced(pat, pat_len, pp);
+                int inner_start = group_open + 1;
+                int inner_len = (after - 1) - inner_start;
                 pp = after;
-                /* Skip optional separator + kind (one char each). */
-                if (pp < pat_len && pat[pp] != ' ' && pat[pp] != '$' && pat[pp] != '\n') {
+                /* Separator + kind. The separator is any single non-`*+?` char
+                 * (commonly `,`); kind is `*`, `+`, or `?`. */
+                char sep = '\0';
+                pp = macro_skip_ws(pat, pat_len, pp);
+                if (pp < pat_len && pat[pp] != '*' && pat[pp] != '+' && pat[pp] != '?' &&
+                    pat[pp] != '$') {
+                    sep = pat[pp];
                     pp++;
                 }
-                if (pp < pat_len && (pat[pp] == '*' || pat[pp] == '+' || pat[pp] == '?')) {
+                if (pp < pat_len && (pat[pp] == '*' || pat[pp] == '+' || pat[pp] == '?'))
                     pp++;
+
+                bool matched_reps = false;
+                if (arena && inner_len > 0) {
+                    int probe = macro_skip_ws(in, in_len, ip);
+                    int iterations = 0;
+                    bool inner_ok = true;
+                    while (probe < in_len) {
+                        int next = macro_match_inner_once(arena, pat + inner_start, inner_len, in,
+                                                          in_len, probe, env);
+                        if (next < 0) {
+                            inner_ok = iterations > 0; /* trailing separator etc. */
+                            break;
+                        }
+                        iterations++;
+                        probe = macro_skip_ws(in, in_len, next);
+                        if (sep && probe < in_len && in[probe] == sep) {
+                            probe = macro_skip_ws(in, in_len, probe + 1);
+                            continue;
+                        }
+                        break;
+                    }
+                    if (inner_ok && iterations > 0) {
+                        ip = probe;
+                        matched_reps = true;
+                    }
                 }
-                /* Consume the rest of the input greedy until we hit
-                 * the next literal pattern char. */
-                int next_lit = pp;
-                while (next_lit < pat_len && (pat[next_lit] == ' ' || pat[next_lit] == '\t' ||
-                                              pat[next_lit] == '\n' || pat[next_lit] == '\r')) {
-                    next_lit++;
-                }
-                if (next_lit >= pat_len) {
-                    ip = in_len;
-                } else {
-                    char target = pat[next_lit];
-                    while (ip < in_len && in[ip] != target)
-                        ip++;
+                if (!matched_reps) {
+                    /* Wildcard fallback: bind nothing, skip input to the next
+                     * literal pattern char. */
+                    int next_lit = pp;
+                    while (next_lit < pat_len &&
+                           (pat[next_lit] == ' ' || pat[next_lit] == '\t' ||
+                            pat[next_lit] == '\n' || pat[next_lit] == '\r')) {
+                        next_lit++;
+                    }
+                    if (next_lit >= pat_len) {
+                        ip = in_len;
+                    } else {
+                        char target = pat[next_lit];
+                        while (ip < in_len && in[ip] != target)
+                            ip++;
+                    }
                 }
                 continue;
             }
@@ -4360,10 +4604,12 @@ int cbm_rust_macro_opaque_token_end(const char *text, int len, int from) {
     return end;
 }
 
-/* Substitute env bindings into the transcriber text. Allocates a
- * fresh string in the arena. */
-static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const MacroEnv *env,
-                              bool *truncated) {
+/* Substitute env bindings into the transcriber text. Allocates a fresh string
+ * in the arena. `rep_index` selects the iteration when expanding inside a
+ * repetition body: >= 0 resolves a rep metavar to its i-th value, < 0 means
+ * not currently inside a repetition. */
+static char *macro_substitute_rep(CBMArena *arena, const char *xs, int xs_len, const MacroEnv *env,
+                                  int rep_index, bool *truncated) {
     /* Estimate output size: each metavar expansion could be up to
      * ~256 bytes; bound the total at xs_len * 4 + 4KB. */
     if (xs_len < 0 || xs_len > (INT_MAX - 4096) / 4) {
@@ -4392,30 +4638,37 @@ static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const
         }
         char c = xs[xp];
         if (c == '$' && xp + 1 < xs_len) {
-            /* Skip rep groups: `$(...)<sep><kind>` — naive expansion:
-             * emit the body once, no separator handling. */
+            /* Repetition group `$(<body>)<sep><kind>`: expand the body once per
+             * bound iteration, joining with the separator. */
             if (xs[xp + 1] == '(') {
                 int body_start = xp + 2;
                 int after = macro_consume_balanced(xs, xs_len, xp + 1);
                 int body_end = after - 1;
-                /* Emit the body recursively substituted. */
-                char *inner =
-                    macro_substitute(arena, xs + body_start, body_end - body_start, env, truncated);
-                if (inner) {
-                    int il = (int)strlen(inner);
-                    if (op + il < cap) {
-                        memcpy(out + op, inner, il);
-                        op += il;
-                    } else if (truncated) {
-                        *truncated = true;
-                    }
-                }
+                int body_len = body_end - body_start;
                 xp = after;
-                /* Skip optional separator + kind. */
+                char sep = '\0';
+                if (xp < xs_len && xs[xp] != ' ' && xs[xp] != '\n' && xs[xp] != '*' &&
+                    xs[xp] != '+' && xs[xp] != '?')
+                    sep = xs[xp];
                 if (xp < xs_len && xs[xp] != ' ' && xs[xp] != '\n')
                     xp++;
-                if (xp < xs_len && (xs[xp] == '*' || xs[xp] == '+' || xs[xp] == '?')) {
+                if (xp < xs_len && (xs[xp] == '*' || xs[xp] == '+' || xs[xp] == '?'))
                     xp++;
+                int iters = macro_rep_iteration_count(env, xs + body_start, body_len);
+                for (int it = 0; it < iters; it++) {
+                    if (it > 0 && sep && op < cap)
+                        out[op++] = sep;
+                    char *inner = macro_substitute_rep(arena, xs + body_start, body_len, env, it,
+                                                       truncated);
+                    if (inner) {
+                        int il = (int)strlen(inner);
+                        if (op + il < cap) {
+                            memcpy(out + op, inner, (size_t)il);
+                            op += il;
+                        } else if (truncated) {
+                            *truncated = true;
+                        }
+                    }
                 }
                 continue;
             }
@@ -4428,6 +4681,23 @@ static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const
                 if (nl < 32) {
                     memcpy(name_buf, xs + name_start, nl);
                     name_buf[nl] = '\0';
+                    /* Inside a repetition, a rep metavar resolves to its i-th
+                     * bound value; outside, and for scalar metavars, use the
+                     * single binding. */
+                    if (rep_index >= 0) {
+                        int rv_len = 0;
+                        const char *rv = macro_rep_value(env, name_buf, rep_index, &rv_len);
+                        if (rv) {
+                            if (op + rv_len < cap) {
+                                memcpy(out + op, rv, (size_t)rv_len);
+                                op += rv_len;
+                                xp = name_end;
+                                continue;
+                            }
+                            if (truncated)
+                                *truncated = true;
+                        }
+                    }
                     const MacroBinding *b = macro_env_lookup(env, name_buf);
                     if (b && b->value) {
                         if (op + b->value_len < cap) {
@@ -4450,6 +4720,12 @@ static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const
     }
     out[op] = '\0';
     return out;
+}
+
+/* Top-level substitution: not inside any repetition. */
+static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const MacroEnv *env,
+                              bool *truncated) {
+    return macro_substitute_rep(arena, xs, xs_len, env, -1, truncated);
 }
 
 static bool macro_contains_repetition_syntax(const char *text, int len) {
@@ -4527,8 +4803,8 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             repetition_pattern_present ||
             macro_contains_repetition_syntax(r->pattern_text, r->pattern_len);
         if (r->pattern_text && inv_args &&
-            macro_pattern_match(r->pattern_text, r->pattern_len, inv_args, inv_args_len, &env,
-                                ctx->max_macro_bindings, &binding_limit_hit)) {
+            macro_pattern_match(ctx->arena, r->pattern_text, r->pattern_len, inv_args,
+                                inv_args_len, &env, ctx->max_macro_bindings, &binding_limit_hit)) {
             hit = r;
             break;
         }
