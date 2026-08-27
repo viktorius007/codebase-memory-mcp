@@ -167,6 +167,7 @@ extern const TSLanguage *tree_sitter_pine(void);
 extern const TSLanguage *tree_sitter_mojo(void);
 extern const TSLanguage *tree_sitter_objectscript_udl(void);
 extern const TSLanguage *tree_sitter_objectscript_routine(void);
+extern const TSLanguage *tree_sitter_arkts(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -249,6 +250,23 @@ static const char *ts_class_types[] = {"class_declaration",
                                        "internal_module",
                                        NULL};
 static const char *ts_decorator_types[] = {"decorator", NULL};
+
+// ==================== ARKTS (HarmonyOS .ets) ====================
+// TypeScript-superset grammar (first-party tree-sitter-typescript fork).
+// Reuses the JS/TS arrays and adds the ArkUI constructs: `@Component struct`
+// components are class-like containers (struct_declaration), and their
+// decorated state members (public_field_definition) are extracted as fields
+// so @State/@Prop/@Link/... properties are findable.
+static const char *arkts_class_types[] = {"class_declaration",
+                                          "class",
+                                          "abstract_class_declaration",
+                                          "struct_declaration",
+                                          "enum_declaration",
+                                          "interface_declaration",
+                                          "type_alias_declaration",
+                                          "internal_module",
+                                          NULL};
+static const char *arkts_field_types[] = {"public_field_definition", NULL};
 
 // ==================== QML (Qt) ====================
 // QMLJS grammar is a TypeScript superset plus declarative ui_* nodes, so the
@@ -547,7 +565,16 @@ static const char *objc_var_types[] = {"declaration", NULL};
 static const char *objc_assign_types[] = {"assignment_expression", NULL};
 
 // ==================== SWIFT ====================
-static const char *swift_func_types[] = {"function_declaration", "macro_declaration", NULL};
+// protocol_function_declaration: a protocol's method requirements. Needed here as
+// well as in the name resolvers — extract_class_methods gates on this set, so
+// without the entry the requirement is walked and then discarded.
+static const char *swift_func_types[] = {"function_declaration", "protocol_function_declaration",
+                                         "macro_declaration", NULL};
+// KNOWN GAP: struct_declaration and enum_declaration are not node types in the
+// vendored tree-sitter-swift grammar — it models both as class_declaration — so
+// these two entries never match anything, and a bare Swift `enum` is labeled
+// Class rather than Enum. Left in place deliberately: they are the only marker
+// of that modelling gap, and deleting them would hide it. Tracked separately.
 static const char *swift_class_types[] = {"class_declaration", "protocol_declaration",
                                           "struct_declaration", "enum_declaration", NULL};
 static const char *swift_field_types[] = {"property_declaration", NULL};
@@ -656,13 +683,17 @@ static const char *hcl_call_types[] = {"function_call", NULL};
 static const char *hcl_var_types[] = {"attribute", NULL};
 
 // ==================== SQL ====================
-static const char *sql_func_types[] = {"create_function", "function_declaration", NULL};
+static const char *sql_func_types[] = {"create_function", "function_declaration",
+                                       "create_procedure", NULL};
 static const char *sql_field_types[] = {"column_definition", NULL};
-static const char *sql_class_types[] = {"custom_type", NULL};
+// create_table/create_view route through the class-def path where
+// extract_sql_ddl_class_def turns them into first-class Table/View nodes
+// (previously they were generic Variable nodes via sql_var_types).
+static const char *sql_class_types[] = {"custom_type", "create_table", "create_view",
+                                        "create_materialized_view", NULL};
 static const char *sql_module_types[] = {"program", NULL};
 static const char *sql_call_types[] = {"invocation", NULL};
 static const char *sql_branch_types[] = {"if_statement", "case_expression", NULL};
-static const char *sql_var_types[] = {"create_table", "create_view", NULL};
 
 // ==================== DOCKERFILE ====================
 static const char *dockerfile_module_types[] = {"source_file", NULL};
@@ -1840,7 +1871,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     // CBM_LANG_SQL
     [CBM_LANG_SQL] = {CBM_LANG_SQL, sql_func_types, sql_class_types, sql_field_types,
                       sql_module_types, sql_call_types, empty_types, empty_types, sql_branch_types,
-                      sql_var_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
+                      empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
                       tree_sitter_sql, NULL},
 
     // CBM_LANG_DOCKERFILE
@@ -2626,6 +2657,15 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     // pipeline transcodes Export XML to UDL (iris_export_xml.c) and re-extracts
     // each class as CBM_LANG_OBJECTSCRIPT_UDL, so this language never reaches
     // cbm_lang_spec()/cbm_ts_language() directly. Left as a zero spec.
+
+    // CBM_LANG_ARKTS
+    [CBM_LANG_ARKTS] = {CBM_LANG_ARKTS, ts_func_types, arkts_class_types, arkts_field_types,
+                        js_module_types, js_call_types, js_import_types, js_import_types,
+                        js_branch_types, js_var_types,
+                        (const char *[]){"assignment_expression", "augmented_assignment_expression",
+                                         NULL},
+                        js_throw_types, NULL, ts_decorator_types, NULL,
+                        ts_env_members, tree_sitter_arkts, NULL},
 
 };
 

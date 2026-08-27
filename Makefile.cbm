@@ -247,6 +247,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_env_accesses.c \
     $(CBM_DIR)/extract_channels.c \
     $(CBM_DIR)/extract_k8s.c \
+    $(CBM_DIR)/extract_dbt.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c \
     $(CBM_DIR)/macro_table.c \
@@ -509,6 +510,7 @@ TEST_FOUNDATION_SRCS = \
     tests/test_workspace.c \
     tests/test_platform.c \
     tests/test_diagnostics.c \
+    tests/test_complexity.c \
     tests/test_dump_verify.c \
     tests/test_subprocess.c \
     tests/test_private_file_lock.c \
@@ -716,9 +718,9 @@ BUILD_DIR = build/c
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O3 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      $(SANITIZE) $(COVERAGE_FLAGS)
+                      -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE) $(COVERAGE_FLAGS)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      $(TSAN_SANITIZE)
+                      -DCBM_ENABLE_TEST_SEAMS=1 -DCBM_SANITIZED_BUILD=1 $(TSAN_SANITIZE)
 
 # Object files for grammars + ts_runtime + lsp_all + preprocessor
 GRAMMAR_OBJS_TEST = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/%.o,$(GRAMMAR_SRCS))

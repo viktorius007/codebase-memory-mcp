@@ -275,12 +275,26 @@ static TSNode resolve_ocaml_func_name(TSNode node) {
     return null_node;
 }
 
+static TSNode sql_last_identifier(TSNode node, TSNode best, bool *found) {
+    if (strcmp(ts_node_type(node), "identifier") == 0) {
+        best = node;
+        *found = true;
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        best = sql_last_identifier(ts_node_child(node, i), best, found);
+    }
+    return best;
+}
+
 // SQL: resolve create_function name from object_reference→identifier or direct identifier.
 static TSNode resolve_sql_func_name(TSNode node) {
     TSNode obj_ref = cbm_find_child_by_kind(node, "object_reference");
     if (!ts_node_is_null(obj_ref)) {
-        TSNode id = cbm_find_child_by_kind(obj_ref, "identifier");
-        if (!ts_node_is_null(id)) {
+        bool found = false;
+        TSNode empty = {0};
+        TSNode id = sql_last_identifier(obj_ref, empty, &found);
+        if (found) {
             return id;
         }
     }
@@ -4131,11 +4145,60 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     return true;
 }
 
+static void collect_sql_relation_usages(CBMExtractCtx *ctx, TSNode node, const char *enclosing_qn) {
+    if (strcmp(ts_node_type(node), "relation") == 0) {
+        TSNode name_node = resolve_sql_func_name(node);
+        if (!ts_node_is_null(name_node)) {
+            char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+            if (name && name[0]) {
+                CBMUsage usage = {0};
+                usage.ref_name = name;
+                usage.enclosing_func_qn = enclosing_qn;
+                cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+            }
+        }
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        collect_sql_relation_usages(ctx, ts_node_child(node, i), enclosing_qn);
+    }
+}
+
+static bool extract_sql_ddl_class_def(CBMExtractCtx *ctx, TSNode node, const char *kind) {
+    if (ctx->language != CBM_LANG_SQL) {
+        return false;
+    }
+    const char *label;
+    if (strcmp(kind, "create_table") == 0) {
+        label = "Table";
+    } else if (strcmp(kind, "create_view") == 0 || strcmp(kind, "create_materialized_view") == 0) {
+        label = "View";
+    } else {
+        return false;
+    }
+    TSNode name_node = resolve_sql_func_name(node);
+    if (ts_node_is_null(name_node)) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return false;
+    }
+    push_simple_class_def(ctx, node, name, label);
+    const char *qn =
+        cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, qn_safe_segment(ctx->arena, name));
+    collect_sql_relation_usages(ctx, node, qn);
+    return true;
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
 
     if (extract_config_class_def(ctx, node, kind)) {
+        return;
+    }
+    if (extract_sql_ddl_class_def(ctx, node, kind)) {
         return;
     }
 
@@ -4425,7 +4488,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     // through cbm_label_is_type_like(), so a struct still resolves as a type for
     // its methods, fields, inheritance and impls.
     if (ctx->language == CBM_LANG_RUST || ctx->language == CBM_LANG_SWIFT ||
-        ctx->language == CBM_LANG_DLANG) {
+        ctx->language == CBM_LANG_DLANG || ctx->language == CBM_LANG_ARKTS) {
         if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "struct_declaration") == 0) {
             label = "Struct";
         }
@@ -6700,6 +6763,7 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
         def.is_exported = cbm_is_exported(name, ctx->language);
+        def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
 
         cbm_defs_push(&ctx->result->defs, a, def);
     }

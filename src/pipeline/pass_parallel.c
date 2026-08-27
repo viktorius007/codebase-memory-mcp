@@ -101,6 +101,8 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
  * memory (the resident floor, not in-flight transients, holds the budget). */
 static _Atomic long g_bp_nap_cycles = 0;
 static _Atomic uint64_t g_lsp_linear_fallback_rows = 0;
+_Atomic uint64_t g_lsp_tail_lookups = 0;
+_Atomic uint64_t g_lsp_tail_candidates = 0;
 
 long cbm_pp_bp_nap_cycles(void) {
     return atomic_load_explicit(&g_bp_nap_cycles, memory_order_relaxed);
@@ -116,6 +118,8 @@ uint64_t cbm_pp_lsp_linear_fallback_rows(void) {
 
 void cbm_pp_lsp_linear_fallback_rows_reset(void) {
     atomic_store_explicit(&g_lsp_linear_fallback_rows, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_lsp_tail_lookups, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_lsp_tail_candidates, 0, memory_order_relaxed);
 }
 
 /* Parse a positive MB-valued retention env knob (CBM_RETAIN_*_MB) into bytes.

@@ -1993,6 +1993,32 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * there is no readable Cargo.toml, leaving *out_m untouched. The resulting
  * manifest feeds cross-CRATE Rust resolution (#56): its [workspace].members
  * map lets `crate_a::foo` route to the member crate's def. */
+_Atomic uint64_t g_pxc_defs_registered = 0;
+_Atomic uint64_t g_pxc_build_files = 0;
+_Atomic uint64_t g_pxc_filter_files = 0;
+_Atomic uint64_t g_pxc_filter_failed = 0;
+
+void cbm_pxc_count_perfile_defs(uint64_t defs) {
+    atomic_fetch_add_explicit(&g_pxc_defs_registered, defs, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pxc_build_files, 1, memory_order_relaxed);
+}
+
+void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint64_t *filter_files,
+                          uint64_t *filter_failed) {
+    if (defs_registered) {
+        *defs_registered = atomic_load_explicit(&g_pxc_defs_registered, memory_order_relaxed);
+    }
+    if (build_files) {
+        *build_files = atomic_load_explicit(&g_pxc_build_files, memory_order_relaxed);
+    }
+    if (filter_files) {
+        *filter_files = atomic_load_explicit(&g_pxc_filter_files, memory_order_relaxed);
+    }
+    if (filter_failed) {
+        *filter_failed = atomic_load_explicit(&g_pxc_filter_failed, memory_order_relaxed);
+    }
+}
+
 /* Per-file cross-LSP dispatch, shared by the PARALLEL resolve worker and the
  * SEQUENTIAL driver. One code path = one semantics: filter the global defs
  * down to the file's own+imported modules via the module-def index, resolve
@@ -2066,6 +2092,14 @@ CBMPxcDispatchStatus cbm_pxc_dispatch_file(
             if (cbm_arena_status(&result->arena) != CBM_ARENA_STATUS_AVAILABLE)
                 publication_status = CBM_PXC_DISPATCH_ALLOCATION_FAILED;
             break;
+        case CBM_LANG_JAVA:
+            cbm_run_java_lsp_cross_with_registry(
+                &result->arena, result, source, source_len, def_module, prebuilt, imp_keys,
+                imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
+            used_prebuilt = true;
+            if (cbm_arena_status(&result->arena) != CBM_ARENA_STATUS_AVAILABLE)
+                publication_status = CBM_PXC_DISPATCH_ALLOCATION_FAILED;
+            break;
         case CBM_LANG_JAVASCRIPT:
         case CBM_LANG_TYPESCRIPT:
         case CBM_LANG_TSX: {
@@ -2130,7 +2164,14 @@ CBMPxcDispatchStatus cbm_pxc_dispatch_file(
             file_defs = filtered;
             file_def_count = filtered_count;
         }
+        atomic_fetch_add_explicit(&g_pxc_filter_files, 1, memory_order_relaxed);
+        if (!filter_succeeded) {
+            atomic_fetch_add_explicit(&g_pxc_filter_failed, 1, memory_order_relaxed);
+        }
     }
+    atomic_fetch_add_explicit(&g_pxc_defs_registered, (uint64_t)file_def_count,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pxc_build_files, 1, memory_order_relaxed);
     if (lang == CBM_LANG_RUST) {
         CBMTypeRegistry *shared = rust_shared_get ? rust_shared_get(rust_shared_ctx) : NULL;
         if (shared) {

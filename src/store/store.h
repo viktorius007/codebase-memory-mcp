@@ -213,6 +213,8 @@ typedef struct {
     int visited_count;
     cbm_edge_info_t *edges;
     int edge_count;
+    /* True when trail expansion hit its recursive-row safety budget. */
+    bool truncated;
 } cbm_traverse_result_t;
 
 /* ── Schema introspection ───────────────────────────────────────── */
@@ -404,6 +406,9 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
 
 /* Find node by qualified_name only (no project filter — QNs are globally unique). */
 int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out);
+
+/* Find all nodes in a project. Returns allocated array, caller frees. */
+int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, int *count);
 
 /* Find nodes by name (exact match). Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
@@ -755,6 +760,11 @@ void cbm_store_search_free(cbm_search_output_t *out);
 
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out);
+
+/* Variable-length Cypher traversal with relationship-trail semantics. */
+int cbm_store_bfs_trail(cbm_store_t *s, int64_t start_id, const char *direction,
+                        const char **edge_types, int edge_type_count, int max_depth,
+                        int max_results, cbm_traverse_result_t *out);
 
 /* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
  * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the

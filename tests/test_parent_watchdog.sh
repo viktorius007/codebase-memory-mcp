@@ -25,9 +25,10 @@ if [[ ! -x "${BINARY}" ]]; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d /tmp/cbm-parent-watchdog-XXXXXX)"
-runtime_parent="${tmpdir}/runtime"
-mkdir -m 700 "${runtime_parent}"
+# shellcheck source=../scripts/test-runtime.sh
+source "${ROOT}/scripts/test-runtime.sh"
+cbm_test_runtime_init
+tmpdir="${CBM_TEST_RUNTIME_ROOT}"
 wrapper_pid=""
 cleanup() {
   if [[ -s "${tmpdir}/child.pid" ]]; then
@@ -36,7 +37,7 @@ cleanup() {
     [[ -n "${child_pid}" ]] && kill "${child_pid}" 2>/dev/null || true
   fi
   [[ -n "${wrapper_pid}" ]] && kill "${wrapper_pid}" 2>/dev/null || true
-  rm -rf "${tmpdir}"
+  cbm_test_runtime_cleanup "${BINARY}"
 }
 trap cleanup EXIT
 
@@ -54,7 +55,6 @@ chmod +x "${tmpdir}/wrapper.sh"
 mkfifo "${tmpdir}/stdin"
 
 CBM_BINARY="${BINARY}" FIFO="${tmpdir}/stdin" TMPDIR_PATH="${tmpdir}" CBM_LOG_LEVEL=info \
-  CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
   "${tmpdir}/wrapper.sh" &
 wrapper_pid=$!
 
