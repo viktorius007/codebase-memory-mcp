@@ -4014,6 +4014,9 @@ static int macro_consume_balanced(const char *s, int len, int from) {
     return p;
 }
 
+static int macro_skip_raw_string(const char *text, int len, int from);
+static int macro_skip_quoted_string(const char *text, int len, int from);
+
 /* Consume a fragment from the input matching the given fragment kind.
  * Returns end position or `from` if the consumption failed. */
 static int macro_consume_fragment(const char *s, int len, int from, const char *frag) {
@@ -4029,8 +4032,18 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
     if (strcmp(frag, "literal") == 0) {
         /* Numeric, string, char, bool literal. */
         char c = s[from];
-        if (c == '"')
-            return macro_consume_balanced(s, len, from);
+        /* String literal, incl. `b"…"` byte strings and `r"…"`/`r#"…"#` raw
+         * strings. `macro_consume_balanced` only recognises bracket openers, so
+         * a quote passed to it returns `from` unchanged — consume the string
+         * span here instead. */
+        {
+            int rs = macro_skip_raw_string(s, len, from);
+            if (rs > from)
+                return rs;
+            int qs = macro_skip_quoted_string(s, len, from);
+            if (qs > from)
+                return qs;
+        }
         if (c == '\'') {
             int q = from + 1;
             if (q < len && s[q] == '\\') {
@@ -4074,6 +4087,23 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
             return macro_consume_fragment(s, len, from, "literal");
         }
         return from + 1;
+    }
+    if (strcmp(frag, "vis") == 0) {
+        /* `pub`, `pub(crate)`, `pub(super)`, `pub(in path)`, or empty. Returns
+         * `from` unchanged for the empty visibility so the caller can bind a
+         * zero-length value rather than fail. */
+        int kw_end = macro_consume_ident(s, len, from);
+        if (kw_end - from == 3 && strncmp(s + from, "pub", 3) == 0) {
+            int p = kw_end;
+            int q = macro_skip_ws(s, len, p);
+            if (q < len && s[q] == '(') {
+                int after = macro_consume_balanced(s, len, q);
+                if (after > q)
+                    p = after;
+            }
+            return p;
+        }
+        return from;
     }
     /* expr / ty / path / pat / stmt / block — balance brackets, stop
      * at top-level `,` or end of input. */
@@ -4228,11 +4258,43 @@ static int macro_scan_to_delim(const char *s, int len, int from, char delim) {
     return p;
 }
 
+/* Register every top-level `$name:frag` metavar of `pat` as an (initially
+ * empty) repetition slot. Used to seed a nested repetition's metavars so a
+ * transcriber body referencing them expands to zero iterations even though the
+ * bounded expander never binds their per-iteration values. A deeper `$(` group
+ * is skipped whole — only one level of nesting is seeded here. */
+static void macro_register_inner_metavars(MacroEnv *env, CBMArena *arena, const char *pat,
+                                          int pat_len) {
+    int p = 0;
+    while (p < pat_len) {
+        p = macro_skip_ws(pat, pat_len, p);
+        if (p >= pat_len)
+            break;
+        if (pat[p] == '$') {
+            int q = macro_skip_ws(pat, pat_len, p + 1);
+            if (q < pat_len && pat[q] == '(') {
+                int after = macro_consume_balanced(pat, pat_len, q);
+                p = (after > q) ? after : q + 1;
+                continue;
+            }
+            int ns = q;
+            int ne = macro_consume_ident(pat, pat_len, ns);
+            if (ne > ns) {
+                macro_rep_slot(env, arena, pat + ns, ne - ns);
+                p = ne;
+                continue;
+            }
+        }
+        p++;
+    }
+}
+
 /* Match the inner pattern of a single-level repetition against the input once
  * starting at `ip`, appending each metavar value to its rep array. Returns the
  * input position after this iteration, or -1 on failure (rolling back any
- * values appended during the attempt). Rejects a nested `$(` in the inner
- * pattern by returning -1. */
+ * values appended during the attempt). A nested `$(` group inside the inner
+ * pattern is consumed against the input but its metavars are left unbound (they
+ * are seeded as empty rep slots so the transcriber drops them). */
 static int macro_match_inner_once(CBMArena *arena, const char *pat, int pat_len, const char *in,
                                   int in_len, int ip, MacroEnv *env) {
     int saved_rep_count = env->rep_count;
@@ -4249,8 +4311,64 @@ static int macro_match_inner_once(CBMArena *arena, const char *pat, int pat_len,
         if (pc == '$') {
             pp++;
             pp = macro_skip_ws(pat, pat_len, pp);
-            if (pp < pat_len && pat[pp] == '(')
-                goto rollback; /* nested repetition unsupported */
+            if (pp < pat_len && pat[pp] == '(') {
+                /* Nested repetition `$( <inner> )<sep><kind>`. The bounded
+                 * expander does not bind nested metavars; it seeds them as empty
+                 * slots (so the transcriber expands them to zero iterations) and
+                 * consumes the matching input span so the surrounding
+                 * single-level match stays aligned. This lets an item-producing
+                 * macro whose variant list carries per-variant attribute or
+                 * alias sub-repetitions (string_enum!) match and expand. */
+                int group_open = pp;
+                int after = macro_consume_balanced(pat, pat_len, pp);
+                if (after <= group_open)
+                    goto rollback;
+                int ninner_start = group_open + 1;
+                int ninner_len = (after - 1) - ninner_start;
+                pp = after;
+                char nsep = '\0';
+                pp = macro_skip_ws(pat, pat_len, pp);
+                if (pp < pat_len && pat[pp] != '*' && pat[pp] != '+' && pat[pp] != '?' &&
+                    pat[pp] != '$')
+                    nsep = pat[pp++];
+                char nkind = '*';
+                if (pp < pat_len && (pat[pp] == '*' || pat[pp] == '+' || pat[pp] == '?'))
+                    nkind = pat[pp++];
+                if (arena && ninner_len > 0) {
+                    macro_register_inner_metavars(env, arena, pat + ninner_start, ninner_len);
+                    int reg_rep_count = env->rep_count;
+                    int reg_counts[RUST_MACRO_MAX_REPS];
+                    for (int i = 0; i < reg_rep_count; i++)
+                        reg_counts[i] = env->reps[i].count;
+                    int probe = macro_skip_ws(in, in_len, ip);
+                    while (probe < in_len) {
+                        int next = macro_match_inner_once(arena, pat + ninner_start, ninner_len, in,
+                                                          in_len, probe, env);
+                        if (next <= probe)
+                            break;
+                        probe = macro_skip_ws(in, in_len, next);
+                        if (nkind == '?')
+                            break;
+                        if (nsep) {
+                            if (probe < in_len && in[probe] == nsep) {
+                                probe = macro_skip_ws(in, in_len, probe + 1);
+                                continue;
+                            }
+                            break;
+                        }
+                        /* No separator: keep matching greedily until the inner
+                         * pattern stops consuming input. */
+                    }
+                    ip = probe;
+                    /* Drop any values the nested matches bound; keep the slots
+                     * registered at count 0 so the transcriber expands them to
+                     * zero iterations rather than falling back to one. */
+                    env->rep_count = reg_rep_count;
+                    for (int i = 0; i < reg_rep_count; i++)
+                        env->reps[i].count = reg_counts[i];
+                }
+                continue;
+            }
             int name_start = pp;
             pp = macro_consume_ident(pat, pat_len, pp);
             int name_end = pp;
@@ -4400,12 +4518,24 @@ static bool macro_pattern_match(CBMArena *arena, const char *pat, int pat_len, c
                             break;
                         }
                         iterations++;
-                        probe = macro_skip_ws(in, in_len, next);
-                        if (sep && probe < in_len && in[probe] == sep) {
-                            probe = macro_skip_ws(in, in_len, probe + 1);
-                            continue;
+                        int advanced = macro_skip_ws(in, in_len, next);
+                        if (sep) {
+                            if (advanced < in_len && in[advanced] == sep) {
+                                probe = macro_skip_ws(in, in_len, advanced + 1);
+                                continue;
+                            }
+                            probe = advanced;
+                            break;
                         }
-                        break;
+                        /* Separator-less repetition (variants delimited by an
+                         * inner `$(,)?`): keep iterating while the inner pattern
+                         * still advances the input. Guard against a zero-width
+                         * match to avoid spinning. */
+                        if (advanced <= probe) {
+                            probe = advanced;
+                            break;
+                        }
+                        probe = advanced;
                     }
                     if (inner_ok && iterations > 0) {
                         ip = probe;
@@ -4455,6 +4585,17 @@ static bool macro_pattern_match(CBMArena *arena, const char *pat, int pat_len, c
             int val_start = ip;
             int val_end = macro_consume_fragment(in, in_len, ip, frag);
             if (val_end <= val_start) {
+                /* `vis` legitimately matches the empty visibility (a private
+                 * item): bind a zero-length value and carry on. */
+                if (strcmp(frag, "vis") == 0) {
+                    if (!macro_env_bind(env, max_bindings, pat + name_start,
+                                        name_end - name_start, in + val_start, 0)) {
+                        if (binding_limit_hit)
+                            *binding_limit_hit = true;
+                        return false;
+                    }
+                    continue;
+                }
                 /* For "expr"/"ty" the matcher may need to accept empty
                  * input (e.g. trailing `$($x:expr),*` form). */
                 return false;
@@ -4711,6 +4852,22 @@ static char *macro_substitute_rep(CBMArena *arena, const char *xs, int xs_len, c
                         if (op + b->value_len < cap) {
                             memcpy(out + op, b->value, b->value_len);
                             op += b->value_len;
+                            xp = name_end;
+                            continue;
+                        }
+                        if (truncated)
+                            *truncated = true;
+                    }
+                    /* `$crate` is the built-in metavar for the defining crate's
+                     * root. It never appears in `env`; left literal it yields
+                     * `$crate::…`, which is not valid Rust and fails the item
+                     * parse. Substitute the `crate` keyword so the generated
+                     * paths parse and the definition extractor can emit the
+                     * macro's items. */
+                    if (nl == 5 && strncmp(name_buf, "crate", 5) == 0) {
+                        if (op + 5 < cap) {
+                            memcpy(out + op, "crate", 5);
+                            op += 5;
                             xp = name_end;
                             continue;
                         }
@@ -7247,6 +7404,43 @@ static void rust_process_trait(RustLSPContext *ctx, TSNode trait_node) {
  * depth cap makes the C recursion independent of adversarial module nesting;
  * deeper items remain unresolved and the health record makes that omission
  * explicit. */
+/* Emit a type definition node (enum/struct/union) for an item produced by a
+ * macro expansion. The syntactic definition walk (extract_defs) never sees
+ * these — the source has only the macro invocation — so without this the
+ * generated type has no graph node and its methods hang off a QN nothing else
+ * references. Only fires inside a macro item expansion; the ordinary file walk
+ * leaves type-node emission to extract_defs to avoid double-counting. */
+static void rust_emit_macro_type_def(RustLSPContext *ctx, TSNode item, const char *label) {
+    if (!ctx->macro_item_expansion || !ctx->defs)
+        return;
+    TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
+    if (ts_node_is_null(name_node))
+        return;
+    char *name = rust_node_text(ctx, name_node);
+    if (!name || !name[0])
+        return;
+    const char *base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    if (!base_qn)
+        return;
+    const char *qn =
+        cbm_rust_cfg_qualified_name(ctx->arena, base_qn, item, ctx->source, CBM_LANG_RUST);
+    if (!qn)
+        return;
+    for (int i = 0; i < ctx->defs->count; i++) {
+        const CBMDefinition *definition = &ctx->defs->items[i];
+        if (definition->qualified_name && strcmp(definition->qualified_name, qn) == 0)
+            return;
+    }
+    CBMDefinition definition = {0};
+    definition.name = cbm_arena_strdup(ctx->arena, name);
+    definition.qualified_name = qn;
+    definition.label = label;
+    definition.file_path = ctx->def_file_path;
+    definition.start_line = ctx->macro_item_start_line;
+    definition.end_line = ctx->macro_item_end_line;
+    cbm_defs_push(ctx->defs, ctx->arena, definition);
+}
+
 static void rust_process_item_list(RustLSPContext *ctx, TSNode list, uint32_t depth) {
     if (depth >= ctx->max_walk_depth) {
         rust_health_record_node(ctx, CBM_RUST_HEALTH_WALK_DEPTH_LIMIT, list);
@@ -7260,6 +7454,10 @@ static void rust_process_item_list(RustLSPContext *ctx, TSNode list, uint32_t de
         const char *kind = ts_node_type(item);
         if (strcmp(kind, "function_item") == 0) {
             rust_process_function(ctx, item, NULL);
+        } else if (strcmp(kind, "enum_item") == 0) {
+            rust_emit_macro_type_def(ctx, item, "Enum");
+        } else if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "union_item") == 0) {
+            rust_emit_macro_type_def(ctx, item, "Struct");
         } else if (strcmp(kind, "impl_item") == 0) {
             rust_process_impl(ctx, item);
         } else if (strcmp(kind, "trait_item") == 0) {

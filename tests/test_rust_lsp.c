@@ -7086,6 +7086,71 @@ TEST(rustlsp_macro_repetition_two_metavars_with_inner_separator) {
     cbm_free_result(r); PASS();
 }
 
+TEST(rustlsp_macro_string_enum_nested_repetition_emits_enum_and_methods) {
+    /* Reduced shape of pm's string_enum! (crates/pm-core/src/entity/string_enum.rs):
+     * a `$vis:vis enum` header, a separator-less outer `+` variant list whose
+     * inner pattern carries nested `$(#[$m:meta])*` and `$( | $alias:literal )*`
+     * sub-repetitions, and a transcriber whose impls reference `$crate`. Every
+     * one of those four shapes independently defeated the bounded expander, so
+     * the generated enum and its inherent methods produced no callable node.
+     * Each must now be emitted. */
+    CBMFileResult *r = extract_rust(
+        "fn sink(_s: &str) {}\n"
+        "macro_rules! string_enum {\n"
+        "    (\n"
+        "        $vis:vis enum $name:ident {\n"
+        "            $(\n"
+        "                $(#[$vmeta:meta])*\n"
+        "                $variant:ident => $canonical:literal $( | $alias:literal )* $(,)?\n"
+        "            )+\n"
+        "        }\n"
+        "    ) => {\n"
+        "        $vis enum $name { $( $variant, )+ }\n"
+        "        impl $name {\n"
+        "            pub fn token(&self) -> &'static str {\n"
+        "                let s: &str = $crate::pick();\n"
+        "                sink(s);\n"
+        "                match self { $( Self::$variant => $canonical, )+ }\n"
+        "            }\n"
+        "        }\n"
+        "    };\n"
+        "}\n"
+        "string_enum! {\n"
+        "    pub enum Status {\n"
+        "        Draft => \"draft\",\n"
+        "        Open => \"open\" | \"opened\",\n"
+        "        Closed => \"closed\",\n"
+        "    }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+
+    /* The generated enum must exist as a callable-owning definition. */
+    int status_enum = 0;
+    int token_method = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *qn = r->defs.items[i].qualified_name;
+        const char *label = r->defs.items[i].label;
+        if (!qn || !label)
+            continue;
+        if (strstr(qn, "Status") && strcmp(label, "Enum") == 0)
+            status_enum++;
+        if (strstr(qn, ".token") && strcmp(label, "Method") == 0)
+            token_method++;
+    }
+    ASSERT_GTE(status_enum, 1);
+    ASSERT_GTE(token_method, 1);
+
+    /* The call `sink(s)` inside the generated method body must resolve. */
+    int sink_edges = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->callee_qn && strcmp(rc->callee_qn, "test.src.main.sink") == 0)
+            sink_edges++;
+    }
+    ASSERT_GTE(sink_edges, 1);
+    cbm_free_result(r); PASS();
+}
+
 TEST(rustlsp_gap_macro_substitute_call) {
     CBMFileResult *r = extract_rust(
         "fn target(x: i32) -> i32 { x }\n"
@@ -9784,6 +9849,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_macro_item_expansion_emits_callable_and_call_edge);
     RUN_TEST(rustlsp_macro_single_level_repetition_expands_each_iteration);
     RUN_TEST(rustlsp_macro_repetition_two_metavars_with_inner_separator);
+    RUN_TEST(rustlsp_macro_string_enum_nested_repetition_emits_enum_and_methods);
     RUN_TEST(rustlsp_gap_macro_substitute_call);
     RUN_TEST(rustlsp_gap_macro_substitute_method_call);
     RUN_TEST(rustlsp_gap_macro_repetition);
