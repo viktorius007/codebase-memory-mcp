@@ -1182,6 +1182,36 @@ static const char *rust_qn_find_segment_path(const char *qualified_name, const c
     return NULL;
 }
 
+/* A `pub use child::item;` re-export exposes `item` one module level up, so a
+ * bare import of the re-exported name carries the ancestor module path while the
+ * definition keeps the deeper one. Accept that: equal leaf, and the imported
+ * source module a segment-prefix of the definition module. Exact equality (no
+ * re-export) is the prefix's degenerate case. This never crosses the leaf and
+ * never widens which crate is searched, so the caller's ambiguity guard (two
+ * matches → NULL) and package-dir filter still reject every decoy. */
+static bool rust_reexport_source_matches(const char *def_relative, const char *source_tail) {
+    if (!def_relative || !source_tail)
+        return false;
+    if (strcmp(def_relative, source_tail) == 0)
+        return true;
+    const char *def_leaf = strrchr(def_relative, '.');
+    const char *src_leaf = strrchr(source_tail, '.');
+    /* Both must have a module path before the leaf; a leaf-only source has no
+     * ancestor module to re-export from and falls back to exact equality. */
+    if (!def_leaf || !src_leaf)
+        return false;
+    if (strcmp(def_leaf + 1, src_leaf + 1) != 0)
+        return false;
+    size_t src_mod_len = (size_t)(src_leaf - source_tail);
+    size_t def_mod_len = (size_t)(def_leaf - def_relative);
+    /* source module must be a strict segment-prefix of the definition module:
+     * the re-exporting ancestor is shallower than the defining module. */
+    if (src_mod_len >= def_mod_len)
+        return false;
+    return strncmp(def_relative, source_tail, src_mod_len) == 0 &&
+           def_relative[src_mod_len] == '.';
+}
+
 static const CBMRegisteredFunc *rust_lookup_routed_imported_func(RustLSPContext *ctx,
                                                                  const char *target) {
     if (!ctx || !ctx->cargo_manifest || !ctx->module_qn || !ctx->registry || !target)
@@ -1254,7 +1284,8 @@ static const CBMRegisteredFunc *rust_lookup_routed_imported_func(RustLSPContext 
                 }
                 used += (size_t)n;
             }
-            if (used >= sizeof(normalized) || strcmp(normalized, source_tail) != 0)
+            if (used >= sizeof(normalized) ||
+                !rust_reexport_source_matches(normalized, source_tail))
                 continue;
             unique = candidate;
             matches++;
@@ -5804,6 +5835,29 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             if (claimed) {
                 rust_emit_unresolved_call(ctx, path, "scoped_module_pending");
                 return;
+            }
+            /* Module-alias-qualified cross-crate call: `alias::fn()` where
+             * `use other_crate::module as alias;`. The exact scoped resolver
+             * above matches on the lexical alias head and cannot see the aliased
+             * module, so rebuild the import target from the resolved module path
+             * and route it through the same Cargo-dependency machinery the bare
+             * identifier form uses below. */
+            const char *scoped_sep = strstr(path, "::");
+            if (scoped_sep) {
+                char *alias_head =
+                    cbm_arena_strndup(ctx->arena, path, (size_t)(scoped_sep - path));
+                const char *alias_module = alias_head ? rust_resolve_use(ctx, alias_head) : NULL;
+                if (alias_module && alias_module[0]) {
+                    const char *routed_import =
+                        cbm_arena_sprintf(ctx->arena, "%s%s", alias_module, scoped_sep);
+                    const CBMRegisteredFunc *routed =
+                        routed_import ? rust_lookup_routed_imported_func(ctx, routed_import) : NULL;
+                    if (routed) {
+                        rust_emit_resolved_call(ctx, routed->qualified_name, "lsp_cross_crate",
+                                                CBM_RUST_CONF_DIRECT);
+                        return;
+                    }
+                }
             }
         }
 

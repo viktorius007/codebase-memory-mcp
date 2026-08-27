@@ -2234,6 +2234,71 @@ TEST(rustlsp_cargo_routed_syntactic_import_survives_authoritative_blocker) {
     PASS();
 }
 
+TEST(rustlsp_cargo_route_resolves_reexported_bare_import) {
+    /* `produce_show_frame_dot` is defined in the `graph.dot` submodule but
+     * `pub use dot::produce_show_frame_dot;` re-exports it one level up, so the
+     * bare cross-crate import carries the ancestor path `graph`. The re-export
+     * ancestor match must resolve it to the deeper definition. */
+    const char *caller = "use pm_core::graph::produce_show_frame_dot;\n"
+                         "fn print() { produce_show_frame_dot(); }\n";
+    CBMRustLSPDef defs[2] = {
+        {.qualified_name = "project.crates.pm-core.src.graph.dot.produce_show_frame_dot",
+         .short_name = "produce_show_frame_dot", .label = "Function",
+         .def_module_qn = "project.crates.pm-core.src.graph.dot"},
+        {.qualified_name = "project.crates.pm-infra.src.decoys.produce_show_frame_dot",
+         .short_name = "produce_show_frame_dot", .label = "Function",
+         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
+    const char *import_names[] = {"produce_show_frame_dot"};
+    const char *import_qns[] = {"pm_core::graph::produce_show_frame_dot"};
+    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
+                                     .target_name = "pm-core",
+                                     .target_package_dir = "crates/pm-core"};
+    CBMCargoManifest manifest = {.is_workspace_root = true,
+                                 .dependency_routes = &route,
+                                 .dependency_route_count = 1};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(
+        &arena, caller, (int)strlen(caller), "project.crates.pm-infra.src.output", defs, 2,
+        import_names, import_qns, 1, NULL, &manifest, &out, NULL, NULL);
+    ASSERT_GTE(find_confident(&out, "print", defs[0].qualified_name), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cargo_route_resolves_module_alias_qualified_call) {
+    /* `use pm_core::entity_shape as ext_shape;` then `ext_shape::append_event_sql()`.
+     * The alias head can't be matched lexically against the aliased module, so
+     * the alias fallback rebuilds the import target and routes it cross-crate. */
+    const char *caller = "use pm_core::entity_shape as ext_shape;\n"
+                         "fn write() { ext_shape::append_event_sql(); }\n";
+    CBMRustLSPDef defs[2] = {
+        {.qualified_name = "project.crates.pm-core.src.entity_shape.append_event_sql",
+         .short_name = "append_event_sql", .label = "Function",
+         .def_module_qn = "project.crates.pm-core.src.entity_shape"},
+        {.qualified_name = "project.crates.pm-infra.src.decoys.append_event_sql",
+         .short_name = "append_event_sql", .label = "Function",
+         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
+    const char *import_names[] = {"ext_shape"};
+    const char *import_qns[] = {"pm_core::entity_shape"};
+    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
+                                     .target_name = "pm-core",
+                                     .target_package_dir = "crates/pm-core"};
+    CBMCargoManifest manifest = {.is_workspace_root = true,
+                                 .dependency_routes = &route,
+                                 .dependency_route_count = 1};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(
+        &arena, caller, (int)strlen(caller), "project.crates.pm-infra.src.external_ref", defs, 2,
+        import_names, import_qns, 1, NULL, &manifest, &out, NULL, NULL);
+    ASSERT_GTE(find_confident(&out, "write", defs[0].qualified_name), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Category 11: Robustness / regressions ────────────────────── */
 
 TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy) {
@@ -9191,6 +9256,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cargo_route_rejects_conflicting_caller_routes);
     RUN_TEST(rustlsp_cargo_route_rejects_target_package_prefix_decoy);
     RUN_TEST(rustlsp_cargo_route_rejects_ambiguous_complete_source_suffix);
+    RUN_TEST(rustlsp_cargo_route_resolves_reexported_bare_import);
+    RUN_TEST(rustlsp_cargo_route_resolves_module_alias_qualified_call);
     RUN_TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy);
     RUN_TEST(rustlsp_crossfile_workspace_member_patterns_stay_crate_scoped);
 
