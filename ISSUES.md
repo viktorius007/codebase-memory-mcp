@@ -12,7 +12,15 @@ distribution note at the bottom.
 
 ## Open
 
-_None._
+- **`cli` mode is unusable inside the OpenAI Codex CLI sandbox.** Every invocation exits with
+  `codebase-memory-mcp: secure CLI coordination could not be created (cache-private)`
+  (`src/main.c` `main_build_identity` → `cbm_daemon_ipc_private_directory_secure(canonical_cache)`
+  returns false). Observed 2026-09-01 across 16
+  Codex dispatches in the project-management repo; agents fell back to source grep. Not yet
+  root-caused: either the sandbox's cache location fails the owner-only/permission predicate, or
+  the predicate cannot stat through the sandbox. Wanted: a diagnostic naming which check failed
+  and the path examined, and either an env override for the cache root or a degraded
+  daemon-less local mode for sandboxed callers.
 
 ## Confirmed behavior
 
