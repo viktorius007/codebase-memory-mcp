@@ -9,11 +9,23 @@
  * safety tests. This header is internal and is not part of the MCP API. */
 typedef bool (*cbm_mcp_quarantine_test_hook_fn)(void *context, const char *step);
 typedef bool (*cbm_mcp_command_test_hook_fn)(void *context, const char *command);
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef void (*cbm_mcp_auto_index_count_test_hook_fn)(void *context);
+#endif
 
 void cbm_mcp_server_set_quarantine_test_hook(cbm_mcp_server_t *srv,
                                              cbm_mcp_quarantine_test_hook_fn hook, void *context);
 void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command_test_hook_fn hook,
                                           void *context);
+void cbm_mcp_server_set_search_output_limit_for_test(cbm_mcp_server_t *srv, size_t limit);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_mcp_server_set_auto_index_count_test_hook(cbm_mcp_server_t *srv,
+                                                   cbm_mcp_auto_index_count_test_hook_fn hook,
+                                                   void *context);
+#endif
+void cbm_mcp_server_set_search_scan_command_for_test(cbm_mcp_server_t *srv, const char *command);
+void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint64_t timeout_ms,
+                                                     bool override_set);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use
@@ -26,10 +38,6 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
 
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 
-/* Count indexable files with the pipeline's native full-mode discovery policy,
- * without retaining per-file results. A false result means the count exceeded
- * file_limit or could not be established before the bounded deadline; every
- * such failure is fail-closed because this is the memory-admission guard. */
 /* Map an internal resolver strategy (as recorded on a CALLS edge by
  * pass_calls.c) to the CLOSED public class published by trace_path's
  * include_evidence output: "lsp" | "language_rule" | "heuristic" |
@@ -40,6 +48,10 @@ enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
  * unmapped internal name into a user-visible field. */
 const char *cbm_mcp_edge_strategy_class(const char *strategy);
 
+/* Count indexable files with the pipeline's native full-mode discovery policy,
+ * without retaining per-file results. A false result means the count exceeded
+ * file_limit or could not be established before the bounded deadline; every
+ * such failure is fail-closed because this is the memory-admission guard. */
 bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
                                           int *file_count_out);
 
@@ -54,5 +66,11 @@ bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *
  * refinement rollup. Production builds do not contain this symbol. */
 void cbm_mcp_test_detect_refinement_fail_rollup_alloc(bool fail);
 #endif
+
+/* Internal search command contract, shared with direct command-boundary tests. */
+bool cbm_search_code_file_pattern_can_prefilter(const char *file_pattern);
+bool cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
+                                    const char *file_pattern, const char *tmpfile,
+                                    const char *filelist, const char *root_path);
 
 #endif

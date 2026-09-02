@@ -124,18 +124,9 @@ static cbm_def_properties_status_t process_def(cbm_pipeline_ctx_t *ctx, const CB
                              def->qualified_name, def->file_path ? def->file_path : rel,
                              (int)def->start_line, (int)def->end_line, props.json);
     cbm_def_properties_destroy(&props);
-    /* Register callable symbols + every type-like container (Class/Struct/
-     * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
-     * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and method/
-     * field resolution can reach them — Struct included so Rust/Go/Swift/D structs
-     * resolve as type targets just as a Class did. Variable/Field defs are also
-     * registered so pass_usages.c can resolve READS/WRITES accesses (rw->var_name)
-     * to a Variable/Field node QN.
-     * KEEP IN SYNC with pass_parallel.c and pipeline_incremental.c's seed sets. */
-    if (node_id > 0 && def->label &&
-        (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
-         strcmp(def->label, "Field") == 0)) {
+    /* Full, parallel and incremental resolution share the registry's symbol
+     * membership, including constants and lineage-only relations. */
+    if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label, lang);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -525,8 +516,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             if (!phase) {
                 phase = "crash";
             }
-            const char *reason =
-                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
+            const char *reason = (strcmp(phase, "hang") == 0)    ? "quarantined after hang"
+                                 : (strcmp(phase, "error") == 0) ? "quarantined after error"
+                                                                 : "quarantined after crash";
             cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
             errors++;
             continue;

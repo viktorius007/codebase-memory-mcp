@@ -130,6 +130,21 @@ static const char *RUST_ATTRIBUTED_STRUCT_PATTERN =
     "    } = input();\n"
     "    let _ = (auth, debug_only);\n"
     "}\n";
+/* Perl formats have a line-oriented body terminated by a lone dot.  The
+ * following named sub pins the important recovery boundary: a grammar must
+ * both accept the format and resume normal declaration parsing afterwards. */
+static const char *PERL_FORMAT_WITH_FOLLOWING_SUB = "package Report;\n"
+                                                    "format REPORT =\n"
+                                                    "@<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n"
+                                                    "$headline\n"
+                                                    ".\n"
+                                                    "sub after_format { return 1; }\n";
+
+/* A grammar refresh must not hide real Perl syntax loss. */
+static const char *PERL_MALFORMED = "package Broken;\n"
+                                    "sub before_error { return 1; }\n"
+                                    "} ] } ]\n"
+                                    "sub after_error { return 2; }\n";
 
 /* ── Tests ────────────────────────────────────────────────────────────────── */
 
@@ -301,6 +316,213 @@ TEST(rust_attributed_struct_pattern_parses_completely) {
 
 /* ── Suite ────────────────────────────────────────────────────────────────── */
 
+/* ── #1610: a missing FINAL NEWLINE is not a parse failure ────────────────────
+ *
+ * A file that does not end with "\n" leaves the grammar's mandatory line
+ * terminator MISSING. That node is ZERO-WIDTH and sits at EOF: the parser
+ * consumed no source for it, so by construction nothing was dropped — no
+ * construct can live in a zero-byte span. Every instruction still parses.
+ *
+ * Reported on #1610 for Dockerfile, where a reporter proved with a byte-exact
+ * matrix that the trigger is independent of BOM, CRLF/LF, exec-form vs
+ * shell-form and file length — it is purely the absent final newline.
+ *
+ * It was never Dockerfile-specific: tcl, fish, gomod and hyprlang flag the same
+ * way, while ini, fsharp, beancount and others do NOT — only because those
+ * grammars declare the terminator token hidden rather than visible. Whether a
+ * user saw a phantom parse_partial came down to a grammar-authoring accident.
+ *
+ * The cost was not cosmetic: a phantom flag writes a "<project>::missed" shadow
+ * row, and until #1609 that row removed the whole project from cross-repo
+ * linking, as source AND as target. */
+TEST(dockerfile_missing_final_newline_not_flagged_issue1610) {
+    const char *src = "FROM mcr.microsoft.com/dotnet/aspnet:8.0\n"
+                      "ENTRYPOINT [\"dotnet\", \"App.dll\"]"; /* deliberately no \n */
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    cbm_free_result(r);
+    if (flagged) {
+        FAIL("a Dockerfile lacking only its final newline must not be parse_partial");
+    }
+    PASS();
+}
+
+/* The same bytes WITH the newline must stay clean — pins the equivalence the
+ * reporter's matrix proved, so a future change cannot "fix" one by breaking the
+ * other. */
+TEST(dockerfile_with_final_newline_still_clean_issue1610) {
+    const char *src = "FROM mcr.microsoft.com/dotnet/aspnet:8.0\n"
+                      "ENTRYPOINT [\"dotnet\", \"App.dll\"]\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    cbm_free_result(r);
+    if (flagged) {
+        FAIL("a terminated Dockerfile must not be parse_partial");
+    }
+    PASS();
+}
+
+/* #1746: on Windows, a Dockerfile whose final instruction is followed by one
+ * ASCII space and then EOF was reported as parse_partial. */
+TEST(dockerfile_trailing_space_at_eof_not_flagged_issue1746) {
+    const char *src = "FROM scratch\nENTRYPOINT [\"a\"] ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    if (flagged) {
+        fprintf(stderr, "  exact issue #1746 fixture flagged: ranges=%s\n",
+                r->error_ranges ? r->error_ranges : "(none)");
+    }
+    cbm_free_result(r);
+    if (flagged) {
+        FAIL("trailing horizontal whitespace at Dockerfile EOF must not be parse_partial");
+    }
+    PASS();
+}
+
+/* The same bytes WITH the LF must stay clean. This is a separate test so the
+ * control executes even while the exact affected fixture is RED. */
+TEST(dockerfile_trailing_space_with_final_newline_clean_issue1746) {
+    const char *src = "FROM scratch\nENTRYPOINT [\"a\"] \n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Removing the trailing space while retaining EOF must also stay clean. */
+TEST(dockerfile_without_trailing_space_at_eof_clean_issue1746) {
+    const char *src = "FROM scratch\nENTRYPOINT [\"a\"]";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The reporter also observed the same failure when the first line uses CRLF. */
+TEST(dockerfile_crlf_trailing_space_at_eof_not_flagged_issue1746) {
+    const char *src = "FROM scratch\r\nENTRYPOINT [\"a\"] ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Language-general, not a Dockerfile patch: these four were each proven to flag
+ * on a stripped trailing newline. */
+TEST(missing_final_newline_not_flagged_across_grammars_issue1610) {
+    struct {
+        const char *src;
+        CBMLanguage lang;
+        const char *path;
+    } cases[] = {
+        {"proc foo {} {}\nproc bar {} {}", CBM_LANG_TCL, "a.tcl"},
+        {"function foo\n  echo hi\nend", CBM_LANG_FISH, "a.fish"},
+        {"module example.com/m\n\ngo 1.21", CBM_LANG_GOMOD, "go.mod"},
+        {"general {\n  gaps_in = 5\n}", CBM_LANG_HYPRLANG, "hypr.conf"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i].src, cases[i].lang, cases[i].path);
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        if (flagged) {
+            fprintf(stderr, "  %s flagged: ranges=%s\n", cases[i].path,
+                    r->error_ranges ? r->error_ranges : "(none)");
+        }
+        cbm_free_result(r);
+        if (flagged) {
+            FAIL("an unterminated final line must not be parse_partial in any grammar");
+        }
+    }
+    PASS();
+}
+
+/* GUARD (the reason this suppression is safe rather than convenient): the rule
+ * is ZERO-WIDTH AT EOF only. A real failure earlier in the file must still be
+ * reported, and its range must name the broken line — not be swallowed along
+ * with the terminator. */
+TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610) {
+    /* Built from C_IFDEF_SPLIT, the fixture this suite already proves is
+     * flagged, with its trailing newline removed. Two conditions now hold at
+     * once: a genuine width-bearing ERROR mid-file, AND an unterminated last
+     * line. Suppressing the EOF terminator must not swallow the real one. */
+    size_t n = strlen(C_IFDEF_SPLIT);
+    char *unterminated = (char *)malloc(n + 1);
+    ASSERT_NOT_NULL(unterminated);
+    memcpy(unterminated, C_IFDEF_SPLIT, n);
+    unterminated[n - 1] = '\0'; /* drop the final newline */
+
+    CBMFileResult *r = do_extract(unterminated, CBM_LANG_C, "split.c");
+    free(unterminated);
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    bool has_ranges = r->error_ranges != NULL;
+    cbm_free_result(r);
+    if (!flagged) {
+        FAIL("a real mid-file parse failure must still be reported when the file also lacks its final newline");
+    }
+    if (!has_ranges) {
+        FAIL("a reported failure must still name its line range");
+    }
+    PASS();
+}
+
+/* GUARD: a MISSING/ERROR node WITH WIDTH at EOF is a genuine loss and must
+ * still be flagged. A Makefile whose final recipe line lacks its newline really
+ * does drop the recipe from the tree — cbm's flag is honest there. */
+TEST(width_bearing_error_at_eof_still_flagged_issue1610) {
+    const char *src = "all:\n\techo hi"; /* no trailing newline; recipe is lost */
+    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    cbm_free_result(r);
+    if (!flagged) {
+        FAIL("a width-bearing parse failure at EOF must still be reported");
+    }
+    PASS();
+}
+
+/* #1838: tree-sitter-perl v1.0.0 rejects a valid line-oriented format and
+ * reports the file as partial.  The supported upstream v1.2.1 grammar accepts
+ * the format and preserves declaration extraction beyond its dot terminator. */
+TEST(perl_format_followed_by_named_sub_is_complete_issue1838) {
+    CBMFileResult *r = do_extract(PERL_FORMAT_WITH_FOLLOWING_SUB, CBM_LANG_PERL, "report.pl");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool partial = r->parse_incomplete;
+    int error_regions = r->error_region_count;
+    bool has_error_ranges = r->error_ranges != NULL;
+    bool has_following_sub = has_def(r, "after_format");
+    if (partial || error_regions != 0 || has_error_ranges || !has_following_sub) {
+        fprintf(stderr,
+                "  Perl format result: partial=%d regions=%d ranges=%s following_sub=%d\n",
+                partial,
+                error_regions,
+                r->error_ranges ? r->error_ranges : "(none)",
+                has_following_sub);
+        cbm_free_result(r);
+        FAIL("a valid Perl format and its following named sub must parse completely");
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perl_malformed_source_remains_partial_issue1838) {
+    CBMFileResult *r = do_extract(PERL_MALFORMED, CBM_LANG_PERL, "broken.pl");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_GTE(r->error_region_count, 1);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -313,4 +535,15 @@ SUITE(parse_coverage) {
     RUN_TEST(c_trailing_recovered_defs_keep_flag);
     RUN_TEST(rust_2024_safe_foreign_items_parse_completely);
     RUN_TEST(rust_attributed_struct_pattern_parses_completely);
+    RUN_TEST(dockerfile_missing_final_newline_not_flagged_issue1610);
+    RUN_TEST(dockerfile_with_final_newline_still_clean_issue1610);
+    RUN_TEST(dockerfile_trailing_space_at_eof_not_flagged_issue1746);
+    RUN_TEST(dockerfile_trailing_space_with_final_newline_clean_issue1746);
+    RUN_TEST(dockerfile_without_trailing_space_at_eof_clean_issue1746);
+    RUN_TEST(dockerfile_crlf_trailing_space_at_eof_not_flagged_issue1746);
+    RUN_TEST(missing_final_newline_not_flagged_across_grammars_issue1610);
+    RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
+    RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST(perl_format_followed_by_named_sub_is_complete_issue1838);
+    RUN_TEST(perl_malformed_source_remains_partial_issue1838);
 }

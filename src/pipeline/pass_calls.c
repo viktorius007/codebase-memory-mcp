@@ -19,6 +19,7 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -86,112 +87,6 @@ static const char *itoa_log(int val) {
     idx = (idx + SKIP_ONE) & PC_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
-}
-
-/* Build per-file import map from cached extraction result or graph buffer edges.
- * Returns parallel arrays of (local_name, module_qn) pairs. Caller frees. */
-/* Parse "local_name":"value" from JSON properties string. Returns strdup'd key or NULL. */
-static char *extract_local_name_from_json(const char *props_json) {
-    if (!props_json) {
-        return NULL;
-    }
-    const char *start = strstr(props_json, "\"local_name\":\"");
-    if (!start) {
-        return NULL;
-    }
-    start += strlen("\"local_name\":\"");
-    const char *end = strchr(start, '"');
-    if (!end || end <= start) {
-        return NULL;
-    }
-    return cbm_strndup(start, end - start);
-}
-
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                            const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
-    *out_keys = NULL;
-    *out_vals = NULL;
-    *out_count = 0;
-
-    /* Fast path: build from cached extraction result (no JSON parsing) */
-    if (result && result->imports.count > 0) {
-        const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
-        const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
-        int count = 0;
-
-        for (int i = 0; i < result->imports.count; i++) {
-            const CBMImport *imp = &result->imports.items[i];
-            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
-                continue;
-            }
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-            free(target_qn);
-            if (!target) {
-                continue;
-            }
-            keys[count] = strdup(imp->local_name);
-            vals[count] = target->qualified_name; /* borrowed from gbuf */
-            count++;
-        }
-
-        *out_keys = keys;
-        *out_vals = vals;
-        *out_count = count;
-        return 0;
-    }
-
-    /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    free(file_qn);
-    if (!file_node) {
-        return 0;
-    }
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    int rc = cbm_gbuf_find_edges_by_source_type(ctx->gbuf, file_node->id, "IMPORTS", &edges,
-                                                &edge_count);
-    if (rc != 0 || edge_count == 0) {
-        return 0;
-    }
-
-    const char **keys = calloc(edge_count, sizeof(const char *));
-    const char **vals = calloc(edge_count, sizeof(const char *));
-    int count = 0;
-
-    for (int i = 0; i < edge_count; i++) {
-        const cbm_gbuf_edge_t *e = edges[i];
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, e->target_id);
-        if (!target) {
-            continue;
-        }
-        char *key = extract_local_name_from_json(e->properties_json);
-        if (key) {
-            keys[count] = key;
-            vals[count] = target->qualified_name;
-            count++;
-        }
-    }
-
-    *out_keys = keys;
-    *out_vals = vals;
-    *out_count = count;
-    return 0;
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    if (keys) {
-        for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
-        }
-        free((void *)keys);
-    }
-    if (vals) {
-        free((void *)vals);
-    }
 }
 
 /* Handle a route registration call: create Route node + HANDLES edge. */
@@ -596,20 +491,29 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    /* TS/JS/TSX weak-method suppression (#592/#606). A member call x.foo() only
-     * reaches the registry when the TS-LSP could not resolve the receiver type
-     * (the LSP block above already returned for type-resolved calls, including
-     * the "resolved but target out of gbuf" fall-through). Binding such a call
-     * by a weak short-name strategy fabricates an edge (`re.test()` -> a project
-     * `test`). Rather than drop it here — which would also skip the service
-     * bypasses below and emit_classified_edge's route/HTTP/CONFIG branches —
-     * defer to emit_classified_edge and suppress ONLY the plain-CALLS
-     * fall-through, so every service edge stays main-identical. res.strategy may
-     * be lsp_* here; the helper's explicit drop-list leaves lsp_* untouched. */
-    bool is_tsjs =
-        lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
-    bool tsjs_drop_plain_call =
-        cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+    /* Dynamic-language weak-member suppression (#592/#606/#1276). A member call
+     * x.foo() only reaches the registry when the language's LSP could not
+     * resolve the receiver type (the LSP block above already returned for
+     * type-resolved calls, including the "resolved but target out of gbuf"
+     * fall-through). Binding such a call by a weak short-name strategy
+     * fabricates an edge (`re.test()` -> a project `test`,
+     * `accelerator.print()` -> MockAccelerator.print). Rather than drop it here
+     * — which would also skip the service bypasses below and
+     * emit_classified_edge's route/HTTP/CONFIG branches — defer to
+     * emit_classified_edge and suppress ONLY the plain-CALLS fall-through, so
+     * every service edge stays main-identical. res.strategy may be lsp_* here;
+     * the helper's explicit drop-list leaves lsp_* untouched.
+     *
+     * This language set MUST match the one in pass_parallel.c exactly — a
+     * language gated on only one resolver produces an edge on the sequential
+     * path and not the parallel one (or vice versa), breaking MT determinism.
+     * ArkTS belongs to the JS/TS family here (#1842); dropping it would
+     * reintroduce the #592/#606 false-edge class for .ets files. */
+    bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
+                                lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+                                lang == CBM_LANG_ARKTS;
+    bool drop_plain_call =
+        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy);
     bool has_receiver =
         strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
 
@@ -644,12 +548,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         (strcmp(target_node->label, "Field") == 0 || strcmp(target_node->label, "Variable") == 0)) {
         return 0;
     }
+    if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+        return 0;
+    }
     bool rust_drop_plain_call = cbm_rust_suppress_weak_receiver_match(
         lang == CBM_LANG_RUST, has_receiver, call->callee_name, res.strategy,
         source_node->file_path, target_node->file_path, target_node->qualified_name);
 
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count, tsjs_drop_plain_call || rust_drop_plain_call);
+                         imp_count, drop_plain_call || rust_drop_plain_call);
     return SKIP_ONE;
 }
 
@@ -793,7 +700,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel, files[i].language, result,
+                                 &imp_keys, &imp_vals, &imp_count);
 
         /* Compute module QN for same-module resolution (directory-based for
          * Java/Go so it matches their def-node QNs in the registry). */
@@ -821,7 +729,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
         cbm_registry_resolve_scope_clear();
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }
@@ -956,7 +864,8 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, files[i].language,
+                                 result, &imp_keys, &imp_vals, &imp_count);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
@@ -975,7 +884,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         }
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
     }
 

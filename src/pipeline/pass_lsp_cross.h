@@ -61,11 +61,13 @@ typedef enum {
  * confused through the typed status. out_def_starts (optional, file_count + 1 entries,
  * caller-owned) receives per-file prefix offsets: file i's defs occupy [out_def_starts[i],
  * out_def_starts[i+1]) — the LSP-surface serializer needs the per-file slices, which the flat array
- * does not otherwise record. */
-CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
-                                    int file_count, const char *project_name, char **def_modules,
-                                    int *out_count, CBMPxcCollectStatus *out_status,
-                                    int *out_def_starts,
+ * does not otherwise record. Nullable ctx enables base-class qualified-name
+ * resolution using the project registry and each file's import map. Surface
+ * probes pass NULL to retain source spelling without a registry. */
+CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                    const cbm_file_info_t *files, int file_count,
+                                    const char *project_name, char **def_modules, int *out_count,
+                                    CBMPxcCollectStatus *out_status, int *out_def_starts,
                                     const struct CBMCargoManifest *rust_manifest);
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
@@ -187,8 +189,9 @@ void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint
 
 static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r,
                                                          CBMLanguage lang) {
-    if (!r)
+    if (!r) {
         return NULL;
+    }
     switch (lang) {
     case CBM_LANG_GO:
         return r->go;
@@ -223,17 +226,17 @@ bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *arena,
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
- * owns source, module_qn, all_defs, imp_keys, imp_vals.
- * NOTE: all_defs is read-only in practice but typed non-const to match
+ * owns source, module_qn, defs, imp_names, imp_qns.
+ * NOTE: defs is read-only in practice but typed non-const to match
  * the existing cbm_run_X_lsp_cross callee signatures. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
-                     const char *module_qn, CBMLSPDef *all_defs, int def_count,
-                     const char **imp_keys, const char **imp_vals, int imp_count);
+                     const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
+                     const char **imp_qns, int imp_count);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
-                        CBMLSPDef *all_defs, int def_count, const char **imp_keys,
-                        const char **imp_vals, int imp_count, bool js_mode, bool jsx_mode,
+                        CBMLSPDef *defs, int def_count, const char **imp_names,
+                        const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode);
 
 /* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the

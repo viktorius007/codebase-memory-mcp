@@ -673,8 +673,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             if (!phase) {
                 phase = "crash";
             }
-            const char *reason =
-                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
+            const char *reason = (strcmp(phase, "hang") == 0)    ? "quarantined after hang"
+                                 : (strcmp(phase, "error") == 0) ? "quarantined after error"
+                                                                 : "quarantined after crash";
             pp_err_add(errs, fi->rel_path, reason, phase);
             ws->errors++;
             continue;
@@ -1088,14 +1089,7 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
     }
-    /* Register callable symbols + every type-like container (Class/Struct/
-     * Interface/Enum/Type/Trait) — see pass_definitions.c for rationale. Struct
-     * included so Rust/Go/Swift/D structs resolve as type targets. Variable/Field
-     * defs are registered too so READS/WRITES can resolve.
-     * KEEP IN SYNC with pass_definitions.c and pipeline_incremental.c. */
-    if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-        cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
-        strcmp(def->label, "Field") == 0) {
+    if (cbm_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label, lang);
         (*reg_entries)++;
     }
@@ -1690,6 +1684,13 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                const CBMCall *call) {
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
+        /* A slash-prefixed raw expression is not a URL string. In JS/TS this
+         * is notably a regex literal (`/<table/i`); genuine string literals
+         * and propagated constants are carried in `value`, while template
+         * literals keep their leading backtick in `expr`. */
+        if (!ca->value && ca->expr && ca->expr[0] == '/') {
+            continue;
+        }
         const char *url = ca->value ? ca->value : ca->expr;
         if (!url || (url[0] != '/' && url[0] != '`')) {
             continue;
@@ -2405,20 +2406,25 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
-        /* TS/JS/TSX weak-method suppression (#592/#606). The receiver-aware guard
-         * must NOT drop this call here: doing so would also skip the #523
-         * callee-name service bypass below, emit_service_edge's route/gRPC/config
-         * branches, and its unconditional detect_url_in_args (which classifies
-         * verb-suffix HTTP clients like api.patch('/x')). Instead, defer to the
-         * emit path and suppress ONLY the plain-CALLS fall-through
-         * (emit_normal_calls_edge), so every service edge stays main-identical by
-         * construction. res.strategy may carry an lsp_* value here (LSP-resolved
-         * calls keep res through this point); the helper's EXPLICIT drop-list
-         * leaves lsp_ts_method / lsp_cross untouched. See #606 direction. */
-        bool is_tsjs =
-            lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
-        bool tsjs_drop_plain_call =
-            cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+        /* Dynamic-language weak-member suppression (#592/#606/#1276). The
+         * receiver-aware guard must NOT drop this call here: doing so would also
+         * skip the #523 callee-name service bypass below, emit_service_edge's
+         * route/gRPC/config branches, and its unconditional detect_url_in_args
+         * (which classifies verb-suffix HTTP clients like api.patch('/x')).
+         * Instead, defer to the emit path and suppress ONLY the plain-CALLS
+         * fall-through (emit_normal_calls_edge), so every service edge stays
+         * main-identical by construction. res.strategy may carry an lsp_* value
+         * here (LSP-resolved calls keep res through this point); the helper's
+         * EXPLICIT drop-list leaves lsp_ts_method / lsp_cross untouched. See
+         * #606 direction.
+         *
+         * This language set MUST match the one in pass_calls.c exactly — see the
+         * note there. ArkTS belongs to the JS/TS family (#1842). */
+        bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
+                                    lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+                                    lang == CBM_LANG_ARKTS;
+        bool drop_plain_call =
+            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy);
         bool has_receiver =
             strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
 
@@ -2512,13 +2518,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                    strcmp(target_node->label, "Variable") == 0)) {
             continue;
         }
+        if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+            continue;
+        }
         bool rust_drop_plain_call = cbm_rust_suppress_weak_receiver_match(
             lang == CBM_LANG_RUST, has_receiver, call->callee_name, res.strategy,
             source_node->file_path, target_node->file_path, target_node->qualified_name);
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          tsjs_drop_plain_call || rust_drop_plain_call);
+                          drop_plain_call || rust_drop_plain_call);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;
@@ -2594,6 +2603,17 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                 continue;
             }
             tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            /* #1928: the registry fallback is a bare-name guess — never let it
+             * bind a reference across a language boundary. Mirrors the
+             * sequential twin (pass_usages.c). */
+            if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+                continue;
+            }
+            /* #1942: a bare Go reference can never denote a struct field. */
+            if (tgt &&
+                cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->ref_name, tgt->label)) {
+                continue;
+            }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
@@ -2653,7 +2673,7 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 /* Resolve reads/writes for one file. */
 static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                             const char *rel, const char *module_qn, const char **imp_keys,
-                            const char **imp_vals, int imp_count) {
+                            const char **imp_vals, int imp_count, CBMLanguage lang) {
     for (int r = 0; r < result->rw.count; r++) {
         CBMReadWrite *rw = &result->rw.items[r];
         if (!rw->var_name) {
@@ -2671,6 +2691,16 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         }
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
+            continue;
+        }
+        /* #1928: every resolution here is a bare-name registry guess — never
+         * let it bind a read/write across a language boundary. Mirrors the
+         * sequential twin (pass_usages.c). */
+        if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+            continue;
+        }
+        /* #1942: a bare Go reference can never denote a struct field. */
+        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->var_name, tgt->label)) {
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";
@@ -3027,6 +3057,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * a mixed-source-root Java↔Kotlin site remains unresolved, so JVM
          * callers run whenever either kind of site exists. */
         bool jvm_cross_lsp = (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN);
+        bool rust_workspace_cross_lsp =
+            (lang == CBM_LANG_RUST && rc->rust_manifest && rc->rust_manifest->member_count > 0);
         int call_reference_sites = pp_call_reference_site_count(result, lang);
         int semantic_sites = result->calls.count + call_reference_sites;
         int qualified_lsp_sites = pp_qualified_lsp_site_count(result);
@@ -3035,7 +3067,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
              (semantic_sites > 0 || pending_lsp_site) &&
-             (jvm_cross_lsp || pending_lsp_site || qualified_lsp_sites < semantic_sites) &&
+             (jvm_cross_lsp || rust_workspace_cross_lsp || pending_lsp_site ||
+              qualified_lsp_sites < semantic_sites) &&
              !is_generated);
         if (lang == CBM_LANG_RUST) {
             pp_apply_rust_definition_universe_status(result, definition_universe_status);
@@ -3223,7 +3256,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── READS / WRITES ────────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_rw(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_rw(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
         atomic_fetch_add_explicit(&rc->time_ns_rw, extract_now_ns() - _ph_t0, memory_order_relaxed);
 
         /* ── INHERITS + DECORATES + IMPLEMENTS ──────────────────── */
