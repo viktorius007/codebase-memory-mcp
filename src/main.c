@@ -756,7 +756,7 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
             return SKIP_ONE;
         }
         args_json = heap_args;
-    } else if (!cli_isatty(0)) {
+    } else if (cbm_cli_args_from_stdin_allowed(tool_name, cli_isatty(0) != 0)) {
         /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json */
         heap_args = cli_slurp_stream(stdin);
         if (heap_args && heap_args[0]) {
