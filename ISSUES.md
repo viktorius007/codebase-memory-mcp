@@ -1,128 +1,42 @@
 # ISSUES — open defects and gaps
 
-This is the canonical backlog. Remove resolved items rather than retaining a
-second history; commit history carries the old investigations.
+This is the canonical backlog of current issues. Remove resolved items; history
+lives in git.
 
-Verified 2026-08-27 against the installed from-source build containing
-`4302d899` (`dev build=bf6b3c2f8f32…`) serving a fresh full index of
-project-management. The prior
-round's "still open" verdicts were measured against a stale DeusData release
-binary (`build=c0cc131b…`) and its stale index; those are void. See the
-distribution note at the bottom.
+## CLI cache validation fails in restricted sandboxes and hides the cause
 
-## Open
+`codebase-memory-mcp cli …` can exit with
+`secure CLI coordination could not be created (cache-private)` before executing
+the requested command. Reported in the OpenAI Codex CLI sandbox; reproduced on
+2026-09-02 with the installed `bf6b3c2f8f32…` build under a macOS sandbox denying
+writes to an existing owner-private temporary cache. The same installed binary
+successfully lists projects outside that restriction. The exact original Codex
+sandbox policy has not been reproduced.
 
-- **`cli` mode is unusable inside the OpenAI Codex CLI sandbox.** Every invocation exits with
-  `codebase-memory-mcp: secure CLI coordination could not be created (cache-private)`
-  (`src/main.c` `main_build_identity` → `cbm_daemon_ipc_private_directory_secure(canonical_cache)`
-  returns false). Observed 2026-09-01 across 16
-  Codex dispatches in the project-management repo; agents fell back to source grep. Not yet
-  root-caused: either the sandbox's cache location fails the owner-only/permission predicate, or
-  the predicate cannot stat through the sandbox. Wanted: a diagnostic naming which check failed
-  and the path examined, and either an env override for the cache root or a degraded
-  daemon-less local mode for sandboxed callers.
+Current source still has both relevant behaviors:
 
-## Confirmed behavior
+- `src/daemon/ipc.c` → `private_directory_tree_open` attempts `mkdirat` while
+  walking existing directories, then unconditionally attempts `fchmod(0700)`
+  and ACL clearing on the cache root. Validation can therefore fail when the
+  sandbox allows reading an already-private cache but denies these writes.
+- `src/main.c` → the local CLI coordination failure branch prints only
+  `cache-private`, discarding the path and failed-check detail available through
+  `cbm_daemon_ipc_validation_detail()`.
 
-Deliberate designs that have been mistaken for defects before. These are not
-bugs; do not "fix" them without changing the contract first.
+Expose the failed check and path in CLI errors, and establish a supported way
+for sandboxed callers to use the CLI while preserving cache and coordination
+security. `CBM_CACHE_DIR` already overrides the cache root; whether an allowed
+private cache resolves the original Codex sandbox failure remains unverified.
 
-- Ambiguous symbols return an ambiguity result rather than a guessed node.
-- Positional JSON and flag-based CLI forms both work; raw positional JSON is
-  deprecated but still accepted.
-- `edge_types` reaches the traversal. OVERRIDE edges run implementation → trait,
-  so an inbound walk from an implementation does not cross its outbound
-  OVERRIDE edge.
-- Module CALLS edges can be real: Rust static/const initializers and top-level
-  Python/shell bodies execute outside a callable. They remain in the graph as
-  structural evidence and are intentionally reported separately from callers.
-- The bare project-root `.__file__` name is not resolvable
-  (`get_code_snippet … .__file__` returns `symbol not found`, exit 1); per-file
-  `__file__` nodes exist internally as `DEFINES` sources.
+## Empty cross-file Java registry performs null-pointer arithmetic
 
-## Fixed and verified on HEAD (2026-08-27)
+`internal/cbm/lsp/java_lsp.c:3898`, in `cbm_java_build_cross_registry`, evaluates
+`jvm + type_count` when `def_count == 0`, leaving `jvm == NULL` and
+`type_count == 0`. The function explicitly supports an empty corpus, but adding
+even zero to a null pointer is undefined behavior.
 
-Removed from Open after live confirmation on the HEAD build; kept here only as a
-short ledger, to be pruned once the release ships them.
-
-- **Cross-file exported `macro_rules!` expansion** (`4302d899`): the project
-  macro pre-pass now records `#[macro_export]` patterns/transcribers by nearest
-  Cargo package, and per-file Rust resolution imports only rules reached through
-  that file's `use crate::…` bindings. The pipeline regression proves generated
-  types and methods appear in the importing file while the same name cannot leak
-  into a sibling workspace crate.
-
-- **Entry-point truncation disclosure** (`8eebc00e`): `entry_points_total` /
-  `entry_points_truncated` present and firing.
-- **Test-target entry points retained** (`629c89a9`): test `main` targets appear
-  in `entry_points`.
-- **`query_graph --max-rows` truncation disclosure** (`e21e48d5`): `truncated:
-  true` emitted when matches exceed the cap; absent otherwise.
-- **`search_graph` degree counts `OVERRIDE`** (`eb12be98` / `eb743fa0`): trait
-  implementations no longer report degree-0; degree-0 hits are genuine zero-edge
-  stubs.
-- **`trace_path`/`detect_changes` reject depth > 15** (`abbf1030`): `depth must
-  be at most 15 (given N)` instead of silent clamping.
-- **Exact build identifier** (`5d1e21a1`): `--version` prints `dev
-  build=<64-hex>` fingerprint.
-- **Route slice truncation disclosure** (`21d39bca`): `get_architecture` routes
-  aspect emits `routes_total` / `routes_truncated`, mirroring the entry-point
-  plumbing. Truncation is measured against the pre-LIMIT `COUNT(*) OVER()`
-  population read before the in-C test-path filter, so the test-path `continue`
-  cannot spoof a false negative.
-- **Re-exported bare and module-alias cross-crate CALLS** (`6fdb6efe`): a bare
-  call of a symbol `pub use`-re-exported through a directory module now resolves
-  via re-export-ancestor matching (`produce_show_frame_dot`), and a
-  module-alias-qualified associated call `alias::fn()` resolves by rebuilding the
-  import target from the aliased module (`ext_shape::append_event_sql`). Existing
-  decoy rejections (target-package prefix, ambiguous source suffix, conflicting
-  routes) still hold.
-- **Single-level macro repetition binding/expansion** (`b0852424`): a
-  `$(...)<sep><kind>` repetition binds each metavar's per-iteration values and
-  expands the transcriber body once per iteration, so item-producing repetition
-  macros emit every generated callable and the calls inside them
-  (`impl_seq_addressed_transport_wire!` now yields all five `validate_decoded`
-  methods).
-- **Nested-repetition item macros expand (`string_enum!`)** (pending commit):
-  five separate expander gaps blocked the `string_enum!` shape
-  (`crates/pm-core/src/entity/string_enum.rs:45`), each independently fatal, all
-  in the clean-room `macro_rules!` expander (`internal/cbm/lsp/rust_lsp.c`):
-  (1) the `$vis:vis` fragment was unsupported, so the `pub enum` header never
-  matched; (2) a separator-less outer `+` iterated once (the variant list
-  separates via an inner `$(,)?`, not an outer sep); (3) a `$(` inside a
-  repetition inner pattern was rolled back to a wildcard, dropping the whole
-  variant list; (4) `$crate` was left literal, so `$crate::…` failed the item
-  parse; (5) `macro_consume_fragment` sent a `:literal` string through the
-  bracket-only balancer, which never advanced past the opening quote. The fix
-  adds `vis` and string-literal fragment consumption, greedy separator-less
-  outer iteration, a nested-`$(` matcher that consumes the span and seeds inner
-  metavars as empty (so the transcriber drops them), `$crate`→`crate`
-  substitution, and macro-expansion-time emission of the generated
-  `enum`/`struct` type node. Verified by
-  `rustlsp_macro_string_enum_nested_repetition_emits_enum_and_methods`
-  (`tests/test_rust_lsp.c`): the generated `Status` enum node, its `token`
-  method, and the `sink` call edge inside that method all appear. Full C suite
-  green (7752 passed). Live-index reconfirmed on a from-source HEAD build
-  (`e76c243b…`, compiled `TEST_SEAMS=1` and run against a private
-  `CBM_TEST_DAEMON_RUNTIME_PARENT` namespace so the account-wide daemon of live
-  MCP clients stayed untouched): a fresh full reindex of project-management now
-  carries an `Enum` node for `DemoStatus`, the same-file `string_enum!`
-  invocation in `string_enum.rs`. Scope limit: this fix covers only same-file
-  invocations; cross-file `#[macro_export]` invocations remain unexpanded for a
-  separate reason (see Open — cross-file macro visibility).
-
-## Distribution hazard (not a code defect)
-
-The binary a session actually runs can lag fork HEAD by a full fix wave. The
-shipped DeusData release trailed the `viktorius007` fork, and the stale account
-daemon kept serving the old in-memory image (`build=c0cc131b…`) even after fixes
-landed in source — `daemon stop` refuses while committed MCP clients from other
-sessions are live. An index built by the stale binary also cannot exercise a
-graph-construction fix after the binary is swapped; a reindex is required.
-`index_repository` alone is not enough: when git state is unchanged it takes the
-incremental path and returns the cached graph as a sub-second no-op (identical
-node/edge counts), so a graph-construction fix is not re-exercised. To verify one
-on an unchanged tree, `delete_project` then `index_repository --mode full`, and
-confirm the node/edge count moved. Before recording any documented fix as broken,
-confirm the running binary carries it (`--version`, or grep its string table for
-a fix marker) and that the graph under test was freshly built by that binary.
+The current-source sanitizer run on 2026-09-02
+(`scripts/test.sh --suites rust_lsp,pipeline,mcp,cli,daemon_ipc`) reported
+`runtime error: applying zero offset to null pointer` at that expression.
+Handle the empty registry without pointer arithmetic on NULL and cover that
+valid input under the sanitizer.
