@@ -269,48 +269,16 @@ typedef struct {
                                         // pass_lsp_cross.c. Default false.
     bool requires_lsp_resolution;       // synthetic semantic candidate (for example an implicit
                                         // C++ operator). Never fall back to textual resolution.
+    bool callee_is_locally_bound;       // bare call foo() whose callee identifier is bound as a
+                                        // parameter of an enclosing function, so it cannot be the
+                                        // module-level foo. Python only today. Read by the
+                                        // weak-local-binding guard. Default false.
 } CBMCall;
 
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
-    /* Rust use-tree leaves are an extraction authority, not a later graph
-     * guess. Zero keeps every non-Rust/legacy initializer source-compatible. */
-    uint32_t declaration_start_byte;
-    uint32_t declaration_end_byte;
-    uint32_t site_start_byte;
-    uint32_t site_end_byte;
-    uint32_t scope_start_byte;     // lexical/module scope containing this exact use leaf
-    uint32_t scope_end_byte;       // exclusive; a site outside this range cannot consume the alias
-    const char *owner_module_path; // inline-module path relative to the declaring file, or ""
-    bool rust_module_scope;        // true only for a use declared directly in a module namespace
-    uint8_t rust_provenance;
-    uint8_t rust_visibility;
 } CBMImport;
-
-typedef enum {
-    CBM_RUST_IMPORT_PROVENANCE_NONE = 0,
-    CBM_RUST_IMPORT_PROVENANCE_NAMED_EXACT = 1,
-    CBM_RUST_IMPORT_PROVENANCE_GLOB_EXACT = 2,
-} CBMRustImportProvenance;
-
-typedef enum {
-    CBM_RUST_IMPORT_VIS_PRIVATE = 0,
-    CBM_RUST_IMPORT_VIS_RESTRICTED = 1,
-    CBM_RUST_IMPORT_VIS_PUBLIC = 2,
-} CBMRustImportVisibility;
-
-typedef enum {
-    CBM_RUST_CARRIER_NOT_RUN = 0,
-    CBM_RUST_CARRIER_COMPLETE = 1,
-    CBM_RUST_CARRIER_PARTIAL = 2,
-} CBMRustCarrierStatus;
-
-typedef struct {
-    uint32_t start_byte;
-    uint32_t end_byte;
-    const char *owner_module_path;
-} CBMRustImportScope;
 
 typedef enum {
     CBM_USAGE_VALUE = 0,
@@ -319,17 +287,19 @@ typedef enum {
 
 typedef struct {
     const char *ref_name;            // referenced identifier
-    const char *resolved_target_qn;  // resolver-proven target; bypasses textual lookup when present
     const char *enclosing_func_qn;   // QN of enclosing function (or module QN)
     CBMUsageKind kind;               // ordinary USAGE or explicit callable reference
     bool may_be_call_reference;      // syntactic candidate; exact LSP proof may upgrade its edge
-    bool is_macro_callable_value;    // function value recovered from an opaque macro invocation
     bool semantic_reference_blocked; // lexical evidence blocks only unproven textual fallback
     bool semantic_reference_local_shadow; // blocker belongs to a non-module lexical scope
     uint32_t lexical_scope_id;            // extraction-local scope instance; never graph identity
     uint32_t site_start_byte;             // exact reference-token span; end > start when present
     uint32_t site_end_byte;               // exclusive byte offset in the source file
     CBMSourceOrigin source_origin;        // raw source or C-family preprocessed buffer
+    bool is_member_access;                // token is the member half of a selector/attribute
+                                          // (Go x.f — field_identifier). The extractor strips
+                                          // the receiver, so this is the only surviving record
+                                          // of selector shape (#1962). Default false.
 } CBMUsage;
 
 typedef struct {
@@ -341,6 +311,9 @@ typedef struct {
     const char *var_name;          // variable name
     const char *enclosing_func_qn; // QN of enclosing function
     bool is_write;                 // true = write, false = read
+    bool is_member_access;         // var_name is the field half of a selector/member LHS
+                                   // (`t.err = x` → "err"); the receiver is stripped here,
+                                   // so this is the only record of selector shape (#1962)
 } CBMReadWrite;
 
 typedef struct {
@@ -409,21 +382,6 @@ typedef struct {
      * an empty `impl Trait for Type {}` block. */
     const char *struct_qn;
 } CBMImplTrait;
-
-// Rust: a bodyless `mod NAME;` declaration (the child module lives in another
-// file). is_cfg_test_gated is true when the declaration is preceded by a
-// #[cfg(test)]-style attribute whose predicate contains the `test` token. Used
-// by the pipeline to propagate is_test across the file boundary to the child
-// module's own file (and transitively to its descendants).
-typedef struct {
-    const char *child_name;    // module name in `mod NAME;`
-    const char *parent_path;   // inline parent path (`outer::inner`) or "" at file root
-    const char *path_override; // `#[path = "..."]` value, relative to the
-                               // declaring file's directory; NULL if absent
-    uint8_t rust_visibility;   // CBMRustImportVisibility of the mod item
-    bool is_inline;            // module body is in the declaring file
-    bool is_cfg_test_gated;    // declaration carries a cfg(test)-style gate
-} CBMModDecl;
 
 typedef enum {
     CBM_RESOLVED_INVOCATION = 0,
@@ -528,78 +486,6 @@ typedef struct {
     int cap;
 } CBMChannelArray;
 
-typedef struct {
-    CBMModDecl *items;
-    int count;
-    int cap;
-} CBMModDeclArray;
-
-/* Allocation-independent Rust semantic-analysis health. Reason values are a
- * persisted-data contract: append new reasons before _COUNT, never renumber an
- * existing value. Issue slots are addressed directly by reason, so recording a
- * cap/failure cannot itself fail because diagnostic storage is unavailable. */
-typedef enum {
-    CBM_RUST_HEALTH_MANIFEST_READ_FAILED = 0,
-    CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL = 1,
-    CBM_RUST_HEALTH_MANIFEST_DEP_LIMIT = 2,
-    CBM_RUST_HEALTH_MANIFEST_MEMBER_LIMIT = 3,
-    CBM_RUST_HEALTH_SOURCE_UNAVAILABLE = 4,
-    CBM_RUST_HEALTH_PARSER_CREATE_FAILED = 5,
-    CBM_RUST_HEALTH_PARSER_PARSE_FAILED = 6,
-    CBM_RUST_HEALTH_MACRO_NO_RULE_MATCH = 7,
-    CBM_RUST_HEALTH_MACRO_DEPTH_LIMIT = 8,
-    CBM_RUST_HEALTH_MACRO_BINDING_LIMIT = 9,
-    CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT = 10,
-    CBM_RUST_HEALTH_MACRO_PARSE_FAILED = 11,
-    CBM_RUST_HEALTH_TYPE_DEPTH_LIMIT = 12,
-    CBM_RUST_HEALTH_EVAL_DEPTH_LIMIT = 13,
-    CBM_RUST_HEALTH_WALK_DEPTH_LIMIT = 14,
-    CBM_RUST_HEALTH_WORK_LIMIT = 15,
-    CBM_RUST_HEALTH_PROC_MACRO_UNSUPPORTED = 16,
-    CBM_RUST_HEALTH_RUSTDOC_UNAVAILABLE = 17,
-    CBM_RUST_HEALTH_MACRO_SUBSTITUTION_LIMIT = 18,
-    CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE = 19,
-    CBM_RUST_HEALTH_MANIFEST_TARGET_AUTHORITY_UNAVAILABLE = 20,
-    CBM_RUST_HEALTH_IMPORT_CARRIER_PARTIAL = 21,
-    CBM_RUST_HEALTH_REASON_COUNT = 22,
-} CBMRustHealthReason;
-
-typedef enum {
-    CBM_RUST_ANALYSIS_COMPLETE = 0,
-    CBM_RUST_ANALYSIS_PARTIAL = 1,
-    CBM_RUST_ANALYSIS_FAILED = 2,
-} CBMRustAnalysisStatus;
-
-typedef enum {
-    CBM_RUST_HEALTH_ROUTE_SINGLE_FILE = 1U << 0,
-    CBM_RUST_HEALTH_ROUTE_CROSS_FILE = 1U << 1,
-} CBMRustHealthRoute;
-
-typedef struct {
-    uint32_t count;
-    uint32_t first_start_byte;
-    uint32_t first_end_byte;
-} CBMRustHealthIssue;
-
-typedef struct {
-    uint32_t required_routes;
-    uint32_t completed_routes;
-    uint32_t resolved_emitted;
-    uint32_t unresolved_emitted;
-    CBMRustHealthIssue issues[CBM_RUST_HEALTH_REASON_COUNT];
-} CBMRustAnalysisHealth;
-
-void cbm_rust_health_record(CBMRustAnalysisHealth *health, CBMRustHealthReason reason,
-                            uint32_t start_byte, uint32_t end_byte);
-void cbm_rust_health_merge(CBMRustAnalysisHealth *dst, const CBMRustAnalysisHealth *src);
-const char *cbm_rust_health_reason_name(CBMRustHealthReason reason);
-CBMRustAnalysisStatus cbm_rust_health_status(const CBMRustAnalysisHealth *health);
-
-typedef enum {
-    CBM_FILE_STATUS_COMPLETE = 0,
-    CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE = 1,
-} CBMFileStatus;
-
 // Full extraction result for one file.
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
@@ -618,10 +504,6 @@ typedef struct CBMFileResult {
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
-    CBMModDeclArray mod_decls;           // Rust: bodyless `mod NAME;` child declarations
-    CBMRustCarrierStatus rust_imports_status;
-    CBMRustCarrierStatus rust_mod_decls_status;
-    CBMRustAnalysisHealth rust_health; // fixed-size Rust semantic degradation report
 
     const char *module_qn;      // module qualified name
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none
@@ -640,6 +522,21 @@ typedef struct CBMFileResult {
      * completeness guarantee. Callers should treat a flagged file as "prefer
      * grep here", never treat an unflagged file as provably complete. */
     bool parse_incomplete;
+    /* True when the ranges cover so much of the file that they are no longer
+     * useful advice — one range over 80% of the line count. The file WAS
+     * indexed, but pointing a reader at almost every line tells them nothing,
+     * so the report says "read the source" instead of listing the range.
+     *
+     * Its main customers are non-C languages. The refinement that narrows a
+     * whole-file range using the preprocessed parse only runs for C, C++ and
+     * CUDA, so a Python, Java or Ruby file whose root node is ERROR still
+     * reports 1-N.
+     *
+     * Note the naming: this field and the phase string it produces are both
+     * `parse_unusable`. The older `parse_incomplete` field emits the phase
+     * `parse_partial` instead. That mismatch is historical, not deliberate —
+     * do not copy it. */
+    bool parse_unusable;
     const char *error_ranges;
     int error_region_count;
     bool is_test_file;
@@ -711,6 +608,13 @@ typedef struct {
 
 typedef struct {
     CBMArena *arena;
+    /* Scratch for AST traversal, owned by the cbm_extract_file_ex call that
+     * built this context and destroyed when it returns. Nothing a
+     * CBMFileResult points at may be allocated here: `arena` is the result's
+     * own, and it outlives extraction by the whole pipeline (#1997). NULL in a
+     * context built without one, in which case the stacks fall back to
+     * `arena`. */
+    CBMArena *scratch;
     CBMFileResult *result;
     const char *source;
     int source_len;
@@ -798,17 +702,6 @@ void cbm_free_tree(CBMFileResult *result);
 // Free a standalone TSTree pointer (for Go layer cleanup).
 void cbm_free_tree_ptr(TSTree *tree);
 
-/* Allocation status for every language. Derived from the result arena so a
- * failed grow, string copy, or traversal stack allocation cannot be hidden by
- * a caller that only observes the completed per-file result. */
-CBMFileStatus cbm_file_result_status(const CBMFileResult *result);
-
-#ifdef CBM_ENABLE_TEST_SEAMS
-/* Exercise the exact allocation-to-file/Rust boundary without relying on the
- * host allocator to exhaust memory. */
-void cbm_file_result_test_finalize_allocation(CBMFileResult *result, CBMLanguage language);
-#endif
-
 // Reset the thread-local parser's internal state, releasing slab-allocated
 // subtrees. Must be called BEFORE cbm_slab_reset_thread() so the slab rebuild
 // doesn't corrupt live parser state.
@@ -856,21 +749,20 @@ int cbm_macro_extraction_enabled(void);
 // --- Internal helpers used by extractors ---
 
 // Growable array push functions (arena-allocated, no individual free needed).
-bool cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
-bool cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
-bool cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
-bool cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
-bool cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
-bool cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
-bool cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
-bool cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
-bool cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
-bool cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
-bool cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
-bool cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
-bool cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
-bool cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
-bool cbm_moddecls_push(CBMModDeclArray *arr, CBMArena *a, CBMModDecl md);
+void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
+void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
+void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
+void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
+void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
+void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
+void cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
+void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
+void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
+void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
+void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
+void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
+void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
+void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 
 // --- Sub-extractor entry points ---
 
@@ -883,7 +775,6 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 // contains a dbt builtin call. Defined in extract_dbt.c.
 void cbm_extract_dbt(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
-void cbm_rust_imports_mark_semantic_calls(CBMFileResult *result);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
 void cbm_extract_type_refs(CBMExtractCtx *ctx);

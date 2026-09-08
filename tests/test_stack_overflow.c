@@ -12,9 +12,6 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression (#913) */
-#include "lsp/java_lsp.h"
-#include "lsp/cs_lsp.h"
-#include "lsp/rust_lsp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -410,23 +407,13 @@ TEST(cpp_large_templated_header_no_crash_issue424) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 #if !defined(_WIN32)
-#include <errno.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
 
-/* Wall-clock ceiling for a forked extraction child. A stack-safe walker
- * completes a deeply nested file near-instantly (the guard truncates the walk);
- * a walker that overruns the stack dies by signal well before this. The alarm
- * is a safety net so a *hang*-class pathology (unbounded non-crashing spin)
- * also surfaces as a signal death rather than wedging the whole suite. */
-#define SO_CHILD_TIMEOUT_SECS 30
-
-/* Run cbm_extract_file in a forked child; true if the child died by signal
- * (SIGSEGV/SIGBUS from stack overflow, SIGABRT from a sanitizer report, or
- * SIGALRM from the watchdog below). Mirrors tests/test_lang_contract.c. On
- * Windows run in-process (a genuine crash there aborts the runner — hard,
- * visible failure). */
+/* Run cbm_extract_file in a forked child; true if the child died by signal.
+ * Mirrors tests/test_lang_contract.c. On Windows run in-process (a genuine
+ * crash there aborts the runner — hard, visible failure). */
 static bool so_extract_crashes(const char *content, CBMLanguage lang, const char *relpath) {
 #if defined(_WIN32)
     CBMFileResult *r =
@@ -442,7 +429,6 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
         return false;
     }
     if (pid == 0) {
-        alarm(SO_CHILD_TIMEOUT_SECS); /* watchdog: SIGALRM default-terminates */
         CBMFileResult *r =
             cbm_extract_file(content, (int)strlen(content), lang, "so", relpath, 0, NULL, NULL);
         if (r) {
@@ -453,113 +439,6 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
     int status = 0;
     (void)waitpid(pid, &status, 0);
     return WIFSIGNALED(status);
-#endif
-}
-
-/* Exercise the C# type parser directly. The full extractor now materializes
- * ordered signature text before the LSP runs; on this deliberately adversarial
- * 6000-deep type that unrelated pass can consume the watchdog and falsely
- * report that cs_parse_type_node's recursion guard failed. */
-static bool so_csharp_lsp_type_walk_fails_in_process(const char *content) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    TSParser *parser = ts_parser_new();
-    if (!parser || !ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_CSHARP))) {
-        if (parser)
-            ts_parser_delete(parser);
-        cbm_arena_destroy(&arena);
-        return true;
-    }
-    TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
-    if (!tree) {
-        ts_parser_delete(parser);
-        cbm_arena_destroy(&arena);
-        return true;
-    }
-    CBMTypeRegistry registry;
-    cbm_registry_init(&registry, &arena);
-    cbm_registry_finalize(&registry);
-    CBMResolvedCallArray resolved = {0};
-    CSLSPContext ctx;
-    cs_lsp_init(&ctx, &arena, content, (int)strlen(content), &registry, "so", &resolved);
-    cs_lsp_process_file(&ctx, ts_tree_root_node(tree));
-    ts_tree_delete(tree);
-    ts_parser_delete(parser);
-    cbm_arena_destroy(&arena);
-    return false;
-}
-
-static bool so_csharp_lsp_type_walk_crashes(const char *content) {
-#if defined(_WIN32)
-    return so_csharp_lsp_type_walk_fails_in_process(content);
-#else
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid < 0)
-        return true;
-    if (pid == 0) {
-        alarm(SO_CHILD_TIMEOUT_SECS);
-        _exit(so_csharp_lsp_type_walk_fails_in_process(content) ? 125 : 0);
-    }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(pid, &status, 0);
-    } while (waited < 0 && errno == EINTR);
-    return waited != pid || WIFSIGNALED(status) || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
-#endif
-}
-
-/* Exercise the Rust call walker directly.  The full extractor copies each
- * remaining nested argument before LSP runs, which makes this adversarial
- * fixture measure unrelated quadratic work rather than the Rust depth guard. */
-static bool so_rust_lsp_walk_fails_in_process(const char *content) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    TSParser *parser = ts_parser_new();
-    if (!parser || !ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST))) {
-        if (parser)
-            ts_parser_delete(parser);
-        cbm_arena_destroy(&arena);
-        return true;
-    }
-    TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
-    if (!tree) {
-        ts_parser_delete(parser);
-        cbm_arena_destroy(&arena);
-        return true;
-    }
-    CBMTypeRegistry registry;
-    cbm_registry_init(&registry, &arena);
-    cbm_registry_finalize(&registry);
-    CBMResolvedCallArray resolved = {0};
-    RustLSPContext ctx;
-    rust_lsp_init(&ctx, &arena, content, (int)strlen(content), &registry, "so", &resolved);
-    rust_lsp_process_file(&ctx, ts_tree_root_node(tree));
-    ts_tree_delete(tree);
-    ts_parser_delete(parser);
-    cbm_arena_destroy(&arena);
-    return false;
-}
-
-static bool so_rust_lsp_walk_crashes(const char *content) {
-#if defined(_WIN32)
-    return so_rust_lsp_walk_fails_in_process(content);
-#else
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid < 0)
-        return true;
-    if (pid == 0) {
-        alarm(SO_CHILD_TIMEOUT_SECS);
-        _exit(so_rust_lsp_walk_fails_in_process(content) ? 125 : 0);
-    }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(pid, &status, 0);
-    } while (waited < 0 && errno == EINTR);
-    return waited != pid || WIFSIGNALED(status) || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
 #endif
 }
 
@@ -893,293 +772,14 @@ TEST(lsp_kotlin_deep_nesting_no_crash) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * Unguarded LSP walker/parser recursion guards (2026-07)
- *
- * Companions to the guarded java/c walks above: the remaining per-language
- * resolve/eval call-walkers and the *_parse_type_node type parsers recursed on
- * raw AST / type-nesting depth with NO runtime depth cap. Indexing one
- * pathologically nested source file (deep nested calls `f(f(...f(1)...))` or
- * deep nested generics `Vec<Vec<...i32...>>`) drives one C frame per level →
- * C-stack exhaustion → SIGSEGV. tree-sitter imposes no parse-depth limit, so
- * the deep tree reaches the walker intact (the java/c probes above already
- * proved rc=139 pre-guard at this depth). Each repro forks a child so a
- * regression signals RED in the parent instead of killing the runner.
- *
- * Two depth constants, for two distinct crash budgets:
- *
- *  - SO_DEEP_DEPTH (30000) drives the resolve/eval call-walkers. The call path
- *    is O(depth) end-to-end, so 30000 frames overflow the 8 MB stack pre-guard
- *    yet index near-instantly post-guard (the guard truncates the walk at 512).
- *
- *  - SO_TYPE_DEPTH (6000) drives the *_parse_type_node type parsers. It clears
- *    every measured pristine crash threshold (rust ~1750, cs ~3000, java ~4500
- *    — verified against a pristine-branch build) with margin, while staying
- *    well under a genuinely-slow deep-generic *parse* cost that is O(depth²) in
- *    tree-sitter + extraction and unrelated to this stack fix (~160s at 30000
- *    for java — the "block processing is minutes-slow at depth >= 3000"
- *    adversarial-input pathology called out in the perf-sweep report). Guarded,
- *    a 6000-deep generic indexes in a few seconds — comfortably inside the
- *    child watchdog below. kotlin / c++ / python type parsers do NOT overflow
- *    even at 8000-12000 (smaller frames / shallower type trees), so their
- *    identical guard is latent defense-in-depth and is not crash-tested here.
- * ═══════════════════════════════════════════════════════════════════ */
-
-#define SO_DEEP_DEPTH 30000
-#define SO_TYPE_DEPTH 6000
-
-/* malloc'd "<open>×depth <leaf> <close>×depth", e.g. open="Vec<" close=">"
- * leaf="i32" → "Vec<Vec<...i32...>>". Synthesises a pathologically nested
- * generic/subscript type text. Caller frees. */
-static char *so_nest(const char *open, const char *leaf, const char *close, int depth) {
-    size_t olen = strlen(open), clen = strlen(close), llen = strlen(leaf);
-    size_t sz = (size_t)depth * (olen + clen) + llen + 1;
-    char *s = malloc(sz);
-    if (!s)
-        return NULL;
-    char *p = s;
-    for (int i = 0; i < depth; i++) {
-        memcpy(p, open, olen);
-        p += olen;
-    }
-    memcpy(p, leaf, llen);
-    p += llen;
-    for (int i = 0; i < depth; i++) {
-        memcpy(p, close, clen);
-        p += clen;
-    }
-    *p = '\0';
-    return s;
-}
-
-/* malloc'd "<fn>(<fn>(...<fn>(1)...))" — `depth` nested call expressions.
- * Caller frees. */
-static char *so_nest_call(const char *fn, int depth) {
-    size_t flen = strlen(fn);
-    size_t sz = (size_t)depth * (flen + 1) + (size_t)depth + 2;
-    char *s = malloc(sz);
-    if (!s)
-        return NULL;
-    char *p = s;
-    for (int i = 0; i < depth; i++) {
-        memcpy(p, fn, flen);
-        p += flen;
-        *p++ = '(';
-    }
-    *p++ = '1';
-    for (int i = 0; i < depth; i++)
-        *p++ = ')';
-    *p = '\0';
-    return s;
-}
-
-/* Wrap a nested-type text in a per-language function-parameter declaration and
- * run the extractor in a forked child; assert it does not crash. `fmt` must
- * contain exactly one %s for the nested type. */
-static bool so_type_in_param_crashes(const char *fmt, const char *nested, CBMLanguage lang,
-                                     const char *relpath) {
-    size_t sz = strlen(fmt) + strlen(nested) + 64;
-    char *src = malloc(sz);
-    if (!src)
-        return false;
-    snprintf(src, sz, fmt, nested);
-    bool crashed = so_extract_crashes(src, lang, relpath);
-    free(src);
-    return crashed;
-}
-
-static TSNode so_named_child_of_type(TSNode parent, const char *kind) {
-    uint32_t count = ts_node_named_child_count(parent);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_named_child(parent, i);
-        if (strcmp(ts_node_type(child), kind) == 0)
-            return child;
-    }
-    return (TSNode){0};
-}
-
-/* Parse Java once, then exercise java_parse_type_node directly.  The generic
- * guard belongs to that semantic parser; running the entire extraction
- * pipeline makes unrelated definition/signature work consume the watchdog. */
-static int so_java_parse_param_type(const char *source) {
-    const TSLanguage *language = cbm_ts_language(CBM_LANG_JAVA);
-    TSParser *parser = ts_parser_new();
-    if (!language || !parser || !ts_parser_set_language(parser, language)) {
-        if (parser)
-            ts_parser_delete(parser);
-        return 1;
-    }
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
-    if (!tree) {
-        ts_parser_delete(parser);
-        return 1;
-    }
-
-    TSNode root = ts_tree_root_node(tree);
-    TSNode class_decl = so_named_child_of_type(root, "class_declaration");
-    TSNode class_body = ts_node_child_by_field_name(class_decl, "body", 4);
-    TSNode method = so_named_child_of_type(class_body, "method_declaration");
-    TSNode parameters = ts_node_child_by_field_name(method, "parameters", 10);
-    TSNode parameter = so_named_child_of_type(parameters, "formal_parameter");
-    TSNode type = ts_node_child_by_field_name(parameter, "type", 4);
-    if (ts_node_is_null(type)) {
-        ts_tree_delete(tree);
-        ts_parser_delete(parser);
-        return 1;
-    }
-
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMTypeRegistry registry;
-    cbm_registry_init(&registry, &arena);
-    CBMResolvedCallArray resolved = {0};
-    JavaLSPContext ctx;
-    java_lsp_init(&ctx, &arena, source, (int)strlen(source), &registry, "", "so", &resolved);
-    (void)java_parse_type_node(&ctx, type);
-
-    cbm_arena_destroy(&arena);
-    ts_tree_delete(tree);
-    ts_parser_delete(parser);
-    return 0;
-}
-
-static bool so_java_param_type_crashes(const char *nested) {
-    size_t size = strlen(nested) + 64;
-    char *source = malloc(size);
-    if (!source)
-        return true;
-    snprintf(source, size, "class X { void f(%s p) {} }\n", nested);
-#if defined(_WIN32)
-    bool failed = so_java_parse_param_type(source) != 0;
-#else
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid < 0) {
-        free(source);
-        return true;
-    }
-    if (pid == 0) {
-        alarm(SO_CHILD_TIMEOUT_SECS);
-        _exit(so_java_parse_param_type(source));
-    }
-    int status = 0;
-    bool failed = waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
-#endif
-    free(source);
-    return failed;
-}
-
-/* ── *_parse_type_node family: deeply nested generic parameter types ──
- *
- * rust / java / c# overflow their type parser on a deeply nested generic
- * annotation pre-guard (verified against a pristine-branch build). Post-guard
- * the parser truncates at the 512 cap and the annotation degrades to `unknown`.
- * (kotlin / c++ / python type parsers do not overflow at test-viable depths —
- * their identical guard is latent; see the section header.) */
-
-TEST(lsp_rust_nested_generic_type_no_crash) {
-    /* rust_parse_type_node (rust_lsp.c) recurses on generic_type argument nesting. */
-    char *ty = so_nest("Vec<", "i32", ">", SO_TYPE_DEPTH);
-    ASSERT_NOT_NULL(ty);
-    ASSERT_FALSE(
-        so_type_in_param_crashes("fn f(x: %s) {}\n", ty, CBM_LANG_RUST, "nested_generic.rs"));
-    free(ty);
-    PASS();
-}
-
-TEST(lsp_java_nested_generic_type_no_crash) {
-    /* java_parse_type_node (java_lsp.c) recurses on generic_type argument nesting. */
-    char *ty = so_nest("List<", "String", ">", SO_TYPE_DEPTH);
-    ASSERT_NOT_NULL(ty);
-    ASSERT_FALSE(so_java_param_type_crashes(ty));
-    free(ty);
-    PASS();
-}
-
-TEST(lsp_csharp_nested_generic_type_no_crash) {
-    /* cs_parse_type_node (cs_lsp.c) recurses on generic_name argument nesting. */
-    char *ty = so_nest("List<", "int", ">", SO_TYPE_DEPTH);
-    ASSERT_NOT_NULL(ty);
-    size_t source_size = strlen(ty) + 64;
-    char *source = malloc(source_size);
-    ASSERT_NOT_NULL(source);
-    snprintf(source, source_size, "class X { void f(%s p) {} }\n", ty);
-    ASSERT_FALSE(so_csharp_lsp_type_walk_crashes(source));
-    free(source);
-    free(ty);
-    PASS();
-}
-
-/* ── resolve/eval call-walkers: deeply nested call expressions ── */
-
-TEST(lsp_python_deep_parens_no_crash) {
-    /* py_eval_expr_type (py_lsp.c) recurses through parenthesized_expression. */
-    const int DEPTH = SO_DEEP_DEPTH;
-    size_t sz = (size_t)DEPTH * 2 + 64;
-    char *src = malloc(sz);
-    ASSERT_NOT_NULL(src);
-    char *p = src;
-    p += snprintf(p, sz, "def g():\n    return ");
-    memset(p, '(', DEPTH);
-    p += DEPTH;
-    *p++ = '1';
-    memset(p, ')', DEPTH);
-    p += DEPTH;
-    snprintf(p, sz - (size_t)(p - src), "\n");
-    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PYTHON, "deep_parens.py"));
-    free(src);
-    PASS();
-}
-
-TEST(lsp_ts_deep_nesting_no_crash) {
-    /* process_node (ts_lsp.c). */
-    char *call = so_nest_call("f", SO_DEEP_DEPTH);
-    ASSERT_NOT_NULL(call);
-    size_t sz = strlen(call) + 64;
-    char *src = malloc(sz);
-    ASSERT_NOT_NULL(src);
-    snprintf(src, sz, "function f(a) { return a; }\nfunction g() { return %s; }\n", call);
-    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_TYPESCRIPT, "deep_calls.ts"));
-    free(src);
-    free(call);
-    PASS();
-}
-
-TEST(lsp_csharp_deep_nesting_no_crash) {
-    /* cs_resolve_calls_in_node (cs_lsp.c). */
-    char *call = so_nest_call("f", SO_DEEP_DEPTH);
-    ASSERT_NOT_NULL(call);
-    size_t sz = strlen(call) + 96;
-    char *src = malloc(sz);
-    ASSERT_NOT_NULL(src);
-    snprintf(src, sz, "class X { int f(int a) { return a; } int g() { return %s; } }\n", call);
-    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_CSHARP, "DeepCalls.cs"));
-    free(src);
-    free(call);
-    PASS();
-}
-
-TEST(lsp_rust_deep_nesting_no_crash) {
-    /* rust_resolve_calls_in_node (rust_lsp.c). */
-    char *call = so_nest_call("f", SO_DEEP_DEPTH);
-    ASSERT_NOT_NULL(call);
-    size_t sz = strlen(call) + 64;
-    char *src = malloc(sz);
-    ASSERT_NOT_NULL(src);
-    snprintf(src, sz, "fn f(a: i32) -> i32 { a }\nfn g() -> i32 { %s }\n", call);
-    ASSERT_FALSE(so_rust_lsp_walk_crashes(src));
-    free(src);
-    free(call);
-    PASS();
-}
-
-/* ═══════════════════════════════════════════════════════════════════
  * Suite registration
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Split into three sub-suites so parallel/sharded runs are not serialized
- * behind one ~4-minute suite (it was the wall-clock critical path). The fork's
- * recursion-depth regression tests (nested generic types + resolve/eval
- * call-walkers) are folded into the shards below. */
+ * behind one ~4-minute suite (it was the wall-clock critical path: every
+ * other suite finished underneath it). Pure re-registration — the 20
+ * RUN_TEST entries are exactly the ones the single suite carried; the
+ * before/after test-count parity is asserted in the shard runner. */
 SUITE(stack_overflow_a) {
     cbm_init();
 
@@ -1190,12 +790,6 @@ SUITE(stack_overflow_a) {
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
     RUN_TEST(lsp_python_deep_expression_no_crash);
     RUN_TEST(lsp_perl_deep_expression_no_crash);
-
-    /* Unguarded *_parse_type_node family — deeply nested generic types
-     * (rust / java / c# overflow pre-guard; kotlin / c++ / python latent). */
-    RUN_TEST(lsp_rust_nested_generic_type_no_crash);
-    RUN_TEST(lsp_java_nested_generic_type_no_crash);
-    RUN_TEST(lsp_csharp_nested_generic_type_no_crash);
 
     cbm_shutdown();
 }
@@ -1209,12 +803,6 @@ SUITE(stack_overflow_b) {
     RUN_TEST(lsp_go_deep_nesting_no_crash);
     RUN_TEST(lsp_php_deep_nesting_no_crash);
     RUN_TEST(lsp_kotlin_deep_nesting_no_crash);
-
-    /* Unguarded resolve/eval call-walkers — deeply nested call expressions. */
-    RUN_TEST(lsp_python_deep_parens_no_crash);
-    RUN_TEST(lsp_ts_deep_nesting_no_crash);
-    RUN_TEST(lsp_csharp_deep_nesting_no_crash);
-    RUN_TEST(lsp_rust_deep_nesting_no_crash);
 
     cbm_shutdown();
 }

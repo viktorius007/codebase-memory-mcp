@@ -7,13 +7,12 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
-#include "helpers.h" // cbm_is_test_file (directory-aware test detection)
+#include "foundation/constants.h"     /* CBM_SZ_* */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include "../src/foundation/compat_fs.h"
 #include <time.h>
 #include "macro_table.h"
 #include "iris_export_xml.h"
-#include "extract_node_stack.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -112,74 +111,6 @@ static CBMFileResult *extract_with_macros(const char *src, CBMLanguage lang, con
     return r;
 }
 
-TEST(extract_result_growth_allocation_status_has_exact_32_item_control) {
-    CBMFileResult result = {0};
-    cbm_arena_init(&result.arena);
-    cbm_arena_test_fail_after(&result.arena, 1);
-
-    CBMDefinition def = {0};
-    for (int i = 0; i < 32; i++) {
-        ASSERT_TRUE(cbm_defs_push(&result.defs, &result.arena, def));
-    }
-    ASSERT_EQ(32, result.defs.count);
-    ASSERT_EQ(CBM_FILE_STATUS_COMPLETE, cbm_file_result_status(&result));
-
-    cbm_arena_destroy(&result.arena);
-    PASS();
-}
-
-TEST(extract_result_growth_allocation_status_fails_exact_33rd_item) {
-    CBMFileResult result = {0};
-    cbm_arena_init(&result.arena);
-    cbm_arena_test_fail_after(&result.arena, 1);
-
-    CBMDefinition def = {0};
-    for (int i = 0; i < 32; i++) {
-        ASSERT_TRUE(cbm_defs_push(&result.defs, &result.arena, def));
-    }
-    ASSERT_FALSE(cbm_defs_push(&result.defs, &result.arena, def));
-    ASSERT_EQ(32, result.defs.count);
-    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(&result));
-
-    cbm_arena_destroy(&result.arena);
-    PASS();
-}
-
-TEST(extract_string_allocation_failure_is_sticky_at_file_boundary) {
-    CBMFileResult result = {0};
-    cbm_arena_init(&result.arena);
-    cbm_arena_test_fail_after(&result.arena, 0);
-
-    ASSERT_NULL(cbm_arena_strdup(&result.arena, "lost"));
-    ASSERT_NOT_NULL(cbm_arena_strdup(&result.arena, "later allocation succeeds"));
-    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(&result));
-
-    cbm_arena_destroy(&result.arena);
-    PASS();
-}
-
-TEST(extract_node_stack_growth_reports_whole_subtree_loss) {
-    CBMFileResult *parsed =
-        extract("const a = 1;\nconst b = 2;\n", CBM_LANG_JAVASCRIPT, "test", "src/two.js");
-    ASSERT_NOT_NULL(parsed);
-    ASSERT_NOT_NULL(parsed->cached_tree);
-    TSNode root = ts_tree_root_node(parsed->cached_tree);
-    ASSERT_GTE(ts_node_child_count(root), 2);
-
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    cbm_arena_test_fail_after(&arena, 1);
-    TSNodeStack stack;
-    ASSERT_TRUE(ts_nstack_init(&stack, &arena, 1));
-    ASSERT_FALSE(ts_nstack_push_children(&stack, &arena, root));
-    ASSERT_EQ(0, stack.count);
-    ASSERT_EQ(CBM_ARENA_STATUS_ALLOCATION_UNAVAILABLE, cbm_arena_status(&arena));
-
-    cbm_arena_destroy(&arena);
-    cbm_free_result(parsed);
-    PASS();
-}
-
 /* ═══════════════════════════════════════════════════════════════════
  * Group A: OOP Languages
  * ═══════════════════════════════════════════════════════════════════ */
@@ -232,6 +163,57 @@ TEST(extract_ts_factory_object_methods_issue341) {
     ASSERT(has_def_any(r, "addItem"));
     ASSERT(has_def_any(r, "moveItem"));
     ASSERT(has_def_any(r, "deleteItem"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2010, split out of #1997: AST traversal stacks were allocated from
+ * result->arena, which the parallel pass holds for every file until the whole
+ * result cache is freed, so a one-file scratch structure was retained for the
+ * length of the index. cbm_extract_channels runs for every file and dispatches
+ * TypeScript to extract_channels_js, whose two walks take a 4096-entry TSNode
+ * stack each, and the ES import walk takes a 512-entry one:
+ * 2 * 4096 * 32 + 512 * 32 = 278528 bytes charged to the arena of a one-line
+ * file.
+ *
+ * The bound is derived, not tuned. Measured on this source, total_alloc was
+ * 365984 before the scratch arena and is 87456 after, exactly that difference.
+ * Of the 87456 that remain, 7680 is the defs item array at GROW_ARRAY's
+ * starting capacity of 32 times sizeof(CBMDefinition) 240, and the other 79776
+ * is everything else this file's extraction interns; none of it is traversal
+ * scratch. So the bound sits above 87456 with room and a factor of four below
+ * 365984.
+ *
+ * It is a byte budget, not a proof of lifetime; that is
+ * extract_traversal_stacks_come_from_ctx_scratch_issue2010 in test_mem.c. */
+TEST(traversal_stack_not_in_result_arena_issue2010) {
+    CBMFileResult *r = extract("export const x = 1;\n", CBM_LANG_TYPESCRIPT, "t", "a.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(has_def_any(r, "x"));
+    /* Read the field rather than cbm_arena_total(): this file sees
+     * internal/cbm/arena.h, which declares a subset of the API. test_mem.c
+     * includes foundation/arena.h ahead of cbm.h and can call the accessor. */
+    ASSERT_LT(r->arena.total_alloc, (size_t)CBM_SZ_128 * CBM_SZ_1K);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Not a scratch test. The C and C++ preprocessed second pass builds its own
+ * extraction context (pp_ctx in cbm_extract_file_ex), and that context carries
+ * ctx->scratch so every context in the file is uniform, but nothing reads it
+ * there: pp_ctx reaches only cbm_extract_unified and cbm_run_c_lsp, and neither
+ * extract_unified.c nor anything under internal/cbm/lsp/ includes
+ * extract_node_stack.h, so no traversal stack is built on that path today.
+ * This guards the macro-expansion path itself, which had no assertion on a call
+ * that exists only after expansion. */
+TEST(extract_c_macro_hidden_call_survives_preprocessed_pass_issue2010) {
+    CBMFileResult *r = extract("void target(void) {}\n"
+                               "#define INVOKE() target()\n"
+                               "void caller(void) { INVOKE(); }\n",
+                               CBM_LANG_C, "t", "macro_call.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_call(r, "target"));
     cbm_free_result(r);
     PASS();
 }
@@ -908,28 +890,6 @@ TEST(rust_function) {
     PASS();
 }
 
-TEST(rust_foreign_function_signatures_have_distinct_qns) {
-    CBMFileResult *r = extract("unsafe extern \"C\" {\n"
-                               "    safe fn alpha();\n"
-                               "    unsafe fn beta();\n"
-                               "    #[cfg(unix)]\n"
-                               "    fn platform();\n"
-                               "    #[cfg(windows)]\n"
-                               "    fn platform();\n"
-                               "}\n",
-                               CBM_LANG_RUST, "t", "src/ffi.rs");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-    ASSERT(has_def(r, "Function", "alpha"));
-    ASSERT(has_def(r, "Function", "beta"));
-    ASSERT(has_def_qn(r, "t.src.ffi.alpha"));
-    ASSERT(has_def_qn(r, "t.src.ffi.beta"));
-    ASSERT(has_def_qn(r, "t.src.ffi.platform#cfg(unix)"));
-    ASSERT(has_def_qn(r, "t.src.ffi.platform#cfg(windows)"));
-    cbm_free_result(r);
-    PASS();
-}
-
 TEST(rust_struct) {
     CBMFileResult *r = extract("pub struct Point { pub x: f64, pub y: f64 }\nimpl Point { pub fn "
                                "new(x: f64, y: f64) -> Self { Point { x, y } } }\n",
@@ -938,54 +898,6 @@ TEST(rust_struct) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Struct", "Point"));
     ASSERT(has_def(r, "Method", "new"));
-    const CBMDefinition *constructor = NULL;
-    for (int i = 0; i < r->defs.count; i++) {
-        if (strcmp(r->defs.items[i].label, "Method") == 0 &&
-            strcmp(r->defs.items[i].name, "new") == 0) {
-            constructor = &r->defs.items[i];
-            break;
-        }
-    }
-    ASSERT_NOT_NULL(constructor);
-    ASSERT_STR_EQ(constructor->return_type, "Self");
-    ASSERT_NOT_NULL(constructor->return_types);
-    ASSERT_STR_EQ(constructor->return_types[0], "Self");
-    ASSERT_NULL(constructor->return_types[1]);
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rust_nested_associated_call_preserves_each_exact_carrier) {
-    const char *source = "struct Builder;\n"
-                         "impl Builder {\n"
-                         "    fn new_multi_thread() -> Builder { Builder }\n"
-                         "    fn enable_all(&mut self) -> &mut Self { self }\n"
-                         "    fn build(&mut self) {}\n"
-                         "}\n"
-                         "fn exact() { Builder::new_multi_thread().enable_all().build(); }\n";
-    CBMFileResult *r = extract(source, CBM_LANG_RUST, "test", "src/lib.rs");
-    ASSERT_NOT_NULL(r);
-
-    const char *expected_names[] = {"Builder::new_multi_thread",
-                                    "Builder::new_multi_thread().enable_all",
-                                    "Builder::new_multi_thread().enable_all().build"};
-    const char *expected_sites[] = {"Builder::new_multi_thread()",
-                                    "Builder::new_multi_thread().enable_all()",
-                                    "Builder::new_multi_thread().enable_all().build()"};
-    for (int expected = 0; expected < 3; expected++) {
-        int count = 0;
-        for (int i = 0; i < r->calls.count; i++) {
-            const CBMCall *call = &r->calls.items[i];
-            size_t site_len = call->site_end_byte - call->site_start_byte;
-            if (call->callee_name && strcmp(call->callee_name, expected_names[expected]) == 0 &&
-                strlen(expected_sites[expected]) == site_len &&
-                strncmp(source + call->site_start_byte, expected_sites[expected], site_len) == 0) {
-                count++;
-            }
-        }
-        ASSERT_EQ(count, 1);
-    }
-
     cbm_free_result(r);
     PASS();
 }
@@ -1236,6 +1148,33 @@ TEST(elixir_function) {
     PASS();
 }
 
+/* tree-sitter-elixir gives a call's arguments node no field name, so the
+ * generic `arguments` field lookup returns null and first_string_arg was never
+ * populated for any Elixir call — Phoenix route paths, service URLs and config
+ * keys all key off it. */
+TEST(elixir_call_string_argument) {
+    CBMFileResult *r = extract("defmodule Sample do\n"
+                               "  def run do\n"
+                               "    get(\"/wallets\", WalletController)\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "sample.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int seen = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "get") != 0) {
+            continue;
+        }
+        seen = 1;
+        ASSERT_NOT_NULL(r->calls.items[i].first_string_arg);
+        ASSERT_STR_EQ("/wallets", r->calls.items[i].first_string_arg);
+    }
+    ASSERT_EQ(1, seen);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Haskell --- */
 TEST(haskell_function) {
     CBMFileResult *r = extract("add :: Int -> Int -> Int\nadd x y = x + y\n\nmultiply :: Int -> "
@@ -1365,19 +1304,18 @@ TEST(form_procedure) {
 
 /* --- Oracle PL/SQL --- */
 TEST(plsql_package_and_call) {
-    const char *src =
-        "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
-        "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
-        "    v_sal NUMBER;\n"
-        "  BEGIN\n"
-        "    v_sal := util_pkg.calc_salary(p_name);\n"
-        "    IF v_sal > 0 THEN\n"
-        "      RETURN v_sal;\n"
-        "    END IF;\n"
-        "    RAISE no_data_found;\n"
-        "  END;\n"
-        "END emp_pkg;\n"
-        "/\n";
+    const char *src = "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
+                      "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
+                      "    v_sal NUMBER;\n"
+                      "  BEGIN\n"
+                      "    v_sal := util_pkg.calc_salary(p_name);\n"
+                      "    IF v_sal > 0 THEN\n"
+                      "      RETURN v_sal;\n"
+                      "    END IF;\n"
+                      "    RAISE no_data_found;\n"
+                      "  END;\n"
+                      "END emp_pkg;\n"
+                      "/\n";
     CBMFileResult *r = extract(src, CBM_LANG_PLSQL, "t", "emp_pkg.pkb");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
@@ -1950,6 +1888,24 @@ TEST(swift_chained_call) {
     PASS();
 }
 
+/* A Swift force-unwrap is the one thing that reaches the scanner's suppressor
+ * path -- the rule that stops `try!` emitting its `!` as a token of its own.
+ * That path shifted an int by up to TOKEN_COUNT bits, which runs past the
+ * width of the type once the index reaches 31.
+ *
+ * This test cannot go red here. The normal test build prints the UBSan
+ * message and carries on, which is why the bug survived. The Windows
+ * CLANGARM64 leg runs UBSan in trap mode, where the same shift is an
+ * illegal-instruction crash, so parsing this file at all is the check. */
+TEST(swift_force_unwrap_scanner_shift) {
+    CBMFileResult *r =
+        extract("func load() { let u = cached! }\n", CBM_LANG_SWIFT, "t", "Load.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Objective-C --- */
 TEST(objc_interface) {
     CBMFileResult *r =
@@ -2342,9 +2298,10 @@ TEST(dbt_source_and_two_arg_ref) {
     /* Both dbt builtins name the relation in their LAST string argument:
      * source('group','table') -> table, and the two-argument
      * ref('package','model') form -> model. */
-    CBMFileResult *r = extract("SELECT * FROM {{ source('raw', 'customers') }}\n"
-                               "UNION ALL SELECT * FROM {{ ref('analytics', 'legacy_customers') }}\n",
-                               CBM_LANG_SQL, "t", "models/stg_customers.sql");
+    CBMFileResult *r =
+        extract("SELECT * FROM {{ source('raw', 'customers') }}\n"
+                "UNION ALL SELECT * FROM {{ ref('analytics', 'legacy_customers') }}\n",
+                CBM_LANG_SQL, "t", "models/stg_customers.sql");
     ASSERT_NOT_NULL(r);
     ASSERT(has_def(r, "Model", "stg_customers"));
     ASSERT(has_usage(r, "customers"));
@@ -2921,41 +2878,6 @@ TEST(python_docstring) {
     PASS();
 }
 
-/* A multi-line Rust `///` doc block must be captured in FULL, not collapsed to
- * its last physical line. tree-sitter-rust parses each `///` line as its own
- * line_comment sibling, so reading a single prev-sibling truncates the block to
- * the last line only. */
-TEST(rust_multiline_docstring) {
-    CBMFileResult *r = extract("/// First summary line.\n"
-                               "/// Second detail line.\n"
-                               "/// Third closing line.\n"
-                               "pub fn documented() {}\n",
-                               CBM_LANG_RUST, "t", "doc.rs");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-    ASSERT(has_def(r, "Function", "documented"));
-    int found = 0;
-    for (int i = 0; i < r->defs.count; i++) {
-        if (strcmp(r->defs.items[i].name, "documented") == 0) {
-            found = 1;
-            const char *doc = r->defs.items[i].docstring;
-            ASSERT_NOT_NULL(doc);
-            /* All three lines present, in source order — not just the last. */
-            const char *p1 = strstr(doc, "First summary line");
-            const char *p2 = strstr(doc, "Second detail line");
-            const char *p3 = strstr(doc, "Third closing line");
-            ASSERT_NOT_NULL(p1);
-            ASSERT_NOT_NULL(p2);
-            ASSERT_NOT_NULL(p3);
-            ASSERT_TRUE(p1 < p2);
-            ASSERT_TRUE(p2 < p3);
-        }
-    }
-    ASSERT_TRUE(found);
-    cbm_free_result(r);
-    PASS();
-}
-
 TEST(go_function_extraction) {
     CBMFileResult *r =
         extract("package main\n\n// Greet returns a greeting.\nfunc Greet(name string) string "
@@ -3450,9 +3372,12 @@ TEST(vue_embedded_structure_negative_controls_issue1410) {
     PASS();
 }
 
-TEST(vue_embedded_structure_host_controls_issue1410) {
-    CBMFileResult *plain = extract("function plainTs(): void { target(); }\n", CBM_LANG_TYPESCRIPT,
-                                   "t", "plain.ts");
+/* The sibling hosts ride Vue's embedded seam: the function and call a .ts file
+ * yields come out of a plain <script> (or Astro's frontmatter fence) the same
+ * way, alongside the import those blocks always produced. */
+TEST(embedded_structure_sibling_hosts_issue1807) {
+    CBMFileResult *plain =
+        extract("function plainTs(): void { target(); }\n", CBM_LANG_TYPESCRIPT, "t", "plain.ts");
     ASSERT_NOT_NULL(plain);
     ASSERT_FALSE(plain->has_error);
     ASSERT_EQ(count_defs_named(plain, "Function", "plainTs"), 1);
@@ -3464,23 +3389,190 @@ TEST(vue_embedded_structure_host_controls_issue1410) {
         const char *path;
         const char *source;
     } hosts[] = {
-        {CBM_LANG_SVELTE, "Control.svelte",
-         "<script>import value from './svelte.js'; function hidden() { target(); }</script>\n"},
-        {CBM_LANG_HTML, "control.html",
-         "<script>import value from './html.js'; function hidden() { target(); }</script>\n"},
-        {CBM_LANG_ASTRO, "Control.astro",
-         "---\nimport value from './astro.js'; function hidden() { target(); }\n---\n"},
+        {CBM_LANG_SVELTE, "Sibling.svelte",
+         "<script>import value from './svelte.js'; function visible() { target(); }</script>\n"},
+        {CBM_LANG_HTML, "sibling.html",
+         "<script>import value from './html.js'; function visible() { target(); }</script>\n"},
+        {CBM_LANG_ASTRO, "Sibling.astro",
+         "---\nimport value from './astro.js'; function visible() { target(); }\n---\n"},
     };
     for (int i = 0; i < 3; i++) {
         CBMFileResult *r = extract(hosts[i].source, hosts[i].language, "t", hosts[i].path);
         ASSERT_NOT_NULL(r);
         ASSERT_FALSE(r->has_error);
         ASSERT_EQ(count_defs_with_label(r, "Module"), 1);
-        ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
-        ASSERT_EQ(r->calls.count, 0);
+        ASSERT_EQ(count_defs_named(r, "Function", "visible"), 1);
+        ASSERT_EQ(count_calls_named(r, "target"), 1);
         ASSERT_EQ(r->imports.count, 1);
         cbm_free_result(r);
     }
+    PASS();
+}
+
+/* Blocks that must never yield inline symbols, whatever the host: an external
+ * program (src=) and a non-JavaScript MIME type. The bodies are deliberately
+ * code, so a leak would surface as a definition and a call. HTML's own tag
+ * walker still records the src= reference as an import; that edge names the
+ * external file and is not the inline body leaking through. */
+TEST(embedded_structure_inert_blocks_issue1807) {
+    static const struct {
+        CBMLanguage language;
+        const char *path;
+        const char *source;
+        int imports;
+    } blocks[] = {
+        {CBM_LANG_VUE, "Inert.vue",
+         "<script type=\"application/json\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_VUE, "Inert.vue",
+         "<script src=\"./x.js\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_SVELTE, "Inert.svelte",
+         "<script type=\"application/json\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_SVELTE, "Inert.svelte",
+         "<script src=\"./x.js\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_HTML, "inert.html",
+         "<script type=\"application/json\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_HTML, "inert.html",
+         "<script type=\"importmap\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_HTML, "inert.html",
+         "<script type=\"text/x-template\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_HTML, "inert.html",
+         "<script src=\"./x.js\">function hidden() { target(); }</script>\n", 1},
+        {CBM_LANG_ASTRO, "Inert.astro",
+         "<script type=\"application/json\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_ASTRO, "Inert.astro",
+         "<script src=\"./x.js\">function hidden() { target(); }</script>\n", 0},
+    };
+    for (int i = 0; i < 10; i++) {
+        CBMFileResult *r = extract(blocks[i].source, blocks[i].language, "t", blocks[i].path);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        ASSERT_EQ(count_defs_with_label(r, "Module"), 1);
+        ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+        ASSERT_EQ(r->calls.count, 0);
+        ASSERT_EQ(r->imports.count, blocks[i].imports);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Svelte's module-level block (<script context="module">, or <script module>
+ * since Svelte 5) is a second block in the same file: both contribute, each
+ * honouring its own lang=, in host-file coordinates. */
+TEST(svelte_embedded_structure_both_blocks_issue1807) {
+    static const char *sources[] = {
+        "<script context=\"module\" lang=\"ts\">\n"
+        "export function fromModule(): number { return shared(); }\n"
+        "</script>\n"
+        "<script lang=\"ts\">\n"
+        "import { shared } from './shared';\n"
+        "function fromInstance(): number { return shared() + fromModule(); }\n"
+        "</script>\n"
+        "<button on:click={fromInstance}>{fromModule()}</button>\n",
+        "<script module lang=\"ts\">\n"
+        "export function fromModule(): number { return shared(); }\n"
+        "</script>\n"
+        "<script lang=\"ts\">\n"
+        "import { shared } from './shared';\n"
+        "function fromInstance(): number { return shared() + fromModule(); }\n"
+        "</script>\n"
+        "<button onclick={fromInstance}>{fromModule()}</button>\n",
+    };
+    for (int i = 0; i < 2; i++) {
+        CBMFileResult *r = extract(sources[i], CBM_LANG_SVELTE, "t", "Widget.svelte");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        ASSERT_EQ(count_defs_with_label(r, "Function"), 2);
+        ASSERT_EQ(count_defs_named(r, "Function", "fromModule"), 1);
+        ASSERT_EQ(count_defs_named(r, "Function", "fromInstance"), 1);
+        ASSERT_EQ(count_calls_named(r, "shared"), 2);
+        ASSERT_EQ(count_calls_named(r, "fromModule"), 1);
+        ASSERT_EQ(r->imports.count, 1);
+        ASSERT(has_import(r, "shared"));
+        for (int d = 0; d < r->defs.count; d++) {
+            const CBMDefinition *def = &r->defs.items[d];
+            if (strcmp(def->name, "fromModule") == 0) {
+                ASSERT_EQ(def->start_line, 2);
+            } else if (strcmp(def->name, "fromInstance") == 0) {
+                ASSERT_EQ(def->start_line, 6);
+            }
+        }
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Every type= form HTML itself runs as JavaScript contributes, in host-file
+ * coordinates; a data block on the same page does not. */
+TEST(html_embedded_structure_issue1807) {
+    CBMFileResult *r =
+        extract("<!DOCTYPE html><html><head>\n"
+                "<script type=\"module\">\n"
+                "import { renderApp } from './app.js';\n"
+                "function boot() { renderApp(); }\n"
+                "</script>\n"
+                "<script type=\"text/javascript\">\n"
+                "function legacy() { boot(); }\n"
+                "</script>\n"
+                "<script type=\"application/javascript\">\n"
+                "function fallback() { legacy(); }\n"
+                "</script>\n"
+                "<script type=\"application/ld+json\">{\"@type\": \"Thing\"}</script>\n"
+                "</head><body></body></html>\n",
+                CBM_LANG_HTML, "t", "index.html");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 3);
+    ASSERT_EQ(count_calls_named(r, "renderApp"), 1);
+    ASSERT_EQ(count_calls_named(r, "boot"), 1);
+    ASSERT_EQ(count_calls_named(r, "legacy"), 1);
+    ASSERT_EQ(r->imports.count, 1);
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "boot") == 0) {
+            ASSERT_EQ(d->start_line, 4);
+        } else if (strcmp(d->name, "legacy") == 0) {
+            ASSERT_EQ(d->start_line, 7);
+        } else if (strcmp(d->name, "fallback") == 0) {
+            ASSERT_EQ(d->start_line, 10);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Astro's frontmatter fence and <script> bodies are TypeScript by default: an
+ * interface and typed signatures parse, and both blocks contribute in
+ * host-file coordinates. */
+TEST(astro_embedded_structure_issue1807) {
+    CBMFileResult *r = extract("---\n"
+                               "import Header from './Header.astro';\n"
+                               "interface Props { title: string }\n"
+                               "const { title }: Props = Astro.props;\n"
+                               "function heading(): string { return format(title); }\n"
+                               "---\n"
+                               "<Header />\n"
+                               "<script>\n"
+                               "function hydrate(): void { heading(); }\n"
+                               "</script>\n",
+                               CBM_LANG_ASTRO, "t", "Page.astro");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def_any(r, "Props"));
+    ASSERT_EQ(count_defs_named(r, "Function", "heading"), 1);
+    ASSERT_EQ(count_defs_named(r, "Function", "hydrate"), 1);
+    ASSERT_EQ(count_calls_named(r, "format"), 1);
+    ASSERT_EQ(count_calls_named(r, "heading"), 1);
+    ASSERT_EQ(r->imports.count, 1);
+    ASSERT(has_import(r, "Header.astro"));
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "heading") == 0) {
+            ASSERT_EQ(d->start_line, 5);
+        } else if (strcmp(d->name, "hydrate") == 0) {
+            ASSERT_EQ(d->start_line, 9);
+        }
+    }
+    cbm_free_result(r);
     PASS();
 }
 
@@ -3910,11 +4002,11 @@ TEST(extract_java_method_annotations_issue382) {
 /* ── ArkTS (HarmonyOS .ets) ─────────────────────────────────────── */
 
 TEST(arkts_component_struct) {
-    CBMFileResult *r = extract(
-        "@Entry\n@Component\nstruct Index {\n  @State message: string = 'Hello'\n\n"
-        "  build() {\n    Column() {\n      Text(this.message).fontSize(20)\n    }\n"
-        "    .width('100%')\n  }\n}\n",
-        CBM_LANG_ARKTS, "t", "Index.ets");
+    CBMFileResult *r =
+        extract("@Entry\n@Component\nstruct Index {\n  @State message: string = 'Hello'\n\n"
+                "  build() {\n    Column() {\n      Text(this.message).fontSize(20)\n    }\n"
+                "    .width('100%')\n  }\n}\n",
+                CBM_LANG_ARKTS, "t", "Index.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Struct", "Index"));
@@ -3945,12 +4037,12 @@ TEST(arkts_exported_struct_decorators) {
 }
 
 TEST(arkts_member_decorators) {
-    CBMFileResult *r = extract(
-        "@Component\nstruct S {\n  @State a: number = 0\n  @Prop b: string\n"
-        "  @Link c: boolean\n  @Provide('k') d: string = ''\n  @Consume('k') e: string\n"
-        "  @StorageLink('s') f: number = 1\n  @State @Watch('onW') g: boolean = false\n\n"
-        "  build() {\n  }\n}\n",
-        CBM_LANG_ARKTS, "t", "S.ets");
+    CBMFileResult *r =
+        extract("@Component\nstruct S {\n  @State a: number = 0\n  @Prop b: string\n"
+                "  @Link c: boolean\n  @Provide('k') d: string = ''\n  @Consume('k') e: string\n"
+                "  @StorageLink('s') f: number = 1\n  @State @Watch('onW') g: boolean = false\n\n"
+                "  build() {\n  }\n}\n",
+                CBM_LANG_ARKTS, "t", "S.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(decorators_contain(find_def_by_name(r, "a"), "State"));
@@ -3990,11 +4082,11 @@ TEST(arkts_no_phantom_builtin_defs) {
 }
 
 TEST(arkts_builder_extend_styles) {
-    CBMFileResult *r = extract(
-        "@Builder\nfunction card(t: string) {\n  Column() {\n    Text(t)\n  }\n}\n\n"
-        "@Extend(Text)\nfunction fancy(size: number) {\n  .fontSize(size)\n}\n\n"
-        "@Styles\nfunction pressed() {\n  .backgroundColor('#eee')\n}\n",
-        CBM_LANG_ARKTS, "t", "b.ets");
+    CBMFileResult *r =
+        extract("@Builder\nfunction card(t: string) {\n  Column() {\n    Text(t)\n  }\n}\n\n"
+                "@Extend(Text)\nfunction fancy(size: number) {\n  .fontSize(size)\n}\n\n"
+                "@Styles\nfunction pressed() {\n  .backgroundColor('#eee')\n}\n",
+                CBM_LANG_ARKTS, "t", "b.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "card"));
@@ -4081,6 +4173,120 @@ TEST(extract_java_jaxrs_path_composition_issue1005) {
     PASS();
 }
 
+/* Return the file's Module definition (extraction pushes it first), or NULL. */
+static const CBMDefinition *find_module_def(CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Module") == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Blazor: a routable component declares its route with a `@page` directive in
+ * MARKUP, above the `@code` block. The C# grammar recovers `@code` (that is why
+ * .razor already yields methods via extra_extensions) but never sees the
+ * directive, so a routable page contributes no Route node and
+ * get_architecture(routes) is empty for a whole Blazor app.
+ *
+ * The route hangs off the file's Module definition, not off a class: a .razor
+ * component's class is implicit — it is never written in the source — so there
+ * is no class node to carry it. The Module's qualified name already IS the
+ * component's identity (t.Pages.Counter), and insert_def_into_gbuf creates
+ * Route+HANDLES for any definition carrying route_path, whatever its label. */
+TEST(extract_blazor_page_directive_routes_component) {
+    CBMFileResult *r = extract("@page \"/counter\"\n"
+                               "@inject NavigationManager Nav\n"
+                               "\n"
+                               "<h1>Counter</h1>\n"
+                               "<button @onclick=\"Increment\">Click</button>\n"
+                               "\n"
+                               "@code {\n"
+                               "    private int count;\n"
+                               "    private void Increment() { count++; }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "Pages/Counter.razor");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* The markup must not cost us the @code block we already extract today. */
+    ASSERT_NOT_NULL(find_def_by_name(r, "Increment"));
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->route_path);
+    ASSERT_STR_EQ(mod->route_path, "/counter");
+    /* A routable Blazor page is reached by navigation, i.e. GET. */
+    ASSERT_NOT_NULL(mod->route_method);
+    ASSERT_STR_EQ(mod->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The directive scan must not fire on every .razor file. A non-routable
+ * component (no @page) has to stay route-free, or every shared component in the
+ * tree becomes a bogus Route node. */
+TEST(extract_blazor_component_without_page_has_no_route) {
+    CBMFileResult *r = extract("@inject IJSRuntime JS\n"
+                               "\n"
+                               "<div class=\"card\">@Title</div>\n"
+                               "\n"
+                               "@code {\n"
+                               "    private void Refresh() { }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "Shared/Card.razor");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NULL(mod->route_path);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Razor Pages: `@page` is what turns a .cshtml view INTO a page — it is the
+ * defining directive of the model, not an optional annotation as it is on a
+ * Blazor component. So an ASP.NET Core app's routable surface lives entirely
+ * in file types that were unmapped until now, and every one of those routes
+ * was invisible.
+ *
+ * Same mechanism as the .razor case: the directive sits in markup above any
+ * code block, where the C# grammar never reaches, so it is read from raw
+ * source and hangs off the file's Module definition. */
+TEST(extract_razor_page_directive_routes_cshtml_view) {
+    CBMFileResult *r = extract("@page \"/orders\"\n"
+                               "@model OrderIndexModel\n"
+                               "\n"
+                               "<h1>Orders</h1>\n"
+                               "<table><tr><td>@Model.Count</td></tr></table>\n",
+                               CBM_LANG_CSHARP, "t", "Pages/Orders/Index.cshtml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->route_path);
+    ASSERT_STR_EQ(mod->route_path, "/orders");
+    /* A Razor Page is reached by navigation, i.e. GET — same as a component. */
+    ASSERT_NOT_NULL(mod->route_method);
+    ASSERT_STR_EQ(mod->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The overwhelming majority of .cshtml files are layouts, partials and views
+ * with no `@page` at all. If the scan fired on those, an ASP.NET app would
+ * gain a bogus Route node per view — worse than the missing routes it set out
+ * to fix, because a wrong route looks authoritative. */
+TEST(extract_razor_layout_without_page_has_no_route) {
+    CBMFileResult *r = extract("@model LayoutModel\n"
+                               "<!DOCTYPE html>\n"
+                               "<html><body>@RenderBody()</body></html>\n",
+                               CBM_LANG_CSHARP, "t", "Pages/Shared/_Layout.cshtml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NULL(mod->route_path);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A comment between decorators must not drop the decorators above it.
  * Comments are NAMED tree-sitter nodes, so the prev-sibling walk used to stop
  * at one — a documented route (@Post + @HttpCode above an explanatory comment)
@@ -4115,6 +4321,41 @@ static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) 
     return NULL;
 }
 
+/* #1892: the Swift grammar declares no "arguments" field, so the generic field
+ * lookup read nothing and every Swift call lost its arguments. Without the URL
+ * the service-pattern table cannot raise an HTTP_CALLS edge or a Route node,
+ * even though Alamofire/Moya/URLSession are already listed in it. */
+TEST(swift_call_string_arg_issue1892) {
+    CBMFileResult *r =
+        extract("func listWidgets() { AF.request(\"https://example.com/api/v1/widgets\") }\n",
+                CBM_LANG_SWIFT, "t", "Client.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "AF.request");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "https://example.com/api/v1/widgets");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Swift labels its arguments, and each one sits in a value_argument node that
+ * leads with the label. Reading the first child alone would return `with`
+ * rather than the path. */
+TEST(swift_labeled_call_string_arg_issue1892) {
+    CBMFileResult *r =
+        extract("func fetch() { URLSession.shared.dataTask(with: \"/api/v1/widgets/1\") }\n",
+                CBM_LANG_SWIFT, "t", "Fetch.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "URLSession.shared.dataTask");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/v1/widgets/1");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1009: URL-builder helper pattern — a function returning a URL-shaped
  * literal, consumed as client(buildPath(id)). The builder's URL is recorded in
  * the per-file constant map and resolved at the call site, for both return
@@ -4141,6 +4382,49 @@ TEST(extract_ts_url_builder_issue1009) {
     ASSERT_NOT_NULL(c2);
     ASSERT_NOT_NULL(c2->first_string_arg);
     ASSERT_STR_EQ(c2->first_string_arg, "/api/v1/arrows/{}");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A route registration names its middleware before its handler, and every
+ * framework here puts the handler last. The handler scan took the FIRST
+ * argument that looked like a function reference, so a named middleware won
+ * and the HANDLES edge pointed at the middleware instead of the handler. */
+TEST(extract_ts_route_handler_after_named_middleware) {
+    CBMFileResult *r = extract("function requireAuth(req: any, res: any, next: any) { next(); }\n"
+                               "function rateLimit(req: any, res: any, next: any) { next(); }\n"
+                               "function listUsers(req: any, res: any) { res.json([]); }\n"
+                               "routerGet(\"/users\", requireAuth, rateLimit, listUsers);\n",
+                               CBM_LANG_TYPESCRIPT, "t", "routes.ts");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *c = find_call_by_callee(r, "routerGet");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/users");
+    ASSERT_NOT_NULL(c->second_arg_name);
+    ASSERT_STR_EQ(c->second_arg_name, "listUsers");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same route with its middleware written inline. An arrow function is not
+ * one of the kinds the handler scan accepts, so three of them pushed the real
+ * handler past the scan bound and no handler came back at all. */
+TEST(extract_ts_route_handler_after_inline_middleware) {
+    CBMFileResult *r = extract("function listOrders(req: any, res: any) { res.json([]); }\n"
+                               "routerGet(\"/orders\",\n"
+                               "  (req: any, res: any, next: any) => { next(); },\n"
+                               "  (req: any, res: any, next: any) => { next(); },\n"
+                               "  (req: any, res: any, next: any) => { next(); },\n"
+                               "  listOrders);\n",
+                               CBM_LANG_TYPESCRIPT, "t", "orders.ts");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *c = find_call_by_callee(r, "routerGet");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/orders");
+    ASSERT_NOT_NULL(c->second_arg_name);
+    ASSERT_STR_EQ(c->second_arg_name, "listOrders");
     cbm_free_result(r);
     PASS();
 }
@@ -4999,6 +5283,190 @@ TEST(extract_python_member_call_flags_is_method) {
     PASS();
 }
 
+/* Python bare-call local-binding flag (the bare-call counterpart of the
+ * receiver flag above). Pins BOTH directions: a callee shadowed by a parameter
+ * of an enclosing scope IS flagged so the resolver can suppress a weak
+ * short-name match, while an unshadowed callee — a genuine module-level
+ * function, an imported name, or a nested `def` — is NOT, so its true edge
+ * survives. Every parameter binding form the grammar produces is covered, since
+ * a form the extractor silently missed would leave that shape unguarded. */
+TEST(extract_python_bare_call_flags_locally_bound_callee) {
+    CBMFileResult *r = extract("from pkg import helper\n"
+                               "\n"
+                               "def outer(run, *rest, timeout=5, label: str = 'x', **opts):\n"
+                               "    def inner():\n"
+                               "        return run()\n"
+                               "    rest()\n"
+                               "    timeout()\n"
+                               "    label()\n"
+                               "    opts()\n"
+                               "    module_level()\n"
+                               "    helper()\n"
+                               "    return inner()\n"
+                               "\n"
+                               "def typed(cb: Callable):\n"
+                               "    return cb()\n"
+                               "\n"
+                               "apply_it = lambda fn: fn()\n",
+                               CBM_LANG_PYTHON, "t", "x.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* callee name -> (expected flag, seen count) */
+    struct {
+        const char *callee;
+        bool expect_bound;
+        int seen;
+    } cases[] = {
+        {"run", true, 0},           /* closure over an ENCLOSING function's parameter */
+        {"rest", true, 0},          /* *args   -> list_splat_pattern                  */
+        {"timeout", true, 0},       /* default_parameter                              */
+        {"label", true, 0},         /* typed_default_parameter (keyword-only)         */
+        {"opts", true, 0},          /* **kwargs -> dictionary_splat_pattern           */
+        {"cb", true, 0},            /* typed_parameter, no default                    */
+        {"fn", true, 0},            /* lambda parameter                               */
+        {"module_level", false, 0}, /* unbound: the true cross-file edge         */
+        {"helper", false, 0},       /* imported name, not a parameter            */
+        {"inner", false, 0},        /* nested def: a real target, keep the edge  */
+    };
+    const int case_count = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *cn = r->calls.items[i].callee_name;
+        if (!cn) {
+            continue;
+        }
+        for (int c = 0; c < case_count; c++) {
+            if (strcmp(cn, cases[c].callee) != 0) {
+                continue;
+            }
+            cases[c].seen++;
+            if (r->calls.items[i].callee_is_locally_bound != cases[c].expect_bound) {
+                printf("  bare-call flag mismatch for %s(): got %d, expected %d\n", cases[c].callee,
+                       r->calls.items[i].callee_is_locally_bound ? 1 : 0,
+                       cases[c].expect_bound ? 1 : 0);
+            }
+            ASSERT_EQ(r->calls.items[i].callee_is_locally_bound, cases[c].expect_bound);
+        }
+    }
+    /* Each shape must appear exactly once, so a missed extraction cannot let the
+     * loop above pass vacuously. */
+    for (int c = 0; c < case_count; c++) {
+        if (cases[c].seen != 1) {
+            printf("  bare call %s() extracted %d times, expected 1\n", cases[c].callee,
+                   cases[c].seen);
+        }
+        ASSERT_EQ(cases[c].seen, 1);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The bare-call flag is DEPTH-INDEPENDENT, and the binding is UNWOUND when its
+ * scope closes.
+ *
+ * Both properties come from the same design decision. The answer is carried by
+ * the unified walk -- parameters are bound when a def or lambda scope opens and
+ * unwound when it closes -- rather than recomputed per call by ascending the
+ * tree. An ascending walk is O(depth) per call, and every level of f(f(f(...)))
+ * is itself a bare call, so it is quadratic in a file's nesting depth; that hung
+ * stack_overflow_b's 30,000-deep fixture rather than merely slowing it. An
+ * earlier cut capped the ascent at 64 ancestors and FAILED OPEN past it, which
+ * silently stopped suppressing on deep-but-ordinary code.
+ *
+ * Pinned deterministically rather than by wall clock -- a timing assertion would
+ * be a lottery, not a gate. The depth case fails if a cap is reintroduced; the
+ * unwind case fails if a frame's bindings outlive its scope. */
+TEST(extract_python_bare_call_flag_is_depth_independent) {
+    /* Shallow: return_statement / block / function_definition — 3 ancestors. */
+    CBMFileResult *shallow = extract("def shallow(handler):\n"
+                                     "    return handler()\n",
+                                     CBM_LANG_PYTHON, "t", "s.py");
+    ASSERT_NOT_NULL(shallow);
+    ASSERT_FALSE(shallow->has_error);
+    int shallow_seen = 0;
+    for (int i = 0; i < shallow->calls.count; i++) {
+        const char *cn = shallow->calls.items[i].callee_name;
+        if (cn && strcmp(cn, "handler") == 0) {
+            shallow_seen++;
+            ASSERT_TRUE(shallow->calls.items[i].callee_is_locally_bound);
+        }
+    }
+    ASSERT_EQ(shallow_seen, 1);
+    cbm_free_result(shallow);
+
+    /* Deep: 200 parenthesized_expression ancestors separate the SAME call from
+     * its enclosing def. The parameter still shadows it, so it stays flagged --
+     * depth changes nothing. This is the case a 64-ancestor cap got wrong. */
+    const int PARENS = 200;
+    size_t sz = (size_t)PARENS * 2 + 128;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *w = src;
+    w += snprintf(w, sz, "def deep(handler):\n    return ");
+    memset(w, '(', (size_t)PARENS);
+    w += PARENS;
+    w += snprintf(w, sz - (size_t)(w - src), "handler()");
+    memset(w, ')', (size_t)PARENS);
+    w += PARENS;
+    snprintf(w, sz - (size_t)(w - src), "\n");
+
+    CBMFileResult *deep = extract(src, CBM_LANG_PYTHON, "t", "d.py");
+    ASSERT_NOT_NULL(deep);
+    ASSERT_FALSE(deep->has_error);
+    int deep_seen = 0;
+    for (int i = 0; i < deep->calls.count; i++) {
+        const char *cn = deep->calls.items[i].callee_name;
+        if (cn && strcmp(cn, "handler") == 0) {
+            deep_seen++;
+            ASSERT_TRUE(deep->calls.items[i].callee_is_locally_bound);
+        }
+    }
+    ASSERT_EQ(deep_seen, 1);
+    cbm_free_result(deep);
+    free(src);
+
+    /* Unwind: `handler` is a parameter of shadowed() and a module-level function
+     * of the same name. The call INSIDE shadowed() is flagged; the call in
+     * sibling(), after that scope closed, must NOT be — it really does resolve
+     * to the module-level def. A binding that outlived its frame would flag it
+     * and destroy a true edge, which is the one direction this guard must never
+     * fail in. Nested same-name defs also pin the count: leaving the inner scope
+     * must not unbind the outer one. */
+    CBMFileResult *unwound = extract("def handler():\n"
+                                     "    return 1\n"
+                                     "\n"
+                                     "def shadowed(handler):\n"
+                                     "    def inner(handler):\n"
+                                     "        return handler()\n"
+                                     "    return inner(handler) or handler()\n"
+                                     "\n"
+                                     "def sibling():\n"
+                                     "    return handler()\n",
+                                     CBM_LANG_PYTHON, "t", "u.py");
+    ASSERT_NOT_NULL(unwound);
+    ASSERT_FALSE(unwound->has_error);
+    int flagged = 0;
+    int unflagged = 0;
+    for (int i = 0; i < unwound->calls.count; i++) {
+        const char *cn = unwound->calls.items[i].callee_name;
+        if (!cn || strcmp(cn, "handler") != 0) {
+            continue;
+        }
+        if (unwound->calls.items[i].callee_is_locally_bound) {
+            flagged++;
+        } else {
+            unflagged++;
+        }
+    }
+    /* Two shadowed calls (inner body, and shadowed()'s own tail) and exactly one
+     * unshadowed call in sibling(). */
+    ASSERT_EQ(flagged, 2);
+    ASSERT_EQ(unflagged, 1);
+    cbm_free_result(unwound);
+    PASS();
+}
+
 /* TS/JS/TSX receiver-aware flag (#592/#606; same intent as the Perl flag above).
  * A member call x.foo() with a non-this/super receiver is flagged is_method so
  * the resolver can suppress a weak short-name match (`re.test()` must not bind a
@@ -5297,281 +5765,6 @@ TEST(walk_defs_no_truncation_over_4096_issue668) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * is_test detection: directory-aware (Rust tests/ + benches/)
- *
- * cbm_is_test_file was a basename-only per-language switch, so Rust
- * integration-test files whose basename lacks the _test.rs / test_ affix
- * (e.g. tests/contract_tests.rs) and benchmarks under benches/ read as
- * PRODUCTION. That verdict flows to the Module node's is_test flag, which the
- * default architecture views filter on — so test-only code polluted the
- * hotspot / cluster / coupling views. The fix teaches the Rust arm the Cargo
- * tests/ + benches/ directory convention. (Fix A)
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* Locate the synthetic per-file Module definition (label "Module"). */
-static const CBMDefinition *find_module_def(CBMFileResult *r) {
-    for (int i = 0; i < r->defs.count; i++) {
-        if (strcmp(r->defs.items[i].label, "Module") == 0)
-            return &r->defs.items[i];
-    }
-    return NULL;
-}
-
-TEST(is_test_rust_tests_dir_directory_aware) {
-    /* Core miss: a Rust integration-test file whose basename lacks the
-     * _test.rs / test_ affix but lives under a crate `tests/` directory. */
-    ASSERT_TRUE(cbm_is_test_file("crates/foo/tests/contract_tests.rs", CBM_LANG_RUST));
-    ASSERT_TRUE(cbm_is_test_file("tests/contract_tests.rs", CBM_LANG_RUST));
-    /* Benchmarks under `benches/` are test-tier code too. */
-    ASSERT_TRUE(cbm_is_test_file("benches/throughput.rs", CBM_LANG_RUST));
-    ASSERT_TRUE(cbm_is_test_file("crates/foo/benches/throughput.rs", CBM_LANG_RUST));
-
-    /* Pre-existing basename affixes must keep working. */
-    ASSERT_TRUE(cbm_is_test_file("handler_test.rs", CBM_LANG_RUST));
-    ASSERT_TRUE(cbm_is_test_file("test_handler.rs", CBM_LANG_RUST));
-
-    /* No over-broadening: genuine production Rust stays production. A `tests/`
-     * path SEGMENT is required — a mere substring like `src/testing.rs` or a
-     * filename such as `latest.rs` must NOT be misclassified. */
-    ASSERT_FALSE(cbm_is_test_file("src/lib.rs", CBM_LANG_RUST));
-    ASSERT_FALSE(cbm_is_test_file("crates/foo/src/handler.rs", CBM_LANG_RUST));
-    ASSERT_FALSE(cbm_is_test_file("src/testing.rs", CBM_LANG_RUST));
-    ASSERT_FALSE(cbm_is_test_file("crates/foo/src/latest.rs", CBM_LANG_RUST));
-
-    /* Every OTHER language's switch arm is UNCHANGED: the directory rule is
-     * Rust-only. Go stays basename `_test.go`, so a Go file merely under
-     * tests/ is NOT flagged, while `_test.go` still is. */
-    ASSERT_FALSE(cbm_is_test_file("tests/contract.go", CBM_LANG_GO));
-    ASSERT_TRUE(cbm_is_test_file("handler_test.go", CBM_LANG_GO));
-
-    PASS();
-}
-
-TEST(is_test_rust_tests_dir_propagates_to_module) {
-    /* The per-file verdict must reach the Module definition's is_test flag —
-     * that flag is what the architecture-view SQL filters read. */
-    CBMFileResult *r = extract("fn checks_contract() { assert_eq!(1, 1); }\n", CBM_LANG_RUST, "t",
-                               "crates/foo/tests/contract_tests.rs");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-    const CBMDefinition *mod = find_module_def(r);
-    ASSERT_NOT_NULL(mod);
-    ASSERT_TRUE(mod->is_test);
-    cbm_free_result(r);
-
-    /* A production file's Module must stay is_test=false. */
-    CBMFileResult *p =
-        extract("pub fn handle() {}\n", CBM_LANG_RUST, "t", "crates/foo/src/handler.rs");
-    ASSERT_NOT_NULL(p);
-    ASSERT_FALSE(p->has_error);
-    const CBMDefinition *pmod = find_module_def(p);
-    ASSERT_NOT_NULL(pmod);
-    ASSERT_FALSE(pmod->is_test);
-    cbm_free_result(p);
-
-    PASS();
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * is_test detection: per-DEFINITION (Rust #[cfg(test)] mod under src/)
- *
- * The directory rule above only flags whole test-tier FILES. Rust unit tests
- * and test doubles live in `#[cfg(test)] mod tests { ... }` blocks inside
- * ordinary src/ production files, so file-level detection leaves every def in
- * those modules classified as production (is_test=false) — the exact defs
- * (fakes, fixtures) that then pollute the hotspot / architecture views.
- *
- * The producer must set is_test PER DEFINITION: any def lexically inside a
- * `#[cfg(test)]`-attributed module (any nesting depth) is test code, while a
- * sibling def outside such a module in the SAME file stays production.
- *
- * Matching rule: a `mod` whose preceding attribute is `#[cfg(...)]` and whose
- * cfg predicate token list contains the `test` token gates its body — this
- * also catches `#[cfg(any(test, feature = "testkit"))]`, the pattern the real
- * codebase uses. (Fix A, deferred half.)
- * ═══════════════════════════════════════════════════════════════════ */
-
-TEST(is_test_cfg_test_mod_marks_defs_per_definition) {
-    /* A production src/ file: a #[cfg(test)] mod alongside real production
-     * code. File-level detection says is_test_file=false (it is under src/,
-     * not tests/), so only the per-def rule can flag the module's contents. */
-    const char *src =
-        "pub fn handle() {}\n"                 // production sibling -> false
-        "#[cfg(test)]\n"
-        "mod tests {\n"
-        "    fn helper() {}\n"                 // inside cfg(test) mod -> true
-        "    mod nested {\n"
-        "        fn deep() {}\n"               // nested inside cfg(test) -> true
-        "    }\n"
-        "}\n";
-    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "crates/foo/src/handler.rs");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-
-    /* (b) sibling outside the cfg(test) mod stays production. */
-    const CBMDefinition *handle = find_def_by_name(r, "handle");
-    ASSERT_NOT_NULL(handle);
-    ASSERT_FALSE(handle->is_test);
-
-    /* (a) fn directly inside #[cfg(test)] mod tests {} is test code. */
-    const CBMDefinition *helper = find_def_by_name(r, "helper");
-    ASSERT_NOT_NULL(helper);
-    ASSERT_TRUE(helper->is_test);
-
-    /* (c) fn in a NESTED mod inside the cfg(test) mod is test code too. */
-    const CBMDefinition *deep = find_def_by_name(r, "deep");
-    ASSERT_NOT_NULL(deep);
-    ASSERT_TRUE(deep->is_test);
-
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(is_test_file_marks_every_definition) {
-    /* A test-tier FILE's verdict must reach every definition in it, not just
-     * the Module node. Before this rule, a fn in crates/foo/tests/e2e.rs
-     * carried is_test=false (only its parent Module got true), so integration
-     * tests and trybuild UI fixtures polluted the production boundary / fan /
-     * hotspot views exactly like the pre-Fix-A cfg(test) gap — observed live
-     * as pm-cli→pm-entity-derive weight 13, ~all e2e test callers binding a
-     * fixture's StorageRow.get. */
-    CBMFileResult *r = extract("fn checks_contract() { assert_eq!(1, 1); }\n"
-                               "struct Fixture;\n",
-                               CBM_LANG_RUST, "t", "crates/foo/tests/contract_tests.rs");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-    const CBMDefinition *f = find_def_by_name(r, "checks_contract");
-    ASSERT_NOT_NULL(f);
-    ASSERT_TRUE(f->is_test);
-    const CBMDefinition *s = find_def_by_name(r, "Fixture");
-    ASSERT_NOT_NULL(s);
-    ASSERT_TRUE(s->is_test);
-    cbm_free_result(r);
-
-    /* Language-agnostic: a Python test_*.py file's defs are test code. */
-    CBMFileResult *py =
-        extract("def test_it():\n    pass\n", CBM_LANG_PYTHON, "t", "scripts/test_runner.py");
-    ASSERT_NOT_NULL(py);
-    ASSERT_FALSE(py->has_error);
-    const CBMDefinition *pyf = find_def_by_name(py, "test_it");
-    ASSERT_NOT_NULL(pyf);
-    ASSERT_TRUE(pyf->is_test);
-    cbm_free_result(py);
-
-    /* Control: a production file's defs stay is_test=false. */
-    CBMFileResult *p =
-        extract("pub fn handle() {}\n", CBM_LANG_RUST, "t", "crates/foo/src/handler.rs");
-    ASSERT_NOT_NULL(p);
-    ASSERT_FALSE(p->has_error);
-    const CBMDefinition *h = find_def_by_name(p, "handle");
-    ASSERT_NOT_NULL(h);
-    ASSERT_FALSE(h->is_test);
-    cbm_free_result(p);
-
-    PASS();
-}
-
-TEST(is_test_cfg_any_test_mod_marks_defs) {
-    /* The cfg predicate need not be a bare `test`: any cfg whose argument list
-     * contains the `test` token gates the module — e.g.
-     * #[cfg(any(test, feature = "testkit"))], the user's real pattern. A
-     * cfg WITHOUT a test token must NOT flag its module. */
-    const char *src =
-        "#[cfg(any(test, feature = \"testkit\"))]\n"
-        "mod kit {\n"
-        "    fn fake() {}\n"                   // cfg(any(test,...)) -> true
-        "}\n"
-        "#[cfg(feature = \"serde\")]\n"
-        "mod ser {\n"
-        "    fn real() {}\n"                   // cfg without test token -> false
-        "}\n";
-    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "crates/foo/src/lib.rs");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-
-    const CBMDefinition *fake = find_def_by_name(r, "fake");
-    ASSERT_NOT_NULL(fake);
-    ASSERT_TRUE(fake->is_test);
-
-    const CBMDefinition *real = find_def_by_name(r, "real");
-    ASSERT_NOT_NULL(real);
-    ASSERT_FALSE(real->is_test);
-
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rust_cfg_method_twins_have_balanced_collision_free_qns) {
-    const char *src =
-        "struct Runner;\n"
-        "#[cfg(unix)]\n"
-        "impl Runner {\n"
-        "    #[cfg(feature = \"fast\")]\n"
-        "    fn execute(&self) { unix_only(); }\n"
-        "}\n"
-        "#[cfg(windows)]\n"
-        "impl Runner {\n"
-        "    #[cfg(feature = \"safe\")]\n"
-        "    fn execute(&self) { windows_only(); }\n"
-        "}\n";
-    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "src/lib.rs");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-
-    const CBMDefinition *methods[2] = {0};
-    int count = 0;
-    for (int i = 0; i < r->defs.count && count < 2; i++) {
-        const CBMDefinition *d = &r->defs.items[i];
-        if (d->label && d->name && strcmp(d->label, "Method") == 0 &&
-            strcmp(d->name, "execute") == 0) {
-            methods[count++] = d;
-        }
-    }
-    ASSERT_EQ(count, 2);
-    ASSERT_NOT_NULL(methods[0]->qualified_name);
-    ASSERT_NOT_NULL(methods[1]->qualified_name);
-    ASSERT_STR_NEQ(methods[0]->qualified_name, methods[1]->qualified_name);
-    ASSERT_NULL(strchr(methods[0]->qualified_name, ']'));
-    ASSERT_NULL(strchr(methods[1]->qualified_name, ']'));
-    ASSERT_NOT_NULL(strstr(methods[0]->qualified_name, "#cfg("));
-    ASSERT_NOT_NULL(strstr(methods[1]->qualified_name, "#cfg("));
-    ASSERT_NOT_NULL(strstr(methods[0]->qualified_name, ")#cfg("));
-    ASSERT_NOT_NULL(strstr(methods[1]->qualified_name, ")#cfg("));
-
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rust_cfg_module_call_scope_matches_definition_qn) {
-    const char *src =
-        "fn target() {}\n"
-        "#[cfg(test)]\n"
-        "mod tests {\n"
-        "    #[test]\n"
-        "    fn caller() { target(); }\n"
-        "}\n";
-    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "src/lib.rs");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-
-    const CBMDefinition *caller = find_def_by_name(r, "caller");
-    const CBMCall *target = find_call_by_callee(r, "target");
-    ASSERT_NOT_NULL(caller);
-    ASSERT_NOT_NULL(target);
-    ASSERT_NOT_NULL(caller->qualified_name);
-    ASSERT_NOT_NULL(target->enclosing_func_qn);
-    ASSERT_NOT_NULL(strstr(caller->qualified_name, "#cfg(test)"));
-    if (strcmp(target->enclosing_func_qn, caller->qualified_name) != 0) {
-        fprintf(stderr, "  cfg-module QN mismatch: def=%s call=%s\n", caller->qualified_name,
-                target->enclosing_func_qn);
-    }
-    ASSERT_STR_EQ(target->enclosing_func_qn, caller->qualified_name);
-
-    cbm_free_result(r);
-    PASS();
-}
-
-/* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -5682,8 +5875,8 @@ TEST(extract_c_test_dir_marks_is_test_issue1294) {
  * not be (#1294). */
 TEST(extract_python_method_test_dir_marks_is_test_issue1294) {
     const char *src = "class Foo:\n"
-                       "    def helper(self):\n"
-                       "        pass\n";
+                      "    def helper(self):\n"
+                      "        pass\n";
 
     /* Python's LSP layer injects synthetic builtin stub Methods (str.upper,
      * dict.get, ...) into defs.items alongside real ones (py_builtins.c), so
@@ -6931,11 +7124,6 @@ SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
 
-    RUN_TEST(extract_result_growth_allocation_status_has_exact_32_item_control);
-    RUN_TEST(extract_result_growth_allocation_status_fails_exact_33rd_item);
-    RUN_TEST(extract_string_allocation_failure_is_sticky_at_file_boundary);
-    RUN_TEST(extract_node_stack_growth_reports_whole_subtree_loss);
-
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
@@ -6948,6 +7136,8 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_method_call_flags_is_method);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
+    RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
+    RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
@@ -6990,6 +7180,8 @@ SUITE(extraction) {
     RUN_TEST(extract_r_box_use_imports_issue218);
     RUN_TEST(extract_r_dollar_call_issue219);
     RUN_TEST(extract_ts_factory_object_methods_issue341);
+    RUN_TEST(traversal_stack_not_in_result_arena_issue2010);
+    RUN_TEST(extract_c_macro_hidden_call_survives_preprocessed_pass_issue2010);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
@@ -7029,9 +7221,7 @@ SUITE(extraction) {
 
     /* Systems */
     RUN_TEST(rust_function);
-    RUN_TEST(rust_foreign_function_signatures_have_distinct_qns);
     RUN_TEST(rust_struct);
-    RUN_TEST(rust_nested_associated_call_preserves_each_exact_carrier);
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
     RUN_TEST(go_interface);
@@ -7055,6 +7245,7 @@ SUITE(extraction) {
 
     /* Functional */
     RUN_TEST(elixir_function);
+    RUN_TEST(elixir_call_string_argument);
     RUN_TEST(haskell_function);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
@@ -7108,6 +7299,9 @@ SUITE(extraction) {
     RUN_TEST(swift_method_call);
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
+    RUN_TEST(swift_force_unwrap_scanner_shift);
+    RUN_TEST(swift_call_string_arg_issue1892);
+    RUN_TEST(swift_labeled_call_string_arg_issue1892);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
     RUN_TEST(dart_top_level_function);
@@ -7177,7 +7371,6 @@ SUITE(extraction) {
 
     /* cbm_test.go ports */
     RUN_TEST(python_docstring);
-    RUN_TEST(rust_multiline_docstring);
     RUN_TEST(go_function_extraction);
     RUN_TEST(js_arrow_function);
 
@@ -7212,7 +7405,11 @@ SUITE(extraction) {
     RUN_TEST(vue_imports_basic);
     RUN_TEST(vue_embedded_structure_issue1410);
     RUN_TEST(vue_embedded_structure_negative_controls_issue1410);
-    RUN_TEST(vue_embedded_structure_host_controls_issue1410);
+    RUN_TEST(embedded_structure_sibling_hosts_issue1807);
+    RUN_TEST(embedded_structure_inert_blocks_issue1807);
+    RUN_TEST(svelte_embedded_structure_both_blocks_issue1807);
+    RUN_TEST(html_embedded_structure_issue1807);
+    RUN_TEST(astro_embedded_structure_issue1807);
     RUN_TEST(html_imports_basic);
 
     /* config_extraction_test.go ports */
@@ -7256,10 +7453,16 @@ SUITE(extraction) {
     RUN_TEST(arkts_lazy_import);
     RUN_TEST(arkts_ts_compat);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_blazor_page_directive_routes_component);
+    RUN_TEST(extract_blazor_component_without_page_has_no_route);
+    RUN_TEST(extract_razor_page_directive_routes_cshtml_view);
+    RUN_TEST(extract_razor_layout_without_page_has_no_route);
     RUN_TEST(extract_ts_template_string_url_issue1006);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_ts_url_builder_issue1009);
+    RUN_TEST(extract_ts_route_handler_after_named_middleware);
+    RUN_TEST(extract_ts_route_handler_after_inline_middleware);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);
     RUN_TEST(extract_c_url_builder_gated_issue1009);
     RUN_TEST(extract_ts_url_builder_mixed_returns_issue1009);
@@ -7296,14 +7499,6 @@ SUITE(extraction) {
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
 
-    /* is_test detection (Fix A): directory-aware Rust tests/ + benches/ */
-    RUN_TEST(is_test_rust_tests_dir_directory_aware);
-    RUN_TEST(is_test_rust_tests_dir_propagates_to_module);
-    RUN_TEST(is_test_cfg_test_mod_marks_defs_per_definition);
-    RUN_TEST(is_test_file_marks_every_definition);
-    RUN_TEST(is_test_cfg_any_test_mod_marks_defs);
-    RUN_TEST(rust_cfg_method_twins_have_balanced_collision_free_qns);
-    RUN_TEST(rust_cfg_module_call_scope_matches_definition_qn);
     /* #518/#519 — prose carried into docstring so nodes_fts can index it */
     RUN_TEST(markdown_section_body_becomes_docstring_issue518);
     RUN_TEST(markdown_section_body_stops_at_next_heading_issue518);

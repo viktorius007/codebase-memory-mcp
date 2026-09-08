@@ -21,8 +21,6 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pass_ensemble_routing.h"
 #include "pipeline/worker_pool.h"
-#include "lsp/rust_cargo.h"
-#include "lsp/rust_lsp.h"
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
 #include "store/store.h"
@@ -185,7 +183,6 @@ struct cbm_pipeline {
     cbm_file_error_t *file_errors;
     int file_errors_count;
     int file_errors_cap;
-    bool file_error_capture_failed;
 
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
@@ -211,20 +208,6 @@ struct cbm_pipeline {
      * finds no rows and correctly falls back to a full rebuild. */
     cbm_lsp_surface_row_t *surface_rows;
     int surface_row_count;
-
-    /* Generation-owned Rust semantic health, captured while result arenas are
-     * still alive and published with the graph/manifest in the same stage. */
-    cbm_coverage_row_t *rust_health_rows;
-    int rust_health_row_count;
-    int rust_health_row_cap;
-    int rust_files_total;
-    int rust_files_capture_expected;
-    int rust_files_captured;
-    bool rust_health_capture_failed;
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    bool test_fail_coverage_alloc;
-    int test_file_error_alloc_position;
-#endif
 
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
@@ -361,203 +344,6 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
     p->surface_row_count = count;
 }
 
-static void pipeline_clear_rust_health_rows(cbm_pipeline_t *p) {
-    if (!p) {
-        return;
-    }
-    for (int i = 0; i < p->rust_health_row_count; i++) {
-        free((char *)p->rust_health_rows[i].rel_path);
-        free((char *)p->rust_health_rows[i].detail);
-    }
-    free(p->rust_health_rows);
-    p->rust_health_rows = NULL;
-    p->rust_health_row_count = 0;
-    p->rust_health_row_cap = 0;
-    p->rust_files_captured = 0;
-    p->rust_health_capture_failed = false;
-}
-
-static int pipeline_count_rust_files(const cbm_file_info_t *files, int count) {
-    int total = 0;
-    for (int i = 0; files && i < count; i++) {
-        total += files[i].language == CBM_LANG_RUST;
-    }
-    return total;
-}
-
-void cbm_pipeline_begin_rust_health_capture(cbm_pipeline_t *p, const cbm_file_info_t *files,
-                                            int count, bool whole_generation) {
-    if (!p) {
-        return;
-    }
-    pipeline_clear_rust_health_rows(p);
-    p->rust_files_capture_expected = pipeline_count_rust_files(files, count);
-    if (whole_generation) {
-        p->rust_files_total = p->rust_files_capture_expected;
-    }
-}
-
-static const char *rust_status_name(CBMRustAnalysisStatus status) {
-    switch (status) {
-    case CBM_RUST_ANALYSIS_COMPLETE:
-        return "complete";
-    case CBM_RUST_ANALYSIS_PARTIAL:
-        return "partial";
-    case CBM_RUST_ANALYSIS_FAILED:
-        return "failed";
-    }
-    return "failed";
-}
-
-static char *pipeline_rust_health_json(const CBMRustAnalysisHealth *health,
-                                       CBMRustAnalysisStatus status) {
-    char buf[CBM_SZ_4K];
-    int n = snprintf(buf, sizeof(buf),
-                     "{\"version\":1,\"status\":\"%s\",\"required_routes\":%u,"
-                     "\"completed_routes\":%u,\"resolved_emitted\":%u,"
-                     "\"unresolved_emitted\":%u,\"issues\":[",
-                     rust_status_name(status), health->required_routes, health->completed_routes,
-                     health->resolved_emitted, health->unresolved_emitted);
-    if (n < 0 || (size_t)n >= sizeof(buf)) {
-        return NULL;
-    }
-    size_t used = (size_t)n;
-    bool comma = false;
-    for (int reason = 0; reason < CBM_RUST_HEALTH_REASON_COUNT; reason++) {
-        const CBMRustHealthIssue *issue = &health->issues[reason];
-        if (issue->count == 0) {
-            continue;
-        }
-        n = snprintf(buf + used, sizeof(buf) - used,
-                     "%s{\"reason\":\"%s\",\"count\":%u,\"first_start_byte\":%u,"
-                     "\"first_end_byte\":%u}",
-                     comma ? "," : "", cbm_rust_health_reason_name((CBMRustHealthReason)reason),
-                     issue->count, issue->first_start_byte, issue->first_end_byte);
-        if (n < 0 || (size_t)n >= sizeof(buf) - used) {
-            return NULL;
-        }
-        used += (size_t)n;
-        comma = true;
-    }
-    if (used + 3 > sizeof(buf)) {
-        return NULL;
-    }
-    memcpy(buf + used, "]}", 3);
-    return strdup(buf);
-}
-
-void cbm_pipeline_capture_rust_health(cbm_pipeline_t *p, const char *rel_path,
-                                      const CBMRustAnalysisHealth *source_health) {
-    if (!p || !rel_path) {
-        return;
-    }
-    CBMRustAnalysisHealth health = {0};
-    if (source_health) {
-        health = *source_health;
-    } else {
-        cbm_rust_health_record(&health, CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
-    }
-    health.required_routes |= CBM_RUST_HEALTH_ROUTE_SINGLE_FILE | CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-    p->rust_files_captured++;
-    CBMRustAnalysisStatus status = cbm_rust_health_status(&health);
-    if (status == CBM_RUST_ANALYSIS_COMPLETE) {
-        return;
-    }
-    if (p->rust_health_row_count >= p->rust_health_row_cap) {
-        int next = p->rust_health_row_cap ? p->rust_health_row_cap * 2 : 16;
-        cbm_coverage_row_t *grown = realloc(p->rust_health_rows, (size_t)next * sizeof(*grown));
-        if (!grown) {
-            p->rust_health_capture_failed = true;
-            return;
-        }
-        p->rust_health_rows = grown;
-        p->rust_health_row_cap = next;
-    }
-    char *path = strdup(rel_path);
-    char *detail = pipeline_rust_health_json(&health, status);
-    if (!path || !detail) {
-        free(path);
-        free(detail);
-        p->rust_health_capture_failed = true;
-        return;
-    }
-    p->rust_health_rows[p->rust_health_row_count++] = (cbm_coverage_row_t){
-        .rel_path = path,
-        .kind =
-            status == CBM_RUST_ANALYSIS_PARTIAL ? "analysis_partial:rust" : "analysis_failed:rust",
-        .detail = detail,
-    };
-}
-
-void cbm_pipeline_capture_rust_cache(cbm_pipeline_t *p, const cbm_file_info_t *files, int count,
-                                     CBMFileResult *const *cache) {
-    CBMRustAnalysisHealth manifest_health = {0};
-    if (p && pipeline_count_rust_files(files, count) > 0) {
-        CBMArena cargo_arena;
-        CBMCargoManifest cargo_manifest;
-        cbm_arena_init(&cargo_arena);
-        (void)cbm_pxc_build_rust_manifest(p->repo_path, &cargo_arena, &cargo_manifest);
-        manifest_health = cargo_manifest.health;
-        cbm_arena_destroy(&cargo_arena);
-    }
-    for (int i = 0; p && files && i < count; i++) {
-        if (files[i].language == CBM_LANG_RUST) {
-            CBMRustAnalysisHealth health = {0};
-            if (cache && cache[i]) {
-                health = cache[i]->rust_health;
-            } else if (files[i].size == 0) {
-                health.required_routes =
-                    CBM_RUST_HEALTH_ROUTE_SINGLE_FILE | CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-                health.completed_routes = health.required_routes;
-            } else {
-                cbm_rust_health_record(&health, CBM_RUST_HEALTH_SOURCE_UNAVAILABLE, 0, 0);
-            }
-            cbm_rust_health_merge(&health, &manifest_health);
-            cbm_pipeline_capture_rust_health(p, files[i].rel_path, &health);
-        }
-    }
-}
-
-cbm_coverage_row_t *cbm_pipeline_alloc_coverage_rows(cbm_pipeline_t *p, int count) {
-    if (!p || count <= 0) {
-        return NULL;
-    }
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    if (p->test_fail_coverage_alloc) {
-        return NULL;
-    }
-#endif
-    return malloc((size_t)count * sizeof(cbm_coverage_row_t));
-}
-
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-void cbm_pipeline_test_fail_coverage_alloc(cbm_pipeline_t *p, bool fail) {
-    if (p) {
-        p->test_fail_coverage_alloc = fail;
-    }
-}
-#endif
-
-void cbm_pipeline_get_rust_health(const cbm_pipeline_t *p, const cbm_coverage_row_t **rows,
-                                  int *row_count, const char **recording_status,
-                                  int *rust_files_total) {
-    if (rows) {
-        *rows = p ? p->rust_health_rows : NULL;
-    }
-    if (row_count) {
-        *row_count = p ? p->rust_health_row_count : 0;
-    }
-    if (recording_status) {
-        *recording_status = p && !p->rust_health_capture_failed &&
-                                    p->rust_files_captured == p->rust_files_capture_expected
-                                ? "complete"
-                                : "unknown";
-    }
-    if (rust_files_total) {
-        *rust_files_total = p ? p->rust_files_total : -1;
-    }
-}
-
 void cbm_pipeline_free(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -588,7 +374,6 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     cbm_store_free_lsp_surfaces(p->surface_rows, p->surface_row_count);
     p->surface_rows = NULL;
     p->surface_row_count = 0;
-    pipeline_clear_rust_health_rows(p);
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
@@ -667,69 +452,28 @@ static char *fe_strdup(const char *s) {
     return d;
 }
 
-static bool pipeline_file_error_test_allows_alloc(cbm_pipeline_t *p) {
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    if (p && p->test_file_error_alloc_position > 0 && --p->test_file_error_alloc_position == 0) {
-        return false;
-    }
-#else
-    (void)p;
-#endif
-    return true;
-}
-
-void cbm_pipeline_mark_file_error_capture_failed(cbm_pipeline_t *p) {
-    if (p) {
-        p->file_error_capture_failed = true;
-    }
-}
-
-bool cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
                                  const char *phase) {
     if (!p) {
-        return false;
-    }
-    char *path_copy = pipeline_file_error_test_allows_alloc(p) ? fe_strdup(path) : NULL;
-    char *reason_copy = pipeline_file_error_test_allows_alloc(p) ? fe_strdup(reason) : NULL;
-    char *phase_copy = pipeline_file_error_test_allows_alloc(p) ? fe_strdup(phase) : NULL;
-    if ((path && !path_copy) || (reason && !reason_copy) || (phase && !phase_copy)) {
-        free(path_copy);
-        free(reason_copy);
-        free(phase_copy);
-        p->file_error_capture_failed = true;
-        return false;
+        return;
     }
     if (p->file_errors_count >= p->file_errors_cap) {
         int ncap = p->file_errors_cap ? p->file_errors_cap * 2 : 16;
         cbm_file_error_t *grown =
-            pipeline_file_error_test_allows_alloc(p)
-                ? (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown))
-                : NULL;
+            (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown));
         if (!grown) {
-            free(path_copy);
-            free(reason_copy);
-            free(phase_copy);
-            p->file_error_capture_failed = true;
-            return false;
+            /* Never abort indexing just to record a skip — drop this record. */
+            return;
         }
         p->file_errors = grown;
         p->file_errors_cap = ncap;
     }
     cbm_file_error_t *e = &p->file_errors[p->file_errors_count];
-    e->path = path_copy;
-    e->reason = reason_copy;
-    e->phase = phase_copy;
+    e->path = fe_strdup(path);
+    e->reason = fe_strdup(reason);
+    e->phase = fe_strdup(phase);
     p->file_errors_count++;
-    return true;
 }
-
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-void cbm_pipeline_test_fail_file_error_alloc_at(cbm_pipeline_t *p, int position) {
-    if (p) {
-        p->test_file_error_alloc_position = position;
-    }
-}
-#endif
 
 void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count) {
     if (out) {
@@ -738,10 +482,6 @@ void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **ou
     if (count) {
         *count = p ? p->file_errors_count : 0;
     }
-}
-
-bool cbm_pipeline_file_error_capture_complete(const cbm_pipeline_t *p) {
-    return p && !p->file_error_capture_failed;
 }
 
 void cbm_pipeline_get_ignored(const cbm_pipeline_t *p, cbm_ignored_file_t **out, int *count,
@@ -903,17 +643,6 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         }
     }
 
-    /* Collect workspace members (manifest directory → declared package name) so
-     * every File node can carry its TRUE package identity as a "pkg" property.
-     * This is what lets the store label a member by its manifest name regardless
-     * of directory layout — a crate at xtask/ whose [package] name is "buildtool"
-     * reads as "buildtool", not the "src" QN segment. Reuses the pkgmap manifest
-     * parsers (no new parsing); repos with no manifests collect zero members and
-     * pay only one bounded directory walk. */
-    cbm_pkg_members_t members;
-    cbm_pkg_members_init(&members);
-    cbm_pkgmap_collect_members(p->repo_path, &members);
-
     /* Collect unique directories and create Folder/Package nodes */
     CBMHashTable *seen_dirs = cbm_ht_create(CBM_SZ_256);
 
@@ -931,15 +660,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
 
         char props[CBM_SZ_256];
         const char *ext = strrchr(basename, '.');
-        const char *pkg = cbm_pkg_members_lookup(&members, rel);
-        if (pkg && pkg[0]) {
-            char pkg_esc[CBM_SZ_128];
-            cbm_json_escape(pkg_esc, sizeof(pkg_esc), pkg);
-            snprintf(props, sizeof(props), "{\"extension\":\"%s\",\"pkg\":\"%s\"}", ext ? ext : "",
-                     pkg_esc);
-        } else {
-            snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
-        }
+        snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
 
         const char *qualified_name = file_qn;
         const char *file_path = rel;
@@ -984,7 +705,6 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     /* Free seen_dirs keys */
     cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
     cbm_ht_free(seen_dirs);
-    cbm_pkg_members_free(&members);
 
     cbm_log_info("pass.done", "pass", "structure", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)),
                  "edges", itoa_buf(cbm_gbuf_edge_count(p->gbuf)));
@@ -1170,190 +890,6 @@ static bool route_sr_denied(const CBMStringRef *sr) {
     return is_upstream_config_key(sr->key_path);
 }
 
-/* ── Cross-file Rust #[cfg(test)] mod propagation ────────────────────
- *
- * A file's defs are extracted in isolation, so a module gated by a
- * #[cfg(test)]-style attribute on its DECLARATION in the PARENT file
- * (`#[cfg(any(test, feature="testkit"))] pub mod fakes;`) is invisible to the
- * child file's own extraction — every def in the fakes/ files indexes is_test=false.
- * Test-gating is transitive: once `fakes` is test, every module it declares
- * (`mod decision_store;` in fakes/mod.rs) is test too, whether or not that inner
- * declaration repeats the attribute. This step runs after all files are
- * extracted and their nodes are in the graph — the only point with the whole
- * file set in view — seeds a worklist from gated declarations, BFS-marks the
- * transitive child-file closure, then flips is_test on those files' def nodes. */
-
-/* Resolve the directory that a Rust source file's inline modules live under.
- * For dir/mod.rs, dir/lib.rs, dir/main.rs the module dir IS `dir`; for any
- * other dir/stem.rs it is `dir/stem` (the `dir.rs` + `dir/` sibling layout).
- * Writes up to buflen bytes (no trailing slash); returns false on overflow. */
-static bool rust_module_dir_for_file(const char *rel_path, char *buf, size_t buflen) {
-    const char *slash = strrchr(rel_path, '/');
-    const char *base = slash ? slash + SKIP_ONE : rel_path;
-    size_t dir_len = slash ? (size_t)(slash - rel_path) : 0;
-
-    /* stem = basename without the ".rs" extension */
-    const char *dot = strrchr(base, '.');
-    size_t stem_len = dot ? (size_t)(dot - base) : strlen(base);
-
-    bool base_is_entry = (stem_len == 3 && strncmp(base, "mod", 3) == 0) ||
-                         (stem_len == 3 && strncmp(base, "lib", 3) == 0) ||
-                         (stem_len == 4 && strncmp(base, "main", 4) == 0);
-
-    if (base_is_entry) {
-        if (dir_len >= buflen) {
-            return false;
-        }
-        memcpy(buf, rel_path, dir_len);
-        buf[dir_len] = '\0';
-        return true;
-    }
-    /* dir/stem  (dir may be empty for a crate-root file like `foo.rs`) */
-    size_t need = dir_len + (dir_len ? 1 : 0) + stem_len;
-    if (need >= buflen) {
-        return false;
-    }
-    size_t p = 0;
-    if (dir_len) {
-        memcpy(buf, rel_path, dir_len);
-        p = dir_len;
-        buf[p++] = '/';
-    }
-    memcpy(buf + p, base, stem_len);
-    buf[p + stem_len] = '\0';
-    return true;
-}
-
-/* Given a declaring file and a child module name, resolve the two candidate
- * child files (`<moduledir>/<child>.rs` and `<moduledir>/<child>/mod.rs`) and,
- * for each that exists in path_to_idx, mark it test and enqueue it. */
-/* Mark the file at rel_path (if present in path_to_idx) test and enqueue it. */
-static void rust_mark_candidate(const char *cand, const CBMHashTable *path_to_idx, char *marked,
-                                int *queue, int *qtail) {
-    void *slot = cbm_ht_get(path_to_idx, cand);
-    if (!slot) {
-        return;
-    }
-    int idx = (int)(intptr_t)slot - 1; /* stored as idx+1 to keep non-NULL */
-    if (!marked[idx]) {
-        marked[idx] = 1;
-        queue[(*qtail)++] = idx;
-    }
-}
-
-static void rust_resolve_and_mark_child(const char *decl_rel, const CBMModDecl *md,
-                                        const CBMHashTable *path_to_idx, char *marked, int *queue,
-                                        int *qtail) {
-    char cand[CBM_PATH_MAX];
-
-    /* `#[path = "FILE"]` overrides the default mapping: FILE is relative to the
-     * declaring file's own directory. */
-    if (md->path_override && md->path_override[0]) {
-        const char *slash = strrchr(decl_rel, '/');
-        size_t dir_len = slash ? (size_t)(slash - decl_rel) : 0;
-        int n = dir_len ? snprintf(cand, sizeof(cand), "%.*s/%s", (int)dir_len, decl_rel,
-                                   md->path_override)
-                        : snprintf(cand, sizeof(cand), "%s", md->path_override);
-        if (n > 0 && (size_t)n < sizeof(cand)) {
-            rust_mark_candidate(cand, path_to_idx, marked, queue, qtail);
-        }
-        return;
-    }
-
-    /* Default Cargo mapping: <moduledir>/<child>.rs OR <moduledir>/<child>/mod.rs. */
-    char moddir[CBM_PATH_MAX];
-    if (!rust_module_dir_for_file(decl_rel, moddir, sizeof(moddir))) {
-        return;
-    }
-    const char *fmts[] = {"%s/%s.rs", "%s/%s/mod.rs"};
-    /* A crate-root moduledir is empty (""); avoid a leading "/". */
-    for (int f = 0; f < 2; f++) {
-        int n = moddir[0]
-                    ? snprintf(cand, sizeof(cand), fmts[f], moddir, md->child_name)
-                    : snprintf(cand, sizeof(cand), f == 0 ? "%s.rs" : "%s/mod.rs", md->child_name);
-        if (n <= 0 || (size_t)n >= sizeof(cand)) {
-            continue;
-        }
-        rust_mark_candidate(cand, path_to_idx, marked, queue, qtail);
-    }
-}
-
-static void cbm_pipeline_propagate_cfg_test_modules(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
-                                                    CBMFileResult **result_cache, int file_count) {
-    if (file_count <= 0) {
-        return;
-    }
-    /* rel_path → (idx+1). +1 so a real index 0 stays a non-NULL value. */
-    CBMHashTable *path_to_idx = cbm_ht_create((uint32_t)file_count * 2 + 1);
-    for (int i = 0; i < file_count; i++) {
-        if (result_cache[i] && files[i].rel_path) {
-            cbm_ht_set(path_to_idx, files[i].rel_path, (void *)(intptr_t)(i + 1));
-        }
-    }
-
-    char *marked = (char *)calloc((size_t)file_count, sizeof(char));
-    int *queue = (int *)calloc((size_t)file_count, sizeof(int));
-    if (!marked || !queue) {
-        free(marked);
-        free(queue);
-        cbm_ht_free(path_to_idx);
-        return;
-    }
-    int qhead = 0, qtail = 0;
-
-    /* Seed: every GATED bodyless declaration marks its child file(s). */
-    for (int i = 0; i < file_count; i++) {
-        CBMFileResult *r = result_cache[i];
-        if (!r) {
-            continue;
-        }
-        for (int d = 0; d < r->mod_decls.count; d++) {
-            if (r->mod_decls.items[d].is_cfg_test_gated) {
-                rust_resolve_and_mark_child(files[i].rel_path, &r->mod_decls.items[d], path_to_idx,
-                                            marked, queue, &qtail);
-            }
-        }
-    }
-
-    /* BFS: a marked file's OWN declarations (gated or not) mark their children —
-     * the whole subtree under a gated module is test code. */
-    while (qhead < qtail) {
-        int i = queue[qhead++];
-        CBMFileResult *r = result_cache[i];
-        if (!r) {
-            continue;
-        }
-        for (int d = 0; d < r->mod_decls.count; d++) {
-            rust_resolve_and_mark_child(files[i].rel_path, &r->mod_decls.items[d], path_to_idx,
-                                        marked, queue, &qtail);
-        }
-    }
-
-    /* Flip is_test on the marked files' def nodes. */
-    CBMHashTable *marked_paths = cbm_ht_create((uint32_t)qtail * 2 + 1);
-    int marked_count = 0;
-    for (int i = 0; i < file_count; i++) {
-        if (marked[i] && files[i].rel_path) {
-            cbm_ht_set(marked_paths, files[i].rel_path, (void *)1);
-            marked_count++;
-        }
-    }
-    int flipped = marked_count ? cbm_gbuf_mark_test_files(gbuf, marked_paths) : 0;
-    cbm_ht_free(marked_paths);
-
-    if (marked_count) {
-        char f_buf[CBM_SZ_16];
-        char n_buf[CBM_SZ_16];
-        snprintf(f_buf, sizeof(f_buf), "%d", marked_count);
-        snprintf(n_buf, sizeof(n_buf), "%d", flipped);
-        cbm_log_info("cfg_test.propagate", "files", f_buf, "defs_flipped", n_buf);
-    }
-
-    free(marked);
-    free(queue);
-    cbm_ht_free(path_to_idx);
-}
-
 static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
                                               CBMFileResult **result_cache, int file_count) {
     /* DENY-WINS-BY-VALUE: the same URL is often extracted as several string_refs
@@ -1468,74 +1004,23 @@ static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_i
     return cbm_pipeline_pass_lsp_cross(ctx, files, file_count, ctx->result_cache);
 }
 
-static bool pipeline_macro_manifest_dir(const char *rel_path, char *dir, size_t capacity) {
-    const char *suffix = "Cargo.toml";
-    size_t path_len = rel_path ? strlen(rel_path) : 0;
-    size_t suffix_len = strlen(suffix);
-    if (path_len < suffix_len || strcmp(rel_path + path_len - suffix_len, suffix) != 0 ||
-        (path_len > suffix_len && rel_path[path_len - suffix_len - 1] != '/'))
-        return false;
-    size_t dir_len = path_len - suffix_len;
-    if (dir_len > 0 && rel_path[dir_len - 1] == '/')
-        dir_len--;
-    if (dir_len >= capacity)
-        return false;
-    memcpy(dir, rel_path, dir_len);
-    dir[dir_len] = '\0';
-    return true;
-}
-
-static char *pipeline_read_macro_source(const char *path, int *source_len) {
-    FILE *file = cbm_fopen(path, "rb");
-    if (!file)
-        return NULL;
-    fseek(file, 0, SEEK_END);
-    long size = ftell(file);
-    rewind(file);
-    char *source = size >= 0 ? malloc((size_t)size + 1) : NULL;
-    if (source) {
-        size_t read = fread(source, 1, (size_t)size, file);
-        source[read] = '\0';
-        *source_len = (int)read;
-    }
-    (void)fclose(file);
-    return source;
-}
-
-static void pipeline_collect_exported_rust_macros(CBMMacroTable *table,
-                                                  const cbm_file_info_t *files, int count) {
-    for (int i = 0; i < count; i++) {
-        if (files[i].language != CBM_LANG_RUST || !files[i].path || !files[i].rel_path)
-            continue;
-        int source_len = 0;
-        char *source = pipeline_read_macro_source(files[i].path, &source_len);
-        if (!source)
-            continue;
-        if (strstr(source, "macro_export")) {
-            const char *package_dir =
-                cbm_macro_table_rust_package_for_path(table, files[i].rel_path);
-            cbm_rust_collect_exported_macro_rules(table, source, source_len,
-                                                  package_dir ? package_dir : "");
-        }
-        free(source);
-    }
-}
-
-/* Build the project macro table used by ObjectScript and Rust extraction. */
+/* Run the sequential pipeline path: definitions, k8s, lsp_cross, calls, usages, semantic. */
+/* Build the ObjectScript $$$macro table from .inc include files in the repo.
+ * Returns NULL (and does no work) when no ObjectScript include files exist.
+ * Caller owns the returned heap table (free via cbm_macro_table_free). */
 CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
                                                 const char *repo_path) {
     (void)repo_path;
     bool has_inc = false;
-    bool has_rust = false;
     for (int i = 0; i < count; i++) {
-        has_rust = has_rust || files[i].language == CBM_LANG_RUST;
         if (files[i].language == CBM_LANG_OBJECTSCRIPT_ROUTINE && files[i].path &&
             (strrchr(files[i].path, '.') != NULL &&
              strcmp(strrchr(files[i].path, '.'), ".inc") == 0)) {
             has_inc = true;
+            break;
         }
     }
-    if (!has_inc && !has_rust) {
+    if (!has_inc) {
         return NULL;
     }
 
@@ -1545,19 +1030,7 @@ CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, in
     }
 
     cbm_arena_init(&mt->arena);
-    if (has_inc)
-        cbm_macro_table_init_system(mt);
-
-    for (int i = 0; i < count; i++) {
-        char package_dir[CBM_SZ_4K];
-        if (files[i].rel_path &&
-            pipeline_macro_manifest_dir(files[i].rel_path, package_dir, sizeof(package_dir)))
-            cbm_macro_table_add_rust_package(mt, package_dir);
-    }
-    if (has_rust && mt->rust_package_count == 0)
-        cbm_macro_table_add_rust_package(mt, "");
-    if (has_rust)
-        pipeline_collect_exported_rust_macros(mt, files, count);
+    cbm_macro_table_init_system(mt);
 
     for (int i = 0; i < count; i++) {
         if (files[i].language != CBM_LANG_OBJECTSCRIPT_ROUTINE) {
@@ -1620,7 +1093,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     } seq_passes[] = {
         {cbm_pipeline_pass_definitions, "definitions", false},
         {cbm_pipeline_pass_k8s, "k8s", true},
-        {seq_pass_lsp_cross_dispatch, "lsp_cross", false},
+        {seq_pass_lsp_cross_dispatch, "lsp_cross", true},
         {cbm_pipeline_pass_calls, "calls", false},
         {cbm_pipeline_pass_usages, "usages", false},
         {cbm_pipeline_pass_semantic, "semantic", false},
@@ -1645,10 +1118,8 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (seq_cache && rc == 0) {
         cbm_pipeline_extract_infra_routes(p->gbuf, files, seq_cache, file_count);
         cbm_pipeline_process_infra_bindings(p->gbuf, files, seq_cache, file_count);
-        cbm_pipeline_propagate_cfg_test_modules(p->gbuf, files, seq_cache, file_count);
     }
     if (seq_cache) {
-        cbm_pipeline_capture_rust_cache(p, files, file_count, seq_cache);
         for (int i = 0; i < file_count; i++) {
             if (seq_cache[i]) {
                 cbm_free_result(seq_cache[i]);
@@ -1776,47 +1247,15 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     char **def_modules = NULL;
     int def_count = 0;
-    CBMPxcCollectStatus def_collect_status = CBM_PXC_COLLECT_EMPTY;
     CBMLSPDef *all_defs = NULL;
     int *def_starts = NULL;
-    CBMArena rust_collect_manifest_arena;
-    CBMCargoManifest rust_collect_manifest;
-    const CBMCargoManifest *rust_collect_manifest_ptr = NULL;
-    bool rust_collect_manifest_arena_live = false;
     if (run_cross_lsp) {
-        for (int i = 0; i < file_count; i++) {
-            if (cache[i] && files[i].language == CBM_LANG_RUST) {
-                cbm_arena_init(&rust_collect_manifest_arena);
-                rust_collect_manifest_arena_live = true;
-                if (cbm_pxc_build_rust_manifest(ctx->repo_path, &rust_collect_manifest_arena,
-                                                &rust_collect_manifest)) {
-                    rust_collect_manifest_ptr = &rust_collect_manifest;
-                }
-                break;
-            }
-        }
         def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
         def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
-        if (def_modules) {
-            all_defs = cbm_pxc_collect_all_defs(ctx, cache, files, file_count, ctx->project_name,
-                                                def_modules, &def_count, &def_collect_status,
-                                                def_starts, rust_collect_manifest_ptr);
-        } else {
-            def_collect_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
-        }
-    }
-    if (rust_collect_manifest_arena_live) {
-        cbm_arena_destroy(&rust_collect_manifest_arena);
-    }
-    if (def_collect_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
-        for (int i = 0; i < file_count; i++) {
-            if (cache[i] && files[i].language == CBM_LANG_RUST) {
-                cache[i]->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-                cache[i]->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-                cbm_rust_health_record(&cache[i]->rust_health,
-                                       CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
-            }
-        }
+        all_defs = def_modules
+                       ? cbm_pxc_collect_all_defs(ctx, cache, files, file_count, ctx->project_name,
+                                                  def_modules, &def_count, def_starts)
+                       : NULL;
     }
     /* Serialize per-file LSP surfaces NOW — the result cache dies with this
      * pass, and the rows are what lets an incremental run detect body-only
@@ -1887,21 +1326,12 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
          * first NULL-filter rust file (the amplifier files) inside cbm_parallel_resolve
          * — repos whose rust files all filter to subsets never pay the build/RSS. */
     }
-    cbm_pxc_test_poison_non_rust_registry(&cross_lsp_arena);
-    bool non_rust_registry_failed =
-        cbm_arena_status(&cross_lsp_arena) != CBM_ARENA_STATUS_AVAILABLE;
-    if (cbm_arena_status(&cross_lsp_arena) != CBM_ARENA_STATUS_AVAILABLE) {
-        memset(&cross_registries, 0, sizeof(cross_registries));
-    }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("lsp_cross_prepare");
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    rc = non_rust_registry_failed
-             ? CBM_NOT_FOUND
-             : cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, files,
-                                    cache, file_count, all_defs, def_count, def_collect_status,
-                                    def_modules, module_def_index, &cross_registries);
+    rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
+                              def_count, def_modules, module_def_index, &cross_registries);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("parallel_resolve");
@@ -1917,8 +1347,6 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
     cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
-    cbm_pipeline_propagate_cfg_test_modules(p->gbuf, files, cache, file_count);
-    cbm_pipeline_capture_rust_cache(p, files, file_count, cache);
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
             cbm_free_result(cache[i]);
@@ -2361,31 +1789,6 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     cbm_project_t project_info = {0};
     bool have_project_info =
         cbm_store_get_project(store, generation->project, &project_info) == CBM_STORE_OK;
-    /* The byte writer creates the projects row but intentionally does not
-     * create store_meta. Historically a later missed-coverage graph rebuild
-     * happened to call upsert_project, so clean generations (and generations
-     * containing only analysis_* health rows) stayed permanently "legacy"
-     * and could not mint resumable cursors. Make the current generation
-     * explicit in the sealed stage itself. A failed/cancelled stage is still
-     * discarded before the atomic rename, so live project and coverage
-     * metadata cannot advance independently. */
-    if (ok && have_project_info) {
-        char previous_generation[96];
-        ok = cbm_store_generation(store, previous_generation, sizeof(previous_generation)) ==
-             CBM_STORE_OK;
-        ok = ok && cbm_store_upsert_project(store, generation->project, project_info.root_path) ==
-                       CBM_STORE_OK;
-        cbm_project_free_fields(&project_info);
-        memset(&project_info, 0, sizeof(project_info));
-        char published_generation[96];
-        ok = ok &&
-             cbm_store_generation(store, published_generation, sizeof(published_generation)) ==
-                 CBM_STORE_OK &&
-             strcmp(published_generation, "legacy") != 0 &&
-             strcmp(published_generation, previous_generation) != 0;
-        have_project_info =
-            ok && cbm_store_get_project(store, generation->project, &project_info) == CBM_STORE_OK;
-    }
     cbm_log_info("publish.timing", "block", "get_project", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
@@ -2393,7 +1796,7 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     meta.generation = have_project_info ? project_info.indexed_at : NULL;
     meta.coverage_version = CBM_SEMANTIC_INDEX_VERSION;
     meta.hash_records_complete = true;
-    if (!ok || !have_project_info ||
+    if (!have_project_info ||
         cbm_store_coverage_replace_ex(store, generation->project, generation->coverage,
                                       generation->coverage_count, &meta) != CBM_STORE_OK) {
         ok = false;
@@ -2411,6 +1814,16 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
         ok = false;
     }
     cbm_log_info("publish.timing", "block", "fts", "elapsed_ms", itoa_buf((int)elapsed_ms(t_pub)));
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
+    /* This is the shared commit tail for complete rebuilds and isolated
+     * deltas. Stamp only after every graph/metadata/FTS mutation: a fresh
+     * staging file receives a new uid, while a cloned delta keeps its uid and
+     * advances the mutation counter. A failure discards the private stage. */
+    if (ok && cbm_store_generation_advance(store) != CBM_STORE_OK) {
+        ok = false;
+    }
+    cbm_log_info("publish.timing", "block", "generation", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
     if (ok && !cbm_store_check_integrity(store)) {
         ok = false;
@@ -2570,20 +1983,14 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
-    const cbm_coverage_row_t *rust_cov = NULL;
-    int rust_cov_count = 0;
-    const char *rust_recording_status = NULL;
-    int rust_files_total = -1;
-    cbm_pipeline_get_rust_health(p, &rust_cov, &rust_cov_count, &rust_recording_status,
-                                 &rust_files_total);
-    int cov_total = p->file_errors_count + p->excluded_count + p->ignored_count + rust_cov_count;
+    int cov_total = p->file_errors_count + p->excluded_count + p->ignored_count;
     cbm_coverage_row_t *cov = NULL;
     int cov_count = 0;
-    bool coverage_rows_available = cov_total == 0 && !p->file_error_capture_failed;
+    bool coverage_rows_available = cov_total == 0;
     if (cov_total > 0) {
-        cov = cbm_pipeline_alloc_coverage_rows(p, cov_total);
+        cov = malloc((size_t)cov_total * sizeof(*cov));
         if (cov) {
-            coverage_rows_available = !p->file_error_capture_failed;
+            coverage_rows_available = true;
             for (int i = 0; i < p->file_errors_count; i++) {
                 cov[cov_count++] = (cbm_coverage_row_t){.rel_path = p->file_errors[i].path,
                                                         .kind = p->file_errors[i].phase,
@@ -2598,9 +2005,6 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
                 cov[cov_count++] = (cbm_coverage_row_t){.rel_path = p->ignored_files[i].rel_path,
                                                         .kind = "not_indexed_file",
                                                         .detail = p->ignored_files[i].reason};
-            }
-            for (int i = 0; i < rust_cov_count; i++) {
-                cov[cov_count++] = rust_cov[i];
             }
         }
     }
@@ -2625,9 +2029,6 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
                 .ignored_files_total = p->ignored_total,
                 .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
                 .hash_records_complete = true,
-                .rust_analysis_recording_status =
-                    coverage_rows_available ? rust_recording_status : "unknown",
-                .rust_files_total = rust_files_total,
             },
         .surface_rows = p->surface_rows,
         .surface_row_count = p->surface_row_count,
@@ -2762,7 +2163,6 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 /* Run structure + extraction passes (parallel or sequential). */
 static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                 const cbm_file_info_t *files, int file_count) {
-    cbm_pipeline_begin_rust_health_capture(p, files, file_count, true);
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     CBM_PROF_START(t_struct);
@@ -2857,9 +2257,6 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         rc = CBM_NOT_FOUND;
         goto cleanup;
     }
-    /* Discovery owns the exact generation-wide Rust denominator even when an
-     * incremental route later re-analyzes only a changed subset. */
-    cbm_pipeline_begin_rust_health_capture(p, files, file_count, true);
 
     /* Snapshot every semantic input once before routing/extraction. The same
      * bytes drive exact no-op comparison and are checked against a fresh

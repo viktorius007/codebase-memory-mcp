@@ -75,17 +75,19 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 
 ## Local source patches (applied atop pinned upstream)
 
-The grammars below carry a small local source patch on top of the pinned
-upstream commit recorded in the vendoring table below. Re-vendoring from
-upstream must re-apply these.
+The grammars below carry a small local patch to their vendored sources, on
+top of the pinned upstream commit recorded in the vendoring table below.
+Re-vendoring from upstream must re-apply these, unless the reason column
+names an upstream commit that already carries the change — then drop the
+row instead.
 
 | grammar | location | patch | reason |
 |---|---|---|---|
 | crystal    | `crystal/scanner.c`, serialize    | guard `memcpy(&buffer[offset], state->literals.contents, literal_content_size)` with `if (literal_content_size > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source on the empty-state serialize round-trip (formal UB, harmless) |
 | rescript   | `rescript/scanner.c`, deserialize | guard `memcpy(state, buffer, n_bytes)` with `if (n_bytes > 0)` | UBSan: zero-length `memcpy` with a NULL `buffer` / `n_bytes == 0` on empty-state deserialize (formal UB, harmless). The sibling serialize copies a fixed `sizeof(ScannerState)` (always > 0, non-NULL src) and needs no guard. |
 | purescript | `purescript/scanner.c`, serialize | guard `memcpy(buffer, indents->data, to_copy)` with `if (to_copy > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source when the indent vector is empty (formal UB, harmless) |
-| rust | `rust/grammar.patch`, SHA-256 `49e90abe4cc013e7239348509c8c0c636b0c728964d300dd17a0617da6d1d42b` | apply to official `tree-sitter/tree-sitter-rust` `77a3747266f4d621d0757825e6b11edcbf991ca5`, then generate with `tree-sitter-cli 0.26.7 --abi 15` | Carries upstream PR #256's Rust 2024 foreign-item safety grammar and only PR #301's attributed struct-pattern-field hunk. The generated parser is reproducible with `scripts/vendor-grammar.sh`; no scanner or AST-contract redesign is included. |
 | plsql      | `plsql/parser.c`, include         | `#include <tree_sitter/parser.h>` → `#include "tree_sitter/parser.h"` | The older ABI-14 generator emits angle brackets; every other vendored grammar uses the quoted form, which resolves the per-grammar `tree_sitter/` header from the including file's directory |
+| swift      | `swift/scanner.c`, `OP_SYMBOL_SUPPRESSOR` + `eat_operators` | `1UL <<` / `1 <<` → `1ULL <<` | UBSan: `1 << suppressor` shifts an `int` by up to `TOKEN_COUNT` bits, undefined once the index reaches 31, while the mask it feeds is `uint64_t`. `1UL << FAKE_TRY_BANG` is the same defect on Windows, where `unsigned long` is 32 bits and `FAKE_TRY_BANG` is 32; the CLANGARM64 leg runs UBSan in trap mode, so there it is an illegal instruction rather than a log line. Upstream already carries both changes: `fb63a7004f07` (2026-04-06, upstream #558) for `eat_operators`, `6ab8d1d74ebd` (2026-08-10) for the `OP_SYMBOL_SUPPRESSOR` entry. Our pin `8abb3e8b3325` (2026-03-20) predates both, so this is a backport rather than a local invention — a re-vendor past 2026-08-10 should delete this row, not re-apply it |
 
 ## Vendored from verified upstream
 
@@ -198,7 +200,7 @@ upstream must re-apply these.
 | ron | 14 | tree-sitter-grammars/tree-sitter-ron | `78938553b930` | VERIFIED-BOTH | ✅ |
 | rst | 14 | stsewd/tree-sitter-rst | `4e562e1598b9` | VERIFIED-BOTH | ✅ |
 | ruby | 14 | tree-sitter/tree-sitter-ruby | `ad907a69da0c` | VERIFIED-BOTH | ✅ |
-| rust | 15 | tree-sitter/tree-sitter-rust | `77a3747266f4` | PINNED-PATCHED | ✅ |
+| rust | 15 | tree-sitter/tree-sitter-rust | `77a3747266f4` | VERIFIED-BOTH | ✅ |
 | scala | 15 | tree-sitter/tree-sitter-scala | `14c5cfd2b8e0` | VERIFIED-BOTH | ✅ |
 | scheme | 14 | 6cdh/tree-sitter-scheme | `c6cb7c7d7a04` | VERIFIED-BOTH | ✅ |
 | scss | 14 | serenadeai/tree-sitter-scss | `c478c6868648` | MISMATCH | ✅ |

@@ -128,10 +128,15 @@ static cbm_store_t *lrp_open_indexed(LRP_Proj *lp) {
      * last one. */
     free(lp->project);
     lp->project = cbm_project_name_from_path(lp->tmpdir);
-    if (!lp->project) return NULL;
-    /* Resolve THROUGH the production resolver so the runner's
-     * CBM_CACHE_DIR isolation applies (never the user's real cache). */
-    th_cache_db_path(lp->dbpath, sizeof(lp->dbpath), lp->project);
+    if (!lp->project)
+        return NULL;
+    const char *home = getenv("HOME");
+    if (!home)
+        home = "/tmp";
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    cbm_mkdir(cache_dir);
+    snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
     if (!lp->srv)
@@ -828,14 +833,11 @@ TEST(lrp_rust_s6_trait_method) {
     /* Trait Display is defined in display.rs; Dog implements it in dog.rs.
      * run() in main.rs calls d.show() on a Dog where show() comes from the trait. */
     static const LRP_File f[] = {
-        {"display.rs",
-         "pub trait Display {\n    fn show(&self) -> String;\n}\n"},
-        {"dog.rs",
-         "use crate::display::Display;\n\npub struct Dog { pub name: String }\n\n"
-         "impl Display for Dog {\n"
-         "    fn show(&self) -> String { self.name.clone() }\n}\n"},
-        {"main.rs",
-         "mod display;\nmod dog;\n\nfn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
+        {"display.rs", "pub trait Display {\n    fn show(&self) -> String;\n}\n"},
+        {"dog.rs", "mod display;\n\npub struct Dog { pub name: String }\n\n"
+                   "impl display::Display for Dog {\n"
+                   "    fn show(&self) -> String { self.name.clone() }\n}\n"},
+        {"main.rs", "mod dog;\n\nfn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
     /* RED: d.show() on &Dog requires knowing Dog implements Display and that
      * show() maps to Dog's impl — needs lsp_cross + trait resolution. */
     ASSERT_TRUE(lrp_assert_calls(f, 3, 1, "rust/S6/trait_method", 0));

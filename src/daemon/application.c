@@ -62,7 +62,6 @@ enum {
     APPLICATION_BACKGROUND_REAP_MS = 10000,
     APPLICATION_UPDATE_VERSION_CAP = 128,
     APPLICATION_UPDATE_NOTICE_CAP = 1024,
-    APPLICATION_OVERSIZE_MESSAGE_CAP = 512,
 };
 
 /* There is deliberately NO production update-check provider. The daemon used to
@@ -373,6 +372,11 @@ static bool application_regular_db_exists(const char *project) {
     }
     struct stat status;
     return stat(path, &status) == 0 && S_ISREG(status.st_mode);
+}
+
+static bool application_canonical_directory_exists(const char *path) {
+    cbm_path_info_t info = {0};
+    return cbm_path_info_utf8(path, &info) == 0 && info.is_directory;
 }
 
 static cbm_daemon_application_watch_t *application_find_watch_locked(
@@ -1584,6 +1588,33 @@ static bool application_index_args_normalize_defaults(yyjson_mut_val *root) {
     return true;
 }
 
+/* One directory is one root. The auto-index job spells repo_path the way the
+ * session policy holds it - the platform's native form, backslashes on
+ * Windows - while an explicit index_repository request arrives in the
+ * handler's forward-slash spelling. Compared byte-exact the two never matched
+ * on Windows, and the request was refused as an options conflict instead of
+ * joining the job already running for its root. The policy keeps its
+ * spelling: the sensitive-root and allowed-root containment checks match it
+ * byte-exact against HOME and the granted roots, and respelling it there
+ * admitted $HOME. So the fold happens here, on this comparison's private copy,
+ * and nothing the daemon stores changes. */
+static bool application_index_args_fold_repo_path(yyjson_mut_doc *document) {
+    yyjson_mut_val *root = yyjson_mut_doc_get_root(document);
+    yyjson_mut_val *repo_path = yyjson_mut_obj_get(root, "repo_path");
+    if (!repo_path || !yyjson_mut_is_str(repo_path)) {
+        return true;
+    }
+    char *folded = strdup(yyjson_mut_get_str(repo_path));
+    if (!folded) {
+        return false;
+    }
+    cbm_normalize_path_sep(folded);
+    yyjson_mut_val *key = yyjson_mut_str(document, "repo_path");
+    yyjson_mut_val *value = yyjson_mut_strcpy(document, folded);
+    free(folded);
+    return key && value && yyjson_mut_obj_replace(root, key, value);
+}
+
 static bool application_index_args_equal(const char *left, const char *right) {
     if (!left || !right) {
         return false;
@@ -1596,12 +1627,18 @@ static bool application_index_args_equal(const char *left, const char *right) {
     yyjson_mut_val *right_root = right_copy ? yyjson_mut_doc_get_root(right_copy) : NULL;
     bool equal = application_index_args_normalize_defaults(left_root) &&
                  application_index_args_normalize_defaults(right_root) &&
+                 application_index_args_fold_repo_path(left_copy) &&
+                 application_index_args_fold_repo_path(right_copy) &&
                  yyjson_mut_equals(left_root, right_root);
     yyjson_mut_doc_free(left_copy);
     yyjson_mut_doc_free(right_copy);
     yyjson_doc_free(left_source);
     yyjson_doc_free(right_source);
     return equal;
+}
+
+bool cbm_daemon_application_index_args_equal_for_test(const char *left, const char *right) {
+    return application_index_args_equal(left, right);
 }
 
 /* Caller holds application->mutex. Keeping watcher ownership validation and
@@ -2031,25 +2068,6 @@ static void application_background_initialize(cbm_daemon_application_session_t *
                               memory_order_release);
 }
 
-/* A result the daemon cannot frame is a REPORTABLE outcome, not a transport
- * fault: the handler already succeeded, so the only thing missing is a way to
- * say so. Substituting a bounded MCP error envelope for the unsendable payload
- * keeps the caller — usually an agent that sees one line of output and cannot
- * ask a follow-up question — able to tell "your result was too big" from "the
- * daemon died", and tells it what to change. The alternative (dropping to
- * HANDLER_ERROR) is the collapse this exists to prevent. */
-static char *application_oversize_result(const char *tool, size_t response_length) {
-    char message[APPLICATION_OVERSIZE_MESSAGE_CAP];
-    (void)snprintf(message, sizeof(message),
-                   "result too large to return: %.64s produced %zu bytes, over the %u-byte daemon "
-                   "response limit. The query itself succeeded — only the payload is unsendable. "
-                   "Narrow it and retry: return fewer or shorter fields, lower the row limit, or "
-                   "add a filter.",
-                   tool && tool[0] ? tool : "this request", response_length,
-                   (unsigned)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX);
-    return cbm_mcp_text_result(message, true);
-}
-
 static bool application_jsonrpc_success(const char *response) {
     yyjson_doc *document = response ? yyjson_read(response, strlen(response), 0) : NULL;
     yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
@@ -2374,9 +2392,7 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     if (canonical && allowed_present) {
         canonical = cbm_canonical_path(allowed, canonical_allowed, sizeof(canonical_allowed));
     }
-    struct stat root_status;
-    canonical =
-        canonical && stat(canonical_root, &root_status) == 0 && S_ISDIR(root_status.st_mode);
+    canonical = canonical && application_canonical_directory_exists(canonical_root);
     bool set =
         canonical && cbm_mcp_server_set_session_context(session->mcp, canonical_root,
                                                         allowed_present ? canonical_allowed : NULL);
@@ -2539,23 +2555,15 @@ static cbm_daemon_runtime_application_status_t application_tool_request(
         return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     }
     char *response = cbm_mcp_handle_tool(session->mcp, tool, args);
+    free(tool);
     free(args);
     if (!response) {
-        free(tool);
         return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
     }
     size_t response_length = strlen(response);
-    if (response_length > CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX) {
-        char *oversize = application_oversize_result(tool, response_length);
+    if (response_length > UINT32_MAX) {
         free(response);
-        free(tool);
-        if (!oversize) {
-            return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
-        }
-        response = oversize;
-        response_length = strlen(response);
-    } else {
-        free(tool);
+        return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
     }
     *response_out = (uint8_t *)response;
     *response_length_out = (uint32_t)response_length;
@@ -3397,9 +3405,8 @@ static int application_background_index(cbm_daemon_application_t *application,
         return -1;
     }
     char canonical_root[APPLICATION_PATH_CAP];
-    struct stat root_status;
     if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root)) ||
-        stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+        !application_canonical_directory_exists(canonical_root)) {
         return -1;
     }
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);

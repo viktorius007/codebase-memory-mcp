@@ -220,13 +220,7 @@ static int varint_len(int64_t value) {
 
 // SQLite serial type for a TEXT value
 static int64_t text_serial_type(int len) {
-    return ((int64_t)len * PAIR_LEN) + TEXT_SERIAL_BASE;
-}
-
-// Test seam: exposes the file-static text_serial_type so its 64-bit numeric
-// contract can be asserted directly, without constructing a ~1 GiB TEXT value.
-int64_t cbm_text_serial_type_for_test(int len) {
-    return text_serial_type(len);
+    return (len * PAIR_LEN) + TEXT_SERIAL_BASE;
 }
 
 // SQLite serial type for an integer value

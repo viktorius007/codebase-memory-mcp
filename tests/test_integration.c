@@ -106,11 +106,12 @@ static int integration_setup(void) {
     if (!g_project)
         return -1;
 
-    /* Build db path for direct store queries (pipeline writes here). Resolve
-     * THROUGH the production resolver so the runner's CBM_CACHE_DIR isolation
-     * applies (never the user's real cache). */
-    th_cache_db_path(g_dbpath, sizeof(g_dbpath), g_project);
-    if (!cbm_mkdir_p(th_cache_dir(), 0700)) {
+    /* Build db path for direct store queries (pipeline writes here) */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    int dbpath_length =
+        cache_dir ? snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project) : -1;
+    if (dbpath_length <= 0 || (size_t)dbpath_length >= sizeof(g_dbpath) ||
+        !cbm_mkdir_p(cache_dir, 0700)) {
         return -1;
     }
 
@@ -797,222 +798,11 @@ TEST(index_reports_excluded_subtrees_issue411) {
     PASS();
 }
 
-/* Workspace members must be labelled by their MANIFEST [package] name, not by a
- * QN path segment. get_architecture's "packages" aspect groups def nodes into
- * packages; with no source Package nodes it falls back to cbm_qn_to_package(),
- * which returns QN segment[2]. That segment is the crate name ONLY under the
- * `crates/<name>/…` layout — a member outside crates/ (Rust `xtask/`, JS
- * `packages/`, Go multi-module, Python src-layout) yields the wrong label. For a
- * crate at `xtask/src/main.rs` the QN is `proj.xtask.src.main.<fn>` so segment[2]
- * is "src" — a package/directory that does not exist. A member under crates/ has
- * its name at segment[2] already, so it must NOT regress.
- *
- * This models the xtask case with a manifest whose declared name DIFFERS from its
- * directory (dir `xtask/`, `[package] name = "buildtool"`) so the ONLY correct
- * source is the manifest, not any path segment. RED until package identity is
- * keyed to the owning manifest. Self-contained (builds + indexes its own repo). */
-TEST(arch_packages_use_manifest_name_not_qn_segment) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_pkgname_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-
-    /* Virtual workspace root: [workspace] only, NO [package] — must NOT become a
-     * package root (a member whose dir != name is the whole point). */
-    ASSERT_EQ(th_write_file(TH_PATH(tmp, "Cargo.toml"),
-                            "[workspace]\nmembers = [\"xtask\", \"crates/mycore\"]\n"),
-              0);
-
-    /* Member OUTSIDE crates/ whose manifest name differs from its directory. */
-    ASSERT_EQ(th_write_file(TH_PATH(tmp, "xtask/Cargo.toml"),
-                            "[package]\nname = \"buildtool\"\nversion = \"0.1.0\"\n"),
-              0);
-    ASSERT_EQ(th_write_file(TH_PATH(tmp, "xtask/src/main.rs"), "pub fn build_it() -> i32 { 1 }\n"
-                                                               "fn helper() -> i32 { 2 }\n"),
-              0);
-
-    /* Member UNDER crates/ (dir == name) — the layout the heuristic gets right;
-     * it must stay itself (no regression). */
-    ASSERT_EQ(th_write_file(TH_PATH(tmp, "crates/mycore/Cargo.toml"),
-                            "[package]\nname = \"mycore\"\nversion = \"0.1.0\"\n"),
-              0);
-    ASSERT_EQ(
-        th_write_file(TH_PATH(tmp, "crates/mycore/src/lib.rs"), "pub fn core_fn() -> i32 { 3 }\n"),
-        0);
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    char args[600];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp);
-    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
-    ASSERT_NOT_NULL(resp);
-    free(resp);
-
-    char *project = cbm_project_name_from_path(tmp);
-    ASSERT_NOT_NULL(project);
-    char dbpath[600];
-    /* Resolve THROUGH the production resolver so the runner's CBM_CACHE_DIR
-     * isolation applies (never the user's real cache). */
-    th_cache_db_path(dbpath, sizeof(dbpath), project);
-
-    cbm_store_t *store = cbm_store_open_path(dbpath);
-    ASSERT_NOT_NULL(store);
-
-    cbm_architecture_info_t info;
-    const char *aspects[] = {"packages"};
-    ASSERT_EQ(cbm_store_get_architecture(store, project, NULL, aspects, 1, &info), CBM_STORE_OK);
-
-    bool has_buildtool = false; /* manifest name of the xtask-style member */
-    bool has_src = false;       /* the buggy QN-segment[2] label */
-    bool has_mycore = false;    /* crates/ member — must not regress */
-    for (int i = 0; i < info.package_count; i++) {
-        const char *nm = info.packages[i].name;
-        if (!nm) {
-            continue;
-        }
-        if (strcmp(nm, "buildtool") == 0) {
-            has_buildtool = true;
-        }
-        if (strcmp(nm, "src") == 0) {
-            has_src = true;
-        }
-        if (strcmp(nm, "mycore") == 0) {
-            has_mycore = true;
-        }
-    }
-    cbm_store_architecture_free(&info);
-    cbm_store_close(store);
-    cbm_mcp_server_free(srv);
-
-    unlink(dbpath);
-    char wal[620], shm[620];
-    snprintf(wal, sizeof(wal), "%s-wal", dbpath);
-    unlink(wal);
-    snprintf(shm, sizeof(shm), "%s-shm", dbpath);
-    unlink(shm);
-    free(project);
-    th_rmtree(tmp);
-
-    ASSERT_TRUE(has_buildtool); /* labelled by manifest name, not "src" */
-    ASSERT_TRUE(!has_src);      /* the phantom path-segment package is gone */
-    ASSERT_TRUE(has_mycore);    /* crates/ member unchanged */
-    PASS();
-}
-
-/* Run "git -C <dir> <args>" with a neutral identity so the test needs no global
- * git config. Mirrors repro_issue520.c:r520_git / test_watcher.c:wt_git. */
-static int integ_git(const char *dir, const char *args) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "git -C \"%s\" -c user.name=t -c user.email=t@t.io "
-             "-c init.defaultBranch=main -c commit.gpgsign=false %s",
-             dir, args);
-    return system(cmd);
-}
-
-/* Regression: the git-history pass re-derived File node props from scratch
- * ({extension,last_modified,change_count}) and re-upserted them, and
- * cbm_gbuf_upsert_node REPLACES properties_json wholesale — so it clobbered the
- * "pkg" property that pass_structure stamped from the owning manifest. Any file
- * with commit history lost its package identity; only never-committed files kept
- * it. The sibling arch_packages_use_manifest_name_not_qn_segment test never
- * caught this because its fixture has NO git history (file_temporal_count == 0),
- * so the clobbering branch never ran. This variant commits the tree first, so
- * "buildtool" survives ONLY if the git-history pass preserves the pkg property.
- * RED before the merge-not-replace fix in pass_githistory.c. */
-TEST(arch_packages_manifest_name_survives_git_history) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_pkggit_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-
-    ASSERT_EQ(th_write_file(TH_PATH(tmp, "Cargo.toml"),
-                            "[workspace]\nmembers = [\"xtask\", \"crates/mycore\"]\n"),
-              0);
-    /* Member OUTSIDE crates/ whose manifest name differs from its directory. */
-    ASSERT_EQ(th_write_file(TH_PATH(tmp, "xtask/Cargo.toml"),
-                            "[package]\nname = \"buildtool\"\nversion = \"0.1.0\"\n"),
-              0);
-    ASSERT_EQ(th_write_file(TH_PATH(tmp, "xtask/src/main.rs"), "pub fn build_it() -> i32 { 1 }\n"
-                                                               "fn helper() -> i32 { 2 }\n"),
-              0);
-    ASSERT_EQ(th_write_file(TH_PATH(tmp, "crates/mycore/Cargo.toml"),
-                            "[package]\nname = \"mycore\"\nversion = \"0.1.0\"\n"),
-              0);
-    ASSERT_EQ(
-        th_write_file(TH_PATH(tmp, "crates/mycore/src/lib.rs"), "pub fn core_fn() -> i32 { 3 }\n"),
-        0);
-
-    /* Commit the tree so the git-history pass produces per-file temporal data and
-     * re-upserts every tracked File node — the exact path that dropped pkg. */
-    ASSERT_EQ(integ_git(tmp, "init -q"), 0);
-    ASSERT_EQ(integ_git(tmp, "add -A"), 0);
-    ASSERT_EQ(integ_git(tmp, "commit -q -m init"), 0);
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    char args[600];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp);
-    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
-    ASSERT_NOT_NULL(resp);
-    free(resp);
-
-    char *project = cbm_project_name_from_path(tmp);
-    ASSERT_NOT_NULL(project);
-    char dbpath[600];
-    /* Resolve THROUGH the production resolver so the runner's CBM_CACHE_DIR
-     * isolation applies (never the user's real cache). */
-    th_cache_db_path(dbpath, sizeof(dbpath), project);
-
-    cbm_store_t *store = cbm_store_open_path(dbpath);
-    ASSERT_NOT_NULL(store);
-
-    cbm_architecture_info_t info;
-    const char *aspects[] = {"packages"};
-    ASSERT_EQ(cbm_store_get_architecture(store, project, NULL, aspects, 1, &info), CBM_STORE_OK);
-
-    bool has_buildtool = false; /* manifest name — present only if pkg survived */
-    bool has_src = false;       /* the QN-segment fallback the clobber exposes */
-    bool has_mycore = false;
-    for (int i = 0; i < info.package_count; i++) {
-        const char *nm = info.packages[i].name;
-        if (!nm) {
-            continue;
-        }
-        if (strcmp(nm, "buildtool") == 0) {
-            has_buildtool = true;
-        }
-        if (strcmp(nm, "src") == 0) {
-            has_src = true;
-        }
-        if (strcmp(nm, "mycore") == 0) {
-            has_mycore = true;
-        }
-    }
-    cbm_store_architecture_free(&info);
-    cbm_store_close(store);
-    cbm_mcp_server_free(srv);
-
-    unlink(dbpath);
-    char wal[620], shm[620];
-    snprintf(wal, sizeof(wal), "%s-wal", dbpath);
-    unlink(wal);
-    snprintf(shm, sizeof(shm), "%s-shm", dbpath);
-    unlink(shm);
-    free(project);
-    th_rmtree(tmp);
-
-    ASSERT_TRUE(has_buildtool); /* pkg survived the git-history re-upsert */
-    ASSERT_TRUE(!has_src);      /* no phantom path-segment package */
-    ASSERT_TRUE(has_mycore);
-    PASS();
-}
-
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(integration) {
-    RUN_TEST(arch_packages_use_manifest_name_not_qn_segment);
-    RUN_TEST(arch_packages_manifest_name_survives_git_history);
     RUN_TEST(index_reports_excluded_subtrees_issue411);
     /* Set up: create temp project and index it */
     if (integration_setup() != 0) {

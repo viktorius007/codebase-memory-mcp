@@ -38,6 +38,10 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
 
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 
+/* Count indexable files with the pipeline's native full-mode discovery policy,
+ * without retaining per-file results. A false result means the count exceeded
+ * file_limit or could not be established before the bounded deadline; every
+ * such failure is fail-closed because this is the memory-admission guard. */
 /* Map an internal resolver strategy (as recorded on a CALLS edge by
  * pass_calls.c) to the CLOSED public class published by trace_path's
  * include_evidence output: "lsp" | "language_rule" | "heuristic" |
@@ -48,10 +52,6 @@ enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
  * unmapped internal name into a user-visible field. */
 const char *cbm_mcp_edge_strategy_class(const char *strategy);
 
-/* Count indexable files with the pipeline's native full-mode discovery policy,
- * without retaining per-file results. A false result means the count exceeded
- * file_limit or could not be established before the bounded deadline; every
- * such failure is fail-closed because this is the memory-admission guard. */
 bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
                                           int *file_count_out);
 
@@ -61,16 +61,47 @@ bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
 bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *hunks,
                               int hunk_count, const char *file);
 
-#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-/* Deterministic allocation-loss seam for detect_changes' oversized-response
- * refinement rollup. Production builds do not contain this symbol. */
-void cbm_mcp_test_detect_refinement_fail_rollup_alloc(bool fail);
-#endif
-
-/* Internal search command contract, shared with direct command-boundary tests. */
+/* search_code Windows pre-scan optimization: only simple suffix globs can be
+ * moved ahead of
+ * Select-String without changing the existing full-path
+ * PowerShell -like contract. Exposed for
+ * direct boundary tests only. */
 bool cbm_search_code_file_pattern_can_prefilter(const char *file_pattern);
-bool cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
+bool cbm_search_code_windows_path_matches_prefilter(const char *path, const char *file_pattern);
+
+/* Internal command builder exposed so tests can pin the PowerShell pipeline
+ * ordering without
+ * starting an external shell. */
+void cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
                                     const char *file_pattern, const char *tmpfile,
                                     const char *filelist, const char *root_path);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Reject opening one changed file while detect_changes fingerprints its live
+ * snapshot. This makes otherwise platform-specific permission/read races
+ * deterministic without changing production filesystem behavior. */
+typedef bool (*cbm_mcp_snapshot_read_test_hook_fn)(void *context, const char *absolute_path);
+void cbm_mcp_server_set_snapshot_read_test_hook(cbm_mcp_server_t *srv,
+                                                cbm_mcp_snapshot_read_test_hook_fn hook,
+                                                void *context);
+
+/* Filesystem PATH_MAX prevents a portable end-to-end fixture for multi-KiB
+ * stored paths. This seam drives the normal search result ownership,
+ * directory aggregation, and renderer pipeline with synthetic identities. */
+char *cbm_mcp_render_search_rows_for_testing(const char *const *qualified_names,
+                                             const char *const *file_paths, int row_count,
+                                             bool json_format);
+
+/* Drive the production raw-source slicer and renderer without relying on an
+ * external grep/PowerShell text decoder. This keeps malformed-byte paging
+ * deterministic on every test platform. */
+char *cbm_mcp_render_raw_preview_for_testing(const char *content, bool content_offset_set,
+                                             size_t content_offset, bool json_format);
+
+/* Exercise search_graph's semantic continuation metadata without allocating
+ * a 100k-row vector fixture. The production emitters remain the code under
+ * test; this seam only supplies their already-ranked page descriptor. */
+char *cbm_mcp_render_semantic_paging_for_testing(int total, int offset, int returned, int limit,
+                                                 bool total_exact, bool json_format);
+#endif
 
 #endif

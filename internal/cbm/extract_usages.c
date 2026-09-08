@@ -5,7 +5,6 @@
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
-#include "lsp/rust_lsp.h"
 
 enum { LAST_IDX = 1 };
 #include <stdint.h> // uint32_t
@@ -49,36 +48,6 @@ static void usage_slow_parent_fallback_test_note(void) {}
 static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
 static bool is_direct_argument_value(TSNode node);
 static TSNode python_direct_callable_attribute_site(TSNode node);
-
-// Check if a node is inside a call expression (to avoid double-counting as usage)
-static bool is_inside_call(TSNode node, const CBMLangSpec *spec) {
-    TSNode cur = ts_node_parent(node);
-    while (!ts_node_is_null(cur)) {
-        if (cbm_kind_in_set(cur, spec->call_node_types)) {
-            return true;
-        }
-        cur = ts_node_parent(cur);
-    }
-    return false;
-}
-
-// Check if a node is inside an import statement
-static bool is_inside_import(TSNode node, const CBMLangSpec *spec) {
-    bool has_imports = spec->import_node_types && spec->import_node_types[0];
-    bool has_from_imports = spec->import_from_types && spec->import_from_types[0];
-    if (!has_imports && !has_from_imports) {
-        return false;
-    }
-    TSNode cur = ts_node_parent(node);
-    while (!ts_node_is_null(cur)) {
-        if ((has_imports && cbm_kind_in_set(cur, spec->import_node_types)) ||
-            (has_from_imports && cbm_kind_in_set(cur, spec->import_from_types))) {
-            return true;
-        }
-        cur = ts_node_parent(cur);
-    }
-    return false;
-}
 
 // Is this an identifier-like node that represents a reference?
 static bool is_reference_node(TSNode node, CBMLanguage lang) {
@@ -135,6 +104,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_QML:
     case CBM_LANG_CFSCRIPT:
         return strcmp(kind, "property_identifier") == 0 ||
@@ -1454,6 +1424,7 @@ static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage langua
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_GO:
     case CBM_LANG_PYTHON:
     case CBM_LANG_C:
@@ -1579,7 +1550,7 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         (void)occurrence_parent(cursor, node, &parent, &parent_field);
     }
     bool ts_family = ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-                     ctx->language == CBM_LANG_TSX;
+                     ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS;
     if (ts_family && strcmp(kind, "property_identifier") == 0 && !ts_node_is_null(parent) &&
         strcmp(ts_node_type(parent), "member_expression") == 0) {
         TSNode property = ts_node_child_by_field_name(parent, TS_FIELD("property"));
@@ -1613,14 +1584,8 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
                    ? parent
                    : (TSNode){0};
     }
-    bool rust_let_value = false;
-    if (ctx->language == CBM_LANG_RUST && !ts_node_is_null(parent) &&
-        strcmp(ts_node_type(parent), "let_declaration") == 0) {
-        TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
-        rust_let_value = !ts_node_is_null(value) && ts_node_eq(value, node);
-    }
     if (ctx->language == CBM_LANG_RUST && strcmp(kind, "scoped_identifier") == 0) {
-        return rust_let_value || is_direct_argument_value_walk(node, state) ? node : (TSNode){0};
+        return is_direct_argument_value_walk(node, state) ? node : (TSNode){0};
     }
     if (ctx->language == CBM_LANG_CSHARP) {
         return csharp_callable_value_site(node);
@@ -1648,9 +1613,6 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         strcmp(ts_node_type(parent), "assignment") == 0) {
         TSNode right = ts_node_child_by_field_name(parent, TS_FIELD("right"));
         return !ts_node_is_null(right) && ts_node_eq(right, node) ? node : (TSNode){0};
-    }
-    if (rust_let_value) {
-        return node;
     }
     if (is_direct_argument_value_walk(node, state)) {
         return node;
@@ -2091,7 +2053,8 @@ static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const 
     }
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
-    case CBM_LANG_TSX: {
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS: {
         if (strcmp(ts_node_type(boundary), "import_statement") != 0) {
             return false;
         }
@@ -2278,7 +2241,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         scope_id = lexical_ancestor_of_kind(state, current_id, true, false);
         whole_scope = true;
     } else if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-               ctx->language == CBM_LANG_TSX) {
+               ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
         bool is_var = js_var_binding(node);
         scope_id = lexical_ancestor_of_kind(state, current_id, is_var, !is_var);
         if (scope_id == 0) {
@@ -2491,208 +2454,9 @@ static bool emit_direct_perl_coderef_usage(CBMExtractCtx *ctx, TSNode node,
     return true;
 }
 
-/* Rust macro_rules! dispatch tables commonly retain a callable as the value
- * on the right side of `descriptor => path;`. tree-sitter deliberately keeps
- * a macro invocation's token tree opaque, so ordinary reference extraction
- * cannot see that function value. Record only an unambiguous Rust path in
- * that precise table shape; the Rust cross-file resolver later proves the
- * target before pass_usages materializes the USAGE edge. */
-static bool rust_macro_table_path(const char *text, size_t length) {
-    size_t pos = 0;
-    if (length >= 2 && text[0] == ':' && text[1] == ':') {
-        pos = 2;
-    }
-    while (pos < length) {
-        if (!(isalpha((unsigned char)text[pos]) || text[pos] == '_')) {
-            return false;
-        }
-        pos++;
-        while (pos < length && (isalnum((unsigned char)text[pos]) || text[pos] == '_')) {
-            pos++;
-        }
-        if (pos == length) {
-            return true;
-        }
-        if (pos + 1 >= length || text[pos] != ':' || text[pos + 1] != ':') {
-            return false;
-        }
-        pos += 2;
-    }
-    return false;
-}
-
-static void emit_rust_serde_hook_usages(CBMExtractCtx *ctx, TSNode attribute,
-                                        const char *enclosing_func_qn, uint32_t lexical_scope_id) {
-    static const char *keys[] = {"default", "skip_serializing_if", "serialize_with",
-                                 "deserialize_with"};
-    if (!ctx || ctx->language != CBM_LANG_RUST || !ctx->source || !enclosing_func_qn ||
-        strcmp(ts_node_type(attribute), "attribute_item") != 0) {
-        return;
-    }
-    uint32_t start_byte = ts_node_start_byte(attribute);
-    uint32_t end_byte = ts_node_end_byte(attribute);
-    if (end_byte <= start_byte || end_byte > (uint32_t)ctx->source_len) {
-        return;
-    }
-    const char *text = ctx->source + start_byte;
-    size_t length = (size_t)(end_byte - start_byte);
-    const char *attribute_end = text + length;
-    if (length < 2 || text[0] != '#' || text[1] != '[') {
-        return;
-    }
-    size_t head = 2;
-    while (head < length && isspace((unsigned char)text[head])) {
-        head++;
-    }
-    enum { SERDE_LENGTH = sizeof("serde") - 1 };
-    if (head + SERDE_LENGTH > length || strncmp(text + head, "serde", SERDE_LENGTH) != 0 ||
-        (head + SERDE_LENGTH < length && text[head + SERDE_LENGTH] != '(' &&
-         !isspace((unsigned char)text[head + SERDE_LENGTH]))) {
-        return;
-    }
-
-    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
-        size_t key_length = strlen(keys[k]);
-        const char *match = text;
-        while ((match = strstr(match, keys[k])) && match + key_length <= attribute_end) {
-            if (match > text && (isalnum((unsigned char)match[-1]) || match[-1] == '_')) {
-                match += key_length;
-                continue;
-            }
-            const char *cursor = match + key_length;
-            while (cursor < attribute_end && isspace((unsigned char)*cursor)) {
-                cursor++;
-            }
-            if (cursor >= attribute_end || *cursor++ != '=') {
-                match += key_length;
-                continue;
-            }
-            while (cursor < attribute_end && isspace((unsigned char)*cursor)) {
-                cursor++;
-            }
-            if (cursor >= attribute_end || *cursor++ != '"') {
-                match += key_length;
-                continue;
-            }
-            const char *path = cursor;
-            while (cursor < attribute_end && *cursor != '"' && *cursor != '\\') {
-                cursor++;
-            }
-            size_t path_length = (size_t)(cursor - path);
-            if (cursor < attribute_end && *cursor == '"' &&
-                rust_macro_table_path(path, path_length)) {
-                CBMUsage usage = {
-                    .ref_name = cbm_arena_strndup(ctx->arena, path, path_length),
-                    .enclosing_func_qn = enclosing_func_qn,
-                    .kind = CBM_USAGE_VALUE,
-                    .is_macro_callable_value = true,
-                    .lexical_scope_id = lexical_scope_id,
-                    .site_start_byte = start_byte + (uint32_t)(path - text),
-                    .site_end_byte = start_byte + (uint32_t)(cursor - text),
-                };
-                cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
-            }
-            match += key_length;
-        }
-    }
-}
-
-static void emit_rust_macro_table_value(CBMExtractCtx *ctx, const char *text,
-                                        uint32_t invocation_start, size_t value_start,
-                                        size_t value_end, const char *enclosing_func_qn,
-                                        uint32_t lexical_scope_id) {
-    while (value_end > value_start && isspace((unsigned char)text[value_end - 1])) {
-        value_end--;
-    }
-    if (!rust_macro_table_path(text + value_start, value_end - value_start)) {
-        return;
-    }
-    const char *name = cbm_arena_strndup(ctx->arena, text + value_start, value_end - value_start);
-    if (!name) {
-        return;
-    }
-    CBMUsage usage = {
-        .ref_name = name,
-        .enclosing_func_qn = enclosing_func_qn,
-        .kind = CBM_USAGE_VALUE,
-        .is_macro_callable_value = true,
-        .lexical_scope_id = lexical_scope_id,
-        .site_start_byte = invocation_start + (uint32_t)value_start,
-        .site_end_byte = invocation_start + (uint32_t)value_end,
-    };
-    cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
-}
-
-static void emit_rust_macro_table_usages(CBMExtractCtx *ctx, TSNode invocation,
-                                         const char *enclosing_func_qn, uint32_t lexical_scope_id) {
-    if (!ctx || ctx->language != CBM_LANG_RUST || !ctx->source || !enclosing_func_qn ||
-        strcmp(ts_node_type(invocation), "macro_invocation") != 0) {
-        return;
-    }
-    uint32_t start_byte = ts_node_start_byte(invocation);
-    uint32_t end_byte = ts_node_end_byte(invocation);
-    if (end_byte <= start_byte || end_byte > (uint32_t)ctx->source_len) {
-        return;
-    }
-    const char *text = ctx->source + start_byte;
-    size_t length = (size_t)(end_byte - start_byte);
-    size_t pos = 0;
-    while (pos < length && text[pos] != '!') {
-        pos++;
-    }
-    if (pos == length) {
-        return;
-    }
-    while (++pos < length && isspace((unsigned char)text[pos])) {}
-    if (pos == length || (text[pos] != '{' && text[pos] != '(' && text[pos] != '[')) {
-        return;
-    }
-
-    char outer_close = text[pos] == '{' ? '}' : (text[pos] == '(' ? ')' : ']');
-    int depth = 1;
-    size_t entry_start = pos + 1;
-    for (pos = entry_start; pos < length; pos++) {
-        int opaque_end = cbm_rust_macro_opaque_token_end(text, (int)length, (int)pos);
-        if (opaque_end != (int)pos) {
-            pos = (size_t)opaque_end - 1;
-            continue;
-        }
-        char c = text[pos];
-        if (c == '{' || c == '(' || c == '[') {
-            depth++;
-            continue;
-        }
-        if (c == '}' || c == ')' || c == ']') {
-            if (--depth == 0 && c == outer_close) {
-                return;
-            }
-            continue;
-        }
-        if (depth != 1 || c != '=' || pos + 1 >= length || text[pos + 1] != '>') {
-            continue;
-        }
-
-        size_t value_start = pos + 2;
-        while (value_start < length && isspace((unsigned char)text[value_start])) {
-            value_start++;
-        }
-        size_t value_end = value_start;
-        while (value_end < length && text[value_end] != ';') {
-            value_end++;
-        }
-        if (value_end == length) {
-            return;
-        }
-        emit_rust_macro_table_value(ctx, text, start_byte, value_start, value_end,
-                                    enclosing_func_qn, lexical_scope_id);
-        pos = value_end;
-    }
-}
-
 // Try to emit a usage for a reference node. Returns early if the node should be skipped.
-static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
-    emit_rust_serde_hook_usages(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0);
-    emit_rust_macro_table_usages(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0);
+static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                           bool inside_call, bool inside_import) {
     if (emit_direct_perl_coderef_usage(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0)) {
         return;
     }
@@ -2705,7 +2469,7 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (is_call_argument_label(node)) {
         return;
     }
-    if (is_inside_call(node, spec) || is_inside_import(node, spec)) {
+    if (inside_call || inside_import) {
         return;
     }
     if (is_binding_occurrence(ctx, node, spec, NULL) ||
@@ -2722,18 +2486,79 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     }
 }
 
-// Iterative usage walker — explicit stack
+// Iterative usage walker — explicit stack.
+//
+// The call/import ancestry that gates usage emission is maintained as ENTER/
+// EXIT counters on the walk instead of per-node ancestor re-walks: the old
+// is_inside_call/is_inside_import helpers climbed every ancestor via
+// ts_node_parent, and tree-sitter's ts_node_parent RE-DESCENDS from the root
+// scanning siblings — O(depth x sibling-position) per node, which went
+// quadratic on wide nodes (a 1,536-argument call in dotnet/runtime's JIT
+// torture tests put 92% of extract time into these walks; 490 s for one
+// 147 KB file). Counter semantics match the helpers exactly: strict ancestors
+// only — a node is emitted BEFORE its own kind increments the counters, so a
+// call node itself does not count as "inside a call".
 static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, 4096);
-    ts_nstack_push(&stack, ctx->arena, root);
+    typedef struct {
+        TSNode node;
+        uint32_t next_child;
+        bool counts_call;
+        bool counts_import;
+    } UsageFrame;
+    int cap = 256;
+    UsageFrame *frames = (UsageFrame *)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*frames));
+    if (!frames) {
+        return;
+    }
+    bool has_imports = spec->import_node_types && spec->import_node_types[0];
+    bool has_from_imports = spec->import_from_types && spec->import_from_types[0];
+    int call_depth = 0;
+    int import_depth = 0;
+    int top = 0;
+    frames[top++] = (UsageFrame){root, 0, false, false};
+    bool entering = true;
 
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        try_emit_usage(ctx, node, spec);
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
-            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+    while (top > 0) {
+        UsageFrame *f = &frames[top - 1];
+        if (entering) {
+            try_emit_usage(ctx, f->node, spec, call_depth > 0, import_depth > 0);
+            f->counts_call = cbm_kind_in_set(f->node, spec->call_node_types);
+            f->counts_import =
+                (has_imports && cbm_kind_in_set(f->node, spec->import_node_types)) ||
+                (has_from_imports && cbm_kind_in_set(f->node, spec->import_from_types));
+            if (f->counts_call) {
+                call_depth++;
+            }
+            if (f->counts_import) {
+                import_depth++;
+            }
+        }
+        uint32_t count = ts_node_child_count(f->node);
+        if (f->next_child < count) {
+            TSNode child = ts_node_child(f->node, f->next_child);
+            f->next_child++;
+            if (top == cap) {
+                int new_cap = cap * 2;
+                UsageFrame *grown =
+                    (UsageFrame *)cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*grown));
+                if (!grown) {
+                    return;
+                }
+                memcpy(grown, frames, (size_t)cap * sizeof(*frames));
+                frames = grown;
+                cap = new_cap;
+            }
+            frames[top++] = (UsageFrame){child, 0, false, false};
+            entering = true;
+        } else {
+            if (f->counts_call) {
+                call_depth--;
+            }
+            if (f->counts_import) {
+                import_depth--;
+            }
+            top--;
+            entering = false;
         }
     }
 }
@@ -2751,10 +2576,6 @@ void cbm_extract_usages(CBMExtractCtx *ctx) {
 // Uses WalkState flags instead of parent-chain walks for O(1) context checks.
 
 void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
-    emit_rust_serde_hook_usages(ctx, node, state->enclosing_func_qn,
-                                active_lexical_scope_id(state));
-    emit_rust_macro_table_usages(ctx, node, state->enclosing_func_qn,
-                                 active_lexical_scope_id(state));
     if (emit_direct_perl_coderef_usage(ctx, node, state->enclosing_func_qn,
                                        active_lexical_scope_id(state))) {
         return;
@@ -2852,6 +2673,10 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         usage.ref_name = name;
         usage.enclosing_func_qn = state->enclosing_func_qn;
         usage.lexical_scope_id = usage_lexical_scope_id_for_node(ctx, state, node);
+        /* The member half of a selector is its own reference node
+         * (field_identifier); record that shape — the name alone cannot carry
+         * it, and the Go Field guard keys on it (#1962). */
+        usage.is_member_access = strcmp(ts_node_type(node), "field_identifier") == 0;
         stamp_usage_site(ctx, &usage, node, name, state);
         cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
     }

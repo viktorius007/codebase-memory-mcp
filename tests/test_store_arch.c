@@ -97,7 +97,7 @@ static cbm_store_t *setup_arch_test_store(void) {
                             .file_path = "internal/service/service.go"};
     int64_t id_helper = cbm_store_upsert_node(s, &fn_helper);
 
-    /* Test target entry point */
+    /* Test function (should be excluded) */
     cbm_node_t fn_test = {.project = "test",
                           .label = "Function",
                           .name = "TestHandleRequest",
@@ -105,14 +105,6 @@ static cbm_store_t *setup_arch_test_store(void) {
                           .file_path = "internal/handler/handler_test.go",
                           .properties_json = "{\"is_entry_point\":true}"};
     int64_t id_test = cbm_store_upsert_node(s, &fn_test);
-
-    cbm_node_t ui_main = {.project = "test",
-                          .label = "Function",
-                          .name = "main",
-                          .qualified_name = "test.tests.ui.pass.main",
-                          .file_path = "tests/ui/pass.rs",
-                          .properties_json = "{\"is_entry_point\":true,\"is_test\":true}"};
-    cbm_store_upsert_node(s, &ui_main);
 
     /* Route */
     cbm_node_t route = {
@@ -165,57 +157,17 @@ TEST(arch_get_all) {
     PASS();
 }
 
-TEST(arch_entry_points_include_test_targets) {
+TEST(arch_entry_points_exclude_tests) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"entry_points"};
     ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
-    bool found_ui_main = false;
     for (int i = 0; i < info.entry_point_count; i++) {
-        if (strcmp(info.entry_points[i].file, "tests/ui/pass.rs") == 0) {
-            found_ui_main = true;
-        }
+        ASSERT_TRUE(strstr(info.entry_points[i].file, "test") == NULL);
     }
-    ASSERT_TRUE(found_ui_main);
-    ASSERT_EQ(info.entry_point_count, 4); /* production, test harness, and UI-target mains */
-    ASSERT_EQ(info.entry_point_total, 4);
-    ASSERT_FALSE(info.entry_points_truncated);
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-TEST(arch_entry_points_report_exact_total_when_slice_is_truncated) {
-    cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_NOT_NULL(s);
-    ASSERT_EQ(cbm_store_upsert_project(s, "entry-total", "/tmp/entry-total"), CBM_STORE_OK);
-
-    for (int i = 0; i < 21; i++) {
-        char name[32];
-        char qualified_name[64];
-        char file_path[64];
-        snprintf(name, sizeof(name), "entry_%02d", i);
-        snprintf(qualified_name, sizeof(qualified_name), "entry-total.cmd.%s", name);
-        snprintf(file_path, sizeof(file_path), "cmd/%s.c", name);
-        cbm_node_t node = {.project = "entry-total",
-                           .label = "Function",
-                           .name = name,
-                           .qualified_name = qualified_name,
-                           .file_path = file_path,
-                           .properties_json = "{\"is_entry_point\":true}"};
-        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
-    }
-
-    cbm_architecture_info_t info = {0};
-    const char *aspects[] = {"entry_points"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "entry-total", NULL, aspects, 1, &info),
-              CBM_STORE_OK);
-    ASSERT_EQ(info.entry_point_count, 20);
-    ASSERT_EQ(info.entry_point_total, 21);
-    ASSERT_TRUE(info.entry_points_truncated);
+    ASSERT_EQ(info.entry_point_count, 2); /* main, HandleRequest */
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -323,8 +275,7 @@ TEST(arch_path_scoping) {
     ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
     ASSERT_EQ(scoped_pkg_nodes, 1);
 
-    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") >
-                cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
 
     cbm_architecture_info_t scoped_slash;
     memset(&scoped_slash, 0, sizeof(scoped_slash));
@@ -397,43 +348,6 @@ TEST(arch_routes) {
     ASSERT_STR_EQ(info.routes[0].method, "POST");
     ASSERT_STR_EQ(info.routes[0].path, "/api/orders");
     ASSERT_STR_EQ(info.routes[0].handler, "HandleRequest");
-    ASSERT_EQ(info.route_total, 1);
-    ASSERT_FALSE(info.routes_truncated);
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-TEST(arch_routes_report_exact_total_when_slice_is_truncated) {
-    cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_NOT_NULL(s);
-    ASSERT_EQ(cbm_store_upsert_project(s, "route-total", "/tmp/route-total"), CBM_STORE_OK);
-
-    for (int i = 0; i < 21; i++) {
-        char name[32];
-        char qualified_name[64];
-        char props[128];
-        snprintf(name, sizeof(name), "/api/r%02d", i);
-        snprintf(qualified_name, sizeof(qualified_name), "route-total.route.%02d", i);
-        snprintf(props, sizeof(props),
-                 "{\"method\":\"GET\",\"path\":\"%s\",\"handler\":\"h%02d\"}", name, i);
-        cbm_node_t node = {.project = "route-total",
-                           .label = "Route",
-                           .name = name,
-                           .qualified_name = qualified_name,
-                           .file_path = "src/routes.rs",
-                           .properties_json = props};
-        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
-    }
-
-    cbm_architecture_info_t info = {0};
-    const char *aspects[] = {"routes"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "route-total", NULL, aspects, 1, &info),
-              CBM_STORE_OK);
-    ASSERT_EQ(info.route_count, 20);
-    ASSERT_EQ(info.route_total, 21);
-    ASSERT_TRUE(info.routes_truncated);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -458,480 +372,6 @@ TEST(arch_hotspots) {
     }
     /* May not be found with few edges — just log */
     (void)found;
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-/* Regression: a private, single-definition function whose simple name collides
- * with a std/builtin method (`collect`, `new`, `from`, `iter`, `clone`) must NOT
- * accrue hotspot fan-in from unrelated std-method call sites. The resolver binds
- * a bare `x.collect()` (std Iterator::collect) onto the lone user `collect` via a
- * weak short-name strategy (unique_name / suffix_match), and stamps a LOW
- * confidence (import-unreachability floors it to ~0.375). arch_hotspots counted
- * every CALLS edge regardless, inflating fan-in (observed 358 across 86 files for
- * one private helper). The ranking must count only high-confidence CALLS edges,
- * while genuine same-name user→user calls (high confidence) still count.
- *
- * RED at branch base (arch_hotspots counts all edges): `collect` fan_in == 6.
- * GREEN after fix (low-confidence std-collision edges excluded): fan_in == 1. */
-static int hotspot_fanin_helper(cbm_architecture_info_t *info, const char *name) {
-    for (int i = 0; i < info->hotspot_count; i++) {
-        if (info->hotspots[i].name && strcmp(info->hotspots[i].name, name) == 0) {
-            return info->hotspots[i].fan_in;
-        }
-    }
-    return -1; /* not present in the hotspot list */
-}
-
-TEST(arch_hotspots_exclude_low_confidence_name_collisions) {
-    cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_TRUE(s != NULL);
-    cbm_store_upsert_project(s, "hs", "/tmp/hs");
-
-    /* One private, single-definition helper named `collect` (collides with the
-     * std Iterator::collect method name). */
-    cbm_node_t fn_collect = {.project = "hs",
-                             .label = "Function",
-                             .name = "collect",
-                             .qualified_name = "hs.src.lint.collect",
-                             .file_path = "src/lint.rs"};
-    int64_t id_collect = cbm_store_upsert_node(s, &fn_collect);
-
-    /* A genuinely high-fan-in user function to prove real hotspots survive. */
-    cbm_node_t fn_process = {.project = "hs",
-                             .label = "Function",
-                             .name = "process",
-                             .qualified_name = "hs.src.core.process",
-                             .file_path = "src/core.rs"};
-    int64_t id_process = cbm_store_upsert_node(s, &fn_process);
-
-    /* Six distinct caller functions in six files. */
-    int64_t callers[6];
-    for (int i = 0; i < 6; i++) {
-        char name[32], qn[64], path[64];
-        snprintf(name, sizeof(name), "caller_%d", i);
-        snprintf(qn, sizeof(qn), "hs.src.mod%d.caller_%d", i, i);
-        snprintf(path, sizeof(path), "src/mod%d.rs", i);
-        cbm_node_t c = {.project = "hs",
-                        .label = "Function",
-                        .name = name,
-                        .qualified_name = qn,
-                        .file_path = path};
-        callers[i] = cbm_store_upsert_node(s, &c);
-    }
-
-    /* Five LOW-confidence edges onto `collect`: these are the std `x.collect()`
-     * call sites mis-bound to the lone user def via a weak short-name strategy
-     * (import-unreachable unique_name → confidence floored to 0.375). They are
-     * name-collision noise and must NOT count toward fan-in. */
-    for (int i = 0; i < 5; i++) {
-        cbm_edge_t e = {.project = "hs",
-                        .source_id = callers[i],
-                        .target_id = id_collect,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"collect\",\"confidence\":0.375,"
-                            "\"strategy\":\"unique_name\",\"candidates\":1}"};
-        cbm_store_insert_edge(s, &e);
-    }
-
-    /* One HIGH-confidence, genuine same-name user→user call onto `collect`
-     * (same_module). This is a real call and MUST count. */
-    cbm_edge_t legit = {.project = "hs",
-                        .source_id = callers[5],
-                        .target_id = id_collect,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"collect\",\"confidence\":0.90,"
-                                           "\"strategy\":\"same_module\",\"candidates\":1}"};
-    cbm_store_insert_edge(s, &legit);
-
-    /* Three HIGH-confidence callers of `process` (a real hotspot). */
-    for (int i = 0; i < 3; i++) {
-        cbm_edge_t e = {.project = "hs",
-                        .source_id = callers[i],
-                        .target_id = id_process,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"process\",\"confidence\":0.90,"
-                                           "\"strategy\":\"same_module\",\"candidates\":1}"};
-        cbm_store_insert_edge(s, &e);
-    }
-
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "hs", NULL, aspects, 1, &info), CBM_STORE_OK);
-
-    /* `collect` accrues fan-in only from the single genuine high-confidence
-     * user→user call, NOT the five std-collision noise edges. */
-    ASSERT_EQ(hotspot_fanin_helper(&info, "collect"), 1);
-
-    /* The genuine hotspot keeps its full high-confidence fan-in. */
-    ASSERT_EQ(hotspot_fanin_helper(&info, "process"), 3);
-
-    /* And the real hotspot outranks the de-noised helper. */
-    ASSERT_TRUE(hotspot_fanin_helper(&info, "process") > hotspot_fanin_helper(&info, "collect"));
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-/* Cross-package boundaries (and the fan/layer aspects derived from the same
- * arch_boundaries scan) must count only high-confidence CALLS edges — the same
- * gate arch_hotspots applies. Ungated, low-confidence name-collision edges
- * (std `x.collect()` mis-bound cross-package at ~0.14-0.375) manufacture
- * phantom boundaries: observed live as pm-cli→xtask 180 / pm-core→xtask 117,
- * promoting a leaf dev-tooling crate to a "core" layer.
- *
- * RED at branch base (edge scan has no confidence filter): the collision-only
- * pair app→tool appears with call_count 5. GREEN after gating: app→tool absent;
- * the genuine high-confidence app→lib boundary survives with its full count. */
-static int boundary_count_helper(cbm_architecture_info_t *info, const char *from, const char *to) {
-    for (int i = 0; i < info->boundary_count; i++) {
-        if (strcmp(info->boundaries[i].from, from) == 0 &&
-            strcmp(info->boundaries[i].to, to) == 0) {
-            return info->boundaries[i].call_count;
-        }
-    }
-    return -1; /* boundary not reported */
-}
-
-TEST(arch_boundaries_exclude_low_confidence_name_collisions) {
-    cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_TRUE(s != NULL);
-    cbm_store_upsert_project(s, "bd", "/tmp/bd");
-
-    /* Three packages via File-node pkg props: app (callers), tool (collision
-     * target), lib (genuine dependency). */
-    cbm_node_t f_app = {.project = "bd",
-                        .label = "File",
-                        .name = "main.rs",
-                        .qualified_name = "bd.app.src.main.__file__",
-                        .file_path = "app/src/main.rs",
-                        .properties_json = "{\"extension\":\".rs\",\"pkg\":\"app\"}"};
-    cbm_store_upsert_node(s, &f_app);
-    cbm_node_t f_tool = {.project = "bd",
-                         .label = "File",
-                         .name = "util.rs",
-                         .qualified_name = "bd.tool.src.util.__file__",
-                         .file_path = "tool/src/util.rs",
-                         .properties_json = "{\"extension\":\".rs\",\"pkg\":\"tool\"}"};
-    cbm_store_upsert_node(s, &f_tool);
-    cbm_node_t f_lib = {.project = "bd",
-                        .label = "File",
-                        .name = "core.rs",
-                        .qualified_name = "bd.lib.src.core.__file__",
-                        .file_path = "lib/src/core.rs",
-                        .properties_json = "{\"extension\":\".rs\",\"pkg\":\"lib\"}"};
-    cbm_store_upsert_node(s, &f_lib);
-
-    /* Collision target in `tool`: a private fn named `collect`. */
-    cbm_node_t fn_collect = {.project = "bd",
-                             .label = "Function",
-                             .name = "collect",
-                             .qualified_name = "bd.tool.src.util.collect",
-                             .file_path = "tool/src/util.rs"};
-    int64_t id_collect = cbm_store_upsert_node(s, &fn_collect);
-
-    /* Genuine dependency target in `lib`. */
-    cbm_node_t fn_run = {.project = "bd",
-                         .label = "Function",
-                         .name = "run",
-                         .qualified_name = "bd.lib.src.core.run",
-                         .file_path = "lib/src/core.rs"};
-    int64_t id_run = cbm_store_upsert_node(s, &fn_run);
-
-    /* Five caller functions in `app`. */
-    int64_t callers[5];
-    for (int i = 0; i < 5; i++) {
-        char name[32], qn[64];
-        snprintf(name, sizeof(name), "caller_%d", i);
-        snprintf(qn, sizeof(qn), "bd.app.src.main.caller_%d", i);
-        cbm_node_t c = {.project = "bd",
-                        .label = "Function",
-                        .name = name,
-                        .qualified_name = qn,
-                        .file_path = "app/src/main.rs"};
-        callers[i] = cbm_store_upsert_node(s, &c);
-    }
-
-    /* Five LOW-confidence collision edges app→tool: std `x.collect()` call
-     * sites mis-bound cross-package. Must NOT create a boundary. */
-    for (int i = 0; i < 5; i++) {
-        cbm_edge_t e = {.project = "bd",
-                        .source_id = callers[i],
-                        .target_id = id_collect,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"collect\",\"confidence\":0.375,"
-                            "\"strategy\":\"unique_name\",\"candidates\":1}"};
-        cbm_store_insert_edge(s, &e);
-    }
-
-    /* Three HIGH-confidence genuine edges app→lib. Must survive in full. */
-    for (int i = 0; i < 3; i++) {
-        cbm_edge_t e = {.project = "bd",
-                        .source_id = callers[i],
-                        .target_id = id_run,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"run\",\"confidence\":0.90,"
-                                           "\"strategy\":\"import_match\",\"candidates\":1}"};
-        cbm_store_insert_edge(s, &e);
-    }
-
-    /* One legacy edge app→lib with NO confidence property: the IS NULL arm
-     * must keep counting it (same semantics as the hotspot gate). */
-    cbm_edge_t legacy = {.project = "bd",
-                         .source_id = callers[3],
-                         .target_id = id_run,
-                         .type = "CALLS",
-                         .properties_json = "{\"callee\":\"run\"}"};
-    cbm_store_insert_edge(s, &legacy);
-
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"boundaries"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "bd", NULL, aspects, 1, &info), CBM_STORE_OK);
-
-    /* The collision-only pair must not be reported as a boundary at all. */
-    ASSERT_EQ(boundary_count_helper(&info, "app", "tool"), -1);
-
-    /* The genuine boundary keeps its full count: 3 high-confidence + 1 legacy
-     * no-confidence edge. */
-    ASSERT_EQ(boundary_count_helper(&info, "app", "lib"), 4);
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-/* Synthetic builtin nodes must not mint pseudo-packages. The Python/Kotlin
- * builtin registries create real graph nodes with sentinel file_paths
- * (<python-builtins>, <kotlin-builtins>) and QNs like builtins.len. They are
- * Function/Class labelled, so the arch_boundaries node scan picks them up,
- * finds no declared pkg for the sentinel path, and the QN fallback mints
- * "len"/"dict"/"list" as packages — observed live as boundaries
- * pm-cli→dict 8 and layer entries "dict — core — high fan-in". A call to a
- * builtin is stdlib usage, not a cross-package dependency.
- *
- * RED at branch base: app→len reported as a boundary with call_count 3.
- * GREEN: no boundary targets a builtin; genuine app→lib survives. */
-TEST(arch_boundaries_exclude_synthetic_builtin_nodes) {
-    cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_TRUE(s != NULL);
-    cbm_store_upsert_project(s, "sb", "/tmp/sb");
-
-    cbm_node_t f_app = {.project = "sb",
-                        .label = "File",
-                        .name = "run.py",
-                        .qualified_name = "sb.app.run.__file__",
-                        .file_path = "app/run.py",
-                        .properties_json = "{\"extension\":\".py\",\"pkg\":\"app\"}"};
-    cbm_store_upsert_node(s, &f_app);
-    cbm_node_t f_lib = {.project = "sb",
-                        .label = "File",
-                        .name = "core.py",
-                        .qualified_name = "sb.lib.core.__file__",
-                        .file_path = "lib/core.py",
-                        .properties_json = "{\"extension\":\".py\",\"pkg\":\"lib\"}"};
-    cbm_store_upsert_node(s, &f_lib);
-
-    /* Synthetic builtin node exactly as the Python builtin registry mints it:
-     * sentinel file_path, builtins.* QN. */
-    cbm_node_t fn_len = {.project = "sb",
-                         .label = "Function",
-                         .name = "len",
-                         .qualified_name = "builtins.len",
-                         .file_path = "<python-builtins>"};
-    int64_t id_len = cbm_store_upsert_node(s, &fn_len);
-
-    cbm_node_t fn_core = {.project = "sb",
-                          .label = "Function",
-                          .name = "core_fn",
-                          .qualified_name = "sb.lib.core.core_fn",
-                          .file_path = "lib/core.py"};
-    int64_t id_core = cbm_store_upsert_node(s, &fn_core);
-
-    int64_t callers[3];
-    for (int i = 0; i < 3; i++) {
-        char name[32], qn[64];
-        snprintf(name, sizeof(name), "caller_%d", i);
-        snprintf(qn, sizeof(qn), "sb.app.run.caller_%d", i);
-        cbm_node_t c = {.project = "sb",
-                        .label = "Function",
-                        .name = name,
-                        .qualified_name = qn,
-                        .file_path = "app/run.py"};
-        callers[i] = cbm_store_upsert_node(s, &c);
-    }
-
-    /* Three HIGH-confidence calls onto the builtin — resolution is confident,
-     * the target is just not repo code. Must NOT create a boundary. */
-    for (int i = 0; i < 3; i++) {
-        cbm_edge_t e = {.project = "sb",
-                        .source_id = callers[i],
-                        .target_id = id_len,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"len\",\"confidence\":0.95,"
-                                           "\"strategy\":\"builtin\",\"candidates\":1}"};
-        cbm_store_insert_edge(s, &e);
-    }
-
-    /* Two genuine cross-package calls app→lib. Must survive. */
-    for (int i = 0; i < 2; i++) {
-        cbm_edge_t e = {.project = "sb",
-                        .source_id = callers[i],
-                        .target_id = id_core,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"core_fn\",\"confidence\":0.90,"
-                                           "\"strategy\":\"import_match\",\"candidates\":1}"};
-        cbm_store_insert_edge(s, &e);
-    }
-
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"boundaries"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "sb", NULL, aspects, 1, &info), CBM_STORE_OK);
-
-    /* No boundary may target the builtin pseudo-package. */
-    ASSERT_EQ(boundary_count_helper(&info, "app", "len"), -1);
-
-    /* The genuine cross-package boundary keeps its count. */
-    ASSERT_EQ(boundary_count_helper(&info, "app", "lib"), 2);
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-/* Test-code callers must not manufacture cross-package boundaries. A test
- * function (is_test=true) that calls a bare generic method — `.new()`,
- * `.canonicalize()`, `.env()` — gets its CALLS edge mis-bound onto a lone
- * same-named function in another package. The short-name resolver floors such
- * a guess to ~0.55: JUST past the 0.5 confidence gate, so the confidence
- * filter alone does NOT drop it. Observed live on the pm repo as a spurious
- * pm-git-safety→pm-cli boundary (weight 16), driven entirely by is_test
- * callers in crates/git-safety/src/db_path.rs invoking `new`/`canonicalize`.
- * Test code is not part of the architecture's dependency structure, so its
- * callers must be excluded from boundary/fan/layer aggregation — the same gate
- * arch_hotspots/arch_entry_points already apply to their node scans.
- *
- * RED at branch base (node scan has no is_test filter): app→tool reported as a
- * boundary with call_count 5. GREEN: the test-caller pair is gone, while the
- * genuine non-test app→lib boundary survives with its full count. */
-TEST(arch_boundaries_exclude_test_callers) {
-    cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_TRUE(s != NULL);
-    cbm_store_upsert_project(s, "tc", "/tmp/tc");
-
-    /* Three packages via File-node pkg props: app (callers), tool (collision
-     * target), lib (genuine dependency). */
-    cbm_node_t f_app = {.project = "tc",
-                        .label = "File",
-                        .name = "lib.rs",
-                        .qualified_name = "tc.app.src.lib.__file__",
-                        .file_path = "app/src/lib.rs",
-                        .properties_json = "{\"extension\":\".rs\",\"pkg\":\"app\"}"};
-    cbm_store_upsert_node(s, &f_app);
-    cbm_node_t f_tool = {.project = "tc",
-                         .label = "File",
-                         .name = "util.rs",
-                         .qualified_name = "tc.tool.src.util.__file__",
-                         .file_path = "tool/src/util.rs",
-                         .properties_json = "{\"extension\":\".rs\",\"pkg\":\"tool\"}"};
-    cbm_store_upsert_node(s, &f_tool);
-    cbm_node_t f_lib = {.project = "tc",
-                        .label = "File",
-                        .name = "core.rs",
-                        .qualified_name = "tc.lib.src.core.__file__",
-                        .file_path = "lib/src/core.rs",
-                        .properties_json = "{\"extension\":\".rs\",\"pkg\":\"lib\"}"};
-    cbm_store_upsert_node(s, &f_lib);
-
-    /* Collision target in `tool`: a lone fn named `new`. */
-    cbm_node_t fn_new = {.project = "tc",
-                         .label = "Function",
-                         .name = "new",
-                         .qualified_name = "tc.tool.src.util.new",
-                         .file_path = "tool/src/util.rs"};
-    int64_t id_new = cbm_store_upsert_node(s, &fn_new);
-
-    /* Genuine dependency target in `lib`. */
-    cbm_node_t fn_run = {.project = "tc",
-                         .label = "Function",
-                         .name = "run",
-                         .qualified_name = "tc.lib.src.core.run",
-                         .file_path = "lib/src/core.rs"};
-    int64_t id_run = cbm_store_upsert_node(s, &fn_run);
-
-    /* Five TEST caller functions in `app` (is_test=true), same file as a
-     * source file — the #[cfg(test)] mod case: file_path is NOT a test path,
-     * only the node's is_test flag marks it. */
-    int64_t test_callers[5];
-    for (int i = 0; i < 5; i++) {
-        char name[32], qn[64];
-        snprintf(name, sizeof(name), "test_case_%d", i);
-        snprintf(qn, sizeof(qn), "tc.app.src.lib.test_case_%d", i);
-        cbm_node_t c = {.project = "tc",
-                        .label = "Function",
-                        .name = name,
-                        .qualified_name = qn,
-                        .file_path = "app/src/lib.rs",
-                        .properties_json = "{\"is_test\":true}"};
-        test_callers[i] = cbm_store_upsert_node(s, &c);
-    }
-
-    /* Three genuine NON-test callers in `app` (distinct sources so their edges
-     * do not dedup to one). */
-    int64_t prod_callers[3];
-    for (int i = 0; i < 3; i++) {
-        char name[32], qn[64];
-        snprintf(name, sizeof(name), "drive_%d", i);
-        snprintf(qn, sizeof(qn), "tc.app.src.lib.drive_%d", i);
-        cbm_node_t c = {.project = "tc",
-                        .label = "Function",
-                        .name = name,
-                        .qualified_name = qn,
-                        .file_path = "app/src/lib.rs",
-                        .properties_json = "{\"is_test\":false}"};
-        prod_callers[i] = cbm_store_upsert_node(s, &c);
-    }
-
-    /* Five edges test→tool onto `new` at confidence 0.55 — PAST the 0.5 gate,
-     * so only the is_test-caller exclusion can drop them. Must NOT create a
-     * boundary. */
-    for (int i = 0; i < 5; i++) {
-        cbm_edge_t e = {.project = "tc",
-                        .source_id = test_callers[i],
-                        .target_id = id_new,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"new\",\"confidence\":0.55,"
-                                           "\"strategy\":\"unique_name\",\"candidates\":1}"};
-        cbm_store_insert_edge(s, &e);
-    }
-
-    /* Three HIGH-confidence genuine edges drive→lib from the non-test callers.
-     * Must survive in full. */
-    for (int i = 0; i < 3; i++) {
-        cbm_edge_t e = {.project = "tc",
-                        .source_id = prod_callers[i],
-                        .target_id = id_run,
-                        .type = "CALLS",
-                        .properties_json = "{\"callee\":\"run\",\"confidence\":0.90,"
-                                           "\"strategy\":\"import_match\",\"candidates\":1}"};
-        cbm_store_insert_edge(s, &e);
-    }
-
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"boundaries"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "tc", NULL, aspects, 1, &info), CBM_STORE_OK);
-
-    /* The test-caller-only pair must not be reported as a boundary at all. */
-    ASSERT_EQ(boundary_count_helper(&info, "app", "tool"), -1);
-
-    /* The genuine non-test boundary keeps its full count. */
-    ASSERT_EQ(boundary_count_helper(&info, "app", "lib"), 3);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -1066,145 +506,6 @@ TEST(arch_layers) {
             ASSERT_STR_EQ(info.layers[i].layer, "api");
         }
     }
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-/* Packages array must report the SAME cross-package fan-in/fan-out that the
- * layer analysis derives from call boundaries — not a hard-coded zero. Fixture
- * has no Package nodes, so arch_packages derives names via cbm_qn_to_package,
- * matching the boundary-derived names, and the join is unambiguous. */
-TEST(arch_packages_report_fan) {
-    cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_NOT_NULL(s);
-    ASSERT_EQ(cbm_store_upsert_project(s, "fan", "/tmp/fan"), CBM_STORE_OK);
-
-    /* Two packages (alpha, beta) via 4-segment QNs: seg[2] is the package. */
-    cbm_node_t a1 = {.project = "fan",
-                     .label = "Function",
-                     .name = "a1",
-                     .qualified_name = "fan.src.alpha.a1",
-                     .file_path = "src/alpha/a.c"};
-    cbm_node_t a2 = {.project = "fan",
-                     .label = "Function",
-                     .name = "a2",
-                     .qualified_name = "fan.src.alpha.a2",
-                     .file_path = "src/alpha/a.c"};
-    cbm_node_t b1 = {.project = "fan",
-                     .label = "Function",
-                     .name = "b1",
-                     .qualified_name = "fan.src.beta.b1",
-                     .file_path = "src/beta/b.c"};
-    int64_t id_a1 = cbm_store_upsert_node(s, &a1);
-    int64_t id_a2 = cbm_store_upsert_node(s, &a2);
-    int64_t id_b1 = cbm_store_upsert_node(s, &b1);
-
-    /* Cross-package calls: alpha→beta and beta→alpha (each count 1). */
-    cbm_edge_t e_ab = {.project = "fan", .source_id = id_a1, .target_id = id_b1, .type = "CALLS"};
-    cbm_edge_t e_ba = {.project = "fan", .source_id = id_b1, .target_id = id_a2, .type = "CALLS"};
-    cbm_store_insert_edge(s, &e_ab);
-    cbm_store_insert_edge(s, &e_ba);
-
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"packages", "boundaries"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "fan", NULL, aspects, 2, &info), CBM_STORE_OK);
-
-    ASSERT_TRUE(info.package_count >= 2);
-    ASSERT_TRUE(info.boundary_count > 0);
-
-    /* Ground truth: derive each package's fan from the boundaries aspect —
-     * exactly what the layer analysis does. The packages array must agree. */
-    bool saw_alpha = false, saw_beta = false;
-    for (int i = 0; i < info.package_count; i++) {
-        const char *pkg = info.packages[i].name;
-        int expect_in = 0, expect_out = 0;
-        for (int b = 0; b < info.boundary_count; b++) {
-            if (strcmp(info.boundaries[b].from, pkg) == 0)
-                expect_out += info.boundaries[b].call_count;
-            if (strcmp(info.boundaries[b].to, pkg) == 0)
-                expect_in += info.boundaries[b].call_count;
-        }
-        ASSERT_EQ(info.packages[i].fan_in, expect_in);
-        ASSERT_EQ(info.packages[i].fan_out, expect_out);
-        if (strcmp(pkg, "alpha") == 0) {
-            saw_alpha = true;
-            ASSERT_EQ(info.packages[i].fan_in, 1);
-            ASSERT_EQ(info.packages[i].fan_out, 1);
-        }
-        if (strcmp(pkg, "beta") == 0) {
-            saw_beta = true;
-            ASSERT_EQ(info.packages[i].fan_in, 1);
-            ASSERT_EQ(info.packages[i].fan_out, 1);
-        }
-    }
-    ASSERT_TRUE(saw_alpha);
-    ASSERT_TRUE(saw_beta);
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-TEST(arch_packages_include_small_layer_packages) {
-    /* The packages aspect truncated to the top-15 groups by node count while
-     * the layers aspect caps at ST_MAX_PKGS (64), so a small package that
-     * layers reports (observed live: single-file Python scripts with 3-5 defs,
-     * classified via their entry points) was silently absent from packages —
-     * the two aspects contradicted each other. Both must honour the same cap:
-     * any package small enough to be truncated from packages must not appear
-     * in layers either; with ≤64 groups, both list it. */
-    cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_NOT_NULL(s);
-    ASSERT_EQ(cbm_store_upsert_project(s, "trunc", "/tmp/trunc"), CBM_STORE_OK);
-
-    /* 16 bulk packages (pkg00..pkg15) with 2 defs each outrank... */
-    for (int p = 0; p < 16; p++) {
-        for (int d = 0; d < 2; d++) {
-            char qn[128], fp[64], nm[32];
-            snprintf(nm, sizeof(nm), "f%d_%d", p, d);
-            snprintf(qn, sizeof(qn), "trunc.src.pkg%02d.f%d_%d", p, p, d);
-            snprintf(fp, sizeof(fp), "src/pkg%02d/a.c", p);
-            cbm_node_t n = {.project = "trunc",
-                            .label = "Function",
-                            .name = nm,
-                            .qualified_name = qn,
-                            .file_path = fp};
-            ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
-        }
-    }
-    /* ...one single-definition package whose def is an entry point, so the
-     * layers aspect names it. */
-    cbm_node_t script = {.project = "trunc",
-                         .label = "Function",
-                         .name = "main",
-                         .qualified_name = "trunc.scripts.tiny-script.main",
-                         .file_path = "scripts/tiny-script.py",
-                         .properties_json = "{\"is_entry_point\":true}"};
-    ASSERT_TRUE(cbm_store_upsert_node(s, &script) > 0);
-
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"packages", "layers"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "trunc", NULL, aspects, 2, &info), CBM_STORE_OK);
-
-    bool in_layers = false;
-    for (int i = 0; i < info.layer_count; i++) {
-        if (strcmp(info.layers[i].name, "tiny-script") == 0) {
-            in_layers = true;
-        }
-    }
-    ASSERT_TRUE(in_layers); /* precondition: layers does report it */
-
-    bool in_packages = false;
-    for (int i = 0; i < info.package_count; i++) {
-        if (strcmp(info.packages[i].name, "tiny-script") == 0) {
-            in_packages = true;
-        }
-    }
-    ASSERT_TRUE(in_packages); /* the defect: truncated out before the fix */
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -2219,74 +1520,6 @@ TEST(arch_clusters_basic) {
     PASS();
 }
 
-/* A cluster's label must be the real package/crate name (QN segment[2]), not
- * the top-level directory (segment[1]). With a repo layout like
- * crates/<crate>/... every cluster would otherwise be uselessly labeled
- * "crates". Two cliques, each dominated by a distinct crate under a shared top
- * dir; each cluster's label must be that crate's name, never the top dir. */
-TEST(arch_cluster_label_is_crate_not_topdir) {
-    cbm_store_t *s = cbm_store_open_memory();
-    cbm_store_upsert_project(s, "test", "/tmp/test");
-
-    /* 5-segment QNs: test.crates.<crate>.mod.fnN — seg[1]="crates" (top dir),
-     * seg[2]=<crate> (real package). Two crates, one clique each. */
-    const char *crates[2] = {"alphacrate", "betacrate"};
-    int64_t id[8];
-    for (int i = 0; i < 8; i++) {
-        char nm[32];
-        char qn[80];
-        int grp = i / 4;
-        snprintf(nm, sizeof(nm), "fn%d", i);
-        snprintf(qn, sizeof(qn), "test.crates.%s.mod.fn%d", crates[grp], i);
-        cbm_node_t node = {.project = "test",
-                           .label = "Function",
-                           .name = nm,
-                           .qualified_name = qn,
-                           .file_path = "f.rs"};
-        id[i] = cbm_store_upsert_node(s, &node);
-    }
-    for (int g = 0; g < 2; g++) {
-        for (int a = 0; a < 4; a++) {
-            for (int b = a + 1; b < 4; b++) {
-                cbm_edge_t e = {.project = "test",
-                                .source_id = id[(g * 4) + a],
-                                .target_id = id[(g * 4) + b],
-                                .type = "CALLS"};
-                cbm_store_insert_edge(s, &e);
-            }
-        }
-    }
-    cbm_edge_t bridge = {
-        .project = "test", .source_id = id[0], .target_id = id[4], .type = "CALLS"};
-    cbm_store_insert_edge(s, &bridge);
-
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"clusters"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
-    ASSERT_TRUE(info.cluster_count >= 2);
-
-    bool saw_alpha = false, saw_beta = false;
-    for (int i = 0; i < info.cluster_count; i++) {
-        ASSERT_NOT_NULL(info.clusters[i].label);
-        /* Never the top-level directory. */
-        ASSERT_TRUE(strcmp(info.clusters[i].label, "crates") != 0);
-        /* Always a real crate name. */
-        ASSERT_TRUE(strcmp(info.clusters[i].label, "alphacrate") == 0 ||
-                    strcmp(info.clusters[i].label, "betacrate") == 0);
-        if (strcmp(info.clusters[i].label, "alphacrate") == 0)
-            saw_alpha = true;
-        if (strcmp(info.clusters[i].label, "betacrate") == 0)
-            saw_beta = true;
-    }
-    ASSERT_TRUE(saw_alpha);
-    ASSERT_TRUE(saw_beta);
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
 /* ── Helper function tests ──────────────────────────────────────── */
 
 TEST(qn_to_package) {
@@ -2443,25 +1676,17 @@ TEST(search_case_sensitive_explicit) {
 SUITE(store_arch) {
     /* Architecture */
     RUN_TEST(arch_get_all);
-    RUN_TEST(arch_entry_points_include_test_targets);
-    RUN_TEST(arch_entry_points_report_exact_total_when_slice_is_truncated);
+    RUN_TEST(arch_entry_points_exclude_tests);
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
     RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
     RUN_TEST(arch_routes);
-    RUN_TEST(arch_routes_report_exact_total_when_slice_is_truncated);
     RUN_TEST(arch_hotspots);
-    RUN_TEST(arch_hotspots_exclude_low_confidence_name_collisions);
-    RUN_TEST(arch_boundaries_exclude_low_confidence_name_collisions);
-    RUN_TEST(arch_boundaries_exclude_synthetic_builtin_nodes);
-    RUN_TEST(arch_boundaries_exclude_test_callers);
     RUN_TEST(arch_boundaries);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
-    RUN_TEST(arch_packages_report_fan);
-    RUN_TEST(arch_packages_include_small_layer_packages);
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
 
@@ -2510,7 +1735,6 @@ SUITE(store_arch) {
     RUN_TEST(leiden_multilevel_collapses_noise);
     RUN_TEST(leiden_resolution_controls_granularity);
     RUN_TEST(arch_clusters_basic);
-    RUN_TEST(arch_cluster_label_is_crate_not_topdir);
 
     /* Helpers */
     RUN_TEST(qn_to_package);

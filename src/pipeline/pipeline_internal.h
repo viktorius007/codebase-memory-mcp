@@ -21,12 +21,6 @@
 #include <stdatomic.h>
 #include <string.h>
 
-typedef enum {
-    CBM_PXC_COLLECT_ALLOCATION_FAILED = -1,
-    CBM_PXC_COLLECT_EMPTY = 0,
-    CBM_PXC_COLLECT_AVAILABLE = 1,
-} CBMPxcCollectStatus;
-
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
 /* Maximum byte budget for tree-sitter extraction per file */
@@ -82,43 +76,10 @@ typedef struct {
     cbm_pkg_entry_t *items;
     int count;
     int cap;
-    bool complete;
 } cbm_pkg_entries_t;
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
-
-/* A workspace member: the DIRECTORY that owns a manifest and the package NAME
- * that manifest declares. Unlike cbm_pkg_entry_t (which maps an import specifier
- * to a resolved entry-file QN for IMPORTS resolution), this pairs a member's
- * on-disk location with its authoritative name so def/File nodes can be labelled
- * by their true package regardless of directory layout (a crate at xtask/ whose
- * [package] name is "buildtool" reads as "buildtool", not the "src" QN segment). */
-typedef struct {
-    char *dir;  /* heap: manifest directory, rel to repo root ("" = root) */
-    char *name; /* heap: declared package name from the manifest */
-} cbm_pkg_member_t;
-
-typedef struct {
-    cbm_pkg_member_t *items;
-    int count;
-    int cap;
-    bool complete;
-} cbm_pkg_members_t;
-
-void cbm_pkg_members_init(cbm_pkg_members_t *m);
-void cbm_pkg_members_free(cbm_pkg_members_t *m);
-
-/* Walk repo_path for package manifests and record (directory, declared-name) for
- * each. Reuses the same manifest parsers as pkgmap (no new parsing); the declared
- * name is each manifest's primary/first parsed package name. NULL-safe. Returns
- * the number of members collected. */
-int cbm_pkgmap_collect_members(const char *repo_path, cbm_pkg_members_t *out);
-
-/* Return the declared name of the member owning file_rel — the LONGEST member
- * directory that is a path-prefix of file_rel — or NULL when no member owns it
- * (the file falls back to QN-segment package derivation downstream). Borrowed. */
-const char *cbm_pkg_members_lookup(const cbm_pkg_members_t *m, const char *file_rel);
 
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
@@ -589,14 +550,12 @@ struct CBMModuleDefIndex;
 
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
-                         int worker_count, const cbm_file_info_t *rust_authority_files,
-                         CBMFileResult *const *rust_authority_cache, int rust_authority_count,
+                         int worker_count,
                          /* Cross-file LSP inputs — pre-built once by the caller and
                           * shared read-only across workers (typed non-const to match
                           * the existing cbm_run_X_lsp_cross signatures the resolve
                           * worker forwards them to). Pass NULL/0/NULL to skip. */
-                         CBMLSPDef *all_defs, int def_count,
-                         CBMPxcCollectStatus definition_universe_status, char *const *def_modules,
+                         CBMLSPDef *all_defs, int def_count, char *const *def_modules,
                          /* Optional inverted index module_qn → defs[] — fallback
                           * path when there's no pre-built registry for this lang. */
                          struct CBMModuleDefIndex *module_def_index,
@@ -785,6 +744,10 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
 int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
                                                cbm_file_hash_t **out, int *out_count);
 
+/* Compatibility contract persisted in coverage metadata. Increment when a
+ * graph/manifest semantic change makes prior exact-input indexes unsafe. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
+
 typedef struct {
     cbm_gbuf_t *gbuf;
     const char *final_db_path;
@@ -857,22 +820,6 @@ void cbm_pipeline_discard_stage(const char *stage_path);
  * Takes ownership; dump_and_persist_hashes writes them into the staging
  * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
 void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
-void cbm_pipeline_begin_rust_health_capture(cbm_pipeline_t *p, const cbm_file_info_t *files,
-                                            int count, bool whole_generation);
-void cbm_pipeline_capture_rust_health(cbm_pipeline_t *p, const char *rel_path,
-                                      const CBMRustAnalysisHealth *health);
-void cbm_pipeline_capture_rust_cache(cbm_pipeline_t *p, const cbm_file_info_t *files, int count,
-                                     CBMFileResult *const *cache);
-void cbm_pipeline_get_rust_health(const cbm_pipeline_t *p, const cbm_coverage_row_t **rows,
-                                  int *row_count, const char **recording_status,
-                                  int *rust_files_total);
-cbm_coverage_row_t *cbm_pipeline_alloc_coverage_rows(cbm_pipeline_t *p, int count);
-void cbm_pipeline_mark_file_error_capture_failed(cbm_pipeline_t *p);
-bool cbm_pipeline_file_error_capture_complete(const cbm_pipeline_t *p);
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-void cbm_pipeline_test_fail_coverage_alloc(cbm_pipeline_t *p, bool fail);
-void cbm_pipeline_test_fail_file_error_alloc_at(cbm_pipeline_t *p, int position);
-#endif
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
@@ -917,6 +864,12 @@ void cbm_pp_bp_nap_cycles_reset(void);
 uint64_t cbm_pp_lsp_linear_fallback_rows(void);
 void cbm_pp_lsp_linear_fallback_rows_reset(void);
 
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Test-only view of the Studio Export range join, so the ",+<N>" truncation
+ * marker rules can be checked without building a 256-region export file. */
+bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMFileResult *part);
+#endif
+
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 /* Deterministic test-only operation count for the shared semantic-reference
  * matcher used by both sequential and fused-parallel usage materialization. */
@@ -936,13 +889,6 @@ typedef enum {
 /* Deterministic one-shot fault injection for the incremental-parallel result
  * cache allocation. Reset explicitly so one test cannot affect another. */
 void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void);
-void cbm_pipeline_incremental_test_fail_combined_definition_alloc_once(void);
-void cbm_parallel_test_fail_error_alloc_at(int position);
-bool cbm_parallel_test_error_add_is_atomic(int allocation_position);
-void cbm_parallel_test_fail_rust_registry_after(size_t successful_allocations);
-bool cbm_parallel_test_rust_registry_failure_is_rejected(size_t successful_allocations);
-bool cbm_pipeline_incremental_test_combined_definition_failure_is_typed(void);
-bool cbm_parallel_test_collect_failure_does_not_duplicate_health(void);
 void cbm_pipeline_incremental_test_force_legacy_partial_once(void);
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_predump_once(void);

@@ -131,10 +131,6 @@ typedef struct KotlinLSPContext {
      * Zero via memset. */
     int walk_depth;
 
-    /* Recursion guard for kotlin_parse_type_node on deeply nested generics
-     * (same cap; see cbm_lsp_max_walk_depth). Zero via memset. */
-    int type_depth;
-
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
     /* Cross-file only (NULL per-file): unique short type name -> registered

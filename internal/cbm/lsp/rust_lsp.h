@@ -35,7 +35,6 @@
  * here to avoid pulling rust_cargo.h into every consumer that only
  * needs the LSP API. */
 struct CBMCargoManifest;
-struct CBMMacroTable;
 
 /* Global confidence assigned to LSP-resolved call edges. The pipeline's
  * shared override resolver (`pipeline/lsp_resolve.h`) only admits entries
@@ -50,10 +49,6 @@ struct CBMMacroTable;
 #define CBM_RUST_CONF_MACRO_KNOWN 0.85f /* known std macro mapped to fn */
 #define CBM_RUST_CONF_OPERATOR 0.88f    /* a+b → T::add (operator trait) */
 
-/* Return the byte after a Rust string, character literal, or comment beginning
- * at `from`, or `from` when the source begins with an ordinary token. */
-int cbm_rust_macro_opaque_token_end(const char *text, int len, int from);
-
 /* Rust-flavoured LSP context: one per file, lifetime tied to a single
  * `cbm_extract_file()` invocation (or the cross-file caller's arena). */
 typedef struct {
@@ -61,7 +56,6 @@ typedef struct {
     const char *source;
     int source_len;
     const char *root_source; /* immutable original file buffer */
-    TSNode root;             /* exact current-file AST for cfg-safe local authority */
 
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
@@ -80,13 +74,7 @@ typedef struct {
      * `crate::foo::Bar`). Glob imports go in `glob_module_qns` instead. */
     const char **use_local_names;
     const char **use_module_paths;
-    bool *use_authoritative;
-    uint32_t *use_scope_starts;
-    uint32_t *use_scope_ends;
-    const char **use_owner_module_paths;
     int use_count;
-    uint32_t lookup_site_byte;
-    const char *current_module_path;
 
     const char **glob_module_qns;
     int glob_count;
@@ -133,7 +121,6 @@ typedef struct {
      * synthetic transcriber buffer, so their tree-sitter offsets cannot be
      * used to decide which source-level macro_rules! definition is visible. */
     uint32_t macro_origin_byte;
-    uint32_t macro_origin_end_byte;
     bool macro_origin_valid;
 
     /* Recursion guard for macro expansion. Real macro_rules! can be
@@ -183,27 +170,6 @@ typedef struct {
     /* Output: resolved (and unresolved-with-reason) calls accumulate here. */
     CBMResolvedCallArray *resolved_calls;
 
-    /* Generated callable definitions recovered from item-producing
-     * macro_rules! expansions. NULL for low-level/cross-file callers. */
-    CBMDefArray *defs;
-    const char *def_file_path;
-    bool macro_item_expansion;
-    uint32_t macro_item_start_line;
-    uint32_t macro_item_end_line;
-
-    /* Optional resolver-proven value references. Single-file extraction owns
-     * this array; lower-level and cross-file callers may leave it NULL. */
-    CBMUsageArray *usages;
-
-    /* Storage for resolved usage target names. Cross-file resolution uses a
-     * temporary arena, so its annotations must instead belong to the result. */
-    CBMArena *usage_target_arena;
-
-    /* Borrowed, allocation-independent semantic degradation sink. A NULL sink
-     * preserves the public low-level context API for callers that do not own a
-     * CBMFileResult; production single-file extraction always supplies one. */
-    CBMRustAnalysisHealth *health;
-
     /* Syntactic-call list (result->calls), borrowed from the per-file
      * extraction result. The downstream pipeline only turns a resolved_call
      * into a CALLS edge when a *syntactic* CBMCall with the same
@@ -222,26 +188,6 @@ typedef struct {
      * around the macro-argument re-parse where the syntactic extractor never
      * produced a call node. */
     int inject_syn_calls;
-
-    /* Recursion-depth guards (crash guard, distinct from the eval_step_count
-     * width budget). Separate counters mirror c_lsp.c so mutually-recursive
-     * walks don't share a budget and prematurely degrade legitimately-deep
-     * code. type_depth bounds rust_parse_type_node on deeply nested generics
-     * (Vec<Vec<…>>); eval_depth bounds rust_eval_expr_type; walk_depth bounds
-     * rust_resolve_calls_in_node. Past the cap the subtree collapses to unknown
-     * / stops resolving — graceful degradation, not stack exhaustion. */
-    int type_depth;
-    int eval_depth;
-    int walk_depth;
-
-    /* Per-context ceilings make the production limits explicit and let tests
-     * exercise both sides of each boundary without pathological fixtures. */
-    int max_type_depth;
-    int max_eval_depth;
-    int max_walk_depth;
-    int max_eval_steps;
-    int max_macro_depth;
-    int max_macro_bindings;
 
     /* Current invocation occurrence in ORIGINAL-file coordinates. Ordinary
      * source calls use their tree-sitter node directly. Calls recovered by
@@ -282,9 +228,6 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
  * full `module_path` is stored verbatim (e.g. `std::collections::HashMap`).
  * Glob imports (`use foo::*`) go through `rust_lsp_add_glob` instead. */
 void rust_lsp_add_use(RustLSPContext *ctx, const char *local_name, const char *module_path);
-void rust_lsp_add_authoritative_use(RustLSPContext *ctx, const char *local_name,
-                                    const char *module_path, uint32_t scope_start,
-                                    uint32_t scope_end, const char *owner_module_path);
 void rust_lsp_add_glob(RustLSPContext *ctx, const char *module_qn);
 
 /* Process every function/method in the file, walking statements and
@@ -341,11 +284,7 @@ void cbm_run_rust_lsp(CBMArena *arena, CBMFileResult *result, const char *source
  * behaviour. */
 void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, const char *source,
                                     int source_len, TSNode root,
-                                    const struct CBMCargoManifest *manifest,
-                                    const struct CBMMacroTable *macro_table);
-
-bool cbm_rust_collect_exported_macro_rules(struct CBMMacroTable *table, const char *source,
-                                           int source_len, const char *package_dir);
+                                    const struct CBMCargoManifest *manifest);
 
 /* Register a curated subset of the Rust core/alloc/std prelude into the
  * given registry. The seed is intentionally compact (~150 types, ~600
@@ -370,29 +309,26 @@ void cbm_rust_crates_register(CBMTypeRegistry *reg, CBMArena *arena);
 typedef struct {
     const char *qualified_name;
     const char *short_name;
-    const char *label;                  /* "Function", "Method", "Type", "Trait" */
-    const char *receiver_type;          /* for methods: receiver type QN (NULL for free fns) */
-    const char *def_module_qn;          /* module QN where this def lives */
-    const char *crate_root_qn;          /* authoritative Cargo member root; NULL if unproven */
-    const char *crate_source_module_qn; /* exact module QN of selected target source */
-    const char *return_types;           /* "|"-separated return type texts          */
-    const char *embedded_types;         /* "|"-separated embedded type QNs          */
-    const char *field_defs;             /* "|"-separated "name:type" pairs          */
-    const char *method_names_str;       /* "|"-separated method names for traits   */
+    const char *label;            /* "Function", "Method", "Type", "Trait" */
+    const char *receiver_type;    /* for methods: receiver type QN (NULL for free fns) */
+    const char *def_module_qn;    /* module QN where this def lives */
+    const char *return_types;     /* "|"-separated return type texts          */
+    const char *embedded_types;   /* "|"-separated embedded type QNs          */
+    const char *field_defs;       /* "|"-separated "name:type" pairs          */
+    const char *method_names_str; /* "|"-separated method names for traits   */
     const char **signature_param_types; /* borrowed ordered parameter texts    */
     int signature_param_count;          /* positional entries; "?" is unknown */
     const char *trait_qn;               /* raw impl-trait spelling; uniquely canonicalized */
-    bool is_interface;                  /* true for traits                          */
-    bool is_rust_impl_relation;         /* independent type-level impl record       */
-    bool is_abstract;                   /* required trait declaration (no default)  */
+    bool is_interface;            /* true for traits                          */
+    bool is_rust_impl_relation;   /* independent type-level impl record       */
+    bool is_abstract;             /* required trait declaration (no default)  */
 } CBMRustLSPDef;
 
 /* Run cross-file resolution on a single file. */
 void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMRustLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
-                            TSTree *cached_tree, CBMResolvedCallArray *out,
-                            CBMRustAnalysisHealth *health);
+                            TSTree *cached_tree, CBMResolvedCallArray *out);
 
 /* Same as `cbm_run_rust_lsp_cross`, plus an optional parsed Cargo manifest
  * (NULL = manifest-free behaviour). The manifest lets call paths whose head
@@ -405,25 +341,7 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
-                                          CBMRustAnalysisHealth *health);
-
-void cbm_run_rust_lsp_cross_scoped_with_manifest(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
-    int def_count, const char **import_names, const char **import_qns,
-    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
-    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
-    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health);
-
-/* Cross-file variants that also annotate function-value usages. `usage_arena`
- * owns those target QNs and must outlive the temporary resolver arena. */
-void cbm_run_rust_lsp_cross_scoped_with_manifest_and_usages(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
-    int def_count, const char **import_names, const char **import_qns,
-    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
-    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
-    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health, CBMUsageArray *usages,
-    CBMArena *usage_arena);
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 /* Tier-2: build the project-wide Rust cross registry ONCE from all defs, finalize,
  * and seal read-only. Shared across every Rust file's resolve (mirrors C/py/cs/ts).
@@ -441,23 +359,7 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
-                                          CBMRustAnalysisHealth *health);
-
-void cbm_run_rust_lsp_cross_scoped_with_registry(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
-    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
-    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
-    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health);
-
-void cbm_run_rust_lsp_cross_scoped_with_registry_and_usages(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
-    const CBMRustImportScope *import_scopes, int import_count, TSTree *cached_tree,
-    const struct CBMCargoManifest *manifest, CBMResolvedCallArray *out,
-    CBMCallArray *synthetic_calls, CBMRustAnalysisHealth *health, CBMUsageArray *usages,
-    CBMArena *usage_arena);
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 /* Per-file input for batch cross-file Rust LSP processing. */
 typedef struct {
@@ -470,7 +372,6 @@ typedef struct {
     const char **import_names;
     const char **import_qns;
     int import_count;
-    CBMRustAnalysisHealth *health;
 } CBMBatchRustLSPFile;
 
 /* Process several files in one CGo call (per-file arenas, result copy). */

@@ -78,7 +78,6 @@ typedef struct {
 /* ── forward declarations ─────────────────────────────────────────── */
 
 static void kt_resolve_calls_in_node_inner(KotlinLSPContext *ctx, TSNode node);
-static const CBMType *kotlin_parse_type_node_inner(KotlinLSPContext *ctx, TSNode node);
 
 /* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
  * per nesting level; a deeply-nested or cyclic file can overflow the native
@@ -2197,15 +2196,6 @@ static void kt_process_property_decl(KotlinLSPContext *ctx, TSNode node) {
 /* ── type parsing ─────────────────────────────────────────────────── */
 
 const CBMType *kotlin_parse_type_node(KotlinLSPContext *ctx, TSNode node) {
-    if (ctx->type_depth >= cbm_lsp_max_walk_depth())
-        return cbm_type_unknown();
-    ctx->type_depth++;
-    const CBMType *result = kotlin_parse_type_node_inner(ctx, node);
-    ctx->type_depth--;
-    return result;
-}
-
-static const CBMType *kotlin_parse_type_node_inner(KotlinLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
     }

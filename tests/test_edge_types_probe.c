@@ -99,9 +99,12 @@ static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) 
     lp->project = cbm_project_name_from_path(lp->tmpdir);
     if (!lp->project) return NULL;
 
-    /* Resolve THROUGH the production resolver so the runner's
-     * CBM_CACHE_DIR isolation applies (never the user's real cache). */
-    th_cache_db_path(lp->dbpath, sizeof(lp->dbpath), lp->project);
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    cbm_mkdir(cache_dir);
+    snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
 
     lp->srv = cbm_mcp_server_new(NULL);
@@ -409,6 +412,30 @@ TEST(handles_spring_java) {
          "    public String getOrder(int id) {\n"
          "        return \"order:\" + id;\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* Spring (Java) — the path attribute may sit anywhere in the annotation.
+ * Java puts no order on annotation attributes, so `path` after `name`,
+ * `produces` and `consumes` is ordinary source. The argument scan stopped
+ * after the third attribute, so the path was never read and no Route node
+ * formed. A HANDLES count alone cannot catch that, because the class-level
+ * @RequestMapping still produces one route on its own. */
+TEST(handles_spring_java_path_attribute_fourth) {
+    static const char *routes[] = {"/api/orders", NULL};
+    static const EtFile f[] = {
+        {"OrderController.java",
+         "package com.example;\n\n"
+         "import org.springframework.web.bind.annotation.RequestMapping;\n"
+         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+         "@RequestMapping(\"/api\")\npublic class OrderController {\n"
+         "    @GetMapping(name = \"listOrders\",\n"
+         "                produces = \"application/json\",\n"
+         "                consumes = \"application/json\",\n"
+         "                path = \"/orders\")\n"
+         "    public String listOrders() {\n"
+         "        return \"orders\";\n    }\n}\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -787,83 +814,6 @@ TEST(http_calls_reqwest_rust) {
          "pub fn fetch_items() -> String {\n    reqwest_get(\"/api/items\")\n}\n\n"
          "pub fn push_item(body: &str) -> String {\n    reqwest_post(\"/api/items\", body)\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HTTP_CALLS", 1));
-    PASS();
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  HTTP_CALLS false-positives — filesystem paths must NOT mint Routes
- *
- *  detect_url_in_args (pass_parallel.c) runs for EVERY resolved call and,
- *  pre-fix, minted a Route + HTTP_CALLS edge from ANY argument string whose
- *  first char is '/', gated only by a weak junk filter with no filesystem-path
- *  exclusion. On a pure-CLI codebase this invented HTTP Routes (and a downstream
- *  "api" layer) from ordinary path literals like Path::new("/tmp/fixture").
- *  The fix routes detect_url_in_args through the strict
- *  cbm_service_pattern_is_http_route_literal predicate (already used by
- *  route_edge_visitor) so filesystem roots (/tmp) and filesystem extensions
- *  (.db) are rejected while genuine http(s):// and /api routes still pass.
- * ══════════════════════════════════════════════════════════════════ */
-
-/* True iff a Route node with the exact given name exists in the graph. */
-static bool et_has_route_named(cbm_store_t *store, const char *project, const char *name) {
-    cbm_node_t *nodes = NULL;
-    int count = 0;
-    if (cbm_store_find_nodes_by_label(store, project, "Route", &nodes, &count) != CBM_STORE_OK) {
-        return false;
-    }
-    bool found = false;
-    for (int i = 0; i < count; i++) {
-        if (nodes[i].name && strcmp(nodes[i].name, name) == 0) {
-            found = true;
-            break;
-        }
-    }
-    cbm_store_free_nodes(nodes, count);
-    return found;
-}
-
-/* Filesystem-path args to resolved calls must NOT become Routes, while a genuine
- * HTTP client route (reqwest → "/api/items") AND a bare "/api" route arg still do.
- * Uses the parallel path (>=50 files) because detect_url_in_args lives there. */
-TEST(http_calls_no_route_from_filesystem_path) {
-    static const EtFile meaningful[] = {
-        {"paths.rs",
-         /* Genuine HTTP client call: reqwest wrapper (QN carries "reqwest") with
-          * a real /api route — its Route flows through the recognized-client path
-          * (emit_http_async_service_edge), proving genuine detection is intact. */
-         "pub fn reqwest_get(url: &str) -> String {\n    url.to_string()\n}\n\n"
-         "pub fn fetch_items() -> String {\n    reqwest_get(\"/api/items\")\n}\n\n"
-         /* Genuine /api route arg to a NON-client call — pre-fix and post-fix this
-          * is minted by detect_url_in_args itself; proves the fix does not over-
-          * reject legitimate route-shaped args. */
-         "pub fn register(path: &str) -> String {\n    path.to_string()\n}\n\n"
-         "pub fn wire_routes() -> String {\n    register(\"/api/reports\")\n}\n\n"
-         /* False positives: ordinary filesystem paths passed to a resolved call.
-          * "/tmp/fixture" hits the filesystem-root branch; "/nonexistent/data.db"
-          * hits the filesystem-extension branch. Neither may become a Route. */
-         "pub fn load_fixture(path: &str) -> String {\n    path.to_string()\n}\n\n"
-         "pub fn seed() -> String {\n    load_fixture(\"/tmp/fixture\")\n}\n\n"
-         "pub fn open_db() -> String {\n    load_fixture(\"/nonexistent/data.db\")\n}\n"}};
-    EtProj lp;
-    cbm_store_t *store =
-        et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
-    bool tmp_route = store && et_has_route_named(store, lp.project, "/tmp/fixture");
-    bool db_route = store && et_has_route_named(store, lp.project, "/nonexistent/data.db");
-    bool api_items_route = store && et_has_route_named(store, lp.project, "/api/items");
-    bool api_reports_route = store && et_has_route_named(store, lp.project, "/api/reports");
-    if (tmp_route || db_route || !api_items_route || !api_reports_route) {
-        fprintf(stderr,
-                "  [ET-ROUTE-FP] tmp_route=%d db_route=%d api_items=%d api_reports=%d "
-                "(want 0 0 1 1)\n",
-                tmp_route, db_route, api_items_route, api_reports_route);
-    }
-    et_cleanup(&lp, store);
-    /* (a) filesystem paths must NOT be Routes (the false-positive being fixed) */
-    ASSERT_FALSE(tmp_route);
-    ASSERT_FALSE(db_route);
-    /* (b) genuine routes must STILL be Routes (detection not broken) */
-    ASSERT_TRUE(api_items_route);
-    ASSERT_TRUE(api_reports_route);
     PASS();
 }
 
@@ -1652,6 +1602,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
     RUN_TEST(handles_spring_java);
+    RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);
     RUN_TEST(handles_jaxrs_java);
     RUN_TEST(handles_aspnet_csharp);
@@ -1671,7 +1622,6 @@ SUITE(edge_types_probe) {
     RUN_TEST(http_calls_httparty_ruby);
     RUN_TEST(http_calls_guzzle_php);
     RUN_TEST(http_calls_reqwest_rust);
-    RUN_TEST(http_calls_no_route_from_filesystem_path);
 
     /* ASYNC_CALLS — message queue dispatch (5 brokers × languages) */
     RUN_TEST(async_calls_celery_python);

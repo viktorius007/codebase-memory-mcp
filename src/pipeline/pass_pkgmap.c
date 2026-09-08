@@ -99,7 +99,6 @@ void cbm_pkg_entries_init(cbm_pkg_entries_t *e) {
     e->items = NULL;
     e->count = 0;
     e->cap = 0;
-    e->complete = true;
 }
 
 static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_rel) {
@@ -109,7 +108,6 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
         if (!tmp) {
             free(pkg_name);
             free(entry_rel);
-            e->complete = false;
             return;
         }
         e->items = tmp;
@@ -1120,26 +1118,14 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
  * recursion bound — even directory junctions / symlink cycles cannot make
  * it hang. On Windows we additionally skip reparse points before
  * descending as a best-effort early-out. */
-/* Per-manifest callback: invoked once for every manifest file the walk finds,
- * with the file already read into `source`. */
-typedef void (*pkgmap_manifest_cb)(const char *basename, const char *rel_path, const char *source,
-                                   int source_len, void *userdata);
-
-/* Generic manifest walk. Owns the symlink-skip / depth-cap / skip-dir /
- * excluded-dir termination guarantees so callers (pkgmap entries + member
- * collection) share one traversal instead of duplicating the load-bearing
- * safety logic. Returns the number of manifest files dispatched to `cb`. */
-static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgmap_manifest_cb cb,
-                                 void *userdata, int depth, char **excluded_dirs,
-                                 int excluded_count, bool *complete) {
+static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
+                           int depth, char **excluded_dirs, int excluded_count) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
         cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
         return 0;
     }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
-        if (complete)
-            *complete = false;
         return 0;
     }
     int parsed = 0;
@@ -1175,8 +1161,8 @@ static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgma
                 continue;
             }
 #endif
-            parsed += pkgmap_walk_manifests(abs_path, rel_path, cb, userdata, depth + 1,
-                                            excluded_dirs, excluded_count, complete);
+            parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1, excluded_dirs,
+                                      excluded_count);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
@@ -1188,28 +1174,15 @@ static int pkgmap_walk_manifests(const char *abs_dir, const char *rel_dir, pkgma
         int source_len = 0;
         char *source = pkgmap_read_file(abs_path, &source_len);
         if (!source) {
-            if (complete)
-                *complete = false;
             continue;
         }
-        cb(name, rel_path, source, source_len, userdata);
-        parsed++;
+        if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
+            parsed++;
+        }
         free(source);
     }
     cbm_closedir(dir);
     return parsed;
-}
-
-/* Callback adapter: parse a manifest into the pkgmap entries collection. */
-static void pkgmap_entries_cb(const char *basename, const char *rel_path, const char *source,
-                              int source_len, void *userdata) {
-    cbm_pkgmap_try_parse(basename, rel_path, source, source_len, (cbm_pkg_entries_t *)userdata);
-}
-
-static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
-                           int depth, char **excluded_dirs, int excluded_count) {
-    return pkgmap_walk_manifests(abs_dir, rel_dir, pkgmap_entries_cb, entries, depth, excluded_dirs,
-                                 excluded_count, &entries->complete);
 }
 
 /* Scan a repository for package manifest files via the filesystem
@@ -1231,126 +1204,6 @@ int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char
     int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
-}
-
-/* ── Workspace member collection (directory → declared name) ───── */
-
-void cbm_pkg_members_init(cbm_pkg_members_t *m) {
-    m->items = NULL;
-    m->count = 0;
-    m->cap = 0;
-    m->complete = true;
-}
-
-void cbm_pkg_members_free(cbm_pkg_members_t *m) {
-    if (!m) {
-        return;
-    }
-    for (int i = 0; i < m->count; i++) {
-        free(m->items[i].dir);
-        free(m->items[i].name);
-    }
-    free(m->items);
-    m->items = NULL;
-    m->count = 0;
-    m->cap = 0;
-}
-
-static void pkg_members_push(cbm_pkg_members_t *m, char *dir, char *name) {
-    if (!dir || !name) {
-        free(dir);
-        free(name);
-        m->complete = false;
-        return;
-    }
-    /* First manifest to claim a directory wins — a polyglot dir with two
-     * manifests keeps a single stable name. */
-    for (int i = 0; i < m->count; i++) {
-        if (strcmp(m->items[i].dir, dir) == 0) {
-            free(dir);
-            free(name);
-            return;
-        }
-    }
-    if (m->count >= m->cap) {
-        int new_cap = m->cap == 0 ? PKGMAP_INIT_CAP : m->cap * PAIR_LEN;
-        cbm_pkg_member_t *tmp = realloc(m->items, (size_t)new_cap * sizeof(cbm_pkg_member_t));
-        if (!tmp) {
-            free(dir);
-            free(name);
-            m->complete = false;
-            return;
-        }
-        m->items = tmp;
-        m->cap = new_cap;
-    }
-    m->items[m->count].dir = dir;
-    m->items[m->count].name = name;
-    m->count++;
-}
-
-/* Callback adapter: record the manifest's DIRECTORY and its declared package
- * NAME as a workspace member. The declared name is the manifest's primary parsed
- * package name (the first pkg entry). A manifest that declares no package name
- * (e.g. a virtual Cargo [workspace] root with no [package]) yields no entries and
- * therefore contributes NO member — exactly right, so a workspace root never
- * masquerades as a package. */
-static void pkg_members_cb(const char *basename, const char *rel_path, const char *source,
-                           int source_len, void *userdata) {
-    cbm_pkg_entries_t tmp;
-    cbm_pkg_entries_init(&tmp);
-    cbm_pkgmap_try_parse(basename, rel_path, source, source_len, &tmp);
-    if (!tmp.complete)
-        ((cbm_pkg_members_t *)userdata)->complete = false;
-    if (tmp.count > 0 && tmp.items[0].pkg_name && tmp.items[0].pkg_name[0]) {
-        pkg_members_push((cbm_pkg_members_t *)userdata, path_dirname(rel_path),
-                         strdup(tmp.items[0].pkg_name));
-    }
-    cbm_pkg_entries_free(&tmp);
-}
-
-int cbm_pkgmap_collect_members(const char *repo_path, cbm_pkg_members_t *out) {
-    if (!repo_path || !out) {
-        return 0;
-    }
-    int parsed =
-        pkgmap_walk_manifests(repo_path, "", pkg_members_cb, out, 0, NULL, 0, &out->complete);
-    cbm_log_info("pkgmap.members", "manifests", pkgmap_itoa(parsed), "members",
-                 pkgmap_itoa(out->count));
-    return out->count;
-}
-
-/* True when `dir` is a path-prefix of `file_rel` at a path boundary: dir=="" (the
- * repo root, matches anything) or file_rel begins with "dir/". Rejects the
- * spurious "src" ⊂ "srcfoo/x" match a bare strncmp would accept. */
-static bool member_dir_owns(const char *dir, const char *file_rel) {
-    if (dir[0] == '\0') {
-        return true;
-    }
-    size_t dl = strlen(dir);
-    return strncmp(file_rel, dir, dl) == 0 && file_rel[dl] == '/';
-}
-
-const char *cbm_pkg_members_lookup(const cbm_pkg_members_t *m, const char *file_rel) {
-    if (!m || !file_rel) {
-        return NULL;
-    }
-    const char *best = NULL;
-    size_t best_len = 0;
-    /* Nearest enclosing member wins: crates/mycore/src/lib.rs is owned by
-     * crates/mycore, not by a root-level "" member. */
-    for (int i = 0; i < m->count; i++) {
-        const char *dir = m->items[i].dir;
-        if (!member_dir_owns(dir, file_rel)) {
-            continue;
-        }
-        size_t dl = strlen(dir);
-        if (best == NULL || dl > best_len) {
-            best = m->items[i].name;
-            best_len = dl;
-        }
-    }
-    return best;
 }
 
 /* Build pkgmap for sequential path (reads manifest files directly) */
@@ -1544,7 +1397,11 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     /* 1. Try relative import resolution (existing logic) */
     char *resolved = cbm_pipeline_resolve_relative_import(source_rel, module_path);
     if (resolved) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+        /* The relative resolver has already removed an explicit JS/TS file
+         * extension.  Treat the remaining path as a module path verbatim so a
+         * dotted extensionless basename such as `featureX.engine` is not
+         * stripped a second time by cbm_pipeline_fqn_module. */
+        char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
         free(resolved);
         return qn;
     }

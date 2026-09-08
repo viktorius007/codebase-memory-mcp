@@ -7,6 +7,7 @@
  */
 #include "cypher/cypher.h"
 #include "foundation/compat.h"
+#include "foundation/constants.h"
 #include "store/store.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
@@ -25,6 +26,7 @@ enum {
     CYP_MAX_VARS = 16,     /* max Cypher variables in a query */
     CYP_MAX_EDGE_VARS = 8, /* max edge variables */
     CYP_GROWTH_10 = 10,    /* binding growth factor */
+    CYP_GROWTH_2 = 2,      /* geometric buffer growth (#1196) */
     CYP_CHAR_IDX1 = 1,     /* second character index (e.g. op[1]) */
     CYP_EBUF_MASK = 7,
     CYP_NODE_COLS = 4, /* columns per node var: name, qn, label, file */
@@ -32,9 +34,12 @@ enum {
     CYP_COL_BUF = 48,  /* max column buffer (16 vars * 3 cols) */
     CYP_FOUND_NONE = -1,
     /* search miss sentinel */ /* mask for ebuf ring buffer (8 entries) */
-    CYP_UNWIND_ELEM_MAX = 256, /* max chars copied from one UNWIND list token */
 };
 #define CYP_DBL_MAX 1e308
+/* execute_single binds the first pattern's leading node even when the query
+ * leaves it unnamed, so the engine needs a name for it. The binding slot is
+ * real, which is why check_pattern_var_capacity counts it. */
+#define CYP_ANON_HEAD_VAR "_n0"
 
 #include <ctype.h>
 #include <limits.h> // INT_MAX
@@ -127,14 +132,6 @@ static void lex_string_literal(const char *input, int len, int *pos, char quote,
     buf[blen] = '\0';
     if (*pos < len) {
         (*pos)++; /* skip closing quote */
-    } else if (!out->error) {
-        out->diagnostic = (cbm_cypher_diagnostic_t){
-            .kind = CBM_CYPHER_DIAGNOSTIC_UNTERMINATED_STRING,
-            .expected = TOK_STRING,
-            .actual = TOK_EOF,
-            .byte_position = start - SKIP_ONE,
-        };
-        out->error = heap_strdup("unterminated string literal");
     }
     lex_push(out, TOK_STRING, buf, start - SKIP_ONE);
 }
@@ -144,81 +141,82 @@ typedef struct {
     const char *name;
     cbm_token_type_t type;
 } kw_entry_t;
-static const kw_entry_t keywords[] = {/* Core query */
-                                      {"MATCH", TOK_MATCH},
-                                      {"WHERE", TOK_WHERE},
-                                      {"RETURN", TOK_RETURN},
-                                      {"ORDER", TOK_ORDER},
-                                      {"BY", TOK_BY},
-                                      {"LIMIT", TOK_LIMIT},
-                                      {"AND", TOK_AND},
-                                      {"OR", TOK_OR},
-                                      {"AS", TOK_AS},
-                                      {"DISTINCT", TOK_DISTINCT},
-                                      {"COUNT", TOK_COUNT},
-                                      {"CONTAINS", TOK_CONTAINS},
-                                      {"STARTS", TOK_STARTS},
-                                      {"WITH", TOK_WITH},
-                                      {"NOT", TOK_NOT},
-                                      {"ASC", TOK_ASC},
-                                      {"DESC", TOK_DESC},
-                                      /* Phase 1-2: operators + expression */
-                                      {"ENDS", TOK_ENDS},
-                                      {"IN", TOK_IN},
-                                      {"IS", TOK_IS},
-                                      {"NULL", TOK_NULL_KW},
-                                      {"XOR", TOK_XOR},
-                                      /* Phase 3-4: SKIP, UNION, UNWIND, aggregates */
-                                      {"SKIP", TOK_SKIP},
-                                      {"UNION", TOK_UNION},
-                                      {"UNWIND", TOK_UNWIND},
-                                      {"SUM", TOK_SUM},
-                                      {"AVG", TOK_AVG},
-                                      {"MIN", TOK_MIN_KW},
-                                      {"MAX", TOK_MAX_KW},
-                                      {"COLLECT", TOK_COLLECT},
-                                      /* Phase 5: string functions + CASE */
-                                      {"toLower", TOK_TOLOWER},
-                                      {"toUpper", TOK_TOUPPER},
-                                      {"toString", TOK_TOSTRING},
-                                      {"tolower", TOK_TOLOWER},
-                                      {"toupper", TOK_TOUPPER},
-                                      {"tostring", TOK_TOSTRING},
-                                      {"CASE", TOK_CASE},
-                                      {"WHEN", TOK_WHEN},
-                                      {"THEN", TOK_THEN},
-                                      {"ELSE", TOK_ELSE},
-                                      {"END", TOK_END},
-                                      /* Phase 7: OPTIONAL */
-                                      {"OPTIONAL", TOK_OPTIONAL},
-                                      /* Recognized-but-unsupported write/admin keywords */
-                                      {"CREATE", TOK_CREATE},
-                                      {"DELETE", TOK_DELETE},
-                                      {"DETACH", TOK_DETACH},
-                                      {"SET", TOK_SET},
-                                      {"REMOVE", TOK_REMOVE},
-                                      {"MERGE", TOK_MERGE},
-                                      {"YIELD", TOK_YIELD},
-                                      {"CALL", TOK_CALL},
-                                      {"ALL", TOK_ALL},
-                                      {"TRUE", TOK_TRUE},
-                                      {"FALSE", TOK_FALSE},
-                                      {"EXISTS", TOK_EXISTS},
-                                      {"MANDATORY", TOK_MANDATORY},
-                                      {"FOREACH", TOK_FOREACH},
-                                      {"ON", TOK_ON},
-                                      {"ADD", TOK_ADD},
-                                      {"CONSTRAINT", TOK_CONSTRAINT},
-                                      {"DO", TOK_DO},
-                                      {"DROP", TOK_DROP},
-                                      {"FOR", TOK_FOR},
-                                      {"FROM", TOK_FROM},
-                                      {"GRAPH", TOK_GRAPH},
-                                      {"OF", TOK_OF},
-                                      {"REQUIRE", TOK_REQUIRE},
-                                      {"SCALAR", TOK_SCALAR},
-                                      {"UNIQUE", TOK_UNIQUE},
-                                      {NULL, 0}};
+static const kw_entry_t keywords[] = {
+    /* Core query */
+    {"MATCH", TOK_MATCH},
+    {"WHERE", TOK_WHERE},
+    {"RETURN", TOK_RETURN},
+    {"ORDER", TOK_ORDER},
+    {"BY", TOK_BY},
+    {"LIMIT", TOK_LIMIT},
+    {"AND", TOK_AND},
+    {"OR", TOK_OR},
+    {"AS", TOK_AS},
+    {"DISTINCT", TOK_DISTINCT},
+    {"COUNT", TOK_COUNT},
+    {"CONTAINS", TOK_CONTAINS},
+    {"STARTS", TOK_STARTS},
+    {"WITH", TOK_WITH},
+    {"NOT", TOK_NOT},
+    {"ASC", TOK_ASC},
+    {"DESC", TOK_DESC},
+    /* Phase 1-2: operators + expression */
+    {"ENDS", TOK_ENDS},
+    {"IN", TOK_IN},
+    {"IS", TOK_IS},
+    {"NULL", TOK_NULL_KW},
+    {"XOR", TOK_XOR},
+    /* Phase 3-4: SKIP, UNION, UNWIND, aggregates */
+    {"SKIP", TOK_SKIP},
+    {"UNION", TOK_UNION},
+    {"UNWIND", TOK_UNWIND},
+    {"SUM", TOK_SUM},
+    {"AVG", TOK_AVG},
+    {"MIN", TOK_MIN_KW},
+    {"MAX", TOK_MAX_KW},
+    {"COLLECT", TOK_COLLECT},
+    /* Phase 5: string functions + CASE */
+    {"toLower", TOK_TOLOWER},
+    {"toUpper", TOK_TOUPPER},
+    {"toString", TOK_TOSTRING},
+    {"tolower", TOK_TOLOWER},
+    {"toupper", TOK_TOUPPER},
+    {"tostring", TOK_TOSTRING},
+    {"CASE", TOK_CASE},
+    {"WHEN", TOK_WHEN},
+    {"THEN", TOK_THEN},
+    {"ELSE", TOK_ELSE},
+    {"END", TOK_END},
+    /* Phase 7: OPTIONAL */
+    {"OPTIONAL", TOK_OPTIONAL},
+    /* Recognized-but-unsupported write/admin keywords */
+    {"CREATE", TOK_CREATE},
+    {"DELETE", TOK_DELETE},
+    {"DETACH", TOK_DETACH},
+    {"SET", TOK_SET},
+    {"REMOVE", TOK_REMOVE},
+    {"MERGE", TOK_MERGE},
+    {"YIELD", TOK_YIELD},
+    {"CALL", TOK_CALL},
+    {"ALL", TOK_ALL},
+    {"TRUE", TOK_TRUE},
+    {"FALSE", TOK_FALSE},
+    {"EXISTS", TOK_EXISTS},
+    {"MANDATORY", TOK_MANDATORY},
+    {"FOREACH", TOK_FOREACH},
+    {"ON", TOK_ON},
+    {"ADD", TOK_ADD},
+    {"CONSTRAINT", TOK_CONSTRAINT},
+    {"DO", TOK_DO},
+    {"DROP", TOK_DROP},
+    {"FOR", TOK_FOR},
+    {"FROM", TOK_FROM},
+    {"GRAPH", TOK_GRAPH},
+    {"OF", TOK_OF},
+    {"REQUIRE", TOK_REQUIRE},
+    {"SCALAR", TOK_SCALAR},
+    {"UNIQUE", TOK_UNIQUE},
+    {NULL, 0}};
 
 static cbm_token_type_t keyword_lookup(const char *word) {
     /* Case-insensitive compare */
@@ -415,17 +413,7 @@ int cbm_lex(const char *input, cbm_lex_result_t *out) {
             continue;
         }
 
-        /* Reject unknown input rather than silently deleting it and executing a
-         * different query. Keep scanning only to preserve lexer ownership and
-         * the terminating EOF token for direct callers. */
-        if (!out->error) {
-            out->diagnostic = (cbm_cypher_diagnostic_t){
-                .kind = CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_CHARACTER,
-                .unexpected_byte = (unsigned char)c,
-                .byte_position = i,
-            };
-            out->error = heap_strdup("unsupported character");
-        }
+        /* Unknown character — skip */
         i++;
     }
 
@@ -456,116 +444,12 @@ void cbm_lex_free(cbm_lex_result_t *r) {
  * any hand-written or generated query while leaving the stack untouched. */
 enum { CYPHER_MAX_PARSE_DEPTH = 256 };
 
-/* Indexed by cbm_token_type_t so adding a token without a human name is visible
- * beside the enum. The formatter still has an explicit numeric fallback for a
- * corrupt/out-of-range token, but a numeric code is never the whole remedy. */
-static const char *const cypher_token_names[TOK_COUNT_TYPES] = {
-    [TOK_MATCH] = "MATCH",
-    [TOK_WHERE] = "WHERE",
-    [TOK_RETURN] = "RETURN",
-    [TOK_ORDER] = "ORDER",
-    [TOK_BY] = "BY",
-    [TOK_LIMIT] = "LIMIT",
-    [TOK_AND] = "AND",
-    [TOK_OR] = "OR",
-    [TOK_AS] = "AS",
-    [TOK_DISTINCT] = "DISTINCT",
-    [TOK_COUNT] = "COUNT",
-    [TOK_CONTAINS] = "CONTAINS",
-    [TOK_STARTS] = "STARTS",
-    [TOK_WITH] = "WITH",
-    [TOK_NOT] = "NOT",
-    [TOK_ASC] = "ASC",
-    [TOK_DESC] = "DESC",
-    [TOK_NEQ] = "'!=' or '<>'",
-    [TOK_ENDS] = "ENDS",
-    [TOK_IN] = "IN",
-    [TOK_IS] = "IS",
-    [TOK_NULL_KW] = "NULL",
-    [TOK_XOR] = "XOR",
-    [TOK_SKIP] = "SKIP",
-    [TOK_UNION] = "UNION",
-    [TOK_UNWIND] = "UNWIND",
-    [TOK_SUM] = "SUM",
-    [TOK_AVG] = "AVG",
-    [TOK_MIN_KW] = "MIN",
-    [TOK_MAX_KW] = "MAX",
-    [TOK_COLLECT] = "COLLECT",
-    [TOK_TOLOWER] = "toLower",
-    [TOK_TOUPPER] = "toUpper",
-    [TOK_TOSTRING] = "toString",
-    [TOK_CASE] = "CASE",
-    [TOK_WHEN] = "WHEN",
-    [TOK_THEN] = "THEN",
-    [TOK_ELSE] = "ELSE",
-    [TOK_END] = "END",
-    [TOK_CREATE] = "CREATE",
-    [TOK_DELETE] = "DELETE",
-    [TOK_DETACH] = "DETACH",
-    [TOK_SET] = "SET",
-    [TOK_REMOVE] = "REMOVE",
-    [TOK_MERGE] = "MERGE",
-    [TOK_OPTIONAL] = "OPTIONAL",
-    [TOK_YIELD] = "YIELD",
-    [TOK_CALL] = "CALL",
-    [TOK_ALL] = "ALL",
-    [TOK_TRUE] = "TRUE",
-    [TOK_FALSE] = "FALSE",
-    [TOK_EXISTS] = "EXISTS",
-    [TOK_MANDATORY] = "MANDATORY",
-    [TOK_FOREACH] = "FOREACH",
-    [TOK_ON] = "ON",
-    [TOK_ADD] = "ADD",
-    [TOK_CONSTRAINT] = "CONSTRAINT",
-    [TOK_DO] = "DO",
-    [TOK_DROP] = "DROP",
-    [TOK_FOR] = "FOR",
-    [TOK_FROM] = "FROM",
-    [TOK_GRAPH] = "GRAPH",
-    [TOK_OF] = "OF",
-    [TOK_REQUIRE] = "REQUIRE",
-    [TOK_SCALAR] = "SCALAR",
-    [TOK_UNIQUE] = "UNIQUE",
-    [TOK_LPAREN] = "'('",
-    [TOK_RPAREN] = "')'",
-    [TOK_LBRACKET] = "'['",
-    [TOK_RBRACKET] = "']'",
-    [TOK_DASH] = "'-'",
-    [TOK_GT] = "'>'",
-    [TOK_LT] = "'<'",
-    [TOK_COLON] = "':'",
-    [TOK_DOT] = "'.'",
-    [TOK_LBRACE] = "'{'",
-    [TOK_RBRACE] = "'}'",
-    [TOK_STAR] = "'*'",
-    [TOK_COMMA] = "','",
-    [TOK_EQ] = "'='",
-    [TOK_EQTILDE] = "'=~'",
-    [TOK_GTE] = "'>='",
-    [TOK_LTE] = "'<='",
-    [TOK_PIPE] = "'|'",
-    [TOK_DOTDOT] = "'..'",
-    [TOK_IDENT] = "an identifier",
-    [TOK_STRING] = "a string literal",
-    [TOK_NUMBER] = "a number",
-    [TOK_EOF] = "end of input",
-};
-
-static const char *cypher_token_name(cbm_token_type_t type, char *fallback, size_t fallback_size) {
-    if (type >= 0 && type < TOK_COUNT_TYPES && cypher_token_names[type]) {
-        return cypher_token_names[type];
-    }
-    snprintf(fallback, fallback_size, "unknown token (internal code %d)", (int)type);
-    return fallback;
-}
-
 typedef struct {
     const cbm_token_t *tokens;
     int count;
     int pos;
     int depth; /* current recursive-descent depth; see CYPHER_MAX_PARSE_DEPTH */
     char error[CBM_SZ_512];
-    cbm_cypher_diagnostic_t diagnostic;
 } parser_t;
 
 /* Enter one level of recursive descent. Returns false when the cap is hit, in
@@ -591,29 +475,6 @@ static const cbm_token_t *peek(parser_t *p) {
     return &p->tokens[p->pos];
 }
 
-static void parser_set_unexpected_token(parser_t *p, cbm_token_type_t expected) {
-    if (p->diagnostic.kind != CBM_CYPHER_DIAGNOSTIC_NONE) {
-        return;
-    }
-    p->diagnostic = (cbm_cypher_diagnostic_t){
-        .kind = CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_TOKEN,
-        .expected = expected,
-        .actual = peek(p)->type,
-        .byte_position = peek(p)->pos,
-    };
-}
-
-static void parser_ensure_syntax_diagnostic(parser_t *p) {
-    if (p->diagnostic.kind != CBM_CYPHER_DIAGNOSTIC_NONE) {
-        return;
-    }
-    p->diagnostic = (cbm_cypher_diagnostic_t){
-        .kind = CBM_CYPHER_DIAGNOSTIC_SYNTAX,
-        .actual = peek(p)->type,
-        .byte_position = peek(p)->pos,
-    };
-}
-
 static const cbm_token_t *advance(parser_t *p) {
     if (p->pos >= p->count) {
         return &p->tokens[p->count - SKIP_ONE];
@@ -637,52 +498,8 @@ static const cbm_token_t *expect(parser_t *p, cbm_token_type_t type) {
     if (check(p, type)) {
         return advance(p);
     }
-    parser_set_unexpected_token(p, type);
-    char expected_fallback[CBM_SZ_64];
-    char actual_fallback[CBM_SZ_64];
-    snprintf(p->error, sizeof(p->error), "expected %s, found %s at byte %d",
-             cypher_token_name(type, expected_fallback, sizeof(expected_fallback)),
-             cypher_token_name(peek(p)->type, actual_fallback, sizeof(actual_fallback)),
-             peek(p)->pos);
-    return NULL;
-}
-
-/* True when a token is word-shaped: a bare identifier or any keyword. Keywords
- * are produced only by lex_try_ident via keyword_lookup, so the keyword table
- * is the authority — enumerating token types here would silently drift the
- * moment a keyword is added. */
-static bool is_word_token(cbm_token_type_t t) {
-    if (t == TOK_IDENT) {
-        return true;
-    }
-    for (const kw_entry_t *kw = keywords; kw->name; kw++) {
-        if (kw->type == t) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Consume the property name after a '.'.
- *
- * openCypher allows a keyword as a property key — after a dot nothing else can
- * appear — but the lexer maps keywords unconditionally, so `a.count` arrived as
- * TOK_COUNT, `expect(TOK_IDENT)` missed, the property was dropped AND the token
- * was left unconsumed. The query then died at the trailing-token check with
- * "unexpected trailing tokens", an error naming the wrong problem entirely.
- *
- * Any word-shaped token is a valid property name here. A literal or punctuation
- * still is not, and a missing name is now a hard error rather than a silently
- * property-less item that projects blank. */
-static const cbm_token_t *expect_property_name(parser_t *p) {
-    if (is_word_token(peek(p)->type)) {
-        return advance(p);
-    }
-    parser_set_unexpected_token(p, TOK_IDENT);
-    char actual_fallback[CBM_SZ_64];
-    snprintf(p->error, sizeof(p->error), "expected a property name after '.', found %s at byte %d",
-             cypher_token_name(peek(p)->type, actual_fallback, sizeof(actual_fallback)),
-             peek(p)->pos);
+    snprintf(p->error, sizeof(p->error), "expected token type %d, got %d at pos %d", type,
+             peek(p)->type, peek(p)->pos);
     return NULL;
 }
 
@@ -749,14 +566,7 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
 
         match(p, TOK_COMMA); /* optional comma */
     }
-    if (!expect(p, TOK_RBRACE)) {
-        for (int i = 0; i < n; i++) {
-            safe_str_free(&arr[i].key);
-            safe_str_free(&arr[i].value);
-        }
-        free(arr);
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_RBRACE);
 
     *out = arr;
     *count = n;
@@ -811,7 +621,6 @@ static int parse_node(parser_t *p, cbm_node_pattern_t *out) {
     }
 
     if (!expect(p, TOK_RPAREN)) {
-        p->diagnostic.context = CBM_CYPHER_CONTEXT_NODE_PATTERN;
         return CBM_NOT_FOUND;
     }
     return 0;
@@ -853,7 +662,6 @@ static int parse_rel_types(parser_t *p, cbm_rel_pattern_t *out) {
 
     const cbm_token_t *t = expect(p, TOK_IDENT);
     if (!t) {
-        p->diagnostic.context = CBM_CYPHER_CONTEXT_RELATIONSHIP_TYPE;
         free(types);
         return CBM_NOT_FOUND;
     }
@@ -867,7 +675,6 @@ static int parse_rel_types(parser_t *p, cbm_rel_pattern_t *out) {
     while (match(p, TOK_PIPE)) {
         t = expect(p, TOK_IDENT);
         if (!t) {
-            p->diagnostic.context = CBM_CYPHER_CONTEXT_RELATIONSHIP_TYPE;
             for (int i = 0; i < n; i++) {
                 safe_str_free(&types[i]);
             }
@@ -1162,16 +969,7 @@ static cbm_expr_t *parse_in_list(parser_t *p, cbm_condition_t *c) {
             break;
         }
     }
-    if (!expect(p, TOK_RBRACKET)) {
-        for (int i = 0; i < vn; i++) {
-            safe_str_free(&vals[i]);
-        }
-        free(vals);
-        safe_str_free(&c->variable);
-        safe_str_free(&c->property);
-        safe_str_free(&c->op);
-        return NULL;
-    }
+    expect(p, TOK_RBRACKET);
     c->in_values = vals;
     c->in_value_count = vn;
     return expr_leaf(*c);
@@ -1206,16 +1004,12 @@ static char *parse_comparison_op(parser_t *p) {
     }
     if (check(p, TOK_STARTS)) {
         advance(p);
-        if (!expect(p, TOK_WITH)) {
-            return NULL;
-        }
+        expect(p, TOK_WITH);
         return heap_strdup("STARTS WITH");
     }
     if (check(p, TOK_ENDS)) {
         advance(p);
-        if (!expect(p, TOK_WITH)) {
-            return NULL;
-        }
+        expect(p, TOK_WITH);
         return heap_strdup("ENDS WITH");
     }
     return NULL;
@@ -1252,8 +1046,7 @@ static void free_one_rel_pattern(cbm_rel_pattern_t *r) {
 static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     advance(p); /* EXISTS */
     if (!match(p, TOK_LBRACE)) {
-        parser_set_unexpected_token(p, TOK_LBRACE);
-        snprintf(p->error, sizeof(p->error), "expected '{' after EXISTS");
+        snprintf(p->error, sizeof(p->error), "expected '{' after EXISTS at pos %d", peek(p)->pos);
         return NULL;
     }
     cbm_node_pattern_t anchor = {0};
@@ -1268,12 +1061,7 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
                  "'(var)-[:TYPE]->()' is supported");
         return NULL;
     }
-    if (!expect(p, TOK_RBRACE)) {
-        free_one_node_pattern(&anchor);
-        free_one_rel_pattern(&rel);
-        free_one_node_pattern(&far_node);
-        return NULL;
-    }
+    expect(p, TOK_RBRACE);
 
     cbm_condition_t c = {0};
     c.negated = negated;
@@ -1298,24 +1086,10 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
         advance(p);
         if (match(p, TOK_NOT)) {
             c->op = heap_strdup("IS NOT NULL");
-            if (!expect(p, TOK_NULL_KW)) {
-                cond_func_fields_free(c);
-                safe_str_free(&c->variable);
-                safe_str_free(&c->property);
-                safe_str_free(&c->op);
-                safe_str_free(&c->coalesce_default);
-                return NULL;
-            }
+            expect(p, TOK_NULL_KW);
         } else {
+            expect(p, TOK_NULL_KW);
             c->op = heap_strdup("IS NULL");
-            if (!expect(p, TOK_NULL_KW)) {
-                cond_func_fields_free(c);
-                safe_str_free(&c->variable);
-                safe_str_free(&c->property);
-                safe_str_free(&c->op);
-                safe_str_free(&c->coalesce_default);
-                return NULL;
-            }
         }
         return expr_leaf(*c);
     }
@@ -1332,9 +1106,7 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
     /* Standard operators */
     c->op = parse_comparison_op(p);
     if (!c->op) {
-        if (!p->error[0]) {
-            snprintf(p->error, sizeof(p->error), "expected an operator after the expression");
-        }
+        snprintf(p->error, sizeof(p->error), "unexpected operator at pos %d", peek(p)->pos);
         cond_func_fields_free(c);
         safe_str_free(&c->variable);
         safe_str_free(&c->property);
@@ -1352,7 +1124,7 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
         advance(p);
         c->value = heap_strdup("false");
     } else {
-        snprintf(p->error, sizeof(p->error), "expected a value after the operator");
+        snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
         cond_func_fields_free(c);
         safe_str_free(&c->variable);
         safe_str_free(&c->property);
@@ -1419,7 +1191,7 @@ static int parse_condition_lhs(parser_t *p, cbm_condition_t *c) {
     }
 
     if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect_property_name(p);
+        const cbm_token_t *prop = expect(p, TOK_IDENT);
         if (!prop) {
             return CBM_NOT_FOUND;
         }
@@ -1465,10 +1237,7 @@ static cbm_expr_t *parse_atom_expr(parser_t *p) { // NOLINT(misc-no-recursion)
         }
         cbm_expr_t *e = parse_or_expr(p);
         parse_depth_leave(p);
-        if (!expect(p, TOK_RPAREN)) {
-            expr_free(e);
-            return NULL;
-        }
+        expect(p, TOK_RPAREN);
         return e;
     }
     return parse_condition_expr(p);
@@ -1612,7 +1381,7 @@ static const char *parse_value_literal(parser_t *p) {
         char buf[CBM_SZ_256];
         const cbm_token_t *v = advance(p);
         if (match(p, TOK_DOT)) {
-            const cbm_token_t *pr = expect_property_name(p);
+            const cbm_token_t *pr = expect(p, TOK_IDENT);
             snprintf(buf, sizeof(buf), "%s.%s", v->text, pr ? pr->text : "");
         } else {
             snprintf(buf, sizeof(buf), "%s", v->text);
@@ -1676,22 +1445,8 @@ static cbm_case_expr_t *parse_case_expr(parser_t *p) {
     if (match(p, TOK_ELSE)) {
         kase->else_val = parse_value_literal(p);
     }
-    if (!expect(p, TOK_END)) {
-        return kase;
-    }
+    expect(p, TOK_END);
     return kase;
-}
-
-static void free_case_expr(cbm_case_expr_t *k); /* defined with the query free helpers */
-
-static void free_return_item_fields(cbm_return_item_t *item) {
-    safe_str_free(&item->variable);
-    safe_str_free(&item->property);
-    safe_str_free(&item->alias);
-    safe_str_free(&item->func);
-    free_case_expr(item->kase);
-    func_args_free(item->args, item->arg_count);
-    memset(item, 0, sizeof(*item));
 }
 
 /* Parse a single RETURN/WITH item (aggregate, string func, CASE, or plain var.prop).
@@ -1743,11 +1498,10 @@ static int parse_var_dot_prop(parser_t *p, cbm_return_item_t *item) {
     }
     item->variable = heap_strdup(var->text);
     if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect_property_name(p);
-        if (!prop) {
-            return CBM_NOT_FOUND;
+        const cbm_token_t *prop = expect(p, TOK_IDENT);
+        if (prop) {
+            item->property = heap_strdup(prop->text);
         }
-        item->property = heap_strdup(prop->text);
     }
     return 0;
 }
@@ -1768,15 +1522,11 @@ static bool is_named_func_call(parser_t *p) {
 static int parse_named_func_item(parser_t *p, cbm_return_item_t *item) {
     const char *canon = scalar_func_canonical(peek(p)->text);
     advance(p); /* consume the function name */
-    if (!expect(p, TOK_LPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_LPAREN);
     if (parse_var_dot_prop(p, item) < 0) {
         return CBM_NOT_FOUND;
     }
-    if (!expect(p, TOK_RPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_RPAREN);
     item->func = heap_strdup(canon);
     return 0;
 }
@@ -1816,11 +1566,10 @@ static int parse_func_arg(parser_t *p, cbm_func_arg_t *arg) {
     }
     arg->variable = heap_strdup(var->text);
     if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect_property_name(p);
-        if (!prop) {
-            return CBM_NOT_FOUND;
+        const cbm_token_t *prop = expect(p, TOK_IDENT);
+        if (prop) {
+            arg->property = heap_strdup(prop->text);
         }
-        arg->property = heap_strdup(prop->text);
     }
     return 0;
 }
@@ -1830,9 +1579,7 @@ static int parse_func_arg(parser_t *p, cbm_func_arg_t *arg) {
 static int parse_multiarg_func_item(parser_t *p, cbm_return_item_t *item) {
     const char *canon = multiarg_func_canonical(peek(p)->text);
     advance(p); /* function name */
-    if (!expect(p, TOK_LPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_LPAREN);
     int cap = CYP_INIT_CAP4;
     item->args = malloc((size_t)cap * sizeof(cbm_func_arg_t));
     item->arg_count = 0;
@@ -1849,9 +1596,7 @@ static int parse_multiarg_func_item(parser_t *p, cbm_return_item_t *item) {
         }
         item->arg_count++;
     }
-    if (!expect(p, TOK_RPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_RPAREN);
     item->func = heap_strdup(canon);
     /* Surface the first variable arg as variable/property for column naming. */
     if (item->arg_count > 0 && item->args[0].variable) {
@@ -1867,9 +1612,7 @@ static int parse_multiarg_func_item(parser_t *p, cbm_return_item_t *item) {
 static int parse_aggregate_item(parser_t *p, cbm_return_item_t *item) {
     cbm_token_type_t ft = peek(p)->type;
     advance(p);
-    if (!expect(p, TOK_LPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_LPAREN);
     /* Optional DISTINCT inside the call: COUNT(DISTINCT x) (#239). */
     item->distinct = match(p, TOK_DISTINCT);
     if (match(p, TOK_STAR)) {
@@ -1879,9 +1622,7 @@ static int parse_aggregate_item(parser_t *p, cbm_return_item_t *item) {
             return CBM_NOT_FOUND;
         }
     }
-    if (!expect(p, TOK_RPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_RPAREN);
     item->func = heap_strdup(agg_func_name(ft));
     return 0;
 }
@@ -1890,15 +1631,11 @@ static int parse_aggregate_item(parser_t *p, cbm_return_item_t *item) {
 static int parse_string_func_item(parser_t *p, cbm_return_item_t *item) {
     cbm_token_type_t ft = peek(p)->type;
     advance(p);
-    if (!expect(p, TOK_LPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_LPAREN);
     if (parse_var_dot_prop(p, item) < 0) {
         return CBM_NOT_FOUND;
     }
-    if (!expect(p, TOK_RPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_RPAREN);
     item->func = heap_strdup(str_func_name(ft));
     return 0;
 }
@@ -1910,10 +1647,6 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
         advance(p);
         item->kase = parse_case_expr(p);
         item->variable = heap_strdup("CASE");
-        if (p->error[0]) {
-            free_return_item_fields(item);
-            return CBM_NOT_FOUND;
-        }
     } else if (is_aggregate_tok(peek(p)->type)) {
         rc = parse_aggregate_item(p, item);
     } else if (is_string_func_tok(peek(p)->type)) {
@@ -1926,7 +1659,6 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
         rc = parse_var_dot_prop(p, item);
     }
     if (rc < 0) {
-        free_return_item_fields(item);
         return CBM_NOT_FOUND;
     }
     /* A bare identifier followed by '(' is a function we don't recognise
@@ -1946,122 +1678,86 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
             snprintf(p->error, sizeof(p->error),
                      "unsupported expression: list indexing/slicing '[...]' is not supported");
         }
-        free_return_item_fields(item);
+        safe_str_free(&item->variable);
+        safe_str_free(&item->property);
         return CBM_NOT_FOUND;
     }
     /* Optional AS alias */
     if (match(p, TOK_AS)) {
         const cbm_token_t *alias = expect(p, TOK_IDENT);
-        if (!alias) {
-            free_return_item_fields(item);
-            return CBM_NOT_FOUND;
+        if (alias) {
+            item->alias = heap_strdup(alias->text);
         }
-        item->alias = heap_strdup(alias->text);
     }
     return 0;
 }
 
 /* Parse aggregate function call for ORDER BY */
-static int parse_order_by_agg(parser_t *p, char *buf, size_t buf_sz) {
+static void parse_order_by_agg(parser_t *p, char *buf, size_t buf_sz) {
     const char *fn = agg_func_name(peek(p)->type);
     advance(p);
-    if (!expect(p, TOK_LPAREN)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_LPAREN);
     if (match(p, TOK_STAR)) {
         snprintf(buf, buf_sz, "%s(*)", fn);
     } else {
         const cbm_token_t *var = expect(p, TOK_IDENT);
-        if (!var) {
-            return CBM_NOT_FOUND;
-        }
-        snprintf(buf, buf_sz, "%s(%s)", fn, var->text);
+        snprintf(buf, buf_sz, "%s(%s)", fn, var ? var->text : "");
     }
-    return expect(p, TOK_RPAREN) ? 0 : CBM_NOT_FOUND;
+    expect(p, TOK_RPAREN);
 }
 
 /* Parse var[.prop] for ORDER BY */
-static int parse_order_by_var(parser_t *p, char *buf, size_t buf_sz) {
+static void parse_order_by_var(parser_t *p, char *buf, size_t buf_sz) {
     const cbm_token_t *var = expect(p, TOK_IDENT);
     if (!var) {
-        return CBM_NOT_FOUND;
+        return;
     }
     snprintf(buf, buf_sz, "%s", var->text);
     if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect_property_name(p);
-        if (!prop) {
-            return CBM_NOT_FOUND;
+        const cbm_token_t *prop = expect(p, TOK_IDENT);
+        if (prop) {
+            snprintf(buf, buf_sz, "%s.%s", var->text, prop->text);
         }
-        snprintf(buf, buf_sz, "%s.%s", var->text, prop->text);
     }
-    return 0;
 }
 
-/* Parse one ORDER BY sort key into buf. Returns 0, or CBM_NOT_FOUND with
- * p->error set. A missing key used to leave buf empty, which then matched no
- * column and was silently dropped — `ORDER BY` with nothing after it parsed
- * clean and sorted nothing. */
-static int parse_order_by_expr(parser_t *p, char *buf, size_t buf_sz) {
+/* Parse ORDER BY expression into buf. Returns buf. */
+static char *parse_order_by_expr(parser_t *p, char *buf, size_t buf_sz) {
     buf[0] = '\0';
-    /* An aggregate keyword is only a call when a '(' follows; otherwise it is a
-     * projected alias that happens to be keyword-shaped (e.g. `... AS count`),
-     * and consuming it as a call would misparse the key. */
-    if (is_aggregate_tok(peek(p)->type) && p->pos + SKIP_ONE < p->count &&
-        p->tokens[p->pos + SKIP_ONE].type == TOK_LPAREN) {
-        return parse_order_by_agg(p, buf, buf_sz);
+    if (is_aggregate_tok(peek(p)->type)) {
+        parse_order_by_agg(p, buf, buf_sz);
+    } else {
+        parse_order_by_var(p, buf, buf_sz);
     }
-    return parse_order_by_var(p, buf, buf_sz);
+    return buf;
 }
 
-/* Consume an ORDER BY key's optional ASC/DESC direction; NULL if absent. */
-static const char *parse_order_dir_token(parser_t *p) {
-    if (match(p, TOK_ASC)) {
-        return "ASC";
-    }
-    if (match(p, TOK_DESC)) {
-        return "DESC";
-    }
-    return NULL;
-}
-
-/* Append one parsed sort key (expression + its own direction) to the clause. */
-static int append_order_key(parser_t *p, cbm_return_clause_t *r, int *cap) {
-    char key_buf[CBM_SZ_256];
-    if (parse_order_by_expr(p, key_buf, sizeof(key_buf)) < 0) {
-        return CBM_NOT_FOUND;
-    }
-    if (r->order_key_count >= *cap) {
-        *cap = *cap ? *cap * PAIR_LEN : CYP_INIT_CAP4;
-        r->order_keys = safe_realloc(r->order_keys, (size_t)*cap * sizeof(cbm_order_key_t));
-    }
-    const char *dir = parse_order_dir_token(p);
-    r->order_keys[r->order_key_count++] =
-        (cbm_order_key_t){.expr = heap_strdup(key_buf), .desc = dir && strcmp(dir, "DESC") == 0};
-    return 0;
-}
-
-/* Parse `ORDER BY k1 [ASC|DESC] [, k2 [ASC|DESC]]...`.
- *
- * openCypher (and the SQL standard it follows here) define this as a
- * lexicographic tuple sort: order by k1, break ties with k2, and so on, each
- * key carrying its own direction. Every key is now KEPT. Previously the
- * trailing keys were consumed only so a following SKIP/LIMIT would not be left
- * unparsed, then thrown away — silently degrading the query to a first-key-only
- * sort whose output is indistinguishable from a correct one. */
+/* Parse the full comma-separated ORDER BY key list (#1334). Consuming only the
+ * first key left ", key2 ... LIMIT n" unparsed, which silently dropped the
+ * LIMIT and flooded the caller with the whole result set. Returns 0 on
+ * success, CBM_NOT_FOUND when the key list exceeds the modeled maximum. */
 static int parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
-    if (!expect(p, TOK_BY)) {
-        return CBM_NOT_FOUND;
-    }
-    int cap = 0;
+    expect(p, TOK_BY);
     do {
-        if (append_order_key(p, r, &cap) < 0) {
+        if (r->order_key_count >= CBM_CYPHER_ORDER_KEYS_MAX) {
             return CBM_NOT_FOUND;
         }
+        char order_buf[CBM_SZ_256];
+        parse_order_by_expr(p, order_buf, sizeof(order_buf));
+        bool desc = false;
+        if (match(p, TOK_ASC)) {
+            desc = false;
+        } else if (match(p, TOK_DESC)) {
+            desc = true;
+        }
+        r->order_keys[r->order_key_count] = heap_strdup(order_buf);
+        r->order_descs[r->order_key_count] = desc;
+        r->order_key_count++;
     } while (match(p, TOK_COMMA));
     return 0;
 }
 
-static void free_return_clause(cbm_return_clause_t *r); /* defined below; used on parse failure */
+static void free_return_clause(cbm_return_clause_t *r);
 
 /* Parse RETURN/WITH clause (shared logic) */
 static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_with) {
@@ -2111,37 +1807,43 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
     /* Projection is materialized per row into fixed-width stack arrays sized at
      * CBM_SZ_32 columns (execute_return_simple and its siblings). Bound the
      * parsed item count to that width so an over-wide RETURN is rejected here
-     * instead of writing past those arrays downstream. */
-    if (r->count > CBM_SZ_32) {
+     * instead of writing past those arrays downstream.
+     *
+     * WITH is bounded tighter, by CYP_MAX_VARS. Every item a WITH projects
+     * becomes one variable of the binding that carries the rest of the query,
+     * and binding_t holds exactly CYP_MAX_VARS variables. A wider WITH used to
+     * parse, then lose every alias past the 16th in with_add_vbinding_var and
+     * answer with silently blank columns. Refuse it here, the same way an
+     * over-wide RETURN is refused, so the caller sees an error instead of a
+     * short or empty result. */
+    if (r->count > (is_with ? CYP_MAX_VARS : CBM_SZ_32)) {
         free_return_clause(r);
         return CBM_NOT_FOUND;
     }
 
 tail:
     /* Optional ORDER BY */
-    if (match(p, TOK_ORDER) && parse_order_by_clause(p, r) < 0) {
-        free_return_clause(r);
-        return CBM_NOT_FOUND;
+    if (match(p, TOK_ORDER)) {
+        if (parse_order_by_clause(p, r) < 0) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
+        }
     }
 
     /* Optional SKIP */
     if (match(p, TOK_SKIP)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (!num) {
-            free_return_clause(r);
-            return CBM_NOT_FOUND;
+        if (num) {
+            r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
         }
-        r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     /* Optional LIMIT */
     if (match(p, TOK_LIMIT)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (!num) {
-            free_return_clause(r);
-            return CBM_NOT_FOUND;
+        if (num) {
+            r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
         }
-        r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     *out = r;
@@ -2154,8 +1856,6 @@ static int parse_return(parser_t *p, cbm_return_clause_t **out) {
 }
 
 /* Parse a single MATCH pattern into pat */
-static void free_pattern(cbm_pattern_t *pat); /* defined with the query free helpers */
-
 static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     memset(pat, 0, sizeof(*pat));
     int node_cap = CYP_INIT_CAP4;
@@ -2163,104 +1863,78 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     pat->nodes = malloc(node_cap * sizeof(cbm_node_pattern_t));
     pat->rels = calloc(rel_cap, sizeof(cbm_rel_pattern_t));
 
-    pat->node_count = SKIP_ONE;
     if (parse_node(p, &pat->nodes[0]) < 0) {
-        free_pattern(pat);
-        memset(pat, 0, sizeof(*pat));
         return CBM_NOT_FOUND;
     }
+    pat->node_count = SKIP_ONE;
 
     while (check(p, TOK_DASH) || check(p, TOK_LT)) {
         if (pat->rel_count >= rel_cap) {
             rel_cap *= PAIR_LEN;
             pat->rels = safe_realloc(pat->rels, rel_cap * sizeof(cbm_rel_pattern_t));
         }
-        int rel_index = pat->rel_count++;
-        if (parse_rel(p, &pat->rels[rel_index]) < 0) {
-            free_pattern(pat);
-            memset(pat, 0, sizeof(*pat));
+        if (parse_rel(p, &pat->rels[pat->rel_count]) < 0) {
             return CBM_NOT_FOUND;
         }
+        pat->rel_count++;
 
         if (pat->node_count >= node_cap) {
             node_cap *= PAIR_LEN;
             pat->nodes = safe_realloc(pat->nodes, node_cap * sizeof(cbm_node_pattern_t));
         }
-        int node_index = pat->node_count++;
-        if (parse_node(p, &pat->nodes[node_index]) < 0) {
-            free_pattern(pat);
-            memset(pat, 0, sizeof(*pat));
+        if (parse_node(p, &pat->nodes[pat->node_count]) < 0) {
             return CBM_NOT_FOUND;
         }
+        pat->node_count++;
     }
     return 0;
-}
-
-/* Append one UNWIND literal-list element token to `buf`, bounded against `cap`.
- * `blen` is the current length; the return value is the new length, only ever
- * advanced while it stays below `cap`, so `buf` can never overflow (over-long
- * elements are truncated). Per-token text is additionally capped via `%.*s`. */
-static int unwind_append_elem(char *buf, int blen, int cap, const char *fmt, const char *text) {
-    int win = cap - blen;
-    if (win > 0) {
-        int w = snprintf(buf + blen, (size_t)win, fmt, CYP_UNWIND_ELEM_MAX, text);
-        blen += (w > 0 && w < win) ? w : (win - SKIP_ONE);
-    }
-    return blen;
-}
-
-/* Parse an UNWIND literal list [1, "a", ...] into a heap JSON array string.
- * `cap` reserves the final two bytes for the closing ']' and NUL, and every
- * write is bounded against it, so a list far larger than the fixed scratch
- * buffer is truncated rather than overflowing it. Consumes through the ']'. */
-static char *parse_unwind_literal_list(parser_t *p) {
-    advance(p); /* '[' */
-    char buf[CBM_SZ_2K] = "[";
-    int blen = SKIP_ONE;
-    const int cap = (int)sizeof(buf) - PAIR_LEN;
-    while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
-        if (blen > SKIP_ONE && blen < cap) {
-            buf[blen++] = ',';
-        }
-        if (check(p, TOK_STRING)) {
-            blen = unwind_append_elem(buf, blen, cap, "\"%.*s\"", peek(p)->text);
-            advance(p);
-        } else if (check(p, TOK_NUMBER)) {
-            blen = unwind_append_elem(buf, blen, cap, "%.*s", peek(p)->text);
-            advance(p);
-        } else {
-            advance(p);
-        }
-        match(p, TOK_COMMA);
-    }
-    if (!expect(p, TOK_RBRACKET)) {
-        return NULL;
-    }
-    buf[blen] = ']';
-    buf[blen + SKIP_ONE] = '\0';
-    return heap_strdup(buf);
 }
 
 /* Parse UNWIND [...] AS var clause into query */
-static int parse_unwind_clause(parser_t *p, cbm_query_t *q) {
+static void parse_unwind_clause(parser_t *p, cbm_query_t *q) {
     advance(p);
     if (check(p, TOK_LBRACKET)) {
-        q->unwind_expr = parse_unwind_literal_list(p);
-        if (!q->unwind_expr) {
-            return CBM_NOT_FOUND;
+        /* Literal list: [1, 2, 3] — collect as JSON array string */
+        advance(p);
+        char buf[CBM_SZ_2K] = "[";
+        int blen = SKIP_ONE;
+        /* snprintf returns the length it WOULD have written, so a single
+         * oversized token (string literals lex up to CBM_SZ_4K-1) can push
+         * blen past sizeof(buf). Clamp after every write and guard the raw
+         * buf[blen++] stores, mirroring format_collect_list(). */
+        const int cap = (int)sizeof(buf);
+        while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
+            if (blen > SKIP_ONE && blen < cap - SKIP_ONE) {
+                buf[blen++] = ',';
+            }
+            if (check(p, TOK_STRING)) {
+                blen += snprintf(buf + blen, (size_t)(cap - blen), "\"%s\"", peek(p)->text);
+                advance(p);
+            } else if (check(p, TOK_NUMBER)) {
+                blen += snprintf(buf + blen, (size_t)(cap - blen), "%s", peek(p)->text);
+                advance(p);
+            } else {
+                advance(p);
+            }
+            if (blen >= cap) {
+                blen = cap - SKIP_ONE;
+            }
+            match(p, TOK_COMMA);
         }
+        expect(p, TOK_RBRACKET);
+        if (blen < cap - SKIP_ONE) {
+            buf[blen++] = ']';
+        }
+        buf[blen] = '\0';
+        q->unwind_expr = heap_strdup(buf);
     } else if (check(p, TOK_IDENT)) {
         q->unwind_expr = heap_strdup(advance(p)->text);
     }
-    if (!expect(p, TOK_AS)) {
-        return CBM_NOT_FOUND;
-    }
+    expect(p, TOK_AS);
     const cbm_token_t *alias = expect(p, TOK_IDENT);
-    if (!alias) {
-        return CBM_NOT_FOUND;
+    if (alias) {
+        q->unwind_alias = heap_strdup(alias->text);
     }
-    q->unwind_alias = heap_strdup(alias->text);
-    return 0;
 }
 
 /* Parse a chain of MATCH / OPTIONAL MATCH patterns into query.
@@ -2273,7 +1947,7 @@ static int parse_match_chain(parser_t *p, cbm_query_t *q, int *pat_cap) {
             opt = true;
         }
         if (!expect(p, TOK_MATCH)) {
-            return CBM_NOT_FOUND;
+            break;
         }
         if (q->pattern_count >= *pat_cap) {
             *pat_cap *= PAIR_LEN;
@@ -2325,16 +1999,18 @@ static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recur
             if (sub.error) {
                 snprintf(p->error, sizeof(p->error), "%s", sub.error);
             }
-            p->diagnostic = sub.diagnostic;
             cbm_parse_free(&sub);
             return CBM_NOT_FOUND;
         }
         q->union_next = sub.query;
         sub.query = NULL;
         cbm_parse_free(&sub);
-        /* The recursive sub-parse consumed and validated the entire UNION tail
-         * (including its own trailing EOF); mark it consumed so cbm_parse's
-         * end-of-input assertion below does not misfire on the UNION remainder. */
+        /* The branch after UNION was parsed by a SEPARATE parser over a slice
+         * of these tokens, so this parser's cursor never moved past the UNION
+         * keyword. That sub-parse now refuses to succeed with anything left
+         * over, so everything from here to the end is accounted for. Move the
+         * cursor to the end to say so, or cbm_parse's end-of-input check reads
+         * a fully parsed UNION query as unfinished. */
         p->pos = p->count;
     }
     return 0;
@@ -2349,21 +2025,13 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
     const char *unsup = unsupported_clause_error(peek(&p)->type);
     if (unsup) {
         out->error = heap_strdup(unsup);
-        parser_ensure_syntax_diagnostic(&p);
-        out->diagnostic = p.diagnostic;
         return CBM_NOT_FOUND;
     }
 
     cbm_query_t *q = calloc(CBM_ALLOC_ONE, sizeof(cbm_query_t));
 
     if (check(&p, TOK_UNWIND)) {
-        if (parse_unwind_clause(&p, q) < 0) {
-            parser_ensure_syntax_diagnostic(&p);
-            out->error = heap_strdup(p.error[0] ? p.error : "failed to parse UNWIND");
-            out->diagnostic = p.diagnostic;
-            cbm_query_free(q);
-            return CBM_NOT_FOUND;
-        }
+        parse_unwind_clause(&p, q);
     }
 
     bool first_optional = false;
@@ -2372,9 +2040,7 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
         first_optional = true;
     }
     if (!expect(&p, TOK_MATCH)) {
-        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "expected MATCH");
-        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -2384,9 +2050,7 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
     q->pattern_optional = malloc(pat_cap * sizeof(bool));
 
     if (parse_match_pattern(&p, &q->patterns[0]) < 0) {
-        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse pattern");
-        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -2394,57 +2058,49 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
     q->pattern_count = SKIP_ONE;
 
     if (parse_match_chain(&p, q, &pat_cap) < 0) {
-        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse additional pattern");
-        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
 
     if (parse_where(&p, &q->where) < 0) {
-        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse WHERE");
-        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
 
     if (parse_post_where(&p, q, &pat_cap) < 0) {
-        parser_ensure_syntax_diagnostic(&p);
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse query");
-        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
 
-    /* A required token is never optional just because a narrow parser helper
-     * ignored expect()'s return value. Reject the first recorded mismatch even
-     * if later parsing happened to consume the rest of the query. */
-    if (p.error[0]) {
-        parser_ensure_syntax_diagnostic(&p);
+    /* Every token must be consumed. The grammar accepts at most one WITH and
+     * treats RETURN as optional, so a query with a second WITH stage — or any
+     * typo after RETURN — used to stop parsing there and succeed anyway. The
+     * dropped tail took the filter and the RETURN with it, and the engine
+     * answered from the fragment it had parsed, using its default projection.
+     * That reported success and returned wrong rows, which is worse than a
+     * refusal because nothing tells the caller to look. Refuse instead. */
+    if (peek(&p)->type != TOK_EOF) {
+        /* Only mention the one-WITH limit when a standalone WITH really is
+         * sitting in the part we could not read. Saying it every time points
+         * a reader at WITH when the problem is a typo. A WITH straight after
+         * STARTS is the STARTS WITH operator rather than a clause, the same
+         * guard parse_post_where uses. */
+        const char *hint = "";
+        for (int i = p.pos; i < p.count; i++) {
+            if (p.tokens[i].type == TOK_WITH &&
+                (i == 0 || p.tokens[i - SKIP_ONE].type != TOK_STARTS)) {
+                hint = " Note that only one WITH clause is supported.";
+                break;
+            }
+        }
+        snprintf(p.error, sizeof(p.error),
+                 "unexpected input at pos %d ('%s') — the query was not fully "
+                 "parsed.%s",
+                 peek(&p)->pos, peek(&p)->text ? peek(&p)->text : "", hint);
         out->error = heap_strdup(p.error);
-        out->diagnostic = p.diagnostic;
-        cbm_query_free(q);
-        return CBM_NOT_FOUND;
-    }
-
-    /* Every token must be consumed. A leftover non-EOF token means a clause was
-     * silently dropped (e.g. a second ORDER BY key that swallowed the LIMIT, or
-     * a SKIP after LIMIT) — surface it as an error instead of honoring a partial
-     * query whose LIMIT/SKIP was quietly discarded. */
-    if (!check(&p, TOK_EOF)) {
-        p.diagnostic = (cbm_cypher_diagnostic_t){
-            .kind = CBM_CYPHER_DIAGNOSTIC_TRAILING_TOKEN,
-            .expected = TOK_EOF,
-            .actual = peek(&p)->type,
-            .byte_position = peek(&p)->pos,
-        };
-        char actual_fallback[CBM_SZ_64];
-        snprintf(p.error, sizeof(p.error), "unexpected %s at byte %d after the query was complete",
-                 cypher_token_name(peek(&p)->type, actual_fallback, sizeof(actual_fallback)),
-                 peek(&p)->pos);
-        out->error = heap_strdup(p.error);
-        out->diagnostic = p.diagnostic;
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -2528,13 +2184,22 @@ static void free_return_clause(cbm_return_clause_t *r) {
         return;
     }
     for (int i = 0; i < r->count; i++) {
-        free_return_item_fields(&r->items[i]);
+        safe_str_free(&r->items[i].variable);
+        safe_str_free(&r->items[i].property);
+        safe_str_free(&r->items[i].alias);
+        safe_str_free(&r->items[i].func);
+        free_case_expr(r->items[i].kase);
+        for (int j = 0; j < r->items[i].arg_count; j++) {
+            safe_str_free(&r->items[i].args[j].variable);
+            safe_str_free(&r->items[i].args[j].property);
+            safe_str_free(&r->items[i].args[j].literal);
+        }
+        free(r->items[i].args);
     }
     free(r->items);
-    for (int i = 0; i < r->order_key_count; i++) {
-        safe_str_free(&r->order_keys[i].expr);
+    for (int k = 0; k < r->order_key_count; k++) {
+        safe_str_free(&r->order_keys[k]);
     }
-    free(r->order_keys);
     free(r);
 }
 
@@ -2559,203 +2224,20 @@ void cbm_query_free(cbm_query_t *q) {
 
 /* ── Convenience: lex + parse ───────────────────────────────────── */
 
-static void diagnostic_append(char **cursor, size_t *remaining, const char *text) {
-    if (*remaining == 0) {
-        return;
-    }
-    int written = snprintf(*cursor, *remaining, "%s", text);
-    if (written < 0) {
-        return;
-    }
-    size_t consumed = (size_t)written < *remaining ? (size_t)written : *remaining - SKIP_ONE;
-    *cursor += consumed;
-    *remaining -= consumed;
-}
-
-/* Copy a bounded window around the failure and escape anything that could make
- * an MCP error multi-line, ambiguous, or terminal-active. */
-static void cypher_diagnostic_context(const char *query, int byte_position, char *out,
-                                      size_t out_size) {
-    enum { SOURCE_WINDOW_BYTES = 64, SOURCE_WINDOW_BEFORE = 32 };
-    if (!out || out_size == 0) {
-        return;
-    }
-    out[0] = '\0';
-    if (!query) {
-        return;
-    }
-
-    size_t query_len = strlen(query);
-    size_t position = byte_position < 0 ? 0 : (size_t)byte_position;
-    if (position > query_len) {
-        position = query_len;
-    }
-    size_t start = 0;
-    if (query_len > SOURCE_WINDOW_BYTES) {
-        start = position > SOURCE_WINDOW_BEFORE ? position - SOURCE_WINDOW_BEFORE : 0;
-        if (start + SOURCE_WINDOW_BYTES > query_len) {
-            start = query_len - SOURCE_WINDOW_BYTES;
-        }
-    }
-    size_t end = query_len < start + SOURCE_WINDOW_BYTES ? query_len : start + SOURCE_WINDOW_BYTES;
-
-    char *cursor = out;
-    size_t remaining = out_size;
-    if (start > 0) {
-        diagnostic_append(&cursor, &remaining, "...");
-    }
-    for (size_t i = start; i < end && remaining > SKIP_ONE; i++) {
-        unsigned char c = (unsigned char)query[i];
-        char escaped[CYP_BUF_8];
-        const char *piece = escaped;
-        switch (c) {
-        case '\\':
-            piece = "\\\\";
-            break;
-        case '"':
-            piece = "\\\"";
-            break;
-        case '\n':
-            piece = "\\n";
-            break;
-        case '\r':
-            piece = "\\r";
-            break;
-        case '\t':
-            piece = "\\t";
-            break;
-        default:
-            if (c >= 0x20 && c <= 0x7e) {
-                escaped[0] = (char)c;
-                escaped[1] = '\0';
-            } else {
-                snprintf(escaped, sizeof(escaped), "\\x%02X", c);
-            }
-            break;
-        }
-        diagnostic_append(&cursor, &remaining, piece);
-    }
-    if (end < query_len) {
-        diagnostic_append(&cursor, &remaining, "...");
-    }
-}
-
-static char *format_cypher_diagnostic(const char *query, const cbm_cypher_diagnostic_t *diagnostic,
-                                      const char *detail) {
-    char expected_fallback[CBM_SZ_64];
-    char actual_fallback[CBM_SZ_64];
-    char summary[CBM_SZ_256];
-    char remedy[CBM_SZ_512];
-    char context[CBM_SZ_512];
-    cypher_diagnostic_context(query, diagnostic->byte_position, context, sizeof(context));
-
-    switch (diagnostic->kind) {
-    case CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_TOKEN:
-        snprintf(
-            summary, sizeof(summary), "Invalid Cypher query: expected %s but found %s at byte %d",
-            cypher_token_name(diagnostic->expected, expected_fallback, sizeof(expected_fallback)),
-            cypher_token_name(diagnostic->actual, actual_fallback, sizeof(actual_fallback)),
-            diagnostic->byte_position);
-        if (diagnostic->context == CBM_CYPHER_CONTEXT_NODE_PATTERN) {
-            const char *following =
-                cypher_token_name(diagnostic->actual, actual_fallback, sizeof(actual_fallback));
-            snprintf(remedy, sizeof(remedy),
-                     "Remedy: close the node pattern before %s; for example, MATCH "
-                     "(n:Function) RETURN n.name LIMIT 10.",
-                     following);
-        } else if (diagnostic->context == CBM_CYPHER_CONTEXT_RELATIONSHIP_TYPE) {
-            snprintf(remedy, sizeof(remedy),
-                     "Remedy: name the relationship type after ':'; for example, MATCH "
-                     "(a)-[:CALLS]->(b) RETURN a, b LIMIT 10.");
-        } else if (diagnostic->expected == TOK_MATCH) {
-            snprintf(remedy, sizeof(remedy),
-                     "Remedy: start with MATCH and use read-only clause order; for example, MATCH "
-                     "(n:Function) RETURN n.name LIMIT 10.");
-        } else {
-            snprintf(remedy, sizeof(remedy),
-                     "Remedy: supply the expected syntax, or retry with a narrower query such as "
-                     "MATCH (n:Function) RETURN n.name LIMIT 10.");
-        }
-        break;
-    case CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_CHARACTER: {
-        char unexpected[CBM_SZ_16];
-        if (diagnostic->unexpected_byte >= 0x20 && diagnostic->unexpected_byte <= 0x7e) {
-            snprintf(unexpected, sizeof(unexpected), "'%c'", diagnostic->unexpected_byte);
-        } else {
-            snprintf(unexpected, sizeof(unexpected), "byte 0x%02X", diagnostic->unexpected_byte);
-        }
-        snprintf(summary, sizeof(summary),
-                 "Invalid Cypher query: unsupported character %s at byte %d", unexpected,
-                 diagnostic->byte_position);
-        snprintf(remedy, sizeof(remedy),
-                 "Remedy: remove the unsupported character and retry with read-only Cypher; for "
-                 "example, MATCH (n:Function) RETURN n.name LIMIT 10.");
-        break;
-    }
-    case CBM_CYPHER_DIAGNOSTIC_UNTERMINATED_STRING: {
-        size_t query_len = query ? strlen(query) : 0;
-        bool single_quote = query && diagnostic->byte_position >= 0 &&
-                            (size_t)diagnostic->byte_position < query_len &&
-                            query[diagnostic->byte_position] == '\'';
-        snprintf(summary, sizeof(summary),
-                 "Invalid Cypher query: unterminated %s-quoted string at byte %d",
-                 single_quote ? "single" : "double", diagnostic->byte_position);
-        snprintf(remedy, sizeof(remedy),
-                 single_quote
-                     ? "Remedy: close the string with a single quote, or escape an internal quote; "
-                       "then retry the query."
-                     : "Remedy: close the string with a double quote, or escape an internal quote "
-                       "as \\\"; then retry the query.");
-        break;
-    }
-    case CBM_CYPHER_DIAGNOSTIC_TRAILING_TOKEN:
-        snprintf(summary, sizeof(summary),
-                 "Invalid Cypher query: unexpected %s at byte %d after the query was complete",
-                 cypher_token_name(diagnostic->actual, actual_fallback, sizeof(actual_fallback)),
-                 diagnostic->byte_position);
-        snprintf(remedy, sizeof(remedy),
-                 "Remedy: use clause order MATCH, WHERE, RETURN, ORDER BY, SKIP, LIMIT; for "
-                 "example, MATCH (n:Function) RETURN n.name SKIP 1 LIMIT 2.");
-        break;
-    case CBM_CYPHER_DIAGNOSTIC_SYNTAX:
-        snprintf(summary, sizeof(summary), "Invalid Cypher query: %s; found %s at byte %d",
-                 detail ? detail : "syntax error",
-                 cypher_token_name(diagnostic->actual, actual_fallback, sizeof(actual_fallback)),
-                 diagnostic->byte_position);
-        snprintf(remedy, sizeof(remedy),
-                 "Remedy: supply the missing syntax, or retry with a narrower query such as MATCH "
-                 "(n:Function) RETURN n.name LIMIT 10.");
-        break;
-    case CBM_CYPHER_DIAGNOSTIC_NONE:
-    default:
-        snprintf(summary, sizeof(summary), "Invalid Cypher query: %s",
-                 detail ? detail : "syntax error");
-        snprintf(remedy, sizeof(remedy),
-                 "Remedy: retry with supported read-only syntax, starting from a narrower query "
-                 "such as MATCH (n:Function) RETURN n.name LIMIT 10.");
-        break;
-    }
-
-    char message[CBM_SZ_2K];
-    snprintf(message, sizeof(message), "%s. Context: \"%s\". %s", summary, context, remedy);
-    return heap_strdup(message);
-}
-
 int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error) {
     *out = NULL;
     *error = NULL;
 
     cbm_lex_result_t lr = {0};
     if (cbm_lex(query, &lr) < 0 || lr.error) {
-        *error = format_cypher_diagnostic(query, &lr.diagnostic, lr.error ? lr.error : "lex error");
+        *error = heap_strdup(lr.error ? lr.error : "lex error");
         cbm_lex_free(&lr);
         return CBM_NOT_FOUND;
     }
 
     cbm_parse_result_t pr = {0};
     if (cbm_parse(lr.tokens, lr.count, &pr) < 0) {
-        *error =
-            format_cypher_diagnostic(query, &pr.diagnostic, pr.error ? pr.error : "parse error");
+        *error = heap_strdup(pr.error ? pr.error : "parse error");
         cbm_parse_free(&pr);
         cbm_lex_free(&lr);
         return CBM_NOT_FOUND;
@@ -3144,15 +2626,11 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
 
 /* Evaluate a comparison operator between actual and expected strings. */
 static bool eval_comparison_op(const char *op, const char *actual, const char *expected) {
-    bool boolean_equivalent = (strcmp(actual, "true") == 0 && strcmp(expected, "1") == 0) ||
-                              (strcmp(actual, "false") == 0 && strcmp(expected, "0") == 0) ||
-                              (strcmp(expected, "true") == 0 && strcmp(actual, "1") == 0) ||
-                              (strcmp(expected, "false") == 0 && strcmp(actual, "0") == 0);
     if (strcmp(op, "=") == 0) {
-        return strcmp(actual, expected) == 0 || boolean_equivalent;
+        return strcmp(actual, expected) == 0;
     }
     if (strcmp(op, "<>") == 0) {
-        return strcmp(actual, expected) != 0 && !boolean_equivalent;
+        return strcmp(actual, expected) != 0;
     }
     if (strcmp(op, "=~") == 0) {
         cbm_regex_t re;
@@ -3407,32 +2885,13 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 
 static _Thread_local uint64_t g_cypher_deadline_ms = 0; /* absolute; 0 = disarmed */
 static _Thread_local bool g_cypher_timed_out = false;
+/* Sticky for one cbm_cypher_execute call. Unlike row_count, this survives caps
+ * that happen before DISTINCT, aggregation, ORDER BY, or the final projection. */
+static _Thread_local bool g_cypher_truncated = false;
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
-
-/* Set when a grouping value or the assembled group key did not fit its fixed
- * buffer. Two rows whose keys differ only past the cut then collide into one
- * group, so the emitted count is wrong with nothing to show for it — the one
- * failure mode a query engine must never have. Surfaced as a hard error. */
-static _Thread_local bool g_cypher_group_key_truncated = false;
-
-/* The ORDER BY key that could not be resolved to a sortable column, or "" when
- * every sort key resolved. An unresolvable key silently skipped the sort and
- * returned scan-ordered rows that are indistinguishable from sorted ones, so
- * the key is captured here and the entry point fails the query with it named. */
-static _Thread_local char g_cypher_unresolved_order_key[CBM_SZ_256] = "";
-
-static void cypher_record_unresolved_order_key(const char *key) {
-    if (g_cypher_unresolved_order_key[0]) {
-        return; /* keep the first, matching the deadline flag's sticky semantics */
-    }
-    snprintf(g_cypher_unresolved_order_key, sizeof(g_cypher_unresolved_order_key), "%s",
-             key ? key : "");
-}
 
 static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
-    g_cypher_group_key_truncated = false;
-    g_cypher_unresolved_order_key[0] = '\0';
     int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
                                                         : CYPHER_DEADLINE_BUDGET_MS;
     g_cypher_deadline_ms = cbm_now_ms() + (uint64_t)budget;
@@ -3666,31 +3125,14 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
     free(copy);
 }
 
-static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_rows,
-                               cbm_node_pattern_t *first, cbm_node_t **out_nodes, int *out_count) {
+static void scan_pattern_nodes(cbm_store_t *store, const char *project, cbm_node_pattern_t *first,
+                               cbm_node_t **out_nodes, int *out_count) {
     if (first->label && strchr(first->label, '|')) {
         scan_alternation_labels(store, project, first->label, out_nodes, out_count);
     } else if (first->label) {
         cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count);
     } else {
-        cbm_search_params_t params = {.project = project,
-                                      .min_degree = CYP_FOUND_NONE,
-                                      .max_degree = CYP_FOUND_NONE,
-                                      .limit = max_rows * CYP_GROWTH_10};
-        cbm_search_output_t sout = {0};
-        cbm_store_search(store, &params, &sout);
-        *out_count = sout.count;
-        *out_nodes = malloc(sout.count * sizeof(cbm_node_t));
-        for (int i = 0; i < sout.count; i++) {
-            (*out_nodes)[i] = sout.results[i].node;
-            sout.results[i].node.name = NULL;
-            sout.results[i].node.project = NULL;
-            sout.results[i].node.label = NULL;
-            sout.results[i].node.qualified_name = NULL;
-            sout.results[i].node.file_path = NULL;
-            sout.results[i].node.properties_json = NULL;
-        }
-        cbm_store_search_free(&sout);
+        cbm_store_find_nodes(store, project, out_nodes, out_count);
     }
     /* Apply inline property filters — free rejected nodes' strings */
     if (first->prop_count > 0) {
@@ -3713,10 +3155,33 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_
 
 /* Process edges: look up target node, filter by label/props, add binding.
  * `inbound` controls which end of the edge is the target id. */
+/* #1196 (second mechanism): a hop's output buffer must hold EVERY matched
+ * row. max_rows is an OUTPUT-row limit — projection already enforces it — and
+ * WHERE/aggregation run after expansion, so any cap here silently falsifies
+ * results: field-measured, count() reported 9,360 of 13,691 DEFINES because
+ * the old bind_cap*10 ceiling dropped edges before aggregation ever saw them,
+ * and a labeled source did not save you. The buffer now grows geometrically;
+ * only allocation failure stops materialisation (the #601 deadline still
+ * bounds time), and match_count stays truthful either way (#627 contract). */
+static bool binding_out_append(binding_t **rows, int *count, int *cap, binding_t *nb) {
+    if (*count == *cap) {
+        int next = *cap > 0 ? *cap * CYP_GROWTH_2 : CYP_GROWTH_10;
+        binding_t *grown = realloc(*rows, (size_t)next * sizeof(binding_t));
+        if (!grown) {
+            binding_free(nb);
+            return false;
+        }
+        *rows = grown;
+        *cap = next;
+    }
+    (*rows)[(*count)++] = *nb;
+    return true;
+}
+
 static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count, bool inbound,
                           const cbm_node_pattern_t *target_node, binding_t *b, const char *to_var,
-                          const char *rel_var, binding_t *new_bindings, int *new_count, int max_new,
-                          int *match_count) {
+                          const char *rel_var, binding_t **new_bindings, int *new_count,
+                          int *new_cap, int *match_count) {
     /* When the terminal node variable is ALREADY bound (e.g. the second pattern
      * `(c)-[:CALLS]->(f)` where `f` came from an earlier MATCH), we must FILTER
      * to edges that actually reach the bound node — not overwrite the caller's
@@ -3749,16 +3214,14 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
             node_fields_free(&found);
             continue;
         }
-        (*match_count)++; /* a real neighbour exists, budget or not */
-        if (*new_count < max_new) {
-            binding_t nb = {0};
-            binding_copy(&nb, b);
-            binding_set(&nb, to_var, &found);
-            if (rel_var) {
-                binding_set_edge(&nb, rel_var, &edges[ei]);
-            }
-            new_bindings[(*new_count)++] = nb;
+        (*match_count)++; /* a real neighbour exists, OOM or not */
+        binding_t nb = {0};
+        binding_copy(&nb, b);
+        binding_set(&nb, to_var, &found);
+        if (rel_var) {
+            binding_set_edge(&nb, rel_var, &edges[ei]);
         }
+        (void)binding_out_append(new_bindings, new_count, new_cap, &nb);
         node_fields_free(&found);
     }
 }
@@ -3770,17 +3233,22 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
 /* C11 _Thread_local directly: cypher.c stays windows.h-free (compat.h pulls
  * in windows.h, whose legacy `far` macro breaks this file's identifiers). */
 static _Thread_local int g_cypher_depth_clamped = 0;
+static _Thread_local int g_cypher_trail_truncated = 0;
 
 static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
-                              const char *to_var, binding_t *new_bindings, int *new_count,
-                              int max_new, int *match_count) {
+                              const char *to_var, binding_t **new_bindings, int *new_count,
+                              int *new_cap, int *match_count) {
     /* Clamp BOTH the explicit (`*1..N`) and unbounded (`*`, `*..m`) forms to the
      * engine ceiling: an explicit N above the cap was previously honoured
      * verbatim, driving cbm_store_bfs to an unbounded hop count (#887). WARN on
      * clamp — never a silent truncation. */
     int depth_cap = cbm_cypher_max_depth();
     int max_depth = rel->max_hops > 0 ? rel->max_hops : depth_cap;
+    /* A range clamped to the engine ceiling (or an unbounded one) is probed one
+     * hop beyond it: a candidate out there means the clamp hid real rows, so the
+     * result is reported truncated; a clamp on a shallow graph stays a warning. */
+    bool probe_beyond_depth_cap = rel->max_hops <= 0 || max_depth > depth_cap;
     if (max_depth > depth_cap) {
         char req_buf[16];
         char cap_buf[16];
@@ -3792,13 +3260,27 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     }
     cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
-    cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT, &tr);
+    int traversal_depth = probe_beyond_depth_cap ? depth_cap + SKIP_ONE : max_depth;
+    cbm_store_bfs_trail(store, src->id, dir, rel->types, rel->type_count, traversal_depth,
+                        CBM_PERCENT, &tr);
+    if (tr.truncated) {
+        g_cypher_trail_truncated = 1;
+    }
+    cbm_node_t *bound_to = binding_get(b, to_var);
+    int64_t bound_to_id = bound_to ? bound_to->id : 0;
     /* Same contract as process_edges: the budget caps materialisation, never
      * detection, so a saturated source cannot report match_count == 0 and get a
      * fabricated OPTIONAL "no match" row. */
     for (int v = 0; v < tr.visited_count; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
+        if (hop->hop > max_depth) {
+            g_cypher_truncated = true; /* the probe hop found a candidate past the cap */
+            continue;
+        }
         if (hop->hop < rel->min_hops) {
+            continue;
+        }
+        if (bound_to && hop->node.id != bound_to_id) {
             continue;
         }
         if (target_node->label && !label_alt_matches(hop->node.label, target_node->label)) {
@@ -3808,12 +3290,10 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
             continue;
         }
         (*match_count)++;
-        if (*new_count < max_new) {
-            binding_t nb = {0};
-            binding_copy(&nb, b);
-            binding_set(&nb, to_var, &hop->node);
-            new_bindings[(*new_count)++] = nb;
-        }
+        binding_t nb = {0};
+        binding_copy(&nb, b);
+        binding_set(&nb, to_var, &hop->node);
+        (void)binding_out_append(new_bindings, new_count, new_cap, &nb);
     }
     cbm_store_traverse_free(&tr);
 }
@@ -3821,8 +3301,8 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
 /* Expand fixed-length (1-hop) relationship edges */
 static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                                 cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
-                                const char *to_var, binding_t *new_bindings, int *new_count,
-                                int max_new, int *match_count) {
+                                const char *to_var, binding_t **new_bindings, int *new_count,
+                                int *new_cap, int *match_count) {
     bool is_inbound = rel->direction && strcmp(rel->direction, "inbound") == 0;
     bool is_any = rel->direction && strcmp(rel->direction, "any") == 0;
     const char *rel_var = rel->variable;
@@ -3839,7 +3319,7 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                                                     &edge_count);
             }
             process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
-                          new_bindings, new_count, max_new, match_count);
+                          new_bindings, new_count, new_cap, match_count);
             cbm_store_free_edges(edges, edge_count);
         }
         if (is_any) {
@@ -3849,7 +3329,7 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                 cbm_store_find_edges_by_target_type(store, src->id, rel->types[ti], &edges,
                                                     &edge_count);
                 process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
-                              new_bindings, new_count, max_new, match_count);
+                              new_bindings, new_count, new_cap, match_count);
                 cbm_store_free_edges(edges, edge_count);
             }
         }
@@ -3862,21 +3342,21 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
             cbm_store_find_edges_by_source(store, src->id, &edges, &edge_count);
         }
         process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
-                      new_bindings, new_count, max_new, match_count);
+                      new_bindings, new_count, new_cap, match_count);
         cbm_store_free_edges(edges, edge_count);
         if (is_any) {
             edges = NULL;
             edge_count = 0;
             cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count);
             process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
-                          new_bindings, new_count, max_new, match_count);
+                          new_bindings, new_count, new_cap, match_count);
             cbm_store_free_edges(edges, edge_count);
         }
     }
 }
 
 static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
-                                int *bind_count, const int *bind_cap, const char **var_name,
+                                int *bind_count, int *bind_cap, const char **var_name,
                                 bool is_optional) {
     for (int ri = 0; ri < pat->rel_count; ri++) {
         /* #601: stop expanding further hops once the wall-clock budget is spent
@@ -3890,16 +3370,14 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
-        /* Size this hop's output for BOTH writers without dropping any row: the
-         * expansion helpers emit at most max_new = bind_cap*10 rows (they stop at
-         * max_new), and the OPTIONAL fallback emits at most one row per source
-         * (<= *bind_count). A source either matches (feeds the expansion) or takes
-         * the fallback, never both, so the two counts are additive and bounded by
-         * max_new + *bind_count. Computed in size_t so the product cannot overflow.
-         * The previous "+ 1" sizing fit only a SINGLE fallback row after a
-         * saturated expansion; a second one ran off the end (heap OOB, CWE-787). */
-        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + (size_t)*bind_count;
-        binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+        /* #1196: the hop's output buffer GROWS to hold every matched row —
+         * the old bind_cap*10 ceiling silently dropped edges before WHERE and
+         * aggregation, falsifying counts. binding_out_append handles growth
+         * and the OPTIONAL fallback shares it, so no writer can run off the
+         * end and no row class is dropped (the old fixed sizing had exactly
+         * those two failure modes, CWE-787 and the OPTIONAL data loss). */
+        int new_cap = *bind_count > 0 ? *bind_count : CYP_GROWTH_10;
+        binding_t *new_bindings = malloc((size_t)new_cap * sizeof(binding_t));
         if (!new_bindings) {
             return; /* OOM: leave existing bindings untouched rather than corrupt */
         }
@@ -3917,24 +3395,22 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
             int match_count = 0;
 
-            int max_new = *bind_cap * CYP_GROWTH_10;
             if (is_variable_length) {
-                expand_var_length(store, rel, target_node, b, src, to_var, new_bindings, &new_count,
-                                  max_new, &match_count);
+                expand_var_length(store, rel, target_node, b, src, to_var, &new_bindings,
+                                  &new_count, &new_cap, &match_count);
             } else {
-                expand_fixed_length(store, rel, target_node, b, src, to_var, new_bindings,
-                                    &new_count, max_new, &match_count);
+                expand_fixed_length(store, rel, target_node, b, src, to_var, &new_bindings,
+                                    &new_count, &new_cap, &match_count);
             }
 
             /* OPTIONAL MATCH: no expansion for this source, so keep the binding
-             * with the target unbound (projection renders it ""). The buffer is
-             * sized max_new + *bind_count precisely so every such fallback row has
-             * a slot — no guard needed, and no OPTIONAL no-match row is dropped. */
+             * with the target unbound (projection renders it ""). The shared
+             * growable append gives every fallback row a slot. */
             if (is_optional && match_count == 0) {
                 binding_t nb = {0};
                 binding_copy(&nb, b);
                 /* Don't set to_var — it remains unbound; projection returns "" */
-                new_bindings[new_count++] = nb;
+                (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
             }
         }
 
@@ -3944,6 +3420,7 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
         free(*bindings);
         *bindings = new_bindings;
         *bind_count = new_count;
+        *bind_cap = new_cap;
         *var_name = to_var;
     }
 }
@@ -3987,68 +3464,45 @@ static bool rb_is_numeric_column(const result_builder_t *rb, int col) {
     return false;
 }
 
-/* A resolved sort key: which result column it reads, how to compare it, and
- * which way round. Resolution and numeric typing are done once per key before
- * sorting, not per comparison. */
-typedef struct {
-    int col;
-    bool numeric;
-    bool desc;
-} rb_sort_key_t;
-
-/* Compare two rows as a lexicographic tuple over the resolved keys: the first
- * key that separates them decides, so later keys act purely as tie-breakers.
- * Returns <0, 0 or >0. Zero means equal on EVERY key, which the caller relies
- * on to keep the sort stable. */
-static int rb_compare_rows(const char **ra, const char **rb2, const rb_sort_key_t *keys,
-                           int key_count) {
-    for (int k = 0; k < key_count; k++) {
-        const char *va = ra[keys[k].col];
-        const char *vb = rb2[keys[k].col];
-        int cmp;
-        if (keys[k].numeric) {
-            long da = strtol(va, NULL, CBM_DECIMAL_BASE);
-            long db = strtol(vb, NULL, CBM_DECIMAL_BASE);
-            cmp = (da > db) - (da < db);
-        } else {
-            cmp = strcmp(va, vb);
-        }
-        if (cmp != 0) {
-            return keys[k].desc ? -cmp : cmp;
-        }
-    }
-    return 0;
-}
-
 static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *ret) {
-    if (ret->order_key_count <= 0) {
+    if (ret->order_key_count == 0) {
         return;
     }
-
-    /* Resolve every key up front. A key naming no projected column and no alias
-     * cannot be evaluated here — the rows hold projected strings and the
-     * bindings are gone — and skipping it would return scan-ordered rows that
-     * look exactly like a correctly sorted answer, the one failure a query
-     * engine must never have. This applies to EVERY key, not just the first:
-     * an unresolvable tie-breaker is as silent as an unresolvable primary key.
-     * Record it; the entry point turns it into an error. */
-    rb_sort_key_t keys[CBM_SZ_32];
-    int key_count = 0;
-    for (int k = 0; k < ret->order_key_count && k < CBM_SZ_32; k++) {
-        int col = rb_find_order_column(rb, ret, ret->order_keys[k].expr);
-        if (col < 0) {
-            cypher_record_unresolved_order_key(ret->order_keys[k].expr);
-            return;
+    /* Resolve every key up front; an unresolvable key is skipped, matching the
+     * single-key forgiveness (sorting on what can be resolved beats dropping
+     * the whole ORDER BY). */
+    int cols[CBM_CYPHER_ORDER_KEYS_MAX];
+    bool numeric[CBM_CYPHER_ORDER_KEYS_MAX];
+    bool descs[CBM_CYPHER_ORDER_KEYS_MAX];
+    int keys = 0;
+    for (int k = 0; k < ret->order_key_count; k++) {
+        int order_col = rb_find_order_column(rb, ret, ret->order_keys[k]);
+        if (order_col < 0) {
+            continue;
         }
-        keys[key_count++] = (rb_sort_key_t){
-            .col = col, .numeric = rb_is_numeric_column(rb, col), .desc = ret->order_keys[k].desc};
+        cols[keys] = order_col;
+        numeric[keys] = rb_is_numeric_column(rb, order_col);
+        descs[keys] = ret->order_descs[k];
+        keys++;
     }
-
-    /* Bubble sort: swapping only on cmp > 0 (never on 0) keeps it stable, so
-     * rows equal on every key retain their relative order. */
+    if (keys == 0) {
+        return;
+    }
     for (int i = 0; i < rb->row_count - SKIP_ONE; i++) {
         for (int j = 0; j < rb->row_count - i - SKIP_ONE; j++) {
-            if (rb_compare_rows(rb->rows[j], rb->rows[j + SKIP_ONE], keys, key_count) > 0) {
+            int cmp = 0;
+            for (int k = 0; k < keys && cmp == 0; k++) {
+                if (numeric[k]) {
+                    cmp = (int)strtol(rb->rows[j][cols[k]], NULL, CBM_DECIMAL_BASE) -
+                          (int)strtol(rb->rows[j + SKIP_ONE][cols[k]], NULL, CBM_DECIMAL_BASE);
+                } else {
+                    cmp = strcmp(rb->rows[j][cols[k]], rb->rows[j + SKIP_ONE][cols[k]]);
+                }
+                if (descs[k]) {
+                    cmp = -cmp;
+                }
+            }
+            if (cmp > 0) {
                 const char **tmp = rb->rows[j];
                 rb->rows[j] = rb->rows[j + SKIP_ONE];
                 rb->rows[j + SKIP_ONE] = tmp;
@@ -4057,7 +3511,8 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
     }
 }
 
-static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
+static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit,
+                                bool limit_is_engine_budget) {
     /* Skip */
     if (skip_n > 0 && skip_n < rb->row_count) {
         for (int i = 0; i < skip_n; i++) {
@@ -4079,6 +3534,9 @@ static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
     }
     /* Limit */
     if (limit >= 0 && rb->row_count > limit) {
+        if (limit_is_engine_budget) {
+            g_cypher_truncated = true;
+        }
         for (int i = limit; i < rb->row_count; i++) {
             for (int c = 0; c < rb->col_count; c++) {
                 safe_str_free(&rb->rows[i][c]);
@@ -4322,6 +3780,25 @@ static const char *project_item(binding_t *b, cbm_return_item_t *item, char *fun
     if (is_scalar_value_func(item->func)) {
         return apply_string_func(item->func, raw, func_buf, buf_sz);
     }
+    /* Direct node/edge fields live in the binding until this row has been
+     * copied by rb_add_row. Keep those allocation-backed values intact: the
+     * fixed per-column scratch buffer exists only to stabilize computed and
+     * JSON-derived rotating-buffer values. Copying every value through it
+     * silently clipped long qualified names and paths to 511 bytes before the
+     * MCP response budget or prefix directory ever saw them. */
+    for (int i = 0; raw && raw[0] && i < b->var_count; i++) {
+        const cbm_node_t *node = &b->var_nodes[i];
+        if (raw == node->project || raw == node->label || raw == node->name ||
+            raw == node->qualified_name || raw == node->file_path || raw == node->properties_json) {
+            return raw;
+        }
+    }
+    for (int i = 0; raw && raw[0] && i < b->edge_var_count; i++) {
+        const cbm_edge_t *edge = &b->edge_vars[i];
+        if (raw == edge->project || raw == edge->type || raw == edge->properties_json) {
+            return raw;
+        }
+    }
     /* Copy into the caller's per-column buffer. `raw` may point to node_prop's
      * rotating scratch buffer, which the next column's projection would overwrite
      * before rb_add_row copies the assembled row — aliasing every such column to
@@ -4345,53 +3822,6 @@ static bool is_aggregate_func(const char *func) {
             strcmp(func, "MIN") == 0 || strcmp(func, "MAX") == 0 || strcmp(func, "COLLECT") == 0);
 }
 
-/* True when a RETURN/WITH item is a grouping key rather than an aggregate.
- * `item->func` carries scalar and entity-introspection functions (type, labels,
- * toLower, coalesce, ...) as well as aggregates, so its mere presence must never
- * stand in for "this is an aggregate": doing so drops the item from the group
- * key and then formats it as an aggregate, collapsing every row into one group
- * and emitting the row count in the grouping column. */
-static bool is_group_key_item(const cbm_return_item_t *item) {
-    return !is_aggregate_func(item->func);
-}
-
-/* Build the group key for one binding, and project each grouping item's value
- * into caller-owned `valbufs` (vals[ci] points into it, so the values survive
- * until the group entry strdup's them). Aggregate columns get the placeholder
- * "0" and contribute nothing to the key. Shared by the RETURN and WITH
- * aggregation paths — both group by exactly the non-aggregate items. */
-static void agg_build_group_key(cbm_return_clause_t *rc, binding_t *b, char *key, size_t key_sz,
-                                const char **vals, char valbufs[][CBM_SZ_512]) {
-    int klen = 0;
-    for (int ci = 0; ci < rc->count; ci++) {
-        if (!is_group_key_item(&rc->items[ci])) {
-            vals[ci] = "0";
-            continue;
-        }
-        /* project_item may return its own scratch (a stable static, or a
-         * per-column buffer it copied into); persist the value in valbufs. */
-        const char *v = project_item(b, &rc->items[ci], valbufs[ci], CBM_SZ_512);
-        if (v != valbufs[ci]) {
-            if (snprintf(valbufs[ci], CBM_SZ_512, "%s", v ? v : "") >= CBM_SZ_512) {
-                g_cypher_group_key_truncated = true;
-            }
-        } else if (strlen(valbufs[ci]) == CBM_SZ_512 - SKIP_ONE) {
-            /* project_item filled the buffer exactly to its limit — indis-
-             * tinguishable from a value it had to cut, so treat it as cut. */
-            g_cypher_group_key_truncated = true;
-        }
-        vals[ci] = valbufs[ci];
-        int need = snprintf(key + klen, key_sz - (size_t)klen, "%s|", vals[ci]);
-        if (need < 0 || (size_t)need >= key_sz - (size_t)klen) {
-            g_cypher_group_key_truncated = true;
-        }
-        klen += need;
-        if (klen >= (int)key_sz) {
-            klen = (int)key_sz - SKIP_ONE;
-        }
-    }
-}
-
 /* Append `val` to a string list only if not already present — i.e. maintain a
  * set of distinct values. Used by COUNT(DISTINCT x) (#239). */
 static void distinct_list_add(char ***list, int *count, const char *val) {
@@ -4405,35 +3835,26 @@ static void distinct_list_add(char ***list, int *count, const char *val) {
     (*list)[idx] = heap_strdup(val);
 }
 
-/* Compare two projected bindings as a lexicographic tuple over the ORDER BY
- * keys: the first key that separates them decides, later keys break ties.
- * Values are compared numerically when BOTH parse as numbers, else as strings —
- * decided per key and per pair, since a virtual var carries no column type.
- * Returns 0 only when the two are equal on every key. */
-static int compare_bindings(binding_t *a, binding_t *b, const cbm_order_key_t *keys,
-                            int key_count) {
-    for (int k = 0; k < key_count; k++) {
-        const char *va = binding_get_virtual(a, keys[k].expr, NULL);
-        const char *vb = binding_get_virtual(b, keys[k].expr, NULL);
-        char *ea = NULL;
-        char *eb = NULL;
-        double da = strtod(va, &ea);
-        double db = strtod(vb, &eb);
-        int cmp = (ea != va && eb != vb) ? ((da > db) - (da < db)) : strcmp(va, vb);
-        if (cmp != 0) {
-            return keys[k].desc ? -cmp : cmp;
-        }
-    }
-    return 0;
-}
-
-/* Sort bindings by the ORDER BY key tuple using a stable bubble sort (it swaps
- * only on cmp > 0, never on equal, so ties keep their relative order). */
-static void sort_bindings(binding_t *vbindings, int count, const cbm_order_key_t *keys,
-                          int key_count) {
+/* Sort bindings by the ORDER BY key list (virtual variables) using bubble
+ * sort; later keys break ties, direction is per key (#1334). */
+static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clause_t *wc) {
     for (int i = 0; i < count - SKIP_ONE; i++) {
         for (int j = 0; j < count - i - SKIP_ONE; j++) {
-            if (compare_bindings(&vbindings[j], &vbindings[j + SKIP_ONE], keys, key_count) > 0) {
+            int cmp = 0;
+            for (int k = 0; k < wc->order_key_count && cmp == 0; k++) {
+                const char *va = binding_get_virtual(&vbindings[j], wc->order_keys[k], NULL);
+                const char *vb2 =
+                    binding_get_virtual(&vbindings[j + SKIP_ONE], wc->order_keys[k], NULL);
+                char *ea = NULL;
+                char *eb = NULL;
+                double da = strtod(va, &ea);
+                double db = strtod(vb2, &eb);
+                cmp = (ea != va && eb != vb2) ? ((da > db) - (da < db)) : strcmp(va, vb2);
+                if (wc->order_descs[k]) {
+                    cmp = -cmp;
+                }
+            }
+            if (cmp > 0) {
                 binding_t tmp = vbindings[j];
                 vbindings[j] = vbindings[j + SKIP_ONE];
                 vbindings[j + SKIP_ONE] = tmp;
@@ -4464,6 +3885,14 @@ static void bindings_skip_limit(binding_t *vbindings, int *count, int skip, int 
     }
 }
 
+/* Sort, skip, and limit binding array in-place */
+static void with_sort_skip_limit(const cbm_return_clause_t *wc, binding_t *vbindings, int *vcount) {
+    if (wc->order_key_count > 0) {
+        sort_bindings(vbindings, *vcount, wc);
+    }
+    bindings_skip_limit(vbindings, vcount, wc->skip, wc->limit);
+}
+
 /* Resolve the alias or compute a default name for a WITH/RETURN item */
 static const char *resolve_item_alias(const cbm_return_item_t *item, char *name_buf,
                                       size_t buf_sz) {
@@ -4476,39 +3905,6 @@ static const char *resolve_item_alias(const cbm_return_item_t *item, char *name_
         snprintf(name_buf, buf_sz, "%s", item->variable);
     }
     return name_buf;
-}
-
-/* True when a WITH sort key names one of the clause's own projected outputs.
- *
- * The projected vbindings carry exactly one virtual var per WITH item, named by
- * resolve_item_alias, so that alias set is the complete set of sortable keys.
- * Anything else made binding_get_virtual return "" for every row, which compares
- * equal throughout and left the rows in scan order — a silent non-sort. */
-static bool with_order_key_resolves(const cbm_return_clause_t *wc, const char *key) {
-    for (int ci = 0; ci < wc->count; ci++) {
-        char name_buf[CBM_SZ_256];
-        const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-        if (strcmp(alias, key) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Sort, skip, and limit binding array in-place */
-static void with_sort_skip_limit(const cbm_return_clause_t *wc, binding_t *vbindings, int *vcount) {
-    if (wc->order_key_count > 0) {
-        /* Every key must resolve, not just the first — an unresolvable
-         * tie-breaker sorts as silently as an unresolvable primary key. */
-        for (int k = 0; k < wc->order_key_count; k++) {
-            if (!with_order_key_resolves(wc, wc->order_keys[k].expr)) {
-                cypher_record_unresolved_order_key(wc->order_keys[k].expr);
-                return; /* leave SKIP/LIMIT unapplied too: the query fails as a whole */
-            }
-        }
-        sort_bindings(vbindings, *vcount, wc->order_keys, wc->order_key_count);
-    }
-    bindings_skip_limit(vbindings, vcount, wc->skip, wc->limit);
 }
 
 /* ── WITH clause: project bindings through aggregation or rename ── */
@@ -4525,11 +3921,26 @@ typedef struct {
     int64_t *group_node_ids; /* per-item node id when the group var is a node (0 = not) */
 } with_agg_t;
 
-/* Find or create an aggregation group. Returns index. `vals` holds the already-
- * projected grouping values for this binding (see agg_build_group_key). */
+/* Build a group key from non-aggregate WITH items */
+static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
+    int kl = 0;
+    for (int ci = 0; ci < wc->count; ci++) {
+        if (is_aggregate_func(wc->items[ci].func)) {
+            continue;
+        }
+        char vbuf[CBM_SZ_512];
+        const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
+        kl += snprintf(key + kl, key_sz - (size_t)kl, "%s|", v);
+        if (kl >= (int)key_sz) {
+            kl = (int)key_sz - SKIP_ONE;
+        }
+    }
+    return kl;
+}
+
+/* Find or create an aggregation group. Returns index. */
 static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap,
-                                   cbm_return_clause_t *wc, binding_t *b, const char *key,
-                                   const char **vals) {
+                                   cbm_return_clause_t *wc, binding_t *b, const char *key) {
     for (int a = 0; a < *agg_cnt; a++) {
         if (strcmp((*aggs)[a].group_key, key) == 0) {
             return a;
@@ -4554,11 +3965,20 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         (*aggs)[found].maxs[ci] = -CYP_DBL_MAX;
     }
     for (int ci = 0; ci < wc->count; ci++) {
-        (*aggs)[found].group_vals[ci] = heap_strdup(vals[ci]);
+        if (is_aggregate_func(wc->items[ci].func)) {
+            (*aggs)[found].group_vals[ci] = heap_strdup("0");
+            continue;
+        }
+        char vbuf[CBM_SZ_512];
+        const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
+        (*aggs)[found].group_vals[ci] = heap_strdup(v);
         /* If this group item is a bare node variable, remember its id so the
          * carried virtual var can re-fetch any property (group_vals holds only
-         * the name). A function's result is a computed scalar, not the node, so
-         * it carries no id. */
+         * the name). Excludes entity-introspection funcs (labels/id/keys/
+         * properties): those project a scalar off the node (via project_item
+         * above), not the node itself, so the carried id must not be set or a
+         * later alias.property re-fetches the source node's real properties
+         * instead of returning empty for the non-node alias. */
         if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
             cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
             if (gn) {
@@ -4572,7 +3992,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
 /* Accumulate aggregation values for a binding */
 static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, binding_t *b) {
     for (int ci = 0; ci < wc->count; ci++) {
-        if (is_group_key_item(&wc->items[ci])) {
+        if (!is_aggregate_func(wc->items[ci].func)) {
             continue;
         }
         agg->counts[ci]++;
@@ -4649,11 +4069,8 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
 
     for (int bi = 0; bi < bind_count; bi++) {
         char key[CBM_SZ_1K] = "";
-        const char *vals[CBM_SZ_32];
-        char valbufs[CBM_SZ_32][CBM_SZ_512];
-        agg_build_group_key(wc, &bindings[bi], key, sizeof(key), vals, valbufs);
-        int found =
-            with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, wc, &bindings[bi], key, vals);
+        with_agg_build_key(wc, &bindings[bi], key, sizeof(key));
+        int found = with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, wc, &bindings[bi], key);
         with_agg_accumulate(&aggs[found], wc, &bindings[bi]);
     }
 
@@ -4670,7 +4087,7 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-            if (!is_group_key_item(&wc->items[ci])) {
+            if (is_aggregate_func(wc->items[ci].func)) {
                 char vbuf[CBM_SZ_64];
                 if (wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0) {
                     snprintf(vbuf, sizeof(vbuf), "%d", aggs[a].distinct_n[ci]); /* #239 */
@@ -4824,17 +4241,34 @@ static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *b
 
 /* Project RETURN * — all bound variable properties */
 /* Collect all variable names from query patterns */
+/* Has this variable already been collected? A query may name the same variable
+ * in more than one pattern, and RETURN * must give it one set of columns. */
+static bool star_var_seen(const char **vars, int vc, const char *name) {
+    for (int i = 0; i < vc; i++) {
+        if (strcmp(vars[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Collect the variables a RETURN * projects, in the order the query names them
+ * and with no repeats. Without the repeat check, `MATCH (f) OPTIONAL MATCH
+ * (f)-[:CALLS]->(g)` names f in two patterns and f gets its four columns
+ * twice. */
 static int collect_pattern_vars(cbm_query_t *q, const char **vars, int max_vars) {
     int vc = 0;
     for (int pi = 0; pi < q->pattern_count; pi++) {
         for (int ni = 0; ni < q->patterns[pi].node_count && vc < max_vars; ni++) {
-            if (q->patterns[pi].nodes[ni].variable) {
-                vars[vc++] = q->patterns[pi].nodes[ni].variable;
+            const char *var = q->patterns[pi].nodes[ni].variable;
+            if (var && !star_var_seen(vars, vc, var)) {
+                vars[vc++] = var;
             }
         }
         for (int ri = 0; ri < q->patterns[pi].rel_count && vc < max_vars; ri++) {
-            if (q->patterns[pi].rels[ri].variable) {
-                vars[vc++] = q->patterns[pi].rels[ri].variable;
+            const char *var = q->patterns[pi].rels[ri].variable;
+            if (var && !star_var_seen(vars, vc, var)) {
+                vars[vc++] = var;
             }
         }
     }
@@ -4886,15 +4320,61 @@ static void project_star_row(binding_t *b, const char **vars, int vc, const char
     }
 }
 
+/* RETURN * after a WITH.
+ *
+ * The pattern's variables are out of scope by this point — the WITH replaced
+ * them with the names it made. Each of those names holds one value, not a
+ * node, so each is ONE column rather than the four a node variable gets.
+ *
+ * Reading the pattern here instead is the fault this function exists to avoid:
+ * it named variables the bindings no longer hold, found nothing for every one
+ * of them, and answered a full result of empty strings with no error. */
+static void execute_return_star_after_with(cbm_query_t *q, binding_t *bindings, int bind_count,
+                                           int max_rows, result_builder_t *rb) {
+    cbm_return_clause_t *wc = q->with_clause;
+    char name_bufs[CYP_MAX_VARS][CBM_SZ_128];
+    const char *cols[CYP_MAX_VARS];
+    /* parse_return_or_with refuses a WITH wider than CYP_MAX_VARS, so this
+     * clamp cannot fire. It stays as the bound this function relies on. */
+    int col_n = wc->count < CYP_MAX_VARS ? wc->count : CYP_MAX_VARS;
+    for (int i = 0; i < col_n; i++) {
+        cols[i] = resolve_item_alias(&wc->items[i], name_bufs[i], sizeof(name_bufs[i]));
+    }
+    rb_set_columns(rb, cols, col_n);
+    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+        const char *vals[CYP_MAX_VARS];
+        for (int i = 0; i < col_n; i++) {
+            cbm_node_t *vn = binding_get(&bindings[bi], cols[i]);
+            vals[i] = vn && vn->name ? vn->name : "";
+        }
+        rb_add_row(rb, vals);
+    }
+}
+
 static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_count, int max_rows,
                                 result_builder_t *rb) {
+    if (q->with_clause) {
+        execute_return_star_after_with(q, bindings, bind_count, max_rows, rb);
+        return;
+    }
     const char *vars[CBM_SZ_32];
     int vc = collect_pattern_vars(q, vars, CBM_SZ_32);
     build_star_columns(rb, vars, vc);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    int projection_cap = max_rows;
+    bool cap_is_engine_budget = true;
+    cbm_return_clause_t *ret = q->ret;
+    if (ret && ret->limit >= 0 && ret->limit <= max_rows && !ret->distinct &&
+        ret->order_key_count == 0 && ret->skip <= 0) {
+        projection_cap = ret->limit;
+        cap_is_engine_budget = false;
+    }
+    for (int bi = 0; bi < bind_count && rb->row_count < projection_cap; bi++) {
         const char *vals[CBM_SZ_128];
         project_star_row(&bindings[bi], vars, vc, vals);
         rb_add_row(rb, vals);
+    }
+    if (cap_is_engine_budget && bind_count > projection_cap) {
+        g_cypher_truncated = true;
     }
 }
 
@@ -4972,7 +4452,7 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
 /* Accumulate a binding into RETURN aggregation */
 static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
-        if (is_group_key_item(&ret->items[ci])) {
+        if (!is_aggregate_func(ret->items[ci].func)) {
             continue;
         }
         entry->counts[ci]++;
@@ -5018,12 +4498,37 @@ static void ret_agg_free(ret_agg_entry_t *aggs, int agg_count, int item_count) {
     free(aggs);
 }
 
+/* Execute RETURN with aggregation */
+/* Build group key and projected values for one binding */
+static void ret_agg_build_key(cbm_return_clause_t *ret, binding_t *b, char *key, size_t key_sz,
+                              const char **vals, char valbufs[][CBM_SZ_512]) {
+    int klen = 0;
+    for (int ci = 0; ci < ret->count; ci++) {
+        if (is_aggregate_func(ret->items[ci].func)) {
+            vals[ci] = "0";
+            continue;
+        }
+        /* project_item may return its own scratch (stable static or a per-column
+         * buffer it copied into); persist the value in the caller-owned valbufs
+         * so vals[] survives until ret_agg_init_group strdup's it. */
+        const char *v = project_item(b, &ret->items[ci], valbufs[ci], CBM_SZ_512);
+        if (v != valbufs[ci]) {
+            snprintf(valbufs[ci], CBM_SZ_512, "%s", v ? v : "");
+        }
+        vals[ci] = valbufs[ci];
+        klen += snprintf(key + klen, key_sz - (size_t)klen, "%s|", vals[ci]);
+        if (klen >= (int)key_sz) {
+            klen = (int)key_sz - SKIP_ONE;
+        }
+    }
+}
+
 /* Emit one aggregated row into the result builder */
 static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, result_builder_t *rb) {
     const char *row[CBM_SZ_32];
     char bufs[CBM_SZ_32][CBM_SZ_64];
     for (int ci = 0; ci < ret->count; ci++) {
-        if (is_group_key_item(&ret->items[ci])) {
+        if (!is_aggregate_func(ret->items[ci].func)) {
             row[ci] = agg->group_vals[ci];
             continue;
         }
@@ -5056,7 +4561,7 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
         char key[CBM_SZ_1K] = "";
         const char *vals[CBM_SZ_32];
         char valbufs[CBM_SZ_32][CBM_SZ_512];
-        agg_build_group_key(ret, &bindings[bi], key, sizeof(key), vals, valbufs);
+        ret_agg_build_key(ret, &bindings[bi], key, sizeof(key), vals, valbufs);
 
         int found = CYP_FOUND_NONE;
         for (int a = 0; a < agg_count; a++) {
@@ -5116,8 +4621,10 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
 static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
-    if (ret->limit > 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
-        proj_cap = ret->limit < max_rows ? ret->limit : max_rows;
+    bool cap_is_engine_budget = true;
+    if (ret->limit >= 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
+        proj_cap = ret->limit;
+        cap_is_engine_budget = false;
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
         const char *vals[CBM_SZ_32];
@@ -5127,6 +4634,9 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
                 project_item(&bindings[bi], &ret->items[ci], func_bufs[ci], sizeof(func_bufs[ci]));
         }
         rb_add_row(rb, vals);
+    }
+    if (cap_is_engine_budget && bind_count > proj_cap) {
+        g_cypher_truncated = true;
     }
 }
 
@@ -5154,9 +4664,13 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
                                        int max_rows, result_builder_t *rb) {
     const char *vars[CYP_MAX_VARS];
     int vc = 0;
-    for (int ni = 0; ni < pat0->node_count && vc < CYP_MAX_VARS; ni++) {
+    for (int ni = 0; ni < pat0->node_count; ni++) {
         if (pat0->nodes[ni].variable) {
-            vars[vc++] = pat0->nodes[ni].variable;
+            if (vc < CYP_MAX_VARS) {
+                vars[vc++] = pat0->nodes[ni].variable;
+            } else {
+                g_cypher_truncated = true;
+            }
         }
     }
     build_default_columns(rb, vars, vc);
@@ -5170,6 +4684,9 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
             vals[((size_t)v * CYP_EDGE_COLS) + PAIR_LEN] = n && n->label ? n->label : "";
         }
         rb_add_row(rb, vals);
+    }
+    if (bind_count > max_rows) {
+        g_cypher_truncated = true;
     }
 }
 
@@ -5242,8 +4759,8 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
      * graphs (e.g. an unbound `c` scanned against ~29 K `f` bindings), wrapping
      * the int product negative and yielding a tiny/garbage malloc → heap OOB
      * write → SIGSEGV/SIGABRT (#627). */
-    size_t alloc_n = (size_t)*bind_count * (size_t)extra_count * (size_t)CYP_GROWTH_10 + SKIP_ONE;
-    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    int new_cap = *bind_count > 0 && extra_count > 0 ? *bind_count : SKIP_ONE;
+    binding_t *new_bindings = malloc((size_t)new_cap * sizeof(binding_t));
     if (!new_bindings) {
         return; /* OOM: leave existing bindings untouched rather than corrupt */
     }
@@ -5260,7 +4777,7 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
             const char *tv = nvar;
             expand_pattern_rels(store, patn, &tmp, &tc, &tcap, &tv, opt);
             for (int ti = 0; ti < tc; ti++) {
-                new_bindings[new_count++] = tmp[ti];
+                (void)binding_out_append(&new_bindings, &new_count, &new_cap, &tmp[ti]);
             }
             free(tmp);
         }
@@ -5299,21 +4816,39 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
     bool scan_targets =
         !rel_inbound; /* (start)->(term): start = edge source = scan term's inbound */
 
-    size_t alloc_n = (size_t)*bind_count * (size_t)CYP_GROWTH_10 + SKIP_ONE;
-    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    /* Size this hop's output for BOTH writers without dropping any row: the
+     * materialised expansion is capped at max_new = *bind_count * 10 rows (only
+     * the WRITE is gated on max_new; match DETECTION below is not, so a full
+     * buffer never hides a real neighbour), and the OPTIONAL fallback
+     * emits at most one row per source (<= *bind_count). A source either matches
+     * (feeds the expansion) or takes the fallback, never both, so the two counts
+     * are additive and bounded by max_new + *bind_count. Computed in size_t so
+     * the product cannot overflow.
+     * The previous "+ SKIP_ONE" sizing tied max_new to the whole buffer, so once
+     * the expansion saturated it the fallback guard silently dropped every later
+     * OPTIONAL no-match row (a data-loss bug, not an OOB — the fallback stayed
+     * in-bounds behind that guard) — exactly the rows
+     * `OPTIONAL MATCH ... WHERE <start> IS NULL` is meant to surface. */
+    int new_cap = *bind_count > 0 ? *bind_count : CYP_GROWTH_10;
+    binding_t *new_bindings = malloc((size_t)new_cap * sizeof(binding_t));
     if (!new_bindings) {
         return;
     }
     int new_count = 0;
-    int max_new = (int)alloc_n;
 
-    for (int bi = 0; bi < *bind_count && new_count < max_new; bi++) {
+    for (int bi = 0; bi < *bind_count; bi++) {
         binding_t *b = &(*bindings)[bi];
         cbm_node_t *term = binding_get(b, patn->nodes[1].variable ? patn->nodes[1].variable : "");
         int match_count = 0;
         if (term) {
-            for (int ti = 0;
-                 ti < (rel->type_count > 0 ? rel->type_count : 1) && new_count < max_new; ti++) {
+            /* Detection is decoupled from the write budget: scan every edge and
+             * type unconditionally so match_count reflects the true neighbour
+             * count, and gate only the WRITE on the ceiling (below). If detection
+             * stopped at max_new too, a saturated buffer would leave match_count at
+             * 0 for a terminal that actually has callers, and the fallback below
+             * would fabricate an UNBOUND "dead code" row for live code — worse than
+             * dropping a row. */
+            for (int ti = 0; ti < (rel->type_count > 0 ? rel->type_count : 1); ti++) {
                 cbm_edge_t *edges = NULL;
                 int edge_count = 0;
                 if (rel->type_count > 0) {
@@ -5329,7 +4864,7 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                 } else {
                     cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
                 }
-                for (int ei = 0; ei < edge_count && new_count < max_new; ei++) {
+                for (int ei = 0; ei < edge_count; ei++) {
                     int64_t sid = scan_targets ? edges[ei].source_id : edges[ei].target_id;
                     cbm_node_t found = {0};
                     if (cbm_store_find_node_by_id(store, sid, &found) != CBM_STORE_OK) {
@@ -5339,25 +4874,28 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                         node_fields_free(&found);
                         continue;
                     }
+                    match_count++;
                     binding_t nb = {0};
                     binding_copy(&nb, b);
                     binding_set(&nb, start_var, &found);
                     if (rel->variable) {
                         binding_set_edge(&nb, rel->variable, &edges[ei]);
                     }
+                    (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
                     node_fields_free(&found);
-                    new_bindings[new_count++] = nb;
-                    match_count++;
                 }
                 cbm_store_free_edges(edges, edge_count);
             }
         }
-        if (opt && match_count == 0 && new_count < max_new) {
-            /* No matching neighbour: keep the row with start_var left UNBOUND so
-             * `WHERE <start> IS NULL` correctly identifies the no-edge case. */
+        if (opt && match_count == 0) {
+            /* GENUINELY no matching neighbour: the scan above runs unconditionally,
+             * so match_count is the true neighbour count and match_count == 0 here
+             * means the terminal really has none. Keep the row with start_var left
+             * UNBOUND so `WHERE <start> IS NULL` correctly identifies the no-edge
+             * case; the shared growable append gives every fallback row a slot. */
             binding_t nb = {0};
             binding_copy(&nb, b);
-            new_bindings[new_count++] = nb;
+            (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
         }
     }
 
@@ -5400,7 +4938,7 @@ static int expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const 
 
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
-        scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes, &extra_count);
+        scan_pattern_nodes(store, project, &patn->nodes[0], &extra_nodes, &extra_count);
         int rc = 0;
         if (patn->rel_count == 0) {
             rc = cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
@@ -5442,8 +4980,9 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         rb_apply_distinct(rb);
     }
     rb_apply_order_by(rb, ret);
-    int result_limit = ret->limit >= 0 && ret->limit < max_rows ? ret->limit : max_rows;
-    rb_apply_skip_limit(rb, ret->skip, result_limit);
+    bool limit_is_engine_budget = ret->limit < 0;
+    rb_apply_skip_limit(rb, ret->skip, limit_is_engine_budget ? max_rows : ret->limit,
+                        limit_is_engine_budget);
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
@@ -5453,14 +4992,13 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     /* Step 1: Scan initial nodes */
     cbm_node_t *scanned = NULL;
     int scan_count = 0;
-    scan_pattern_nodes(store, project, CYPHER_RESULT_CEILING, &pat0->nodes[0], &scanned,
-                       &scan_count);
+    scan_pattern_nodes(store, project, &pat0->nodes[0], &scanned, &scan_count);
 
     /* Build initial bindings with early WHERE */
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
     binding_t *bindings = malloc((bind_cap + SKIP_ONE) * sizeof(binding_t));
     int bind_count = 0;
-    const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
+    const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : CYP_ANON_HEAD_VAR;
 
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
         if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
@@ -5482,7 +5020,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                         q->pattern_optional[0]);
 
     /* Step 2b: Additional patterns */
-    if (expand_additional_patterns(store, q, project, CYPHER_RESULT_CEILING, &bindings, &bind_count,
+    if (expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count,
                                    &bind_cap) != 0) {
         for (int bi = 0; bi < bind_count; bi++) {
             binding_free(&bindings[bi]);
@@ -5630,13 +5168,98 @@ static const char *scope_checkable_var(const cbm_return_item_t *item) {
     return item->variable;
 }
 
+/* Says which limit the query passed and how to get under it. An unnamed node
+ * takes no slot — except the head of the first pattern, which the engine binds
+ * either way — so dropping a name the query never uses is the cheap way out.
+ * Splitting the MATCH is NOT — every pattern of one query shares one binding,
+ * which is why the caller counts across all of them. Separate queries do work,
+ * because each gets a binding of its own. */
+static char *var_capacity_error(const char *kind, int limit) {
+    char buf[CBM_SZ_256];
+    snprintf(buf, sizeof(buf),
+             "too many %s variables: a query can name at most %d — "
+             "leave the name off the ones you do not use, or run separate queries",
+             kind, limit);
+    return heap_strdup(buf);
+}
+
+/* A binding holds a fixed number of variables: CYP_MAX_VARS node variables and
+ * CYP_MAX_EDGE_VARS edge variables, both in plain arrays (see binding_t).
+ * binding_set and binding_set_edge drop anything past those without a word, so
+ * a query naming more variables than a binding holds cannot be answered — the
+ * extra names bind to nothing and project as empty strings, which reads as
+ * "the graph holds no such data" rather than "this query is too wide".
+ *
+ * Refuse such a query instead, before any row is touched. Bounding the input
+ * here is also what stops collect_declared_names below overflowing its array:
+ * the patterns contribute at most CYP_MAX_VARS + CYP_MAX_EDGE_VARS names, plus
+ * one UNWIND alias, which is well inside CYP_SCOPE_MAX_NAMES.
+ *
+ * Counts DISTINCT variables across every pattern, because they all land in the
+ * same binding: a multi-MATCH query shares one, and an OPTIONAL MATCH pattern
+ * sits in this same array (q->pattern_optional marks which). A node variable
+ * and an edge variable may share a name and each take a slot, because the
+ * binding keeps the two in separate arrays. */
+static char *check_pattern_var_capacity(const cbm_query_t *q) {
+    /* Initialized because cppcheck cannot see that scope_holds reads only the
+     * node_n / edge_n entries already written, and reports the first call as a
+     * read of an uninitialized array. */
+    const char *node_vars[CYP_MAX_VARS] = {NULL};
+    const char *edge_vars[CYP_MAX_EDGE_VARS] = {NULL};
+    int node_n = 0;
+    int edge_n = 0;
+    /* The head of the first pattern always takes a node slot, named or not:
+     * execute_single binds it under CYP_ANON_HEAD_VAR when the query leaves it
+     * unnamed. Count it first, or a query with an unnamed head and CYP_MAX_VARS
+     * named nodes passes this check and still loses its last name in
+     * binding_set — the exact silence this guard exists to remove. */
+    if (q->pattern_count > 0 && q->patterns[0].node_count > 0 &&
+        !q->patterns[0].nodes[0].variable) {
+        node_vars[node_n++] = CYP_ANON_HEAD_VAR;
+    }
+    for (int pi = 0; pi < q->pattern_count; pi++) {
+        const cbm_pattern_t *pat = &q->patterns[pi];
+        for (int ni = 0; ni < pat->node_count; ni++) {
+            const char *var = pat->nodes[ni].variable;
+            if (!var || scope_holds(node_vars, node_n, var)) {
+                continue;
+            }
+            if (node_n >= CYP_MAX_VARS) {
+                return var_capacity_error("node", CYP_MAX_VARS);
+            }
+            node_vars[node_n++] = var;
+        }
+        for (int ri = 0; ri < pat->rel_count; ri++) {
+            const char *var = pat->rels[ri].variable;
+            if (!var || scope_holds(edge_vars, edge_n, var)) {
+                continue;
+            }
+            if (edge_n >= CYP_MAX_EDGE_VARS) {
+                return var_capacity_error("edge", CYP_MAX_EDGE_VARS);
+            }
+            edge_vars[edge_n++] = var;
+        }
+    }
+    return NULL;
+}
+
 /* Answers NULL when the query is fine, or a heap message naming the first
  * variable that is not in scope. Checks one query; the caller walks a UNION. */
 static char *check_projection_scope(const cbm_query_t *q) {
+    /* Runs first, so the rest of this function can trust that the query names
+     * no more variables than the arrays below can model. */
+    char *capacity_err = check_pattern_var_capacity(q);
+    if (capacity_err) {
+        return capacity_err;
+    }
+
     const char *declared[CYP_SCOPE_MAX_NAMES];
     int declared_n = collect_declared_names(q, declared, CYP_SCOPE_MAX_NAMES);
     if (declared_n < 0) {
-        return NULL; /* too many names to model — stay quiet rather than guess */
+        /* Unreachable while the capacity check above holds. Kept so the guard
+         * still stands if either bound ever moves. Skipping the check was the
+         * old behaviour, and it let an out-of-scope name through in silence. */
+        return NULL;
     }
 
     /* A WITH still reads the pattern variables. */
@@ -5660,7 +5283,7 @@ static char *check_projection_scope(const cbm_query_t *q) {
     if (q->with_clause) {
         scope_n = collect_with_names(q->with_clause, after_with, CYP_SCOPE_MAX_NAMES);
         if (scope_n < 0) {
-            return NULL;
+            return NULL; /* unreachable: a WITH holds at most CYP_SCOPE_MAX_NAMES items */
         }
         scope = after_with;
     }
@@ -5680,6 +5303,8 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
     g_cypher_depth_clamped = 0;
+    g_cypher_trail_truncated = 0;
+    g_cypher_truncated = false;
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
@@ -5705,6 +5330,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     if (execute_single(store, q, project, max_rows, &rb) < 0) {
         rb_free(&rb);
         cbm_query_free(q);
+        out->truncated = g_cypher_truncated;
         out->error = heap_strdup("query aborted: out of memory or an allocation limit was reached");
         return CBM_NOT_FOUND;
     }
@@ -5717,6 +5343,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
+            out->truncated = g_cypher_truncated;
             out->error =
                 heap_strdup("query aborted: out of memory or an allocation limit was reached");
             return CBM_NOT_FOUND;
@@ -5740,6 +5367,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     if (g_cypher_timed_out) {
         rb_free(&rb);
         cbm_query_free(q);
+        out->truncated = g_cypher_truncated;
         out->error =
             heap_strdup("query exceeded the execution time limit — narrow the pattern with a WHERE "
                         "filter, use a directed MATCH instead of an unbounded OPTIONAL MATCH, or "
@@ -5747,40 +5375,12 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
         return CBM_NOT_FOUND;
     }
 
-    /* An ORDER BY key that resolved to no column sorted nothing, and unsorted
-     * rows in scan order are indistinguishable from correctly sorted ones. Name
-     * the key and say what would fix it, rather than return the wrong order. */
-    if (g_cypher_unresolved_order_key[0]) {
-        char ebuf[CBM_SZ_512];
-        snprintf(ebuf, sizeof(ebuf),
-                 "unsupported: ORDER BY '%s' — sorting works on the returned columns, and '%s' is "
-                 "not one of them; add it to RETURN (e.g. RETURN ..., %s) or sort by a projected "
-                 "column or its AS alias",
-                 g_cypher_unresolved_order_key, g_cypher_unresolved_order_key,
-                 g_cypher_unresolved_order_key);
-        rb_free(&rb);
-        cbm_query_free(q);
-        out->error = heap_strdup(ebuf);
-        return CBM_NOT_FOUND;
-    }
-
-    /* A truncated grouping value merges rows that differ only past the cut,
-     * producing a wrong count that looks exactly like a correct one. Fail loudly
-     * rather than return it. */
-    if (g_cypher_group_key_truncated) {
-        rb_free(&rb);
-        cbm_query_free(q);
-        out->error = heap_strdup(
-            "unsupported: a grouping value exceeded the group-key buffer — aggregating on it "
-            "would silently merge distinct groups; return a shorter key (e.g. left(x, 200)) "
-            "or group on a different property");
-        return CBM_NOT_FOUND;
-    }
-
     /* Check ceiling */
     if (rb.row_count >= CYPHER_RESULT_CEILING) {
+        g_cypher_truncated = true;
         rb_free(&rb);
         cbm_query_free(q);
+        out->truncated = true;
         out->error = heap_strdup("result exceeded 100k rows — use narrower filters or add LIMIT");
         return CBM_NOT_FOUND;
     }
@@ -5789,12 +5389,25 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     out->col_count = rb.col_count;
     out->rows = rb.rows;
     out->row_count = rb.row_count;
-    if (g_cypher_depth_clamped > 0) {
+    /* Any internal ceiling that prevented exhaustive evaluation: a candidate or
+     * traversal budget, or a variable-length range clamped to the engine cap. */
+    out->truncated = g_cypher_truncated || g_cypher_trail_truncated != 0;
+    if (g_cypher_depth_clamped > 0 || g_cypher_trail_truncated) {
         char wbuf[CBM_SZ_256];
-        snprintf(wbuf, sizeof(wbuf),
-                 "variable-length hop range clamped to the engine ceiling (%d) — an empty "
-                 "result may mean \"clamped\", not \"no such path\"",
-                 g_cypher_depth_clamped);
+        if (g_cypher_depth_clamped > 0 && g_cypher_trail_truncated) {
+            snprintf(wbuf, sizeof(wbuf),
+                     "variable-length hop range clamped to the engine ceiling (%d) and "
+                     "traversal budget was exhausted — results may be partial",
+                     g_cypher_depth_clamped);
+        } else if (g_cypher_depth_clamped > 0) {
+            snprintf(wbuf, sizeof(wbuf),
+                     "variable-length hop range clamped to the engine ceiling (%d) — an empty "
+                     "result may mean \"clamped\", not \"no such path\"",
+                     g_cypher_depth_clamped);
+        } else {
+            snprintf(wbuf, sizeof(wbuf),
+                     "variable-length traversal budget was exhausted — results may be partial");
+        }
         out->warning = heap_strdup(wbuf);
     }
 

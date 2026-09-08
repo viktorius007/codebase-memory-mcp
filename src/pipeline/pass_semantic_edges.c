@@ -170,33 +170,6 @@ static int inject_body_pattern_tokens(const char *bt, char **tokens, int count, 
     return count;
 }
 
-static int inject_body_pattern_tokens_from_json(const char *json, char **tokens, int count,
-                                                int max_tokens) {
-    /* extract_body_ident_tokens() emits at most CBM_SZ_2K - 1 raw bytes.
-     * json_str_value decodes the serialized carrier back into that bound. */
-    char bt_buf[CBM_SZ_2K];
-    const char *bt = json ? json_str_value(json, "bt", bt_buf, sizeof(bt_buf)) : NULL;
-    return inject_body_pattern_tokens(bt, tokens, count, max_tokens);
-}
-
-#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-bool cbm_semantic_test_body_field_injects_token(const char *json, const char *expected) {
-    if (!expected) {
-        return false;
-    }
-    char *tokens[CBM_SEM_MAX_TOKENS] = {0};
-    int count = inject_body_pattern_tokens_from_json(json, tokens, 0, CBM_SEM_MAX_TOKENS);
-    bool found = false;
-    for (int i = 0; i < count; i++) {
-        if (strcmp(tokens[i], expected) == 0) {
-            found = true;
-        }
-        free(tokens[i]);
-    }
-    return found;
-}
-#endif
-
 /* Inject tokens for one CALLS-target name based on keyword groups. */
 static int inject_callee_tokens(const char *name, char **tokens, int count, int max_tokens) {
     static const char *const LOG_FNS[] = {"log", "Log", "warn", "debug", "info", NULL};
@@ -292,12 +265,16 @@ static int inject_pattern_tokens(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbu
         return count;
     }
 
+    char bt_buf[CBM_SZ_512];
+    const char *bt = n->properties_json
+                         ? json_str_value(n->properties_json, "bt", bt_buf, sizeof(bt_buf))
+                         : NULL;
     char dec_buf[CBM_SZ_256];
     const char *decs = n->properties_json ? json_str_value(n->properties_json, "decorators",
                                                            dec_buf, sizeof(dec_buf))
                                           : NULL;
 
-    count = inject_body_pattern_tokens_from_json(n->properties_json, tokens, count, max_tokens);
+    count = inject_body_pattern_tokens(bt, tokens, count, max_tokens);
     count = inject_calls_pattern_tokens(n, gbuf, tokens, count, max_tokens);
     count = inject_decorator_tokens(decs, tokens, count, max_tokens);
     count = inject_name_pattern_tokens(n->name, tokens, count, max_tokens);
@@ -336,7 +313,7 @@ static const char *file_ext(const char *path) {
 
 /* Extract a JSON string value by key (simple strstr-based, no full parse). */
 static const char *json_str_value(const char *json, const char *key, char *buf, int bufsize) {
-    if (!json || !key || !buf || bufsize <= 0) {
+    if (!json || !key) {
         return NULL;
     }
     char search[CBM_SZ_64];
@@ -346,47 +323,17 @@ static const char *json_str_value(const char *json, const char *key, char *buf, 
         return NULL;
     }
     start += strlen(search);
-    int length = 0;
-    for (const char *cursor = start; *cursor; cursor++) {
-        char value = *cursor;
-        if (value == '"') {
-            buf[length] = '\0';
-            return buf;
-        }
-        if (value == '\\') {
-            cursor++;
-            if (!*cursor) {
-                return NULL;
-            }
-            switch (*cursor) {
-            case 'n':
-                value = '\n';
-                break;
-            case 'r':
-                value = '\r';
-                break;
-            case 't':
-                value = '\t';
-                break;
-            case 'b':
-                value = '\b';
-                break;
-            case 'f':
-                value = '\f';
-                break;
-            default:
-                value = *cursor;
-                break;
-            }
-        }
-        /* Preserve the established bounded behavior for larger generic
-         * metadata fields. The body-token carrier itself is raw-bounded to
-         * CBM_SZ_2K - 1, so its dedicated 2 KiB consumers cannot truncate. */
-        if (length < bufsize - SKIP_ONE) {
-            buf[length++] = value;
-        }
+    const char *end = strchr(start, '"');
+    if (!end) {
+        return NULL;
     }
-    return NULL;
+    int len = (int)(end - start);
+    if (len >= bufsize) {
+        len = bufsize - SKIP_ONE;
+    }
+    memcpy(buf, start, (size_t)len);
+    buf[len] = '\0';
+    return buf;
 }
 
 /* Extract a JSON array of strings by key. Returns count. */
@@ -426,49 +373,18 @@ static int json_str_array(const char *json, const char *key, char **out, int max
 
 /* Tokenize a single string field keyed out of node->properties_json, if
  * present.  Returns the new count after appending any tokens. */
-static int tokenize_json_string_field_with_buffer(const char *json, const char *key, char *buf,
-                                                  int buf_size, char **tokens, int count,
-                                                  int max_tokens) {
+static int tokenize_json_string_field(const char *json, const char *key, char **tokens, int count,
+                                      int max_tokens) {
     if (count >= max_tokens) {
         return count;
     }
-    if (!json_str_value(json, key, buf, buf_size)) {
+    char buf[CBM_SZ_512];
+    if (!json_str_value(json, key, buf, sizeof(buf))) {
         return count;
     }
     count += cbm_sem_tokenize(buf, tokens + count, max_tokens - count);
     return count;
 }
-
-static int tokenize_json_string_field(const char *json, const char *key, char **tokens, int count,
-                                      int max_tokens) {
-    char buf[CBM_SZ_512];
-    return tokenize_json_string_field_with_buffer(json, key, buf, sizeof(buf), tokens, count,
-                                                  max_tokens);
-}
-
-static int tokenize_body_tokens_field(const char *json, char **tokens, int count, int max_tokens) {
-    char buf[CBM_SZ_2K];
-    return tokenize_json_string_field_with_buffer(json, "bt", buf, sizeof(buf), tokens, count,
-                                                  max_tokens);
-}
-
-#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-bool cbm_semantic_test_body_field_contains_token(const char *json, const char *expected) {
-    if (!expected) {
-        return false;
-    }
-    char *tokens[CBM_SEM_MAX_TOKENS] = {0};
-    int count = tokenize_body_tokens_field(json, tokens, 0, CBM_SEM_MAX_TOKENS);
-    bool found = false;
-    for (int i = 0; i < count; i++) {
-        if (strcmp(tokens[i], expected) == 0) {
-            found = true;
-        }
-        free(tokens[i]);
-    }
-    return found;
-}
-#endif
 
 /* Tokenize a JSON array field (e.g. "param_names", "decorators"). */
 static int tokenize_json_array_field(const char *json, const char *key, char **tokens, int count,
@@ -546,25 +462,12 @@ static int tokenize_call_neighbors(const cbm_gbuf_node_t *n, const cbm_gbuf_t *g
     return count;
 }
 
-static const char *content_qualified_name(const char *qualified_name, const char *project_name) {
-    if (!qualified_name || !project_name || !project_name[0]) {
-        return qualified_name;
-    }
-    size_t project_len = strlen(project_name);
-    if (strncmp(qualified_name, project_name, project_len) == 0 &&
-        qualified_name[project_len] == '.') {
-        return qualified_name + project_len + 1;
-    }
-    return qualified_name;
-}
-
-static int tokenize_node(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf, const char *project_name,
-                         char **tokens, int max_tokens) {
+static int tokenize_node(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf, char **tokens,
+                         int max_tokens) {
     int count = 0;
     count += cbm_sem_tokenize(n->name, tokens + count, max_tokens - count);
     if (n->qualified_name && count < max_tokens) {
-        count += cbm_sem_tokenize(content_qualified_name(n->qualified_name, project_name),
-                                  tokens + count, max_tokens - count);
+        count += cbm_sem_tokenize(n->qualified_name, tokens + count, max_tokens - count);
     }
     if (n->file_path && count < max_tokens) {
         count += cbm_sem_tokenize(n->file_path, tokens + count, max_tokens - count);
@@ -582,7 +485,7 @@ static int tokenize_node(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf, const
             tokenize_json_array_field(n->properties_json, "param_types", tokens, count, max_tokens);
         count =
             tokenize_json_array_field(n->properties_json, "decorators", tokens, count, max_tokens);
-        count = tokenize_body_tokens_field(n->properties_json, tokens, count, max_tokens);
+        count = tokenize_json_string_field(n->properties_json, "bt", tokens, count, max_tokens);
     }
     count = tokenize_call_neighbors(n, gbuf, /*outbound=*/true, tokens, count, max_tokens);
 
@@ -697,7 +600,6 @@ typedef struct {
     char **all_tokens;                 /* output: all_tokens[f * MAX + t] */
     int *token_counts;                 /* output: token count per function */
     int func_count;
-    const char *project_name; /* storage prefix, excluded from semantic tokens */
     _Atomic int next_idx;
     /* Per-worker token intern pools (key==value==the one owned strdup):
      * identical tokens ("xfs", "error", ...) recur across hundreds of
@@ -720,7 +622,7 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
          * in this slot, which avoids a spurious analyzer "leak" diagnostic on
          * the previous stack-local relay pattern. */
         char **dst = &tc->all_tokens[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
-        int count = tokenize_node(n, tc->gbuf, tc->project_name, dst, CBM_SEM_MAX_TOKENS);
+        int count = tokenize_node(n, tc->gbuf, dst, CBM_SEM_MAX_TOKENS);
         count = inject_pattern_tokens(n, tc->gbuf, dst, count, CBM_SEM_MAX_TOKENS);
         if (tc->pools && tc->pools[worker_id]) {
             CBMHashTable *pool = tc->pools[worker_id];
@@ -1090,8 +992,12 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
      * sequence — so an unstable order changes WHICH semantic edges are
      * emitted. Sort the cheap pointer array by qualified name (unique) and
      * re-derive the three fields set so far; the heavy per-func payloads are
-     * filled in later phases, so no 12.7 KB structs are moved. */
-    qsort(node_ptrs, (size_t)func_count, sizeof(node_ptrs[0]), cmp_node_ptr_by_qn);
+     * filled in later phases, so no 12.7 KB structs are moved.
+     * A graph with no Function/Method nodes never allocates node_ptrs, and
+     * qsort's base is declared nonnull (glibc), so skip the sort outright. */
+    if (func_count > 0) {
+        qsort(node_ptrs, (size_t)func_count, sizeof(node_ptrs[0]), cmp_node_ptr_by_qn);
+    }
     for (int k = 0; k < func_count; k++) {
         funcs[k].node_id = node_ptrs[k]->id;
         funcs[k].file_path = node_ptrs[k]->file_path;
@@ -1260,14 +1166,13 @@ static void phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_
  * all_tokens[] and token_counts[].  Caller allocates the arrays. */
 static void phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf, char **all_tokens,
                             int *token_counts, int func_count, int worker_count,
-                            CBMHashTable **pools, const char *project_name) {
+                            CBMHashTable **pools) {
     tokenize_ctx_t tc = {
         .node_ptrs = node_ptrs,
         .gbuf = gbuf,
         .all_tokens = all_tokens,
         .token_counts = token_counts,
         .func_count = func_count,
-        .project_name = project_name,
         .pools = pools,
     };
     atomic_init(&tc.next_idx, 0);
@@ -1495,7 +1400,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
         }
     }
     phase2_tokenize(node_ptrs, gbuf, all_tokens, token_counts, func_count, worker_count,
-                    token_pools, ctx->project_name);
+                    token_pools);
     CBM_PROF_END_N("semantic_edges", "2_tokenize_parallel", t_phase2, func_count);
     free(node_ptrs);
 

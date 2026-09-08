@@ -15,7 +15,12 @@
 enum {
     PP_RING = 4,
     PP_RING_MASK = 3,
+    PP_JSON_MARGIN = 10,
+    PP_ESC_MARGIN = 3,
     PP_ESC_SPACE = 2,
+    /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
+     * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
+    PP_JSON_FIELD_OVERHEAD = 6,
     PP_ARGS_MARGIN = 20,
     /* ,"line":<int> -> comma + key (7) + colon + up to 10 digits + NUL. */
     PP_LINE_MARGIN = 24,
@@ -63,7 +68,6 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #define PP_RETAIN_PER_FILE_HARD_MAX_BYTES (32ULL * 1024 * 1024) /* 32 MiB per file */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
-#include "pipeline/definition_properties.h"
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/lsp_resolve.h"
 #include "lsp/rust_cargo.h"
@@ -86,6 +90,8 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "cbm.h"
 #include "arena.h"
 #include "macro_table.h"
+#include "simhash/minhash.h"
+#include "semantic/ast_profile.h"
 
 #include <errno.h>
 #include <stdatomic.h>
@@ -101,6 +107,8 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
  * memory (the resident floor, not in-flight transients, holds the budget). */
 static _Atomic long g_bp_nap_cycles = 0;
 static _Atomic uint64_t g_lsp_linear_fallback_rows = 0;
+/* Defined here, declared in lsp_resolve.h — the uncapped tail-match scan's
+ * cost, surfaced at end of resolve (#1669). */
 _Atomic uint64_t g_lsp_tail_lookups = 0;
 _Atomic uint64_t g_lsp_tail_candidates = 0;
 
@@ -281,37 +289,7 @@ typedef struct {
     cbm_file_error_t *items;
     int count;
     int cap;
-    bool capture_failed;
 } pp_err_list_t;
-
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-static atomic_int g_pp_test_error_alloc_position = 0;
-static atomic_size_t g_pp_test_rust_registry_fail_after = SIZE_MAX;
-#define PP_TEST_POISON_REGISTRY_AFTER_BUILD (SIZE_MAX - 1)
-
-void cbm_parallel_test_fail_error_alloc_at(int position) {
-    atomic_store(&g_pp_test_error_alloc_position, position);
-}
-
-void cbm_parallel_test_fail_rust_registry_after(size_t successful_allocations) {
-    atomic_store(&g_pp_test_rust_registry_fail_after, successful_allocations);
-}
-
-static bool pp_err_test_allows_alloc(void) {
-    int position = atomic_load(&g_pp_test_error_alloc_position);
-    while (position > 0) {
-        if (atomic_compare_exchange_weak(&g_pp_test_error_alloc_position, &position,
-                                         position - 1)) {
-            return position != 1;
-        }
-    }
-    return true;
-}
-#else
-static bool pp_err_test_allows_alloc(void) {
-    return true;
-}
-#endif
 
 /* NULL-safe heap strdup. */
 static char *pp_err_dup(const char *s) {
@@ -319,69 +297,33 @@ static char *pp_err_dup(const char *s) {
         return NULL;
     }
     size_t n = strlen(s) + 1;
-    /* cppcheck-suppress knownConditionTrueFalse -- false in allocation-fault tests. */
-    char *d = pp_err_test_allows_alloc() ? (char *)malloc(n) : NULL;
+    char *d = (char *)malloc(n);
     if (d) {
         memcpy(d, s, n);
     }
     return d;
 }
 
-static bool pp_err_add(pp_err_list_t *list, const char *path, const char *reason,
+static void pp_err_add(pp_err_list_t *list, const char *path, const char *reason,
                        const char *phase) {
     if (!list) {
-        return false;
-    }
-    char *path_copy = pp_err_dup(path);
-    char *reason_copy = pp_err_dup(reason);
-    char *phase_copy = pp_err_dup(phase);
-    if ((path && !path_copy) || (reason && !reason_copy) || (phase && !phase_copy)) {
-        free(path_copy);
-        free(reason_copy);
-        free(phase_copy);
-        list->capture_failed = true;
-        return false;
+        return;
     }
     if (list->count >= list->cap) {
         int ncap = list->cap ? list->cap * 2 : 8;
         cbm_file_error_t *grown =
-            /* cppcheck-suppress knownConditionTrueFalse -- false in allocation-fault tests. */
-            pp_err_test_allows_alloc()
-                ? (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown))
-                : NULL;
+            (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown));
         if (!grown) {
-            free(path_copy);
-            free(reason_copy);
-            free(phase_copy);
-            list->capture_failed = true;
-            return false;
+            return; /* drop on OOM — never fail extraction to record a skip */
         }
         list->items = grown;
         list->cap = ncap;
     }
-    list->items[list->count].path = path_copy;
-    list->items[list->count].reason = reason_copy;
-    list->items[list->count].phase = phase_copy;
+    list->items[list->count].path = pp_err_dup(path);
+    list->items[list->count].reason = pp_err_dup(reason);
+    list->items[list->count].phase = pp_err_dup(phase);
     list->count++;
-    return true;
 }
-
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-bool cbm_parallel_test_error_add_is_atomic(int allocation_position) {
-    pp_err_list_t list = {0};
-    cbm_parallel_test_fail_error_alloc_at(allocation_position);
-    bool added = pp_err_add(&list, "broken.rs", "extract failed", "extract");
-    bool atomic = !added && list.count == 0 && list.capture_failed;
-    for (int i = 0; i < list.count; i++) {
-        free(list.items[i].path);
-        free(list.items[i].reason);
-        free(list.items[i].phase);
-    }
-    free(list.items);
-    cbm_parallel_test_fail_error_alloc_at(0);
-    return atomic;
-}
-#endif
 
 /* Free source buffer. */
 static void free_source(char *buf) {
@@ -395,6 +337,210 @@ static const char *itoa_log(int val) {
     idx = (idx + SKIP_ONE) & PP_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
+}
+
+/* Append a JSON-escaped string value to buf at position *pos. */
+/* Escape one character for JSON. Returns bytes written (1 or 2). */
+static int json_escape_char(char *buf, size_t avail, char ch) {
+    char esc = 0;
+    switch (ch) {
+    case '"':
+        esc = '"';
+        break;
+    case '\\':
+        esc = '\\';
+        break;
+    case '\n':
+        esc = 'n';
+        break;
+    case '\r':
+        esc = 'r';
+        break;
+    case '\t':
+        esc = 't';
+        break;
+    default:
+        if (avail >= SKIP_ONE) {
+            /* Any other raw control byte (e.g. form feed) is invalid inside a
+             * JSON string — degrade to a space. */
+            buf[0] = ((unsigned char)ch < 0x20) ? ' ' : ch;
+        }
+        return SKIP_ONE;
+    }
+    if (avail >= PP_ESC_SPACE) {
+        buf[0] = '\\';
+        buf[SKIP_ONE] = esc;
+    }
+    return PP_ESC_SPACE;
+}
+
+/* Escaped length of a string under json_escape_char's rules: escaped
+ * characters expand to 2 bytes, everything else stays 1. */
+static size_t pp_json_escaped_len(const char *s) {
+    size_t n = 0;
+    for (; *s; s++) {
+        switch (*s) {
+        case '"':
+        case '\\':
+        case '\n':
+        case '\r':
+        case '\t':
+            n += PP_ESC_SPACE;
+            break;
+        default:
+            n += SKIP_ONE;
+        }
+    }
+    return n;
+}
+
+/* Appends are ATOMIC: a field is emitted only if the WHOLE serialized form
+ * fits (with PP_ESC_SPACE bytes reserved for the closing '}' + NUL). Cutting a
+ * field mid-value produced unterminated strings/arrays — malformed properties
+ * JSON that aborts every json_extract()-based consumer downstream (seen on the
+ * Linux kernel: 50-param functions truncated at the 2 KB cap). Dropping an
+ * oversized optional field whole keeps the JSON valid. Twin of
+ * pass_definitions.c — keep both in sync. */
+static void append_json_string(char *buf, size_t bufsize, size_t *pos, const char *key,
+                               const char *val) {
+    if (!val || val[0] == '\0') {
+        return;
+    }
+    size_t required = strlen(key) + pp_json_escaped_len(val) + PP_JSON_FIELD_OVERHEAD;
+    if (*pos + required + PP_ESC_SPACE > bufsize) {
+        return; /* whole field would not fit — skip it atomically */
+    }
+    size_t p = *pos;
+    int w = snprintf(buf + p, bufsize - p, ",\"%s\":\"", key);
+    if (w <= 0 || (size_t)w >= bufsize - p) {
+        return;
+    }
+    p += (size_t)w;
+    for (const char *s = val; *s && p < bufsize - PP_ESC_MARGIN; s++) {
+        int n = json_escape_char(buf + p, bufsize - p - PP_ESC_SPACE, *s);
+        p += (size_t)n;
+    }
+    if (p < bufsize - SKIP_ONE) {
+        buf[p++] = '"';
+    }
+    buf[p] = '\0';
+    *pos = p;
+}
+
+/* Append a JSON array of strings: ,"key":["a","b","c"]. Atomic like
+ * append_json_string: emitted only if the whole array fits. */
+static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const char *key,
+                                  const char **arr) {
+    if (!arr || !arr[0] || *pos >= bufsize - PP_JSON_MARGIN) {
+        return;
+    }
+    /* ,"key":[ + per item "<escaped>" + separating commas + ] */
+    size_t required = strlen(key) + PP_JSON_FIELD_OVERHEAD;
+    for (int i = 0; arr[i]; i++) {
+        required += pp_json_escaped_len(arr[i]) + PP_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
+    }
+    if (*pos + required + PP_ESC_SPACE > bufsize) {
+        return; /* whole array would not fit — skip it atomically */
+    }
+    size_t p = *pos;
+    int n = snprintf(buf + p, bufsize - p, ",\"%s\":[", key);
+    if (n <= 0 || p + (size_t)n >= bufsize - PP_ESC_SPACE) {
+        return;
+    }
+    p += (size_t)n;
+    for (int i = 0; arr[i]; i++) {
+        if (i > 0 && p < bufsize - SKIP_ONE) {
+            buf[p++] = ',';
+        }
+        if (p < bufsize - SKIP_ONE) {
+            buf[p++] = '"';
+        }
+        /* Full escaping (not just quote/backslash): items like C param types
+         * sliced from multi-line declarations carry raw \n/\t bytes, which are
+         * invalid inside JSON strings. */
+        for (const char *s = arr[i]; *s && p < bufsize - PP_ESC_SPACE; s++) {
+            p += (size_t)json_escape_char(buf + p, bufsize - p - PP_ESC_SPACE, *s);
+        }
+        if (p < bufsize - SKIP_ONE) {
+            buf[p++] = '"';
+        }
+    }
+    if (p < bufsize - SKIP_ONE) {
+        buf[p++] = ']';
+    }
+    buf[p] = '\0';
+    *pos = p;
+}
+
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+    /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
+     * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
+     * keep a lean properties blob (lossless — those fields are always zero for
+     * non-functions). Cuts RAM, gbuf-merge copy and dump volume. Mirrors
+     * pass_definitions.c::build_def_props — keep both in sync. */
+    const bool is_fn =
+        def->label && (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0);
+    int n;
+    if (is_fn) {
+        n = snprintf(buf, bufsize,
+                     "{\"complexity\":%d,\"cognitive\":%d,\"loop_count\":%d,\"loop_depth\":%d,"
+                     "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
+                     "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
+                     "\"unguarded_recursion\":%s,"
+                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s",
+                     def->complexity, def->cognitive, def->loop_count, def->loop_depth,
+                     def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
+                     def->linear_scan_in_loop, def->alloc_in_loop,
+                     def->recursion_in_loop ? "true" : "false",
+                     def->unguarded_recursion ? "true" : "false", def->lines,
+                     def->is_exported ? "true" : "false", def->is_test ? "true" : "false",
+                     def->is_entry_point ? "true" : "false");
+    } else {
+        n = snprintf(buf, bufsize,
+                     "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
+                     "\"is_entry_point\":%s",
+                     def->complexity, def->lines, def->is_exported ? "true" : "false",
+                     def->is_test ? "true" : "false", def->is_entry_point ? "true" : "false");
+    }
+    if (n <= 0 || (size_t)n >= bufsize) {
+        buf[0] = '\0';
+        return;
+    }
+    size_t pos = (size_t)n;
+    append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
+    append_json_string(buf, bufsize, &pos, "signature", def->signature);
+    append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
+    append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
+    append_json_str_array(buf, bufsize, &pos, "decorators", def->decorators);
+    append_json_str_array(buf, bufsize, &pos, "base_classes", def->base_classes);
+    append_json_str_array(buf, bufsize, &pos, "param_names", def->param_names);
+    append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
+    append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
+    append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+
+    /* MinHash fingerprint — append if present and buffer has room.
+     * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
+    if (def->fingerprint && def->fingerprint_k > 0 &&
+        pos + CBM_MINHASH_HEX_LEN + CBM_MINHASH_JSON_OVERHEAD < bufsize) {
+        char fp_hex[CBM_MINHASH_HEX_BUF];
+        cbm_minhash_to_hex((const cbm_minhash_t *)def->fingerprint, fp_hex, sizeof(fp_hex));
+        append_json_string(buf, bufsize, &pos, "fp", fp_hex);
+    }
+
+    /* AST structural profile — append if present and buffer has room. */
+    if (def->structural_profile && pos + CBM_AST_PROFILE_BUF < bufsize) {
+        append_json_string(buf, bufsize, &pos, "sp", def->structural_profile);
+    }
+
+    /* Body tokens — raw identifiers from function body AST for semantic search. */
+    if (def->body_tokens && pos + CBM_SZ_512 < bufsize) {
+        append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
+    }
+
+    if (pos < bufsize - SKIP_ONE) {
+        buf[pos] = '}';
+        buf[pos + SKIP_ONE] = '\0';
+    }
 }
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
@@ -514,7 +660,6 @@ typedef struct {
      * path lock). Merged into the pipeline in the sequential merge loop. */
     pp_err_list_t *err_lists;
     _Atomic int oversized_warned; /* throttle for the index.file_oversized WARN */
-    _Atomic bool property_serialization_failed;
 
     /* Back-pressure futility latch: set when a full collect+nap cycle ended
      * still over budget — the resident floor (graph + retained sources), not
@@ -525,38 +670,24 @@ typedef struct {
 
     const CBMMacroTable *macro_table;            /* ObjectScript $$$macros (NULL if none) */
     const CBMReturnTypeTable *return_type_table; /* ObjectScript return types (NULL if none) */
+
+    /* Superlinearity probe — see profile.h. Ticked on each file claim below. */
+    cbm_scale_probe_t scale;
 } extract_ctx_t;
-
-#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-static atomic_long g_property_serialization_failures = 0;
-
-void cbm_parallel_test_property_serialization_failures_reset(void) {
-    atomic_store(&g_property_serialization_failures, 0);
-}
-
-long cbm_parallel_test_property_serialization_failures(void) {
-    return atomic_load(&g_property_serialization_failures);
-}
-#endif
 
 /* Cap on the number of index.file_oversized WARN lines (the full list still goes
  * to the response/logfile — this only throttles the stderr noise). */
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
-static cbm_def_properties_status_t insert_def_into_gbuf(extract_worker_state_t *ws,
-                                                        const cbm_file_info_t *fi,
-                                                        CBMDefinition *def) {
-    cbm_def_properties_t props = {0};
-    cbm_def_properties_status_t prop_status = cbm_def_properties_build(def, &props);
-    if (prop_status != CBM_DEF_PROPERTIES_OK) {
-        return prop_status;
-    }
+static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
+                                 CBMDefinition *def) {
+    char props[CBM_SZ_2K];
+    build_def_props(props, sizeof(props), def);
     int64_t func_id =
         cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name,
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
-                             (int)def->start_line, (int)def->end_line, props.json);
-    cbm_def_properties_destroy(&props);
+                             (int)def->start_line, (int)def->end_line, props);
     ws->nodes_created++;
     if (def->route_path && def->route_path[0] != '\0') {
         const char *rm = def->route_method ? def->route_method : "ANY";
@@ -575,7 +706,6 @@ static cbm_def_properties_status_t insert_def_into_gbuf(extract_worker_state_t *
         snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
         cbm_gbuf_insert_edge(ws->local_gbuf, func_id, route_id, "HANDLES", hprops);
     }
-    return CBM_DEF_PROPERTIES_OK;
 }
 
 static void log_extract_fail(int pos, uint64_t ms, const char *path) {
@@ -603,14 +733,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
     /* Pull files from shared atomic counter */
     while (SKIP_ONE) {
-        if (atomic_load_explicit(&ec->property_serialization_failed, memory_order_acquire)) {
-            break;
-        }
         int sort_pos =
             atomic_fetch_add_explicit(&ec->next_file_idx, SKIP_ONE, memory_order_relaxed);
         if (sort_pos >= ec->file_count) {
             break;
         }
+        cbm_scale_tick(&ec->scale, sort_pos);
         if (atomic_load_explicit(ec->cancelled, memory_order_relaxed)) {
             break;
         }
@@ -665,9 +793,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * skip in this worker's list (merged into the pipeline's file-error list
          * later, surfacing in skipped[]) and move on — the good files still
          * index and status stays "indexed". No-op unless the supervisor set
-         * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path used by supervised
-         * recovery; pass_definitions.c and cbm_extract_file retain the same guard
-         * for direct/sequential embedders. */
+         * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path; the supervisor's
+         * single-threaded recovery run instead takes the sequential path
+         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both. */
         if (cbm_index_is_quarantined(fi->rel_path)) {
             const char *phase = cbm_index_quarantine_phase(fi->rel_path);
             if (!phase) {
@@ -711,8 +839,16 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
 
         /* Per-file start log: shows which file each worker is processing.
-         * Critical for diagnosing stuck workers on large vendored files. */
-        if (sort_pos < PP_LOG_THRESH) { /* first 2 rounds of workers = most interesting */
+         * Critical for diagnosing stuck workers on large vendored files.
+         *
+         * Under a crash-durable log (i.e. a supervised worker) EVERY file gets
+         * its line, not just the first rounds. That log is the only evidence a
+         * contained crash or a kill leaves behind, and #1145/#1130 are
+         * unattributable precisely because it never named the file that was in
+         * flight — the run ends with the culprit still on the last lines. One
+         * line per file, never per node. */
+        if (sort_pos < PP_LOG_THRESH || /* first 2 rounds of workers = most interesting */
+            cbm_log_crash_durable()) {
             cbm_log_info("parallel.extract.file.start", "pos", itoa_log(sort_pos), "size_kb",
                          itoa_log(source_len / CBM_SZ_1K), "path", fi->rel_path);
         }
@@ -753,36 +889,19 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         } else if (result->parse_incomplete) {
             /* Best-effort parse-coverage signal (#963): the file WAS indexed,
              * but its tree contains ERROR/MISSING regions whose constructs are
-             * silently absent from the graph. Not a skip — recorded under the
-             * distinct "parse_partial" phase (reason = the line-range list) so
-             * the MCP layer reports it separately from skipped[]. */
+             * silently absent from the graph. Neither phase is a skip — both
+             * are recorded separately from skipped[] by the MCP layer.
+             * "parse_unusable" means one range covers so much of the file that
+             * naming the lines helps nobody; see parse_unusable in cbm.h. */
             pp_err_add(errs, fi->rel_path, result->error_ranges ? result->error_ranges : "unknown",
-                       "parse_partial");
+                       result->parse_unusable ? "parse_unusable" : "parse_partial");
         }
 
         /* Create definition nodes in local gbuf */
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
             if (def->qualified_name && def->name) {
-                cbm_def_properties_status_t prop_status = insert_def_into_gbuf(ws, fi, def);
-                if (prop_status != CBM_DEF_PROPERTIES_OK) {
-#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-                    atomic_fetch_add(&g_property_serialization_failures, 1);
-#endif
-                    char reason[CBM_SZ_128];
-                    snprintf(reason, sizeof(reason), "definition properties %s (limit=%d bytes)",
-                             cbm_def_properties_status_name(prop_status),
-                             CBM_DEF_PROPERTIES_MAX_BYTES);
-                    pp_err_add(errs, fi->rel_path, reason, "properties");
-                    cbm_log_warn("definition.properties.failed", "path", fi->rel_path, "symbol",
-                                 def->qualified_name, "reason",
-                                 cbm_def_properties_status_name(prop_status), "limit_bytes",
-                                 itoa_log(CBM_DEF_PROPERTIES_MAX_BYTES));
-                    ws->errors++;
-                    atomic_store_explicit(&ec->property_serialization_failed, true,
-                                          memory_order_release);
-                    break;
-                }
+                insert_def_into_gbuf(ws, fi, def);
             }
         }
 
@@ -913,6 +1032,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     if (file_count == 0) {
         return 0;
     }
+
     cbm_log_info("parallel.extract.start", "files", itoa_log(file_count), "workers",
                  itoa_log(worker_count));
     {
@@ -979,9 +1099,6 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     /* Per-worker skip lists (separate allocation; merged into the pipeline in the
      * sequential merge loop below). */
     pp_err_list_t *err_lists = calloc((size_t)worker_count, sizeof(pp_err_list_t));
-    if (!err_lists) {
-        cbm_pipeline_mark_file_error_capture_failed(ctx->pipeline);
-    }
 
     /* ObjectScript macro table (NULL when no .inc include files present). */
     CBMMacroTable *pp_macro_table =
@@ -1011,13 +1128,14 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     atomic_init(&ec.retained_bytes, 0);
     atomic_init(&ec.retain_cap_warned, 0);
     atomic_init(&ec.oversized_warned, 0);
-    atomic_init(&ec.property_serialization_failed, false);
     atomic_init(&ec.bp_futile, 0);
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
     cbm_parallel_for_opts_t parallel_opts = {.max_workers = worker_count, .force_pthreads = false};
+    cbm_scale_begin(&ec.scale, "parallel_extract", (long)file_count);
     cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts);
+    cbm_scale_end(&ec.scale);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
 
     /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
@@ -1039,9 +1157,6 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
      * failed still surfaces its skips. */
     if (err_lists) {
         for (int i = 0; i < worker_count; i++) {
-            if (err_lists[i].capture_failed) {
-                cbm_pipeline_mark_file_error_capture_failed(ctx->pipeline);
-            }
             for (int j = 0; j < err_lists[i].count; j++) {
                 cbm_pipeline_add_file_error(ctx->pipeline, err_lists[i].items[j].path,
                                             err_lists[i].items[j].reason,
@@ -1061,9 +1176,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     free(sorted);
     cbm_macro_table_free(pp_macro_table); /* ObjectScript macro table (NULL-safe) */
 
-    if (atomic_load(ctx->cancelled) ||
-        atomic_load_explicit(&ec.property_serialization_failed, memory_order_acquire)) {
-        return atomic_load(ctx->cancelled) ? CBM_NOT_FOUND : CBM_PIPELINE_ABORT_PRESERVE_DB;
+    if (atomic_load(ctx->cancelled)) {
+        return CBM_NOT_FOUND;
     }
 
     log_extract_mem_stats(worker_count);
@@ -1084,13 +1198,15 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
 /* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns edge count. */
 static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
-                                 CBMLanguage lang, int *reg_entries) {
+                                 int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
     }
+    /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
+     * (helpers.c) — see pass_definitions.c for the per-label rationale. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label, lang);
+        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
         (*reg_entries)++;
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -1220,8 +1336,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
         for (int d = 0; d < result->defs.count; d++) {
-            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel,
-                                                   files[i].language, &reg_entries);
+            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
@@ -1262,9 +1377,6 @@ typedef struct {
     int max_workers;
 
     CBMFileResult **result_cache;
-    const cbm_file_info_t *rust_authority_files;
-    CBMFileResult *const *rust_authority_cache;
-    int rust_authority_count;
     const cbm_gbuf_t *main_gbuf;    /* READ-ONLY during Phase 4 */
     const cbm_registry_t *registry; /* READ-ONLY during Phase 4 */
     _Atomic int64_t *shared_ids;
@@ -1277,7 +1389,6 @@ typedef struct {
      * worker forwards them to). NULL/0 → cross-LSP no-ops. */
     CBMLSPDef *all_defs;
     int def_count;
-    CBMPxcCollectStatus definition_universe_status;
     char *const *def_modules; /* per-file module QN; def_modules[i] for files[i] */
     /* Optional inverted index for per-file def filtering (gopls pattern).
      * When non-NULL, the fused worker calls cbm_pxc_filter_defs_for_file
@@ -1289,8 +1400,10 @@ typedef struct {
      * cbm_run_X_lsp_cross_with_registry — skip per-file build entirely.
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
-    /* Immutable Cargo snapshot owned by cbm_parallel_resolve and borrowed by
-     * every Rust dispatch. Worker threads never consult ambient state. */
+
+    /* Parsed once on the coordinator thread and borrowed read-only by resolve
+     * workers.  The pointer is installed into each worker's TLS slot so Rust's
+     * manifest-aware cross-file resolver sees the same Cargo context. */
     const CBMCargoManifest *rust_manifest;
 
     /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
@@ -1299,8 +1412,6 @@ typedef struct {
      * under rust_shared_mu into rust_shared_arena, published via rust_shared_reg;
      * torn down after the worker dispatch. */
     _Atomic(CBMTypeRegistry *) rust_shared_reg;
-    _Atomic bool rust_shared_allocation_failed;
-    _Atomic bool dispatch_allocation_failed;
     cbm_mutex_t rust_shared_mu;
     CBMArena rust_shared_arena;
     bool rust_shared_arena_live;
@@ -1336,6 +1447,11 @@ typedef struct {
     _Atomic uint64_t time_ns_rc_target;     /* gbuf_find_by_qn for target */
     _Atomic uint64_t time_ns_rc_emit;       /* emit_service_edge */
     _Atomic uint64_t time_ns_rc_source;     /* find_source_node */
+
+    /* Superlinearity probe — see profile.h. This is the pass that made it
+     * necessary (#1669: 87% of a Java index), so it is the one that must never
+     * again grow superlinear without saying so. */
+    cbm_scale_probe_t scale;
 } resolve_ctx_t;
 
 /* Minimum buffer space needed per arg JSON object */
@@ -1672,13 +1788,6 @@ static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
     return !is_junk_url(norm);
 }
 
-/* Strict HTTP-route-literal predicate (owned by service_patterns.c; declared
- * locally, mirroring pass_route_nodes.c, because service_patterns.h does not
- * export it). Rejects filesystem roots (/tmp, /Users, ...), filesystem
- * extensions (.db, .conf, ...) and delimiter/path-builder callees while
- * accepting http(s):// and /api-style routes. */
-bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
-
 /* Detect API paths in call arguments and create HTTP_CALLS edges. */
 static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                const CBMCall *call) {
@@ -1699,10 +1808,6 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
             continue;
         }
-        /* Gate on the strict predicate so ordinary filesystem-path literals
-         * (Path::new("/tmp/fixture"), PathBuf::from("/x.db"), ...) do not mint
-         * phantom Routes. route_edge_visitor already gates HTTP_CALLS on this;
-         * this closes the detect_url_in_args bypass. */
         if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
             continue;
         }
@@ -1854,10 +1959,12 @@ static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, c
         cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"graphql\"}");
 
     char esc_c[CBM_SZ_256];
+    char esc_op[CBM_SZ_512];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    cbm_json_escape(esc_op, sizeof(esc_op), p);
     char props[CBM_SZ_1K];
     snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"operation\":\"%s\",\"confidence\":%.2f}",
-             esc_c, p, res->confidence);
+             esc_c, esc_op, res->confidence);
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRAPHQL_CALLS", props);
 }
 
@@ -2025,11 +2132,6 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     int cand_count = 0;
     cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
     for (int ci = 0; ci < cand_count; ci++) {
-        /* Honour the caller's language scope: a cross-language name collision
-         * must not win the field-type hint any more than a registry resolve. */
-        if (!cbm_registry_candidate_in_resolve_scope(rc->registry, cands[ci])) {
-            continue;
-        }
         if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
             const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
             if (better && better->id != source_id) {
@@ -2139,33 +2241,6 @@ static bool lsp_idx_insert_leaf(CBMHashTable *index, CBMResolvedCall *candidate,
     return inserted;
 }
 
-/* Rust cfg-disambiguated method QNs append `#cfg(...)` to the source leaf.
- * The raw carrier retains only the Rust spelling. Mirror the authoritative
- * exact-site matcher by indexing that spelling as an alias; the shared key's
- * ambiguity tombstone still fails closed if two cfg targets claim one site. */
-static bool lsp_idx_insert_cfg_leaf_alias(CBMHashTable *index, CBMResolvedCall *candidate,
-                                          const char *leaf, const cbm_gbuf_t *gbuf,
-                                          const char *project_name, bool allow_tail_match) {
-    if (!leaf) {
-        return true;
-    }
-    const char *cfg = strstr(leaf, "#cfg(");
-    if (!cfg || cfg == leaf) {
-        return true;
-    }
-    size_t bare_len = (size_t)(cfg - leaf);
-    char *bare = (char *)malloc(bare_len + 1);
-    if (!bare) {
-        return false;
-    }
-    memcpy(bare, leaf, bare_len);
-    bare[bare_len] = '\0';
-    bool inserted =
-        lsp_idx_insert_leaf(index, candidate, bare, true, gbuf, project_name, allow_tail_match);
-    free(bare);
-    return inserted;
-}
-
 static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CBMCall *call,
                                              bool exact_site, bool *key_built, bool *ambiguous) {
     if (key_built) {
@@ -2249,20 +2324,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     continue;
                 }
                 CBMHashTable *index = exact_site ? lsp_exact_idx : lsp_legacy_idx;
-                const char *callee_leaf = cbm_lsp_bare_segment(rc_e->callee_qn);
-                bool inserted = lsp_idx_insert_leaf(index, rc_e, callee_leaf, exact_site,
-                                                    rc->main_gbuf, rc->project_name, allow_tail);
+                bool inserted =
+                    lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->callee_qn),
+                                        exact_site, rc->main_gbuf, rc->project_name, allow_tail);
                 if (!inserted) {
                     if (exact_site) {
                         lsp_exact_idx_complete = false;
                     } else {
                         lsp_legacy_idx_complete = false;
                     }
-                }
-                if (exact_site &&
-                    !lsp_idx_insert_cfg_leaf_alias(index, rc_e, callee_leaf, rc->main_gbuf,
-                                                   rc->project_name, allow_tail)) {
-                    lsp_exact_idx_complete = false;
                 }
                 if (rc_e->reason && cbm_pipeline_invocation_reason_join_strategy(rc_e->strategy)) {
                     inserted = lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->reason),
@@ -2423,10 +2493,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                     lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
                                     lang == CBM_LANG_ARKTS;
+        /* Bare-call local-binding suppression — see the note in pass_calls.c.
+         * This gate MUST stay identical to the one there. */
+        bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
         bool drop_plain_call =
-            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy);
-        bool has_receiver =
-            strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
+            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+            cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
+                                                 call->callee_is_locally_bound, res.strategy);
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
@@ -2491,6 +2564,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
+        if (target_node && source_node->id != target_node->id &&
+            cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+            /* #725: same guard as pass_calls.c — do not emit a suffix_match
+             * CALLS edge across a language boundary. */
+            continue;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
@@ -2512,22 +2591,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             }
             continue;
         }
-        /* Field/Variable entries exist in the registry for usage edges, not as
-         * legal CALLS targets. Keep sequential and parallel behavior identical. */
-        if (target_node->label && (strcmp(target_node->label, "Field") == 0 ||
-                                   strcmp(target_node->label, "Variable") == 0)) {
-            continue;
-        }
-        if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
-            continue;
-        }
-        bool rust_drop_plain_call = cbm_rust_suppress_weak_receiver_match(
-            lang == CBM_LANG_RUST, has_receiver, call->callee_name, res.strategy,
-            source_node->file_path, target_node->file_path, target_node->qualified_name);
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          drop_plain_call || rust_drop_plain_call);
+                          drop_plain_call);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;
@@ -2563,12 +2630,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         const cbm_gbuf_node_t *tgt = NULL;
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
-        if (usage->resolved_target_qn) {
-            tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, usage->resolved_target_qn);
-            if (!tgt) {
-                continue;
-            }
-        } else if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
+        if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
             bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
             semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
                 &result->resolved_calls, reference_index_ready ? &reference_index : NULL, usage,
@@ -2584,17 +2646,22 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             }
         }
         if (!tgt) {
-            /* Token-tree shape alone cannot prove what a macro does with this path. */
-            if (usage->is_macro_callable_value) {
-                continue;
-            }
             /* Exact semantic ownership beats textual name fallback even when
              * the semantic target is not materialized in this graph. */
             if (semantic_reference) {
                 continue;
             }
-            cbm_resolution_t res = cbm_registry_resolve(rc->registry, usage->ref_name, module_qn,
-                                                        imp_keys, imp_vals, imp_count);
+            /* SQL usages are FROM/JOIN lineage refs and may bind Table/View
+             * targets (cbm_registry_resolve_lineage); every other language
+             * resolves through the default variant, whose central relation
+             * veto keeps same-named code identifiers out of the lineage layer.
+             * Must mirror the sequential twin (pass_usages.c) exactly. */
+            cbm_resolution_t res =
+                (lang == CBM_LANG_SQL)
+                    ? cbm_registry_resolve_lineage(rc->registry, usage->ref_name, module_qn,
+                                                   imp_keys, imp_vals, imp_count)
+                    : cbm_registry_resolve(rc->registry, usage->ref_name, module_qn, imp_keys,
+                                           imp_vals, imp_count);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }
@@ -2609,9 +2676,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
-            /* #1942: a bare Go reference can never denote a struct field. */
-            if (tgt &&
-                cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->ref_name, tgt->label)) {
+            /* #1942/#1962: a bare Go reference can never denote a struct
+             * field; the member half of a selector may. */
+            if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      tgt->label)) {
                 continue;
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
@@ -2699,8 +2767,9 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
             continue;
         }
-        /* #1942: a bare Go reference can never denote a struct field. */
-        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->var_name, tgt->label)) {
+        /* #1942/#1962: a bare Go reference can never denote a struct field;
+         * a selector-LHS write (`t.err = x`) may bind it. */
+        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->is_member_access, tgt->label)) {
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";
@@ -2848,32 +2917,15 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
     CBMTypeRegistry *p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_acquire);
     if (p)
         return p;
-    if (atomic_load_explicit(&rc->rust_shared_allocation_failed, memory_order_acquire))
-        return NULL;
     if (!rc->all_defs || rc->def_count <= 0)
         return NULL;
     cbm_mutex_lock(&rc->rust_shared_mu);
     p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_relaxed);
-    if (!p && !atomic_load_explicit(&rc->rust_shared_allocation_failed, memory_order_relaxed)) {
+    if (!p) {
         cbm_arena_init(&rc->rust_shared_arena);
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-        size_t fail_after = atomic_exchange(&g_pp_test_rust_registry_fail_after, SIZE_MAX);
-        if (fail_after != SIZE_MAX && fail_after != PP_TEST_POISON_REGISTRY_AFTER_BUILD) {
-            cbm_arena_test_fail_after(&rc->rust_shared_arena, fail_after);
-        }
-#endif
         rc->rust_shared_arena_live = true;
         p = cbm_rust_build_cross_registry(&rc->rust_shared_arena, rc->all_defs, rc->def_count);
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-        if (fail_after == PP_TEST_POISON_REGISTRY_AFTER_BUILD) {
-            cbm_arena_test_fail_after(&rc->rust_shared_arena, 0);
-            (void)cbm_arena_alloc(&rc->rust_shared_arena, 1);
-        }
-#endif
-        if (cbm_arena_status(&rc->rust_shared_arena) != CBM_ARENA_STATUS_AVAILABLE) {
-            p = NULL;
-            atomic_store_explicit(&rc->rust_shared_allocation_failed, true, memory_order_release);
-        } else if (p) {
+        if (p) {
             char sb[96];
             snprintf(sb, sizeof(sb), "types=%d funcs=%d", p->type_count, p->func_count);
             cbm_log_info("cross_lsp.rust_registry", "scale", sb);
@@ -2889,37 +2941,6 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
 static CBMTypeRegistry *pp_rust_shared_registry_get(void *ctx) {
     return pp_rust_shared_registry((resolve_ctx_t *)ctx);
 }
-
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-bool cbm_parallel_test_rust_registry_failure_is_rejected(size_t successful_allocations) {
-    CBMLSPDef defs[2] = {
-        {.qualified_name = "test.demo.Type",
-         .short_name = "Type",
-         .label = "Type",
-         .def_module_qn = "test.demo",
-         .lang = CBM_LANG_RUST},
-        {.qualified_name = "test.demo.Type.call",
-         .short_name = "call",
-         .label = "Method",
-         .receiver_type = "test.demo.Type",
-         .def_module_qn = "test.demo",
-         .lang = CBM_LANG_RUST},
-    };
-    resolve_ctx_t rc = {.all_defs = defs, .def_count = 2};
-    atomic_init(&rc.rust_shared_reg, NULL);
-    atomic_init(&rc.rust_shared_allocation_failed, false);
-    cbm_mutex_init(&rc.rust_shared_mu);
-    cbm_parallel_test_fail_rust_registry_after(successful_allocations);
-    CBMTypeRegistry *registry = pp_rust_shared_registry(&rc);
-    bool rejected = registry == NULL &&
-                    atomic_load_explicit(&rc.rust_shared_allocation_failed, memory_order_acquire);
-    if (rc.rust_shared_arena_live) {
-        cbm_arena_destroy(&rc.rust_shared_arena);
-    }
-    cbm_mutex_destroy(&rc.rust_shared_mu);
-    return rejected;
-}
-#endif
 
 static int pp_call_reference_site_count(const CBMFileResult *result, CBMLanguage lang) {
     int count = 0;
@@ -2944,25 +2965,6 @@ static int pp_qualified_lsp_site_count(const CBMFileResult *result) {
     }
     return count;
 }
-
-static void pp_apply_rust_definition_universe_status(
-    CBMFileResult *result, CBMPxcCollectStatus definition_universe_status) {
-    result->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-    if (definition_universe_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
-        result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-    }
-}
-
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-bool cbm_parallel_test_collect_failure_does_not_duplicate_health(void) {
-    CBMFileResult result = {0};
-    cbm_rust_health_record(&result.rust_health, CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
-    pp_apply_rust_definition_universe_status(&result, CBM_PXC_COLLECT_ALLOCATION_FAILED);
-    return result.rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count == 1 &&
-           (result.rust_health.required_routes & CBM_RUST_HEALTH_ROUTE_CROSS_FILE) != 0 &&
-           (result.rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_CROSS_FILE) == 0;
-}
-#endif
 
 /* A per-file semantic walk can discover a faithful source occurrence that the
  * syntax extractor cannot represent as a CBMCall yet: Python operators and
@@ -2993,6 +2995,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
 
+    cbm_pxc_set_rust_manifest(rc->rust_manifest);
+
     if (!ws->local_edge_buf) {
         ws->local_edge_buf =
             cbm_gbuf_new_shared_ids(rc->project_name, rc->repo_path, rc->shared_ids);
@@ -3012,6 +3016,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         if (file_idx >= rc->file_count) {
             break;
         }
+        cbm_scale_tick(&rc->scale, file_idx);
         if (atomic_load_explicit(rc->cancelled, memory_order_relaxed)) {
             break;
         }
@@ -3063,26 +3068,12 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         int semantic_sites = result->calls.count + call_reference_sites;
         int qualified_lsp_sites = pp_qualified_lsp_site_count(result);
         bool pending_lsp_site = pp_has_pending_lsp_site(result);
-        CBMPxcCollectStatus definition_universe_status = rc->definition_universe_status;
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
              (semantic_sites > 0 || pending_lsp_site) &&
              (jvm_cross_lsp || rust_workspace_cross_lsp || pending_lsp_site ||
               qualified_lsp_sites < semantic_sites) &&
              !is_generated);
-        if (lang == CBM_LANG_RUST) {
-            pp_apply_rust_definition_universe_status(result, definition_universe_status);
-            /* No pending semantic site is a completed no-op route: the
-             * single-file resolver already covered every eligible site. A
-             * missing project definition universe is not complete. */
-            bool no_semantic_sites = semantic_sites == 0 && !pending_lsp_site;
-            bool definition_universe_available = rc->all_defs && rc->def_count > 0;
-            if (definition_universe_status != CBM_PXC_COLLECT_ALLOCATION_FAILED &&
-                !cross_lsp_eligible && !is_generated &&
-                (no_semantic_sites || definition_universe_available)) {
-                result->rust_health.completed_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-            }
-        }
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
@@ -3096,15 +3087,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * step below AND the resolve_file_* chain — no duplicate build. */
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
-        CBMRustImportScope *rust_import_scopes = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        CBMPxcImportMapStatus import_status = cbm_pxc_build_import_map_with_rust_authority(
-            rc->main_gbuf, rc->project_name, rel, lang, result, rc->rust_authority_files,
-            rc->rust_authority_cache, rc->rust_authority_count, rc->rust_manifest, &imp_keys,
-            &imp_vals, &rust_import_scopes, &imp_count);
-        if (lang == CBM_LANG_RUST)
-            cbm_pxc_record_rust_authority_health(result, rc->rust_manifest, import_status);
+        cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang, result, &imp_keys,
+                                 &imp_vals, &imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
 
@@ -3129,12 +3115,6 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * 98.7% hot spot in resolve_file_calls (881 of 893s CPU). */
         cbm_registry_resolve_cache_begin(result->calls.count + result->usages.count + 64);
 
-        /* Scope every resolve in this file to the caller's language-group so a
-         * cross-language name collision cannot bind (e.g. a Python `dict.get()`
-         * call binding to a Rust `get` fn). Spans all resolve sub-passes and
-         * the field-type hint; cleared at file exit. */
-        cbm_registry_resolve_scope_begin(lang);
-
         char *module_qn =
             cbm_pipeline_fqn_module_dir(rc->project_name, rel, pp_module_is_dir(lang));
 
@@ -3156,8 +3136,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * which allocates through this worker's TLS slab. Reclaiming
          * here keeps the slab high-water bounded as the resolve phase
          * walks across thousands of files in a single worker thread. */
-        if (cross_lsp_eligible &&
-            (lang != CBM_LANG_RUST || import_status == CBM_PXC_IMPORT_MAP_COMPLETE)) {
+        if (cross_lsp_eligible) {
             char *lsp_source_owned = NULL;
             const char *lsp_source = result->source;
             int lsp_source_len = result->source_len;
@@ -3179,23 +3158,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * file around the resolve so a hang HERE is attributed to
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
-                CBMPxcDispatchStatus dispatch_status = cbm_pxc_dispatch_file(
-                    lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
-                    rc->module_def_index, rc->all_defs, rc->def_count, imp_keys, imp_vals,
-                    rust_import_scopes, imp_count, rc->rust_manifest, pp_rust_shared_registry_get,
-                    rc);
-                if (dispatch_status == CBM_PXC_DISPATCH_ALLOCATION_FAILED &&
-                    lang != CBM_LANG_RUST) {
-                    atomic_store_explicit(&rc->dispatch_allocation_failed, true,
-                                          memory_order_release);
-                }
-                if (lang == CBM_LANG_RUST &&
-                    atomic_load_explicit(&rc->rust_shared_allocation_failed,
-                                         memory_order_acquire)) {
-                    cbm_rust_health_record(&result->rust_health,
-                                           CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
-                    result->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-                }
+                cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
+                                      rc->cross_registries, rc->module_def_index, rc->all_defs,
+                                      rc->def_count, imp_keys, imp_vals, imp_count,
+                                      pp_rust_shared_registry_get, rc);
                 cbm_index_mark_done(rel);
                 /* Free the on-demand re-read (no-op when source was retained). */
                 free_source(lsp_source_owned);
@@ -3226,10 +3192,6 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * Track C's real crash-attribution signal; leave it unwired. */
                 atomic_fetch_add_explicit(&rc->lsp_cross_skipped_no_source, SKIP_ONE,
                                           memory_order_relaxed);
-                if (lang == CBM_LANG_RUST) {
-                    cbm_rust_health_record(&result->rust_health, CBM_RUST_HEALTH_SOURCE_UNAVAILABLE,
-                                           0, 0);
-                }
             }
         }
 
@@ -3268,11 +3230,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         cbm_registry_reach_cache_end();
         cbm_registry_import_map_cache_end();
         cbm_registry_resolve_cache_end();
-        cbm_registry_resolve_scope_clear();
 
         free(module_qn);
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
-        free(rust_import_scopes);
 
         atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                   memory_order_relaxed);
@@ -3283,6 +3243,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
      * into dead TLS and are never retired, so a later cross-thread free can
      * never bring their refcount to zero (leak). Retiring them here releases
      * each page as its final chunk returns. */
+    cbm_pxc_set_rust_manifest(NULL);
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     cbm_service_pattern_cache_end();
@@ -3290,19 +3251,13 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
-                         int worker_count, const cbm_file_info_t *rust_authority_files,
-                         CBMFileResult *const *rust_authority_cache, int rust_authority_count,
-                         CBMLSPDef *all_defs, int def_count,
-                         CBMPxcCollectStatus definition_universe_status, char *const *def_modules,
-                         struct CBMModuleDefIndex *module_def_index, void *cross_registries_v) {
+                         int worker_count, CBMLSPDef *all_defs, int def_count,
+                         char *const *def_modules, struct CBMModuleDefIndex *module_def_index,
+                         void *cross_registries_v) {
     /* See header: typed as void* across the TU boundary; cast back here. */
     CBMCrossLspRegistries *cross_registries = (CBMCrossLspRegistries *)cross_registries_v;
     if (file_count == 0) {
         return 0;
-    }
-    if (cbm_pxc_collection_requires_abort(result_cache, files, file_count,
-                                          definition_universe_status)) {
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
     cbm_log_info("parallel.resolve.start", "files", itoa_log(file_count), "workers",
@@ -3322,13 +3277,15 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
             break;
         }
     }
-    CBMArena cargo_arena;
-    CBMCargoManifest cargo_manifest;
-    const CBMCargoManifest *rust_manifest = NULL;
+    CBMArena rust_manifest_arena;
+    CBMCargoManifest rust_manifest;
+    bool rust_manifest_arena_live = false;
+    const CBMCargoManifest *rust_manifest_ptr = NULL;
     if (have_rust) {
-        cbm_arena_init(&cargo_arena);
-        if (cbm_pxc_build_rust_manifest(ctx->repo_path, &cargo_arena, &cargo_manifest)) {
-            rust_manifest = &cargo_manifest;
+        cbm_arena_init(&rust_manifest_arena);
+        rust_manifest_arena_live = true;
+        if (cbm_pxc_build_rust_manifest(ctx, &rust_manifest_arena, &rust_manifest)) {
+            rust_manifest_ptr = &rust_manifest;
         }
     }
 
@@ -3340,35 +3297,31 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .workers = workers,
         .max_workers = worker_count,
         .result_cache = result_cache,
-        .rust_authority_files = rust_authority_files,
-        .rust_authority_cache = rust_authority_cache,
-        .rust_authority_count = rust_authority_count,
         .main_gbuf = ctx->gbuf,
         .registry = ctx->registry,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
         .all_defs = all_defs,
         .def_count = def_count,
-        .definition_universe_status = definition_universe_status,
         .def_modules = def_modules,
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
-        .rust_manifest = rust_manifest,
+        .rust_manifest = rust_manifest_ptr,
     };
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
     atomic_init(&rc.lsp_cross_skipped_no_source, 0);
     /* F4 lazy shared Rust registry: mutex up before workers spawn. */
     atomic_init(&rc.rust_shared_reg, NULL);
-    atomic_init(&rc.rust_shared_allocation_failed, false);
-    atomic_init(&rc.dispatch_allocation_failed, false);
     cbm_mutex_init(&rc.rust_shared_mu);
     rc.rust_shared_arena_live = false;
 
     /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
+    cbm_scale_begin(&rc.scale, "parallel_resolve", (long)file_count);
     cbm_parallel_for(worker_count, resolve_worker, &rc, opts);
+    cbm_scale_end(&rc.scale);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
@@ -3379,8 +3332,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         rc.rust_shared_arena_live = false;
     }
     cbm_mutex_destroy(&rc.rust_shared_mu);
-    if (have_rust) {
-        cbm_arena_destroy(&cargo_arena);
+    if (rust_manifest_arena_live) {
+        cbm_arena_destroy(&rust_manifest_arena);
     }
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
@@ -3411,9 +3364,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
      * sequential pipeline runs — the two venues must emit identical graphs). */
     total_lsp_overrides += cbm_pipeline_override_explicit(ctx);
 
-    if (atomic_load(ctx->cancelled) ||
-        atomic_load_explicit(&rc.dispatch_allocation_failed, memory_order_acquire)) {
-        return atomic_load(ctx->cancelled) ? CBM_NOT_FOUND : CBM_PIPELINE_ABORT_PRESERVE_DB;
+    if (atomic_load(ctx->cancelled)) {
+        return CBM_NOT_FOUND;
     }
 
     /* Summary metric that replaces the removed `pass.timing pass=lsp_cross`
@@ -3426,6 +3378,56 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         "files_skipped_no_source",
         itoa_log(atomic_load_explicit(&rc.lsp_cross_skipped_no_source, memory_order_relaxed)),
         "defs_total", itoa_log(def_count));
+
+    /* Cross-LSP cost, NORMALISED (#1669). Wall time alone cannot distinguish
+     * "big repo" from "superlinear pass"; us_per_file can. For a pass that is
+     * linear in file count this number is roughly CONSTANT across repo sizes.
+     * When cross-file LSP rebuilds its registry from a corpus-scaled def set,
+     * per-file cost tracks defs_total instead — measured 35ms/file at 5.8k
+     * files and 209ms/file at 46k on the same tree, which is the O(n^2) that
+     * cost a 6x java regression and took an 11-corpus two-binary A/B to find.
+     * Emitted next to defs_total so one grep on two differently sized repos
+     * answers it. */
+    int cross_files = atomic_load_explicit(&rc.lsp_cross_processed, memory_order_relaxed);
+    uint64_t cross_us = atomic_load_explicit(&rc.time_ns_cross_lsp, memory_order_relaxed) / 1000ULL;
+    if (cross_files > 0) {
+        char cf_buf[CBM_SZ_32];
+        char nf_buf[CBM_SZ_32];
+        char cu_buf[CBM_SZ_32];
+        char pk_buf[CBM_SZ_32];
+        snprintf(cf_buf, sizeof(cf_buf), "%llu",
+                 (unsigned long long)(cross_us / (uint64_t)cross_files));
+        snprintf(nf_buf, sizeof(nf_buf), "%d", cross_files);
+        snprintf(cu_buf, sizeof(cu_buf), "%llu", (unsigned long long)(cross_us / 1000ULL));
+        snprintf(pk_buf, sizeof(pk_buf), "%llu",
+                 (unsigned long long)(def_count > 0
+                                          ? (cross_us * 1000ULL) /
+                                                ((uint64_t)cross_files * (uint64_t)def_count)
+                                          : 0ULL));
+        cbm_log_info("parallel.resolve.cross_lsp_cost", "cross_lsp_ms", cu_buf, "files", nf_buf,
+                     "us_per_file", cf_buf, "defs_total", itoa_log(def_count),
+                     "us_per_file_per_kdef", pk_buf);
+
+        /* What the per-file registry build actually cost. defs_per_file is the
+         * lever: if it tracks defs_total rather than the file's own module plus
+         * imports, the module filter is not containing the work and cross-file
+         * LSP is O(files x corpus_defs). */
+        uint64_t reg_defs = 0;
+        uint64_t reg_files = 0;
+        uint64_t flt_files = 0;
+        uint64_t flt_failed = 0;
+        cbm_pxc_filter_stats(&reg_defs, &reg_files, &flt_files, &flt_failed);
+        if (reg_files > 0) {
+            char rd_buf[CBM_SZ_32];
+            char ff_buf[CBM_SZ_32];
+            char fp_buf[CBM_SZ_32];
+            snprintf(rd_buf, sizeof(rd_buf), "%llu", (unsigned long long)(reg_defs / reg_files));
+            snprintf(ff_buf, sizeof(ff_buf), "%llu", (unsigned long long)flt_failed);
+            snprintf(fp_buf, sizeof(fp_buf), "%llu", (unsigned long long)flt_files);
+            cbm_log_info("parallel.resolve.perfile_registry", "defs_per_file", rd_buf, "defs_total",
+                         itoa_log(def_count), "filtered_files", fp_buf, "filter_failed", ff_buf);
+        }
+    }
 
     cbm_log_info("parallel.resolve.done", "calls", itoa_log(total_calls), "usages",
                  itoa_log(total_usages), "semantic", itoa_log(total_semantic + go_impl),
@@ -3504,5 +3506,27 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                  "resolve", rsv_buf);
     cbm_log_info("parallel.resolve.calls_breakdown2", "field_hint", hnt_buf, "find_target", tgt_buf,
                  "emit_edge", emt_buf);
+
+    /* Candidate-scan cost (#1669). `per_lookup` is the diagnostic that matters:
+     * it is a property of the CORPUS, not of the machine, so it is comparable
+     * across runs and versions. If it grows with repo size, the tail-match scan
+     * is turning resolve superlinear — which is precisely what took an
+     * 11-corpus two-binary A/B to establish the first time. `fallback_rows`
+     * was already counted but, until now, readable only from a test. */
+    uint64_t tail_lookups = atomic_load_explicit(&g_lsp_tail_lookups, memory_order_relaxed);
+    uint64_t tail_cands = atomic_load_explicit(&g_lsp_tail_candidates, memory_order_relaxed);
+    char tl_buf[CBM_SZ_32];
+    char tc_buf[CBM_SZ_32];
+    char tp_buf[CBM_SZ_32];
+    char fb_buf[CBM_SZ_32];
+    snprintf(tl_buf, sizeof(tl_buf), "%llu", (unsigned long long)tail_lookups);
+    snprintf(tc_buf, sizeof(tc_buf), "%llu", (unsigned long long)tail_cands);
+    snprintf(tp_buf, sizeof(tp_buf), "%llu",
+             (unsigned long long)(tail_lookups ? tail_cands / tail_lookups : 0ULL));
+    snprintf(fb_buf, sizeof(fb_buf), "%llu",
+             (unsigned long long)atomic_load_explicit(&g_lsp_linear_fallback_rows,
+                                                      memory_order_relaxed));
+    cbm_log_info("parallel.resolve.scan_cost", "tail_lookups", tl_buf, "tail_candidates", tc_buf,
+                 "per_lookup", tp_buf, "fallback_rows", fb_buf);
     return 0;
 }

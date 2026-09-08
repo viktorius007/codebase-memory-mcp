@@ -164,12 +164,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         const cbm_gbuf_node_t *tgt = NULL;
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
-        if (usage->resolved_target_qn) {
-            tgt = cbm_gbuf_find_by_qn(ctx->gbuf, usage->resolved_target_qn);
-            if (!tgt) {
-                continue;
-            }
-        } else if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
+        if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
             bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
             semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
                 &result->resolved_calls, reference_index_ready ? &reference_index : NULL, usage,
@@ -190,10 +185,6 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
          * only value use—not an occurrence-exact callable target. Emit USAGE in
          * that case; CALL_REFERENCE is reserved for the exact LSP join. */
         if (!tgt) {
-            /* Token-tree shape alone cannot prove what a macro does with this path. */
-            if (usage->is_macro_callable_value) {
-                continue;
-            }
             /* An occurrence-exact semantic record owns this reference even when
              * its target is not materialized in the graph (for example, a
              * Kotlin local function). Falling back by raw name here would bind
@@ -225,9 +216,10 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
-            /* #1942: a bare Go reference can never denote a struct field. */
-            if (tgt &&
-                cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->ref_name, tgt->label)) {
+            /* #1942/#1962: a bare Go reference can never denote a struct
+             * field; the member half of a selector may. */
+            if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      tgt->label)) {
                 continue;
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
@@ -318,8 +310,9 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
             continue;
         }
-        /* #1942: a bare Go reference can never denote a struct field. */
-        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->var_name, tgt->label)) {
+        /* #1942/#1962: a bare Go reference can never denote a struct field;
+         * a selector-LHS write (`t.err = x`) may bind it. */
+        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->is_member_access, tgt->label)) {
             continue;
         }
 
@@ -384,10 +377,6 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pu_module_is_dir(files[i].language));
 
-        /* Keep all usage-like resolution for this file inside its language
-         * group so bare-name collisions cannot bind across languages. */
-        cbm_registry_resolve_scope_begin(files[i].language);
-
         usage_resolved += resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals,
                                               imp_count, files[i].language);
         throw_resolved +=
@@ -395,7 +384,6 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count,
                                         files[i].language);
 
-        cbm_registry_resolve_scope_clear();
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {

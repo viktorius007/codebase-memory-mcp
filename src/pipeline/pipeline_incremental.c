@@ -17,8 +17,6 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <time.h>
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
-#include "lsp/rust_cargo.h"
-#include "macro_table.h"
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
 #include "pipeline/pipeline_internal.h"
@@ -50,16 +48,11 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 /* One-shot fault injection for the parallel incremental result cache. The
  * production build has no hook or branch at this allocation site. */
 static atomic_bool g_incr_test_fail_result_cache_alloc = false;
-static atomic_bool g_incr_test_fail_combined_definition_alloc = false;
 static atomic_bool g_incr_test_force_legacy_partial = false;
 static atomic_int g_incr_test_last_route = CBM_INCREMENTAL_ROUTE_NONE;
 
 void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void) {
     atomic_store(&g_incr_test_fail_result_cache_alloc, true);
-}
-
-void cbm_pipeline_incremental_test_fail_combined_definition_alloc_once(void) {
-    atomic_store(&g_incr_test_fail_combined_definition_alloc, true);
 }
 
 void cbm_pipeline_incremental_test_force_legacy_partial_once(void) {
@@ -72,7 +65,6 @@ cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void) {
 
 void cbm_pipeline_incremental_test_reset_faults(void) {
     atomic_store(&g_incr_test_fail_result_cache_alloc, false);
-    atomic_store(&g_incr_test_fail_combined_definition_alloc, false);
     atomic_store(&g_incr_test_force_legacy_partial, false);
     atomic_store(&g_incr_test_last_route, CBM_INCREMENTAL_ROUTE_NONE);
     cbm_pipeline_persist_test_reset_faults();
@@ -1048,14 +1040,7 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
-    /* Derive the definition's language from its file path so the incremental
-     * registry seeds the SAME language-group tags a full reindex would (the
-     * gbuf node carries no language field). cbm_language_for_filename wants a
-     * basename; the full rel-path works because the extension lookup only reads
-     * the tail. An unknown extension yields CBM_LANG_COUNT → wildcard group. */
-    CBMLanguage lang =
-        node->file_path ? cbm_language_for_filename(node->file_path) : CBM_LANG_COUNT;
-    cbm_registry_add(r, node->name, node->qualified_name, node->label, lang);
+    cbm_registry_add(r, node->name, node->qualified_name, node->label);
 }
 
 static void free_incremental_result_cache(CBMFileResult **cache, int count) {
@@ -1111,9 +1096,6 @@ typedef struct {
      * the arenas live exactly as long as cr.arena itself. */
     CBMArena *rehydrate_arenas;
     int rehydrate_arena_count;
-    cbm_file_info_t *base_authority_files;
-    CBMFileResult **base_authority_cache;
-    int base_authority_count;
 } closure_resolve_t;
 
 typedef struct {
@@ -1218,58 +1200,9 @@ static int surface_added_names(const char *stored_json, const char *fresh_json, 
 /* Run parallel or sequential extract+resolve for changed files. Any failure
  * aborts before persistence: the caller discards this in-memory graph and
  * preserves the old on-disk database and its retryable hashes. */
-static CBMLSPDef *materialize_closure_definition_universe(
-    CBMArena *arena, const CBMLSPDef *base_defs, int base_count, const CBMLSPDef *fresh_defs,
-    int fresh_count, int *out_count, CBMPxcCollectStatus *out_status) {
-    *out_count = base_count + fresh_count;
-    *out_status = *out_count == 0 ? CBM_PXC_COLLECT_EMPTY : CBM_PXC_COLLECT_AVAILABLE;
-    if (*out_count == 0) {
-        return NULL;
-    }
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    if (atomic_exchange(&g_incr_test_fail_combined_definition_alloc, false)) {
-        *out_count = 0;
-        *out_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
-        return NULL;
-    }
-#endif
-    CBMLSPDef *defs = (CBMLSPDef *)cbm_arena_alloc(arena, (size_t)*out_count * sizeof(*defs));
-    if (!defs) {
-        *out_count = 0;
-        *out_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
-        return NULL;
-    }
-    if (base_count > 0) {
-        memcpy(defs, base_defs, (size_t)base_count * sizeof(*defs));
-    }
-    if (fresh_count > 0) {
-        memcpy(defs + base_count, fresh_defs, (size_t)fresh_count * sizeof(*defs));
-    }
-    return defs;
-}
-
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-bool cbm_pipeline_incremental_test_combined_definition_failure_is_typed(void) {
-    CBMLSPDef base = {.qualified_name = "project.base"};
-    CBMLSPDef fresh = {.qualified_name = "project.fresh"};
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    cbm_arena_test_fail_after(&arena, 0);
-    int count = -1;
-    CBMPxcCollectStatus status = CBM_PXC_COLLECT_AVAILABLE;
-    CBMLSPDef *defs =
-        materialize_closure_definition_universe(&arena, &base, 1, &fresh, 1, &count, &status);
-    bool typed = defs == NULL && count == 0 && status == CBM_PXC_COLLECT_ALLOCATION_FAILED;
-    cbm_arena_destroy(&arena);
-    return typed;
-}
-#endif
-
 static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
                                closure_resolve_t *closure) {
     struct timespec t;
-
-    cbm_pipeline_begin_rust_health_capture(ctx->pipeline, changed_files, ci, false);
 
     /* Per-file LSP always runs (every mode). Cross-file LSP: the legacy
      * partial route still skips it (NULL cross_registries below); the
@@ -1340,7 +1273,6 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         CBMLSPDef *all_defs = NULL;
         int all_def_count = 0;
-        CBMPxcCollectStatus definition_universe_status = CBM_PXC_COLLECT_EMPTY;
         char **def_modules = NULL;
         CBMModuleDefIndex *module_def_index = NULL;
         CBMCrossLspRegistries cross_registries = {0};
@@ -1351,35 +1283,12 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             def_modules = (char **)calloc((size_t)ci, sizeof(char *));
             int *def_starts = (int *)calloc((size_t)ci + 1, sizeof(int));
             int fresh_count = 0;
-            CBMPxcCollectStatus fresh_status = CBM_PXC_COLLECT_EMPTY;
-            CBMArena rust_manifest_arena;
-            CBMCargoManifest rust_manifest;
-            const CBMCargoManifest *rust_manifest_ptr = NULL;
-            bool rust_manifest_arena_live = false;
-            for (int i = 0; i < ci; i++) {
-                if (cache[i] && changed_files[i].language == CBM_LANG_RUST) {
-                    cbm_arena_init(&rust_manifest_arena);
-                    rust_manifest_arena_live = true;
-                    if (cbm_pxc_build_rust_manifest(ctx->repo_path, &rust_manifest_arena,
-                                                    &rust_manifest)) {
-                        rust_manifest_ptr = &rust_manifest;
-                    }
-                    break;
-                }
-            }
             CBMLSPDef *fresh_defs =
                 def_modules && def_starts
                     ? cbm_pxc_collect_all_defs(ctx, cache, changed_files, ci, ctx->project_name,
-                                               def_modules, &fresh_count, &fresh_status, def_starts,
-                                               rust_manifest_ptr)
+                                               def_modules, &fresh_count, def_starts)
                     : NULL;
-            if (!def_modules || !def_starts) {
-                fresh_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
-            }
-            if (rust_manifest_arena_live) {
-                cbm_arena_destroy(&rust_manifest_arena);
-            }
-            if (fresh_status != CBM_PXC_COLLECT_ALLOCATION_FAILED && def_starts &&
+            if ((fresh_defs || fresh_count == 0) && def_starts &&
                 cbm_lsp_surface_build_rows(ctx->project_name, cache, changed_files, ci, fresh_defs,
                                            def_starts, &closure->fresh_rows,
                                            &closure->fresh_count) != 0) {
@@ -1387,20 +1296,20 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                 closure->fresh_count = 0;
             }
             free(def_starts);
-            if (fresh_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
-                for (int i = 0; i < ci; i++) {
-                    if (cache[i] && changed_files[i].language == CBM_LANG_RUST) {
-                        cache[i]->rust_health.required_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-                        cache[i]->rust_health.completed_routes &= ~CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-                        cbm_rust_health_record(&cache[i]->rust_health,
-                                               CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
-                    }
-                }
+            all_def_count = closure->base_def_count + fresh_count;
+            if (all_def_count > 0) {
+                all_defs = (CBMLSPDef *)cbm_arena_alloc(&closure->arena,
+                                                        (size_t)all_def_count * sizeof(CBMLSPDef));
             }
-            all_defs = materialize_closure_definition_universe(
-                &closure->arena, closure->base_defs, closure->base_def_count, fresh_defs,
-                fresh_count, &all_def_count, &definition_universe_status);
             if (all_defs) {
+                if (closure->base_def_count > 0) {
+                    memcpy(all_defs, closure->base_defs,
+                           (size_t)closure->base_def_count * sizeof(CBMLSPDef));
+                }
+                if (fresh_count > 0) {
+                    memcpy(all_defs + closure->base_def_count, fresh_defs,
+                           (size_t)fresh_count * sizeof(CBMLSPDef));
+                }
                 module_def_index = cbm_pxc_build_module_def_index(all_defs, all_def_count);
                 /* Tier-2 shared registries are an amortization: the full
                  * pipeline pays one build over all defs to make 85k per-file
@@ -1422,31 +1331,9 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                     cross_registries.java =
                         cbm_java_build_cross_registry(xa, all_defs, all_def_count);
                     registries_arg = &cross_registries;
-                    cbm_pxc_test_poison_non_rust_registry(xa);
-                    if (cbm_arena_status(xa) != CBM_ARENA_STATUS_AVAILABLE) {
-                        memset(&cross_registries, 0, sizeof(cross_registries));
-                        registries_arg = NULL;
-                        definition_universe_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
-                    }
                 }
-            } else if (definition_universe_status != CBM_PXC_COLLECT_ALLOCATION_FAILED) {
+            } else {
                 all_def_count = 0;
-            }
-            if (cbm_arena_status(&closure->arena) != CBM_ARENA_STATUS_AVAILABLE) {
-                definition_universe_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
-            }
-            if (fresh_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
-                definition_universe_status = CBM_PXC_COLLECT_ALLOCATION_FAILED;
-            }
-            if (definition_universe_status == CBM_PXC_COLLECT_ALLOCATION_FAILED) {
-                for (int i = 0; i < ci; i++) {
-                    if (cache[i] && changed_files[i].language == CBM_LANG_RUST &&
-                        cache[i]->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE]
-                                .count == 0) {
-                        cbm_rust_health_record(&cache[i]->rust_health,
-                                               CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE, 0, 0);
-                    }
-                }
             }
             free(fresh_defs);
             /* The resolve workers borrow def_modules strings; ownership moves
@@ -1459,46 +1346,9 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                          "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        cbm_file_info_t *authority_files = NULL;
-        CBMFileResult **authority_cache = NULL;
-        int authority_count = 0;
-        if (closure) {
-            int rust_changed = 0;
-            for (int i = 0; i < ci; i++)
-                if (cache[i] && changed_files[i].language == CBM_LANG_RUST)
-                    rust_changed++;
-            int authority_capacity = closure->base_authority_count + rust_changed;
-            if (authority_capacity > 0) {
-                authority_files =
-                    (cbm_file_info_t *)calloc((size_t)authority_capacity, sizeof(*authority_files));
-                authority_cache =
-                    (CBMFileResult **)calloc((size_t)authority_capacity, sizeof(*authority_cache));
-            }
-            if (authority_capacity > 0 && (!authority_files || !authority_cache)) {
-                rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
-            } else {
-                for (int i = 0; i < closure->base_authority_count; i++) {
-                    authority_files[authority_count] = closure->base_authority_files[i];
-                    authority_cache[authority_count++] = closure->base_authority_cache[i];
-                }
-                for (int i = 0; i < ci; i++) {
-                    if (!cache[i] || changed_files[i].language != CBM_LANG_RUST)
-                        continue;
-                    authority_files[authority_count] = changed_files[i];
-                    authority_cache[authority_count++] = cache[i];
-                }
-            }
-        }
-        if (rc == 0) {
-            rc = cbm_parallel_resolve(
-                ctx, changed_files, ci, cache, &shared_ids, worker_count,
-                closure ? authority_files : changed_files,
-                closure ? authority_cache : (CBMFileResult *const *)cache,
-                closure ? authority_count : ci, all_defs, all_def_count, definition_universe_status,
-                closure ? closure->def_modules : NULL, module_def_index, registries_arg);
-        }
-        free(authority_files);
-        free(authority_cache);
+        rc = cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count,
+                                  all_defs, all_def_count, closure ? closure->def_modules : NULL,
+                                  module_def_index, registries_arg);
         if (module_def_index) {
             cbm_pxc_free_module_def_index(module_def_index);
         }
@@ -1508,7 +1358,6 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
         cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
-        cbm_pipeline_capture_rust_cache(ctx->pipeline, changed_files, ci, cache);
         free_incremental_result_cache(cache, ci);
         return rc;
     } else {
@@ -1553,7 +1402,6 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         if (rc == 0) {
             rc = cbm_pipeline_check_cancel(ctx);
         }
-        cbm_pipeline_capture_rust_cache(ctx->pipeline, changed_files, ci, cache);
         if (owns_cache) {
             free_incremental_result_cache(cache, ci);
             ctx->result_cache = prior_cache;
@@ -1682,8 +1530,6 @@ typedef struct {
     CBMArena *arena;      /* this worker's arena (owned by cr) */
     CBMLSPDef **row_defs; /* per-row result pointers */
     int *row_counts;      /* per-row def counts; -1 = decode failure */
-    CBMFileResult **row_carriers;
-    int *row_carrier_status; /* 1 Rust, 0 non-Rust, -1 corrupt */
 } rehydrate_worker_t;
 
 static void *rehydrate_worker(void *arg) {
@@ -1693,27 +1539,6 @@ static void *rehydrate_worker(void *arg) {
         int count = cbm_lsp_surface_defs_from_json(w->arena, w->rows[i]->defs_json, &defs);
         w->row_defs[i] = defs;
         w->row_counts[i] = count;
-        CBMFileResult *carrier = cbm_arena_alloc(w->arena, sizeof(*carrier));
-        int carrier_status =
-            carrier
-                ? cbm_lsp_surface_rust_carrier_from_json(w->arena, w->rows[i]->defs_json, carrier)
-                : -1;
-        if (carrier_status == 1 && count > 0) {
-            carrier->defs.items = cbm_arena_alloc(w->arena, (size_t)count * sizeof(CBMDefinition));
-            if (!carrier->defs.items) {
-                carrier_status = -1;
-            } else {
-                memset(carrier->defs.items, 0, (size_t)count * sizeof(CBMDefinition));
-                carrier->defs.count = count;
-                carrier->defs.cap = count;
-                for (int d = 0; d < count; d++)
-                    carrier->defs.items[d].qualified_name = defs[d].qualified_name;
-            }
-        }
-        w->row_carriers[i] = carrier_status == 1 ? carrier : NULL;
-        w->row_carrier_status[i] = carrier_status;
-        if (carrier_status < 0)
-            w->row_counts[i] = -1;
     }
     return NULL;
 }
@@ -1761,36 +1586,14 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
         char **def_modules = (char **)calloc((size_t)probe_count, sizeof(char *));
         int *def_starts = (int *)calloc((size_t)probe_count + 1, sizeof(int));
         int def_count = 0;
-        CBMPxcCollectStatus collect_status = CBM_PXC_COLLECT_EMPTY;
         CBMLSPDef *defs = NULL;
-        CBMArena rust_manifest_arena;
-        CBMCargoManifest rust_manifest;
-        const CBMCargoManifest *rust_manifest_ptr = NULL;
-        bool rust_manifest_arena_live = false;
-        for (int i = 0; i < probe_count; i++) {
-            if (cache[i] && probe_files[i].language == CBM_LANG_RUST) {
-                cbm_arena_init(&rust_manifest_arena);
-                rust_manifest_arena_live = true;
-                if (cbm_pxc_build_rust_manifest(cbm_pipeline_repo_path(p), &rust_manifest_arena,
-                                                &rust_manifest)) {
-                    rust_manifest_ptr = &rust_manifest;
-                }
-                break;
-            }
-        }
         if (def_modules && def_starts) {
             defs = cbm_pxc_collect_all_defs(NULL, cache, probe_files, probe_count, project,
-                                            def_modules, &def_count, &collect_status, def_starts,
-                                            rust_manifest_ptr);
-            rc = collect_status == CBM_PXC_COLLECT_ALLOCATION_FAILED
-                     ? -1
-                     : cbm_lsp_surface_build_rows(project, cache, probe_files, probe_count, defs,
-                                                  def_starts, out_rows, out_count);
+                                            def_modules, &def_count, def_starts);
+            rc = cbm_lsp_surface_build_rows(project, cache, probe_files, probe_count, defs,
+                                            def_starts, out_rows, out_count);
         } else {
             rc = -1;
-        }
-        if (rust_manifest_arena_live) {
-            cbm_arena_destroy(&rust_manifest_arena);
         }
         free(defs);
         free(def_starts);
@@ -2255,20 +2058,13 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         CBMLSPDef **row_defs =
             (CBMLSPDef **)calloc((size_t)(elig_count ? elig_count : 1), sizeof(*row_defs));
         int *row_counts = (int *)calloc((size_t)(elig_count ? elig_count : 1), sizeof(int));
-        CBMFileResult **row_carriers =
-            (CBMFileResult **)calloc((size_t)(elig_count ? elig_count : 1), sizeof(*row_carriers));
-        int *row_carrier_status =
-            (int *)calloc((size_t)(elig_count ? elig_count : 1), sizeof(*row_carrier_status));
         cr.rehydrate_arenas = (CBMArena *)calloc((size_t)workers, sizeof(CBMArena));
         cbm_thread_t *threads = (cbm_thread_t *)calloc((size_t)workers, sizeof(cbm_thread_t));
         rehydrate_worker_t *wargs = (rehydrate_worker_t *)calloc((size_t)workers, sizeof(*wargs));
-        if (!row_defs || !row_counts || !row_carriers || !row_carrier_status ||
-            !cr.rehydrate_arenas || !threads || !wargs) {
+        if (!row_defs || !row_counts || !cr.rehydrate_arenas || !threads || !wargs) {
             free(elig);
             free(row_defs);
             free(row_counts);
-            free(row_carriers);
-            free(row_carrier_status);
             free(threads);
             free(wargs);
             goto out;
@@ -2285,9 +2081,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                                             .worker_count = workers,
                                             .arena = &cr.rehydrate_arenas[w],
                                             .row_defs = row_defs,
-                                            .row_counts = row_counts,
-                                            .row_carriers = row_carriers,
-                                            .row_carrier_status = row_carrier_status};
+                                            .row_counts = row_counts};
             if (cbm_thread_create(&threads[w], 0, rehydrate_worker, &wargs[w]) != 0) {
                 break;
             }
@@ -2326,35 +2120,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                 }
             }
         }
-        if (decode_ok) {
-            int rust_rows = 0;
-            for (int i = 0; i < elig_count; i++)
-                if (row_carrier_status[i] == 1)
-                    rust_rows++;
-            if (rust_rows > 0) {
-                cr.base_authority_files =
-                    (cbm_file_info_t *)calloc((size_t)rust_rows, sizeof(cbm_file_info_t));
-                cr.base_authority_cache =
-                    (CBMFileResult **)calloc((size_t)rust_rows, sizeof(CBMFileResult *));
-                if (!cr.base_authority_files || !cr.base_authority_cache) {
-                    decode_ok = false;
-                } else {
-                    for (int i = 0; i < elig_count; i++) {
-                        if (row_carrier_status[i] != 1)
-                            continue;
-                        int a = cr.base_authority_count++;
-                        cr.base_authority_files[a].rel_path = (char *)elig[i]->rel_path;
-                        cr.base_authority_files[a].language = CBM_LANG_RUST;
-                        cr.base_authority_cache[a] = row_carriers[i];
-                    }
-                }
-            }
-        }
         free(elig);
         free(row_defs);
         free(row_counts);
-        free(row_carriers);
-        free(row_carrier_status);
         if (!decode_ok) {
             goto out;
         }
@@ -2411,15 +2179,12 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         free((void *)ctx.return_type_table);
     }
     if (ctx.macro_table) {
-        cbm_macro_table_free((CBMMacroTable *)ctx.macro_table);
+        free((void *)ctx.macro_table);
     }
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
     if (phase_rc != 0) {
         cbm_log_error("delta.err", "phase", "extract_resolve", "rc", itoa_buf(phase_rc));
-        if (phase_rc == CBM_PIPELINE_ABORT_PRESERVE_DB || phase_rc == CBM_PIPELINE_PERSIST_FAILED) {
-            result = phase_rc;
-        }
         goto out;
     }
     cbm_log_info("delta.repair", "files", itoa_buf(ci), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
@@ -2459,18 +2224,11 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int run_ignored_count = 0;
     int run_ignored_total = 0;
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
-    const cbm_coverage_row_t *rust_cov = NULL;
-    int rust_cov_count = 0;
-    const char *rust_recording_status = NULL;
-    int rust_files_total = -1;
-    cbm_pipeline_get_rust_health(p, &rust_cov, &rust_cov_count, &rust_recording_status,
-                                 &rust_files_total);
-    int cov_cap =
-        old_cov_count + run_err_count + run_excluded_count + run_ignored_count + rust_cov_count;
-    bool coverage_rows_available = cov_cap == 0 && cbm_pipeline_file_error_capture_complete(p);
+    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
+    bool coverage_rows_available = cov_cap == 0;
     if (cov_cap > 0) {
-        cov = cbm_pipeline_alloc_coverage_rows(p, cov_cap);
-        coverage_rows_available = cov != NULL && cbm_pipeline_file_error_capture_complete(p);
+        cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
+        coverage_rows_available = cov != NULL;
     }
     if (cov) {
         for (int i = 0; i < old_cov_count; i++) {
@@ -2497,9 +2255,6 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             cov[cov_n].kind = "not_indexed_file";
             cov[cov_n].detail = run_ignored[i].reason;
             cov_n++;
-        }
-        for (int i = 0; i < rust_cov_count; i++) {
-            cov[cov_n++] = rust_cov[i];
         }
     }
 
@@ -2574,9 +2329,6 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                     .ignored_files_total = run_ignored_total,
                     .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
                     .hash_records_complete = true,
-                    .rust_analysis_recording_status =
-                        coverage_rows_available ? rust_recording_status : "unknown",
-                    .rust_files_total = rust_files_total,
                 },
             .surface_rows = NULL,
             .surface_row_count = 0,
@@ -2617,8 +2369,6 @@ out:
             cbm_arena_destroy(&cr.rehydrate_arenas[i]);
         }
         free(cr.rehydrate_arenas);
-        free(cr.base_authority_files);
-        free(cr.base_authority_cache);
         cbm_arena_destroy(&cr.arena);
     }
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
@@ -2692,15 +2442,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_coverage_meta_t meta = {0};
         int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
         const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
-        int discovered_rust_files = -1;
-        cbm_pipeline_get_rust_health(p, NULL, NULL, NULL, &discovered_rust_files);
-        bool metadata_current =
-            meta_rc == CBM_STORE_OK && meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
-            meta.hash_records_complete && meta.index_mode &&
-            strcmp(meta.index_mode, mode_name) == 0 && meta.rust_analysis_recording_status &&
-            strcmp(meta.rust_analysis_recording_status, "complete") == 0 &&
-            meta.rust_files_total >= 0;
-        bool exact = metadata_current && meta.rust_files_total == discovered_rust_files &&
+        bool metadata_current = meta_rc == CBM_STORE_OK &&
+                                meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
+                                meta.hash_records_complete && meta.index_mode &&
+                                strcmp(meta.index_mode, mode_name) == 0;
+        bool exact = metadata_current &&
                      cbm_pipeline_semantic_manifests_equal(stored, stored_count, baseline_manifest,
                                                            baseline_count);
         cbm_store_coverage_meta_clear(&meta);
@@ -3008,7 +2754,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         ctx.return_type_table = NULL;
     }
     if (ctx.macro_table) {
-        cbm_macro_table_free((CBMMacroTable *)ctx.macro_table);
+        free((void *)ctx.macro_table);
         ctx.macro_table = NULL;
     }
 
@@ -3051,19 +2797,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
-    const cbm_coverage_row_t *rust_cov = NULL;
-    int rust_cov_count = 0;
-    const char *rust_recording_status = NULL;
-    int rust_files_total = -1;
-    cbm_pipeline_get_rust_health(p, &rust_cov, &rust_cov_count, &rust_recording_status,
-                                 &rust_files_total);
-    int cov_cap =
-        old_cov_count + run_err_count + run_excluded_count + run_ignored_count + rust_cov_count;
+    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
     if (cov_cap > 0) {
-        cov = cbm_pipeline_alloc_coverage_rows(p, cov_cap);
+        cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
     }
-    bool coverage_rows_available =
-        (cov_cap == 0 || cov != NULL) && cbm_pipeline_file_error_capture_complete(p);
+    bool coverage_rows_available = cov_cap == 0 || cov != NULL;
     if (cov) {
         CBMHashTable *changed_set = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
         for (int i = 0; i < ci; i++) {
@@ -3094,9 +2832,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cov[cov_n].kind = "not_indexed_file";
             cov[cov_n].detail = run_ignored[i].reason;
             cov_n++;
-        }
-        for (int i = 0; i < rust_cov_count; i++) {
-            cov[cov_n++] = rust_cov[i];
         }
     }
 
@@ -3150,9 +2885,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .ignored_files_total = run_ignored_total,
         .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
         .hash_records_complete = true,
-        .rust_analysis_recording_status =
-            coverage_rows_available ? rust_recording_status : "unknown",
-        .rust_files_total = rust_files_total,
     };
     /* Publish surfaces: the surviving previous rows plus this run's fresh
      * ones (closure route). The legacy test route publishes none — its

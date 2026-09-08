@@ -10,18 +10,16 @@
 #include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
 #include <stdatomic.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-#ifndef _WIN32
-#include <pwd.h>
-#endif
 
 #ifdef __linux__
-/* Linux-only cgroup tests additionally need sys/stat for mkdir and dirent
- * for the shell-free recursive teardown. */
+/* Linux-only cgroup tests need stdio for FILE*, stdlib for mkdtemp,
+ * string for strncpy/strchr, sys/stat for mkdir, dirent for the
+ * shell-free recursive teardown. */
 #include <dirent.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #endif
 
@@ -421,6 +419,79 @@ TEST(platform_cache_dir_rejects_truncated_override) {
     PASS();
 }
 
+/* cbm_env_long reads a whole number, or says it could not.
+ *
+ * atoi and atol answer 0 for text they cannot read, and 0 is a real setting at
+ * every place this project reads a number out of the environment. So the
+ * helper reports whether the read worked instead of folding a failure into a
+ * value that looks fine. */
+TEST(platform_env_long_reads_a_clean_number) {
+    const char *name = "CBM_TEST_ENV_LONG";
+    char *saved = getenv(name) ? strdup(getenv(name)) : NULL;
+    long out = 0;
+
+    ASSERT_EQ(cbm_setenv(name, "42", 1), 0);
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, 42);
+
+    /* Zero is a real answer, not a failure. This is the case that made
+     * CBM_INDEX_MAX_RESTARTS=0 mean 100 restarts. */
+    ASSERT_EQ(cbm_setenv(name, "0", 1), 0);
+    out = 999;
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, 0);
+
+    ASSERT_EQ(cbm_setenv(name, "-7", 1), 0);
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, -7);
+
+    if (saved) {
+        (void)cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        (void)cbm_unsetenv(name);
+    }
+    PASS();
+}
+
+TEST(platform_env_long_refuses_what_it_cannot_read) {
+    const char *name = "CBM_TEST_ENV_LONG";
+    char *saved = getenv(name) ? strdup(getenv(name)) : NULL;
+
+    /* Every one of these used to answer 0 through atol. */
+    const char *unreadable[] = {
+        "abc",  "30s",  " 30", "30 ", "",    "1e3",
+        "0x10", "+ 30", "--3", "3.5", "99999999999999999999999999",
+    };
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        ASSERT_EQ(cbm_setenv(name, unreadable[i], 1), 0);
+        long out = 1234; /* a value the helper must not touch */
+        if (cbm_env_long(name, &out)) {
+            printf("  \"%s\" was read as %ld\n", unreadable[i], out);
+        }
+        ASSERT_TRUE(!cbm_env_long(name, &out));
+        ASSERT_EQ(out, 1234);
+    }
+
+    /* A variable nobody set answers false too. */
+    ASSERT_EQ(cbm_unsetenv(name), 0);
+    long out = 555;
+    ASSERT_TRUE(!cbm_env_long(name, &out));
+    ASSERT_EQ(out, 555);
+
+    /* A NULL destination is refused rather than written through. */
+    ASSERT_EQ(cbm_setenv(name, "5", 1), 0);
+    ASSERT_TRUE(!cbm_env_long(name, NULL));
+
+    if (saved) {
+        (void)cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        (void)cbm_unsetenv(name);
+    }
+    PASS();
+}
+
 #ifdef _WIN32
 /* cbm_safe_getenv reads Windows' wide environment as UTF-8. Its matching
  * setter must update that same wide environment; _putenv_s alone interprets
@@ -685,34 +756,7 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
-/* The test runner must NEVER read or write the user's real project cache.
- * Hundreds of orphaned tmp-cbm_* project dbs were found leaked into
- * ~/.cache/codebase-memory-mcp because indexing tests ran against the default
- * cache dir and skipped (or crashed before) their unlink teardown. The
- * structural fix is runner-level: main() points CBM_CACHE_DIR at a fresh temp
- * dir before any suite runs, so every store the tests touch lives — and dies —
- * outside the user's cache. This test is the guard: it fails if the runner
- * ever again resolves to the real user cache. RED before the runner sets
- * CBM_CACHE_DIR; GREEN after. */
-TEST(runner_cache_isolated_from_user_cache) {
-    const char *resolved = cbm_resolve_cache_dir();
-    ASSERT_NOT_NULL(resolved);
-
-#ifndef _WIN32
-    /* The harness sentinel repoints $HOME at a private temp dir, so the real
-     * user cache must be derived from the passwd entry, not the environment. */
-    struct passwd *pw = getpwuid(getuid());
-    if (pw && pw->pw_dir && pw->pw_dir[0]) {
-        char user_cache[1024];
-        snprintf(user_cache, sizeof(user_cache), "%s/.cache/codebase-memory-mcp", pw->pw_dir);
-        ASSERT_TRUE(strcmp(resolved, user_cache) != 0);
-    }
-#endif
-    PASS();
-}
-
 SUITE(platform) {
-    RUN_TEST(runner_cache_isolated_from_user_cache);
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
     RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
     RUN_TEST(platform_mkdtemp_is_thread_safe);
@@ -736,6 +780,8 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
+    RUN_TEST(platform_env_long_reads_a_clean_number);
+    RUN_TEST(platform_env_long_refuses_what_it_cannot_read);
     RUN_TEST(platform_system_info);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);

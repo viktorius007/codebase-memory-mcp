@@ -19,7 +19,6 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
-#include "lsp/rust_cargo.h"
 #include "lsp/rust_lsp.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
@@ -29,45 +28,6 @@
 static CBMFileResult *extract_rust(const char *source) {
     return cbm_extract_file(source, (int)strlen(source), CBM_LANG_RUST,
                             "test", "src/main.rs", 0, NULL, NULL);
-}
-
-static CBMFileResult *extract_rust_with_limits(const char *source, int max_type_depth,
-                                               int max_eval_depth, int max_walk_depth,
-                                               int max_eval_steps, int max_macro_depth,
-                                               int max_macro_bindings) {
-    CBMFileResult *result = extract_rust(source);
-    if (!result || !result->cached_tree)
-        return result;
-
-    memset(&result->resolved_calls, 0, sizeof(result->resolved_calls));
-    memset(&result->rust_health, 0, sizeof(result->rust_health));
-    result->rust_health.required_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
-
-    TSNode root = ts_tree_root_node(result->cached_tree);
-    CBMTypeRegistry registry;
-    cbm_rust_build_local_registry(&result->arena, &registry, result, result->module_qn, root,
-                                  source);
-    cbm_registry_finalize(&registry);
-
-    RustLSPContext context;
-    rust_lsp_init(&context, &result->arena, source, (int)strlen(source), &registry,
-                  result->module_qn, &result->resolved_calls);
-    context.health = &result->rust_health;
-    if (max_type_depth >= 0)
-        context.max_type_depth = max_type_depth;
-    if (max_eval_depth >= 0)
-        context.max_eval_depth = max_eval_depth;
-    if (max_walk_depth >= 0)
-        context.max_walk_depth = max_walk_depth;
-    if (max_eval_steps >= 0)
-        context.max_eval_steps = max_eval_steps;
-    if (max_macro_depth >= 0)
-        context.max_macro_depth = max_macro_depth;
-    if (max_macro_bindings >= 0)
-        context.max_macro_bindings = max_macro_bindings;
-    rust_lsp_process_file(&context, root);
-    result->rust_health.completed_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
-    return result;
 }
 
 static CBMTypeRegistry *rustlsp_return_shared_registry(void *ctx) {
@@ -84,44 +44,6 @@ static int find_resolved(const CBMFileResult *r, const char *callerSub,
         }
     }
     return -1;
-}
-
-static int count_resolved_exact(const CBMFileResult *r, const char *caller_qn,
-                                const char *callee_qn) {
-    int count = 0;
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
-        if (rc->caller_qn && strcmp(rc->caller_qn, caller_qn) == 0 && rc->callee_qn &&
-            strcmp(rc->callee_qn, callee_qn) == 0) {
-            count++;
-        }
-    }
-    return count;
-}
-
-static int count_resolved_array_exact(const CBMResolvedCallArray *calls, const char *caller_qn,
-                                      const char *callee_qn) {
-    int count = 0;
-    for (int i = 0; calls && i < calls->count; i++) {
-        const CBMResolvedCall *call = &calls->items[i];
-        if (call->caller_qn && call->callee_qn && strcmp(call->caller_qn, caller_qn) == 0 &&
-            strcmp(call->callee_qn, callee_qn) == 0)
-            count++;
-    }
-    return count;
-}
-
-static int count_resolved_exact_site(const CBMFileResult *result, const char *caller_qn,
-                                     const char *callee_qn, uint32_t start, uint32_t end) {
-    int count = 0;
-    for (int i = 0; result && i < result->resolved_calls.count; i++) {
-        const CBMResolvedCall *call = &result->resolved_calls.items[i];
-        if (call->caller_qn && call->callee_qn && strcmp(call->caller_qn, caller_qn) == 0 &&
-            strcmp(call->callee_qn, callee_qn) == 0 && call->site_start_byte == start &&
-            call->site_end_byte == end)
-            count++;
-    }
-    return count;
 }
 
 static int require_resolved(const CBMFileResult *r, const char *callerSub,
@@ -238,82 +160,6 @@ TEST(rustlsp_two_free_functions) {
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "double"), 0);
     ASSERT_GTE(require_resolved(r, "run", "triple"), 0);
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_cfg_module_caller_qn_matches_extraction) {
-    CBMFileResult *r = extract_rust(
-        "fn target() {}\n"
-        "#[cfg(test)]\n"
-        "mod tests {\n"
-        "    #[test]\n"
-        "    fn caller() { target(); }\n"
-        "}\n");
-    ASSERT_NOT_NULL(r);
-    int idx = require_resolved(r, "caller#cfg(test)", "target");
-    ASSERT_GTE(idx, 0);
-    ASSERT_STR_EQ(r->resolved_calls.items[idx].caller_qn, "test.src.main.caller#cfg(test)");
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_nested_function_owns_its_calls) {
-    CBMFileResult *r = extract_rust(
-        "fn target() {}\n"
-        "fn outer() {\n"
-        "    fn inner() { target(); }\n"
-        "}\n");
-    ASSERT_NOT_NULL(r);
-    int idx = require_resolved(r, "outer.inner", "target");
-    ASSERT_GTE(idx, 0);
-    ASSERT_STR_EQ(r->resolved_calls.items[idx].caller_qn, "test.src.main.outer.inner");
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_nested_function_resolves_outer_call) {
-    CBMFileResult *r = extract_rust(
-        "fn outer() {\n"
-        "    fn walk(n: u32) { if n > 0 { walk(n - 1); } }\n"
-        "    walk(1);\n"
-        "}\n");
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(count_resolved_exact(r, "test.src.main.outer", "test.src.main.outer.walk"), 1);
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_wildcard_let_retains_function_value) {
-    CBMFileResult *r = extract_rust(
-        "fn retain() { fn retained() {} let _ = retained; }\n");
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(count_resolved_exact(r, "test.src.main.retain", "test.src.main.retain.retained"),
-              1);
-    int joined = 0;
-    for (int i = 0; i < r->usages.count; i++) {
-        const CBMUsage *usage = &r->usages.items[i];
-        if (usage->ref_name && strcmp(usage->ref_name, "retained") == 0 &&
-            cbm_pipeline_find_lsp_reference(&r->resolved_calls, usage, false)) {
-            ASSERT_TRUE(usage->may_be_call_reference);
-            joined++;
-        }
-    }
-    ASSERT_EQ(joined, 1);
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_trait_default_method_owns_its_calls) {
-    CBMFileResult *r = extract_rust(
-        "trait Port {\n"
-        "    fn complete(&self) { self.complete_with_attempts(); }\n"
-        "    fn complete_with_attempts(&self);\n"
-        "}\n");
-    ASSERT_NOT_NULL(r);
-    int idx = require_resolved(r, "Port.complete", "Port.complete_with_attempts");
-    ASSERT_GTE(idx, 0);
-    ASSERT_STR_EQ(r->resolved_calls.items[idx].caller_qn, "test.src.main.Port.complete");
     cbm_free_result(r);
     PASS();
 }
@@ -621,51 +467,6 @@ TEST(rustlsp_format_returns_string) {
     PASS();
 }
 
-TEST(rustlsp_static_macro_table_records_function_value_usage) {
-    CBMFileResult *r = extract_rust(
-        "fn handler() {}\n"
-        "macro_rules! table {\n"
-        "    ($($descriptor:expr => $run:path;)+) => {\n"
-        "        const TABLE: &[fn()] = &[$($run),+];\n"
-        "    };\n"
-        "}\n"
-        "table! { /* a delimiter in trivia: } */ '}' => handler; }\n");
-    ASSERT_NOT_NULL(r);
-    int matched = 0;
-    for (int i = 0; i < r->usages.count; i++) {
-        const CBMUsage *usage = &r->usages.items[i];
-        if (usage->ref_name && usage->resolved_target_qn &&
-            strcmp(usage->ref_name, "handler") == 0 &&
-            strstr(usage->resolved_target_qn, ".handler") != NULL &&
-            usage->enclosing_func_qn && strcmp(usage->enclosing_func_qn, r->module_qn) == 0) {
-            matched++;
-        }
-    }
-    ASSERT_EQ(matched, 1);
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_macro_table_ignores_opaque_token_contents) {
-    CBMFileResult *r = extract_rust(
-        "fn handler() {}\n"
-        "macro_rules! passthrough { ($($token:tt)*) => {}; }\n"
-        "passthrough! { /* 1 => handler; */ }\n"
-        "passthrough! { r#\"2 => handler;\"# }\n");
-    ASSERT_NOT_NULL(r);
-    int matched = 0;
-    for (int i = 0; i < r->usages.count; i++) {
-        const CBMUsage *usage = &r->usages.items[i];
-        if (usage->is_macro_callable_value && usage->ref_name &&
-            strcmp(usage->ref_name, "handler") == 0) {
-            matched++;
-        }
-    }
-    ASSERT_EQ(matched, 0);
-    cbm_free_result(r);
-    PASS();
-}
-
 /* ── Category 8: Stdlib semantics ─────────────────────────────── */
 
 TEST(rustlsp_hashmap_insert_get) {
@@ -757,470 +558,15 @@ TEST(rustlsp_crossfile_method_dispatch) {
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
 
-    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, 2, imp_names,
-                           imp_qns, 1, NULL, &out, NULL);
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller),
+                           "test.caller",
+                           defs, 2,
+                           imp_names, imp_qns, 1,
+                           NULL, &out);
 
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
 
     cbm_arena_destroy(&a);
-    PASS();
-}
-
-TEST(rustlsp_crossfile_crate_import_factory_chain_exact_site) {
-    const char *caller = "fn imported_free_factory() { make_runner().dry_run(); }\n"
-                         "trait DryRun { fn dry_run(&self); }\n"
-                         "fn weak_receiver<T: DryRun>(value: T) { value.dry_run(); }\n";
-    const char *site = strstr(caller, "make_runner().dry_run()");
-    ASSERT_NOT_NULL(site);
-    uint32_t expected_start = (uint32_t)(site - caller);
-    uint32_t expected_end = expected_start + (uint32_t)strlen("make_runner().dry_run()");
-
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMRustLSPDef defs[3];
-    memset(defs, 0, sizeof(defs));
-    defs[0].qualified_name = "test.src.runner.BuildRunner";
-    defs[0].short_name = "BuildRunner";
-    defs[0].label = "Type";
-    defs[0].def_module_qn = "test.src.runner";
-    defs[1].qualified_name = "test.src.runner.make_runner";
-    defs[1].short_name = "make_runner";
-    defs[1].label = "Function";
-    defs[1].def_module_qn = "test.src.runner";
-    defs[1].return_types = "test.src.runner.BuildRunner";
-    defs[2].qualified_name = "test.src.runner.BuildRunner.dry_run";
-    defs[2].short_name = "dry_run";
-    defs[2].label = "Method";
-    defs[2].receiver_type = "test.src.runner.BuildRunner";
-    defs[2].def_module_qn = "test.src.runner";
-
-    const char *imp_names[] = {"make_runner"};
-    const char *imp_qns[] = {"crate::runner::make_runner"};
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller), "test.src.compile", defs, 3,
-                           imp_names, imp_qns, 1, NULL, &out, NULL);
-
-    int exact = 0;
-    int weak_stolen = 0;
-    for (int i = 0; i < out.count; i++) {
-        const CBMResolvedCall *call = &out.items[i];
-        if (call->caller_qn && call->callee_qn &&
-            strcmp(call->caller_qn, "test.src.compile.imported_free_factory") == 0 &&
-            strcmp(call->callee_qn, "test.src.runner.BuildRunner.dry_run") == 0 &&
-            call->site_start_byte == expected_start && call->site_end_byte == expected_end) {
-            exact++;
-        }
-        if (call->caller_qn && call->callee_qn &&
-            strcmp(call->caller_qn, "test.src.compile.weak_receiver") == 0 &&
-            strcmp(call->callee_qn, "test.src.runner.BuildRunner.dry_run") == 0) {
-            weak_stolen++;
-        }
-    }
-    ASSERT_EQ(exact, 1);
-    ASSERT_EQ(weak_stolen, 0);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_crossfile_relative_use_roots_canonicalize) {
-    const char *caller = "fn via_self() { make_local().dry_run(); }\n"
-                         "fn via_super() { make_parent().dry_run(); }\n"
-                         "fn via_self_type() { LocalRunner::new().dry_run(); }\n"
-                         "fn via_super_type() { BuildRunner::new().dry_run(); }\n"
-                         "fn via_nested_super() { make_grand().dry_run(); }\n";
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMRustLSPDef defs[9];
-    memset(defs, 0, sizeof(defs));
-    defs[0].qualified_name = "test.src.group.runner.BuildRunner";
-    defs[0].short_name = "BuildRunner";
-    defs[0].label = "Type";
-    defs[0].def_module_qn = "test.src.group.runner";
-    defs[1].qualified_name = "test.src.group.runner.BuildRunner.dry_run";
-    defs[1].short_name = "dry_run";
-    defs[1].label = "Method";
-    defs[1].receiver_type = "test.src.group.runner.BuildRunner";
-    defs[1].def_module_qn = "test.src.group.runner";
-    defs[2].qualified_name = "test.src.group.compile.local.make_local";
-    defs[2].short_name = "make_local";
-    defs[2].label = "Function";
-    defs[2].def_module_qn = "test.src.group.compile.local";
-    defs[2].return_types = "test.src.group.runner.BuildRunner";
-    defs[3].qualified_name = "test.src.group.runner.make_parent";
-    defs[3].short_name = "make_parent";
-    defs[3].label = "Function";
-    defs[3].def_module_qn = "test.src.group.runner";
-    defs[3].return_types = "test.src.group.runner.BuildRunner";
-    defs[4].qualified_name = "test.src.group.runner.BuildRunner.new";
-    defs[4].short_name = "new";
-    defs[4].label = "Method";
-    defs[4].receiver_type = "test.src.group.runner.BuildRunner";
-    defs[4].def_module_qn = "test.src.group.runner";
-    defs[4].return_types = "Self";
-    defs[5].qualified_name = "test.src.group.compile.local.LocalRunner";
-    defs[5].short_name = "LocalRunner";
-    defs[5].label = "Type";
-    defs[5].def_module_qn = "test.src.group.compile.local";
-    defs[6].qualified_name = "test.src.group.compile.local.LocalRunner.new";
-    defs[6].short_name = "new";
-    defs[6].label = "Method";
-    defs[6].receiver_type = "test.src.group.compile.local.LocalRunner";
-    defs[6].def_module_qn = "test.src.group.compile.local";
-    defs[6].return_types = "Self";
-    defs[7].qualified_name = "test.src.group.compile.local.LocalRunner.dry_run";
-    defs[7].short_name = "dry_run";
-    defs[7].label = "Method";
-    defs[7].receiver_type = "test.src.group.compile.local.LocalRunner";
-    defs[7].def_module_qn = "test.src.group.compile.local";
-    defs[8].qualified_name = "test.src.runner.make_grand";
-    defs[8].short_name = "make_grand";
-    defs[8].label = "Function";
-    defs[8].def_module_qn = "test.src.runner";
-    defs[8].return_types = "test.src.group.runner.BuildRunner";
-
-    const char *imp_names[] = {"make_local", "make_parent", "LocalRunner", "BuildRunner",
-                               "make_grand"};
-    const char *imp_qns[] = {"self::local::make_local", "super::runner::make_parent",
-                             "self::local::LocalRunner", "super::runner::BuildRunner",
-                             "super::super::runner::make_grand"};
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller), "test.src.group.compile", defs, 9,
-                           imp_names, imp_qns, 5, NULL, &out, NULL);
-    int local = 0;
-    int parent = 0;
-    int local_type = 0;
-    int parent_type = 0;
-    int grandparent = 0;
-    for (int i = 0; i < out.count; i++) {
-        const CBMResolvedCall *call = &out.items[i];
-        if (!call->caller_qn || !call->callee_qn) {
-            continue;
-        }
-        if (strcmp(call->callee_qn, "test.src.group.runner.BuildRunner.dry_run") == 0 &&
-            strcmp(call->caller_qn, "test.src.group.compile.via_self") == 0)
-            local++;
-        if (strcmp(call->callee_qn, "test.src.group.runner.BuildRunner.dry_run") == 0 &&
-            strcmp(call->caller_qn, "test.src.group.compile.via_super") == 0)
-            parent++;
-        if (strcmp(call->callee_qn, "test.src.group.compile.local.LocalRunner.dry_run") == 0 &&
-            strcmp(call->caller_qn, "test.src.group.compile.via_self_type") == 0)
-            local_type++;
-        if (strcmp(call->callee_qn, "test.src.group.runner.BuildRunner.dry_run") == 0 &&
-            strcmp(call->caller_qn, "test.src.group.compile.via_super_type") == 0)
-            parent_type++;
-        if (strcmp(call->callee_qn, "test.src.group.runner.BuildRunner.dry_run") == 0 &&
-            strcmp(call->caller_qn, "test.src.group.compile.via_nested_super") == 0)
-            grandparent++;
-    }
-    ASSERT_EQ(local, 1);
-    ASSERT_EQ(parent, 1);
-    ASSERT_EQ(local_type, 1);
-    ASSERT_EQ(parent_type, 1);
-    ASSERT_EQ(grandparent, 1);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_crossfile_rooted_impl_returns_require_authoritative_crate_root) {
-    const char *alpha_root = "project.crates.alpha.src";
-    const char *alpha_source = "project.crates.alpha.src.lib";
-    CBMLSPDef defs[20] = {0};
-    defs[0] = (CBMLSPDef){.qualified_name = "project.crates.alpha.src.factory.deep.Factory",
-                          .short_name = "Factory",
-                          .label = "Type",
-                          .def_module_qn = "project.crates.alpha.src.factory.deep",
-                          .rust_crate_root_qn = alpha_root,
-                          .rust_crate_source_module_qn = alpha_source,
-                          .lang = CBM_LANG_RUST};
-    const char *factory_methods[] = {"make_crate", "make_self", "make_super", "make_self_kw"};
-    const char *factory_method_qns[] = {
-        "project.crates.alpha.src.factory.deep.Factory.make_crate",
-        "project.crates.alpha.src.factory.deep.Factory.make_self",
-        "project.crates.alpha.src.factory.deep.Factory.make_super",
-        "project.crates.alpha.src.factory.deep.Factory.make_self_kw"};
-    const char *factory_returns[] = {"crate::domain::CrateRunner", "self::SelfRunner",
-                                     "super::super::domain::SuperRunner", "Self"};
-    for (int i = 0; i < 4; i++) {
-        defs[1 + i] = (CBMLSPDef){.qualified_name = factory_method_qns[i],
-                                  .short_name = factory_methods[i],
-                                  .label = "Method",
-                                  .receiver_type = "project.crates.alpha.src.factory.deep.Factory",
-                                  .def_module_qn = "project.crates.alpha.src.factory.deep",
-                                  .rust_crate_root_qn = alpha_root,
-                                  .rust_crate_source_module_qn = alpha_source,
-                                  .return_types = factory_returns[i],
-                                  .lang = CBM_LANG_RUST};
-    }
-    const char *runner_qns[] = {"project.crates.alpha.src.domain.CrateRunner",
-                                "project.crates.alpha.src.factory.deep.SelfRunner",
-                                "project.crates.alpha.src.domain.SuperRunner"};
-    const char *runner_names[] = {"CrateRunner", "SelfRunner", "SuperRunner"};
-    const char *runner_method_qns[] = {"project.crates.alpha.src.domain.CrateRunner.dry_run",
-                                       "project.crates.alpha.src.factory.deep.SelfRunner.dry_run",
-                                       "project.crates.alpha.src.domain.SuperRunner.dry_run"};
-    for (int i = 0; i < 3; i++) {
-        defs[5 + (i * 2)] =
-            (CBMLSPDef){.qualified_name = runner_qns[i],
-                        .short_name = runner_names[i],
-                        .label = "Type",
-                        .def_module_qn = i == 1 ? "project.crates.alpha.src.factory.deep"
-                                                : "project.crates.alpha.src.domain",
-                        .rust_crate_root_qn = alpha_root,
-                        .rust_crate_source_module_qn = alpha_source,
-                        .lang = CBM_LANG_RUST};
-        defs[6 + (i * 2)] =
-            (CBMLSPDef){.qualified_name = runner_method_qns[i],
-                        .short_name = "dry_run",
-                        .label = "Method",
-                        .receiver_type = runner_qns[i],
-                        .def_module_qn = i == 1 ? "project.crates.alpha.src.factory.deep"
-                                                : "project.crates.alpha.src.domain",
-                        .rust_crate_root_qn = alpha_root,
-                        .rust_crate_source_module_qn = alpha_source,
-                        .lang = CBM_LANG_RUST};
-    }
-    defs[11] =
-        (CBMLSPDef){.qualified_name = "project.crates.alpha.src.factory.deep.Factory.dry_run",
-                    .short_name = "dry_run",
-                    .label = "Method",
-                    .receiver_type = "project.crates.alpha.src.factory.deep.Factory",
-                    .def_module_qn = "project.crates.alpha.src.factory.deep",
-                    .rust_crate_root_qn = alpha_root,
-                    .rust_crate_source_module_qn = alpha_source,
-                    .lang = CBM_LANG_RUST};
-
-    /* No authoritative root: the old positional rule minted project.crates.*
-     * and could bind this same-named non-member decoy. The carrier must leave
-     * crate:: unqualified and the chain unresolved instead. */
-    defs[12] = (CBMLSPDef){.qualified_name = "project.crates.alpha.src.factory.deep.MissingFactory",
-                           .short_name = "MissingFactory",
-                           .label = "Type",
-                           .def_module_qn = "project.crates.alpha.src.factory.deep",
-                           .lang = CBM_LANG_RUST};
-    defs[13] = (CBMLSPDef){.qualified_name =
-                               "project.crates.alpha.src.factory.deep.MissingFactory.make_missing",
-                           .short_name = "make_missing",
-                           .label = "Method",
-                           .receiver_type = "project.crates.alpha.src.factory.deep.MissingFactory",
-                           .def_module_qn = "project.crates.alpha.src.factory.deep",
-                           .return_types = "crate::domain::CrateRunner",
-                           .lang = CBM_LANG_RUST};
-    defs[14] = (CBMLSPDef){.qualified_name = "project.crates.domain.CrateRunner.dry_run",
-                           .short_name = "dry_run",
-                           .label = "Method",
-                           .receiver_type = "project.crates.domain.CrateRunner",
-                           .def_module_qn = "project.crates.domain",
-                           .lang = CBM_LANG_RUST};
-    defs[15] = (CBMLSPDef){.qualified_name =
-                               "project.crates.alpha.src.factory.deep.Factory.make_root_item",
-                           .short_name = "make_root_item",
-                           .label = "Method",
-                           .receiver_type = "project.crates.alpha.src.factory.deep.Factory",
-                           .def_module_qn = "project.crates.alpha.src.factory.deep",
-                           .rust_crate_root_qn = alpha_root,
-                           .rust_crate_source_module_qn = alpha_source,
-                           .return_types = "crate::RootRunner",
-                           .lang = CBM_LANG_RUST};
-    defs[16] = (CBMLSPDef){.qualified_name = "project.crates.alpha.src.lib.RootRunner",
-                           .short_name = "RootRunner",
-                           .label = "Type",
-                           .def_module_qn = alpha_source,
-                           .rust_crate_root_qn = alpha_root,
-                           .rust_crate_source_module_qn = alpha_source,
-                           .lang = CBM_LANG_RUST};
-    defs[17] = (CBMLSPDef){.qualified_name = "project.crates.alpha.src.lib.RootRunner.dry_run",
-                           .short_name = "dry_run",
-                           .label = "Method",
-                           .receiver_type = "project.crates.alpha.src.lib.RootRunner",
-                           .def_module_qn = alpha_source,
-                           .rust_crate_root_qn = alpha_root,
-                           .rust_crate_source_module_qn = alpha_source,
-                           .lang = CBM_LANG_RUST};
-    /* A literal `crate.*` registry identity must not make missing Cargo
-     * metadata resolvable. */
-    defs[18] = (CBMLSPDef){.qualified_name = "crate.domain.CrateRunner",
-                           .short_name = "CrateRunner",
-                           .label = "Type",
-                           .def_module_qn = "crate.domain",
-                           .lang = CBM_LANG_RUST};
-    defs[19] = (CBMLSPDef){.qualified_name = "crate.domain.CrateRunner.dry_run",
-                           .short_name = "dry_run",
-                           .label = "Method",
-                           .receiver_type = "crate.domain.CrateRunner",
-                           .def_module_qn = "crate.domain",
-                           .lang = CBM_LANG_RUST};
-
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 20);
-    ASSERT_NOT_NULL(registry);
-    for (int i = 0; i < 3; i++) {
-        const CBMRegisteredFunc *method =
-            cbm_registry_lookup_func(registry, defs[1 + i].qualified_name);
-        ASSERT_NOT_NULL(method);
-        ASSERT_NOT_NULL(method->signature);
-        ASSERT_NOT_NULL(method->signature->data.func.return_types);
-        const CBMType *ret = method->signature->data.func.return_types[0];
-        ASSERT_NOT_NULL(ret);
-        ASSERT_EQ(ret->kind, CBM_TYPE_NAMED);
-        ASSERT_STR_EQ(ret->data.named.qualified_name, runner_qns[i]);
-    }
-    const CBMRegisteredFunc *self_method =
-        cbm_registry_lookup_func(registry, defs[4].qualified_name);
-    ASSERT_NOT_NULL(self_method);
-    ASSERT_STR_EQ(self_method->signature->data.func.return_types[0]->data.named.qualified_name,
-                  "Self");
-    const CBMRegisteredFunc *root_item_factory =
-        cbm_registry_lookup_func(registry, defs[15].qualified_name);
-    ASSERT_NOT_NULL(root_item_factory);
-    ASSERT_STR_EQ(
-        root_item_factory->signature->data.func.return_types[0]->data.named.qualified_name,
-        "project.crates.alpha.src.lib.RootRunner");
-
-    const char *source = "fn rooted_returns() {\n"
-                         "    Factory::make_crate().dry_run();\n"
-                         "    Factory::make_self().dry_run();\n"
-                         "    Factory::make_super().dry_run();\n"
-                         "    Factory::make_self_kw().dry_run();\n"
-                         "    Factory::make_root_item().dry_run();\n"
-                         "    MissingFactory::make_missing().dry_run();\n"
-                         "}\n";
-    const char *import_names[] = {"Factory", "MissingFactory"};
-    const char *import_qns[] = {"project::crates::alpha::src::factory::deep::Factory",
-                                "project::crates::alpha::src::factory::deep::MissingFactory"};
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source),
-                                         "project.crates.alpha.src.caller", registry, import_names,
-                                         import_qns, 2, NULL, NULL, &out, NULL, NULL);
-    int exact[5] = {0};
-    int positional_decoy = 0;
-    for (int i = 0; i < out.count; i++) {
-        const CBMResolvedCall *call = &out.items[i];
-        if (!call->caller_qn || !call->callee_qn ||
-            strcmp(call->caller_qn, "project.crates.alpha.src.caller.rooted_returns") != 0) {
-            continue;
-        }
-        for (int j = 0; j < 3; j++) {
-            if (strcmp(call->callee_qn, runner_method_qns[j]) == 0) {
-                exact[j]++;
-            }
-        }
-        if (strcmp(call->callee_qn, "project.crates.alpha.src.factory.deep.Factory.dry_run") == 0) {
-            exact[3]++;
-        }
-        if (strcmp(call->callee_qn, "project.crates.alpha.src.lib.RootRunner.dry_run") == 0) {
-            exact[4]++;
-        }
-        if (strcmp(call->callee_qn, "project.crates.domain.CrateRunner.dry_run") == 0) {
-            positional_decoy++;
-        }
-    }
-    for (int i = 0; i < 5; i++) {
-        ASSERT_EQ(exact[i], 1);
-    }
-    ASSERT_EQ(positional_decoy, 0);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_manifest_free_self_super_returns_preserve_module_semantics) {
-    CBMLSPDef defs[] = {
-        {.qualified_name = "project.group.factory.deep.Factory",
-         .short_name = "Factory",
-         .label = "Type",
-         .def_module_qn = "project.group.factory.deep",
-         .lang = CBM_LANG_RUST},
-        {.qualified_name = "project.group.factory.deep.Factory.make_self",
-         .short_name = "make_self",
-         .label = "Method",
-         .receiver_type = "project.group.factory.deep.Factory",
-         .def_module_qn = "project.group.factory.deep",
-         .return_types = "self::SelfRunner",
-         .lang = CBM_LANG_RUST},
-        {.qualified_name = "project.group.factory.deep.Factory.make_super",
-         .short_name = "make_super",
-         .label = "Method",
-         .receiver_type = "project.group.factory.deep.Factory",
-         .def_module_qn = "project.group.factory.deep",
-         .return_types = "super::super::domain::SuperRunner",
-         .lang = CBM_LANG_RUST},
-        {.qualified_name = "project.group.factory.deep.SelfRunner",
-         .short_name = "SelfRunner",
-         .label = "Type",
-         .def_module_qn = "project.group.factory.deep",
-         .lang = CBM_LANG_RUST},
-        {.qualified_name = "project.group.factory.deep.SelfRunner.dry_run",
-         .short_name = "dry_run",
-         .label = "Method",
-         .receiver_type = "project.group.factory.deep.SelfRunner",
-         .def_module_qn = "project.group.factory.deep",
-         .lang = CBM_LANG_RUST},
-        {.qualified_name = "project.group.domain.SuperRunner",
-         .short_name = "SuperRunner",
-         .label = "Type",
-         .def_module_qn = "project.group.domain",
-         .lang = CBM_LANG_RUST},
-        {.qualified_name = "project.group.domain.SuperRunner.dry_run",
-         .short_name = "dry_run",
-         .label = "Method",
-         .receiver_type = "project.group.domain.SuperRunner",
-         .def_module_qn = "project.group.domain",
-         .lang = CBM_LANG_RUST},
-        /* Same leaves outside the module-relative identities are decoys. */
-        {.qualified_name = "project.other.SelfRunner.dry_run",
-         .short_name = "dry_run",
-         .label = "Method",
-         .receiver_type = "project.other.SelfRunner",
-         .def_module_qn = "project.other",
-         .lang = CBM_LANG_RUST},
-        {.qualified_name = "project.other.SuperRunner.dry_run",
-         .short_name = "dry_run",
-         .label = "Method",
-         .receiver_type = "project.other.SuperRunner",
-         .def_module_qn = "project.other",
-         .lang = CBM_LANG_RUST},
-    };
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMTypeRegistry *registry =
-        cbm_rust_build_cross_registry(&arena, defs, (int)(sizeof(defs) / sizeof(defs[0])));
-    ASSERT_NOT_NULL(registry);
-    const CBMRegisteredFunc *self_factory =
-        cbm_registry_lookup_func(registry, defs[1].qualified_name);
-    const CBMRegisteredFunc *super_factory =
-        cbm_registry_lookup_func(registry, defs[2].qualified_name);
-    ASSERT_NOT_NULL(self_factory);
-    ASSERT_NOT_NULL(super_factory);
-    ASSERT_STR_EQ(self_factory->signature->data.func.return_types[0]->data.named.qualified_name,
-                  "project.group.factory.deep.SelfRunner");
-    ASSERT_STR_EQ(super_factory->signature->data.func.return_types[0]->data.named.qualified_name,
-                  "project.group.domain.SuperRunner");
-    const char *source = "fn run() { Factory::make_self().dry_run(); "
-                         "Factory::make_super().dry_run(); }\n";
-    const char *names[] = {"Factory"};
-    const char *qns[] = {"project::group::factory::deep::Factory"};
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source),
-                                         "project.group.caller", registry, names, qns, 1, NULL,
-                                         NULL, &out, NULL, NULL);
-    int self_hit = 0;
-    int super_hit = 0;
-    int decoy_hit = 0;
-    for (int i = 0; i < out.count; i++) {
-        const char *qn = out.items[i].callee_qn;
-        if (!qn)
-            continue;
-        if (strcmp(qn, "project.group.factory.deep.SelfRunner.dry_run") == 0)
-            self_hit++;
-        if (strcmp(qn, "project.group.domain.SuperRunner.dry_run") == 0)
-            super_hit++;
-        if (strncmp(qn, "project.other.", 14) == 0)
-            decoy_hit++;
-    }
-    ASSERT_EQ(self_hit, 1);
-    ASSERT_EQ(super_hit, 1);
-    ASSERT_EQ(decoy_hit, 0);
-    cbm_arena_destroy(&arena);
     PASS();
 }
 
@@ -1257,51 +603,11 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     memset(&out, 0, sizeof(out));
     cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller", reg,
                                          imp_names, imp_qns, 1, NULL, /*manifest=*/NULL, &out,
-                                         /*synthetic_calls=*/NULL, /*health=*/NULL);
+                                         /*synthetic_calls=*/NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
 
     cbm_arena_destroy(&a);
-    PASS();
-}
-
-TEST(rustlsp_shared_registry_scoped_path_beats_local_same_name) {
-    const char *source = "mod helper;\n"
-                         "fn target() {}\n"
-                         "fn outer() { helper::target(); }\n";
-    CBMFileResult *result = extract_rust(source);
-    ASSERT_NOT_NULL(result);
-    ASSERT_EQ(count_resolved_exact(result, "test.src.main.outer", "test.src.main.target"), 0);
-
-    CBMLSPDef defs[2] = {0};
-    defs[0] = (CBMLSPDef){.qualified_name = "test.src.main.target",
-                          .short_name = "target",
-                          .label = "Function",
-                          .def_module_qn = "test.src.main",
-                          .lang = CBM_LANG_RUST};
-    defs[1] = (CBMLSPDef){.qualified_name = "test.src.helper.target",
-                          .short_name = "target",
-                          .label = "Function",
-                          .def_module_qn = "test.src.helper",
-                          .lang = CBM_LANG_RUST};
-    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&result->arena, defs, 2);
-    ASSERT_NOT_NULL(registry);
-    cbm_run_rust_lsp_cross_with_registry(
-        &result->arena, source, (int)strlen(source), result->module_qn, registry, NULL, NULL, 0,
-        NULL, NULL, &result->resolved_calls, NULL, &result->rust_health);
-    ASSERT_EQ(count_resolved_exact(result, "test.src.main.outer", "test.src.helper.target"), 1);
-
-    const CBMResolvedCall *joined = NULL;
-    for (int i = 0; i < result->calls.count; i++) {
-        const CBMCall *call = &result->calls.items[i];
-        if (call->enclosing_func_qn && strcmp(call->enclosing_func_qn, "test.src.main.outer") == 0 &&
-            call->callee_name && strstr(call->callee_name, "target")) {
-            joined = cbm_pipeline_find_lsp_resolution(&result->resolved_calls, call, false);
-        }
-    }
-    ASSERT_NOT_NULL(joined);
-    ASSERT_STR_EQ(joined->callee_qn, "test.src.helper.target");
-    cbm_free_result(result);
     PASS();
 }
 
@@ -1348,7 +654,7 @@ TEST(rustlsp_relative_type_requires_declared_module) {
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
-                                         NULL, NULL, 0, NULL, NULL, &out, NULL, NULL);
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
     int stolen = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(stolen, 0);
@@ -1364,7 +670,7 @@ TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed) {
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
-                                         NULL, NULL, 0, NULL, NULL, &out, NULL, NULL);
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
     int guessed = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(guessed, 0);
@@ -1396,9 +702,9 @@ TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier) {
     CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&result.arena, defs, 1);
     ASSERT_NOT_NULL(reg);
 
-    cbm_run_rust_lsp_cross_with_registry(
-        &result.arena, caller, (int)strlen(caller), "test.main", reg, imp_names, imp_qns, 1, NULL,
-        /*manifest=*/NULL, &result.resolved_calls, &result.calls, &result.rust_health);
+    cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
+                                         reg, imp_names, imp_qns, 1, NULL, /*manifest=*/NULL,
+                                         &result.resolved_calls, &result.calls);
 
     int resolved = find_confident(&result.resolved_calls, "hidden", "lib.render");
     int carriers = 0;
@@ -1493,7 +799,7 @@ TEST(rustlsp_shared_dispatch_merges_existing_exact_occurrence) {
     const char *imp_qns[] = {"test::lib"};
 
     cbm_pxc_dispatch_file(CBM_LANG_RUST, result, source, (int)strlen(source), "src/main.rs",
-                          result->module_qn, NULL, NULL, defs, 2, imp_names, imp_qns, NULL, 1, NULL,
+                          result->module_qn, NULL, NULL, defs, 2, imp_names, imp_qns, 1,
                           rustlsp_return_shared_registry, shared);
 
     int local_after = 0;
@@ -1632,9 +938,9 @@ TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact) {
     const char *imp_qns[] = {"test::a", "test::b"};
     CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&result.arena, defs, 2);
     ASSERT_NOT_NULL(reg);
-    cbm_run_rust_lsp_cross_with_registry(
-        &result.arena, caller, (int)strlen(caller), "test.main", reg, imp_names, imp_qns, 2, NULL,
-        /*manifest=*/NULL, &result.resolved_calls, &result.calls, &result.rust_health);
+    cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
+                                         reg, imp_names, imp_qns, 2, NULL, /*manifest=*/NULL,
+                                         &result.resolved_calls, &result.calls);
 
     const char *a_site = strstr(caller, "a::render()");
     const char *b_site = strstr(caller, "b::render()");
@@ -2080,8 +1386,8 @@ TEST(rustlsp_crossfile_free_function) {
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
 
-    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.main", defs, 1, imp_names,
-                           imp_qns, 1, NULL, &out, NULL);
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.main",
+                           defs, 1, imp_names, imp_qns, 1, NULL, &out);
 
     ASSERT_GTE(find_confident(&out, "main", "utils.greet"), 0);
 
@@ -2089,413 +1395,7 @@ TEST(rustlsp_crossfile_free_function) {
     PASS();
 }
 
-static int routed_named_import_result(CBMRustLSPDef *defs, int def_count, const char *import_qn,
-                                      CBMCargoDependencyRoute *routes, int route_count) {
-    const char *caller = "use pm_core::transport::{ParsedTransportPath, parse_transport_path};\n"
-                         "fn parse() { parse_transport_path(\"path\"); }\n";
-    const char *import_names[] = {"parse_transport_path"};
-    const char *import_qns[] = {import_qn};
-    CBMCargoManifest manifest = {.is_workspace_root = true,
-                                 .dependency_routes = routes,
-                                 .dependency_route_count = route_count};
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_manifest(
-        &arena, caller, (int)strlen(caller), "project.crates.pm-infra.src.transport", defs,
-        def_count, import_names, import_qns, 1, NULL, &manifest, &out, NULL, NULL);
-    int result = find_confident(&out, "parse", defs[0].qualified_name);
-    cbm_arena_destroy(&arena);
-    return result;
-}
-
-TEST(rustlsp_cargo_route_resolves_preserved_source_import) {
-    CBMRustLSPDef defs[2] = {
-        {.qualified_name = "project.crates.pm-core.src.transport.mod.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-core.src.transport.mod"},
-        {.qualified_name = "project.crates.pm-infra.src.decoys.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
-    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
-                                     .target_name = "pm-core",
-                                     .target_package_dir = "crates/pm-core"};
-    ASSERT_GTE(routed_named_import_result(defs, 2,
-                                          "pm_core::transport::parse_transport_path", &route, 1),
-               0);
-    PASS();
-}
-
-TEST(rustlsp_cargo_route_keeps_authoritative_empty_import_blocked) {
-    CBMRustLSPDef defs[2] = {
-        {.qualified_name = "project.crates.pm-core.src.transport.mod.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-core.src.transport.mod"},
-        {.qualified_name = "project.crates.pm-infra.src.decoys.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
-    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
-                                     .target_name = "pm-core",
-                                     .target_package_dir = "crates/pm-core"};
-    ASSERT_EQ(routed_named_import_result(defs, 2, "", &route, 1), -1);
-    PASS();
-}
-
-TEST(rustlsp_cargo_route_rejects_conflicting_caller_routes) {
-    CBMRustLSPDef defs[2] = {
-        {.qualified_name = "project.crates.pm-core.src.transport.mod.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-core.src.transport.mod"},
-        {.qualified_name = "project.crates.pm-infra.src.decoys.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
-    CBMCargoDependencyRoute routes[2] = {
-        {.package_dir = "crates/pm-infra", .name = "pm_core", .target_name = "pm-core",
-         .target_package_dir = "crates/pm-core"},
-        {.package_dir = "crates/pm-infra", .name = "pm_core", .target_name = "pm-core-decoy",
-         .target_package_dir = "crates/pm-core-decoy"}};
-    ASSERT_EQ(routed_named_import_result(defs, 2,
-                                         "pm_core::transport::parse_transport_path", routes, 2),
-              -1);
-    PASS();
-}
-
-TEST(rustlsp_cargo_route_rejects_target_package_prefix_decoy) {
-    CBMRustLSPDef defs[2] = {
-        {.qualified_name = "project.crates.pm-core-decoy.src.transport.mod.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-core-decoy.src.transport.mod"},
-        {.qualified_name = "project.crates.pm-infra.src.decoys.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
-    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
-                                     .target_name = "pm-core",
-                                     .target_package_dir = "crates/pm-core"};
-    ASSERT_EQ(routed_named_import_result(defs, 2,
-                                         "pm_core::transport::parse_transport_path", &route, 1),
-              -1);
-    PASS();
-}
-
-TEST(rustlsp_cargo_route_rejects_ambiguous_complete_source_suffix) {
-    CBMRustLSPDef defs[2] = {
-        {.qualified_name = "project.crates.pm-core.src.transport.mod.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-core.src.transport.mod"},
-        {.qualified_name = "project.crates.pm-core.src.transport.parse_transport_path",
-         .short_name = "parse_transport_path", .label = "Function",
-         .def_module_qn = "project.crates.pm-core.src.transport"}};
-    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
-                                     .target_name = "pm-core",
-                                     .target_package_dir = "crates/pm-core"};
-    ASSERT_EQ(routed_named_import_result(defs, 2,
-                                         "pm_core::transport::parse_transport_path", &route, 1),
-              -1);
-    PASS();
-}
-
-TEST(rustlsp_cargo_routed_syntactic_import_survives_authoritative_blocker) {
-    const char *caller =
-        "use pm_core::entity_model::{Other, EntityDescriptor};\n"
-        "use pm_core::port::error::{DomainError, Result, require_row_count_ceiling};\n"
-        "fn bare() { require_row_count_ceiling(1, 2, \"row\"); }\n"
-        "fn method(descriptor: &EntityDescriptor) { descriptor.projected_schema(); }\n";
-    CBMRustLSPDef defs[2] = {0};
-    defs[0].qualified_name = "project.crates.pm-core.src.port.error.require_row_count_ceiling";
-    defs[0].short_name = "require_row_count_ceiling";
-    defs[0].label = "Function";
-    defs[0].def_module_qn = "project.crates.pm-core.src.port.error";
-    defs[1].qualified_name =
-        "project.crates.pm-core.src.entity_model.EntityDescriptor.projected_schema";
-    defs[1].short_name = "projected_schema";
-    defs[1].label = "Method";
-    defs[1].def_module_qn = "project.crates.pm-core.src.entity_model";
-    defs[1].receiver_type = "project.crates.pm-core.src.entity_model.EntityDescriptor";
-
-    const char *import_names[] = {"require_row_count_ceiling", "EntityDescriptor"};
-    const char *blocked_targets[] = {"", ""};
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMCargoManifest manifest = {0};
-    ASSERT_TRUE(cbm_cargo_add_dependency_route(&arena, &manifest, "crates/pm-infra", "pm-core",
-                                               "pm-core", "crates/pm-core"));
-    ASSERT_TRUE(cbm_cargo_add_dependency_route(&arena, &manifest, "crates/other", "pm-core",
-                                               "pm-core", "crates/decoy-core"));
-    ASSERT_TRUE(cbm_cargo_add_dependency_route(&arena, &manifest, "xtask", "pm-infra", "pm-infra",
-                                               "crates/pm-infra"));
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_manifest(&arena, caller, (int)strlen(caller),
-                                         "project.crates.pm-infra.src.adr", defs, 2, import_names,
-                                         blocked_targets, 2, NULL, &manifest, &out, NULL, NULL);
-
-    ASSERT_GTE(find_confident(&out, "bare", "require_row_count_ceiling"), 0);
-    ASSERT_GTE(find_confident(&out, "method", "EntityDescriptor.projected_schema"), 0);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_route_resolves_reexported_bare_import) {
-    /* `produce_show_frame_dot` is defined in the `graph.dot` submodule but
-     * `pub use dot::produce_show_frame_dot;` re-exports it one level up, so the
-     * bare cross-crate import carries the ancestor path `graph`. The re-export
-     * ancestor match must resolve it to the deeper definition. */
-    const char *caller = "use pm_core::graph::produce_show_frame_dot;\n"
-                         "fn print() { produce_show_frame_dot(); }\n";
-    CBMRustLSPDef defs[2] = {
-        {.qualified_name = "project.crates.pm-core.src.graph.dot.produce_show_frame_dot",
-         .short_name = "produce_show_frame_dot", .label = "Function",
-         .def_module_qn = "project.crates.pm-core.src.graph.dot"},
-        {.qualified_name = "project.crates.pm-infra.src.decoys.produce_show_frame_dot",
-         .short_name = "produce_show_frame_dot", .label = "Function",
-         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
-    const char *import_names[] = {"produce_show_frame_dot"};
-    const char *import_qns[] = {"pm_core::graph::produce_show_frame_dot"};
-    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
-                                     .target_name = "pm-core",
-                                     .target_package_dir = "crates/pm-core"};
-    CBMCargoManifest manifest = {.is_workspace_root = true,
-                                 .dependency_routes = &route,
-                                 .dependency_route_count = 1};
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_manifest(
-        &arena, caller, (int)strlen(caller), "project.crates.pm-infra.src.output", defs, 2,
-        import_names, import_qns, 1, NULL, &manifest, &out, NULL, NULL);
-    ASSERT_GTE(find_confident(&out, "print", defs[0].qualified_name), 0);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_route_resolves_module_alias_qualified_call) {
-    /* `use pm_core::entity_shape::external_ref as ext_shape;` then
-     * `ext_shape::append_event_sql()`. The alias targets an inline `pub mod`
-     * whose submodule the indexer folds into the parent, so the definition QN is
-     * shallower (`entity_shape.append_event_sql`) than the aliased import path
-     * (`entity_shape.external_ref`). The alias fallback rebuilds the import
-     * target and the routed lookup matches across that folded submodule. */
-    const char *caller = "use pm_core::entity_shape::external_ref as ext_shape;\n"
-                         "fn write() { ext_shape::append_event_sql(); }\n";
-    CBMRustLSPDef defs[2] = {
-        {.qualified_name = "project.crates.pm-core.src.entity_shape.append_event_sql",
-         .short_name = "append_event_sql", .label = "Function",
-         .def_module_qn = "project.crates.pm-core.src.entity_shape"},
-        {.qualified_name = "project.crates.pm-infra.src.decoys.append_event_sql",
-         .short_name = "append_event_sql", .label = "Function",
-         .def_module_qn = "project.crates.pm-infra.src.decoys"}};
-    const char *import_names[] = {"ext_shape"};
-    const char *import_qns[] = {"pm_core::entity_shape::external_ref"};
-    CBMCargoDependencyRoute route = {.package_dir = "crates/pm-infra", .name = "pm_core",
-                                     .target_name = "pm-core",
-                                     .target_package_dir = "crates/pm-core"};
-    CBMCargoManifest manifest = {.is_workspace_root = true,
-                                 .dependency_routes = &route,
-                                 .dependency_route_count = 1};
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_manifest(
-        &arena, caller, (int)strlen(caller), "project.crates.pm-infra.src.external_ref", defs, 2,
-        import_names, import_qns, 1, NULL, &manifest, &out, NULL, NULL);
-    ASSERT_GTE(find_confident(&out, "write", defs[0].qualified_name), 0);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
 /* ── Category 11: Robustness / regressions ────────────────────── */
-
-TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy) {
-    const char *caller = "fn caller() { alien::dispatch(); }\n";
-    const char *requested = "alien::dispatch()";
-    const char *site = strstr(caller, requested);
-    ASSERT_NOT_NULL(site);
-    uint32_t expected_start = (uint32_t)(site - caller);
-    uint32_t expected_end = expected_start + (uint32_t)strlen(requested);
-
-    CBMRustLSPDef defs[1];
-    memset(defs, 0, sizeof(defs));
-    defs[0].qualified_name = "project.other_crate.handlers.dispatch";
-    defs[0].short_name = "dispatch";
-    defs[0].label = "Function";
-    defs[0].def_module_qn = "project.other_crate.handlers";
-
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMCargoManifest manifest = {0};
-    manifest.is_workspace_root = true;
-    manifest.members[0] =
-        (CBMCargoMember){.member_name = "caller_crate", .member_path = "caller_crate"};
-    manifest.members[1] =
-        (CBMCargoMember){.member_name = "other_crate", .member_path = "other_crate"};
-    manifest.member_count = 2;
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_manifest(&arena, caller, (int)strlen(caller),
-                                         "project.caller_crate.main", defs, 1, NULL, NULL, 0, NULL,
-                                         &manifest, &out, NULL, NULL);
-
-    int wrong_target = 0;
-    int exact_unresolved = 0;
-    bool exact_requested_spelling = false;
-    for (int i = 0; i < out.count; i++) {
-        const CBMResolvedCall *call = &out.items[i];
-        if (!call->caller_qn || strcmp(call->caller_qn, "project.caller_crate.main.caller") != 0 ||
-            call->site_start_byte != expected_start || call->site_end_byte != expected_end) {
-            continue;
-        }
-        exact_requested_spelling =
-            (size_t)(call->site_end_byte - call->site_start_byte) == strlen(requested) &&
-            strncmp(caller + call->site_start_byte, requested, strlen(requested)) == 0;
-        if (call->callee_qn &&
-            strcmp(call->callee_qn, "project.other_crate.handlers.dispatch") == 0) {
-            wrong_target++;
-        }
-        if (call->callee_qn && strcmp(call->callee_qn, "alien.dispatch") == 0 && call->reason &&
-            strcmp(call->reason, "function_not_in_registry") == 0) {
-            exact_unresolved++;
-        }
-    }
-    cbm_arena_destroy(&arena);
-
-    ASSERT_TRUE(exact_requested_spelling);
-    ASSERT_EQ(wrong_target, 0);
-    ASSERT_EQ(exact_unresolved, 1);
-    PASS();
-}
-
-TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy) {
-    const char *caller = "fn caller() { unknown::dispatch(); }\n";
-    const char *requested = "unknown::dispatch()";
-    const char *site = strstr(caller, requested);
-    ASSERT_NOT_NULL(site);
-    uint32_t expected_start = (uint32_t)(site - caller);
-    uint32_t expected_end = expected_start + (uint32_t)strlen(requested);
-
-    CBMRustLSPDef defs[2];
-    memset(defs, 0, sizeof(defs));
-    defs[0].qualified_name = "project.crates.caller_crate.handlers.dispatch";
-    defs[0].short_name = "dispatch";
-    defs[0].label = "Function";
-    defs[0].def_module_qn = "project.crates.caller_crate.handlers";
-    defs[1].qualified_name = "project.crates.other_crate.handlers.dispatch";
-    defs[1].short_name = "dispatch";
-    defs[1].label = "Function";
-    defs[1].def_module_qn = "project.crates.other_crate.handlers";
-
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMCargoManifest manifest = {0};
-    manifest.is_workspace_root = true;
-    manifest.members[0] =
-        (CBMCargoMember){.member_name = "caller_crate", .member_path = "crates/caller_crate"};
-    manifest.members[1] =
-        (CBMCargoMember){.member_name = "other_crate", .member_path = "crates/other_crate"};
-    manifest.member_count = 2;
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_manifest(&arena, caller, (int)strlen(caller),
-                                         "project.crates.caller_crate.main", defs, 2, NULL, NULL, 0,
-                                         NULL, &manifest, &out, NULL, NULL);
-
-    int exact_target = 0;
-    int wrong_target = 0;
-    int unresolved = 0;
-    bool exact_requested_spelling = false;
-    for (int i = 0; i < out.count; i++) {
-        const CBMResolvedCall *call = &out.items[i];
-        if (!call->caller_qn ||
-            strcmp(call->caller_qn, "project.crates.caller_crate.main.caller") != 0 ||
-            call->site_start_byte != expected_start || call->site_end_byte != expected_end) {
-            continue;
-        }
-        exact_requested_spelling =
-            (size_t)(call->site_end_byte - call->site_start_byte) == strlen(requested) &&
-            strncmp(caller + call->site_start_byte, requested, strlen(requested)) == 0;
-        if (call->callee_qn &&
-            strcmp(call->callee_qn, "project.crates.caller_crate.handlers.dispatch") == 0 &&
-            call->strategy && strcmp(call->strategy, "lsp_short_name_unique") == 0) {
-            exact_target++;
-        }
-        if (call->callee_qn &&
-            strcmp(call->callee_qn, "project.crates.other_crate.handlers.dispatch") == 0) {
-            wrong_target++;
-        }
-        if (call->callee_qn && strcmp(call->callee_qn, "unknown.dispatch") == 0 && call->reason) {
-            unresolved++;
-        }
-    }
-    cbm_arena_destroy(&arena);
-
-    ASSERT_TRUE(exact_requested_spelling);
-    ASSERT_EQ(exact_target, 1);
-    ASSERT_EQ(wrong_target, 0);
-    ASSERT_EQ(unresolved, 0);
-    PASS();
-}
-
-TEST(rustlsp_crossfile_workspace_member_patterns_stay_crate_scoped) {
-    const char *caller = "fn caller() { unknown::dispatch(); }\n";
-    const char *member_patterns[] = {"crates/*", "crates/caller_crate/"};
-    for (int pattern_index = 0; pattern_index < 2; pattern_index++) {
-        CBMCargoManifest manifest = {0};
-        manifest.is_workspace_root = true;
-        manifest.members[0] = (CBMCargoMember){.member_name = "caller_crate",
-                                               .member_path = member_patterns[pattern_index]};
-        manifest.member_count = 1;
-        if (pattern_index == 1) {
-            manifest.members[1] = (CBMCargoMember){.member_name = "other_crate",
-                                                   .member_path = "crates/other_crate/"};
-            manifest.member_count = 2;
-        }
-
-        CBMRustLSPDef defs[2] = {0};
-        defs[0].qualified_name = "project.crates.caller_crate.handlers.dispatch";
-        defs[0].short_name = "dispatch";
-        defs[0].label = "Function";
-        defs[0].def_module_qn = "project.crates.caller_crate.handlers";
-        defs[1].qualified_name = "project.crates.other_crate.handlers.dispatch";
-        defs[1].short_name = "dispatch";
-        defs[1].label = "Function";
-        defs[1].def_module_qn = "project.crates.other_crate.handlers";
-
-        CBMArena arena;
-        cbm_arena_init(&arena);
-        CBMResolvedCallArray out = {0};
-        cbm_run_rust_lsp_cross_with_manifest(&arena, caller, (int)strlen(caller),
-                                             "project.crates.caller_crate.main", defs, 2, NULL,
-                                             NULL, 0, NULL, &manifest, &out, NULL, NULL);
-        int exact_target = 0;
-        int wrong_target = 0;
-        for (int i = 0; i < out.count; i++) {
-            const char *target = out.items[i].callee_qn;
-            if (target && strcmp(target, defs[0].qualified_name) == 0) {
-                exact_target++;
-            } else if (target && strcmp(target, defs[1].qualified_name) == 0) {
-                wrong_target++;
-            }
-        }
-        ASSERT_EQ(1, exact_target);
-        ASSERT_EQ(0, wrong_target);
-
-        memset(&out, 0, sizeof(out));
-        cbm_run_rust_lsp_cross_with_manifest(&arena, caller, (int)strlen(caller),
-                                             "project.crates.caller_crate.main", &defs[1], 1, NULL,
-                                             NULL, 0, NULL, &manifest, &out, NULL, NULL);
-        int unresolved = 0;
-        wrong_target = 0;
-        for (int i = 0; i < out.count; i++) {
-            const CBMResolvedCall *call = &out.items[i];
-            if (call->callee_qn && strcmp(call->callee_qn, defs[1].qualified_name) == 0) {
-                wrong_target++;
-            }
-            if (call->reason && strcmp(call->reason, "function_not_in_registry") == 0) {
-                unresolved++;
-            }
-        }
-        ASSERT_EQ(0, wrong_target);
-        ASSERT_EQ(1, unresolved);
-        cbm_arena_destroy(&arena);
-    }
-    PASS();
-}
 
 TEST(rustlsp_handles_empty_file) {
     CBMFileResult *r = extract_rust("// nothing here\n");
@@ -2614,410 +1514,6 @@ TEST(rustlsp_chained_method_calls) {
     ASSERT_GTE(require_resolved(r, "run", "String.new"), 0);
     ASSERT_GTE(require_resolved(r, "run", "String.to_uppercase"), 0);
     ASSERT_GTE(require_resolved(r, "run", "String.len"), 0);
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_cargo_value_receiver_generic_impl_exact_sites) {
-    const char *impl_source =
-        "struct BuildRunner<'a>(&'a ());\n"
-        "impl<'a> BuildRunner<'a> {\n"
-        "    fn dry_run(mut self) -> Result<(), ()> { self.prepare()?; Ok(()) }\n"
-        "    fn prepare(&mut self) -> Result<(), ()> { Ok(()) }\n"
-        "}\n";
-    CBMFileResult *impl_result = extract_rust(impl_source);
-    ASSERT_NOT_NULL(impl_result);
-    ASSERT_EQ(1, count_resolved_exact(impl_result, "test.src.main.BuildRunner.dry_run",
-                                      "test.src.main.BuildRunner.prepare"));
-    cbm_free_result(impl_result);
-
-    const char *caller =
-        "fn compile_ws(value: &()) -> Result<(), ()> {\n"
-        "    let build_runner = BuildRunner::new(value)?;\n"
-        "    build_runner.borrow()?.prepare()?;\n"
-        "    if true { build_runner.dry_run() } else { build_runner.compile(()) }\n"
-        "}\n";
-    CBMRustLSPDef defs[6] = {
-        {.qualified_name = "test.src.compile.BuildRunner",
-         .short_name = "BuildRunner",
-         .label = "Type",
-         .def_module_qn = "test.src.compile"},
-        {.qualified_name = "test.src.compile.BuildRunner.new",
-         .short_name = "new",
-         .label = "Method",
-         .receiver_type = "test.src.compile.BuildRunner",
-         .def_module_qn = "test.src.compile",
-         .return_types = "CargoResult<Self>"},
-        {.qualified_name = "test.src.compile.BuildRunner.dry_run",
-         .short_name = "dry_run",
-         .label = "Method",
-         .receiver_type = "test.src.compile.BuildRunner",
-         .def_module_qn = "test.src.compile"},
-        {.qualified_name = "test.src.compile.BuildRunner.compile",
-         .short_name = "compile",
-         .label = "Method",
-         .receiver_type = "test.src.compile.BuildRunner",
-         .def_module_qn = "test.src.compile"},
-        {.qualified_name = "test.src.compile.BuildRunner.borrow",
-         .short_name = "borrow",
-         .label = "Method",
-         .receiver_type = "test.src.compile.BuildRunner",
-         .def_module_qn = "test.src.compile",
-         .return_types = "CargoResult<&Self>"},
-        {.qualified_name = "test.src.compile.BuildRunner.prepare",
-         .short_name = "prepare",
-         .label = "Method",
-         .receiver_type = "test.src.compile.BuildRunner",
-         .def_module_qn = "test.src.compile"},
-    };
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross(&arena, caller, (int)strlen(caller), "test.src.compile", defs, 6, NULL,
-                           NULL, 0, NULL, &out, NULL);
-    uint32_t dry_start = (uint32_t)(strstr(caller, "build_runner.dry_run()") - caller);
-    uint32_t compile_start = (uint32_t)(strstr(caller, "build_runner.compile(())") - caller);
-    int dry_count = 0;
-    int compile_count = 0;
-    int prepare_count = 0;
-    for (int i = 0; i < out.count; i++) {
-        const CBMResolvedCall *call = &out.items[i];
-        if (!call->caller_qn || !call->callee_qn ||
-            strcmp(call->caller_qn, "test.src.compile.compile_ws") != 0)
-            continue;
-        if (strcmp(call->callee_qn, "test.src.compile.BuildRunner.dry_run") == 0 &&
-            call->site_start_byte == dry_start &&
-            call->site_end_byte == dry_start + (uint32_t)strlen("build_runner.dry_run()"))
-            dry_count++;
-        if (strcmp(call->callee_qn, "test.src.compile.BuildRunner.compile") == 0 &&
-            call->site_start_byte == compile_start &&
-            call->site_end_byte == compile_start + (uint32_t)strlen("build_runner.compile(())"))
-            compile_count++;
-        if (strcmp(call->callee_qn, "test.src.compile.BuildRunner.prepare") == 0)
-            prepare_count++;
-    }
-    ASSERT_EQ(dry_count, 1);
-    ASSERT_EQ(compile_count, 1);
-    ASSERT_EQ(prepare_count, 1);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_tokio_cfg_chain_exact_sites) {
-    const char *source = "struct Builder;\n"
-                         "impl Builder {\n"
-                         "    #[cfg(feature = \"rt-multi-thread\")]\n"
-                         "    #[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
-                         "    fn new_multi_thread() -> Builder { Builder }\n"
-                         "    fn enable_all(&mut self) -> &mut Self { self }\n"
-                         "    fn build(&mut self) -> Result<(), ()> { Ok(()) }\n"
-                         "}\n"
-                         "struct Runtime;\n"
-                         "impl Runtime {\n"
-                         "    #[cfg(feature = \"rt-multi-thread\")]\n"
-                         "    #[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
-                         "    fn new() -> Result<(), ()> {\n"
-                         "        Builder::new_multi_thread().enable_all().build()\n"
-                         "    }\n"
-                         "}\n";
-    CBMFileResult *result = extract_rust(source);
-    ASSERT_NOT_NULL(result);
-    const char *caller =
-        "test.src.main.Runtime.new#cfg(feature=rt-multi-thread)#cfg(feature=rt-multi-thread)";
-    const char *new_multi = "test.src.main.Builder.new_multi_thread#cfg(feature=rt-multi-thread)"
-                            "#cfg(feature=rt-multi-thread)";
-    const char *new_site = strstr(source, "Builder::new_multi_thread()");
-    const char *enable_site = strstr(source, "Builder::new_multi_thread().enable_all()");
-    const char *build_site = strstr(source, "Builder::new_multi_thread().enable_all().build()");
-    ASSERT_NOT_NULL(new_site);
-    ASSERT_NOT_NULL(enable_site);
-    ASSERT_NOT_NULL(build_site);
-    int exact_new = 0;
-    int exact_enable = 0;
-    int exact_build = 0;
-    for (int i = 0; i < result->resolved_calls.count; i++) {
-        const CBMResolvedCall *call = &result->resolved_calls.items[i];
-        if (!call->caller_qn || !call->callee_qn || strcmp(call->caller_qn, caller) != 0)
-            continue;
-        if (strcmp(call->callee_qn, new_multi) == 0 &&
-            call->site_start_byte == (uint32_t)(new_site - source) &&
-            call->site_end_byte ==
-                (uint32_t)(new_site - source + strlen("Builder::new_multi_thread()")))
-            exact_new++;
-        if (strcmp(call->callee_qn, "test.src.main.Builder.enable_all") == 0 &&
-            call->site_start_byte == (uint32_t)(enable_site - source) &&
-            call->site_end_byte == (uint32_t)(enable_site - source +
-                                              strlen("Builder::new_multi_thread().enable_all()")))
-            exact_enable++;
-        if (strcmp(call->callee_qn, "test.src.main.Builder.build") == 0 &&
-            call->site_start_byte == (uint32_t)(build_site - source) &&
-            call->site_end_byte ==
-                (uint32_t)(build_site - source +
-                           strlen("Builder::new_multi_thread().enable_all().build()")))
-            exact_build++;
-    }
-    ASSERT_EQ(exact_new, 1);
-    ASSERT_EQ(exact_enable, 1);
-    ASSERT_EQ(exact_build, 1);
-
-    const CBMCall *new_carrier = NULL;
-    for (int i = 0; i < result->calls.count; i++) {
-        const CBMCall *call = &result->calls.items[i];
-        if (call->site_start_byte == (uint32_t)(new_site - source) &&
-            call->site_end_byte ==
-                (uint32_t)(new_site - source + strlen("Builder::new_multi_thread()"))) {
-            new_carrier = call;
-            break;
-        }
-    }
-    ASSERT_NOT_NULL(new_carrier);
-    const CBMResolvedCall *joined =
-        cbm_pipeline_find_lsp_resolution(&result->resolved_calls, new_carrier, false);
-    ASSERT_NOT_NULL(joined);
-    ASSERT_STR_EQ(joined->callee_qn, new_multi);
-
-    /* Mechanism-impossible control: the cfg suffix may be ignored only for the
-     * exact source occurrence, never by a nearby/legacy name-only join. */
-    CBMCall wrong_site = *new_carrier;
-    wrong_site.site_end_byte++;
-    ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, &wrong_site, false));
-
-    cbm_free_result(result);
-
-    /* Tokio imports Builder through a project macro, so tree-sitter exposes no
-     * use_declaration. The explicit receiver plus one current-crate target is
-     * still authoritative; a second same-leaf receiver makes it impossible. */
-    const char *cross_source = "cfg_rt_multi_thread! { use crate::runtime::Builder; }\n"
-                               "struct Runtime;\n"
-                               "impl Runtime {\n"
-                               "#[cfg(feature = \"rt-multi-thread\")]\n"
-                               "#[cfg_attr(docsrs, doc(cfg(feature = \"rt-multi-thread\")))]\n"
-                               "fn new() -> Result<(), ()> {\n"
-                               "Builder::new_multi_thread().enable_all().build()\n"
-                               "}\n}\n";
-    CBMRustLSPDef cross_defs[4] = {
-        {.qualified_name = new_multi,
-         .short_name = "new_multi_thread",
-         .label = "Method",
-         .receiver_type = "test.src.builder.Builder",
-         .def_module_qn = "test.src.builder",
-         .return_types = "Builder"},
-        {.qualified_name = "test.src.builder.Builder.enable_all",
-         .short_name = "enable_all",
-         .label = "Method",
-         .receiver_type = "test.src.builder.Builder",
-         .def_module_qn = "test.src.builder",
-         .return_types = "&mut Self"},
-        {.qualified_name = "test.src.builder.Builder.build",
-         .short_name = "build",
-         .label = "Method",
-         .receiver_type = "test.src.builder.Builder",
-         .def_module_qn = "test.src.builder"},
-        {.qualified_name = "test.src.builder.Builder",
-         .short_name = "Builder",
-         .label = "Type",
-         .def_module_qn = "test.src.builder"},
-    };
-    /* Replace local-test QNs with the cross-file identities used above. */
-    cross_defs[0].qualified_name =
-        "test.src.builder.Builder.new_multi_thread#cfg(feature=rt-multi-thread)"
-        "#cfg(feature=rt-multi-thread)";
-    CBMArena cross_arena;
-    cbm_arena_init(&cross_arena);
-    CBMResolvedCallArray cross_out = {0};
-    cbm_run_rust_lsp_cross(&cross_arena, cross_source, (int)strlen(cross_source),
-                           "test.src.runtime", cross_defs, 4, NULL, NULL, 0, NULL, &cross_out,
-                           NULL);
-    CBMFileResult cross_result = {.resolved_calls = cross_out};
-    ASSERT_EQ(count_resolved_exact(&cross_result,
-                                   "test.src.runtime.Runtime.new#cfg(feature=rt-multi-thread)"
-                                   "#cfg(feature=rt-multi-thread)",
-                                   cross_defs[0].qualified_name),
-              1);
-    cbm_arena_destroy(&cross_arena);
-
-    CBMRustLSPDef ambiguous_defs[5];
-    memcpy(ambiguous_defs, cross_defs, sizeof(cross_defs));
-    ambiguous_defs[4] = (CBMRustLSPDef){
-        .qualified_name = "test.src.other.Builder.new_multi_thread#cfg(feature=rt-multi-thread)",
-        .short_name = "new_multi_thread",
-        .label = "Method",
-        .receiver_type = "test.src.other.Builder",
-        .def_module_qn = "test.src.other",
-        .return_types = "Builder"};
-    CBMArena ambiguous_arena;
-    cbm_arena_init(&ambiguous_arena);
-    CBMResolvedCallArray ambiguous_out = {0};
-    cbm_run_rust_lsp_cross(&ambiguous_arena, cross_source, (int)strlen(cross_source),
-                           "test.src.runtime", ambiguous_defs, 5, NULL, NULL, 0, NULL,
-                           &ambiguous_out, NULL);
-    CBMFileResult ambiguous_result = {.resolved_calls = ambiguous_out};
-    ASSERT_EQ(count_resolved_exact(&ambiguous_result,
-                                   "test.src.runtime.Runtime.new#cfg(feature=rt-multi-thread)"
-                                   "#cfg(feature=rt-multi-thread)",
-                                   cross_defs[0].qualified_name),
-              0);
-    cbm_arena_destroy(&ambiguous_arena);
-    PASS();
-}
-
-TEST(rustlsp_auth_shadow_initializer_precedes_binding_with_explicit_pattern_type) {
-    const char *source = "struct Auth;\n"
-                         "impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
-                         "struct AppServerArgs { auth: Auth }\n"
-                         "fn unknown<T>() -> T { panic!() }\n"
-                         "fn run() -> Result<(), ()> {\n"
-                         "  let AppServerArgs { auth } = unknown();\n"
-                         "  let auth = auth.try_into_settings()?;\n"
-                         "  Ok(auth)\n"
-                         "}\n";
-    CBMFileResult *r = extract_rust(source);
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(1,
-              count_resolved_exact(r, "test.src.main.run", "test.src.main.Auth.try_into_settings"));
-    const char *auth_site = strstr(source, "auth.try_into_settings()");
-    ASSERT_NOT_NULL(auth_site);
-    ASSERT_EQ(1, count_resolved_exact_site(
-                     r, "test.src.main.run", "test.src.main.Auth.try_into_settings",
-                     (uint32_t)(auth_site - source),
-                     (uint32_t)(auth_site - source + strlen("auth.try_into_settings()"))));
-    cbm_free_result(r);
-
-    const char *typed_shadow =
-        "struct Auth;\n"
-        "impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
-        "fn unknown<T>() -> T { panic!() }\n"
-        "fn run() -> Result<(), ()> {\n"
-        "  let auth: Auth = unknown();\n"
-        "  let auth = auth.try_into_settings()?;\n"
-        "  Ok(auth)\n"
-        "}\n";
-    r = extract_rust(typed_shadow);
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(1,
-              count_resolved_exact(r, "test.src.main.run", "test.src.main.Auth.try_into_settings"));
-    cbm_free_result(r);
-
-    const char *pattern_without_shadow =
-        "struct Auth;\n"
-        "impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
-        "struct AppServerArgs { auth: Auth }\n"
-        "fn unknown<T>() -> T { panic!() }\n"
-        "fn run() -> Result<(), ()> {\n"
-        "  let AppServerArgs { auth } = unknown();\n"
-        "  let settings = auth.try_into_settings()?;\n"
-        "  Ok(settings)\n"
-        "}\n";
-    r = extract_rust(pattern_without_shadow);
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(1,
-              count_resolved_exact(r, "test.src.main.run", "test.src.main.Auth.try_into_settings"));
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_let_else_alternative_uses_outer_binding) {
-    const char *source = "struct Auth;\n"
-                         "impl Auth { fn try_into_settings(self) -> Result<(), ()> { Ok(()) } }\n"
-                         "struct Other;\n"
-                         "fn none<T>() -> Option<T> { None }\n"
-                         "fn run(auth: Auth) -> Result<(), ()> {\n"
-                         "  let Some(auth): Option<Other> = none() else {\n"
-                         "    auth.try_into_settings()?;\n"
-                         "    return Ok(());\n"
-                         "  };\n"
-                         "  Ok(())\n"
-                         "}\n";
-    CBMFileResult *r = extract_rust(source);
-    ASSERT_NOT_NULL(r);
-    const char *site = strstr(source, "auth.try_into_settings()");
-    ASSERT_NOT_NULL(site);
-    ASSERT_EQ(1, count_resolved_exact_site(
-                     r, "test.src.main.run", "test.src.main.Auth.try_into_settings",
-                     (uint32_t)(site - source),
-                     (uint32_t)(site - source + strlen("auth.try_into_settings()"))));
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_cfg_twin_local_struct_fields_block_registry_in_both_routes) {
-    const char *source = "struct Good; impl Good { fn convert(self) {} }\n"
-                         "struct Bad; impl Bad { fn convert(self) {} }\n"
-                         "#[cfg(feature = \"a\")] struct Args { auth: Good }\n"
-                         "#[cfg(not(feature = \"a\"))] struct Args { auth: Bad }\n"
-                         "fn unknown<T>() -> T { panic!() }\n"
-                         "fn run() { let Args { auth } = unknown(); auth.convert(); }\n";
-    CBMFileResult *single = extract_rust(source);
-    ASSERT_NOT_NULL(single);
-    ASSERT_EQ(0, count_resolved_exact(single, "test.src.main.run", "test.src.main.Good.convert"));
-    ASSERT_EQ(0, count_resolved_exact(single, "test.src.main.run", "test.src.main.Bad.convert"));
-    cbm_free_result(single);
-
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMRustLSPDef defs[6] = {
-        {.qualified_name = "test.src.main.Good",
-         .short_name = "Good",
-         .label = "Type",
-         .def_module_qn = "test.src.main"},
-        {.qualified_name = "test.src.main.Good.convert",
-         .short_name = "convert",
-         .label = "Method",
-         .receiver_type = "test.src.main.Good",
-         .def_module_qn = "test.src.main"},
-        {.qualified_name = "test.src.main.Bad",
-         .short_name = "Bad",
-         .label = "Type",
-         .def_module_qn = "test.src.main"},
-        {.qualified_name = "test.src.main.Bad.convert",
-         .short_name = "convert",
-         .label = "Method",
-         .receiver_type = "test.src.main.Bad",
-         .def_module_qn = "test.src.main"},
-        {.qualified_name = "test.src.main.Args",
-         .short_name = "Args",
-         .label = "Type",
-         .def_module_qn = "test.src.main",
-         .field_defs = "auth:Good"},
-        {.qualified_name = "test.src.main.unknown",
-         .short_name = "unknown",
-         .label = "Function",
-         .def_module_qn = "test.src.main",
-         .return_types = "T"},
-    };
-    CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross(&arena, source, (int)strlen(source), "test.src.main", defs, 6, NULL,
-                           NULL, 0, NULL, &out, NULL);
-    ASSERT_EQ(0,
-              count_resolved_array_exact(&out, "test.src.main.run", "test.src.main.Good.convert"));
-    ASSERT_EQ(0,
-              count_resolved_array_exact(&out, "test.src.main.run", "test.src.main.Bad.convert"));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_exact_associated_callable_value_accepts_receiver_and_rejects_decoy) {
-    const char *source =
-        "struct LoaderOverrides;\n"
-        "impl LoaderOverrides { fn with_managed_config_path_for_tests() {} }\n"
-        "struct Decoy; impl Decoy { fn with_managed_config_path_for_tests() {} }\n"
-        "fn consume(_: fn()) {}\n"
-        "fn run() { consume(LoaderOverrides::with_managed_config_path_for_tests); }\n";
-    CBMFileResult *r = extract_rust(source);
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(1, count_resolved_exact(
-                     r, "test.src.main.run",
-                     "test.src.main.LoaderOverrides.with_managed_config_path_for_tests"));
-    const char *loader_site = strstr(source, "LoaderOverrides::with_managed_config_path_for_tests");
-    ASSERT_NOT_NULL(loader_site);
-    ASSERT_EQ(1, count_resolved_exact_site(
-                     r, "test.src.main.run",
-                     "test.src.main.LoaderOverrides.with_managed_config_path_for_tests",
-                     (uint32_t)(loader_site - source),
-                     (uint32_t)(loader_site - source +
-                                strlen("LoaderOverrides::with_managed_config_path_for_tests"))));
-    ASSERT_EQ(0, count_resolved_exact(r, "test.src.main.run",
-                                      "test.src.main.Decoy.with_managed_config_path_for_tests"));
     cbm_free_result(r);
     PASS();
 }
@@ -5935,8 +4431,7 @@ TEST(rustlsp_cov_xf_two_methods) {
     defs[2].short_name = "beta";  defs[2].label = "Method"; defs[2].receiver_type = "p.demo.Thing"; defs[2].def_module_qn = "p.demo";
     const char *imp_n[] = {"demo"}; const char *imp_q[] = {"p::demo"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out);
     ASSERT_GTE(find_confident(&out, "run", "Thing.alpha"), 0);
     ASSERT_GTE(find_confident(&out, "run", "Thing.beta"), 0);
     cbm_arena_destroy(&a); PASS();
@@ -5956,8 +4451,7 @@ TEST(rustlsp_cov_xf_trait_impl) {
     defs[2].def_module_qn = "p.demo";
     const char *imp_n[] = {"demo"}; const char *imp_q[] = {"p::demo"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out);
     ASSERT_GTE(find_confident(&out, "run", "Foo.beep"), 0);
     cbm_arena_destroy(&a); PASS();
 }
@@ -5971,8 +4465,7 @@ TEST(rustlsp_cov_xf_free_function_chain) {
     defs[0].return_types = "alloc.string.String";
     const char *imp_n[] = {"util"}; const char *imp_q[] = {"p::util"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out);
     ASSERT_GTE(find_confident(&out, "run", "util.make"), 0);
     cbm_arena_destroy(&a); PASS();
 }
@@ -5994,8 +4487,7 @@ TEST(rustlsp_cov_xf_empty_defs) {
     const char *src = "fn run() {}\n";
     CBMArena a; cbm_arena_init(&a);
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", NULL, 0, NULL, NULL, 0, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", NULL, 0, NULL, NULL, 0, NULL, &out);
     cbm_arena_destroy(&a); PASS();
 }
 TEST(rustlsp_cov_xf_nested_modules) {
@@ -6006,8 +4498,7 @@ TEST(rustlsp_cov_xf_nested_modules) {
     defs[0].qualified_name = "p.a.b.c.deep";
     defs[0].short_name = "deep"; defs[0].label = "Function"; defs[0].def_module_qn = "p.a.b.c";
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, NULL, NULL, 0, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, NULL, NULL, 0, NULL, &out);
     cbm_arena_destroy(&a); PASS();
 }
 TEST(rustlsp_cov_xf_with_stdlib_chain) {
@@ -6023,8 +4514,7 @@ TEST(rustlsp_cov_xf_with_stdlib_chain) {
     defs[0].field_defs = "contents:String";
     const char *imp_n[] = {"demo"}; const char *imp_q[] = {"p::demo"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out);
     cbm_arena_destroy(&a); PASS();
 }
 TEST(rustlsp_cov_xf_with_def_and_method) {
@@ -6037,8 +4527,7 @@ TEST(rustlsp_cov_xf_with_def_and_method) {
     defs[0].return_types = "()";
     const char *imp_n[] = {"utils"}; const char *imp_q[] = {"p::utils"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 1, imp_n, imp_q, 1, NULL, &out);
     ASSERT_GTE(find_confident(&out, "run", "utils.work"), 0);
     cbm_arena_destroy(&a); PASS();
 }
@@ -6056,8 +4545,7 @@ TEST(rustlsp_cov_xf_caller_with_let) {
     defs[2].short_name = "use_it"; defs[2].label = "Method"; defs[2].receiver_type = "p.util.Thing"; defs[2].def_module_qn = "p.util";
     const char *imp_n[] = {"util"}; const char *imp_q[] = {"p::util"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out);
     ASSERT_GTE(find_confident(&out, "run", "make_thing"), 0);
     ASSERT_GTE(find_confident(&out, "run", "Thing.use_it"), 0);
     cbm_arena_destroy(&a); PASS();
@@ -6066,8 +4554,7 @@ TEST(rustlsp_cov_xf_no_imports) {
     const char *src = "fn run() {}\n";
     CBMArena a; cbm_arena_init(&a);
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", NULL, 0, NULL, NULL, 0, NULL,
-                           &out, NULL);
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", NULL, 0, NULL, NULL, 0, NULL, &out);
     cbm_arena_destroy(&a); PASS();
 }
 
@@ -6976,181 +5463,6 @@ TEST(rustlsp_gap_macro_rule_with_call_inside) {
     cbm_free_result(r); PASS();
 }
 
-TEST(rustlsp_macro_item_expansion_emits_callable_and_call_edge) {
-    CBMFileResult *r = extract_rust(
-        "fn target() {}\n"
-        "macro_rules! define_callable { () => { fn generated() { target(); } } }\n"
-        "define_callable!();\n");
-    ASSERT_NOT_NULL(r);
-    const CBMDefinition *generated = NULL;
-    for (int i = 0; i < r->defs.count; i++) {
-        if (r->defs.items[i].qualified_name &&
-            strcmp(r->defs.items[i].qualified_name, "test.src.main.generated") == 0) {
-            generated = &r->defs.items[i];
-            break;
-        }
-    }
-    ASSERT_NOT_NULL(generated);
-    ASSERT_STR_EQ(generated->label, "Function");
-    ASSERT_EQ(count_resolved_exact(r, "test.src.main.generated", "test.src.main.target"), 1);
-
-    const CBMResolvedCall *edge = NULL;
-    for (int i = 0; i < r->calls.count; i++) {
-        const CBMCall *call = &r->calls.items[i];
-        if (call->enclosing_func_qn &&
-            strcmp(call->enclosing_func_qn, "test.src.main.generated") == 0) {
-            edge = cbm_pipeline_find_lsp_resolution(&r->resolved_calls, call, false);
-            if (edge && strcmp(edge->callee_qn, "test.src.main.target") == 0)
-                break;
-            edge = NULL;
-        }
-    }
-    ASSERT_NOT_NULL(edge);
-    cbm_free_result(r); PASS();
-}
-
-TEST(rustlsp_macro_single_level_repetition_expands_each_iteration) {
-    /* Single-level `$(...)+` producing one impl per iteration, each with a
-     * method calling a shared free function. Mirrors the real
-     * impl_seq_addressed_transport_wire! shape. Before repetition binding, the
-     * body expanded once (or not at all) and the per-iteration methods and
-     * their call edges were absent. */
-    CBMFileResult *r = extract_rust(
-        "fn refuse() {}\n"
-        "struct Alpha; struct Beta; struct Gamma;\n"
-        "trait Wire { fn check(&self); }\n"
-        "macro_rules! impl_wire {\n"
-        "    ($($t:ty),+ $(,)?) => {\n"
-        "        $(impl Wire for $t {\n"
-        "            fn check(&self) { refuse(); }\n"
-        "        })+\n"
-        "    };\n"
-        "}\n"
-        "impl_wire!(Alpha, Beta, Gamma);\n");
-    ASSERT_NOT_NULL(r);
-
-    /* Each generated `check` method must exist as a callable and carry a CALLS
-     * edge to `refuse`. */
-    int check_methods = 0;
-    for (int i = 0; i < r->defs.count; i++) {
-        if (r->defs.items[i].qualified_name &&
-            strstr(r->defs.items[i].qualified_name, ".check") &&
-            r->defs.items[i].label && strcmp(r->defs.items[i].label, "Method") == 0)
-            check_methods++;
-    }
-    ASSERT_GTE(check_methods, 3);
-
-    int refuse_edges = 0;
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
-        if (rc->callee_qn && strcmp(rc->callee_qn, "test.src.main.refuse") == 0)
-            refuse_edges++;
-    }
-    ASSERT_GTE(refuse_edges, 3);
-    cbm_free_result(r); PASS();
-}
-
-TEST(rustlsp_macro_repetition_two_metavars_with_inner_separator) {
-    /* Exact shape of impl_seq_addressed_transport_wire!: two metavars per
-     * iteration separated by a literal `=>`, with the second metavar used inside
-     * a path expression (`Kind::$kind`). */
-    CBMFileResult *r = extract_rust(
-        "enum Kind { Reason, Adr, Issue }\n"
-        "fn refuse(_k: Kind) {}\n"
-        "struct ReasonWire; struct AdrWire; struct IssueWire;\n"
-        "trait Wire { fn validate(&self); }\n"
-        "macro_rules! impl_wire {\n"
-        "    ($($t:ty => $k:ident),+ $(,)?) => {\n"
-        "        $(impl Wire for $t {\n"
-        "            fn validate(&self) { refuse(Kind::$k); }\n"
-        "        })+\n"
-        "    };\n"
-        "}\n"
-        "impl_wire!(ReasonWire => Reason, AdrWire => Adr, IssueWire => Issue,);\n");
-    ASSERT_NOT_NULL(r);
-    int validate_methods = 0;
-    for (int i = 0; i < r->defs.count; i++) {
-        if (r->defs.items[i].qualified_name &&
-            strstr(r->defs.items[i].qualified_name, ".validate") &&
-            r->defs.items[i].label && strcmp(r->defs.items[i].label, "Method") == 0)
-            validate_methods++;
-    }
-    ASSERT_GTE(validate_methods, 3);
-    int refuse_edges = 0;
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
-        if (rc->callee_qn && strcmp(rc->callee_qn, "test.src.main.refuse") == 0)
-            refuse_edges++;
-    }
-    ASSERT_GTE(refuse_edges, 3);
-    cbm_free_result(r); PASS();
-}
-
-TEST(rustlsp_macro_string_enum_nested_repetition_emits_enum_and_methods) {
-    /* Reduced shape of pm's string_enum! (crates/pm-core/src/entity/string_enum.rs):
-     * a `$vis:vis enum` header, a separator-less outer `+` variant list whose
-     * inner pattern carries nested `$(#[$m:meta])*` and `$( | $alias:literal )*`
-     * sub-repetitions, and a transcriber whose impls reference `$crate`. Every
-     * one of those four shapes independently defeated the bounded expander, so
-     * the generated enum and its inherent methods produced no callable node.
-     * Each must now be emitted. */
-    CBMFileResult *r = extract_rust(
-        "fn sink(_s: &str) {}\n"
-        "macro_rules! string_enum {\n"
-        "    (\n"
-        "        $vis:vis enum $name:ident {\n"
-        "            $(\n"
-        "                $(#[$vmeta:meta])*\n"
-        "                $variant:ident => $canonical:literal $( | $alias:literal )* $(,)?\n"
-        "            )+\n"
-        "        }\n"
-        "    ) => {\n"
-        "        $vis enum $name { $( $variant, )+ }\n"
-        "        impl $name {\n"
-        "            pub fn token(&self) -> &'static str {\n"
-        "                let s: &str = $crate::pick();\n"
-        "                sink(s);\n"
-        "                match self { $( Self::$variant => $canonical, )+ }\n"
-        "            }\n"
-        "        }\n"
-        "    };\n"
-        "}\n"
-        "string_enum! {\n"
-        "    pub enum Status {\n"
-        "        Draft => \"draft\",\n"
-        "        Open => \"open\" | \"opened\",\n"
-        "        Closed => \"closed\",\n"
-        "    }\n"
-        "}\n");
-    ASSERT_NOT_NULL(r);
-
-    /* The generated enum must exist as a callable-owning definition. */
-    int status_enum = 0;
-    int token_method = 0;
-    for (int i = 0; i < r->defs.count; i++) {
-        const char *qn = r->defs.items[i].qualified_name;
-        const char *label = r->defs.items[i].label;
-        if (!qn || !label)
-            continue;
-        if (strstr(qn, "Status") && strcmp(label, "Enum") == 0)
-            status_enum++;
-        if (strstr(qn, ".token") && strcmp(label, "Method") == 0)
-            token_method++;
-    }
-    ASSERT_GTE(status_enum, 1);
-    ASSERT_GTE(token_method, 1);
-
-    /* The call `sink(s)` inside the generated method body must resolve. */
-    int sink_edges = 0;
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
-        if (rc->callee_qn && strcmp(rc->callee_qn, "test.src.main.sink") == 0)
-            sink_edges++;
-    }
-    ASSERT_GTE(sink_edges, 1);
-    cbm_free_result(r); PASS();
-}
-
 TEST(rustlsp_gap_macro_substitute_call) {
     CBMFileResult *r = extract_rust(
         "fn target(x: i32) -> i32 { x }\n"
@@ -7319,48 +5631,12 @@ TEST(rustlsp_gap_macro_with_ty_and_expr) {
     cbm_free_result(r); PASS();
 }
 
-TEST(rustlsp_gap_macro_no_match_is_fail_closed) {
-    const char *source = "fn unmatched_arm_sentinel() {}\n"
-                         "macro_rules! one_arm { (expected) => { unmatched_arm_sentinel() } }\n"
-                         "fn run() { one_arm!(unexpected); }\n";
-    CBMFileResult *r = extract_rust(source);
+TEST(rustlsp_gap_macro_no_match_falls_through) {
+    /* Macro with one rule but called with mismatched args — not a crash. */
+    CBMFileResult *r = extract_rust(
+        "macro_rules! one_arg { ($x:expr) => { $x } }\n"
+        "fn run() -> i32 { one_arg!(1) }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_EQ(count_resolved_exact(r, "test.src.main.run", "test.src.main.unmatched_arm_sentinel"),
-              0);
-    const char *site = strstr(source, "one_arm!(unexpected)");
-    ASSERT_NOT_NULL(site);
-    const CBMRustHealthIssue *issue = &r->rust_health.issues[CBM_RUST_HEALTH_MACRO_NO_RULE_MATCH];
-    ASSERT_EQ(1, issue->count);
-    ASSERT_EQ((uint32_t)(site - source), issue->first_start_byte);
-    ASSERT_EQ((uint32_t)(site - source + strlen("one_arm!(unexpected)")), issue->first_end_byte);
-    ASSERT_EQ(1, r->rust_health.unresolved_emitted);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&r->rust_health));
-    bool exact_unresolved = false;
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall *call = &r->resolved_calls.items[i];
-        if (call->callee_qn && strcmp(call->callee_qn, "one_arm") == 0 && call->reason &&
-            strcmp(call->reason, "macro_no_rule_match") == 0 && call->confidence == 0.0f &&
-            call->site_start_byte == issue->first_start_byte &&
-            call->site_end_byte == issue->first_end_byte) {
-            exact_unresolved = true;
-        }
-    }
-    ASSERT_TRUE(exact_unresolved);
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(rustlsp_gap_macro_later_matching_arm_only) {
-    CBMFileResult *r = extract_rust("fn first_arm_sentinel() {}\n"
-                                    "fn selected_later_arm() {}\n"
-                                    "macro_rules! choose {\n"
-                                    "    (first) => { first_arm_sentinel() };\n"
-                                    "    (second) => { selected_later_arm() };\n"
-                                    "}\n"
-                                    "fn run() { choose!(second); }\n");
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(count_resolved_exact(r, "test.src.main.run", "test.src.main.selected_later_arm"), 1);
-    ASSERT_EQ(count_resolved_exact(r, "test.src.main.run", "test.src.main.first_arm_sentinel"), 0);
     cbm_free_result(r); PASS();
 }
 
@@ -8076,44 +6352,6 @@ TEST(rustlsp_partial_cargo_parses_workspace) {
     PASS();
 }
 
-TEST(rustlsp_cargo_parses_typed_explicit_targets) {
-    const char *toml = "[package]\nname = \"routes\"\nversion = \"0.1.0\"\n"
-                       "[lib]\npath = \"engine/lib_entry.rs\"\n"
-                       "[[bin]]\nname = \"worker\"\npath = \"apps/worker_entry.rs\"\n"
-                       "[[bin]]\nname = \"admin\"\npath = \"apps/admin_entry.rs\"\n";
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-    ASSERT_EQ(manifest.target_count, 3);
-    ASSERT_EQ(manifest.targets[0].kind, CBM_CARGO_TARGET_LIB);
-    ASSERT_STR_EQ(manifest.targets[0].source_path, "engine/lib_entry.rs");
-    ASSERT_EQ(manifest.targets[1].kind, CBM_CARGO_TARGET_BIN);
-    ASSERT_STR_EQ(manifest.targets[1].source_path, "apps/worker_entry.rs");
-    ASSERT_EQ(manifest.targets[2].kind, CBM_CARGO_TARGET_BIN);
-    ASSERT_STR_EQ(manifest.targets[2].source_path, "apps/admin_entry.rs");
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_target_allocation_failure_marks_inventory_incomplete) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    size_t saved_used = arena.used;
-    int saved_nblocks = arena.nblocks;
-    arena.used = arena.block_size;
-    arena.nblocks = CBM_ARENA_MAX_BLOCKS;
-    CBMCargoManifest manifest = {.targets_complete = true};
-    ASSERT_FALSE(cbm_cargo_add_routed_target(&arena, &manifest, CBM_CARGO_TARGET_LIB, "broken",
-                                             "pkg", "pkg/src/lib.rs", NULL));
-    ASSERT_FALSE(manifest.targets_complete);
-    ASSERT_EQ(manifest.target_count, 0);
-    arena.used = saved_used;
-    arena.nblocks = saved_nblocks;
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
 TEST(rustlsp_partial_cargo_handles_comments_and_quirks) {
     CBMArena a; cbm_arena_init(&a);
     const char *toml =
@@ -8135,798 +6373,6 @@ TEST(rustlsp_partial_cargo_handles_comments_and_quirks) {
     ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "log"));
     ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "anyhow"));
     cbm_arena_destroy(&a);
-    PASS();
-}
-
-TEST(rustlsp_cargo_accepts_rust_analyzer_inline_boolean_fixture) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    const char *toml =
-        "[workspace.dependencies]\n"
-        "ra-ap-rustc_lexer = { version = \"0.166\", default-features = false }\n"
-        "ra-ap-rustc_parse_format = { version = \"0.166\", default-features = false }\n"
-        "salsa = { version = \"0.28.2\", default-features = false, features = [\n"
-        "    \"rayon\",\n"
-        "    \"macros\",\n"
-        "] }\n";
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-
-    ASSERT_EQ(3, manifest.dep_count);
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "ra-ap-rustc_lexer"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "ra-ap-rustc_parse_format"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "salsa"));
-    ASSERT_EQ(0, manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL].count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&manifest.health));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_accepts_cargo_dotted_key_and_multiline_string_fixture) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    const char *toml = "[ \"package\" ]\n"
-                       "name = \"cargo-\\x66ixture\"\n"
-                       "edition.workspace = true\n"
-                       "license.workspace = true\n"
-                       "description = \"\"\"\n"
-                       "Cargo, a package manager for Rust.\n"
-                       "\"\"\"\n"
-                       "[ workspace ]\n"
-                       "members = [\"crates/\\u0061\", \"crates/\\e\", \"crates/\\xE9\"]\n"
-                       "[package.metadata.\"x]................................................"
-                       ".................................................................%%%\"]\n"
-                       "ignored = true\n"
-                       "[ \"dependencies\" ]\n"
-                       "\"serde\\u005fjson\" = \"1\"\n"
-                       "[ \"dependencies.fake\" ]\n"
-                       "path = \"../must-not-route\"\n"
-                       "[dependencies.local-subtable]\n"
-                       "path = \"../local\"\n"
-                       "[dev-dependencies]\n"
-                       "ordinary-dev = \"1\"\n"
-                       "[dev-dependencies.dev-subtable]\n"
-                       "path = \"../dev-subtable\"\n"
-                       "[build-dependencies.build-subtable]\n"
-                       "path = \"../build-subtable\"\n"
-                       "[ workspace . dependencies . workspace-subtable ]\n"
-                       "path = \"../workspace-subtable\"\n"
-                       "[ target . 'cfg(unix)' . dev-dependencies ]\n"
-                       "libc.workspace = true\n"
-                       "[target.'cfg(target_os = \"linux\")'.dependencies]\n"
-                       "cargo-credential-libsecret.workspace = true\n"
-                       "[target.'cfg(windows)'.dependencies.windows-sys]\n"
-                       "workspace = true\n"
-                       "features = [\"Win32_Foundation\"]\n"
-                       "[target.x86_64-pc-windows-msvc.build-dependencies]\n"
-                       "target-build-only = \"1\"\n"
-                       "[target.x86_64-pc-windows-msvc.dev-dependencies.target-dev-subtable]\n"
-                       "path = \"../target-dev-subtable\"\n"
-                       "[target.x86_64-pc-windows-msvc.build-dependencies.target-build-subtable]\n"
-                       "path = \"../target-build-subtable\"\n"
-                       "[build-dependencies]\n"
-                       "build-only = \"1\"\n"
-                       "[[ example ]]\n"
-                       "name = \"escaped-fixture\"\n"
-                       "path = \"examples/escaped.rs\"\n"
-                       "[[test]]\n"
-                       "name = \"integration\"\n"
-                       "path = \"tests/integration.rs\"\n"
-                       "[[bench]]\n"
-                       "name = \"speed\"\n"
-                       "path = \"benches/speed.rs\"\n";
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-
-    ASSERT_STR_EQ("cargo-fixture", manifest.package_name);
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "libc"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "cargo-credential-libsecret"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "windows-sys"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "serde_json"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "workspace-subtable"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "target-build-only"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "build-only"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "ordinary-dev"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "dev-subtable"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "build-subtable"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "target-dev-subtable"));
-    ASSERT_TRUE(cbm_cargo_is_known_dep(&manifest, "target-build-subtable"));
-    ASSERT_FALSE(cbm_cargo_is_known_dep(&manifest, "fake"));
-    ASSERT_EQ(3, manifest.member_count);
-    ASSERT_STR_EQ("crates/a", manifest.members[0].member_path);
-    ASSERT_STR_EQ("crates/\x1b", manifest.members[1].member_path);
-    ASSERT_STR_EQ("crates/\xC3\xA9", manifest.members[2].member_path);
-    ASSERT_EQ(3, manifest.target_count);
-    ASSERT_EQ(CBM_CARGO_TARGET_EXAMPLE, manifest.targets[0].kind);
-    ASSERT_EQ(CBM_CARGO_TARGET_TEST, manifest.targets[1].kind);
-    ASSERT_EQ(CBM_CARGO_TARGET_BENCH, manifest.targets[2].kind);
-    bool found_local_path = false;
-    for (int i = 0; i < manifest.dep_count; i++) {
-        if (manifest.deps[i].name && strcmp(manifest.deps[i].name, "local-subtable") == 0 &&
-            manifest.deps[i].path && strcmp(manifest.deps[i].path, "../local") == 0) {
-            found_local_path = true;
-        }
-    }
-    ASSERT_TRUE(found_local_path);
-    ASSERT_EQ(0, manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL].count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&manifest.health));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_unterminated_inline_table_remains_partial) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    const char *toml = "[dependencies]\n"
-                       "broken = { version = \"1\", default-features = false\n";
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-
-    const CBMRustHealthIssue *issue =
-        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL];
-    ASSERT_EQ(1, issue->count);
-    ASSERT_EQ((uint32_t)(strstr(toml, "broken") - toml), issue->first_start_byte);
-    ASSERT_EQ((uint32_t)strlen(toml), issue->first_end_byte);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_malformed_header_and_inline_field_remain_partial) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    const char *toml = "[dependencies\n"
-                       "later = [\"not-a-header-close\"]\n"
-                       "[dependencies]\n"
-                       "broken = { path \"../local\" }\n";
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-
-    const CBMRustHealthIssue *issue =
-        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL];
-    ASSERT_GTE(issue->count, 2);
-    ASSERT_EQ(0, issue->first_start_byte);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_parser_allocation_loss_is_not_complete) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    cbm_arena_test_fail_after(&arena, 0);
-    const char *toml = "[package]\nname = \"lost\"\n[dependencies]\nserde = \"1\"\n";
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-
-    ASSERT_EQ(CBM_ARENA_STATUS_ALLOCATION_UNAVAILABLE, cbm_arena_status(&arena));
-    ASSERT_EQ(1, manifest.health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
-    ASSERT_FALSE(manifest.targets_complete);
-    ASSERT_TRUE(cbm_rust_health_status(&manifest.health) != CBM_RUST_ANALYSIS_COMPLETE);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_rejects_newline_assignment_and_invalid_unicode) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    const char *toml = "[dependencies]\n"
-                       "serde\n"
-                       "= \"1\"\n"
-                       "\"bad\\uD800\" = \"1\"\n";
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-
-    ASSERT_FALSE(cbm_cargo_is_known_dep(&manifest, "serde"));
-    ASSERT_GTE(manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL].count, 2);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_ignored_section_rejects_newline_assignment) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    const char *toml = "[package.metadata.tool]\n"
-                       "key\n"
-                       "= \"value\"\n";
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-
-    ASSERT_GTE(manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL].count, 1);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_health_status_is_derived_from_routes_and_issues) {
-    CBMRustAnalysisHealth health = {0};
-    health.required_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE | CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&health));
-
-    health.completed_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
-    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&health));
-
-    health.completed_routes |= CBM_RUST_HEALTH_ROUTE_CROSS_FILE;
-    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&health));
-
-    cbm_rust_health_record(&health, CBM_RUST_HEALTH_WORK_LIMIT, 41, 73);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&health));
-    PASS();
-}
-
-TEST(rustlsp_allocation_loss_reason_is_stable_and_route_incomplete) {
-    const char *source = "fn target() {}\nfn run() { target(); }\n";
-    CBMFileResult *result = extract_rust(source);
-    ASSERT_NOT_NULL(result);
-    ASSERT_NOT_NULL(result->cached_tree);
-    TSNode root = ts_tree_root_node(result->cached_tree);
-    memset(&result->rust_health, 0, sizeof(result->rust_health));
-
-    cbm_arena_test_fail_after(&result->arena, 0);
-    ASSERT_NULL(cbm_arena_strdup(&result->arena, "force allocation loss"));
-    cbm_run_rust_lsp(&result->arena, result, source, (int)strlen(source), root);
-
-    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(result));
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.required_routes);
-    ASSERT_EQ(0, result->rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_SINGLE_FILE);
-    ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
-    ASSERT_STR_EQ("allocation_unavailable",
-                  cbm_rust_health_reason_name(CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE));
-    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&result->rust_health));
-
-    cbm_free_result(result);
-    PASS();
-}
-
-TEST(rustlsp_impl_return_allocation_fails_inside_resolver_without_crash) {
-    const char *source = "struct Builder;\n"
-                         "impl Builder { fn make() -> Self { Builder } }\n"
-                         "fn run() { Builder::make(); }\n";
-    CBMFileResult *result = extract_rust(source);
-    ASSERT_NOT_NULL(result);
-    ASSERT_NOT_NULL(result->cached_tree);
-    TSNode root = ts_tree_root_node(result->cached_tree);
-    memset(&result->rust_health, 0, sizeof(result->rust_health));
-
-    cbm_arena_test_fail_class(&result->arena, CBM_ARENA_ALLOCATION_RUST_IMPL_RETURN);
-    cbm_run_rust_lsp(&result->arena, result, source, (int)strlen(source), root);
-
-    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(result));
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.required_routes);
-    ASSERT_EQ(0, result->rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_SINGLE_FILE);
-    ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&result->rust_health));
-
-    cbm_free_result(result);
-    PASS();
-}
-
-static int assert_rustlsp_local_registry_allocation_class_fails(
-    const char *source, CBMArenaAllocationClass allocation_class) {
-    CBMFileResult *result = extract_rust(source);
-    ASSERT_NOT_NULL(result);
-    ASSERT_NOT_NULL(result->cached_tree);
-    TSNode root = ts_tree_root_node(result->cached_tree);
-    memset(&result->rust_health, 0, sizeof(result->rust_health));
-
-    cbm_arena_test_fail_class(&result->arena, allocation_class);
-    cbm_run_rust_lsp(&result->arena, result, source, (int)strlen(source), root);
-
-    ASSERT_EQ(CBM_FILE_STATUS_ALLOCATION_UNAVAILABLE, cbm_file_result_status(result));
-    ASSERT_EQ(0, result->rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_SINGLE_FILE);
-    ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
-    cbm_free_result(result);
-    return 0;
-}
-
-TEST(rustlsp_definition_return_allocation_fails_without_null_dereference) {
-    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
-                     "struct Builder;\nfn make() -> Builder { Builder }\nfn run() { make(); }\n",
-                     CBM_ARENA_ALLOCATION_RUST_DEFINITION_RETURN));
-    PASS();
-}
-
-TEST(rustlsp_grouped_use_prefix_allocation_fails_without_null_dereference) {
-    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
-                     "pub struct A; pub struct B;\n"
-                     "use crate::{A, B};\n"
-                     "fn run() {}\n",
-                     CBM_ARENA_ALLOCATION_RUST_GROUPED_USE_PREFIX));
-    PASS();
-}
-
-TEST(rustlsp_grouped_use_body_allocation_fails_without_null_dereference) {
-    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
-                     "pub struct A; pub struct B;\n"
-                     "use crate::{A, B};\n"
-                     "fn run() {}\n",
-                     CBM_ARENA_ALLOCATION_RUST_GROUPED_USE_BODY));
-    PASS();
-}
-
-TEST(rustlsp_grouped_use_inline_comment_preserves_complete_named_leaves) {
-    CBMFileResult *result = extract_rust(
-        "use crate::runtime::{Builder, /* keep the grouped carrier exact */ Runtime};\n");
-    ASSERT_NOT_NULL(result);
-    ASSERT_EQ(CBM_RUST_CARRIER_COMPLETE, result->rust_imports_status);
-    int builder = 0;
-    int runtime = 0;
-    for (int i = 0; i < result->imports.count; i++) {
-        const CBMImport *import = &result->imports.items[i];
-        if (import->local_name && import->module_path &&
-            strcmp(import->local_name, "Builder") == 0 &&
-            strcmp(import->module_path, "crate::runtime::Builder") == 0)
-            builder++;
-        if (import->local_name && import->module_path &&
-            strcmp(import->local_name, "Runtime") == 0 &&
-            strcmp(import->module_path, "crate::runtime::Runtime") == 0)
-            runtime++;
-    }
-    ASSERT_EQ(1, builder);
-    ASSERT_EQ(1, runtime);
-    cbm_free_result(result);
-    PASS();
-}
-
-TEST(rustlsp_ast_return_patch_allocation_fails_without_null_dereference) {
-    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
-                     "struct Builder;\nfn make() -> Builder { Builder }\nfn run() { make(); }\n",
-                     CBM_ARENA_ALLOCATION_RUST_AST_RETURN_PATCH));
-    PASS();
-}
-
-TEST(rustlsp_derive_embedded_allocation_fails_without_null_dereference) {
-    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
-                     "#[derive(Clone)]\nstruct Builder;\nfn run(b: Builder) { b.clone(); }\n",
-                     CBM_ARENA_ALLOCATION_RUST_DERIVE_EMBEDDED));
-    PASS();
-}
-
-TEST(rustlsp_derive_return_allocation_fails_without_null_dereference) {
-    ASSERT_EQ(0, assert_rustlsp_local_registry_allocation_class_fails(
-                     "#[derive(Clone)]\nstruct Builder;\nfn run(b: Builder) { b.clone(); }\n",
-                     CBM_ARENA_ALLOCATION_RUST_DERIVE_RETURN));
-    PASS();
-}
-
-static int assert_rustlsp_cross_return_allocation_fails_without_null_dereference(
-    CBMArenaAllocationClass allocation_class) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMLSPDef def = {
-        .qualified_name = "test.lib.make",
-        .short_name = "make",
-        .label = "Function",
-        .def_module_qn = "test.lib",
-        .return_types = "test.lib.Builder",
-    };
-
-    cbm_arena_test_fail_class(&arena, allocation_class);
-    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, &def, 1);
-
-    ASSERT_NOT_NULL(registry);
-    ASSERT_EQ(CBM_ARENA_STATUS_ALLOCATION_UNAVAILABLE, cbm_arena_status(&arena));
-
-    cbm_arena_destroy(&arena);
-    return 0;
-}
-
-TEST(rustlsp_cross_return_array_allocation_fails_without_null_dereference) {
-    ASSERT_EQ(0, assert_rustlsp_cross_return_allocation_fails_without_null_dereference(
-                     CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_ARRAY));
-    PASS();
-}
-
-TEST(rustlsp_cross_return_buffer_allocation_fails_without_null_dereference) {
-    ASSERT_EQ(0, assert_rustlsp_cross_return_allocation_fails_without_null_dereference(
-                     CBM_ARENA_ALLOCATION_RUST_CROSS_RETURN_BUFFER));
-    PASS();
-}
-
-TEST(rustlsp_late_allocation_loss_revokes_completed_route_at_file_boundary) {
-    CBMFileResult result = {0};
-    cbm_arena_init(&result.arena);
-    result.rust_health.required_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
-    result.rust_health.completed_routes = CBM_RUST_HEALTH_ROUTE_SINGLE_FILE;
-
-    cbm_arena_test_fail_after(&result.arena, 0);
-    ASSERT_NULL(cbm_arena_strdup(&result.arena, "late loss"));
-    cbm_file_result_test_finalize_allocation(&result, CBM_LANG_RUST);
-
-    ASSERT_EQ(0, result.rust_health.completed_routes & CBM_RUST_HEALTH_ROUTE_SINGLE_FILE);
-    ASSERT_EQ(1, result.rust_health.issues[CBM_RUST_HEALTH_ALLOCATION_UNAVAILABLE].count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&result.rust_health));
-
-    cbm_arena_destroy(&result.arena);
-    PASS();
-}
-
-TEST(rustlsp_health_healthy_file_completes_and_counts_emissions) {
-    CBMFileResult *result = extract_rust("fn target() {}\n"
-                                         "fn run() { target(); missing(); }\n");
-    ASSERT_NOT_NULL(result);
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.required_routes);
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.completed_routes);
-    ASSERT_EQ(1, result->rust_health.resolved_emitted);
-    ASSERT_EQ(1, result->rust_health.unresolved_emitted);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&result->rust_health));
-    for (int reason = 0; reason < CBM_RUST_HEALTH_REASON_COUNT; reason++) {
-        ASSERT_EQ(0, result->rust_health.issues[reason].count);
-    }
-    ASSERT_EQ(1, count_resolved_exact(result, "test.src.main.run", "test.src.main.target"));
-    cbm_free_result(result);
-    PASS();
-}
-
-TEST(rustlsp_health_parse_error_is_partial_with_first_parser_span) {
-    const char *source = "fn ok() {}\nfn broken( {\n";
-    CBMFileResult *result = extract_rust(source);
-    ASSERT_NOT_NULL(result);
-    const CBMRustHealthIssue *issue =
-        &result->rust_health.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED];
-    ASSERT_EQ(1, issue->count);
-    ASSERT_EQ((uint32_t)(strstr(source, "fn broken") - source), issue->first_start_byte);
-    ASSERT_EQ((uint32_t)strlen(source) - 1U, issue->first_end_byte);
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_SINGLE_FILE, result->rust_health.completed_routes);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&result->rust_health));
-    cbm_free_result(result);
-    PASS();
-}
-
-TEST(rustlsp_health_walk_and_work_limits_report_omitted_subtrees) {
-    const char *source = "fn target() {}\nfn run() { target(); }\n";
-    CBMFileResult *shallow = extract_rust_with_limits(source, -1, -1, 1, -1, -1, -1);
-    ASSERT_NOT_NULL(shallow);
-    const CBMRustHealthIssue *walk = &shallow->rust_health.issues[CBM_RUST_HEALTH_WALK_DEPTH_LIMIT];
-    ASSERT_TRUE(walk->count > 0);
-    ASSERT_TRUE(walk->first_end_byte > walk->first_start_byte);
-    ASSERT_EQ(0, count_resolved_exact(shallow, "test.src.main.run", "test.src.main.target"));
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&shallow->rust_health));
-    cbm_free_result(shallow);
-
-    CBMFileResult *deep = extract_rust_with_limits(source, -1, -1, 64, -1, -1, -1);
-    ASSERT_NOT_NULL(deep);
-    ASSERT_EQ(0, deep->rust_health.issues[CBM_RUST_HEALTH_WALK_DEPTH_LIMIT].count);
-    ASSERT_EQ(1, count_resolved_exact(deep, "test.src.main.run", "test.src.main.target"));
-    cbm_free_result(deep);
-
-    CBMFileResult *starved = extract_rust_with_limits(source, -1, -1, -1, 0, -1, -1);
-    ASSERT_NOT_NULL(starved);
-    const CBMRustHealthIssue *work = &starved->rust_health.issues[CBM_RUST_HEALTH_WORK_LIMIT];
-    ASSERT_EQ(1, work->count);
-    ASSERT_TRUE(work->first_end_byte > work->first_start_byte);
-    ASSERT_EQ(0, count_resolved_exact(starved, "test.src.main.run", "test.src.main.target"));
-    cbm_free_result(starved);
-
-    CBMFileResult *funded = extract_rust_with_limits(source, -1, -1, -1, 100, -1, -1);
-    ASSERT_NOT_NULL(funded);
-    ASSERT_EQ(0, funded->rust_health.issues[CBM_RUST_HEALTH_WORK_LIMIT].count);
-    ASSERT_EQ(1, count_resolved_exact(funded, "test.src.main.run", "test.src.main.target"));
-    cbm_free_result(funded);
-    PASS();
-}
-
-TEST(rustlsp_health_type_and_eval_limits_report_exact_omissions) {
-    const char *source = "fn run(value: String) { value.len(); }\n";
-    CBMFileResult *limited = extract_rust_with_limits(source, 0, 0, -1, -1, -1, -1);
-    ASSERT_NOT_NULL(limited);
-    const CBMRustHealthIssue *type_issue =
-        &limited->rust_health.issues[CBM_RUST_HEALTH_TYPE_DEPTH_LIMIT];
-    const CBMRustHealthIssue *eval_issue =
-        &limited->rust_health.issues[CBM_RUST_HEALTH_EVAL_DEPTH_LIMIT];
-    ASSERT_TRUE(type_issue->count > 0);
-    ASSERT_TRUE(type_issue->first_end_byte > type_issue->first_start_byte);
-    ASSERT_TRUE(eval_issue->count > 0);
-    ASSERT_TRUE(eval_issue->first_end_byte > eval_issue->first_start_byte);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&limited->rust_health));
-    cbm_free_result(limited);
-
-    CBMFileResult *control = extract_rust_with_limits(source, 64, 64, -1, -1, -1, -1);
-    ASSERT_NOT_NULL(control);
-    ASSERT_EQ(0, control->rust_health.issues[CBM_RUST_HEALTH_TYPE_DEPTH_LIMIT].count);
-    ASSERT_EQ(0, control->rust_health.issues[CBM_RUST_HEALTH_EVAL_DEPTH_LIMIT].count);
-    ASSERT_TRUE(find_resolved(control, "run", "String.len") >= 0 ||
-                find_resolved(control, "run", "len") >= 0);
-    cbm_free_result(control);
-    PASS();
-}
-
-TEST(rustlsp_health_macro_binding_and_repetition_caps_are_occurrence_scoped) {
-    const char *depth_source = "fn depth_sentinel() {}\n"
-                               "macro_rules! invoke { () => { depth_sentinel() } }\n"
-                               "fn run() { invoke!(); }\n";
-    CBMFileResult *depth_limited = extract_rust_with_limits(depth_source, -1, -1, -1, -1, 0, -1);
-    ASSERT_NOT_NULL(depth_limited);
-    const char *depth_site = strstr(depth_source, "invoke!()");
-    ASSERT_NOT_NULL(depth_site);
-    const CBMRustHealthIssue *depth_issue =
-        &depth_limited->rust_health.issues[CBM_RUST_HEALTH_MACRO_DEPTH_LIMIT];
-    ASSERT_EQ(1, depth_issue->count);
-    ASSERT_EQ((uint32_t)(depth_site - depth_source), depth_issue->first_start_byte);
-    ASSERT_EQ(0, count_resolved_exact(depth_limited, "test.src.main.run",
-                                      "test.src.main.depth_sentinel"));
-    cbm_free_result(depth_limited);
-
-    CBMFileResult *depth_control = extract_rust_with_limits(depth_source, -1, -1, -1, -1, 8, -1);
-    ASSERT_NOT_NULL(depth_control);
-    ASSERT_EQ(0, depth_control->rust_health.issues[CBM_RUST_HEALTH_MACRO_DEPTH_LIMIT].count);
-    ASSERT_EQ(1, count_resolved_exact(depth_control, "test.src.main.run",
-                                      "test.src.main.depth_sentinel"));
-    cbm_free_result(depth_control);
-
-    const char *parse_source = "macro_rules! broken { () => { let = ; } }\n"
-                               "fn run() { broken!(); }\n";
-    CBMFileResult *parse_failed = extract_rust(parse_source);
-    ASSERT_NOT_NULL(parse_failed);
-    const char *parse_site = strstr(parse_source, "broken!()");
-    ASSERT_NOT_NULL(parse_site);
-    const CBMRustHealthIssue *parse_issue =
-        &parse_failed->rust_health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED];
-    ASSERT_EQ(1, parse_issue->count);
-    ASSERT_EQ((uint32_t)(parse_site - parse_source), parse_issue->first_start_byte);
-    ASSERT_EQ((uint32_t)(parse_site - parse_source + strlen("broken!()")),
-              parse_issue->first_end_byte);
-    cbm_free_result(parse_failed);
-
-    const char *binding_source = "fn sentinel() {}\n"
-                                 "macro_rules! pair { ($a:expr, $b:expr) => { sentinel() } }\n"
-                                 "fn run() { pair!(1, 2); }\n";
-    CBMFileResult *binding = extract_rust_with_limits(binding_source, -1, -1, -1, -1, -1, 1);
-    ASSERT_NOT_NULL(binding);
-    const char *binding_site = strstr(binding_source, "pair!(1, 2)");
-    ASSERT_NOT_NULL(binding_site);
-    const CBMRustHealthIssue *binding_issue =
-        &binding->rust_health.issues[CBM_RUST_HEALTH_MACRO_BINDING_LIMIT];
-    ASSERT_EQ(1, binding_issue->count);
-    ASSERT_EQ((uint32_t)(binding_site - binding_source), binding_issue->first_start_byte);
-    ASSERT_EQ(0, count_resolved_exact(binding, "test.src.main.run", "test.src.main.sentinel"));
-    cbm_free_result(binding);
-
-    const char *repeat_source = "macro_rules! many { ($($x:expr),*) => { $(consume($x);)* } }\n"
-                                "fn consume(_: i32) {}\n"
-                                "fn run() { many!(1, 2); }\n";
-    CBMFileResult *repeat = extract_rust(repeat_source);
-    ASSERT_NOT_NULL(repeat);
-    const CBMRustHealthIssue *repeat_issue =
-        &repeat->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT];
-    ASSERT_EQ(0, repeat_issue->count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&repeat->rust_health));
-    cbm_free_result(repeat);
-    PASS();
-}
-
-TEST(rustlsp_complex_repetition_pattern_is_not_reported_as_unmatched_rust) {
-    const char *source = "macro_rules! declare { ($(#[$meta:meta])* $name:ident) => { "
-                         "$(#[$meta])* struct $name; } }\n"
-                         "declare! { #[derive(Clone)] Record }\n";
-    CBMFileResult *result = extract_rust(source);
-    ASSERT_NOT_NULL(result);
-    ASSERT_EQ(0, result->rust_health.issues[CBM_RUST_HEALTH_MACRO_NO_RULE_MATCH].count);
-    ASSERT_EQ(0, result->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT].count);
-    ASSERT_EQ(0, result->rust_health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&result->rust_health));
-    cbm_free_result(result);
-    PASS();
-}
-
-TEST(rustlsp_health_macro_repetition_and_substitution_reasons_are_truthful) {
-    const char *literal_source =
-        "fn consume() {}\n"
-        "macro_rules! literal { () => {{ let _ = \"$(\"; /* $( is data */ consume() }} }\n"
-        "fn run() { literal!(); }\n";
-    CBMFileResult *literal = extract_rust(literal_source);
-    ASSERT_NOT_NULL(literal);
-    ASSERT_EQ(0, literal->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT].count);
-    ASSERT_EQ(0, literal->rust_health.issues[CBM_RUST_HEALTH_MACRO_SUBSTITUTION_LIMIT].count);
-    ASSERT_EQ(0, literal->rust_health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&literal->rust_health));
-    cbm_free_result(literal);
-
-    const char *prefix = "fn consume(_: &str) {}\n"
-                         "macro_rules! pass { ($x:expr) => { consume($x) } }\n"
-                         "fn run() { pass!(\"";
-    const char *suffix = "\"); }\n";
-    size_t payload_len = 6000;
-    size_t source_len = strlen(prefix) + payload_len + strlen(suffix);
-    char *source = (char *)malloc(source_len + 1);
-    ASSERT_NOT_NULL(source);
-    size_t used = strlen(prefix);
-    memcpy(source, prefix, used);
-    memset(source + used, 'x', payload_len);
-    used += payload_len;
-    memcpy(source + used, suffix, strlen(suffix) + 1);
-
-    CBMFileResult *truncated = extract_rust(source);
-    ASSERT_NOT_NULL(truncated);
-    const char *site = strstr(source, "pass!(");
-    ASSERT_NOT_NULL(site);
-    const CBMRustHealthIssue *substitution =
-        &truncated->rust_health.issues[CBM_RUST_HEALTH_MACRO_SUBSTITUTION_LIMIT];
-    ASSERT_EQ(1, substitution->count);
-    ASSERT_EQ((uint32_t)(site - source), substitution->first_start_byte);
-    ASSERT_EQ(0, truncated->rust_health.issues[CBM_RUST_HEALTH_MACRO_REPETITION_LIMIT].count);
-    cbm_free_result(truncated);
-    free(source);
-    PASS();
-}
-
-TEST(rustlsp_cross_health_is_explicit_and_survives_parse_degradation) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMResolvedCallArray output = {0};
-    CBMRustAnalysisHealth health = {0};
-    const char *source = "fn broken( {\n";
-    cbm_run_rust_lsp_cross_with_manifest(&arena, source, (int)strlen(source), "test.main", NULL, 0,
-                                         NULL, NULL, 0, NULL, NULL, &output, NULL, &health);
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.required_routes);
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.completed_routes);
-    ASSERT_EQ(1, health.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&health));
-
-    memset(&output, 0, sizeof(output));
-    memset(&health, 0, sizeof(health));
-    const char *healthy_source = "fn run() {}\n";
-    cbm_run_rust_lsp_cross_with_manifest(&arena, healthy_source, (int)strlen(healthy_source),
-                                         "test.main", NULL, 0, NULL, NULL, 0, NULL, NULL, &output,
-                                         NULL, &health);
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.required_routes);
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.completed_routes);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_COMPLETE, cbm_rust_health_status(&health));
-
-    memset(&health, 0, sizeof(health));
-    cbm_run_rust_lsp_cross_with_manifest(&arena, NULL, 0, "test.main", NULL, 0, NULL, NULL, 0, NULL,
-                                         NULL, &output, NULL, &health);
-    ASSERT_EQ(CBM_RUST_HEALTH_ROUTE_CROSS_FILE, health.required_routes);
-    ASSERT_EQ(0, health.completed_routes);
-    ASSERT_EQ(1, health.issues[CBM_RUST_HEALTH_SOURCE_UNAVAILABLE].count);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_FAILED, cbm_rust_health_status(&health));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_parse_health_is_idempotent_across_single_and_cross_routes) {
-    const char *fixtures[] = {
-        "---\n"
-        "-\n"
-        "---\n"
-        "1\n",
-        "---cargo\n"
-        "//~^ ERROR: unclosed frontmatter\n"
-        "\n"
-        "//@ compile-flags: --crate-type lib\n"
-        "\n"
-        "#![feature(frontmatter)]\n"
-        "\n"
-        "fn foo(x: i32) -> i32 {\n"
-        "    ---x\n"
-        "     //~^ WARNING: use of a double negation [double_negations]\n"
-        "}\n"
-        "\n"
-        "// this test is for the weird case that valid Rust code can have three dashes\n"
-        "// within them and get treated as a frontmatter close.\n",
-        "----cargo\n"
-        "//~^ ERROR: unclosed frontmatter\n"
-        "//~| ERROR: frontmatters are experimental\n"
-        "\n"
-        "// Similarly, a use statement should allow for recovery as well (as\n"
-        "// per unclosed-1.rs)\n"
-        "\n"
-        "use std::env;\n"
-        "\n"
-        "fn main() {}\n",
-    };
-
-    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
-        const char *source = fixtures[i];
-        CBMFileResult *result = extract_rust(source);
-        ASSERT_NOT_NULL(result);
-        ASSERT_NOT_NULL(result->cached_tree);
-        ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count);
-
-        CBMArena arena;
-        cbm_arena_init(&arena);
-        CBMResolvedCallArray output = {0};
-        CBMRustAnalysisHealth cross_only = {0};
-        cbm_run_rust_lsp_cross_with_manifest(&arena, source, (int)strlen(source), "test.main", NULL,
-                                             0, NULL, NULL, 0, result->cached_tree, NULL, &output,
-                                             NULL, &cross_only);
-        ASSERT_EQ(1, cross_only.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count);
-
-        memset(&output, 0, sizeof(output));
-        cbm_run_rust_lsp_cross_with_manifest(&arena, source, (int)strlen(source), "test.main", NULL,
-                                             0, NULL, NULL, 0, result->cached_tree, NULL, &output,
-                                             NULL, &result->rust_health);
-        ASSERT_EQ(1, result->rust_health.issues[CBM_RUST_HEALTH_PARSER_PARSE_FAILED].count);
-        cbm_arena_destroy(&arena);
-        cbm_free_result(result);
-    }
-    PASS();
-}
-
-TEST(rustlsp_health_record_retains_first_span_and_saturates) {
-    CBMRustAnalysisHealth health = {0};
-    cbm_rust_health_record(&health, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, 12, 19);
-    cbm_rust_health_record(&health, CBM_RUST_HEALTH_MACRO_PARSE_FAILED, 50, 61);
-    ASSERT_EQ(2, health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].count);
-    ASSERT_EQ(12, health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].first_start_byte);
-    ASSERT_EQ(19, health.issues[CBM_RUST_HEALTH_MACRO_PARSE_FAILED].first_end_byte);
-
-    health.issues[CBM_RUST_HEALTH_WORK_LIMIT].count = UINT32_MAX;
-    cbm_rust_health_record(&health, CBM_RUST_HEALTH_WORK_LIMIT, 70, 80);
-    ASSERT_EQ(UINT32_MAX, health.issues[CBM_RUST_HEALTH_WORK_LIMIT].count);
-    PASS();
-}
-
-TEST(rustlsp_cargo_malformed_input_records_first_exact_span) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    const char *toml = "[package]\nname = \"unterminated";
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, (int)strlen(toml), &manifest);
-
-    const CBMRustHealthIssue *issue =
-        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_PARSE_PARTIAL];
-    const char *quote = strchr(toml, '"');
-    ASSERT_NOT_NULL(quote);
-    ASSERT_EQ(1, issue->count);
-    ASSERT_EQ((uint32_t)(quote - toml), issue->first_start_byte);
-    ASSERT_EQ((uint32_t)strlen(toml), issue->first_end_byte);
-    ASSERT_EQ(CBM_RUST_ANALYSIS_PARTIAL, cbm_rust_health_status(&manifest.health));
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_dependency_cap_records_each_dropped_entry) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    char toml[16384];
-    int used = snprintf(toml, sizeof(toml), "[dependencies]\n");
-    uint32_t first_dropped = 0;
-    for (int i = 0; i < CBM_CARGO_MAX_DEPS + 2; i++) {
-        if (i == CBM_CARGO_MAX_DEPS)
-            first_dropped = (uint32_t)used;
-        used += snprintf(toml + used, sizeof(toml) - (size_t)used, "dep_%03d = \"1\"\n", i);
-    }
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, used, &manifest);
-
-    const CBMRustHealthIssue *issue = &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_DEP_LIMIT];
-    ASSERT_EQ(CBM_CARGO_MAX_DEPS, manifest.dep_count);
-    ASSERT_EQ(2, issue->count);
-    ASSERT_EQ(first_dropped, issue->first_start_byte);
-    ASSERT_TRUE(issue->first_end_byte > issue->first_start_byte);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
-TEST(rustlsp_cargo_member_cap_records_each_dropped_entry) {
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    size_t toml_cap = (size_t)(CBM_CARGO_MAX_MEMBERS + 2) * 32U + 64U;
-    char *toml = malloc(toml_cap);
-    ASSERT_NOT_NULL(toml);
-    int used = snprintf(toml, toml_cap, "[workspace]\nmembers = [");
-    uint32_t first_dropped = 0;
-    for (int i = 0; i < CBM_CARGO_MAX_MEMBERS + 2; i++) {
-        if (i > 0)
-            used += snprintf(toml + used, toml_cap - (size_t)used, ", ");
-        if (i == CBM_CARGO_MAX_MEMBERS)
-            first_dropped = (uint32_t)used;
-        used += snprintf(toml + used, toml_cap - (size_t)used, "\"crates/member_%03d\"", i);
-    }
-    used += snprintf(toml + used, toml_cap - (size_t)used, "]\n");
-    CBMCargoManifest manifest;
-    cbm_cargo_parse(&arena, toml, used, &manifest);
-
-    const CBMRustHealthIssue *issue =
-        &manifest.health.issues[CBM_RUST_HEALTH_MANIFEST_MEMBER_LIMIT];
-    ASSERT_EQ(CBM_CARGO_MAX_MEMBERS, manifest.member_count);
-    ASSERT_EQ(2, issue->count);
-    ASSERT_EQ(first_dropped, issue->first_start_byte);
-    ASSERT_TRUE(issue->first_end_byte > issue->first_start_byte);
-    free(toml);
-    cbm_arena_destroy(&arena);
     PASS();
 }
 
@@ -9022,7 +6468,7 @@ TEST(rustlsp_extra_cargo_wires_workspace_member) {
     memset(&r->resolved_calls, 0, sizeof(r->resolved_calls));
     cbm_run_rust_lsp_with_manifest(&scratch, r, src, (int)strlen(src),
         r->cached_tree ? ts_tree_root_node(r->cached_tree) : (TSNode){0},
-        &m, NULL);
+        &m);
 
     /* engine::boot should resolve via the workspace member name. */
     bool found_engine_call = false;
@@ -9059,7 +6505,7 @@ TEST(rustlsp_extra_cargo_wires_external_dep) {
     memset(&r->resolved_calls, 0, sizeof(r->resolved_calls));
     cbm_run_rust_lsp_with_manifest(&scratch, r, src, (int)strlen(src),
         r->cached_tree ? ts_tree_root_node(r->cached_tree) : (TSNode){0},
-        &m, NULL);
+        &m);
 
     bool routed = false;
     for (int i = 0; i < r->resolved_calls.count; i++) {
@@ -9322,11 +6768,6 @@ void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
     RUN_TEST(rustlsp_two_free_functions);
-    RUN_TEST(rustlsp_cfg_module_caller_qn_matches_extraction);
-    RUN_TEST(rustlsp_nested_function_owns_its_calls);
-    RUN_TEST(rustlsp_nested_function_resolves_outer_call);
-    RUN_TEST(rustlsp_wildcard_let_retains_function_value);
-    RUN_TEST(rustlsp_trait_default_method_owns_its_calls);
 
     /* Inherent impl */
     RUN_TEST(rustlsp_struct_method_dispatch);
@@ -9359,8 +6800,6 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_println_macro);
     RUN_TEST(rustlsp_vec_macro_with_inner_call);
     RUN_TEST(rustlsp_format_returns_string);
-    RUN_TEST(rustlsp_static_macro_table_records_function_value_usage);
-    RUN_TEST(rustlsp_macro_table_ignores_opaque_token_contents);
 
     /* Stdlib semantics */
     RUN_TEST(rustlsp_hashmap_insert_get);
@@ -9372,12 +6811,7 @@ void suite_rust_lsp(void) {
 
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
-    RUN_TEST(rustlsp_crossfile_crate_import_factory_chain_exact_site);
-    RUN_TEST(rustlsp_crossfile_relative_use_roots_canonicalize);
-    RUN_TEST(rustlsp_crossfile_rooted_impl_returns_require_authoritative_crate_root);
-    RUN_TEST(rustlsp_manifest_free_self_super_returns_preserve_module_semantics);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
-    RUN_TEST(rustlsp_shared_registry_scoped_path_beats_local_same_name);
     RUN_TEST(rustlsp_relative_type_requires_declared_module);
     RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);
     RUN_TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier);
@@ -9394,17 +6828,6 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_nested_macro_rules_call_does_not_inherit_outer_site_map);
     RUN_TEST(rustlsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(rustlsp_crossfile_free_function);
-    RUN_TEST(rustlsp_cargo_routed_syntactic_import_survives_authoritative_blocker);
-    RUN_TEST(rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy);
-    RUN_TEST(rustlsp_cargo_route_resolves_preserved_source_import);
-    RUN_TEST(rustlsp_cargo_route_keeps_authoritative_empty_import_blocked);
-    RUN_TEST(rustlsp_cargo_route_rejects_conflicting_caller_routes);
-    RUN_TEST(rustlsp_cargo_route_rejects_target_package_prefix_decoy);
-    RUN_TEST(rustlsp_cargo_route_rejects_ambiguous_complete_source_suffix);
-    RUN_TEST(rustlsp_cargo_route_resolves_reexported_bare_import);
-    RUN_TEST(rustlsp_cargo_route_resolves_module_alias_qualified_call);
-    RUN_TEST(rustlsp_crossfile_qualified_fallback_selects_same_crate_with_decoy);
-    RUN_TEST(rustlsp_crossfile_workspace_member_patterns_stay_crate_scoped);
 
     /* Robustness */
     RUN_TEST(rustlsp_handles_empty_file);
@@ -9418,12 +6841,6 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_disambiguates_two_impls_same_method);
     RUN_TEST(rustlsp_method_after_string_from);
     RUN_TEST(rustlsp_chained_method_calls);
-    RUN_TEST(rustlsp_cargo_value_receiver_generic_impl_exact_sites);
-    RUN_TEST(rustlsp_tokio_cfg_chain_exact_sites);
-    RUN_TEST(rustlsp_auth_shadow_initializer_precedes_binding_with_explicit_pattern_type);
-    RUN_TEST(rustlsp_let_else_alternative_uses_outer_binding);
-    RUN_TEST(rustlsp_cfg_twin_local_struct_fields_block_registry_in_both_routes);
-    RUN_TEST(rustlsp_exact_associated_callable_value_accepts_receiver_and_rejects_decoy);
     RUN_TEST(rustlsp_box_constructor);
     RUN_TEST(rustlsp_arc_clone);
     RUN_TEST(rustlsp_iterator_filter_collect);
@@ -9846,10 +7263,6 @@ void suite_rust_lsp(void) {
     /* Cov §W: macro_rules! expander */
     RUN_TEST(rustlsp_gap_macro_simple_rule);
     RUN_TEST(rustlsp_gap_macro_rule_with_call_inside);
-    RUN_TEST(rustlsp_macro_item_expansion_emits_callable_and_call_edge);
-    RUN_TEST(rustlsp_macro_single_level_repetition_expands_each_iteration);
-    RUN_TEST(rustlsp_macro_repetition_two_metavars_with_inner_separator);
-    RUN_TEST(rustlsp_macro_string_enum_nested_repetition_emits_enum_and_methods);
     RUN_TEST(rustlsp_gap_macro_substitute_call);
     RUN_TEST(rustlsp_gap_macro_substitute_method_call);
     RUN_TEST(rustlsp_gap_macro_repetition);
@@ -9867,8 +7280,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_macro_emit_struct);
     RUN_TEST(rustlsp_gap_macro_define_macro_via_macro);
     RUN_TEST(rustlsp_gap_macro_with_ty_and_expr);
-    RUN_TEST(rustlsp_gap_macro_no_match_is_fail_closed);
-    RUN_TEST(rustlsp_gap_macro_later_matching_arm_only);
+    RUN_TEST(rustlsp_gap_macro_no_match_falls_through);
 
     /* Cov §X: mod foo; file linking */
     RUN_TEST(rustlsp_gap_mod_decl_recorded);
@@ -9957,42 +7369,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_partial_hrtb_stripped);
     RUN_TEST(rustlsp_partial_cargo_parses_simple);
     RUN_TEST(rustlsp_partial_cargo_parses_workspace);
-    RUN_TEST(rustlsp_cargo_parses_typed_explicit_targets);
-    RUN_TEST(rustlsp_cargo_target_allocation_failure_marks_inventory_incomplete);
     RUN_TEST(rustlsp_partial_cargo_handles_comments_and_quirks);
-    RUN_TEST(rustlsp_cargo_accepts_rust_analyzer_inline_boolean_fixture);
-    RUN_TEST(rustlsp_cargo_accepts_cargo_dotted_key_and_multiline_string_fixture);
-    RUN_TEST(rustlsp_cargo_unterminated_inline_table_remains_partial);
-    RUN_TEST(rustlsp_cargo_malformed_header_and_inline_field_remain_partial);
-    RUN_TEST(rustlsp_cargo_parser_allocation_loss_is_not_complete);
-    RUN_TEST(rustlsp_cargo_rejects_newline_assignment_and_invalid_unicode);
-    RUN_TEST(rustlsp_cargo_ignored_section_rejects_newline_assignment);
-    RUN_TEST(rustlsp_health_status_is_derived_from_routes_and_issues);
-    RUN_TEST(rustlsp_allocation_loss_reason_is_stable_and_route_incomplete);
-    RUN_TEST(rustlsp_impl_return_allocation_fails_inside_resolver_without_crash);
-    RUN_TEST(rustlsp_definition_return_allocation_fails_without_null_dereference);
-    RUN_TEST(rustlsp_grouped_use_prefix_allocation_fails_without_null_dereference);
-    RUN_TEST(rustlsp_grouped_use_body_allocation_fails_without_null_dereference);
-    RUN_TEST(rustlsp_grouped_use_inline_comment_preserves_complete_named_leaves);
-    RUN_TEST(rustlsp_ast_return_patch_allocation_fails_without_null_dereference);
-    RUN_TEST(rustlsp_derive_embedded_allocation_fails_without_null_dereference);
-    RUN_TEST(rustlsp_derive_return_allocation_fails_without_null_dereference);
-    RUN_TEST(rustlsp_cross_return_array_allocation_fails_without_null_dereference);
-    RUN_TEST(rustlsp_cross_return_buffer_allocation_fails_without_null_dereference);
-    RUN_TEST(rustlsp_late_allocation_loss_revokes_completed_route_at_file_boundary);
-    RUN_TEST(rustlsp_health_healthy_file_completes_and_counts_emissions);
-    RUN_TEST(rustlsp_health_parse_error_is_partial_with_first_parser_span);
-    RUN_TEST(rustlsp_health_walk_and_work_limits_report_omitted_subtrees);
-    RUN_TEST(rustlsp_health_type_and_eval_limits_report_exact_omissions);
-    RUN_TEST(rustlsp_health_macro_binding_and_repetition_caps_are_occurrence_scoped);
-    RUN_TEST(rustlsp_complex_repetition_pattern_is_not_reported_as_unmatched_rust);
-    RUN_TEST(rustlsp_health_macro_repetition_and_substitution_reasons_are_truthful);
-    RUN_TEST(rustlsp_cross_health_is_explicit_and_survives_parse_degradation);
-    RUN_TEST(rustlsp_parse_health_is_idempotent_across_single_and_cross_routes);
-    RUN_TEST(rustlsp_health_record_retains_first_span_and_saturates);
-    RUN_TEST(rustlsp_cargo_malformed_input_records_first_exact_span);
-    RUN_TEST(rustlsp_cargo_dependency_cap_records_each_dropped_entry);
-    RUN_TEST(rustlsp_cargo_member_cap_records_each_dropped_entry);
     RUN_TEST(rustlsp_partial_chalk_lite_clone_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_display_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_multi_bound);

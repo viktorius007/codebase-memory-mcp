@@ -58,16 +58,6 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
                   -I$(CBM_DIR) -I$(TS_INCLUDE)
 
-# Native source coverage is opt-in and orthogonal to the sanitizer and
-# production feature sets.  Keeping the instrumentation in one variable makes
-# every test translation unit (including C++, the grammar objects, and the LSP
-# unity object) use the same mapping format and puts the matching runtime on the
-# test link.  Production flags intentionally never reference this variable.
-COVERAGE_FLAGS :=
-ifeq ($(COVERAGE),1)
-COVERAGE_FLAGS := -fprofile-instr-generate -fcoverage-mapping -fno-omit-frame-pointer
-endif
-
 # Test seams are OPT-IN, never opt-out. Some suites drive behaviour that only a
 # test should be able to ask for (fork an orphan the watchdog must reap, publish
 # a lease-ownership marker). That code has no production caller and reads exactly
@@ -85,17 +75,16 @@ endif
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O3 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) \
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) \
               $(GLOBAL_OVERRIDE_DEFINE) $(CFLAGS_EXTRA)
-CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O3
+CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
 EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
 	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
-	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_DAEMON_RUNTIME_ENABLE_TEST_API=1 \
-	-DCBM_ENABLE_TEST_SEAMS=1
+	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1
 # The build system is the single source of truth for "is this binary
 # instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
 # clang's feature-check spelling and every non-ASan sanitizer, so the
@@ -109,18 +98,30 @@ endif
 KOTLIN_DEDUP_TEST_DEFINE = -DCBM_KOTLIN_DEDUP_TEST_API=1
 CALL_REFERENCE_LOOKUP_TEST_DEFINE = -DCBM_CALL_REFERENCE_LOOKUP_TEST_API=1
 INCREMENTAL_TEST_DEFINE = -DCBM_INCREMENTAL_TEST_API=1
+COVERAGE_MARKER_TEST_DEFINE = -DCBM_COVERAGE_MARKER_TEST_API=1
 CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) \
 	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
-	$(INCREMENTAL_TEST_DEFINE) -g -O1 $(SANITIZE) $(COVERAGE_FLAGS)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) \
-	$(COVERAGE_FLAGS) $(CXX_STDLIB_FLAGS)
+	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) -g -O1 $(SANITIZE)
+CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(CXX_STDLIB_FLAGS)
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
+# CBM_SANITIZED_BUILD is unconditional here: this flag set exists only to build
+# an instrumented binary. SANITIZED_DEFINE keys off $(SANITIZE), which TSan does
+# not use (it has its own TSAN_SANITIZE), so the define was silently absent and
+# every sanitized-budget branch compiled to its NATIVE value on this leg —
+# exactly the failure the comment above SANITIZED_DEFINE describes for
+# trap-UBSan, repeated on a leg that was never wired up.
+#
+# The same define now goes on EVERY instrumented flag set of our own code, C and
+# C++ alike (CXXFLAGS_TSAN here, GRAMMAR_CFLAGS_TEST/TSAN below). Vendored flag
+# sets are left alone: mimalloc, sqlite3, tre, zstd, lz4 and tree-sitter read no
+# macro of ours.
 CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(KOTLIN_DEDUP_TEST_DEFINE) \
 	$(CALL_REFERENCE_LOOKUP_TEST_DEFINE) $(INCREMENTAL_TEST_DEFINE) \
-	-g -O1 $(TSAN_SANITIZE)
-CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
+	$(COVERAGE_MARKER_TEST_DEFINE) \
+	-DCBM_SANITIZED_BUILD=1 -g -O1 $(TSAN_SANITIZE)
+CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -DCBM_SANITIZED_BUILD=1 -g -O1 \
                 $(TSAN_SANITIZE)
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
@@ -182,10 +183,35 @@ endif
 # ~259 MB of tree-sitter parse tables was mapped executable at runtime while the
 # amd64 build of the same source mapped them R only. That is a large ROP gadget
 # surface for data that is never executed, and it is invisible to section flags.
+#
+# -z relro + -z now finish the same job on the OTHER writable-but-shouldn't-be
+# region: the GOT. Both are free at runtime here (a static binary resolves
+# everything at link time, so there is no lazy binding left to pay for), and
+# they are added because the SHIPPED artifact measurably lacked the property --
+# not because the linker accepts the flags. Measured on this binary, built the
+# way .github/workflows/_build.yml builds the Linux release (STATIC=1, gcc 13.3
+# / GNU ld 2.42, Ubuntu 24.04 aarch64); PT_GNU_RELRO ends at 0x11DA0000 in both:
+#
+#   without -z now:  .got 0x11d9ec20+0x13c8, .got.plt 0x11d9ffe8+0x40
+#                    -> .got.plt ends at 0x11DA0028, i.e. 40 bytes PAST the
+#                       window: those GOT slots stayed writable for the whole
+#                       process lifetime, in every Linux binary we have shipped
+#   with    -z now:  .got.plt folded into .got (0x11d9ec20+0x13c8, ends
+#                    0x11D9FFE8) -> the whole GOT is inside the window and is
+#                    re-mapped read-only after startup
+#
+# -z relro is already this toolchain's default and changes nothing here; it is
+# named anyway so the property stops depending on one distro's spec file (the
+# musl/portable and glibc-floor images are different toolchains, and a default
+# is not a guarantee). A1c/A1d in scripts/ci/check-binary-composition.sh assert
+# the OUTCOME on the produced binary, because a flag the compiler accepts is
+# not evidence that the artifact gained anything -- the same reason A1 exists
+# next to the .note.GNU-stack annotation.
 ELF_HARDENING_FLAGS :=
 ifeq ($(IS_LINUX),yes)
 ifneq ($(IS_MINGW),yes)
-ELF_HARDENING_FLAGS := -Wl,-z,noexecstack -Wl,-z,separate-code
+ELF_HARDENING_FLAGS := -Wl,-z,noexecstack -Wl,-z,separate-code \
+                       -Wl,-z,relro -Wl,-z,now
 endif
 endif
 
@@ -199,8 +225,7 @@ endif
 CXX_STDLIB ?= -lstdc++
 CXX_STDLIB_FLAGS ?=
 LDFLAGS = -lm $(CXX_STDLIB) -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
-LDFLAGS_TEST = -lm $(CXX_STDLIB) -lpthread -lz $(SANITIZE) $(COVERAGE_FLAGS) \
-	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS_TEST = -lm $(CXX_STDLIB) -lpthread -lz $(SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 LDFLAGS_TSAN = -lm $(CXX_STDLIB) -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 
 # ── Source files ─────────────────────────────────────────────────
@@ -266,7 +291,6 @@ LSP_SRCS = $(CBM_DIR)/lsp_all.c
 # an ODR mismatch that under-reads the by-value struct copy. Explicit because this
 # Makefile does not use compiler auto-dependency (-MMD) generation.
 LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
-                 src/foundation/arena.h \
                  $(wildcard $(CBM_DIR)/lsp/*.c $(CBM_DIR)/lsp/*.h \
                             $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h)
 
@@ -337,7 +361,6 @@ PIPELINE_SRCS = \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
     src/pipeline/worker_pool.c \
-    src/pipeline/definition_properties.c \
     src/pipeline/pass_parallel.c \
     src/pipeline/pass_definitions.c \
     src/pipeline/pass_calls.c \
@@ -453,7 +476,7 @@ MIMALLOC_CFLAGS = -std=c11 -O2 -w \
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
-                       -DMI_OVERRIDE=0 $(COVERAGE_FLAGS)
+                       -DMI_OVERRIDE=0
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
@@ -471,7 +494,7 @@ SQLITE3_SRC = vendored/sqlite3/sqlite3.c
 SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
                  $(SQLITE3_OMIT_FLAGS)
 SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
-                      $(SQLITE3_OMIT_FLAGS) $(COVERAGE_FLAGS)
+                      $(SQLITE3_OMIT_FLAGS)
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
@@ -684,6 +707,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_issue787.c \
     tests/repro/repro_issue842.c \
     tests/repro/repro_issue964.c \
+    tests/repro/repro_issue1692.c \
     tests/repro/repro_invariant_calls.c \
     tests/repro/repro_invariant_graph.c \
     tests/repro/repro_invariant_breadth.c \
@@ -718,9 +742,9 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
-GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O3 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE) $(COVERAGE_FLAGS)
+                      -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       -DCBM_ENABLE_TEST_SEAMS=1 -DCBM_SANITIZED_BUILD=1 $(TSAN_SANITIZE)
 
@@ -736,10 +760,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke \
-	coverage-rust coverage-rust-contract mutation-rust mutation-rust-contract \
-	cbm cbm-with-ui frontend embed clean-c \
-	lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -753,29 +774,6 @@ test-foundation: $(BUILD_DIR)/test-foundation
 	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
-
-grammar_inputs = $(wildcard $(CBM_DIR)/vendored/grammars/$(1)/parser.c \
-                           $(CBM_DIR)/vendored/grammars/$(1)/scanner.c \
-                           $(CBM_DIR)/vendored/grammars/$(1)/scanner.cc \
-                           $(CBM_DIR)/vendored/grammars/$(1)/*.h \
-                           $(CBM_DIR)/vendored/grammars/$(1)/*.inc \
-                           $(CBM_DIR)/vendored/grammars/$(1)/tree_sitter/*.h \
-                           $(CBM_DIR)/vendored/grammars/$(1)/common/*.h)
-
-GRAMMAR_NAMES = $(patsubst $(CBM_DIR)/grammar_%.c,%,$(GRAMMAR_SRCS))
-
-define GRAMMAR_OBJECT_RULES
-$(BUILD_DIR)/grammar_$(1).o: $(CBM_DIR)/grammar_$(1).c $(call grammar_inputs,$(1)) | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $$@ $$<
-
-$(BUILD_DIR)/tsan_grammar_$(1).o: $(CBM_DIR)/grammar_$(1).c $(call grammar_inputs,$(1)) | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $$@ $$<
-
-$(BUILD_DIR)/prod_grammar_$(1).o: $(CBM_DIR)/grammar_$(1).c $(call grammar_inputs,$(1)) | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $$@ $$<
-endef
-
-$(foreach grammar,$(GRAMMAR_NAMES),$(eval $(call GRAMMAR_OBJECT_RULES,$(grammar))))
 
 $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
@@ -873,9 +871,9 @@ endif
 LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
 LZ4_OBJ_TSAN = $(BUILD_DIR)/tsan_lz4.o $(BUILD_DIR)/tsan_lz4hc.o
 $(BUILD_DIR)/test_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(COVERAGE_FLAGS) -w -I$(CBM_DIR) -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/test_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(COVERAGE_FLAGS) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 $(BUILD_DIR)/tsan_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/tsan_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
@@ -893,7 +891,7 @@ $(BUILD_DIR)/tsan_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
 ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
 ZSTD_OBJ_TSAN = $(BUILD_DIR)/tsan_zstd.o
 $(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(COVERAGE_FLAGS) $(ZSTD_EXTRA_CFLAGS) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(ZSTD_EXTRA_CFLAGS) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 $(BUILD_DIR)/tsan_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
@@ -912,16 +910,14 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
-test: $(BUILD_DIR)/test-runner $(BUILD_DIR)/codebase-memory-mcp
+test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && sh tests/test_build_identifier.sh $(BUILD_DIR)/codebase-memory-mcp
 
 # Parallel variant: every suite as its own process; identical gate quality
 # (see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh — union guard
 # against --list-suites + aggregated pass/fail/skip totals).
-test-par: $(BUILD_DIR)/test-runner $(BUILD_DIR)/codebase-memory-mcp
+test-par: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && bash scripts/run-tests-parallel.sh $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && sh tests/test_build_identifier.sh $(BUILD_DIR)/codebase-memory-mcp
 
 # Focused native development is intentionally a separate, explicit target so
 # an inherited TEST_SUITES value cannot silently narrow the gating test target.
@@ -930,22 +926,6 @@ test-focused: $(BUILD_DIR)/test-runner
 	@test -n "$(strip $(TEST_SUITES))" || \
 		(echo "TEST_SUITES is required for test-focused"; exit 2)
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
-
-# Deterministic Apple LLVM coverage for the Rust scanner.  The harness creates
-# a collision-safe build/profile directory, verifies that compiler and coverage
-# tools use the same mapping major, and keeps the full build/test/report logs in
-# that directory while printing only a bounded verdict for agent consumers.
-coverage-rust-contract:
-	@bash tests/test_rust_scanner_coverage.sh
-
-coverage-rust:
-	@bash scripts/rust-scanner-coverage.sh
-
-mutation-rust-contract:
-	@bash tests/test_rust_scanner_mutation.sh
-
-mutation-rust:
-	@bash scripts/rust-scanner-mutation.sh
 
 # ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
@@ -1153,6 +1133,12 @@ LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 lint-tidy:
 	@echo "=== clang-tidy ==="
 	@$(CLANG_TIDY) --quiet $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
+
+# clang-tidy, scoped to this commit's staged changes only (scripts/lint-tidy-diff.sh).
+# The pre-commit hook runs this instead of the full lint-tidy sweep above, so a
+# clean commit is not blocked by pre-existing findings elsewhere in the tree.
+lint-tidy-diff:
+	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
 # cppcheck: complementary analysis (config in .cppcheck)
 lint-cppcheck:

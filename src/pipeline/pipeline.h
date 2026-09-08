@@ -22,8 +22,6 @@
 #include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
 #include "foundation/constants.h" /* CBM_SZ_512 */
 
-#include "cbm.h" /* CBMLanguage — registry language-scoping API */
-
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
@@ -131,7 +129,7 @@ typedef struct {
  * NOT thread-safe: call it from the sequential extraction pass, or from the
  * parallel merge step (never from inside a parallel worker — workers collect
  * into per-worker lists and merge sequentially). */
-bool cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
                                  const char *phase);
 
 /* Borrowed accessor for the recorded skips (owned by the pipeline, valid until
@@ -209,46 +207,9 @@ typedef struct {
 cbm_registry_t *cbm_registry_new(void);
 void cbm_registry_free(cbm_registry_t *r);
 
-/* Register a function/method/class. All strings are copied.
- * The definition is tagged with the resolution language-group derived from
- * `lang` (see cbm_registry_lang_group). Call resolution filters candidates to
- * the caller's group so a name collision across unrelated languages (e.g. a
- * Python `get` call and a Rust `get` fn) can never bind — only same-group
- * dialects (C/C++/CUDA, JS/TS/TSX, …) remain mutually resolvable. Pass
- * CBM_LANG_COUNT when the language is unknown to tag the definition as the
- * wildcard group (always resolvable) — an unknown language never drops an
- * otherwise-valid edge. */
+/* Register a function/method/class. All strings are copied. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label, CBMLanguage lang);
-
-/* Coarse resolution language-group for cross-language collision suppression.
- * Same-group languages resolve to each other's symbols; different groups never
- * do. Dialect families that share a symbol table in practice map to one group
- * (C/C++/CUDA/ObjC and the C-preprocessor shader langs; JS/TS/TSX). A language
- * with no meaningful cross-language partner is its own group. CBM_LANG_COUNT
- * (unknown) maps to the wildcard group REG_LANG_GROUP_ANY, which is compatible
- * with every group. Pure; unit-tested in test_registry.c. */
-int cbm_registry_lang_group(CBMLanguage lang);
-
-/* Wildcard group: compatible with every other group in both directions. Used
- * for definitions/callers whose language is unknown (CBM_LANG_COUNT). */
-#define REG_LANG_GROUP_ANY (-1)
-
-/* Set the language-group of the DEFINITIONS being registered on this thread.
- * cbm_registry_add reads it to tag each entry. Scope it around a per-file (or
- * per-language) registration loop; reset with cbm_registry_add_scope_clear when
- * the language is unknown so the wildcard group applies. Thread-local — each
- * extract/registration worker owns its own value. */
-void cbm_registry_add_scope_begin(CBMLanguage lang);
-void cbm_registry_add_scope_clear(void);
-
-/* Set the CALLER language-group for resolution on this thread. cbm_registry_
- * resolve / cbm_registry_fuzzy_resolve filter by-name candidates to this group.
- * Scope it around a per-file resolve loop (alongside the resolve/reach/import
- * caches). Clear (or set CBM_LANG_COUNT) to disable filtering — every candidate
- * is then eligible, preserving pre-scoping behaviour. Thread-local. */
-void cbm_registry_resolve_scope_begin(CBMLanguage lang);
-void cbm_registry_resolve_scope_clear(void);
+                      const char *label);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
@@ -308,15 +269,6 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
-/* A Rust receiver/associated call that reached a weak text-only strategy has no
- * receiver-type evidence. Reject ambiguous matches everywhere (including
- * same-crate `Mode::empty` collisions) and unique matches across Cargo package
- * boundaries. Preserve same-package unique fallback while cross-file typing is
- * incomplete, plus all LSP/import/same-module/qualified matches. */
-bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver, const char *callee_name,
-                                           const char *strategy, const char *source_file,
-                                           const char *target_file, const char *target_qn);
-
 /* Decide whether a resolved member-call edge is weak-strategy noise to drop
  * (#592/#606/#1276): true only when the CALLER's per-language gate says the
  * guard applies (`enabled`), only for a member call with an unresolved receiver
@@ -327,6 +279,18 @@ bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver, cons
  * must be identical in both, or the sequential and parallel resolvers diverge.
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
+
+/* Bare-call counterpart of the guard above. True when a resolved BARE call edge
+ * binds a callee that is shadowed by an enclosing parameter, and the match came
+ * from a weak short-name strategy — so the edge is fabricated by construction
+ * (`def f(run): run()` must not bind an unrelated `SatoriLive.run`). Shares the
+ * member guard's drop-list, so lsp_* / import / same-module matches are kept.
+ * Deliberately keyed on the SCOPE FACT, not on the callee's spelling. The
+ * language set lives at the call sites (pass_calls.c / pass_parallel.c) and must
+ * be identical in both, or the sequential and parallel resolvers diverge.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
+                                          const char *strategy);
 
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
@@ -350,7 +314,7 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
  * Field when the reference text carries no '.'. Go only: other OO languages
  * legitimately reference their own members bare inside method bodies. Pure;
  * unit-tested in test_registry.c. */
-bool cbm_go_suppress_bare_field_ref(bool is_go, const char *ref_name, const char *target_label);
+bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
@@ -372,15 +336,6 @@ int cbm_registry_find_ending_with(const cbm_registry_t *r, const char *suffix, c
 /* Check if candidate QN's module prefix is reachable via any import value. */
 bool cbm_registry_is_import_reachable(const char *candidate_qn, const char **import_vals,
                                       int import_count);
-
-/* True when `candidate_qn` is resolvable from the current thread's resolve
- * scope (cbm_registry_resolve_scope_begin). A candidate whose registered
- * language-group is incompatible with the caller's returns false. Used by
- * ad-hoc candidate walks outside cbm_registry_resolve (e.g. the field-type
- * hint in pass_parallel.c) so they honour the same cross-language gate. A NULL
- * registry/candidate, or an untagged candidate under the wildcard scope,
- * returns true (never drops an otherwise-valid edge). */
-bool cbm_registry_candidate_in_resolve_scope(const cbm_registry_t *r, const char *candidate_qn);
 
 /* Fuzzy resolve: match callee by bare function name (last segment after dots).
  * Returns result with ok=true if found, ok=false if not.

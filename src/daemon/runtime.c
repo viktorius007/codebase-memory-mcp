@@ -99,8 +99,8 @@ enum {
 
     RENDEZVOUS_REQUEST_ABI_OFFSET = 0,
     RENDEZVOUS_REQUEST_VERSION_OFFSET = 4,
-    RENDEZVOUS_REQUEST_BUILD_OFFSET = RENDEZVOUS_REQUEST_VERSION_OFFSET +
-        CBM_DAEMON_RENDEZVOUS_VERSION_TEXT_CAP,
+    RENDEZVOUS_REQUEST_BUILD_OFFSET =
+        RENDEZVOUS_REQUEST_VERSION_OFFSET + CBM_DAEMON_RENDEZVOUS_VERSION_TEXT_CAP,
 
     RENDEZVOUS_RESPONSE_CONNECT_STATUS_OFFSET = 0,
     RENDEZVOUS_RESPONSE_HELLO_STATUS_OFFSET = 4,
@@ -108,14 +108,14 @@ enum {
     RENDEZVOUS_RESPONSE_PROCESS_ID_OFFSET = 16,
     RENDEZVOUS_RESPONSE_CONFLICT_STATUS_OFFSET = 24,
     RENDEZVOUS_RESPONSE_ACTIVE_VERSION_OFFSET = 28,
-    RENDEZVOUS_RESPONSE_ACTIVE_BUILD_OFFSET = RENDEZVOUS_RESPONSE_ACTIVE_VERSION_OFFSET +
-        CBM_DAEMON_RENDEZVOUS_VERSION_TEXT_CAP,
-    RENDEZVOUS_RESPONSE_REQUESTED_VERSION_OFFSET = RENDEZVOUS_RESPONSE_ACTIVE_BUILD_OFFSET +
-        CBM_DAEMON_RENDEZVOUS_BUILD_FINGERPRINT_CAP,
-    RENDEZVOUS_RESPONSE_REQUESTED_BUILD_OFFSET = RENDEZVOUS_RESPONSE_REQUESTED_VERSION_OFFSET +
-        CBM_DAEMON_RENDEZVOUS_VERSION_TEXT_CAP,
-    RENDEZVOUS_RESPONSE_MESSAGE_OFFSET = RENDEZVOUS_RESPONSE_REQUESTED_BUILD_OFFSET +
-        CBM_DAEMON_RENDEZVOUS_BUILD_FINGERPRINT_CAP,
+    RENDEZVOUS_RESPONSE_ACTIVE_BUILD_OFFSET =
+        RENDEZVOUS_RESPONSE_ACTIVE_VERSION_OFFSET + CBM_DAEMON_RENDEZVOUS_VERSION_TEXT_CAP,
+    RENDEZVOUS_RESPONSE_REQUESTED_VERSION_OFFSET =
+        RENDEZVOUS_RESPONSE_ACTIVE_BUILD_OFFSET + CBM_DAEMON_RENDEZVOUS_BUILD_FINGERPRINT_CAP,
+    RENDEZVOUS_RESPONSE_REQUESTED_BUILD_OFFSET =
+        RENDEZVOUS_RESPONSE_REQUESTED_VERSION_OFFSET + CBM_DAEMON_RENDEZVOUS_VERSION_TEXT_CAP,
+    RENDEZVOUS_RESPONSE_MESSAGE_OFFSET =
+        RENDEZVOUS_RESPONSE_REQUESTED_BUILD_OFFSET + CBM_DAEMON_RENDEZVOUS_BUILD_FINGERPRINT_CAP,
 
     ACTIVATION_REQUEST_ACTION_OFFSET = 0,
     ACTIVATION_REQUEST_IDENTITY_OFFSET = 4,
@@ -640,14 +640,6 @@ static bool runtime_windows_file_snapshot_same(const BY_HANDLE_FILE_INFORMATION 
 
 #elif defined(__APPLE__)
 
-#if defined(CBM_DAEMON_RUNTIME_ENABLE_TEST_API)
-static const char *g_runtime_test_process_image_path_override;
-
-void cbm_daemon_runtime_test_set_process_image_path_override(const char *path) {
-    g_runtime_test_process_image_path_override = path;
-}
-#endif
-
 static bool runtime_mac_process_instance(int process_id, struct proc_bsdinfo *info) {
     if (!info) {
         return false;
@@ -798,13 +790,6 @@ static bool runtime_process_image_reference_acquire(
     if (ok) {
         path[path_length] = '\0';
     }
-#if defined(CBM_DAEMON_RUNTIME_ENABLE_TEST_API)
-    if (ok && g_runtime_test_process_image_path_override) {
-        int overridden =
-            snprintf(path, sizeof(path), "%s", g_runtime_test_process_image_path_override);
-        ok = overridden > 0 && overridden < (int)sizeof(path);
-    }
-#endif
     int fd = ok ? open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
     struct stat file_before;
     struct stat file_after;
@@ -1078,27 +1063,6 @@ static bool runtime_worker_send_status(cbm_daemon_runtime_worker_t *worker,
     runtime_put_u32(payload, success ? 1U : 0U);
     return runtime_worker_send_frame(worker, CBM_DAEMON_FRAME_RESPONSE, operation, payload,
                                      (uint32_t)sizeof(payload));
-}
-
-const char *cbm_daemon_runtime_application_status_str(
-    cbm_daemon_runtime_application_status_t status) {
-    switch (status) {
-    case CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR:
-        return "the daemon connection failed or the daemon exited mid-request";
-    case CBM_DAEMON_RUNTIME_APPLICATION_OK:
-        return "the request completed";
-    case CBM_DAEMON_RUNTIME_APPLICATION_BUSY:
-        return "the daemon session already has a request in flight";
-    case CBM_DAEMON_RUNTIME_APPLICATION_UNAVAILABLE:
-        return "the daemon is shutting down and accepted no new work";
-    case CBM_DAEMON_RUNTIME_APPLICATION_REJECTED:
-        return "the daemon rejected the request as malformed or not permitted";
-    case CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR:
-        return "the daemon handler failed to produce a result";
-    case CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED:
-        return "the request was cancelled";
-    }
-    return "the daemon reported an unrecognised status";
 }
 
 static bool runtime_application_status_is_callback_result(

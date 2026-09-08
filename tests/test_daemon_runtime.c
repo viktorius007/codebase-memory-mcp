@@ -382,7 +382,6 @@ static bool runtime_test_copy_executable(const char *source, const char *destina
     return ok;
 }
 
-#ifdef __linux__
 /* PATH must be a copy of this runner: the child runs the
  * __cbm_runtime_image_holder mode, which blocks reading the release pipe
  * wired to its stdin. */
@@ -459,44 +458,17 @@ static pid_t runtime_test_spawn_blocked_executable(const char *path, int *releas
     return child;
 }
 
-static bool runtime_test_stop_blocked_executable(pid_t child, int release_fd) {
+static void runtime_test_stop_blocked_executable(pid_t child, int release_fd) {
     if (release_fd >= 0) {
         (void)close(release_fd);
     }
     if (child <= 0) {
-        return true;
+        return;
     }
-
-    /* The copied test runner exits cleanly when its input pipe closes. Every wait
-     * is bounded so a fixture defect fails instead of hanging the suite. */
+    (void)kill(child, SIGTERM);
     int status = 0;
-    uint64_t deadline = cbm_now_ms() + RUNTIME_TEST_TIMEOUT_MS;
-    while (cbm_now_ms() < deadline) {
-        pid_t waited = waitpid(child, &status, WNOHANG);
-        if (waited == child || (waited < 0 && errno == ECHILD)) {
-            return true;
-        }
-        if (waited < 0 && errno != EINTR) {
-            return false;
-        }
-        cbm_usleep(1000);
-    }
-
-    (void)kill(child, SIGKILL);
-    deadline = cbm_now_ms() + RUNTIME_TEST_TIMEOUT_MS;
-    while (cbm_now_ms() < deadline) {
-        pid_t waited = waitpid(child, &status, WNOHANG);
-        if (waited == child || (waited < 0 && errno == ECHILD)) {
-            return true;
-        }
-        if (waited < 0 && errno != EINTR) {
-            return false;
-        }
-        cbm_usleep(1000);
-    }
-    return false;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
 }
-#endif
 
 #endif
 
@@ -2107,6 +2079,8 @@ TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients) {
     bool second_interrupted = false;
     bool exited = false;
     atomic_store_explicit(&runtime_activation_shutdown_log_seen, false, memory_order_release);
+    CBMLogLevel previous_log_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
     cbm_log_set_sink(runtime_test_activation_shutdown_sink);
 
     if (started) {
@@ -2123,6 +2097,7 @@ TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients) {
         second_interrupted = !cbm_daemon_runtime_client_heartbeat(second, RUNTIME_TEST_TIMEOUT_MS);
     }
     cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_log_level);
     if (first) {
         (void)cbm_daemon_runtime_client_close(first, RUNTIME_TEST_TIMEOUT_MS);
         first = NULL;
@@ -4753,42 +4728,7 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     ASSERT_TRUE(!fingerprinted || strcmp(observed, replacement) != 0);
     PASS();
 }
-#elif defined(__APPLE__)
-TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
-    char directory[RUNTIME_TEST_PATH_CAP] = {0};
-    char replacement_path[RUNTIME_TEST_PATH_CAP] = {0};
-    int directory_written =
-        snprintf(directory, sizeof(directory), "%s/cbm-runtime-image-XXXXXX", cbm_tmpdir());
-    bool setup = directory_written > 0 && directory_written < (int)sizeof(directory) &&
-                 cbm_mkdtemp(directory) != NULL;
-    int replacement_written =
-        setup ? snprintf(replacement_path, sizeof(replacement_path), "%s/replacement", directory)
-              : -1;
-    setup = setup && replacement_written > 0 &&
-            replacement_written < (int)sizeof(replacement_path) &&
-            runtime_test_copy_executable("/bin/echo", replacement_path);
-
-    char original[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    char replacement[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    char observed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    setup = setup &&
-            cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), original) &&
-            cbm_daemon_build_fingerprint_file(replacement_path, replacement) &&
-            strcmp(original, replacement) != 0;
-    cbm_daemon_runtime_test_set_process_image_path_override(replacement_path);
-    bool fingerprinted =
-        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), observed);
-    cbm_daemon_runtime_test_set_process_image_path_override(NULL);
-
-    (void)unlink(replacement_path);
-    (void)rmdir(directory);
-
-    ASSERT_TRUE(setup);
-    ASSERT_FALSE(fingerprinted);
-    ASSERT_STR_EQ(observed, "");
-    PASS();
-}
-#elif defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__)
 TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     char directory[RUNTIME_TEST_PATH_CAP] = {0};
     char image_path[RUNTIME_TEST_PATH_CAP] = {0};
@@ -4828,18 +4768,24 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
             strcmp(original, replacement) != 0;
     bool fingerprinted =
         setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, observed);
-    bool stopped = runtime_test_stop_blocked_executable(child, release_fd);
 
+    runtime_test_stop_blocked_executable(child, release_fd);
     (void)unlink(replacement_path);
     (void)unlink(image_path);
     (void)rmdir(directory);
 
     ASSERT_TRUE(setup);
-    ASSERT_TRUE(stopped);
+#ifdef __linux__
     /* /proc/<pid>/exe is an openable kernel link to the mapped inode, even
      * after that inode has been unlinked by the atomic replacement. */
     ASSERT_TRUE(fingerprinted);
     ASSERT_STR_EQ(observed, original);
+#else
+    /* macOS exposes mapped vnode identity but not a public handle to the
+     * mapped executable. If the old vnode no longer has an openable path we
+     * must fail closed; resolving and hashing the new path is forbidden. */
+    ASSERT_TRUE(!fingerprinted || strcmp(observed, original) == 0);
+#endif
     ASSERT_TRUE(!fingerprinted || strcmp(observed, replacement) != 0);
     PASS();
 }

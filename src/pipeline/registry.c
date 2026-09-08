@@ -31,7 +31,6 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
 
-#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,108 +86,7 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
-
-    /* qnGroup: qualifiedName → resolution language-group, encoded via
-     * REG_GROUP_ENC so the stored void* is never NULL (which cbm_ht cannot
-     * distinguish from "absent"). Populated per definition by cbm_registry_add.
-     * Consulted by the by-name resolution strategies to drop candidates whose
-     * language-group is incompatible with the caller's — see
-     * cbm_registry_lang_group / group_compatible. Keys are BORROWED from the
-     * exact map's heap-owned key strings, so no separate free is needed. */
-    CBMHashTable *qn_group;
 };
-
-/* Encode/decode a language-group as a non-NULL void* for the qn_group table.
- * REG_LANG_GROUP_ANY is -1, real groups are >= 0, so +2 keeps every encoding
- * strictly positive and distinct from NULL ("absent"). */
-#define REG_GROUP_ENC(g) ((void *)(intptr_t)((g) + 2))
-#define REG_GROUP_DEC(v) ((int)((intptr_t)(v) - 2))
-
-/* Caller/definition language-group for the current thread. Definitions are
- * tagged with _add_lang_group at registration; resolution filters candidates
- * against _resolve_lang_group. Both default to the wildcard group so that,
- * absent any scope, behaviour is identical to the pre-scoping resolver. */
-static CBM_TLS int _add_lang_group = REG_LANG_GROUP_ANY;
-static CBM_TLS int _resolve_lang_group = REG_LANG_GROUP_ANY;
-
-/* Two groups resolve to each other iff equal, or either is the wildcard. */
-static inline bool group_compatible(int a, int b) {
-    return a == REG_LANG_GROUP_ANY || b == REG_LANG_GROUP_ANY || a == b;
-}
-
-int cbm_registry_lang_group(CBMLanguage lang) {
-    switch (lang) {
-    /* C family: one symbol table in practice (shared headers, extern "C",
-     * CUDA/ObjC/shader dialects that run through the C preprocessor). */
-    case CBM_LANG_C:
-    case CBM_LANG_CPP:
-    case CBM_LANG_CUDA:
-    case CBM_LANG_OBJC:
-    case CBM_LANG_GLSL:
-    case CBM_LANG_HLSL:
-    case CBM_LANG_ISPC:
-    case CBM_LANG_SLANG:
-        return (int)CBM_LANG_C;
-    /* JS/TS family: TS/TSX compile to JS and share a module/symbol space;
-     * the cross-LSP layer already treats them as one (pass_lsp_cross.h). */
-    case CBM_LANG_JAVASCRIPT:
-    case CBM_LANG_TYPESCRIPT:
-    case CBM_LANG_TSX:
-    case CBM_LANG_ARKTS:
-        return (int)CBM_LANG_JAVASCRIPT;
-    case CBM_LANG_COUNT:
-        return REG_LANG_GROUP_ANY; /* unknown language → wildcard */
-    default:
-        return (int)lang; /* every other language is its own group */
-    }
-}
-
-void cbm_registry_add_scope_begin(CBMLanguage lang) {
-    _add_lang_group = cbm_registry_lang_group(lang);
-}
-
-void cbm_registry_add_scope_clear(void) {
-    _add_lang_group = REG_LANG_GROUP_ANY;
-}
-
-void cbm_registry_resolve_scope_begin(CBMLanguage lang) {
-    _resolve_lang_group = cbm_registry_lang_group(lang);
-}
-
-void cbm_registry_resolve_scope_clear(void) {
-    _resolve_lang_group = REG_LANG_GROUP_ANY;
-}
-
-/* Language-group of a registered QN, or the wildcard group when the QN was
- * never tagged (defensive: an untagged symbol must not be silently dropped). */
-static int group_of_qn(const cbm_registry_t *r, const char *qn) {
-    if (!r->qn_group) {
-        return REG_LANG_GROUP_ANY;
-    }
-    void *v = cbm_ht_get(r->qn_group, qn);
-    return v ? REG_GROUP_DEC(v) : REG_LANG_GROUP_ANY;
-}
-
-/* True when candidate `qn` is resolvable from the current resolve scope. A QN
- * whose group is incompatible with _resolve_lang_group is a cross-language name
- * collision and must not bind. */
-static bool candidate_in_resolve_scope(const cbm_registry_t *r, const char *qn) {
-    return group_compatible(_resolve_lang_group, group_of_qn(r, qn));
-}
-
-/* Copy the group-compatible subset of `arr` into `out` (capacity `max`),
- * returning the count. When the resolve scope is the wildcard, this is a
- * verbatim copy (no filtering) — the pre-scoping candidate set. */
-static int filter_candidates_by_group(const cbm_registry_t *r, const qn_array_t *arr,
-                                      const char **out, int max) {
-    int n = 0;
-    for (int i = 0; i < arr->count && n < max; i++) {
-        if (candidate_in_resolve_scope(r, arr->items[i])) {
-            out[n++] = arr->items[i];
-        }
-    }
-    return n;
-}
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -531,83 +429,6 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
-static bool rust_package_name(const char *file_path, char *out, size_t cap) {
-    if (!file_path)
-        return false;
-    const char *src = strstr(file_path, "/src/");
-    if (!src)
-        return false;
-    const char *start = src;
-    while (start > file_path && start[-1] != '/')
-        start--;
-    size_t len = (size_t)(src - start);
-    if (len == 0 || len >= cap)
-        return false;
-    memcpy(out, start, len);
-    out[len] = '\0';
-    return true;
-}
-
-bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver, const char *callee_name,
-                                           const char *strategy, const char *source_file,
-                                           const char *target_file, const char *target_qn) {
-    if (!is_rust || !has_receiver || !strategy || !strategy[0]) {
-        return false;
-    }
-    bool ambiguous = strcmp(strategy, "suffix_match") == 0 ||
-                     strcmp(strategy, "fuzzy_multi") == 0 || strcmp(strategy, "fuzzy") == 0;
-    bool unique_text =
-        strcmp(strategy, "unique_name") == 0 || strcmp(strategy, "fuzzy_single") == 0;
-    if (!ambiguous && !unique_text) {
-        return false; /* LSP/import/same-module/field-type evidence is authoritative. */
-    }
-    /* An explicit associated receiver is usable evidence even when the LSP did
-     * not know the external type. If `Mode::empty` resolved to
-     * `FrozenPrefix.empty`, the owner names contradict each other: reject it.
-     * Complex UFCS/generic receivers are left to the other evidence gates. */
-    const char *last_sep = callee_name ? strstr(callee_name, "::") : NULL;
-    if (last_sep) {
-        const char *scan = last_sep;
-        while ((scan = strstr(scan + 2, "::")) != NULL)
-            last_sep = scan;
-        const char *owner_end = last_sep;
-        const char *owner_start = owner_end;
-        while (owner_start > callee_name &&
-               (isalnum((unsigned char)owner_start[-1]) || owner_start[-1] == '_')) {
-            owner_start--;
-        }
-        size_t owner_len = (size_t)(owner_end - owner_start);
-        const char *method_dot = target_qn ? strrchr(target_qn, '.') : NULL;
-        if (owner_len > 0 && method_dot) {
-            const char *target_owner_end = method_dot;
-            const char *target_owner_start = target_owner_end;
-            while (target_owner_start > target_qn && target_owner_start[-1] != '.')
-                target_owner_start--;
-            size_t target_owner_len = (size_t)(target_owner_end - target_owner_start);
-            if (owner_len != target_owner_len ||
-                strncmp(owner_start, target_owner_start, owner_len) != 0) {
-                return true;
-            }
-        }
-    }
-    /* A suffix/fuzzy-multi match explicitly chose among multiple same-name
-     * candidates, so it is never evidence for a receiver call. */
-    if (ambiguous) {
-        return true;
-    }
-    /* A unique textual candidate can recover a real same-package call while
-     * cross-file type inference is incomplete. Across Cargo packages it has no
-     * receiver evidence and is the same phantom class as an ambiguous match. */
-    if (unique_text) {
-        char source_package[CBM_SZ_256];
-        char target_package[CBM_SZ_256];
-        return rust_package_name(source_file, source_package, sizeof(source_package)) &&
-               rust_package_name(target_file, target_package, sizeof(target_package)) &&
-               strcmp(source_package, target_package) != 0;
-    }
-    return false;
-}
-
 /* Dynamic-language analogue of the Perl guard above (#592/#606/#1276
  * direction; precedent #477). A member call `x.foo()` reaches the weak textual
  * cascade ONLY when the language's LSP could not resolve the receiver type —
@@ -627,20 +448,69 @@ bool cbm_rust_suppress_weak_receiver_match(bool is_rust, bool has_receiver, cons
  * per-language decision made at the call sites in pass_calls.c and
  * pass_parallel.c, which MUST stay in lockstep — a gate added to only one of
  * them diverges the sequential and parallel resolvers. */
-bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy) {
-    if (!enabled || !is_method || !strategy || !strategy[0]) {
+/* The weak short-name strategies that actually reach the call-resolution
+ * guards: the registry's suffix_match / unique_name and the parallel
+ * field_type_hint. "fuzzy" is listed as defensive insurance only —
+ * cbm_registry_fuzzy_resolve is not wired into the sequential/parallel resolvers
+ * today, so it never reaches these helpers, but naming it keeps a future wiring
+ * from silently reintroducing the noise. Everything else — same_module /
+ * import_map / import_map_suffix / qualified_suffix / callee_suffix /
+ * service_pattern / lsp_* — is a receiver- or import-aware match and is KEPT.
+ *
+ * Shared by BOTH weak-call guards below so the drop-list exists exactly once: a
+ * list that drifted between the member guard and the local-binding guard would
+ * make the two disagree about what "weak" means. */
+static bool weak_short_name_strategy(const char *strategy) {
+    if (!strategy || !strategy[0]) {
         return false;
     }
-    /* Weak short-name strategies that actually reach the call-resolution guards:
-     * the registry's suffix_match / unique_name and the parallel field_type_hint.
-     * "fuzzy" is listed as defensive insurance only — cbm_registry_fuzzy_resolve
-     * is not wired into the sequential/parallel resolvers today, so it never
-     * reaches this helper, but naming it keeps a future wiring from silently
-     * reintroducing the noise. Everything else — same_module / import_map /
-     * import_map_suffix / qualified_suffix / callee_suffix / service_pattern /
-     * lsp_* — is a receiver- or import-aware match and is KEPT. */
     return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+}
+
+bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy) {
+    if (!enabled || !is_method) {
+        return false;
+    }
+    return weak_short_name_strategy(strategy);
+}
+
+/* Bare-call counterpart of the member guard above. A Python call `foo()` whose
+ * callee identifier is bound as a parameter of an enclosing scope cannot be the
+ * module-level `foo`: the parameter shadows it for the whole body. Binding such
+ * a call to a project Function/Method by a weak short-name strategy fabricates
+ * the edge by construction (`def _run_with_heavy_slot(run): run()` ->
+ * SatoriLive.run).
+ *
+ * This is deliberately NOT keyed on the callee's spelling. A list of
+ * "generic-looking" names (get / run / execute) asserts that certain spellings
+ * are usually noise, which is a claim about corpus fashion rather than about
+ * what the resolver knew — and it ages invisibly, because nothing fails when the
+ * distribution shifts, the graph just quietly loses different edges. A parameter
+ * binding is a fact about THIS file's scope, decidable outright.
+ *
+ * `enabled` is the caller's per-language gate, kept out of the helper for the
+ * same reason as the member guard: the two call sites in pass_calls.c and
+ * pass_parallel.c MUST enumerate the identical language set, or the sequential
+ * and parallel resolvers diverge. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
+                                          const char *strategy) {
+    if (!enabled || !callee_is_locally_bound) {
+        return false;
+    }
+    return weak_short_name_strategy(strategy);
+}
+
+static bool js_ts_family(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+           lang == CBM_LANG_ARKTS;
+}
+
+/* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
+ * in the extension table, so a .c file referencing a symbol declared in its
+ * own header would otherwise read as a language boundary. */
+static bool c_cpp_family(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
 }
 
 static const char *path_basename(const char *path) {
@@ -659,8 +529,27 @@ static const char *path_basename(const char *path) {
 
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy) {
-    return strategy && strcmp(strategy, "suffix_match") == 0 &&
-           cbm_suppress_cross_language_ref(caller_lang, target_file_path);
+    /* Two same-named symbols in different languages: suffix_match picks one
+     * winner by import-distance and attaches every bare-name call to it
+     * (#725, Bash/Python main, JS/Python commit). unique_name is the
+     * candidates==1 case (#1572) and is not this guard. */
+    if (!strategy || strcmp(strategy, "suffix_match") != 0) {
+        return false;
+    }
+    if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
+        return false;
+    }
+    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    if (target_lang == CBM_LANG_COUNT) {
+        return false;
+    }
+    if (caller_lang == target_lang) {
+        return false;
+    }
+    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    return true;
 }
 
 bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path) {
@@ -685,28 +574,30 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
     if (caller_lang == target_lang) {
         return false;
     }
-    if (cbm_registry_lang_group(caller_lang) == cbm_registry_lang_group(target_lang)) {
+    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    if (c_cpp_family(caller_lang) && c_cpp_family(target_lang)) {
         return false;
     }
     return true;
 }
 
-bool cbm_go_suppress_bare_field_ref(bool is_go, const char *ref_name, const char *target_label) {
-    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
-     * field access is always a selector expression (x.f), and selector
-     * references resolve through the LSP join, never through the bare-name
-     * registry fallback. Every Field-targeted reference edge in the field
-     * census carried dot-less text, so dropping the bind loses nothing real.
-     * Go-gated: a C#/Java/C++/Python method body legitimately references its
-     * own members bare (cp_reads_writes_cs_static_field pins that shape as
-     * required), so a global veto would break those languages. */
-    if (!is_go || !ref_name || !ref_name[0] || !target_label) {
+bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label) {
+    /* #1942/#1962: a bare Go identifier can never denote a struct field —
+     * field access is always a selector expression (x.f). The extractor
+     * strips the receiver before the resolver runs (resolve_lhs_write_name
+     * records the trailing field name; is_reference_node records the inner
+     * field_identifier), so the reference TEXT is always dot-less and cannot
+     * carry the distinction — the recorded is_member_access shape can. Only a
+     * reference that was never the member half of a selector is refused a
+     * Field bind. Go-gated: a C#/Java/C++/Python method body legitimately
+     * references its own members bare (cp_reads_writes_cs_static_field pins
+     * that shape as required), so a global veto would break those languages. */
+    if (!is_go || is_member_access || !target_label) {
         return false;
     }
-    if (strcmp(target_label, "Field") != 0) {
-        return false;
-    }
-    return strchr(ref_name, '.') == NULL;
+    return strcmp(target_label, "Field") == 0;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -718,7 +609,6 @@ cbm_registry_t *cbm_registry_new(void) {
     }
     r->exact = cbm_ht_create(CBM_SZ_1K);
     r->by_name = cbm_ht_create(CBM_SZ_512);
-    r->qn_group = cbm_ht_create(CBM_SZ_1K);
     return r;
 }
 
@@ -751,16 +641,13 @@ void cbm_registry_free(cbm_registry_t *r) {
     for (int i = 0; i < r->label_pool_n; i++) {
         free(r->label_pool[i]);
     }
-    /* qn_group values are encoded scalars and its keys are borrowed from the
-     * exact map's heap-owned keys (already freed above) — free the table only. */
-    cbm_ht_free(r->qn_group);
     free(r);
 }
 
 /* ── Registration ────────────────────────────────────────────────── */
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label, CBMLanguage lang) {
+                      const char *label) {
     (void)name;
     if (!r || !qualified_name || !label) {
         return;
@@ -793,18 +680,6 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
      * of a second strdup — this pair of copies was ~280 MB on the kernel. */
     cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
     const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
-
-    /* Tag this definition's resolution language-group. Key off the exact map's
-     * persistent heap-owned key so qn_group borrows (no second strdup, no
-     * separate free). `lang` is the file's language; the current add-scope
-     * (cbm_registry_add_scope_begin) is a fallback for callers that register
-     * from a per-language loop without a per-def language. An explicit `lang`
-     * always wins over the scope. */
-    int group = (lang == CBM_LANG_COUNT) ? _add_lang_group : cbm_registry_lang_group(lang);
-    const char *persistent_key = cbm_ht_get_key(r->exact, qualified_name);
-    if (persistent_key) {
-        cbm_ht_set(r->qn_group, persistent_key, REG_GROUP_ENC(group));
-    }
 
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
@@ -934,8 +809,7 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
                 const char *qn = arr->items[i];
                 size_t klen = strlen(qn);
                 if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
-                    strcmp(qn + klen - ds_len, dot_suffix) == 0 &&
-                    candidate_in_resolve_scope(r, qn)) {
+                    strcmp(qn + klen - ds_len, dot_suffix) == 0) {
                     return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
                                               REG_RESOLVED};
                 }
@@ -1051,31 +925,99 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
+/* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
+ * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
+ * throw away, and throwing it away binds Foundation's URLSession.shared.data to
+ * a project's own PickedFile.data: high confidence, and nothing in the graph
+ * shows it is wrong. Require instead that the candidate's own parent segment
+ * appears somewhere in the chain. Calendar.utcGregorian.startOfDayUTC resolving
+ * to AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
+ *
+ * Only an upper-case first segment is guarded. A lower-case root names a value
+ * (vm.load, http.Get, os.path.join) whose declared type the chain does not
+ * show, so the chain proves nothing there and the call passes through
+ * unchanged. A callee with no separator passes through as well.
+ *
+ * Language agnostic by design: the registry holds no language, and every
+ * language that writes receiver chains gains the same protection. */
+static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+    /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
+     * the same way qualified_suffix_match does. */
+    char dotted[CBM_SZ_512];
+    size_t w = 0;
+    for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
+        if (s[0] == ':' && s[1] == ':') {
+            dotted[w++] = '.';
+            s += 2;
+        } else {
+            dotted[w++] = *s++;
+        }
+    }
+    dotted[w] = '\0';
+
+    const char *last_dot = strrchr(dotted, '.');
+    if (!last_dot) {
+        return true; /* bare name — no receiver chain to judge */
+    }
+    if (dotted[0] < 'A' || dotted[0] > 'Z') {
+        return true; /* lower-case root names a value, not a type */
+    }
+    /* A name written in capitals with underscores is a constant holding a
+     * value, not a type: ISO_4217_URL.lower is a string's own method. JSON and
+     * URL carry no underscore and stay guarded. */
+    int has_underscore = 0;
+    int all_caps = 1;
+    for (const char *c = dotted; c < last_dot && *c != '.'; c++) {
+        if (*c == '_') {
+            has_underscore = 1;
+        } else if (*c >= 'a' && *c <= 'z') {
+            all_caps = 0;
+            break;
+        }
+    }
+    if (all_caps && has_underscore) {
+        return true;
+    }
+
+    /* The candidate's parent segment: the one before its final name. */
+    const char *cand_last = strrchr(candidate_qn, '.');
+    if (!cand_last || cand_last == candidate_qn) {
+        return true; /* top-level candidate — no parent to look for */
+    }
+    const char *parent = cand_last;
+    while (parent > candidate_qn && parent[-1] != '.') {
+        parent--;
+    }
+    size_t parent_len = (size_t)(cand_last - parent);
+
+    /* Walk the chain — every segment before the final callee name. A trailing
+     * "()" is dropped so JSONEncoder().encode reads as JSONEncoder. */
+    for (const char *seg = dotted; seg < last_dot;) {
+        const char *end = strchr(seg, '.');
+        size_t len = (size_t)(end - seg);
+        if (len >= 2 && seg[len - 2] == '(' && seg[len - 1] == ')') {
+            len -= 2; /* an empty "()" — JSONEncoder().encode names JSONEncoder */
+        }
+        if (len == parent_len && strncmp(seg, parent, parent_len) == 0) {
+            return true;
+        }
+        seg = end + SKIP_ONE;
+    }
+    return false;
+}
+
 /* Strategy 3+4: Name lookup + suffix match */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
                                             int import_count) {
     const char *lookup = simple_name(callee_name);
-    qn_array_t *raw = cbm_ht_get(r->by_name, lookup);
-    if (!raw || raw->count == 0) {
+    qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
+    if (!arr || arr->count == 0) {
         return empty_result();
     }
-    if (raw->count > REG_MAX_CANDIDATES) {
+    if (arr->count > REG_MAX_CANDIDATES) {
         return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
-
-    /* Language-scope the candidate set: a caller in language X can only bind to
-     * a same-group definition, so drop cross-group name collisions BEFORE any
-     * strategy runs. `arr` is a shallow view over the filtered buffer; when the
-     * resolve scope is the wildcard this is a verbatim copy (no behaviour
-     * change). Bounded by REG_MAX_CANDIDATES, checked above. */
-    const char *scoped[CBM_SZ_256];
-    int scoped_count = filter_candidates_by_group(r, raw, scoped, CBM_SZ_256);
-    if (scoped_count == 0) {
-        return empty_result(); /* every candidate was another language */
-    }
-    qn_array_t arr_view = {.items = (char **)scoped, .count = scoped_count, .cap = scoped_count};
-    const qn_array_t *arr = &arr_view;
 
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
@@ -1089,6 +1031,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 3: unique name */
     if (arr->count == SKIP_ONE) {
+        if (!receiver_chain_admits(callee_name, arr->items[0])) {
+            return empty_result();
+        }
         double conf = CONF_UNIQUE_NAME;
         if (import_vals && import_count > 0 &&
             !is_import_reachable(arr->items[0], import_vals, import_count)) {
@@ -1103,6 +1048,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     }
     const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
     if (best) {
+        if (!receiver_chain_admits(callee_name, best)) {
+            return empty_result();
+        }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
@@ -1245,24 +1193,13 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
 
     /* Extract simple name (last segment after dots) */
     const char *lookup = simple_name(callee_name);
-    qn_array_t *raw = cbm_ht_get(r->by_name, lookup);
-    if (!raw || raw->count == 0) {
+    qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
+    if (!arr || arr->count == 0) {
         return no_match;
     }
-    if (raw->count > REG_MAX_CANDIDATES) {
+    if (arr->count > REG_MAX_CANDIDATES) {
         return no_match; /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
-
-    /* Language-scope first: a fuzzy bare-name guess must not cross language
-     * groups any more than a strict resolve can. Wildcard scope → verbatim
-     * copy (pre-scoping behaviour). */
-    const char *scoped[CBM_SZ_256];
-    int scoped_count = filter_candidates_by_group(r, raw, scoped, CBM_SZ_256);
-    if (scoped_count == 0) {
-        return no_match;
-    }
-    qn_array_t arr_view = {.items = (char **)scoped, .count = scoped_count, .cap = scoped_count};
-    const qn_array_t *arr = &arr_view;
 
     bool have_imports = (import_map_vals && import_map_count > 0);
 
@@ -1361,11 +1298,4 @@ int cbm_registry_find_ending_with(const cbm_registry_t *r, const char *suffix, c
 bool cbm_registry_is_import_reachable(const char *candidate_qn, const char **import_vals,
                                       int import_count) {
     return is_import_reachable(candidate_qn, import_vals, import_count);
-}
-
-bool cbm_registry_candidate_in_resolve_scope(const cbm_registry_t *r, const char *candidate_qn) {
-    if (!r || !candidate_qn) {
-        return true;
-    }
-    return candidate_in_resolve_scope(r, candidate_qn);
 }

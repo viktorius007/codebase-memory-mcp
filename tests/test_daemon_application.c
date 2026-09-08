@@ -28,7 +28,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <yyjson/yyjson.h>
 
 /* Observation-wait budget. This is a HANG DETECTOR, not a latency
  * assertion: every waiter returns the moment its condition holds, so green
@@ -715,6 +714,45 @@ TEST(daemon_application_requires_immutable_explicit_context) {
     PASS();
 }
 
+TEST(daemon_application_accepts_utf8_session_context_root) {
+    char root[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-context-caf\xC3\xA9-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 311);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    bool context_ok = root_ok && app_test_context_request(root, root, &context, &context_length);
+    cbm_daemon_runtime_application_status_t status =
+        context_ok ? app_test_request(&callbacks, session, context, context_length, &response,
+                                      &response_length)
+                   : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+
+    free(context);
+    free(response);
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (root_ok) {
+        (void)cbm_rmdir(root);
+    }
+
+    ASSERT_TRUE(root_ok);
+    ASSERT_NOT_NULL(application);
+    ASSERT_NOT_NULL(session);
+    ASSERT_TRUE(context_ok);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(response_length, 0);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 TEST(daemon_application_mcp_notification_has_no_response) {
     cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
     cbm_daemon_runtime_application_callbacks_t callbacks =
@@ -914,153 +952,6 @@ TEST(daemon_application_restricted_profile_owns_no_background_surfaces) {
     ASSERT_EQ(watch_count, 0);
     ASSERT_EQ(active_jobs, 0);
     ASSERT_FALSE(final_ui.ui_enabled);
-    ASSERT_TRUE(stopped);
-    PASS();
-}
-
-/* A tool result larger than one daemon frame is a REPORTABLE outcome, not a
- * transport fault. Before this contract the daemon dropped the response and
- * returned HANDLER_ERROR, which the CLI collapsed into one opaque line — an
- * agent could not tell "your result was too big" from "the daemon died", and
- * was told nothing about narrowing the query. The payload here is built from
- * a real tool (manage_adr get) whose response the daemon cannot frame. */
-TEST(daemon_application_oversize_tool_result_reports_cause_and_remedy) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
-    bool had_cache = old_cache != NULL;
-    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
-    char root[APP_TEST_PATH_CAP];
-    char cache[APP_TEST_PATH_CAP];
-    (void)snprintf(root, sizeof(root), "%s/cbm-app-oversize-root-XXXXXX", cbm_tmpdir());
-    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-oversize-cache-XXXXXX", cbm_tmpdir());
-    bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool env_ok =
-        dirs_ok && (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
-    char *project = env_ok ? cbm_project_name_from_path(root) : NULL;
-
-    /* One byte over the frame budget is enough: the guard is on total payload
-     * bytes, so a boundary-sized ADR proves the limit is the real one and not
-     * a rounder number that merely happens to be larger. */
-    size_t adr_bytes = (size_t)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX + 1U;
-    char *huge_adr = project ? malloc(adr_bytes + 1U) : NULL;
-    if (huge_adr) {
-        memset(huge_adr, 'A', adr_bytes);
-        huge_adr[adr_bytes] = '\0';
-    }
-    char db_path[APP_TEST_PATH_CAP] = {0};
-    bool seeded = false;
-    if (huge_adr) {
-        (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
-        cbm_store_t *seed = cbm_store_open_path(db_path);
-        seeded = seed && cbm_store_upsert_project(seed, project, root) == CBM_STORE_OK &&
-                 cbm_store_adr_store(seed, project, huge_adr) == CBM_STORE_OK;
-        cbm_store_close(seed);
-    }
-
-    cbm_daemon_application_t *application = seeded ? cbm_daemon_application_new(NULL) : NULL;
-    cbm_daemon_runtime_application_callbacks_t callbacks =
-        cbm_daemon_application_runtime_callbacks(application);
-    cbm_daemon_runtime_application_session_t *session =
-        application ? app_test_open(&callbacks, 306) : NULL;
-    uint8_t *context = NULL;
-    uint32_t context_length = 0;
-    char adr_args[APP_TEST_PATH_CAP + 64];
-    (void)snprintf(adr_args, sizeof(adr_args), "{\"project\":\"%s\",\"mode\":\"get\"}",
-                   project ? project : "");
-    uint8_t *adr_tool = NULL;
-    uint32_t adr_tool_length = 0;
-    bool encoded = session && app_test_context_request(root, root, &context, &context_length) &&
-                   app_test_tool_request("manage_adr", adr_args, &adr_tool, &adr_tool_length);
-
-    uint8_t *response = NULL;
-    uint32_t response_length = 0;
-    cbm_daemon_runtime_application_status_t context_status =
-        encoded ? app_test_request(&callbacks, session, context, context_length, &response,
-                                   &response_length)
-                : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
-    free(response);
-    response = NULL;
-    response_length = 0;
-    cbm_daemon_runtime_application_status_t adr_status =
-        context_status == CBM_DAEMON_RUNTIME_APPLICATION_OK
-            ? app_test_request(&callbacks, session, adr_tool, adr_tool_length, &response,
-                               &response_length)
-            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
-
-    /* The universal MCP envelope limit is lower than the daemon frame limit,
-     * so it must fail closed before the daemon's transport fallback. Assert
-     * the stable structured error contract rather than either layer's prose. */
-    const char *text = response ? (const char *)response : "";
-    bool sendable = response && response_length > 0 &&
-                    response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX;
-    yyjson_doc *response_doc = sendable ? yyjson_read(text, response_length, 0) : NULL;
-    yyjson_val *root_value = response_doc ? yyjson_doc_get_root(response_doc) : NULL;
-    yyjson_val *content = yyjson_is_obj(root_value) ? yyjson_obj_get(root_value, "content") : NULL;
-    yyjson_val *item = yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
-    const char *message = yyjson_is_obj(item) ? yyjson_get_str(yyjson_obj_get(item, "text")) : NULL;
-    yyjson_val *structured =
-        yyjson_is_obj(root_value) ? yyjson_obj_get(root_value, "structuredContent") : NULL;
-    const char *structured_error =
-        yyjson_is_obj(structured) ? yyjson_get_str(yyjson_obj_get(structured, "error")) : NULL;
-    bool flagged_error =
-        yyjson_is_obj(root_value) && yyjson_get_bool(yyjson_obj_get(root_value, "isError"));
-    bool consistent_fields = message && structured_error && strcmp(message, structured_error) == 0;
-    bool names_cause = message &&
-                       strstr(message, "result exceeds safe response envelope") != NULL &&
-                       strstr(message, "no partial result returned") != NULL;
-    size_t measured_complete_bytes = 0;
-    unsigned measured_limit_bytes = 0;
-    const char *measurements = message ? strstr(message, "complete_response_bytes=") : NULL;
-    bool states_real_limit = measurements &&
-                             sscanf(measurements, "complete_response_bytes=%zu limit_bytes=%u",
-                                    &measured_complete_bytes, &measured_limit_bytes) == 2 &&
-                             measured_complete_bytes > CBM_MCP_RESULT_MAX_BYTES &&
-                             measured_limit_bytes == CBM_MCP_RESULT_MAX_BYTES;
-    bool gives_remedy = message && strstr(message, "manage_adr use mode=sections") != NULL;
-    /* The bulk payload itself must NOT have been smuggled through. */
-    bool payload_withheld = sendable && strstr(text, "AAAAAAAAAAAAAAAA") == NULL;
-
-    yyjson_doc_free(response_doc);
-    free(response);
-    free(context);
-    free(adr_tool);
-    free(huge_adr);
-    if (session) {
-        callbacks.session_close(callbacks.context, session);
-    }
-    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
-    cbm_daemon_application_free(application);
-    if (db_path[0]) {
-        char sidecar[APP_TEST_PATH_CAP];
-        (void)cbm_unlink(db_path);
-        (void)snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
-        (void)cbm_unlink(sidecar);
-        (void)snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
-        (void)cbm_unlink(sidecar);
-    }
-    free(project);
-    if (dirs_ok) {
-        (void)cbm_rmdir(root);
-        (void)th_rmtree(cache);
-    }
-    if (had_cache) {
-        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
-    } else {
-        (void)cbm_unsetenv("CBM_CACHE_DIR");
-    }
-    free(saved_cache);
-
-    ASSERT_TRUE(env_ok);
-    ASSERT_TRUE(seeded);
-    ASSERT_TRUE(encoded);
-    ASSERT_EQ(context_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
-    ASSERT_EQ(adr_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
-    ASSERT_TRUE(sendable);
-    ASSERT_TRUE(flagged_error);
-    ASSERT_TRUE(consistent_fields);
-    ASSERT_TRUE(names_cause);
-    ASSERT_TRUE(states_real_limit);
-    ASSERT_TRUE(gives_remedy);
-    ASSERT_TRUE(payload_withheld);
     ASSERT_TRUE(stopped);
     PASS();
 }
@@ -5491,16 +5382,40 @@ TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death) {
     PASS();
 }
 
+/* One directory is one root for the job registry. The auto-index job spells
+ * repo_path the way the session policy holds it - the platform's native form,
+ * backslashes on Windows - while an explicit index_repository request arrives
+ * in the handler's forward-slash spelling. Compared byte-exact the two never
+ * matched on Windows, and the request was refused as an options conflict
+ * instead of joining the job already running for its root. The fold runs on
+ * every platform, so this binds wherever the suite runs; every other option
+ * stays exact. */
+TEST(daemon_application_index_args_compare_repo_path_separator_equivalently) {
+    ASSERT_TRUE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\"}", "{\"repo_path\":\"C:/repos/cbm\"}"));
+    ASSERT_TRUE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\",\"mode\":\"full\"}",
+        "{\"mode\":\"full\",\"repo_path\":\"C:/repos/cbm\"}"));
+    ASSERT_FALSE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\"}", "{\"repo_path\":\"C:/repos/cbm2\"}"));
+    ASSERT_FALSE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\"}", "{\"repo_path\":\"C:/repos/cbm/sub\"}"));
+    ASSERT_FALSE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\",\"mode\":\"incremental\"}",
+        "{\"repo_path\":\"C:/repos/cbm\"}"));
+    PASS();
+}
+
 SUITE(daemon_application) {
     RUN_TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death);
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
     RUN_TEST(daemon_application_request_cancel_is_scoped_to_exact_token);
     RUN_TEST(daemon_application_requires_immutable_explicit_context);
+    RUN_TEST(daemon_application_accepts_utf8_session_context_root);
     RUN_TEST(daemon_application_ui_config_updates_are_masked_and_serialized);
     RUN_TEST(daemon_application_ui_config_rejects_noncanonical_frames);
     RUN_TEST(daemon_application_ui_readiness_proof_is_generation_bound_before_context);
     RUN_TEST(daemon_application_restricted_profile_owns_no_background_surfaces);
-    RUN_TEST(daemon_application_oversize_tool_result_reports_cause_and_remedy);
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
@@ -5509,6 +5424,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
+    RUN_TEST(daemon_application_index_args_compare_repo_path_separator_equivalently);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);

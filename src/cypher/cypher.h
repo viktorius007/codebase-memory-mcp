@@ -133,31 +133,6 @@ typedef struct {
     int pos;          /* byte offset in source */
 } cbm_token_t;
 
-/* Machine-readable syntax failure retained alongside the human message. */
-typedef enum {
-    CBM_CYPHER_DIAGNOSTIC_NONE,
-    CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_TOKEN,
-    CBM_CYPHER_DIAGNOSTIC_UNEXPECTED_CHARACTER,
-    CBM_CYPHER_DIAGNOSTIC_UNTERMINATED_STRING,
-    CBM_CYPHER_DIAGNOSTIC_TRAILING_TOKEN,
-    CBM_CYPHER_DIAGNOSTIC_SYNTAX,
-} cbm_cypher_diagnostic_kind_t;
-
-typedef enum {
-    CBM_CYPHER_CONTEXT_NONE,
-    CBM_CYPHER_CONTEXT_NODE_PATTERN,
-    CBM_CYPHER_CONTEXT_RELATIONSHIP_TYPE,
-} cbm_cypher_diagnostic_context_t;
-
-typedef struct {
-    cbm_cypher_diagnostic_kind_t kind;
-    cbm_cypher_diagnostic_context_t context;
-    cbm_token_type_t expected;
-    cbm_token_type_t actual;
-    unsigned char unexpected_byte;
-    int byte_position;
-} cbm_cypher_diagnostic_t;
-
 /* ── Lexer ──────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -165,7 +140,6 @@ typedef struct {
     int count;
     int capacity;
     char *error; /* NULL if no error */
-    cbm_cypher_diagnostic_t diagnostic;
 } cbm_lex_result_t;
 
 /* Tokenize a Cypher query string. Caller must call cbm_lex_free(). */
@@ -288,23 +262,23 @@ typedef struct {
     int arg_count;
 } cbm_return_item_t;
 
-/* One ORDER BY sort key. `ORDER BY a, b DESC` is a lexicographic tuple sort:
- * rows are ordered by the first key, ties broken by the next, and so on — each
- * key carrying its own direction. */
-typedef struct {
-    const char *expr; /* "variable.property" or "COUNT(var)" or alias */
-    bool desc;        /* true = DESC; false = ASC, the default */
-} cbm_order_key_t;
+/* Upper bound on ORDER BY sort keys. Queries with more keys are rejected at
+ * parse time: an unmodeled key must be a loud error, never a silently dropped
+ * remainder (#1334 - the unconsumed tail swallowed the LIMIT clause). */
+#define CBM_CYPHER_ORDER_KEYS_MAX 8
 
 typedef struct {
     cbm_return_item_t *items;
     int count;
     bool distinct;
-    bool star;                   /* RETURN * */
-    cbm_order_key_t *order_keys; /* NULL if no ORDER BY */
-    int order_key_count;         /* 0 if no ORDER BY */
-    int skip;                    /* SKIP N, 0 = none */
-    int limit;                   /* 0 = default */
+    bool star; /* RETURN * */
+    /* ORDER BY key list, in priority order. Each key is "variable.property",
+     * "COUNT(var)" or an alias; direction is per key (Cypher semantics). */
+    const char *order_keys[CBM_CYPHER_ORDER_KEYS_MAX];
+    bool order_descs[CBM_CYPHER_ORDER_KEYS_MAX]; /* false = ASC (default) */
+    int order_key_count;                         /* 0 = no ORDER BY */
+    int skip;                                    /* SKIP N, 0 = none */
+    int limit;                                   /* 0 = default */
 } cbm_return_clause_t;
 
 /* Full query AST */
@@ -332,7 +306,6 @@ struct cbm_query {
 typedef struct {
     cbm_query_t *query;
     char *error; /* NULL if no error */
-    cbm_cypher_diagnostic_t diagnostic;
 } cbm_parse_result_t;
 
 /* Parse tokens into AST. Caller must call cbm_parse_free(). */
@@ -348,6 +321,10 @@ typedef struct {
     /* rows[row_idx][col_idx] = string value */
     const char ***rows;
     int row_count;
+    /* True when an internal row/candidate ceiling prevented exhaustive
+     * evaluation. A Cypher LIMIT is part of query semantics and does not set
+     * this flag by itself. */
+    bool truncated;
     /* Non-NULL when the query was rejected (e.g. result too large) */
     char *error;
     /* Non-NULL advisory (caller-visible, not an error): e.g. a variable-

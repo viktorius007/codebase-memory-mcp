@@ -108,8 +108,8 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
 /* Get CALLS degree of a node (inbound and outbound). */
 void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
 
-/* Get distinct file paths for a project. Caller must free each out[i] and out itself.
- * Returns CBM_STORE_OK or CBM_STORE_ERR. */
+/* Get distinct canonical File-node paths, with a non-Folder node fallback for legacy/manual
+ * stores that have no File nodes. Caller frees each out[i] and out itself. */
 int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count);
 
 /* Persisted index-format identity. Bump when a change alters the QN scheme
@@ -219,8 +219,7 @@ typedef struct {
 
 typedef struct {
     cbm_node_t node;
-    int hop;                     /* BFS depth from root */
-    int64_t predecessor_edge_id; /* deterministic shortest-path edge from hop-1 */
+    int hop; /* BFS depth from root */
 } cbm_node_hop_t;
 
 typedef struct {
@@ -230,7 +229,6 @@ typedef struct {
     double confidence;
     int64_t source_id; /* edge endpoints — let callers match an edge to a hop node */
     int64_t target_id;
-    int64_t edge_id;
     const char *properties_json; /* raw edge properties (carries CALLS arg expressions) */
 } cbm_edge_info_t;
 
@@ -240,8 +238,10 @@ typedef struct {
     int visited_count;
     cbm_edge_info_t *edges;
     int edge_count;
-    /* True when trail expansion hit its recursive-row safety budget. */
+    /* True when trail expansion hit its recursive-row safety budget (or, for
+     * the plain BFS, the max_results ceiling); counts are lower bounds. */
     bool truncated;
+    bool edges_truncated; /* optional edge-data ceiling reached; node counts stay exact */
 } cbm_traverse_result_t;
 
 /* ── Schema introspection ───────────────────────────────────────── */
@@ -444,9 +444,17 @@ int cbm_store_checkpoint(cbm_store_t *s);
  * connection, in bytes; -1 = unlimited (SQLite default / pre-fix). */
 int64_t cbm_store_journal_size_limit(cbm_store_t *s);
 
+/* Advance the pagination-cursor generation atomically. Seeds a genuinely
+ * legacy database with a fresh per-file uid, preserves that uid thereafter,
+ * and increments its canonical uint64 mutation counter. Safe inside an
+ * existing transaction (implemented with a nested savepoint); malformed or
+ * partial metadata fails closed without committing a partial advance. */
+int cbm_store_generation_advance(cbm_store_t *s);
+
 /* Opaque store generation for pagination-cursor staleness detection:
- * "u<db_uid>g<mutation_gen>" — db_uid is minted per DB file, mutation_gen
- * bumps on every index run. "legacy" for DBs predating store_meta. */
+ * "u<16-lower-hex-db_uid>g<canonical-uint64-mutation_gen>". Returns "legacy"
+ * only when store_meta is genuinely absent; malformed or missing metadata is
+ * an error. */
 int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
 
 /* Seal a fully-written staging database before atomic publication.
@@ -628,17 +636,6 @@ int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
 
 /* ── Index coverage (#963) ──────────────────────────────────────── */
 
-/* One shared compatibility contract for every coverage writer and reader.
- * Bump only when the persisted semantic coverage meaning or metadata contract
- * changes; old/missing versions must be treated as unknown. */
-enum {
-    CBM_SEMANTIC_INDEX_VERSION = 4,
-    CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS = 256,
-    CBM_ANALYSIS_COVERAGE_DETAIL_MAX_BYTES = 4096,
-    CBM_SYNTACTIC_COVERAGE_PAGE_MAX_ROWS = 256,
-    CBM_SYNTACTIC_COVERAGE_DETAIL_MAX_BYTES = 4096,
-};
-
 /* One best-effort coverage row: a file the indexer could not fully cover.
  * kind "parse_partial" = indexed but the parse tree had ERROR/MISSING regions
  * (detail = 1-based line ranges "12-40,88-90"); skip kinds "read"/"extract"/
@@ -665,117 +662,7 @@ typedef struct {
     int ignored_files_total;
     int coverage_version;
     bool hash_records_complete;
-    /* "complete" only when every discovered Rust file in this generation
-     * was captured after all required analysis routes. "unknown" is the
-     * conservative value for old/missing metadata. */
-    const char *rust_analysis_recording_status;
-    int rust_files_total;
 } cbm_coverage_meta_t;
-
-/* Bounded semantic-analysis coverage page. Only `analysis_*` rows participate;
- * syntactic coverage rows and their details are never materialized. Metadata,
- * exact totals, and rows are read from one SQLite snapshot. Page identity is
- * the stable binary order (rel_path, kind). A truncated detail retains its
- * exact byte length and SHA-256 so callers can report the omission explicitly. */
-typedef struct {
-    const char *rel_path;
-    const char *kind;
-    const char *detail;
-    int64_t detail_complete_bytes;
-    bool detail_truncated;
-    char detail_sha256[65];
-} cbm_analysis_coverage_row_t;
-
-typedef struct {
-    int64_t rows_total;
-    int64_t partial_rows;
-    int64_t failed_rows;
-    int64_t unsupported_rows;
-    int64_t degraded_files_total;
-    int64_t partial_files;
-    int64_t failed_files;
-    int64_t unsupported_files;
-} cbm_analysis_coverage_totals_t;
-
-typedef struct {
-    bool has_meta;
-    cbm_coverage_meta_t meta;
-    cbm_analysis_coverage_totals_t totals;
-    cbm_analysis_coverage_row_t *rows;
-    int returned;
-    int64_t next_offset;
-    bool has_more;
-} cbm_analysis_coverage_page_t;
-
-typedef enum {
-    CBM_ANALYSIS_COVERAGE_OK = 0,
-    CBM_ANALYSIS_COVERAGE_INVALID_ARGUMENT,
-    CBM_ANALYSIS_COVERAGE_STORE_ERROR,
-    CBM_ANALYSIS_COVERAGE_ALLOCATION_FAILED,
-} cbm_analysis_coverage_status_t;
-
-/* One typed syntactic-coverage request avoids selector ambiguity across the
- * three authoritative lookup shapes. PROJECT requires selector == NULL;
- * EXACT_PATH requires a non-empty repository-relative selector; SCOPE accepts
- * an empty selector for the project root. Every mode excludes `analysis_*`
- * rows in SQL before totals, hashing, or row materialization. */
-typedef enum {
-    CBM_SYNTACTIC_COVERAGE_PROJECT = 0,
-    CBM_SYNTACTIC_COVERAGE_EXACT_PATH,
-    CBM_SYNTACTIC_COVERAGE_SCOPE,
-} cbm_syntactic_coverage_mode_t;
-
-typedef struct {
-    const char *project;
-    cbm_syntactic_coverage_mode_t mode;
-    const char *selector;
-    int64_t offset;
-    int limit;
-    size_t detail_preview_bytes;
-} cbm_syntactic_coverage_request_t;
-
-typedef enum {
-    CBM_SYNTACTIC_COVERAGE_MATCH_PROJECT = 0,
-    CBM_SYNTACTIC_COVERAGE_MATCH_EXACT,
-    CBM_SYNTACTIC_COVERAGE_MATCH_ANCESTOR,
-    CBM_SYNTACTIC_COVERAGE_MATCH_DESCENDANT,
-} cbm_syntactic_coverage_match_t;
-
-typedef struct {
-    const char *rel_path;
-    const char *kind;
-    const char *detail;
-    int64_t detail_complete_bytes;
-    bool detail_truncated;
-    char detail_sha256[65];
-    cbm_syntactic_coverage_match_t match;
-} cbm_syntactic_coverage_row_t;
-
-typedef struct {
-    int64_t rows_total;
-    int64_t parse_partial_rows;
-    int64_t skipped_rows;
-    int64_t not_indexed_dir_rows;
-    int64_t not_indexed_file_rows;
-} cbm_syntactic_coverage_totals_t;
-
-typedef struct {
-    bool has_meta;
-    cbm_coverage_meta_t meta;
-    cbm_syntactic_coverage_totals_t totals;
-    char rows_sha256[65];
-    cbm_syntactic_coverage_row_t *rows;
-    int returned;
-    int64_t next_offset;
-    bool has_more;
-} cbm_syntactic_coverage_page_t;
-
-typedef enum {
-    CBM_SYNTACTIC_COVERAGE_OK = 0,
-    CBM_SYNTACTIC_COVERAGE_INVALID_ARGUMENT,
-    CBM_SYNTACTIC_COVERAGE_STORE_ERROR,
-    CBM_SYNTACTIC_COVERAGE_ALLOCATION_FAILED,
-} cbm_syntactic_coverage_status_t;
 
 /* Replace the project's coverage rows in one transaction, then prune rows for
  * files absent from file_hashes (deleted from the repo). Call AFTER hashes
@@ -808,39 +695,6 @@ int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char
 int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out);
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
 
-/* Read one bounded semantic-analysis page plus exact totals/current metadata.
- * offset is a row ordinal in stable (rel_path, kind) order. limit must be
- * 1..CBM_ANALYSIS_COVERAGE_PAGE_MAX_ROWS; detail_preview_bytes must be at most
- * CBM_ANALYSIS_COVERAGE_DETAIL_MAX_BYTES. Empty/current generations succeed
- * with zero totals and has_meta=true. Allocation failure is distinguishable
- * from SQLite/argument failures. `out` must be zero-initialized before its
- * first call and cleared before reuse. */
-cbm_analysis_coverage_status_t cbm_store_analysis_coverage_get_page(
-    cbm_store_t *s, const char *project, int64_t offset, int limit, size_t detail_preview_bytes,
-    cbm_analysis_coverage_page_t *out);
-void cbm_store_analysis_coverage_page_clear(cbm_analysis_coverage_page_t *page);
-
-/* Read one bounded canonical syntactic page plus exact category totals,
- * current metadata, and a SHA-256 of every selected full row in stable binary
- * (rel_path, kind) order. offset is a row ordinal in that stream. The output
- * must be zero-initialized before its first call and cleared before reuse. */
-cbm_syntactic_coverage_status_t cbm_store_syntactic_coverage_get_page(
-    cbm_store_t *s, const cbm_syntactic_coverage_request_t *request,
-    cbm_syntactic_coverage_page_t *out);
-void cbm_store_syntactic_coverage_page_clear(cbm_syntactic_coverage_page_t *page);
-
-#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-typedef void (*cbm_analysis_coverage_test_hook_fn)(void *userdata);
-void cbm_store_analysis_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations);
-void cbm_store_analysis_coverage_test_set_after_totals_hook(cbm_store_t *s,
-                                                            cbm_analysis_coverage_test_hook_fn hook,
-                                                            void *userdata);
-typedef void (*cbm_syntactic_coverage_test_hook_fn)(void *userdata);
-void cbm_store_syntactic_coverage_test_fail_alloc_after(cbm_store_t *s, int allocations);
-void cbm_store_syntactic_coverage_test_set_after_totals_hook(
-    cbm_store_t *s, cbm_syntactic_coverage_test_hook_fn hook, void *userdata);
-#endif
-
 /* Name of the derived miss-graph shadow project ("<project>::missed").
  * cbm_store_coverage_replace materializes the coverage rows as a file-
  * structure graph (Project → Folder → File{kind, detail}) under this project
@@ -866,6 +720,13 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
 int cbm_store_bfs_trail(cbm_store_t *s, int64_t start_id, const char *direction,
                         const char **edge_types, int edge_type_count, int max_depth,
                         int max_results, cbm_traverse_result_t *out);
+/* BFS with an explicit edge-data budget. max_edges=0 skips the secondary
+ * all-pairs edge lookup; max_edges>0 collects at most that many edges and
+ * raises out->edges_truncated on saturation. Node traversal is unchanged.
+ * This is intended for lean callers that need nodes but not edge properties. */
+int cbm_store_bfs_with_edge_limit(cbm_store_t *s, int64_t start_id, const char *direction,
+                                  const char **edge_types, int edge_type_count, int max_depth,
+                                  int max_results, int max_edges, cbm_traverse_result_t *out);
 
 /* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
  * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the
@@ -1013,17 +874,13 @@ typedef struct {
     int language_count;
     int package_count;
     int entry_point_count;
-    int entry_point_total;
     int route_count;
-    int route_total;
     int hotspot_count;
     int boundary_count;
     int service_count;
     int layer_count;
     int cluster_count;
     int file_tree_count;
-    bool entry_points_truncated;
-    bool routes_truncated;
 } cbm_architecture_info_t;
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
@@ -1191,7 +1048,11 @@ typedef struct {
 /* Search for nodes similar to the given query keywords using stored RI vectors.
  * Builds a merged query vector from the keywords, then does cosine scan via
  * the cbm_cosine_i8 SQL function joined with the nodes table.
- * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
+ * Returns CBM_STORE_OK with results sorted by score DESC (possibly zero),
+ * CBM_STORE_NOT_FOUND when the store carries no node_vectors table (lean
+ * index — an empty universe, not a fault), or CBM_STORE_ERR when the scan
+ * itself failed; callers must not render CBM_STORE_ERR as zero matches.
+ * Caller must free with cbm_store_free_vector_results. */
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count);

@@ -53,12 +53,7 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 
 /* ── MCP protocol helpers ─────────────────────────────────────── */
 
-/* Complete serialized CallToolResult ceiling, including structuredContent. */
-#define CBM_MCP_RESULT_MAX_BYTES 65536U
-
-/* Format an MCP tool result with text content. Returns heap-allocated JSON.
- * Oversize results fail closed as an explicit bounded error; no partial
- * payload is returned. */
+/* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
 /* Return true when notifications/cancelled params target the active request. */
@@ -80,7 +75,6 @@ const char *cbm_mcp_tool_name(int index);
 /* Tool metadata by name (static; do not free; NULL when unknown). Used by the
  * generated client adapters so they can emit descriptions and parameter
  * schemas without drifting from tools/list. */
-const char *cbm_mcp_tool_title(const char *tool_name);
 const char *cbm_mcp_tool_description(const char *tool_name);
 
 /* Render the top-level --help "Tools:" block from the registry so the help
@@ -294,5 +288,9 @@ void cbm_mcp_server_request_scope_end(cbm_mcp_server_t *srv);
  * Writes to out_path (up to out_size bytes). Returns true on success.
  * On Windows, strips leading / from /C:/path. */
 bool cbm_parse_file_uri(const char *uri, char *out_path, int out_size);
+
+/* How many restarts a failed index worker gets, as CBM_INDEX_MAX_RESTARTS sets
+ * it. Exposed so a test can check what the setting resolves to. */
+int cbm_index_restart_cap_for_testing(void);
 
 #endif /* CBM_MCP_H */

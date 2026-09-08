@@ -3481,13 +3481,6 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
 static const CBMType *py_parse_type_text(CBMArena *arena, const char *ann);
 static const CBMType *py_parse_type_text_qn(CBMArena *arena, const char *ann,
                                             const char *module_qn);
-/* Depth-threaded core of py_parse_type_text_qn. This parser has no PyLSPContext
- * to carry a depth field, so the recursion bound rides an explicit parameter:
- * nested subscript annotations (List[List[…int…]]) recurse one C frame per
- * level. Past the cap the subtree collapses to unknown — graceful degradation,
- * not a stack-exhaustion crash. */
-static const CBMType *py_parse_type_text_qn_depth(CBMArena *arena, const char *ann,
-                                                  const char *module_qn, int depth);
 
 /* Trim ASCII whitespace from both ends of an arena-allocated copy. */
 static char *py_trim_ws(CBMArena *arena, const char *start, size_t len) {
@@ -3557,13 +3550,6 @@ static const char **py_split_subscript_args(CBMArena *arena, const char *s, int 
 
 static const CBMType *py_parse_type_text_qn(CBMArena *arena, const char *ann,
                                             const char *module_qn) {
-    return py_parse_type_text_qn_depth(arena, ann, module_qn, 0);
-}
-
-static const CBMType *py_parse_type_text_qn_depth(CBMArena *arena, const char *ann,
-                                                  const char *module_qn, int depth) {
-    if (depth >= cbm_lsp_max_walk_depth())
-        return cbm_type_unknown();
     if (!ann || !ann[0])
         return cbm_type_unknown();
     size_t len = strlen(ann);
@@ -3573,7 +3559,7 @@ static const CBMType *py_parse_type_text_qn_depth(CBMArena *arena, const char *a
         if (unquoted) {
             memcpy(unquoted, ann + 1, len - 2);
             unquoted[len - 2] = '\0';
-            return py_parse_type_text_qn_depth(arena, unquoted, module_qn, depth + 1);
+            return py_parse_type_text_qn(arena, unquoted, module_qn);
         }
     }
 
@@ -3606,8 +3592,7 @@ static const CBMType *py_parse_type_text_qn_depth(CBMArena *arena, const char *a
                         arena, (size_t)(arg_n + 1) * sizeof(const CBMType *));
                     if (arg_types) {
                         for (int i = 0; i < arg_n; i++) {
-                            arg_types[i] = py_parse_type_text_qn_depth(arena, arg_strs[i],
-                                                                       module_qn, depth + 1);
+                            arg_types[i] = py_parse_type_text_qn(arena, arg_strs[i], module_qn);
                         }
                         arg_types[arg_n] = NULL;
                     }
@@ -3670,7 +3655,7 @@ static const CBMType *py_parse_type_text_qn_depth(CBMArena *arena, const char *a
                 if (arg_types && arg_n > 0) {
                     return cbm_type_template(arena, btrim, arg_types, arg_n);
                 }
-                return py_parse_type_text_qn_depth(arena, btrim, module_qn, depth + 1);
+                return py_parse_type_text_qn(arena, btrim, module_qn);
             }
         }
     }
@@ -3703,8 +3688,7 @@ static const CBMType *py_parse_type_text_qn_depth(CBMArena *arena, const char *a
                     arena, (size_t)(onum + 1) * sizeof(const CBMType *));
                 if (members) {
                     for (int j = 0; j < onum; j++) {
-                        members[j] =
-                            py_parse_type_text_qn_depth(arena, out[j], module_qn, depth + 1);
+                        members[j] = py_parse_type_text_qn(arena, out[j], module_qn);
                     }
                     return cbm_type_union(arena, members, onum);
                 }

@@ -125,12 +125,6 @@ typedef enum {
     CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED = 6,
 } cbm_daemon_runtime_application_status_t;
 
-/* An agent reading one line of CLI output cannot see a stack trace or ask a
- * follow-up question, so every terminal status must name itself rather than
- * collapse into one generic failure. Static storage; never NULL. */
-const char *cbm_daemon_runtime_application_status_str(
-    cbm_daemon_runtime_application_status_t status);
-
 typedef uint64_t cbm_daemon_runtime_application_token_t;
 #define CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID UINT64_C(0)
 
@@ -256,12 +250,6 @@ bool cbm_daemon_runtime_hello_request_encode(uint8_t out[CBM_DAEMON_RENDEZVOUS_R
  * match both the claimed and active build fingerprints. */
 bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
                                                   char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
-
-#if defined(__APPLE__) && defined(CBM_DAEMON_RUNTIME_ENABLE_TEST_API)
-/* Test-only TOCTOU seam: substitute the candidate returned by proc_pidpath
- * before the production vnode-to-executable-mapping checks run. */
-void cbm_daemon_runtime_test_set_process_image_path_override(const char *path);
-#endif
 
 /* Ask any current daemon generation to drain before install/update/uninstall.
  * This is not a normal HELLO and never creates an application session. The

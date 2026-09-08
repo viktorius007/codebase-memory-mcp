@@ -41,35 +41,6 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path, const char *module_qn);
 
-// Rust only: fold a `#[cfg(...)]` predicate carried by `func_node` into `base_qn`,
-// producing the cfg-disambiguated QN (`foo` -> `foo#cfg(unix)]`) that keeps
-// cfg-gated twin definitions distinct in the graph (#495). Returns `base_qn`
-// unchanged when the function carries no cfg attribute or the language is not
-// Rust.
-//
-// SINGLE SOURCE OF TRUTH for that suffix: the DEFINITION walk (extract_defs.c)
-// and the enclosing-function attribution used by the CALL walk must produce
-// byte-identical QNs, because calls_find_source() (src/pipeline/pass_calls.c)
-// joins them by exact QN equality. When only the def side applied the suffix,
-// every call inside a cfg-gated fn missed that lookup and was silently
-// re-attributed to the file's `__file__` node — inflating trace_path's
-// `callers_total` with a non-callable row while dropping the real caller.
-const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
-                                        const char *source, CBMLanguage lang);
-const char *cbm_rust_callable_qualified_name(CBMArena *a, const char *project, const char *rel_path,
-                                             const char *module_qn, TSNode func_node,
-                                             const char *source);
-
-// Truncate a type's generic-argument list in place: `Holder<T>` -> `Holder`,
-// `From<Feet>` -> `From`. A qualified path with no `<` (`io::Write`) is left
-// alone. The base name IS the type's identity in the graph.
-//
-// SINGLE SOURCE OF TRUTH: the definition walk names an impl's Method node after
-// the STRIPPED type, so the call walk's class-scope QN must strip identically or
-// the exact-equality join in calls_find_source() misses and the call is
-// re-attributed to the file's `__file__` node.
-void cbm_strip_generic_args(char *type_name);
-
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 
@@ -150,6 +121,13 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
 
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
+
+// Find every child node matching `kind` (unlike cbm_find_child_by_kind,
+// which stops at the first match). Writes up to `max` nodes into `out`;
+// returns how many were found. Repeated sibling nodes of the same kind are
+// common in some grammars (e.g. C#/PHP stack each `[Attr]` as its own
+// attribute_list child) — see #1692.
+int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max);
 
 /* --- Lisp-family shared gates ---------------------------------------------
  * The defs, calls and unified extractors each walk the same generic `list`

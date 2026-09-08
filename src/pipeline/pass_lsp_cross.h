@@ -42,13 +42,6 @@
 
 /* True iff this language has a cbm_run_X_lsp_cross resolver wired up. */
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
-bool cbm_pxc_collection_requires_abort(CBMFileResult *const *cache, const cbm_file_info_t *files,
-                                       int file_count, CBMPxcCollectStatus status);
-
-typedef enum {
-    CBM_PXC_DISPATCH_COMPLETE = 0,
-    CBM_PXC_DISPATCH_ALLOCATION_FAILED = 1,
-} CBMPxcDispatchStatus;
 
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the
@@ -56,40 +49,24 @@ typedef enum {
  * returned CBMLSPDef[] are borrowed from cache[i]->arena and from
  * def_modules[i] — caller must keep both alive while the array is in
  * use. Returns the malloc'd array (free() it) and writes the entry
- * count to *out_count and the disjoint outcome to *out_status. An empty
- * universe and allocation failure both return NULL/write 0, but can never be
- * confused through the typed status. out_def_starts (optional, file_count + 1 entries,
- * caller-owned) receives per-file prefix offsets: file i's defs occupy [out_def_starts[i],
- * out_def_starts[i+1]) — the LSP-surface serializer needs the per-file slices, which the flat array
- * does not otherwise record. Nullable ctx enables base-class qualified-name
- * resolution using the project registry and each file's import map. Surface
- * probes pass NULL to retain source spelling without a registry. */
+ * count to *out_count. Returns NULL on alloc failure or when no defs
+ * exist. out_def_starts (optional, file_count + 1 entries, caller-owned)
+ * receives per-file prefix offsets: file i's defs occupy
+ * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
+ * needs the per-file slices, which the flat array does not otherwise
+ * record.
+ *
+ * `ctx` (nullable) enables cross-file base-class resolution: for the
+ * languages whose cross registrars read embedded_types as qualified names
+ * (Python, JS/TS/TSX), every CBMDefinition.base_classes spelling is resolved
+ * to a project QN through ctx->registry plus the file's import map — the same
+ * inputs pass_semantic uses to draw its INHERITS edge, so the LSP's
+ * inheritance view and the graph's cannot diverge. Pass NULL to keep the raw
+ * source spelling (surface-probe paths that build no registry). */
 CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
                                     const cbm_file_info_t *files, int file_count,
                                     const char *project_name, char **def_modules, int *out_count,
-                                    CBMPxcCollectStatus *out_status, int *out_def_starts,
-                                    const struct CBMCargoManifest *rust_manifest);
-
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-/* Deterministic one-shot allocation seams local to the cross-LSP publication
- * boundary. `copy_position` is 1-based across required/optional string fields. */
-void cbm_pxc_test_fail_collect_alloc_once(void);
-void cbm_pxc_test_fail_target_route_alloc_once(void);
-void cbm_pxc_test_poison_non_rust_registry_once(void);
-void cbm_pxc_test_fail_destination_copy_at(int copy_position);
-bool cbm_pxc_test_append_results(CBMFileResult *destination, const CBMResolvedCallArray *source);
-bool cbm_pxc_test_append_synthetic_calls(CBMFileResult *destination, const CBMCallArray *source);
-bool cbm_pxc_test_non_rust_destination_failure_is_typed(void);
-bool cbm_pxc_test_package_lib_visible(int caller_root, int lib_root);
-bool cbm_pxc_test_package_lib_visible_for_caller(const cbm_file_info_t *files,
-                                                 CBMFileResult *const *cache, int file_count,
-                                                 int caller,
-                                                 const struct CBMCargoManifest *manifest,
-                                                 int lib_root);
-#endif
-
-/* Production call sites invoke this unconditionally; non-test builds are a no-op. */
-void cbm_pxc_test_poison_non_rust_registry(CBMArena *arena);
+                                    int *out_def_starts);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
@@ -100,20 +77,6 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
  * metadata cannot diverge between pipelines. Values are owned by the returned
  * map (not borrowed from gbuf); release both arrays with
  * cbm_pxc_free_import_map(). */
-typedef enum {
-    CBM_PXC_IMPORT_MAP_COMPLETE = 0,
-    CBM_PXC_IMPORT_MAP_ALLOCATION_FAILED = 1,
-    CBM_PXC_IMPORT_MAP_AUTHORITY_UNAVAILABLE = 2,
-} CBMPxcImportMapStatus;
-
-CBMPxcImportMapStatus cbm_pxc_build_import_map_with_rust_authority(
-    const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path, CBMLanguage lang,
-    const CBMFileResult *result, const cbm_file_info_t *files, CBMFileResult *const *cache,
-    int file_count, const struct CBMCargoManifest *rust_manifest, const char ***out_keys,
-    const char ***out_vals, CBMRustImportScope **out_scopes, int *out_count);
-void cbm_pxc_record_rust_authority_health(CBMFileResult *result,
-                                          const struct CBMCargoManifest *manifest,
-                                          CBMPxcImportMapStatus import_status);
 int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
                              CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count);
@@ -216,13 +179,15 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     }
 }
 
+/* Build and borrow the Rust Cargo manifest used for cross-crate (#56) routing.
+ * The manifest owns strings in manifest_arena; callers keep that arena alive
+ * until every resolver worker has joined.  Each worker must install the shared
+ * immutable pointer in its own TLS slot before dispatch and clear it afterward. */
 struct CBMCargoManifest;
-
-/* Parse the repository root Cargo.toml into caller-owned arena storage. The
- * immutable result may be borrowed by every Rust cross-LSP dispatch until the
- * caller destroys `arena`. False means no readable root manifest. */
-bool cbm_pxc_build_rust_manifest(const char *repo_path, CBMArena *arena,
+bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manifest_arena,
                                  struct CBMCargoManifest *out_manifest);
+void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
+const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
@@ -245,12 +210,12 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * per-file fallback with FILTERED defs for languages without a shared
  * variant. rust_shared_get (nullable) supplies the lazily-built shared Rust
  * registry for NULL-filter rust files. */
-CBMPxcDispatchStatus cbm_pxc_dispatch_file(
-    CBMLanguage lang, CBMFileResult *result, const char *source, int source_len, const char *rel,
-    const char *def_module, const CBMCrossLspRegistries *cross_registries,
-    const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs, int all_def_count,
-    const char **imp_keys, const char **imp_vals, const CBMRustImportScope *rust_import_scopes,
-    int imp_count, const struct CBMCargoManifest *rust_manifest,
-    CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx);
+void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
+                           int source_len, const char *rel, const char *def_module,
+                           const CBMCrossLspRegistries *cross_registries,
+                           const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
+                           int all_def_count, const char **imp_keys, const char **imp_vals,
+                           int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
+                           void *rust_shared_ctx);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

@@ -9,7 +9,7 @@ Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 **Prerequisites**: C compiler (gcc or clang), make, zlib, Git. Optional: Node.js 22+ (for graph UI).
 
 ```bash
-git clone https://github.com/viktorius007/codebase-memory-mcp.git
+git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
 git config core.hooksPath scripts/hooks  # activates pre-commit security checks
 scripts/build.sh
@@ -20,31 +20,13 @@ Linux: `sudo apt install build-essential zlib1g-dev` (Debian/Ubuntu) or `sudo dn
 
 The binary is output to `build/c/codebase-memory-mcp`.
 
-`build.sh` is always a clean build of `BUILD_DIR`; the content-verified compiler
-cache (ccache, wired up by `scripts/env.sh`) keeps repeat builds fast without
-ever reusing a stale object. Set `CBM_NO_CCACHE=1` to disable it.
-
-The build also accepts `EXTRA_CFLAGS`, `EXTRA_CXXFLAGS`, and `EXTRA_LDFLAGS` for
-local instrumentation or platform-specific linker experiments. On macOS with the
-default Apple linker, the final link remains a single serial step.
-
 ## Run Tests
 
 ```bash
 scripts/test.sh
 ```
 
-For a fast iteration loop, run just the suites you are touching — this rebuilds
-the test-runner incrementally and takes seconds:
-
-```bash
-scripts/test.sh --suites daemon,daemon_ipc
-build/c/test-runner --list-suites   # available suite names
-```
-
-The default run builds with ASan + UBSan and runs the full C test suite through
-the parallel harness; `CBM_TEST_SEQUENTIAL=1` restores the single-process
-runner. Key test files:
+This builds with ASan + UBSan and runs the full C test suite. Key test files:
 - `tests/test_pipeline.c` — pipeline integration tests
 - `tests/test_httplink.c` — HTTP route extraction and linking
 - `tests/test_mcp.c` — MCP protocol and tool handler tests

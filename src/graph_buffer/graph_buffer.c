@@ -915,46 +915,6 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     return deleted_count;
 }
 
-/* Rewrite a node's properties JSON so the is_test flag reads true. The producer
- * (build_def_props) always emits exactly one literal `"is_test":false` or
- * `"is_test":true` token, so a substring rewrite is well-defined. `false`→`true`
- * is one byte shorter, so the tail is shifted left in place (no realloc); an
- * already-true node is left untouched. Returns 1 if the node was flipped. */
-static int node_props_set_is_test_true(cbm_gbuf_node_t *n) {
-    if (!n->properties_json) {
-        return 0;
-    }
-    char *hit = strstr(n->properties_json, "\"is_test\":false");
-    if (!hit) {
-        return 0; /* already true, or flag absent (non-def node) */
-    }
-    char *false_tok = hit + strlen("\"is_test\":");
-    /* Overwrite "false" with "true" and close the 1-byte gap by moving the
-     * remainder (including the NUL) left one position. */
-    memcpy(false_tok, "true", 4);
-    char *tail = false_tok + strlen("false"); /* first byte after "false" */
-    memmove(false_tok + strlen("true"), tail, strlen(tail) + 1);
-    return 1;
-}
-
-int cbm_gbuf_mark_test_files(cbm_gbuf_t *gb, const CBMHashTable *file_paths) {
-    if (!gb || !file_paths) {
-        return 0;
-    }
-    int flipped = 0;
-    for (int i = 0; i < gb->nodes.count; i++) {
-        cbm_gbuf_node_t *n = gb->nodes.items[i];
-        if (!n->file_path || !n->qualified_name) {
-            continue;
-        }
-        if (!cbm_ht_get(file_paths, n->file_path)) {
-            continue;
-        }
-        flipped += node_props_set_is_test_true(n);
-    }
-    return flipped;
-}
-
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
     if (!gb || !db_path || !project) {
         return CBM_NOT_FOUND;
@@ -1085,7 +1045,18 @@ static double edge_props_confidence(const char *props_json) {
     if (!p) {
         return CBM_EDGE_CONF_ABSENT;
     }
-    return strtod(p + sizeof(conf_key) - SKIP_ONE, NULL);
+    /* strtod answers 0.0 for text it cannot read, and 0.0 is a real
+     * confidence that beats CBM_EDGE_CONF_ABSENT. So a blob carrying
+     * "confidence":null used to outrank a clean blob that carries no
+     * confidence at all, and displace it. Ask strtod where it stopped: an
+     * end pointer that never moved means it read nothing. */
+    const char *value = p + sizeof(conf_key) - SKIP_ONE;
+    char *end = NULL;
+    double conf = strtod(value, &end);
+    if (end == value) {
+        return CBM_EDGE_CONF_ABSENT;
+    }
+    return conf;
 }
 
 /* Decide whether an incoming property blob replaces the stored one on a

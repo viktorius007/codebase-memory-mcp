@@ -12,19 +12,25 @@
  */
 #include "foundation/constants.h"
 
-enum { PD_RING = 4, PD_RING_MASK = 3 };
+enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD_ESC_SPACE = 2 };
+/* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
+ * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
+enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "pipeline/pipeline.h"
 #include <stdint.h>
+#include <ctype.h>
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
-#include "pipeline/definition_properties.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 #include "arena.h"
 #include "iris_export_xml.h"
+#include "simhash/minhash.h"
+#include "semantic/ast_profile.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,26 +114,228 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
+/* Append a JSON-escaped string value to buf at position *pos.
+ * Writes: ,"key":"escaped_value"
+ * Handles: \, ", \n, \r, \t */
+static int def_json_escape_char(char *buf, size_t avail, char ch) {
+    char esc = 0;
+    switch (ch) {
+    case '"':
+        esc = '"';
+        break;
+    case '\\':
+        esc = '\\';
+        break;
+    case '\n':
+        esc = 'n';
+        break;
+    case '\r':
+        esc = 'r';
+        break;
+    case '\t':
+        esc = 't';
+        break;
+    default:
+        if (avail >= SKIP_ONE) {
+            /* Any other raw control byte (e.g. form feed) is invalid inside a
+             * JSON string — degrade to a space. */
+            buf[0] = ((unsigned char)ch < 0x20) ? ' ' : ch;
+        }
+        return SKIP_ONE;
+    }
+    if (avail >= PD_ESC_SPACE) {
+        buf[0] = '\\';
+        buf[SKIP_ONE] = esc;
+    }
+    return PD_ESC_SPACE;
+}
+
+/* Escaped length of a string under def_json_escape_char's rules: escaped
+ * characters expand to 2 bytes, everything else stays 1. */
+static size_t def_json_escaped_len(const char *s) {
+    size_t n = 0;
+    for (; *s; s++) {
+        switch (*s) {
+        case '"':
+        case '\\':
+        case '\n':
+        case '\r':
+        case '\t':
+            n += PD_ESC_SPACE;
+            break;
+        default:
+            n += SKIP_ONE;
+        }
+    }
+    return n;
+}
+
+/* Appends are ATOMIC: a field is emitted only if the WHOLE serialized form
+ * fits (with PD_ESC_SPACE bytes reserved for the closing '}' + NUL). Cutting a
+ * field mid-value produced unterminated strings/arrays — malformed properties
+ * JSON that aborts every json_extract()-based consumer downstream (seen on the
+ * Linux kernel: 50-param functions truncated at the 2 KB cap). Dropping an
+ * oversized optional field whole keeps the JSON valid. */
+static void append_json_string(char *buf, size_t bufsize, size_t *pos, const char *key,
+                               const char *val) {
+    if (!val || val[0] == '\0') {
+        return;
+    }
+    /* ,"key":"<escaped>" — comma + 2 key quotes + colon + 2 value quotes */
+    size_t required = strlen(key) + def_json_escaped_len(val) + PD_JSON_FIELD_OVERHEAD;
+    if (*pos + required + PD_ESC_SPACE > bufsize) {
+        return; /* whole field would not fit — skip it atomically */
+    }
+    size_t p = *pos;
+    int w = snprintf(buf + p, bufsize - p, ",\"%s\":\"", key);
+    if (w <= 0 || (size_t)w >= bufsize - p) {
+        return;
+    }
+    p += (size_t)w;
+    for (const char *s = val; *s && p < bufsize - PD_ESC_MARGIN; s++) {
+        p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
+    }
+    if (p < bufsize - SKIP_ONE) {
+        buf[p++] = '"';
+    }
+    buf[p] = '\0';
+    *pos = p;
+}
+
+/* Append a JSON array of strings: ,"key":["a","b","c"]. Atomic like
+ * append_json_string: emitted only if the whole array fits. */
+static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const char *key,
+                                  const char **arr) {
+    if (!arr || !arr[0] || *pos >= bufsize - PD_JSON_MARGIN) {
+        return;
+    }
+    /* ,"key":[ + per item "<escaped>" + separating commas + ] */
+    size_t required = strlen(key) + PD_JSON_FIELD_OVERHEAD;
+    for (int i = 0; arr[i]; i++) {
+        required += def_json_escaped_len(arr[i]) + PD_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
+    }
+    if (*pos + required + PD_ESC_SPACE > bufsize) {
+        return; /* whole array would not fit — skip it atomically */
+    }
+    size_t p = *pos;
+    int n = snprintf(buf + p, bufsize - p, ",\"%s\":[", key);
+    if (n <= 0 || p + (size_t)n >= bufsize - PD_ESC_SPACE) {
+        return;
+    }
+    p += (size_t)n;
+    for (int i = 0; arr[i]; i++) {
+        if (i > 0 && p < bufsize - SKIP_ONE) {
+            buf[p++] = ',';
+        }
+        if (p < bufsize - SKIP_ONE) {
+            buf[p++] = '"';
+        }
+        /* Full escaping (not just quote/backslash): items like C param types
+         * sliced from multi-line declarations carry raw \n/\t bytes, which are
+         * invalid inside JSON strings. */
+        for (const char *s = arr[i]; *s && p < bufsize - PD_ESC_SPACE; s++) {
+            p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
+        }
+        if (p < bufsize - SKIP_ONE) {
+            buf[p++] = '"';
+        }
+    }
+    if (p < bufsize - SKIP_ONE) {
+        buf[p++] = ']';
+    }
+    buf[p] = '\0';
+    *pos = p;
+}
+
+/* Build properties JSON for a definition node. */
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+    /* The complexity/loop/recursion metrics are only meaningful for executable
+     * units (Function/Method). Emitting them on the millions of Macro/Field/
+     * Variable/Class/Enum nodes — where they are always zero — bloats every
+     * node's properties (~150 B), inflating RAM, the gbuf merge copy and the
+     * dump. Gate the block to functions; other labels keep the lean base. */
+    const bool is_fn =
+        def->label && (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0);
+    int n;
+    if (is_fn) {
+        n = snprintf(buf, bufsize,
+                     "{\"complexity\":%d,\"cognitive\":%d,\"loop_count\":%d,\"loop_depth\":%d,"
+                     "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
+                     "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
+                     "\"unguarded_recursion\":%s,"
+                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s",
+                     def->complexity, def->cognitive, def->loop_count, def->loop_depth,
+                     def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
+                     def->linear_scan_in_loop, def->alloc_in_loop,
+                     def->recursion_in_loop ? "true" : "false",
+                     def->unguarded_recursion ? "true" : "false", def->lines,
+                     def->is_exported ? "true" : "false", def->is_test ? "true" : "false",
+                     def->is_entry_point ? "true" : "false");
+    } else {
+        n = snprintf(buf, bufsize,
+                     "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
+                     "\"is_entry_point\":%s",
+                     def->complexity, def->lines, def->is_exported ? "true" : "false",
+                     def->is_test ? "true" : "false", def->is_entry_point ? "true" : "false");
+    }
+
+    if (n <= 0 || (size_t)n >= bufsize) {
+        buf[0] = '\0';
+        return;
+    }
+    size_t pos = (size_t)n;
+    append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
+    append_json_string(buf, bufsize, &pos, "signature", def->signature);
+    append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
+    append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
+    append_json_str_array(buf, bufsize, &pos, "decorators", def->decorators);
+    append_json_str_array(buf, bufsize, &pos, "base_classes", def->base_classes);
+    append_json_str_array(buf, bufsize, &pos, "param_names", def->param_names);
+    append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
+    append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
+    append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+
+    /* MinHash fingerprint — append if present and buffer has room. */
+    if (def->fingerprint && def->fingerprint_k > 0 &&
+        pos + CBM_MINHASH_HEX_LEN + CBM_MINHASH_JSON_OVERHEAD < bufsize) {
+        char fp_hex[CBM_MINHASH_HEX_BUF];
+        cbm_minhash_to_hex((const cbm_minhash_t *)def->fingerprint, fp_hex, sizeof(fp_hex));
+        append_json_string(buf, bufsize, &pos, "fp", fp_hex);
+    }
+
+    /* AST structural profile */
+    if (def->structural_profile && pos + CBM_AST_PROFILE_BUF < bufsize) {
+        append_json_string(buf, bufsize, &pos, "sp", def->structural_profile);
+    }
+
+    /* Body tokens */
+    if (def->body_tokens && pos + CBM_SZ_512 < bufsize) {
+        append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
+    }
+
+    if (pos < bufsize - SKIP_ONE) {
+        buf[pos] = '}';
+        buf[pos + SKIP_ONE] = '\0';
+    }
+}
+
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
-static cbm_def_properties_status_t process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
-                                               const char *rel, CBMLanguage lang) {
+static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel) {
     if (!def->qualified_name || !def->name) {
-        return CBM_DEF_PROPERTIES_OK;
+        return;
     }
-    cbm_def_properties_t props = {0};
-    cbm_def_properties_status_t prop_status = cbm_def_properties_build(def, &props);
-    if (prop_status != CBM_DEF_PROPERTIES_OK) {
-        return prop_status;
-    }
-    int64_t node_id =
-        cbm_gbuf_upsert_node(ctx->gbuf, def->label ? def->label : "Function", def->name,
-                             def->qualified_name, def->file_path ? def->file_path : rel,
-                             (int)def->start_line, (int)def->end_line, props.json);
-    cbm_def_properties_destroy(&props);
-    /* Full, parallel and incremental resolution share the registry's symbol
-     * membership, including constants and lineage-only relations. */
+    char props[CBM_SZ_2K];
+    build_def_props(props, sizeof(props), def);
+    int64_t node_id = cbm_gbuf_upsert_node(
+        ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
+        def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
+     * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
+     * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
+     * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
+     * through the same predicate, so the three registries cannot diverge. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label, lang);
+        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -141,7 +349,6 @@ static cbm_def_properties_status_t process_def(cbm_pipeline_ctx_t *ctx, const CB
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
         }
     }
-    return CBM_DEF_PROPERTIES_OK;
 }
 
 /* Create Channel nodes + EMITS / LISTENS_ON edges for one file's channels.
@@ -259,9 +466,10 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
         if (target && target->id != source_node->id) {
+            char esc_ln[CBM_SZ_128];
+            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
             char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
-                     imp->local_name ? imp->local_name : "");
+            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
             cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
             count++;
         }
@@ -337,26 +545,92 @@ static bool objectscript_export_append_secondary_arrays(CBMFileResult *aggregate
 /* Preserve every generated class's parse diagnostics. The generated UDL
  * snippets all map back to one physical Studio Export file, so their compact
  * range lists can be concatenated using the ordinary comma separator. */
+/* Read the trailing ",+<N>" truncation marker off a range string. Returns the
+ * number of dropped ranges the marker reports, or 0 when there is no marker,
+ * and writes the length of the part before the marker to `body_len`. */
+static int objectscript_export_split_range_marker(const char *ranges, size_t *body_len) {
+    size_t len = ranges ? strlen(ranges) : 0;
+    *body_len = len;
+    if (len == 0) {
+        return 0;
+    }
+    size_t i = len;
+    while (i > 0 && isdigit((unsigned char)ranges[i - 1])) {
+        i--;
+    }
+    if (i == len || i == 0 || ranges[i - 1] != '+') {
+        return 0;
+    }
+    size_t marker = i - 1; /* index of '+' */
+    if (marker > 0 && ranges[marker - 1] == ',') {
+        marker--; /* drop the separator too */
+    }
+    *body_len = marker;
+    return atoi(ranges + i);
+}
+
+/* Join one Studio Export part's ranges onto the aggregate.
+ *
+ * One export file can hold several <Class> elements, each parsed separately,
+ * so their range strings get concatenated. A ",+<N>" truncation marker must
+ * end up ONCE, at the very end: every reader stops at the first token that is
+ * not a range, so a marker left in the middle would silently hide every range
+ * after it. Strip the marker off both sides, join the plain ranges, then add
+ * one marker back carrying the summed count. */
 static bool objectscript_export_append_error_ranges(CBMFileResult *aggregate,
                                                     const CBMFileResult *part) {
     aggregate->parse_incomplete = aggregate->parse_incomplete || part->parse_incomplete;
+    aggregate->parse_unusable = aggregate->parse_unusable || part->parse_unusable;
     aggregate->error_region_count += part->error_region_count;
     if (!part->error_ranges || !part->error_ranges[0]) {
         return true;
     }
-    const char *combined = NULL;
-    if (aggregate->error_ranges && aggregate->error_ranges[0]) {
-        combined = cbm_arena_sprintf(&aggregate->arena, "%s,%s", aggregate->error_ranges,
-                                     part->error_ranges);
+
+    size_t agg_len = 0;
+    size_t part_len = 0;
+    int dropped = 0;
+    const char *agg_body = aggregate->error_ranges;
+    if (agg_body && agg_body[0]) {
+        dropped += objectscript_export_split_range_marker(agg_body, &agg_len);
     } else {
-        combined = cbm_arena_strdup(&aggregate->arena, part->error_ranges);
+        agg_body = NULL;
+    }
+    dropped += objectscript_export_split_range_marker(part->error_ranges, &part_len);
+
+    const char *combined = NULL;
+    if (agg_body && agg_len > 0 && part_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s,%.*s", (int)agg_len, agg_body,
+                                     (int)part_len, part->error_ranges);
+    } else if (agg_body && agg_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s", (int)agg_len, agg_body);
+    } else if (part_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s", (int)part_len, part->error_ranges);
+    } else {
+        combined = cbm_arena_strdup(&aggregate->arena, "");
     }
     if (!combined) {
         return false;
     }
+    if (dropped > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%s%s+%d", combined, combined[0] ? "," : "",
+                                     dropped);
+        if (!combined) {
+            return false;
+        }
+    }
     aggregate->error_ranges = combined;
     return true;
 }
+
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Test seam. This join only fires for a Studio Export file holding several
+ * <Class> elements where a class overruns the 256-region cap — hard to reach
+ * through the pipeline, easy to get wrong, and a wrong result hides ranges
+ * without saying so. Expose the join so the marker rules can be pinned. */
+bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMFileResult *part) {
+    return objectscript_export_append_error_ranges(aggregate, part);
+}
+#endif
 
 /* Studio Export files may contain multiple <Class> elements, while the
  * pipeline cache has one slot per physical file. Extract each generated UDL
@@ -578,39 +852,14 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         } else if (result->parse_incomplete) {
             /* Best-effort parse-coverage signal (#963): indexed, but with
              * ERROR/MISSING regions — see pass_parallel.c (keep in sync). */
-            cbm_pipeline_add_file_error(ctx->pipeline, rel,
-                                        result->error_ranges ? result->error_ranges : "unknown",
-                                        "parse_partial");
+            cbm_pipeline_add_file_error(
+                ctx->pipeline, rel, result->error_ranges ? result->error_ranges : "unknown",
+                result->parse_unusable ? "parse_unusable" : "parse_partial");
         }
 
         /* Create nodes for each definition */
         for (int d = 0; d < result->defs.count; d++) {
-            const CBMDefinition *def = &result->defs.items[d];
-            cbm_def_properties_status_t prop_status = process_def(ctx, def, rel, lang);
-            if (prop_status != CBM_DEF_PROPERTIES_OK) {
-                char reason[CBM_SZ_128];
-                snprintf(reason, sizeof(reason), "definition properties %s (limit=%d bytes)",
-                         cbm_def_properties_status_name(prop_status), CBM_DEF_PROPERTIES_MAX_BYTES);
-                cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, "properties");
-                cbm_log_warn("definition.properties.failed", "path", rel, "symbol",
-                             def->qualified_name ? def->qualified_name : "?", "reason",
-                             cbm_def_properties_status_name(prop_status), "limit_bytes",
-                             itoa_log(CBM_DEF_PROPERTIES_MAX_BYTES));
-                if (local_cache) {
-                    local_cache[i] = result;
-                } else {
-                    cbm_free_result(result);
-                }
-                if (owns_local_cache) {
-                    for (int j = 0; j < file_count; j++) {
-                        if (local_cache[j]) {
-                            cbm_free_result(local_cache[j]);
-                        }
-                    }
-                    free(local_cache);
-                }
-                return CBM_PIPELINE_ABORT_PRESERVE_DB;
-            }
+            process_def(ctx, &result->defs.items[d], rel);
             total_defs++;
         }
 

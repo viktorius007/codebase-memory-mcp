@@ -16,6 +16,7 @@ int tf_skip_count = 0;
 #include "foundation/constants.h"  /* CBM_SZ_4K — forced stderr buffer */
 #include "foundation/log.h"        /* crash-durable worker log probe */
 #include "foundation/mem.h"        /* cbm_mem_init — worker budget */
+#include "foundation/log.h"        /* worker liveness heartbeat probe */
 #include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
@@ -234,17 +235,21 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
         fflush(NULL);
         _Exit(response ? 0 : 1);
     }
+    if (strstr(args_json, "\"heartbeat\"")) {
+        FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
+        if (response) {
+            (void)fputs("{\"probe\":\"heartbeat\"}", response);
+            (void)fclose(response);
+        }
+        cbm_log_info("pipeline.discover", "files", "1");
+        (void)fprintf(stderr, "async worker heartbeat probe ready\n");
+        fflush(NULL);
+        _Exit(response ? 0 : 1);
+    }
     if (strstr(args_json, "\"crash\"")) {
         (void)fprintf(stderr, "async worker crash probe\n");
         fflush(NULL);
-#ifdef __APPLE__
-        /* See cbm_test_fault_inject: SIGABRT can wedge ASan workers forever
-         * on macOS, whereas SIGKILL is still a real abrupt worker death. */
-        (void)kill(getpid(), SIGKILL);
-        _Exit(128 + SIGKILL);
-#else
         abort();
-#endif
     }
     if (strstr(args_json, "\"buffered-kill\"")) {
         /* The 0-byte-worker-log repro. tf_maybe_run_index_worker has already
@@ -353,6 +358,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
+    cbm_log_init_for_process(false, true);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
@@ -739,13 +745,6 @@ static bool g_skip_perf = false;
         }                                    \
     } while (0)
 
-#define RUN_EXPLICIT_SUITE(name)                     \
-    do {                                             \
-        if (g_suite_argc > 1 && suite_requested(#name)) { \
-            RUN_SUITE(name);                         \
-        }                                            \
-    } while (0)
-
 /* Forward declarations of suite functions */
 extern void suite_arena(void);
 extern void suite_hash_table(void);
@@ -863,8 +862,6 @@ extern void suite_security(void);
 extern void suite_yaml(void);
 extern void suite_integration(void);
 extern void suite_lang_contract(void);
-extern void suite_lang_contract_rest(void);
-extern void suite_lang_contract_breadth(void);
 extern void suite_edge_imports(void);
 extern void suite_edge_structural(void);
 extern void suite_lsp_resolution_probe(void);
@@ -881,18 +878,6 @@ extern void suite_grammar_probe_e(void);
 extern void suite_grammar_probe_f(void);
 extern void suite_grammar_probe_g(void);
 extern void suite_incremental(void);
-extern void suite_incremental_mutation_core(void);
-extern void suite_incremental_mutation_edge(void);
-extern void suite_incremental_mutation_adversarial(void);
-extern void suite_incremental_mutation_adversarial_light(void);
-extern void suite_incremental_mutation_adversarial_heavy(void);
-extern void suite_incremental_mutation_stress(void);
-extern void suite_incremental_mutation_recovery(void);
-extern void suite_incremental_mutation(void);
-extern void suite_incremental_search_graph(void);
-extern void suite_incremental_query_graph(void);
-extern void suite_incremental_code_trace(void);
-extern void suite_incremental_misc_tools(void);
 extern void suite_semantic(void);
 extern void suite_ast_profile(void);
 extern void suite_slab_alloc(void);
@@ -1200,8 +1185,6 @@ int main(int argc, char **argv) {
 
     /* Per-language graph contracts (node/edge types, attribution, no-crash) */
     RUN_SELECTED_SUITE(lang_contract);
-    RUN_EXPLICIT_SUITE(lang_contract_rest);
-    RUN_EXPLICIT_SUITE(lang_contract_breadth);
     RUN_SELECTED_SUITE(edge_imports);
     RUN_SELECTED_SUITE(edge_structural);
     RUN_SELECTED_SUITE(lsp_resolution_probe);
@@ -1219,18 +1202,6 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(grammar_probe_g);
 
     RUN_SELECTED_SUITE_PERF(incremental);
-    RUN_EXPLICIT_SUITE(incremental_mutation_core);
-    RUN_EXPLICIT_SUITE(incremental_mutation_edge);
-    RUN_EXPLICIT_SUITE(incremental_mutation_adversarial);
-    RUN_EXPLICIT_SUITE(incremental_mutation_adversarial_light);
-    RUN_EXPLICIT_SUITE(incremental_mutation_adversarial_heavy);
-    RUN_EXPLICIT_SUITE(incremental_mutation_stress);
-    RUN_EXPLICIT_SUITE(incremental_mutation_recovery);
-    RUN_EXPLICIT_SUITE(incremental_mutation);
-    RUN_EXPLICIT_SUITE(incremental_search_graph);
-    RUN_EXPLICIT_SUITE(incremental_query_graph);
-    RUN_EXPLICIT_SUITE(incremental_code_trace);
-    RUN_EXPLICIT_SUITE(incremental_misc_tools);
 
     if (g_list_only) {
         fflush(stdout);

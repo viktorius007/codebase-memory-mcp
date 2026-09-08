@@ -24,6 +24,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <sqlite3.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -75,10 +76,19 @@ static cbm_store_t *lang_open_indexed(LangProj *lp) {
     if (!lp->project) {
         return NULL;
     }
-    /* Resolve THROUGH the production resolver so the runner's
-     * CBM_CACHE_DIR isolation applies (never the user's real cache). */
-    th_cache_db_path(lp->dbpath, sizeof(lp->dbpath), lp->project);
-    cbm_mkdir_p(th_cache_dir(), 0755);
+    char cache_dir[512];
+    const char *configured_cache = getenv("CBM_CACHE_DIR");
+    if (configured_cache && configured_cache[0]) {
+        snprintf(cache_dir, sizeof(cache_dir), "%s", configured_cache);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home) {
+            home = "/tmp";
+        }
+        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    }
+    cbm_mkdir_p(cache_dir, 0755);
+    snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
     if (!lp->srv) {
@@ -987,59 +997,17 @@ static const CallCase CALL_CASES[] = {
      true, NULL},
 };
 
-static LangMetrics calls_metrics_for_file(cbm_store_t *store, const char *project, const char *rel) {
-    LangMetrics m = {0};
-    cbm_node_t *nodes = NULL;
-    int count = 0;
-    if (!store || cbm_store_find_nodes_by_file(store, project, rel, &nodes, &count) != CBM_STORE_OK) {
-        return m;
-    }
-
-    m.ok = count > 0;
-    for (int i = 0; i < count; i++) {
-        const char *label = nodes[i].label;
-        if (!label || (strcmp(label, "Function") != 0 && strcmp(label, "Method") != 0)) {
-            continue;
-        }
-
-        cbm_edge_t *edges = NULL;
-        int edge_count = 0;
-        if (cbm_store_find_edges_by_source_type(store, nodes[i].id, "CALLS", &edges, &edge_count) ==
-            CBM_STORE_OK) {
-            if (edge_count > 0) {
-                m.callers++;
-                m.calls += edge_count;
-            }
-            cbm_store_free_edges(edges, edge_count);
-        }
-    }
-
-    cbm_store_free_nodes(nodes, count);
-    return m;
-}
-
 TEST(contract_calls_breadth) {
     /* EVERY language must resolve a same-file caller->callee into a CALLS edge.
      * No skips/allowlists: a language that does not is a hard FAILURE that
      * reproduces the bug (the gap_note explains the known cause for the ones we
      * have already root-caused). These stay RED until fixed. */
     int n = (int)(sizeof(CALL_CASES) / sizeof(CALL_CASES[0]));
-    enum { CALL_BREADTH_PATH_BUF = 128 };
-    static char names[128][CALL_BREADTH_PATH_BUF];
-    LangFile files[128] = {0};
-    ASSERT_TRUE(n <= (int)(sizeof(files) / sizeof(files[0])));
-    for (int i = 0; i < n; i++) {
-        snprintf(names[i], sizeof(names[i]), "calls/%03d/%s", i, CALL_CASES[i].filename);
-        files[i].name = names[i];
-        files[i].content = CALL_CASES[i].content;
-    }
-
-    LangProj lp;
-    cbm_store_t *store = lang_index_files(&lp, files, n);
     int failures = 0;
     for (int i = 0; i < n; i++) {
         const CallCase *c = &CALL_CASES[i];
-        LangMetrics m = calls_metrics_for_file(store, lp.project, files[i].name);
+        const LangFile f = {c->filename, c->content};
+        LangMetrics m = lang_metrics(&f, 1);
         if (!(m.ok && m.calls >= 1 && m.callers >= 1)) {
             fprintf(stderr, "  [CALLS-BREADTH] FAIL %-11s ok=%d calls=%d callers=%d%s%s\n", c->lang,
                     m.ok, m.calls, m.callers, c->gap_note ? " — " : "",
@@ -1047,7 +1015,6 @@ TEST(contract_calls_breadth) {
             failures++;
         }
     }
-    lang_cleanup(&lp, store);
     fprintf(stderr,
             "  [CALLS-BREADTH] %d langs: %d FAILURES (each = a language that does not "
             "resolve a same-file CALLS edge)\n",
@@ -1745,7 +1712,9 @@ TEST(contract_edge_parallel_service_edges) {
         {"gql.py", "def gql(query_string):\n    return query_string\n"},
         {"client.py",
          "from gql import gql\n\n\ndef fetch_user():\n"
-         "    return gql(\"query GetUser { user { id name } }\")\n\n\n"
+         /* The embedded double quote survives extraction from this single-quoted
+          * Python string and breaks GRAPHQL_CALLS JSON unless operation is escaped. */
+         "    return gql('query GetUser { user(name: \"quoted\") { id name } }')\n\n\n"
          "def create_user():\n"
          "    return gql(\"mutation CreateUser { addUser(name: \\\"x\\\") { id } }\")\n"},
         /* TRPC_CALLS: local createTRPCProxyClient (same-module resolution). */
@@ -1786,6 +1755,19 @@ TEST(contract_edge_parallel_service_edges) {
     int grpc = store ? cbm_store_count_edges_by_type(store, lp.project, "GRPC_CALLS") : -1;
     int trpc = store ? cbm_store_count_edges_by_type(store, lp.project, "TRPC_CALLS") : -1;
     int infra = store ? cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS") : -1;
+    int invalid_props = -1;
+    if (store) {
+        sqlite3_stmt *stmt = NULL;
+        sqlite3 *db = cbm_store_get_db(store);
+        if (db && sqlite3_prepare_v2(db,
+                                    "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                                    "AND properties != '' AND json_valid(properties)=0;",
+                                    -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            invalid_props = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
     if (graphql < 1 || grpc < 1 || trpc < 1 || infra < 1) {
         fprintf(stderr,
                 "  [EDGE] parallel-service: GRAPHQL_CALLS=%d GRPC_CALLS=%d TRPC_CALLS=%d "
@@ -1798,6 +1780,7 @@ TEST(contract_edge_parallel_service_edges) {
     ASSERT_TRUE(grpc >= 1);
     ASSERT_TRUE(trpc >= 1);
     ASSERT_TRUE(infra >= 1);
+    ASSERT_EQ(invalid_props, 0);
     PASS();
 }
 
@@ -1857,64 +1840,64 @@ TEST(contract_edge_file_changes_with) {
 
 /* ══════════════════════════════════════════════════════════════════ */
 
-#define RUN_LANG_CONTRACT_REST_TESTS()          \
-    do {                                        \
-        RUN_TEST(contract_kotlin_imports_extracted); \
-        RUN_TEST(contract_c_calls_attributed_to_function); \
-        RUN_TEST(contract_java_extract_no_crash); \
-        RUN_TEST(contract_go_calls);            \
-        RUN_TEST(contract_rust_methods);        \
-        RUN_TEST(contract_csharp_methods);      \
-        RUN_TEST(contract_php_methods);         \
-        RUN_TEST(contract_java_methods);        \
-        RUN_TEST(contract_kotlin_methods);      \
-        RUN_TEST(contract_python_relative_import); \
-        RUN_TEST(contract_python_aliased_from_import_calls); \
-        RUN_TEST(contract_python_absolute_aliased_from_import_calls); \
-        RUN_TEST(contract_python_ghost_module_aliased_from_import_no_calls); \
-        RUN_TEST(contract_typescript_relative_import); \
-        RUN_TEST(contract_chialisp_constant_resolves_across_files); \
-        RUN_TEST(contract_edge_defines);        \
-        RUN_TEST(contract_edge_defines_method); \
-        RUN_TEST(contract_edge_contains_file);  \
-        RUN_TEST(contract_edge_inherits);       \
-        RUN_TEST(contract_edge_implements);     \
-        RUN_TEST(contract_edge_decorates);      \
-        RUN_TEST(contract_edge_tests_file);     \
-        RUN_TEST(contract_edge_handles);        \
-        RUN_TEST(contract_edge_http_calls);     \
-        RUN_TEST(contract_edge_async_calls);    \
-        RUN_TEST(contract_edge_data_flows);     \
-        RUN_TEST(contract_edge_similar_to);     \
-        RUN_TEST(contract_edge_semantically_related); \
-        RUN_TEST(contract_edge_tests);          \
-        RUN_TEST(contract_edge_workspaces_imports_issue408); \
-        RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767); \
-        RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767); \
-        RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988); \
-        RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999); \
-        RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted); \
-        RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871); \
-        RUN_TEST(contract_edge_depends_on);     \
-        RUN_TEST(contract_edge_parallel_service_edges); \
-        RUN_TEST(contract_edge_file_changes_with); \
-    } while (0)
-
-#define RUN_LANG_CONTRACT_BREADTH_TESTS()       \
-    do {                                        \
-        RUN_TEST(contract_all_grammars_in_graph); \
-        RUN_TEST(contract_calls_breadth);       \
-    } while (0)
-
-SUITE(lang_contract_rest) {
-    RUN_LANG_CONTRACT_REST_TESTS();
-}
-
-SUITE(lang_contract_breadth) {
-    RUN_LANG_CONTRACT_BREADTH_TESTS();
-}
-
 SUITE(lang_contract) {
-    RUN_LANG_CONTRACT_REST_TESTS();
-    RUN_LANG_CONTRACT_BREADTH_TESTS();
+    /* The three known-bug reproductions. Kotlin reproduces in-fixture (an
+     * extraction-layer bug, scale-independent). C call-attribution and the
+     * Java/TS extraction crash only manifest at real-repo scale, so a small
+     * fixture passes here — their reproductions live in the real-repo scale
+     * tier; these fast contracts still guard against regressions. */
+    RUN_TEST(contract_kotlin_imports_extracted);
+    RUN_TEST(contract_c_calls_attributed_to_function);
+    RUN_TEST(contract_java_extract_no_crash);
+
+    /* Rich per-language invariants (P3). */
+    RUN_TEST(contract_go_calls);
+    RUN_TEST(contract_rust_methods);
+    RUN_TEST(contract_csharp_methods);
+    RUN_TEST(contract_php_methods);
+    RUN_TEST(contract_java_methods);
+    RUN_TEST(contract_kotlin_methods);
+    RUN_TEST(contract_python_relative_import);
+    RUN_TEST(contract_python_aliased_from_import_calls);
+    RUN_TEST(contract_python_absolute_aliased_from_import_calls);
+    RUN_TEST(contract_python_ghost_module_aliased_from_import_no_calls);
+    RUN_TEST(contract_typescript_relative_import);
+
+    /* Graph-level breadth across all grammars (P4). */
+    RUN_TEST(contract_chialisp_constant_resolves_across_files);
+    RUN_TEST(contract_all_grammars_in_graph);
+
+    /* CALLS-edge breadth across non-LSP languages (P5). */
+    RUN_TEST(contract_calls_breadth);
+
+    /* Cross-cutting / semantic edge-type presence (P6). Each asserts the
+     * pipeline still emits that edge type; a RED here is a real regression. */
+    RUN_TEST(contract_edge_defines);
+    RUN_TEST(contract_edge_defines_method);
+    RUN_TEST(contract_edge_contains_file);
+    RUN_TEST(contract_edge_inherits);
+    RUN_TEST(contract_edge_implements);
+    RUN_TEST(contract_edge_decorates);
+    RUN_TEST(contract_edge_tests_file);
+    RUN_TEST(contract_edge_handles);
+    RUN_TEST(contract_edge_http_calls);
+    RUN_TEST(contract_edge_async_calls);
+    RUN_TEST(contract_edge_data_flows);
+    RUN_TEST(contract_edge_similar_to);
+    RUN_TEST(contract_edge_semantically_related);
+
+    /* P6 (continued): remaining edge types — TESTS, DEPENDS_ON, the
+     * parallel-path service edges (GRAPHQL/GRPC/TRPC_CALLS + INFRA_MAPS), and
+     * FILE_CHANGES_WITH (git co-change). Completes 25-edge-type coverage. */
+    RUN_TEST(contract_edge_tests);
+    RUN_TEST(contract_edge_workspaces_imports_issue408);
+    RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767);
+    RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767);
+    RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988);
+    RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
+    RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
+    RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
+    RUN_TEST(contract_edge_depends_on);
+    RUN_TEST(contract_edge_parallel_service_edges);
+    RUN_TEST(contract_edge_file_changes_with);
 }

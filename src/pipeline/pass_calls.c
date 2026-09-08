@@ -19,7 +19,6 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
-#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -87,6 +86,122 @@ static const char *itoa_log(int val) {
     idx = (idx + SKIP_ONE) & PC_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
+}
+
+/* Build per-file import map from cached extraction result or graph buffer edges.
+ * Returns parallel arrays of (local_name, module_qn) pairs. Caller frees. */
+/* Parse "local_name":"value" from JSON properties string. Returns strdup'd key or NULL. */
+static char *extract_local_name_from_json(const char *props_json) {
+    if (!props_json) {
+        return NULL;
+    }
+    const char *start = strstr(props_json, "\"local_name\":\"");
+    if (!start) {
+        return NULL;
+    }
+    start += strlen("\"local_name\":\"");
+    const char *end = strchr(start, '"');
+    if (!end || end <= start) {
+        return NULL;
+    }
+    return cbm_strndup(start, end - start);
+}
+
+static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                            const CBMFileResult *result, const char ***out_keys,
+                            const char ***out_vals, int *out_count) {
+    *out_keys = NULL;
+    *out_vals = NULL;
+    *out_count = 0;
+
+    /* Fast path: build from cached extraction via the same resolver used for
+     * IMPORTS edges. Do NOT use cbm_pipeline_fqn_module(module_path) — Python
+     * from-imports store "pkg.symbol" (and aliases) in module_path, which is
+     * not a filesystem rel-path and misses the def node. */
+    if (result && result->imports.count > 0) {
+        const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
+        const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
+        int count = 0;
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
+
+        for (int i = 0; i < result->imports.count; i++) {
+            const CBMImport *imp = &result->imports.items[i];
+            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
+                continue;
+            }
+            const cbm_gbuf_node_t *target =
+                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, NULL);
+            if (!target) {
+                continue;
+            }
+            keys[count] = strdup(imp->local_name);
+            vals[count] = target->qualified_name; /* borrowed from gbuf */
+            count++;
+        }
+        free(file_qn);
+
+        if (count > 0) {
+            *out_keys = keys;
+            *out_vals = vals;
+            *out_count = count;
+            return 0;
+        }
+        free((void *)keys);
+        free((void *)vals);
+        /* Fall through to IMPORTS-edge scan when extraction paths did not
+         * resolve (should be rare once resolve_import_node is used). */
+    }
+
+    /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    free(file_qn);
+    if (!file_node) {
+        return 0;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_gbuf_find_edges_by_source_type(ctx->gbuf, file_node->id, "IMPORTS", &edges,
+                                                &edge_count);
+    if (rc != 0 || edge_count == 0) {
+        return 0;
+    }
+
+    const char **keys = calloc(edge_count, sizeof(const char *));
+    const char **vals = calloc(edge_count, sizeof(const char *));
+    int count = 0;
+
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_edge_t *e = edges[i];
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, e->target_id);
+        if (!target) {
+            continue;
+        }
+        char *key = extract_local_name_from_json(e->properties_json);
+        if (key) {
+            keys[count] = key;
+            vals[count] = target->qualified_name;
+            count++;
+        }
+    }
+
+    *out_keys = keys;
+    *out_vals = vals;
+    *out_count = count;
+    return 0;
+}
+
+static void free_import_map(const char **keys, const char **vals, int count) {
+    if (keys) {
+        for (int i = 0; i < count; i++) {
+            free((void *)keys[i]);
+        }
+        free((void *)keys);
+    }
+    if (vals) {
+        free((void *)vals);
+    }
 }
 
 /* Handle a route registration call: create Route node + HANDLES edge. */
@@ -512,10 +627,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                 lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
                                 lang == CBM_LANG_ARKTS;
+    /* Bare-call local-binding suppression. A member call has a receiver the
+     * guard above can reason about; a bare `run()` has none, so that guard
+     * cannot see this class at all. Python-only today because the extraction
+     * flag is set only for Python — this gate MUST match pass_parallel.c's
+     * exactly, for the same divergence reason noted above. */
+    bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
     bool drop_plain_call =
-        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy);
-    bool has_receiver =
-        strchr(call->callee_name, '.') != NULL || strstr(call->callee_name, "::") != NULL;
+        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+        cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
+                                             call->callee_is_locally_bound, res.strategy);
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -541,22 +662,14 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
-    /* The shared registry also contains Field/Variable nodes for USAGE and
-     * READS/WRITES resolution. They are never callable; a textual name match
-     * must not turn member access into a CALLS edge. */
-    if (target_node->label &&
-        (strcmp(target_node->label, "Field") == 0 || strcmp(target_node->label, "Variable") == 0)) {
-        return 0;
-    }
+    /* #725: suffix_match is language-agnostic and will attach a Python
+     * Store.commit() call to a JS function named commit (or a Bash main
+     * to a Python main). Drop that weak cross-language edge. */
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
-    bool rust_drop_plain_call = cbm_rust_suppress_weak_receiver_match(
-        lang == CBM_LANG_RUST, has_receiver, call->callee_name, res.strategy,
-        source_node->file_path, target_node->file_path, target_node->qualified_name);
-
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count, drop_plain_call || rust_drop_plain_call);
+                         imp_count, drop_plain_call);
     return SKIP_ONE;
 }
 
@@ -700,17 +813,12 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel, files[i].language, result,
-                                 &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
 
         /* Compute module QN for same-module resolution (directory-based for
          * Java/Go so it matches their def-node QNs in the registry). */
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pc_module_is_dir(files[i].language));
-
-        /* Scope resolution to the caller's language-group so cross-language
-         * name collisions cannot bind (mirrors the parallel path). */
-        cbm_registry_resolve_scope_begin(files[i].language);
 
         /* Resolve each call */
         for (int c = 0; c < result->calls.count; c++) {
@@ -727,9 +835,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             }
         }
 
-        cbm_registry_resolve_scope_clear();
         free(module_qn);
-        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }
@@ -864,8 +971,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, files[i].language,
-                                 result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
@@ -884,7 +990,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         }
 
         free(module_qn);
-        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
     }
 

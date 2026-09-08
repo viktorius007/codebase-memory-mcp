@@ -375,24 +375,6 @@ static const char *path_basename(const char *path) {
     return last ? last + SKIP_ONE : path;
 }
 
-// True when `dir` (e.g. "tests") is a PATH SEGMENT of `path`, i.e. `path`
-// starts with "dir/" or contains "/dir/". A bare substring match is rejected on
-// purpose: `src/testing.rs` and `latest.rs` must NOT count as living under a
-// `tests/` directory.
-static bool has_path_dir_segment(const char *path, const char *dir) {
-    size_t dlen = strlen(dir);
-    if (strncmp(path, dir, dlen) == 0 && path[dlen] == '/') {
-        return true;
-    }
-    for (const char *slash = strchr(path, '/'); slash; slash = strchr(slash + SKIP_ONE, '/')) {
-        const char *seg = slash + SKIP_ONE;
-        if (strncmp(seg, dir, dlen) == 0 && seg[dlen] == '/') {
-            return true;
-        }
-    }
-    return false;
-}
-
 // Strip extension from basename
 static void strip_ext(const char *base, char *buf, size_t buflen) {
     const char *dot = strrchr(base, '.');
@@ -420,11 +402,10 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
      * below would otherwise catch). Mirrors the directory set cbm_is_test_path
      * (src/pipeline/pass_tests.c) already uses for TESTS-edge detection, so
      * the extraction-time is_test_file flag agrees with it (#1294). */
-    if (lang != CBM_LANG_GO &&
-        (strstr(rel_path, "__tests__/") || strstr(rel_path, "/tests/") ||
-         strstr(rel_path, "/test/") || strstr(rel_path, "/spec/") ||
-         has_prefix(rel_path, "tests/") || has_prefix(rel_path, "test/") ||
-         has_prefix(rel_path, "spec/") || has_prefix(rel_path, "__tests__/"))) {
+    if (strstr(rel_path, "__tests__/") || strstr(rel_path, "/tests/") ||
+        strstr(rel_path, "/test/") || strstr(rel_path, "/spec/") ||
+        has_prefix(rel_path, "tests/") || has_prefix(rel_path, "test/") ||
+        has_prefix(rel_path, "spec/") || has_prefix(rel_path, "__tests__/")) {
         return true;
     }
 
@@ -451,13 +432,8 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
                has_suffix(base, "Spec.kt") || has_suffix(base, "Test.scala") ||
                has_suffix(base, "Spec.scala");
     case CBM_LANG_RUST:
-        // Rust tests are typically mod tests inside the file, but test files too.
-        // Cargo also places integration tests under a crate-root `tests/` dir and
-        // benchmarks under `benches/`, where the basename carries no _test.rs /
-        // test_ affix (e.g. tests/contract_tests.rs) — a basename-only rule
-        // misses those, so also honour the directory convention.
-        return has_suffix(base, "_test.rs") || has_prefix(base, "test_") ||
-               has_path_dir_segment(rel_path, "tests") || has_path_dir_segment(rel_path, "benches");
+        // Rust tests are typically mod tests inside the file, but test files too
+        return has_suffix(base, "_test.rs") || has_prefix(base, "test_");
     case CBM_LANG_RUBY:
         return has_suffix(base, "_test.rb") || has_suffix(base, "_spec.rb") ||
                has_prefix(base, "test_");
@@ -488,6 +464,18 @@ TSNode cbm_find_child_by_kind(TSNode parent, const char *kind) {
     }
     TSNode null_node = {0};
     return null_node;
+}
+
+int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max) {
+    int n = 0;
+    uint32_t count = ts_node_child_count(parent);
+    for (uint32_t i = 0; i < count && n < max; i++) {
+        TSNode child = ts_node_child(parent, i);
+        if (strcmp(ts_node_type(child), kind) == 0) {
+            out[n++] = child;
+        }
+    }
+    return n;
 }
 
 /* ── Node-type classification: TSSymbol bitset acceleration ───────────────
@@ -1196,169 +1184,6 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     return NULL;
 }
 
-void cbm_strip_generic_args(char *type_name) {
-    if (!type_name) {
-        return;
-    }
-    char *lt = strchr(type_name, '<');
-    if (lt) {
-        *lt = '\0';
-    }
-}
-
-/* Fold a Rust `#[cfg(...)]` predicate into a function QN. See helpers.h for the
- * single-source-of-truth contract this upholds between the def walk and the call
- * walk. The suffix is built from the raw `cfg(` text with whitespace and quotes
- * dropped, so `#[cfg(feature = "x")]` and `#[cfg(feature="x")]` agree. */
-static const char *rust_cfg_normalized(CBMArena *a, const char *attr) {
-    const char *cfg = attr ? strstr(attr, "cfg(") : NULL;
-    if (!cfg) {
-        return NULL;
-    }
-    size_t max_len = strlen(cfg);
-    char *buf = (char *)cbm_arena_alloc(a, max_len + 1);
-    if (!buf) {
-        return NULL;
-    }
-    size_t len = 0;
-    int depth = 0;
-    bool closed = false;
-    for (const char *p = cfg; *p; p++) {
-        char ch = *p;
-        if (ch == '(') {
-            depth++;
-        } else if (ch == ')') {
-            depth--;
-        }
-        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' && ch != '"' && ch != '\'') {
-            buf[len++] = ch;
-        }
-        if (depth == 0 && ch == ')') {
-            closed = true;
-            break;
-        }
-    }
-    if (!closed) {
-        return NULL;
-    }
-    buf[len] = '\0';
-    return buf;
-}
-
-const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn, TSNode func_node,
-                                        const char *source, CBMLanguage lang) {
-    if (lang != CBM_LANG_RUST || !base_qn || ts_node_is_null(func_node) || !source) {
-        return base_qn;
-    }
-
-    /* A method's identity is gated by attributes on the method AND its
-     * enclosing impl/module items. Collect from inner to outer and from nearest
-     * attribute backwards, then append in reverse so the suffix is stable
-     * source order (outer → inner). This keeps def and call-source QNs equal and
-     * prevents cfg-twin methods/impls from collapsing in the graph store. */
-    const char **predicates = NULL;
-    int count = 0;
-    int cap = 0;
-    for (TSNode subject = func_node; !ts_node_is_null(subject); subject = ts_node_parent(subject)) {
-        const char *kind = ts_node_type(subject);
-        bool cfg_scope = strcmp(kind, "function_item") == 0 ||
-                         strcmp(kind, "function_signature_item") == 0 ||
-                         strcmp(kind, "impl_item") == 0 || strcmp(kind, "mod_item") == 0 ||
-                         strcmp(kind, "trait_item") == 0 || strcmp(kind, "foreign_mod_item") == 0;
-        if (!cfg_scope) {
-            continue;
-        }
-        for (TSNode prev = ts_node_prev_sibling(subject); !ts_node_is_null(prev);
-             prev = ts_node_prev_sibling(prev)) {
-            if (strcmp(ts_node_type(prev), "attribute_item") != 0) {
-                if (ts_node_is_named(prev)) {
-                    break;
-                }
-                continue;
-            }
-            const char *attr = cbm_node_text(a, prev, source);
-            const char *normalized = rust_cfg_normalized(a, attr);
-            if (!normalized) {
-                continue;
-            }
-            if (count >= cap) {
-                int next_cap = cap ? cap * 2 : 4;
-                const char **grown =
-                    (const char **)realloc(predicates, sizeof(char *) * (size_t)next_cap);
-                if (!grown) {
-                    free(predicates);
-                    return base_qn;
-                }
-                predicates = grown;
-                cap = next_cap;
-            }
-            predicates[count++] = normalized;
-        }
-    }
-
-    const char *qualified_name = base_qn;
-    for (int i = count - 1; i >= 0; i--) {
-        qualified_name = cbm_arena_sprintf(a, "%s#%s", qualified_name, predicates[i]);
-    }
-    free(predicates);
-    return qualified_name;
-}
-
-const char *cbm_rust_callable_qualified_name(CBMArena *a, const char *project, const char *rel_path,
-                                             const char *module_qn, TSNode func_node,
-                                             const char *source) {
-    if (!a || !project || !rel_path || !module_qn || ts_node_is_null(func_node) || !source) {
-        return module_qn;
-    }
-
-    const char **names = NULL;
-    int count = 0;
-    int cap = 0;
-    TSNode impl_node = {0};
-    for (TSNode cur = func_node; !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
-        const char *kind = ts_node_type(cur);
-        if (strcmp(kind, "function_item") == 0 || strcmp(kind, "function_signature_item") == 0) {
-            TSNode name_node = ts_node_child_by_field_name(cur, TS_FIELD("name"));
-            char *name = ts_node_is_null(name_node) ? NULL : cbm_node_text(a, name_node, source);
-            if (name && name[0]) {
-                if (count >= cap) {
-                    int next_cap = cap ? cap * 2 : 4;
-                    const char **grown =
-                        (const char **)realloc(names, sizeof(char *) * (size_t)next_cap);
-                    if (!grown) {
-                        free(names);
-                        return module_qn;
-                    }
-                    names = grown;
-                    cap = next_cap;
-                }
-                names[count++] = name;
-            }
-        } else if (strcmp(kind, "impl_item") == 0 && ts_node_is_null(impl_node)) {
-            impl_node = cur;
-        }
-    }
-    if (count == 0) {
-        free(names);
-        return module_qn;
-    }
-
-    const char *qualified_name = module_qn;
-    if (!ts_node_is_null(impl_node)) {
-        TSNode type_node = ts_node_child_by_field_name(impl_node, TS_FIELD("type"));
-        char *type_name = ts_node_is_null(type_node) ? NULL : cbm_node_text(a, type_node, source);
-        if (type_name && type_name[0]) {
-            cbm_strip_generic_args(type_name);
-            qualified_name = cbm_fqn_compute(a, project, rel_path, type_name);
-        }
-    }
-    for (int i = count - 1; i >= 0; i--) {
-        qualified_name = cbm_arena_sprintf(a, "%s.%s", qualified_name, names[i]);
-    }
-    free(names);
-    return cbm_rust_cfg_qualified_name(a, qualified_name, func_node, source, CBM_LANG_RUST);
-}
-
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path,
                                   const char *module_qn) {
@@ -1369,9 +1194,6 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
     const char *name = func_node_name(a, func_node, source, lang);
     if (!name || !name[0]) {
         return module_qn;
-    }
-    if (lang == CBM_LANG_RUST) {
-        return cbm_rust_callable_qualified_name(a, project, rel_path, module_qn, func_node, source);
     }
 
     // Check if the function is inside a class — compute classQN.funcName.
@@ -1405,13 +1227,11 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         }
         if (class_chain) {
             const char *class_qn = cbm_fqn_compute(a, project, rel_path, class_chain);
-            return cbm_rust_cfg_qualified_name(a, cbm_arena_sprintf(a, "%s.%s", class_qn, name),
-                                               func_node, source, lang);
+            return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
         }
     }
 
-    return cbm_rust_cfg_qualified_name(a, cbm_fqn_compute(a, project, rel_path, name), func_node,
-                                       source, lang);
+    return cbm_fqn_compute(a, project, rel_path, name);
 }
 
 // --- Cached enclosing function QN ---
