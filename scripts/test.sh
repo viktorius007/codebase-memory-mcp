@@ -346,6 +346,15 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.
 echo "=== Step 5e: watcher_enabled kill-switch regression (#335) ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
 
+# Step 5f: CLI cache validation under a filesystem sandbox.
+echo "=== Step 5f: CLI cache validation under a filesystem sandbox ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_cli_sandbox.sh"
+
+if [ "${CBM_TEST_CODEX_SANDBOX:-0}" = "1" ]; then
+    echo "=== Step 5g: Codex sandbox integration ==="
+    CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_cli_codex_sandbox.sh"
+fi
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).
