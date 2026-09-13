@@ -358,6 +358,15 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
 echo "=== Step 5f: worker request-scope regression ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_session_scope.sh"
 
+# Step 5g: CLI cache validation under a filesystem sandbox.
+echo "=== Step 5g: CLI cache validation under a filesystem sandbox ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_cli_sandbox.sh"
+
+if [ "${CBM_TEST_CODEX_SANDBOX:-0}" = "1" ]; then
+    echo "=== Step 5h: Codex sandbox integration ==="
+    CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_cli_codex_sandbox.sh"
+fi
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).

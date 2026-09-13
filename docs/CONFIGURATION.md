@@ -190,7 +190,108 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and CLI clients inherit their current environment and execute commands through the shared daemon.
+
+### CLI use inside a filesystem sandbox
+
+On POSIX, an existing cache owned by the current user with mode `0700` and no
+extended ACL is validated without creating directories or rewriting its
+permissions. If permissions or an ACL need repair, CBM still requires that repair
+to succeed. A refusal includes the failing check and path after `cache-private`.
+
+Configure the sandbox to allow reading the cache and its ancestors, and writing
+the coordination files under the shared rendezvous directory. The CLI executes
+commands through the shared daemon. To deny all cache writes to the CLI process,
+start that daemon outside the restriction with `codebase-memory-mcp daemon start`
+before launching the sandboxed client. Starting a new daemon inside the sandbox
+requires cache write access for its logs and other state; indexing also requires
+the daemon to be able to write the store. A read-only cache does not make the CLI
+independent of its coordination locks.
+
+If the default locations are outside the sandbox's allowed paths, choose private
+directories within those paths using `CBM_CACHE_DIR` and `CBM_RUNTIME_DIR`.
+Create the runtime parent before launching CBM. Close active CBM processes before
+changing either location, then use the same settings in every MCP client and CLI
+environment so they continue to share indexes and coordination. Changing the
+cache location selects a different store; it does not copy existing indexes.
+
+The macOS regression test exercises `cli list_projects` against a running daemon
+with all client writes denied to an existing private cache and an allowed runtime
+directory. Other sandbox policies may additionally restrict runtime locks,
+process execution, or reads; the command still needs those permissions for its
+normal operation.
+
+Run that regression from an unsandboxed host shell. macOS refuses to apply its
+test profile inside an existing sandbox (`sandbox_apply: Operation not
+permitted`), so a nested invocation exits before CBM runs. The test still launches
+the CLI inside the profile it defines and verifies that the denied write control
+fails with `Operation not permitted`.
+
+#### Codex exec on macOS
+
+Verified with Codex CLI `0.152.0`: the default `workspace-write` sandbox also
+denies the Unix socket connection to CBM's daemon. A warm daemon and a private
+cache alone are therefore insufficient. With `read-only`, coordination-file
+writes are denied as well. CBM currently reports these as a daemon connection
+timeout or an exact-build admission failure.
+
+Use the patched CBM binary for both client and daemon, start the daemon outside
+the sandbox, and locate its socket:
+
+```bash
+codebase-memory-mcp daemon start
+ls "${CBM_RUNTIME_DIR:-/private/tmp}/cbm-daemon-$(id -u)"/*.sock
+```
+
+Codex supports a named permissions profile with that exact socket allowed. This
+configuration replaces the legacy `sandbox_mode` and `[sandbox_workspace_write]`
+settings; do not combine them or pass `-s` when selecting the named profile.
+Replace the placeholder socket path with the path printed above:
+
+```toml
+default_permissions = "cbm"
+
+[features.network_proxy]
+enabled = true
+
+[permissions.cbm]
+extends = ":workspace"
+
+[permissions.cbm.network]
+enabled = true
+
+[permissions.cbm.network.unix_sockets]
+"/private/tmp/cbm-daemon-<uid>/cbm-<key>.sock" = "allow"
+```
+
+Both the network proxy and the profile's network setting are required in the
+tested Codex version: the socket entry alone did not permit the connection.
+Direct TCP connections remain blocked: a control connection to an unlisted
+endpoint was denied while `cli list_projects` succeeded. See
+the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+for permissions profiles and Unix socket rules.
+
+For a read-only filesystem profile, change `extends` to `":read-only"` and add
+only the daemon's coordination directory as writable:
+
+```toml
+[permissions.cbm.filesystem]
+"/private/tmp/cbm-daemon-<uid>" = "write"
+```
+
+Use the actual runtime location if `CBM_RUNTIME_DIR` is set. A `:workspace`
+profile also needs this write rule when that location lies outside its writable
+workspace and temporary directories. Keep that value and
+`CBM_CACHE_DIR` identical between the daemon and the Codex agent. These
+permissions do not remove CBM's owner, ACL, peer-identity, or build checks.
+
+The optional integration test uses the installed `codex sandbox` command and a
+temporary daemon to check default socket denial, scoped access, and blocked
+unlisted networking:
+
+```bash
+CBM_TEST_CODEX_SANDBOX=1 bash tests/test_cli_codex_sandbox.sh
+```
 
 
 ### Roots that are always refused

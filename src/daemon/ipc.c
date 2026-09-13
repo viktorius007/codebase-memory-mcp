@@ -1724,6 +1724,88 @@ static bool posix_directory_transition_secure(int parent_fd, int child_fd) {
     return true;
 }
 
+static bool private_directory_fd_secure(int fd, const char *directory_path) {
+    struct stat status;
+    if (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
+        ipc_validation_detail_set("%s: stat failed or not a directory (errno %d)", directory_path,
+                                  errno);
+        return false;
+    }
+    if (status.st_uid != geteuid()) {
+        ipc_validation_detail_set("%s: owner uid %ld, expected euid %ld", directory_path,
+                                  (long)status.st_uid, (long)geteuid());
+        return false;
+    }
+    /* An already-private directory must be usable when the sandbox allows
+     * inspection but denies metadata writes. Repairs still fail closed. */
+    if ((status.st_mode & 07777) != 0700 && fchmod(fd, 0700) != 0) {
+        ipc_validation_detail_set("%s: chmod 0700 failed (errno %d)", directory_path, errno);
+        return false;
+    }
+    if (!cbm_macos_extended_acl_fd_is_empty(fd) && !cbm_macos_extended_acl_fd_clear(fd)) {
+        ipc_validation_detail_set("%s: extended ACL not clearable", directory_path);
+        return false;
+    }
+    if (fstat(fd, &status) != 0) {
+        ipc_validation_detail_set("%s: final stat failed (errno %d)", directory_path, errno);
+        return false;
+    }
+    if (!S_ISDIR(status.st_mode) || status.st_uid != geteuid() ||
+        (status.st_mode & 07777) != 0700) {
+        ipc_validation_detail_set("%s: final owner/mode check failed (uid %ld, mode 0%o; "
+                                  "expected euid %ld, mode 0700)",
+                                  directory_path, (long)status.st_uid,
+                                  (unsigned)(status.st_mode & 07777), (long)geteuid());
+        return false;
+    }
+    if (!cbm_macos_extended_acl_fd_is_empty(fd)) {
+        ipc_validation_detail_set("%s: extended ACL still present after validation",
+                                  directory_path);
+        return false;
+    }
+    return true;
+}
+
+static int private_directory_component_open(int parent_fd, const char *component,
+                                            const char *directory_path) {
+    if (!posix_directory_parent_secure(parent_fd)) {
+        ipc_validation_detail_set(
+            "%s: the directory CONTAINING '%s' is not a usable private-directory parent "
+            "(it must be owned by you or root, not world-writable unless root-owned and sticky, "
+            "and carry no allow-ACL). Check that containing directory, not '%s' itself",
+            directory_path, component, component);
+        return -1;
+    }
+    int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+    int fd = openat(parent_fd, component, flags);
+    bool created = false;
+    if (fd < 0 && errno == ENOENT) {
+        created = mkdirat(parent_fd, component, 0700) == 0;
+        if (!created && errno != EEXIST) {
+            ipc_validation_detail_set("%s: mkdir component '%s' failed (errno %d)", directory_path,
+                                      component, errno);
+            return -1;
+        }
+        fd = openat(parent_fd, component, flags);
+    }
+    if (fd < 0) {
+        ipc_validation_detail_set("%s: open directory component '%s' failed (errno %d)",
+                                  directory_path, component, errno);
+        return -1;
+    }
+    if (!fd_set_cloexec(fd) || !posix_directory_transition_secure(parent_fd, fd)) {
+        ipc_validation_detail_set("%s: directory component '%s' failed secure transition check",
+                                  directory_path, component);
+        (void)close(fd);
+        return -1;
+    }
+    if (created && !private_directory_fd_secure(fd, directory_path)) {
+        (void)close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static int private_directory_tree_open(const char *directory_path) {
     if (!directory_path || !directory_path[0] || O_DIRECTORY == 0 || O_NOFOLLOW == 0) {
         return -1;
@@ -1735,6 +1817,10 @@ static int private_directory_tree_open(const char *directory_path) {
     bool absolute = path[0] == '/';
     int current_fd = open(absolute ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     bool ok = current_fd >= 0 && fd_set_cloexec(current_fd);
+    if (!ok) {
+        ipc_validation_detail_set("%s: open starting directory '%s' failed (errno %d)",
+                                  directory_path, absolute ? "/" : ".", errno);
+    }
     char *cursor = path;
     while (ok && *cursor == '/') {
         cursor++;
@@ -1748,56 +1834,19 @@ static int private_directory_tree_open(const char *directory_path) {
         char saved = *cursor;
         *cursor = '\0';
         if (strcmp(component, ".") == 0) {
-            /* Relative paths may contain a harmless explicit current-dir
-             * component. Parent traversal is never valid for private logs. */
+            /* Explicit current-dir components are harmless; parent traversal
+             * would escape the ancestry checks. */
         } else if (strcmp(component, "..") == 0 || !component[0]) {
+            ipc_validation_detail_set("%s: invalid directory component '%s'", directory_path,
+                                      component);
             ok = false;
         } else {
-            ok = posix_directory_parent_secure(current_fd);
-            if (!ok) {
-                /* #1537: this branch used to leave the detail empty, so the
-                 * caller fell back to printing errno — which NOTHING here sets.
-                 * A reporter was handed "errno 2" (ENOENT) for a permission
-                 * refusal and went looking for a missing file that existed.
-                 * An unset errno is not a diagnosis.
-                 *
-                 * The first version of that fix then named the WRONG directory.
-                 * posix_directory_parent_secure() validates current_fd — the
-                 * directory we are already in — but the message printed
-                 * `component`, the child about to be entered. So #1537 read
-                 * "ancestor '.cache'" when /Users/<user> was refusing, and
-                 * #1621 read "cbm-daemon-501" when /private/tmp was. Both
-                 * reporters inspected a directory that was not the one
-                 * refusing, found it clean, and said so — correctly. Naming the
-                 * containing directory is the difference between a report we
-                 * can act on and weeks of talking past each other. */
-                ipc_validation_detail_set(
-                    "%s: the directory CONTAINING '%s' is not a usable private-directory parent "
-                    "(it must be owned by you, not world-writable, and carry no allow-ACL). Check "
-                    "that containing directory, not '%s' itself",
-                    directory_path, component, component);
-            }
-            bool created = ok && mkdirat(current_fd, component, 0700) == 0;
-            if (!created && errno != EEXIST) {
-                ok = false;
-            }
-            int next_fd =
-                ok ? openat(current_fd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
-                   : -1;
-            struct stat status;
-            ok = next_fd >= 0 && fd_set_cloexec(next_fd) && fstat(next_fd, &status) == 0 &&
-                 S_ISDIR(status.st_mode) && posix_directory_transition_secure(current_fd, next_fd);
-            if (ok && created) {
-                ok = status.st_uid == geteuid() && fchmod(next_fd, 0700) == 0 &&
-                     cbm_macos_extended_acl_fd_clear(next_fd) &&
-                     cbm_macos_extended_acl_fd_is_empty(next_fd);
-            }
+            int next_fd = private_directory_component_open(current_fd, component, directory_path);
+            ok = next_fd >= 0;
             if (ok) {
                 (void)close(current_fd);
                 current_fd = next_fd;
                 visited = true;
-            } else if (next_fd >= 0) {
-                (void)close(next_fd);
             }
         }
         *cursor = saved;
@@ -1805,37 +1854,12 @@ static int private_directory_tree_open(const char *directory_path) {
             cursor++;
         }
     }
-    struct stat final_status;
     if (ok && !visited) {
         ipc_validation_detail_set("%s: no path components resolved", directory_path);
         ok = false;
     }
-    if (ok && (fstat(current_fd, &final_status) != 0 || !S_ISDIR(final_status.st_mode))) {
-        ipc_validation_detail_set("%s: final stat failed or not a directory (errno %d)",
-                                  directory_path, errno);
-        ok = false;
-    }
-    if (ok && final_status.st_uid != geteuid()) {
-        ipc_validation_detail_set("%s: owner uid %ld, expected euid %ld", directory_path,
-                                  (long)final_status.st_uid, (long)geteuid());
-        ok = false;
-    }
-    if (ok && fchmod(current_fd, 0700) != 0) {
-        ipc_validation_detail_set("%s: chmod 0700 failed (errno %d)", directory_path, errno);
-        ok = false;
-    }
-    if (ok && !cbm_macos_extended_acl_fd_clear(current_fd)) {
-        ipc_validation_detail_set("%s: extended ACL not clearable", directory_path);
-        ok = false;
-    }
-    if (ok && (fstat(current_fd, &final_status) != 0 || (final_status.st_mode & 07777) != 0700)) {
-        ipc_validation_detail_set("%s: mode 0%o survived chmod, expected 0700", directory_path,
-                                  (unsigned)(final_status.st_mode & 07777));
-        ok = false;
-    }
-    if (ok && !cbm_macos_extended_acl_fd_is_empty(current_fd)) {
-        ipc_validation_detail_set("%s: extended ACL still present after clear", directory_path);
-        ok = false;
+    if (ok) {
+        ok = private_directory_fd_secure(current_fd, directory_path);
     }
     free(path);
     if (!ok) {
