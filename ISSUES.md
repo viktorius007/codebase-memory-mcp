@@ -75,3 +75,44 @@ The current-source sanitizer run on 2026-09-02
 `runtime error: applying zero offset to null pointer` at that expression.
 Handle the empty registry without pointer arithmetic on NULL and cover that
 valid input under the sanitizer.
+
+## get_architecture aspect lists truncate silently
+
+Authored pre-sync against `main` at `56749c16`; line numbers below predate the
+826-commit sync and may have shifted.
+
+`arch_entry_points` (`src/store/store.c:6424`) and `arch_routes`
+(`src/store/store.c:6500`) both append a hard `LIMIT 20` with no `ORDER BY`, and
+the result carries no total and no `truncated` flag. The rendered header
+(`entry_points: 20`) states the returned count where a reader expects the
+population, so a partial list is indistinguishable from a complete one and the
+rows chosen are in unspecified scan order. On this repo `entry_points` returns
+20 of 54 qualifying nodes and drops `main` in `src/main.c` — the aspect reports
+a pure-C engine as a set of React components — while `routes` returns 20 of 44.
+`arch_hotspots` (`src/store/store.c:6595`) caps at 10 but does order by
+`fan_in DESC`, so it is correct-but-bounded rather than arbitrary. Fix: report
+`total` and `truncated` per aspect, as `index_status` already does for its
+coverage categories, and give the capped aspects a deterministic `ORDER BY`.
+
+## Boolean node properties are unusable with the natural Cypher predicate
+
+They are stored as integer `1` but surface to the Cypher layer as the string
+`'true'`, so `MATCH (n) WHERE n.is_entry_point = 1` returns zero rows and no
+warning, while `= 'true'` returns 72. A zero-row result is the reported shape of
+a type mismatch, which makes this a silent false negative on exactly the
+existence questions the engine is asked. Numeric properties are unaffected —
+`n.complexity > 10` returns 817, matching
+`CAST(json_extract(properties,'$.complexity') AS INTEGER) > 10` in SQL, and is
+not a lexical compare (5,530 nodes hold complexity 2–9, which would sort above
+`'10'` as text and do not appear). Fix: coerce booleans to a consistent type at
+the Cypher boundary, or reject `= 1` against a boolean property instead of
+returning an empty result.
+
+## arch_entry_points and arch_hotspots exclude production paths via unanchored LIKE
+
+`arch_entry_points` (`src/store/store.c:6422`) and `arch_hotspots`
+(`src/store/store.c:6591`) exclude test material with `file_path NOT LIKE
+'%test%'`, an unanchored substring match that also drops production paths
+containing the token anywhere (`latest/`, `contest/`, `testbed/`). The companion
+`is_test` property check on the same rows is the precise test; the `LIKE` is
+redundant where `is_test` is set and wrong where it is not.
