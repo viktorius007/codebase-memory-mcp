@@ -312,3 +312,54 @@ one root. The `project not found` error then prints all 43 names in its
 `available_projects` field. The registry should mark or prune projects whose
 root is gone, and the not-found hint should rank near matches instead of
 dumping everything.
+
+## Rust: fabricated CALLS/USAGE edges from name-based resolution (measured 38% pair precision against rust-analyzer LSIF)
+
+Measured 2026-09-17 against a rust-analyzer LSIF gold standard over the
+complete intra-crate cross-module edge population of six crates in the
+project-management workspace (commit `dd7ec1b2e`; index built 2026-09-16T23:27Z
+from the same tree). Of 96 module-pair edges the graph asserts (semantic types:
+CALLS, USAGE, IMPORTS, OVERRIDE, IMPLEMENTS, WRITES, CALL_REFERENCE, TESTS),
+only 36 have any compiler-verified reference behind them. Three adjudicated
+fabrication classes, each verified against source:
+
+1. **Pure name collision.** Six modules in pm-infra's sqlite tree carry CALLS
+   edges into `rebuild_plan`; every callee is `execute`. The real call sites
+   invoke rusqlite's `Statement::execute`/`Connection::execute`; the graph
+   attributed them by bare name to the module's inherent `execute`. The target
+   module is compiler-proven caller-free: it holds a *fulfilled*
+   `#![expect(dead_code)]` (`crates/pm-infra/src/sqlite/rebuild_plan.rs:1`).
+2. **Interface-routed attribution to concrete impls, including test fakes.**
+   `usecase/issue.rs:94` calls `.list_issues()` on a port trait defined in
+   pm-port; the graph emits a plain CALLS edge to a test-fixture impl in a
+   sibling module (`usecase/task.rs:477`). In `trace_path` responses this
+   class is at least labelled `via_port`; in raw `query_graph` edges it is
+   indistinguishable from a compile dependency.
+3. **Variable-node USAGE noise.** Function nodes carry USAGE edges to Variable
+   nodes in other files that merely share a name (`task`, `step`), no
+   reference of any kind at the site.
+
+Consequence: any consumer that reads graph edges as evidence of coupling —
+dead-code checks, blast-radius claims, crate-split planning — gets confidently
+wrong answers with no response field flagging the uncertainty. Evidence bundle
+with the LSIF ground truth and a self-contained reproduction:
+`evidence/pm-lsif-2026-09-17/` (README, `compare.py`, `pm-lsif.json.gz`).
+Full analysis with per-crate confusion sets:
+`/Users/viktor/Projects/project-management/docs/research/codebase-memory-vs-lsif-2026-09-17.md`.
+
+## Rust: type/const/import references largely absent from the graph (measured 20% pair recall against rust-analyzer LSIF)
+
+Same measurement as the entry above, opposite direction: of 182 module-pair
+reference edges the LSIF gold standard proves, the graph holds 36. Recall
+tracks code style — 100% in call-heavy pm-graph, 50% in pm-cli-grammar, 23% in
+pm-domain, 10% in pm-infra's sqlite tree, 0% in pm-validate — because the
+missing edges are dominated by type references, const imports, and item-level
+`use`: `entity_model → cli_schema` (76 LSIF refs, absent),
+`migration_registry → migrations` (58 refs, absent), all four
+`*_rules → content_guard` substrate edges in pm-validate (absent). Function
+calls are the only reference class captured reliably, and (per the entry
+above) they are over-captured. Since most real compile-time coupling in
+type-heavy Rust is exactly these missing classes, module- or crate-level
+dependency questions answered from the graph are wrong in the silent
+direction: a clean "no edges" result means nothing. Same evidence bundle and
+reproduction: `evidence/pm-lsif-2026-09-17/`.
