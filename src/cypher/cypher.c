@@ -2258,6 +2258,7 @@ int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error) {
 /* A binding: maps variable names to nodes and/or edges */
 typedef struct {
     const char *var_names[CYP_MAX_VARS]; /* variable names (nodes) */
+    char *owned_var_names[CYP_MAX_VARS]; /* heap-owned names for virtual bindings */
     cbm_node_t var_nodes[CYP_MAX_VARS];  /* node data */
     int var_count;
     const char *edge_var_names[CYP_MAX_EDGE_VARS]; /* variable names (edges) */
@@ -2550,6 +2551,7 @@ static void binding_set_edge(binding_t *b, const char *var, const cbm_edge_t *ed
 /* Free all deep-copied nodes and edges in a binding */
 static void binding_free(binding_t *b) {
     for (int i = 0; i < b->var_count; i++) {
+        free(b->owned_var_names[i]);
         node_fields_free(&b->var_nodes[i]);
     }
     for (int i = 0; i < b->edge_var_count; i++) {
@@ -2561,7 +2563,8 @@ static void binding_free(binding_t *b) {
 static void binding_copy(binding_t *dst, const binding_t *src) {
     dst->var_count = src->var_count;
     for (int i = 0; i < src->var_count; i++) {
-        dst->var_names[i] = src->var_names[i]; /* AST-owned, not freed */
+        dst->owned_var_names[i] = src->owned_var_names[i] ? heap_strdup(src->var_names[i]) : NULL;
+        dst->var_names[i] = dst->owned_var_names[i] ? dst->owned_var_names[i] : src->var_names[i];
         node_deep_copy(&dst->var_nodes[i], &src->var_nodes[i]);
     }
     dst->edge_var_count = src->edge_var_count;
@@ -2586,6 +2589,7 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
         return;
     }
     b->var_names[b->var_count] = var; /* not owned — points to AST string */
+    b->owned_var_names[b->var_count] = NULL;
     node_deep_copy(&b->var_nodes[b->var_count], node);
     b->var_count++;
 }
@@ -4029,9 +4033,10 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
 
 /* Add a virtual variable binding for one WITH item */
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
-    cbm_node_t vn = {.name = heap_strdup(val), .qualified_name = heap_strdup(alias)};
+    cbm_node_t vn = {.name = heap_strdup(val)};
     if (vb->var_count < CYP_BUF_16) {
-        vb->var_names[vb->var_count] = vn.qualified_name;
+        vb->owned_var_names[vb->var_count] = heap_strdup(alias);
+        vb->var_names[vb->var_count] = vb->owned_var_names[vb->var_count];
         vb->var_nodes[vb->var_count] = vn;
         vb->var_count++;
     }
@@ -4097,6 +4102,17 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                 }
                 with_add_vbinding_var(&vb, alias, vbuf);
             } else {
+                if (aggs[a].group_node_ids[ci] > 0 && vb.store) {
+                    cbm_node_t full = {0};
+                    if (cbm_store_find_node_by_id(vb.store, aggs[a].group_node_ids[ci], &full) ==
+                        CBM_STORE_OK) {
+                        const char *node_alias =
+                            wc->items[ci].alias ? wc->items[ci].alias : wc->items[ci].variable;
+                        binding_set(&vb, node_alias, &full);
+                        node_fields_free(&full);
+                        continue;
+                    }
+                }
                 with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci]);
                 /* Tag the carried virtual var with the node id (when the group
                  * var is a node) so node_prop can re-fetch its full properties. */
@@ -4117,6 +4133,15 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
         binding_t vb = {0};
         vb.store = bindings[bi].store; /* so node_prop can re-fetch / compute on the projection */
         for (int ci = 0; ci < wc->count; ci++) {
+            if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
+                cbm_node_t *node = binding_get(&bindings[bi], wc->items[ci].variable);
+                if (node) {
+                    const char *node_alias =
+                        wc->items[ci].alias ? wc->items[ci].alias : wc->items[ci].variable;
+                    binding_set(&vb, node_alias, node);
+                    continue;
+                }
+            }
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
             char func_buf[CBM_SZ_512];
