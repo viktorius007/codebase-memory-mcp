@@ -121,6 +121,12 @@ static inline bool cbm_pipeline_lsp_allow_tail_match(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN;
 }
 
+/* Rust call candidates currently have no trusted semantic provenance. Reject
+ * them before either materializer can fall back to textual resolution. */
+static inline bool cbm_pipeline_call_candidate_admitted(CBMLanguage lang) {
+    return lang != CBM_LANG_RUST;
+}
+
 /* When a JVM callable-reference occurrence has no exact semantic target, its
  * ordinary-USAGE fallback must still respect package/import reachability.
  * `unique_name` and `suffix_match` are project-wide guesses: admitting either

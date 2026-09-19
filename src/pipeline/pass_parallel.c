@@ -2634,6 +2634,9 @@ static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CB
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang) {
+    if (!cbm_pipeline_call_candidate_admitted(lang)) {
+        return;
+    }
     /* Two occurrence-aware indexes preserve the authoritative matcher's
      * primary ordering without restoring its O(calls × resolutions) scan:
      * exact caller+leaf+span first, then the legacy caller+leaf fallback.
