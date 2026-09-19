@@ -333,10 +333,10 @@ TEST(contract_java_extract_no_crash) {
 
 /* ══════════════════════════════════════════════════════════════════
  *  RICH PER-LANGUAGE CONTRACTS (P3) — invariants that must hold for each
- *  hybrid-LSP language on a clean same-file fixture: resolution produces
- *  CALLS, those CALLS are attributed to a callable (not the Module), and
- *  user-defined types are modeled. These guard against silent per-language
- *  regressions (a grammar/LSP change that stops resolving or mis-attributes).
+ *  hybrid-LSP language on a clean same-file fixture: supported resolvers
+ *  produce CALLS attributed to a callable (not the Module), while Rust fails
+ *  CALLS closed without trusted binding provenance. Callable outbound degree
+ *  and user-defined types remain structural controls for every language.
  * ══════════════════════════════════════════════════════════════════ */
 
 typedef struct {
@@ -375,7 +375,7 @@ TEST(contract_go_calls) {
     PASS();
 }
 
-/* Rust: keep structural declarations while semantic calls fail closed. */
+/* Rust: keep structural outbound/type controls while semantic CALLS fail closed. */
 TEST(contract_rust_methods) {
     static const LangFile f[] = {
         {"calc.rs", "struct Calc {\n    base: i32,\n}\n\n"
@@ -386,7 +386,7 @@ TEST(contract_rust_methods) {
     LangMetrics m = lang_metrics(f, 1);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.calls, 0);
-    ASSERT_EQ(m.callers, 0);
+    ASSERT_TRUE(m.callers >= 1);
     ASSERT_TRUE(m.types >= 1); /* struct Calc */
     PASS();
 }
