@@ -410,10 +410,10 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
 }
 
 /* Classify a resolved call and emit the appropriate edge. */
-/* When suppress_plain_calls is true (a TS/JS/TSX weak short-name member-call
- * match, #592/#606), the route/HTTP/ASYNC/CONFIG service classifications below
- * still run — only the plain CALLS fall-through is skipped, so a fabricated
- * project edge is dropped while every service edge stays main-identical. */
+/* When suppress_plain_calls is true, the route/HTTP/ASYNC/CONFIG service
+ * classifications below still run. Only the plain CALLS fall-through is
+ * skipped, whether suppression comes from a weak member match or language
+ * admission policy. */
 static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
                                  const cbm_resolution_t *res, const char *module_qn,
@@ -441,7 +441,7 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         return;
     }
     if (suppress_plain_calls) {
-        return; /* weak TS/JS member-call match with an unresolved receiver (#606) */
+        return;
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
@@ -479,9 +479,6 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
                                int imp_count, CBMLanguage lang) {
-    if (!cbm_pipeline_call_candidate_admitted(lang)) {
-        return 0;
-    }
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
         return 0;
@@ -509,7 +506,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                                 imp_vals, imp_count, false);
+                                 imp_vals, imp_count, !cbm_pipeline_plain_call_admitted(lang));
             return SKIP_ONE;
         }
     }
@@ -672,7 +669,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count, drop_plain_call);
+                         imp_count,
+                         drop_plain_call || !cbm_pipeline_plain_call_admitted(lang));
     return SKIP_ONE;
 }
 

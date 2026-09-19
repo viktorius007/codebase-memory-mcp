@@ -2350,12 +2350,11 @@ static void emit_trpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "TRPC_CALLS", props);
 }
 
-/* When suppress_plain_calls is true (a TS/JS/TSX weak short-name member-call
- * match, #592/#606), every service classification below still runs — only the
- * plain CALLS fall-through (emit_normal_calls_edge) is skipped. detect_url_in_args
- * and the HTTP/ASYNC/gRPC/GraphQL/tRPC/CONFIG/route branches are unaffected, so
- * a verb-suffix HTTP client (api.patch('/x')), broker, or route registration
- * keeps its edge; only the fabricated project CALLS edge is dropped. */
+/* When suppress_plain_calls is true, every service classification below still
+ * runs. Only the plain CALLS fall-through (emit_normal_calls_edge) is skipped,
+ * whether suppression comes from a weak member match or language admission
+ * policy. detect_url_in_args and the HTTP/ASYNC/gRPC/GraphQL/tRPC/CONFIG/route
+ * branches remain unaffected. */
 static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_gbuf_node_t *target, const CBMCall *call,
                               const cbm_resolution_t *res, const char *module_qn,
@@ -2634,9 +2633,6 @@ static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CB
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang) {
-    if (!cbm_pipeline_call_candidate_admitted(lang)) {
-        return;
-    }
     /* Two occurrence-aware indexes preserve the authoritative matcher's
      * primary ordering without restoring its O(calls × resolutions) scan:
      * exact caller+leaf+span first, then the legacy caller+leaf fallback.
@@ -2942,7 +2938,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          drop_plain_call);
+                          drop_plain_call || !cbm_pipeline_plain_call_admitted(lang));
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;

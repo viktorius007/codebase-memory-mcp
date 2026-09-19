@@ -121,9 +121,9 @@ static inline bool cbm_pipeline_lsp_allow_tail_match(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN;
 }
 
-/* Rust call candidates currently have no trusted semantic provenance. Reject
- * them before either materializer can fall back to textual resolution. */
-static inline bool cbm_pipeline_call_candidate_admitted(CBMLanguage lang) {
+/* Rust call candidates currently have no trusted semantic provenance. Keep
+ * their analysis available, but do not materialize them as plain CALLS. */
+static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang) {
     return lang != CBM_LANG_RUST;
 }
 
