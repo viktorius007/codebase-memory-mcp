@@ -577,6 +577,39 @@ static cbm_store_t *setup_cypher_store(void) {
     return s;
 }
 
+static cbm_store_t *setup_cypher_boolean_kind_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "bool_kind", "/tmp/bool-kind");
+
+    cbm_node_t boolean_node = {.project = "bool_kind",
+                               .label = "BooleanKind",
+                               .name = "boolean",
+                               .qualified_name = "bool_kind.boolean",
+                               .properties_json = "{\"flag\":true}"};
+    cbm_node_t string_node = {.project = "bool_kind",
+                              .label = "BooleanKind",
+                              .name = "string",
+                              .qualified_name = "bool_kind.string",
+                              .properties_json = "{\"flag\":\"true\"}"};
+    cbm_node_t number_node = {.project = "bool_kind",
+                              .label = "BooleanKind",
+                              .name = "number",
+                              .qualified_name = "bool_kind.number",
+                              .properties_json = "{\"flag\":1}"};
+
+    int64_t boolean_id = cbm_store_upsert_node(s, &boolean_node);
+    int64_t string_id = cbm_store_upsert_node(s, &string_node);
+    cbm_store_upsert_node(s, &number_node);
+
+    cbm_edge_t edge = {.project = "bool_kind",
+                       .source_id = boolean_id,
+                       .target_id = string_id,
+                       .type = "FLAGGED",
+                       .properties_json = "{\"flag\":true}"};
+    cbm_store_insert_edge(s, &edge);
+    return s;
+}
+
 /* The query string is caller-supplied and the WHERE grammar recurses once per
  * nested '(' and once per NOT, with no depth counter between the MCP entry point
  * and the recursive descent. A few tens of KB of '(' therefore exhausted the
@@ -1991,6 +2024,108 @@ TEST(cypher_exec_where_numeric) {
     ASSERT_EQ(rc, 0);
     /* HandleOrder starts at 10 */
     ASSERT_GTE(r.row_count, 1);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_json_boolean_string_and_number_equality_are_distinct) {
+    cbm_store_t *s = setup_cypher_boolean_kind_store();
+    const char *queries[] = {
+        "MATCH (n:BooleanKind) WHERE n.flag = true RETURN n.qualified_name",
+        "MATCH (n:BooleanKind) WHERE n.flag = 'true' RETURN n.qualified_name",
+        "MATCH (n:BooleanKind) WHERE n.flag = 1 RETURN n.qualified_name",
+    };
+    const char *expected[] = {"bool_kind.boolean", "bool_kind.string", "bool_kind.number"};
+
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        cbm_cypher_result_t r = {0};
+        int rc = cbm_cypher_execute(s, queries[i], "bool_kind", 0, &r);
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(r.row_count, 1);
+        ASSERT_STR_EQ(r.rows[0][0], expected[i]);
+        cbm_cypher_result_free(&r);
+    }
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_json_number_keeps_quoted_numeric_equality) {
+    cbm_store_t *s = setup_cypher_boolean_kind_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(
+        s, "MATCH (n:BooleanKind) WHERE n.flag = '1' RETURN n.qualified_name", "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "bool_kind.number");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_json_boolean_inequality_is_inverse_of_equality) {
+    cbm_store_t *s = setup_cypher_boolean_kind_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (n:BooleanKind) WHERE n.flag <> 'true' "
+                                "RETURN n.qualified_name ORDER BY n.qualified_name",
+                                "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "bool_kind.boolean");
+    ASSERT_STR_EQ(r.rows[1][0], "bool_kind.number");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_function_lhs_keeps_legacy_untyped_comparison) {
+    cbm_store_t *s = setup_cypher_boolean_kind_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (n:BooleanKind) "
+                                "WHERE coalesce(n.flag, 'false') = true "
+                                "RETURN n.qualified_name ORDER BY n.qualified_name",
+                                "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "bool_kind.boolean");
+    ASSERT_STR_EQ(r.rows[1][0], "bool_kind.string");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_relationship_json_boolean_equality_is_typed) {
+    cbm_store_t *s = setup_cypher_boolean_kind_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a)-[r:FLAGGED]->(b) WHERE r.flag = true "
+                                "RETURN a.qualified_name, r.type, b.qualified_name",
+                                "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "bool_kind.boolean");
+    ASSERT_STR_EQ(r.rows[0][1], "FLAGGED");
+    ASSERT_STR_EQ(r.rows[0][2], "bool_kind.string");
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (a)-[r:FLAGGED]->(b) WHERE r.flag = 'true' "
+                            "RETURN a.qualified_name, r.type, b.qualified_name",
+                            "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
 
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
@@ -4588,6 +4723,11 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_defines_edge);
     RUN_TEST(cypher_exec_no_results);
     RUN_TEST(cypher_exec_where_numeric);
+    RUN_TEST(cypher_exec_json_boolean_string_and_number_equality_are_distinct);
+    RUN_TEST(cypher_exec_json_number_keeps_quoted_numeric_equality);
+    RUN_TEST(cypher_exec_json_boolean_inequality_is_inverse_of_equality);
+    RUN_TEST(cypher_exec_function_lhs_keeps_legacy_untyped_comparison);
+    RUN_TEST(cypher_exec_relationship_json_boolean_equality_is_typed);
     /* Go test ports */
     RUN_TEST(cypher_exec_distinct);
     RUN_TEST(cypher_exec_with_distinct_issue238);
