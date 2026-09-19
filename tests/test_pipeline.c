@@ -1173,6 +1173,173 @@ static int named_node_count(cbm_store_t *s, const char *project, const char *nam
     return count;
 }
 
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+enum {
+    RESTORE_RUST_CALLS = 0,
+    RESTORE_RUST_TESTS,
+    RESTORE_GO_CALLS,
+    RESTORE_RUST_USAGE,
+    RESTORE_EDGE_COUNT,
+};
+
+typedef struct {
+    bool fixture_written;
+    int baseline_rc;
+    int lookup_counts[3];
+    int64_t insert_ids[RESTORE_EDGE_COUNT];
+    int pre_counts[RESTORE_EDGE_COUNT];
+    bool seed_verified;
+    int incremental_rc;
+    cbm_incremental_route_t route;
+    int post_counts[RESTORE_EDGE_COUNT];
+} PersistedEdgeRestoreObservation;
+
+static int unique_named_node_id(cbm_store_t *store, const char *project, const char *name,
+                                int64_t *out_id) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    if (count == 1) {
+        *out_id = nodes[0].id;
+    }
+    if (nodes) {
+        cbm_store_free_nodes(nodes, count);
+    }
+    return count;
+}
+
+static PersistedEdgeRestoreObservation observe_persisted_edge_restore(bool force_legacy) {
+    static const char *types[RESTORE_EDGE_COUNT] = {"CALLS", "TESTS", "CALLS", "USAGE"};
+    static const char *source_names[RESTORE_EDGE_COUNT] = {
+        "rust_persisted_restore_source", "rust_persisted_restore_source",
+        "GoPersistedRestoreSource", "rust_persisted_restore_source"};
+    static const char target_name[] = "rust_persisted_restore_target";
+    PersistedEdgeRestoreObservation result = {.baseline_rc = -1, .incremental_rc = -1};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_persisted_restore_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return result;
+    }
+    char rust_source_path[512];
+    char rust_target_path[512];
+    char go_source_path[512];
+    snprintf(rust_source_path, sizeof(rust_source_path), "%s/rust_source.rs", tmp);
+    snprintf(rust_target_path, sizeof(rust_target_path), "%s/rust_target.rs", tmp);
+    snprintf(go_source_path, sizeof(go_source_path), "%s/go_source.go", tmp);
+    result.fixture_written =
+        th_write_file(rust_source_path, "pub fn rust_persisted_restore_source() -> i32 { 1 }\n") ==
+            0 &&
+        th_write_file(rust_target_path, "pub fn rust_persisted_restore_target() -> i32 { 1 }\n") ==
+            0 &&
+        th_write_file(go_source_path,
+                      "package fixture\nfunc GoPersistedRestoreSource() int { return 1 }\n") == 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/restore.db", tmp);
+    cbm_pipeline_t *baseline =
+        result.fixture_written ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+    char project[256] = {0};
+    if (baseline) {
+        result.baseline_rc = cbm_pipeline_run(baseline);
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    }
+    cbm_store_t *store = result.baseline_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    int64_t rust_source_id = 0;
+    int64_t rust_target_id = 0;
+    int64_t go_source_id = 0;
+    if (store) {
+        result.lookup_counts[0] =
+            unique_named_node_id(store, project, "rust_persisted_restore_source", &rust_source_id);
+        result.lookup_counts[1] =
+            unique_named_node_id(store, project, target_name, &rust_target_id);
+        result.lookup_counts[2] =
+            unique_named_node_id(store, project, "GoPersistedRestoreSource", &go_source_id);
+        int64_t source_ids[RESTORE_EDGE_COUNT] = {rust_source_id, rust_source_id, go_source_id,
+                                                  rust_source_id};
+        for (int i = 0; i < RESTORE_EDGE_COUNT; i++) {
+            cbm_edge_t edge = {.project = project,
+                               .source_id = source_ids[i],
+                               .target_id = rust_target_id,
+                               .type = types[i],
+                               .properties_json = "{}"};
+            result.insert_ids[i] = cbm_store_insert_edge(store, &edge);
+            result.pre_counts[i] =
+                named_edge_count(store, project, types[i], source_names[i], target_name);
+        }
+        result.seed_verified = result.lookup_counts[0] == 1 && result.lookup_counts[1] == 1 &&
+                               result.lookup_counts[2] == 1;
+        for (int i = 0; result.seed_verified && i < RESTORE_EDGE_COUNT; i++) {
+            result.seed_verified = result.insert_ids[i] > 0 && result.pre_counts[i] == 1;
+        }
+        cbm_store_close(store);
+    }
+    if (baseline) {
+        cbm_pipeline_free(baseline);
+    }
+
+    if (result.seed_verified &&
+        th_write_file(rust_target_path, "pub fn rust_persisted_restore_target() -> i32 { 2 }\n") ==
+            0) {
+        cbm_pipeline_incremental_test_reset_faults();
+        if (force_legacy) {
+            cbm_pipeline_incremental_test_force_legacy_partial_once();
+        }
+        cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (incremental) {
+            result.incremental_rc = cbm_pipeline_run(incremental);
+            result.route = cbm_pipeline_incremental_test_last_route();
+            cbm_pipeline_free(incremental);
+        }
+        store = result.incremental_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (store) {
+            for (int i = 0; i < RESTORE_EDGE_COUNT; i++) {
+                result.post_counts[i] =
+                    named_edge_count(store, project, types[i], source_names[i], target_name);
+            }
+            cbm_store_close(store);
+        }
+        cbm_pipeline_incremental_test_reset_faults();
+    }
+    th_rmtree(tmp);
+    return result;
+}
+
+static int assert_persisted_edge_restore(PersistedEdgeRestoreObservation result,
+                                         cbm_incremental_route_t expected_route) {
+    ASSERT_TRUE(result.fixture_written);
+    ASSERT_EQ(result.baseline_rc, 0);
+    ASSERT_EQ(result.lookup_counts[0], 1);
+    ASSERT_EQ(result.lookup_counts[1], 1);
+    ASSERT_EQ(result.lookup_counts[2], 1);
+    for (int i = 0; i < RESTORE_EDGE_COUNT; i++) {
+        ASSERT_GT(result.insert_ids[i], 0);
+        ASSERT_EQ(result.pre_counts[i], 1);
+    }
+    ASSERT_TRUE(result.seed_verified);
+    ASSERT_EQ(result.incremental_rc, 0);
+    ASSERT_EQ(result.route, expected_route);
+    ASSERT_EQ(result.post_counts[RESTORE_RUST_CALLS], 0);
+    ASSERT_EQ(result.post_counts[RESTORE_RUST_TESTS], 0);
+    ASSERT_EQ(result.post_counts[RESTORE_GO_CALLS], 1);
+    ASSERT_EQ(result.post_counts[RESTORE_RUST_USAGE], 1);
+    return 0;
+}
+
+TEST(pipeline_legacy_restore_rejects_persisted_rust_calls_and_tests) {
+    PersistedEdgeRestoreObservation result = observe_persisted_edge_restore(true);
+    ASSERT_EQ(assert_persisted_edge_restore(result, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL), 0);
+    PASS();
+}
+
+TEST(pipeline_closure_restore_rejects_persisted_rust_calls_and_tests) {
+    PersistedEdgeRestoreObservation result = observe_persisted_edge_restore(false);
+    ASSERT_EQ(assert_persisted_edge_restore(result, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    PASS();
+}
+#endif
+
 typedef struct {
     int run_rc;
     bool store_opened;
@@ -14585,6 +14752,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    RUN_TEST(pipeline_legacy_restore_rejects_persisted_rust_calls_and_tests);
+    RUN_TEST(pipeline_closure_restore_rejects_persisted_rust_calls_and_tests);
     RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);

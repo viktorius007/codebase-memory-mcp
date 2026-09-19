@@ -921,38 +921,17 @@ typedef struct {
     int cap;
 } cbm_edge_capture_t;
 
-/* Edge types that must NOT be re-linked from the pre-purge snapshot, because a
- * full reindex (re)computes them via a pass whose result can differ from the
- * snapshot — restoring a stale copy could leave wrong properties or even an
- * edge a full reindex would not produce:
- *   - SIMILAR_TO / SEMANTICALLY_RELATED: rebuilt wholesale by the incremental
- *     post-passes (similarity / semantic_edges) over a drifting corpus.
- *   - FILE_CHANGES_WITH (git-history coupling) and DATA_FLOWS (route data flow):
- *     produced only by full-pipeline post-passes (githistory / route_nodes)
- *     that do NOT run during incremental; they remain a known incremental
- *     limitation rather than something to restore stale.
- * Every other edge type IS safe to re-link, by one of two routes that both
- * match a full reindex: edges re-emitted by the per-file resolution passes that
- * run incrementally (CALLS, CALL_REFERENCE, USAGE, DEFINES, DEFINES_METHOD, INHERITS,
- * IMPLEMENTS) are deduped on re-link, while structural containment edges
- * (CONTAINS_FILE, CONTAINS_FOLDER) — which the full-only structure pass does
- * NOT regenerate incrementally — are preserved precisely by this snapshot. */
-static bool incr_edge_type_is_recomputed(const char *type) {
-    return type && (strcmp(type, "SIMILAR_TO") == 0 || strcmp(type, "SEMANTICALLY_RELATED") == 0 ||
-                    strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
-}
-
 /* cbm_gbuf_foreach_edge visitor: snapshot inbound cross-file edges into
  * changed files so they survive the purge and can be re-linked afterward. */
 static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     cbm_edge_capture_t *cap = (cbm_edge_capture_t *)userdata;
-    if (incr_edge_type_is_recomputed(edge->type)) {
-        return;
-    }
     const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(cap->gbuf, edge->source_id);
     const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_id(cap->gbuf, edge->target_id);
     if (!src || !tgt || !src->qualified_name || !tgt->qualified_name || !src->file_path ||
         !tgt->file_path) {
+        return;
+    }
+    if (!cbm_pipeline_persisted_edge_is_restorable(src->file_path, edge->type)) {
         return;
     }
     /* Keep only edges that the purge would orphan permanently: target is in a
