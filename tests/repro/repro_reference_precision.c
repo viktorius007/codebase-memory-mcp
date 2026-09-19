@@ -554,7 +554,7 @@ static int rp_assert_callable_alias_graph(const char *filename, const char *sour
     ASSERT_GTE(shadowed_node, 1);
     ASSERT_GTE(actual_node, 1);
     ASSERT_EQ(wrong_call, 0);
-    ASSERT_EQ(exact_call, 1);
+    ASSERT_EQ(exact_call, language == CBM_LANG_RUST ? 0 : 1);
     return 0;
 }
 
@@ -848,7 +848,7 @@ TEST(repro_rust_direct_scoped_function_value_is_exact_reference) {
 
     ASSERT_EQ(target_node, 1);
     ASSERT_EQ(decoy_node, 1);
-    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(registrar_call, 0);
     ASSERT_EQ(target_reference, 1);
     ASSERT_EQ(target_usage, 0);
     ASSERT_EQ(target_call, 0);
@@ -1263,7 +1263,7 @@ static int rp_assert_cross_file_exact_function_value(const RFile *files, int fil
     }
 
     ASSERT_GTE(target_node, 1);
-    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(registrar_call, language == CBM_LANG_RUST ? 0 : 1);
     ASSERT_EQ(precise_reference, 1);
     ASSERT_EQ(ordinary_usage, 0);
     ASSERT_EQ(fabricated_call, 0);
@@ -2231,7 +2231,7 @@ static int rp_assert_complex_function_values_stay_usage(const char *filename, co
 
     ASSERT_GTE(handler_node, 1);
     ASSERT_GTE(alternate_node, 1);
-    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(registrar_call, language == CBM_LANG_RUST ? 0 : 1);
     ASSERT_EQ(handler_usage, 1);
     ASSERT_EQ(alternate_usage, 1);
     ASSERT_EQ(handler_reference, 0);

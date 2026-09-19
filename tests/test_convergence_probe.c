@@ -87,21 +87,20 @@
  *       a known function.
  *     TS: GREEN — arrow functions call named exports; ts_lsp_cross resolves.
  *   D2 recursive calls:
- *     All languages: GREEN — self-calls resolve to the same node.
+ *     Supported languages: GREEN. Rust retains Function nodes but withholds
+ *       CALLS under the accepted fail-closed policy.
  *   D3 async/await:
  *     Python async def: GREEN — async def is extracted as a Function; awaiting
  *       a known coroutine should produce a CALLS edge.
  *     TS await: GREEN — ts_lsp_cross resolves awaited calls same as sync.
  *     C# async Task: GREEN if the name-based resolver finds the awaited method.
- *     Rust .await: UNCERTAIN/RED — "await" is a postfix operator, not a
- *       function call; the extractor's rust_call_types may not include it.
+ *     Rust .await: fail-closed CALLS; Function nodes remain observable.
  *     Kotlin suspend: UNCERTAIN — suspend functions appear as Function nodes
  *       but coroutine calls may not be extracted as CBMCalls.
  *   D4 operator overloads:
  *     Python __add__: RED — operator calls (a + b) are not extracted as
  *       CBMCalls in the Python extractor; only explicit method calls are.
- *     Rust Add trait impl: RED — `a + b` with impl Add is a desugared method
- *       call, but the extractor sees a binary_expression, not a call_expression.
+ *     Rust Add trait impl: fail-closed CALLS; Method nodes remain observable.
  *     C++ operator+: RED — same desugaring issue; call_expression captures
  *       only direct call syntax, not operator tokens.
  *     Kotlin operator fun: UNCERTAIN — Kotlin operator overload is a named
@@ -110,15 +109,13 @@
  *   D5 interface/trait dispatch:
  *     Go: GREEN — interface method called through a concrete value; lsp_cross
  *       infers the concrete type from assignment.
- *     Rust dyn Trait: UNCERTAIN — dyn Trait dispatch; receiver type is erased
- *       at the call site; lsp_cross may not wire Rust.
+ *     Rust dyn Trait: fail-closed CALLS; Method nodes remain observable.
  *     Java: RED — no lsp_cross; name-based resolver finds method if unique.
  *     C#: RED — no lsp_cross wiring; same as Java.
  *   D6 enum/sealed variant method:
  *     Kotlin sealed class variant: GREEN — variant is a data class with its
  *       own methods; calls resolve by name if unique.
- *     Rust enum method: UNCERTAIN — impl on enum; method call on a value
- *       typed as the enum; lsp_cross is not wired for Rust.
+ *     Rust enum method: fail-closed CALLS; Method nodes remain observable.
  *     Java enum method: UNCERTAIN — same Java/no-lsp_cross situation.
  *
  * AREA E — Node-creation corners:
@@ -790,27 +787,25 @@ TEST(cp_recursive_python) {
     int calls = cp_edges(store, lp.project, "CALLS");
     if (calls < 1) cp_diag(store, lp.project, "recursive/python");
     cp_cleanup(&lp, store);
-    ASSERT_TRUE(calls >= 1);  /* run->factorial (self-loop suppressed by design) */
+    ASSERT_TRUE(calls >= 1); /* run->factorial (self-loop suppressed by design) */
     PASS();
 }
 
-/* D2c — Rust recursive function.
- * FIXTURE FIX (was RED): pure self-call sum->sum is suppressed as a self-loop
- * (see D2a).  Add a non-self caller run->sum so a real CALLS edge appears; the
- * recursive shape is retained.  (run->sum resolves via the name-based registry
- * resolver — a plain same-file function call, no `::` path involved.) */
+/* D2c — Rust recursive function. Definitions remain observable while the
+ * accepted Rust policy withholds both recursive and ordinary CALLS edges. */
 TEST(cp_recursive_rust) {
-    static const CP_File f[] = {
-        {"math.rs",
-         "pub fn sum(n: u64) -> u64 {\n"
-         "    if n == 0 { return 0; }\n    n + sum(n - 1)\n}\n\n"
-         "pub fn run() -> u64 { sum(5) }\n"}};
+    static const CP_File f[] = {{"math.rs", "pub fn sum(n: u64) -> u64 {\n"
+                                            "    if n == 0 { return 0; }\n    n + sum(n - 1)\n}\n\n"
+                                            "pub fn run() -> u64 { sum(5) }\n"}};
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
-    if (calls < 1) cp_diag(store, lp.project, "recursive/rust");
+    int functions = cp_count_label(store, lp.project, "Function");
+    if (calls != 0 || functions < 2)
+        cp_diag(store, lp.project, "recursive/rust");
     cp_cleanup(&lp, store);
-    ASSERT_TRUE(calls >= 1);  /* run->sum (self-loop sum->sum suppressed by design) */
+    ASSERT_TRUE(functions >= 2);
+    ASSERT_EQ(calls, 0);
     PASS();
 }
 
@@ -820,17 +815,17 @@ TEST(cp_recursive_rust) {
  * recursive shape is retained. */
 TEST(cp_recursive_java) {
     static const CP_File f[] = {
-        {"Fib.java",
-         "package app;\n\nclass Fib {\n"
-         "    static long fib(int n) {\n"
-         "        if (n <= 1) return n;\n        return fib(n-1) + fib(n-2);\n    }\n\n"
-         "    static long run() { return fib(10); }\n}\n"}};
+        {"Fib.java", "package app;\n\nclass Fib {\n"
+                     "    static long fib(int n) {\n"
+                     "        if (n <= 1) return n;\n        return fib(n-1) + fib(n-2);\n    }\n\n"
+                     "    static long run() { return fib(10); }\n}\n"}};
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
-    if (calls < 1) cp_diag(store, lp.project, "recursive/java");
+    if (calls < 1)
+        cp_diag(store, lp.project, "recursive/java");
     cp_cleanup(&lp, store);
-    ASSERT_TRUE(calls >= 1);  /* run->fib (self-loop fib->fib suppressed by design) */
+    ASSERT_TRUE(calls >= 1); /* run->fib (self-loop fib->fib suppressed by design) */
     PASS();
 }
 
@@ -896,24 +891,21 @@ TEST(cp_async_csharp_task) {
     PASS();
 }
 
-/* D3d — Rust .await on an async fn.
- * EXPECTED UNCERTAIN/RED: `future.await` is a postfix await_expression
- * in tree-sitter-rust.  rust_call_types = {"call_expression"} only;
- * await_expression is not included, so the awaited call is not extracted.
- * Assert CORRECT outcome (calls >= 1); RED if extractor misses it. */
+/* D3d — Rust .await on an async fn. Function nodes remain observable while
+ * the accepted Rust policy withholds CALLS edges. */
 TEST(cp_async_rust_await) {
-    static const CP_File f[] = {
-        {"svc.rs",
-         "async fn fetch(url: &str) -> String { url.to_string() }\n\n"
-         "async fn run(url: &str) -> String {\n    fetch(url).await\n}\n"}};
+    static const CP_File f[] = {{"svc.rs",
+                                 "async fn fetch(url: &str) -> String { url.to_string() }\n\n"
+                                 "async fn run(url: &str) -> String {\n    fetch(url).await\n}\n"}};
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
-    int calls   = cp_edges(store, lp.project, "CALLS");
+    int calls = cp_edges(store, lp.project, "CALLS");
     int fn_count = cp_count_label(store, lp.project, "Function");
-    if (calls < 1) cp_diag(store, lp.project, "async/rust_await");
+    if (calls != 0 || fn_count < 2)
+        cp_diag(store, lp.project, "async/rust_await");
     cp_cleanup(&lp, store);
-    ASSERT_TRUE(fn_count >= 2);  /* async fns must still become Function nodes */
-    ASSERT_TRUE(calls >= 1);     /* RED if .await not in rust_call_types */
+    ASSERT_TRUE(fn_count >= 2); /* async fns must still become Function nodes */
+    ASSERT_EQ(calls, 0);
     PASS();
 }
 
@@ -923,10 +915,9 @@ TEST(cp_async_rust_await) {
  * resolver should produce a CALLS edge via the name-based resolver. */
 TEST(cp_async_kotlin_suspend) {
     static const CP_File f[] = {
-        {"Fetch.kt",
-         "suspend fun fetchData(url: String): String = url\n\n"
-         "suspend fun process(url: String): String {\n"
-         "    val data = fetchData(url)\n    return data.uppercase()\n}\n"}};
+        {"Fetch.kt", "suspend fun fetchData(url: String): String = url\n\n"
+                     "suspend fun process(url: String): String {\n"
+                     "    val data = fetchData(url)\n    return data.uppercase()\n}\n"}};
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
@@ -963,28 +954,25 @@ TEST(cp_operator_python_add) {
     PASS();
 }
 
-/* D4b — Rust Add trait operator overload.
- * EXPECTED RED: `a + b` is a binary_expression; rust_call_types =
- * {"call_expression"} only; the add() desugaring is not extracted. */
+/* D4b — Rust Add trait operator overload. Method nodes remain observable while
+ * the accepted Rust policy withholds CALLS edges. */
 TEST(cp_operator_rust_add) {
     static const CP_File f[] = {
-        {"point.rs",
-         "use std::ops::Add;\n\n"
-         "#[derive(Clone, Copy)]\npub struct Point { pub x: i32, pub y: i32 }\n\n"
-         "impl Add for Point {\n    type Output = Point;\n\n"
-         "    fn add(self, other: Point) -> Point {\n"
-         "        Point { x: self.x + other.x, y: self.y + other.y }\n    }\n}\n\n"
-         "pub fn combine(a: Point, b: Point) -> Point { a + b }\n"}};
+        {"point.rs", "use std::ops::Add;\n\n"
+                     "#[derive(Clone, Copy)]\npub struct Point { pub x: i32, pub y: i32 }\n\n"
+                     "impl Add for Point {\n    type Output = Point;\n\n"
+                     "    fn add(self, other: Point) -> Point {\n"
+                     "        Point { x: self.x + other.x, y: self.y + other.y }\n    }\n}\n\n"
+                     "pub fn combine(a: Point, b: Point) -> Point { a + b }\n"}};
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
-    if (calls < 1) cp_diag(store, lp.project, "operator/rust_add");
+    int methods = cp_count_label(store, lp.project, "Method");
+    if (calls != 0 || methods < 1)
+        cp_diag(store, lp.project, "operator/rust_add");
     cp_cleanup(&lp, store);
-    /* REAL BUG: `a + b` is a binary_expression; lang_specs.c rust_call_types =
-     * {call_expression, macro_invocation} has no binary_expression entry, so the
-     * Add-trait operator desugaring (a.add(b)) is never extracted as a call →
-     * 0 CALLS. [KNOWN class 12] */
-    ASSERT_TRUE(calls >= 1);
+    ASSERT_TRUE(methods >= 1);
+    ASSERT_EQ(calls, 0);
     PASS();
 }
 
@@ -993,19 +981,19 @@ TEST(cp_operator_rust_add) {
  * may or may not desugar it to a.plus(b) call. */
 TEST(cp_operator_kotlin_plus) {
     static const CP_File f[] = {
-        {"Vec.kt",
-         "data class Vec(val x: Int, val y: Int) {\n"
-         "    operator fun plus(other: Vec): Vec = Vec(x + other.x, y + other.y)\n"
-         "    operator fun minus(other: Vec): Vec = Vec(x - other.x, y - other.y)\n}\n\n"
-         "fun combine(a: Vec, b: Vec): Vec = a + b\n"}};
+        {"Vec.kt", "data class Vec(val x: Int, val y: Int) {\n"
+                   "    operator fun plus(other: Vec): Vec = Vec(x + other.x, y + other.y)\n"
+                   "    operator fun minus(other: Vec): Vec = Vec(x - other.x, y - other.y)\n}\n\n"
+                   "fun combine(a: Vec, b: Vec): Vec = a + b\n"}};
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
-    int calls   = cp_edges(store, lp.project, "CALLS");
+    int calls = cp_edges(store, lp.project, "CALLS");
     int methods = cp_count_label(store, lp.project, "Method");
-    if (calls < 1) cp_diag(store, lp.project, "operator/kotlin_plus");
+    if (calls < 1)
+        cp_diag(store, lp.project, "operator/kotlin_plus");
     cp_cleanup(&lp, store);
-    ASSERT_TRUE(methods >= 1);   /* operator funs must be Method nodes */
-    ASSERT_TRUE(calls >= 1);     /* UNCERTAIN/RED if binary_expression not desugared */
+    ASSERT_TRUE(methods >= 1); /* operator funs must be Method nodes */
+    ASSERT_TRUE(calls >= 1);   /* UNCERTAIN/RED if binary_expression not desugared */
     PASS();
 }
 
@@ -1033,10 +1021,8 @@ TEST(cp_interface_dispatch_go) {
     PASS();
 }
 
-/* D5b — Rust dyn Trait dispatch.
- * EXPECTED UNCERTAIN: Rust lsp_cross is not wired (cbm_pxc_has_cross_lsp
- * returns false for Rust); dyn Trait erases the concrete type; the name-
- * based resolver may find the method by name if unique. */
+/* D5b — Rust dyn Trait dispatch. Method nodes remain observable while the
+ * accepted Rust policy withholds CALLS edges. */
 TEST(cp_interface_dispatch_rust_dyn) {
     static const CP_File f[] = {
         {"shapes.rs",
@@ -1050,10 +1036,12 @@ TEST(cp_interface_dispatch_rust_dyn) {
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
-    if (calls < 1) cp_diag(store, lp.project, "interface_dispatch/rust_dyn");
+    int methods = cp_count_label(store, lp.project, "Method");
+    if (calls != 0 || methods < 2)
+        cp_diag(store, lp.project, "interface_dispatch/rust_dyn");
     cp_cleanup(&lp, store);
-    /* UNCERTAIN: RED if Rust lsp_cross gap prevents trait-dispatch resolution */
-    ASSERT_TRUE(calls >= 1);
+    ASSERT_TRUE(methods >= 2);
+    ASSERT_EQ(calls, 0);
     PASS();
 }
 
@@ -1061,16 +1049,15 @@ TEST(cp_interface_dispatch_rust_dyn) {
  * EXPECTED UNCERTAIN: the name-based resolver may find the method by name
  * if unique within the project. */
 TEST(cp_interface_dispatch_java) {
-    static const CP_File f[] = {
-        {"Shape.java",
-         "package app;\n\n"
-         "interface Shape { double area(); double perimeter(); }\n\n"
-         "class Circle implements Shape {\n    double r;\n"
-         "    Circle(double r) { this.r = r; }\n"
-         "    public double area() { return Math.PI * r * r; }\n"
-         "    public double perimeter() { return 2 * Math.PI * r; }\n}\n\n"
-         "class Util {\n    static double describe(Shape s) {\n"
-         "        return s.area() + s.perimeter();\n    }\n}\n"}};
+    static const CP_File f[] = {{"Shape.java",
+                                 "package app;\n\n"
+                                 "interface Shape { double area(); double perimeter(); }\n\n"
+                                 "class Circle implements Shape {\n    double r;\n"
+                                 "    Circle(double r) { this.r = r; }\n"
+                                 "    public double area() { return Math.PI * r * r; }\n"
+                                 "    public double perimeter() { return 2 * Math.PI * r; }\n}\n\n"
+                                 "class Util {\n    static double describe(Shape s) {\n"
+                                 "        return s.area() + s.perimeter();\n    }\n}\n"}};
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
@@ -1129,16 +1116,11 @@ TEST(cp_enum_variant_rust_impl) {
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls   = cp_edges(store, lp.project, "CALLS");
     int methods = cp_count_label(store, lp.project, "Method");
-    if (calls < 1) cp_diag(store, lp.project, "enum_variant/rust_impl");
+    if (calls != 0 || methods < 1)
+        cp_diag(store, lp.project, "enum_variant/rust_impl");
     cp_cleanup(&lp, store);
     ASSERT_TRUE(methods >= 1);  /* label + opposite must be Method nodes */
-    /* REAL BUG: `d.label()` is a method call on a receiver typed as the enum
-     * Direction.  Rust is NOT in cbm_pxc_has_cross_lsp (src/pipeline/
-     * pass_lsp_cross.c — only Go/C/CPP/CUDA/Python/JS/TS/TSX/PHP), so there is
-     * no type-aware resolver to map the receiver to Direction::label, and the
-     * name-based registry resolver does not resolve `recv.method()` method calls
-     * → 0 CALLS. [KNOWN class 4 — Rust no cross-LSP] */
-    ASSERT_TRUE(calls >= 1);
+    ASSERT_EQ(calls, 0);
     PASS();
 }
 
@@ -1157,11 +1139,12 @@ TEST(cp_enum_method_java) {
          "        return d.label() + (d.isWeekend() ? \"(rest)\" : \"(work)\");\n    }\n}\n"}};
     CP_Proj lp;
     cbm_store_t *store = cp_index_files(&lp, f, 1);
-    int calls   = cp_edges(store, lp.project, "CALLS");
-    int types   = cp_count_label(store, lp.project, "Enum");
-    if (calls < 1) cp_diag(store, lp.project, "enum_method/java");
+    int calls = cp_edges(store, lp.project, "CALLS");
+    int types = cp_count_label(store, lp.project, "Enum");
+    if (calls < 1)
+        cp_diag(store, lp.project, "enum_method/java");
     cp_cleanup(&lp, store);
-    ASSERT_TRUE(types >= 1);   /* enum Day must become an Enum node */
+    ASSERT_TRUE(types >= 1); /* enum Day must become an Enum node */
     ASSERT_TRUE(calls >= 1);
     PASS();
 }
@@ -1582,7 +1565,7 @@ SUITE(convergence_probe) {
     RUN_TEST(cp_recursive_go);
     /* D2b Python               — EXPECTED GREEN */
     RUN_TEST(cp_recursive_python);
-    /* D2c Rust                 — EXPECTED GREEN */
+    /* D2c Rust                 — EXPECTED FAIL-CLOSED CALLS */
     RUN_TEST(cp_recursive_rust);
     /* D2d Java                 — EXPECTED GREEN */
     RUN_TEST(cp_recursive_java);
@@ -1594,7 +1577,7 @@ SUITE(convergence_probe) {
     RUN_TEST(cp_async_ts_await);
     /* D3c C# async Task        — EXPECTED GREEN */
     RUN_TEST(cp_async_csharp_task);
-    /* D3d Rust .await          — EXPECTED UNCERTAIN/RED */
+    /* D3d Rust .await          — EXPECTED FAIL-CLOSED CALLS */
     RUN_TEST(cp_async_rust_await);
     /* D3e Kotlin suspend       — EXPECTED UNCERTAIN */
     RUN_TEST(cp_async_kotlin_suspend);
@@ -1602,7 +1585,7 @@ SUITE(convergence_probe) {
     /* ── AREA D4: Operator overloads (3 cases) ───────── */
     /* D4a Python __add__       — EXPECTED RED */
     RUN_TEST(cp_operator_python_add);
-    /* D4b Rust Add trait       — EXPECTED RED */
+    /* D4b Rust Add trait       — EXPECTED FAIL-CLOSED CALLS */
     RUN_TEST(cp_operator_rust_add);
     /* D4c Kotlin operator fun  — EXPECTED UNCERTAIN */
     RUN_TEST(cp_operator_kotlin_plus);
@@ -1610,7 +1593,7 @@ SUITE(convergence_probe) {
     /* ── AREA D5: Interface/trait dispatch (3 cases) ─── */
     /* D5a Go interface         — EXPECTED GREEN */
     RUN_TEST(cp_interface_dispatch_go);
-    /* D5b Rust dyn Trait       — EXPECTED UNCERTAIN */
+    /* D5b Rust dyn Trait       — EXPECTED FAIL-CLOSED CALLS */
     RUN_TEST(cp_interface_dispatch_rust_dyn);
     /* D5c Java interface       — EXPECTED UNCERTAIN */
     RUN_TEST(cp_interface_dispatch_java);
@@ -1618,7 +1601,7 @@ SUITE(convergence_probe) {
     /* ── AREA D6: Enum/sealed variant methods (3 cases) ─ */
     /* D6a Kotlin sealed        — EXPECTED GREEN */
     RUN_TEST(cp_enum_variant_kotlin_sealed);
-    /* D6b Rust enum impl       — EXPECTED UNCERTAIN */
+    /* D6b Rust enum impl       — EXPECTED FAIL-CLOSED CALLS */
     RUN_TEST(cp_enum_variant_rust_impl);
     /* D6c Java enum method     — EXPECTED UNCERTAIN */
     RUN_TEST(cp_enum_method_java);

@@ -129,6 +129,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <foundation/platform.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -146,7 +147,9 @@
 
 typedef struct {
     char tmpdir[256];
+    char cache[256];
     char dbpath[512];
+    char *saved_cache;
     char *project;
     cbm_mcp_server_t *srv;
 } ES_LangProj;
@@ -164,22 +167,44 @@ static void es_lc_to_fwd_slashes(char *p) {
     }
 }
 
+static void es_lang_restore_cache(ES_LangProj *lp) {
+    if (lp->saved_cache) {
+        cbm_setenv("CBM_CACHE_DIR", lp->saved_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(lp->saved_cache);
+    lp->saved_cache = NULL;
+    th_rmtree(lp->cache);
+}
+
 static cbm_store_t *es_lang_open_indexed(ES_LangProj *lp) {
     lp->project = cbm_project_name_from_path(lp->tmpdir);
     if (!lp->project) {
         return NULL;
     }
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
+    snprintf(lp->cache, sizeof(lp->cache), "/tmp/cbm_es_cache_XXXXXX");
+    if (!cbm_mkdtemp(lp->cache)) {
+        return NULL;
     }
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    lp->saved_cache = saved_cache ? strdup(saved_cache) : NULL;
+    if ((saved_cache && !lp->saved_cache) || cbm_setenv("CBM_CACHE_DIR", lp->cache, 1) != 0) {
+        free(lp->saved_cache);
+        lp->saved_cache = NULL;
+        th_rmtree(lp->cache);
+        return NULL;
+    }
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        es_lang_restore_cache(lp);
+        return NULL;
+    }
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
     if (!lp->srv) {
+        es_lang_restore_cache(lp);
         return NULL;
     }
     char args[700];
@@ -188,7 +213,13 @@ static cbm_store_t *es_lang_open_indexed(ES_LangProj *lp) {
     if (resp) {
         free(resp);
     }
-    return cbm_store_open_path(lp->dbpath);
+    cbm_store_t *store = cbm_store_open_path(lp->dbpath);
+    if (!store) {
+        cbm_mcp_server_free(lp->srv);
+        lp->srv = NULL;
+        es_lang_restore_cache(lp);
+    }
+    return store;
 }
 
 static cbm_store_t *es_lang_index_files(ES_LangProj *lp, const ES_LangFile *files, int nfiles) {
@@ -225,6 +256,7 @@ static void es_lang_cleanup(ES_LangProj *lp, cbm_store_t *store) {
         cbm_mcp_server_free(lp->srv);
         lp->srv = NULL;
     }
+    es_lang_restore_cache(lp);
     free(lp->project);
     lp->project = NULL;
     th_rmtree(lp->tmpdir);
@@ -296,6 +328,20 @@ static int es_edge_present(const ES_LangFile *files, int nfiles, const char *edg
     }
     es_lang_cleanup(&lp, store);
     return got >= floor;
+}
+
+static int es_edge_absent_with_definitions(const ES_LangFile *files, int nfiles, const char *edge) {
+    ES_LangProj lp;
+    cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
+    int got = store ? cbm_store_count_edges_by_type(store, lp.project, edge) : -1;
+    int definitions = store ? cbm_store_count_edges_by_type(store, lp.project, "DEFINES") : -1;
+    if (got != 0 || definitions < 1) {
+        fprintf(stderr, "  [ES-EDGE] FAIL %-20s got=%d expected=0 definitions=%d expected>=1\n",
+                edge, got, definitions);
+        es_dump_edge_histogram(store, lp.project);
+    }
+    es_lang_cleanup(&lp, store);
+    return got == 0 && definitions >= 1;
 }
 
 static int es_exact_edge_by_name(const ES_LangFile *files, int nfiles, const char *edge_type,
@@ -373,7 +419,7 @@ TEST(es_calls_crossfile_rust) {
     static const ES_LangFile f[] = {
         {"lib.rs", "pub fn square(x: i32) -> i32 {\n    x * x\n}\n"},
         {"main.rs", "mod lib;\n\nfn run(n: i32) -> i32 {\n    lib::square(n)\n}\n"}};
-    ASSERT_FALSE(es_edge_present(f, 2, "CALLS", 1));
+    ASSERT_TRUE(es_edge_absent_with_definitions(f, 2, "CALLS"));
     PASS();
 }
 

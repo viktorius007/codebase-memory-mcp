@@ -1965,17 +1965,32 @@ TEST(tool_detect_changes_impact_shape) {
     char *r = call_tool_timed("detect_changes", &ms,
                               "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
     TOOL_OK(r, ms);
-    ASSERT(strstr(r, "direction: inbound") != NULL); /* default = blast radius */
-    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    bool tree_ok = strstr(r, "\"isError\":true") == NULL;
+    bool tree_direction = strstr(r, "direction: inbound") != NULL;
+    bool tree_seed_symbols = strstr(r, "seed_symbols:") != NULL;
+    if (!tree_ok || !tree_direction || !tree_seed_symbols) {
+        fprintf(stderr, "detect_changes tree response: %.1000s\n", r);
+    }
     /* format:"json" returns the same model as structured JSON. */
     free(r);
     r = call_tool_timed("detect_changes", &ms,
                         "{\"project\":\"%s\",\"base_branch\":\"HEAD\",\"format\":\"json\"}",
                         g_project);
     TOOL_OK(r, ms);
-    ASSERT(resp_has_key(r, "impacted_total"));
-    ASSERT(resp_has_key(r, "direction"));
+    bool json_ok = strstr(r, "\"isError\":true") == NULL;
+    bool json_shape = resp_has_key(r, "impacted_total") && resp_has_key(r, "direction");
+    bool json_direction = strstr(r, "\\\"direction\\\":\\\"inbound\\\"") != NULL ||
+                          strstr(r, "\"direction\":\"inbound\"") != NULL;
+    if (!json_ok || !json_shape || !json_direction) {
+        fprintf(stderr, "detect_changes JSON response: %.1000s\n", r);
+    }
     free(r);
+    ASSERT_TRUE(tree_ok);
+    ASSERT_TRUE(tree_direction); /* default = blast radius */
+    ASSERT_TRUE(tree_seed_symbols);
+    ASSERT_TRUE(json_ok);
+    ASSERT_TRUE(json_shape);
+    ASSERT_TRUE(json_direction);
     PASS();
 }
 
