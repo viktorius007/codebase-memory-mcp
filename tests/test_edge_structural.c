@@ -335,9 +335,9 @@ static int es_exact_edge_by_name(const ES_LangFile *files, int nfiles, const cha
 /* ══════════════════════════════════════════════════════════════════
  * FAMILY 1: CALLS cross-file
  *
- * Function defined in file A, called from file B.  The registry is
- * project-wide so cross-file is identical to same-file for the resolver.
- * ALL 9 hybrid-LSP languages are expected GREEN.
+ * Function defined in file A, called from file B. The registry is
+ * project-wide so cross-file is identical to same-file for supported
+ * resolvers; Rust remains fail-closed without trusted binding provenance.
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Go: caller in main.go, callee in util.go — same package. */
@@ -368,12 +368,12 @@ TEST(es_calls_crossfile_cpp) {
     PASS();
 }
 
-/* Rust: caller in main.rs, callee in lib.rs (pub fn). */
+/* Rust: cross-file CALLS lacks trusted binding provenance and stays absent. */
 TEST(es_calls_crossfile_rust) {
     static const ES_LangFile f[] = {
         {"lib.rs", "pub fn square(x: i32) -> i32 {\n    x * x\n}\n"},
         {"main.rs", "mod lib;\n\nfn run(n: i32) -> i32 {\n    lib::square(n)\n}\n"}};
-    ASSERT_TRUE(es_edge_present(f, 2, "CALLS", 1)); /* run -> square */
+    ASSERT_FALSE(es_edge_present(f, 2, "CALLS", 1));
     PASS();
 }
 

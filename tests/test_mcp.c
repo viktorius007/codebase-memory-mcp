@@ -6609,7 +6609,7 @@ TEST(tool_trace_budget_never_slices_identifiers) {
             yyjson_val *floor_root = yyjson_doc_get_root(floor_doc);
             ASSERT_EQ(yyjson_get_int(yyjson_obj_get(floor_root, "callees_total")), 1);
             ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(floor_root, "callees_total_relation")),
-                          "eq");
+                          "gte");
             ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(floor_root, "has_more")));
             ASSERT_TRUE(
                 yyjson_get_bool(yyjson_obj_get(floor_root, "continuation_requires_higher_budget")));
@@ -6619,7 +6619,7 @@ TEST(tool_trace_budget_never_slices_identifiers) {
             yyjson_doc_free(floor_doc);
         } else {
             ASSERT_NOT_NULL(strstr(floor, "callees_total: 1"));
-            ASSERT_NOT_NULL(strstr(floor, "callees_total_relation: eq"));
+            ASSERT_NOT_NULL(strstr(floor, "callees_total_relation: gte"));
             ASSERT_NOT_NULL(strstr(floor, "has_more: true"));
             ASSERT_NOT_NULL(strstr(floor, "continuation_requires_higher_budget: true"));
             ASSERT_NOT_NULL(strstr(floor, "output_budget_floor_exceeded: true"));

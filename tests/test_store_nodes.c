@@ -5,6 +5,7 @@
  * TestNodeDedup, TestProjectCRUD, TestUpsertNodeBatch, etc.)
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <store/store.h>
 #include <foundation/constants.h>
 #include <foundation/platform.h>
