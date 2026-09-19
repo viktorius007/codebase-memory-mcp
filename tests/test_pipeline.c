@@ -6176,17 +6176,11 @@ TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier) {
     PASS();
 }
 
-/* Same fused-eligibility hole for Rust built-in macro arguments. The parser
- * exposes format! but not render() inside its token tree. Per-file LSP already
- * qualifies every parser-backed site in hidden.rs, so the fused heuristic sees
- * no remaining work and never runs the cross pass that would discover both the
- * semantic render target and its exact synthetic carrier.
- *
- * The exact same 55-file fixture is indexed once through the sequential path
- * first. A hidden() -> render CALLS edge there is a strong non-vacuity control:
- * only the sequential cross-LSP pass can discover both the macro-hidden call
- * and its synthetic carrier. The parallel run must preserve that result. */
-TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier) {
+/* Rust built-in macro arguments can expose a cross-file call candidate, but
+ * neither pipeline may materialize it as a definite CALLS edge without trusted
+ * semantic provenance. The exact same 55-file fixture exercises the sequential
+ * and parallel paths so their final-graph result must remain equivalent. */
+TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_syn_par_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
@@ -6264,11 +6258,12 @@ TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier) {
 
     ASSERT_EQ(seq_run_rc, 0);
     ASSERT_TRUE(seq_store_opened);
-    ASSERT_TRUE(seq_hidden_to_render); /* same fixture is semantically resolvable */
     ASSERT_EQ(run_rc, 0);
     ASSERT_TRUE(store_opened);
     ASSERT_TRUE(render_target_present); /* target is present in the parallel graph */
-    ASSERT_TRUE(hidden_to_render);      /* RED: fused eligibility skips hidden.rs */
+    ASSERT_FALSE(seq_hidden_to_render);
+    ASSERT_FALSE(hidden_to_render);
+    ASSERT_EQ(seq_hidden_to_render, hidden_to_render);
     PASS();
 }
 
@@ -14603,7 +14598,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
-    RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
+    RUN_TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);

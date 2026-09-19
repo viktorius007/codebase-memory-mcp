@@ -2781,47 +2781,39 @@ static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
     return gbuf;
 }
 
-TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest) {
+TEST(parallel_rust_workspace_candidates_need_trusted_provenance_for_calls) {
     cbm_gbuf_t *gbuf = run_issue56_parallel_workspace(false);
     ASSERT_NOT_NULL(gbuf);
 
-    const cbm_gbuf_edge_t *correct =
-        find_call_edge_to_target_fragment(gbuf, "main.run", ".crate_a.");
-    const bool correct_found = correct != NULL;
+    const bool desired_candidate =
+        callable_has_call_target_fragment(gbuf, "main.run", ".crate_a.");
     const bool unlisted = callable_has_call_target_fragment(gbuf, "main.run", ".unlisted.");
-    const bool manifest_strategy =
-        correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
-    if (!correct || unlisted || !manifest_strategy) {
-        printf("  issue56 manifest diagnostic: correct=%d unlisted=%d strategy=%d\n", correct_found,
-               unlisted, manifest_strategy);
+    if (desired_candidate || unlisted) {
+        printf("  issue56 manifest diagnostic: desired=%d unlisted=%d\n", desired_candidate,
+               unlisted);
     }
     cbm_gbuf_free(gbuf);
 
-    ASSERT_TRUE(correct_found);
+    ASSERT_FALSE(desired_candidate);
     ASSERT_FALSE(unlisted);
-    ASSERT_TRUE(manifest_strategy);
     PASS();
 }
 
-TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution) {
+TEST(parallel_rust_local_shadow_candidates_need_trusted_provenance_for_calls) {
     cbm_gbuf_t *gbuf = run_issue56_parallel_workspace(true);
     ASSERT_NOT_NULL(gbuf);
 
-    const cbm_gbuf_edge_t *correct =
-        find_call_edge_to_target_fragment(gbuf, "main.run", ".crate_a.");
-    const bool correct_found = correct != NULL;
+    const bool desired_candidate =
+        callable_has_call_target_fragment(gbuf, "main.run", ".crate_a.");
     const bool wrong_local = callable_has_call_target_fragment(gbuf, "main.run", ".crate_b.");
-    const bool manifest_strategy =
-        correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
-    if (!correct || wrong_local || !manifest_strategy) {
-        printf("  issue56 local-shadow diagnostic: correct=%d wrong_local=%d strategy=%d\n",
-               correct_found, wrong_local, manifest_strategy);
+    if (desired_candidate || wrong_local) {
+        printf("  issue56 local-shadow diagnostic: desired=%d wrong_local=%d\n",
+               desired_candidate, wrong_local);
     }
     cbm_gbuf_free(gbuf);
 
-    ASSERT_TRUE(correct_found);
+    ASSERT_FALSE(desired_candidate);
     ASSERT_FALSE(wrong_local);
-    ASSERT_TRUE(manifest_strategy);
     PASS();
 }
 
@@ -4449,8 +4441,8 @@ SUITE(parallel) {
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
-    RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);
-    RUN_TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution);
+    RUN_TEST(parallel_rust_workspace_candidates_need_trusted_provenance_for_calls);
+    RUN_TEST(parallel_rust_local_shadow_candidates_need_trusted_provenance_for_calls);
     RUN_TEST(rust_untrusted_candidates_never_materialize_definite_calls);
     RUN_TEST(parallel_rust_known_macro_does_not_fallback_to_local_function);
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);
