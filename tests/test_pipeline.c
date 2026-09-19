@@ -1173,6 +1173,25 @@ static int named_node_count(cbm_store_t *s, const char *project, const char *nam
     return count;
 }
 
+typedef struct {
+    int rc;
+    bool known;
+    unsigned int gaps;
+} RustSemanticCoverageObservation;
+
+static RustSemanticCoverageObservation observe_rust_semantic_coverage(cbm_store_t *store,
+                                                                      const char *project) {
+    RustSemanticCoverageObservation result = {.rc = CBM_STORE_ERR};
+    cbm_coverage_meta_t meta = {0};
+    result.rc = cbm_store_coverage_meta_get(store, project, &meta);
+    if (result.rc == CBM_STORE_OK) {
+        result.known = meta.rust_semantic_gaps_known;
+        result.gaps = meta.rust_semantic_gaps;
+    }
+    cbm_store_coverage_meta_clear(&meta);
+    return result;
+}
+
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 enum {
     RESTORE_RUST_CALLS = 0,
@@ -1187,12 +1206,14 @@ enum {
 typedef struct {
     bool fixture_written;
     int baseline_rc;
+    RustSemanticCoverageObservation baseline_rust_coverage;
     int lookup_counts[3];
     int64_t insert_ids[RESTORE_EDGE_COUNT];
     int pre_counts[RESTORE_EDGE_COUNT];
     bool seed_verified;
     int incremental_rc;
     cbm_incremental_route_t route;
+    RustSemanticCoverageObservation published_rust_coverage;
     int post_counts[RESTORE_EDGE_COUNT];
 } PersistedEdgeRestoreObservation;
 
@@ -1254,6 +1275,7 @@ static PersistedEdgeRestoreObservation observe_persisted_edge_restore(bool force
     int64_t rust_target_id = 0;
     int64_t go_source_id = 0;
     if (store) {
+        result.baseline_rust_coverage = observe_rust_semantic_coverage(store, project);
         result.lookup_counts[0] =
             unique_named_node_id(store, project, "rust_persisted_restore_source", &rust_source_id);
         result.lookup_counts[1] =
@@ -1298,6 +1320,7 @@ static PersistedEdgeRestoreObservation observe_persisted_edge_restore(bool force
         }
         store = result.incremental_rc == 0 ? cbm_store_open_path(db_path) : NULL;
         if (store) {
+            result.published_rust_coverage = observe_rust_semantic_coverage(store, project);
             for (int i = 0; i < RESTORE_EDGE_COUNT; i++) {
                 result.post_counts[i] =
                     named_edge_count(store, project, types[i], source_names[i], target_name);
@@ -1314,6 +1337,9 @@ static int assert_persisted_edge_restore(PersistedEdgeRestoreObservation result,
                                          cbm_incremental_route_t expected_route) {
     ASSERT_TRUE(result.fixture_written);
     ASSERT_EQ(result.baseline_rc, 0);
+    ASSERT_EQ(result.baseline_rust_coverage.rc, CBM_STORE_OK);
+    ASSERT_TRUE(result.baseline_rust_coverage.known);
+    ASSERT_EQ(result.baseline_rust_coverage.gaps, 7U);
     ASSERT_EQ(result.lookup_counts[0], 1);
     ASSERT_EQ(result.lookup_counts[1], 1);
     ASSERT_EQ(result.lookup_counts[2], 1);
@@ -1324,6 +1350,9 @@ static int assert_persisted_edge_restore(PersistedEdgeRestoreObservation result,
     ASSERT_TRUE(result.seed_verified);
     ASSERT_EQ(result.incremental_rc, 0);
     ASSERT_EQ(result.route, expected_route);
+    ASSERT_EQ(result.published_rust_coverage.rc, CBM_STORE_OK);
+    ASSERT_TRUE(result.published_rust_coverage.known);
+    ASSERT_EQ(result.published_rust_coverage.gaps, 7U);
     ASSERT_EQ(result.post_counts[RESTORE_RUST_CALLS], 0);
     ASSERT_EQ(result.post_counts[RESTORE_RUST_TESTS], 0);
     ASSERT_EQ(result.post_counts[RESTORE_GO_CALLS], 1);
@@ -2976,6 +3005,8 @@ TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full) {
     repaired_edges = cbm_store_count_edges(store, project);
     repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE", "closureProbeCaller",
                                              "closureProbeHelper", "lib.ts");
+    RustSemanticCoverageObservation repaired_rust_coverage =
+        observe_rust_semantic_coverage(store, project);
     cbm_store_close(store);
 
     char full_db[512];
@@ -2987,6 +3018,9 @@ TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full) {
     th_rmtree(tmp);
 
     ASSERT_EQ(repaired_refs, 1);
+    ASSERT_EQ(repaired_rust_coverage.rc, CBM_STORE_OK);
+    ASSERT_TRUE(repaired_rust_coverage.known);
+    ASSERT_EQ(repaired_rust_coverage.gaps, 0U);
     ASSERT_EQ(repaired_nodes, full_nodes);
     ASSERT_EQ(repaired_edges, full_edges);
     ASSERT_EQ(repaired_refs, full_refs);
@@ -4348,7 +4382,7 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     ASSERT_GT(cbm_store_insert_edge(metadata_store, &old_implements), 0);
     ASSERT_GT(cbm_store_insert_edge(metadata_store, &old_override), 0);
     cbm_coverage_meta_t legacy_meta = current_meta;
-    legacy_meta.coverage_version = 1;
+    legacy_meta.coverage_version = 3;
     ASSERT_EQ(cbm_store_coverage_replace_ex(metadata_store, project, coverage_rows, coverage_count,
                                             &legacy_meta),
               CBM_STORE_OK);
@@ -4888,6 +4922,8 @@ TEST(pipeline_incremental_successful_publication_preserves_adr) {
     cbm_store_t *adr_store = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(adr_store);
     ASSERT_EQ(cbm_store_adr_store(adr_store, project, adr_text), CBM_STORE_OK);
+    RustSemanticCoverageObservation baseline_rust_coverage =
+        observe_rust_semantic_coverage(adr_store, project);
     cbm_store_close(adr_store);
 
     write_temp_file(tmp, "generation.py",
@@ -4903,6 +4939,8 @@ TEST(pipeline_incremental_successful_publication_preserves_adr) {
     cbm_adr_t adr = {0};
     int adr_rc = cbm_store_adr_get(published, project, &adr);
     bool adr_matches = adr_rc == CBM_STORE_OK && adr.content && strcmp(adr.content, adr_text) == 0;
+    RustSemanticCoverageObservation published_rust_coverage =
+        observe_rust_semantic_coverage(published, project);
     cbm_store_adr_free(&adr);
     cbm_store_close(published);
     cbm_pipeline_incremental_test_reset_faults();
@@ -4910,6 +4948,12 @@ TEST(pipeline_incremental_successful_publication_preserves_adr) {
 
     ASSERT_EQ(run_rc, 0);
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(baseline_rust_coverage.rc, CBM_STORE_OK);
+    ASSERT_TRUE(baseline_rust_coverage.known);
+    ASSERT_EQ(baseline_rust_coverage.gaps, 0U);
+    ASSERT_EQ(published_rust_coverage.rc, CBM_STORE_OK);
+    ASSERT_TRUE(published_rust_coverage.known);
+    ASSERT_EQ(published_rust_coverage.gaps, 0U);
     ASSERT_TRUE(adr_matches);
     PASS();
 }

@@ -2474,6 +2474,130 @@ TEST(tool_search_graph_basic) {
 /* Forward declarations for helpers defined later in this file */
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
+static const char TEST_RUST_SEMANTIC_NOTE[] =
+    "Rust semantic coverage is partial or unknown; omitted facts may change rows or cells, and "
+    "positive affected fact counts are lower bounds.";
+
+static int assert_rust_semantic_object(yyjson_val *root, const char *status, const char *reason) {
+    yyjson_val *semantic = yyjson_obj_get(root, "semantic_coverage");
+    yyjson_val *rust = semantic ? yyjson_obj_get(semantic, "rust") : NULL;
+    ASSERT_NOT_NULL(rust);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust, "status")), status);
+    yyjson_val *reasons = yyjson_obj_get(rust, "reasons");
+    ASSERT_NOT_NULL(reasons);
+    ASSERT_EQ(yyjson_arr_size(reasons), reason ? 1 : 0);
+    if (reason) {
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(reasons, 0)), reason);
+    }
+    return 0;
+}
+
+static int assert_rust_semantic_note(yyjson_val *root, bool expected) {
+    yyjson_val *note = yyjson_obj_get(root, "semantic_note");
+    if (expected) {
+        ASSERT_STR_EQ(yyjson_get_str(note), TEST_RUST_SEMANTIC_NOTE);
+    } else {
+        ASSERT_NULL(note);
+    }
+    return 0;
+}
+
+static int assert_rust_semantic_endpoints(cbm_mcp_server_t *srv, const char *status,
+                                          const char *reason, const char *edge_type,
+                                          const char *ordinary_status) {
+    const char *status_args[] = {
+        "{\"project\":\"test-project\",\"format\":\"json\"}",
+        "{\"project\":\"test-project\",\"diagnostics\":\"full\",\"format\":\"json\"}",
+    };
+    for (size_t i = 0; i < sizeof(status_args) / sizeof(status_args[0]); i++) {
+        char *response = cbm_mcp_handle_tool(srv, "index_status", status_args[i]);
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        ASSERT_EQ(assert_rust_semantic_object(yyjson_doc_get_root(doc), status, reason), 0);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"test-project\",\"paths\":[\"./missing.rs\",\"main.go\"],"
+        "\"scopes\":[\".\"],\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(assert_rust_semantic_object(root, status, reason), 0);
+    yyjson_val *paths = yyjson_obj_get(root, "paths");
+    yyjson_val *rust_path = yyjson_arr_get(paths, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust_path, "requested_path")), "./missing.rs");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust_path, "path")), "missing.rs");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust_path, "status")), ordinary_status);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust_path, "semantic_status")), status);
+    yyjson_val *path_reasons = yyjson_obj_get(rust_path, "semantic_reasons");
+    ASSERT_EQ(yyjson_arr_size(path_reasons), reason ? 1 : 0);
+    if (reason) {
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(path_reasons, 0)), reason);
+    }
+    yyjson_val *non_rust_path = yyjson_arr_get(paths, 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(non_rust_path, "status")), ordinary_status);
+    ASSERT_NULL(yyjson_obj_get(non_rust_path, "semantic_status"));
+    ASSERT_NULL(yyjson_obj_get(non_rust_path, "semantic_reasons"));
+    yyjson_val *scope = yyjson_arr_get(yyjson_obj_get(root, "scopes"), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(scope, "semantic_status")), status);
+    yyjson_val *scope_reasons = yyjson_obj_get(scope, "semantic_reasons");
+    ASSERT_EQ(yyjson_arr_size(scope_reasons), reason ? 1 : 0);
+    if (reason) {
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(scope_reasons, 0)), reason);
+    }
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    char trace_args[384];
+    snprintf(trace_args, sizeof(trace_args),
+             "{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
+             "\"direction\":\"outbound\",\"edge_types\":[\"%s\"],\"format\":\"json\"}",
+             edge_type);
+    response = cbm_mcp_handle_tool(srv, "trace_path", trace_args);
+    ASSERT_NOT_NULL(response);
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_GT(yyjson_get_int(yyjson_obj_get(root, "callees_total")), 0);
+    bool complete = strcmp(status, "semantic_complete") == 0;
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "callees_total_relation")),
+                  complete ? "eq" : "gte");
+    ASSERT_EQ(assert_rust_semantic_note(root, !complete), 0);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "query_graph",
+        "{\"project\":\"test-project\",\"query\":\"MATCH (n) RETURN n.name LIMIT 1\","
+        "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+    ASSERT_EQ(assert_rust_semantic_note(root, !complete), 0);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    return 0;
+}
 
 TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -4787,6 +4911,16 @@ TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound) {
                            .end_line = index + 1};
         ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
     }
+    cbm_coverage_row_t missed_rows[] = {
+        {.rel_path = "src/missed-a.rs", .kind = "parse_partial", .detail = "1"},
+        {.rel_path = "src/missed-b.rs", .kind = "parse_partial", .detail = "2"},
+    };
+    for (size_t i = 0; i < sizeof(missed_rows) / sizeof(missed_rows[0]); i++) {
+        ASSERT_EQ(
+            cbm_store_upsert_file_hash(store, project, missed_rows[i].rel_path, "fixture", 0, 0),
+            CBM_STORE_OK);
+    }
+    ASSERT_EQ(cbm_store_coverage_replace(store, project, missed_rows, 2), CBM_STORE_OK);
     const char *query = "MATCH (n:Function) RETURN n.qualified_name AS qn, n.file_path AS file "
                         "ORDER BY qn";
 
@@ -4806,6 +4940,8 @@ TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound) {
     char *first_cursor = strdup(yyjson_get_str(next_value));
     ASSERT_NOT_NULL(first_cursor);
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "next_offset")), 2);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "semantic_note")), TEST_RUST_SEMANTIC_NOTE);
     ASSERT_STR_EQ(
         yyjson_get_str(yyjson_arr_get(yyjson_arr_get(yyjson_obj_get(root, "rows"), 0), 0)),
         "query-cursor.row_0");
@@ -4825,6 +4961,9 @@ TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound) {
     ASSERT_NOT_NULL(strstr(inner, "query-cursor.row_2"));
     ASSERT_NOT_NULL(strstr(inner, "query-cursor.row_3"));
     ASSERT_NULL(strstr(inner, "query-cursor.row_0"));
+    ASSERT_NOT_NULL(strstr(inner, "total_relation: eq"));
+    ASSERT_NOT_NULL(strstr(inner, "semantic_note:"));
+    ASSERT_NOT_NULL(strstr(inner, TEST_RUST_SEMANTIC_NOTE));
     const char *cursor_line = strstr(inner, "next_cursor: ");
     ASSERT_NOT_NULL(cursor_line);
     cursor_line += strlen("next_cursor: ");
@@ -4849,6 +4988,8 @@ TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound) {
     ASSERT_NOT_NULL(doc);
     root = yyjson_doc_get_root(doc);
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "semantic_note")), TEST_RUST_SEMANTIC_NOTE);
     ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
     ASSERT_NULL(yyjson_obj_get(root, "next_cursor"));
     yyjson_doc_free(doc);
@@ -4866,6 +5007,8 @@ TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound) {
     ASSERT_NOT_NULL(doc);
     root = yyjson_doc_get_root(doc);
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "semantic_note")), TEST_RUST_SEMANTIC_NOTE);
     ASSERT_STR_EQ(
         yyjson_get_str(yyjson_arr_get(yyjson_arr_get(yyjson_obj_get(root, "rows"), 0), 0)),
         "query-cursor.row_4");
@@ -4873,6 +5016,48 @@ TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound) {
     yyjson_doc_free(doc);
     free(inner);
     free(response);
+
+    const char *cursor_query = "MATCH (n) RETURN n.name ORDER BY n.name";
+    for (int missed = 0; missed < 2; missed++) {
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",%s\"query\":\"%s\",\"max_rows\":1,"
+                 "\"max_output_tokens\":2000,\"format\":\"json\"}",
+                 project, missed ? "\"graph\":\"missed\"," : "", cursor_query);
+        response = cbm_mcp_handle_tool(srv, "query_graph", args);
+        inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 1);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+        ASSERT_EQ(assert_rust_semantic_note(root, !missed), 0);
+        next_value = yyjson_obj_get(root, "next_cursor");
+        ASSERT_TRUE(yyjson_is_str(next_value));
+        char *mirror_cursor = strdup(yyjson_get_str(next_value));
+        ASSERT_NOT_NULL(mirror_cursor);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",%s\"query\":\"%s\",\"max_rows\":1,"
+                 "\"max_output_tokens\":2000,\"format\":\"json\",\"cursor\":\"%s\"}",
+                 project, missed ? "\"graph\":\"missed\"," : "", cursor_query, mirror_cursor);
+        response = cbm_mcp_handle_tool(srv, "query_graph", args);
+        inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 1);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+        ASSERT_EQ(assert_rust_semantic_note(root, !missed), 0);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+        free(mirror_cursor);
+    }
 
     /* A changed row without a generation bump is still detected by the full
      * ordered-materialization digest. */
@@ -4990,6 +5175,14 @@ TEST(tool_query_graph_budget_bounds_first_row_and_json_escaping) {
                        .qualified_name = "query-wide-row.wide",
                        .file_path = "wide.c"};
     ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    char missed_path[5001];
+    memset(missed_path, 'm', sizeof(missed_path) - 4U);
+    memcpy(missed_path + sizeof(missed_path) - 4U, ".rs", 4U);
+    cbm_coverage_row_t missed_row = {
+        .rel_path = missed_path, .kind = "parse_partial", .detail = "1"};
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, missed_path, "fixture", 0, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_replace(store, project, &missed_row, 1), CBM_STORE_OK);
 
     const char *formats[] = {"tree", "json"};
     for (int i = 0; i < 2; i++) {
@@ -5007,12 +5200,18 @@ TEST(tool_query_graph_budget_bounds_first_row_and_json_escaping) {
             ASSERT_NOT_NULL(doc);
             yyjson_val *root = yyjson_doc_get_root(doc);
             ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 0);
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "semantic_note")),
+                          TEST_RUST_SEMANTIC_NOTE);
             ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
             ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "truncation_reason")),
                           "output_budget");
             yyjson_doc_free(doc);
         } else {
             ASSERT_NOT_NULL(strstr(inner, "returned: 0"));
+            ASSERT_NOT_NULL(strstr(inner, "total_relation: eq"));
+            ASSERT_NOT_NULL(strstr(inner, "semantic_note:"));
+            ASSERT_NOT_NULL(strstr(inner, TEST_RUST_SEMANTIC_NOTE));
             ASSERT_NOT_NULL(strstr(inner, "truncation_reason: output_budget"));
         }
         free(inner);
@@ -5025,25 +5224,156 @@ TEST(tool_query_graph_budget_bounds_first_row_and_json_escaping) {
     char alias[5001];
     memset(alias, 'a', sizeof(alias) - 1);
     alias[sizeof(alias) - 1] = '\0';
-    char wide_query_args[5500];
-    snprintf(wide_query_args, sizeof(wide_query_args),
-             "{\"project\":\"%s\",\"query\":\"MATCH (n) RETURN n.name AS %s\","
-             "\"format\":\"json\",\"max_output_tokens\":128}",
-             project, alias);
-    char *response = cbm_mcp_handle_tool(srv, "query_graph", wide_query_args);
+    char wide_query_args[5600];
+    for (int format = 0; format < 2; format++) {
+        for (int missed = 0; missed < 2; missed++) {
+            snprintf(wide_query_args, sizeof(wide_query_args),
+                     "{\"project\":\"%s\",%s\"query\":\"MATCH (n) RETURN n.name AS %s\","
+                     "\"format\":\"%s\",\"max_output_tokens\":128}",
+                     project, missed ? "\"graph\":\"missed\"," : "", alias,
+                     format ? "json" : "tree");
+            char *response = cbm_mcp_handle_tool(srv, "query_graph", wide_query_args);
+            char *inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            ASSERT_LTE((int)strlen(inner), 512);
+            if (format) {
+                yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+                ASSERT_NOT_NULL(doc);
+                yyjson_val *root = yyjson_doc_get_root(doc);
+                ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "columns_omitted")));
+                ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 0);
+                ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+                ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "truncation_reason")),
+                              "output_budget");
+                ASSERT_EQ(assert_rust_semantic_note(root, !missed), 0);
+                yyjson_doc_free(doc);
+            } else {
+                ASSERT_NOT_NULL(strstr(inner, "columns_omitted: true"));
+                ASSERT_NOT_NULL(strstr(inner, "returned: 0"));
+                ASSERT_NOT_NULL(strstr(inner, "total_relation: eq"));
+                ASSERT_NOT_NULL(strstr(inner, "truncation_reason: output_budget"));
+                if (missed) {
+                    ASSERT_NULL(strstr(inner, "semantic_note:"));
+                } else {
+                    ASSERT_NOT_NULL(strstr(inner, "semantic_note:"));
+                    ASSERT_NOT_NULL(strstr(inner, TEST_RUST_SEMANTIC_NOTE));
+                }
+            }
+            free(inner);
+            free(response);
+        }
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_semantic_note_bytes_force_budget_floor) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "query-semantic-budget";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/query-semantic-budget"), CBM_STORE_OK);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "fits",
+                       .qualified_name = "query-semantic-budget.fits",
+                       .file_path = "fits.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    cbm_project_t project_row = {0};
+    ASSERT_EQ(cbm_store_get_project(store, project, &project_row), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {
+        .generation = project_row.indexed_at,
+        .index_mode = "full",
+        .recorded_at = "2026-09-19T00:00:00Z",
+        .recording_status = "complete",
+        .coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION,
+        .hash_records_complete = true,
+        .rust_semantic_gaps = 0U,
+        .rust_semantic_gaps_known = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &meta), CBM_STORE_OK);
+
+    char alias[601];
+    memset(alias, 'a', sizeof(alias) - 1U);
+    alias[sizeof(alias) - 1U] = '\0';
+    char args[1400];
+    int low = 128;
+    int high = 20000;
+    int threshold_tokens = -1;
+    int iterations = 0;
+    while (low <= high && iterations < 16) {
+        int candidate = low + (high - low) / 2;
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"query\":\"MATCH (n) RETURN n.name AS %s LIMIT 1\","
+                 "\"format\":\"json\",\"max_output_tokens\":%d}",
+                 project, alias, candidate);
+        char *candidate_response = cbm_mcp_handle_tool(srv, "query_graph", args);
+        ASSERT_NOT_NULL(candidate_response);
+        char *candidate_inner = extract_text_content(candidate_response);
+        ASSERT_NOT_NULL(candidate_inner);
+        yyjson_doc *candidate_doc = yyjson_read(candidate_inner, strlen(candidate_inner), 0);
+        ASSERT_NOT_NULL(candidate_doc);
+        yyjson_val *candidate_root = yyjson_doc_get_root(candidate_doc);
+        bool fits = yyjson_get_int(yyjson_obj_get(candidate_root, "returned")) == 1 &&
+                    yyjson_obj_get(candidate_root, "columns_omitted") == NULL &&
+                    yyjson_obj_get(candidate_root, "semantic_note") == NULL;
+        yyjson_doc_free(candidate_doc);
+        free(candidate_inner);
+        free(candidate_response);
+
+        if (fits) {
+            threshold_tokens = candidate;
+            high = candidate - 1;
+        } else {
+            low = candidate + 1;
+        }
+        iterations++;
+    }
+    ASSERT_LTE(iterations, 16);
+    ASSERT_GT(threshold_tokens, 127);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"query\":\"MATCH (n) RETURN n.name AS %s LIMIT 1\","
+             "\"format\":\"json\",\"max_output_tokens\":%d}",
+             project, alias, threshold_tokens);
+    char *response = cbm_mcp_handle_tool(srv, "query_graph", args);
+    ASSERT_NOT_NULL(response);
     char *inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
-    ASSERT_LTE((int)strlen(inner), 512);
     yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
     yyjson_val *root = yyjson_doc_get_root(doc);
-    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "columns_omitted")));
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 0);
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "truncation_reason")), "output_budget");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 1);
+    ASSERT_NULL(yyjson_obj_get(root, "columns_omitted"));
+    ASSERT_NULL(yyjson_obj_get(root, "semantic_note"));
     yyjson_doc_free(doc);
     free(inner);
     free(response);
 
+    meta.rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE;
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &meta), CBM_STORE_OK);
+    response = cbm_mcp_handle_tool(srv, "query_graph", args);
+    ASSERT_NOT_NULL(response);
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), 0);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "columns_omitted")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "truncation_reason")), "output_budget");
+    ASSERT_EQ(assert_rust_semantic_note(root, true), 0);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    cbm_project_free_fields(&project_row);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -5889,91 +6219,318 @@ TEST(tool_rust_semantic_coverage_isolated_bits_and_controls) {
         .rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE,
         .rust_semantic_gaps_known = true,
     };
+    cbm_node_t handle = {0};
+    cbm_node_t process = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, "test-project",
+                                        "test-project.cmd.server.main.HandleRequest", &handle),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, "test-project",
+                                        "test-project.cmd.server.main.ProcessOrder", &process),
+              CBM_STORE_OK);
+    const char *extra_edge_types[] = {"IMPLEMENTS", "OVERRIDE", "USAGE"};
+    for (size_t i = 0; i < sizeof(extra_edge_types) / sizeof(extra_edge_types[0]); i++) {
+        cbm_edge_t edge = {.project = "test-project",
+                           .source_id = handle.id,
+                           .target_id = process.id,
+                           .type = extra_edge_types[i]};
+        ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+    }
+
+    struct {
+        unsigned int gaps;
+        const char *status;
+        const char *reason;
+        const char *edge_type;
+    } known_states[] = {
+        {0U, "semantic_complete", NULL, "CALLS"},
+        {1U, "semantic_partial", "binding_oracle_unavailable", "CALLS"},
+        {2U, "semantic_partial", "expanded_calls_unavailable", "CALLS"},
+        {4U, "semantic_partial", "impl_relationships_unavailable", "IMPLEMENTS"},
+    };
+    for (size_t i = 0; i < sizeof(known_states) / sizeof(known_states[0]); i++) {
+        meta.rust_semantic_gaps = known_states[i].gaps;
+        meta.rust_semantic_gaps_known = true;
+        ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
+                  CBM_STORE_OK);
+        ASSERT_EQ(assert_rust_semantic_endpoints(srv, known_states[i].status,
+                                                 known_states[i].reason, known_states[i].edge_type,
+                                                 "no_recorded_issue"),
+                  0);
+    }
+
+    enum {
+        UNKNOWN_MISSING_ROW,
+        UNKNOWN_MISSING_COLUMN,
+        UNKNOWN_SQL_NULL,
+        UNKNOWN_READ_FAILURE,
+        UNKNOWN_STALE_GENERATION,
+        UNKNOWN_STALE_VERSION,
+        UNKNOWN_INVALID_BITS,
+    };
+    struct {
+        int kind;
+        const char *ordinary_status;
+    } unknown_states[] = {
+        {UNKNOWN_MISSING_ROW, "coverage_unavailable"},
+        {UNKNOWN_MISSING_COLUMN, "no_recorded_issue"},
+        {UNKNOWN_SQL_NULL, "no_recorded_issue"},
+        {UNKNOWN_READ_FAILURE, "coverage_unavailable"},
+        {UNKNOWN_STALE_GENERATION, "coverage_unavailable"},
+        {UNKNOWN_STALE_VERSION, "no_recorded_issue"},
+        {UNKNOWN_INVALID_BITS, "no_recorded_issue"},
+    };
+    /* Removing only rust_semantic_gaps exercises the legacy SELECT fallback;
+     * removing coverage_version makes both metadata SELECTs fail. */
+    for (size_t i = 0; i < sizeof(unknown_states) / sizeof(unknown_states[0]); i++) {
+        meta.generation = project.indexed_at;
+        meta.coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION;
+        meta.rust_semantic_gaps = 0U;
+        meta.rust_semantic_gaps_known = true;
+        ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
+                  CBM_STORE_OK);
+        switch (unknown_states[i].kind) {
+        case UNKNOWN_MISSING_ROW:
+            ASSERT_EQ(cbm_store_exec(
+                          store, "DELETE FROM index_coverage_meta WHERE project='test-project';"),
+                      CBM_STORE_OK);
+            break;
+        case UNKNOWN_MISSING_COLUMN:
+            ASSERT_EQ(cbm_store_exec(store, "ALTER TABLE index_coverage_meta RENAME COLUMN "
+                                            "rust_semantic_gaps TO legacy_rust_semantic_gaps;"),
+                      CBM_STORE_OK);
+            break;
+        case UNKNOWN_SQL_NULL:
+            ASSERT_EQ(cbm_store_exec(store,
+                                     "UPDATE index_coverage_meta SET rust_semantic_gaps=NULL "
+                                     "WHERE project='test-project';"),
+                      CBM_STORE_OK);
+            break;
+        case UNKNOWN_READ_FAILURE:
+            ASSERT_EQ(cbm_store_exec(store, "ALTER TABLE index_coverage_meta RENAME COLUMN "
+                                            "coverage_version TO broken_coverage_version;"),
+                      CBM_STORE_OK);
+            break;
+        case UNKNOWN_STALE_GENERATION:
+            meta.generation = "stale-generation";
+            ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
+                      CBM_STORE_OK);
+            break;
+        case UNKNOWN_STALE_VERSION:
+            meta.coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION - 1;
+            ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
+                      CBM_STORE_OK);
+            break;
+        case UNKNOWN_INVALID_BITS:
+            meta.rust_semantic_gaps = 8U;
+            ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
+                      CBM_STORE_OK);
+            break;
+        }
+        ASSERT_EQ(assert_rust_semantic_endpoints(srv, "semantic_unknown", NULL, "CALLS",
+                                                 unknown_states[i].ordinary_status),
+                  0);
+        if (unknown_states[i].kind == UNKNOWN_MISSING_COLUMN) {
+            ASSERT_EQ(cbm_store_exec(store, "ALTER TABLE index_coverage_meta RENAME COLUMN "
+                                            "legacy_rust_semantic_gaps TO rust_semantic_gaps;"),
+                      CBM_STORE_OK);
+        } else if (unknown_states[i].kind == UNKNOWN_READ_FAILURE) {
+            ASSERT_EQ(cbm_store_exec(store, "ALTER TABLE index_coverage_meta RENAME COLUMN "
+                                            "broken_coverage_version TO coverage_version;"),
+                      CBM_STORE_OK);
+        }
+    }
+
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_doc *doc = NULL;
+    yyjson_val *root = NULL;
+
+    meta.generation = project.indexed_at;
+    meta.coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION;
+    meta.rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE;
+    meta.rust_semantic_gaps_known = true;
     ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta), CBM_STORE_OK);
+    struct {
+        const char *edge_type;
+        const char *relation;
+        bool note;
+    } trace_controls[] = {
+        {"OVERRIDE", "gte", true},
+        {"USAGE", "eq", false},
+    };
+    for (size_t i = 0; i < sizeof(trace_controls) / sizeof(trace_controls[0]); i++) {
+        char args[384];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
+                 "\"direction\":\"outbound\",\"edge_types\":[\"%s\"],\"format\":\"json\"}",
+                 trace_controls[i].edge_type);
+        response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        ASSERT_NOT_NULL(response);
+        inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callees_total")), 1);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "callees_total_relation")),
+                      trace_controls[i].relation);
+        ASSERT_EQ(assert_rust_semantic_note(root, trace_controls[i].note), 0);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
 
-    char *status_response = cbm_mcp_handle_tool(
-        srv, "index_status",
-        "{\"project\":\"test-project\",\"diagnostics\":\"none\",\"format\":\"json\"}");
-    ASSERT_NOT_NULL(status_response);
-    char *status_inner = extract_text_content(status_response);
-    ASSERT_NOT_NULL(status_inner);
-    ASSERT_NOT_NULL(strstr(status_inner, "\"semantic_coverage\""));
-    ASSERT_NOT_NULL(strstr(status_inner, "\"status\":\"semantic_partial\""));
-    ASSERT_NOT_NULL(strstr(status_inner, "binding_oracle_unavailable"));
-    free(status_inner);
-    free(status_response);
+    struct {
+        unsigned int gaps;
+        bool known;
+        const char *relation;
+        bool note;
+    } inbound_states[] = {
+        {CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE, true, "gte", true},
+        {0U, false, "gte", true},
+        {0U, true, "eq", false},
+    };
+    for (size_t i = 0; i < sizeof(inbound_states) / sizeof(inbound_states[0]); i++) {
+        meta.rust_semantic_gaps = inbound_states[i].gaps;
+        meta.rust_semantic_gaps_known = inbound_states[i].known;
+        ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
+                  CBM_STORE_OK);
+        response = cbm_mcp_handle_tool(
+            srv, "trace_path",
+            "{\"project\":\"test-project\",\"function_name\":\"ProcessOrder\","
+            "\"direction\":\"inbound\",\"edge_types\":[\"CALLS\"],\"format\":\"json\"}");
+        ASSERT_NOT_NULL(response);
+        inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callers_total")), 1);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "callers_total_relation")),
+                      inbound_states[i].relation);
+        ASSERT_EQ(assert_rust_semantic_note(root, inbound_states[i].note), 0);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
 
-    char *response =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"test-project\",\"paths\":[\"missing.rs\",\"main.go\"],"
-                            "\"scopes\":[\".\"],\"format\":\"json\"}");
-    ASSERT_NOT_NULL(response);
-    char *inner = extract_text_content(response);
-    ASSERT_NOT_NULL(inner);
-    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
-    ASSERT_NOT_NULL(doc);
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *rust = yyjson_obj_get(yyjson_obj_get(root, "semantic_coverage"), "rust");
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust, "status")), "semantic_partial");
-    yyjson_val *reasons = yyjson_obj_get(rust, "reasons");
-    ASSERT_EQ(yyjson_arr_size(reasons), 1);
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(reasons, 0)), "binding_oracle_unavailable");
-    yyjson_val *rust_path = yyjson_arr_get(yyjson_obj_get(root, "paths"), 0);
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust_path, "semantic_status")), "semantic_partial");
-    yyjson_val *go_path = yyjson_arr_get(yyjson_obj_get(root, "paths"), 1);
-    ASSERT_NULL(yyjson_obj_get(go_path, "semantic_status"));
-    yyjson_val *scope = yyjson_arr_get(yyjson_obj_get(root, "scopes"), 0);
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(scope, "semantic_status")), "semantic_partial");
-    yyjson_doc_free(doc);
-    free(inner);
-    free(response);
-
-    response =
-        cbm_mcp_handle_tool(srv, "trace_path",
-                            "{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
-                            "\"direction\":\"outbound\",\"format\":\"json\"}");
-    inner = extract_text_content(response);
-    doc = yyjson_read(inner, strlen(inner), 0);
-    root = yyjson_doc_get_root(doc);
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "callees_total_relation")), "gte");
-    ASSERT_NOT_NULL(yyjson_obj_get(root, "semantic_note"));
-    yyjson_doc_free(doc);
-    free(inner);
-    free(response);
+    /* ProcessOrder has an inbound CALLS edge but no outbound CALLS edge. This
+     * pins zero as a semantic lower bound without confusing it with no node. */
+    struct {
+        unsigned int gaps;
+        const char *relation;
+        bool note;
+    } zero_states[] = {
+        {CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE, "gte", true},
+        {0U, "eq", false},
+    };
+    const char *formats[] = {"tree", "json"};
+    for (size_t state = 0; state < sizeof(zero_states) / sizeof(zero_states[0]); state++) {
+        meta.rust_semantic_gaps = zero_states[state].gaps;
+        meta.rust_semantic_gaps_known = true;
+        ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
+                  CBM_STORE_OK);
+        for (size_t format = 0; format < sizeof(formats) / sizeof(formats[0]); format++) {
+            char args[384];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"test-project\",\"function_name\":\"ProcessOrder\","
+                     "\"direction\":\"outbound\",\"edge_types\":[\"CALLS\"],\"format\":\"%s\"}",
+                     formats[format]);
+            response = cbm_mcp_handle_tool(srv, "trace_path", args);
+            ASSERT_NOT_NULL(response);
+            inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            if (strcmp(formats[format], "json") == 0) {
+                doc = yyjson_read(inner, strlen(inner), 0);
+                ASSERT_NOT_NULL(doc);
+                root = yyjson_doc_get_root(doc);
+                ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callees_total")), 0);
+                ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "callees_total_relation")),
+                              zero_states[state].relation);
+                yyjson_val *note = yyjson_obj_get(root, "semantic_note");
+                if (zero_states[state].note) {
+                    ASSERT_STR_EQ(yyjson_get_str(note), TEST_RUST_SEMANTIC_NOTE);
+                } else {
+                    ASSERT_NULL(note);
+                }
+                yyjson_doc_free(doc);
+            } else {
+                char relation[64];
+                snprintf(relation, sizeof(relation), "callees_total_relation: %s",
+                         zero_states[state].relation);
+                ASSERT_NOT_NULL(strstr(inner, "callees_total: 0"));
+                ASSERT_NOT_NULL(strstr(inner, relation));
+                if (zero_states[state].note) {
+                    ASSERT_NOT_NULL(strstr(inner, "semantic_note:"));
+                    ASSERT_NOT_NULL(strstr(inner, TEST_RUST_SEMANTIC_NOTE));
+                } else {
+                    ASSERT_NULL(strstr(inner, "semantic_note:"));
+                    ASSERT_NULL(strstr(inner, TEST_RUST_SEMANTIC_NOTE));
+                }
+            }
+            free(inner);
+            free(response);
+        }
+    }
 
     meta.rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE;
     ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta), CBM_STORE_OK);
-    response =
-        cbm_mcp_handle_tool(srv, "trace_path",
-                            "{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
-                            "\"direction\":\"outbound\",\"format\":\"json\"}");
-    inner = extract_text_content(response);
-    doc = yyjson_read(inner, strlen(inner), 0);
-    root = yyjson_doc_get_root(doc);
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "callees_total_relation")), "eq");
-    ASSERT_NULL(yyjson_obj_get(root, "semantic_note"));
-    yyjson_doc_free(doc);
-    free(inner);
-    free(response);
+    struct {
+        const char *query;
+        const char *extra;
+        bool json;
+        int code_returned;
+        int missed_returned;
+        const char *code_identity;
+    } query_cases[] = {
+        {"MATCH (n) RETURN n.name ORDER BY n.name LIMIT 1", "", false, 1, 0, "HandleRequest"},
+        {"MATCH (n:MissingNode) RETURN n.name", "", true, 0, 0, NULL},
+        {"MATCH (n) RETURN count(*) AS n", "", true, 1, 1, NULL},
+        {"MATCH (n) RETURN n.name ORDER BY n.name", "\"offset\":1,\"max_rows\":1,", true, 1, 0,
+         NULL},
+    };
+    for (size_t i = 0; i < sizeof(query_cases) / sizeof(query_cases[0]); i++) {
+        for (int missed = 0; missed < 2; missed++) {
+            char args[768];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"test-project\",%s\"query\":\"%s\",%s\"format\":\"%s\"}",
+                     missed ? "\"graph\":\"missed\"," : "", query_cases[i].query,
+                     query_cases[i].extra, query_cases[i].json ? "json" : "tree");
+            response = cbm_mcp_handle_tool(srv, "query_graph", args);
+            ASSERT_NOT_NULL(response);
+            inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            int expected_returned =
+                missed ? query_cases[i].missed_returned : query_cases[i].code_returned;
+            if (query_cases[i].json) {
+                doc = yyjson_read(inner, strlen(inner), 0);
+                ASSERT_NOT_NULL(doc);
+                root = yyjson_doc_get_root(doc);
+                ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), expected_returned);
+                ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "total_relation")), "eq");
+                ASSERT_EQ(assert_rust_semantic_note(root, !missed), 0);
+                yyjson_doc_free(doc);
+            } else {
+                char returned[32];
+                snprintf(returned, sizeof(returned), "returned: %d", expected_returned);
+                ASSERT_NOT_NULL(strstr(inner, returned));
+                ASSERT_NOT_NULL(strstr(inner, "total_relation: eq"));
+                if (missed) {
+                    ASSERT_NULL(strstr(inner, "semantic_note:"));
+                    ASSERT_NULL(strstr(inner, TEST_RUST_SEMANTIC_NOTE));
+                } else {
+                    ASSERT_NOT_NULL(strstr(inner, "semantic_note:"));
+                    ASSERT_NOT_NULL(strstr(inner, TEST_RUST_SEMANTIC_NOTE));
+                    ASSERT_NOT_NULL(strstr(inner, query_cases[i].code_identity));
+                }
+            }
+            free(inner);
+            free(response);
+        }
+    }
 
-    response = cbm_mcp_handle_tool(
-        srv, "query_graph",
-        "{\"project\":\"test-project\",\"query\":\"MATCH (n) RETURN n.name LIMIT 1\","
-        "\"format\":\"json\"}");
-    inner = extract_text_content(response);
-    ASSERT_NOT_NULL(strstr(inner, "semantic_note"));
-    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
-    free(inner);
-    free(response);
-    response =
-        cbm_mcp_handle_tool(srv, "query_graph",
-                            "{\"project\":\"test-project\",\"graph\":\"missed\","
-                            "\"query\":\"MATCH (n) RETURN n.name LIMIT 1\",\"format\":\"json\"}");
-    inner = extract_text_content(response);
-    ASSERT_NULL(strstr(inner, "semantic_note"));
-    free(inner);
-    free(response);
-
+    cbm_node_free_fields(&process);
+    cbm_node_free_fields(&handle);
     cbm_project_free_fields(&project);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
@@ -6610,6 +7167,8 @@ TEST(tool_trace_budget_never_slices_identifiers) {
             ASSERT_EQ(yyjson_get_int(yyjson_obj_get(floor_root, "callees_total")), 1);
             ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(floor_root, "callees_total_relation")),
                           "gte");
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(floor_root, "semantic_note")),
+                          TEST_RUST_SEMANTIC_NOTE);
             ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(floor_root, "has_more")));
             ASSERT_TRUE(
                 yyjson_get_bool(yyjson_obj_get(floor_root, "continuation_requires_higher_budget")));
@@ -6620,6 +7179,8 @@ TEST(tool_trace_budget_never_slices_identifiers) {
         } else {
             ASSERT_NOT_NULL(strstr(floor, "callees_total: 1"));
             ASSERT_NOT_NULL(strstr(floor, "callees_total_relation: gte"));
+            ASSERT_NOT_NULL(strstr(floor, "semantic_note:"));
+            ASSERT_NOT_NULL(strstr(floor, TEST_RUST_SEMANTIC_NOTE));
             ASSERT_NOT_NULL(strstr(floor, "has_more: true"));
             ASSERT_NOT_NULL(strstr(floor, "continuation_requires_higher_budget: true"));
             ASSERT_NOT_NULL(strstr(floor, "output_budget_floor_exceeded: true"));
@@ -6700,7 +7261,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     ASSERT_NOT_NULL(strstr(inner, "short_row"));
     yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
-    yyjson_val *next_value = yyjson_obj_get(yyjson_doc_get_root(doc), "next_cursor");
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "semantic_note")), TEST_RUST_SEMANTIC_NOTE);
+    yyjson_val *next_value = yyjson_obj_get(root, "next_cursor");
     ASSERT_NOT_NULL(next_value);
     char *cursor = strdup(yyjson_get_str(next_value));
     ASSERT_NOT_NULL(cursor);
@@ -6722,6 +7285,7 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
     yyjson_val *floor = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(floor, "semantic_note")), TEST_RUST_SEMANTIC_NOTE);
     ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(floor, "continuation_requires_higher_budget")));
     ASSERT_NULL(yyjson_obj_get(floor, "next_cursor"));
     yyjson_doc_free(doc);
@@ -6740,7 +7304,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     ASSERT_NULL(strstr(inner, "short_row"));
     doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
-    yyjson_val *callees = yyjson_obj_get(yyjson_doc_get_root(doc), "callees");
+    root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "semantic_note")), TEST_RUST_SEMANTIC_NOTE);
+    yyjson_val *callees = yyjson_obj_get(root, "callees");
     ASSERT_NOT_NULL(callees);
     const char *long_prefix_out = NULL;
     yyjson_val *long_row = trace_grouped_row_named(callees, "long_row", &long_prefix_out);
@@ -20549,6 +21115,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_default_budget_is_truthful_and_expandable);
     RUN_TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound);
     RUN_TEST(tool_query_graph_budget_bounds_first_row_and_json_escaping);
+    RUN_TEST(tool_query_graph_semantic_note_bytes_force_budget_floor);
     RUN_TEST(tool_query_graph_prefix_directory_is_lossless_and_json_stays_direct);
     RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
     RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);

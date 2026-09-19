@@ -2304,7 +2304,7 @@ TEST(store_coverage_meta_rust_semantic_gaps_migrate_and_roundtrip) {
     ASSERT_FALSE(meta.rust_semantic_gaps_known);
     cbm_store_coverage_meta_clear(&meta);
 
-    cbm_coverage_meta_t known_zero = {
+    cbm_coverage_meta_t written_meta = {
         .generation = "generation-1",
         .index_mode = "full",
         .recorded_at = "now",
@@ -2314,22 +2314,37 @@ TEST(store_coverage_meta_rust_semantic_gaps_migrate_and_roundtrip) {
         .rust_semantic_gaps = 0U,
         .rust_semantic_gaps_known = true,
     };
-    ASSERT_EQ(cbm_store_coverage_replace_ex(writable, "legacy", NULL, 0, &known_zero),
-              CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_coverage_meta_get(writable, "legacy", &meta), CBM_STORE_OK);
-    ASSERT_TRUE(meta.rust_semantic_gaps_known);
-    ASSERT_EQ(meta.rust_semantic_gaps, 0U);
-    cbm_store_coverage_meta_clear(&meta);
-    known_zero.rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE |
-                                    CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE;
-    ASSERT_EQ(cbm_store_coverage_replace_ex(writable, "legacy", NULL, 0, &known_zero),
-              CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_coverage_meta_get(writable, "legacy", &meta), CBM_STORE_OK);
-    ASSERT_EQ(meta.rust_semantic_gaps, 5U);
-    cbm_store_coverage_meta_clear(&meta);
+    ASSERT_EQ(CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE, 1U);
+    ASSERT_EQ(CBM_RUST_SEMANTIC_GAP_EXPANDED_CALLS_UNAVAILABLE, 2U);
+    ASSERT_EQ(CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE, 4U);
+    ASSERT_EQ(CBM_RUST_SEMANTIC_GAPS_ALL, 7U);
+    const unsigned int accepted_masks[] = {
+        0U, 1U, 2U, 4U, 7U,
+    };
+    for (size_t i = 0; i < sizeof(accepted_masks) / sizeof(accepted_masks[0]); i++) {
+        written_meta.rust_semantic_gaps = accepted_masks[i];
+        ASSERT_EQ(cbm_store_coverage_replace_ex(writable, "legacy", NULL, 0, &written_meta),
+                  CBM_STORE_OK);
+        ASSERT_EQ(cbm_store_coverage_meta_get(writable, "legacy", &meta), CBM_STORE_OK);
+        ASSERT_TRUE(meta.rust_semantic_gaps_known);
+        ASSERT_EQ(meta.rust_semantic_gaps, accepted_masks[i]);
+        cbm_store_coverage_meta_clear(&meta);
+    }
     cbm_store_close(writable);
     writable = cbm_store_open_path(writable_path);
     ASSERT_NOT_NULL(writable);
+    ASSERT_EQ(cbm_store_coverage_meta_get(writable, "legacy", &meta), CBM_STORE_OK);
+    ASSERT_TRUE(meta.rust_semantic_gaps_known);
+    ASSERT_EQ(meta.rust_semantic_gaps, 7U);
+    cbm_store_coverage_meta_clear(&meta);
+    written_meta.rust_semantic_gaps = 7U;
+    written_meta.rust_semantic_gaps_known = false;
+    ASSERT_EQ(cbm_store_coverage_replace_ex(writable, "legacy", NULL, 0, &written_meta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(writable, "legacy", &meta), CBM_STORE_OK);
+    ASSERT_FALSE(meta.rust_semantic_gaps_known);
+    ASSERT_EQ(meta.rust_semantic_gaps, 0U);
+    cbm_store_coverage_meta_clear(&meta);
     cbm_store_close(writable);
 
     cbm_store_t *readonly = cbm_store_open_path_query(readonly_path);
