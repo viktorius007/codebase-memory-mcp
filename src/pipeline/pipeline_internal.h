@@ -57,6 +57,29 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
            (strcmp(node->label, "Folder") == 0 || strcmp(node->label, "Project") == 0);
 }
 
+/* Persisted inbound edges may be restored only when a full rebuild would
+ * preserve them. Rust CALLS are intentionally absent until they have trusted
+ * provenance, and TESTS derived from those calls must not survive either. */
+static inline bool cbm_pipeline_persisted_edge_is_restorable(const char *source_file_path,
+                                                             const char *type) {
+    if (!source_file_path || !source_file_path[0] || !type) {
+        return false;
+    }
+    if (strcmp(type, "SIMILAR_TO") == 0 || strcmp(type, "SEMANTICALLY_RELATED") == 0 ||
+        strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0) {
+        return false;
+    }
+    const char *slash = strrchr(source_file_path, '/');
+    const char *backslash = strrchr(source_file_path, '\\');
+    const char *separator = slash;
+    if (!separator || (backslash && backslash > separator)) {
+        separator = backslash;
+    }
+    const char *basename = separator ? separator + 1 : source_file_path;
+    return cbm_language_for_filename(basename) != CBM_LANG_RUST ||
+           (strcmp(type, "CALLS") != 0 && strcmp(type, "TESTS") != 0);
+}
+
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL
 #define CBM_US_PER_SEC 1000000LL

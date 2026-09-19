@@ -89,16 +89,6 @@ int cbm_delta_stage_clone(const char *final_db_path, char **out_stage_path) {
     return 0;
 }
 
-/* Snapshot inbound cross-file edges into the given files from OUTSIDE them,
- * keyed by endpoint qualified names — the same semantics as the gbuf-based
- * capture, expressed as one indexed query per chunk. Edge types a full
- * reindex recomputes wholesale are excluded for the same reasons recorded
- * there (restoring a stale copy could produce edges a full build would not). */
-static bool delta_edge_type_is_recomputed(const char *type) {
-    return type && (strcmp(type, "SIMILAR_TO") == 0 || strcmp(type, "SEMANTICALLY_RELATED") == 0 ||
-                    strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
-}
-
 int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const char *const *paths,
                                int path_count, cbm_delta_saved_edge_t **out, int *out_count) {
     *out = NULL;
@@ -125,7 +115,8 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
                          /* CROSS JOIN pins nodes-first: the planner otherwise walks
                           * EVERY project edge through the url_path index prefix
                           * (measured 14.6s vs 4ms at kernel scale). */
-                         "SELECT src.qualified_name, tgt.qualified_name, e.type, e.properties"
+                         "SELECT src.qualified_name, tgt.qualified_name, e.type, e.properties,"
+                         " src.file_path"
                          " FROM nodes tgt"
                          " CROSS JOIN edges e ON e.target_id = tgt.id"
                          " CROSS JOIN nodes src ON e.source_id = src.id"
@@ -150,7 +141,8 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
         int step_rc;
         while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
             const char *type = (const char *)sqlite3_column_text(stmt, 2);
-            if (delta_edge_type_is_recomputed(type)) {
+            const char *source_file_path = (const char *)sqlite3_column_text(stmt, 4);
+            if (!cbm_pipeline_persisted_edge_is_restorable(source_file_path, type)) {
                 continue;
             }
             if (count >= cap) {
