@@ -8,6 +8,7 @@
 #include "cypher/cypher.h"
 #include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
 #include "store/store.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
@@ -2579,7 +2580,7 @@ static void binding_set_edge(binding_t *b, const char *var, const cbm_edge_t *ed
 /* Free all deep-copied nodes and edges in a binding */
 static void binding_free(binding_t *b) {
     for (int i = 0; i < b->var_count; i++) {
-        free(b->owned_var_names[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, b->owned_var_names[i]);
         node_fields_free(&b->var_nodes[i]);
     }
     for (int i = 0; i < b->edge_var_count; i++) {
@@ -2591,7 +2592,8 @@ static void binding_free(binding_t *b) {
 static void binding_copy(binding_t *dst, const binding_t *src) {
     dst->var_count = src->var_count;
     for (int i = 0; i < src->var_count; i++) {
-        dst->owned_var_names[i] = src->owned_var_names[i] ? heap_strdup(src->var_names[i]) : NULL;
+        dst->owned_var_names[i] =
+            src->owned_var_names[i] ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, src->var_names[i]) : NULL;
         dst->var_names[i] = dst->owned_var_names[i] ? dst->owned_var_names[i] : src->var_names[i];
         node_deep_copy(&dst->var_nodes[i], &src->var_nodes[i]);
     }
@@ -4070,7 +4072,7 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
     cbm_node_t vn = {.name = heap_strdup(val)};
     if (vb->var_count < CYP_BUF_16) {
-        vb->owned_var_names[vb->var_count] = heap_strdup(alias);
+        vb->owned_var_names[vb->var_count] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, alias);
         vb->var_names[vb->var_count] = vb->owned_var_names[vb->var_count];
         vb->var_nodes[vb->var_count] = vn;
         vb->var_count++;
