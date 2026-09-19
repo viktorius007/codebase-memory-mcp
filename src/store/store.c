@@ -359,7 +359,7 @@ static int init_schema(cbm_store_t *s) {
             return CBM_STORE_ERR;
         }
         while (sqlite3_step(columns) == SQLITE_ROW) {
-            const char *name = (const char *)sqlite3_column_text(columns, 1);
+            const char *name = (const char *)sqlite3_column_text(columns, ST_COL_1);
             if (name && strcmp(name, "rust_semantic_gaps") == 0) {
                 have_rust_semantic_gaps = true;
                 break;
@@ -3948,6 +3948,14 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     return CBM_STORE_OK;
 }
 
+static void bind_rust_semantic_gaps(sqlite3_stmt *stmt, const cbm_coverage_meta_t *meta) {
+    if (meta->rust_semantic_gaps_known) {
+        sqlite3_bind_int64(stmt, ST_COL_10, (sqlite3_int64)meta->rust_semantic_gaps);
+    } else {
+        sqlite3_bind_null(stmt, ST_COL_10);
+    }
+}
+
 int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                                   const cbm_coverage_row_t *rows, int count,
                                   const cbm_coverage_meta_t *meta) {
@@ -4089,11 +4097,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         sqlite3_bind_int(up_meta, 7, ignored_total);
         sqlite3_bind_int(up_meta, 8, coverage_version);
         sqlite3_bind_int(up_meta, 9, meta->hash_records_complete ? 1 : 0);
-        if (meta->rust_semantic_gaps_known) {
-            sqlite3_bind_int64(up_meta, 10, (sqlite3_int64)meta->rust_semantic_gaps);
-        } else {
-            sqlite3_bind_null(up_meta, 10);
-        }
+        bind_rust_semantic_gaps(up_meta, meta);
         int meta_rc = sqlite3_step(up_meta);
         sqlite3_finalize(up_meta);
         if (meta_rc != SQLITE_DONE) {
@@ -4286,9 +4290,9 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
-        out->rust_semantic_gaps_known = sqlite3_column_type(stmt, 9) != SQLITE_NULL;
+        out->rust_semantic_gaps_known = sqlite3_column_type(stmt, ST_COL_9) != SQLITE_NULL;
         if (out->rust_semantic_gaps_known) {
-            out->rust_semantic_gaps = (unsigned int)sqlite3_column_int64(stmt, 9);
+            out->rust_semantic_gaps = (unsigned int)sqlite3_column_int64(stmt, ST_COL_9);
         }
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||

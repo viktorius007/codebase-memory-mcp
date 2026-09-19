@@ -2205,6 +2205,15 @@ int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation)
     return cbm_pipeline_publish_staged(stage_path, generation, true, false);
 }
 
+static unsigned int rust_semantic_gaps_for_manifest(const cbm_pipeline_generation_t *generation) {
+    for (int i = 0; i < generation->manifest_count; i++) {
+        if (cbm_str_ends_with(generation->manifest[i].rel_path, ".rs")) {
+            return CBM_RUST_SEMANTIC_GAPS_ALL;
+        }
+    }
+    return 0U;
+}
+
 /* Complete and publish an already-materialized staging database: metadata
  * writes, FTS policy, integrity, seal, then the shared finalize leg. Takes
  * ownership of stage_path (frees it on every path). fts_wholesale selects
@@ -2261,16 +2270,8 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     meta.generation = have_project_info ? project_info.indexed_at : NULL;
     meta.coverage_version = CBM_SEMANTIC_INDEX_VERSION;
     meta.hash_records_complete = true;
-    meta.rust_semantic_gaps = 0U;
+    meta.rust_semantic_gaps = rust_semantic_gaps_for_manifest(generation);
     meta.rust_semantic_gaps_known = true;
-    for (int i = 0; i < generation->manifest_count; i++) {
-        const char *path = generation->manifest[i].rel_path;
-        size_t len = path ? strlen(path) : 0U;
-        if (len >= 3U && strcmp(path + len - 3U, ".rs") == 0) {
-            meta.rust_semantic_gaps = CBM_RUST_SEMANTIC_GAPS_ALL;
-            break;
-        }
-    }
     if (!have_project_info ||
         cbm_store_coverage_replace_ex(store, generation->project, generation->coverage,
                                       generation->coverage_count, &meta) != CBM_STORE_OK) {
