@@ -4014,22 +4014,44 @@ TEST(cypher_exec_with_count) {
     PASS();
 }
 
-/* Regression: a bare node group-var carried through WITH aggregation must project
- * its real properties (not blank). Pre-fix, the carried var held only the node
- * name, so RETURN g.file_path returned "". */
-TEST(cypher_exec_with_node_groupvar_prop) {
+TEST(cypher_exec_with_rename_preserves_carried_node) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute(s,
-                                "MATCH (f:Function)-[:CALLS]->(g:Function) "
-                                "WHERE g.name = \"ValidateOrder\" "
-                                "WITH g, COUNT(*) AS c "
-                                "RETURN g.file_path, g.name, c",
+                                "MATCH (f:Function) WHERE f.name = \"HandleOrder\" "
+                                "WITH f AS carried "
+                                "RETURN carried.qualified_name, carried.file_path, "
+                                "carried.label, carried.start_line, carried.end_line",
                                 "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 1);
-    ASSERT_STR_EQ(r.rows[0][0], "validate.go"); /* was "" before the fix */
-    ASSERT_STR_EQ(r.rows[0][1], "ValidateOrder");
+    ASSERT_STR_EQ(r.rows[0][0], "test.HandleOrder");
+    ASSERT_STR_EQ(r.rows[0][1], "handler.go");
+    ASSERT_STR_EQ(r.rows[0][2], "Function");
+    ASSERT_STR_EQ(r.rows[0][3], "10");
+    ASSERT_STR_EQ(r.rows[0][4], "30");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_with_aggregate_preserves_carried_node) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (g:Function) WHERE g.name = \"ValidateOrder\" "
+                                "WITH g, count(*) AS c "
+                                "RETURN g.qualified_name, g.file_path, g.label, "
+                                "g.start_line, g.end_line, c",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "test.ValidateOrder");
+    ASSERT_STR_EQ(r.rows[0][1], "validate.go");
+    ASSERT_STR_EQ(r.rows[0][2], "Function");
+    ASSERT_STR_EQ(r.rows[0][3], "5");
+    ASSERT_STR_EQ(r.rows[0][4], "15");
+    ASSERT_STR_EQ(r.rows[0][5], "1");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
@@ -4825,9 +4847,10 @@ SUITE(cypher) {
     /* Phase 6: WITH clause */
     RUN_TEST(cypher_exec_with_rename);
     RUN_TEST(cypher_exec_with_count);
+    RUN_TEST(cypher_exec_with_rename_preserves_carried_node);
+    RUN_TEST(cypher_exec_with_aggregate_preserves_carried_node);
     RUN_TEST(cypher_issue1111_with_type_count_group);
     RUN_TEST(cypher_issue1111_with_scalar_func_alias_no_node_leak);
-    RUN_TEST(cypher_exec_with_node_groupvar_prop);
     RUN_TEST(cypher_exec_with_where);
     RUN_TEST(cypher_exec_with_orderby_limit);
     RUN_TEST(cypher_parse_with);
