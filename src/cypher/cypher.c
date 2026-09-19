@@ -216,7 +216,8 @@ static const kw_entry_t keywords[] = {
     {"REQUIRE", TOK_REQUIRE},
     {"SCALAR", TOK_SCALAR},
     {"UNIQUE", TOK_UNIQUE},
-    {NULL, 0}};
+    {NULL, 0},
+};
 
 static cbm_token_type_t keyword_lookup(const char *word) {
     /* Case-insensitive compare */

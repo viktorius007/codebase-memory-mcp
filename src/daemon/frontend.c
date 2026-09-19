@@ -56,8 +56,8 @@ enum {
     /* The owner thread may be draining a supervised process tree. Preserve the
      * supervisor's complete graceful + forced-settle window before the monitor
      * fail-stops the process, plus scheduling/teardown margin. */
-    FRONTEND_MAINTENANCE_GRACE_MS =
-        CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS + CBM_SUBPROCESS_FORCE_SETTLE_MS + 1000,
+    FRONTEND_MAINTENANCE_GRACE_MS = CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS +
+        CBM_SUBPROCESS_FORCE_SETTLE_MS + 1000,
     FRONTEND_PARTICIPANT_NAME_CAP = 64,
 };
 
