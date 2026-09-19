@@ -2305,6 +2305,14 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
                                      cbm_scalar_kind_t *kind);
 static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
 
+static const char *node_number_prop(int value, char *out, cbm_scalar_kind_t *kind) {
+    if (kind) {
+        *kind = CBM_SCALAR_KIND_NUMBER;
+    }
+    snprintf(out, CBM_SZ_512, "%d", value);
+    return out;
+}
+
 static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store,
                              cbm_scalar_kind_t *kind) {
     if (kind) {
@@ -2329,18 +2337,10 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     buf_idx = (buf_idx + SKIP_ONE) % CYP_BUF_8;
 
     if (strcmp(prop, "start_line") == 0) {
-        if (kind) {
-            *kind = CBM_SCALAR_KIND_NUMBER;
-        }
-        snprintf(out, CBM_SZ_512, "%d", n->start_line);
-        return out;
+        return node_number_prop(n->start_line, out, kind);
     }
     if (strcmp(prop, "end_line") == 0) {
-        if (kind) {
-            *kind = CBM_SCALAR_KIND_NUMBER;
-        }
-        snprintf(out, CBM_SZ_512, "%d", n->end_line);
-        return out;
+        return node_number_prop(n->end_line, out, kind);
     }
     /* Virtual computed properties: in_degree/out_degree via CALLS edges.
      * Enables Cypher dead-code detection: WHERE n.in_degree = 0. */
@@ -2349,11 +2349,7 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
         int out_deg = 0;
         cbm_store_node_degree(store, n->id, &in_deg, &out_deg);
         int val = (strcmp(prop, "in_degree") == 0) ? in_deg : out_deg;
-        if (kind) {
-            *kind = CBM_SCALAR_KIND_NUMBER;
-        }
-        snprintf(out, CBM_SZ_512, "%d", val);
-        return out;
+        return node_number_prop(val, out, kind);
     }
     /* Fall back to any value stored in the node's properties JSON — exposes the
      * extraction metrics (complexity, cognitive, loop_count, loop_depth,
@@ -2382,17 +2378,9 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
                 snprintf(out, CBM_SZ_512, "%s", rv);
                 res = out;
             } else if (strcmp(prop, "start_line") == 0) {
-                if (kind) {
-                    *kind = CBM_SCALAR_KIND_NUMBER;
-                }
-                snprintf(out, CBM_SZ_512, "%d", full.start_line);
-                res = out;
+                res = node_number_prop(full.start_line, out, kind);
             } else if (strcmp(prop, "end_line") == 0) {
-                if (kind) {
-                    *kind = CBM_SCALAR_KIND_NUMBER;
-                }
-                snprintf(out, CBM_SZ_512, "%d", full.end_line);
-                res = out;
+                res = node_number_prop(full.end_line, out, kind);
             } else if (full.properties_json && full.properties_json[0] == '{') {
                 const char *jv =
                     json_extract_prop(full.properties_json, prop, out, CBM_SZ_512, kind);
