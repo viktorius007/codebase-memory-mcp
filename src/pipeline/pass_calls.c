@@ -669,8 +669,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count,
-                         drop_plain_call || !cbm_pipeline_plain_call_admitted(lang));
+                         imp_count, drop_plain_call || !cbm_pipeline_plain_call_admitted(lang));
     return SKIP_ONE;
 }
 
