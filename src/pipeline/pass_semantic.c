@@ -578,9 +578,11 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
                                   imp_count, &inherits_count, &decorates_count);
         }
 
-        /* ── IMPLEMENTS from impl_traits (Rust) ─────────────────── */
-        implements_count +=
-            resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
+        /* Textual Rust impl names are not a semantic identity oracle. */
+        if (files[i].language != CBM_LANG_RUST) {
+            implements_count +=
+                resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
+        }
 
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
@@ -659,7 +661,8 @@ int cbm_pipeline_override_explicit(cbm_pipeline_ctx_t *ctx) {
             }
             /* Go's implicit satisfaction already emits OVERRIDE with interface
              * semantics; running both would double-cover .go sources. */
-            if (cls->file_path && fp_ends_with(cls->file_path, ".go")) {
+            if (cls->file_path &&
+                (fp_ends_with(cls->file_path, ".go") || fp_ends_with(cls->file_path, ".rs"))) {
                 continue;
             }
             created += override_match_methods(ctx, cls, base);

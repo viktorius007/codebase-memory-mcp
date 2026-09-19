@@ -77,7 +77,8 @@ static inline bool cbm_pipeline_persisted_edge_is_restorable(const char *source_
     }
     const char *basename = separator ? separator + 1 : source_file_path;
     return cbm_language_for_filename(basename) != CBM_LANG_RUST ||
-           (strcmp(type, "CALLS") != 0 && strcmp(type, "TESTS") != 0);
+           (strcmp(type, "CALLS") != 0 && strcmp(type, "TESTS") != 0 &&
+            strcmp(type, "IMPLEMENTS") != 0 && strcmp(type, "OVERRIDE") != 0);
 }
 
 /* Time unit conversions */
@@ -802,7 +803,7 @@ int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
  * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
+enum { CBM_SEMANTIC_INDEX_VERSION = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

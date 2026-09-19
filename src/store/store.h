@@ -648,6 +648,16 @@ typedef struct {
     const char *detail;
 } cbm_coverage_row_t;
 
+enum {
+    CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE = 1U << 0,
+    CBM_RUST_SEMANTIC_GAP_EXPANDED_CALLS_UNAVAILABLE = 1U << 1,
+    CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE = 1U << 2,
+    CBM_RUST_SEMANTIC_GAPS_ALL = CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE |
+        CBM_RUST_SEMANTIC_GAP_EXPANDED_CALLS_UNAVAILABLE |
+        CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE,
+    CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION = 4,
+};
+
 /* Metadata describing how completely one index run recorded the best-effort
  * coverage signal. `recording_status` is "complete", "truncated", or
  * "unavailable"; it is deliberately separate from hash_records_complete.
@@ -662,6 +672,8 @@ typedef struct {
     int ignored_files_total;
     int coverage_version;
     bool hash_records_complete;
+    unsigned int rust_semantic_gaps;
+    bool rust_semantic_gaps_known;
 } cbm_coverage_meta_t;
 
 /* Replace the project's coverage rows in one transaction, then prune rows for

@@ -5583,9 +5583,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
 
     /* The marked file: both real ranges survive, the marker is flagged, and the
      * "12" from the marker never becomes a range of its own. */
-    char *marked =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
+    char *marked = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(marked);
     char *marked_inner = extract_text_content(marked);
     ASSERT_NOT_NULL(marked_inner);
@@ -5597,9 +5597,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
     free(marked);
 
     /* The same ranges without a marker must NOT be reported as truncated. */
-    char *plain =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
+    char *plain = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(plain);
     char *plain_inner = extract_text_content(plain);
     ASSERT_NOT_NULL(plain_inner);
@@ -5610,9 +5610,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
 
     /* The reader's own limit stops the list early, so it must say so even
      * though the producer sent no marker. */
-    char *widest =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
+    char *widest = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(widest);
     char *wide_inner = extract_text_content(widest);
     ASSERT_NOT_NULL(wide_inner);
@@ -5712,8 +5712,10 @@ static int write_coverage_meta(cbm_store_t *store, const char *generation,
         .recording_status = recording_status,
         .ignored_files_stored = 0,
         .ignored_files_total = 0,
-        .coverage_version = 1,
+        .coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION,
         .hash_records_complete = true,
+        .rust_semantic_gaps = 0U,
+        .rust_semantic_gaps_known = true,
     };
     return cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta);
 }
@@ -5864,6 +5866,115 @@ TEST(tool_check_index_coverage_surfaces_lookup_errors) {
 
     free(inner);
     free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_rust_semantic_coverage_isolated_bits_and_controls) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {
+        .generation = project.indexed_at,
+        .index_mode = "full",
+        .recorded_at = "2026-09-19T00:00:00Z",
+        .recording_status = "complete",
+        .coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION,
+        .hash_records_complete = true,
+        .rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE,
+        .rust_semantic_gaps_known = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta), CBM_STORE_OK);
+
+    char *status_response = cbm_mcp_handle_tool(
+        srv, "index_status",
+        "{\"project\":\"test-project\",\"diagnostics\":\"none\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(status_response);
+    char *status_inner = extract_text_content(status_response);
+    ASSERT_NOT_NULL(status_inner);
+    ASSERT_NOT_NULL(strstr(status_inner, "\"semantic_coverage\""));
+    ASSERT_NOT_NULL(strstr(status_inner, "\"status\":\"semantic_partial\""));
+    ASSERT_NOT_NULL(strstr(status_inner, "binding_oracle_unavailable"));
+    free(status_inner);
+    free(status_response);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "check_index_coverage",
+                            "{\"project\":\"test-project\",\"paths\":[\"missing.rs\",\"main.go\"],"
+                            "\"scopes\":[\".\"],\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *rust = yyjson_obj_get(yyjson_obj_get(root, "semantic_coverage"), "rust");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust, "status")), "semantic_partial");
+    yyjson_val *reasons = yyjson_obj_get(rust, "reasons");
+    ASSERT_EQ(yyjson_arr_size(reasons), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(reasons, 0)), "binding_oracle_unavailable");
+    yyjson_val *rust_path = yyjson_arr_get(yyjson_obj_get(root, "paths"), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(rust_path, "semantic_status")), "semantic_partial");
+    yyjson_val *go_path = yyjson_arr_get(yyjson_obj_get(root, "paths"), 1);
+    ASSERT_NULL(yyjson_obj_get(go_path, "semantic_status"));
+    yyjson_val *scope = yyjson_arr_get(yyjson_obj_get(root, "scopes"), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(scope, "semantic_status")), "semantic_partial");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    response =
+        cbm_mcp_handle_tool(srv, "trace_path",
+                            "{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
+                            "\"direction\":\"outbound\",\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "callees_total_relation")), "gte");
+    ASSERT_NOT_NULL(yyjson_obj_get(root, "semantic_note"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    meta.rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE;
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta), CBM_STORE_OK);
+    response =
+        cbm_mcp_handle_tool(srv, "trace_path",
+                            "{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
+                            "\"direction\":\"outbound\",\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "callees_total_relation")), "eq");
+    ASSERT_NULL(yyjson_obj_get(root, "semantic_note"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "query_graph",
+        "{\"project\":\"test-project\",\"query\":\"MATCH (n) RETURN n.name LIMIT 1\","
+        "\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(strstr(inner, "semantic_note"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    free(inner);
+    free(response);
+    response =
+        cbm_mcp_handle_tool(srv, "query_graph",
+                            "{\"project\":\"test-project\",\"graph\":\"missed\","
+                            "\"query\":\"MATCH (n) RETURN n.name LIMIT 1\",\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    ASSERT_NULL(strstr(inner, "semantic_note"));
+    free(inner);
+    free(response);
+
+    cbm_project_free_fields(&project);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -15182,6 +15293,14 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     const char *proj_name = "test-project";
     cbm_mcp_server_set_project(srv, proj_name);
     cbm_store_upsert_project(st, proj_name, proj_dir);
+    cbm_project_t project_row = {0};
+    if (cbm_store_get_project(st, proj_name, &project_row) != CBM_STORE_OK ||
+        write_coverage_meta(st, project_row.indexed_at, "complete") != CBM_STORE_OK) {
+        cbm_project_free_fields(&project_row);
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    cbm_project_free_fields(&project_row);
 
     /* Create nodes */
     cbm_node_t n_hr = {0};
@@ -20391,6 +20510,7 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
+    RUN_TEST(tool_rust_semantic_coverage_isolated_bits_and_controls);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */

@@ -509,6 +509,7 @@ static const tool_def_t TOOLS[] = {
      "Read-only Cypher for multi-hop, aggregation, complexity, or cross-service analysis. "
      "Default: 200 visible rows with "
      "exact/lower-bound totals and truncation; continue safely with next_cursor. "
+     "Code-graph pages disclose partial or unknown Rust semantic coverage. "
      "graph=missed is a file tree of flagged coverage gaps; absence is not proof of completeness. "
      "Use get_graph_schema(diagnostics=full) for properties.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
@@ -531,7 +532,8 @@ static const tool_def_t TOOLS[] = {
 
     {"trace_path",
      "Trace callers/callees, data flow, or cross-service paths. Defaults exclude tests and "
-     "resolver evidence. Rows keep qn/hop with explicit totals, relations, and continuations.",
+     "resolver evidence. Rows keep qn/hop with explicit totals, relations, continuations, and "
+     "lower bounds when requested Rust semantics are partial or unknown.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
      "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3,"
@@ -676,7 +678,8 @@ static const tool_def_t TOOLS[] = {
 
     {"index_status",
      "Project readiness, counts, root, and coverage gaps. diagnostics adds coverage rows; verbose "
-     "adds Git paths. Best-effort only; verify cited paths with check_index_coverage.",
+     "adds Git paths. Always reports Rust semantic coverage. Best-effort only; verify cited paths "
+     "with check_index_coverage.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"verbose\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Add worktree/"
      "shadow Git paths for index-location debugging.\"},"
@@ -689,7 +692,8 @@ static const tool_def_t TOOLS[] = {
 
     {"check_index_coverage",
      "Best-effort exact-path/scope coverage and freshness, paged separately. full diagnostics "
-     "adds raw detail. Clean is not proof of completeness.",
+     "adds raw detail. Reports project Rust semantics and overlays exact .rs paths. Clean is not "
+     "proof of completeness.",
      "{\"type\":\"object\",\"properties\":{"
      "\"project\":{\"type\":\"string\"},"
      "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":128},"
@@ -5518,6 +5522,94 @@ static bool query_graph_semantic_prefix_column(const char *column) {
            strcmp(leaf, "source_file") == 0;
 }
 
+typedef enum {
+    RUST_SEMANTIC_COMPLETE = 0,
+    RUST_SEMANTIC_PARTIAL,
+    RUST_SEMANTIC_UNKNOWN,
+} rust_semantic_status_t;
+
+typedef struct {
+    rust_semantic_status_t status;
+    unsigned int gaps;
+} rust_semantic_coverage_t;
+
+static const char RUST_SEMANTIC_NOTE[] =
+    "Rust semantic coverage is partial or unknown; omitted facts may change rows or cells, and "
+    "positive affected fact counts are lower bounds.";
+
+static rust_semantic_coverage_t rust_semantic_coverage_get(cbm_store_t *store,
+                                                           const char *project) {
+    rust_semantic_coverage_t result = {.status = RUST_SEMANTIC_UNKNOWN, .gaps = 0U};
+    cbm_project_t project_row = {0};
+    cbm_coverage_meta_t meta = {0};
+    bool have_project = cbm_store_get_project(store, project, &project_row) == CBM_STORE_OK;
+    bool have_meta = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK;
+    bool current = have_project && have_meta && project_row.indexed_at && meta.generation &&
+                   strcmp(project_row.indexed_at, meta.generation) == 0 &&
+                   meta.coverage_version == CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION &&
+                   meta.rust_semantic_gaps_known &&
+                   (meta.rust_semantic_gaps & ~CBM_RUST_SEMANTIC_GAPS_ALL) == 0U;
+    if (current) {
+        result.gaps = meta.rust_semantic_gaps;
+        result.status = result.gaps == 0U ? RUST_SEMANTIC_COMPLETE : RUST_SEMANTIC_PARTIAL;
+    }
+    if (have_meta) {
+        cbm_store_coverage_meta_clear(&meta);
+    }
+    if (have_project) {
+        safe_str_free(&project_row.name);
+        safe_str_free(&project_row.indexed_at);
+        safe_str_free(&project_row.root_path);
+    }
+    return result;
+}
+
+static const char *rust_semantic_status_name(rust_semantic_status_t status) {
+    if (status == RUST_SEMANTIC_COMPLETE) {
+        return "semantic_complete";
+    }
+    if (status == RUST_SEMANTIC_PARTIAL) {
+        return "semantic_partial";
+    }
+    return "semantic_unknown";
+}
+
+static yyjson_mut_val *rust_semantic_reasons_json(yyjson_mut_doc *doc,
+                                                  rust_semantic_coverage_t coverage) {
+    yyjson_mut_val *reasons = yyjson_mut_arr(doc);
+    if (coverage.status != RUST_SEMANTIC_PARTIAL) {
+        return reasons;
+    }
+    if ((coverage.gaps & CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE) != 0U) {
+        yyjson_mut_arr_add_str(doc, reasons, "binding_oracle_unavailable");
+    }
+    if ((coverage.gaps & CBM_RUST_SEMANTIC_GAP_EXPANDED_CALLS_UNAVAILABLE) != 0U) {
+        yyjson_mut_arr_add_str(doc, reasons, "expanded_calls_unavailable");
+    }
+    if ((coverage.gaps & CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE) != 0U) {
+        yyjson_mut_arr_add_str(doc, reasons, "impl_relationships_unavailable");
+    }
+    return reasons;
+}
+
+static void rust_semantic_add_object(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                     rust_semantic_coverage_t coverage) {
+    yyjson_mut_val *semantic = yyjson_mut_obj(doc);
+    yyjson_mut_val *rust = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, rust, "status", rust_semantic_status_name(coverage.status));
+    yyjson_mut_obj_add_val(doc, rust, "reasons", rust_semantic_reasons_json(doc, coverage));
+    yyjson_mut_obj_add_str(doc, rust, "note",
+                           "Rust CALLS, expanded calls, IMPLEMENTS, and OVERRIDE facts may be "
+                           "omitted according to the listed semantic gaps.");
+    yyjson_mut_obj_add_val(doc, semantic, "rust", rust);
+    yyjson_mut_obj_add_val(doc, root, "semantic_coverage", semantic);
+}
+
+static bool path_has_rust_extension(const char *path) {
+    size_t len = path ? strlen(path) : 0U;
+    return len >= 3U && strcmp(path + len - 3U, ".rs") == 0;
+}
+
 static char *query_graph_tree_rows_text(const cbm_cypher_result_t *result, int row_offset,
                                         int row_count, bool allow_directory) {
     cbm_sb_t sb;
@@ -5594,7 +5686,8 @@ static const char *query_graph_truncation_reason(const cbm_cypher_result_t *resu
 static char *query_graph_tree_response_text(const cbm_cypher_result_t *result, int row_offset,
                                             int row_count, int visible_count, bool exact_total,
                                             bool allow_directory,
-                                            const query_graph_cursor_context_t *cursor_context) {
+                                            const query_graph_cursor_context_t *cursor_context,
+                                            const char *semantic_note) {
     bool budget_hit = row_count < visible_count;
     bool materialized_more = row_offset + row_count < result->row_count;
     bool page_limit_hit = !budget_hit && materialized_more;
@@ -5616,6 +5709,9 @@ static char *query_graph_tree_response_text(const cbm_cypher_result_t *result, i
     }
     cbm_tree_scalar_bool(&sb, "has_more", truncated);
     cbm_tree_scalar_bool(&sb, "truncated", truncated);
+    if (semantic_note) {
+        cbm_tree_scalar_str(&sb, "semantic_note", semantic_note);
+    }
     const char *reason = query_graph_truncation_reason(result, budget_hit, page_limit_hit);
     if (reason) {
         cbm_tree_scalar_str(&sb, "truncation_reason", reason);
@@ -5643,7 +5739,8 @@ static char *query_graph_tree_response_text(const cbm_cypher_result_t *result, i
 
 static char *query_graph_json_response_text(const cbm_cypher_result_t *result, int row_offset,
                                             int row_count, int visible_count, bool exact_total,
-                                            const query_graph_cursor_context_t *cursor_context) {
+                                            const query_graph_cursor_context_t *cursor_context,
+                                            const char *semantic_note) {
     bool budget_hit = row_count < visible_count;
     bool materialized_more = row_offset + row_count < result->row_count;
     bool page_limit_hit = !budget_hit && materialized_more;
@@ -5674,6 +5771,9 @@ static char *query_graph_json_response_text(const cbm_cypher_result_t *result, i
     }
     yyjson_mut_obj_add_bool(doc, root, "has_more", truncated);
     yyjson_mut_obj_add_bool(doc, root, "truncated", truncated);
+    if (semantic_note) {
+        yyjson_mut_obj_add_str(doc, root, "semantic_note", semantic_note);
+    }
     const char *reason = query_graph_truncation_reason(result, budget_hit, page_limit_hit);
     if (reason) {
         yyjson_mut_obj_add_str(doc, root, "truncation_reason", reason);
@@ -5707,7 +5807,8 @@ static char *query_graph_json_response_text(const cbm_cypher_result_t *result, i
  * small, explicit recovery envelope and let the caller raise the budget to
  * retrieve the exact columns and first row. */
 static char *query_graph_budget_floor_text(const cbm_cypher_result_t *result, int row_offset,
-                                           bool exact_total, bool json_format) {
+                                           bool exact_total, bool json_format,
+                                           const char *semantic_note) {
     if (json_format) {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
         yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -5724,6 +5825,9 @@ static char *query_graph_budget_floor_text(const cbm_cypher_result_t *result, in
         yyjson_mut_obj_add_bool(doc, root, "has_more", true);
         yyjson_mut_obj_add_bool(doc, root, "truncated", true);
         yyjson_mut_obj_add_str(doc, root, "truncation_reason", "output_budget");
+        if (semantic_note) {
+            yyjson_mut_obj_add_str(doc, root, "semantic_note", semantic_note);
+        }
         yyjson_mut_obj_add_str(doc, root, "hint",
                                "Column metadata or first row exceeds output budget; raise "
                                "max_output_tokens.");
@@ -5745,6 +5849,9 @@ static char *query_graph_budget_floor_text(const cbm_cypher_result_t *result, in
     cbm_tree_scalar_bool(&sb, "has_more", true);
     cbm_tree_scalar_bool(&sb, "truncated", true);
     cbm_tree_scalar_str(&sb, "truncation_reason", "output_budget");
+    if (semantic_note) {
+        cbm_tree_scalar_str(&sb, "semantic_note", semantic_note);
+    }
     cbm_tree_scalar_str(&sb, "hint",
                         "Column metadata or first row exceeds output budget; raise "
                         "max_output_tokens.");
@@ -5806,6 +5913,10 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 
     char covproj[CBM_SZ_512];
     const char *cypher_project = project;
+    rust_semantic_coverage_t semantic_coverage = rust_semantic_coverage_get(store, project);
+    const char *semantic_note = !missed_graph && semantic_coverage.status != RUST_SEMANTIC_COMPLETE
+                                    ? RUST_SEMANTIC_NOTE
+                                    : NULL;
     if (missed_graph) {
         cbm_store_coverage_shadow_project(covproj, sizeof(covproj), project);
         cypher_project = covproj;
@@ -5908,6 +6019,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     }
     size_t byte_budget = (size_t)max_output_tokens * (size_t)MCP_OUTPUT_BYTES_PER_TOKEN_ESTIMATE;
     size_t estimated = 256U;
+    if (semantic_note) {
+        estimated += strlen(semantic_note) + sizeof("semantic_note");
+    }
     for (int c = 0; c < result.col_count; c++) {
         estimated += strlen(result.columns[c]) + 1U;
     }
@@ -5944,8 +6058,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         int high = exact_upper;
         while (low <= high) {
             int middle = low + (high - low) / 2;
-            char *candidate = query_graph_json_response_text(
-                &result, row_offset, middle, available_rows, exact_total, &cursor_context);
+            char *candidate =
+                query_graph_json_response_text(&result, row_offset, middle, available_rows,
+                                               exact_total, &cursor_context, semantic_note);
             bool fits = candidate && strlen(candidate) <= byte_budget;
             free(candidate);
             if (fits) {
@@ -5956,7 +6071,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             }
         }
         json = query_graph_json_response_text(&result, row_offset, output_rows, available_rows,
-                                              exact_total, &cursor_context);
+                                              exact_total, &cursor_context, semantic_note);
     } else {
         /* A repeated multi-KiB path/QN prefix can make the complete compact
          * page tiny even when the raw estimate is enormous. Probe that common
@@ -5966,7 +6081,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         if (available_rows <= 512 && estimated <= QUERY_COMPACT_FULL_PROBE_MAX_BYTES) {
             char *candidate =
                 query_graph_tree_response_text(&result, row_offset, available_rows, available_rows,
-                                               exact_total, true, &cursor_context);
+                                               exact_total, true, &cursor_context, semantic_note);
             if (candidate && strlen(candidate) <= byte_budget) {
                 output_rows = available_rows;
                 json = candidate;
@@ -5981,9 +6096,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             int high = exact_upper;
             while (low <= high) {
                 int middle = low + (high - low) / 2;
-                char *candidate =
-                    query_graph_tree_response_text(&result, row_offset, middle, available_rows,
-                                                   exact_total, false, &cursor_context);
+                char *candidate = query_graph_tree_response_text(&result, row_offset, middle,
+                                                                 available_rows, exact_total, false,
+                                                                 &cursor_context, semantic_note);
                 bool fits = candidate && strlen(candidate) <= byte_budget;
                 free(candidate);
                 if (fits) {
@@ -6008,7 +6123,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
                  candidate_rows--) {
                 char *candidate = query_graph_tree_response_text(
                     &result, row_offset, candidate_rows, available_rows, exact_total, true,
-                    &cursor_context);
+                    &cursor_context, semantic_note);
                 bool fits = candidate && strlen(candidate) <= byte_budget;
                 if (fits) {
                     output_rows = candidate_rows;
@@ -6018,15 +6133,16 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
                 free(candidate);
             }
             if (!json) {
-                json =
-                    query_graph_tree_response_text(&result, row_offset, output_rows, available_rows,
-                                                   exact_total, true, &cursor_context);
+                json = query_graph_tree_response_text(&result, row_offset, output_rows,
+                                                      available_rows, exact_total, true,
+                                                      &cursor_context, semantic_note);
             }
         }
     }
     if (json && output_rows == 0 && strlen(json) > byte_budget) {
         free(json);
-        json = query_graph_budget_floor_text(&result, row_offset, exact_total, qg_legacy_json);
+        json = query_graph_budget_floor_text(&result, row_offset, exact_total, qg_legacy_json,
+                                             semantic_note);
     }
     cbm_cypher_result_free(&result);
     free(cursor_arg);
@@ -6119,6 +6235,18 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
      * response look complete precisely when the discovery cap was hit. */
     bool generation_matches =
         have_meta && indexed_at && meta.generation && strcmp(indexed_at, meta.generation) == 0;
+    rust_semantic_coverage_t semantic_coverage = {
+        .status = RUST_SEMANTIC_UNKNOWN,
+        .gaps = 0U,
+    };
+    if (generation_matches && meta.coverage_version == CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION &&
+        meta.rust_semantic_gaps_known &&
+        (meta.rust_semantic_gaps & ~CBM_RUST_SEMANTIC_GAPS_ALL) == 0U) {
+        semantic_coverage.gaps = meta.rust_semantic_gaps;
+        semantic_coverage.status =
+            semantic_coverage.gaps == 0U ? RUST_SEMANTIC_COMPLETE : RUST_SEMANTIC_PARTIAL;
+    }
+    rust_semantic_add_object(doc, root, semantic_coverage);
     bool ignored_total_authoritative = generation_matches && meta.ignored_files_total >= ni_file_n;
     int ni_file_total = ni_file_n;
     if (ignored_total_authoritative) {
@@ -6520,6 +6648,17 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                               strcmp(proj.indexed_at, meta.generation) == 0;
     const char *recording_status =
         have_meta && meta.recording_status ? meta.recording_status : "unknown";
+    rust_semantic_coverage_t semantic_coverage = {
+        .status = RUST_SEMANTIC_UNKNOWN,
+        .gaps = 0U,
+    };
+    if (generation_matches && meta.coverage_version == CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION &&
+        meta.rust_semantic_gaps_known &&
+        (meta.rust_semantic_gaps & ~CBM_RUST_SEMANTIC_GAPS_ALL) == 0U) {
+        semantic_coverage.gaps = meta.rust_semantic_gaps;
+        semantic_coverage.status =
+            semantic_coverage.gaps == 0U ? RUST_SEMANTIC_COMPLETE : RUST_SEMANTIC_PARTIAL;
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -6547,6 +6686,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                            have_meta ? meta.coverage_version : 0);
     yyjson_mut_obj_add_bool(doc, meta_obj, "generation_matches", generation_matches);
     yyjson_mut_obj_add_val(doc, root, "metadata", meta_obj);
+    rust_semantic_add_object(doc, root, semantic_coverage);
 
     yyjson_mut_val *path_results = yyjson_mut_arr(doc);
     int path_returned = 0;
@@ -6576,6 +6716,12 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                 continue;
             }
             yyjson_mut_obj_add_strcpy(doc, item, "path", rel);
+            if (path_has_rust_extension(rel)) {
+                yyjson_mut_obj_add_str(doc, item, "semantic_status",
+                                       rust_semantic_status_name(semantic_coverage.status));
+                yyjson_mut_obj_add_val(doc, item, "semantic_reasons",
+                                       rust_semantic_reasons_json(doc, semantic_coverage));
+            }
             cbm_coverage_row_t *rows = NULL;
             int row_count = 0;
             int cov_rc = cbm_store_coverage_get_path(store, project, rel, &rows, &row_count);
@@ -6645,6 +6791,10 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                 continue;
             }
             yyjson_mut_obj_add_strcpy(doc, item, "scope", scope[0] ? scope : ".");
+            yyjson_mut_obj_add_str(doc, item, "semantic_status",
+                                   rust_semantic_status_name(semantic_coverage.status));
+            yyjson_mut_obj_add_val(doc, item, "semantic_reasons",
+                                   rust_semantic_reasons_json(doc, semantic_coverage));
             cbm_coverage_row_t *rows = NULL;
             int row_count = 0;
             int cov_rc = cbm_store_coverage_get_scope(store, project, scope, &rows, &row_count);
@@ -9184,6 +9334,20 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     const char *edge_types[MCP_COL_16];
     int edge_type_count = 0;
     yyjson_doc *et_doc_keep = resolve_trace_edge_types(args, mode, edge_types, &edge_type_count);
+    rust_semantic_coverage_t trace_semantic = rust_semantic_coverage_get(store, project);
+    bool trace_semantic_affected = false;
+    for (int i = 0; i < edge_type_count; i++) {
+        bool calls_affected =
+            strcmp(edge_types[i], "CALLS") == 0 &&
+            (trace_semantic.status == RUST_SEMANTIC_UNKNOWN ||
+             (trace_semantic.gaps & (CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE |
+                                     CBM_RUST_SEMANTIC_GAP_EXPANDED_CALLS_UNAVAILABLE)) != 0U);
+        bool impl_affected =
+            (strcmp(edge_types[i], "IMPLEMENTS") == 0 || strcmp(edge_types[i], "OVERRIDE") == 0) &&
+            (trace_semantic.status == RUST_SEMANTIC_UNKNOWN ||
+             (trace_semantic.gaps & CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE) != 0U);
+        trace_semantic_affected = trace_semantic_affected || calls_affected || impl_affected;
+    }
 
     /* Run BFS for each requested direction.
      * IMPORTANT: emitters borrow node-string pointers — traversal results
@@ -9367,6 +9531,8 @@ render_trace_output:;
             in_total++;
         }
     }
+    bool out_semantic_lower_bound = trace_semantic_affected && out_total > 0;
+    bool in_semantic_lower_bound = trace_semantic_affected && in_total > 0;
 
     free(json);
     json = NULL;
@@ -9386,7 +9552,8 @@ render_trace_output:;
         bool flat_trace = render_risk || render_data_flow;
         if (do_outbound) {
             cbm_tree_scalar_int(&sb, "callees_total", out_total);
-            cbm_tree_scalar_str(&sb, "callees_total_relation", tr_out.truncated ? "gte" : "eq");
+            cbm_tree_scalar_str(&sb, "callees_total_relation",
+                                tr_out.truncated || out_semantic_lower_bound ? "gte" : "eq");
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callees", &view_out, render_risk, include_tests,
                                   render_data_flow, render_evidence, &out_edge_ctx);
@@ -9397,7 +9564,8 @@ render_trace_output:;
         }
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, "callers_total", in_total);
-            cbm_tree_scalar_str(&sb, "callers_total_relation", tr_in.truncated ? "gte" : "eq");
+            cbm_tree_scalar_str(&sb, "callers_total_relation",
+                                tr_in.truncated || in_semantic_lower_bound ? "gte" : "eq");
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callers", &view_in, render_risk, include_tests,
                                   render_data_flow, render_evidence, &in_edge_ctx);
@@ -9450,6 +9618,9 @@ render_trace_output:;
                                     "depth/edge_types or disable data_flow/include_evidence.");
             }
         }
+        if (trace_semantic_affected) {
+            cbm_tree_scalar_str(&sb, "semantic_note", RUST_SEMANTIC_NOTE);
+        }
         json = cbm_sb_finish(&sb);
     } else {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -9464,7 +9635,7 @@ render_trace_output:;
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
             yyjson_mut_obj_add_str(doc, root, "callees_total_relation",
-                                   tr_out.truncated ? "gte" : "eq");
+                                   tr_out.truncated || out_semantic_lower_bound ? "gte" : "eq");
             yyjson_mut_obj_add_val(
                 doc, root, "callees",
                 bfs_to_tree_json(doc, &view_out, risk_labels && emit_optional_fields, include_tests,
@@ -9474,12 +9645,15 @@ render_trace_output:;
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
             yyjson_mut_obj_add_str(doc, root, "callers_total_relation",
-                                   tr_in.truncated ? "gte" : "eq");
+                                   tr_in.truncated || in_semantic_lower_bound ? "gte" : "eq");
             yyjson_mut_obj_add_val(
                 doc, root, "callers",
                 bfs_to_tree_json(doc, &view_in, risk_labels && emit_optional_fields, include_tests,
                                  data_flow && emit_optional_fields,
                                  include_evidence && emit_optional_fields, &in_edge_ctx));
+        }
+        if (trace_semantic_affected) {
+            yyjson_mut_obj_add_str(doc, root, "semantic_note", RUST_SEMANTIC_NOTE);
         }
         if (trace_truncated) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
@@ -9533,12 +9707,13 @@ render_trace_output:;
                 if (do_outbound) {
                     cbm_tree_scalar_int(&floor, "callees_total", out_total);
                     cbm_tree_scalar_str(&floor, "callees_total_relation",
-                                        tr_out.truncated ? "gte" : "eq");
+                                        tr_out.truncated || out_semantic_lower_bound ? "gte"
+                                                                                     : "eq");
                 }
                 if (do_inbound) {
                     cbm_tree_scalar_int(&floor, "callers_total", in_total);
                     cbm_tree_scalar_str(&floor, "callers_total_relation",
-                                        tr_in.truncated ? "gte" : "eq");
+                                        tr_in.truncated || in_semantic_lower_bound ? "gte" : "eq");
                 }
                 cbm_tree_scalar_bool(&floor, "has_more", floor_has_more);
                 if (floor_has_more) {
@@ -9547,6 +9722,9 @@ render_trace_output:;
                 cbm_tree_scalar_bool(&floor, "truncated", true);
                 cbm_tree_scalar_str(&floor, "truncation_reason", "output_budget");
                 cbm_tree_scalar_bool(&floor, "output_budget_floor_exceeded", true);
+                if (trace_semantic_affected) {
+                    cbm_tree_scalar_str(&floor, "semantic_note", RUST_SEMANTIC_NOTE);
+                }
                 cbm_tree_scalar_int(&floor, "max_output_bytes", (long long)output_budget_bytes);
                 if (optional_fields_omitted) {
                     cbm_tree_scalar_bool(&floor, "optional_fields_omitted", true);
@@ -9563,12 +9741,14 @@ render_trace_output:;
                 if (do_outbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callees_total", out_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callees_total_relation",
-                                           tr_out.truncated ? "gte" : "eq");
+                                           tr_out.truncated || out_semantic_lower_bound ? "gte"
+                                                                                        : "eq");
                 }
                 if (do_inbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callers_total", in_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callers_total_relation",
-                                           tr_in.truncated ? "gte" : "eq");
+                                           tr_in.truncated || in_semantic_lower_bound ? "gte"
+                                                                                      : "eq");
                 }
                 yyjson_mut_obj_add_bool(floor_doc, floor, "has_more", floor_has_more);
                 if (floor_has_more) {
@@ -9578,6 +9758,9 @@ render_trace_output:;
                 yyjson_mut_obj_add_bool(floor_doc, floor, "truncated", true);
                 yyjson_mut_obj_add_str(floor_doc, floor, "truncation_reason", "output_budget");
                 yyjson_mut_obj_add_bool(floor_doc, floor, "output_budget_floor_exceeded", true);
+                if (trace_semantic_affected) {
+                    yyjson_mut_obj_add_str(floor_doc, floor, "semantic_note", RUST_SEMANTIC_NOTE);
+                }
                 yyjson_mut_obj_add_uint(floor_doc, floor, "max_output_bytes", output_budget_bytes);
                 if (optional_fields_omitted) {
                     yyjson_mut_obj_add_bool(floor_doc, floor, "optional_fields_omitted", true);

@@ -119,6 +119,17 @@ static int setup_parallel_repo(void) {
                "    @Override\n    public double area() { return 0.0; }\n}\n");
     fclose(f);
 
+    /* Matching Rust trait/type/method names are a negative discriminator:
+     * neither venue may promote them to IMPLEMENTS or derived OVERRIDE. */
+    snprintf(path, sizeof(path), "%s/probe/impl.rs", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "pub trait Named { fn name(&self) -> &'static str; }\n"
+               "pub struct Thing;\n"
+               "impl Named for Thing { fn name(&self) -> &'static str { \"thing\" } }\n");
+    fclose(f);
+
     return 0;
 }
 
@@ -526,7 +537,7 @@ TEST(parallel_implements_parity) {
 TEST(parallel_semantic_fixture_expected_counts) {
     if (ensure_parity_setup() != 0)
         FAIL("setup failed");
-    /* Circle implements Shape; Base extends Circle — in BOTH venues. */
+    /* Only the Java control is admitted; the Rust name match stays omitted. */
     ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_seq_gbuf, "IMPLEMENTS"), 1);
     ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_par_gbuf, "IMPLEMENTS"), 1);
     ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_seq_gbuf, "INHERITS"), 1);
@@ -1035,8 +1046,7 @@ TEST(rust_untrusted_candidates_never_materialize_definite_calls) {
         const char *source;
         int expected_calls;
     } cases[] = {
-        {"rust_exact", "exact.rs", CBM_LANG_RUST,
-         "fn target() {}\nfn caller() { target(); }\n", 0},
+        {"rust_exact", "exact.rs", CBM_LANG_RUST, "fn target() {}\nfn caller() { target(); }\n", 0},
         {"rust_receiver", "receiver.rs", CBM_LANG_RUST,
          "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
          "fn caller(worker: &Worker) { worker.work(); }\n",
@@ -1059,10 +1069,8 @@ TEST(rust_untrusted_candidates_never_materialize_definite_calls) {
         files[0].rel_path = (char *)cases[i].filename;
         files[0].language = cases[i].language;
 
-        cbm_gbuf_t *sequential =
-            run_sequential("rust_call_gate", tmpdir, files, 1);
-        cbm_gbuf_t *parallel =
-            run_parallel("rust_call_gate", tmpdir, files, 1, 1);
+        cbm_gbuf_t *sequential = run_sequential("rust_call_gate", tmpdir, files, 1);
+        cbm_gbuf_t *parallel = run_parallel("rust_call_gate", tmpdir, files, 1, 1);
         ASSERT_NOT_NULL(sequential);
         ASSERT_NOT_NULL(parallel);
 
@@ -2785,8 +2793,7 @@ TEST(parallel_rust_workspace_candidates_need_trusted_provenance_for_calls) {
     cbm_gbuf_t *gbuf = run_issue56_parallel_workspace(false);
     ASSERT_NOT_NULL(gbuf);
 
-    const bool desired_candidate =
-        callable_has_call_target_fragment(gbuf, "main.run", ".crate_a.");
+    const bool desired_candidate = callable_has_call_target_fragment(gbuf, "main.run", ".crate_a.");
     const bool unlisted = callable_has_call_target_fragment(gbuf, "main.run", ".unlisted.");
     if (desired_candidate || unlisted) {
         printf("  issue56 manifest diagnostic: desired=%d unlisted=%d\n", desired_candidate,
@@ -2803,12 +2810,11 @@ TEST(parallel_rust_local_shadow_candidates_need_trusted_provenance_for_calls) {
     cbm_gbuf_t *gbuf = run_issue56_parallel_workspace(true);
     ASSERT_NOT_NULL(gbuf);
 
-    const bool desired_candidate =
-        callable_has_call_target_fragment(gbuf, "main.run", ".crate_a.");
+    const bool desired_candidate = callable_has_call_target_fragment(gbuf, "main.run", ".crate_a.");
     const bool wrong_local = callable_has_call_target_fragment(gbuf, "main.run", ".crate_b.");
     if (desired_candidate || wrong_local) {
-        printf("  issue56 local-shadow diagnostic: desired=%d wrong_local=%d\n",
-               desired_candidate, wrong_local);
+        printf("  issue56 local-shadow diagnostic: desired=%d wrong_local=%d\n", desired_candidate,
+               wrong_local);
     }
     cbm_gbuf_free(gbuf);
 

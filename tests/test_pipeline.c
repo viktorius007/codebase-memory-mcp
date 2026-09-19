@@ -1179,6 +1179,8 @@ enum {
     RESTORE_RUST_TESTS,
     RESTORE_GO_CALLS,
     RESTORE_RUST_USAGE,
+    RESTORE_RUST_IMPLEMENTS,
+    RESTORE_RUST_OVERRIDE,
     RESTORE_EDGE_COUNT,
 };
 
@@ -1211,10 +1213,12 @@ static int unique_named_node_id(cbm_store_t *store, const char *project, const c
 }
 
 static PersistedEdgeRestoreObservation observe_persisted_edge_restore(bool force_legacy) {
-    static const char *types[RESTORE_EDGE_COUNT] = {"CALLS", "TESTS", "CALLS", "USAGE"};
+    static const char *types[RESTORE_EDGE_COUNT] = {"CALLS", "TESTS",      "CALLS",
+                                                    "USAGE", "IMPLEMENTS", "OVERRIDE"};
     static const char *source_names[RESTORE_EDGE_COUNT] = {
         "rust_persisted_restore_source", "rust_persisted_restore_source",
-        "GoPersistedRestoreSource", "rust_persisted_restore_source"};
+        "GoPersistedRestoreSource",      "rust_persisted_restore_source",
+        "rust_persisted_restore_source", "rust_persisted_restore_source"};
     static const char target_name[] = "rust_persisted_restore_target";
     PersistedEdgeRestoreObservation result = {.baseline_rc = -1, .incremental_rc = -1};
     char tmp[256];
@@ -1257,7 +1261,7 @@ static PersistedEdgeRestoreObservation observe_persisted_edge_restore(bool force
         result.lookup_counts[2] =
             unique_named_node_id(store, project, "GoPersistedRestoreSource", &go_source_id);
         int64_t source_ids[RESTORE_EDGE_COUNT] = {rust_source_id, rust_source_id, go_source_id,
-                                                  rust_source_id};
+                                                  rust_source_id, rust_source_id, rust_source_id};
         for (int i = 0; i < RESTORE_EDGE_COUNT; i++) {
             cbm_edge_t edge = {.project = project,
                                .source_id = source_ids[i],
@@ -1324,6 +1328,8 @@ static int assert_persisted_edge_restore(PersistedEdgeRestoreObservation result,
     ASSERT_EQ(result.post_counts[RESTORE_RUST_TESTS], 0);
     ASSERT_EQ(result.post_counts[RESTORE_GO_CALLS], 1);
     ASSERT_EQ(result.post_counts[RESTORE_RUST_USAGE], 1);
+    ASSERT_EQ(result.post_counts[RESTORE_RUST_IMPLEMENTS], 0);
+    ASSERT_EQ(result.post_counts[RESTORE_RUST_OVERRIDE], 0);
     return 0;
 }
 
@@ -4299,6 +4305,9 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_metadata_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "generation.py", "def ExactMetadataGeneration():\n    return 1\n");
+    write_temp_file(tmp, "legacy.rs",
+                    "pub fn oldEdgeSource() -> i32 { 1 }\n"
+                    "pub fn oldEdgeTarget() -> i32 { 2 }\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
 
@@ -4325,6 +4334,19 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
               CBM_STORE_OK);
     cbm_coverage_meta_t current_meta = {0};
     ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &current_meta), CBM_STORE_OK);
+    int64_t old_source_id = 0;
+    int64_t old_target_id = 0;
+    ASSERT_EQ(unique_named_node_id(metadata_store, project, "oldEdgeSource", &old_source_id), 1);
+    ASSERT_EQ(unique_named_node_id(metadata_store, project, "oldEdgeTarget", &old_target_id), 1);
+    cbm_edge_t old_implements = {.project = project,
+                                 .source_id = old_source_id,
+                                 .target_id = old_target_id,
+                                 .type = "IMPLEMENTS",
+                                 .properties_json = "{}"};
+    cbm_edge_t old_override = old_implements;
+    old_override.type = "OVERRIDE";
+    ASSERT_GT(cbm_store_insert_edge(metadata_store, &old_implements), 0);
+    ASSERT_GT(cbm_store_insert_edge(metadata_store, &old_override), 0);
     cbm_coverage_meta_t legacy_meta = current_meta;
     legacy_meta.coverage_version = 1;
     ASSERT_EQ(cbm_store_coverage_replace_ex(metadata_store, project, coverage_rows, coverage_count,
@@ -4347,6 +4369,10 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &migrated_meta), CBM_STORE_OK);
     int migrated_version = migrated_meta.coverage_version;
     bool migrated_hashes_complete = migrated_meta.hash_records_complete;
+    int migrated_rust_implements =
+        named_edge_count(metadata_store, project, "IMPLEMENTS", "oldEdgeSource", "oldEdgeTarget");
+    int migrated_rust_override =
+        named_edge_count(metadata_store, project, "OVERRIDE", "oldEdgeSource", "oldEdgeTarget");
     char migrated_mode[32];
     snprintf(migrated_mode, sizeof(migrated_mode), "%s",
              migrated_meta.index_mode ? migrated_meta.index_mode : "");
@@ -4384,6 +4410,8 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     ASSERT_EQ(migration_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(migrated_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_TRUE(migrated_hashes_complete);
+    ASSERT_EQ(migrated_rust_implements, 0);
+    ASSERT_EQ(migrated_rust_override, 0);
     ASSERT_STR_EQ(migrated_mode, "fast");
     ASSERT_EQ(mode_change_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(full_version, CBM_SEMANTIC_INDEX_VERSION);

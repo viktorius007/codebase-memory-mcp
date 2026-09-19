@@ -463,11 +463,10 @@ TEST(contract_python_relative_import) {
 
 /* Python: relative aliased from-import must CALLS the real def (execute). */
 TEST(contract_python_aliased_from_import_calls) {
-    static const LangFile f[] = {
-        {"gate.py", "def execute(x):\n    return x\n"},
-        {"router.py",
-         "from .gate import execute as bridge_execute\n\n\n"
-         "def submit_task(y):\n    return bridge_execute(y)\n"}};
+    static const LangFile f[] = {{"gate.py", "def execute(x):\n    return x\n"},
+                                 {"router.py",
+                                  "from .gate import execute as bridge_execute\n\n\n"
+                                  "def submit_task(y):\n    return bridge_execute(y)\n"}};
     LangProj lp;
     cbm_store_t *store = lang_index_files(&lp, f, 2);
     ASSERT_TRUE(store != NULL);
@@ -560,10 +559,8 @@ TEST(contract_python_absolute_aliased_from_import_calls) {
 
 /* Python: unresolvable module + alias must emit no CALLS (no invented edge). */
 TEST(contract_python_ghost_module_aliased_from_import_no_calls) {
-    static const LangFile f[] = {
-        {"router.py",
-         "from ghost_module import nope as alias\n\n\n"
-         "def submit_task(y):\n    return alias(y)\n"}};
+    static const LangFile f[] = {{"router.py", "from ghost_module import nope as alias\n\n\n"
+                                               "def submit_task(y):\n    return alias(y)\n"}};
     LangProj lp;
     cbm_store_t *store = lang_index_files(&lp, f, 1);
     ASSERT_TRUE(store != NULL);
@@ -1158,7 +1155,7 @@ TEST(contract_edge_inherits) {
     PASS();
 }
 
-/* IMPLEMENTS — Rust `impl Trait for Struct` (Java/TS `implements` -> INHERITS). */
+/* Rust impl names remain omitted without trusted HIR/rustc identities. */
 TEST(contract_edge_implements) {
     static const LangFile f[] = {{"shapes.rs",
                                   "trait Greet {\n    fn hello(&self) -> String;\n}\n\n"
@@ -1170,7 +1167,7 @@ TEST(contract_edge_implements) {
                                   "        self.side * self.side\n    }\n}\n\n"
                                   "impl Greet for Square {\n    fn hello(&self) -> String {\n"
                                   "        String::from(\"square\")\n    }\n}\n"}};
-    ASSERT_TRUE(edge_present(f, 1, "IMPLEMENTS", 2)); /* 3 impl-for blocks */
+    ASSERT_FALSE(edge_present(f, 1, "IMPLEMENTS", 1));
     PASS();
 }
 
@@ -1759,10 +1756,11 @@ TEST(contract_edge_parallel_service_edges) {
     if (store) {
         sqlite3_stmt *stmt = NULL;
         sqlite3 *db = cbm_store_get_db(store);
-        if (db && sqlite3_prepare_v2(db,
-                                    "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
-                                    "AND properties != '' AND json_valid(properties)=0;",
-                                    -1, &stmt, NULL) == SQLITE_OK &&
+        if (db &&
+            sqlite3_prepare_v2(db,
+                               "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                               "AND properties != '' AND json_valid(properties)=0;",
+                               -1, &stmt, NULL) == SQLITE_OK &&
             sqlite3_step(stmt) == SQLITE_ROW) {
             invalid_props = sqlite3_column_int(stmt, 0);
         }

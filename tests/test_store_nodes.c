@@ -7,6 +7,7 @@
 #include "test_framework.h"
 #include <store/store.h>
 #include <foundation/constants.h>
+#include <foundation/platform.h>
 #include <cbm.h>
 #include <sqlite3.h>
 #include <string.h>
@@ -2268,6 +2269,78 @@ TEST(store_coverage_meta_zero_row_truncation_and_delete) {
     PASS();
 }
 
+TEST(store_coverage_meta_rust_semantic_gaps_migrate_and_roundtrip) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cbm-rust-gaps-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char writable_path[512];
+    char readonly_path[512];
+    snprintf(writable_path, sizeof(writable_path), "%s/writable.db", tmpdir);
+    snprintf(readonly_path, sizeof(readonly_path), "%s/readonly.db", tmpdir);
+    static const char legacy_schema[] =
+        "CREATE TABLE projects(name TEXT PRIMARY KEY,indexed_at TEXT NOT NULL,root_path TEXT NOT "
+        "NULL);"
+        "CREATE TABLE index_coverage_meta(project TEXT PRIMARY KEY,generation TEXT NOT NULL,"
+        "index_mode TEXT NOT NULL,recorded_at TEXT NOT NULL,recording_status TEXT NOT NULL,"
+        "ignored_files_stored INTEGER NOT NULL DEFAULT 0,ignored_files_total INTEGER NOT NULL "
+        "DEFAULT 0,coverage_version INTEGER NOT NULL DEFAULT 1,hash_records_complete INTEGER NOT "
+        "NULL DEFAULT 0);"
+        "INSERT INTO projects VALUES('legacy','generation-1','/tmp/legacy');"
+        "INSERT INTO index_coverage_meta VALUES('legacy','generation-1','full','now','complete',"
+        "0,0,3,1);";
+    const char *paths[] = {writable_path, readonly_path};
+    for (size_t i = 0; i < 2; i++) {
+        sqlite3 *raw = NULL;
+        ASSERT_EQ(sqlite3_open(paths[i], &raw), SQLITE_OK);
+        ASSERT_EQ(sqlite3_exec(raw, legacy_schema, NULL, NULL, NULL), SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    cbm_store_t *writable = cbm_store_open_path(writable_path);
+    ASSERT_NOT_NULL(writable);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(writable, "legacy", &meta), CBM_STORE_OK);
+    ASSERT_FALSE(meta.rust_semantic_gaps_known);
+    cbm_store_coverage_meta_clear(&meta);
+
+    cbm_coverage_meta_t known_zero = {
+        .generation = "generation-1",
+        .index_mode = "full",
+        .recorded_at = "now",
+        .recording_status = "complete",
+        .coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION,
+        .hash_records_complete = true,
+        .rust_semantic_gaps = 0U,
+        .rust_semantic_gaps_known = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(writable, "legacy", NULL, 0, &known_zero),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(writable, "legacy", &meta), CBM_STORE_OK);
+    ASSERT_TRUE(meta.rust_semantic_gaps_known);
+    ASSERT_EQ(meta.rust_semantic_gaps, 0U);
+    cbm_store_coverage_meta_clear(&meta);
+    known_zero.rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE |
+                                    CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE;
+    ASSERT_EQ(cbm_store_coverage_replace_ex(writable, "legacy", NULL, 0, &known_zero),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(writable, "legacy", &meta), CBM_STORE_OK);
+    ASSERT_EQ(meta.rust_semantic_gaps, 5U);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(writable);
+    writable = cbm_store_open_path(writable_path);
+    ASSERT_NOT_NULL(writable);
+    cbm_store_close(writable);
+
+    cbm_store_t *readonly = cbm_store_open_path_query(readonly_path);
+    ASSERT_NOT_NULL(readonly);
+    ASSERT_EQ(cbm_store_coverage_meta_get(readonly, "legacy", &meta), CBM_STORE_OK);
+    ASSERT_FALSE(meta.rust_semantic_gaps_known);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(readonly);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(store_coverage_replace_rejects_invalid_row_arguments) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -2365,6 +2438,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_roundtrip_prune_shadow);
     RUN_TEST(store_coverage_targeted_path_and_scope_lookup);
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
+    RUN_TEST(store_coverage_meta_rust_semantic_gaps_migrate_and_roundtrip);
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);

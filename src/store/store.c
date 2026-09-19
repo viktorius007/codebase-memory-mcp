@@ -341,12 +341,36 @@ static int init_schema(cbm_store_t *s) {
         "  ignored_files_stored INTEGER NOT NULL DEFAULT 0,"
         "  ignored_files_total INTEGER NOT NULL DEFAULT 0,"
         "  coverage_version INTEGER NOT NULL DEFAULT 1,"
-        "  hash_records_complete INTEGER NOT NULL DEFAULT 0"
+        "  hash_records_complete INTEGER NOT NULL DEFAULT 0,"
+        "  rust_semantic_gaps INTEGER"
         ");";
 
     int rc = exec_sql(s, ddl);
     if (rc != CBM_STORE_OK) {
         return rc;
+    }
+
+    {
+        sqlite3_stmt *columns = NULL;
+        bool have_rust_semantic_gaps = false;
+        if (sqlite3_prepare_v2(s->db, "PRAGMA table_info(index_coverage_meta);", CBM_NOT_FOUND,
+                               &columns, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage meta schema probe");
+            return CBM_STORE_ERR;
+        }
+        while (sqlite3_step(columns) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(columns, 1);
+            if (name && strcmp(name, "rust_semantic_gaps") == 0) {
+                have_rust_semantic_gaps = true;
+                break;
+            }
+        }
+        sqlite3_finalize(columns);
+        if (!have_rust_semantic_gaps &&
+            exec_sql(s, "ALTER TABLE index_coverage_meta ADD COLUMN rust_semantic_gaps INTEGER;") !=
+                CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
     }
 
     /* Schema-compat probe (#768): DBs created before the local_name_gen
@@ -4045,11 +4069,12 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                 "INSERT INTO index_coverage_meta "
                 "(project, generation, index_mode, recorded_at, recording_status, "
                 " ignored_files_stored, ignored_files_total, coverage_version, "
-                " hash_records_complete) "
-                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
+                " hash_records_complete, rust_semantic_gaps) "
+                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) "
                 "ON CONFLICT(project) DO UPDATE SET generation=?2, index_mode=?3, "
                 "recorded_at=?4, recording_status=?5, ignored_files_stored=?6, "
-                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9;",
+                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9, "
+                "rust_semantic_gaps=?10;",
                 CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
             store_set_error_sqlite(s, "coverage meta upsert prepare");
             (void)exec_sql(s, "ROLLBACK;");
@@ -4064,6 +4089,11 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         sqlite3_bind_int(up_meta, 7, ignored_total);
         sqlite3_bind_int(up_meta, 8, coverage_version);
         sqlite3_bind_int(up_meta, 9, meta->hash_records_complete ? 1 : 0);
+        if (meta->rust_semantic_gaps_known) {
+            sqlite3_bind_int64(up_meta, 10, (sqlite3_int64)meta->rust_semantic_gaps);
+        } else {
+            sqlite3_bind_null(up_meta, 10);
+        }
         int meta_rc = sqlite3_step(up_meta);
         sqlite3_finalize(up_meta);
         if (meta_rc != SQLITE_DONE) {
@@ -4229,13 +4259,20 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db,
-                           "SELECT project, generation, index_mode, recorded_at, recording_status, "
-                           "ignored_files_stored, ignored_files_total, coverage_version, "
-                           "hash_records_complete FROM index_coverage_meta WHERE project = ?1;",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "coverage meta get prepare");
-        return CBM_STORE_ERR;
+    const char *select_meta =
+        "SELECT project, generation, index_mode, recorded_at, recording_status, "
+        "ignored_files_stored, ignored_files_total, coverage_version, "
+        "hash_records_complete, rust_semantic_gaps "
+        "FROM index_coverage_meta WHERE project = ?1;";
+    if (sqlite3_prepare_v2(s->db, select_meta, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        const char *select_legacy =
+            "SELECT project, generation, index_mode, recorded_at, recording_status, "
+            "ignored_files_stored, ignored_files_total, coverage_version, "
+            "hash_records_complete, NULL FROM index_coverage_meta WHERE project = ?1;";
+        if (sqlite3_prepare_v2(s->db, select_legacy, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage meta get prepare");
+            return CBM_STORE_ERR;
+        }
     }
     bind_text(stmt, SKIP_ONE, project);
     int rc = sqlite3_step(stmt);
@@ -4249,6 +4286,10 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
+        out->rust_semantic_gaps_known = sqlite3_column_type(stmt, 9) != SQLITE_NULL;
+        if (out->rust_semantic_gaps_known) {
+            out->rust_semantic_gaps = (unsigned int)sqlite3_column_int64(stmt, 9);
+        }
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
             !out->recording_status) {
