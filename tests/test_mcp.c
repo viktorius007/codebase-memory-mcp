@@ -6485,7 +6485,7 @@ TEST(tool_rust_semantic_coverage_isolated_bits_and_controls) {
     } query_cases[] = {
         {"MATCH (n) RETURN n.name ORDER BY n.name LIMIT 1", "", false, 1, 0, "HandleRequest"},
         {"MATCH (n:MissingNode) RETURN n.name", "", true, 0, 0, NULL},
-        {"MATCH (n) RETURN count(*) AS n", "", true, 1, 1, NULL},
+        {"MATCH (n) RETURN count(*) AS n", "", true, 1, 0, NULL},
         {"MATCH (n) RETURN n.name ORDER BY n.name", "\"offset\":1,\"max_rows\":1,", true, 1, 0,
          NULL},
     };
