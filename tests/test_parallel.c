@@ -1022,6 +1022,67 @@ static int count_calls_edges_to_tail(const cbm_gbuf_t *gbuf, const char *target_
     return count;
 }
 
+/* Rust's embedded resolver and generic registry produce useful candidates,
+ * but neither is trusted provenance for a definite graph fact.  Exercise the
+ * final sequential and parallel materializers with both a direct-name match
+ * and a receiver-driven match; the C row proves the existing admission rule
+ * for a language with established textual call resolution remains intact. */
+TEST(rust_untrusted_candidates_never_materialize_definite_calls) {
+    static const struct {
+        const char *tag;
+        const char *filename;
+        CBMLanguage language;
+        const char *source;
+        int expected_calls;
+    } cases[] = {
+        {"rust_exact", "exact.rs", CBM_LANG_RUST,
+         "fn target() {}\nfn caller() { target(); }\n", 0},
+        {"rust_receiver", "receiver.rs", CBM_LANG_RUST,
+         "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
+         "fn caller(worker: &Worker) { worker.work(); }\n",
+         0},
+        {"c_exact", "exact.c", CBM_LANG_C,
+         "void target(void) {}\nvoid caller(void) { target(); }\n", 1},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char tmpdir[256];
+        snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_rust_call_gate_%s_XXXXXX", cases[i].tag);
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", tmpdir, cases[i].filename);
+        ASSERT_EQ(th_write_file(path, cases[i].source), 0);
+
+        cbm_file_info_t files[1] = {0};
+        files[0].path = path;
+        files[0].rel_path = (char *)cases[i].filename;
+        files[0].language = cases[i].language;
+
+        cbm_gbuf_t *sequential =
+            run_sequential("rust_call_gate", tmpdir, files, 1);
+        cbm_gbuf_t *parallel =
+            run_parallel("rust_call_gate", tmpdir, files, 1, 1);
+        ASSERT_NOT_NULL(sequential);
+        ASSERT_NOT_NULL(parallel);
+
+        int sequential_calls = cbm_gbuf_edge_count_by_type(sequential, "CALLS");
+        int parallel_calls = cbm_gbuf_edge_count_by_type(parallel, "CALLS");
+        if (sequential_calls != cases[i].expected_calls ||
+            parallel_calls != cases[i].expected_calls) {
+            printf("  Rust call admission diagnostic: case=%s expected=%d seq=%d par=%d\n",
+                   cases[i].tag, cases[i].expected_calls, sequential_calls, parallel_calls);
+        }
+        ASSERT_EQ(sequential_calls, cases[i].expected_calls);
+        ASSERT_EQ(parallel_calls, cases[i].expected_calls);
+
+        cbm_gbuf_free(sequential);
+        cbm_gbuf_free(parallel);
+        th_rmtree(tmpdir);
+    }
+    PASS();
+}
+
 typedef struct {
     bool injected;
 } lsp_legacy_injection_t;
@@ -4390,6 +4451,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);
     RUN_TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution);
+    RUN_TEST(rust_untrusted_candidates_never_materialize_definite_calls);
     RUN_TEST(parallel_rust_known_macro_does_not_fallback_to_local_function);
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);
     RUN_TEST(parallel_c_preprocessed_coordinate_collision_preserves_hidden_target);
