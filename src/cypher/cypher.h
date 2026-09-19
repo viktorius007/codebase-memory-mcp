@@ -188,6 +188,13 @@ typedef struct {
     const char *literal;  /* literal string/number text (NULL if a variable ref) */
 } cbm_func_arg_t;
 
+typedef enum {
+    CBM_SCALAR_KIND_UNKNOWN,
+    CBM_SCALAR_KIND_STRING,
+    CBM_SCALAR_KIND_NUMBER,
+    CBM_SCALAR_KIND_BOOLEAN,
+} cbm_scalar_kind_t;
+
 /* WHERE condition */
 typedef struct {
     const char *variable;
@@ -195,6 +202,7 @@ typedef struct {
     const char *op; /* "=", "<>", "=~", "CONTAINS", "STARTS WITH", "ENDS WITH",
                        ">", "<", ">=", "<=", "IN", "IS NULL", "IS NOT NULL" */
     const char *value;
+    cbm_scalar_kind_t value_kind;
     bool negated; /* NOT prefix */
     /* coalesce(var.prop, literal) in WHERE (#874): when set, a missing/empty
      * property value is substituted with this literal before the op runs. */

@@ -638,7 +638,9 @@ static const tool_def_t TOOLS[] = {
      "\"mode\":{\"type\":\"string\","
      "\"enum\":[\"compact\",\"full\",\"files\"],\"default\":\"compact\"},"
      "\"context\":{\"type\":\"integer\"},"
-     "\"regex\":{\"type\":\"boolean\",\"default\":false},"
+     "\"regex\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"false uses fixed-string matching; true applies the pattern as a "
+     "regular expression.\"},"
      "\"debug\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Add scope_ms/scan_ms/enrich_ms phase timings.\"},"
      "\"limit\":{\"type\":\"integer\","
@@ -14655,42 +14657,6 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                 "invalid regex pattern (regex=true): check for unbalanced (), [], or {}", true);
         }
         cbm_regfree(&probe);
-    }
-
-    /* ── Phase 0.5: Multi-word → regex conversion ───────────── */
-    /* If pattern contains whitespace and is not already a regex, convert to a
-     * regex that matches all words in order: "foo bar baz" → "foo.*bar.*baz".
-     * This avoids requiring the exact phrase as a contiguous substring. */
-    if (!use_regex && strchr(pattern, ' ')) {
-        size_t plen = strlen(pattern);
-        /* Worst case: every char is a space → ".*" between each char */
-        char *regex_pat = malloc(plen * 3 + 1);
-        if (regex_pat) {
-            char *dst = regex_pat;
-            const char *src = pattern;
-            bool in_space = false;
-            while (*src) {
-                if (*src == ' ' || *src == '\t') {
-                    if (!in_space) {
-                        *dst++ = '.';
-                        *dst++ = '*';
-                        in_space = true;
-                    }
-                } else {
-                    /* Escape regex metacharacters from user input */
-                    if (strchr("\\^$.|?*+()[]{}", *src)) {
-                        *dst++ = '\\';
-                    }
-                    *dst++ = *src;
-                    in_space = false;
-                }
-                src++;
-            }
-            *dst = '\0';
-            free(pattern);
-            pattern = regex_pat;
-            use_regex = true;
-        }
     }
 
     /* ── Phase 1: Grep scan ──────────────────────────────────── */

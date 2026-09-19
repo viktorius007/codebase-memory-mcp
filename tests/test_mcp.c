@@ -8548,6 +8548,44 @@ TEST(tool_search_code_limit_declares_a_minimum_issue1511) {
     PASS();
 }
 
+TEST(tool_search_code_regex_description_states_mode_contract) {
+    static const char expected[] =
+        "false uses fixed-string matching; true applies the pattern as a regular expression.";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":37,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *result = root ? yyjson_obj_get(root, "result") : NULL;
+    yyjson_val *tools = result ? yyjson_obj_get(result, "tools") : NULL;
+    yyjson_val *description = NULL;
+    if (tools && yyjson_is_arr(tools)) {
+        size_t index, max;
+        yyjson_val *tool;
+        yyjson_arr_foreach(tools, index, max, tool) {
+            yyjson_val *name = yyjson_obj_get(tool, "name");
+            if (!name || !yyjson_is_str(name) || strcmp(yyjson_get_str(name), "search_code") != 0) {
+                continue;
+            }
+            yyjson_val *schema = yyjson_obj_get(tool, "inputSchema");
+            yyjson_val *props = schema ? yyjson_obj_get(schema, "properties") : NULL;
+            yyjson_val *regex = props ? yyjson_obj_get(props, "regex") : NULL;
+            description = regex ? yyjson_obj_get(regex, "description") : NULL;
+            break;
+        }
+    }
+    bool exact = description && yyjson_is_str(description) &&
+                 strcmp(yyjson_get_str(description), expected) == 0;
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
 TEST(tool_search_code_declares_independent_result_and_raw_content_paging) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     char *resp = cbm_mcp_server_handle(
@@ -8600,27 +8638,42 @@ TEST(tool_search_code_no_project) {
     PASS();
 }
 
-TEST(search_code_multi_word) {
+TEST(search_code_regex_flag_selects_exact_matching_mode) {
+    static const struct {
+        const char *pattern;
+        bool regex;
+        int expected_count;
+    } cases[] = {
+        {"HandleRequest error", false, 0},
+        {"HandleRequest error", true, 0},
+        {"HandleRequest() error", false, 1},
+        {"HandleRequest.*error", true, 1},
+    };
     char tmp[512];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* Multi-word query "HandleRequest error" — should find the line
-     * "func HandleRequest() error {" via regex conversion. */
-    char req[512];
-    snprintf(req, sizeof(req),
-             "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"search_code\","
-             "\"arguments\":{\"pattern\":\"HandleRequest error\","
-             "\"project\":\"test-project\"}}}");
-
-    char *resp = cbm_mcp_server_handle(srv, req);
-    ASSERT_NOT_NULL(resp);
-    /* Should find at least one result (not zero) */
-    ASSERT_TRUE(strstr(resp, "HandleRequest") != NULL);
-    /* Should NOT contain an error about "not found" */
-    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
-    free(resp);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"pattern\":\"%s\",\"project\":\"test-project\",\"regex\":%s,"
+                 "\"format\":\"json\",\"raw_limit\":10,\"max_output_tokens\":10000}",
+                 cases[i].pattern, cases[i].regex ? "true" : "false");
+        char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        ASSERT_NOT_NULL(root);
+        ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "total_grep_matches")),
+                  cases[i].expected_count);
+        ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "total_results")),
+                  cases[i].expected_count);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
 
     cleanup_snippet_dir(tmp);
     cbm_mcp_server_free(srv);
@@ -20554,9 +20607,10 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_negative_limit_is_not_echoed_issue1511);
     RUN_TEST(tool_search_code_limit_declares_a_minimum_issue1511);
+    RUN_TEST(tool_search_code_regex_description_states_mode_contract);
     RUN_TEST(tool_search_code_declares_independent_result_and_raw_content_paging);
     RUN_TEST(tool_search_code_no_project);
-    RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_regex_flag_selects_exact_matching_mode);
     RUN_TEST(search_code_full_preserves_utf8_source);
     RUN_TEST(search_code_raw_match_preserves_utf8_content);
     RUN_TEST(search_code_context_preserves_utf8_context);

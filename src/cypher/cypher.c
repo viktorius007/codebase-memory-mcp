@@ -1116,14 +1116,20 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
     }
 
     /* Value */
-    if (check(p, TOK_STRING) || check(p, TOK_NUMBER)) {
+    if (check(p, TOK_STRING)) {
         c->value = heap_strdup(advance(p)->text);
+        c->value_kind = CBM_SCALAR_KIND_STRING;
+    } else if (check(p, TOK_NUMBER)) {
+        c->value = heap_strdup(advance(p)->text);
+        c->value_kind = CBM_SCALAR_KIND_NUMBER;
     } else if (check(p, TOK_TRUE)) {
         advance(p);
         c->value = heap_strdup("true");
+        c->value_kind = CBM_SCALAR_KIND_BOOLEAN;
     } else if (check(p, TOK_FALSE)) {
         advance(p);
         c->value = heap_strdup("false");
+        c->value_kind = CBM_SCALAR_KIND_BOOLEAN;
     } else {
         snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
         cond_func_fields_free(c);
@@ -2258,6 +2264,7 @@ int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error) {
 /* A binding: maps variable names to nodes and/or edges */
 typedef struct {
     const char *var_names[CYP_MAX_VARS]; /* variable names (nodes) */
+    char *owned_var_names[CYP_MAX_VARS]; /* heap-owned names for virtual bindings */
     cbm_node_t var_nodes[CYP_MAX_VARS];  /* node data */
     int var_count;
     const char *edge_var_names[CYP_MAX_EDGE_VARS]; /* variable names (edges) */
@@ -2293,10 +2300,15 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
 
 /* Get node property by name.
  * store may be NULL; only needed for virtual degree properties. */
-static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
+static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz,
+                                     cbm_scalar_kind_t *kind);
 static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
 
-static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store) {
+static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store,
+                             cbm_scalar_kind_t *kind) {
+    if (kind) {
+        *kind = CBM_SCALAR_KIND_UNKNOWN;
+    }
     if (!n || !prop) {
         return "";
     }
@@ -2338,7 +2350,7 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
      * transitive_loop_depth, recursive) and any other persisted property to
      * WHERE/RETURN, e.g. WHERE n.loop_depth >= 2. */
     if (n->properties_json && n->properties_json[0] == '{') {
-        const char *v = json_extract_prop(n->properties_json, prop, out, CBM_SZ_512);
+        const char *v = json_extract_prop(n->properties_json, prop, out, CBM_SZ_512, kind);
         if (v && v[0]) {
             return v;
         }
@@ -2366,7 +2378,8 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
                 snprintf(out, CBM_SZ_512, "%d", full.end_line);
                 res = out;
             } else if (full.properties_json && full.properties_json[0] == '{') {
-                const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
+                const char *jv =
+                    json_extract_prop(full.properties_json, prop, out, CBM_SZ_512, kind);
                 if (jv && jv[0]) {
                     res = out;
                 }
@@ -2383,7 +2396,11 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
 /* Extract a string value from JSON properties_json by key.
  * Writes result to buf (up to buf_sz). Returns buf if found, "" otherwise.
  * Handles both string values ("key":"value") and numeric values ("key":1.5). */
-static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz) {
+static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz,
+                                     cbm_scalar_kind_t *kind) {
+    if (kind) {
+        *kind = CBM_SCALAR_KIND_UNKNOWN;
+    }
     if (!json || !key) {
         buf[0] = '\0';
         return buf;
@@ -2402,6 +2419,9 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
         p++;
     }
     if (*p == '"') {
+        if (kind) {
+            *kind = CBM_SCALAR_KIND_STRING;
+        }
         /* String value — honor backslash escapes: without this, an embedded \"
          * cuts the value short at the first escaped quote. */
         p++;
@@ -2445,6 +2465,12 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
         buf[i] = '\0';
     } else {
         /* Numeric or other scalar value */
+        if (kind && (isdigit((unsigned char)*p) || *p == '-')) {
+            *kind = CBM_SCALAR_KIND_NUMBER;
+        } else if (kind && (strncmp(p, "true", CYP_BUF_4) == 0 ||
+                            strncmp(p, "false", CYP_BUF_4 + SKIP_ONE) == 0)) {
+            *kind = CBM_SCALAR_KIND_BOOLEAN;
+        }
         size_t i = 0;
         while (*p && *p != ',' && *p != '}' && *p != ' ' && i < buf_sz - SKIP_ONE) {
             buf[i++] = *p++;
@@ -2457,7 +2483,10 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
 /* Get edge property by name. Uses rotating thread-local buffers to allow
  * multiple concurrent calls (e.g. projecting r.url_path, r.confidence
  * in the same row). */
-static const char *edge_prop(const cbm_edge_t *e, const char *prop) {
+static const char *edge_prop(const cbm_edge_t *e, const char *prop, cbm_scalar_kind_t *kind) {
+    if (kind) {
+        *kind = CBM_SCALAR_KIND_UNKNOWN;
+    }
     if (!e || !prop) {
         return "";
     }
@@ -2468,7 +2497,7 @@ static const char *edge_prop(const cbm_edge_t *e, const char *prop) {
     static CBM_TLS char ebufs[CYP_BUF_8][CBM_SZ_512];
     static CBM_TLS int ebuf_idx = 0;
     char *buf = ebufs[ebuf_idx++ & CYP_EBUF_MASK];
-    json_extract_prop(e->properties_json, prop, buf, CBM_SZ_512);
+    json_extract_prop(e->properties_json, prop, buf, CBM_SZ_512, kind);
     return buf;
 }
 
@@ -2550,6 +2579,7 @@ static void binding_set_edge(binding_t *b, const char *var, const cbm_edge_t *ed
 /* Free all deep-copied nodes and edges in a binding */
 static void binding_free(binding_t *b) {
     for (int i = 0; i < b->var_count; i++) {
+        free(b->owned_var_names[i]);
         node_fields_free(&b->var_nodes[i]);
     }
     for (int i = 0; i < b->edge_var_count; i++) {
@@ -2561,7 +2591,8 @@ static void binding_free(binding_t *b) {
 static void binding_copy(binding_t *dst, const binding_t *src) {
     dst->var_count = src->var_count;
     for (int i = 0; i < src->var_count; i++) {
-        dst->var_names[i] = src->var_names[i]; /* AST-owned, not freed */
+        dst->owned_var_names[i] = src->owned_var_names[i] ? heap_strdup(src->var_names[i]) : NULL;
+        dst->var_names[i] = dst->owned_var_names[i] ? dst->owned_var_names[i] : src->var_names[i];
         node_deep_copy(&dst->var_nodes[i], &src->var_nodes[i]);
     }
     dst->edge_var_count = src->edge_var_count;
@@ -2586,6 +2617,7 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
         return;
     }
     b->var_names[b->var_count] = var; /* not owned — points to AST string */
+    b->owned_var_names[b->var_count] = NULL;
     node_deep_copy(&b->var_nodes[b->var_count], node);
     b->var_count++;
 }
@@ -2594,7 +2626,9 @@ static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *ite
                                       size_t bufsz);
 
 /* Resolve the actual property value for a condition from a binding */
-static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b) {
+static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b,
+                                           cbm_scalar_kind_t *kind) {
+    *kind = CBM_SCALAR_KIND_UNKNOWN;
     /* Multi-arg scalar function LHS: coalesce(f.depth, 0) >= 2 (#874).
      * Evaluated through the same code path as RETURN projections. The value is
      * consumed by eval_condition before any other condition is resolved, so a
@@ -2612,26 +2646,30 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
 
     cbm_edge_t *e = binding_get_edge(b, c->variable);
     if (e) {
-        return edge_prop(e, c->property);
+        return edge_prop(e, c->property, kind);
     }
     cbm_node_t *n = binding_get(b, c->variable);
     if (!n) {
         return NULL; /* unbound variable */
     }
     if (c->property) {
-        return node_prop(n, c->property, b->store);
+        return node_prop(n, c->property, b->store, kind);
     }
     /* Bare alias (e.g. post-WITH virtual var) — use node name directly */
     return n->name ? n->name : "";
 }
 
 /* Evaluate a comparison operator between actual and expected strings. */
-static bool eval_comparison_op(const char *op, const char *actual, const char *expected) {
+static bool eval_comparison_op(const char *op, const char *actual, cbm_scalar_kind_t actual_kind,
+                               const char *expected, cbm_scalar_kind_t expected_kind) {
+    bool boolean_kind_mismatch =
+        actual_kind != CBM_SCALAR_KIND_UNKNOWN && actual_kind != expected_kind &&
+        (actual_kind == CBM_SCALAR_KIND_BOOLEAN || expected_kind == CBM_SCALAR_KIND_BOOLEAN);
     if (strcmp(op, "=") == 0) {
-        return strcmp(actual, expected) == 0;
+        return !boolean_kind_mismatch && strcmp(actual, expected) == 0;
     }
     if (strcmp(op, "<>") == 0) {
-        return strcmp(actual, expected) != 0;
+        return boolean_kind_mismatch || strcmp(actual, expected) != 0;
     }
     if (strcmp(op, "=~") == 0) {
         cbm_regex_t re;
@@ -2713,7 +2751,8 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         return c->negated ? !result : result;
     }
 
-    const char *actual = resolve_condition_value(c, b);
+    cbm_scalar_kind_t actual_kind;
+    const char *actual = resolve_condition_value(c, b, &actual_kind);
     /* coalesce(var.prop, literal) (#874): a missing/empty property value
      * falls back to the literal default before the operator runs. */
     if (c->coalesce_default && (!actual || actual[0] == '\0')) {
@@ -2747,7 +2786,7 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         return c->negated ? !result : result;
     }
 
-    result = eval_comparison_op(c->op, actual, c->value);
+    result = eval_comparison_op(c->op, actual, actual_kind, c->value, c->value_kind);
     return c->negated ? !result : result;
 }
 
@@ -2812,7 +2851,7 @@ static bool looks_like_regex(const char *s) {
 static bool check_inline_props(const cbm_node_t *n, const cbm_prop_filter_t *props, int count,
                                cbm_store_t *store) {
     for (int i = 0; i < count; i++) {
-        const char *actual = node_prop(n, props[i].key, store);
+        const char *actual = node_prop(n, props[i].key, store, NULL);
         if (looks_like_regex(props[i].value)) {
             cbm_regex_t re;
             if (cbm_regcomp(&re, props[i].value, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
@@ -2944,12 +2983,12 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
         /* Bare `RETURN r` on an edge: surface the full properties JSON
          * (or "{}" if none) so callers can inspect timestamps, weights,
          * etc. without naming each property. */
-        return prop ? edge_prop(e, prop) : (e->properties_json ? e->properties_json : "{}");
+        return prop ? edge_prop(e, prop, NULL) : (e->properties_json ? e->properties_json : "{}");
     }
     cbm_node_t *n = binding_get(b, var);
     if (n) {
         if (prop) {
-            return node_prop(n, prop, b->store);
+            return node_prop(n, prop, b->store, NULL);
         }
         return n->name ? n->name : "";
     }
@@ -4029,9 +4068,10 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
 
 /* Add a virtual variable binding for one WITH item */
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
-    cbm_node_t vn = {.name = heap_strdup(val), .qualified_name = heap_strdup(alias)};
+    cbm_node_t vn = {.name = heap_strdup(val)};
     if (vb->var_count < CYP_BUF_16) {
-        vb->var_names[vb->var_count] = vn.qualified_name;
+        vb->owned_var_names[vb->var_count] = heap_strdup(alias);
+        vb->var_names[vb->var_count] = vb->owned_var_names[vb->var_count];
         vb->var_nodes[vb->var_count] = vn;
         vb->var_count++;
     }
@@ -4097,6 +4137,17 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                 }
                 with_add_vbinding_var(&vb, alias, vbuf);
             } else {
+                if (aggs[a].group_node_ids[ci] > 0 && vb.store) {
+                    cbm_node_t full = {0};
+                    if (cbm_store_find_node_by_id(vb.store, aggs[a].group_node_ids[ci], &full) ==
+                        CBM_STORE_OK) {
+                        const char *node_alias =
+                            wc->items[ci].alias ? wc->items[ci].alias : wc->items[ci].variable;
+                        binding_set(&vb, node_alias, &full);
+                        node_fields_free(&full);
+                        continue;
+                    }
+                }
                 with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci]);
                 /* Tag the carried virtual var with the node id (when the group
                  * var is a node) so node_prop can re-fetch its full properties. */
@@ -4117,6 +4168,15 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
         binding_t vb = {0};
         vb.store = bindings[bi].store; /* so node_prop can re-fetch / compute on the projection */
         for (int ci = 0; ci < wc->count; ci++) {
+            if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
+                cbm_node_t *node = binding_get(&bindings[bi], wc->items[ci].variable);
+                if (node) {
+                    const char *node_alias =
+                        wc->items[ci].alias ? wc->items[ci].alias : wc->items[ci].variable;
+                    binding_set(&vb, node_alias, node);
+                    continue;
+                }
+            }
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
             char func_buf[CBM_SZ_512];
@@ -4301,7 +4361,7 @@ static void build_star_columns(result_builder_t *rb, const char **vars, int vc) 
 static void project_star_var(binding_t *b, const char *var, const char **vals) {
     cbm_edge_t *edge = binding_get_edge(b, var);
     if (edge) {
-        vals[0] = edge_prop(edge, "type");
+        vals[0] = edge_prop(edge, "type", NULL);
         vals[SKIP_ONE] = "";
         vals[PAIR_LEN] = "";
         vals[CYP_TRIPLE] = "";
