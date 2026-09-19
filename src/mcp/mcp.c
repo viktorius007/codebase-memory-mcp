@@ -9533,8 +9533,8 @@ render_trace_output:;
             in_total++;
         }
     }
-    bool out_semantic_lower_bound = trace_semantic_affected && out_total > 0;
-    bool in_semantic_lower_bound = trace_semantic_affected && in_total > 0;
+    bool out_semantic_lower_bound = trace_semantic_affected;
+    bool in_semantic_lower_bound = trace_semantic_affected;
 
     free(json);
     json = NULL;
