@@ -15799,6 +15799,51 @@ TEST(seal_cs_shared_registry_readonly) {
     PASS();
 }
 
+TEST(cs_cross_registry_handles_empty_foreign_and_csharp_definitions) {
+    CBMLSPDef defs[3] = {
+        {.qualified_name = "foreign.helper",
+         .short_name = "helper",
+         .label = "Function",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "test.mod.Box",
+         .short_name = "Box",
+         .label = "Class",
+         .def_module_qn = "test.mod",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "test.mod.Box.Unwrap",
+         .short_name = "Unwrap",
+         .label = "Method",
+         .receiver_type = "test.mod.Box",
+         .def_module_qn = "test.mod",
+         .lang = CBM_LANG_CSHARP},
+    };
+
+    CBMArena empty_arena;
+    cbm_arena_init(&empty_arena);
+    CBMTypeRegistry *empty = cbm_cs_build_cross_registry(&empty_arena, NULL, 0);
+    ASSERT_NOT_NULL(empty);
+    ASSERT_TRUE(empty->read_only);
+    cbm_arena_destroy(&empty_arena);
+
+    CBMArena foreign_arena;
+    cbm_arena_init(&foreign_arena);
+    CBMTypeRegistry *foreign = cbm_cs_build_cross_registry(&foreign_arena, defs, 1);
+    ASSERT_NOT_NULL(foreign);
+    ASSERT_TRUE(foreign->read_only);
+    ASSERT_NULL(cbm_registry_lookup_func(foreign, "foreign.helper"));
+    cbm_arena_destroy(&foreign_arena);
+
+    CBMArena csharp_arena;
+    cbm_arena_init(&csharp_arena);
+    CBMTypeRegistry *csharp = cbm_cs_build_cross_registry(&csharp_arena, defs + 1, 2);
+    ASSERT_NOT_NULL(csharp);
+    ASSERT_TRUE(csharp->read_only);
+    ASSERT_NOT_NULL(cbm_registry_lookup_type(csharp, "test.mod.Box"));
+    ASSERT_NOT_NULL(cbm_registry_lookup_func(csharp, "test.mod.Box.Unwrap"));
+    cbm_arena_destroy(&csharp_arena);
+    PASS();
+}
+
 TEST(seal_ts_shared_registry_readonly) {
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -16381,6 +16426,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_method_return_refinement_is_copy_on_write);
     RUN_TEST(seal_py_shared_registry_readonly_fields);
     RUN_TEST(seal_cs_shared_registry_readonly);
+    RUN_TEST(cs_cross_registry_handles_empty_foreign_and_csharp_definitions);
     RUN_TEST(seal_ts_shared_registry_readonly);
     RUN_TEST(seal_go_shared_registry_readonly);
     RUN_TEST(registry_short_name_indexes);

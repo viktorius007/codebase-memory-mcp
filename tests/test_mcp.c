@@ -11085,20 +11085,26 @@ TEST(search_code_reports_phase_timings_only_in_debug_mode) {
     char *response = cbm_mcp_handle_tool(
         srv, "search_code", "{\"pattern\":\"HandleRequest\",\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(response);
-    ASSERT_NULL(strstr(response, "scope_ms"));
-    ASSERT_NULL(strstr(response, "scan_ms"));
-    ASSERT_NULL(strstr(response, "enrich_ms"));
-    ASSERT_NOT_NULL(strstr(response, "elapsed_ms"));
+    bool normal_ok = strstr(response, "\"isError\":true") == NULL;
+    bool normal_shape =
+        strstr(response, "scope_ms") == NULL && strstr(response, "scan_ms") == NULL &&
+        strstr(response, "enrich_ms") == NULL && strstr(response, "elapsed_ms") != NULL;
+    if (!normal_ok || !normal_shape) {
+        fprintf(stderr, "search_code normal response: %.1000s\n", response);
+    }
     free(response);
 
     response = cbm_mcp_handle_tool(
         srv, "search_code",
         "{\"pattern\":\"HandleRequest\",\"project\":\"test-project\",\"debug\":true}");
     ASSERT_NOT_NULL(response);
-    ASSERT_NOT_NULL(strstr(response, "scope_ms"));
-    ASSERT_NOT_NULL(strstr(response, "scan_ms"));
-    ASSERT_NOT_NULL(strstr(response, "enrich_ms"));
-    ASSERT_NOT_NULL(strstr(response, "elapsed_ms"));
+    bool debug_ok = strstr(response, "\"isError\":true") == NULL;
+    bool debug_shape =
+        strstr(response, "scope_ms") != NULL && strstr(response, "scan_ms") != NULL &&
+        strstr(response, "enrich_ms") != NULL && strstr(response, "elapsed_ms") != NULL;
+    if (!debug_ok || !debug_shape) {
+        fprintf(stderr, "search_code debug response: %.1000s\n", response);
+    }
     free(response);
 
     response = cbm_mcp_handle_tool(
@@ -11106,14 +11112,24 @@ TEST(search_code_reports_phase_timings_only_in_debug_mode) {
         "{\"pattern\":\"HandleRequest\",\"project\":\"test-project\",\"format\":\"json\","
         "\"debug\":true}");
     ASSERT_NOT_NULL(response);
-    ASSERT_NOT_NULL(strstr(response, "\\\"scope_ms\\\":"));
-    ASSERT_NOT_NULL(strstr(response, "\\\"scan_ms\\\":"));
-    ASSERT_NOT_NULL(strstr(response, "\\\"enrich_ms\\\":"));
-    ASSERT_NOT_NULL(strstr(response, "\\\"elapsed_ms\\\":"));
+    bool json_ok = strstr(response, "\"isError\":true") == NULL;
+    bool json_shape = strstr(response, "\\\"scope_ms\\\":") != NULL &&
+                      strstr(response, "\\\"scan_ms\\\":") != NULL &&
+                      strstr(response, "\\\"enrich_ms\\\":") != NULL &&
+                      strstr(response, "\\\"elapsed_ms\\\":") != NULL;
+    if (!json_ok || !json_shape) {
+        fprintf(stderr, "search_code JSON debug response: %.1000s\n", response);
+    }
     free(response);
 
     cleanup_snippet_dir(tmp);
     cbm_mcp_server_free(srv);
+    ASSERT_TRUE(normal_ok);
+    ASSERT_TRUE(normal_shape);
+    ASSERT_TRUE(debug_ok);
+    ASSERT_TRUE(debug_shape);
+    ASSERT_TRUE(json_ok);
+    ASSERT_TRUE(json_shape);
     PASS();
 }
 
@@ -14634,23 +14650,29 @@ TEST(tool_detect_changes_pages_changed_files_and_honors_semantic_budget) {
     response = cbm_mcp_handle_tool(srv, "detect_changes",
                                    "{\"project\":\"detect-pages-project\",\"base_branch\":\"HEAD\","
                                    "\"scope\":\"files\",\"format\":\"json\"}");
-    ASSERT_NOT_NULL(response);
-    inner = extract_text_content(response);
-    ASSERT_NOT_NULL(inner);
-    doc = yyjson_read(inner, strlen(inner), 0);
-    ASSERT_NOT_NULL(doc);
-    root = yyjson_doc_get_root(doc);
-    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "snapshot_cursor_unavailable")));
-    ASSERT_NULL(yyjson_obj_get(root, "changed_next_cursor"));
-    yyjson_doc_free(doc);
+    inner = response ? extract_text_content(response) : NULL;
+    doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    root = doc ? yyjson_doc_get_root(doc) : NULL;
+    bool snapshot_cursor_withheld =
+        root && yyjson_get_bool(yyjson_obj_get(root, "snapshot_cursor_unavailable"));
+    bool snapshot_cursor_absent = root && !yyjson_obj_get(root, "changed_next_cursor");
+    if (!snapshot_cursor_withheld || !snapshot_cursor_absent) {
+        fprintf(stderr, "detect_changes incomplete snapshot response: %.1000s\n",
+                response ? response : "(null)");
+    }
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
     free(inner);
     free(response);
 
     response = cbm_mcp_handle_tool(srv, "detect_changes", cursor_args);
-    ASSERT_NOT_NULL(response);
-    inner = extract_text_content(response);
-    ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "snapshot_unavailable"));
+    inner = response ? extract_text_content(response) : NULL;
+    bool replay_rejected = inner && strstr(inner, "snapshot_unavailable") != NULL;
+    if (!replay_rejected) {
+        fprintf(stderr, "detect_changes incomplete snapshot replay response: %.1000s\n",
+                response ? response : "(null)");
+    }
     free(inner);
     free(response);
     cbm_mcp_server_set_snapshot_read_test_hook(srv, NULL, NULL);
@@ -14753,6 +14775,9 @@ TEST(tool_detect_changes_pages_changed_files_and_honors_semantic_budget) {
     free(saved_cache_copy);
     ASSERT_EQ(th_rmtree(cache), 0);
     ASSERT_EQ(th_rmtree(repo), 0);
+    ASSERT_TRUE(snapshot_cursor_withheld);
+    ASSERT_TRUE(snapshot_cursor_absent);
+    ASSERT_TRUE(replay_rejected);
     PASS();
 }
 

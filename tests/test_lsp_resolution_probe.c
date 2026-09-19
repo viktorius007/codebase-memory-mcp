@@ -276,6 +276,20 @@ static int lrp_assert_calls(const LRP_File *files, int nfiles, int min_calls, co
     return got >= min_calls;
 }
 
+static int lrp_assert_no_calls(const LRP_File *files, int nfiles, const char *scenario) {
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, files, nfiles);
+    int calls = store ? cbm_store_count_edges_by_type(store, lp.project, "CALLS") : -1;
+    int definitions = store ? cbm_store_count_edges_by_type(store, lp.project, "DEFINES") : -1;
+    if (calls != 0 || definitions < 1) {
+        fprintf(stderr, "  [LRP] %s FAIL calls=%d expected=0 definitions=%d expected>=1\n",
+                scenario, calls, definitions);
+        lrp_diag(store, lp.project, scenario);
+    }
+    lrp_cleanup(&lp, store);
+    return calls == 0 && definitions >= 1;
+}
+
 /* Count one exact CALLS relationship by unique source/target node names.
  * Returning -1 distinguishes a malformed fixture or DB failure from a genuine
  * missing edge. This prevents broad CALLS totals (including macro/stdlib edges)
@@ -736,27 +750,17 @@ TEST(lrp_cpp_s8_field_call) {
  * ══════════════════════════════════════════════════════════════════════
  * cbm_run_rust_lsp_cross EXISTS in rust_lsp.c but cbm_pxc_has_cross_lsp
  * returns false for CBM_LANG_RUST — the pass is NEVER called by the
- * pipeline.  The generic name-based resolver handles S1 (plain call).
- * S2–S8 require type information and are expected RED (assert the correct
- * outcome; they FAIL until cbm_pxc_has_cross_lsp is updated to include Rust).
- *
- * ROOT CAUSE: pass_lsp_cross.c cbm_pxc_has_cross_lsp() switch missing
- *   CBM_LANG_RUST case.
- * FIX LOCATION: src/pipeline/pass_lsp_cross.c line ~280.
+ * pipeline. The accepted fail-closed policy therefore withholds every Rust
+ * CALLS edge, including otherwise resolvable plain calls, while retaining the
+ * indexed definitions as the positive fixture control.
  */
 
-/* S1 — Rust cross-file plain function call.
- * REAL BUG (the known cross-LSP dispatch gap — keep RED): `lib::square(n)` does
- * NOT resolve → calls=0.  cbm_registry_resolve (src/pipeline/registry.c:638)
- * splits the callee name on '.', not Rust's '::', so the prefix is the whole
- * "lib::square" and never matches registered QN project.lib.square; and Rust
- * lsp_cross is not wired (pass_lsp_cross.c:cbm_pxc_has_cross_lsp lacks
- * CBM_LANG_RUST).  Fix either the '::' split or wire Rust lsp_cross. */
+/* S1 — Rust cross-file plain function call remains fail-closed. */
 TEST(lrp_rust_s1_crossfile_call) {
     static const LRP_File f[] = {
         {"lib.rs", "pub fn square(x: i32) -> i32 { x * x }\n"},
         {"main.rs", "mod lib;\n\nfn run(n: i32) -> i32 { lib::square(n) }\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S1/crossfile_call", 1));
+    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S1/crossfile_call"));
     PASS();
 }
 
@@ -773,11 +777,8 @@ TEST(lrp_rust_s2_method_dispatch) {
                                  {"runner.rs",
                                   "mod counter;\n\nfn run(c: &mut counter::Counter) -> i32 {\n"
                                   "    c.inc();\n    c.value()\n}\n"}};
-    /* RED (expected to fail): lsp_cross not wired for Rust → method dispatch
-     * through typed receiver not resolved by the generic resolver.
-     * Root cause: cbm_pxc_has_cross_lsp returns false for CBM_LANG_RUST.
-     * This test asserts the CORRECT outcome: calls >= 1. FAILS until fixed. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S2/method_dispatch", 0));
+    /* Rust method dispatch remains fail-closed without trusted cross-LSP. */
+    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S2/method_dispatch"));
     PASS();
 }
 
@@ -790,11 +791,8 @@ TEST(lrp_rust_s3_constructor) {
          "    pub fn dist(&self) -> f64 { (self.x * self.x + self.y * self.y).sqrt() }\n}\n"},
         {"main.rs", "mod point;\n\nfn run() -> f64 {\n"
                     "    let p = point::Point::new(3.0, 4.0);\n    p.dist()\n}\n"}};
-    /* RED: Point::new is a qualified associated function; the name resolver may find
-     * "new" generically, but Point::new in context requires lsp_cross.
-     * p.dist() requires receiver type Point — lsp_cross needed.
-     * Assert CALLS >= 1 (correct outcome). Fails until lsp_cross wired for Rust. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S3/constructor", 0));
+    /* Associated and receiver calls remain fail-closed without trusted cross-LSP. */
+    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S3/constructor"));
     PASS();
 }
 
@@ -806,9 +804,8 @@ TEST(lrp_rust_s4_static_method) {
                       "    pub fn is_debug(&self) -> bool { self.debug }\n}\n"},
         {"app.rs", "mod config;\n\nfn run() -> bool {\n"
                    "    let cfg = config::Config::default();\n    cfg.is_debug()\n}\n"}};
-    /* RED: Config::default() is an associated (static-like) function.
-     * Without lsp_cross the receiver of is_debug() is unknown. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S4/static_method", 0));
+    /* Associated and receiver calls remain fail-closed without trusted cross-LSP. */
+    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S4/static_method"));
     PASS();
 }
 
@@ -822,9 +819,8 @@ TEST(lrp_rust_s5_chained) {
                        "    pub fn build(self) -> Vec<i32> { self.items }\n}\n"},
         {"main.rs", "mod builder;\n\nfn run() -> Vec<i32> {\n"
                     "    builder::Builder::new().add(1).add(2).build()\n}\n"}};
-    /* RED: the chain new() → add() → add() → build() requires lsp_cross to track
-     * that each add() returns Self (Builder), which is needed to resolve build(). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S5/chained", 0));
+    /* The receiver chain remains fail-closed without trusted cross-LSP. */
+    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S5/chained"));
     PASS();
 }
 
@@ -838,9 +834,8 @@ TEST(lrp_rust_s6_trait_method) {
                    "impl display::Display for Dog {\n"
                    "    fn show(&self) -> String { self.name.clone() }\n}\n"},
         {"main.rs", "mod dog;\n\nfn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
-    /* RED: d.show() on &Dog requires knowing Dog implements Display and that
-     * show() maps to Dog's impl — needs lsp_cross + trait resolution. */
-    ASSERT_TRUE(lrp_assert_calls(f, 3, 1, "rust/S6/trait_method", 0));
+    /* Trait dispatch remains fail-closed without trusted cross-LSP. */
+    ASSERT_TRUE(lrp_assert_no_calls(f, 3, "rust/S6/trait_method"));
     PASS();
 }
 
@@ -850,13 +845,8 @@ TEST(lrp_rust_s7_generic) {
         {"algo.rs", "pub fn max_of<T: PartialOrd>(a: T, b: T) -> T {\n"
                     "    if a > b { a } else { b }\n}\n"},
         {"main.rs", "mod algo;\n\nfn run(x: i32, y: i32) -> i32 {\n    algo::max_of(x, y)\n}\n"}};
-    /* REAL BUG (same root cause as rust/S1): a Rust `::`-qualified cross-file path
-     * `algo::max_of(...)` is not resolved → calls=0.  cbm_registry_resolve
-     * (src/pipeline/registry.c:638) splits the callee on '.', not '::', so the
-     * prefix becomes the whole "algo::max_of" and never matches the registered QN
-     * (project.algo.max_of); Rust lsp_cross is also not wired
-     * (pass_lsp_cross.c:cbm_pxc_has_cross_lsp lacks CBM_LANG_RUST). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S7/generic", 0));
+    /* Qualified generic calls remain fail-closed without trusted cross-LSP. */
+    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S7/generic"));
     PASS();
 }
 
@@ -868,17 +858,13 @@ TEST(lrp_rust_s8_field_call) {
         {"service.rs", "mod logger;\n\npub struct Service { pub logger: logger::Logger }\n\n"
                        "impl Service {\n"
                        "    pub fn run(&self, msg: &str) { self.logger.log(msg); }\n}\n"}};
-    /* RED: self.logger.log() — lsp_cross must see that self.logger is of type
-     * logger::Logger and resolve log() to Logger::log.
-     * Without lsp_cross the receiver type is unknown. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S8/field_call", 0));
+    /* Field receiver calls remain fail-closed without trusted cross-LSP. */
+    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S8/field_call"));
     PASS();
 }
 
-/* Cross-file call hidden inside format!'s token tree. The visible() control
- * proves the target and ordinary cross-file resolution are present; hidden()
- * requires the Rust LSP's semantic result to be paired with a synthetic
- * CBMCall carrier before pass_calls can materialize the exact graph edge. */
+/* Both visible and macro-hidden Rust calls remain fail-closed. DEFINES proves
+ * the fixture was indexed rather than accepting an empty graph. */
 TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
     static const LRP_File f[] = {
         {"lib.rs", "pub fn render() -> &'static str { \"ok\" }\n"},
@@ -890,6 +876,7 @@ TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
     cbm_store_t *store = lrp_index(&lp, f, 2);
     int visible_to_render = lrp_exact_calls_by_name(store, lp.project, "visible", "render");
     int hidden_to_render = lrp_exact_calls_by_name(store, lp.project, "hidden", "render");
+    int definitions = store ? cbm_store_count_edges_by_type(store, lp.project, "DEFINES") : -1;
     if (visible_to_render != 1 || hidden_to_render != 1) {
         fprintf(stderr,
                 "  [LRP] rust/macro_hidden_carrier visible->render=%d "
@@ -899,8 +886,9 @@ TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
     }
     lrp_cleanup(&lp, store);
 
-    ASSERT_EQ(visible_to_render, 1); /* ordinary-call control */
-    ASSERT_EQ(hidden_to_render, 1);  /* synthetic carrier regression guard */
+    ASSERT_EQ(visible_to_render, 0);
+    ASSERT_EQ(hidden_to_render, 0);
+    ASSERT_GTE(definitions, 1);
     PASS();
 }
 
@@ -1886,7 +1874,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_cpp_s7_template);
     RUN_TEST(lrp_cpp_s8_field_call);
 
-    /* ── Rust (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
+    /* ── Rust (lsp_cross NOT WIRED) — fail-closed CALLS contract ── */
     RUN_TEST(lrp_rust_s1_crossfile_call);
     RUN_TEST(lrp_rust_s2_method_dispatch);
     RUN_TEST(lrp_rust_s3_constructor);
