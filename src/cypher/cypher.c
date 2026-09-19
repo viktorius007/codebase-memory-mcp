@@ -2329,20 +2329,29 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     buf_idx = (buf_idx + SKIP_ONE) % CYP_BUF_8;
 
     if (strcmp(prop, "start_line") == 0) {
+        if (kind) {
+            *kind = CBM_SCALAR_KIND_NUMBER;
+        }
         snprintf(out, CBM_SZ_512, "%d", n->start_line);
         return out;
     }
     if (strcmp(prop, "end_line") == 0) {
+        if (kind) {
+            *kind = CBM_SCALAR_KIND_NUMBER;
+        }
         snprintf(out, CBM_SZ_512, "%d", n->end_line);
         return out;
     }
     /* Virtual computed properties: in_degree/out_degree via CALLS edges.
-     * Enables Cypher dead-code detection: WHERE n.in_degree = '0'. */
+     * Enables Cypher dead-code detection: WHERE n.in_degree = 0. */
     if (store && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0)) {
         int in_deg = 0;
         int out_deg = 0;
         cbm_store_node_degree(store, n->id, &in_deg, &out_deg);
         int val = (strcmp(prop, "in_degree") == 0) ? in_deg : out_deg;
+        if (kind) {
+            *kind = CBM_SCALAR_KIND_NUMBER;
+        }
         snprintf(out, CBM_SZ_512, "%d", val);
         return out;
     }
@@ -2373,9 +2382,15 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
                 snprintf(out, CBM_SZ_512, "%s", rv);
                 res = out;
             } else if (strcmp(prop, "start_line") == 0) {
+                if (kind) {
+                    *kind = CBM_SCALAR_KIND_NUMBER;
+                }
                 snprintf(out, CBM_SZ_512, "%d", full.start_line);
                 res = out;
             } else if (strcmp(prop, "end_line") == 0) {
+                if (kind) {
+                    *kind = CBM_SCALAR_KIND_NUMBER;
+                }
                 snprintf(out, CBM_SZ_512, "%d", full.end_line);
                 res = out;
             } else if (full.properties_json && full.properties_json[0] == '{') {
@@ -2664,14 +2679,14 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
 /* Evaluate a comparison operator between actual and expected strings. */
 static bool eval_comparison_op(const char *op, const char *actual, cbm_scalar_kind_t actual_kind,
                                const char *expected, cbm_scalar_kind_t expected_kind) {
-    bool boolean_kind_mismatch =
-        actual_kind != CBM_SCALAR_KIND_UNKNOWN && actual_kind != expected_kind &&
-        (actual_kind == CBM_SCALAR_KIND_BOOLEAN || expected_kind == CBM_SCALAR_KIND_BOOLEAN);
+    bool known_kind_mismatch = actual_kind != CBM_SCALAR_KIND_UNKNOWN &&
+                               expected_kind != CBM_SCALAR_KIND_UNKNOWN &&
+                               actual_kind != expected_kind;
     if (strcmp(op, "=") == 0) {
-        return !boolean_kind_mismatch && strcmp(actual, expected) == 0;
+        return !known_kind_mismatch && strcmp(actual, expected) == 0;
     }
     if (strcmp(op, "<>") == 0) {
-        return boolean_kind_mismatch || strcmp(actual, expected) != 0;
+        return known_kind_mismatch || strcmp(actual, expected) != 0;
     }
     if (strcmp(op, "=~") == 0) {
         cbm_regex_t re;

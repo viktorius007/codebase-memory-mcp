@@ -595,6 +595,7 @@ static cbm_store_t *setup_cypher_boolean_kind_store(void) {
                               .label = "BooleanKind",
                               .name = "number",
                               .qualified_name = "bool_kind.number",
+                              .start_line = 1,
                               .properties_json = "{\"flag\":1}"};
 
     int64_t boolean_id = cbm_store_upsert_node(s, &boolean_node);
@@ -2052,12 +2053,73 @@ TEST(cypher_exec_json_boolean_string_and_number_equality_are_distinct) {
     PASS();
 }
 
-TEST(cypher_exec_json_number_keeps_quoted_numeric_equality) {
+TEST(cypher_exec_json_number_distinguishes_quoted_numeric_literal) {
     cbm_store_t *s = setup_cypher_boolean_kind_store();
     cbm_cypher_result_t r = {0};
 
-    int rc = cbm_cypher_execute(
-        s, "MATCH (n:BooleanKind) WHERE n.flag = '1' RETURN n.qualified_name", "bool_kind", 0, &r);
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (n:BooleanKind) WHERE n.flag = 1 "
+                                "RETURN n.qualified_name",
+                                "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "bool_kind.number");
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (n:BooleanKind) WHERE n.flag = '1' "
+                            "RETURN n.qualified_name",
+                            "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_start_line_matches_numeric_literal) {
+    cbm_store_t *s = setup_cypher_boolean_kind_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:BooleanKind {name: 'number'}) "
+                                "WHERE f.start_line = 1 RETURN f.qualified_name",
+                                "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "bool_kind.number");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_start_line_rejects_quoted_numeric_literal) {
+    cbm_store_t *s = setup_cypher_boolean_kind_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:BooleanKind {name: 'number'}) "
+                                "WHERE f.start_line = '1' RETURN f.qualified_name",
+                                "bool_kind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_start_line_differs_from_quoted_numeric_literal) {
+    cbm_store_t *s = setup_cypher_boolean_kind_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:BooleanKind {name: 'number'}) "
+                                "WHERE f.start_line <> '1' RETURN f.qualified_name",
+                                "bool_kind", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 1);
     ASSERT_STR_EQ(r.rows[0][0], "bool_kind.number");
@@ -4746,7 +4808,10 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_no_results);
     RUN_TEST(cypher_exec_where_numeric);
     RUN_TEST(cypher_exec_json_boolean_string_and_number_equality_are_distinct);
-    RUN_TEST(cypher_exec_json_number_keeps_quoted_numeric_equality);
+    RUN_TEST(cypher_exec_json_number_distinguishes_quoted_numeric_literal);
+    RUN_TEST(cypher_exec_start_line_matches_numeric_literal);
+    RUN_TEST(cypher_exec_start_line_rejects_quoted_numeric_literal);
+    RUN_TEST(cypher_exec_start_line_differs_from_quoted_numeric_literal);
     RUN_TEST(cypher_exec_json_boolean_inequality_is_inverse_of_equality);
     RUN_TEST(cypher_exec_function_lhs_keeps_legacy_untyped_comparison);
     RUN_TEST(cypher_exec_relationship_json_boolean_equality_is_typed);
