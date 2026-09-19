@@ -7589,6 +7589,14 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
+    bool cycles_requested = aspect_explicitly_named(aspects_arr, "cycles");
+    bool cycles_semantic_affected = false;
+    if (cycles_requested) {
+        const char *cycle_edge_types[] = {"CALLS"};
+        rust_semantic_coverage_t coverage = rust_semantic_coverage_get(store, project);
+        cycles_semantic_affected = trace_semantic_edges_affected(cycle_edge_types, 1, coverage);
+    }
+
     /* Default (no aspects) = compact summary. The old default rendered ALL
      * aspects including the full file_tree — ~94KB (~23K tokens) on a
      * mid-size repo, a context bomb for the LLM consumers. Explicit
@@ -7843,7 +7851,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
         /* cycles: circular CALLS dependencies (SCCs of size > 1) — opt-in, it
          * scans the whole call graph. A quotient/condensation view. */
-        if (aspect_explicitly_named(aspects_arr, "cycles")) {
+        if (cycles_requested) {
             int64_t **members = NULL;
             int *sizes = NULL;
             int ncyc = 0;
@@ -7860,6 +7868,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                                         "call graph exceeded the scan budget; cycle list may be "
                                         "incomplete");
                 }
+                rust_semantic_add_note_tree(&sb, cycles_semantic_affected);
                 if (total_cyc > ncyc) {
                     char omit[CBM_SZ_128];
                     snprintf(omit, sizeof(omit), "cycles_omitted: %d  (showing the first %d)\n",
@@ -8123,7 +8132,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     append_cross_repo_summary(doc, root, &schema);
 
     /* cycles: SCCs of size > 1 in the CALLS graph (same model as tree). */
-    if (aspect_explicitly_named(aspects_arr, "cycles")) {
+    if (cycles_requested) {
         int64_t **members = NULL;
         int *sizes = NULL;
         int ncyc = 0;
@@ -8135,6 +8144,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_int(doc, root, "call_edges_scanned", scanned);
             yyjson_mut_obj_add_int(doc, root, "cycles_total", total_cyc);
             yyjson_mut_obj_add_bool(doc, root, "cycles_partial", etrunc);
+            rust_semantic_add_note_json(doc, root, cycles_semantic_affected);
             yyjson_mut_val *cyc = yyjson_mut_arr(doc);
             for (int c = 0; c < ncyc; c++) {
                 yyjson_mut_val *o = yyjson_mut_obj(doc);

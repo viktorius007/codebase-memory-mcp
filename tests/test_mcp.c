@@ -2890,6 +2890,71 @@ TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294) {
     PASS();
 }
 
+TEST(tool_get_architecture_cycles_caveats_partial_rust_calls) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "rust-cycle-coverage";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/rust-cycle-coverage"), CBM_STORE_OK);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "standalone",
+                       .qualified_name = "rust-cycle-coverage.main.standalone",
+                       .file_path = "src/main.rs",
+                       .start_line = 1,
+                       .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+
+    cbm_project_t project_row = {0};
+    ASSERT_EQ(cbm_store_get_project(store, project, &project_row), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {
+        .generation = project_row.indexed_at,
+        .index_mode = "full",
+        .recorded_at = "2026-09-20T00:00:00Z",
+        .recording_status = "complete",
+        .coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION,
+        .hash_records_complete = true,
+        .rust_semantic_gaps = CBM_RUST_SEMANTIC_GAP_BINDING_ORACLE_UNAVAILABLE,
+        .rust_semantic_gaps_known = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &meta), CBM_STORE_OK);
+    cbm_project_free_fields(&project_row);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "get_architecture",
+        "{\"project\":\"rust-cycle-coverage\",\"aspects\":[\"cycles\"],\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "call_edges_scanned")), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "cycles_total")), 0);
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "cycles_partial")));
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(root, "cycles")), 0);
+    ASSERT_EQ(assert_rust_semantic_note(root, true), 0);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "get_architecture",
+        "{\"project\":\"rust-cycle-coverage\",\"aspects\":[\"cycles\"],\"format\":\"tree\"}");
+    ASSERT_NOT_NULL(response);
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "call_edges_scanned: 0"));
+    ASSERT_NOT_NULL(strstr(inner, "cycles_total: 0"));
+    ASSERT_NOT_NULL(strstr(inner, "cycles: 0"));
+    ASSERT_NOT_NULL(strstr(inner, TEST_RUST_SEMANTIC_NOTE));
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* SCC condensation (get_architecture aspect "cycles"): a 3-function CALLS
  * cycle A->B->C->A must be reported as one circular dependency of size 3 with
  * all three members; a separate acyclic chain (D->E) must NOT appear. The
@@ -2901,6 +2966,21 @@ TEST(tool_get_architecture_cycles_detects_scc) {
     const char *proj = "cycproj";
     cbm_mcp_server_set_project(srv, proj);
     cbm_store_upsert_project(st, proj, "/tmp/cyc");
+
+    cbm_project_t project_row = {0};
+    ASSERT_EQ(cbm_store_get_project(st, proj, &project_row), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {
+        .generation = project_row.indexed_at,
+        .index_mode = "full",
+        .recorded_at = "2026-09-20T00:00:00Z",
+        .recording_status = "complete",
+        .coverage_version = CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION,
+        .hash_records_complete = true,
+        .rust_semantic_gaps = 0U,
+        .rust_semantic_gaps_known = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(st, proj, NULL, 0, &meta), CBM_STORE_OK);
+    cbm_project_free_fields(&project_row);
 
     const char *names[5] = {"A", "B", "C", "D", "E"};
     enum { LONG_CYCLE_QN_BYTES = 2500 };
@@ -2942,7 +3022,10 @@ TEST(tool_get_architecture_cycles_detects_scc) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "call_edges_scanned: 4"));
+    ASSERT_NOT_NULL(strstr(inner, "cycles_total: 1"));
     ASSERT_NOT_NULL(strstr(inner, "cycles: 1")); /* exactly one SCC of size>1 */
+    ASSERT_NULL(strstr(inner, "semantic_note:"));
     ASSERT_NOT_NULL(strstr(inner, long_cycle_qn));
     ASSERT_NOT_NULL(strstr(inner, "cycproj.m.B"));
     ASSERT_NOT_NULL(strstr(inner, "cycproj.m.C"));
@@ -2959,7 +3042,12 @@ TEST(tool_get_architecture_cycles_detects_scc) {
     ASSERT_NOT_NULL(inner);
     yyjson_doc *cycle_doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(cycle_doc);
-    yyjson_val *cycles = yyjson_obj_get(yyjson_doc_get_root(cycle_doc), "cycles");
+    yyjson_val *cycle_root = yyjson_doc_get_root(cycle_doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(cycle_root, "call_edges_scanned")), 4);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(cycle_root, "cycles_total")), 1);
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(cycle_root, "cycles_partial")));
+    ASSERT_EQ(assert_rust_semantic_note(cycle_root, false), 0);
+    yyjson_val *cycles = yyjson_obj_get(cycle_root, "cycles");
     yyjson_val *cycle = yyjson_arr_get_first(cycles);
     yyjson_val *members = cycle ? yyjson_obj_get(cycle, "members") : NULL;
     bool found_long_qn = false;
@@ -21117,6 +21205,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_grouped_dotless_qn_round_trips);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
+    RUN_TEST(tool_get_architecture_cycles_caveats_partial_rust_calls);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_get_code_snippet_omits_over_budget_whole_line);
