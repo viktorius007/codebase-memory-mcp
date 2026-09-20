@@ -7,6 +7,11 @@ set -euo pipefail
 
 ROOT="${CBM_MUTATION_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 MANIFEST="${CBM_MUTATION_MANIFEST:-$ROOT/tests/mutation/rust-scanner.tsv}"
+
+# Per-seed snapshot builds start from empty directories; without the compiler
+# cache every seed recompiles the whole test-runner cold. Resolved against
+# this script's own location because $ROOT may be a bare fixture checkout.
+. "$(cd "$(dirname "$0")" && pwd)/ccache-env.sh"
 STEP="initialization"
 ARTIFACT_DIR=""
 
