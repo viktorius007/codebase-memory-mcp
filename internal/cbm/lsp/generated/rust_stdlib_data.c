@@ -15,7 +15,7 @@
  *   - core::result::Result<T, E> + 17 methods
  *   - alloc::string::String + 22 methods
  *   - alloc::vec::Vec<T>     + 25 methods
- *   - alloc::collections::HashMap<K, V>, BTreeMap<K, V> + 12 methods each
+ *   - std::collections::HashMap<K, V>, alloc::collections::BTreeMap<K, V> + 12 methods each
  *   - core::iter::Iterator + 22 method signatures
  *   - alloc::boxed::Box<T> + 4 methods
  *   - core::fmt::{Display, Debug} traits with `fmt`
@@ -79,9 +79,9 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
     ADD_TYPE("core.result.Result", "Result", false);
     ADD_TYPE("alloc.string.String", "String", false);
     ADD_TYPE("alloc.vec.Vec", "Vec", false);
-    ADD_TYPE("alloc.collections.HashMap", "HashMap", false);
+    ADD_TYPE("std.collections.HashMap", "HashMap", false);
     ADD_TYPE("alloc.collections.BTreeMap", "BTreeMap", false);
-    ADD_TYPE("alloc.collections.HashSet", "HashSet", false);
+    ADD_TYPE("std.collections.HashSet", "HashSet", false);
     ADD_TYPE("alloc.collections.BTreeSet", "BTreeSet", false);
     ADD_TYPE("alloc.collections.VecDeque", "VecDeque", false);
     ADD_TYPE("alloc.boxed.Box", "Box", false);
@@ -259,21 +259,21 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
 
     /* ── HashMap<K, V> methods ─────────────────────────────────── */
     {
-        const char* T = "alloc.collections.HashMap";
-        ADD_FUNC(T, "new",         "alloc.collections.HashMap.new",         cbm_type_unknown());
-        ADD_FUNC(T, "with_capacity","alloc.collections.HashMap.with_capacity",cbm_type_unknown());
-        ADD_FUNC(T, "insert",      "alloc.collections.HashMap.insert",      cbm_type_unknown());
-        ADD_FUNC(T, "get",         "alloc.collections.HashMap.get",         cbm_type_unknown());
-        ADD_FUNC(T, "get_mut",     "alloc.collections.HashMap.get_mut",     cbm_type_unknown());
-        ADD_FUNC(T, "remove",      "alloc.collections.HashMap.remove",      cbm_type_unknown());
-        ADD_FUNC(T, "contains_key","alloc.collections.HashMap.contains_key",t_bool);
-        ADD_FUNC(T, "len",         "alloc.collections.HashMap.len",         t_usize);
-        ADD_FUNC(T, "is_empty",    "alloc.collections.HashMap.is_empty",    t_bool);
-        ADD_FUNC(T, "clear",       "alloc.collections.HashMap.clear",       t_unit);
-        ADD_FUNC(T, "keys",        "alloc.collections.HashMap.keys",        cbm_type_unknown());
-        ADD_FUNC(T, "values",      "alloc.collections.HashMap.values",      cbm_type_unknown());
-        ADD_FUNC(T, "iter",        "alloc.collections.HashMap.iter",        cbm_type_unknown());
-        ADD_FUNC(T, "entry",       "alloc.collections.HashMap.entry",       cbm_type_unknown());
+        const char* T = "std.collections.HashMap";
+        ADD_FUNC(T, "new",         "std.collections.HashMap.new",         cbm_type_unknown());
+        ADD_FUNC(T, "with_capacity","std.collections.HashMap.with_capacity",cbm_type_unknown());
+        ADD_FUNC(T, "insert",      "std.collections.HashMap.insert",      cbm_type_unknown());
+        ADD_FUNC(T, "get",         "std.collections.HashMap.get",         cbm_type_unknown());
+        ADD_FUNC(T, "get_mut",     "std.collections.HashMap.get_mut",     cbm_type_unknown());
+        ADD_FUNC(T, "remove",      "std.collections.HashMap.remove",      cbm_type_unknown());
+        ADD_FUNC(T, "contains_key","std.collections.HashMap.contains_key",t_bool);
+        ADD_FUNC(T, "len",         "std.collections.HashMap.len",         t_usize);
+        ADD_FUNC(T, "is_empty",    "std.collections.HashMap.is_empty",    t_bool);
+        ADD_FUNC(T, "clear",       "std.collections.HashMap.clear",       t_unit);
+        ADD_FUNC(T, "keys",        "std.collections.HashMap.keys",        cbm_type_unknown());
+        ADD_FUNC(T, "values",      "std.collections.HashMap.values",      cbm_type_unknown());
+        ADD_FUNC(T, "iter",        "std.collections.HashMap.iter",        cbm_type_unknown());
+        ADD_FUNC(T, "entry",       "std.collections.HashMap.entry",       cbm_type_unknown());
     }
     {
         const char* T = "alloc.collections.BTreeMap";
@@ -368,27 +368,15 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
         ADD_FUNC("core.ops.Div",            "div",       "core.ops.Div.div",           cbm_type_unknown());
     }
 
-    /* ── std re-exports (alias the alloc/core paths) ────────────
-     *
-     * Many prelude types (`String`, `Vec`, `HashMap`, `Arc`, `Box`, …)
-     * are defined in `alloc` and re-exported through `std`. When user
-     * code writes `use std::collections::HashMap;` the path the LSP
-     * sees is `std::collections::HashMap` — but our seed registers the
-     * methods under `alloc.collections.HashMap`. We patch this by
-     * also registering each std QN with an `alias_of` link, so the
-     * registry-aware lookups resolve through alias chains.
-     *
-     * The list mirrors the most-used `std` re-exports — adding more is
-     * cheap and harmless (an extra ~20 bytes per entry). */
+    /* The registered std aliases preserve the defining core/alloc owner.
+     * HashMap and HashSet are defined in std and need no re-export alias. */
     {
         struct ReExport { const char* std_qn; const char* alloc_qn; const char* short_name; };
         static const struct ReExport reexports[] = {
             {"std.string.String",            "alloc.string.String",            "String"},
             {"std.string.ToString",          "alloc.string.ToString",          "ToString"},
             {"std.vec.Vec",                  "alloc.vec.Vec",                  "Vec"},
-            {"std.collections.HashMap",      "alloc.collections.HashMap",      "HashMap"},
             {"std.collections.BTreeMap",     "alloc.collections.BTreeMap",     "BTreeMap"},
-            {"std.collections.HashSet",      "alloc.collections.HashSet",      "HashSet"},
             {"std.collections.BTreeSet",     "alloc.collections.BTreeSet",     "BTreeSet"},
             {"std.collections.VecDeque",     "alloc.collections.VecDeque",     "VecDeque"},
             {"std.boxed.Box",                "alloc.boxed.Box",                "Box"},
@@ -1271,18 +1259,18 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
         ADD_FUNC(T, "into_sorted_vec","alloc.collections.BinaryHeap.into_sorted_vec", cbm_type_unknown());
     }
     {
-        const char* T = "alloc.collections.HashSet";
-        ADD_FUNC(T, "new",        "alloc.collections.HashSet.new",        cbm_type_unknown());
-        ADD_FUNC(T, "insert",     "alloc.collections.HashSet.insert",     t_bool);
-        ADD_FUNC(T, "remove",     "alloc.collections.HashSet.remove",     t_bool);
-        ADD_FUNC(T, "contains",   "alloc.collections.HashSet.contains",   t_bool);
-        ADD_FUNC(T, "len",        "alloc.collections.HashSet.len",        t_usize);
-        ADD_FUNC(T, "is_empty",   "alloc.collections.HashSet.is_empty",   t_bool);
-        ADD_FUNC(T, "clear",      "alloc.collections.HashSet.clear",      t_unit);
-        ADD_FUNC(T, "iter",       "alloc.collections.HashSet.iter",       cbm_type_unknown());
-        ADD_FUNC(T, "intersection","alloc.collections.HashSet.intersection",cbm_type_unknown());
-        ADD_FUNC(T, "union",      "alloc.collections.HashSet.union",      cbm_type_unknown());
-        ADD_FUNC(T, "difference", "alloc.collections.HashSet.difference", cbm_type_unknown());
+        const char* T = "std.collections.HashSet";
+        ADD_FUNC(T, "new",        "std.collections.HashSet.new",        cbm_type_unknown());
+        ADD_FUNC(T, "insert",     "std.collections.HashSet.insert",     t_bool);
+        ADD_FUNC(T, "remove",     "std.collections.HashSet.remove",     t_bool);
+        ADD_FUNC(T, "contains",   "std.collections.HashSet.contains",   t_bool);
+        ADD_FUNC(T, "len",        "std.collections.HashSet.len",        t_usize);
+        ADD_FUNC(T, "is_empty",   "std.collections.HashSet.is_empty",   t_bool);
+        ADD_FUNC(T, "clear",      "std.collections.HashSet.clear",      t_unit);
+        ADD_FUNC(T, "iter",       "std.collections.HashSet.iter",       cbm_type_unknown());
+        ADD_FUNC(T, "intersection","std.collections.HashSet.intersection",cbm_type_unknown());
+        ADD_FUNC(T, "union",      "std.collections.HashSet.union",      cbm_type_unknown());
+        ADD_FUNC(T, "difference", "std.collections.HashSet.difference", cbm_type_unknown());
     }
     {
         const char* T = "alloc.collections.VecDeque";
@@ -1490,22 +1478,22 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
         ADD_FUNC(T, "fill_with",    "alloc.vec.Vec.fill_with",       t_unit);
     }
 
-    /* ── alloc::collections::HashMap extras ───────────────────── */
+    /* ── std::collections::HashMap extras ───────────────────── */
     {
-        const char* T = "alloc.collections.HashMap";
-        ADD_FUNC(T, "drain",        "alloc.collections.HashMap.drain",        cbm_type_unknown());
-        ADD_FUNC(T, "retain",       "alloc.collections.HashMap.retain",       t_unit);
-        ADD_FUNC(T, "extend",       "alloc.collections.HashMap.extend",       t_unit);
-        ADD_FUNC(T, "values_mut",   "alloc.collections.HashMap.values_mut",   cbm_type_unknown());
-        ADD_FUNC(T, "iter_mut",     "alloc.collections.HashMap.iter_mut",     cbm_type_unknown());
-        ADD_FUNC(T, "into_iter",    "alloc.collections.HashMap.into_iter",    cbm_type_unknown());
-        ADD_FUNC(T, "into_keys",    "alloc.collections.HashMap.into_keys",    cbm_type_unknown());
-        ADD_FUNC(T, "into_values",  "alloc.collections.HashMap.into_values",  cbm_type_unknown());
-        ADD_FUNC(T, "shrink_to_fit","alloc.collections.HashMap.shrink_to_fit",t_unit);
-        ADD_FUNC(T, "reserve",      "alloc.collections.HashMap.reserve",      t_unit);
-        ADD_FUNC(T, "capacity",     "alloc.collections.HashMap.capacity",     t_usize);
-        ADD_FUNC(T, "hasher",       "alloc.collections.HashMap.hasher",       cbm_type_unknown());
-        ADD_FUNC(T, "raw_entry",    "alloc.collections.HashMap.raw_entry",    cbm_type_unknown());
+        const char* T = "std.collections.HashMap";
+        ADD_FUNC(T, "drain",        "std.collections.HashMap.drain",        cbm_type_unknown());
+        ADD_FUNC(T, "retain",       "std.collections.HashMap.retain",       t_unit);
+        ADD_FUNC(T, "extend",       "std.collections.HashMap.extend",       t_unit);
+        ADD_FUNC(T, "values_mut",   "std.collections.HashMap.values_mut",   cbm_type_unknown());
+        ADD_FUNC(T, "iter_mut",     "std.collections.HashMap.iter_mut",     cbm_type_unknown());
+        ADD_FUNC(T, "into_iter",    "std.collections.HashMap.into_iter",    cbm_type_unknown());
+        ADD_FUNC(T, "into_keys",    "std.collections.HashMap.into_keys",    cbm_type_unknown());
+        ADD_FUNC(T, "into_values",  "std.collections.HashMap.into_values",  cbm_type_unknown());
+        ADD_FUNC(T, "shrink_to_fit","std.collections.HashMap.shrink_to_fit",t_unit);
+        ADD_FUNC(T, "reserve",      "std.collections.HashMap.reserve",      t_unit);
+        ADD_FUNC(T, "capacity",     "std.collections.HashMap.capacity",     t_usize);
+        ADD_FUNC(T, "hasher",       "std.collections.HashMap.hasher",       cbm_type_unknown());
+        ADD_FUNC(T, "raw_entry",    "std.collections.HashMap.raw_entry",    cbm_type_unknown());
     }
 
     /* ── std::sync extras ─────────────────────────────────────── */
@@ -1694,18 +1682,18 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
 
     /* ── HashSet extras ───────────────────────────────────────── */
     {
-        const char* T = "alloc.collections.HashSet";
-        ADD_FUNC(T, "extend",         "alloc.collections.HashSet.extend",         t_unit);
-        ADD_FUNC(T, "drain",          "alloc.collections.HashSet.drain",          cbm_type_unknown());
-        ADD_FUNC(T, "into_iter",      "alloc.collections.HashSet.into_iter",      cbm_type_unknown());
-        ADD_FUNC(T, "is_subset",      "alloc.collections.HashSet.is_subset",      t_bool);
-        ADD_FUNC(T, "is_superset",    "alloc.collections.HashSet.is_superset",    t_bool);
-        ADD_FUNC(T, "is_disjoint",    "alloc.collections.HashSet.is_disjoint",    t_bool);
-        ADD_FUNC(T, "symmetric_difference","alloc.collections.HashSet.symmetric_difference", cbm_type_unknown());
-        ADD_FUNC(T, "shrink_to_fit",  "alloc.collections.HashSet.shrink_to_fit",  t_unit);
-        ADD_FUNC(T, "reserve",        "alloc.collections.HashSet.reserve",        t_unit);
-        ADD_FUNC(T, "capacity",       "alloc.collections.HashSet.capacity",       t_usize);
-        ADD_FUNC(T, "hasher",         "alloc.collections.HashSet.hasher",         cbm_type_unknown());
+        const char* T = "std.collections.HashSet";
+        ADD_FUNC(T, "extend",         "std.collections.HashSet.extend",         t_unit);
+        ADD_FUNC(T, "drain",          "std.collections.HashSet.drain",          cbm_type_unknown());
+        ADD_FUNC(T, "into_iter",      "std.collections.HashSet.into_iter",      cbm_type_unknown());
+        ADD_FUNC(T, "is_subset",      "std.collections.HashSet.is_subset",      t_bool);
+        ADD_FUNC(T, "is_superset",    "std.collections.HashSet.is_superset",    t_bool);
+        ADD_FUNC(T, "is_disjoint",    "std.collections.HashSet.is_disjoint",    t_bool);
+        ADD_FUNC(T, "symmetric_difference","std.collections.HashSet.symmetric_difference", cbm_type_unknown());
+        ADD_FUNC(T, "shrink_to_fit",  "std.collections.HashSet.shrink_to_fit",  t_unit);
+        ADD_FUNC(T, "reserve",        "std.collections.HashSet.reserve",        t_unit);
+        ADD_FUNC(T, "capacity",       "std.collections.HashSet.capacity",       t_usize);
+        ADD_FUNC(T, "hasher",         "std.collections.HashSet.hasher",         cbm_type_unknown());
     }
 
     /* ── BTreeSet extras ──────────────────────────────────────── */

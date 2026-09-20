@@ -313,6 +313,41 @@ TEST(rustlsp_nested_use_aliases_resolve_exact_targets) {
     PASS();
 }
 
+TEST(rustlsp_collection_imports_preserve_library_owner) {
+    const char *source =
+        "use std::collections::{HashMap as Map, HashSet as Set, BTreeMap as Tree};\n"
+        "fn run(m: &Map<i32, i32>, s: &Set<i32>, t: &Tree<i32, i32>) {\n"
+        "    m.len(); s.len(); t.len();\n"
+        "    let _ = Map::<i32, i32>::new();\n"
+        "    let _ = Set::<i32>::new();\n"
+        "    let _ = Tree::<i32, i32>::new();\n"
+        "}\n";
+    const char *expected[] = {
+        "std.collections.HashMap.len", "std.collections.HashSet.len", "alloc.collections.BTreeMap.len",
+        "std.collections.HashMap.new", "std.collections.HashSet.new", "alloc.collections.BTreeMap.new",
+    };
+    CBMFileResult *r = extract_rust(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray cross = {0};
+    cbm_run_rust_lsp_cross(&arena, source, (int)strlen(source), "test.src.main",
+                          NULL, 0, NULL, NULL, 0, NULL, &cross);
+    const CBMResolvedCallArray *results[] = {&r->resolved_calls, &cross};
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(results[mode]->count, 6);
+        for (int i = 0; i < 6; i++) {
+            ASSERT_STR_EQ(results[mode]->items[i].caller_qn, "test.src.main.run");
+            ASSERT_STR_EQ(results[mode]->items[i].callee_qn, expected[i]);
+            ASSERT_TRUE(results[mode]->items[i].confidence >= CBM_LSP_CONFIDENCE_FLOOR);
+        }
+    }
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_use_as_alias) {
     CBMFileResult *r = extract_rust(
         "use std::collections::HashMap as Map;\n"
@@ -6808,6 +6843,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_use_alias_call);
     RUN_TEST(rustlsp_use_brace_list);
     RUN_TEST(rustlsp_nested_use_aliases_resolve_exact_targets);
+    RUN_TEST(rustlsp_collection_imports_preserve_library_owner);
     RUN_TEST(rustlsp_use_as_alias);
 
     /* Generics */
