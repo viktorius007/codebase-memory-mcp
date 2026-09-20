@@ -734,3 +734,30 @@ scanning 9,414 of 9,727 CALLS edges undocumented, semantic ranking still
 missing `git_common_dir` (UUID helpers at score ≈0.003 lead), and cross-file
 dead-code false positives (`abort_prepublication_session`, in-degree 0 with a
 real cross-file caller) pending the plan's cross-file restoration.
+
+---
+
+# Deferred close-out items from the 2026-09-20 lane restoration
+
+Small jobs deliberately deferred at session close (all context in the
+sections above; tip at deferral: 9abf6ed5):
+
+- Coverage floors: scripts/rust-scanner-coverage.sh still carries fork-era
+  floors and fails on the current tree (measured pre-merge: rust_lsp.c
+  72.65/56.26, rust_cargo.c 90.69/56.16, rust_rustdoc.c 64.02/37.65).
+  Recalibrate from two byte-identical runs on the merged tree, rounded down
+  one decimal.
+- Lane-presence contract: a Step 0 check that every rust-scanner.tsv row's
+  patch exists and passes `git apply --check`, so patch drift fails the
+  venue leg instead of surfacing as a harness error at the next mutation run.
+- CI wiring: mutation-rust and scip-rust run only as local Makefile targets;
+  neither the fork nor this tree ever gated them in CI. Decide venue and cost.
+- One full default scripts/test.sh leg on the merged tip has not run
+  (per-branch legs all ran; Step 5e conflicts with a live installed daemon
+  on the dev host — see the cross-crate report's triage).
+- Flake worth its own issue: tool_detect_changes_impact_shape
+  (tests/test_incremental.c:1988) fails under 16-job load via the
+  contained-command runner branch at src/mcp/mcp.c:16018-16030; diagnostic
+  does not distinguish runner failure from git semantics. Same family:
+  CBM_RUNTIME_DIR paths over ~50 bytes fail with an empty validation detail
+  (src/main.c:2838).
