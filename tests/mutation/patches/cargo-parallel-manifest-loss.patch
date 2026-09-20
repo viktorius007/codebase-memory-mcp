@@ -1,12 +1,13 @@
 diff --git a/src/pipeline/pass_parallel.c b/src/pipeline/pass_parallel.c
+index bccffa4c..ed457fcc 100644
 --- a/src/pipeline/pass_parallel.c
 +++ b/src/pipeline/pass_parallel.c
-@@ -3268,7 +3268,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+@@ -3510,7 +3510,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
          .def_modules = def_modules,
          .module_def_index = module_def_index,
          .cross_registries = cross_registries,
--        .rust_manifest = rust_manifest,
-+        .rust_manifest = cross_registries ? NULL : rust_manifest,
+-        .rust_manifest = rust_manifest_ptr,
++        .rust_manifest = cross_registries ? NULL : rust_manifest_ptr,
      };
      atomic_init(&rc.next_file_idx, 0);
      atomic_init(&rc.lsp_cross_processed, 0);
