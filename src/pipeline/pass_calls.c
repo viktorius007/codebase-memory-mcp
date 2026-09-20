@@ -475,6 +475,72 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 }
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
+static int emit_unresolved_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
+                                const cbm_gbuf_node_t *source_node, const char *module_qn,
+                                const char **imp_keys, const char **imp_vals, int imp_count) {
+    /* Resolution is empty when the callee belongs to an EXTERNAL client
+     * library whose source is not in the indexed tree (e.g. `requests.get`,
+     * `httpx.post`) — the import map skips it (no node) and no project symbol
+     * matches. The service-pattern signal lives in the RAW callee_name
+     * ("requests.get" contains "requests"), so classify on that and emit the
+     * HTTP_CALLS/ASYNC_CALLS edge directly (target is a synthesized route
+     * node, not the absent library). Without this the call is dropped and
+     * cross-repo matching finds no edge to match (#523). The parallel path
+     * has the equivalent empty-resolution fallback in resolve_file_calls.
+     *
+     * Native `fetch()` (#856) belongs here too, not in the substring
+     * tables above: it only counts as the global API once resolution has
+     * already failed to find a local/imported `fetch` definition. */
+    /* Route registration on an unresolvable callee (#952): facade-style
+     * Laravel (`Route::get('/x', ...)`) — the facade class lives in
+     * vendor/ and is never indexed, so resolution is ALWAYS empty in real
+     * apps. Classify by callee suffix + path-shaped first arg, exactly
+     * like the parallel path's callee_suffix fallback; without this the
+     * sequential path minted zero Route nodes for such files. */
+    if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+        call->first_string_arg[0] == '/') {
+        handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count);
+        return SKIP_ONE;
+    }
+    cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
+    if (esvc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
+        esvc = CBM_SVC_HTTP;
+    }
+    if (esvc == CBM_SVC_HTTP || esvc == CBM_SVC_ASYNC) {
+        const char *u = call->first_string_arg;
+        bool has_url_or_topic = u && u[0] != '\0' &&
+                                (u[0] == '/' || strstr(u, "://") != NULL ||
+                                 (esvc == CBM_SVC_ASYNC && strlen(u) > PAIR_LEN));
+        if (has_url_or_topic) {
+            cbm_resolution_t svc_res = {
+                .qualified_name = call->callee_name,
+                .confidence = PC_SVC_PATTERN_CONF,
+                .strategy = "service_pattern",
+                .candidate_count = 0,
+            };
+            emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, esvc, false);
+            return SKIP_ONE;
+        }
+    }
+    return 0;
+}
+
+static bool emit_service_pattern_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
+                                      const cbm_gbuf_node_t *source_node,
+                                      const cbm_resolution_t *res, cbm_svc_kind_t kind) {
+    if (kind != CBM_SVC_HTTP && kind != CBM_SVC_ASYNC) {
+        return false;
+    }
+    const char *url = call->first_string_arg;
+    if (!url || !url[0] ||
+        !(url[0] == '/' || strstr(url, "://") ||
+          (kind == CBM_SVC_ASYNC && strlen(url) > PAIR_LEN))) {
+        return false;
+    }
+    emit_http_async_edge(ctx, call, source_node, NULL, res, kind, false);
+    return true;
+}
+
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
@@ -528,69 +594,21 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * service checks below miss it and the call is dropped. Detect it on the
      * callee_name FIRST so the HTTP_CALLS/ASYNC_CALLS edge is emitted regardless
      * (target is a synthesized route node, not the unindexed library). (#523) */
-    cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
-    if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
-        const char *cu = call->first_string_arg;
-        bool chas_url = cu && cu[0] != '\0' &&
-                        (cu[0] == '/' || strstr(cu, "://") != NULL ||
-                         (csvc == CBM_SVC_ASYNC && strlen(cu) > PAIR_LEN));
-        if (chas_url) {
-            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
-                                        .confidence = PC_SVC_PATTERN_CONF,
-                                        .strategy = "service_pattern",
-                                        .candidate_count = 0};
-            emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, csvc, false);
-            return SKIP_ONE;
-        }
+    cbm_resolution_t svc_res = {
+        .qualified_name = call->callee_name,
+        .confidence = PC_SVC_PATTERN_CONF,
+        .strategy = "service_pattern",
+    };
+    if (emit_service_pattern_call(ctx, call, source_node, &svc_res,
+                                  cbm_service_pattern_match(call->callee_name))) {
+        return SKIP_ONE;
     }
 
     cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
                                                 imp_keys, imp_vals, imp_count);
-    if (!res.qualified_name || res.qualified_name[0] == '\0') {
-        /* Resolution is empty when the callee belongs to an EXTERNAL client
-         * library whose source is not in the indexed tree (e.g. `requests.get`,
-         * `httpx.post`) — the import map skips it (no node) and no project symbol
-         * matches. The service-pattern signal lives in the RAW callee_name
-         * ("requests.get" contains "requests"), so classify on that and emit the
-         * HTTP_CALLS/ASYNC_CALLS edge directly (target is a synthesized route
-         * node, not the absent library). Without this the call is dropped and
-         * cross-repo matching finds no edge to match (#523). The parallel path
-         * has the equivalent empty-resolution fallback in resolve_file_calls.
-         *
-         * Native `fetch()` (#856) belongs here too, not in the substring
-         * tables above: it only counts as the global API once resolution has
-         * already failed to find a local/imported `fetch` definition. */
-        /* Route registration on an unresolvable callee (#952): facade-style
-         * Laravel (`Route::get('/x', ...)`) — the facade class lives in
-         * vendor/ and is never indexed, so resolution is ALWAYS empty in real
-         * apps. Classify by callee suffix + path-shaped first arg, exactly
-         * like the parallel path's callee_suffix fallback; without this the
-         * sequential path minted zero Route nodes for such files. */
-        if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
-            call->first_string_arg[0] == '/') {
-            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
-                                      imp_count);
-            return SKIP_ONE;
-        }
-        cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
-        if (esvc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
-            esvc = CBM_SVC_HTTP;
-        }
-        if (esvc == CBM_SVC_HTTP || esvc == CBM_SVC_ASYNC) {
-            const char *u = call->first_string_arg;
-            bool has_url_or_topic = u && u[0] != '\0' &&
-                                    (u[0] == '/' || strstr(u, "://") != NULL ||
-                                     (esvc == CBM_SVC_ASYNC && strlen(u) > PAIR_LEN));
-            if (has_url_or_topic) {
-                cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
-                                            .confidence = PC_SVC_PATTERN_CONF,
-                                            .strategy = "service_pattern",
-                                            .candidate_count = 0};
-                emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, esvc, false);
-                return SKIP_ONE;
-            }
-        }
-        return 0;
+    if (!res.qualified_name || !res.qualified_name[0]) {
+        return emit_unresolved_call(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                    imp_count);
     }
 
     /* Perl call-graph noise guard (#476). Perl has no LSP resolver, so the
@@ -646,16 +664,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * the missing target must NOT drop the call — otherwise no HTTP_CALLS edge
      * is written and cross-repo matching finds nothing (#523). Emit directly
      * when the call carries a URL/topic first argument. */
-    cbm_svc_kind_t svc = cbm_service_pattern_match(res.qualified_name);
-    if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
-        const char *u = call->first_string_arg;
-        bool has_url_or_topic = u && u[0] != '\0' &&
-                                (u[0] == '/' || strstr(u, "://") != NULL ||
-                                 (svc == CBM_SVC_ASYNC && strlen(u) > PAIR_LEN));
-        if (has_url_or_topic) {
-            emit_http_async_edge(ctx, call, source_node, NULL, &res, svc, false);
-            return SKIP_ONE;
-        }
+    if (emit_service_pattern_call(ctx, call, source_node, &res,
+                                  cbm_service_pattern_match(res.qualified_name))) {
+        return SKIP_ONE;
     }
 
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);

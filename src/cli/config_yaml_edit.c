@@ -3356,33 +3356,41 @@ static bool yaml_owned_value_is_our_binary(const char *v, size_t vlen) {
            (name_len == sizeof(exe) - 1U && memcmp(name, exe, name_len) == 0);
 }
 
-static bool yaml_owned_entry_is_prior_shape(const char *data, size_t len, const char *entry_key,
-                                            size_t entry_key_len) {
-    /* Split into lines, tolerating CRLF. */
-    enum { PRIOR_MAX_LINES = 8 };
-    struct {
-        const char *text;
-        size_t len;
-    } lines[PRIOR_MAX_LINES];
+typedef struct {
+    const char *text;
+    size_t len;
+} yaml_owned_line_t;
+
+static size_t yaml_owned_split_lines(const char *data, size_t len, yaml_owned_line_t *lines,
+                                     size_t capacity) {
     size_t count = 0U;
     size_t pos = 0U;
     while (pos < len) {
         const char *nl = memchr(data + pos, '\n', len - pos);
         size_t line_len = nl ? (size_t)(nl - (data + pos)) : len - pos;
         size_t trimmed = line_len;
-        while (trimmed > 0U && (data[pos + trimmed - 1U] == '\r')) {
+        while (trimmed > 0U && (data[pos + trimmed - YAML_UNIT] == '\r')) {
             trimmed--;
         }
         if (trimmed > 0U) {
-            if (count == PRIOR_MAX_LINES) {
-                return false;
+            if (count == capacity) {
+                return 0;
             }
             lines[count].text = data + pos;
             lines[count].len = trimmed;
             count++;
         }
-        pos += line_len + (nl ? 1U : 0U);
+        pos += line_len + (nl ? YAML_UNIT : 0U);
     }
+    return count;
+}
+
+static bool yaml_owned_entry_is_prior_shape(const char *data, size_t existing_entry_len,
+                                            const char *entry_key, size_t entry_key_len) {
+    /* Split into lines, tolerating CRLF. */
+    enum { PRIOR_MAX_LINES = 8 };
+    yaml_owned_line_t lines[PRIOR_MAX_LINES];
+    size_t count = yaml_owned_split_lines(data, existing_entry_len, lines, PRIOR_MAX_LINES);
     if (count < 2U) {
         return false;
     }
@@ -3405,7 +3413,7 @@ static bool yaml_owned_entry_is_prior_shape(const char *data, size_t len, const 
                                               lines[1].len - (sizeof(cmd_prefix) - 1U));
     }
     size_t i = 1U;
-    if (i < count && lines[i].len == sizeof(goose_name) - 1U &&
+    if (lines[i].len == YAML_LITERAL_LEN(goose_name) &&
         memcmp(lines[i].text, goose_name, lines[i].len) == 0) {
         i++;
     }

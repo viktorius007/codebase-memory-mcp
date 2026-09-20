@@ -870,6 +870,8 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     } else if (profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
         allowed = scout_tools;
         allowed_count = sizeof(scout_tools) / sizeof(scout_tools[0]);
+    } else {
+        return false;
     }
     for (size_t i = 0U; i < allowed_count; i++) {
         if (strcmp(name, allowed[i]) == 0) {

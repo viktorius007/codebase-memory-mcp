@@ -396,7 +396,7 @@ static void application_remove_watch_entry_locked(cbm_daemon_application_t *appl
     while (*cursor && *cursor != watch) {
         cursor = &(*cursor)->next;
     }
-    if (*cursor != watch) {
+    if (!*cursor) {
         return;
     }
     *cursor = watch->next;

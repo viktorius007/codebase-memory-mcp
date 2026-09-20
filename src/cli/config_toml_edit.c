@@ -2119,6 +2119,31 @@ static int toml_append_body_entry(toml_buffer_t *output, const char *body,
                : TOML_EDIT_ERR;
 }
 
+static int toml_merge_body_line(const char *existing, const toml_line_t *line, int multiline_state,
+                                const char *body, const toml_body_spec_t *spec, const char *newline,
+                                unsigned char *emitted, toml_buffer_t *output) {
+    if (multiline_state == TOML_STRING_NONE) {
+        toml_assignment_t assignment;
+        if (toml_parse_assignment(existing, line, &assignment) != TOML_EDIT_OK) {
+            return TOML_EDIT_ERR;
+        }
+        size_t desired = assignment.present ? toml_body_spec_find(spec, &assignment.key) : SIZE_MAX;
+        if (desired != SIZE_MAX) {
+            int rc = TOML_EDIT_ERR;
+            if (!emitted[desired] && !assignment.multiline_value) {
+                rc = toml_append_body_entry(output, body, &spec->entries[desired], newline);
+                if (rc == TOML_EDIT_OK) {
+                    emitted[desired] = true;
+                }
+            }
+            toml_assignment_dispose(&assignment);
+            return rc;
+        }
+        toml_assignment_dispose(&assignment);
+    }
+    return toml_buffer_append(output, existing + line->start, line->full_end - line->start);
+}
+
 static int toml_merge_named_table(const char *existing, size_t existing_len,
                                   const toml_table_scan_t *scan, const char *body,
                                   const toml_body_spec_t *spec, const char *newline,
@@ -2137,35 +2162,9 @@ static int toml_merge_named_table(const char *existing, size_t existing_len,
         if (line.start >= scan->direct_end) {
             break;
         }
-        int replaced = 0;
-        if (multiline_state == TOML_STRING_NONE) {
-            toml_assignment_t assignment;
-            if (toml_parse_assignment(existing, &line, &assignment) != TOML_EDIT_OK) {
-                free(emitted);
-                return TOML_EDIT_ERR;
-            }
-            if (assignment.present) {
-                size_t desired = toml_body_spec_find(spec, &assignment.key);
-                if (desired != SIZE_MAX) {
-                    if (emitted[desired] || assignment.multiline_value ||
-                        toml_append_body_entry(output, body, &spec->entries[desired], newline) !=
-                            TOML_EDIT_OK) {
-                        toml_assignment_dispose(&assignment);
-                        free(emitted);
-                        return TOML_EDIT_ERR;
-                    }
-                    emitted[desired] = 1U;
-                    replaced = 1;
-                }
-            }
-            toml_assignment_dispose(&assignment);
-        }
-        if (!replaced && toml_buffer_append(output, existing + line.start,
-                                            line.full_end - line.start) != TOML_EDIT_OK) {
-            free(emitted);
-            return TOML_EDIT_ERR;
-        }
-        if (toml_scan_line_strings(existing, &line, &multiline_state) != TOML_EDIT_OK) {
+        if (toml_merge_body_line(existing, &line, multiline_state, body, spec, newline, emitted,
+                                 output) != TOML_EDIT_OK ||
+            toml_scan_line_strings(existing, &line, &multiline_state) != TOML_EDIT_OK) {
             free(emitted);
             return TOML_EDIT_ERR;
         }

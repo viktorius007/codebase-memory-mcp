@@ -2421,6 +2421,303 @@ static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CB
 }
 
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
+static void index_resolved_call(resolve_ctx_t *rc, CBMResolvedCall *rc_e,
+                                CBMHashTable *lsp_exact_idx, CBMHashTable *lsp_legacy_idx,
+                                bool *lsp_exact_idx_complete, bool *lsp_legacy_idx_complete,
+                                bool allow_tail) {
+    if (rc_e->kind != CBM_RESOLVED_INVOCATION || !rc_e->caller_qn || !rc_e->callee_qn ||
+        rc_e->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        return;
+    }
+    bool exact_site = cbm_pipeline_source_site_present(rc_e->site_start_byte, rc_e->site_end_byte);
+    bool legacy_site = cbm_pipeline_source_site_legacy(rc_e->site_start_byte, rc_e->site_end_byte);
+    if (!exact_site && !legacy_site) {
+        return;
+    }
+    CBMHashTable *index = exact_site ? lsp_exact_idx : lsp_legacy_idx;
+    bool inserted = lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->callee_qn),
+                                        exact_site, rc->main_gbuf, rc->project_name, allow_tail);
+    if (!inserted) {
+        if (exact_site) {
+            *lsp_exact_idx_complete = false;
+        } else {
+            *lsp_legacy_idx_complete = false;
+        }
+    }
+    if (rc_e->reason && cbm_pipeline_invocation_reason_join_strategy(rc_e->strategy)) {
+        inserted = lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->reason), exact_site,
+                                       rc->main_gbuf, rc->project_name, allow_tail);
+        if (!inserted) {
+            if (exact_site) {
+                *lsp_exact_idx_complete = false;
+            } else {
+                *lsp_legacy_idx_complete = false;
+            }
+        }
+    }
+    if (exact_site && rc_e->strategy && strcmp(rc_e->strategy, "lsp_destructor") == 0 &&
+        !lsp_idx_insert_leaf(index, rc_e, "~", true, rc->main_gbuf, rc->project_name, allow_tail)) {
+        *lsp_exact_idx_complete = false;
+    }
+}
+
+static const CBMResolvedCall *find_indexed_lsp_call(resolve_ctx_t *rc, CBMFileResult *result,
+                                                    CBMCall *call, CBMHashTable *lsp_exact_idx,
+                                                    CBMHashTable *lsp_legacy_idx,
+                                                    bool lsp_exact_idx_complete,
+                                                    bool lsp_legacy_idx_complete, bool allow_tail) {
+    const CBMResolvedCall *lsp = NULL;
+    bool exact_key_built = true;
+    bool exact_key_ambiguous = false;
+    bool legacy_key_built = true;
+    uint64_t _rc_t0 = extract_now_ns();
+    if (cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte)) {
+        lsp = lsp_idx_lookup(lsp_exact_idx, call, true, &exact_key_built, &exact_key_ambiguous);
+    }
+    bool exact_index_authoritative = lsp_exact_idx_complete && exact_key_built;
+    if (!lsp && !exact_index_authoritative) {
+        /* An incomplete exact index must fail closed: consult the
+         * authoritative matcher before a legacy row can win. */
+        atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows,
+                                  (uint64_t)result->resolved_calls.count, memory_order_relaxed);
+        lsp = cbm_pipeline_find_lsp_resolution_in_graph(&result->resolved_calls, call, allow_tail,
+                                                        rc->main_gbuf, rc->project_name);
+    }
+    if (!lsp && !call->requires_lsp_resolution && exact_index_authoritative &&
+        !exact_key_ambiguous) {
+        lsp = lsp_idx_lookup(lsp_legacy_idx, call, false, &legacy_key_built, NULL);
+    }
+    if (!lsp && (!lsp_legacy_idx_complete || !legacy_key_built || allow_tail ||
+                 call->requires_lsp_resolution)) {
+        /* Fallback to the linear scan for edge cases the index may
+         * miss (e.g. callee_name that wasn't the registered short
+         * name). Keeps semantics identical. */
+        atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows,
+                                  (uint64_t)result->resolved_calls.count, memory_order_relaxed);
+        lsp = cbm_pipeline_find_lsp_resolution_in_graph(&result->resolved_calls, call, allow_tail,
+                                                        rc->main_gbuf, rc->project_name);
+    }
+    atomic_fetch_add_explicit(&rc->time_ns_rc_lsp_lookup, extract_now_ns() - _rc_t0,
+                              memory_order_relaxed);
+    return lsp;
+}
+
+static const cbm_gbuf_node_t *resolve_file_call_target(resolve_ctx_t *rc,
+                                                       resolve_worker_state_t *ws, CBMCall *call,
+                                                       const CBMResolvedCall *lsp, bool allow_tail,
+                                                       const char *module_qn, const char **imp_keys,
+                                                       const char **imp_vals, int imp_count,
+                                                       CBMLanguage lang, cbm_resolution_t *res) {
+    uint64_t _rc_t0 = extract_now_ns();
+    const cbm_gbuf_node_t *lsp_target = NULL;
+    if (lsp) {
+        /* Canonicalise to the gbuf node's QN so res->qualified_name matches
+         * the gbuf even when the cross-file fallback had to prefix the
+         * project name. */
+        bool exact_external_target = call->requires_lsp_resolution &&
+                                     cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
+        lsp_target = exact_external_target
+                         ? cbm_pipeline_lsp_target_node_strict(rc->main_gbuf, rc->project_name,
+                                                               lsp->callee_qn, allow_tail)
+                         : cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
+                                                        lsp->callee_qn, allow_tail);
+        if (lsp_target) {
+            res->qualified_name = lsp_target->qualified_name;
+            res->strategy = lsp->strategy ? lsp->strategy : "lsp_override";
+            res->confidence = (double)lsp->confidence;
+            res->candidate_count = SKIP_ONE;
+            ws->lsp_overrides++;
+        }
+    }
+    /* #1085: fall back to the registry resolver whenever the LSP did not
+     * yield a gbuf-resolvable target — whether no LSP resolution existed,
+     * OR the LSP was confident but its callee_qn isn't a node in the gbuf
+     * (the JSX-via-tsconfig-alias case: the TS LSP resolves the element
+     * ref to an alias-path QN that never matches a def node, so lsp_target
+     * is NULL). The old `else` ran the registry ONLY when lsp was null, so
+     * an LSP-with-unresolvable-target dropped the edge outright — silently
+     * losing every alias-imported JSX component edge on the parallel path
+     * (~21% of a Next.js call graph) while the sequential pass, which falls
+     * THROUGH to the registry here, kept them. This restores seq/parallel
+     * parity via the import_map / unique_name resolution. Synthetic
+     * semantic candidates are deliberately excluded: they require an
+     * exact LSP target and must fail closed rather than accepting a textual
+     * registry match. */
+    if ((!res->qualified_name || !res->qualified_name[0]) && !call->requires_lsp_resolution) {
+        *res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys, imp_vals,
+                                    imp_count);
+    }
+    atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
+                              memory_order_relaxed);
+    return lsp_target;
+}
+
+static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_state_t *ws,
+                                            CBMCall *call, const cbm_gbuf_node_t *source_node,
+                                            const char *resolved_qn, const char *module_qn,
+                                            const char **imp_keys, const char **imp_vals,
+                                            int imp_count) {
+    cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+    if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
+        const char *cu = call->first_string_arg;
+        bool chas_url = cu && cu[0] != '\0' &&
+                        (cu[0] == '/' || strstr(cu, "://") != NULL ||
+                         (csvc == CBM_SVC_ASYNC && strlen(cu) > PP_ESC_SPACE));
+        if (chas_url) {
+            cbm_resolution_t svc_res = {
+                .qualified_name = call->callee_name,
+                .confidence = PP_HALF_CONF,
+                .strategy = "service_pattern",
+            };
+            emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
+                              module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
+                              false);
+            return true;
+        }
+    }
+
+    if (!resolved_qn || resolved_qn[0] == '\0') {
+        if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
+            cbm_resolution_t fake_res = {
+                .qualified_name = call->callee_name,
+                .confidence = PP_HALF_CONF,
+                .strategy = "callee_suffix",
+            };
+            emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
+                              module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
+                              false);
+        } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
+            /* Native `fetch()` (#856): only the global API once resolution
+             * has failed to find a local/imported `fetch`. Call the low-level
+             * emitter directly — emit_service_edge re-derives its own kind
+             * from res->qualified_name via cbm_service_pattern_match, which
+             * "fetch" deliberately never matches (mirrors pass_calls.c). */
+            const char *u = call->first_string_arg;
+            if (u && u[0] != '\0' && (u[0] == '/' || strstr(u, "://") != NULL)) {
+                cbm_resolution_t fake_res = {
+                    .qualified_name = call->callee_name,
+                    .confidence = PP_HALF_CONF,
+                    .strategy = "service_pattern",
+                };
+                emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
+                                             CBM_SVC_HTTP, u);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMCall *call,
+                                    cbm_resolution_t res, const cbm_gbuf_node_t *source_node,
+                                    const cbm_gbuf_node_t *lsp_target, const char *module_qn,
+                                    const char **imp_keys, const char **imp_vals, int imp_count,
+                                    CBMLanguage lang) {
+
+    uint64_t _rc_t0 = extract_now_ns();
+    try_field_type_hint(rc, &res, call->callee_name, source_node->id);
+    atomic_fetch_add_explicit(&rc->time_ns_rc_hint, extract_now_ns() - _rc_t0,
+                              memory_order_relaxed);
+
+    /* Perl call-graph noise guard (#476), mirroring the sequential pass
+     * (pass_calls.c). Perl has no LSP resolver; for builtins (push/shift/
+     * keys/...) and method calls ($obj->m, unresolved receiver), suppress
+     * only WEAK cross-file short-name matches and keep the high-confidence
+     * same_module / import_map strategies so a genuine same-file or
+     * imported call to a builtin-named sub still resolves. Placed after the
+     * field-type hint so a hint cannot re-introduce a suppressed edge.
+     * Gated to Perl — other languages are unaffected. */
+    if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method, call->callee_name,
+                                        res.strategy)) {
+        return;
+    }
+
+    /* Dynamic-language weak-member suppression (#592/#606/#1276). The
+     * receiver-aware guard must NOT drop this call here: doing so would also
+     * skip the #523 callee-name service bypass below, emit_service_edge's
+     * route/gRPC/config branches, and its unconditional detect_url_in_args
+     * (which classifies verb-suffix HTTP clients like api.patch('/x')).
+     * Instead, defer to the emit path and suppress ONLY the plain-CALLS
+     * fall-through (emit_normal_calls_edge), so every service edge stays
+     * main-identical by construction. res.strategy may carry an lsp_* value
+     * here (LSP-resolved calls keep res through this point); the helper's
+     * EXPLICIT drop-list leaves lsp_ts_method / lsp_cross untouched. See
+     * #606 direction.
+     *
+     * This language set MUST match the one in pass_calls.c exactly — see the
+     * note there. ArkTS belongs to the JS/TS family (#1842). */
+    bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
+                                lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+                                lang == CBM_LANG_ARKTS;
+    /* Bare-call local-binding suppression — see the note in pass_calls.c.
+     * This gate MUST stay identical to the one there. */
+    bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
+    bool drop_plain_call =
+        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+        cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
+                                             call->callee_is_locally_bound, res.strategy);
+
+    /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
+     * service signal lives in the callee_name. The registry can mis-resolve
+     * it to a spurious builtin short-name match (`requests.get` ->
+     * `builtins.dict.get` via "get"), which is non-empty and not an HTTP
+     * pattern, so the resolved-QN service checks below miss it and the call
+     * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
+     * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
+     * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
+    if (emit_file_call_service_fallback(rc, ws, call, source_node, res.qualified_name, module_qn,
+                                        imp_keys, imp_vals, imp_count)) {
+        return;
+    }
+    /* Reuse lsp_target as target_node when LSP resolved — avoids a
+     * second cbm_gbuf_find_by_qn lookup. try_field_type_hint may have
+     * upgraded res.qualified_name to a different candidate, in which
+     * case we must re-resolve. */
+    _rc_t0 = extract_now_ns();
+    const cbm_gbuf_node_t *target_node;
+    if (lsp_target && res.qualified_name == lsp_target->qualified_name) {
+        target_node = lsp_target;
+    } else {
+        target_node = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+    }
+    atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
+                              memory_order_relaxed);
+    if (target_node && source_node->id != target_node->id &&
+        cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+        /* #725: same guard as pass_calls.c — do not emit a suffix_match
+         * CALLS edge across a language boundary. */
+        return;
+    }
+    if (!target_node || source_node->id == target_node->id) {
+        /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
+         * resolve to an unindexed QN (target_node == NULL), but their edge
+         * target is a synthesized route node, not the library — emit them
+         * anyway so cross-repo matching has an HTTP_CALLS edge to work with
+         * (#523). Mirrors the sequential resolve_single_call bypass. */
+        cbm_svc_kind_t psvc = cbm_service_pattern_match(res.qualified_name);
+        if ((psvc == CBM_SVC_HTTP || psvc == CBM_SVC_ASYNC) && !target_node) {
+            const char *u = call->first_string_arg;
+            bool url_or_topic = u && u[0] != '\0' &&
+                                (u[0] == '/' || strstr(u, "://") != NULL ||
+                                 (psvc == CBM_SVC_ASYNC && strlen(u) > PP_ESC_SPACE));
+            if (url_or_topic) {
+                emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res, module_qn,
+                                  rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
+                                  false);
+                ws->calls_resolved++;
+            }
+        }
+        return;
+    }
+    _rc_t0 = extract_now_ns();
+    emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
+                      rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
+                      drop_plain_call || !cbm_pipeline_plain_call_admitted(lang));
+    atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
+                              memory_order_relaxed);
+    ws->calls_resolved++;
+}
+
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang) {
@@ -2446,46 +2743,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         if (lsp_exact_idx || lsp_legacy_idx) {
             for (int i = 0; i < result->resolved_calls.count; i++) {
-                CBMResolvedCall *rc_e = &result->resolved_calls.items[i];
-                if (rc_e->kind != CBM_RESOLVED_INVOCATION || !rc_e->caller_qn || !rc_e->callee_qn ||
-                    rc_e->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
-                    continue;
-                }
-                bool exact_site =
-                    cbm_pipeline_source_site_present(rc_e->site_start_byte, rc_e->site_end_byte);
-                bool legacy_site =
-                    cbm_pipeline_source_site_legacy(rc_e->site_start_byte, rc_e->site_end_byte);
-                if (!exact_site && !legacy_site) {
-                    continue;
-                }
-                CBMHashTable *index = exact_site ? lsp_exact_idx : lsp_legacy_idx;
-                bool inserted =
-                    lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->callee_qn),
-                                        exact_site, rc->main_gbuf, rc->project_name, allow_tail);
-                if (!inserted) {
-                    if (exact_site) {
-                        lsp_exact_idx_complete = false;
-                    } else {
-                        lsp_legacy_idx_complete = false;
-                    }
-                }
-                if (rc_e->reason && cbm_pipeline_invocation_reason_join_strategy(rc_e->strategy)) {
-                    inserted = lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->reason),
-                                                   exact_site, rc->main_gbuf, rc->project_name,
-                                                   allow_tail);
-                    if (!inserted) {
-                        if (exact_site) {
-                            lsp_exact_idx_complete = false;
-                        } else {
-                            lsp_legacy_idx_complete = false;
-                        }
-                    }
-                }
-                if (exact_site && rc_e->strategy && strcmp(rc_e->strategy, "lsp_destructor") == 0 &&
-                    !lsp_idx_insert_leaf(index, rc_e, "~", true, rc->main_gbuf, rc->project_name,
-                                         allow_tail)) {
-                    lsp_exact_idx_complete = false;
-                }
+                index_resolved_call(rc, &result->resolved_calls.items[i], lsp_exact_idx,
+                                    lsp_legacy_idx, &lsp_exact_idx_complete,
+                                    &lsp_legacy_idx_complete, allow_tail);
             }
         }
     }
@@ -2511,80 +2771,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * depending on whether parallel mode kicked in. Unique-tail
          * fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
         cbm_resolution_t res = {0};
-        const CBMResolvedCall *lsp = NULL;
-        bool exact_key_built = true;
-        bool exact_key_ambiguous = false;
-        bool legacy_key_built = true;
-        _rc_t0 = extract_now_ns();
-        if (cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte)) {
-            lsp = lsp_idx_lookup(lsp_exact_idx, call, true, &exact_key_built, &exact_key_ambiguous);
-        }
-        bool exact_index_authoritative = lsp_exact_idx_complete && exact_key_built;
-        if (!lsp && !exact_index_authoritative) {
-            /* An incomplete exact index must fail closed: consult the
-             * authoritative matcher before a legacy row can win. */
-            atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows,
-                                      (uint64_t)result->resolved_calls.count, memory_order_relaxed);
-            lsp = cbm_pipeline_find_lsp_resolution_in_graph(
-                &result->resolved_calls, call, allow_tail, rc->main_gbuf, rc->project_name);
-        }
-        if (!lsp && !call->requires_lsp_resolution && exact_index_authoritative &&
-            !exact_key_ambiguous) {
-            lsp = lsp_idx_lookup(lsp_legacy_idx, call, false, &legacy_key_built, NULL);
-        }
-        if (!lsp && (!lsp_legacy_idx_complete || !legacy_key_built || allow_tail ||
-                     call->requires_lsp_resolution)) {
-            /* Fallback to the linear scan for edge cases the index may
-             * miss (e.g. callee_name that wasn't the registered short
-             * name). Keeps semantics identical. */
-            atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows,
-                                      (uint64_t)result->resolved_calls.count, memory_order_relaxed);
-            lsp = cbm_pipeline_find_lsp_resolution_in_graph(
-                &result->resolved_calls, call, allow_tail, rc->main_gbuf, rc->project_name);
-        }
-        atomic_fetch_add_explicit(&rc->time_ns_rc_lsp_lookup, extract_now_ns() - _rc_t0,
-                                  memory_order_relaxed);
-        _rc_t0 = extract_now_ns();
-        const cbm_gbuf_node_t *lsp_target = NULL;
-        if (lsp) {
-            /* Canonicalise to the gbuf node's QN so res.qualified_name matches
-             * the gbuf even when the cross-file fallback had to prefix the
-             * project name. */
-            bool exact_external_target = call->requires_lsp_resolution &&
-                                         cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
-            lsp_target = exact_external_target
-                             ? cbm_pipeline_lsp_target_node_strict(rc->main_gbuf, rc->project_name,
-                                                                   lsp->callee_qn, allow_tail)
-                             : cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
-                                                            lsp->callee_qn, allow_tail);
-            if (lsp_target) {
-                res.qualified_name = lsp_target->qualified_name;
-                res.strategy = lsp->strategy ? lsp->strategy : "lsp_override";
-                res.confidence = (double)lsp->confidence;
-                res.candidate_count = 1;
-                ws->lsp_overrides++;
-            }
-        }
-        /* #1085: fall back to the registry resolver whenever the LSP did not
-         * yield a gbuf-resolvable target — whether no LSP resolution existed,
-         * OR the LSP was confident but its callee_qn isn't a node in the gbuf
-         * (the JSX-via-tsconfig-alias case: the TS LSP resolves the element
-         * ref to an alias-path QN that never matches a def node, so lsp_target
-         * is NULL). The old `else` ran the registry ONLY when lsp was null, so
-         * an LSP-with-unresolvable-target dropped the edge outright — silently
-         * losing every alias-imported JSX component edge on the parallel path
-         * (~21% of a Next.js call graph) while the sequential pass, which falls
-         * THROUGH to the registry here, kept them. This restores seq/parallel
-         * parity via the import_map / unique_name resolution. Synthetic
-         * semantic candidates are deliberately excluded: they require an
-         * exact LSP target and must fail closed rather than accepting a textual
-         * registry match. */
-        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution) {
-            res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
-                                       imp_vals, imp_count);
-        }
-        atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
-                                  memory_order_relaxed);
+        const CBMResolvedCall *lsp =
+            find_indexed_lsp_call(rc, result, call, lsp_exact_idx, lsp_legacy_idx,
+                                  lsp_exact_idx_complete, lsp_legacy_idx_complete, allow_tail);
+        const cbm_gbuf_node_t *lsp_target = resolve_file_call_target(
+            rc, ws, call, lsp, allow_tail, module_qn, imp_keys, imp_vals, imp_count, lang, &res);
 
         /* A synthetic semantic candidate is an invocation only when the LSP
          * resolved it to a concrete graph node. Never let registry, field-name,
@@ -2592,147 +2783,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (call->requires_lsp_resolution && !lsp_target) {
             continue;
         }
-
-        _rc_t0 = extract_now_ns();
-        try_field_type_hint(rc, &res, call->callee_name, source_node->id);
-        atomic_fetch_add_explicit(&rc->time_ns_rc_hint, extract_now_ns() - _rc_t0,
-                                  memory_order_relaxed);
-
-        /* Perl call-graph noise guard (#476), mirroring the sequential pass
-         * (pass_calls.c). Perl has no LSP resolver; for builtins (push/shift/
-         * keys/...) and method calls ($obj->m, unresolved receiver), suppress
-         * only WEAK cross-file short-name matches and keep the high-confidence
-         * same_module / import_map strategies so a genuine same-file or
-         * imported call to a builtin-named sub still resolves. Placed after the
-         * field-type hint so a hint cannot re-introduce a suppressed edge.
-         * Gated to Perl — other languages are unaffected. */
-        if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method,
-                                            call->callee_name, res.strategy)) {
-            continue;
-        }
-
-        /* Dynamic-language weak-member suppression (#592/#606/#1276). The
-         * receiver-aware guard must NOT drop this call here: doing so would also
-         * skip the #523 callee-name service bypass below, emit_service_edge's
-         * route/gRPC/config branches, and its unconditional detect_url_in_args
-         * (which classifies verb-suffix HTTP clients like api.patch('/x')).
-         * Instead, defer to the emit path and suppress ONLY the plain-CALLS
-         * fall-through (emit_normal_calls_edge), so every service edge stays
-         * main-identical by construction. res.strategy may carry an lsp_* value
-         * here (LSP-resolved calls keep res through this point); the helper's
-         * EXPLICIT drop-list leaves lsp_ts_method / lsp_cross untouched. See
-         * #606 direction.
-         *
-         * This language set MUST match the one in pass_calls.c exactly — see the
-         * note there. ArkTS belongs to the JS/TS family (#1842). */
-        bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
-                                    lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
-                                    lang == CBM_LANG_ARKTS;
-        /* Bare-call local-binding suppression — see the note in pass_calls.c.
-         * This gate MUST stay identical to the one there. */
-        bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
-        bool drop_plain_call =
-            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
-            cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
-                                                 call->callee_is_locally_bound, res.strategy);
-
-        /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
-         * service signal lives in the callee_name. The registry can mis-resolve
-         * it to a spurious builtin short-name match (`requests.get` ->
-         * `builtins.dict.get` via "get"), which is non-empty and not an HTTP
-         * pattern, so the resolved-QN service checks below miss it and the call
-         * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
-         * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
-         * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
-        cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
-        if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
-            const char *cu = call->first_string_arg;
-            bool chas_url = cu && cu[0] != '\0' &&
-                            (cu[0] == '/' || strstr(cu, "://") != NULL ||
-                             (csvc == CBM_SVC_ASYNC && strlen(cu) > PP_ESC_SPACE));
-            if (chas_url) {
-                cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
-                                            .confidence = PP_HALF_CONF,
-                                            .strategy = "service_pattern"};
-                emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
-                                  module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
-                continue;
-            }
-        }
-
-        if (!res.qualified_name || res.qualified_name[0] == '\0') {
-            if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
-                cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
-                                             .confidence = PP_HALF_CONF,
-                                             .strategy = "callee_suffix"};
-                emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
-                                  module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
-            } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
-                /* Native `fetch()` (#856): only the global API once resolution
-                 * has failed to find a local/imported `fetch`. Call the low-level
-                 * emitter directly — emit_service_edge re-derives its own kind
-                 * from res->qualified_name via cbm_service_pattern_match, which
-                 * "fetch" deliberately never matches (mirrors pass_calls.c). */
-                const char *u = call->first_string_arg;
-                if (u && u[0] != '\0' && (u[0] == '/' || strstr(u, "://") != NULL)) {
-                    cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
-                                                 .confidence = PP_HALF_CONF,
-                                                 .strategy = "service_pattern"};
-                    emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
-                                                 CBM_SVC_HTTP, u);
-                }
-            }
-            continue;
-        }
-        /* Reuse lsp_target as target_node when LSP resolved — avoids a
-         * second cbm_gbuf_find_by_qn lookup. try_field_type_hint may have
-         * upgraded res.qualified_name to a different candidate, in which
-         * case we must re-resolve. */
-        _rc_t0 = extract_now_ns();
-        const cbm_gbuf_node_t *target_node;
-        if (lsp_target && res.qualified_name == lsp_target->qualified_name) {
-            target_node = lsp_target;
-        } else {
-            target_node = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
-        }
-        atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
-                                  memory_order_relaxed);
-        if (target_node && source_node->id != target_node->id &&
-            cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
-            /* #725: same guard as pass_calls.c — do not emit a suffix_match
-             * CALLS edge across a language boundary. */
-            continue;
-        }
-        if (!target_node || source_node->id == target_node->id) {
-            /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
-             * resolve to an unindexed QN (target_node == NULL), but their edge
-             * target is a synthesized route node, not the library — emit them
-             * anyway so cross-repo matching has an HTTP_CALLS edge to work with
-             * (#523). Mirrors the sequential resolve_single_call bypass. */
-            cbm_svc_kind_t psvc = cbm_service_pattern_match(res.qualified_name);
-            if ((psvc == CBM_SVC_HTTP || psvc == CBM_SVC_ASYNC) && !target_node) {
-                const char *u = call->first_string_arg;
-                bool url_or_topic = u && u[0] != '\0' &&
-                                    (u[0] == '/' || strstr(u, "://") != NULL ||
-                                     (psvc == CBM_SVC_ASYNC && strlen(u) > PP_ESC_SPACE));
-                if (url_or_topic) {
-                    emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res, module_qn,
-                                      rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                                      false);
-                    ws->calls_resolved++;
-                }
-            }
-            continue;
-        }
-        _rc_t0 = extract_now_ns();
-        emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
-                          rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          drop_plain_call || !cbm_pipeline_plain_call_admitted(lang));
-        atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
-                                  memory_order_relaxed);
-        ws->calls_resolved++;
+        emit_resolved_file_call(rc, ws, call, res, source_node, lsp_target, module_qn, imp_keys,
+                                imp_vals, imp_count, lang);
     }
     if (lsp_exact_idx) {
         cbm_ht_foreach(lsp_exact_idx, lsp_idx_free_key, NULL);

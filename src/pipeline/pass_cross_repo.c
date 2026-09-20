@@ -1064,6 +1064,35 @@ static cr_match_result_t match_typed_routes(cbm_store_t *src_store, const char *
 static void free_project_list(char **projects, int count);
 
 /* When target_projects = ["*"], scan the cache directory for all .db files. */
+static bool cr_is_project_database_name(const char *name) {
+    size_t len = strlen(name);
+    return len >= CR_COL_4 && strcmp(name + len - CR_DB_EXT_LEN, ".db") == 0 &&
+           strcmp(name, "_cross_repo.db") != 0 && strcmp(name, "_config.db") != 0;
+}
+
+static bool cr_project_from_database_name(const char *name, char *project, size_t capacity) {
+    size_t length = strlen(name) - CR_DB_EXT_LEN;
+    if (length >= capacity) {
+        return false;
+    }
+    memcpy(project, name, length);
+    project[length] = '\0';
+    return cbm_validate_project_name(project) && cr_project_exists(project);
+}
+
+static int cr_sort_unique_projects(char **projects, int count) {
+    qsort(projects, (size_t)count, sizeof(*projects), cr_project_compare);
+    int unique_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (unique_count == 0 || strcmp(projects[i], projects[unique_count - SKIP_ONE]) != 0) {
+            projects[unique_count++] = projects[i];
+        } else {
+            free(projects[i]);
+        }
+    }
+    return unique_count;
+}
+
 static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
     *out = NULL;
     const char *dir = cr_cache_dir();
@@ -1094,13 +1123,9 @@ static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
             failed = true;
             break;
         }
-        size_t len = strlen(ent->name);
-        if (len < CR_COL_4 || strcmp(ent->name + len - CR_DB_EXT_LEN, ".db") != 0) {
-            continue;
-        }
         /* Internal stores are exact filenames. Substring filtering would hide
          * legitimate projects such as orders_config_service or api-wal. */
-        if (strcmp(ent->name, "_cross_repo.db") == 0 || strcmp(ent->name, "_config.db") == 0) {
+        if (!cr_is_project_database_name(ent->name)) {
             continue;
         }
         if (count >= CR_MAX_PROJECTS) {
@@ -1108,13 +1133,7 @@ static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
             break;
         }
         char project[CBM_DIRENT_NAME_MAX];
-        size_t project_length = len - CR_DB_EXT_LEN;
-        if (project_length == 0 || project_length >= sizeof(project)) {
-            continue;
-        }
-        memcpy(project, ent->name, project_length);
-        project[project_length] = '\0';
-        if (!cbm_validate_project_name(project) || !cr_project_exists(project)) {
+        if (!cr_project_from_database_name(ent->name, project, sizeof(project))) {
             continue;
         }
         if (count >= cap) {
@@ -1139,17 +1158,8 @@ static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
         free_project_list(projects, count);
         return cr_cancel_requested(ctx) ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
     }
-    qsort(projects, (size_t)count, sizeof(*projects), cr_project_compare);
-    int unique_count = 0;
-    for (int i = 0; i < count; i++) {
-        if (unique_count == 0 || strcmp(projects[i], projects[unique_count - 1]) != 0) {
-            projects[unique_count++] = projects[i];
-        } else {
-            free(projects[i]);
-        }
-    }
     *out = projects;
-    return unique_count;
+    return cr_sort_unique_projects(projects, count);
 }
 
 static void free_project_list(char **projects, int count) {

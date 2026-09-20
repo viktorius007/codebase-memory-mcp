@@ -10,6 +10,7 @@
  * Called from pipeline.c when a DB with stored hashes already exists.
  */
 #include "foundation/constants.h"
+#include "foundation/arena.h"
 
 enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline.h"
@@ -104,6 +105,7 @@ static const char *itoa_buf(int v) {
 
 /* ── Platform-portable mtime_ns ──────────────────────────────────── */
 
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static int64_t stat_mtime_ns(const struct stat *st) {
 #ifdef __APPLE__
     return ((int64_t)st->st_mtimespec.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
@@ -113,6 +115,7 @@ static int64_t stat_mtime_ns(const struct stat *st) {
     return ((int64_t)st->st_mtim.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
 #endif
 }
+#endif
 
 static const char *incr_mode_name(int mode) {
     switch (mode) {
@@ -657,6 +660,7 @@ int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *
 /* Classify discovered files against stored hashes using mtime+size.
  * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
  * Caller must free the returned array. */
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
                             int stored_count, int *out_changed, int *out_unchanged) {
     bool *changed = calloc((size_t)file_count, sizeof(bool));
@@ -703,6 +707,7 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
     *out_unchanged = n_unchanged;
     return changed;
 }
+#endif
 
 /* Classify stored files that are absent from current discovery. Returns the
  * count of truly-deleted files (output via out_deleted) and ALSO collects
@@ -906,6 +911,7 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
  *   - A target whose qualified_name no longer exists (symbol deleted or
  *     renamed by the edit) is dropped — matching full-reindex semantics. */
 
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 typedef struct {
     char *source_qn;
     char *target_qn;
@@ -994,6 +1000,7 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
     cap->count = 0;
     cap->cap = 0;
 }
+#endif
 
 /* ── Persist file hashes ─────────────────────────────────────────── */
 
@@ -1179,6 +1186,134 @@ static int surface_added_names(const char *stored_json, const char *fresh_json, 
 /* Run parallel or sequential extract+resolve for changed files. Any failure
  * aborts before persistence: the caller discards this in-memory graph and
  * preserves the old on-disk database and its retryable hashes. */
+static CBMCrossLspRegistries *build_closure_registries(
+    cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci, CBMFileResult **cache,
+    closure_resolve_t *closure, CBMLSPDef **all_defs_out, int *all_def_count_out,
+    CBMModuleDefIndex **module_def_index_out, CBMCrossLspRegistries *cross_registries,
+    struct timespec t) {
+    CBMLSPDef *all_defs = NULL;
+    int all_def_count = 0;
+    char **def_modules = NULL;
+    CBMModuleDefIndex *module_def_index = NULL;
+    CBMCrossLspRegistries *registries_arg = NULL;
+    /* Fresh surfaces for the re-parsed files, from the same collect
+     * path a full build uses; then registries over stored + fresh. */
+    def_modules = (char **)calloc((size_t)ci, sizeof(char *));
+    int *def_starts = (int *)calloc((size_t)ci + SKIP_ONE, sizeof(int));
+    int fresh_count = 0;
+    CBMLSPDef *fresh_defs =
+        def_modules && def_starts
+            ? cbm_pxc_collect_all_defs(ctx, &closure->arena, cache, changed_files, ci,
+                                       ctx->project_name, def_modules, &fresh_count, def_starts)
+            : NULL;
+    if ((fresh_defs || fresh_count == 0) && def_starts &&
+        cbm_lsp_surface_build_rows(ctx, ctx->project_name, cache, changed_files, ci, fresh_defs,
+                                   def_starts, &closure->fresh_rows, &closure->fresh_count) != 0) {
+        closure->fresh_rows = NULL;
+        closure->fresh_count = 0;
+    }
+    free(def_starts);
+    all_def_count = closure->base_def_count + fresh_count;
+    if (all_def_count > 0) {
+        all_defs = (CBMLSPDef *)cbm_arena_alloc(&closure->arena,
+                                                (size_t)all_def_count * sizeof(CBMLSPDef));
+    }
+    if (all_defs) {
+        if (closure->base_def_count > 0) {
+            memcpy(all_defs, closure->base_defs,
+                   (size_t)closure->base_def_count * sizeof(CBMLSPDef));
+        }
+        if (fresh_defs) {
+            memcpy(all_defs + closure->base_def_count, fresh_defs,
+                   (size_t)fresh_count * sizeof(CBMLSPDef));
+        }
+        module_def_index = cbm_pxc_build_module_def_index(all_defs, all_def_count);
+        /* Tier-2 shared registries are an amortization: the full
+         * pipeline pays one build over all defs to make 85k per-file
+         * resolves O(1). A floor-sized closure resolves a handful of
+         * files, so the build (minutes-scale over multi-million-def
+         * corpora) can never pay for itself — the per-file fallback
+         * path, filtered through module_def_index, is the SAME
+         * pre-Tier-2 resolution code the full pipeline still uses
+         * for languages without a shared registry, so convergence
+         * is unaffected; only the amortization strategy changes. */
+        if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
+            CBMArena *xa = &closure->arena;
+            cross_registries->go = cbm_go_build_cross_registry(xa, all_defs, all_def_count);
+            cross_registries->python = cbm_py_build_cross_registry(xa, all_defs, all_def_count);
+            cross_registries->c = cbm_c_build_cross_registry(xa, all_defs, all_def_count);
+            cross_registries->cs = cbm_cs_build_cross_registry(xa, all_defs, all_def_count);
+            cross_registries->ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
+            cross_registries->java = cbm_java_build_cross_registry(xa, all_defs, all_def_count);
+            registries_arg = cross_registries;
+        }
+    } else {
+        all_def_count = 0;
+    }
+    free(fresh_defs);
+    /* The resolve workers borrow def_modules strings; ownership moves
+     * to the closure ctx so they outlive resolve + calls. */
+    closure->def_modules = def_modules;
+    closure->def_module_count = ci;
+    def_modules = NULL;
+    cbm_log_info("incremental.closure_registries", "base", itoa_buf(closure->base_def_count),
+                 "fresh", itoa_buf(fresh_count), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    *all_defs_out = all_defs;
+    *all_def_count_out = all_def_count;
+    *module_def_index_out = module_def_index;
+    return registries_arg;
+}
+
+static int run_sequential_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files,
+                                          int ci) {
+    cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf(ci));
+
+    /* Keep the definition pass's transformed/extracted result alive for
+     * the following resolution passes. This mirrors the full sequential
+     * pipeline and is required for transform-only inputs such as
+     * ObjectScript Studio Export XML, whose original source cannot be
+     * re-extracted directly by the call/usage/semantic passes. */
+    CBMFileResult **prior_cache = ctx->result_cache;
+    CBMFileResult **cache = prior_cache;
+    bool owns_cache = false;
+    if (!cache && ci > 0) {
+        cache = (CBMFileResult **)calloc((size_t)ci, sizeof(CBMFileResult *));
+        if (!cache) {
+            cbm_log_error("incremental.err", "phase", "result_cache_alloc");
+            return CBM_NOT_FOUND;
+        }
+        ctx->result_cache = cache;
+        owns_cache = true;
+    }
+    int rc = cbm_pipeline_pass_definitions(ctx, changed_files, ci);
+    if (rc == 0) {
+        rc = cbm_pipeline_check_cancel(ctx);
+    }
+    if (rc == 0) {
+        rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);
+    }
+    if (rc == 0) {
+        rc = cbm_pipeline_check_cancel(ctx);
+    }
+    if (rc == 0) {
+        rc = cbm_pipeline_pass_usages(ctx, changed_files, ci);
+    }
+    if (rc == 0) {
+        rc = cbm_pipeline_check_cancel(ctx);
+    }
+    if (rc == 0) {
+        rc = cbm_pipeline_pass_semantic(ctx, changed_files, ci);
+    }
+    if (rc == 0) {
+        rc = cbm_pipeline_check_cancel(ctx);
+    }
+    if (owns_cache) {
+        free_incremental_result_cache(cache, ci);
+        ctx->result_cache = prior_cache;
+    }
+    return rc;
+}
+
 static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
                                closure_resolve_t *closure) {
     struct timespec t;
@@ -1252,86 +1387,19 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         CBMLSPDef *all_defs = NULL;
         int all_def_count = 0;
-        char **def_modules = NULL;
         CBMModuleDefIndex *module_def_index = NULL;
         CBMCrossLspRegistries cross_registries = {0};
         CBMCrossLspRegistries *registries_arg = NULL;
         if (closure) {
-            /* Fresh surfaces for the re-parsed files, from the same collect
-             * path a full build uses; then registries over stored + fresh. */
-            def_modules = (char **)calloc((size_t)ci, sizeof(char *));
-            int *def_starts = (int *)calloc((size_t)ci + 1, sizeof(int));
-            int fresh_count = 0;
-            CBMLSPDef *fresh_defs =
-                def_modules && def_starts
-                    ? cbm_pxc_collect_all_defs(ctx, &closure->arena, cache, changed_files, ci,
-                                               ctx->project_name, def_modules, &fresh_count,
-                                               def_starts)
-                    : NULL;
-            if ((fresh_defs || fresh_count == 0) && def_starts &&
-                cbm_lsp_surface_build_rows(ctx, ctx->project_name, cache, changed_files, ci,
-                                           fresh_defs, def_starts, &closure->fresh_rows,
-                                           &closure->fresh_count) != 0) {
-                closure->fresh_rows = NULL;
-                closure->fresh_count = 0;
-            }
-            free(def_starts);
-            all_def_count = closure->base_def_count + fresh_count;
-            if (all_def_count > 0) {
-                all_defs = (CBMLSPDef *)cbm_arena_alloc(&closure->arena,
-                                                        (size_t)all_def_count * sizeof(CBMLSPDef));
-            }
-            if (all_defs) {
-                if (closure->base_def_count > 0) {
-                    memcpy(all_defs, closure->base_defs,
-                           (size_t)closure->base_def_count * sizeof(CBMLSPDef));
-                }
-                if (fresh_count > 0) {
-                    memcpy(all_defs + closure->base_def_count, fresh_defs,
-                           (size_t)fresh_count * sizeof(CBMLSPDef));
-                }
-                module_def_index = cbm_pxc_build_module_def_index(all_defs, all_def_count);
-                /* Tier-2 shared registries are an amortization: the full
-                 * pipeline pays one build over all defs to make 85k per-file
-                 * resolves O(1). A floor-sized closure resolves a handful of
-                 * files, so the build (minutes-scale over multi-million-def
-                 * corpora) can never pay for itself — the per-file fallback
-                 * path, filtered through module_def_index, is the SAME
-                 * pre-Tier-2 resolution code the full pipeline still uses
-                 * for languages without a shared registry, so convergence
-                 * is unaffected; only the amortization strategy changes. */
-                if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
-                    CBMArena *xa = &closure->arena;
-                    cross_registries.go = cbm_go_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.python =
-                        cbm_py_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.java =
-                        cbm_java_build_cross_registry(xa, all_defs, all_def_count);
-                    registries_arg = &cross_registries;
-                }
-            } else {
-                all_def_count = 0;
-            }
-            free(fresh_defs);
-            /* The resolve workers borrow def_modules strings; ownership moves
-             * to the closure ctx so they outlive resolve + calls. */
-            closure->def_modules = def_modules;
-            closure->def_module_count = ci;
-            def_modules = NULL;
-            cbm_log_info("incremental.closure_registries", "base",
-                         itoa_buf(closure->base_def_count), "fresh", itoa_buf(fresh_count),
-                         "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+            registries_arg =
+                build_closure_registries(ctx, changed_files, ci, cache, closure, &all_defs,
+                                         &all_def_count, &module_def_index, &cross_registries, t);
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count,
                                   all_defs, all_def_count, closure ? closure->def_modules : NULL,
                                   module_def_index, registries_arg);
-        if (module_def_index) {
-            cbm_pxc_free_module_def_index(module_def_index);
-        }
+        cbm_pxc_free_module_def_index(module_def_index);
         if (rc == 0) {
             rc = cbm_pipeline_check_cancel(ctx);
         }
@@ -1341,52 +1409,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         free_incremental_result_cache(cache, ci);
         return rc;
     } else {
-        cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf(ci));
-
-        /* Keep the definition pass's transformed/extracted result alive for
-         * the following resolution passes. This mirrors the full sequential
-         * pipeline and is required for transform-only inputs such as
-         * ObjectScript Studio Export XML, whose original source cannot be
-         * re-extracted directly by the call/usage/semantic passes. */
-        CBMFileResult **prior_cache = ctx->result_cache;
-        CBMFileResult **cache = prior_cache;
-        bool owns_cache = false;
-        if (!cache && ci > 0) {
-            cache = (CBMFileResult **)calloc((size_t)ci, sizeof(CBMFileResult *));
-            if (!cache) {
-                cbm_log_error("incremental.err", "phase", "result_cache_alloc");
-                return CBM_NOT_FOUND;
-            }
-            ctx->result_cache = cache;
-            owns_cache = true;
-        }
-        int rc = cbm_pipeline_pass_definitions(ctx, changed_files, ci);
-        if (rc == 0) {
-            rc = cbm_pipeline_check_cancel(ctx);
-        }
-        if (rc == 0) {
-            rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);
-        }
-        if (rc == 0) {
-            rc = cbm_pipeline_check_cancel(ctx);
-        }
-        if (rc == 0) {
-            rc = cbm_pipeline_pass_usages(ctx, changed_files, ci);
-        }
-        if (rc == 0) {
-            rc = cbm_pipeline_check_cancel(ctx);
-        }
-        if (rc == 0) {
-            rc = cbm_pipeline_pass_semantic(ctx, changed_files, ci);
-        }
-        if (rc == 0) {
-            rc = cbm_pipeline_check_cancel(ctx);
-        }
-        if (owns_cache) {
-            free_incremental_result_cache(cache, ci);
-            ctx->result_cache = prior_cache;
-        }
-        return rc;
+        return run_sequential_extract_resolve(ctx, changed_files, ci);
     }
 }
 
@@ -1466,6 +1489,7 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
 }
 /* Publish the test-only legacy partial result through the same atomic
  * generation boundary as full indexing. */
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             atomic_int *cancelled, const cbm_file_hash_t *manifest,
                             int manifest_count, const char *adr_content,
@@ -1496,6 +1520,8 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
     }
     return 0;
 }
+
+#endif
 
 /* Parallel base-def rehydration: rows are independent, so the JSON decode
  * fans out across workers on a stride; assembly back into one array stays
@@ -2383,13 +2409,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     closure_plan_t closure_plan = {0};
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     bool closure_active = false;
+#endif
 
     const char *project = cbm_pipeline_project_name(p);
 
-    bool force_legacy_partial = false;
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    force_legacy_partial = incr_test_take_force_legacy_partial();
+    bool force_legacy_partial = incr_test_take_force_legacy_partial();
     incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_NONE);
 #endif
 
@@ -2421,7 +2448,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * semantic-manifest match is a no-op; any byte/set/mode/migration delta
      * rebuilds the complete graph. This avoids partial LSP/package/config
      * convergence gaps while retaining the common unchanged-repo fast path. */
-    if (!force_legacy_partial) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (!force_legacy_partial)
+#endif
+    {
         cbm_coverage_meta_t meta = {0};
         int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
         const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
@@ -2458,8 +2488,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         if (metadata_current &&
             closure_try_plan(p, store, project, files, file_count, stored, stored_count,
                              baseline_manifest, baseline_count, &closure_plan)) {
-            closure_active = true;
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+            closure_active = true;
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
 #endif
             cbm_log_info("incremental.route", "route", "closure_repair", "files",
@@ -2481,12 +2511,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int n_changed = 0;
     int n_unchanged = 0;
     bool *is_changed = NULL;
-    if (closure_active) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (closure_active)
+#endif
+    {
         n_changed = closure_plan.count;
-    } else {
+    }
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    else {
         is_changed =
             classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
     }
+#endif
 
     /* Classify stored files absent from current discovery: truly-deleted
      * (purge) vs mode-skipped (preserve nodes AND hash rows). */
@@ -2504,6 +2540,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Fast path: nothing changed → skip. The on-disk DB is left untouched,
      * which means existing hash rows (including for any mode-skipped files
      * that were already preserved by an earlier run) remain intact. */
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (!closure_active && n_changed == 0 && deleted_count == 0) {
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
         incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_NOOP);
@@ -2516,6 +2553,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_store_close(store);
         return 0;
     }
+#endif
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (!closure_active) {
@@ -2548,22 +2586,31 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_file_info_t *changed_files =
         (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_info_t)) : NULL;
     int ci = 0;
-    if (closure_active) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (closure_active)
+#endif
+    {
         for (int i = 0; i < closure_plan.count; i++) {
             changed_files[ci++] = closure_plan.files[i];
         }
-    } else {
+    }
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    else {
         for (int i = 0; i < file_count; i++) {
             if (is_changed[i]) {
                 changed_files[ci++] = files[i];
             }
         }
     }
+#endif
     free(is_changed);
 
     cbm_log_info("incremental.reparse", "files", itoa_buf(ci));
 
-    if (closure_active) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (closure_active)
+#endif
+    {
         /* The delta executor owns everything passed and never touches the
          * live database; its every failure falls back to a full rebuild. */
         return run_closure_delta(p, db_path, project, baseline_manifest, baseline_count,
@@ -2572,6 +2619,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                  t0);
     }
 
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     struct timespec t;
 
     /* Step 1: Load existing graph into RAM */
@@ -2886,4 +2934,5 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
     return persist_rc;
+#endif
 }
