@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the selected native runtime set: the executable, its authenticated integration asset, and—when requested—the content-addressed UI pack.
+**Code intelligence for AI coding agents.** This npm wrapper downloads, verifies, and caches the selected native runtime set: the executable and its authenticated integration asset, with the graph UI included.
 
 High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 162 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 45 automatic/conditional client surfaces.
 
@@ -15,7 +15,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 npm install -g codebase-memory-mcp
 ```
 
-The runtime set for your platform is downloaded automatically at install time. There is one composition per platform and the graph UI is always included — the former `CBM_VARIANT=ui` opt-in is obsolete.
+The runtime set for your platform is downloaded automatically at install time. There is one composition per platform and the graph UI is always included.
 
 Then configure your coding agents:
 
@@ -27,10 +27,10 @@ Restart your agent. Say **"Index this project"** — done.
 
 ## Why codebase-memory-mcp
 
-- **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline with LZ4 compression and in-memory SQLite.
+- **RAM-first indexing** — LZ4 compression and in-memory SQLite.
 - **Plug and play** — verified native runtime sets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64). No Docker or API keys; Node.js owns package download, cache repair, and launch.
 - **162 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
-- **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search.
+- **Structured exploration** — retrieve symbols and relationships directly; measure answer quality and token use on your workload.
 - **45 supported automatic/conditional client surfaces** — `install` configures the appropriate MCP, durable-context, and documented hook surfaces without widening client permissions.
 - **Detected automatically (39)** — Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Grok Build, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, Pi, and Oh My Pi (omp).
 - **Conditional or explicit (6)** — Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE, and Sourcegraph Cody. Bob IDE is touched only when `~/.bob/mcp.json` already exists.
@@ -63,10 +63,10 @@ codebase-memory-mcp uninstall        # remove agent configs
 Every MCP tool is also available directly from the command line:
 
 ```bash
-codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
-codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
-codebase-memory-mcp cli trace_call_path '{"function_name": "main", "direction": "both"}'
-codebase-memory-mcp cli get_architecture '{}'
+codebase-memory-mcp cli index_repository --repo-path /path/to/repo
+codebase-memory-mcp cli search_graph --name-pattern '.*Handler.*' --label Function
+codebase-memory-mcp cli trace_path --function-name main --direction both
+codebase-memory-mcp cli get_architecture
 ```
 
 ## MCP Tools
@@ -74,20 +74,18 @@ codebase-memory-mcp cli get_architecture '{}'
 | Category | Tools |
 |----------|-------|
 | **Indexing** | `index_repository`, `list_projects`, `delete_project`, `index_status` |
-| **Querying** | `search_graph`, `trace_call_path`, `detect_changes`, `query_graph` |
-| **Analysis** | `get_architecture`, `get_graph_schema`, `get_code_snippet`, `search_code` |
+| **Querying** | `search_graph`, `trace_path`, `detect_changes`, `query_graph` |
+| **Analysis** | `get_architecture`, `get_graph_schema`, `get_code_snippet`, `search_code`, `check_index_coverage` |
 | **Advanced** | `manage_adr`, `ingest_traces` |
 
 ## Performance
 
-Benchmarked on Apple M3 Pro:
-
-| Operation | Time |
-|-----------|------|
-| Linux kernel full index (28M LOC, 75K files) | 3 min |
-| Django full index | ~6s |
-| Cypher query | <1ms |
-| Trace call path (depth=5) | <10ms |
+Measure indexing/query latency and agent savings on your repository and host;
+no current-tree latency or token-savings guarantee is published here. Parser
+support does not establish semantic completeness. Rust currently admits only
+exact file-local free-function calls and derived TESTS; methods, cross-file calls
+and implementation relationships remain gated. Consult the source checkout's
+Rust accuracy plan and measurement guide under `docs/` for scope and verification.
 
 ## Full Documentation
 

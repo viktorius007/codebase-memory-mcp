@@ -6,10 +6,11 @@ The remaining objective is in [RUST_CODEGRAPH_TRUTH_PLAN.md](RUST_CODEGRAPH_TRUT
 
 ## Current gate
 
-The complete repair tree passed the canonical scripts/test.sh gate on macOS arm64:
+The source/test tree committed at `61fde702` passed the canonical scripts/test.sh
+gate on macOS arm64:
 **8,074 passed, 0 failed, 10 skipped**, across 141 suites under ASan/UBSan.
 All subsequent production-runtime and security-string checks passed; the command
-exited 0. The separately committed lint cleanup (568a27d8) passed the same full gate.
+exited 0.
 
 Repository lint-ci, diff-scoped clang-tidy, the security audit and whitespace checks
 passed on the final source. No lint suppression was added. Independent source

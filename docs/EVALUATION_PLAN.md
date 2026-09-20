@@ -1,20 +1,27 @@
-# codebase-memory-mcp — Evaluation Plan (159 Languages)
+# codebase-memory-mcp — Evaluation Plan (159-language draft cohort)
 
 > **Status:** Working plan document, **for peer review prior to execution**. This is a **plan, not a
 > result set** — it defines *how* the next evaluation is run and contains no scores. Execution happens
 > **downstream**, after this specification is reviewed; §15 requires a pilot run before the full sweep.
 >
-> **Single version.** There are no `v1/`, `v8/`, `v(x)/` result directories anymore — that scheme
-> is retired. Every run writes to one flat output tree (`eval-results/`) and overwrites the
-> previous run. History lives in git, not in versioned folders.
+> **Scope:** The 159-language catalog below is a draft evaluation cohort, not the current
+> supported-language inventory (162). Reconcile the cohort and resolver capabilities with the
+> tested build before execution. The nine-language deep-dive group is a selection, not an
+> exhaustive list of Hybrid LSP languages or a semantic-completeness claim. In particular,
+> [Rust coverage is partial](RUST_CODEGRAPH_TRUTH_PLAN.md); unsupported relationships must be
+> reported as coverage gaps, not inferred from absent edges.
+>
+> **Outputs:** Each run writes one flat `eval-results/` tree. Commit evidence before replacing
+> it; history lives in Git. Draft corpus paths and symbol names require validation at pinned
+> revisions, and tool examples must be checked against the tested build's schema.
 
 ---
 
 ## 1. Purpose
 
 Measure how well `codebase-memory-mcp`'s structured knowledge-graph queries answer real developer
-questions compared to plain text exploration (Grep / Glob / Read), across **all 159 supported
-languages**, and — for the 9 LSP-hybrid languages — how well the deeper capabilities
+questions compared to plain text exploration (Grep / Glob / Read), across the **159-language
+draft cohort**, and — for its nine-language deep-dive group — how well the deeper capabilities
 (**cross-repo intelligence** and **semantic / similarity edges**) actually perform.
 
 Two conditions answer the **same questions** on the **same repository** per language:
@@ -27,32 +34,21 @@ Two conditions answer the **same questions** on the **same repository** per lang
 A third evaluator — an **LLM-as-a-Judge** (§9) — grades both answer sets blind against the actual
 source code.
 
-### What changed from the old v8 plan
-
-| Old (v8) | New |
-|----------|-----|
-| 66 languages | **159 languages** (full `CBM_LANG_*` registry) |
-| 5 language *groups* share one 12-question set | **5 bespoke questions per language**, each its own subchapter (§12) |
-| Versioned result dirs `v(x)/` | **One** `eval-results/` tree, no versions |
-| MCP answered by a budget-capped sub-agent | **Hybrid**: main session orchestrates, graph-only sub-agents answer (§4) |
-| Manual grading | **LLM-as-a-Judge**, blinded (§9) |
-| No deep capability tests | **Deep-dive block** for the 9 LSP-hybrid languages: cross-repo + semantic/similar (§11) |
-
 ---
 
 ## 2. Scope: the 159 languages
 
-The supported set is the `CBMLanguage` enum in `internal/cbm/cbm.h` (`CBM_LANG_GO=0` …
-`CBM_LANG_CFML`, before `CBM_LANG_COUNT`). The canonical short name used throughout this plan is the
+The current supported set is the `CBMLanguage` enum in `internal/cbm/cbm.h`, before
+`CBM_LANG_COUNT`; this draft cohort is not exhaustive. The canonical short name used throughout this plan is the
 lowercased enum suffix (`CBM_LANG_GO` → `go`, `CBM_LANG_CSHARP` → `csharp`,
 `CBM_LANG_COMMONLISP` → `commonlisp`). The complete repo assignment for all 159 is the master table
 in §8.
 
 ### The 9 LSP-hybrid languages (deep-dive cohort)
 
-These have dedicated hybrid LSP modules under `internal/cbm/lsp/` and therefore type-aware
-call/usage resolution, plus they are the only languages where cross-repo and semantic/similar edges
-are mature enough to deserve a deep-dive:
+The selected deep-dive languages have resolver modules under `internal/cbm/lsp/`.
+Validate their actual published relationships and coverage flags before choosing questions;
+the presence of a resolver does not establish complete call/usage or cross-repo resolution:
 
 `go` · `python` · `typescript` · `java` · `c` · `csharp` · `php` · `kotlin` · `rust`
 
@@ -563,8 +559,8 @@ sub-score (e.g. "verified `Cart.checkout` exists at `cart.go:88` ✓; claimed 12
      by Claude → judge with a non-Claude model) to minimize self-preference at no extra panel cost.
   2. If the judge *is* same-family, the report must carry an explicit **self-preference caveat** and
      must not present the score as bias-free.
-  (A cross-family panel was considered and deferred — see §16.3 fork B. It remains the stronger option
-  if cross-provider access is available at execution time; the plan does not block on it.)
+  A cross-family panel is an execution-time option when cross-provider access is available;
+  disclose the selected protocol before grading (§16).
 - **3 independent passes**, per-question score = **median**; disagreement spread > 0.4 flags the
   question for manual spot-check. *Caveat recorded in the report: 3 passes of one model measure the
   model's consistency, not its bias — they tighten variance, they do not remove self-preference.*
@@ -963,8 +959,9 @@ D5→`search_code("instance ")` + `search_graph(name_pattern=".*walk.*|.*query.*
 **Gate 0 — de-risk before bulk authoring (do these first):**
 - [ ] **[CR-5]** Validate cross-repo edges form on ONE OTel pair (checkout→product-catalog) indexed
       as two projects. If not, switch to genuinely-separate repos or report cross-repo as a gap.
-- [ ] **[Fork A]** Decide scope: **pilot** (9 LSP + ~10 representative others) vs full 159 now.
-- [ ] **[Fork B]** Decide judge: cross-family panel vs single disclosed model.
+- [ ] Reconcile the draft cohort with the supported-language registry and current coverage.
+- [ ] Run the **pilot** (nine selected resolver languages + ~10 representative others) before the full cohort.
+- [ ] Record the judge protocol: cross-family panel or single disclosed model.
 
 **Build-out:**
 - [ ] Extend `scripts/clone-bench-repos.sh` to all 159 (symlinks + subset rules from §8); pin SHAs.
@@ -986,142 +983,26 @@ D5→`search_code("instance ")` + `search_graph(name_pattern=".*walk.*|.*query.*
 
 ---
 
-## 16. Challenger review
+## 16. Evaluation controls
 
-> Per project policy, this plan's methodology is reviewed by the `challenger` agent before it is
-> finalized. The full report is inserted here verbatim. Fixes adopted from it are marked
-> **[CR-n]** at their section; two strategic forks (§16.1) remain open decisions.
+The methodology in §§3–15 uses these controls. Review transcripts and superseded
+alternatives live in Git.
 
-### 16.1 Challenger-driven changes adopted
+| Control | Requirement | Owner section |
+|---|---|---|
+| CR-1 | Author D1/D3 grep-first, D2/D4 graph-first; label D5's graph advantage. | §12 |
+| CR-2 | Name the judge model, disclose family bias and use the fixed grading protocol. | §9.4 |
+| CR-3 | Report answering-phase and full-session token costs separately. | §5 |
+| CR-4 | Publish completion only after output is flushed; consume completion sentinels. | §4 |
+| CR-5 | Verify CROSS edges on one service pair before authoring the remaining deep-dives. | §11.1 |
+| CR-6 | Scope near-duplicate checks to Type-1/2, with at least 20 verified pairs. | §11.2 |
+| CR-7 | Aggregate D5 within each group only. | §3 |
+| CR-8 | Resume from the completion manifest rather than repeating completed languages. | §4 |
+| CR-9 | Verify at least 30% of cited symbols (minimum five where available); ground completeness in an enumeration. | §9.1 |
 
-| # | Finding | Change | Where |
-|---|---------|--------|-------|
-| CR-1 | Questions authored from graph-discovered symbols bias D1/D3 toward graph-visible code | **Symmetric authoring**: D1 & D3 questions are authored *grep-first* (symbols found by text search, never via the graph); D2 & D4 graph-first; D5 is openly graph-favoring and labeled as such | §12 |
-| CR-2 | Single-family judge → 10–25% self-preference inflation | **Single disclosed judge model, preferring a non-Claude family**; bias caveated; cross-family panel kept as an execution-time upgrade (§16.3) | §9.4 |
-| CR-3 | Excluding Explorer orientation tokens flatters the Token Ratio | Report **both** a narrow (answering-phase) and a **full-session** token metric | §5 |
-| CR-4 | File-existence polling can read a half-written file | **Atomic completion**: agent writes output, fsyncs, then writes a `<lang>.<phase>.done` sentinel; the orchestrator polls the sentinel only | §4 |
-| CR-5 | "OTel sub-dir = project" may not form CROSS edges | **Gate**: validate CROSS edges on one OTel pair *before* authoring the rest of the deep-dive | §11.1 |
-| CR-6 | 3–5 hand-picked duplicate pairs have no statistical standing | **S2 ground truth from the indexer's own simhash clusters** (reproducible), scoped to Type-1/2 near-exact dupes; minimum 20-pair set | §11.2 |
-| CR-7 | D5 means different things per group → cross-group rollup is noise | **D5 is reported within-group only**, never aggregated across all 159 | §3, §10 |
-| CR-8 | No checkpoint/resume; one dropout restarts from zero | **Completion manifest** (`eval-results/manifest.json`); every phase skips already-`.done` languages | §4, §13 |
-| CR-9 | Verification samples 3–5 of N claims → Completeness ungrounded | Judge verification sample **scales with claim count** (≥30% of cited symbols, min 5); Completeness must cite the enumeration it compared against | §9.1 |
-
-### 16.2 Full challenger report (verbatim)
-
-> The report below is reproduced in full, unedited, as required by project policy.
-
-#### Challenge Review: EVALUATION_PLAN.md — codebase-memory-mcp 159-Language Benchmark
-
-##### What Looks Good
-
-The three-pass median judge with disagreement-spread flagging (§9.4) is a sound baseline for LLM-as-a-judge consistency. Documenting the C cross-repo gap explicitly rather than papering over it (§11.1 caveat) is intellectually honest. Tying judging to ground-truth verification with capped Correctness at 0.5 for unverifiable claims (§9.4) is the right instinct, even if the implementation has holes (see below). The per-language tier system (§10.3) gives actionable output rather than a single aggregate number.
-
-##### Assumptions to Verify
-
-**Assumption 1: the "bespoke questions written against real symbols" guarantee neutrality.**
-The plan states questions are written after Phase 0/1 once `search_graph`/`get_architecture` confirm actual identifiers (§12, authoring note). The person writing the questions therefore already used the graph to discover the symbols. This systematically biases D1, D2, and D3 questions toward symbols the graph indexed successfully. A function the graph missed — because of a parse error, label mismatch, or LSP gap — cannot appear in the question, because the author would never have discovered it that way. The Explorer is then asked to find things the graph already confirmed it can find. Consequence: quality gaps for underserved symbols are invisible in the data.
-
-**Assumption 2: "identical overhead cancels out" justifies excluding spawn/teardown tokens (§5).**
-This only holds if overhead is truly equal. The Explorer is an `Explore` sub-agent (open-ended, unlimited tool calls, no instructions about how to be efficient). The Graph agent is a graph-only agent with a narrow, well-specified tool set. The Explorer will consume more context just orienting itself — directory listings, initial Glob probes, dead-end reads. Excluding this overhead hides a real cost that a developer deciding "should I use the MCP?" would pay. The token ratio reported will favor Graph artificially, independently of quality.
-
-**Assumption 3: file-existence polling is reliable at scale (§4).**
-The plan detects agent completion by polling for `<lang>-graph.md`/`<lang>-explorer.md` existence. A file can be partially written when the polling check fires (write syscall in progress). There is no described fsync barrier, atomic rename, or completion-marker protocol (e.g., writing a `.done` sentinel after a final `fsync`). At 159 × 3 agents per batch, a race here corrupts the input to the judge phase silently. The plan notes the v8 lesson about `SendMessage` killing agents mid-write — this is the exact same failure mode, shifted from shutdown to detection.
-
-**Assumption 4: "one OTel Demo sub-directory = one project" validly exercises cross-repo intelligence.**
-This is the most critical structural assumption. The cross-repo feature (`CROSS_HTTP_CALLS`, `CROSS_ASYNC_CALLS`) is designed for separately maintained codebases with independent deploy cycles. Indexing two service directories from the same monorepo as "separate projects" is an artificial split. The monorepo may share proto definitions, a common `pb.go` directory, or Bazel build rules that the indexer would normally traverse. Whether the CROSS edges even form in this configuration has not been validated — the plan asks for it (§15) but doesn't answer it. If they don't form, 8 of 9 deep-dives measure nothing meaningful.
-
-**Assumption 5: the 3-pass judge is immune to self-preference bias.**
-The plan specifies "one judge model, fixed prompt" (§9.4) but does not name the judge model, and the two conditions' answers were presumably written by Claude sub-agents. If the judge is from the Claude family, self-preference bias of 10–25% has been empirically demonstrated across Llama/Claude/GPT pairs (Zheng et al., 2024; Panickssery et al., 2024). Three passes of the same biased model gives a precise median of a biased number, not an unbiased estimate.
-
-##### Alternatives Worth Considering
-
-**Alternative A: Tiered evaluation — deep on 9 LSP + stratified sample of Group E (not all 159).**
-795 hand-written questions across 159 languages is an enormous authoring investment. Most of the actionable signal lives in: (a) the 9 LSP languages where the graph has type-aware edges, (b) the ~20 popular languages where regressions would be noticed by users, and (c) a representative handful of Group E config/data languages. The other ~110 niche languages (fennel, squirrel, smali, beancount, pine, hyprlang…) will score similarly to each other and to a naive Grep baseline because the graph cannot index them structurally beyond token counting. A stratified sample of 30–40 languages would likely yield the same tier distribution with 1/4 the cost and would be rerunnable on demand. Trade-off: loses the "covers all 159" marketing claim. But a poorly-executed 159-language sweep is weaker evidence than a rigorous 40-language one.
-
-**Alternative B: Symmetric question authoring — half written from grep discovery, half from graph discovery.**
-To remove the symbol-discovery bias identified in Assumption 1, split the 5 questions: questions for D1 and D3 (concrete retrieval) are written by a Grep-first author who finds symbols by text search without touching the graph, and questions for D2 and D4 are written by a graph author. D5 is intentionally graph-favoring (semantic/similarity) — acknowledge that openly rather than presenting it as neutral. Trade-off: doubles authoring complexity per language but removes the most serious validity threat.
-
-**Alternative C: Use a heterogeneous judge panel (different model families).**
-Run three passes with three different judge models (e.g., GPT-4o, Claude, Gemini) rather than three passes with the same model. Per-question score is the cross-family median. Self-preference bias cancels rather than compounds. This is a well-established pattern in adversarial evaluation (MT-Bench, Chatbot Arena). Trade-off: 3× judge API cost, requires cross-provider API access. The cost is real but the bias problem is also real — a single-model judge's 3-pass median is not a substitute.
-
-**Alternative D: Use the OTel Demo's own integration-test fixtures as cross-repo ground truth.**
-The OTel Demo ships its own integration tests and service topology documentation, which manually enumerate which service calls which endpoint. This is a pre-existing, publicly defensible ground-truth source that avoids the "author reads the code and writes the ground truth" circularity problem in §11.1's X1 metric. Trade-off: ground truth scope is bounded by what the integration tests assert, which may miss some call paths.
-
-**Alternative E: Use BigCloneBench or a validated corpus for S2 near-duplicate ground truth.**
-The plan proposes "3–5 known near-duplicate / copy-pasted function pairs found by manual read or simhash dump" as the S2 ground truth. This is a sample of 3–5 pairs per language, constructed by the same team running the evaluation. The academic literature has demonstrated that hand-built near-duplicate ground truth is systematically biased and mislabelled even at scale (Krinke 2022, arXiv 2505.04311 — 93% mislabelling rate for weak Type-3/4 clones in BigCloneBench). A 3-pair sample has no statistical standing whatsoever. Better alternatives: use simhash-computed clusters on the full repo as pseudo-ground-truth (at least reproducible), or scope S2 to only exact/near-exact duplicates (Type-1/2) where manual verification is tractable.
-
-##### Risk Register
-
-| Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| Questions authored from graph discovery bias D1/D2/D3 toward graph-visible symbols | High | High | Symmetric authoring (Alt B) or explicit caveat in methodology |
-| Single-family judge produces self-preference inflation of 10–25% | High | High | Cross-family judge panel (Alt C) |
-| File-existence polling causes silent partial-write corruption at scale | Medium | High | Atomic sentinel file (`.done`) written only after the output file is flushed |
-| OTel monorepo sub-dirs do not form CROSS edges; 8/9 deep-dives are void | Medium | High | Validate a single pair before committing to this design; document fallback |
-| C cross-repo pair (redis/hiredis, RESP protocol) produces 0 CROSS edges | High | Medium | Already flagged — treat as documented gap; consider using a WASM/Wasm-C host if a genuine C HTTP service pair can be found |
-| 159-language sweep is not completable in one session without checkpointing | High | Medium | Add explicit checkpoint/resume logic to the script; describe failure-recovery in §13 |
-| ~30 flagged ⚠️ repos unavailable, too small, or wrong language on run day | Medium | Medium | Validate all ⚠️ rows before authoring questions; fallback fixture corpus per §8.1 |
-| Shallow clone at run time produces a different HEAD than during question authoring | Medium | Medium | Pin repos by commit SHA during authoring; bake SHA into `clone-bench-repos.sh` |
-| 3-pass median of same judge hides variance; passes are correlated not independent | Medium | Medium | Cross-family panel or acknowledge limitation explicitly in §9 |
-| Explorer spawn overhead excluded but material; Token Ratio misleads | Medium | Medium | Include full-session token cost as a second metric; label the narrow metric clearly |
-
-##### Operational Concerns
-
-**Scale / execution feasibility.**
-159 × (clone + cold index + graph agent + explorer agent + 3 judge passes) = at minimum 159 × 5 agent invocations = 795 sub-agent sessions, plus 159 × 3 = 477 judge passes. Cold indexing alone for 159 repos, some requiring "full" mode (semantic edges, vector index), will be measured in hours for languages like Haskell/pandoc, Python/httpie, or any repo with millions of lines. The plan gives no clock estimate, no session-continuation strategy if the main session times out, and no checkpoint format beyond "the file exists." One session dropout at language 87 means re-running from language 1 unless someone adds explicit resume logic. This is the single largest operational risk.
-
-**The Explorer "unlimited tool calls" vs Graph "fixed tool set" asymmetry.**
-The Graph agent knows exactly which tools to call: `search_graph` → `trace_call_path` → `get_code_snippet`. It has a clear playbook (the "expected graph tools" hint in §12). The Explorer has no playbook — it is a general `Explore` sub-agent that must orient itself, guess directory structure, and iteratively refine searches. These are not symmetric difficulty conditions. The Graph agent benefits from structured orientation that is invisible to the evaluation because the tool responses come pre-structured. This is not a flaw in the product — it is a real advantage. But the plan presents it as a neutral "same questions, same time window" comparison, which it is not.
-
-**The D5 dimension is structurally not neutral.**
-D5 is defined as "Cross-cutting / Semantic" with the primary tool listed as `search_code` / `search_graph(semantic_query=…)`. For Group E (config/markup/schema) languages, the plan reinterprets D5 as "duplication / naming-pattern / config↔code links." This re-interpretation is ad hoc and dimension-specific — the D5 graph tool advantage does not transfer to these languages in the same way. Aggregating D5 scores across Group A–E languages with such different operational definitions will produce a meaningless cross-group rollup.
-
-**No described failure threshold for an individual run.**
-If the Graph agent returns zero results on D2 (zero-result rate flagged in §5), does the run for that question still count? Is a zero-result a FAIL automatically, or does the judge still grade it? The rubric says Correctness is capped at 0.5 for unverified claims, but a zero-result has no claim to verify. This edge case likely produces a judge confusion artifact at scale.
-
-**The judge's ground-truth verification is token-expensive and shallow.**
-§9.1 says the judge verifies a "sample 3–5 cited symbols/files/lines per question." At 795 questions × 3 judge passes = 2,385 judge invocations, each doing live Grep/Read on the actual repo, this is non-trivial API cost and time. More importantly, sampling 3–5 symbols out of an answer that may cite 20–30 means 85%+ of the answer's claims go unverified. An answer that correctly identifies 3 of 12 handlers will pass the Correctness sample check at 1.0 (all 3 sampled claims correct) while a Completeness-aware judge would score it low. The plan splits Correctness and Completeness into separate sub-scores, which partially addresses this — but the verification step only feeds Correctness, leaving Completeness graded purely on the LLM's intuition about "full scope."
-
-##### Research Findings
-
-- Self-preference bias (10–25% inflation) in same-family LLM judges: arXiv 2410.21819; "Quantifying and Mitigating Self-Preference"; FutureAGI bias mitigation survey
-- Frontier models exceed 50% error rates on advanced bias tests: Adaline LLM-as-a-Judge reliability
-- Position bias (judge flips preference when A/B swapped, even GPT-4): LLM-as-a-Judge biases (sebastiansigl.com)
-- Near-duplicate benchmark ground truth — BigCloneBench 93% mislabelling rate, "BigCloneBench Considered Harmful": arXiv 2505.04311; Krinke IWSC22
-- Benchmark over-optimism from design choice multiplicity: arXiv 2106.02447
-- Code search: grep vs. semantic divergence; only 20–30% solutions overlap: GrepRAG arXiv 2601.23254
-- OTel Demo services and languages (confirmed): OpenTelemetry Demo Services
-- Multi-agent file-polling reliability risks, event-driven vs. polling: Multi-Agent Reliability Patterns
-- Redis/hiredis uses RESP (not HTTP routes), so CROSS edges cannot form: Redis RESP Protocol; Hiredis GitHub
-
-##### Questions for the Developer
-
-1. **Question authoring source of truth (§12 authoring note):** When you write "questions must cite real symbols, so they are filled in during Phase 0/1" — do you mean you will use the graph to discover those symbols, or will you independently verify them with Grep? If graph-first, you have the bias I described. What is your plan to ensure D1/D3 questions target symbols that Grep can also find?
-2. **Judge model identity (§9.4):** What model will be the judge? If it is any Claude model, the same-family self-preference effect applies to every Claude-written Graph and Explorer answer. Have you considered a cross-family judge rotation, or at minimum disclosing the judge model in the report so readers can calibrate?
-3. **CROSS edge formation in OTel sub-dirs (§11.1, §15):** Before writing 157 more language chapters, have you actually run `index_repository(mode="cross-repo-intelligence")` on two OTel service sub-dirs and confirmed that CROSS_HTTP_CALLS edges form? This is the load-bearing question for the entire deep-dive block. What is the fallback plan if they don't?
-4. **Session continuity (§13):** What happens when the main session context window fills up or hits the usage limit at language 94? Is there a described checkpoint format — e.g., a manifest of completed languages that `clone-bench-repos.sh` can consult to skip already-done languages — or does the whole run restart from zero?
-5. **D5 cross-group comparability (§3, §8):** You aggregate D5 scores across all 159 languages. But D5 for Go means `semantic_query=["dispatch","route"]` surfacing functions from a vector index. D5 for gitignore means "naming-pattern / config↔code links." These are different operations using different graph tools. Do you actually intend the cross-language D5 rollup in §10.1 to be meaningful, or is it cosmetic?
-6. **S2 ground truth (§11.2):** "3–5 known near-duplicate function pairs" — how will you construct this set for each of the 9 LSP languages? Will you use the simhash output the indexer already produces, or is this a manual read? A 3-pair sample with no inter-rater agreement cannot support a recall claim. What is the minimum ground-truth size you consider credible?
-7. **Token exclusion policy (§5):** If a developer is deciding whether to adopt codebase-memory-mcp, they pay the full session cost, including agent spawn, orientation, and formatting. Why should the reported "Token Ratio" exclude the Explorer's orientation cost? Would you consider reporting both the narrow metric and the full-session metric?
-8. **The 159-vs-tiered question (over-engineering check):** The plan acknowledges ~30 ⚠️ repos need validation before questions can be written. For languages like `regex` (fixture corpus), `csv` (data, not code), `dotenv` (a handful of fixture files), `sshconfig` (few files), what meaningful D1–D5 question set can be written? Is the signal from these languages worth the cost of the infrastructure to collect it?
-
-##### Recommendation
-
-The evaluation's most serious flaw is not operational — it is that the bespoke questions will almost certainly be written from graph-discovered symbols (because the authoring process says "do Phase 0/1 first"), making the graph condition a partial answer to its own test. Combined with a single-family judge that carries 10–25% self-preference bias, the result will be a well-executed benchmark that systematically overstates the graph's advantage. Fix these two issues — symmetric question authoring and a cross-family judge panel — before running the full 159-language sweep, or the SUMMARY.md will not be a credible external artifact. The 159-language scope is also premature given that ~30 repos need validation and session-continuity infrastructure does not yet exist; a pilot run on the 9 LSP languages plus 10 representative Group E languages would de-risk the methodology before committing to 795 hand-written questions.
-
-### 16.3 Strategic forks — resolved
-
-- **Fork A — scope: RESOLVED → full 159, specified in this document; execution is downstream.**
-  This document is a **specification to be peer-reviewed before any run**. It therefore enumerates all
-  159 languages with complete chapters (§14). The challenger's pilot recommendation is preserved as
-  an **execution-time** safeguard: §15 Gate 0 requires a pilot (9 LSP + ~10 representative others) to
-  validate the methodology *before* the downstream team commits to the full sweep. So: the *plan*
-  covers 159; the *first run* should still be a pilot.
-- **Fork B — judge: RESOLVED → single disclosed model** (§9.4), preferring a non-Claude family to
-  limit self-preference, with the bias caveat stated in the report. A cross-family panel remains a
-  documented upgrade path if cross-provider access exists at run time.
-
-
+Run the pilot in §15 before a full cohort sweep. A cross-family judge panel is an
+execution-time option when provider access is available; disclose the selected
+protocol and its limitations before grading.
 
 ---
 

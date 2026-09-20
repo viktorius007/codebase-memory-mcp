@@ -2,7 +2,7 @@
 
 mcp-name: io.github.DeusData/codebase-memory-mcp
 
-**Fast code intelligence engine for AI coding agents.** Indexes an average repository in milliseconds, the Linux kernel (28M LOC) in 3 minutes. Answers structural queries in under 1ms.
+**Code intelligence for AI coding agents.** Indexing/query latency and agent savings depend on the repository, build and host; measure them on your workload rather than treating historical timings as current guarantees.
 
 This Python wrapper downloads the selected `codebase-memory-mcp` runtime set from [GitHub Releases](https://github.com/DeusData/codebase-memory-mcp/releases) on first run and verifies it before publishing it in your OS cache directory. The set contains the native executable and authenticated integration asset, with the graph UI always embedded.
 

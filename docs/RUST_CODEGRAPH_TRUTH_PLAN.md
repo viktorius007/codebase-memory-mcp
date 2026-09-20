@@ -76,6 +76,6 @@ exact-target controls alongside refusals in both publication modes. Update resto
 migration and coverage policies consistently.
 
 Use private runtime/cache directories for tests and corpus experiments. Do not alter
-the live corpus, its default index or a shared daemon. Nothing in this repair session
-was pushed or installed; the installed tool and existing indexes are not verified
-as containing these changes.
+the live corpus, its default index or a shared daemon. Source verification does not
+establish that the installed tool or existing indexes contain these changes;
+verify the build identity and reindex before relying on the repaired behavior.

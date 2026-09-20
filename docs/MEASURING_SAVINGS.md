@@ -10,9 +10,9 @@ repository without mixing three different questions:
 
 Measure and report those classes separately. A fast graph query does not prove
 that the final answer is correct, and CBM's query counters do not reveal the
-agent's model-token or total tool-call consumption. The README's published
-[performance figures](../README.md#performance), the
-[language benchmark](BENCHMARK.md) and the more detailed
+agent's model-token or total tool-call consumption. The README's
+[performance guidance](../README.md#performance), the
+[benchmark status and grading guide](BENCHMARK.md) and the more detailed
 [evaluation plan](EVALUATION_PLAN.md) provide the grading concepts and the
 larger comparative methodology behind this smaller recipe.
 

@@ -2,7 +2,7 @@
 
 Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 
-> **Important**: This project is a **pure C binary** (rewritten from Go in v0.5.0). Please submit C code, not Go. Go PRs may be ported but cannot be merged directly.
+> **Important**: The native engine is written in C. Submit engine changes and regression tests in C; the graph UI and distribution wrappers use their own languages.
 
 ## Build from Source
 
@@ -55,7 +55,7 @@ src/
   foundation/       Arena allocator, hash table, string utils, platform compat
   store/            SQLite graph storage (WAL mode, FTS5)
   cypher/           Cypher query → SQL translation
-  mcp/              MCP server (JSON-RPC 2.0 over stdio, 14 tools)
+  mcp/              MCP server (JSON-RPC 2.0 over stdio, 15 tools)
   pipeline/         Multi-pass indexing pipeline
     pass_*.c        Individual pipeline passes (definitions, calls, usages, etc.)
     httplink.c      HTTP route extraction (Go/Express/Laravel/Ktor/Python)
@@ -81,7 +81,7 @@ Language support is split between two layers:
 
 1. Check the language spec in `internal/cbm/lang_specs.c`
 2. Use regression tests to verify extraction: `tests/test_extraction.c`
-3. Check parity tests: `internal/cbm/regression_test.go` (legacy, being migrated)
+3. Check publication-mode parity in `tests/test_pipeline.c` and `tests/test_parallel.c`
 4. Add a test case in `tests/test_pipeline.c` for integration-level fixes
 5. Verify with a real open-source repo
 
@@ -144,7 +144,7 @@ If in doubt, open an issue and ask.
 
 ### Code Requirements
 
-- **C code only** — this project was rewritten from Go to pure C in v0.5.0. Go PRs will be acknowledged and potentially ported, but cannot be merged directly.
+- **C engine code and tests** — keep UI and distribution-wrapper changes in their respective languages.
 - Include tests for new functionality
 - Run `scripts/test.sh` and `scripts/lint.sh` before submitting
 - Keep PRs focused — avoid unrelated reformatting or refactoring
