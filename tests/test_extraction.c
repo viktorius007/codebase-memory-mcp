@@ -5809,6 +5809,35 @@ TEST(extract_rust_test_attr_marks_is_test_issue855) {
     PASS();
 }
 
+TEST(extract_rust_test_attributes_match_paths_not_documentation) {
+    const char *source =
+        "#[ /* outer /* nested */ trivia */ test ] fn rejects_empty() {}\n"
+        "#[ tokio :: test(flavor = \"current_thread\") ] async fn accepts_async() {}\n"
+        "#[doc = \"tokio::test\"] fn helper() {}\n"
+        "#[not_tokio::test] fn similar_module() {}\n"
+        "#[tokio::test_helper] fn similar_name() {}\n"
+        "#[::tokio::test{}] async fn absolute_braces() {}\n"
+        "#[tokio::test[]] async fn brackets() {}\n"
+        "#[\xe2\x80\xa8test] fn unicode_space() {}\n";
+    const char *names[] = {"rejects_empty", "accepts_async", "helper", "similar_module", "similar_name", "absolute_braces", "brackets", "unicode_space"};
+    const bool expected[] = {true, true, false, false, false, true, true, true};
+    CBMFileResult *r = extract(source, CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < 8; i++) {
+        int matches = 0;
+        for (int j = 0; j < r->defs.count; j++) {
+            if (r->defs.items[j].name && strcmp(r->defs.items[j].name, names[i]) == 0) {
+                ASSERT_EQ(r->defs.items[j].is_test, expected[i]);
+                matches++;
+            }
+        }
+        ASSERT_EQ(matches, 1);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Function.is_test must follow the file's test-directory membership, not just
  * a test_/_test basename convention: a helper under tests/ with none of those
  * naming conventions (tests/helpers/fixtures.c) was previously indexed as an
@@ -7864,6 +7893,7 @@ SUITE(extraction) {
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
+    RUN_TEST(extract_rust_test_attributes_match_paths_not_documentation);
     RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);
     RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);

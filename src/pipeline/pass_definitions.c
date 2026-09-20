@@ -27,6 +27,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/limits.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
+#include "helpers.h"
 #include "arena.h"
 #include "iris_export_xml.h"
 #include "simhash/minhash.h"
@@ -255,6 +256,8 @@ static int definition_base_properties(char *buf, size_t bufsize, const CBMDefini
      * dump. Gate the block to functions; other labels keep the lean base. */
     const bool is_fn =
         def->label && (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0);
+    const char *rust_test =
+        cbm_rust_definition_has_test_attribute(def) ? ",\"rust_test_attribute\":true" : "";
     if (!is_fn) {
         return snprintf(buf, bufsize,
                         "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
@@ -267,13 +270,13 @@ static int definition_base_properties(char *buf, size_t bufsize, const CBMDefini
                     "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
                     "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
                     "\"unguarded_recursion\":%s,"
-                    "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s",
+                    "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s%s,\"is_entry_point\":%s",
                     def->complexity, def->cognitive, def->loop_count, def->loop_depth,
                     def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
                     def->linear_scan_in_loop, def->alloc_in_loop,
                     def->recursion_in_loop ? "true" : "false",
                     def->unguarded_recursion ? "true" : "false", def->lines,
-                    def->is_exported ? "true" : "false", def->is_test ? "true" : "false",
+                    def->is_exported ? "true" : "false", def->is_test ? "true" : "false", rust_test,
                     def->is_entry_point ? "true" : "false");
 }
 

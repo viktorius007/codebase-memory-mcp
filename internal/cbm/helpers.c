@@ -62,6 +62,125 @@ char *cbm_node_text(CBMArena *a, TSNode node, const char *source) {
     return cbm_arena_strndup(a, source + start, end - start);
 }
 
+static size_t rust_attribute_whitespace_size(const char *text) {
+    if (isspace((unsigned char)*text)) {
+        return SKIP_ONE;
+    }
+    static const char *const unicode[] = {
+        "\xc2\x85", "\xe2\x80\x8e", "\xe2\x80\x8f", "\xe2\x80\xa8", "\xe2\x80\xa9",
+    };
+    for (size_t i = 0; i < sizeof(unicode) / sizeof(unicode[0]); i++) {
+        size_t length = strlen(unicode[i]);
+        if (strncmp(text, unicode[i], length) == 0) {
+            return length;
+        }
+    }
+    return 0;
+}
+
+/* Rust block comments nest, including between attribute path tokens. */
+static const char *rust_skip_attribute_trivia(const char *text) {
+    for (;;) {
+        size_t space;
+        while ((space = rust_attribute_whitespace_size(text)) > 0) {
+            text += space;
+        }
+        if (text[0] == '/' && text[SKIP_ONE] == '/') {
+            while (*text && *text != '\n') {
+                text++;
+            }
+        } else if (text[0] == '/' && text[SKIP_ONE] == '*') {
+            size_t depth = SKIP_ONE;
+            text += PAIR_LEN;
+            while (*text && depth > 0) {
+                if (text[0] == '/' && text[SKIP_ONE] == '*') {
+                    depth++;
+                    text += PAIR_LEN;
+                } else if (text[0] == '*' && text[SKIP_ONE] == '/') {
+                    depth--;
+                    text += PAIR_LEN;
+                } else {
+                    text++;
+                }
+            }
+        } else {
+            return text;
+        }
+    }
+}
+
+static const char *rust_attribute_path(const char *text, char *path, size_t capacity) {
+    size_t length = 0;
+    for (;;) {
+        if (text[0] == 'r' && text[SKIP_ONE] == '#') {
+            text += PAIR_LEN;
+        }
+        if (!isalpha((unsigned char)*text) && *text != '_') {
+            return NULL;
+        }
+        while (isalnum((unsigned char)*text) || *text == '_') {
+            if (length + SKIP_ONE >= capacity) {
+                return NULL;
+            }
+            path[length++] = *text++;
+        }
+        text = rust_skip_attribute_trivia(text);
+        if (text[0] != ':' || text[SKIP_ONE] != ':') {
+            break;
+        }
+        if (length + PAIR_LEN >= capacity) {
+            return NULL;
+        }
+        path[length++] = ':';
+        path[length++] = ':';
+        text = rust_skip_attribute_trivia(text + PAIR_LEN);
+    }
+    path[length] = '\0';
+    return text;
+}
+
+static bool rust_attribute_is_test(const char *text) {
+    if (!text || *text != '#') {
+        return false;
+    }
+    text = rust_skip_attribute_trivia(text + SKIP_ONE);
+    if (*text != '[') {
+        return false;
+    }
+    text = rust_skip_attribute_trivia(text + SKIP_ONE);
+    if (text[0] == ':' && text[SKIP_ONE] == ':') {
+        text = rust_skip_attribute_trivia(text + PAIR_LEN);
+    }
+    char path[sizeof("test_case::case")];
+    text = rust_attribute_path(text, path, sizeof(path));
+    if (!text) {
+        return false;
+    }
+    if (*text != ']' && *text != '(' && *text != '[' && *text != '{') {
+        return false;
+    }
+    return strcmp(path, "test") == 0 || strcmp(path, "tokio::test") == 0 ||
+           strcmp(path, "async_std::test") == 0 || strcmp(path, "actix_rt::test") == 0 ||
+           strcmp(path, "test_case::case") == 0;
+}
+
+bool cbm_rust_definition_has_test_attribute(const CBMDefinition *def) {
+    if (!def->file_path || !def->decorators || !def->label ||
+        (strcmp(def->label, "Function") != 0 && strcmp(def->label, "Method") != 0)) {
+        return false;
+    }
+    size_t length = strlen(def->file_path);
+    if (length < SLEN(".rs") || strcmp(def->file_path + length - SLEN(".rs"), ".rs") != 0) {
+        return false;
+    }
+    for (int i = 0; def->decorators[i]; i++) {
+        if (rust_attribute_is_test(def->decorators[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // --- Keyword sets per language ---
 
 static const char *go_keywords[] = {

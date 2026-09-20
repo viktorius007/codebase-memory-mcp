@@ -18,6 +18,10 @@ char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 void cbm_extract_rust_use_tree(CBMArena *arena, TSNode argument, const char *source,
                                CBMImportArray *imports);
 
+// Recognize supported test attribute paths on a Rust function or method definition.
+// This records source attributes, not cfg activity or procedural-macro expansion.
+bool cbm_rust_definition_has_test_attribute(const CBMDefinition *def);
+
 // Check if a string is a language keyword (should be skipped as callee/usage).
 bool cbm_is_keyword(const char *name, CBMLanguage lang);
 

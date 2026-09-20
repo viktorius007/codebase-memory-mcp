@@ -6984,6 +6984,120 @@ TEST(testdetect_is_test_function) {
     PASS();
 }
 
+TEST(pipeline_rust_test_attribute_survives_large_docs_in_both_modes) {
+    char tmp[] = "/tmp/cbm_rust_test_attr_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char source[6000];
+    const char *prefix = "#[doc = \"";
+    size_t prefix_len = strlen(prefix);
+    memcpy(source, prefix, prefix_len);
+    memset(source + prefix_len, 'x', 5000);
+    strcpy(source + prefix_len + 5000, "\"]\n#[test]\nfn rejects_empty_input() {}\n");
+    write_temp_file(tmp, "lib.rs", source);
+    for (int i = 0; i < 54; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad_%d.rs", i);
+        write_temp_file(tmp, name, "const PAD: u8 = 0;\n");
+    }
+    char *saved_single =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
+    bool marker[2] = {false};
+    bool dropped[2] = {false};
+    int run_rc[2];
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode == 0)
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        else
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        cbm_setenv("CBM_WORKERS", "4", 1);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/mode_%d.db", tmp, mode);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(pipeline);
+        run_rc[mode] = cbm_pipeline_run(pipeline);
+        cbm_store_t *store = cbm_store_open_path(db);
+        if (store) {
+            cbm_node_t *nodes = NULL;
+            int count = 0;
+            if (cbm_store_find_nodes_by_name(store, cbm_pipeline_project_name(pipeline),
+                                             "rejects_empty_input", &nodes,
+                                             &count) == CBM_STORE_OK &&
+                count == 1) {
+                yyjson_doc *doc =
+                    yyjson_read(nodes[0].properties_json, strlen(nodes[0].properties_json), 0);
+                if (doc) {
+                    yyjson_val *root = yyjson_doc_get_root(doc);
+                    marker[mode] = yyjson_is_true(yyjson_obj_get(root, "rust_test_attribute"));
+                    dropped[mode] = yyjson_obj_get(root, "decorators") == NULL;
+                    yyjson_doc_free(doc);
+                }
+            }
+            cbm_store_free_nodes(nodes, count);
+            cbm_store_close(store);
+        }
+        cbm_pipeline_free(pipeline);
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else
+        cbm_unsetenv("CBM_WORKERS");
+    th_rmtree(tmp);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(run_rc[mode], 0);
+        ASSERT_TRUE(dropped[mode]);
+        ASSERT_TRUE(marker[mode]);
+    }
+    PASS();
+}
+
+TEST(testdetect_explicit_test_marker_does_not_require_name_prefix) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("rust-tests", "/tmp/rust-tests");
+    ASSERT_NOT_NULL(gb);
+    const char *names[] = {"rejects_empty_input", "test_rejects_empty_input", "helper",
+                           "test_helper"};
+    const char *paths[] = {"src/lib.rs", "src/lib.rs", "tests/input.rs", "tests/input.rs"};
+    const char *props[] = {
+        "{\"is_test\":true,\"rust_test_attribute\":true}",
+        "{\"is_test\":true,\"rust_test_attribute\":true}",
+        "{\"is_test\":true}",
+        "{\"is_test\":true,\"decorators\":[\"#[doc = \\\"tokio::test\\\" ]\"]}",
+    };
+    int64_t sources[4];
+    int64_t target =
+        cbm_gbuf_upsert_node(gb, "Function", "parse", "rust-tests.parse", "src/lib.rs", 1, 1, "{}");
+    ASSERT_GT(target, 0);
+    for (int i = 0; i < 4; i++) {
+        sources[i] = cbm_gbuf_upsert_node(gb, "Function", names[i], names[i], paths[i], i + 2,
+                                          i + 2, props[i]);
+        ASSERT_GT(sources[i], 0);
+        cbm_gbuf_insert_edge(gb, sources[i], target, "CALLS", "{}");
+    }
+    cbm_gbuf_insert_edge(gb, sources[0], sources[1], "CALLS", "{}");
+    cbm_pipeline_ctx_t ctx = {.project_name = "rust-tests", .gbuf = gb};
+    ASSERT_EQ(cbm_pipeline_pass_tests(&ctx, NULL, 0), 0);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_type(gb, "TESTS", &edges, &count), 0);
+    ASSERT_EQ(count, 2);
+    int seen[2] = {0};
+    for (int i = 0; i < count; i++) {
+        ASSERT_EQ(edges[i]->target_id, target);
+        ASSERT_TRUE(edges[i]->source_id == sources[0] || edges[i]->source_id == sources[1]);
+        seen[edges[i]->source_id == sources[1]]++;
+    }
+    ASSERT_EQ(seen[0], 1);
+    ASSERT_EQ(seen[1], 1);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Implements pass tests (graph buffer based) ────────────────── */
 
 TEST(implements_creates_override) {
@@ -14854,6 +14968,8 @@ SUITE(pipeline) {
     /* Test detection */
     RUN_TEST(testdetect_is_test_file);
     RUN_TEST(testdetect_is_test_function);
+    RUN_TEST(testdetect_explicit_test_marker_does_not_require_name_prefix);
+    RUN_TEST(pipeline_rust_test_attribute_survives_large_docs_in_both_modes);
     /* Implements pass (graph buffer based) */
     RUN_TEST(implements_creates_override);
     RUN_TEST(implements_no_match);

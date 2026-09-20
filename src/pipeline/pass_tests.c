@@ -29,6 +29,7 @@ enum {
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
+#include "yyjson/yyjson.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,22 @@ static bool node_is_test(const cbm_gbuf_node_t *n) {
 static bool str_ends_with(const char *s, size_t slen, const char *suffix) {
     size_t sflen = strlen(suffix);
     return slen >= sflen && strcmp(s + slen - sflen, suffix) == 0;
+}
+
+/* is_test also marks helpers in test files; only an attribute identifies a
+ * Rust test entry point independently of the function's name. */
+static bool node_has_rust_test_attribute(const cbm_gbuf_node_t *node) {
+    if ((strcmp(node->label, "Function") != 0 && strcmp(node->label, "Method") != 0) ||
+        !node->properties_json) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    if (!doc) {
+        return false;
+    }
+    bool found = yyjson_is_true(yyjson_obj_get(yyjson_doc_get_root(doc), "rust_test_attribute"));
+    yyjson_doc_free(doc);
+    return found;
 }
 
 /* Check if a file path looks like a test file (language-agnostic). */
@@ -238,7 +255,9 @@ static int create_tests_edges(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
 
-        if (!cbm_is_test_func_name(src->name)) {
+        bool rust_source =
+            src->file_path && str_ends_with(src->file_path, strlen(src->file_path), ".rs");
+        if (rust_source ? !node_has_rust_test_attribute(src) : !cbm_is_test_func_name(src->name)) {
             continue;
         }
 
