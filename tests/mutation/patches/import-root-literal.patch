@@ -1,0 +1,8 @@
+diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
+--- a/internal/cbm/lsp/rust_lsp.c
++++ b/internal/cbm/lsp/rust_lsp.c
+@@ -884,3 +884,3 @@ static const char *rust_resolve_use_target(RustLSPContext *ctx, const char *targ
+         ctx->arena, target, ctx->module_qn, ctx->self_type_qn, rust_crate_path_prefix_len(ctx));
+-    if (rooted)
++    if (false && rooted)
+         return rooted;

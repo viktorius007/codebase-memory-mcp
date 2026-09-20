@@ -1,0 +1,14 @@
+# Mutants whose target machinery was deleted by merge 562bfecd and is not yet
+# ported back (ISSUES.md, "Root cause of the 2026-09-20 Rust findings" §6).
+# Each row moves to rust-scanner.tsv in the commit that restores its machinery;
+# the fork-side reference implementation is the first parent of 562bfecd
+# (439454a6). Format matches rust-scanner.tsv.
+#
+# crate-scope-leak: needs rust_resolution_scope_prefix_len /
+#   rust_workspace_member_qn_prefix_len (cross-file crate-scope authority).
+# health-cap-silence: needs rust_health_record_node and the health walk caps.
+# import-root-literal: needs rust_resolve_use_target (cross-file use-target
+#   resolution).
+crate-scope-leak	tests/mutation/patches/crate-scope-leak.patch	rust_lsp	rustlsp_crossfile_qualified_fallback_rejects_other_crate_decoy.*wrong_target == 1, expected 0 == 0
+health-cap-silence	tests/mutation/patches/health-cap-silence.patch	rust_lsp	rustlsp_health_walk_and_work_limits_report_omitted_subtrees.*1 == 1, expected work->count == 0
+import-root-literal	tests/mutation/patches/import-root-literal.patch	rust_lsp	rustlsp_crossfile_crate_import_factory_chain_exact_site.*exact == 0, expected 1 == 1

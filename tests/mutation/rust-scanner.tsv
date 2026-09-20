@@ -1,0 +1,6 @@
+# id<TAB>patch<TAB>suite<TAB>required behavioral failure regex
+macro-fail-open	tests/mutation/patches/macro-fail-open.patch	rust_lsp	rustlsp_gap_macro_no_match_is_fail_closed.*unmatched_arm_sentinel.*== 1, expected 0 == 0
+macro-wrong-arm	tests/mutation/patches/macro-wrong-arm.patch	rust_lsp	rustlsp_gap_macro_later_matching_arm_only.*selected_later_arm.*== 0, expected 1 == 1
+cargo-parallel-manifest-loss	tests/mutation/patches/cargo-parallel-manifest-loss.patch	pipeline	assert_rust_cargo_route\(&parallel\) == 1, expected 0 == 0
+cargo-incremental-manifest-loss	tests/mutation/patches/cargo-incremental-manifest-loss.patch	pipeline	assert_rust_cargo_route\(&incremental\) == 1, expected 0 == 0
+impl-return-loss	tests/mutation/patches/impl-return-loss.patch	extraction	rust_struct.*"\(null\)" != "Self"

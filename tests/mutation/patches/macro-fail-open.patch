@@ -1,0 +1,13 @@
+diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
+--- a/internal/cbm/lsp/rust_lsp.c
++++ b/internal/cbm/lsp/rust_lsp.c
+@@ -3965,6 +3965,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
+             hit = r;
+             break;
+         }
++        /* Historical defect: unmatched invocation fell through to a rule body. */
++        if (!hit)
++            hit = r;
+     }
+     if (binding_limit_hit)
+         rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_BINDING_LIMIT, invocation);

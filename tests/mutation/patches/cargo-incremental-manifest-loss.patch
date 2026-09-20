@@ -1,0 +1,12 @@
+diff --git a/src/pipeline/pass_parallel.c b/src/pipeline/pass_parallel.c
+--- a/src/pipeline/pass_parallel.c
++++ b/src/pipeline/pass_parallel.c
+@@ -3268,7 +3268,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+         .def_modules = def_modules,
+         .module_def_index = module_def_index,
+         .cross_registries = cross_registries,
+-        .rust_manifest = rust_manifest,
++        .rust_manifest = cross_registries ? rust_manifest : NULL,
+     };
+     atomic_init(&rc.next_file_idx, 0);
+     atomic_init(&rc.lsp_cross_processed, 0);
