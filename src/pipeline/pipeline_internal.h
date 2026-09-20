@@ -654,6 +654,10 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
 int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                int file_count);
 
+/* Serialize bounded definition properties for both pipeline modes. Optional large
+ * fields may be omitted; fixed flags precede them. */
+void cbm_pipeline_build_def_props(char *buf, size_t bufsize, const CBMDefinition *def);
+
 int cbm_pipeline_pass_tests(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
 int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx);

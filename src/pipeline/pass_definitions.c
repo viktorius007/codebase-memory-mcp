@@ -247,8 +247,7 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
-/* Build properties JSON for a definition node. */
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+static int definition_base_properties(char *buf, size_t bufsize, const CBMDefinition *def) {
     /* The complexity/loop/recursion metrics are only meaningful for executable
      * units (Function/Method). Emitting them on the millions of Macro/Field/
      * Variable/Class/Enum nodes — where they are always zero — bloats every
@@ -256,29 +255,30 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
      * dump. Gate the block to functions; other labels keep the lean base. */
     const bool is_fn =
         def->label && (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0);
-    int n;
-    if (is_fn) {
-        n = snprintf(buf, bufsize,
-                     "{\"complexity\":%d,\"cognitive\":%d,\"loop_count\":%d,\"loop_depth\":%d,"
-                     "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
-                     "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
-                     "\"unguarded_recursion\":%s,"
-                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s",
-                     def->complexity, def->cognitive, def->loop_count, def->loop_depth,
-                     def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
-                     def->linear_scan_in_loop, def->alloc_in_loop,
-                     def->recursion_in_loop ? "true" : "false",
-                     def->unguarded_recursion ? "true" : "false", def->lines,
-                     def->is_exported ? "true" : "false", def->is_test ? "true" : "false",
-                     def->is_entry_point ? "true" : "false");
-    } else {
-        n = snprintf(buf, bufsize,
-                     "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
-                     "\"is_entry_point\":%s",
-                     def->complexity, def->lines, def->is_exported ? "true" : "false",
-                     def->is_test ? "true" : "false", def->is_entry_point ? "true" : "false");
+    if (!is_fn) {
+        return snprintf(buf, bufsize,
+                        "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
+                        "\"is_entry_point\":%s",
+                        def->complexity, def->lines, def->is_exported ? "true" : "false",
+                        def->is_test ? "true" : "false", def->is_entry_point ? "true" : "false");
     }
+    return snprintf(buf, bufsize,
+                    "{\"complexity\":%d,\"cognitive\":%d,\"loop_count\":%d,\"loop_depth\":%d,"
+                    "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
+                    "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
+                    "\"unguarded_recursion\":%s,"
+                    "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s",
+                    def->complexity, def->cognitive, def->loop_count, def->loop_depth,
+                    def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
+                    def->linear_scan_in_loop, def->alloc_in_loop,
+                    def->recursion_in_loop ? "true" : "false",
+                    def->unguarded_recursion ? "true" : "false", def->lines,
+                    def->is_exported ? "true" : "false", def->is_test ? "true" : "false",
+                    def->is_entry_point ? "true" : "false");
+}
 
+void cbm_pipeline_build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+    int n = definition_base_properties(buf, bufsize, def);
     if (n <= 0 || (size_t)n >= bufsize) {
         buf[0] = '\0';
         return;
@@ -325,7 +325,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
         return;
     }
     char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    cbm_pipeline_build_def_props(props, sizeof(props), def);
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
