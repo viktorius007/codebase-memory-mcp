@@ -291,8 +291,43 @@ static inline bool cbm_pipeline_source_occurrence_eq(uint32_t lhs_start, uint32_
            cbm_pipeline_source_site_eq(lhs_start, lhs_end, rhs_start, rhs_end);
 }
 
-/* Restore bare calls to exact file-local free functions. Method, crate and
- * expansion identities still need their separate repairs. */
+/* One interior dotted segment of `qn` equals seg[0..seg_len). The Rust
+ * cross-crate resolver links a call's source crate head to the registered
+ * definition through this same ".<member>." segment (rust_lsp.c); the
+ * admission predicate re-derives that linkage from its own inputs so a
+ * resolution row joined to a carrier naming a different crate cannot claim
+ * the cross-crate class. */
+static inline bool cbm_pipeline_qn_has_dotted_segment(const char *qn, const char *seg,
+                                                      size_t seg_len) {
+    if (!qn || !seg || seg_len == 0) {
+        return false;
+    }
+    for (const char *p = strchr(qn, '.'); p; p = strchr(p + 1, '.')) {
+        if (strncmp(p + 1, seg, seg_len) == 0 && p[1 + seg_len] == '.') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Rust CALLS admission. Floor for every class: a real parsed call site (never
+ * a synthetic semantic candidate), whose caller is this file's single-segment
+ * free function and whose resolution joined by exact source occurrence.
+ *
+ * Class "plain": bare calls to exact file-local free functions.
+ *
+ * Class "cross-crate": ::-qualified calls whose resolution the resolver
+ * routed into a Cargo workspace member. The strategy string is written at
+ * exactly one site (rust_lsp.c, block #56) whose guards are the class
+ * guarantee: a parsed manifest, the path head declared as a workspace member,
+ * and exactly one registered free function in that member matching the call
+ * tail — ambiguity emits nothing. Name-guess and registry fallbacks emit
+ * other strategies and stay rejected. The predicate re-derives the member
+ * linkage (`.<head>.` in the resolved QN) and rejects file-local targets, so
+ * a mis-joined row cannot enter through this class.
+ *
+ * Method, expansion and import-mediated identities still need their separate
+ * repairs. */
 static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang, const CBMCall *call,
                                                     const CBMResolvedCall *resolved,
                                                     const char *module_qn) {
@@ -300,24 +335,36 @@ static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang, const CBMC
         return true;
     }
     if (!call || !resolved || !module_qn || !resolved->callee_qn || !call->callee_name ||
-        !call->enclosing_func_qn) {
+        !call->enclosing_func_qn || !resolved->strategy || call->requires_lsp_resolution) {
         return false;
     }
     size_t module_len = strlen(module_qn);
-    return !call->requires_lsp_resolution && resolved->strategy &&
-           strncmp(call->enclosing_func_qn, module_qn, module_len) == 0 &&
-           call->enclosing_func_qn[module_len] == '.' &&
-           strchr(call->enclosing_func_qn + module_len + 1, '.') == NULL &&
-           cbm_lsp_bare_segment(call->callee_name) == call->callee_name &&
-           strncmp(resolved->callee_qn, module_qn, module_len) == 0 &&
-           resolved->callee_qn[module_len] == '.' &&
-           strchr(resolved->callee_qn + module_len + 1, '.') == NULL &&
-           cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte) &&
-           cbm_pipeline_source_occurrence_eq(call->site_start_byte, call->site_end_byte,
-                                             call->source_origin, resolved->site_start_byte,
-                                             resolved->site_end_byte, resolved->source_origin) &&
-           (strcmp(resolved->strategy, "lsp_direct") == 0 ||
-            strcmp(resolved->strategy, "lsp_import_alias") == 0);
+    bool caller_file_local = strncmp(call->enclosing_func_qn, module_qn, module_len) == 0 &&
+                             call->enclosing_func_qn[module_len] == '.' &&
+                             strchr(call->enclosing_func_qn + module_len + 1, '.') == NULL;
+    if (!caller_file_local ||
+        !cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte) ||
+        !cbm_pipeline_source_occurrence_eq(call->site_start_byte, call->site_end_byte,
+                                           call->source_origin, resolved->site_start_byte,
+                                           resolved->site_end_byte, resolved->source_origin)) {
+        return false;
+    }
+    if (strcmp(resolved->strategy, "lsp_direct") == 0 ||
+        strcmp(resolved->strategy, "lsp_import_alias") == 0) {
+        return cbm_lsp_bare_segment(call->callee_name) == call->callee_name &&
+               strncmp(resolved->callee_qn, module_qn, module_len) == 0 &&
+               resolved->callee_qn[module_len] == '.' &&
+               strchr(resolved->callee_qn + module_len + 1, '.') == NULL;
+    }
+    if (strcmp(resolved->strategy, "lsp_cross_crate") == 0) {
+        const char *head_sep = strstr(call->callee_name, "::");
+        bool callee_in_this_file = strncmp(resolved->callee_qn, module_qn, module_len) == 0 &&
+                                   resolved->callee_qn[module_len] == '.';
+        return head_sep != NULL && head_sep != call->callee_name && !callee_in_this_file &&
+               cbm_pipeline_qn_has_dotted_segment(resolved->callee_qn, call->callee_name,
+                                                  (size_t)(head_sep - call->callee_name));
+    }
+    return false;
 }
 
 /* Rank an invocation record for one parser carrier. Exact occurrence identity

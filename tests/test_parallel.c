@@ -2851,36 +2851,36 @@ static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
     return gbuf;
 }
 
-TEST(parallel_rust_workspace_candidates_need_trusted_provenance_for_calls) {
+TEST(parallel_rust_workspace_manifest_routes_call_to_declared_member_only) {
     cbm_gbuf_t *gbuf = run_issue56_parallel_workspace(false);
     ASSERT_NOT_NULL(gbuf);
 
     const bool desired_candidate = callable_has_call_target_fragment(gbuf, "main.run", ".crate_a.");
     const bool unlisted = callable_has_call_target_fragment(gbuf, "main.run", ".unlisted.");
-    if (desired_candidate || unlisted) {
+    if (!desired_candidate || unlisted) {
         printf("  issue56 manifest diagnostic: desired=%d unlisted=%d\n", desired_candidate,
                unlisted);
     }
     cbm_gbuf_free(gbuf);
 
-    ASSERT_FALSE(desired_candidate);
+    ASSERT_TRUE(desired_candidate);
     ASSERT_FALSE(unlisted);
     PASS();
 }
 
-TEST(parallel_rust_local_shadow_candidates_need_trusted_provenance_for_calls) {
+TEST(parallel_rust_local_shadow_loses_to_workspace_manifest_provenance) {
     cbm_gbuf_t *gbuf = run_issue56_parallel_workspace(true);
     ASSERT_NOT_NULL(gbuf);
 
     const bool desired_candidate = callable_has_call_target_fragment(gbuf, "main.run", ".crate_a.");
     const bool wrong_local = callable_has_call_target_fragment(gbuf, "main.run", ".crate_b.");
-    if (desired_candidate || wrong_local) {
+    if (!desired_candidate || wrong_local) {
         printf("  issue56 local-shadow diagnostic: desired=%d wrong_local=%d\n", desired_candidate,
                wrong_local);
     }
     cbm_gbuf_free(gbuf);
 
-    ASSERT_FALSE(desired_candidate);
+    ASSERT_TRUE(desired_candidate);
     ASSERT_FALSE(wrong_local);
     PASS();
 }
@@ -4509,8 +4509,8 @@ SUITE(parallel) {
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
-    RUN_TEST(parallel_rust_workspace_candidates_need_trusted_provenance_for_calls);
-    RUN_TEST(parallel_rust_local_shadow_candidates_need_trusted_provenance_for_calls);
+    RUN_TEST(parallel_rust_workspace_manifest_routes_call_to_declared_member_only);
+    RUN_TEST(parallel_rust_local_shadow_loses_to_workspace_manifest_provenance);
     RUN_TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes);
     RUN_TEST(parallel_rust_known_macro_does_not_fallback_to_local_function);
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);

@@ -1,6 +1,6 @@
 # Rust relationship accuracy: current state
 
-Semantic index version: **8**. The broader Rust accuracy objective remains unfinished.
+Semantic index version: **9**. The broader Rust accuracy objective remains unfinished.
 The current supported subset and its verification are recorded in
 [RUST_REPAIR_EVIDENCE.md](RUST_REPAIR_EVIDENCE.md). Commit history owns prior plans,
 investigation transcripts, intermediate results and replay history.
@@ -18,17 +18,23 @@ investigation transcripts, intermediate results and replay history.
 - Both publication modes admit exact, source-site-matched bare calls between
   file-local free functions. Missing Rust semantic targets are terminal:
   project-prefix, leaf-name and generic registry fallbacks cannot invent an edge.
+- Both publication modes admit exact, source-site-matched `::`-qualified calls
+  from file-local free functions to the unique free function inside the Cargo
+  workspace member the source path names. Ambiguous member matches, undeclared
+  heads and missing manifests emit nothing; import-mediated bare cross-crate
+  calls remain unresolved.
 - Lexical imports and local value declarations prevent the tested shadowed names
   from binding to outer functions. Active glob scopes conservatively leave bare
   calls unresolved. The project-wide unique-short-name fallback is removed.
 - Live CALLS and derived TESTS are restored for this bounded subset. Current-epoch
   CALLS/TESTS survive both incremental restoration routes. IMPLEMENTS/OVERRIDE
   remain rejected.
-- Version 8 invalidates earlier semantic indexes. All three Rust partial-coverage
+- Version 9 invalidates earlier semantic indexes. All three Rust partial-coverage
   flags remain set. An omitted relationship is not proof that none exists.
 
-Methods, cross-file calls, expanded calls and implementation relationships are not
-restored. Exact spans alone cannot validate an incorrectly inferred target.
+Methods, import-mediated cross-file calls, expanded calls and implementation
+relationships are not restored. Exact spans alone cannot validate an incorrectly
+inferred target.
 
 ## Remaining valuable work, in order
 
