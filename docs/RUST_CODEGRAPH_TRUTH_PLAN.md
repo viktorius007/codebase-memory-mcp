@@ -38,10 +38,26 @@ inferred target.
 
 ## Remaining valuable work, in order
 
+Method, proven on the cross-crate class (epoch 9): pin the missing capability
+red on a branch; widen `cbm_pipeline_plain_call_admitted`
+(src/pipeline/lsp_resolve.h) by exactly one named class; bump the semantic
+epoch together with tests/semantic-epoch.expected; gate on `make scip-rust`
+(fabricated=0 is unconditional) and `make mutation-rust`.
+
+0. **Import-mediated cross-crate calls.** `use alpha::add;` then bare
+   `add()` never reaches the resolver's workspace block (no `::` head) and
+   stays unresolved. The SCIP fixture already contains the pinned case
+   (`beta total -> alpha add` in tests/fixtures/scip_harness/corpus);
+   admission must route through the import binding, not name matching.
+   Known adjacent gap: package names that differ from their directory
+   basename (hyphen/underscore) miss the `.<member>.` segment needle —
+   fail-closed to omission today, owned by item 2's crate-root derivation.
 1. **Implementation identity.** Preserve trait arguments and receiver identity
    through extraction, caller naming, registries and linking. Distinguish two
    same-named trait methods and distinct From<T> implementations on one receiver
-   before admitting methods or IMPLEMENTS/OVERRIDE.
+   before admitting methods or IMPLEMENTS/OVERRIDE. The admission predicate's
+   shared floor already isolates the caller-side check, so the method-caller
+   widening itself is small once identity is trustworthy.
 2. **Cargo, module and lexical scope.** Derive per-member crate roots, module
    paths, renamed dependencies and import scope from actual workspace inputs.
    Distinguish same-leaf symbols in different modules/crates. Repair semantic
