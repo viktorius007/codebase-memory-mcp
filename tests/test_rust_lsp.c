@@ -2242,16 +2242,19 @@ TEST(rustlsp_strict_str_split) {
     PASS();
 }
 
-TEST(rustlsp_strict_short_name_unique_fallback) {
-    /* Function defined in module scope can be resolved via short-name
-     * fallback even when called via an unknown path. */
+TEST(rustlsp_missing_path_does_not_bind_same_named_local_function) {
     CBMFileResult *r = extract_rust(
         "fn process(x: i32) -> i32 { x * 2 }\n"
         "fn run() -> i32 {\n"
-        "    process(10)\n"
+        "    missing::process(10); process(20)\n"
         "}\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_GTE(require_resolved(r, "run", "process"), 0);
+    ASSERT_EQ(r->resolved_calls.count, 2);
+    ASSERT_STR_EQ(r->resolved_calls.items[0].callee_qn, "missing.process");
+    ASSERT_STR_EQ(r->resolved_calls.items[0].strategy, "lsp_unresolved");
+    ASSERT_TRUE(r->resolved_calls.items[0].confidence == 0.0f);
+    ASSERT_STR_EQ(r->resolved_calls.items[1].callee_qn, "test.src.main.process");
+    ASSERT_TRUE(r->resolved_calls.items[1].confidence >= 0.6f);
     cbm_free_result(r);
     PASS();
 }
@@ -6950,7 +6953,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_strict_string_format_chain);
     RUN_TEST(rustlsp_strict_string_chars_count);
     RUN_TEST(rustlsp_strict_str_split);
-    RUN_TEST(rustlsp_strict_short_name_unique_fallback);
+    RUN_TEST(rustlsp_missing_path_does_not_bind_same_named_local_function);
     RUN_TEST(rustlsp_strict_io_read_to_string);
     RUN_TEST(rustlsp_strict_env_var);
     RUN_TEST(rustlsp_strict_collect_into_vec);

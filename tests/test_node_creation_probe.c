@@ -544,8 +544,8 @@ TEST(probe_rust_calls_edge) {
                                "fn sum_squares(a: i32, b: i32) -> i32 { square(a) + square(b) }\n\n"
                                "fn main() { let _ = sum_squares(3, 4); }\n");
     ASSERT_TRUE(m.ok);
-    ASSERT_EQ(m.calls, 0);
-    ASSERT_EQ(m.callers, 0);
+    ASSERT_EQ(m.calls, 2);
+    ASSERT_EQ(m.functions, 3);
     PASS();
 }
 
@@ -569,7 +569,7 @@ TEST(probe_rust_type_alias) {
                                 "fn run() -> f64 { speed(100.0, 9.58) }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 1);
     PASS();
 }
 

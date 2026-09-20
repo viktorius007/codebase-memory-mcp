@@ -307,7 +307,7 @@ TEST(mn_type_alias_rust) {
         "fn run() -> Res<i32> { parse(\"42\") }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 1);
     PASS();
 }
 
@@ -642,7 +642,7 @@ TEST(mn_multiple_trait_bounds_rust) {
         "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 1);
     PASS();
 }
 
@@ -1083,7 +1083,7 @@ TEST(mn_default_params_rust) {
         "fn run() -> String { default_connect(\"localhost\") }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 2);
     PASS();
 }
 
@@ -1155,7 +1155,7 @@ TEST(mn_pattern_match_rust) {
         "fn run() -> String { process(Ok(42)) }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 4);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 3);
     PASS();
 }
 
@@ -1306,7 +1306,7 @@ TEST(mn_nested_function_rust) {
         "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 3);
     PASS();
 }
 

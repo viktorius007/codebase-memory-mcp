@@ -1033,26 +1033,74 @@ static int count_calls_edges_to_tail(const cbm_gbuf_t *gbuf, const char *target_
     return count;
 }
 
-/* Rust's embedded resolver and generic registry produce useful candidates,
- * but neither is trusted provenance for a definite graph fact.  Exercise the
- * final sequential and parallel materializers with both a direct-name match
- * and a receiver-driven match; the C row proves the existing admission rule
- * for a language with established textual call resolution remains intact. */
-TEST(rust_untrusted_candidates_never_materialize_definite_calls) {
+TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
     static const struct {
         const char *tag;
         const char *filename;
         CBMLanguage language;
         const char *source;
         int expected_calls;
+        const char *target_qn;
     } cases[] = {
-        {"rust_exact", "exact.rs", CBM_LANG_RUST, "fn target() {}\nfn caller() { target(); }\n", 0},
+        {"rust_exact", "exact.rs", CBM_LANG_RUST, "fn target() {}\nfn caller() { target(); }\n",
+         1, "rust_call_gate.exact.target"},
         {"rust_receiver", "receiver.rs", CBM_LANG_RUST,
          "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
          "fn caller(worker: &Worker) { worker.work(); }\n",
-         0},
+         0, NULL},
+        {"rust_ufcs", "ufcs.rs", CBM_LANG_RUST,
+         "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
+         "fn caller(worker: &Worker) { Worker::work(worker); }\n",
+         0, NULL},
+        {"rust_trait", "trait.rs", CBM_LANG_RUST,
+         "trait Work { fn work(&self); }\nstruct Worker;\n"
+         "impl Work for Worker { fn work(&self) {} }\n"
+         "fn caller(worker: &Worker) { Worker::work(worker); }\n", 0, NULL},
+        {"rust_external", "external.rs", CBM_LANG_RUST,
+         "fn clone() {}\nfn push() {}\nfn len() {}\nfn from() {}\n"
+         "fn caller(value: &str) {\n"
+         "    let mut encoded = String::new();\n"
+         "    encoded.push(char::from(97)); value.len(); value.clone(); clone();\n}\n",
+         1, "rust_call_gate.external.clone"},
+        {"rust_external_namespace", "std/env.rs", CBM_LANG_RUST,
+         "fn var(_: &str) {}\nfn caller() { std::env::var(\"PATH\"); }\n", 0, NULL},
+        {"rust_unresolved", "unresolved.rs", CBM_LANG_RUST,
+         "fn clone() {}\nfn caller<T>(value: T) { value.clone(); clone(); }\n",
+         1, "rust_call_gate.unresolved.clone"},
+        {"rust_unreachable", "unreachable.rs", CBM_LANG_RUST,
+         "fn target() {}\nfn caller() { missing::target(); }\n", 0, NULL},
+        {"rust_block_use", "block_use.rs", CBM_LANG_RUST,
+         "fn target() {}\nfn other() {}\n"
+         "fn caller() { target(); use self::other as target; }\n",
+         1, "rust_call_gate.block_use.other"},
+        {"rust_nested_use", "nested_use.rs", CBM_LANG_RUST,
+         "fn target() {}\nfn other() {}\n"
+         "mod nested { use super::other as target; }\nfn caller() { target(); }\n",
+         1, "rust_call_gate.nested_use.target"},
+        {"rust_nested_function", "nested_fn.rs", CBM_LANG_RUST,
+         "fn target() {}\nfn caller() { fn target() {} target(); }\n", 0, NULL},
+        {"rust_const_shadow", "const_shadow.rs", CBM_LANG_RUST,
+         "fn target() {}\nfn other() {}\n"
+         "fn caller() { target(); const target: fn() = other; }\n", 0, NULL},
+        {"rust_glob_shadow", "glob_shadow.rs", CBM_LANG_RUST,
+         "fn drop(_: i32) {}\nfn caller() { use std::mem::*; drop(1); }\n", 0, NULL},
+        {"rust_glob_alias", "glob_alias.rs", CBM_LANG_RUST,
+         "fn first(_: i32) {}\nuse self::first as drop;\n"
+         "fn caller() { use std::mem::*; drop(1); }\n", 0, NULL},
+        {"rust_struct_shadow", "struct_shadow.rs", CBM_LANG_RUST,
+         "fn target(_: i32) {}\nfn caller() { struct target(i32); target(1); }\n", 0, NULL},
+        {"rust_foreign_shadow", "foreign_shadow.rs", CBM_LANG_RUST,
+         "fn target() {}\nfn caller() { extern \"C\" { fn target(); } unsafe { target(); } }\n",
+         0, NULL},
+        {"rust_method_caller", "method_caller.rs", CBM_LANG_RUST,
+         "fn target() {}\nstruct Worker;\nimpl Worker { fn caller() { target(); } }\n",
+         0, NULL},
+        {"rust_import_guess", "import_guess.rs", CBM_LANG_RUST,
+         "use std::env::split_paths as imported;\nfn split_paths(_: &str) {}\n"
+         "fn caller() { imported(\"x\"); }\n", 0, NULL},
         {"c_exact", "exact.c", CBM_LANG_C,
-         "void target(void) {}\nvoid caller(void) { target(); }\n", 1},
+         "void target(void) {}\nvoid caller(void) { target(); }\n",
+         1, "rust_call_gate.exact.target"},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -1061,6 +1109,8 @@ TEST(rust_untrusted_candidates_never_materialize_definite_calls) {
         ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
 
         char path[512];
+        snprintf(path, sizeof(path), "%s/std", tmpdir);
+        ASSERT_EQ(cbm_mkdir(path), 0);
         snprintf(path, sizeof(path), "%s/%s", tmpdir, cases[i].filename);
         ASSERT_EQ(th_write_file(path, cases[i].source), 0);
 
@@ -1069,8 +1119,10 @@ TEST(rust_untrusted_candidates_never_materialize_definite_calls) {
         files[0].rel_path = (char *)cases[i].filename;
         files[0].language = cases[i].language;
 
-        cbm_gbuf_t *sequential = run_sequential("rust_call_gate", tmpdir, files, 1);
-        cbm_gbuf_t *parallel = run_parallel("rust_call_gate", tmpdir, files, 1, 1);
+        cbm_gbuf_t *sequential = run_sequential_with_lsp_cross_and_mutator(
+            "rust_call_gate", tmpdir, files, 1, NULL, NULL, true);
+        cbm_gbuf_t *parallel = run_parallel_with_extract_opts_and_mutator(
+            "rust_call_gate", tmpdir, files, 1, 1, NULL, NULL, NULL, true);
         ASSERT_NOT_NULL(sequential);
         ASSERT_NOT_NULL(parallel);
 
@@ -1083,6 +1135,16 @@ TEST(rust_untrusted_candidates_never_materialize_definite_calls) {
         }
         ASSERT_EQ(sequential_calls, cases[i].expected_calls);
         ASSERT_EQ(parallel_calls, cases[i].expected_calls);
+        if (cases[i].target_qn) {
+            ASSERT_EQ(count_edges_between_nodes(
+                sequential, find_unique_node_by_name_label_qn_suffix(
+                    sequential, "caller", "Function", "caller"),
+                cbm_gbuf_find_by_qn(sequential, cases[i].target_qn), "CALLS"), 1);
+            ASSERT_EQ(count_edges_between_nodes(
+                parallel, find_unique_node_by_name_label_qn_suffix(
+                    parallel, "caller", "Function", "caller"),
+                cbm_gbuf_find_by_qn(parallel, cases[i].target_qn), "CALLS"), 1);
+        }
 
         cbm_gbuf_free(sequential);
         cbm_gbuf_free(parallel);
@@ -4449,7 +4511,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_workspace_candidates_need_trusted_provenance_for_calls);
     RUN_TEST(parallel_rust_local_shadow_candidates_need_trusted_provenance_for_calls);
-    RUN_TEST(rust_untrusted_candidates_never_materialize_definite_calls);
+    RUN_TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes);
     RUN_TEST(parallel_rust_known_macro_does_not_fallback_to_local_function);
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);
     RUN_TEST(parallel_c_preprocessed_coordinate_collision_preserves_hidden_target);

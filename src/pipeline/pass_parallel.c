@@ -2516,11 +2516,10 @@ static const cbm_gbuf_node_t *resolve_file_call_target(resolve_ctx_t *rc,
          * project name. */
         bool exact_external_target = call->requires_lsp_resolution &&
                                      cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
-        lsp_target = exact_external_target
-                         ? cbm_pipeline_lsp_target_node_strict(rc->main_gbuf, rc->project_name,
-                                                               lsp->callee_qn, allow_tail)
-                         : cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
-                                                        lsp->callee_qn, allow_tail);
+        bool allow_fallback = allow_tail && !exact_external_target;
+        lsp_target = cbm_pipeline_lsp_target_node_policy(
+            rc->main_gbuf, lang == CBM_LANG_RUST ? NULL : rc->project_name, lsp->callee_qn,
+            allow_fallback, allow_fallback);
         if (lsp_target) {
             res->qualified_name = lsp_target->qualified_name;
             res->strategy = lsp->strategy ? lsp->strategy : "lsp_override";
@@ -2543,7 +2542,8 @@ static const cbm_gbuf_node_t *resolve_file_call_target(resolve_ctx_t *rc,
      * semantic candidates are deliberately excluded: they require an
      * exact LSP target and must fail closed rather than accepting a textual
      * registry match. */
-    if ((!res->qualified_name || !res->qualified_name[0]) && !call->requires_lsp_resolution) {
+    if ((!res->qualified_name || !res->qualified_name[0]) && !call->requires_lsp_resolution &&
+        lang != CBM_LANG_RUST) {
         *res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys, imp_vals,
                                     imp_count);
     }
@@ -2711,8 +2711,7 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
     }
     _rc_t0 = extract_now_ns();
     emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
-                      rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                      drop_plain_call || !cbm_pipeline_plain_call_admitted(lang));
+                      rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count, drop_plain_call);
     atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                               memory_order_relaxed);
     ws->calls_resolved++;
@@ -2774,13 +2773,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         const CBMResolvedCall *lsp =
             find_indexed_lsp_call(rc, result, call, lsp_exact_idx, lsp_legacy_idx,
                                   lsp_exact_idx_complete, lsp_legacy_idx_complete, allow_tail);
+        if (!cbm_pipeline_plain_call_admitted(lang, call, lsp, module_qn)) {
+            continue;
+        }
         const cbm_gbuf_node_t *lsp_target = resolve_file_call_target(
             rc, ws, call, lsp, allow_tail, module_qn, imp_keys, imp_vals, imp_count, lang, &res);
 
         /* A synthetic semantic candidate is an invocation only when the LSP
          * resolved it to a concrete graph node. Never let registry, field-name,
          * route, or service heuristics manufacture a target for it. */
-        if (call->requires_lsp_resolution && !lsp_target) {
+        if ((call->requires_lsp_resolution || lang == CBM_LANG_RUST) && !lsp_target) {
             continue;
         }
         emit_resolved_file_call(rc, ws, call, res, source_node, lsp_target, module_qn, imp_keys,

@@ -57,9 +57,8 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
            (strcmp(node->label, "Folder") == 0 || strcmp(node->label, "Project") == 0);
 }
 
-/* Persisted inbound edges may be restored only when a full rebuild would
- * preserve them. Rust CALLS are intentionally absent until they have trusted
- * provenance, and TESTS derived from those calls must not survive either. */
+/* The semantic epoch invalidates old Rust call candidates before restoration.
+ * Implementation relationships remain unavailable even in the current epoch. */
 static inline bool cbm_pipeline_persisted_edge_is_restorable(const char *source_file_path,
                                                              const char *type) {
     if (!source_file_path || !source_file_path[0] || !type) {
@@ -77,8 +76,7 @@ static inline bool cbm_pipeline_persisted_edge_is_restorable(const char *source_
     }
     const char *basename = separator ? separator + 1 : source_file_path;
     return cbm_language_for_filename(basename) != CBM_LANG_RUST ||
-           (strcmp(type, "CALLS") != 0 && strcmp(type, "TESTS") != 0 &&
-            strcmp(type, "IMPLEMENTS") != 0 && strcmp(type, "OVERRIDE") != 0);
+           (strcmp(type, "IMPLEMENTS") != 0 && strcmp(type, "OVERRIDE") != 0);
 }
 
 /* Time unit conversions */

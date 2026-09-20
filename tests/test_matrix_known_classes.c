@@ -780,13 +780,7 @@ TEST(mkc_c4_csharp_async_await) {
     PASS();
 }
 
-/* C4-D: Rust — .await expression.
- * red=bug: Rust `future.await` is an `await_expression` node where the
- * operand is a method-call-like expression.  Rust call_types = {call_expression,
- * macro_invocation} — await_expression is not included.
- * Root cause: lang_specs.c rust_call_types does not include await_expression.
- * Fix: either add await_expression to rust_call_types, or teach extract_calls.c
- * to unwrap await_expression and process the inner expression. */
+/* C4-D: Both local calls under .await survive; external methods remain gated. */
 TEST(mkc_c4_rust_await) {
     static const MKC_File f[] = {{"client.rs", "async fn fetch(url: &str) -> String {\n"
                                                "    url.to_string()\n"
@@ -799,9 +793,11 @@ TEST(mkc_c4_rust_await) {
                                                "        let _data = get_data(url).await;\n"
                                                "    }\n"
                                                "}\n"}};
-    /* The accepted Rust policy withholds CALLS while retaining the indexed
-     * fixture nodes as an independent positive control. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 0, "c4/rust/await", 1));
+    MKC_Proj lp;
+    cbm_store_t *store = mkc_index(&lp, f, 1);
+    int calls = store ? cbm_store_count_edges_by_type(store, lp.project, "CALLS") : -1;
+    mkc_cleanup(&lp, store);
+    ASSERT_EQ(calls, 2);
     PASS();
 }
 

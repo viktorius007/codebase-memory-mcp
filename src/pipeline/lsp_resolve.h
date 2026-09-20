@@ -121,12 +121,6 @@ static inline bool cbm_pipeline_lsp_allow_tail_match(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN;
 }
 
-/* Rust call candidates currently have no trusted semantic provenance. Keep
- * their analysis available, but do not materialize them as plain CALLS. */
-static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang) {
-    return lang != CBM_LANG_RUST;
-}
-
 /* When a JVM callable-reference occurrence has no exact semantic target, its
  * ordinary-USAGE fallback must still respect package/import reachability.
  * `unique_name` and `suffix_match` are project-wide guesses: admitting either
@@ -295,6 +289,35 @@ static inline bool cbm_pipeline_source_occurrence_eq(uint32_t lhs_start, uint32_
                                                      uint32_t rhs_end, CBMSourceOrigin rhs_origin) {
     return lhs_origin == rhs_origin &&
            cbm_pipeline_source_site_eq(lhs_start, lhs_end, rhs_start, rhs_end);
+}
+
+/* Restore bare calls to exact file-local free functions. Method, crate and
+ * expansion identities still need their separate repairs. */
+static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang, const CBMCall *call,
+                                                    const CBMResolvedCall *resolved,
+                                                    const char *module_qn) {
+    if (lang != CBM_LANG_RUST) {
+        return true;
+    }
+    if (!call || !resolved || !module_qn || !resolved->callee_qn || !call->callee_name ||
+        !call->enclosing_func_qn) {
+        return false;
+    }
+    size_t module_len = strlen(module_qn);
+    return !call->requires_lsp_resolution && resolved->strategy &&
+           strncmp(call->enclosing_func_qn, module_qn, module_len) == 0 &&
+           call->enclosing_func_qn[module_len] == '.' &&
+           strchr(call->enclosing_func_qn + module_len + 1, '.') == NULL &&
+           cbm_lsp_bare_segment(call->callee_name) == call->callee_name &&
+           strncmp(resolved->callee_qn, module_qn, module_len) == 0 &&
+           resolved->callee_qn[module_len] == '.' &&
+           strchr(resolved->callee_qn + module_len + 1, '.') == NULL &&
+           cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte) &&
+           cbm_pipeline_source_occurrence_eq(call->site_start_byte, call->site_end_byte,
+                                             call->source_origin, resolved->site_start_byte,
+                                             resolved->site_end_byte, resolved->source_origin) &&
+           (strcmp(resolved->strategy, "lsp_direct") == 0 ||
+            strcmp(resolved->strategy, "lsp_import_alias") == 0);
 }
 
 /* Rank an invocation record for one parser carrier. Exact occurrence identity

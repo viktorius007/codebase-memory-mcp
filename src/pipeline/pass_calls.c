@@ -555,14 +555,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
+    if (!cbm_pipeline_plain_call_admitted(lang, call, lsp, module_qn)) {
+        return 0;
+    }
     if (lsp) {
         bool exact_external_target = call->requires_lsp_resolution &&
                                      cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
-        const cbm_gbuf_node_t *target_node =
-            exact_external_target ? cbm_pipeline_lsp_target_node_strict(
-                                        ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail)
-                                  : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
-                                                                 lsp->callee_qn, allow_tail);
+        bool allow_fallback = allow_tail && !exact_external_target;
+        const cbm_gbuf_node_t *target_node = cbm_pipeline_lsp_target_node_policy(
+            ctx->gbuf, lang == CBM_LANG_RUST ? NULL : ctx->project_name, lsp->callee_qn,
+            allow_fallback, allow_fallback);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical
@@ -572,7 +574,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                                 imp_vals, imp_count, !cbm_pipeline_plain_call_admitted(lang));
+                                 imp_vals, imp_count, false);
             return SKIP_ONE;
         }
     }
@@ -582,7 +584,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * invocation target. Textual registry/service fallbacks would bind an
      * unresolved primitive expression such as `int + int` to an unrelated
      * project `operator+`, fabricating a CALLS edge. */
-    if (call->requires_lsp_resolution) {
+    if (call->requires_lsp_resolution || lang == CBM_LANG_RUST) {
         return 0;
     }
 
@@ -680,7 +682,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count, drop_plain_call || !cbm_pipeline_plain_call_admitted(lang));
+                         imp_count, drop_plain_call);
     return SKIP_ONE;
 }
 

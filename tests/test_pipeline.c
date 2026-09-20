@@ -1353,8 +1353,8 @@ static int assert_persisted_edge_restore(PersistedEdgeRestoreObservation result,
     ASSERT_EQ(result.published_rust_coverage.rc, CBM_STORE_OK);
     ASSERT_TRUE(result.published_rust_coverage.known);
     ASSERT_EQ(result.published_rust_coverage.gaps, 7U);
-    ASSERT_EQ(result.post_counts[RESTORE_RUST_CALLS], 0);
-    ASSERT_EQ(result.post_counts[RESTORE_RUST_TESTS], 0);
+    ASSERT_EQ(result.post_counts[RESTORE_RUST_CALLS], 1);
+    ASSERT_EQ(result.post_counts[RESTORE_RUST_TESTS], 1);
     ASSERT_EQ(result.post_counts[RESTORE_GO_CALLS], 1);
     ASSERT_EQ(result.post_counts[RESTORE_RUST_USAGE], 1);
     ASSERT_EQ(result.post_counts[RESTORE_RUST_IMPLEMENTS], 0);
@@ -1362,13 +1362,13 @@ static int assert_persisted_edge_restore(PersistedEdgeRestoreObservation result,
     return 0;
 }
 
-TEST(pipeline_legacy_restore_rejects_persisted_rust_calls_and_tests) {
+TEST(pipeline_legacy_restore_preserves_rust_calls_but_rejects_impls) {
     PersistedEdgeRestoreObservation result = observe_persisted_edge_restore(true);
     ASSERT_EQ(assert_persisted_edge_restore(result, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL), 0);
     PASS();
 }
 
-TEST(pipeline_closure_restore_rejects_persisted_rust_calls_and_tests) {
+TEST(pipeline_closure_restore_preserves_rust_calls_but_rejects_impls) {
     PersistedEdgeRestoreObservation result = observe_persisted_edge_restore(false);
     ASSERT_EQ(assert_persisted_edge_restore(result, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
     PASS();
@@ -6992,7 +6992,8 @@ TEST(pipeline_rust_test_attribute_survives_large_docs_in_both_modes) {
     size_t prefix_len = strlen(prefix);
     memcpy(source, prefix, prefix_len);
     memset(source + prefix_len, 'x', 5000);
-    strcpy(source + prefix_len + 5000, "\"]\n#[test]\nfn rejects_empty_input() {}\n");
+    strcpy(source + prefix_len + 5000,
+           "\"]\n#[test]\nfn rejects_empty_input() { parse(); }\nfn parse() {}\n");
     write_temp_file(tmp, "lib.rs", source);
     for (int i = 0; i < 54; i++) {
         char name[64];
@@ -7004,6 +7005,8 @@ TEST(pipeline_rust_test_attribute_survives_large_docs_in_both_modes) {
     char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
     bool marker[2] = {false};
     bool dropped[2] = {false};
+    int calls[2] = {-1, -1};
+    int tests[2] = {-1, -1};
     int run_rc[2];
     for (int mode = 0; mode < 2; mode++) {
         if (mode == 0)
@@ -7018,6 +7021,10 @@ TEST(pipeline_rust_test_attribute_survives_large_docs_in_both_modes) {
         run_rc[mode] = cbm_pipeline_run(pipeline);
         cbm_store_t *store = cbm_store_open_path(db);
         if (store) {
+            calls[mode] = named_edge_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                           "rejects_empty_input", "parse");
+            tests[mode] = named_edge_count(store, cbm_pipeline_project_name(pipeline), "TESTS",
+                                           "rejects_empty_input", "parse");
             cbm_node_t *nodes = NULL;
             int count = 0;
             if (cbm_store_find_nodes_by_name(store, cbm_pipeline_project_name(pipeline),
@@ -7053,6 +7060,8 @@ TEST(pipeline_rust_test_attribute_survives_large_docs_in_both_modes) {
         ASSERT_EQ(run_rc[mode], 0);
         ASSERT_TRUE(dropped[mode]);
         ASSERT_TRUE(marker[mode]);
+        ASSERT_EQ(calls[mode], 1);
+        ASSERT_EQ(tests[mode], 1);
     }
     PASS();
 }
@@ -14938,8 +14947,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    RUN_TEST(pipeline_legacy_restore_rejects_persisted_rust_calls_and_tests);
-    RUN_TEST(pipeline_closure_restore_rejects_persisted_rust_calls_and_tests);
+    RUN_TEST(pipeline_legacy_restore_preserves_rust_calls_but_rejects_impls);
+    RUN_TEST(pipeline_closure_restore_preserves_rust_calls_but_rejects_impls);
     RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);

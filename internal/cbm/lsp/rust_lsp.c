@@ -58,6 +58,7 @@ static const char *convert_path_to_qn(CBMArena *arena, const char *path);
 static bool rust_type_derefs_to_first_arg(const char *type_qn);
 static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char *name);
 static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text);
+static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
 static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_name,
                                          const char *trait_qn);
 
@@ -312,7 +313,7 @@ static const char *rust_resolve_use(RustLSPContext *ctx, const char *local_name)
     if (!ctx || !local_name) {
         return NULL;
     }
-    for (int i = 0; i < ctx->use_count; i++) {
+    for (int i = ctx->use_count - 1; i >= 0; i--) {
         if (strcmp(ctx->use_local_names[i], local_name) == 0) {
             return ctx->use_module_paths[i];
         }
@@ -626,6 +627,10 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
     }
     if (strcmp(path, "Self") == 0 && ctx->self_type_qn) {
         return ctx->self_type_qn;
+    }
+    if (strncmp(path, "self::", 6) == 0 && ctx->module_qn) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn,
+                                 convert_path_to_qn(ctx->arena, path + 6));
     }
 
     /* crate:: → <root>. We approximate the crate root as the first dotted
@@ -4418,6 +4423,10 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             if (cbm_scope_contains(ctx->current_scope, path)) {
                 return;
             }
+            if (ctx->glob_count > 0) {
+                rust_emit_unresolved_call(ctx, path, "unresolved_glob_import");
+                return;
+            }
         }
 
         const char *qn = rust_resolve_path_expr(ctx, path);
@@ -4427,13 +4436,16 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         /* Try registered free function first. Also try module-prefixed
          * fallback so `Logger::new` (which resolves to "Logger.new")
          * still finds the project's `<module>.Logger.new`. */
-        if (cbm_registry_lookup_func(ctx->registry, qn)) {
-            rust_emit_resolved_call(ctx, qn, "lsp_direct", CBM_RUST_CONF_DIRECT);
+        const CBMRegisteredFunc *direct = cbm_registry_lookup_func(ctx->registry, qn);
+        if (direct && !direct->receiver_type) {
+            const char *strategy = rust_resolve_use(ctx, path) ? "lsp_import_alias" : "lsp_direct";
+            rust_emit_resolved_call_reason(ctx, qn, strategy, CBM_RUST_CONF_DIRECT, path);
             return;
         }
         if (ctx->module_qn && strstr(qn, ".") == NULL) {
             const char *full = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn);
-            if (cbm_registry_lookup_func(ctx->registry, full)) {
+            direct = cbm_registry_lookup_func(ctx->registry, full);
+            if (direct && !direct->receiver_type) {
                 rust_emit_resolved_call(ctx, full, "lsp_direct", CBM_RUST_CONF_DIRECT);
                 return;
             }
@@ -4562,47 +4574,6 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             }
         }
 
-        /* Global short-name fallback: scan the registry for a unique
-         * function whose short_name matches the path's tail and whose
-         * QN starts with the current crate prefix. This gives `mod
-         * foo; use foo::bar; bar()` a chance to resolve when the
-         * intermediate module wasn't tracked through an explicit
-         * use-map entry. */
-        if (tail && *tail && ctx->module_qn) {
-            /* Crate prefix is the first dotted segment of module_qn after
-             * the project name, but for simplicity we just match on
-             * "starts with first dot-segment". */
-            const char *first_dot = strchr(ctx->module_qn, '.');
-            size_t crate_len =
-                first_dot ? (size_t)(first_dot - ctx->module_qn) : strlen(ctx->module_qn);
-            const CBMRegisteredFunc *unique = NULL;
-            int matches = 0;
-            /* Iterate only free funcs whose short_name == tail via the index; the
-             * receiver/short_name/crate-prefix re-checks below are unchanged. */
-            CBMFreeFuncIter ffit;
-            cbm_registry_free_funcs_by_short_name(ctx->registry, tail, &ffit);
-            for (int i; matches < 2 && (i = cbm_free_func_iter_next(&ffit)) >= 0;) {
-                const CBMRegisteredFunc *f = &ctx->registry->funcs[i];
-                if (!f->short_name || !f->qualified_name)
-                    continue;
-                if (f->receiver_type)
-                    continue; /* free functions only */
-                if (strcmp(f->short_name, tail) != 0)
-                    continue;
-                /* Crate-scoped: QN must start with the same prefix. */
-                if (strncmp(f->qualified_name, ctx->module_qn, crate_len) != 0)
-                    continue;
-                matches++;
-                if (matches == 1)
-                    unique = f;
-            }
-            if (matches == 1 && unique) {
-                rust_emit_resolved_call(ctx, unique->qualified_name, "lsp_short_name_unique",
-                                        CBM_RUST_CONF_PROMOTED);
-                return;
-            }
-        }
-
         /* Last-ditch: emit with the resolved path. */
         rust_emit_unresolved_call(ctx, qn, "function_not_in_registry");
         return;
@@ -4639,6 +4610,9 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         return;
     ctx->eval_step_count++;
     const char *kind = ts_node_type(node);
+    if (strcmp(kind, "function_item") == 0) {
+        return; /* A nested item's body is not executed by its enclosing function. */
+    }
 
     /* Bind variables introduced by this statement. */
     rust_process_statement(ctx, node);
@@ -4837,8 +4811,38 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         strcmp(kind, "match_arm") == 0 || strcmp(kind, "closure_expression") == 0;
 
     CBMScope *saved = ctx->current_scope;
+    int saved_use_count = ctx->use_count;
+    int saved_glob_count = ctx->glob_count;
     if (push_scope) {
         ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    }
+    if (strcmp(kind, "block") == 0) {
+        rust_collect_uses(ctx, node);
+        /* Item bindings cover the whole block, including calls before the
+         * declaration. Nested function identity is not module identity. */
+        for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+            TSNode item = ts_node_named_child(node, i);
+            const char *item_kind = ts_node_type(item);
+            if (strcmp(item_kind, "foreign_mod_item") == 0) {
+                TSNode body = ts_node_child_by_field_name(item, "body", 4);
+                for (uint32_t j = 0; j < ts_node_named_child_count(body); j++) {
+                    TSNode name =
+                        ts_node_child_by_field_name(ts_node_named_child(body, j), "name", 4);
+                    if (!ts_node_is_null(name)) {
+                        cbm_scope_bind(ctx->current_scope, rust_node_text(ctx, name),
+                                       cbm_type_unknown());
+                    }
+                }
+            }
+            if (strcmp(item_kind, "function_item") == 0 || strcmp(item_kind, "const_item") == 0 ||
+                strcmp(item_kind, "static_item") == 0 || strcmp(item_kind, "struct_item") == 0) {
+                TSNode name = ts_node_child_by_field_name(item, "name", 4);
+                if (!ts_node_is_null(name)) {
+                    cbm_scope_bind(ctx->current_scope, rust_node_text(ctx, name),
+                                   cbm_type_unknown());
+                }
+            }
+        }
     }
     if (uncertain_callable_flow) {
         ctx->callable_control_flow_depth++;
@@ -4977,6 +4981,8 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     if (push_scope) {
         ctx->current_scope = saved;
     }
+    ctx->use_count = saved_use_count;
+    ctx->glob_count = saved_glob_count;
     if (uncertain_callable_flow) {
         ctx->callable_control_flow_depth--;
     }
@@ -5424,13 +5430,17 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
                         rust_lsp_add_glob(ctx, convert_path_to_qn(ctx->arena, module));
                     }
                 } else if (strcmp(imp->local_name, "_") != 0) {
-                    rust_lsp_add_use(ctx, imp->local_name, imp->module_path);
+                    const char *path = imp->module_path;
+                    if (strncmp(path, "self::", 6) == 0 || strncmp(path, "super::", 7) == 0 ||
+                        strncmp(path, "crate::", 7) == 0) {
+                        path = rust_resolve_path_expr(ctx, path);
+                    }
+                    rust_lsp_add_use(ctx, imp->local_name, path);
                 }
             }
         }
-        /* Recurse into mod_item bodies so nested uses are captured too. */
-        if (strcmp(k, "mod_item") == 0 || strcmp(k, "source_file") == 0 ||
-            strcmp(k, "declaration_list") == 0) {
+        /* Imports belong to this lexical scope, not its nested items. */
+        if (ts_node_eq(n, root)) {
             uint32_t nc = ts_node_child_count(n);
             for (uint32_t i = 0; i < nc; i++) {
                 TSNode c = ts_node_child(n, i);
@@ -6239,12 +6249,13 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
     rust_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
     ctx.cargo_manifest = manifest;
     ctx.syn_calls = synthetic_calls;
-    rust_collect_uses(&ctx, root);
     for (int i = 0; i < import_count; i++) {
         if (import_names[i] && import_qns[i]) {
             rust_lsp_add_use(&ctx, import_names[i], import_qns[i]);
         }
     }
+    /* Source bindings take precedence over heuristic graph import targets. */
+    rust_collect_uses(&ctx, root);
     rust_lsp_process_file(&ctx, root);
 }
 

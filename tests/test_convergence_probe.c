@@ -791,8 +791,7 @@ TEST(cp_recursive_python) {
     PASS();
 }
 
-/* D2c — Rust recursive function. Definitions remain observable while the
- * accepted Rust policy withholds both recursive and ordinary CALLS edges. */
+/* D2c — The ordinary local call survives; self-loop suppression is unchanged. */
 TEST(cp_recursive_rust) {
     static const CP_File f[] = {{"math.rs", "pub fn sum(n: u64) -> u64 {\n"
                                             "    if n == 0 { return 0; }\n    n + sum(n - 1)\n}\n\n"
@@ -801,11 +800,11 @@ TEST(cp_recursive_rust) {
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
     int functions = cp_count_label(store, lp.project, "Function");
-    if (calls != 0 || functions < 2)
+    if (calls != 1 || functions < 2)
         cp_diag(store, lp.project, "recursive/rust");
     cp_cleanup(&lp, store);
     ASSERT_TRUE(functions >= 2);
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 1);
     PASS();
 }
 
@@ -891,8 +890,7 @@ TEST(cp_async_csharp_task) {
     PASS();
 }
 
-/* D3d — Rust .await on an async fn. Function nodes remain observable while
- * the accepted Rust policy withholds CALLS edges. */
+/* D3d — Rust .await preserves the local free-function call. */
 TEST(cp_async_rust_await) {
     static const CP_File f[] = {{"svc.rs",
                                  "async fn fetch(url: &str) -> String { url.to_string() }\n\n"
@@ -901,11 +899,11 @@ TEST(cp_async_rust_await) {
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
     int fn_count = cp_count_label(store, lp.project, "Function");
-    if (calls != 0 || fn_count < 2)
+    if (calls != 1 || fn_count < 2)
         cp_diag(store, lp.project, "async/rust_await");
     cp_cleanup(&lp, store);
     ASSERT_TRUE(fn_count >= 2); /* async fns must still become Function nodes */
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 1);
     PASS();
 }
 
@@ -1021,8 +1019,7 @@ TEST(cp_interface_dispatch_go) {
     PASS();
 }
 
-/* D5b — Rust dyn Trait dispatch. Method nodes remain observable while the
- * accepted Rust policy withholds CALLS edges. */
+/* D5b — The local run->describe call survives; dyn dispatch remains gated. */
 TEST(cp_interface_dispatch_rust_dyn) {
     static const CP_File f[] = {
         {"shapes.rs",
@@ -1037,11 +1034,11 @@ TEST(cp_interface_dispatch_rust_dyn) {
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
     int methods = cp_count_label(store, lp.project, "Method");
-    if (calls != 0 || methods < 2)
+    if (calls != 1 || methods < 2)
         cp_diag(store, lp.project, "interface_dispatch/rust_dyn");
     cp_cleanup(&lp, store);
     ASSERT_TRUE(methods >= 2);
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 1);
     PASS();
 }
 
