@@ -778,7 +778,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 # ── Targets ──────────────────────────────────────────────────────
 
 .PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security \
-	coverage-rust coverage-rust-contract mutation-rust mutation-rust-contract
+	coverage-rust coverage-rust-contract mutation-rust mutation-rust-contract scip-rust
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -960,6 +960,13 @@ mutation-rust-contract:
 
 mutation-rust:
 	@bash scripts/rust-scanner-mutation.sh
+
+# SCIP acceptance lane for Rust CALLS accuracy: indexes a Rust corpus with a
+# production binary built from the current tree, derives an independent
+# rust-analyzer SCIP oracle for the same corpus, and joins the two against a
+# committed expectation.  Opt-in; requires rust-analyzer and cargo.
+scip-rust:
+	@bash scripts/rust-scanner-scip.sh
 
 # ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
