@@ -1,6 +1,6 @@
 # Rust relationship accuracy: current state
 
-Semantic index version: **9**. The broader Rust accuracy objective remains unfinished.
+Semantic index version: **10**. The broader Rust accuracy objective remains unfinished.
 The current supported subset and its verification are recorded in
 [RUST_REPAIR_EVIDENCE.md](RUST_REPAIR_EVIDENCE.md). Commit history owns prior plans,
 investigation transcripts, intermediate results and replay history.
@@ -21,18 +21,18 @@ investigation transcripts, intermediate results and replay history.
 - Both publication modes admit exact, source-site-matched `::`-qualified calls
   from file-local free functions to the unique free function inside the Cargo
   workspace member the source path names. Ambiguous member matches, undeclared
-  heads and missing manifests emit nothing; import-mediated bare cross-crate
-  calls remain unresolved.
+  heads and missing manifests emit nothing. A bare call with an exact lexical
+  import into that member follows the same fail-closed route.
 - Lexical imports and local value declarations prevent the tested shadowed names
   from binding to outer functions. Active glob scopes conservatively leave bare
   calls unresolved. The project-wide unique-short-name fallback is removed.
 - Live CALLS and derived TESTS are restored for this bounded subset. Current-epoch
   CALLS/TESTS survive both incremental restoration routes. IMPLEMENTS/OVERRIDE
   remain rejected.
-- Version 9 invalidates earlier semantic indexes. All three Rust partial-coverage
+- Version 10 invalidates earlier semantic indexes. All three Rust partial-coverage
   flags remain set. An omitted relationship is not proof that none exists.
 
-Methods, import-mediated cross-file calls, expanded calls and implementation
+Methods, other import-mediated cross-file calls, expanded calls and implementation
 relationships are not restored. Exact spans alone cannot validate an incorrectly
 inferred target.
 
@@ -44,14 +44,6 @@ red on a branch; widen `cbm_pipeline_plain_call_admitted`
 epoch together with tests/semantic-epoch.expected; gate on `make scip-rust`
 (fabricated=0 is unconditional) and `make mutation-rust`.
 
-0. **Import-mediated cross-crate calls.** `use alpha::add;` then bare
-   `add()` never reaches the resolver's workspace block (no `::` head) and
-   stays unresolved. The SCIP fixture already contains the pinned case
-   (`beta total -> alpha add` in tests/fixtures/scip_harness/corpus);
-   admission must route through the import binding, not name matching.
-   Known adjacent gap: package names that differ from their directory
-   basename (hyphen/underscore) miss the `.<member>.` segment needle —
-   fail-closed to omission today, owned by item 2's crate-root derivation.
 1. **Implementation identity.** Preserve trait arguments and receiver identity
    through extraction, caller naming, registries and linking. Distinguish two
    same-named trait methods and distinct From<T> implementations on one receiver
@@ -61,7 +53,8 @@ epoch together with tests/semantic-epoch.expected; gate on `make scip-rust`
 2. **Cargo, module and lexical scope.** Derive per-member crate roots, module
    paths, renamed dependencies and import scope from actual workspace inputs.
    Distinguish same-leaf symbols in different modules/crates. Repair semantic
-   target joins before widening cross-file call admission.
+   target joins before widening cross-file call admission. Package names that
+   differ from their directory basename currently miss the member-segment join.
 3. **Wrapper-type propagation.** Trace the first lost type in
    Option<Rc<RefCell<dyn Trait>>> through clone/borrow/method calls. Bind the static
    call to the trait item; report possible concrete dispatch separately.

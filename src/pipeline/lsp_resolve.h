@@ -316,8 +316,9 @@ static inline bool cbm_pipeline_qn_has_dotted_segment(const char *qn, const char
  *
  * Class "plain": bare calls to exact file-local free functions.
  *
- * Class "cross-crate": ::-qualified calls whose resolution the resolver
- * routed into a Cargo workspace member. The strategy string is written at
+ * Class "cross-crate": ::-qualified calls and bare calls with an exact lexical
+ * import whose resolution the resolver routed into a Cargo workspace member.
+ * The strategy is written at
  * exactly one site (rust_lsp.c, block #56) whose guards are the class
  * guarantee: a parsed manifest, the path head declared as a workspace member,
  * and exactly one registered free function in that member matching the call
@@ -326,8 +327,7 @@ static inline bool cbm_pipeline_qn_has_dotted_segment(const char *qn, const char
  * linkage (`.<head>.` in the resolved QN) and rejects file-local targets, so
  * a mis-joined row cannot enter through this class.
  *
- * Method, expansion and import-mediated identities still need their separate
- * repairs. */
+ * Method and expansion identities still need their separate repairs. */
 static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang, const CBMCall *call,
                                                     const CBMResolvedCall *resolved,
                                                     const char *module_qn) {
@@ -360,9 +360,15 @@ static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang, const CBMC
         const char *head_sep = strstr(call->callee_name, "::");
         bool callee_in_this_file = strncmp(resolved->callee_qn, module_qn, module_len) == 0 &&
                                    resolved->callee_qn[module_len] == '.';
-        return head_sep != NULL && head_sep != call->callee_name && !callee_in_this_file &&
-               cbm_pipeline_qn_has_dotted_segment(resolved->callee_qn, call->callee_name,
-                                                  (size_t)(head_sep - call->callee_name));
+        if (head_sep != NULL && head_sep != call->callee_name) {
+            return !callee_in_this_file &&
+                   cbm_pipeline_qn_has_dotted_segment(resolved->callee_qn, call->callee_name,
+                                                      (size_t)(head_sep - call->callee_name));
+        }
+        const char *callee_leaf = strrchr(resolved->callee_qn, '.');
+        return !callee_in_this_file && callee_leaf &&
+               cbm_lsp_bare_segment(call->callee_name) == call->callee_name &&
+               strcmp(callee_leaf + 1, call->callee_name) == 0;
     }
     return false;
 }

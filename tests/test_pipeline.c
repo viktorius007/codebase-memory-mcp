@@ -6530,8 +6530,9 @@ static int setup_rust_cargo_route_repo(const char *tmp) {
                     "pub fn gammaCargoRouteTarget() -> u8 { 92 }\n");
     write_temp_file(tmp, "crates/beta/src/lib.rs",
                     "mod local;\n"
+                    "use alpha::alphaCargoRouteTarget;\n"
                     "pub fn cargoRouteCaller() -> u8 {\n"
-                    "    alpha::alphaCargoRouteTarget() + gamma::gammaCargoRouteTarget()\n"
+                    "    alphaCargoRouteTarget() + gamma::gammaCargoRouteTarget()\n"
                     "}\n");
     for (int i = 0; i < 52; i++) {
         char name[64];
@@ -6606,9 +6607,10 @@ TEST(pipeline_rust_cargo_manifest_converges_across_routes) {
 
     write_temp_file(tmp, "crates/beta/src/lib.rs",
                     "mod local;\n"
+                    "use alpha::alphaCargoRouteTarget;\n"
                     "pub fn cargoRouteCaller() -> u8 {\n"
                     "    let route_marker = 0;\n"
-                    "    route_marker + alpha::alphaCargoRouteTarget()\n"
+                    "    route_marker + alphaCargoRouteTarget()\n"
                     "        + gamma::gammaCargoRouteTarget()\n"
                     "}\n");
     cbm_pipeline_incremental_test_reset_faults();

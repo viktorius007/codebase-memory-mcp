@@ -10,6 +10,6 @@
 # There is no key for fabricated edges (graph CALLS edges the oracle has no
 # reference for): scripts/scip-harness-join.py rejects them unconditionally.
 calls_matched=5
-calls_graph_only_referenced=0
+calls_graph_only_referenced=1
 calls_oracle_only=0
 imports=3

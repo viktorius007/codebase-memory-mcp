@@ -4526,11 +4526,17 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             }
         }
 
-        const char *tail = strrchr(path, ':');
-        if (tail && tail > path && tail[-1] == ':') {
+        const char *workspace_path = path;
+        if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
+            const char *import_target = rust_resolve_use(ctx, path);
+            if (import_target)
+                workspace_path = import_target;
+        }
+        const char *tail = strrchr(workspace_path, ':');
+        if (tail && tail > workspace_path && tail[-1] == ':') {
             tail += 1;
         } else {
-            tail = path;
+            tail = workspace_path;
         }
 
         /* Cross-crate workspace-member resolution (#56): when the call
@@ -4543,9 +4549,10 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
          * path segment plus the call tail. Requires a parsed manifest
          * (threaded through pass_lsp_cross.c); NULL manifest skips this. */
         if (ctx->cargo_manifest && tail && *tail) {
-            const char *head_sep = strstr(path, "::");
-            if (head_sep && head_sep > path) {
-                char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(head_sep - path));
+            const char *head_sep = strstr(workspace_path, "::");
+            if (head_sep && head_sep > workspace_path) {
+                char *head = cbm_arena_strndup(ctx->arena, workspace_path,
+                                               (size_t)(head_sep - workspace_path));
                 const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
                 if (head && cbm_cargo_find_member(m, head)) {
                     /* `.crate_a.` — the member directory appears as a dotted
