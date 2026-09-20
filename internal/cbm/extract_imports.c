@@ -585,38 +585,101 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 }
 
 // --- Rust imports ---
-// use_declaration -> use_list or scoped_use_list
 
-static void parse_rust_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
+/* Read path tokens, excluding comments and whitespace between segments. */
+static char *rust_use_path_text(CBMArena *arena, TSNode node, const char *source) {
+    if (ts_node_is_null(node)) {
+        return cbm_arena_strdup(arena, "");
+    }
+    char *text = cbm_node_text(arena, node, source);
+    size_t length = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    for (;;) {
+        TSNode current = ts_tree_cursor_current_node(&cursor);
+        if (!ts_node_is_extra(current)) {
+            if (ts_tree_cursor_goto_first_child(&cursor)) {
+                continue;
+            }
+            size_t size = ts_node_end_byte(current) - ts_node_start_byte(current);
+            memcpy(text + length, source + ts_node_start_byte(current), size);
+            length += size;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                text[length] = '\0';
+                return text;
+            }
+        }
+    }
+}
 
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
-    if (!ts_tree_cursor_goto_first_child(&cursor)) {
-        ts_tree_cursor_delete(&cursor);
+static CBMImport rust_use_binding(CBMArena *arena, TSNode node, const char *source) {
+    const char *kind = ts_node_type(node);
+    TSNode alias = ts_node_child_by_field_name(node, TS_FIELD("alias"));
+    TSNode path = strcmp(kind, "use_as_clause") == 0
+                      ? ts_node_child_by_field_name(node, TS_FIELD("path"))
+                      : node;
+    char *full = rust_use_path_text(arena, path, source);
+    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        const char *parent_kind = ts_node_type(parent);
+        if (strcmp(parent_kind, "use_declaration") == 0) {
+            break;
+        }
+        if (strcmp(parent_kind, "scoped_use_list") != 0) {
+            continue;
+        }
+        TSNode prefix_node = ts_node_child_by_field_name(parent, TS_FIELD("path"));
+        char *prefix = rust_use_path_text(arena, prefix_node, source);
+        full =
+            strcmp(full, "self") == 0 ? prefix : cbm_arena_sprintf(arena, "%s::%s", prefix, full);
+    }
+    const char *local =
+        ts_node_is_null(alias) ? path_last(arena, full) : cbm_node_text(arena, alias, source);
+    return (CBMImport){.local_name = local, .module_path = full};
+}
+
+void cbm_extract_rust_use_tree(CBMArena *arena, TSNode argument, const char *source,
+                               CBMImportArray *imports) {
+    if (ts_node_is_null(argument)) {
         return;
     }
-    do {
+    TSTreeCursor cursor = ts_tree_cursor_new(argument);
+    for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (strcmp(ts_node_type(node), "use_declaration") != 0) {
+        const char *kind = ts_node_type(node);
+        bool list = strcmp(kind, "use_list") == 0 || strcmp(kind, "scoped_use_list") == 0;
+        if (list && ts_tree_cursor_goto_first_child(&cursor)) {
             continue;
         }
+        TSNode parent = ts_node_parent(node);
+        bool prefix =
+            !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "scoped_use_list") == 0;
+        if (ts_node_is_named(node) && !ts_node_is_extra(node) && !list && !prefix) {
+            cbm_imports_push(imports, arena, rust_use_binding(arena, node, source));
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                return;
+            }
+        }
+    }
+}
 
-        char *full = cbm_node_text(a, node, ctx->source);
-        if (!full) {
-            continue;
-        }
-        // Strip "use " prefix and trailing ";"
-        if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
-            full += USE_PREFIX_LEN;
-        }
-        size_t len = strlen(full);
-        if (len > 0 && full[len - SKIP_ONE] == ';') {
-            full[len - SKIP_ONE] = '\0';
-        }
-
-        CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
-        cbm_imports_push(&ctx->result->imports, a, imp);
-    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+static void parse_rust_imports(CBMExtractCtx *ctx) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            if (strcmp(ts_node_type(node), "use_declaration") == 0) {
+                cbm_extract_rust_use_tree(ctx->arena,
+                                          ts_node_child_by_field_name(node, TS_FIELD("argument")),
+                                          ctx->source, &ctx->result->imports);
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
     ts_tree_cursor_delete(&cursor);
 }
 

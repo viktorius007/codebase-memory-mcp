@@ -5412,82 +5412,19 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
             continue;
         const char *k = ts_node_type(n);
         if (strcmp(k, "use_declaration") == 0) {
-            char *full = rust_node_text(ctx, n);
-            if (full) {
-                if (strncmp(full, "use ", 4) == 0)
-                    full += 4;
-                size_t len = strlen(full);
-                if (len > 0 && full[len - 1] == ';')
-                    full[len - 1] = '\0';
-                /* Trim leading whitespace. */
-                while (*full == ' ')
-                    full++;
-                /* Detect glob. */
-                size_t flen = strlen(full);
-                if (flen >= 3 && strcmp(full + flen - 3, "::*") == 0) {
-                    char *mod = cbm_arena_strndup(ctx->arena, full, flen - 3);
-                    rust_lsp_add_glob(ctx, convert_path_to_qn(ctx->arena, mod));
-                } else if (flen >= 1 && full[flen - 1] == '}') {
-                    /* Brace list: prefix::{a, b as c, d}. */
-                    char *lbr = strchr(full, '{');
-                    if (lbr) {
-                        size_t prefix_len = (size_t)(lbr - full);
-                        /* Strip trailing "::" from prefix. */
-                        while (prefix_len >= 2 && full[prefix_len - 1] == ':' &&
-                               full[prefix_len - 2] == ':') {
-                            prefix_len -= 2;
-                        }
-                        char *prefix = cbm_arena_strndup(ctx->arena, full, prefix_len);
-                        char *body = cbm_arena_strdup(ctx->arena, lbr + 1);
-                        size_t blen = strlen(body);
-                        if (blen > 0 && body[blen - 1] == '}')
-                            body[blen - 1] = '\0';
-                        char *save = NULL;
-                        char *tok = strtok_r(body, ",", &save);
-                        while (tok) {
-                            while (*tok == ' ')
-                                tok++;
-                            char *eb = tok + strlen(tok) - 1;
-                            while (eb > tok && *eb == ' ')
-                                *eb-- = '\0';
-                            if (*tok == '\0') {
-                                tok = strtok_r(NULL, ",", &save);
-                                continue;
-                            }
-                            /* `Read` or `Read as R`. */
-                            char *asp = strstr(tok, " as ");
-                            char *alias = NULL;
-                            char *path_part = tok;
-                            if (asp) {
-                                *asp = '\0';
-                                alias = asp + 4;
-                                while (*alias == ' ')
-                                    alias++;
-                            } else {
-                                alias = (char *)path_last_segment(tok);
-                            }
-                            char *full_path =
-                                (strcmp(tok, "self") == 0)
-                                    ? cbm_arena_strdup(ctx->arena, prefix)
-                                    : cbm_arena_sprintf(ctx->arena, "%s::%s", prefix, path_part);
-                            rust_lsp_add_use(ctx, alias, full_path);
-                            tok = strtok_r(NULL, ",", &save);
-                        }
+            CBMImportArray imports = {0};
+            cbm_extract_rust_use_tree(ctx->arena, ts_node_child_by_field_name(n, "argument", 8),
+                                      ctx->source, &imports);
+            for (int i = 0; i < imports.count; i++) {
+                const CBMImport *imp = &imports.items[i];
+                if (strcmp(imp->local_name, "*") == 0) {
+                    size_t length = strlen(imp->module_path);
+                    if (length > 2) {
+                        char *module = cbm_arena_strndup(ctx->arena, imp->module_path, length - 3);
+                        rust_lsp_add_glob(ctx, convert_path_to_qn(ctx->arena, module));
                     }
-                } else {
-                    /* Single path; possibly followed by ` as X`. */
-                    char *asp = strstr(full, " as ");
-                    char *alias = NULL;
-                    char *path_part = full;
-                    if (asp) {
-                        *asp = '\0';
-                        alias = asp + 4;
-                        while (*alias == ' ')
-                            alias++;
-                    } else {
-                        alias = (char *)path_last_segment(full);
-                    }
-                    rust_lsp_add_use(ctx, alias, path_part);
+                } else if (strcmp(imp->local_name, "_") != 0) {
+                    rust_lsp_add_use(ctx, imp->local_name, imp->module_path);
                 }
             }
         }
@@ -6107,14 +6044,6 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
     ctx.syn_calls = &result->calls;
 
     rust_collect_uses(&ctx, root);
-    /* Bridge any extracted CBMImports the unified extractor saw. */
-    for (int i = 0; i < result->imports.count; i++) {
-        CBMImport *imp = &result->imports.items[i];
-        if (imp->local_name && imp->module_path) {
-            rust_lsp_add_use(&ctx, imp->local_name, imp->module_path);
-        }
-    }
-
     rust_lsp_process_file(&ctx, root);
 }
 

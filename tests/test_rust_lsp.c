@@ -288,6 +288,31 @@ TEST(rustlsp_use_brace_list) {
     PASS();
 }
 
+TEST(rustlsp_nested_use_aliases_resolve_exact_targets) {
+    const char *source =
+        "pub use std::{string::{String as Text}, vec::{Vec as Sequence}};\n"
+        "fn run() { let _ = Text::new(); let _ = Sequence::new(); }\n";
+    CBMFileResult *r = extract_rust(source);
+    ASSERT_NOT_NULL(r);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray cross = {0};
+    cbm_run_rust_lsp_cross(&arena, source, (int)strlen(source), "test.src.main",
+                          NULL, 0, NULL, NULL, 0, NULL, &cross);
+    const CBMResolvedCallArray *results[] = {&r->resolved_calls, &cross};
+    const char *expected[] = {"alloc.string.String.new", "alloc.vec.Vec.new"};
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(results[mode]->count, 2);
+        for (int i = 0; i < 2; i++) {
+            ASSERT_STR_EQ(results[mode]->items[i].caller_qn, "test.src.main.run");
+            ASSERT_STR_EQ(results[mode]->items[i].callee_qn, expected[i]);
+        }
+    }
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_use_as_alias) {
     CBMFileResult *r = extract_rust(
         "use std::collections::HashMap as Map;\n"
@@ -6782,6 +6807,7 @@ void suite_rust_lsp(void) {
     /* Path resolution */
     RUN_TEST(rustlsp_use_alias_call);
     RUN_TEST(rustlsp_use_brace_list);
+    RUN_TEST(rustlsp_nested_use_aliases_resolve_exact_targets);
     RUN_TEST(rustlsp_use_as_alias);
 
     /* Generics */

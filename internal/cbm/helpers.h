@@ -12,6 +12,12 @@ void *cbm_memmem(const void *haystack, size_t haystack_len, const void *needle, 
 // Extract text of a node from source. Returns arena-allocated string.
 char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 
+// Expand a Rust use-declaration argument into source-ordered path/local-name pairs.
+// Paths retain :: separators and glob suffixes; grouped self imports name their module.
+// Strings and appended records are arena-owned. Lexical scope is the caller's responsibility.
+void cbm_extract_rust_use_tree(CBMArena *arena, TSNode argument, const char *source,
+                               CBMImportArray *imports);
+
 // Check if a string is a language keyword (should be skipped as callee/usage).
 bool cbm_is_keyword(const char *name, CBMLanguage lang);
 

@@ -657,7 +657,7 @@ typedef struct {
      CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE)
 
 enum {
-    CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION = 4,
+    CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION = 5,
 };
 
 /* Metadata describing how completely one index run recorded the best-effort

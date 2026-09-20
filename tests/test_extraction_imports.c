@@ -583,6 +583,36 @@ static const import_case_t rust_cases[] = {
       {NULL}, 0, "rust_use_in_fn" },  /* count may be 0 (root-only scan) — no assert */
 };
 
+TEST(rust_use_trees_preserve_exact_paths_and_bindings) {
+    const char *source =
+        "pub(crate) use pm_cli_grammar::context::RepositoryContinuity as RepositoryContinuityPort;\n"
+        "use std::{collections::{HashMap as Map, BTreeMap}, io::{self as io_mod, Read}, sync::*};\n"
+        "use {crate::config::Config, super::helper};\n"
+        "use std :: /* path trivia */ fmt :: {self, Debug as _};\n";
+    const char *expected[][2] = {
+        {"RepositoryContinuityPort", "pm_cli_grammar::context::RepositoryContinuity"},
+        {"Map", "std::collections::HashMap"},
+        {"BTreeMap", "std::collections::BTreeMap"},
+        {"io_mod", "std::io"},
+        {"Read", "std::io::Read"},
+        {"*", "std::sync::*"},
+        {"Config", "crate::config::Config"},
+        {"helper", "super::helper"},
+        {"fmt", "std::fmt"},
+        {"_", "std::fmt::Debug"},
+    };
+    CBMFileResult *r = do_extract(source, CBM_LANG_RUST, "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, sizeof(expected) / sizeof(expected[0]));
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT_STR_EQ(r->imports.items[i].local_name, expected[i][0]);
+        ASSERT_STR_EQ(r->imports.items[i].module_path, expected[i][1]);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_import_table) {
     int failures = run_cases(rust_cases, (int)(sizeof(rust_cases)/sizeof(rust_cases[0])));
     if (failures > 0) {
@@ -1268,6 +1298,7 @@ SUITE(extraction_imports) {
     RUN_TEST(javascript_import_table);
 
     /* Extraction-level spot-checks for languages with graph-level zero-edges */
+    RUN_TEST(rust_use_trees_preserve_exact_paths_and_bindings);
     RUN_TEST(rust_import_table);         /* extraction likely GREEN; graph edges RED downstream */
     RUN_TEST(java_import_table);         /* extraction likely GREEN; graph edges RED downstream */
     RUN_TEST(kotlin_import_table);       /* extraction likely GREEN; graph edges RED downstream */

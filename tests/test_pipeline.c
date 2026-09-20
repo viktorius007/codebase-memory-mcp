@@ -4382,7 +4382,7 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     ASSERT_GT(cbm_store_insert_edge(metadata_store, &old_implements), 0);
     ASSERT_GT(cbm_store_insert_edge(metadata_store, &old_override), 0);
     cbm_coverage_meta_t legacy_meta = current_meta;
-    legacy_meta.coverage_version = 3;
+    legacy_meta.coverage_version = CBM_SEMANTIC_INDEX_VERSION - 1;
     ASSERT_EQ(cbm_store_coverage_replace_ex(metadata_store, project, coverage_rows, coverage_count,
                                             &legacy_meta),
               CBM_STORE_OK);
