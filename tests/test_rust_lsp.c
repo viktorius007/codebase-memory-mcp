@@ -5694,12 +5694,28 @@ TEST(rustlsp_gap_macro_with_ty_and_expr) {
     cbm_free_result(r); PASS();
 }
 
-TEST(rustlsp_gap_macro_no_match_falls_through) {
-    /* Macro with one rule but called with mismatched args — not a crash. */
+TEST(rustlsp_gap_macro_no_match_is_fail_closed) {
     CBMFileResult *r = extract_rust(
-        "macro_rules! one_arg { ($x:expr) => { $x } }\n"
-        "fn run() -> i32 { one_arg!(1) }\n");
+        "fn unmatched_arm_sentinel() {}\n"
+        "macro_rules! one_arm { (expected) => { unmatched_arm_sentinel() } }\n"
+        "fn run() { one_arm!(unexpected); }\n");
     ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "run", "unmatched_arm_sentinel"), 0);
+    cbm_free_result(r); PASS();
+}
+
+TEST(rustlsp_gap_macro_later_matching_arm_only) {
+    CBMFileResult *r = extract_rust(
+        "fn first_arm_sentinel() {}\n"
+        "fn selected_later_arm() {}\n"
+        "macro_rules! choose {\n"
+        "    (first) => { first_arm_sentinel() };\n"
+        "    (second) => { selected_later_arm() };\n"
+        "}\n"
+        "fn run() { choose!(second); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "run", "selected_later_arm"), 1);
+    ASSERT_EQ(count_resolved(r, "run", "first_arm_sentinel"), 0);
     cbm_free_result(r); PASS();
 }
 
@@ -7345,7 +7361,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_macro_emit_struct);
     RUN_TEST(rustlsp_gap_macro_define_macro_via_macro);
     RUN_TEST(rustlsp_gap_macro_with_ty_and_expr);
-    RUN_TEST(rustlsp_gap_macro_no_match_falls_through);
+    RUN_TEST(rustlsp_gap_macro_no_match_is_fail_closed);
+    RUN_TEST(rustlsp_gap_macro_later_matching_arm_only);
 
     /* Cov §X: mod foo; file linking */
     RUN_TEST(rustlsp_gap_mod_decl_recorded);
