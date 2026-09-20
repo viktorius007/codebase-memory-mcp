@@ -739,25 +739,97 @@ real cross-file caller) pending the plan's cross-file restoration.
 
 # Deferred close-out items from the 2026-09-20 lane restoration
 
-Small jobs deliberately deferred at session close (all context in the
-sections above; tip at deferral: 9abf6ed5):
+Context in one paragraph: merge 562bfecd had silently deleted the Rust
+resolver and its whole verification lane; the 2026-09-20 session (sections
+above) restored the lane, fixed three resolver regressions, landed the
+cross-crate call class, and re-armed the mutation harness (all five active
+mutants KILLED at 9abf6ed5). The five items below were deliberately deferred
+at session close. Each one says what it is, why it exists, and exactly what
+"done" looks like, assuming no memory of that session.
 
-- Coverage floors: scripts/rust-scanner-coverage.sh still carries fork-era
-  floors and fails on the current tree (measured pre-merge: rust_lsp.c
-  72.65/56.26, rust_cargo.c 90.69/56.16, rust_rustdoc.c 64.02/37.65).
-  Recalibrate from two byte-identical runs on the merged tree, rounded down
-  one decimal.
-- Lane-presence contract: a Step 0 check that every rust-scanner.tsv row's
-  patch exists and passes `git apply --check`, so patch drift fails the
-  venue leg instead of surfacing as a harness error at the next mutation run.
-- CI wiring: mutation-rust and scip-rust run only as local Makefile targets;
-  neither the fork nor this tree ever gated them in CI. Decide venue and cost.
-- One full default scripts/test.sh leg on the merged tip has not run
-  (per-branch legs all ran; Step 5e conflicts with a live installed daemon
-  on the dev host — see the cross-crate report's triage).
-- Flake worth its own issue: tool_detect_changes_impact_shape
-  (tests/test_incremental.c:1988) fails under 16-job load via the
-  contained-command runner branch at src/mcp/mcp.c:16018-16030; diagnostic
-  does not distinguish runner failure from git semantics. Same family:
-  CBM_RUNTIME_DIR paths over ~50 bytes fail with an empty validation detail
-  (src/main.c:2838).
+## 1. Recalibrate the Rust coverage floors
+
+What: `make -f Makefile.cbm coverage-rust` builds the test suite with Apple
+LLVM source-coverage instrumentation, runs the `rust_lsp` suite, and FAILS
+if line/branch coverage of the three Rust scanner files drops below floors
+hard-coded in scripts/rust-scanner-coverage.sh.
+
+Problem: those floors were calibrated on the pre-merge fork's much larger
+scanner, so the lane currently fails on this tree even though nothing is
+wrong. Measured on this tree pre-merge: rust_lsp.c 72.65% lines / 56.26%
+branches (floors demand 77.5/59.3), rust_cargo.c 90.69/56.16 (75.5/60.0),
+rust_rustdoc.c 64.02/37.65 (64.0/37.6 — passing).
+
+Done: run the lane twice on a quiet machine; the two metrics.tsv files in
+the artifact dirs must be byte-identical (that is the calibration discipline
+the script's own comment describes). Set each floor in
+scripts/rust-scanner-coverage.sh to the measured value rounded DOWN to one
+decimal, commit, and confirm `make -f Makefile.cbm coverage-rust` prints
+`PASS coverage-rust`.
+
+## 2. Add a lane-presence contract step to scripts/test.sh
+
+What: a new cheap "Step 0" check (like the existing Step 0y/0z) asserting
+that every row of tests/mutation/rust-scanner.tsv names a patch file that
+exists AND still applies to the current tree (`git apply --check <patch>`).
+
+Why: the mutation patches encode their target code as diff context. When
+someone edits the mutated region, the patch silently stops applying, and
+nobody notices until the next manual `make mutation-rust` — the same
+"guard rots silently" failure this whole episode was about. A Step 0 check
+makes patch drift fail every test run immediately, for free.
+
+Done: a tests/test_rust_lane_presence_contract.sh wired into scripts/test.sh
+next to Step 0z; deleting a patch or editing its target region makes
+scripts/test.sh fail; untouched tree passes.
+
+## 3. Decide CI wiring for the mutation and SCIP lanes
+
+What: `make -f Makefile.cbm mutation-rust` (~8 min with the compiler cache)
+and `make -f Makefile.cbm scip-rust` (needs rust-analyzer + cargo installed)
+currently run only when a human types them. No CI job runs them; the fork
+never had one either.
+
+Why: a gate nobody runs is documentation. The venue leg only checks the
+lane's files and harness work (Step 0z), not that the mutants still die.
+
+Done: a decision, then wiring. Options: a scheduled/nightly CI job; a job
+triggered on changes under internal/cbm/lsp/, src/pipeline/, or tests/
+mutation/; or an explicit written decision in this file that they stay
+manual-only and when they must be run (e.g. before merging any Rust
+resolver change).
+
+## 4. Run one full scripts/test.sh leg on the merged tip
+
+What: the default no-argument scripts/test.sh — the canonical merge gate —
+has not been run start-to-finish on the final merged main (each lane branch
+ran it separately before merging; the merges were clean).
+
+Caveat known in advance: Step 5e (watcher kill-switch guard) starts the
+production binary, and fails while an installed codebase-memory-mcp daemon
+is running on the machine, because the daemon's build fingerprint differs
+from the in-tree build. Stop the daemon first (it respawns on next MCP
+client use) or accept CI as the venue for that step.
+
+Done: one green run at or after commit 9abf6ed5, or a triaged failure list
+where every failure is host-environmental (daemon conflict or the flake in
+item 5), not a code regression.
+
+## 5. File and fix two diagnostic-gap flakes (own issues)
+
+a) tool_detect_changes_impact_shape (tests/test_incremental.c:1988) fails
+rarely under 16-job parallel load: the detect_changes MCP tool reports
+"git merge-base failed: the contained command could not complete". Root:
+src/mcp/mcp.c:16018-16030 uses one error message both when git itself exits
+nonzero and when the sandboxed subprocess runner fails to spawn under load,
+so a scheduling hiccup is indistinguishable from a git semantics error.
+Fix direction: separate the two branches' messages; consider retrying the
+spawn once.
+
+b) CBM_RUNTIME_DIR (the directory the CLI uses for its coordination socket)
+longer than ~50 bytes makes every CLI command fail with "secure CLI
+coordination could not be created (endpoint)" and an EMPTY detail string
+(src/main.c:2838): the macOS unix-socket path limit is the real cause and
+the diagnostic never names it. Measured: 49-byte parent works, 67 fails;
+the default macOS TMPDIR is already too long. Fix direction: detect the
+sun_path overflow and say so, naming the path and the limit.
