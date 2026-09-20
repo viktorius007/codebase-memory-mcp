@@ -1,0 +1,15 @@
+# Expected join counts for tests/fixtures/scip_harness/corpus (ISSUES.md §5).
+#
+# calls_matched              graph CALLS edges found in the oracle's strict
+#                            same-file free-function call set (must-match)
+# calls_graph_only_referenced graph CALLS edges outside the strict set that the
+#                            oracle still attests with a reference (may-exceed)
+# calls_oracle_only          strict-set oracle edges absent from the graph
+# imports                    IMPORTS edges in the graph
+#
+# There is no key for fabricated edges (graph CALLS edges the oracle has no
+# reference for): scripts/scip-harness-join.py rejects them unconditionally.
+calls_matched=5
+calls_graph_only_referenced=0
+calls_oracle_only=0
+imports=3

@@ -1,7 +1,8 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
+index b46cc84e..7a36d242 100644
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -3965,6 +3965,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
+@@ -3581,6 +3581,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
              hit = r;
              break;
          }
@@ -9,5 +10,5 @@ diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 +        if (!hit)
 +            hit = r;
      }
-     if (binding_limit_hit)
-         rust_health_record_node(ctx, CBM_RUST_HEALTH_MACRO_BINDING_LIMIT, invocation);
+     if (!hit || !hit->transcriber_text || hit->transcriber_len <= 0)
+         return;

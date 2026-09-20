@@ -278,6 +278,13 @@ bash "$ROOT/tests/test_language_count_contract.sh"
 echo "=== Step 0x: packaging version-metadata contract ==="
 bash "$ROOT/tests/test_version_metadata_contract.sh"
 
+echo "=== Step 0y: semantic index epoch contract ==="
+bash "$ROOT/tests/test_semantic_epoch_contract.sh"
+
+echo "=== Step 0z: Rust scanner harness contracts ==="
+bash "$ROOT/tests/test_rust_scanner_mutation.sh"
+bash "$ROOT/tests/test_rust_scanner_coverage.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
