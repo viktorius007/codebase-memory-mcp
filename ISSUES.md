@@ -834,21 +834,13 @@ the diagnostic never names it. Measured: 49-byte parent works, 67 fails;
 the default macOS TMPDIR is already too long. Fix direction: detect the
 sun_path overflow and say so, naming the path and the limit.
 
-## 6. lint-format gate fails at HEAD on five files (pre-existing)
+## 8. Pin the CI clang-format version in Makefile.cbm
 
-`make -f Makefile.cbm lint-format` (Homebrew LLVM 20 and 23 formatters both)
-exits nonzero on src/cli/cli.c, src/daemon/frontend.c, src/daemon/runtime.c,
-src/daemon/version_cohort.c and src/pipeline/pass_lsp_cross.c. Verified
-independent of the Rust impl-identity commits: the gate fails with those
-commits stashed. Either the violations are real drift that CI's formatter
-version misses, or the local Homebrew formatter differs from CI's pinned
-version — determine CI's clang-format version, pin it in Makefile.cbm:1158,
-and reformat or exempt accordingly.
-
-Correction from verification of d2258403: the five-file list is the LLVM 20
-(20.1.8) verdict only. The gate's resolved formatter (brew --prefix llvm =
-23.1.1) flags exactly one file, src/pipeline/pass_lsp_cross.c, and that
-file's drift was introduced by impl-identity commit 17f32acd (clean at
-17f32acd^, failing at 17f32acd under LLVM 23) — so "independent of the Rust
-impl-identity commits" holds only for the 5646255b..d2258403 tip series,
-and the other four files are LLVM-version skew, not drift the gate sees.
+`Makefile.cbm:1158` resolves whatever Homebrew LLVM is installed, so
+formatter verdicts drift across LLVM majors: 20.1.8 and 23.1.1 disagree on
+four files (src/cli/cli.c, src/daemon/frontend.c, src/daemon/runtime.c,
+src/daemon/version_cohort.c) that only LLVM 20 flags. The one file the
+resolved formatter (LLVM 23) flagged, src/pipeline/pass_lsp_cross.c —
+drift introduced by 17f32acd — is reformatted and the gate is green
+locally. Determine CI's pinned clang-format version, pin the same in
+Makefile.cbm:1158, and drop this entry.
