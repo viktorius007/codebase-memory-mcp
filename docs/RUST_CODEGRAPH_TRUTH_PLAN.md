@@ -121,6 +121,23 @@ epoch together with tests/semantic-epoch.expected; gate on `make scip-rust`
    migration test lowers the stored version below 11 and requires the forced-full
    route, so pre-epoch identities cannot be restored into the current graph.
 
+   Step 7 is complete at semantic epoch 12. `cbm_pipeline_plain_call_admitted`
+   admits exactly the keyed trait-impl method class: strategies
+   `lsp_trait_dispatch`, `lsp_trait_ufcs` and `lsp_operator_trait`, a nonempty
+   `callee_impl_key`, a terminal nonempty `[Trait<...>]` identity on the
+   published callee, and leaf equality after suffix removal, on top of the
+   existing exact-occurrence and file-local-caller floor. Missing, name-only,
+   ambiguous, inherent-method and dyn-dispatch targets stay closed, proven by a
+   both-modes end-to-end fixture whose disarm reddens the suite. Gates at this
+   epoch: `make scip-rust` fabricated=0 under rust-analyzer 1.94.0 and 1.98.1,
+   `make mutation-rust` 5/5 killed with no survivors or harness errors, the
+   full `scripts/test.sh` leg, and the semantic-epoch contract at 12. The four
+   named corpus cases were re-verified against a fresh epoch-12 index of the
+   read-only corpus: the `String.from[From<WriterIdentity>]` node is distinct,
+   the `git-safety` `clone` helper attracts only its own file's callers, the
+   `RepositoryContinuityPort` implementations carry keyed identities, and the
+   `Rc<RefCell<dyn ...>>` route emits no edges.
+
 2. **Cargo, module and lexical scope.** Derive per-member crate roots, module
    paths, renamed dependencies and import scope from actual workspace inputs.
    Distinguish same-leaf symbols in different modules/crates. Repair semantic

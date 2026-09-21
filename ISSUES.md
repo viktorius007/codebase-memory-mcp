@@ -11,17 +11,23 @@ or release status. Confirm the behavior before starting a repair.
 
 ## Rust semantic coverage remains partial
 
-Exact file-local free-function CALLS and their derived TESTS are supported.
-Methods, cross-file calls, expanded calls and IMPLEMENTS/OVERRIDE remain gated;
-missing edges do not establish absence. The [accuracy plan](docs/RUST_CODEGRAPH_TRUTH_PLAN.md)
-owns implementation identity, Cargo/module scope, wrapper-type propagation,
-library seeds, cfg/macros and full/incremental corpus verification.
+As of semantic epoch 12: exact file-local free-function CALLS, cross-crate
+workspace CALLS, and keyed trait-implementation method CALLS (published as
+`receiver.method[Trait<...>]` with an implementation key) are supported, with
+their derived TESTS. Expanded (macro) calls, dyn dispatch, and
+IMPLEMENTS/OVERRIDE remain gated; missing edges do not establish absence. The
+[accuracy plan](docs/RUST_CODEGRAPH_TRUTH_PLAN.md) owns implementation
+identity, Cargo/module scope, wrapper-type propagation, library seeds,
+cfg/macros and full/incremental corpus verification.
 
-Important corpus cases include `From<WriterIdentity> for String`, the private
-`git-safety` `clone` helper, aliased `RepositoryContinuityPort` implementations,
-and calls through `Rc<RefCell<dyn RepositoryContinuity>>`. Cycle, impact and test
-answers must be checked after binding changes; a confidence threshold alone
-cannot establish target correctness. See the plan for source paths and scope.
+The named corpus cases were verified against a fresh epoch-12 index:
+`From<WriterIdentity> for String` publishes a distinct keyed node, the private
+`git-safety` `clone` helper attracts only its own file's callers (zero false
+edges project-wide), aliased `RepositoryContinuityPort` implementations carry
+keyed identities, and calls through `Rc<RefCell<dyn RepositoryContinuity>>`
+stay closed. Cycle, impact and test answers must still be rechecked after
+binding changes; a confidence threshold alone cannot establish target
+correctness.
 
 Related reports: [#2053](https://github.com/DeusData/codebase-memory-mcp/issues/2053)
 (same-name false calls), [#2127](https://github.com/DeusData/codebase-memory-mcp/issues/2127)
