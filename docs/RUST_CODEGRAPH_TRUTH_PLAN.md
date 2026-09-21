@@ -50,6 +50,58 @@ epoch together with tests/semantic-epoch.expected; gate on `make scip-rust`
    before admitting methods or IMPLEMENTS/OVERRIDE. The admission predicate's
    shared floor already isolates the caller-side check, so the method-caller
    widening itself is small once identity is trustworthy.
+
+   The first incorrect transition is extraction, before any cross-file layer can
+   recover the distinction. `extract_rust_impl` currently strips generic arguments
+   from both the receiver (`Wrapper<T>` to `Wrapper`) and the implemented trait
+   (`From<Feet>` to `From`), then names every method only as
+   `<receiver-qualified-name>.<method>`. Two legal implementations such as
+   `From<Feet> for Meters` and `From<Inches> for Meters` therefore produce the same
+   `Meters.from` definition and the same `impl_trait = "From"` inside one
+   `CBMFileResult`. The later `receiver_type` and `trait_qn` fields have the right
+   conceptual roles but only receive this already-lossy data.
+
+   Qualified names are persisted graph identity, not presentation: the in-memory
+   graph keys nodes by qualified name and SQLite enforces uniqueness on
+   `(project, qualified_name)`. Publishing a richer method identity is consequently
+   an epoch-changing graph migration. Compact/spill handling already carries the
+   existing `CBMDefinition.impl_trait` and `CBMImplTrait` strings; any new identity
+   field must be added to that walker explicitly.
+
+   Keep the repair serial and atomic. No later layer begins until the focused tests
+   for the preceding layer are green:
+
+   1. Pin extraction loss directly with one fixture containing distinct
+      `From<Feet>` and `From<Inches>` implementations on `Meters`. Assert the two
+      exact trait spellings on both the impl records and their method definitions;
+      do not use graph counts or another proxy as the oracle.
+   2. Preserve the exact trait spelling through extraction only. Do not change
+      method qualified names, registries, publication, admission or the semantic
+      epoch in this step.
+   3. Preserve exact receiver spelling while retaining the declaration-owner
+      identity needed to find the underlying type. Prove the extraction and
+      compact/spill round trip before registry changes.
+   4. Define one canonical internal implementation identity from receiver plus
+      instantiated trait. Use it in Rust registry lookup and prove exact selection
+      plus fail-closed ambiguity for same-named methods. The Rust trait-method lookup
+      and the generic resolved-call occurrence join are separate ambiguity gates;
+      neither substitutes for the other.
+   5. Propagate that identity into resolved caller/callee naming without yet
+      admitting method `CALLS`.
+   6. Publish distinct method nodes and implementation relationships identically in
+      sequential and parallel modes. Bump the semantic epoch at this first persisted
+      identity change, then prove both incremental restoration routes.
+   7. Widen `cbm_pipeline_plain_call_admitted` for exactly the now-trustworthy method
+      class. Keep missing, name-only and ambiguous targets closed.
+
+   Prefer the existing extraction seam (`cbm_extract_file` in the focused extraction
+   suite) over a standalone probe: it observes the direct mechanism without
+   duplicating the production parser/link setup. Each test must carry an exact
+   mechanism-level oracle, a fixture discriminator, and recorded red-before-green
+   evidence. After every production edit, run its focused suite before adding the
+   next layer; the final repair still owes both publication modes, both restoration
+   routes, the Rust SCIP fabricated-zero gate, the Rust mutation lane and the
+   semantic-epoch contract.
 2. **Cargo, module and lexical scope.** Derive per-member crate roots, module
    paths, renamed dependencies and import scope from actual workspace inputs.
    Distinguish same-leaf symbols in different modules/crates. Repair semantic
