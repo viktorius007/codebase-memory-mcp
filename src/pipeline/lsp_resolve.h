@@ -107,6 +107,18 @@ static inline const char *cbm_pipeline_call_callee_leaf(const char *callee_name)
     return cbm_lsp_bare_segment(callee_name);
 }
 
+static inline size_t cbm_pipeline_lsp_method_leaf_len(const char *leaf) {
+    const char *impl_suffix = leaf ? strchr(leaf, '[') : NULL;
+    return leaf ? (impl_suffix ? (size_t)(impl_suffix - leaf) : strlen(leaf)) : 0;
+}
+
+static inline bool cbm_pipeline_lsp_method_leaf_eq(const char *resolved_leaf,
+                                                   const char *call_leaf) {
+    size_t resolved_len = cbm_pipeline_lsp_method_leaf_len(resolved_leaf);
+    return call_leaf && strlen(call_leaf) == resolved_len &&
+           strncmp(resolved_leaf, call_leaf, resolved_len) == 0;
+}
+
 /* Gate for the unique-`Class.method`-tail fallbacks below. Tail-matching by
  * leaf is safe where class-per-file package semantics hold — the JVM
  * languages (Java/Kotlin): the declared `package` is ground truth, a class
@@ -419,7 +431,7 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
     }
     const char *resolved_leaf = cbm_lsp_bare_segment(resolved->callee_qn);
     const char *call_leaf = cbm_lsp_bare_segment(call->callee_name);
-    if (resolved_leaf && call_leaf && strcmp(resolved_leaf, call_leaf) == 0) {
+    if (resolved_leaf && cbm_pipeline_lsp_method_leaf_eq(resolved_leaf, call_leaf)) {
         return true;
     }
 

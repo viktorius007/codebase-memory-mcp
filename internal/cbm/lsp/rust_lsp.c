@@ -4092,11 +4092,19 @@ static bool rust_map_source_range(const RustLSPContext *ctx, uint32_t start, uin
     return true;
 }
 
+static const char *rust_callee_short_name(RustLSPContext *ctx, const char *callee_qn) {
+    const char *dot = strrchr(callee_qn, '.');
+    const char *short_name = dot ? dot + 1 : callee_qn;
+    const char *impl_suffix = strchr(short_name, '[');
+    return impl_suffix ? cbm_arena_strndup(ctx->arena, short_name,
+                                          (size_t)(impl_suffix - short_name))
+                       : short_name;
+}
+
 static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn) {
     if (!ctx || !ctx->syn_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
-    const char *dot = strrchr(callee_qn, '.');
-    const char *short_name = dot ? dot + 1 : callee_qn;
+    const char *short_name = rust_callee_short_name(ctx, callee_qn);
     if (!short_name || !short_name[0])
         return;
     CBMCall call = {0};
@@ -4124,8 +4132,7 @@ static void rust_ensure_known_macro_carrier(RustLSPContext *ctx, const char *mac
         return;
     }
 
-    const char *dot = strrchr(callee_qn, '.');
-    const char *short_name = dot ? dot + 1 : callee_qn;
+    const char *short_name = rust_callee_short_name(ctx, callee_qn);
     for (int i = 0; i < ctx->syn_calls->count; i++) {
         CBMCall *call = &ctx->syn_calls->items[i];
         if (!call->callee_name || !call->enclosing_func_qn ||

@@ -1692,6 +1692,8 @@ TEST(rust_instantiated_trait_spellings_are_retained) {
     int feet_methods = 0;
     int inches_methods = 0;
     int collapsed_methods = 0;
+    int feet_qns = 0;
+    int inches_qns = 0;
     for (int i = 0; i < r->defs.count; i++) {
         CBMDefinition *def = &r->defs.items[i];
         if (!def->label || strcmp(def->label, "Method") != 0 || !def->name ||
@@ -1701,12 +1703,18 @@ TEST(rust_instantiated_trait_spellings_are_retained) {
         feet_methods += def->impl_trait && strcmp(def->impl_trait, "From<Feet>") == 0;
         inches_methods += def->impl_trait && strcmp(def->impl_trait, "From<Inches>") == 0;
         collapsed_methods += def->impl_trait && strcmp(def->impl_trait, "From") == 0;
+        feet_qns += def->qualified_name &&
+                    strcmp(def->qualified_name, "t.lib.Meters.from[From<Feet>]") == 0;
+        inches_qns += def->qualified_name &&
+                      strcmp(def->qualified_name, "t.lib.Meters.from[From<Inches>]") == 0;
     }
     if (from_methods != 2 || feet_methods != 1 || inches_methods != 1 ||
-        collapsed_methods != 0) {
+        collapsed_methods != 0 || feet_qns != 1 || inches_qns != 1) {
         printf("  FAIL  Rust from methods must carry exactly one From<Feet> and one "
-               "From<Inches> impl_trait (methods=%d, feet=%d, inches=%d, collapsed=%d)\n",
-               from_methods, feet_methods, inches_methods, collapsed_methods);
+               "From<Inches> identity (methods=%d, feet=%d, inches=%d, collapsed=%d, "
+               "feet_qn=%d, inches_qn=%d)\n",
+               from_methods, feet_methods, inches_methods, collapsed_methods, feet_qns,
+               inches_qns);
         cbm_free_result(r);
         return 1;
     }

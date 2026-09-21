@@ -6506,6 +6506,103 @@ TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes) {
     PASS();
 }
 
+static int rust_instantiated_method_nodes_are_exact(cbm_store_t *store, const char *project) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (!store || !project ||
+        cbm_store_find_nodes_by_name(store, project, "from", &nodes, &count) != CBM_STORE_OK) {
+        return 0;
+    }
+    char feet_qn[512];
+    char inches_qn[512];
+    snprintf(feet_qn, sizeof(feet_qn), "%s.lib.Meters.from[From<Feet>]", project);
+    snprintf(inches_qn, sizeof(inches_qn), "%s.lib.Meters.from[From<Inches>]", project);
+    char collapsed_qn[512];
+    snprintf(collapsed_qn, sizeof(collapsed_qn), "%s.lib.Meters.from", project);
+    int feet = 0;
+    int inches = 0;
+    int collapsed = 0;
+    for (int i = 0; i < count; i++) {
+        feet += nodes[i].qualified_name && strcmp(nodes[i].qualified_name, feet_qn) == 0;
+        inches += nodes[i].qualified_name && strcmp(nodes[i].qualified_name, inches_qn) == 0;
+        collapsed += nodes[i].qualified_name && strcmp(nodes[i].qualified_name, collapsed_qn) == 0;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return feet == 1 && inches == 1 && collapsed == 0;
+}
+
+TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_nodes_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib.rs",
+                    "trait From<T> { fn from(value: T) -> Self; }\n"
+                    "struct Feet; struct Inches; struct Meters;\n"
+                    "impl From<Feet> for Meters { fn from(_value: Feet) -> Self { Meters } }\n"
+                    "impl From<Inches> for Meters { fn from(_value: Inches) -> Self { Meters } }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "rust_impl_pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_impl_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    char sequential_db[512];
+    snprintf(sequential_db, sizeof(sequential_db), "%s/impl-sequential.db", tmp);
+    cbm_pipeline_t *sequential = cbm_pipeline_new(tmp, sequential_db, CBM_MODE_FULL);
+    int sequential_rc = sequential ? cbm_pipeline_run(sequential) : -1;
+    cbm_store_t *sequential_store = cbm_store_open_path(sequential_db);
+    bool sequential_exact = sequential_store && sequential &&
+                            rust_instantiated_method_nodes_are_exact(
+                                sequential_store, cbm_pipeline_project_name(sequential));
+    if (sequential_store) {
+        cbm_store_close(sequential_store);
+    }
+    cbm_pipeline_free(sequential);
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char parallel_db[512];
+    snprintf(parallel_db, sizeof(parallel_db), "%s/impl-parallel.db", tmp);
+    cbm_pipeline_t *parallel = cbm_pipeline_new(tmp, parallel_db, CBM_MODE_FULL);
+    int parallel_rc = parallel ? cbm_pipeline_run(parallel) : -1;
+    cbm_store_t *parallel_store = cbm_store_open_path(parallel_db);
+    bool parallel_exact = parallel_store && parallel &&
+                          rust_instantiated_method_nodes_are_exact(
+                              parallel_store, cbm_pipeline_project_name(parallel));
+    if (parallel_store) {
+        cbm_store_close(parallel_store);
+    }
+    cbm_pipeline_free(parallel);
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential_rc, 0);
+    ASSERT_EQ(parallel_rc, 0);
+    ASSERT_TRUE(sequential_exact);
+    ASSERT_TRUE(parallel_exact);
+    PASS();
+}
+
 typedef struct {
     int run_rc;
     bool store_opened;
@@ -15095,6 +15192,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes);
+    RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);

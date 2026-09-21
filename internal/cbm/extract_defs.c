@@ -5172,7 +5172,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             continue;
         }
 
-        const char *method_qn = cbm_arena_sprintf(a, "%s.%s", type_qn, name);
+        const char *method_qn = impl_trait
+                                    ? cbm_arena_sprintf(a, "%s.%s[%s]", type_qn, name, impl_trait)
+                                    : cbm_arena_sprintf(a, "%s.%s", type_qn, name);
 
         CBMDefinition def;
         memset(&def, 0, sizeof(def));

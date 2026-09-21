@@ -102,6 +102,17 @@ epoch together with tests/semantic-epoch.expected; gate on `make scip-rust`
    next layer; the final repair still owes both publication modes, both restoration
    routes, the Rust SCIP fabricated-zero gate, the Rust mutation lane and the
    semantic-epoch contract.
+
+   Trait-implementation method nodes use the published qualified-name form
+   `<receiver-qn>.<method>[<instantiated-trait>]`, for example
+   `crate.units.Meters.from[From<Feet>]`. The bracketed suffix keeps the ordinary
+   dot-delimited receiver and method prefix intact while carrying the exact trait
+   spelling already preserved by extraction. Rust paths inside the suffix use `::`,
+   not `.`, so last-dot consumers continue to see the complete method leaf. The
+   colon-aware `pxc_qn_leaf` helper is confined to the separate receiver-level
+   `RustImpl` record and does not parse method qualified names. The two call-join
+   consumers that compare or index method leaves explicitly remove the bracketed
+   provenance before matching it to source spelling.
 2. **Cargo, module and lexical scope.** Derive per-member crate roots, module
    paths, renamed dependencies and import scope from actual workspace inputs.
    Distinguish same-leaf symbols in different modules/crates. Repair semantic

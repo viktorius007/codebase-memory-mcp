@@ -2366,13 +2366,22 @@ static bool lsp_idx_insert_leaf(CBMHashTable *index, CBMResolvedCall *candidate,
     if (!index || !candidate || !candidate->caller_qn || !leaf || !leaf[0]) {
         return false;
     }
-    char *key = lsp_idx_key(candidate->caller_qn, leaf, exact_site, candidate->site_start_byte,
+    size_t leaf_len = cbm_pipeline_lsp_method_leaf_len(leaf);
+    bool has_impl_suffix = leaf[leaf_len] != '\0';
+    char *normalized_leaf = has_impl_suffix ? strndup(leaf, leaf_len) : NULL;
+    if (has_impl_suffix && !normalized_leaf) {
+        return false;
+    }
+    const char *key_leaf = normalized_leaf ? normalized_leaf : leaf;
+    char *key = lsp_idx_key(candidate->caller_qn, key_leaf, exact_site, candidate->site_start_byte,
                             candidate->site_end_byte, candidate->source_origin);
     if (!key) {
+        free(normalized_leaf);
         return false;
     }
     bool inserted = lsp_idx_keep_best(index, key, candidate, gbuf, project_name, allow_tail_match);
     free(key);
+    free(normalized_leaf);
     return inserted;
 }
 
