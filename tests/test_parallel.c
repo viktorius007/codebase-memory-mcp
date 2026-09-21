@@ -3890,8 +3890,16 @@ TEST(lsp_bare_segment_skips_preprocessor_spacing) {
 }
 
 TEST(lsp_bare_segment_ignores_rust_trait_path_in_impl_suffix) {
-    ASSERT_STR_EQ(cbm_lsp_bare_segment("t.lib.Point.fmt[fmt::Display]"),
-                  "fmt[fmt::Display]");
+    ASSERT_STR_EQ(cbm_lsp_bare_segment("t.lib.Point.fmt[fmt::Display]"), "fmt[fmt::Display]");
+    PASS();
+}
+
+TEST(lsp_bare_segment_keeps_leaf_after_subscripted_receiver) {
+    /* Textual callee names carry the full member expression, so a subscript
+     * before the method must not stop the separator scan — only a terminal
+     * impl-provenance suffix does. */
+    ASSERT_STR_EQ(cbm_lsp_bare_segment("this.items[0].run"), "run");
+    ASSERT_STR_EQ(cbm_lsp_bare_segment("obj[key]"), "obj[key]");
     PASS();
 }
 
@@ -4463,6 +4471,7 @@ SUITE(parallel) {
     RUN_TEST(usage_semantic_reference_candidate_trusts_marked_producer);
     RUN_TEST(lsp_bare_segment_skips_preprocessor_spacing);
     RUN_TEST(lsp_bare_segment_ignores_rust_trait_path_in_impl_suffix);
+    RUN_TEST(lsp_bare_segment_keeps_leaf_after_subscripted_receiver);
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
     RUN_TEST(lsp_resolve_distinct_exact_caller_targets_fail_closed);
     RUN_TEST(lsp_resolve_duplicate_exact_caller_rows_same_target_are_not_ambiguous);

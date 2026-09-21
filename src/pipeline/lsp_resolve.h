@@ -64,8 +64,14 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
         return name;
     }
     const char *seg = name;
+    /* A Rust impl-provenance suffix `[Trait<...>]` is always terminal, so a
+     * bracket only stops the scan when the name ends with ']'. A subscript in
+     * a textual callee (`items[0].run`) never does — its method leaf follows
+     * the bracket. */
+    size_t name_len = strlen(name);
+    bool has_terminal_suffix = name_len > 0 && name[name_len - 1] == ']';
     for (const char *p = name; *p; p++) {
-        if (*p == '[') {
+        if (has_terminal_suffix && *p == '[') {
             break;
         }
         /* '.' (dotted QN / Java-style member) and ':' (C++ `::`, last colon

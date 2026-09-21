@@ -833,3 +833,14 @@ coordination could not be created (endpoint)" and an EMPTY detail string
 the diagnostic never names it. Measured: 49-byte parent works, 67 fails;
 the default macOS TMPDIR is already too long. Fix direction: detect the
 sun_path overflow and say so, naming the path and the limit.
+
+## 6. lint-format gate fails at HEAD on five files (pre-existing)
+
+`make -f Makefile.cbm lint-format` (Homebrew LLVM 20 and 23 formatters both)
+exits nonzero on src/cli/cli.c, src/daemon/frontend.c, src/daemon/runtime.c,
+src/daemon/version_cohort.c and src/pipeline/pass_lsp_cross.c. Verified
+independent of the Rust impl-identity commits: the gate fails with those
+commits stashed. Either the violations are real drift that CI's formatter
+version misses, or the local Homebrew formatter differs from CI's pinned
+version — determine CI's clang-format version, pin it in Makefile.cbm:1158,
+and reformat or exempt accordingly.
