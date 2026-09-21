@@ -3889,6 +3889,12 @@ TEST(lsp_bare_segment_skips_preprocessor_spacing) {
     PASS();
 }
 
+TEST(lsp_bare_segment_ignores_rust_trait_path_in_impl_suffix) {
+    ASSERT_STR_EQ(cbm_lsp_bare_segment("t.lib.Point.fmt[fmt::Display]"),
+                  "fmt[fmt::Display]");
+    PASS();
+}
+
 TEST(lsp_resolve_qualified_static_call_normalizes_colons) {
     /* A qualified static call `Pkg::sub` (callee_name keeps the package
      * prefix) must still match a resolved entry whose callee_qn short-name is
@@ -4456,6 +4462,7 @@ TEST(lsp_target_node_supports_long_prefixed_qualified_name) {
 SUITE(parallel) {
     RUN_TEST(usage_semantic_reference_candidate_trusts_marked_producer);
     RUN_TEST(lsp_bare_segment_skips_preprocessor_spacing);
+    RUN_TEST(lsp_bare_segment_ignores_rust_trait_path_in_impl_suffix);
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
     RUN_TEST(lsp_resolve_distinct_exact_caller_targets_fail_closed);
     RUN_TEST(lsp_resolve_duplicate_exact_caller_rows_same_target_are_not_ambiguous);

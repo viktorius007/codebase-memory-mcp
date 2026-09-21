@@ -65,6 +65,9 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
     }
     const char *seg = name;
     for (const char *p = name; *p; p++) {
+        if (*p == '[') {
+            break;
+        }
         /* '.' (dotted QN / Java-style member) and ':' (C++ `::`, last colon
          * wins) are member/scope separators. '>' is only a separator when it
          * closes the `->` arrow (preceded by '-'); a bare '>' closes a template
