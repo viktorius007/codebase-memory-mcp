@@ -671,6 +671,43 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     PASS();
 }
 
+TEST(rustlsp_instantiated_impl_trait_links_canonical_declaration) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.units.Convert";
+    defs[0].short_name = "Convert";
+    defs[0].label = "Trait";
+    defs[0].def_module_qn = "test.units";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.units.Distance";
+    defs[1].short_name = "Distance";
+    defs[1].label = "Struct";
+    defs[1].def_module_qn = "test.units";
+    defs[1].lang = CBM_LANG_RUST;
+    defs[2].qualified_name = "test.units.Distance";
+    defs[2].short_name = "Distance";
+    defs[2].label = "RustImpl";
+    defs[2].receiver_type = "test.units.Distance";
+    defs[2].def_module_qn = "test.units";
+    defs[2].trait_qn = "Convert<Feet>";
+    defs[2].is_rust_impl_relation = true;
+    defs[2].lang = CBM_LANG_RUST;
+
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 3);
+    ASSERT_NOT_NULL(registry);
+    const CBMRegisteredType *distance =
+        cbm_registry_lookup_type(registry, "test.units.Distance");
+    ASSERT_NOT_NULL(distance);
+    ASSERT_NOT_NULL(distance->embedded_types);
+    ASSERT_STR_EQ(distance->embedded_types[0], "test.units.Convert");
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 static CBMTypeRegistry *rustlsp_default_trait_registry(CBMArena *arena, bool add_ambiguous_type) {
     CBMLSPDef defs[5];
     memset(defs, 0, sizeof(defs));
@@ -6893,6 +6930,7 @@ void suite_rust_lsp(void) {
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
+    RUN_TEST(rustlsp_instantiated_impl_trait_links_canonical_declaration);
     RUN_TEST(rustlsp_relative_type_requires_declared_module);
     RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);
     RUN_TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier);

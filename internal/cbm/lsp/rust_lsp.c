@@ -471,10 +471,15 @@ static const char *rust_canonical_impl_trait(CBMArena *arena, const CBMTypeRegis
     if (!normalized || !normalized[0]) {
         return NULL;
     }
+    const char *generic_args = strchr(normalized, '<');
+    const char *lookup_name =
+        generic_args
+            ? cbm_arena_strndup(arena, normalized, (size_t)(generic_args - normalized))
+            : normalized;
 
     /* A bare/relative trait declared in the impl's own module is exact and
      * therefore wins even if another module declares the same leaf. */
-    const char *relative = normalized;
+    const char *relative = lookup_name;
     if (strncmp(relative, "self.", 5) == 0) {
         relative += 5;
     }
@@ -487,15 +492,15 @@ static const char *rust_canonical_impl_trait(CBMArena *arena, const CBMTypeRegis
         }
     }
 
-    const char *exact = rust_trait_name_index_lookup(index, reg, normalized);
+    const char *exact = rust_trait_name_index_lookup(index, reg, lookup_name);
     if (exact) {
         return exact;
     }
 
     /* Prelude traits have canonical external QNs.  This remains fail-closed:
      * the canonical QN must actually be registered in this registry. */
-    if (!strchr(normalized, '.')) {
-        const char *prelude = rust_lookup_prelude(normalized);
+    if (!strchr(lookup_name, '.')) {
+        const char *prelude = rust_lookup_prelude(lookup_name);
         const char *prelude_qn = rust_trait_name_index_lookup(index, reg, prelude);
         if (prelude_qn) {
             return prelude_qn;
@@ -504,7 +509,7 @@ static const char *rust_canonical_impl_trait(CBMArena *arena, const CBMTypeRegis
 
     /* `crate::x::Trait` has no literal `crate` segment in extracted QNs.
      * Resolve its semantic tail only when globally unique. */
-    const char *suffix = normalized;
+    const char *suffix = lookup_name;
     if (strncmp(suffix, "crate.", 6) == 0) {
         suffix += 6;
     } else {
