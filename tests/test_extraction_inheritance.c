@@ -1593,7 +1593,7 @@ static const rust_impl_case_t rust_cases[] = {
     {"trait Serializable { fn serialize(&self) -> Vec<u8>; }\n"
      "struct Buffer<T> { data: Vec<T> }\n"
      "impl<T: Clone> Serializable for Buffer<T> { fn serialize(&self) -> Vec<u8> { vec![] } }",
-     "Serializable", "Buffer"},
+     "Serializable", "Buffer<T>"},
     /* ── Drop trait ──────────────────────────────────────────────── */
     {"struct Resource { name: String }\n"
      "impl Drop for Resource { fn drop(&mut self) { println!(\"drop {}\", self.name); } }",
@@ -1638,7 +1638,7 @@ static const rust_impl_case_t rust_cases[] = {
     /* ── Deref coercion ──────────────────────────────────────────── */
     {"use std::ops::Deref;\nstruct Wrapper<T>(T);\n"
      "impl<T> Deref for Wrapper<T> { type Target = T; fn deref(&self) -> &T { &self.0 } }",
-     "Deref", "Wrapper"},
+     "Deref", "Wrapper<T>"},
     /* ── AsRef trait ─────────────────────────────────────────────── */
     {"struct Path(String);\nimpl AsRef<str> for Path { fn as_ref(&self) -> &str { &self.0 } }",
      "AsRef<str>", "Path"},

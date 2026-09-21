@@ -5117,17 +5117,16 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         return;
     }
 
-    char *type_name = cbm_node_text(a, type_node, ctx->source);
-    if (!type_name || !type_name[0]) {
+    char *receiver_name = cbm_node_text(a, type_node, ctx->source);
+    if (!receiver_name || !receiver_name[0]) {
         return;
     }
+    char *type_name = receiver_name;
     /* Strip generic args from the implementing type: `Buffer<T>` → `Buffer`,
      * `Wrapper<T>` → `Wrapper`. The struct identity is the base name. */
-    {
-        char *lt = strchr(type_name, '<');
-        if (lt) {
-            *lt = '\0';
-        }
+    char *lt = strchr(receiver_name, '<');
+    if (lt) {
+        type_name = cbm_arena_strndup(a, receiver_name, (size_t)(lt - receiver_name));
     }
 
     const char *type_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, type_name);
@@ -5140,7 +5139,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         if (trait_name && trait_name[0]) {
             CBMImplTrait it = {0};
             it.trait_name = trait_name;
-            it.struct_name = type_name;
+            it.struct_name = receiver_name;
             it.struct_qn = type_qn;
             cbm_impltrait_push(&ctx->result->impl_traits, a, it);
             impl_trait = trait_name;

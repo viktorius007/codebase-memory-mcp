@@ -7369,6 +7369,50 @@ TEST(extract_compact_is_idempotent_and_survives_empty_results) {
 
 /* ── Result spill (result_spill.c): park -> load is a faithful round trip ── */
 
+static bool rust_generic_receivers_are_exact(const CBMFileResult *result) {
+    int u32_impls = 0;
+    int string_impls = 0;
+    int collapsed_impls = 0;
+    for (int i = 0; i < result->impl_traits.count; i++) {
+        const CBMImplTrait *impl = &result->impl_traits.items[i];
+        if (!impl->struct_qn || strcmp(impl->struct_qn, "t.lib.Box") != 0) {
+            continue;
+        }
+        u32_impls += impl->struct_name && strcmp(impl->struct_name, "Box<u32>") == 0;
+        string_impls += impl->struct_name && strcmp(impl->struct_name, "Box<String>") == 0;
+        collapsed_impls += impl->struct_name && strcmp(impl->struct_name, "Box") == 0;
+    }
+    return result->impl_traits.count == 2 && u32_impls == 1 && string_impls == 1 &&
+           collapsed_impls == 0;
+}
+
+TEST(extract_rust_generic_impl_receivers_survive_spill) {
+    const char *source =
+        "trait Render {}\n"
+        "struct Box<T>(T);\n"
+        "impl Render for Box<u32> {}\n"
+        "impl Render for Box<String> {}\n";
+    CBMFileResult *result = extract(source, CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(result);
+    ASSERT_TRUE(rust_generic_receivers_are_exact(result));
+    cbm_result_compact(result);
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/cbm_rust_receiver_spill_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    cbm_result_spill_t *spill = cbm_result_spill_open(dir, 1, 1);
+    ASSERT_NOT_NULL(spill);
+    ASSERT_TRUE(cbm_result_spill_park(spill, 0, 0, result));
+    result = cbm_result_spill_load(spill, 0);
+    ASSERT_NOT_NULL(result);
+    ASSERT_TRUE(rust_generic_receivers_are_exact(result));
+
+    cbm_free_result(result);
+    cbm_result_spill_close(spill);
+    cbm_rmdir(dir);
+    PASS();
+}
+
 TEST(extract_spill_round_trip_keeps_every_field) {
     CBMFileResult *r = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
     CBMFileResult *ref = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
@@ -7530,6 +7574,7 @@ TEST(extract_walk_truncated_at_its_cpu_budget) {
 SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
+    RUN_TEST(extract_rust_generic_impl_receivers_survive_spill);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
     RUN_TEST(extract_lsp_skipped_when_parse_used_its_budget_share);
     RUN_TEST(extract_walk_truncated_at_its_cpu_budget);
