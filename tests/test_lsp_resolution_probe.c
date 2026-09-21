@@ -834,8 +834,19 @@ TEST(lrp_rust_s6_trait_method) {
                    "impl display::Display for Dog {\n"
                    "    fn show(&self) -> String { self.name.clone() }\n}\n"},
         {"main.rs", "mod dog;\n\nfn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
-    /* Trait dispatch remains fail-closed without trusted cross-LSP. */
-    ASSERT_TRUE(lrp_assert_no_calls(f, 3, "rust/S6/trait_method"));
+    /* GREEN since epoch 12: the keyed trait-impl class is admitted. The
+     * lsp_trait strategy proves the edge rode the impl-key resolution, not a
+     * short-name guess. */
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 3);
+    ASSERT_NOT_NULL(store);
+    int trait_calls = lrp_count_calls_with_strategy(store, lp.project, "lsp_trait");
+    if (trait_calls < 1) {
+        fprintf(stderr, "  [LRP] rust/S6/trait_method FAIL lsp_trait_calls=%d\n", trait_calls);
+        lrp_diag(store, lp.project, "rust/S6/trait_method");
+    }
+    lrp_cleanup(&lp, store);
+    ASSERT_TRUE(trait_calls >= 1);
     PASS();
 }
 
