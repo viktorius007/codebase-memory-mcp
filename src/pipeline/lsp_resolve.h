@@ -117,8 +117,18 @@ static inline const char *cbm_pipeline_call_callee_leaf(const char *callee_name)
 }
 
 static inline size_t cbm_pipeline_lsp_method_leaf_len(const char *leaf) {
-    const char *impl_suffix = leaf ? strchr(leaf, '[') : NULL;
-    return leaf ? (impl_suffix ? (size_t)(impl_suffix - leaf) : strlen(leaf)) : 0;
+    if (!leaf) {
+        return 0;
+    }
+    /* Only a nonempty `[Trait<...>]` Rust impl-provenance suffix is stripped.
+     * A C++ subscript operator's empty bracket pair (`operator[]`) is part of
+     * the method name itself; truncating it desynchronized the join-index key
+     * and the leaf comparison from the textual `operator[]` callee. */
+    const char *impl_suffix = strchr(leaf, '[');
+    if (!impl_suffix || impl_suffix[1] == ']') {
+        return strlen(leaf);
+    }
+    return (size_t)(impl_suffix - leaf);
 }
 
 static inline bool cbm_pipeline_lsp_method_leaf_eq(const char *resolved_leaf,

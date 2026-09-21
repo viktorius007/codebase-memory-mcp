@@ -3903,6 +3903,59 @@ TEST(lsp_bare_segment_keeps_leaf_after_subscripted_receiver) {
     PASS();
 }
 
+TEST(lsp_resolve_cpp_subscript_operator_leaf_joins) {
+    /* Both sides of a C++ subscript-operator call end with "[]": the
+     * resolved def leaf is `operator[]` and the extractor's synthetic
+     * callee is the same text. The empty bracket pair is part of the
+     * method name, not a Rust impl-provenance suffix, so the leaf
+     * comparison must use the whole leaf (ISSUES.md §7). */
+    CBMResolvedCall resolved = {0};
+    resolved.caller_qn = "t.cpp.caller";
+    resolved.callee_qn = "t.cpp.Vec.operator[]";
+    resolved.strategy = "lsp_operator";
+    resolved.kind = CBM_RESOLVED_INVOCATION;
+    CBMCall call = {0};
+    call.enclosing_func_qn = "t.cpp.caller";
+    call.callee_name = "operator[]";
+    call.requires_lsp_resolution = true;
+    ASSERT_TRUE(cbm_pipeline_invocation_leaf_matches(&resolved, &call, 2));
+    PASS();
+}
+
+TEST(cpp_subscript_operator_call_joins_lsp_override_in_both_modes) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_cpp_op_join_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/vec.cpp", tmpdir);
+    ASSERT_EQ(th_write_file(path,
+                            "struct Vec { int& operator[](int i) { static int x; return x; } };\n"
+                            "void caller() { Vec v; v[0]; }\n"),
+              0);
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"vec.cpp";
+    files[0].language = CBM_LANG_CPP;
+
+    cbm_gbuf_t *sequential = run_sequential_with_lsp_cross_and_mutator("cpp_op_join", tmpdir, files,
+                                                                       1, NULL, NULL, true);
+    cbm_gbuf_t *parallel = run_parallel_with_extract_opts_and_mutator("cpp_op_join", tmpdir, files,
+                                                                      1, 1, NULL, NULL, NULL, true);
+    ASSERT_NOT_NULL(sequential);
+    ASSERT_NOT_NULL(parallel);
+    /* The subscript expression is a synthetic `operator[]` candidate that
+     * never falls back to textual resolution, so the CALLS edge exists only
+     * when the LSP override joins. The parallel mode exercises the index
+     * key path (lsp_idx_insert_leaf/lsp_idx_lookup), the sequential mode the
+     * linear leaf comparison (ISSUES.md §7). */
+    ASSERT_NOT_NULL(find_call_edge_to_target_fragment(parallel, "vec.caller", "operator[]"));
+    ASSERT_NOT_NULL(find_call_edge_to_target_fragment(sequential, "vec.caller", "operator[]"));
+    cbm_gbuf_free(sequential);
+    cbm_gbuf_free(parallel);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(lsp_resolve_qualified_static_call_normalizes_colons) {
     /* A qualified static call `Pkg::sub` (callee_name keeps the package
      * prefix) must still match a resolved entry whose callee_qn short-name is
@@ -4472,6 +4525,8 @@ SUITE(parallel) {
     RUN_TEST(lsp_bare_segment_skips_preprocessor_spacing);
     RUN_TEST(lsp_bare_segment_ignores_rust_trait_path_in_impl_suffix);
     RUN_TEST(lsp_bare_segment_keeps_leaf_after_subscripted_receiver);
+    RUN_TEST(lsp_resolve_cpp_subscript_operator_leaf_joins);
+    RUN_TEST(cpp_subscript_operator_call_joins_lsp_override_in_both_modes);
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
     RUN_TEST(lsp_resolve_distinct_exact_caller_targets_fail_closed);
     RUN_TEST(lsp_resolve_duplicate_exact_caller_rows_same_target_are_not_ambiguous);
