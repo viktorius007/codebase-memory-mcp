@@ -6603,6 +6603,149 @@ TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_mode
     PASS();
 }
 
+static bool exact_call_qns_exist(cbm_store_t *store, const char *project, const char *source_qn,
+                                 const char *target_qn) {
+    cbm_node_t *sources = NULL;
+    int source_count = 0;
+    const char *source_leaf = strrchr(source_qn, '.');
+    const char *target_leaf = strrchr(target_qn, '.');
+    if (!store || !project || !source_leaf || !target_leaf ||
+        cbm_store_find_nodes_by_name(store, project, source_leaf + 1, &sources, &source_count) !=
+            CBM_STORE_OK) {
+        return false;
+    }
+    cbm_node_t *targets = NULL;
+    int target_count = 0;
+    bool found = false;
+    char target_name[128];
+    const char *target_suffix = strchr(target_leaf + 1, '[');
+    size_t target_name_len =
+        target_suffix ? (size_t)(target_suffix - (target_leaf + 1)) : strlen(target_leaf + 1);
+    if (target_name_len >= sizeof(target_name)) {
+        cbm_store_free_nodes(sources, source_count);
+        return false;
+    }
+    memcpy(target_name, target_leaf + 1, target_name_len);
+    target_name[target_name_len] = '\0';
+    if (cbm_store_find_nodes_by_name(store, project, target_name, &targets, &target_count) ==
+        CBM_STORE_OK) {
+        for (int i = 0; i < source_count && !found; i++) {
+            if (!sources[i].qualified_name || strcmp(sources[i].qualified_name, source_qn) != 0) {
+                continue;
+            }
+            cbm_edge_t *edges = NULL;
+            int edge_count = 0;
+            cbm_store_find_edges_by_source_type(store, sources[i].id, "CALLS", &edges, &edge_count);
+            for (int j = 0; j < edge_count && !found; j++) {
+                for (int k = 0; k < target_count; k++) {
+                    found = targets[k].qualified_name &&
+                            strcmp(targets[k].qualified_name, target_qn) == 0 &&
+                            edges[j].target_id == targets[k].id;
+                    if (found) {
+                        break;
+                    }
+                }
+            }
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+    cbm_store_free_nodes(sources, source_count);
+    cbm_store_free_nodes(targets, target_count);
+    return found;
+}
+
+typedef struct {
+    int run_rc;
+    bool admitted;
+    bool ambiguous;
+} RustTraitCallObservation;
+
+static RustTraitCallObservation observe_rust_trait_calls(const char *root, const char *db_name) {
+    RustTraitCallObservation observation = {.run_rc = -1};
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", root, db_name);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    observation.run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        char source_qn[512];
+        char admitted_qn[512];
+        char ambiguous_a_qn[512];
+        char ambiguous_b_qn[512];
+        snprintf(source_qn, sizeof(source_qn), "%s.lib.admitted", project);
+        snprintf(admitted_qn, sizeof(admitted_qn), "%s.lib.Scale.value[Measure<Feet>]", project);
+        observation.admitted = exact_call_qns_exist(store, project, source_qn, admitted_qn);
+        snprintf(source_qn, sizeof(source_qn), "%s.lib.ambiguous", project);
+        snprintf(ambiguous_a_qn, sizeof(ambiguous_a_qn),
+                 "%s.lib.Meters.read[Read<Feet>]", project);
+        snprintf(ambiguous_b_qn, sizeof(ambiguous_b_qn),
+                 "%s.lib.Meters.read[Read<Inches>]", project);
+        observation.ambiguous =
+            exact_call_qns_exist(store, project, source_qn, ambiguous_a_qn) ||
+            exact_call_qns_exist(store, project, source_qn, ambiguous_b_qn);
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return observation;
+}
+
+TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_trait_calls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib.rs",
+                    "trait Measure<T> { fn value(&self) -> u8; }\n"
+                    "trait Read<T> { fn read(&self) -> u8; }\n"
+                    "struct Feet; struct Inches; struct Scale; struct Meters;\n"
+                    "impl Measure<Feet> for Scale { fn value(&self) -> u8 { 1 } }\n"
+                    "impl Read<Feet> for Meters { fn read(&self) -> u8 { 2 } }\n"
+                    "impl Read<Inches> for Meters { fn read(&self) -> u8 { 3 } }\n"
+                    "fn admitted(scale: &Scale) -> u8 { scale.value() }\n"
+                    "fn ambiguous(meters: &Meters) -> u8 { meters.read() }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "rust_trait_call_pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_trait_call_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
+    char *saved_single =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    RustTraitCallObservation sequential =
+        observe_rust_trait_calls(tmp, "trait-calls-sequential.db");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    RustTraitCallObservation parallel = observe_rust_trait_calls(tmp, "trait-calls-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential.run_rc, 0);
+    ASSERT_EQ(parallel.run_rc, 0);
+    ASSERT_FALSE(sequential.ambiguous);
+    ASSERT_FALSE(parallel.ambiguous);
+    ASSERT_TRUE(sequential.admitted);
+    ASSERT_TRUE(parallel.admitted);
+    PASS();
+}
+
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static int sqlite_scalar(sqlite3 *db, const char *sql, const char *project) {
     sqlite3_stmt *stmt = NULL;
@@ -15366,6 +15509,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
+    RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);

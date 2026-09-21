@@ -358,7 +358,13 @@ static inline bool cbm_pipeline_qn_has_dotted_segment(const char *qn, const char
  * linkage (`.<head>.` in the resolved QN) and rejects file-local targets, so
  * a mis-joined row cannot enter through this class.
  *
- * Method and expansion identities still need their separate repairs. */
+ * Class "trait-impl method": a trait-specific Rust resolution carrying both
+ * the concrete implementation key and the published terminal `[Trait<...>]`
+ * identity. The source method leaf must equal the published method leaf after
+ * removing that provenance suffix. Inherent methods have neither the strategy
+ * nor the implementation identity and stay rejected.
+ *
+ * Expansion identities still need their separate repairs. */
 static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang, const CBMCall *call,
                                                     const CBMResolvedCall *resolved,
                                                     const char *module_qn) {
@@ -400,6 +406,18 @@ static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang, const CBMC
         return !callee_in_this_file && callee_leaf &&
                cbm_lsp_bare_segment(call->callee_name) == call->callee_name &&
                strcmp(callee_leaf + 1, call->callee_name) == 0;
+    }
+    if (strcmp(resolved->strategy, "lsp_trait_dispatch") == 0 ||
+        strcmp(resolved->strategy, "lsp_trait_ufcs") == 0 ||
+        strcmp(resolved->strategy, "lsp_operator_trait") == 0) {
+        const char *callee_leaf = strrchr(resolved->callee_qn, '.');
+        const char *impl_suffix = callee_leaf ? strchr(callee_leaf + 1, '[') : NULL;
+        size_t callee_len = strlen(resolved->callee_qn);
+        return resolved->callee_impl_key && resolved->callee_impl_key[0] != '\0' && callee_leaf &&
+               impl_suffix && impl_suffix > callee_leaf + 1 && impl_suffix[1] != ']' &&
+               callee_len > 0 && resolved->callee_qn[callee_len - 1] == ']' &&
+               cbm_pipeline_lsp_method_leaf_eq(callee_leaf + 1,
+                                               cbm_pipeline_call_callee_leaf(call->callee_name));
     }
     return false;
 }
