@@ -1,6 +1,6 @@
 # Rust relationship accuracy: current state
 
-Semantic index version: **10**. The broader Rust accuracy objective remains unfinished.
+Semantic index version: **11**. The broader Rust accuracy objective remains unfinished.
 The current supported subset and its verification are recorded in
 [RUST_REPAIR_EVIDENCE.md](RUST_REPAIR_EVIDENCE.md). Commit history owns prior plans,
 investigation transcripts, intermediate results and replay history.
@@ -29,7 +29,7 @@ investigation transcripts, intermediate results and replay history.
 - Live CALLS and derived TESTS are restored for this bounded subset. Current-epoch
   CALLS/TESTS survive both incremental restoration routes. IMPLEMENTS/OVERRIDE
   remain rejected.
-- Version 10 invalidates earlier semantic indexes. All three Rust partial-coverage
+- Version 11 invalidates earlier semantic indexes. All three Rust partial-coverage
   flags remain set. An omitted relationship is not proof that none exists.
 
 Methods, other import-mediated cross-file calls, expanded calls and implementation
@@ -113,6 +113,14 @@ epoch together with tests/semantic-epoch.expected; gate on `make scip-rust`
    `RustImpl` record and does not parse method qualified names. The two call-join
    consumers that compare or index method leaves explicitly remove the bracketed
    provenance before matching it to source spelling.
+
+   Both incremental restoration routes now have direct parity coverage for this
+   identity. An unchanged Rust file containing the two `From<T>` implementations is
+   restored after another file changes, and its complete node set plus every incident
+   edge is compared symmetrically with a fresh full index. The existing metadata
+   migration test lowers the stored version below 11 and requires the forced-full
+   route, so pre-epoch identities cannot be restored into the current graph.
+
 2. **Cargo, module and lexical scope.** Derive per-member crate roots, module
    paths, renamed dependencies and import scope from actual workspace inputs.
    Distinguish same-leaf symbols in different modules/crates. Repair semantic

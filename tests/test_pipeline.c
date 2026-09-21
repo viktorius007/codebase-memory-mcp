@@ -6603,6 +6603,177 @@ TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_mode
     PASS();
 }
 
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static int sqlite_scalar(sqlite3 *db, const char *sql, const char *project) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    if (project) {
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    }
+    int value = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
+    sqlite3_finalize(stmt);
+    return value;
+}
+
+static int rust_impl_graph_difference_count(const char *actual_db, const char *reference_db,
+                                            const char *project) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *attach = NULL;
+    if (sqlite3_open_v2(actual_db, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, "ATTACH DATABASE ?1 AS reference", -1, &attach, NULL) != SQLITE_OK) {
+        sqlite3_finalize(attach);
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(attach, 1, reference_db, -1, SQLITE_STATIC);
+    if (sqlite3_step(attach) != SQLITE_DONE) {
+        sqlite3_finalize(attach);
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_finalize(attach);
+
+    static const char node_actual_minus_reference[] =
+        "SELECT count(*) FROM (SELECT label,name,qualified_name,file_path,start_line,end_line,"
+        "properties FROM main.nodes WHERE project=?1 AND file_path='lib.rs' EXCEPT SELECT label,"
+        "name,qualified_name,file_path,start_line,end_line,properties FROM reference.nodes WHERE "
+        "project=?1 AND file_path='lib.rs')";
+    static const char node_reference_minus_actual[] =
+        "SELECT count(*) FROM (SELECT label,name,qualified_name,file_path,start_line,end_line,"
+        "properties FROM reference.nodes WHERE project=?1 AND file_path='lib.rs' EXCEPT SELECT "
+        "label,name,qualified_name,file_path,start_line,end_line,properties FROM main.nodes WHERE "
+        "project=?1 AND file_path='lib.rs')";
+    static const char edge_actual_minus_reference[] =
+        "SELECT count(*) FROM (SELECT source.qualified_name,edge.type,target.qualified_name,"
+        "edge.properties FROM main.edges edge JOIN main.nodes source ON source.id=edge.source_id "
+        "JOIN main.nodes target ON target.id=edge.target_id WHERE edge.project=?1 AND "
+        "(source.file_path='lib.rs' OR target.file_path='lib.rs') EXCEPT SELECT "
+        "source.qualified_name,edge.type,target.qualified_name,edge.properties FROM "
+        "reference.edges edge JOIN reference.nodes source ON source.id=edge.source_id JOIN "
+        "reference.nodes target ON target.id=edge.target_id WHERE edge.project=?1 AND "
+        "(source.file_path='lib.rs' OR target.file_path='lib.rs'))";
+    static const char edge_reference_minus_actual[] =
+        "SELECT count(*) FROM (SELECT source.qualified_name,edge.type,target.qualified_name,"
+        "edge.properties FROM reference.edges edge JOIN reference.nodes source ON "
+        "source.id=edge.source_id JOIN reference.nodes target ON target.id=edge.target_id WHERE "
+        "edge.project=?1 AND (source.file_path='lib.rs' OR target.file_path='lib.rs') EXCEPT "
+        "SELECT "
+        "source.qualified_name,edge.type,target.qualified_name,"
+        "edge.properties FROM main.edges edge JOIN main.nodes source ON source.id=edge.source_id "
+        "JOIN main.nodes target ON target.id=edge.target_id WHERE edge.project=?1 AND "
+        "(source.file_path='lib.rs' OR target.file_path='lib.rs'))";
+    const char *queries[] = {node_actual_minus_reference, node_reference_minus_actual,
+                             edge_actual_minus_reference, edge_reference_minus_actual};
+    int difference_count = 0;
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        int count = sqlite_scalar(db, queries[i], project);
+        if (count < 0) {
+            difference_count = -1;
+            break;
+        }
+        difference_count += count;
+    }
+    sqlite3_close(db);
+    return difference_count;
+}
+
+typedef struct {
+    int baseline_rc;
+    int incremental_rc;
+    int full_rc;
+    cbm_incremental_route_t route;
+    bool exact_impl_nodes;
+    int graph_differences;
+} RustImplRestoreObservation;
+
+static RustImplRestoreObservation observe_rust_impl_restore(bool force_legacy) {
+    RustImplRestoreObservation observation = {
+        .baseline_rc = -1, .incremental_rc = -1, .full_rc = -1, .graph_differences = -1};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_restore_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return observation;
+    }
+    write_temp_file(
+        tmp, "lib.rs",
+        "trait From<T> { fn from(value: T) -> Self; }\n"
+        "struct Feet; struct Inches; struct Meters;\n"
+        "impl From<Feet> for Meters { fn from(_value: Feet) -> Self { Meters } }\n"
+        "impl From<Inches> for Meters { fn from(_value: Inches) -> Self { Meters } }\n");
+    write_temp_file(tmp, "changed.rs", "pub fn restore_trigger() -> u8 { 1 }\n");
+
+    char incremental_db[512];
+    char reference_db[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/incremental.db", tmp);
+    snprintf(reference_db, sizeof(reference_db), "%s/reference.db", tmp);
+    char project[256] = {0};
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    if (baseline) {
+        observation.baseline_rc = cbm_pipeline_run(baseline);
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+        cbm_pipeline_free(baseline);
+    }
+
+    write_temp_file(tmp, "changed.rs", "pub fn restore_trigger() -> u8 { 2 }\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    if (force_legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    if (incremental) {
+        observation.incremental_rc = cbm_pipeline_run(incremental);
+        observation.route = cbm_pipeline_incremental_test_last_route();
+        cbm_store_t *store = cbm_store_open_path(incremental_db);
+        observation.exact_impl_nodes =
+            store && rust_instantiated_method_nodes_are_exact(store, project);
+        if (store) {
+            cbm_store_close(store);
+        }
+        cbm_pipeline_free(incremental);
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, reference_db, CBM_MODE_FULL);
+    if (full) {
+        observation.full_rc = cbm_pipeline_run(full);
+        cbm_pipeline_free(full);
+    }
+    if (observation.incremental_rc == 0 && observation.full_rc == 0) {
+        observation.graph_differences =
+            rust_impl_graph_difference_count(incremental_db, reference_db, project);
+    }
+    th_rmtree(tmp);
+    return observation;
+}
+
+static int assert_rust_impl_restore(RustImplRestoreObservation observation,
+                                    cbm_incremental_route_t expected_route) {
+    ASSERT_EQ(observation.baseline_rc, 0);
+    ASSERT_EQ(observation.incremental_rc, 0);
+    ASSERT_EQ(observation.full_rc, 0);
+    ASSERT_EQ(observation.route, expected_route);
+    ASSERT_TRUE(observation.exact_impl_nodes);
+    ASSERT_EQ(observation.graph_differences, 0);
+    return 0;
+}
+
+TEST(pipeline_legacy_restore_keeps_rust_impl_identity_equal_to_full) {
+    ASSERT_EQ(assert_rust_impl_restore(observe_rust_impl_restore(true),
+                                       CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL),
+              0);
+    PASS();
+}
+
+TEST(pipeline_closure_restore_keeps_rust_impl_identity_equal_to_full) {
+    ASSERT_EQ(assert_rust_impl_restore(observe_rust_impl_restore(false),
+                                       CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+              0);
+    PASS();
+}
+#endif
+
 typedef struct {
     int run_rc;
     bool store_opened;
@@ -15178,6 +15349,8 @@ SUITE(pipeline) {
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     RUN_TEST(pipeline_legacy_restore_preserves_rust_calls_but_rejects_impls);
     RUN_TEST(pipeline_closure_restore_preserves_rust_calls_but_rejects_impls);
+    RUN_TEST(pipeline_legacy_restore_keeps_rust_impl_identity_equal_to_full);
+    RUN_TEST(pipeline_closure_restore_keeps_rust_impl_identity_equal_to_full);
     RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
