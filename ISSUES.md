@@ -844,3 +844,34 @@ commits stashed. Either the violations are real drift that CI's formatter
 version misses, or the local Homebrew formatter differs from CI's pinned
 version — determine CI's clang-format version, pin it in Makefile.cbm:1158,
 and reformat or exempt accordingly.
+
+Correction from verification of d2258403: the five-file list is the LLVM 20
+(20.1.8) verdict only. The gate's resolved formatter (brew --prefix llvm =
+23.1.1) flags exactly one file, src/pipeline/pass_lsp_cross.c, and that
+file's drift was introduced by impl-identity commit 17f32acd (clean at
+17f32acd^, failing at 17f32acd under LLVM 23) — so "independent of the Rust
+impl-identity commits" holds only for the 5646255b..d2258403 tip series,
+and the other four files are LLVM-version skew, not drift the gate sees.
+
+## 7. C++ operator[] LSP overrides fail the pipeline leaf match (pre-existing, a72074c4)
+
+cbm_pipeline_lsp_method_leaf_len (src/pipeline/lsp_resolve.h:119-122)
+truncates the resolved leaf at the first '[' — written for the Rust
+`method[Trait<...>]` impl suffix. C++ subscript operators legitimately end
+with ']' on BOTH sides: the def QN leaf is `operator[]` (operator_name node
+accepted verbatim, internal/cbm/helpers.c:1027-1035; emitted as resolved
+callee_qn with reason "lsp_operator" at internal/cbm/lsp/c_lsp.c:4488-4506)
+and the textual callee_name is the synthetic `operator[]`
+(internal/cbm/extract_calls.c:2690-2702). cbm_pipeline_lsp_method_leaf_eq
+then compares truncated length 8 ("operator") against strlen("operator[]")
+= 10 and returns false; executed probe at d2258403: leaf_eq=0 for the
+operator[] pair, leaf_eq=1 for the Rust shape. Neither fallback in
+cbm_pipeline_invocation_leaf_matches recovers it: "lsp_operator" is not in
+cbm_pipeline_invocation_reason_join_strategy (src/pipeline/lsp_resolve.h:425-434)
+and the site_rank==2 escape is gated to "lsp_destructor". Introduced by
+a72074c4 (git log -S cbm_pipeline_lsp_method_leaf_len); before it the plain
+leaf compare matched 10 == 10. Unaffected by d2258403 — cbm_lsp_bare_segment
+returns "operator[]" for both sides at 5646255b^, 5646255b and d2258403
+alike. Fix direction: treat the '[' truncation as impl-suffix stripping
+only when the full-leaf compare fails AND the call-side leaf lacks a
+bracket, or try the untruncated compare first.
