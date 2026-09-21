@@ -92,6 +92,7 @@ typedef struct {
     /* Rust-only raw trait spelling.  The Rust registry canonicalizes this
      * only when it has one exact/unique trait target. */
     const char *trait_qn;
+    const char *receiver_spelling; // Rust-only exact impl receiver; registry identity input
     bool is_rust_impl_relation; // independent type-level impl record (empty impls survive)
     bool is_abstract;           // Rust required trait method; false for defaults
     /* Python-only raw decorator syntax, borrowed from CBMDefinition.  The

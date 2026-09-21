@@ -2505,6 +2505,37 @@ static const CBMRegisteredFunc *rust_registry_lookup_inherent_method_aliased(
     return NULL;
 }
 
+const char *cbm_rust_impl_key(CBMArena *arena, const char *receiver_qn,
+                              const char *receiver_spelling, const char *trait_spelling) {
+    if (!arena || !receiver_qn || !receiver_spelling || !trait_spelling) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(arena, "%zu:%s%zu:%s%zu:%s", strlen(receiver_qn), receiver_qn,
+                             strlen(receiver_spelling), receiver_spelling,
+                             strlen(trait_spelling), trait_spelling);
+}
+
+const CBMRegisteredFunc *cbm_rust_registry_lookup_impl_method(
+    const CBMTypeRegistry *reg, const char *receiver_qn, const char *impl_key,
+    const char *method_name) {
+    if (!reg || !receiver_qn || !impl_key || !method_name) {
+        return NULL;
+    }
+    CBMMethodIter it;
+    cbm_registry_methods(reg, receiver_qn, method_name, &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &reg->funcs[index];
+        if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0 && candidate->impl_key &&
+            strcmp(candidate->impl_key, impl_key) == 0) {
+            return candidate;
+        }
+    }
+    return reg->fallback
+               ? cbm_rust_registry_lookup_impl_method(reg->fallback, receiver_qn, impl_key,
+                                                       method_name)
+               : NULL;
+}
+
 /* Find the trait-impl method for one concrete receiver. With trait_qn==NULL,
  * exactly one implemented trait may contribute this method; two distinct
  * traits are ambiguous and deliberately resolve to NULL. */
@@ -2520,7 +2551,7 @@ static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBM
         return NULL;
     }
     int best_index = -1;
-    const char *matched_trait = NULL;
+    const char *matched_impl = NULL;
     CBMMethodIter it;
     cbm_registry_methods(reg, receiver_qn, method_name, &it);
     for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
@@ -2531,13 +2562,15 @@ static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBM
         if (trait_qn && strcmp(candidate->impl_trait_qn, trait_qn) != 0) {
             continue;
         }
-        if (!trait_qn && matched_trait && strcmp(matched_trait, candidate->impl_trait_qn) != 0) {
+        const char *candidate_impl = candidate->impl_key ? candidate->impl_key
+                                                         : candidate->impl_trait_qn;
+        if (!trait_qn && matched_impl && strcmp(matched_impl, candidate_impl) != 0) {
             if (out_ambiguous) {
                 *out_ambiguous = true;
             }
             return NULL;
         }
-        matched_trait = candidate->impl_trait_qn;
+        matched_impl = candidate_impl;
         if (best_index < 0 || index < best_index) {
             best_index = index;
         }
@@ -5584,6 +5617,10 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                                               reg->type_count - 1);
                 }
             }
+            if (rf.receiver_type && rf.impl_trait_qn && d->receiver) {
+                rf.impl_key =
+                    cbm_rust_impl_key(arena, rf.receiver_type, d->receiver, d->impl_trait);
+            }
 
             cbm_registry_add_func(reg, rf);
         }
@@ -6231,6 +6268,10 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                                               reg->type_count - 1);
                 }
             }
+            if (rf.receiver_type && rf.impl_trait_qn && d->receiver_spelling) {
+                rf.impl_key = cbm_rust_impl_key(arena, rf.receiver_type, d->receiver_spelling,
+                                                d->trait_qn);
+            }
 
             cbm_registry_add_func(reg, rf);
 
@@ -6306,6 +6347,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
             rdefs[i].signature_param_types = defs[i].signature_param_types;
             rdefs[i].signature_param_count = defs[i].signature_param_count;
             rdefs[i].trait_qn = defs[i].trait_qn;
+            rdefs[i].receiver_spelling = defs[i].receiver_spelling;
             rdefs[i].is_interface = defs[i].is_interface;
             rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
             rdefs[i].is_abstract = defs[i].is_abstract;

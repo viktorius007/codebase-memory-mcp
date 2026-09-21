@@ -319,10 +319,17 @@ typedef struct {
     const char **signature_param_types; /* borrowed ordered parameter texts    */
     int signature_param_count;          /* positional entries; "?" is unknown */
     const char *trait_qn;               /* raw impl-trait spelling; uniquely canonicalized */
+    const char *receiver_spelling;      /* exact impl receiver spelling; registry-only */
     bool is_interface;            /* true for traits                          */
     bool is_rust_impl_relation;   /* independent type-level impl record       */
     bool is_abstract;             /* required trait declaration (no default)  */
 } CBMRustLSPDef;
+
+const char *cbm_rust_impl_key(CBMArena *arena, const char *receiver_qn,
+                              const char *receiver_spelling, const char *trait_spelling);
+const CBMRegisteredFunc *cbm_rust_registry_lookup_impl_method(
+    const CBMTypeRegistry *reg, const char *receiver_qn, const char *impl_key,
+    const char *method_name);
 
 /* Run cross-file resolution on a single file. */
 void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,

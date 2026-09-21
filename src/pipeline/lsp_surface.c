@@ -99,6 +99,7 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         yyjson_mut_obj_add_int(doc, o, "lg", (int)d->lang);
         add_str_or_null(doc, o, "ns", d->namespace_name);
         add_str_or_null(doc, o, "tq", d->trait_qn);
+        add_str_or_null(doc, o, "rs", d->receiver_spelling);
         yyjson_mut_obj_add_bool(doc, o, "ir", d->is_rust_impl_relation);
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
@@ -257,6 +258,7 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->lang = (CBMLanguage)yyjson_get_int(yyjson_obj_get(o, "lg"));
         d->namespace_name = arena_str_or_null(arena, yyjson_obj_get(o, "ns"));
         d->trait_qn = arena_str_or_null(arena, yyjson_obj_get(o, "tq"));
+        d->receiver_spelling = arena_str_or_null(arena, yyjson_obj_get(o, "rs"));
         d->is_rust_impl_relation = yyjson_get_bool(yyjson_obj_get(o, "ir"));
         d->is_abstract = yyjson_get_bool(yyjson_obj_get(o, "ab"));
         int dec_count = 0;

@@ -708,6 +708,142 @@ TEST(rustlsp_instantiated_impl_trait_links_canonical_declaration) {
     PASS();
 }
 
+TEST(rustlsp_internal_impl_identity_is_exact_and_ambiguous_unqualified) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.units.From",
+         .short_name = "From",
+         .label = "Trait",
+         .def_module_qn = "test.units",
+         .is_interface = true},
+        {.qualified_name = "test.units.TraitA",
+         .short_name = "TraitA",
+         .label = "Trait",
+         .def_module_qn = "test.units",
+         .is_interface = true},
+        {.qualified_name = "test.units.TraitB",
+         .short_name = "TraitB",
+         .label = "Trait",
+         .def_module_qn = "test.units",
+         .is_interface = true},
+        {.qualified_name = "test.units.Render",
+         .short_name = "Render",
+         .label = "Trait",
+         .def_module_qn = "test.units",
+         .is_interface = true},
+        {.qualified_name = "test.units.Meters",
+         .short_name = "Meters",
+         .label = "Struct",
+         .def_module_qn = "test.units"},
+        {.qualified_name = "test.units.Item",
+         .short_name = "Item",
+         .label = "Struct",
+         .def_module_qn = "test.units"},
+        {.qualified_name = "test.units.Box",
+         .short_name = "Box",
+         .label = "Struct",
+         .def_module_qn = "test.units"},
+        {.qualified_name = "test.units.Meters.from",
+         .short_name = "from",
+         .label = "Method",
+         .receiver_type = "test.units.Meters",
+         .receiver_spelling = "Meters",
+         .def_module_qn = "test.units",
+         .trait_qn = "From<Feet>"},
+        {.qualified_name = "test.units.Meters.from",
+         .short_name = "from",
+         .label = "Method",
+         .receiver_type = "test.units.Meters",
+         .receiver_spelling = "Meters",
+         .def_module_qn = "test.units",
+         .trait_qn = "From<Inches>"},
+        {.qualified_name = "test.units.Item.run",
+         .short_name = "run",
+         .label = "Method",
+         .receiver_type = "test.units.Item",
+         .receiver_spelling = "Item",
+         .def_module_qn = "test.units",
+         .trait_qn = "TraitA"},
+        {.qualified_name = "test.units.Item.run",
+         .short_name = "run",
+         .label = "Method",
+         .receiver_type = "test.units.Item",
+         .receiver_spelling = "Item",
+         .def_module_qn = "test.units",
+         .trait_qn = "TraitB"},
+        {.qualified_name = "test.units.Item.new",
+         .short_name = "new",
+         .label = "Method",
+         .receiver_type = "test.units.Item",
+         .receiver_spelling = "Item",
+         .def_module_qn = "test.units"},
+        {.qualified_name = "test.units.Box.render",
+         .short_name = "render",
+         .label = "Method",
+         .receiver_type = "test.units.Box",
+         .receiver_spelling = "Box<u32>",
+         .def_module_qn = "test.units",
+         .trait_qn = "Render"},
+        {.qualified_name = "test.units.Box.render",
+         .short_name = "render",
+         .label = "Method",
+         .receiver_type = "test.units.Box",
+         .receiver_spelling = "Box<String>",
+         .def_module_qn = "test.units",
+         .trait_qn = "Render"},
+    };
+    for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
+        defs[i].lang = CBM_LANG_RUST;
+    }
+
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(
+        &arena, defs, (int)(sizeof(defs) / sizeof(defs[0])));
+    ASSERT_NOT_NULL(registry);
+    const char *feet_key =
+        cbm_rust_impl_key(&arena, "test.units.Meters", "Meters", "From<Feet>");
+    const char *inches_key =
+        cbm_rust_impl_key(&arena, "test.units.Meters", "Meters", "From<Inches>");
+    const CBMRegisteredFunc *feet = cbm_rust_registry_lookup_impl_method(
+        registry, "test.units.Meters", feet_key, "from");
+    const CBMRegisteredFunc *inches = cbm_rust_registry_lookup_impl_method(
+        registry, "test.units.Meters", inches_key, "from");
+    ASSERT_NOT_NULL(feet);
+    ASSERT_NOT_NULL(inches);
+    ASSERT(feet != inches);
+    ASSERT_NOT_NULL(feet->impl_key);
+    ASSERT_NOT_NULL(inches->impl_key);
+    ASSERT(strcmp(feet->impl_key, inches->impl_key) != 0);
+
+    const char *trait_a_key = cbm_rust_impl_key(&arena, "test.units.Item", "Item", "TraitA");
+    const char *trait_b_key = cbm_rust_impl_key(&arena, "test.units.Item", "Item", "TraitB");
+    const char *box_u32_key =
+        cbm_rust_impl_key(&arena, "test.units.Box", "Box<u32>", "Render");
+    const char *box_string_key =
+        cbm_rust_impl_key(&arena, "test.units.Box", "Box<String>", "Render");
+    ASSERT_NOT_NULL(cbm_rust_registry_lookup_impl_method(registry, "test.units.Item", trait_a_key,
+                                                         "run"));
+    ASSERT_NOT_NULL(cbm_rust_registry_lookup_impl_method(registry, "test.units.Item", trait_b_key,
+                                                         "run"));
+    ASSERT_NOT_NULL(cbm_rust_registry_lookup_impl_method(
+        registry, "test.units.Box", box_u32_key, "render"));
+    ASSERT_NOT_NULL(cbm_rust_registry_lookup_impl_method(
+        registry, "test.units.Box", box_string_key, "render"));
+
+    RustLSPContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.arena = &arena;
+    ctx.registry = registry;
+    ASSERT_NULL(rust_lookup_method(&ctx, "test.units.Meters", "from"));
+    ASSERT_NULL(rust_lookup_method(&ctx, "test.units.Item", "run"));
+    ASSERT_NULL(rust_lookup_method(&ctx, "test.units.Box", "render"));
+    ASSERT_NOT_NULL(rust_lookup_method(&ctx, "test.units.Item", "new"));
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 static CBMTypeRegistry *rustlsp_default_trait_registry(CBMArena *arena, bool add_ambiguous_type) {
     CBMLSPDef defs[5];
     memset(defs, 0, sizeof(defs));
@@ -6931,6 +7067,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_method_dispatch);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_instantiated_impl_trait_links_canonical_declaration);
+    RUN_TEST(rustlsp_internal_impl_identity_is_exact_and_ambiguous_unqualified);
     RUN_TEST(rustlsp_relative_type_requires_declared_module);
     RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);
     RUN_TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier);

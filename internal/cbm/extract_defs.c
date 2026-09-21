@@ -5180,6 +5180,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         def.qualified_name = method_qn;
         def.label = "Method";
         def.file_path = ctx->rel_path;
+        def.receiver = receiver_name;
         def.parent_class = type_qn;
         def.impl_trait = impl_trait;
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;

@@ -7373,6 +7373,8 @@ static bool rust_generic_receivers_are_exact(const CBMFileResult *result) {
     int u32_impls = 0;
     int string_impls = 0;
     int collapsed_impls = 0;
+    int u32_methods = 0;
+    int string_methods = 0;
     for (int i = 0; i < result->impl_traits.count; i++) {
         const CBMImplTrait *impl = &result->impl_traits.items[i];
         if (!impl->struct_qn || strcmp(impl->struct_qn, "t.lib.Box") != 0) {
@@ -7382,16 +7384,24 @@ static bool rust_generic_receivers_are_exact(const CBMFileResult *result) {
         string_impls += impl->struct_name && strcmp(impl->struct_name, "Box<String>") == 0;
         collapsed_impls += impl->struct_name && strcmp(impl->struct_name, "Box") == 0;
     }
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *def = &result->defs.items[i];
+        if (!def->name || strcmp(def->name, "render") != 0) {
+            continue;
+        }
+        u32_methods += def->receiver && strcmp(def->receiver, "Box<u32>") == 0;
+        string_methods += def->receiver && strcmp(def->receiver, "Box<String>") == 0;
+    }
     return result->impl_traits.count == 2 && u32_impls == 1 && string_impls == 1 &&
-           collapsed_impls == 0;
+           collapsed_impls == 0 && u32_methods == 1 && string_methods == 1;
 }
 
 TEST(extract_rust_generic_impl_receivers_survive_spill) {
     const char *source =
         "trait Render {}\n"
         "struct Box<T>(T);\n"
-        "impl Render for Box<u32> {}\n"
-        "impl Render for Box<String> {}\n";
+        "impl Render for Box<u32> { fn render(&self) {} }\n"
+        "impl Render for Box<String> { fn render(&self) {} }\n";
     CBMFileResult *result = extract(source, CBM_LANG_RUST, "t", "lib.rs");
     ASSERT_NOT_NULL(result);
     ASSERT_TRUE(rust_generic_receivers_are_exact(result));

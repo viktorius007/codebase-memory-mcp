@@ -40,6 +40,7 @@ typedef struct {
      * remain NULL when raw cross-file provenance is ambiguous; the Rust trait
      * flag still prevents that method from being mistaken for inherent. */
     const char *impl_trait_qn;
+    const char *impl_key; /* Rust-only internal receiver + instantiated-trait identity */
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.

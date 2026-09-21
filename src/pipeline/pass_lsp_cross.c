@@ -456,6 +456,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         /* Exact impl-block provenance is captured while the Rust impl node is
          * still on hand.  Do not reconstruct it later from leaf names. */
         dst->trait_qn = src->impl_trait ? cbm_arena_strdup(arena, src->impl_trait) : NULL;
+        dst->receiver_spelling = src->receiver ? cbm_arena_strdup(arena, src->receiver) : NULL;
         dst->is_abstract = src->is_abstract;
     }
     return 0;
@@ -544,6 +545,7 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
     dst->short_name = pxc_qn_leaf(receiver_qn);
     dst->label = "RustImpl";
     dst->receiver_type = receiver_qn;
+    dst->receiver_spelling = cbm_arena_strdup(arena, impl->struct_name);
     dst->def_module_qn = module_qn;
     dst->trait_qn = cbm_arena_strdup(arena, impl->trait_name); /* raw; canonicalized later */
     dst->lang = CBM_LANG_RUST;
@@ -1194,6 +1196,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].signature_param_types = defs[i].signature_param_types;
         out[i].signature_param_count = defs[i].signature_param_count;
         out[i].trait_qn = defs[i].trait_qn;
+        out[i].receiver_spelling = defs[i].receiver_spelling;
         out[i].is_interface = defs[i].is_interface;
         out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
         out[i].is_abstract = defs[i].is_abstract;
