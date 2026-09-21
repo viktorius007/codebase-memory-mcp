@@ -5137,15 +5137,6 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     TSNode trait_node = ts_node_child_by_field_name(node, TS_FIELD("trait"));
     if (!ts_node_is_null(trait_node)) {
         char *trait_name = cbm_node_text(a, trait_node, ctx->source);
-        /* Strip generic args from the trait: `From<Feet>` → `From`,
-         * `Index<usize>` → `Index`, `AsRef<str>` → `AsRef`. Qualified paths
-         * like `io::Write` / `fmt::Display` have no `<` and are preserved. */
-        if (trait_name) {
-            char *lt = strchr(trait_name, '<');
-            if (lt) {
-                *lt = '\0';
-            }
-        }
         if (trait_name && trait_name[0]) {
             CBMImplTrait it = {0};
             it.trait_name = trait_name;

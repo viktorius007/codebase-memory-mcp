@@ -1577,7 +1577,7 @@ static const rust_impl_case_t rust_cases[] = {
     /* ── From trait ──────────────────────────────────────────────── */
     {"struct Meters(f64);\nstruct Feet(f64);\n"
      "impl From<Feet> for Meters { fn from(f: Feet) -> Self { Meters(f.0 * 0.3048) } }",
-     "From", "Meters"},
+     "From<Feet>", "Meters"},
     /* ── Default trait ───────────────────────────────────────────── */
     {"struct Config { debug: bool, level: u32 }\n"
      "impl Default for Config { fn default() -> Self { Config { debug: false, level: 0 } } }",
@@ -1625,7 +1625,7 @@ static const rust_impl_case_t rust_cases[] = {
     {"use std::ops::Index;\nstruct Matrix { data: Vec<f64>, cols: usize }\n"
      "impl Index<(usize, usize)> for Matrix { type Output = f64; fn index(&self, idx: (usize, "
      "usize)) -> &f64 { &self.data[idx.0 * self.cols + idx.1] } }",
-     "Index", "Matrix"},
+     "Index<(usize, usize)>", "Matrix"},
     /* ── Add operator overload ───────────────────────────────────── */
     {"use std::ops::Add;\n#[derive(Clone, Copy)]\nstruct Vec2 { x: f32, y: f32 }\n"
      "impl Add for Vec2 { type Output = Vec2; fn add(self, rhs: Vec2) -> Vec2 { Vec2 { x: self.x + "
@@ -1641,7 +1641,7 @@ static const rust_impl_case_t rust_cases[] = {
      "Deref", "Wrapper"},
     /* ── AsRef trait ─────────────────────────────────────────────── */
     {"struct Path(String);\nimpl AsRef<str> for Path { fn as_ref(&self) -> &str { &self.0 } }",
-     "AsRef", "Path"},
+     "AsRef<str>", "Path"},
     /* ── Hash trait ──────────────────────────────────────────────── */
     {"use std::hash::{Hash, Hasher};\n#[derive(Eq, PartialEq)]\nstruct Key(String);\n"
      "impl Hash for Key { fn hash<H: Hasher>(&self, state: &mut H) { self.0.hash(state); } }",
@@ -1656,6 +1656,64 @@ static const rust_impl_case_t rust_cases[] = {
      "}",
      "Serialize", "JsonRecord"},
 };
+
+TEST(rust_instantiated_trait_spellings_are_retained) {
+    const char *src =
+        "struct Meters(f64);\n"
+        "struct Feet(f64);\n"
+        "struct Inches(f64);\n"
+        "impl From<Feet> for Meters { fn from(f: Feet) -> Self { Meters(f.0 * 0.3048) } }\n"
+        "impl From<Inches> for Meters { fn from(i: Inches) -> Self { Meters(i.0 * 0.0254) } }";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_RUST, "t", "lib.rs", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+
+    int feet_impls = 0;
+    int inches_impls = 0;
+    int collapsed_impls = 0;
+    for (int i = 0; i < r->impl_traits.count; i++) {
+        CBMImplTrait *impl = &r->impl_traits.items[i];
+        if (impl->struct_name && strcmp(impl->struct_name, "Meters") == 0) {
+            feet_impls += impl->trait_name && strcmp(impl->trait_name, "From<Feet>") == 0;
+            inches_impls += impl->trait_name && strcmp(impl->trait_name, "From<Inches>") == 0;
+            collapsed_impls += impl->trait_name && strcmp(impl->trait_name, "From") == 0;
+        }
+    }
+    if (r->impl_traits.count != 2 || feet_impls != 1 || inches_impls != 1 ||
+        collapsed_impls != 0) {
+        printf("  FAIL  Rust impl_traits must contain exactly one From<Feet> and one "
+               "From<Inches> for Meters (count=%d, feet=%d, inches=%d, collapsed=%d)\n",
+               r->impl_traits.count, feet_impls, inches_impls, collapsed_impls);
+        cbm_free_result(r);
+        return 1;
+    }
+
+    int from_methods = 0;
+    int feet_methods = 0;
+    int inches_methods = 0;
+    int collapsed_methods = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *def = &r->defs.items[i];
+        if (!def->label || strcmp(def->label, "Method") != 0 || !def->name ||
+            strcmp(def->name, "from") != 0)
+            continue;
+        from_methods++;
+        feet_methods += def->impl_trait && strcmp(def->impl_trait, "From<Feet>") == 0;
+        inches_methods += def->impl_trait && strcmp(def->impl_trait, "From<Inches>") == 0;
+        collapsed_methods += def->impl_trait && strcmp(def->impl_trait, "From") == 0;
+    }
+    if (from_methods != 2 || feet_methods != 1 || inches_methods != 1 ||
+        collapsed_methods != 0) {
+        printf("  FAIL  Rust from methods must carry exactly one From<Feet> and one "
+               "From<Inches> impl_trait (methods=%d, feet=%d, inches=%d, collapsed=%d)\n",
+               from_methods, feet_methods, inches_methods, collapsed_methods);
+        cbm_free_result(r);
+        return 1;
+    }
+
+    cbm_free_result(r);
+    PASS();
+}
 
 TEST(inherit_rust_impls) {
     RUN_RUST_CASES(rust_cases);
@@ -1734,6 +1792,7 @@ SUITE(extraction_inheritance) {
     RUN_TEST(inherit_java);
     RUN_TEST(inherit_csharp);
     RUN_TEST(inherit_cpp);
+    RUN_TEST(rust_instantiated_trait_spellings_are_retained);
     RUN_TEST(inherit_rust_impls);
     RUN_TEST(inherit_ruby);
 
