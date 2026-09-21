@@ -41,7 +41,8 @@
 /* Forward declarations for early callers in the file. */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
-                                    const char *strategy, float confidence);
+                                    const char *callee_impl_key, const char *strategy,
+                                    float confidence);
 static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn);
 static bool rust_map_source_range(const RustLSPContext *ctx, uint32_t start, uint32_t end,
                                   uint32_t *mapped_start, uint32_t *mapped_end);
@@ -2952,7 +2953,7 @@ static void rust_emit_operator_call(RustLSPContext *ctx, const CBMType *recv, co
                                             &mapped_start, &mapped_end);
         ctx->emit_site_start_byte = mapped ? mapped_start : 0;
         ctx->emit_site_end_byte = mapped ? mapped_end : 0;
-        rust_emit_resolved_call(ctx, m->qualified_name, "lsp_operator_trait",
+        rust_emit_resolved_call(ctx, m->qualified_name, m->impl_key, "lsp_operator_trait",
                                 CBM_RUST_CONF_OPERATOR);
         /* `a + b` is a binary_expression, never a syntactic call node, so the
          * extractor produced no CBMCall to pair with the resolved_call above.
@@ -4142,13 +4143,15 @@ static void rust_ensure_known_macro_carrier(RustLSPContext *ctx, const char *mac
 }
 
 static void rust_emit_resolved_call_reason(RustLSPContext *ctx, const char *callee_qn,
-                                           const char *strategy, float confidence,
-                                           const char *reason) {
+                                           const char *callee_impl_key, const char *strategy,
+                                           float confidence, const char *reason) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
     CBMResolvedCall rc = {
         .caller_qn = ctx->enclosing_func_qn,
         .callee_qn = callee_qn,
+        .caller_impl_key = ctx->enclosing_impl_key,
+        .callee_impl_key = callee_impl_key,
         .strategy = strategy,
         .confidence = confidence,
         .reason = reason,
@@ -4163,8 +4166,9 @@ static void rust_emit_resolved_call_reason(RustLSPContext *ctx, const char *call
 }
 
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
-                                    const char *strategy, float confidence) {
-    rust_emit_resolved_call_reason(ctx, callee_qn, strategy, confidence, NULL);
+                                    const char *callee_impl_key, const char *strategy,
+                                    float confidence) {
+    rust_emit_resolved_call_reason(ctx, callee_qn, callee_impl_key, strategy, confidence, NULL);
 }
 
 static bool rust_qn_has_suffix(const char *qualified_name, const char *suffix) {
@@ -4249,6 +4253,7 @@ static void rust_resolve_callable_argument_references(RustLSPContext *ctx, TSNod
         CBMResolvedCall reference = {
             .caller_qn = ctx->enclosing_func_qn,
             .callee_qn = target,
+            .caller_impl_key = ctx->enclosing_impl_key,
             .strategy = "lsp_callable_value_reference",
             .confidence = CBM_RUST_CONF_DIRECT,
             .reason = source_name,
@@ -4267,6 +4272,7 @@ static void rust_emit_unresolved_call(RustLSPContext *ctx, const char *expr_text
     CBMResolvedCall rc = {
         .caller_qn = ctx->enclosing_func_qn,
         .callee_qn = expr_text ? expr_text : "?",
+        .caller_impl_key = ctx->enclosing_impl_key,
         .strategy = "lsp_unresolved",
         .confidence = 0.0f,
         .reason = reason,
@@ -4354,7 +4360,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                     strategy = "lsp_trait_dispatch";
                     conf = (impl_count == 1) ? CBM_RUST_CONF_TRAIT_SOLE : CBM_RUST_CONF_TRAIT_AMB;
                 }
-                rust_emit_resolved_call(ctx, m->qualified_name, strategy, conf);
+                rust_emit_resolved_call(ctx, m->qualified_name, m->impl_key, strategy, conf);
                 (void)args_node;
                 return;
             }
@@ -4393,7 +4399,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 const CBMRegisteredFunc *hm =
                     rust_resolve_trait_method(ctx, next_qn, mname, &hop_impls, NULL);
                 if (hm) {
-                    rust_emit_resolved_call(ctx, hm->qualified_name, "lsp_deref_dispatch",
+                    rust_emit_resolved_call(ctx, hm->qualified_name, hm->impl_key,
+                                            "lsp_deref_dispatch",
                                             CBM_RUST_CONF_PROMOTED);
                     return;
                 }
@@ -4415,7 +4422,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                     const CBMRegisteredFunc *bm =
                         rust_resolve_trait_method(ctx, bound, mname, &bimpls, NULL);
                     if (bm) {
-                        rust_emit_resolved_call(ctx, bm->qualified_name, "lsp_bound_dispatch",
+                        rust_emit_resolved_call(ctx, bm->qualified_name, bm->impl_key,
+                                                "lsp_bound_dispatch",
                                                 CBM_RUST_CONF_TRAIT_AMB);
                         return;
                     }
@@ -4424,8 +4432,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
 
             /* Prelude trait method best-effort. */
             if (is_prelude_trait_method(mname)) {
-                rust_emit_resolved_call(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, mname),
-                                        "lsp_prelude_trait", CBM_RUST_CONF_TRAIT_AMB);
+                rust_emit_resolved_call(ctx,
+                                        cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, mname),
+                                        NULL, "lsp_prelude_trait", CBM_RUST_CONF_TRAIT_AMB);
                 return;
             }
             rust_emit_unresolved_call(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, mname),
@@ -4460,7 +4469,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
             const char *alias_target = cbm_scope_lookup_callable(ctx->current_scope, path);
             if (alias_target) {
-                rust_emit_resolved_call_reason(ctx, alias_target, "lsp_callable_alias",
+                rust_emit_resolved_call_reason(ctx, alias_target, NULL, "lsp_callable_alias",
                                                CBM_RUST_CONF_DIRECT, path);
                 return;
             }
@@ -4483,14 +4492,14 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         const CBMRegisteredFunc *direct = cbm_registry_lookup_func(ctx->registry, qn);
         if (direct && !direct->receiver_type) {
             const char *strategy = rust_resolve_use(ctx, path) ? "lsp_import_alias" : "lsp_direct";
-            rust_emit_resolved_call_reason(ctx, qn, strategy, CBM_RUST_CONF_DIRECT, path);
+            rust_emit_resolved_call_reason(ctx, qn, NULL, strategy, CBM_RUST_CONF_DIRECT, path);
             return;
         }
         if (ctx->module_qn && strstr(qn, ".") == NULL) {
             const char *full = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn);
             direct = cbm_registry_lookup_func(ctx->registry, full);
             if (direct && !direct->receiver_type) {
-                rust_emit_resolved_call(ctx, full, "lsp_direct", CBM_RUST_CONF_DIRECT);
+                rust_emit_resolved_call(ctx, full, NULL, "lsp_direct", CBM_RUST_CONF_DIRECT);
                 return;
             }
         }
@@ -4528,7 +4537,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                         ctx,
                         ti_m ? ti_m->qualified_name
                              : cbm_arena_sprintf(ctx->arena, "%s.%s", trait_qn, short_name),
-                        "lsp_trait_ufcs", CBM_RUST_CONF_TRAIT_SOLE);
+                        ti_m ? ti_m->impl_key : NULL, "lsp_trait_ufcs", CBM_RUST_CONF_TRAIT_SOLE);
                 }
                 return;
             }
@@ -4542,7 +4551,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 m = cbm_registry_lookup_method_aliased(ctx->registry, full_head, short_name);
             }
             if (m) {
-                rust_emit_resolved_call(ctx, m->qualified_name,
+                rust_emit_resolved_call(ctx, m->qualified_name, m->impl_key,
                                         strcmp(short_name, "new") == 0 ? "lsp_constructor"
                                                                        : "lsp_ufcs",
                                         CBM_RUST_CONF_UFCS);
@@ -4558,7 +4567,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 tm = rust_resolve_trait_method(ctx, full_head, short_name, &impls, NULL);
             }
             if (tm && impls == 1) {
-                rust_emit_resolved_call(ctx, tm->qualified_name, "lsp_trait_ufcs",
+                rust_emit_resolved_call(ctx, tm->qualified_name, tm->impl_key, "lsp_trait_ufcs",
                                         CBM_RUST_CONF_TRAIT_SOLE);
                 return;
             }
@@ -4617,7 +4626,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                             mem_unique = f;
                     }
                     if (mem_matches == 1 && mem_unique) {
-                        rust_emit_resolved_call(ctx, mem_unique->qualified_name, "lsp_cross_crate",
+                        rust_emit_resolved_call(ctx, mem_unique->qualified_name,
+                                                mem_unique->impl_key, "lsp_cross_crate",
                                                 CBM_RUST_CONF_DIRECT);
                         return;
                     }
@@ -4832,7 +4842,8 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                         path = cbm_arena_sprintf(ctx->arena, "core.macros.%s", mname);
                     }
                     if (path) {
-                        rust_emit_resolved_call(ctx, path, "lsp_macro", CBM_RUST_CONF_MACRO_KNOWN);
+                        rust_emit_resolved_call(ctx, path, NULL, "lsp_macro",
+                                                CBM_RUST_CONF_MACRO_KNOWN);
                         rust_ensure_known_macro_carrier(ctx, mname, path);
                     }
                 }
@@ -5325,13 +5336,17 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     const char *saved_self = ctx->self_type_qn;
     const char *saved_trait = ctx->self_trait_qn;
+    const char *saved_impl_key = ctx->enclosing_impl_key;
     ctx->self_type_qn = effective_recv;
     ctx->self_trait_qn = NULL;
+    ctx->enclosing_impl_key = NULL;
 
     if (!ts_node_is_null(trait_node) && !is_blanket) {
         char *tt = rust_node_text(ctx, trait_node);
-        if (tt)
+        if (tt) {
             ctx->self_trait_qn = rust_resolve_path_expr(ctx, tt);
+            ctx->enclosing_impl_key = cbm_rust_impl_key(ctx->arena, effective_recv, type_text, tt);
+        }
     }
 
     TSNode body = ts_node_child_by_field_name(impl_node, "body", 4);
@@ -5350,6 +5365,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     ctx->self_type_qn = saved_self;
     ctx->self_trait_qn = saved_trait;
+    ctx->enclosing_impl_key = saved_impl_key;
 }
 
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
@@ -5394,7 +5410,7 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
             ctx->enclosing_func_qn = ctx->module_qn;
             rust_emit_resolved_call(ctx,
                                     cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name),
-                                    "lsp_mod_decl", 0.70f);
+                                    NULL, "lsp_mod_decl", 0.70f);
             ctx->enclosing_func_qn = save_caller;
         }
     }
@@ -6478,6 +6494,12 @@ void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int f
                 memset(dst, 0, sizeof(*dst));
                 dst->caller_qn = src->caller_qn ? cbm_arena_strdup(arena, src->caller_qn) : NULL;
                 dst->callee_qn = src->callee_qn ? cbm_arena_strdup(arena, src->callee_qn) : NULL;
+                dst->caller_impl_key = src->caller_impl_key
+                                           ? cbm_arena_strdup(arena, src->caller_impl_key)
+                                           : NULL;
+                dst->callee_impl_key = src->callee_impl_key
+                                           ? cbm_arena_strdup(arena, src->callee_impl_key)
+                                           : NULL;
                 dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
                 dst->confidence = src->confidence;
                 dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;

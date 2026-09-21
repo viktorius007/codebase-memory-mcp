@@ -336,6 +336,8 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     for (int i = 0; i < r->resolved_calls.count && r->resolved_calls.items; i++) {
         cr_str(c, &r->resolved_calls.items[i].caller_qn);
         cr_str(c, &r->resolved_calls.items[i].callee_qn);
+        cr_str(c, &r->resolved_calls.items[i].caller_impl_key);
+        cr_str(c, &r->resolved_calls.items[i].callee_impl_key);
         cr_str(c, &r->resolved_calls.items[i].strategy);
         cr_str(c, &r->resolved_calls.items[i].reason);
     }

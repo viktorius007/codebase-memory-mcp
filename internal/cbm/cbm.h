@@ -399,6 +399,8 @@ typedef enum {
 typedef struct {
     const char *caller_qn;         // enclosing function QN
     const char *callee_qn;         // resolved target QN (fully qualified)
+    const char *caller_impl_key;   // Rust-only concrete implementation identity
+    const char *callee_impl_key;   // Rust-only concrete implementation identity
     const char *strategy;          // "lsp_type_dispatch", "lsp_direct", etc.
     float confidence;              // 0.90-0.95
     const char *reason;            // diagnostic label for unresolved calls (NULL if resolved)

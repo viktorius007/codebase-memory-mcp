@@ -1008,6 +1008,12 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
             }
             dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
             dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
+            dst->caller_impl_key = src->caller_impl_key
+                                       ? cbm_arena_strdup(dst_arena, src->caller_impl_key)
+                                       : NULL;
+            dst->callee_impl_key = src->callee_impl_key
+                                       ? cbm_arena_strdup(dst_arena, src->callee_impl_key)
+                                       : NULL;
             dst->strategy = cbm_arena_strdup(dst_arena, src->strategy);
             dst->confidence = src->confidence;
             dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
@@ -1048,6 +1054,12 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
             if (src->confidence > dst->confidence) {
                 dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
                 dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
+                dst->caller_impl_key = src->caller_impl_key
+                                           ? cbm_arena_strdup(dst_arena, src->caller_impl_key)
+                                           : NULL;
+                dst->callee_impl_key = src->callee_impl_key
+                                           ? cbm_arena_strdup(dst_arena, src->callee_impl_key)
+                                           : NULL;
                 dst->strategy = src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
                 dst->confidence = src->confidence;
                 dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
@@ -1061,6 +1073,10 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         CBMResolvedCall dst = {0};
         dst.caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
         dst.callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
+        dst.caller_impl_key =
+            src->caller_impl_key ? cbm_arena_strdup(dst_arena, src->caller_impl_key) : NULL;
+        dst.callee_impl_key =
+            src->callee_impl_key ? cbm_arena_strdup(dst_arena, src->callee_impl_key) : NULL;
         dst.strategy = src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
         dst.confidence = src->confidence;
         dst.reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;

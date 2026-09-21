@@ -90,6 +90,7 @@ typedef struct {
     /* Enclosing function context. `enclosing_func_qn` is the QN we attach
      * to every emitted CBMResolvedCall as `caller_qn`. */
     const char *enclosing_func_qn;
+    const char *enclosing_impl_key;
 
     /* `Self` resolution: when inside `impl T { ... }` or
      * `impl Trait for T { ... }`, `self_type_qn` is `T`'s QN. NULL outside

@@ -844,6 +844,90 @@ TEST(rustlsp_internal_impl_identity_is_exact_and_ambiguous_unqualified) {
     PASS();
 }
 
+static const CBMResolvedCall *rustlsp_find_impl_identity_call(
+    const CBMResolvedCallArray *calls, const char *callee_leaf) {
+    for (int i = 0; calls && i < calls->count; i++) {
+        const CBMResolvedCall *call = &calls->items[i];
+        if (call->callee_qn && strstr(call->callee_qn, callee_leaf))
+            return call;
+    }
+    return NULL;
+}
+
+static bool rustlsp_impl_identity_rows_are_exact(const CBMResolvedCallArray *calls) {
+    const CBMResolvedCall *feet = rustlsp_find_impl_identity_call(calls, "Feet.act");
+    const CBMResolvedCall *inches = rustlsp_find_impl_identity_call(calls, "Inches.act");
+    const CBMResolvedCall *plain = rustlsp_find_impl_identity_call(calls, ".plain");
+    return feet && inches && plain &&
+           strcmp(feet->caller_qn, inches->caller_qn) == 0 &&
+           feet->caller_impl_key &&
+           strcmp(feet->caller_impl_key,
+                  "19:test.src.main.Boxed5:Boxed11:Render<u32>") == 0 &&
+           inches->caller_impl_key &&
+           strcmp(inches->caller_impl_key,
+                  "19:test.src.main.Boxed5:Boxed14:Render<String>") == 0 &&
+           feet->callee_impl_key &&
+           strcmp(feet->callee_impl_key, "18:test.src.main.Feet4:Feet8:Act<u32>") == 0 &&
+           inches->callee_impl_key &&
+           strcmp(inches->callee_impl_key,
+                  "20:test.src.main.Inches6:Inches11:Act<String>") == 0 &&
+           plain->caller_impl_key == NULL && plain->callee_impl_key == NULL;
+}
+
+TEST(rustlsp_resolved_calls_carry_exact_impl_identity_local_and_shared) {
+    const char *source =
+        "trait Render<T> { fn render(&self); }\n"
+        "trait Act<T> { fn act(); }\n"
+        "struct Boxed; struct Feet; struct Inches;\n"
+        "impl Act<u32> for Feet { fn act() {} }\n"
+        "impl Act<String> for Inches { fn act() {} }\n"
+        "impl Render<u32> for Boxed { fn render(&self) { Feet::act(); } }\n"
+        "impl Render<String> for Boxed { fn render(&self) { Inches::act(); } }\n"
+        "fn plain() {} fn run() { plain(); }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_TRUE(rustlsp_impl_identity_rows_are_exact(&result->resolved_calls));
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef *defs = cbm_arena_alloc(&arena, (size_t)result->defs.count * sizeof(*defs));
+    ASSERT_NOT_NULL(defs);
+    memset(defs, 0, (size_t)result->defs.count * sizeof(*defs));
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *src = &result->defs.items[i];
+        defs[i].qualified_name = src->qualified_name;
+        defs[i].short_name = src->name;
+        defs[i].label = src->label;
+        defs[i].receiver_type = src->parent_class;
+        defs[i].receiver_spelling = src->receiver;
+        defs[i].trait_qn = src->impl_trait;
+        defs[i].def_module_qn = "test.src.main";
+        defs[i].lang = CBM_LANG_RUST;
+    }
+    CBMTypeRegistry *registry =
+        cbm_rust_build_cross_registry(&arena, defs, result->defs.count);
+    ASSERT_NOT_NULL(registry);
+    CBMResolvedCallArray shared = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.src.main",
+                                         registry, NULL, NULL, 0, NULL, NULL, &shared, NULL);
+    ASSERT_TRUE(rustlsp_impl_identity_rows_are_exact(&shared));
+
+    CBMFileResult merged;
+    memset(&merged, 0, sizeof(merged));
+    cbm_arena_init(&merged.arena);
+    cbm_pxc_run_one(CBM_LANG_RUST, &merged, source, (int)strlen(source), "test.src.main", defs,
+                    result->defs.count, NULL, NULL, 0);
+    ASSERT_TRUE(rustlsp_impl_identity_rows_are_exact(&merged.resolved_calls));
+    cbm_arena_destroy(&merged.arena);
+
+    cbm_result_compact(result);
+    ASSERT_TRUE(rustlsp_impl_identity_rows_are_exact(&result->resolved_calls));
+
+    cbm_arena_destroy(&arena);
+    cbm_free_result(result);
+    PASS();
+}
+
 static CBMTypeRegistry *rustlsp_default_trait_registry(CBMArena *arena, bool add_ambiguous_type) {
     CBMLSPDef defs[5];
     memset(defs, 0, sizeof(defs));
@@ -7068,6 +7152,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_instantiated_impl_trait_links_canonical_declaration);
     RUN_TEST(rustlsp_internal_impl_identity_is_exact_and_ambiguous_unqualified);
+    RUN_TEST(rustlsp_resolved_calls_carry_exact_impl_identity_local_and_shared);
     RUN_TEST(rustlsp_relative_type_requires_declared_module);
     RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);
     RUN_TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier);
