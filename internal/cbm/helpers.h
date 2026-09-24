@@ -246,4 +246,10 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
  * shape that server-side route paths already use. NULL when empty/oversized. */
 const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source);
 
+/* Rust: fold a `#[cfg(...)]` predicate into a definition's qualified name so
+ * cfg-gated twins stay distinct (extract_defs.c). Call-side scope naming
+ * (extract_unified.c) applies the same rule so bodies attach to their node. */
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
+                                        const char *const *decorators);
+
 #endif // CBM_HELPERS_H

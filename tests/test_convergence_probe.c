@@ -1019,7 +1019,8 @@ TEST(cp_interface_dispatch_go) {
     PASS();
 }
 
-/* D5b — The local run->describe call survives; dyn dispatch remains gated. */
+/* D5b — run->describe plus describe->area/perimeter through `&dyn Shape`,
+ * which rust-analyzer also binds to the trait's declared methods. */
 TEST(cp_interface_dispatch_rust_dyn) {
     static const CP_File f[] = {
         {"shapes.rs",
@@ -1034,11 +1035,11 @@ TEST(cp_interface_dispatch_rust_dyn) {
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
     int methods = cp_count_label(store, lp.project, "Method");
-    if (calls != 1 || methods < 2)
+    if (calls != 3 || methods < 2)
         cp_diag(store, lp.project, "interface_dispatch/rust_dyn");
     cp_cleanup(&lp, store);
     ASSERT_TRUE(methods >= 2);
-    ASSERT_EQ(calls, 1);
+    ASSERT_EQ(calls, 3);
     PASS();
 }
 

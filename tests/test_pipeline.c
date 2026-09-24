@@ -6609,18 +6609,27 @@ static bool exact_call_qns_exist(cbm_store_t *store, const char *project, const 
     int source_count = 0;
     const char *source_leaf = strrchr(source_qn, '.');
     const char *target_leaf = strrchr(target_qn, '.');
-    if (!store || !project || !source_leaf || !target_leaf ||
-        cbm_store_find_nodes_by_name(store, project, source_leaf + 1, &sources, &source_count) !=
-            CBM_STORE_OK) {
+    if (!store || !project || !source_leaf || !target_leaf) {
+        return false;
+    }
+    /* Node names carry neither the `[Trait]` nor the `#cfg(..)]` identity
+     * suffix of a qualified name; the qualified names below stay exact. */
+    char source_name[128];
+    size_t source_name_len = strcspn(source_leaf + 1, "[#");
+    if (source_name_len >= sizeof(source_name)) {
+        return false;
+    }
+    memcpy(source_name, source_leaf + 1, source_name_len);
+    source_name[source_name_len] = '\0';
+    if (cbm_store_find_nodes_by_name(store, project, source_name, &sources, &source_count) !=
+        CBM_STORE_OK) {
         return false;
     }
     cbm_node_t *targets = NULL;
     int target_count = 0;
     bool found = false;
     char target_name[128];
-    const char *target_suffix = strchr(target_leaf + 1, '[');
-    size_t target_name_len =
-        target_suffix ? (size_t)(target_suffix - (target_leaf + 1)) : strlen(target_leaf + 1);
+    size_t target_name_len = strcspn(target_leaf + 1, "[#");
     if (target_name_len >= sizeof(target_name)) {
         cbm_store_free_nodes(sources, source_count);
         return false;
@@ -6690,6 +6699,155 @@ static RustTraitCallObservation observe_rust_trait_calls(const char *root, const
     }
     cbm_pipeline_free(pipeline);
     return observation;
+}
+
+typedef struct {
+    int run_rc;
+    bool field_receiver;     /* self.runtime.execute() through a `use crate::a::Runtime` field */
+    bool let_bound_receiver; /* started.initial_event() typed by the method's return */
+    bool trait_impl_caller;  /* D.notify[Host] owns its body's calls */
+    bool dyn_receiver;       /* Arc<dyn Host> dispatches to the trait method */
+    bool reexport_path;      /* crate::Runtime follows lib.rs `pub use a::Runtime` */
+    bool glob_import;        /* `use crate::a::*` binds a unique glob source */
+    bool cfg_caller;         /* a #[cfg] twin keeps its published caller identity */
+    bool super_path;         /* super::m_root() from m/inner.rs reaches m/mod.rs */
+    bool trait_ufcs_guess;   /* Default::default() must stay closed */
+} RustModuleCallObservation;
+
+static RustModuleCallObservation observe_rust_module_calls(const char *root, const char *db_name) {
+    RustModuleCallObservation o = {.run_rc = -1};
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", root, db_name);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    o.run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (store && pipeline) {
+        const char *p = cbm_pipeline_project_name(pipeline);
+        char src[512];
+        char dst[512];
+#define RS_EDGE(field, s, d)                                \
+    do {                                                    \
+        snprintf(src, sizeof(src), "%s." s, p);             \
+        snprintf(dst, sizeof(dst), "%s." d, p);             \
+        o.field = exact_call_qns_exist(store, p, src, dst); \
+    } while (0)
+        RS_EDGE(field_receiver, "src.b.S.go", "src.a.Runtime.execute");
+        RS_EDGE(let_bound_receiver, "src.b.S.go", "src.a.Started.initial_event");
+        RS_EDGE(trait_impl_caller, "src.b.D.notify[Host]", "src.a.helper");
+        RS_EDGE(dyn_receiver, "src.a.spawn", "src.a.Host.notify");
+        RS_EDGE(reexport_path, "src.b.D.notify[Host]", "src.a.Runtime.execute");
+        RS_EDGE(glob_import, "src.c.g", "src.a.helper");
+        RS_EDGE(cfg_caller, "src.a.os_name#cfg(unix)]", "src.a.helper");
+        RS_EDGE(super_path, "src.m.inner.inner", "src.m.mod.m_root");
+        RS_EDGE(trait_ufcs_guess, "src.b.dflt", "src.b.S.default[Default]");
+#undef RS_EDGE
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return o;
+}
+
+/* One crate laid out as Cargo does: file-derived names must map `crate::`,
+ * `super::`, re-exports, globs, field types and trait-impl callers onto the
+ * published nodes identically in both pipelines, while the inference-only
+ * `Default::default()` guess stays closed. */
+TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_module_calls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub mod a;\npub mod b;\npub mod c;\npub mod m;\npub use a::Runtime;\n");
+    write_temp_file(tmp, "src/a.rs",
+                    "use std::sync::Arc;\n"
+                    "pub struct Runtime;\n"
+                    "impl Runtime { pub fn execute(&self) -> Started { Started } }\n"
+                    "pub struct Started;\n"
+                    "impl Started { pub fn initial_event(&self) -> u8 { 1 } }\n"
+                    "pub trait Host { fn notify(&self); }\n"
+                    "pub fn spawn(host: Arc<dyn Host>) { host.notify(); }\n"
+                    "pub fn helper() -> u8 { 2 }\n"
+                    "#[cfg(unix)]\n"
+                    "pub fn os_name() -> u8 { helper() }\n");
+    write_temp_file(tmp, "src/b.rs",
+                    "use crate::a::Runtime;\n"
+                    "use crate::a::helper;\n"
+                    "use crate::a::Host;\n"
+                    "pub struct S { runtime: Runtime }\n"
+                    "impl S {\n"
+                    "    pub fn go(&self) -> u8 {\n"
+                    "        let started = self.runtime.execute();\n"
+                    "        started.initial_event()\n"
+                    "    }\n"
+                    "}\n"
+                    "impl Default for S { fn default() -> Self { S { runtime: Runtime } } }\n"
+                    "pub fn dflt() -> S { Default::default() }\n"
+                    "pub struct D;\n"
+                    "impl Host for D {\n"
+                    "    fn notify(&self) {\n"
+                    "        let helper = helper();\n"
+                    "        let _ = helper;\n"
+                    "        crate::Runtime.execute();\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/c.rs", "use crate::a::*;\npub fn g() -> u8 { helper() }\n");
+    write_temp_file(tmp, "src/m/mod.rs", "pub mod inner;\npub fn m_root() -> u8 { 1 }\n");
+    write_temp_file(tmp, "src/m/inner.rs", "pub fn inner() -> u8 { super::m_root() }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_module_call_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
+    char *saved_single =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    RustModuleCallObservation sequential =
+        observe_rust_module_calls(tmp, "module-calls-sequential.db");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    RustModuleCallObservation parallel = observe_rust_module_calls(tmp, "module-calls-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential.run_rc, 0);
+    ASSERT_EQ(parallel.run_rc, 0);
+    const RustModuleCallObservation *modes[2] = {&sequential, &parallel};
+    for (int i = 0; i < 2; i++) {
+        printf("  Rust module-path diagnostic: mode=%s field=%d let=%d trait_impl=%d dyn=%d "
+               "reexport=%d glob=%d cfg=%d super=%d ufcs_guess=%d\n",
+               i == 0 ? "sequential" : "parallel", modes[i]->field_receiver,
+               modes[i]->let_bound_receiver, modes[i]->trait_impl_caller, modes[i]->dyn_receiver,
+               modes[i]->reexport_path, modes[i]->glob_import, modes[i]->cfg_caller,
+               modes[i]->super_path, modes[i]->trait_ufcs_guess);
+        ASSERT_TRUE(modes[i]->field_receiver);
+        ASSERT_TRUE(modes[i]->let_bound_receiver);
+        ASSERT_TRUE(modes[i]->trait_impl_caller);
+        ASSERT_TRUE(modes[i]->dyn_receiver);
+        ASSERT_TRUE(modes[i]->reexport_path);
+        ASSERT_TRUE(modes[i]->glob_import);
+        ASSERT_TRUE(modes[i]->cfg_caller);
+        ASSERT_TRUE(modes[i]->super_path);
+        ASSERT_FALSE(modes[i]->trait_ufcs_guess);
+    }
+    PASS();
 }
 
 TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes) {
@@ -15510,6 +15668,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
+    RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);

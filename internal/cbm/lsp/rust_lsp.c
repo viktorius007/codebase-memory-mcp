@@ -40,6 +40,11 @@
 
 /* Forward declarations for early callers in the file. */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
+static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path);
+static const char *rust_module_export(RustLSPContext *ctx, const char *module_qn, const char *name);
+static const char *rust_qn_crate_prefix(RustLSPContext *ctx, const char *qn);
+typedef struct RustQnMatch RustQnMatch;
+static void rust_qn_variants(RustLSPContext *ctx, const char *qn, bool want_type, RustQnMatch *m);
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
                                     const char *callee_impl_key, const char *strategy,
                                     float confidence);
@@ -608,6 +613,495 @@ static const char *rust_registered_relative_path(RustLSPContext *ctx, const char
     return current_exists ? current : parent;
 }
 
+/* ── File-derived module identity ──────────────────────────────────
+ * Graph QNs are file paths: `<project>.<dirs>.<src>.<mods>.<stem>`. Rust
+ * paths name modules, so `crate::`, `super::`, workspace crates and inline
+ * or `mod.rs` modules must be mapped onto that shape before any registry
+ * lookup. Every mapping below is checked against the registry and refuses
+ * ambiguity; no short-name guess is admitted. */
+
+static bool rust_segment_is_source_root(const char *seg, size_t len) {
+    static const char *const roots[] = {"src", "tests", "benches", "examples"};
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        if (strlen(roots[i]) == len && strncmp(seg, roots[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `<project>.<member dirs>.<source root>`: the prefix under which this
+ * crate's file-derived QNs live. Without a recognised source-root segment
+ * the legacy two-segment approximation is kept. */
+static const char *rust_crate_root_prefix(RustLSPContext *ctx) {
+    if (!ctx || !ctx->module_qn) {
+        return NULL;
+    }
+    if (ctx->crate_root_prefix) {
+        return ctx->crate_root_prefix;
+    }
+    const char *mq = ctx->module_qn;
+    const char *first = strchr(mq, '.');
+    const char *result = NULL;
+    for (const char *p = first ? first + 1 : NULL; p && *p;) {
+        const char *end = strchr(p, '.');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (rust_segment_is_source_root(p, len)) {
+            result = cbm_arena_strndup(ctx->arena, mq, (size_t)(p + len - mq));
+            break;
+        }
+        if (!end) {
+            break;
+        }
+        p = end + 1;
+    }
+    if (!result) {
+        const char *second = first ? strchr(first + 1, '.') : NULL;
+        result = second ? cbm_arena_strndup(ctx->arena, mq, (size_t)(second - mq)) : mq;
+    }
+    ctx->crate_root_prefix = result;
+    return result;
+}
+
+static bool rust_stem_owns_directory(const char *stem) {
+    return strcmp(stem, "mod") == 0 || strcmp(stem, "lib") == 0 || strcmp(stem, "main") == 0;
+}
+
+/* QN of the directory whose files are this file's child modules: `mod.rs`,
+ * `lib.rs` and `main.rs` own their directory, `foo.rs` owns `foo/`. */
+static const char *rust_module_dir_qn(RustLSPContext *ctx) {
+    if (!ctx || !ctx->module_qn) {
+        return NULL;
+    }
+    if (ctx->module_dir_qn) {
+        return ctx->module_dir_qn;
+    }
+    const char *mq = ctx->module_qn;
+    const char *dot = strrchr(mq, '.');
+    ctx->module_dir_qn = dot && rust_stem_owns_directory(dot + 1)
+                             ? cbm_arena_strndup(ctx->arena, mq, (size_t)(dot - mq))
+                             : mq;
+    return ctx->module_dir_qn;
+}
+
+/* QN of the parent module for `super::`. */
+static const char *rust_super_module_qn(RustLSPContext *ctx) {
+    const char *dir = rust_module_dir_qn(ctx);
+    if (!dir) {
+        return NULL;
+    }
+    const char *dot = strrchr(dir, '.');
+    return dot ? cbm_arena_strndup(ctx->arena, dir, (size_t)(dot - dir)) : NULL;
+}
+
+/* `<project>.<member path>.src` for a workspace member. */
+static const char *rust_member_root_prefix(RustLSPContext *ctx, const CBMCargoMember *member) {
+    if (!ctx || !ctx->module_qn || !member || !member->member_path) {
+        return NULL;
+    }
+    const char *project_end = strchr(ctx->module_qn, '.');
+    size_t project_len =
+        project_end ? (size_t)(project_end - ctx->module_qn) : strlen(ctx->module_qn);
+    const char *path = member->member_path;
+    while (strncmp(path, "./", 2) == 0) {
+        path += 2;
+    }
+    char *dotted = cbm_arena_strdup(ctx->arena, path);
+    for (char *p = dotted; *p; p++) {
+        if (*p == '/') {
+            *p = '.';
+        }
+    }
+    size_t dl = strlen(dotted);
+    while (dl > 0 && dotted[dl - 1] == '.') {
+        dotted[--dl] = '\0';
+    }
+    return cbm_arena_sprintf(ctx->arena, "%.*s.%s.src", (int)project_len, ctx->module_qn, dotted);
+}
+
+/* Rewrite a `crate_name.rest` head onto the member's file-derived prefix. */
+static const char *rust_canonical_workspace_qn(RustLSPContext *ctx, const char *qn) {
+    if (!ctx || !qn || !ctx->cargo_manifest || !ctx->module_qn) {
+        return qn;
+    }
+    const char *dot = strchr(qn, '.');
+    if (!dot) {
+        return qn;
+    }
+    const char *project_end = strchr(ctx->module_qn, '.');
+    size_t project_len =
+        project_end ? (size_t)(project_end - ctx->module_qn) : strlen(ctx->module_qn);
+    if ((size_t)(dot - qn) == project_len && strncmp(qn, ctx->module_qn, project_len) == 0) {
+        return qn;
+    }
+    char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
+    const CBMCargoMember *member =
+        cbm_cargo_find_member((const CBMCargoManifest *)ctx->cargo_manifest, head);
+    const char *prefix = member ? rust_member_root_prefix(ctx, member) : NULL;
+    return prefix ? cbm_arena_sprintf(ctx->arena, "%s%s", prefix, dot) : qn;
+}
+
+struct RustQnMatch {
+    const CBMRegisteredFunc *func;
+    const CBMRegisteredType *type;
+    int matches;
+};
+
+static void rust_qn_probe(RustLSPContext *ctx, const char *candidate, bool want_type,
+                          RustQnMatch *m) {
+    if (!candidate) {
+        return;
+    }
+    if (want_type) {
+        const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, candidate);
+        if (t && t != m->type) {
+            m->type = t;
+            m->matches++;
+        }
+        return;
+    }
+    const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, candidate);
+    if (!f) {
+        /* A cfg-gated free function is published as `<qn>#cfg(...)]`. One
+         * such twin is an exact answer; two are a cfg decision this resolver
+         * cannot make. */
+        const char *leaf_dot = strrchr(candidate, '.');
+        const char *leaf = leaf_dot ? leaf_dot + 1 : candidate;
+        size_t len = strlen(candidate);
+        CBMFreeFuncIter it;
+        cbm_registry_free_funcs_by_short_name_chain(ctx->registry, leaf, &it);
+        int twins = 0;
+        for (int i; (i = cbm_free_func_iter_next(&it)) >= 0;) {
+            const CBMRegisteredFunc *cand = &it.reg->funcs[i];
+            if (cand->qualified_name && strncmp(cand->qualified_name, candidate, len) == 0 &&
+                cand->qualified_name[len] == '#') {
+                f = cand;
+                twins++;
+            }
+        }
+        if (twins != 1) {
+            f = NULL;
+        }
+    }
+    if (f && f != m->func) {
+        m->func = f;
+        m->matches++;
+    }
+}
+
+/* Probe every file layout a module path can denote: the exact QN, a
+ * `mod.rs` directory module, the `lib.rs`/`main.rs` crate root, a child
+ * module declared from a crate-root file, and an inline `mod` flattened by
+ * extraction. Exactly one distinct registered item may answer. */
+static void rust_qn_variants(RustLSPContext *ctx, const char *qn, bool want_type, RustQnMatch *m) {
+    memset(m, 0, sizeof(*m));
+    if (!ctx || !ctx->registry || !qn || !qn[0]) {
+        return;
+    }
+    qn = rust_canonical_workspace_qn(ctx, qn);
+    rust_qn_probe(ctx, qn, want_type, m);
+    const char *leaf_dot = strrchr(qn, '.');
+    if (!leaf_dot || leaf_dot == qn) {
+        return;
+    }
+    const char *leaf = leaf_dot + 1;
+    char *parent = cbm_arena_strndup(ctx->arena, qn, (size_t)(leaf_dot - qn));
+    rust_qn_probe(ctx, cbm_arena_sprintf(ctx->arena, "%s.mod.%s", parent, leaf), want_type, m);
+    const char *prefix = rust_crate_root_prefix(ctx);
+    size_t prefix_len = prefix ? strlen(prefix) : 0;
+    bool under_prefix = prefix && strncmp(parent, prefix, prefix_len) == 0 &&
+                        (parent[prefix_len] == '\0' || parent[prefix_len] == '.');
+    if (under_prefix && parent[prefix_len] == '\0') {
+        rust_qn_probe(ctx, cbm_arena_sprintf(ctx->arena, "%s.lib.%s", prefix, leaf), want_type, m);
+        rust_qn_probe(ctx, cbm_arena_sprintf(ctx->arena, "%s.main.%s", prefix, leaf), want_type, m);
+    }
+    if (under_prefix && parent[prefix_len] != '\0') {
+        /* `<prefix>.lib.child.f` (a child module reached from a crate-root
+         * file) lives in `<prefix>.child.f`; the same holds for `main`. */
+        const char *tail = parent + prefix_len + 1;
+        const char *seg_end = strchr(tail, '.');
+        if (seg_end) {
+            size_t seg_len = (size_t)(seg_end - tail);
+            if ((seg_len == 3 && strncmp(tail, "lib", 3) == 0) ||
+                (seg_len == 4 && strncmp(tail, "main", 4) == 0)) {
+                rust_qn_probe(ctx,
+                              cbm_arena_sprintf(ctx->arena, "%s.%s.%s", prefix, seg_end + 1, leaf),
+                              want_type, m);
+            }
+        }
+        /* `mod` is a keyword, so an interior `.mod.` segment always names a
+         * `mod.rs` file standing for its directory: `a.mod.b.f` is `a.b.f`. */
+        const char *mod_seg = strstr(parent, ".mod.");
+        if (mod_seg) {
+            rust_qn_probe(ctx,
+                          cbm_arena_sprintf(ctx->arena, "%.*s%s.%s", (int)(mod_seg - parent),
+                                            parent, mod_seg + 4, leaf),
+                          want_type, m);
+        }
+        /* Inline `mod name { ... }` items are extracted under the file itself. */
+        const char *parent_dot = strrchr(parent, '.');
+        if (parent_dot && (size_t)(parent_dot - parent) > prefix_len) {
+            rust_qn_probe(
+                ctx,
+                cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)(parent_dot - parent), parent, leaf),
+                want_type, m);
+        }
+    }
+    /* Nothing declared under that module: follow the module file's own
+     * `use` (a `pub use` re-export, or a parent's import seen via `super::*`). */
+    if (m->matches == 0 && ctx->export_depth < 3) {
+        const char *exported = rust_module_export(ctx, parent, leaf);
+        if (exported) {
+            ctx->export_depth++;
+            rust_qn_variants(ctx, exported, want_type, m);
+            ctx->export_depth--;
+        }
+    }
+}
+
+/* Resolve `<module>.<name>` through the module file's own `use` declaration
+ * (`pub use inner::Name;` re-export, or a parent's import seen through
+ * `super::*`). The path text is resolved as that file would resolve it. */
+/* Resolve a raw `use` path as the file with module QN `module_qn` would,
+ * using only module-relative keywords, workspace crate heads and absolute
+ * paths: that file's own imports, globs and `mod` declarations are not
+ * available here. */
+static const char *rust_resolve_path_in_module(RustLSPContext *ctx, const char *module_qn,
+                                               const char *path, const char *relative_dir) {
+    if (strncmp(path, "crate::", 7) == 0) {
+        const char *prefix = rust_qn_crate_prefix(ctx, module_qn);
+        return prefix ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix,
+                                          convert_path_to_qn(ctx->arena, path + 7))
+                      : NULL;
+    }
+    if (strncmp(path, "self::", 6) == 0) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn,
+                                 convert_path_to_qn(ctx->arena, path + 6));
+    }
+    if (strncmp(path, "super::", 7) == 0) {
+        const char *dot = strrchr(module_qn, '.');
+        const char *dir = dot && rust_stem_owns_directory(dot + 1)
+                              ? cbm_arena_strndup(ctx->arena, module_qn, (size_t)(dot - module_qn))
+                              : module_qn;
+        const char *rest = path + 7;
+        const char *parent = dir;
+        for (;;) {
+            const char *pdot = strrchr(parent, '.');
+            if (!pdot) {
+                return NULL;
+            }
+            parent = cbm_arena_strndup(ctx->arena, parent, (size_t)(pdot - parent));
+            if (strncmp(rest, "super::", 7) != 0) {
+                break;
+            }
+            rest += 7;
+        }
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", parent, convert_path_to_qn(ctx->arena, rest));
+    }
+    const char *sep = strstr(path, "::");
+    if (sep && ctx->cargo_manifest) {
+        char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(sep - path));
+        const CBMCargoMember *member =
+            cbm_cargo_find_member((const CBMCargoManifest *)ctx->cargo_manifest, head);
+        const char *member_prefix = member ? rust_member_root_prefix(ctx, member) : NULL;
+        if (member_prefix) {
+            return cbm_arena_sprintf(ctx->arena, "%s.%s", member_prefix,
+                                     convert_path_to_qn(ctx->arena, sep + 2));
+        }
+    }
+    if (sep && relative_dir) {
+        /* `pub use child::Item;` names a module declared by that file; the
+         * registry check on the result keeps an external head harmless. */
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", relative_dir,
+                                 convert_path_to_qn(ctx->arena, path));
+    }
+    return convert_path_to_qn(ctx->arena, path);
+}
+
+/* Resolve `<module>.<name>` through the module file's own `use` declaration
+ * (`pub use inner::Name;` re-export, or a parent's import seen through
+ * `super::*`). Results, including misses, are memoized per file. */
+static const char *rust_module_export(RustLSPContext *ctx, const char *module_qn,
+                                      const char *name) {
+    if (!ctx || !ctx->imports || !ctx->imports->lookup || !module_qn || !name) {
+        return NULL;
+    }
+    const char *memo_key = cbm_arena_sprintf(ctx->arena, "%s\x1f%s", module_qn, name);
+    int32_t memo = cbm_idxmemo_get(&ctx->export_memo, memo_key);
+    if (memo >= 0) {
+        return memo == 0 ? NULL : ctx->export_values[memo - 1];
+    }
+    const char *result = NULL;
+    const char *prefix = rust_crate_root_prefix(ctx);
+    const char *files[4];
+    int file_count = 0;
+    files[file_count++] = module_qn;
+    files[file_count++] = cbm_arena_sprintf(ctx->arena, "%s.mod", module_qn);
+    if (prefix && strcmp(module_qn, prefix) == 0) {
+        files[file_count++] = cbm_arena_sprintf(ctx->arena, "%s.lib", module_qn);
+        files[file_count++] = cbm_arena_sprintf(ctx->arena, "%s.main", module_qn);
+    }
+    const char *own = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
+    for (int i = 0; i < file_count && !result; i++) {
+        const char *path = ctx->imports->lookup(ctx->imports->ctx, files[i], name);
+        if (!path || !path[0]) {
+            continue;
+        }
+        const char *file_dot = strrchr(files[i], '.');
+        const char *file_dir =
+            file_dot && rust_stem_owns_directory(file_dot + 1)
+                ? cbm_arena_strndup(ctx->arena, files[i], (size_t)(file_dot - files[i]))
+                : files[i];
+        const char *absolute = rust_resolve_path_in_module(ctx, files[i], path, NULL);
+        const char *relative = rust_resolve_path_in_module(ctx, files[i], path, file_dir);
+        /* Prefer the reading that names a registered item; the caller
+         * re-validates whichever candidate is returned. */
+        RustQnMatch probe;
+        if (relative && strcmp(relative, absolute ? absolute : "") != 0) {
+            ctx->export_depth++;
+            rust_qn_variants(ctx, relative, false, &probe);
+            if (probe.matches == 0) {
+                rust_qn_variants(ctx, relative, true, &probe);
+            }
+            ctx->export_depth--;
+            if (probe.matches == 1) {
+                result = relative;
+            }
+        }
+        if (!result && absolute && strcmp(absolute, own) != 0) {
+            result = absolute;
+        }
+    }
+    int32_t slot = 0;
+    if (result) {
+        if (ctx->export_value_count % 64 == 0) {
+            const char **grown = (const char **)cbm_arena_alloc(
+                ctx->arena, (size_t)(ctx->export_value_count + 64) * sizeof(char *));
+            if (!grown) {
+                return result;
+            }
+            if (ctx->export_value_count > 0) {
+                memcpy(grown, ctx->export_values, (size_t)ctx->export_value_count * sizeof(char *));
+            }
+            ctx->export_values = grown;
+        }
+        ctx->export_values[ctx->export_value_count++] = result;
+        slot = ctx->export_value_count;
+    }
+    cbm_idxmemo_put_if_absent(&ctx->export_memo, ctx->arena, memo_key, slot);
+    return result;
+}
+
+static const CBMRegisteredFunc *rust_lookup_func_variants(RustLSPContext *ctx, const char *qn) {
+    RustQnMatch m;
+    rust_qn_variants(ctx, qn, false, &m);
+    return m.matches == 1 ? m.func : NULL;
+}
+
+static const CBMRegisteredType *rust_lookup_type_variants(RustLSPContext *ctx, const char *qn) {
+    RustQnMatch m;
+    rust_qn_variants(ctx, qn, true, &m);
+    return m.matches == 1 ? m.type : NULL;
+}
+
+/* A type reachable through exactly one of this file's glob imports. */
+static const CBMRegisteredType *rust_resolve_glob_type(RustLSPContext *ctx, const char *name) {
+    if (!ctx || !name || ctx->glob_count == 0) {
+        return NULL;
+    }
+    const CBMRegisteredType *hit = NULL;
+    int sources = 0;
+    for (int g = 0; g < ctx->glob_count; g++) {
+        const CBMRegisteredType *t = rust_lookup_type_variants(
+            ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->glob_module_qns[g], name));
+        if (t && t != hit) {
+            hit = t;
+            sources++;
+        }
+    }
+    return sources == 1 ? hit : NULL;
+}
+
+/* Crate prefix of an arbitrary file-derived QN (see rust_crate_root_prefix). */
+static const char *rust_qn_crate_prefix(RustLSPContext *ctx, const char *qn) {
+    const char *first = strchr(qn, '.');
+    for (const char *p = first ? first + 1 : NULL; p && *p;) {
+        const char *end = strchr(p, '.');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (rust_segment_is_source_root(p, len)) {
+            return cbm_arena_strndup(ctx->arena, qn, (size_t)(p + len - qn));
+        }
+        if (!end) {
+            break;
+        }
+        p = end + 1;
+    }
+    return NULL;
+}
+
+/* Registered QN for a type name that reached the resolver as
+ * `<defining module>.<Name>`: signature and field types are recorded in
+ * the defining file's module without that file's imports. Recovery order:
+ * exact, layout variants, this file's own import of the same leaf, this
+ * file's module, a unique glob source, then a unique type of that leaf
+ * inside the defining crate. NULL when nothing answers exactly once. */
+static const char *rust_registered_type_qn(RustLSPContext *ctx, const char *qn) {
+    if (!ctx || !ctx->registry || !qn || !qn[0]) {
+        return NULL;
+    }
+    if (cbm_registry_lookup_type(ctx->registry, qn)) {
+        return qn;
+    }
+    const CBMRegisteredType *t = rust_lookup_type_variants(ctx, qn);
+    if (t) {
+        return t->qualified_name;
+    }
+    const char *dot = strrchr(qn, '.');
+    const char *leaf = dot ? dot + 1 : qn;
+    if (!leaf[0] || strchr(leaf, '<')) {
+        return NULL;
+    }
+    const char *imported = rust_resolve_use(ctx, leaf);
+    if (imported) {
+        t = rust_lookup_type_variants(ctx, convert_path_to_qn(ctx->arena, imported));
+        if (t) {
+            return t->qualified_name;
+        }
+    }
+    if (ctx->module_qn) {
+        t = rust_lookup_type_variants(ctx,
+                                      cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, leaf));
+        if (t) {
+            return t->qualified_name;
+        }
+    }
+    t = rust_resolve_glob_type(ctx, leaf);
+    if (t) {
+        return t->qualified_name;
+    }
+    const char *prefix = dot ? rust_qn_crate_prefix(ctx, qn) : NULL;
+    if (!prefix) {
+        return NULL;
+    }
+    size_t prefix_len = strlen(prefix);
+    const CBMRegisteredType *unique = NULL;
+    int count = 0;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->registry, leaf, &it);
+    for (int i; (i = cbm_type_short_iter_next(&it)) >= 0;) {
+        const CBMRegisteredType *cand = &it.reg->types[i];
+        if (!cand->qualified_name || strcmp(cand->short_name ? cand->short_name : "", leaf) != 0) {
+            continue;
+        }
+        if (strncmp(cand->qualified_name, prefix, prefix_len) == 0 &&
+            cand->qualified_name[prefix_len] == '.' && cand != unique) {
+            unique = cand;
+            count++;
+        }
+    }
+    return count == 1 ? unique->qualified_name : NULL;
+}
+
 /* Resolve a Rust *path expression* (e.g. `Foo::bar` or `crate::x::y`)
  * into a canonical QN. The resolver cascades through these rules,
  * matching what `rust-analyzer`'s name resolver does at the path level:
@@ -644,32 +1138,24 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
      * forms `module_qn` as `<project>.<crate>.<rel-path-segments>`, so
      * the first two segments are project + crate root. */
     if (strncmp(path, "crate::", 7) == 0 && ctx->module_qn) {
-        const char *p = ctx->module_qn;
-        int dots = 0;
-        const char *second_dot = NULL;
-        for (; *p; p++) {
-            if (*p == '.') {
-                if (++dots == 2) {
-                    second_dot = p;
-                    break;
-                }
-            }
-        }
-        size_t crate_len =
-            second_dot ? (size_t)(second_dot - ctx->module_qn) : strlen(ctx->module_qn);
-        char *crate_buf = cbm_arena_strndup(ctx->arena, ctx->module_qn, crate_len);
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", crate_buf,
+        const char *prefix = rust_crate_root_prefix(ctx);
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", prefix,
                                  convert_path_to_qn(ctx->arena, path + 7));
     }
 
-    /* super:: → drop last segment of module_qn. */
+    /* super:: → the parent module's directory; `mod.rs`, `lib.rs` and
+     * `main.rs` already stand for their directory. Repeated `super::` climbs. */
     if (strncmp(path, "super::", 7) == 0 && ctx->module_qn) {
-        const char *dot = strrchr(ctx->module_qn, '.');
-        if (dot) {
-            char *parent =
-                cbm_arena_strndup(ctx->arena, ctx->module_qn, (size_t)(dot - ctx->module_qn));
+        const char *parent = rust_super_module_qn(ctx);
+        const char *rest = path + 7;
+        while (parent && strncmp(rest, "super::", 7) == 0) {
+            const char *dot = strrchr(parent, '.');
+            parent = dot ? cbm_arena_strndup(ctx->arena, parent, (size_t)(dot - parent)) : NULL;
+            rest += 7;
+        }
+        if (parent) {
             return cbm_arena_sprintf(ctx->arena, "%s.%s", parent,
-                                     convert_path_to_qn(ctx->arena, path + 7));
+                                     convert_path_to_qn(ctx->arena, rest));
         }
     }
 
@@ -685,9 +1171,18 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
         if (prelude) {
             return prelude;
         }
-        /* Bare identifier — assume same module. */
+        /* Bare identifier — this module's own item, else a unique glob source. */
         if (ctx->module_qn) {
-            return cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, path);
+            const char *own = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, path);
+            if (ctx->glob_count > 0 && ctx->registry &&
+                !cbm_registry_lookup_type(ctx->registry, own) &&
+                !cbm_registry_lookup_func(ctx->registry, own)) {
+                const CBMRegisteredType *glob_type = rust_resolve_glob_type(ctx, path);
+                if (glob_type) {
+                    return glob_type->qualified_name;
+                }
+            }
+            return own;
         }
         return path;
     }
@@ -719,9 +1214,10 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
         const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
         const CBMCargoMember *mem = cbm_cargo_find_member(m, head);
         if (mem) {
-            /* Workspace member: route to `<member_name>.<tail>` so the
-             * pipeline's cross-crate resolution can match it. */
-            return cbm_arena_sprintf(ctx->arena, "%s.%s", head,
+            /* Workspace member: route to its file-derived `<project>.<path>.src`
+             * prefix so the registry's exact QNs can answer. */
+            const char *member_prefix = rust_member_root_prefix(ctx, mem);
+            return cbm_arena_sprintf(ctx->arena, "%s.%s", member_prefix ? member_prefix : head,
                                      convert_path_to_qn(ctx->arena, tail));
         }
         if (cbm_cargo_is_known_dep(m, head)) {
@@ -734,11 +1230,59 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
         }
     }
 
+    /* A head declared by this file's own `mod head;` is a child module of
+     * the directory this file owns. When the registry also holds the other
+     * layout for the same path the identity is not settled and stays open. */
+    if (cbm_idxmemo_get(&ctx->declared_modules, head) >= 0) {
+        const char *dir = rust_module_dir_qn(ctx);
+        if (dir) {
+            const char *tail_qn = convert_path_to_qn(ctx->arena, tail);
+            const char *owned = cbm_arena_sprintf(ctx->arena, "%s.%s.%s", dir, head, tail_qn);
+            const char *other =
+                cbm_arena_sprintf(ctx->arena, "%s.%s.%s", ctx->module_qn, head, tail_qn);
+            bool ambiguous = strcmp(owned, other) != 0 && ctx->registry &&
+                             (cbm_registry_lookup_type(ctx->registry, other) ||
+                              cbm_registry_lookup_func(ctx->registry, other));
+            if (!ambiguous) {
+                return owned;
+            }
+        }
+    }
+
+    /* `Type::item` where the type arrives through exactly one glob import. */
+    if (ctx->glob_count > 0 && ctx->module_qn && ctx->registry) {
+        const char *own = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
+        if (!cbm_registry_lookup_type(ctx->registry, own)) {
+            const CBMRegisteredType *glob_type = rust_resolve_glob_type(ctx, head);
+            if (glob_type) {
+                return cbm_arena_sprintf(ctx->arena, "%s.%s", glob_type->qualified_name,
+                                         convert_path_to_qn(ctx->arena, tail));
+            }
+        }
+    }
+
     /* Treat unknown-head paths as absolute: `std::io::Read` → `std.io.Read`.
      * Type parsing performs the narrower exact project-relative probe; doing
      * it here would reclassify `Type::method` as a direct free-function call
      * before the UFCS/constructor dispatch logic sees it. */
     return convert_path_to_qn(ctx->arena, path);
+}
+
+/* Resolve the module named by a `use path::*` glob. */
+static const char *rust_resolve_module_path(RustLSPContext *ctx, const char *path) {
+    if (!ctx || !path) {
+        return NULL;
+    }
+    if (strcmp(path, "crate") == 0) {
+        return rust_crate_root_prefix(ctx);
+    }
+    if (strcmp(path, "self") == 0) {
+        return ctx->module_qn;
+    }
+    if (strcmp(path, "super") == 0) {
+        return rust_super_module_qn(ctx);
+    }
+    return rust_resolve_path_expr(ctx, path);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -770,6 +1314,10 @@ static const char *resolve_path_to_type_qn(RustLSPContext *ctx, const char *path
     }
     if (cbm_registry_lookup_type(ctx->registry, qn)) {
         return qn;
+    }
+    const CBMRegisteredType *variant = rust_lookup_type_variants(ctx, qn);
+    if (variant) {
+        return variant->qualified_name;
     }
     const char *normalized = convert_path_to_qn(ctx->arena, path);
     if (!normalized || strcmp(qn, normalized) != 0) {
@@ -1493,13 +2041,13 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         const char *full = rust_resolve_use(ctx, name);
         if (full) {
             const char *qn = convert_path_to_qn(ctx->arena, full);
-            const CBMRegisteredFunc *uf = cbm_registry_lookup_func(ctx->registry, qn);
+            const CBMRegisteredFunc *uf = rust_lookup_func_variants(ctx, qn);
             if (uf && uf->signature) {
                 return uf->signature;
             }
-            const CBMRegisteredType *ut = cbm_registry_lookup_type(ctx->registry, qn);
+            const CBMRegisteredType *ut = rust_lookup_type_variants(ctx, qn);
             if (ut) {
-                return cbm_type_named(ctx->arena, qn);
+                return cbm_type_named(ctx->arena, ut->qualified_name);
             }
         }
         /* Same-module type? */
@@ -1525,12 +2073,13 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         if (!qn) {
             return cbm_type_unknown();
         }
-        const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, qn);
+        const CBMRegisteredFunc *f = rust_lookup_func_variants(ctx, qn);
         if (f && f->signature) {
             return f->signature;
         }
-        if (cbm_registry_lookup_type(ctx->registry, qn)) {
-            return cbm_type_named(ctx->arena, qn);
+        const CBMRegisteredType *t = rust_lookup_type_variants(ctx, qn);
+        if (t) {
+            return cbm_type_named(ctx->arena, t->qualified_name);
         }
         return cbm_type_unknown();
     }
@@ -2323,6 +2872,12 @@ static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType
         type_qn = "core.slice";
     } else {
         return cbm_type_unknown();
+    }
+    {
+        const char *registered = rust_registered_type_qn(ctx, type_qn);
+        if (registered) {
+            type_qn = registered;
+        }
     }
     if (!type_qn)
         return cbm_type_unknown();
@@ -4352,6 +4907,10 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         }
 
         if (type_qn) {
+            const char *registered = rust_registered_type_qn(ctx, type_qn);
+            if (registered) {
+                type_qn = registered;
+            }
             int impl_count = 0;
             bool trait_dispatch = false;
             const CBMRegisteredFunc *m =
@@ -4402,6 +4961,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 }
                 if (!next_qn)
                     break;
+                const char *next_registered = rust_registered_type_qn(ctx, next_qn);
+                if (next_registered)
+                    next_qn = next_registered;
                 int hop_impls = 0;
                 const CBMRegisteredFunc *hm =
                     rust_resolve_trait_method(ctx, next_qn, mname, &hop_impls, NULL);
@@ -4483,7 +5045,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             if (cbm_scope_contains(ctx->current_scope, path)) {
                 return;
             }
-            if (ctx->glob_count > 0) {
+            /* A glob declared inside an enclosing block shadows the module's
+             * items; its source is not modelled, so the name stays open. */
+            if (ctx->glob_count > ctx->file_glob_count) {
                 rust_emit_unresolved_call(ctx, path, "unresolved_glob_import");
                 return;
             }
@@ -4496,8 +5060,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         /* Try registered free function first. Also try module-prefixed
          * fallback so `Logger::new` (which resolves to "Logger.new")
          * still finds the project's `<module>.Logger.new`. */
-        const CBMRegisteredFunc *direct = cbm_registry_lookup_func(ctx->registry, qn);
+        const CBMRegisteredFunc *direct = rust_lookup_func_variants(ctx, qn);
         if (direct && !direct->receiver_type) {
+            qn = direct->qualified_name;
             const char *strategy = rust_resolve_use(ctx, path) ? "lsp_import_alias" : "lsp_direct";
             rust_emit_resolved_call_reason(ctx, qn, NULL, strategy, CBM_RUST_CONF_DIRECT, path);
             return;
@@ -4527,6 +5092,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
              * complete pass and win the join. */
             const char *trait_qn = NULL;
             const CBMRegisteredType *head_t = cbm_registry_lookup_type(ctx->registry, head);
+            if (!head_t) {
+                head_t = rust_lookup_type_variants(ctx, head);
+                if (head_t) {
+                    head = cbm_arena_strdup(ctx->arena, head_t->qualified_name);
+                }
+            }
             if (head_t && head_t->is_interface) {
                 trait_qn = head;
             } else if (ctx->module_qn) {
@@ -4574,7 +5145,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 tm = rust_resolve_trait_method(ctx, full_head, short_name, &impls, NULL);
             }
             if (tm && impls == 1) {
-                rust_emit_resolved_call(ctx, tm->qualified_name, tm->impl_key, "lsp_trait_ufcs",
+                /* `Type::method()` names the receiver explicitly, so its sole
+                 * trait implementation is exact; only a trait-headed path
+                 * (`Trait::method()`) depends on inference and stays a guess. */
+                rust_emit_resolved_call(ctx, tm->qualified_name, tm->impl_key,
+                                        head_t && !head_t->is_interface ? "lsp_ufcs"
+                                                                        : "lsp_trait_ufcs",
                                         CBM_RUST_CONF_TRAIT_SOLE);
                 return;
             }
@@ -4642,6 +5218,31 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             }
         }
 
+        /* Glob imports: an item of the current module has already been
+         * tried above and shadows every glob. Exactly one glob source may
+         * define the bare name; two sources, or none, resolve nothing. */
+        if (strcmp(ts_node_type(actual_func), "identifier") == 0 && ctx->glob_count > 0 &&
+            !rust_resolve_use(ctx, path)) {
+            const CBMRegisteredFunc *hit = NULL;
+            int sources = 0;
+            for (int g = 0; g < ctx->glob_count; g++) {
+                const char *candidate =
+                    cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->glob_module_qns[g], path);
+                const CBMRegisteredFunc *f = rust_lookup_func_variants(ctx, candidate);
+                if (f && !f->receiver_type && f != hit) {
+                    hit = f;
+                    sources++;
+                }
+            }
+            if (sources == 1) {
+                rust_emit_resolved_call_reason(ctx, hit->qualified_name, NULL, "lsp_glob_import",
+                                               CBM_RUST_CONF_DIRECT, path);
+                return;
+            }
+            rust_emit_unresolved_call(ctx, path, "unresolved_glob_import");
+            return;
+        }
+
         /* Last-ditch: emit with the resolved path. */
         rust_emit_unresolved_call(ctx, qn, "function_not_in_registry");
         return;
@@ -4680,6 +5281,18 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "function_item") == 0) {
         return; /* A nested item's body is not executed by its enclosing function. */
+    }
+
+    /* A `let` initializer runs before its pattern is in scope: resolve the
+     * value first so `let f = f(x);` still reaches the function `f`. */
+    TSNode let_value = {0};
+    bool let_value_walked = false;
+    if (strcmp(kind, "let_declaration") == 0) {
+        let_value = ts_node_child_by_field_name(node, "value", 5);
+        if (!ts_node_is_null(let_value)) {
+            rust_resolve_calls_in_node(ctx, let_value);
+            let_value_walked = true;
+        }
     }
 
     /* Bind variables introduced by this statement. */
@@ -5042,6 +5655,9 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(node, i);
+        if (let_value_walked && ts_node_eq(c, let_value)) {
+            continue;
+        }
         if (!ts_node_is_null(c)) {
             rust_resolve_calls_in_node(ctx, c);
         }
@@ -5067,7 +5683,34 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
         return;
 
     const char *prefix = parent_qn ? parent_qn : ctx->module_qn;
-    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
+    /* A trait-impl method is published as `<Type>.<name>[<Trait>]` and a
+     * cfg-gated free function as `<name>#cfg(..)]` (extract_rust_impl,
+     * cbm_rust_cfg_qualified_name); the caller identity must match that node. */
+    ctx->enclosing_func_qn =
+        parent_qn && ctx->self_trait_spelling
+            ? cbm_arena_sprintf(ctx->arena, "%s.%s[%s]", prefix, name, ctx->self_trait_spelling)
+            : cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
+    if (!parent_qn) {
+        const char *decorators[17];
+        int count = 0;
+        for (TSNode prev = ts_node_prev_named_sibling(func_node);
+             !ts_node_is_null(prev) && count < 16; prev = ts_node_prev_named_sibling(prev)) {
+            if (strcmp(ts_node_type(prev), "attribute_item") != 0) {
+                break;
+            }
+            decorators[count++] = rust_node_text(ctx, prev);
+        }
+        if (count > 0) {
+            for (int i = 0; i < count / 2; i++) {
+                const char *tmp = decorators[i];
+                decorators[i] = decorators[count - 1 - i];
+                decorators[count - 1 - i] = tmp;
+            }
+            decorators[count] = NULL;
+            ctx->enclosing_func_qn =
+                cbm_rust_cfg_qualified_name(ctx->arena, ctx->enclosing_func_qn, decorators);
+        }
+    }
 
     CBMScope *saved = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
@@ -5343,16 +5986,21 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     const char *saved_self = ctx->self_type_qn;
     const char *saved_trait = ctx->self_trait_qn;
+    const char *saved_trait_spelling = ctx->self_trait_spelling;
     const char *saved_impl_key = ctx->enclosing_impl_key;
     ctx->self_type_qn = effective_recv;
     ctx->self_trait_qn = NULL;
+    ctx->self_trait_spelling = NULL;
     ctx->enclosing_impl_key = NULL;
 
-    if (!ts_node_is_null(trait_node) && !is_blanket) {
+    if (!ts_node_is_null(trait_node)) {
         char *tt = rust_node_text(ctx, trait_node);
-        if (tt) {
+        if (tt && !is_blanket) {
             ctx->self_trait_qn = rust_resolve_path_expr(ctx, tt);
             ctx->enclosing_impl_key = cbm_rust_impl_key(ctx->arena, effective_recv, type_text, tt);
+        }
+        if (tt && tt[0]) {
+            ctx->self_trait_spelling = tt;
         }
     }
 
@@ -5372,6 +6020,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     ctx->self_type_qn = saved_self;
     ctx->self_trait_qn = saved_trait;
+    ctx->self_trait_spelling = saved_trait_spelling;
     ctx->enclosing_impl_key = saved_impl_key;
 }
 
@@ -5501,7 +6150,9 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
                     size_t length = strlen(imp->module_path);
                     if (length > 2) {
                         char *module = cbm_arena_strndup(ctx->arena, imp->module_path, length - 3);
-                        rust_lsp_add_glob(ctx, convert_path_to_qn(ctx->arena, module));
+                        const char *module_qn = rust_resolve_module_path(ctx, module);
+                        rust_lsp_add_glob(ctx, module_qn ? module_qn
+                                                         : convert_path_to_qn(ctx->arena, module));
                     }
                 } else if (strcmp(imp->local_name, "_") != 0) {
                     const char *path = imp->module_path;
@@ -6132,6 +6783,7 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
     ctx.syn_calls = &result->calls;
 
     rust_collect_uses(&ctx, root);
+    ctx.file_glob_count = ctx.glob_count;
     rust_lsp_process_file(&ctx, root);
 }
 
@@ -6230,6 +6882,46 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             continue;
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
 
+        /* Struct fields (`name:type|name:type`) let `self.field.method()` and
+         * `value.field.method()` type their receiver across files. Field types
+         * are spelled in the defining module; rust_registered_type_qn recovers
+         * their registered identity at use time. */
+        if (d->field_defs && d->field_defs[0] && cbm_label_is_type_like(d->label)) {
+            int32_t tix = cbm_idxmemo_get(&type_idx, d->qualified_name);
+            if (tix >= 0 && !reg->types[tix].field_names) {
+                int count = 1;
+                for (const char *p = d->field_defs; *p; p++) {
+                    if (*p == '|')
+                        count++;
+                }
+                const char **names =
+                    (const char **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(char *));
+                const CBMType **types = (const CBMType **)cbm_arena_alloc(
+                    arena, (size_t)(count + 1) * sizeof(const CBMType *));
+                int n = 0;
+                char *buf = cbm_arena_strdup(arena, d->field_defs);
+                for (char *entry = buf; entry && *entry;) {
+                    char *bar = strchr(entry, '|');
+                    if (bar)
+                        *bar = '\0';
+                    char *colon = strchr(entry, ':');
+                    if (colon && colon > entry && colon[1]) {
+                        *colon = '\0';
+                        names[n] = entry;
+                        types[n] = rust_parse_return_type_text(arena, colon + 1, def_mod);
+                        n++;
+                    }
+                    entry = bar ? bar + 1 : NULL;
+                }
+                names[n] = NULL;
+                types[n] = NULL;
+                if (n > 0) {
+                    reg->types[tix].field_names = names;
+                    reg->types[tix].field_types = types;
+                }
+            }
+        }
+
         if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
             CBMRegisteredFunc rf;
             memset(&rf, 0, sizeof(rf));
@@ -6320,16 +7012,15 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
 }
 
 /* Resolve one Rust file against an ALREADY-built (per-file or shared) registry. */
-static void rust_resolve_against_registry(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn, const CBMTypeRegistry *reg,
-                                          const char **import_names, const char **import_qns,
-                                          int import_count, TSNode root,
-                                          const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out,
-                                          CBMCallArray *synthetic_calls) {
+static void rust_resolve_against_registry(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
+    int import_count, TSNode root, const struct CBMCargoManifest *manifest,
+    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
     RustLSPContext ctx;
     rust_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
     ctx.cargo_manifest = manifest;
+    ctx.imports = imports;
     ctx.syn_calls = synthetic_calls;
     for (int i = 0; i < import_count; i++) {
         if (import_names[i] && import_qns[i]) {
@@ -6338,6 +7029,7 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
     }
     /* Source bindings take precedence over heuristic graph import targets. */
     rust_collect_uses(&ctx, root);
+    ctx.file_glob_count = ctx.glob_count;
     rust_lsp_process_file(&ctx, root);
 }
 
@@ -6383,13 +7075,11 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
 
 /* Cross-file Rust resolve using a pre-built shared registry (Tier-2). Skips the
  * per-file registry build; just parse + resolve. Mirrors cbm_run_c_lsp_cross_with_registry. */
-void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn, const CBMTypeRegistry *reg,
-                                          const char **import_names, const char **import_qns,
-                                          int import_count, TSTree *cached_tree,
-                                          const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out,
-                                          CBMCallArray *synthetic_calls) {
+void cbm_run_rust_lsp_cross_with_registry(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
+    int import_count, TSTree *cached_tree, const struct CBMCargoManifest *manifest,
+    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
     if (!source || source_len <= 0 || !out || !reg)
         return;
     TSParser *parser = NULL;
@@ -6409,7 +7099,8 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
     }
     TSNode root = ts_tree_root_node(tree);
     rust_resolve_against_registry(arena, source, source_len, module_qn, reg, import_names,
-                                  import_qns, import_count, root, manifest, out, synthetic_calls);
+                                  import_qns, import_count, root, manifest, imports, out,
+                                  synthetic_calls);
     if (owns_tree) {
         ts_tree_delete(tree);
         if (parser)
@@ -6417,13 +7108,11 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
     }
 }
 
-void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn, CBMRustLSPDef *defs, int def_count,
-                                          const char **import_names, const char **import_qns,
-                                          int import_count, TSTree *cached_tree,
-                                          const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out,
-                                          CBMCallArray *synthetic_calls) {
+void cbm_run_rust_lsp_cross_with_manifest(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
+    int def_count, const char **import_names, const char **import_qns, int import_count,
+    TSTree *cached_tree, const struct CBMCargoManifest *manifest,
+    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
     if (!source || source_len <= 0 || !out)
         return;
 
@@ -6449,7 +7138,8 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
     rust_populate_cross_registry(&reg, arena, defs, def_count, module_qn);
 
     rust_resolve_against_registry(arena, source, source_len, module_qn, &reg, import_names,
-                                  import_qns, import_count, root, manifest, out, synthetic_calls);
+                                  import_qns, import_count, root, manifest, imports, out,
+                                  synthetic_calls);
 
     if (owns_tree) {
         ts_tree_delete(tree);
@@ -6467,7 +7157,7 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             TSTree *cached_tree, CBMResolvedCallArray *out) {
     cbm_run_rust_lsp_cross_with_manifest(arena, source, source_len, module_qn, defs, def_count,
                                          import_names, import_qns, import_count, cached_tree, NULL,
-                                         out, NULL);
+                                         NULL, out, NULL);
 }
 
 void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int file_count,

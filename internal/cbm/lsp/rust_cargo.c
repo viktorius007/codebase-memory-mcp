@@ -208,8 +208,27 @@ static int parse_package_kv(CBMArena* a, const char* s, int len, int from,
     return from;
 }
 
-static int parse_workspace_kv(CBMArena* a, const char* s, int len, int from,
-    CBMCargoManifest* out) {
+static int parse_lib_kv(CBMArena *a, const char *s, int len, int from, CBMCargoManifest *out) {
+    from = skip_ws_and_comment(s, len, from);
+    if (from >= len || s[from] == '[')
+        return from;
+    const char *key = NULL;
+    from = parse_key(a, s, len, from, &key);
+    from = skip_ws_and_comment(s, len, from);
+    if (from < len && s[from] == '=') {
+        from++;
+        from = skip_ws_and_comment(s, len, from);
+    }
+    if (key && strcmp(key, "name") == 0) {
+        from = parse_string(a, s, len, from, &out->lib_name);
+    } else {
+        from = skip_value(s, len, from);
+    }
+    return from;
+}
+
+static int parse_workspace_kv(CBMArena *a, const char *s, int len, int from,
+                              CBMCargoManifest *out) {
     from = skip_ws_and_comment(s, len, from);
     if (from >= len || s[from] == '[') return from;
     out->is_workspace_root = true;
@@ -274,6 +293,8 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
         }
         if (strcmp(section, "package") == 0) {
             from = parse_package_kv(arena, src, src_len, from, out);
+        } else if (strcmp(section, "lib") == 0) {
+            from = parse_lib_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "workspace") == 0) {
             from = parse_workspace_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "dependencies") == 0 ||
@@ -297,23 +318,43 @@ bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head) {
             return true;
         }
     }
-    for (int i = 0; i < m->member_count; i++) {
-        if (m->members[i].member_name &&
-            strcmp(m->members[i].member_name, head) == 0) {
-            return true;
-        }
+    return cbm_cargo_find_member(m, head) != NULL;
+}
+
+/* Cargo exposes a package `a-b` to Rust code as `a_b`. */
+static bool cargo_name_eq(const char *declared, const char *head) {
+    if (!declared || !head)
+        return false;
+    for (; *declared && *head; declared++, head++) {
+        char d = *declared == '-' ? '_' : *declared;
+        char h = *head == '-' ? '_' : *head;
+        if (d != h)
+            return false;
     }
-    return false;
+    return *declared == '\0' && *head == '\0';
 }
 
 const CBMCargoMember* cbm_cargo_find_member(const CBMCargoManifest* m,
     const char* name) {
     if (!m || !name) return NULL;
     for (int i = 0; i < m->member_count; i++) {
-        if (m->members[i].member_name &&
-            strcmp(m->members[i].member_name, name) == 0) {
+        const CBMCargoMember *member = &m->members[i];
+        if (cargo_name_eq(member->crate_name, name) || cargo_name_eq(member->lib_name, name)) {
+            return member;
+        }
+    }
+    for (int i = 0; i < m->member_count; i++) {
+        if (m->members[i].member_name && strcmp(m->members[i].member_name, name) == 0) {
             return &m->members[i];
         }
     }
     return NULL;
+}
+
+void cbm_cargo_set_member_names(CBMCargoMember *member, const char *crate_name,
+                                const char *lib_name) {
+    if (!member)
+        return;
+    member->crate_name = crate_name;
+    member->lib_name = lib_name;
 }

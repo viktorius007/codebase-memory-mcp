@@ -323,9 +323,9 @@ TEST(mkc_c1_rust_new_samefile) {
          "    let p = Point::new(3.0, 4.0);\n"
          "    p.dist()\n"
          "}\n"}};
-    /* The accepted Rust policy withholds CALLS while the helper requires a
-     * non-empty node graph, preventing an empty-fixture false positive. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 0, "c1/rust/new_samefile", 1));
+    /* run -> Point::new (constructor) and run -> p.dist() (receiver typed by
+     * the constructor's `Self` return). */
+    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c1/rust/new_samefile", 1));
     PASS();
 }
 

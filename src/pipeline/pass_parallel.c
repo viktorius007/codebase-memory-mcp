@@ -1354,7 +1354,7 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
 
 /* Create IMPORTS edges for one file's imports (parallel path). */
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                const char *rel, CBMHashTable *namespace_map) {
+                                const char *rel, CBMHashTable *namespace_map, bool rust) {
     int count = 0;
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -1366,6 +1366,9 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
         CBMImport *imp = &result->imports.items[j];
         if (!imp->module_path) {
             continue;
+        }
+        if (rust) {
+            cbm_pipeline_rust_imports_add(ctx, rel, imp);
         }
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
@@ -1470,7 +1473,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
         }
 
-        imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
+        imports_edges += create_imports_edges(ctx, result, rel, namespace_map,
+                                              files[i].language == CBM_LANG_RUST);
         create_channel_edges(ctx, result, rel);
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
         if (loaded) {
@@ -2758,6 +2762,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
     }
 
+    if (lang == CBM_LANG_RUST) {
+        cbm_pxc_rust_dump_file(rel, result);
+    }
     for (int c = 0; c < result->calls.count; c++) {
         CBMCall *call = &result->calls.items[c];
         if (!call->callee_name) {
@@ -2782,7 +2789,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         const CBMResolvedCall *lsp =
             find_indexed_lsp_call(rc, result, call, lsp_exact_idx, lsp_legacy_idx,
                                   lsp_exact_idx_complete, lsp_legacy_idx_complete, allow_tail);
-        if (!cbm_pipeline_plain_call_admitted(lang, call, lsp, module_qn)) {
+        bool admitted = cbm_pipeline_plain_call_admitted(lang, call, lsp, module_qn);
+        if (lang == CBM_LANG_RUST) {
+            cbm_pxc_rust_dump_call(rel, call, lsp, admitted);
+        }
+        if (!admitted) {
             continue;
         }
         const cbm_gbuf_node_t *lsp_target = resolve_file_call_target(
@@ -3195,6 +3206,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_worker_state_t *ws = &rc->workers[worker_id];
 
     cbm_pxc_set_rust_manifest(rc->rust_manifest);
+    cbm_pxc_set_rust_imports(rc->pctx->rust_imports);
 
     if (!ws->local_edge_buf) {
         ws->local_edge_buf = cbm_gbuf_new_worker(rc->project_name, rc->repo_path, rc->shared_ids);
@@ -3455,6 +3467,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         ws->loaded = NULL;
     }
     cbm_pxc_set_rust_manifest(NULL);
+    cbm_pxc_set_rust_imports(NULL);
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     cbm_service_pattern_cache_end();
@@ -3528,6 +3541,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     atomic_init(&rc.rust_shared_reg, NULL);
     cbm_mutex_init(&rc.rust_shared_mu);
     rc.rust_shared_arena_live = false;
+    cbm_pxc_rust_dump_open();
 
     /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
@@ -3540,6 +3554,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     /* Workers joined: the shared Rust registry (if built) is no longer read.
      * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
      * all QNs, so freeing all_defs afterward is safe). */
+    cbm_pxc_rust_dump_close();
     if (rc.rust_shared_arena_live) {
         cbm_arena_destroy(&rc.rust_shared_arena);
         rc.rust_shared_arena_live = false;

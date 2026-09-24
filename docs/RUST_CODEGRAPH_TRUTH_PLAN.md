@@ -1,9 +1,9 @@
 # Rust relationship accuracy: current state
 
-Semantic index version: **11**. The broader Rust accuracy objective remains unfinished.
-The current supported subset and its verification are recorded in
-[RUST_REPAIR_EVIDENCE.md](RUST_REPAIR_EVIDENCE.md). Commit history owns prior plans,
-investigation transcripts, intermediate results and replay history.
+Semantic index version: **13**. The broader Rust accuracy objective remains unfinished.
+The current supported subset, its measurement against rust-analyzer and its
+verification are recorded in [RUST_REPAIR_EVIDENCE.md](RUST_REPAIR_EVIDENCE.md).
+Commit history owns prior plans, investigation transcripts and replay history.
 
 ## Supported behavior
 
@@ -11,156 +11,85 @@ investigation transcripts, intermediate results and replay history.
   expander. Nested groups, aliases, grouped self, globs and comments retain exact
   paths and bindings.
 - Supported test attributes are classified by path, not documentation substrings.
-  A compact attribute marker survives large documentation and is shared by both
-  definition serializers. Attributed tests may have arbitrary names; unannotated
-  helpers do not qualify solely by being in a test file.
 - HashMap and HashSet retain their std owners; BTreeMap retains its alloc owner.
-- Both publication modes admit exact, source-site-matched bare calls between
-  file-local free functions. Missing Rust semantic targets are terminal:
-  project-prefix, leaf-name and generic registry fallbacks cannot invent an edge.
-- Both publication modes admit exact, source-site-matched `::`-qualified calls
-  from file-local free functions to the unique free function inside the Cargo
-  workspace member the source path names. Ambiguous member matches, undeclared
-  heads and missing manifests emit nothing. A bare call with an exact lexical
-  import into that member follows the same fail-closed route.
-- Lexical imports and local value declarations prevent the tested shadowed names
-  from binding to outer functions. Active glob scopes conservatively leave bare
-  calls unresolved. The project-wide unique-short-name fallback is removed.
-- Live CALLS and derived TESTS are restored for this bounded subset. Current-epoch
-  CALLS/TESTS survive both incremental restoration routes. IMPLEMENTS/OVERRIDE
-  remain rejected.
-- Version 11 invalidates earlier semantic indexes. All three Rust partial-coverage
+- Module paths map onto file-derived qualified names: `crate::` resolves to the
+  crate's `<project>.<member dirs>.<src|tests|benches|examples>` prefix,
+  `super::` to the parent directory (`mod.rs`, `lib.rs` and `main.rs` stand for
+  their directory), a `mod child;` head to the child file, and a workspace crate
+  name (`codex_core::x`, matched against each member manifest's package and lib
+  names) to that member's prefix. Every mapped name is probed against the
+  registry in the layouts a path can denote (`a/b.rs`, `a/b/mod.rs`, `lib.rs`,
+  `main.rs`, an inline `mod`, a `#[cfg]` twin) and resolves only when exactly one
+  registered item answers.
+- A name that no file declares is followed through that file's own `use`
+  (`pub use inner::Item;` re-exports, and a parent module's imports seen
+  through `super::*`) using a pipeline-wide table of raw Rust import paths.
+- Glob imports no longer close a file: an item of the current module shadows
+  every glob, an explicit `use` is next, and a bare name is bound through a glob
+  only when exactly one glob source defines it.
+- Struct fields reach the shared registry, and a receiver type spelled in another
+  file's module is recovered through this file's imports, module, globs, or a
+  unique same-crate type of that name, so `self.field.method()` and
+  let-bound method results resolve across files. `Arc<dyn Trait>` and the other
+  std smart pointers dispatch to the trait method through the deref chain.
+- Call sites inside `impl Trait for Type` methods and `#[cfg]`-gated free
+  functions carry the published node identity (`Type.method[Trait]`,
+  `name#cfg(...)]`), so their calls attach to the method or function node instead
+  of the File node. A `let x = x(..)` initializer resolves before its binding
+  shadows the callee.
+- Both publication modes admit an exact, source-site-matched call from any
+  function or method declared in the file to an existing graph node when the
+  resolver strategy is one measured at 98% or better site precision against
+  rust-analyzer on the codex-rs corpus: `lsp_direct`, `lsp_import_alias`,
+  `lsp_glob_import`, `lsp_cross_crate`, `lsp_method_dispatch`,
+  `lsp_trait_dispatch`, `lsp_deref_dispatch`, `lsp_constructor`, `lsp_ufcs`,
+  `lsp_operator_trait`. `Type::trait_method()` on a concrete type is `lsp_ufcs`;
+  `Trait::method()` on a trait head (`Default::default()`, 66% measured) stays
+  `lsp_trait_ufcs` and closed, as do prelude guesses, macro carriers, bound
+  dispatch and callable aliases. Missing, name-only and ambiguous targets emit
+  nothing.
+- Version 13 invalidates earlier semantic indexes. All three Rust partial-coverage
   flags remain set. An omitted relationship is not proof that none exists.
-
-Methods, other import-mediated cross-file calls, expanded calls and implementation
-relationships are not restored. Exact spans alone cannot validate an incorrectly
-inferred target.
 
 ## Remaining valuable work, in order
 
-Method, proven on the cross-crate class (epoch 9): pin the missing capability
-red on a branch; widen `cbm_pipeline_plain_call_admitted`
-(src/pipeline/lsp_resolve.h) by exactly one named class; bump the semantic
-epoch together with tests/semantic-epoch.expected; gate on `make scip-rust`
-(fabricated=0 is unconditional) and `make mutation-rust`.
+Method, proven on every class above: index the corpus with
+`CBM_RUST_RESOLVE_DUMP`, score it with `scripts/scip-site-join.py`, take the
+largest miss class, find its first incorrect transition, fix it, re-score; gate on
+`make scip-rust` (fabricated=0 is unconditional), the focused suites, and the
+semantic-epoch contract. Site-level recall on internal function calls in
+codex-rs stands at 43.6% (rust-analyzer 1.98.1, 2026-09-25); the remaining
+misses, largest first:
 
-1. **Implementation identity.** Preserve trait arguments and receiver identity
-   through extraction, caller naming, registries and linking. Distinguish two
-   same-named trait methods and distinct From<T> implementations on one receiver
-   before admitting methods or IMPLEMENTS/OVERRIDE. The admission predicate's
-   shared floor already isolates the caller-side check, so the method-caller
-   widening itself is small once identity is trustworthy.
-
-   The first incorrect transition is extraction, before any cross-file layer can
-   recover the distinction. `extract_rust_impl` currently strips generic arguments
-   from both the receiver (`Wrapper<T>` to `Wrapper`) and the implemented trait
-   (`From<Feet>` to `From`), then names every method only as
-   `<receiver-qualified-name>.<method>`. Two legal implementations such as
-   `From<Feet> for Meters` and `From<Inches> for Meters` therefore produce the same
-   `Meters.from` definition and the same `impl_trait = "From"` inside one
-   `CBMFileResult`. The later `receiver_type` and `trait_qn` fields have the right
-   conceptual roles but only receive this already-lossy data.
-
-   Qualified names are persisted graph identity, not presentation: the in-memory
-   graph keys nodes by qualified name and SQLite enforces uniqueness on
-   `(project, qualified_name)`. Publishing a richer method identity is consequently
-   an epoch-changing graph migration. Compact/spill handling already carries the
-   existing `CBMDefinition.impl_trait` and `CBMImplTrait` strings; any new identity
-   field must be added to that walker explicitly.
-
-   Keep the repair serial and atomic. No later layer begins until the focused tests
-   for the preceding layer are green:
-
-   1. Pin extraction loss directly with one fixture containing distinct
-      `From<Feet>` and `From<Inches>` implementations on `Meters`. Assert the two
-      exact trait spellings on both the impl records and their method definitions;
-      do not use graph counts or another proxy as the oracle.
-   2. Preserve the exact trait spelling through extraction only. Do not change
-      method qualified names, registries, publication, admission or the semantic
-      epoch in this step.
-   3. Preserve exact receiver spelling while retaining the declaration-owner
-      identity needed to find the underlying type. Prove the extraction and
-      compact/spill round trip before registry changes.
-   4. Define one canonical internal implementation identity from receiver plus
-      instantiated trait. Use it in Rust registry lookup and prove exact selection
-      plus fail-closed ambiguity for same-named methods. The Rust trait-method lookup
-      and the generic resolved-call occurrence join are separate ambiguity gates;
-      neither substitutes for the other.
-   5. Propagate that identity into resolved caller/callee naming without yet
-      admitting method `CALLS`.
-   6. Publish distinct method nodes and implementation relationships identically in
-      sequential and parallel modes. Bump the semantic epoch at this first persisted
-      identity change, then prove both incremental restoration routes.
-   7. Widen `cbm_pipeline_plain_call_admitted` for exactly the now-trustworthy method
-      class. Keep missing, name-only and ambiguous targets closed.
-
-   Prefer the existing extraction seam (`cbm_extract_file` in the focused extraction
-   suite) over a standalone probe: it observes the direct mechanism without
-   duplicating the production parser/link setup. Each test must carry an exact
-   mechanism-level oracle, a fixture discriminator, and recorded red-before-green
-   evidence. After every production edit, run its focused suite before adding the
-   next layer; the final repair still owes both publication modes, both restoration
-   routes, the Rust SCIP fabricated-zero gate, the Rust mutation lane and the
-   semantic-epoch contract.
-
-   Trait-implementation method nodes use the published qualified-name form
-   `<receiver-qn>.<method>[<instantiated-trait>]`, for example
-   `crate.units.Meters.from[From<Feet>]`. The bracketed suffix keeps the ordinary
-   dot-delimited receiver and method prefix intact while carrying the exact trait
-   spelling already preserved by extraction. Rust paths inside the suffix use `::`,
-   not `.`, so last-dot consumers continue to see the complete method leaf. The
-   colon-aware `pxc_qn_leaf` helper is confined to the separate receiver-level
-   `RustImpl` record and does not parse method qualified names. The two call-join
-   consumers that compare or index method leaves explicitly remove the bracketed
-   provenance before matching it to source spelling.
-
-   Both incremental restoration routes now have direct parity coverage for this
-   identity. An unchanged Rust file containing the two `From<T>` implementations is
-   restored after another file changes, and its complete node set plus every incident
-   edge is compared symmetrically with a fresh full index. The existing metadata
-   migration test lowers the stored version below 11 and requires the forced-full
-   route, so pre-epoch identities cannot be restored into the current graph.
-
-   Step 7 is complete at semantic epoch 12. `cbm_pipeline_plain_call_admitted`
-   admits exactly the keyed trait-impl method class: strategies
-   `lsp_trait_dispatch`, `lsp_trait_ufcs` and `lsp_operator_trait`, a nonempty
-   `callee_impl_key`, a terminal nonempty `[Trait<...>]` identity on the
-   published callee, and leaf equality after suffix removal, on top of the
-   existing exact-occurrence and file-local-caller floor. Missing, name-only,
-   ambiguous, inherent-method and dyn-dispatch targets stay closed, proven by a
-   both-modes end-to-end fixture whose disarm reddens the suite. Gates at this
-   epoch: `make scip-rust` fabricated=0 under rust-analyzer 1.94.0 and 1.98.1,
-   `make mutation-rust` 5/5 killed with no survivors or harness errors, the
-   full `scripts/test.sh` leg, and the semantic-epoch contract at 12. The four
-   named corpus cases were re-verified against a fresh epoch-12 index of the
-   read-only corpus: the `String.from[From<WriterIdentity>]` node is distinct,
-   the `git-safety` `clone` helper attracts only its own file's callers, the
-   `RepositoryContinuityPort` implementations carry keyed identities, and the
-   `Rc<RefCell<dyn ...>>` route emits no edges.
-
-2. **Cargo, module and lexical scope.** Derive per-member crate roots, module
-   paths, renamed dependencies and import scope from actual workspace inputs.
-   Distinguish same-leaf symbols in different modules/crates. Repair semantic
-   target joins before widening cross-file call admission. Package names that
-   differ from their directory basename currently miss the member-segment join.
-3. **Wrapper-type propagation.** Trace the first lost type in
-   Option<Rc<RefCell<dyn Trait>>> through clone/borrow/method calls. Bind the static
-   call to the trait item; report possible concrete dispatch separately.
-4. **Library seeds and prelude.** Independently check additional API-validity leads:
-   HashMap.raw_entry, core.slice.windows_mut and Iterator.tuple_windows. Verify
-   prelude membership and local shadowing. Do not bless a seed by copying it into
-   a test expectation.
-5. **Corpus parity and performance.** Compare full and edit-triggered incremental
-   indexes, exact call-site targets, trace/cycle/impact/test answers and non-Rust
-   controls. Measure warm no-change and representative edit-to-query latency with
-   builds idle. The reported 1–2 second warm latency is not a measured guarantee.
-6. **cfg and macros.** Validate configuration-dependent and expanded identities
-   before broadening semantic completeness claims.
+1. **Receiver typing.** 44k internal call sites have a receiver whose type the
+   resolver cannot infer: locals bound from external-crate calls, iterator and
+   `Result` chains, generic parameters, closure parameters, tuple and pattern
+   bindings, `Arc<dyn Trait>` fields of cross-crate traits. Each needs the
+   first lost type traced through `rust_eval_expr_type`.
+2. **Associated functions on unrecovered types.** 19k `Type::assoc()` sites where
+   the type head itself does not resolve (module trees mounted with `#[path]`,
+   `mod tests;` siblings named `*_tests.rs`, macro-generated types, external
+   re-export chains longer than three hops).
+3. **Methods missing on known receivers.** 14k sites where the receiver resolves
+   but the method is not registered under it: trait methods provided through
+   blanket impls or supertraits, methods behind type aliases, cfg-gated impls.
+4. **Free functions through `#[path]` module trees and integration-test crate
+   roots.** 11k bare calls whose module identity is not file-derived.
+5. **Calls without a parsed carrier.** 3k `Default::default()`-style sites need
+   expected-type inference; 2k same-file sites sit in attributed statements the
+   walker skips.
+6. **IMPLEMENTS/OVERRIDE, expanded (macro) calls, dyn dispatch fan-out, corpus
+   parity and performance, cfg evaluation.** Unchanged from the prior plan;
+   IMPORTS edges for Rust are still produced by the generic name matcher and
+   contain fabricated targets (a `Pin` import bound to an unrelated `pin` method),
+   so they must not be used as a resolution source.
 
 ## Corpus and implementation constraints
 
-Read-only corpus: /Users/viktor/Projects/project-management. Recheck its revision
-before measuring; old edge counts are not a current reproduction.
+Read-only corpora: /Users/viktor/Projects/project-management and
+/Users/viktor/Projects/github/codex/codex-rs (156 workspace members, 4,698 Rust
+files). Recheck their revisions before measuring; old edge counts are not a
+current reproduction. Measure a copy of the corpus, never the live checkout.
 
 Useful cases are encode_hex and From<WriterIdentity> for String in
 crates/pm-port/src/writer_identity.rs; the private clone helper in

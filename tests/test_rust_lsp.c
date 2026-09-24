@@ -662,8 +662,8 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
     cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller", reg,
-                                         imp_names, imp_qns, 1, NULL, /*manifest=*/NULL, &out,
-                                         /*synthetic_calls=*/NULL);
+                                         imp_names, imp_qns, 1, NULL, /*manifest=*/NULL,
+                                         /*imports=*/NULL, &out, /*synthetic_calls=*/NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
 
@@ -858,8 +858,11 @@ static bool rustlsp_impl_identity_rows_are_exact(const CBMResolvedCallArray *cal
     const CBMResolvedCall *feet = rustlsp_find_impl_identity_call(calls, "Feet.act");
     const CBMResolvedCall *inches = rustlsp_find_impl_identity_call(calls, "Inches.act");
     const CBMResolvedCall *plain = rustlsp_find_impl_identity_call(calls, ".plain");
-    return feet && inches && plain &&
-           strcmp(feet->caller_qn, inches->caller_qn) == 0 &&
+    /* Each trait impl's method is its own published node, so the two
+     * `render` bodies name distinct callers. */
+    return feet && inches && plain && feet->caller_qn && inches->caller_qn &&
+           strcmp(feet->caller_qn, "test.src.main.Boxed.render[Render<u32>]") == 0 &&
+           strcmp(inches->caller_qn, "test.src.main.Boxed.render[Render<String>]") == 0 &&
            feet->caller_impl_key &&
            strcmp(feet->caller_impl_key,
                   "19:test.src.main.Boxed5:Boxed11:Render<u32>") == 0 &&
@@ -909,7 +912,7 @@ TEST(rustlsp_resolved_calls_carry_exact_impl_identity_local_and_shared) {
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray shared = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.src.main",
-                                         registry, NULL, NULL, 0, NULL, NULL, &shared, NULL);
+                                         registry, NULL, NULL, 0, NULL, NULL, NULL, &shared, NULL);
     ASSERT_TRUE(rustlsp_impl_identity_rows_are_exact(&shared));
 
     CBMFileResult merged;
@@ -971,7 +974,7 @@ TEST(rustlsp_relative_type_requires_declared_module) {
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
-                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+                                         NULL, NULL, 0, NULL, NULL, NULL, &out, NULL);
     int stolen = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(stolen, 0);
@@ -987,7 +990,7 @@ TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed) {
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
-                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+                                         NULL, NULL, 0, NULL, NULL, NULL, &out, NULL);
     int guessed = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(guessed, 0);
@@ -1021,7 +1024,7 @@ TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier) {
 
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          reg, imp_names, imp_qns, 1, NULL, /*manifest=*/NULL,
-                                         &result.resolved_calls, &result.calls);
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls);
 
     int resolved = find_confident(&result.resolved_calls, "hidden", "lib.render");
     int carriers = 0;
@@ -1257,7 +1260,7 @@ TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact) {
     ASSERT_NOT_NULL(reg);
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          reg, imp_names, imp_qns, 2, NULL, /*manifest=*/NULL,
-                                         &result.resolved_calls, &result.calls);
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls);
 
     const char *a_site = strstr(caller, "a::render()");
     const char *b_site = strstr(caller, "b::render()");
@@ -6781,8 +6784,8 @@ TEST(rustlsp_partial_hm_tuple_return) {
 
 /* ── EXTRA battery — Cargo wiring, proc-macro attrs, rustdoc JSON ── */
 
-/* A3 wiring: with a manifest, workspace member paths route through
- * the canonical `<member>.<tail>` form. */
+/* A3 wiring: with a manifest, workspace member paths route through the
+ * member's file-derived `<project>.<member path>.src.<tail>` form. */
 TEST(rustlsp_extra_cargo_wires_workspace_member) {
     /* Set up a manifest declaring a workspace member `engine`. */
     CBMArena a; cbm_arena_init(&a);
@@ -6810,7 +6813,7 @@ TEST(rustlsp_extra_cargo_wires_workspace_member) {
     bool found_engine_call = false;
     for (int i = 0; i < r->resolved_calls.count; i++) {
         const CBMResolvedCall* rc = &r->resolved_calls.items[i];
-        if (rc->callee_qn && strstr(rc->callee_qn, "engine.boot")) {
+        if (rc->callee_qn && strstr(rc->callee_qn, "test.engine.src.boot")) {
             found_engine_call = true;
             break;
         }

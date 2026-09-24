@@ -748,19 +748,18 @@ TEST(lrp_cpp_s8_field_call) {
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 4: RUST (lsp_cross NOT WIRED) ────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
- * cbm_run_rust_lsp_cross EXISTS in rust_lsp.c but cbm_pxc_has_cross_lsp
- * returns false for CBM_LANG_RUST — the pass is NEVER called by the
- * pipeline. The accepted fail-closed policy therefore withholds every Rust
- * CALLS edge, including otherwise resolvable plain calls, while retaining the
- * indexed definitions as the positive fixture control.
+ * Since epoch 13 the Rust resolver maps `mod`/`crate::`/`super::` paths onto
+ * file-derived names and the gate admits every strategy measured at 98%+
+ * site precision against rust-analyzer; each scenario below states the exact
+ * edge that measurement attests. Scenarios still closed name their gap.
  */
 
-/* S1 — Rust cross-file plain function call remains fail-closed. */
+/* S1 — Rust cross-file plain function call behind `mod lib;`. */
 TEST(lrp_rust_s1_crossfile_call) {
     static const LRP_File f[] = {
         {"lib.rs", "pub fn square(x: i32) -> i32 { x * x }\n"},
         {"main.rs", "mod lib;\n\nfn run(n: i32) -> i32 { lib::square(n) }\n"}};
-    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S1/crossfile_call"));
+    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S1/crossfile_call", 1));
     PASS();
 }
 
@@ -791,8 +790,9 @@ TEST(lrp_rust_s3_constructor) {
          "    pub fn dist(&self) -> f64 { (self.x * self.x + self.y * self.y).sqrt() }\n}\n"},
         {"main.rs", "mod point;\n\nfn run() -> f64 {\n"
                     "    let p = point::Point::new(3.0, 4.0);\n    p.dist()\n}\n"}};
-    /* Associated and receiver calls remain fail-closed without trusted cross-LSP. */
-    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S3/constructor"));
+    /* run -> Point::new through the declared module, then p.dist() on the
+     * constructor's `Self` return. */
+    ASSERT_TRUE(lrp_assert_calls(f, 2, 2, "rust/S3/constructor", 1));
     PASS();
 }
 
@@ -819,8 +819,9 @@ TEST(lrp_rust_s5_chained) {
                        "    pub fn build(self) -> Vec<i32> { self.items }\n}\n"},
         {"main.rs", "mod builder;\n\nfn run() -> Vec<i32> {\n"
                     "    builder::Builder::new().add(1).add(2).build()\n}\n"}};
-    /* The receiver chain remains fail-closed without trusted cross-LSP. */
-    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S5/chained"));
+    /* new -> add -> add -> build: each receiver is the previous return type;
+     * the two `add` sites share one run -> add edge. */
+    ASSERT_TRUE(lrp_assert_calls(f, 2, 3, "rust/S5/chained", 1));
     PASS();
 }
 
@@ -856,8 +857,8 @@ TEST(lrp_rust_s7_generic) {
         {"algo.rs", "pub fn max_of<T: PartialOrd>(a: T, b: T) -> T {\n"
                     "    if a > b { a } else { b }\n}\n"},
         {"main.rs", "mod algo;\n\nfn run(x: i32, y: i32) -> i32 {\n    algo::max_of(x, y)\n}\n"}};
-    /* Qualified generic calls remain fail-closed without trusted cross-LSP. */
-    ASSERT_TRUE(lrp_assert_no_calls(f, 2, "rust/S7/generic"));
+    /* run -> algo::max_of; generic parameters do not affect the path. */
+    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S7/generic", 1));
     PASS();
 }
 
@@ -874,8 +875,9 @@ TEST(lrp_rust_s8_field_call) {
     PASS();
 }
 
-/* Both visible and macro-hidden Rust calls remain fail-closed. DEFINES proves
- * the fixture was indexed rather than accepting an empty graph. */
+/* The visible `lib::render()` resolves; the same call inside `format!` still
+ * has no trusted carrier and stays closed. DEFINES proves the fixture was
+ * indexed rather than accepting an empty graph. */
 TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
     static const LRP_File f[] = {
         {"lib.rs", "pub fn render() -> &'static str { \"ok\" }\n"},
@@ -888,16 +890,16 @@ TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
     int visible_to_render = lrp_exact_calls_by_name(store, lp.project, "visible", "render");
     int hidden_to_render = lrp_exact_calls_by_name(store, lp.project, "hidden", "render");
     int definitions = store ? cbm_store_count_edges_by_type(store, lp.project, "DEFINES") : -1;
-    if (visible_to_render != 1 || hidden_to_render != 1) {
+    if (visible_to_render != 1 || hidden_to_render != 0) {
         fprintf(stderr,
                 "  [LRP] rust/macro_hidden_carrier visible->render=%d "
-                "hidden->render=%d (expected 1 each)\n",
+                "hidden->render=%d (expected 1 and 0)\n",
                 visible_to_render, hidden_to_render);
         lrp_diag(store, lp.project, "rust/macro_hidden_carrier");
     }
     lrp_cleanup(&lp, store);
 
-    ASSERT_EQ(visible_to_render, 0);
+    ASSERT_EQ(visible_to_render, 1);
     ASSERT_EQ(hidden_to_render, 0);
     ASSERT_GTE(definitions, 1);
     PASS();

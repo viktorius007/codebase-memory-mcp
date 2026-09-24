@@ -109,6 +109,12 @@ typedef struct {
     const char *project_name; /* borrowed from pipeline */
     const char *repo_path;    /* borrowed from pipeline */
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
+    /* Rust `use` declarations of every indexed file, keyed by file module QN
+     * and local name (cbm_pipeline_rust_imports_key), valued by the raw
+     * path text. Written while IMPORTS edges are created, read-only during
+     * resolve, so re-exports and parent-module globs resolve from source
+     * paths rather than from name-matched IMPORTS edges. */
+    CBMHashTable *rust_imports;
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
     cbm_pipeline_t *pipeline; /* back-pointer for recording per-file skips
@@ -247,6 +253,11 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  *
  * `namespace_map` may be NULL (skips step 2).  `source_file_qn` is the importing
  * file's __file__ QN, used to avoid self-imports in step 3. */
+/* Record one Rust import for the resolver's re-export lookup (pass_lsp_cross.c). */
+void cbm_pipeline_rust_imports_add(cbm_pipeline_ctx_t *ctx, const char *rel,
+                                   const CBMImport *import);
+void cbm_pipeline_rust_imports_free(cbm_pipeline_ctx_t *ctx);
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,

@@ -916,6 +916,54 @@ static const char *objectscript_get_method_qn(CBMExtractCtx *ctx, TSNode node,
 }
 
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
+/* Raw trait text of the `impl Trait for Type` block that directly owns a Rust
+ * function_item, or NULL for inherent impls and free functions. */
+static const char *rust_enclosing_impl_trait(CBMExtractCtx *ctx, TSNode func_node) {
+    if (strcmp(ts_node_type(func_node), "function_item") != 0) {
+        return NULL;
+    }
+    TSNode body = ts_node_parent(func_node);
+    if (ts_node_is_null(body)) {
+        return NULL;
+    }
+    TSNode impl = ts_node_parent(body);
+    if (ts_node_is_null(impl) || strcmp(ts_node_type(impl), "impl_item") != 0) {
+        return NULL;
+    }
+    TSNode trait_node = ts_node_child_by_field_name(impl, TS_FIELD("trait"));
+    if (ts_node_is_null(trait_node)) {
+        return NULL;
+    }
+    char *trait_text = cbm_node_text(ctx->arena, trait_node, ctx->source);
+    return trait_text && trait_text[0] ? trait_text : NULL;
+}
+
+/* The def side folds a leading `#[cfg(...)]` attribute into a Rust free
+ * function's qualified name (cbm_rust_cfg_qualified_name); the body's scope
+ * must carry the same name or its calls source to the File node. */
+static const char *rust_cfg_scope_qn(CBMExtractCtx *ctx, TSNode func_node, const char *plain) {
+    const char *decorators[CBM_SZ_16 + 1];
+    int count = 0;
+    for (TSNode prev = ts_node_prev_named_sibling(func_node);
+         !ts_node_is_null(prev) && count < CBM_SZ_16; prev = ts_node_prev_named_sibling(prev)) {
+        if (strcmp(ts_node_type(prev), "attribute_item") != 0) {
+            break;
+        }
+        decorators[count++] = cbm_node_text(ctx->arena, prev, ctx->source);
+    }
+    if (count == 0) {
+        return plain;
+    }
+    /* Definition order: nearest attribute last, as extract_decorators emits. */
+    for (int i = 0; i < count / 2; i++) {
+        const char *tmp = decorators[i];
+        decorators[i] = decorators[count - 1 - i];
+        decorators[count - 1 - i] = tmp;
+    }
+    decorators[count] = NULL;
+    return cbm_rust_cfg_qualified_name(ctx->arena, plain, decorators);
+}
+
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
     (void)spec;
@@ -1100,12 +1148,24 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     }
 
     if (state->enclosing_class_qn) {
+        /* A Rust trait-impl method is published as `<Type>.<name>[<Trait>]`
+         * (extract_rust_impl); its body's calls must carry the same identity. */
+        const char *impl_trait =
+            ctx->language == CBM_LANG_RUST ? rust_enclosing_impl_trait(ctx, node) : NULL;
+        if (impl_trait) {
+            return cbm_arena_sprintf(ctx->arena, "%s.%s[%s]", state->enclosing_class_qn, qn_name,
+                                     impl_trait);
+        }
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
      * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, qn_name,
-                                       ctx->language);
+    const char *plain = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
+                                                    qn_name, ctx->language);
+    if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "function_item") == 0) {
+        return rust_cfg_scope_qn(ctx, node, plain);
+    }
+    return plain;
 }
 
 // Compute class QN for scope tracking.
@@ -1139,9 +1199,11 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
      * the type here. Without a class scope, an impl method's QN drops the type
      * (proj.file.method) and no longer matches the class-qualified def-side Method
      * node, so in-body calls fall back to the Module. */
+    bool rust_impl = false;
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(node), "impl_item") == 0) {
         name_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        rust_impl = true;
     }
     if (ts_node_is_null(name_node)) {
         return NULL;
@@ -1150,6 +1212,15 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
     if (!name || !name[0]) {
         return NULL;
+    }
+    /* The def side (extract_rust_impl) keys the implementing type by its base
+     * name: `Wrapper<T>` -> `Wrapper`. Mirror that so in-body calls source to
+     * the published Method node instead of the File node. */
+    if (rust_impl) {
+        char *lt = strchr(name, '<');
+        if (lt) {
+            *lt = '\0';
+        }
     }
 
     /* Nested class: prefix with the enclosing class QN (Outer.Inner) so this

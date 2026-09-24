@@ -1964,6 +1964,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_gbuf_t *gbuf = NULL;
     cbm_registry_t *registry = NULL;
     cbm_path_alias_collection_t *path_aliases = NULL;
+    /* Set once the pass context below is initialised; the early `goto out`
+     * paths above that point must not touch it. */
+    cbm_pipeline_ctx_t *live_ctx = NULL;
     CBMHashTable *stale_surface_set = NULL;
     closure_resolve_t cr = {0};
     bool cr_arena_live = false;
@@ -2156,6 +2159,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
     };
+    live_ctx = &ctx;
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
         if (file_qn) {
@@ -2386,6 +2390,7 @@ out:
     if (registry) {
         cbm_registry_free(registry);
     }
+    cbm_pipeline_rust_imports_free(live_ctx);
     cbm_path_alias_collection_free(path_aliases);
     if (gbuf) {
         cbm_gbuf_free(gbuf);
@@ -2798,6 +2803,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_log_error("incremental.err", "phase", "extract_resolve", "rc", itoa_buf(phase_rc));
         free(changed_files);
         cbm_registry_free(registry);
+        cbm_pipeline_rust_imports_free(&ctx);
         cbm_path_alias_collection_free(path_aliases);
         incr_free_edge_capture(&edge_cap);
         cbm_store_free_coverage(old_cov, old_cov_count);
@@ -2868,6 +2874,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     free(changed_files);
     cbm_registry_free(registry);
+    cbm_pipeline_rust_imports_free(&ctx);
     cbm_path_alias_collection_free(path_aliases);
 
     /* Re-link inbound cross-file edges that the purge orphaned. Runs after

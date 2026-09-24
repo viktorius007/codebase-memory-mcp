@@ -2824,10 +2824,14 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     rc = run_extraction_phase(p, &ctx, files, file_count);
     if (rc != 0) {
+        cbm_pipeline_rust_imports_free(&ctx);
         goto cleanup;
     }
 
     rc = run_post_extraction(p, &ctx, files, file_count, baseline_manifest, baseline_count);
+    /* Owned by ctx, which the early `goto cleanup` paths above never
+     * initialise; release it here where ctx is live. */
+    cbm_pipeline_rust_imports_free(&ctx);
     if (rc != 0) {
         goto cleanup;
     }

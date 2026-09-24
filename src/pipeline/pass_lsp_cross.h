@@ -189,6 +189,18 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manife
 void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
+/* CBM_RUST_RESOLVE_DUMP development lane (see pass_lsp_cross.c). */
+void cbm_pxc_rust_dump_open(void);
+void cbm_pxc_rust_dump_close(void);
+void cbm_pxc_rust_dump_file(const char *rel, const CBMFileResult *result);
+void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const CBMResolvedCall *lsp,
+                            bool admitted);
+
+/* Per-thread borrow of the pipeline's Rust import table (pipeline_internal.h),
+ * installed and cleared beside the manifest. */
+void cbm_pxc_set_rust_imports(const CBMHashTable *imports);
+const struct CBMRustImportSource *cbm_pxc_get_rust_import_source(void);
+
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
  * owns source, module_qn, defs, imp_names, imp_qns.

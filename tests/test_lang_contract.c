@@ -375,7 +375,7 @@ TEST(contract_go_calls) {
     PASS();
 }
 
-/* Rust: keep structural outbound/type controls while semantic CALLS fail closed. */
+/* Rust: run -> helper through `self`, main -> run through a typed local. */
 TEST(contract_rust_methods) {
     static const LangFile f[] = {
         {"calc.rs", "struct Calc {\n    base: i32,\n}\n\n"
@@ -385,7 +385,7 @@ TEST(contract_rust_methods) {
                     "fn main() {\n    let c = Calc { base: 1 };\n    let _ = c.run(2);\n}\n"}};
     LangMetrics m = lang_metrics(f, 1);
     ASSERT_TRUE(m.ok);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 2);
     ASSERT_TRUE(m.callers >= 1);
     ASSERT_TRUE(m.types >= 1); /* struct Calc */
     PASS();

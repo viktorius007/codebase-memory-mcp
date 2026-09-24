@@ -11,23 +11,24 @@ or release status. Confirm the behavior before starting a repair.
 
 ## Rust semantic coverage remains partial
 
-As of semantic epoch 12: exact file-local free-function CALLS, cross-crate
-workspace CALLS, and keyed trait-implementation method CALLS (published as
-`receiver.method[Trait<...>]` with an implementation key) are supported, with
-their derived TESTS. Expanded (macro) calls, dyn dispatch, and
-IMPLEMENTS/OVERRIDE remain gated; missing edges do not establish absence. The
-[accuracy plan](docs/RUST_CODEGRAPH_TRUTH_PLAN.md) owns implementation
-identity, Cargo/module scope, wrapper-type propagation, library seeds,
-cfg/macros and full/incremental corpus verification.
+As of semantic epoch 13: exact, source-site-matched CALLS from any function or
+method of a file to an existing graph node are published for the resolver
+strategies measured at 98% or better site precision against rust-analyzer on
+codex-rs (direct, import, glob, cross-crate, inherent/trait/deref method
+dispatch, constructors, UFCS), with their derived TESTS. Site-level recall on
+internal function calls in codex-rs is 43.6% (was 23.8% at epoch 12); the
+[repair evidence](docs/RUST_REPAIR_EVIDENCE.md) records the lane and the
+per-strategy figures, and the [accuracy plan](docs/RUST_CODEGRAPH_TRUTH_PLAN.md)
+owns the remaining miss classes: receiver typing through external calls and
+generics, `#[path]`-mounted module trees, methods behind blanket impls and
+aliases, expected-type inference (`Default::default()`), expanded (macro)
+calls, dyn dispatch fan-out and IMPLEMENTS/OVERRIDE. Missing edges do not
+establish absence.
 
-The named corpus cases were verified against a fresh epoch-12 index:
-`From<WriterIdentity> for String` publishes a distinct keyed node, the private
-`git-safety` `clone` helper attracts only its own file's callers (zero false
-edges project-wide), aliased `RepositoryContinuityPort` implementations carry
-keyed identities, and calls through `Rc<RefCell<dyn RepositoryContinuity>>`
-stay closed. Cycle, impact and test answers must still be rechecked after
-binding changes; a confidence threshold alone cannot establish target
-correctness.
+Rust IMPORTS edges are still produced by the generic name matcher and contain
+fabricated targets (for example a `Pin` import bound to an unrelated `pin`
+method); the resolver no longer consumes them, but the edges themselves remain
+to be repaired.
 
 Related reports: [#2053](https://github.com/DeusData/codebase-memory-mcp/issues/2053)
 (same-name false calls), [#2127](https://github.com/DeusData/codebase-memory-mcp/issues/2127)

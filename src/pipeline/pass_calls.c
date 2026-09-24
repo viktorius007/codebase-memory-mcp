@@ -19,6 +19,7 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -555,7 +556,11 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
-    if (!cbm_pipeline_plain_call_admitted(lang, call, lsp, module_qn)) {
+    bool admitted = cbm_pipeline_plain_call_admitted(lang, call, lsp, module_qn);
+    if (lang == CBM_LANG_RUST) {
+        cbm_pxc_rust_dump_call(rel, call, lsp, admitted);
+    }
+    if (!admitted) {
         return 0;
     }
     if (lsp) {
@@ -786,6 +791,7 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
 
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "calls", "files", itoa_log(file_count));
+    cbm_pxc_rust_dump_open();
 
     /* ObjectScript: build the method-return-type table from the definitions
      * already in the graph buffer so `Set x = obj.Method()` can resolve x's
@@ -832,6 +838,9 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
          * Java/Go so it matches their def-node QNs in the registry). */
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pc_module_is_dir(files[i].language));
+        if (files[i].language == CBM_LANG_RUST) {
+            cbm_pxc_rust_dump_file(rel, result);
+        }
 
         /* Resolve each call */
         for (int c = 0; c < result->calls.count; c++) {
@@ -855,6 +864,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
     }
 
+    cbm_pxc_rust_dump_close();
     cbm_log_info("pass.done", "pass", "calls", "total", itoa_log(total_calls), "resolved",
                  itoa_log(resolved), "unresolved", itoa_log(unresolved), "errors",
                  itoa_log(errors));

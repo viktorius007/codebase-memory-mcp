@@ -1047,15 +1047,16 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
         {"rust_receiver", "receiver.rs", CBM_LANG_RUST,
          "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
          "fn caller(worker: &Worker) { worker.work(); }\n",
-         0, NULL},
+         1, "rust_call_gate.receiver.Worker.work"},
         {"rust_ufcs", "ufcs.rs", CBM_LANG_RUST,
          "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
          "fn caller(worker: &Worker) { Worker::work(worker); }\n",
-         0, NULL},
+         1, "rust_call_gate.ufcs.Worker.work"},
         {"rust_trait", "trait.rs", CBM_LANG_RUST,
          "trait Work { fn work(&self); }\nstruct Worker;\n"
          "impl Work for Worker { fn work(&self) {} }\n"
-         "fn caller(worker: &Worker) { Worker::work(worker); }\n", 0, NULL},
+         "fn caller(worker: &Worker) { Worker::work(worker); }\n",
+         1, "rust_call_gate.trait.Worker.work[Work]"},
         {"rust_external", "external.rs", CBM_LANG_RUST,
          "fn clone() {}\nfn push() {}\nfn len() {}\nfn from() {}\n"
          "fn caller(value: &str) {\n"
@@ -1094,7 +1095,7 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
          0, NULL},
         {"rust_method_caller", "method_caller.rs", CBM_LANG_RUST,
          "fn target() {}\nstruct Worker;\nimpl Worker { fn caller() { target(); } }\n",
-         0, NULL},
+         1, "rust_call_gate.method_caller.target"},
         {"rust_import_guess", "import_guess.rs", CBM_LANG_RUST,
          "use std::env::split_paths as imported;\nfn split_paths(_: &str) {}\n"
          "fn caller() { imported(\"x\"); }\n", 0, NULL},
@@ -1136,13 +1137,16 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
         ASSERT_EQ(sequential_calls, cases[i].expected_calls);
         ASSERT_EQ(parallel_calls, cases[i].expected_calls);
         if (cases[i].target_qn) {
+            /* The one caller declared inside an impl block is a Method node. */
+            const char *caller_label =
+                strcmp(cases[i].tag, "rust_method_caller") == 0 ? "Method" : "Function";
             ASSERT_EQ(count_edges_between_nodes(
                 sequential, find_unique_node_by_name_label_qn_suffix(
-                    sequential, "caller", "Function", "caller"),
+                    sequential, "caller", caller_label, "caller"),
                 cbm_gbuf_find_by_qn(sequential, cases[i].target_qn), "CALLS"), 1);
             ASSERT_EQ(count_edges_between_nodes(
                 parallel, find_unique_node_by_name_label_qn_suffix(
-                    parallel, "caller", "Function", "caller"),
+                    parallel, "caller", caller_label, "caller"),
                 cbm_gbuf_find_by_qn(parallel, cases[i].target_qn), "CALLS"), 1);
         }
 

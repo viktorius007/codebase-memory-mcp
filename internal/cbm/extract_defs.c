@@ -2033,8 +2033,8 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
  * first and one branch is lost (#495). Fold the cfg predicate into the QN so
  * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
  * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
-static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
-                                           const char *const *decorators) {
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
+                                        const char *const *decorators) {
     if (!decorators) {
         return base_qn;
     }
@@ -3758,7 +3758,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into the QN so both branches survive the graph upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
+        def.qualified_name = cbm_rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
         def.is_test = cbm_rust_definition_has_test_attribute(&def);
     }
 

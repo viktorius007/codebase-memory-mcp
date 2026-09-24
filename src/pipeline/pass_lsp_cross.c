@@ -32,6 +32,7 @@
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 
 #include <stdio.h>
@@ -636,7 +637,9 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             }
         }
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
-        if (files[fi].language == CBM_LANG_GO) {
+        /* Rust struct fields are declared beside their struct exactly like
+         * Go's, and `self.field.method()` needs them for the same reason. */
+        if (files[fi].language == CBM_LANG_GO || files[fi].language == CBM_LANG_RUST) {
             pxc_fold_go_struct_fields(arena, fr, defs, file_start, idx);
         }
         if (files[fi].language == CBM_LANG_RUST) {
@@ -1176,8 +1179,202 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
  * where in-file resolution needs no workspace metadata). */
 static _Thread_local const CBMCargoManifest *g_pxc_rust_manifest = NULL;
 
+/* ── CBM_RUST_RESOLVE_DUMP: development oracle lane ───────────────────
+ * When the variable names a file, every Rust resolver record (R rows) and
+ * every parsed Rust call site with its joined resolution and admission
+ * verdict (C rows) is appended as TSV so an external rust-analyzer SCIP
+ * join can score each strategy before the gate (scripts/rust-scanner-scip.sh).
+ * Both pipelines write through one handle; each row is a single fputs so the
+ * stdio lock keeps concurrent worker rows intact. */
+static FILE *g_pxc_rust_dump = NULL;
+
+void cbm_pxc_rust_dump_open(void) {
+    char dump_path[CBM_SZ_1K];
+    if (g_pxc_rust_dump ||
+        !cbm_safe_getenv("CBM_RUST_RESOLVE_DUMP", dump_path, sizeof(dump_path), NULL)) {
+        return;
+    }
+    g_pxc_rust_dump = fopen(dump_path, "a");
+}
+
+void cbm_pxc_rust_dump_close(void) {
+    if (g_pxc_rust_dump) {
+        fclose(g_pxc_rust_dump);
+        g_pxc_rust_dump = NULL;
+    }
+}
+
+static void pxc_rust_dump_field(char *buf, size_t cap, size_t *len, const char *value) {
+    const char *text = value ? value : "-";
+    for (const char *p = text; *p && *len + 4 < cap; p++) {
+        buf[(*len)++] = (*p == '\t' || *p == '\n') ? ' ' : *p;
+    }
+}
+
+static void pxc_rust_dump_row(FILE *dump, const char *rel, const char *kind, uint32_t start,
+                              uint32_t end, const char *a, const char *b, const char *c,
+                              const char *d, float confidence, const char *e, const char *f) {
+    char line[CBM_SZ_2K];
+    size_t len = (size_t)snprintf(line, sizeof(line), "%s\t%s\t%u\t%u\t", kind, rel, start, end);
+    if (len >= sizeof(line)) {
+        return;
+    }
+    const char *cols[] = {a, b, c, d};
+    for (size_t i = 0; i < sizeof(cols) / sizeof(cols[0]); i++) {
+        pxc_rust_dump_field(line, sizeof(line), &len, cols[i]);
+        line[len++] = '\t';
+    }
+    len += (size_t)snprintf(line + len, sizeof(line) - len, "%.2f\t", (double)confidence);
+    if (len + 4 >= sizeof(line)) {
+        return;
+    }
+    pxc_rust_dump_field(line, sizeof(line), &len, e);
+    line[len++] = '\t';
+    pxc_rust_dump_field(line, sizeof(line), &len, f);
+    if (len + 2 >= sizeof(line)) {
+        return;
+    }
+    line[len++] = '\n';
+    line[len] = '\0';
+    fputs(line, dump);
+}
+
+/* One R row per resolver record, then one C row per parser call site with the
+ * joined resolution and the admission verdict. */
+static void pxc_rust_dump_rows(FILE *dump, const char *rel, const CBMFileResult *result) {
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *r = &result->resolved_calls.items[i];
+        pxc_rust_dump_row(dump, rel, "R", r->site_start_byte, r->site_end_byte, r->caller_qn,
+                          r->callee_qn, r->strategy, r->reason, r->confidence,
+                          r->kind == CBM_RESOLVED_INVOCATION ? "invocation" : "reference",
+                          r->callee_impl_key);
+    }
+}
+
+void cbm_pxc_rust_dump_file(const char *rel, const CBMFileResult *result) {
+    if (g_pxc_rust_dump && rel && result) {
+        pxc_rust_dump_rows(g_pxc_rust_dump, rel, result);
+    }
+}
+
+void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const CBMResolvedCall *lsp,
+                            bool admitted) {
+    if (!g_pxc_rust_dump || !rel || !call) {
+        return;
+    }
+    pxc_rust_dump_row(g_pxc_rust_dump, rel, "C", call->site_start_byte, call->site_end_byte,
+                      call->enclosing_func_qn, call->callee_name, lsp ? lsp->callee_qn : NULL,
+                      lsp ? lsp->strategy : NULL, lsp ? lsp->confidence : 0.0f,
+                      admitted ? "admitted" : "closed", lsp ? lsp->callee_impl_key : NULL);
+}
+
 void cbm_pxc_set_rust_manifest(const CBMCargoManifest *m) {
     g_pxc_rust_manifest = m;
+}
+
+static char *pxc_rust_imports_key(const char *module_qn, const char *local_name) {
+    size_t ml = strlen(module_qn);
+    size_t nl = strlen(local_name);
+    char *key = (char *)malloc(ml + nl + 2);
+    if (!key) {
+        return NULL;
+    }
+    memcpy(key, module_qn, ml);
+    key[ml] = '\x1f';
+    memcpy(key + ml + 1, local_name, nl + 1);
+    return key;
+}
+
+void cbm_pipeline_rust_imports_add(cbm_pipeline_ctx_t *ctx, const char *rel,
+                                   const CBMImport *import) {
+    if (!ctx || !rel || !import || !import->local_name || !import->module_path ||
+        strcmp(import->local_name, "_") == 0) {
+        return;
+    }
+    if (!ctx->rust_imports) {
+        ctx->rust_imports = cbm_ht_create(CBM_SZ_4K);
+        if (!ctx->rust_imports) {
+            return;
+        }
+    }
+    char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel, false);
+    if (!module_qn) {
+        return;
+    }
+    char *key = pxc_rust_imports_key(module_qn, import->local_name);
+    free(module_qn);
+    if (!key) {
+        return;
+    }
+    char *path = strdup(import->module_path);
+    if (!path) {
+        free(key);
+        return;
+    }
+    /* The table borrows key strings: keep the first key alive for the
+     * table's lifetime and reuse it when the same local name repeats. */
+    const char *stored_key = cbm_ht_get_key(ctx->rust_imports, key);
+    if (stored_key) {
+        free(key);
+        key = (char *)stored_key;
+    }
+    char *previous = (char *)cbm_ht_set(ctx->rust_imports, key, path);
+    free(previous);
+}
+
+typedef struct {
+    void **items;
+    uint32_t count;
+} pxc_owned_ptrs_t;
+
+static void pxc_rust_imports_collect_entry(const char *key, void *value, void *userdata) {
+    pxc_owned_ptrs_t *owned = (pxc_owned_ptrs_t *)userdata;
+    owned->items[owned->count++] = (void *)key;
+    owned->items[owned->count++] = value;
+}
+
+void cbm_pipeline_rust_imports_free(cbm_pipeline_ctx_t *ctx) {
+    if (!ctx || !ctx->rust_imports) {
+        return;
+    }
+    /* The table borrows keys, so collect every key and value first and free
+     * them only after the table (and its iteration) is gone. */
+    uint32_t entries = cbm_ht_count(ctx->rust_imports);
+    pxc_owned_ptrs_t owned = {.items = calloc((size_t)entries * 2 + 1, sizeof(void *)), .count = 0};
+    if (owned.items) {
+        cbm_ht_foreach(ctx->rust_imports, pxc_rust_imports_collect_entry, &owned);
+    }
+    cbm_ht_free(ctx->rust_imports);
+    ctx->rust_imports = NULL;
+    for (uint32_t i = 0; owned.items && i < owned.count; i++) {
+        free(owned.items[i]);
+    }
+    free(owned.items);
+}
+
+static const char *pxc_rust_import_lookup(void *table, const char *module_qn,
+                                          const char *local_name) {
+    if (!table || !module_qn || !local_name) {
+        return NULL;
+    }
+    char *key = pxc_rust_imports_key(module_qn, local_name);
+    if (!key) {
+        return NULL;
+    }
+    const char *path = (const char *)cbm_ht_get((const CBMHashTable *)table, key);
+    free(key);
+    return path;
+}
+
+static _Thread_local CBMRustImportSource g_pxc_rust_imports = {0};
+
+void cbm_pxc_set_rust_imports(const CBMHashTable *imports) {
+    g_pxc_rust_imports.lookup = imports ? pxc_rust_import_lookup : NULL;
+    g_pxc_rust_imports.ctx = (void *)imports;
+}
+
+const CBMRustImportSource *cbm_pxc_get_rust_import_source(void) {
+    return g_pxc_rust_imports.lookup ? &g_pxc_rust_imports : NULL;
 }
 
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void) {
@@ -1277,7 +1474,8 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
         cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
                                              def_count, imp_names, imp_qns, imp_count, tree,
-                                             g_pxc_rust_manifest, &out, &synthetic_calls);
+                                             g_pxc_rust_manifest, cbm_pxc_get_rust_import_source(),
+                                             &out, &synthetic_calls);
         break;
     }
     default:
@@ -1513,7 +1711,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             CBMCallArray synthetic_calls = {0};
             cbm_run_rust_lsp_cross_with_registry(
                 &scratch, source, source_len, def_module, shared, imp_keys, imp_vals, imp_count,
-                result->cached_tree, cbm_pxc_get_rust_manifest(), &out, &synthetic_calls);
+                result->cached_tree, cbm_pxc_get_rust_manifest(), cbm_pxc_get_rust_import_source(),
+                &out, &synthetic_calls);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             cbm_arena_destroy(&scratch);
@@ -1552,6 +1751,30 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     memset(out_m, 0, sizeof(*out_m));
     cbm_cargo_parse(marena, toml, toml_len, out_m);
     free(toml); /* cargo parser copies into marena */
+    /* Rust code names a member by its package (or lib) name, which need not
+     * equal its directory: read each member manifest so `codex_core::x` can
+     * route to `core/`. A missing or unreadable member manifest leaves the
+     * directory name as the only key. */
+    for (int i = 0; i < out_m->member_count; i++) {
+        CBMCargoMember *member = &out_m->members[i];
+        if (!member->member_path) {
+            continue;
+        }
+        n = snprintf(path, sizeof(path), "%s/%s/Cargo.toml", ctx->repo_path, member->member_path);
+        if (n <= 0 || (size_t)n >= sizeof(path)) {
+            continue;
+        }
+        int member_len = 0;
+        char *member_toml = pxc_read_file(path, &member_len);
+        if (!member_toml || member_len <= 0) {
+            free(member_toml);
+            continue;
+        }
+        CBMCargoManifest member_manifest;
+        cbm_cargo_parse(marena, member_toml, member_len, &member_manifest);
+        free(member_toml);
+        cbm_cargo_set_member_names(member, member_manifest.package_name, member_manifest.lib_name);
+    }
     return true;
 }
 
@@ -1580,6 +1803,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cbm_arena_init(&cargo_arena);
         have_manifest = cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
         cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
+        cbm_pxc_set_rust_imports(ctx->rust_imports);
     }
 
     /* Per-file module QN cache so we don't recompute it once per def + once
@@ -1703,6 +1927,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
      * pass (or a stale thread-local) can never read freed manifest memory. */
     if (have_rust) {
         cbm_pxc_set_rust_manifest(NULL);
+        cbm_pxc_set_rust_imports(NULL);
         cbm_arena_destroy(&cargo_arena);
     }
     (void)have_manifest;

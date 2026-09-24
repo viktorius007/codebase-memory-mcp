@@ -330,20 +330,6 @@ static int es_edge_present(const ES_LangFile *files, int nfiles, const char *edg
     return got >= floor;
 }
 
-static int es_edge_absent_with_definitions(const ES_LangFile *files, int nfiles, const char *edge) {
-    ES_LangProj lp;
-    cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
-    int got = store ? cbm_store_count_edges_by_type(store, lp.project, edge) : -1;
-    int definitions = store ? cbm_store_count_edges_by_type(store, lp.project, "DEFINES") : -1;
-    if (got != 0 || definitions < 1) {
-        fprintf(stderr, "  [ES-EDGE] FAIL %-20s got=%d expected=0 definitions=%d expected>=1\n",
-                edge, got, definitions);
-        es_dump_edge_histogram(store, lp.project);
-    }
-    es_lang_cleanup(&lp, store);
-    return got == 0 && definitions >= 1;
-}
-
 static int es_exact_edge_by_name(const ES_LangFile *files, int nfiles, const char *edge_type,
                                  const char *source_name, const char *target_name) {
     ES_LangProj lp;
@@ -414,12 +400,12 @@ TEST(es_calls_crossfile_cpp) {
     PASS();
 }
 
-/* Rust: cross-file CALLS lacks trusted binding provenance and stays absent. */
+/* Rust: caller in main.rs, callee behind a `mod lib;` declaration. */
 TEST(es_calls_crossfile_rust) {
     static const ES_LangFile f[] = {
         {"lib.rs", "pub fn square(x: i32) -> i32 {\n    x * x\n}\n"},
         {"main.rs", "mod lib;\n\nfn run(n: i32) -> i32 {\n    lib::square(n)\n}\n"}};
-    ASSERT_TRUE(es_edge_absent_with_definitions(f, 2, "CALLS"));
+    ASSERT_TRUE(es_edge_present(f, 2, "CALLS", 1)); /* run -> square */
     PASS();
 }
 

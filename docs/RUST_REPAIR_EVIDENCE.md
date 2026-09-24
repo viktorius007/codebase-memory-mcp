@@ -1,67 +1,98 @@
 # Rust repair verification
 
-This file records the current repair's contract and durable regression oracles.
-Historical runs, discarded candidates and compiler transcripts are retired to Git.
-The remaining objective is in [RUST_CODEGRAPH_TRUTH_PLAN.md](RUST_CODEGRAPH_TRUTH_PLAN.md).
+This file records the current repair's contract, its measurement against
+rust-analyzer, and the durable regression oracles. Historical runs, discarded
+candidates and compiler transcripts are retired to Git. The remaining objective
+is in [RUST_CODEGRAPH_TRUTH_PLAN.md](RUST_CODEGRAPH_TRUTH_PLAN.md).
+
+## Measurement lane
+
+`scripts/scip-site-join.py` scores every parsed Rust call site of an index
+against a rust-analyzer SCIP index of the same corpus. Indexing with
+`CBM_RUST_RESOLVE_DUMP=<file>` writes one `R` row per resolver record and one
+`C` row per call site (joined resolution, strategy, admission verdict); the
+script locates the callee identifier inside each call span, takes the SCIP
+occurrence at that position as truth, and compares the resolver's target with
+the truth definition by file, leaf, owner type and trait. Precision is reported
+per strategy on internal (workspace-function) truths; misses are broken down by
+the resolver's own unresolved reason.
+
+```sh
+rsync -a --exclude target --exclude .git <workspace>/ /tmp/corpus/
+rust-analyzer scip <workspace> --output /tmp/index.scip
+CBM_CACHE_DIR=/tmp/cache CBM_RUNTIME_DIR=$(mktemp -d /tmp/rt.XXXXXX) \
+  CBM_RUST_RESOLVE_DUMP=/tmp/dump.tsv \
+  build/c/codebase-memory-mcp cli index_repository --repo-path /tmp/corpus --mode full --name c
+scripts/scip-site-join.py --corpus /tmp/corpus --dump /tmp/dump.tsv \
+  --db /tmp/cache/c.db --scip /tmp/index.scip --out /tmp/join
+```
+
+Definitions are checked separately: 99.56% of rust-analyzer's function and
+method definitions in codex-rs have a graph node at the same file and lines; the
+remainder are macro-generated items and `extern` declarations.
+
+## codex-rs corpus, epoch 12 to 13 (rust-analyzer 1.98.1, 2026-09-25)
+
+| Measure | Epoch 12 | Epoch 13 |
+|---|---|---|
+| CALLS edges | 22,020 | 73,707 |
+| Call sites admitted | 27,142 | 170k |
+| Site-level recall, internal function calls | 23.8% | 43.6% |
+| Calls attributed to the File node | 631 | 22 |
+| Lowest admitted-strategy precision | 94.0% (`lsp_direct`) | 98.0% (`lsp_trait_dispatch`) |
+
+Per-strategy site precision at epoch 13 on internal truths: `lsp_direct`
+99.90%, `lsp_method_dispatch` 99.88%, `lsp_constructor` 100%, `lsp_ufcs`
+99.80%, `lsp_import_alias` 99.38%, `lsp_glob_import` 99.74%,
+`lsp_deref_dispatch` 99.34%, `lsp_trait_dispatch` 98.05%, `lsp_cross_crate`
+100%. Closed: `lsp_trait_ufcs` 66.67% (`Default::default()` inference),
+`lsp_callable_alias` 0% (closure values), `lsp_prelude_trait` and `lsp_macro`
+(no graph target).
+
+Root causes repaired, each found as the largest miss class of the lane:
+
+1. The admission gate accepted only file-local free-function callers and four
+   strategies; 96% of sites were closed, including 26k measured-correct
+   resolutions.
+2. `crate::` mapped to the first two QN segments, omitting the source root, so
+   every `use crate::…` path missed the registry; `super::` from `mod.rs` and
+   workspace crate names (`codex_core::x`, dir `core`) had the same shape defect,
+   and the manifest parser dropped members past 64.
+3. Any glob import closed every bare call in the file, including same-module
+   items that shadow globs by language rule.
+4. Calls inside `impl Trait for Type` methods and `#[cfg]` twins carried an
+   enclosing name without the published `[Trait]` / `#cfg(..)]` suffix, so they
+   attached to the File node and no resolver row could join.
+5. Struct fields never reached the shared registry, and field or return types
+   spelled in the defining module could not be recovered, so
+   `self.field.method()` never typed its receiver.
+6. `pub use` re-exports and a parent's imports seen through `super::*` were not
+   followed; Rust IMPORTS edges (generic name matcher) were unusable for this,
+   so the pipeline now keeps a table of raw Rust import paths per file.
+7. `let x = x(..)` bound the pattern before resolving the initializer.
 
 ## Current gate
 
-The source/test tree committed at `61fde702` passed the canonical scripts/test.sh
-gate on macOS arm64:
-**8,074 passed, 0 failed, 10 skipped**, across 141 suites under ASan/UBSan.
-All subsequent production-runtime and security-string checks passed; the command
-exited 0.
-
-Repository lint-ci, diff-scoped clang-tidy, the security audit and whitespace checks
-passed on the final source. No lint suppression was added. Independent source
-reviews found no blocking issue in either the cleanup or its Rust integration.
-
-No mutation sweep, installed-binary validation, full-corpus incremental parity check
-or comparable warm-update performance measurement has been completed.
+`make scip-rust` on the committed fixture: `calls_graph=7 matched=5
+graph_only_referenced=2 fabricated=0 oracle_strict=5 oracle_only=0 imports=3`;
+the second attested graph-only edge is the trait-impl method body
+(`Loud::greet` to `shout`) that the epoch-12 gate refused. The semantic-epoch
+contract is 13. Focused suites (`rust_lsp pipeline parallel
+repro_lexical_binding_precision`) and the full `scripts/test.sh` leg are
+recorded in the commit that lands this file.
 
 ## Regression contracts
 
 | Test | Observable contract |
 |---|---|
+| pipeline_rust_module_paths_resolve_exact_calls_in_both_modes | One crate laid out as Cargo does: field-typed and let-bound receivers, a trait-impl caller, `Arc<dyn Trait>`, a `crate::` re-export, a glob, a `#[cfg]` twin caller and `super::` from `mod.rs` all publish the exact edge in both pipelines; `Default::default()` publishes none. |
+| pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes | Keyed trait-impl dispatch admitted; two same-named impls stay closed. |
 | rust_use_trees_preserve_exact_paths_and_bindings | Exact local-name/module-path pairs for nested aliases, grouped self, globs and trivia. |
 | rustlsp_nested_use_aliases_resolve_exact_targets | Exact String/Vec constructor identities and caller in local and cross resolvers. |
-| extract_rust_test_attributes_match_paths_not_documentation | Each definition appears once with its expected attribute classification; documentation-only helpers remain non-tests. |
-| testdetect_explicit_test_marker_does_not_require_name_prefix | Two distinct attributed sources link to the production target; helpers and test-to-test calls do not qualify. |
-| pipeline_rust_test_attribute_survives_large_docs_in_both_modes | Compact marker survives 5,000-byte documentation; live CALLS and TESTS point to parse in both modes. |
-| rustlsp_collection_imports_preserve_library_owner | Exact constructor/method identities retain std HashMap/HashSet and alloc BTreeMap owners. |
-| rust_exact_calls_survive_without_name_fallback_in_both_modes | Real extraction and both materializers preserve exact local free-function edges while refusing guessed, method, external and shadowed targets; a C control stays positive. |
-| rustlsp_missing_path_does_not_bind_same_named_local_function | An unreachable qualified path remains unresolved while the genuine local invocation resolves exactly. |
-
-The binding table includes library/receiver decoys, aliases, block imports, nested
-functions, constants, tuple structs, foreign declarations and glob scopes. Expectations
-are test-owned exact counts and qualified targets, not values read from the resolver.
-
-The two persisted-edge pipeline regressions exercise legacy and closure restoration:
-current-epoch CALLS/TESTS survive and IMPLEMENTS/OVERRIDE do not. They prove restoration
-policy, not whole-corpus full/incremental parity.
-
-Existing convergence, matrix, reference-precision and node probes retain their exact
-fixture-derived positive local edges. Callable references remain distinct from calls;
-self loops and unsupported method bindings remain excluded.
-
-## Executed oracle discrimination
-
-Temporary fixture variations were executed with production unchanged and then restored.
-
-| Property | Fixture variation | Required assertion failed |
-|---|---|---|
-| Exact published binding | Invoke other() instead of target(), retaining both declarations | Total remains one; the caller-to-target edge is absent. |
-| Unreachable path | Invoke process(10) instead of missing::process(10) | Actual local target differs from the unresolved-path expectation. |
-| Live test relationships | Remove parse() but retain declarations and test attribute | CALLS count becomes zero instead of one. |
-| Persisted-edge policy | Seed OVERRIDE instead of CALLS | Both restoration routes retain their expected route and fail the expected CALLS count. |
-| Import identity | Change Map to OtherMap; separately invoke Sequence::new() instead of Text::new() | Exact local-name and String-target assertions fail. |
-| Attribute identity | Add #[test] to a documentation-only helper; remove a source marker; replace the large-doc test attribute with #[allow(dead_code)] | Classification, TESTS count and stored-marker assertions fail respectively. |
-| Library owner | Bind Map to BTreeMap instead of HashMap | Exact std HashMap target differs from alloc BTreeMap. |
-
-Independent rustc 1.94.0, edition-2021 checks corroborated block-import shadowing,
-glob precedence, tuple-struct value shadowing, external aliases, foreign declaration
-shadowing, exact test-attribute classification and collection ownership. These checks
-do not establish Cargo/cfg/macro completeness.
+| extract_rust_test_attributes_match_paths_not_documentation | Each definition appears once with its expected attribute classification. |
+| rustlsp_collection_imports_preserve_library_owner | Std HashMap/HashSet and alloc BTreeMap owners are kept. |
+| rustlsp_missing_path_does_not_bind_same_named_local_function | An unreachable qualified path stays unresolved while the local invocation resolves. |
+| scip harness (`tests/fixtures/scip_harness`) | fabricated=0 unconditionally; matched, graph-only-referenced, oracle-only and imports pinned. |
 
 ## Reproduction
 
@@ -78,6 +109,6 @@ make -j3 -f Makefile.cbm lint-ci lint-tidy-diff
 scripts/security-audit.sh
 ```
 
-Diff lint consumes staged files. For focused iteration, use scripts/test.sh --suites
-with rust_lsp,parallel,pipeline,repro_lexical_binding_precision; it does not replace
+For focused iteration, use scripts/test.sh --suites with
+rust_lsp,pipeline,parallel,repro_lexical_binding_precision; it does not replace
 the complete gate.

@@ -495,7 +495,7 @@ TEST(probe_rust_struct_impl) {
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1); /* struct Stack */
     ASSERT_TRUE(m.functions + m.methods >= 2);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 3); /* demo -> new, push, pop */
     PASS();
 }
 

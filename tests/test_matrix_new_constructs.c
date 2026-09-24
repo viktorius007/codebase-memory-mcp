@@ -727,7 +727,7 @@ TEST(mn_extension_rust_impl) {
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions + m.methods >= 3);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 3); /* demo -> new, enqueue, dequeue */
     PASS();
 }
 
@@ -1009,7 +1009,7 @@ TEST(mn_record_rust_derive) {
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions + m.methods >= 3);
-    ASSERT_EQ(m.calls, 0);
+    ASSERT_EQ(m.calls, 4); /* run -> new, distance, origin; origin -> new */
     PASS();
 }
 

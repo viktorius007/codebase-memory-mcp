@@ -22,8 +22,8 @@
 #include "../arena.h"
 #include <stdbool.h>
 
-#define CBM_CARGO_MAX_DEPS    256
-#define CBM_CARGO_MAX_MEMBERS  64
+#define CBM_CARGO_MAX_DEPS 256
+#define CBM_CARGO_MAX_MEMBERS 1024
 
 typedef struct {
     const char* name;       /* declared dependency name */
@@ -31,13 +31,16 @@ typedef struct {
 } CBMCargoDep;
 
 typedef struct {
-    const char* member_name;   /* directory name */
-    const char* member_path;   /* relative path inside workspace root */
+    const char *member_name; /* directory name */
+    const char *member_path; /* relative path inside workspace root */
+    const char *crate_name;  /* [package].name of the member manifest, or NULL */
+    const char *lib_name;    /* [lib].name of the member manifest, or NULL */
 } CBMCargoMember;
 
 typedef struct CBMCargoManifest {
-    const char* package_name;    /* [package].name, NULL if missing */
-    const char* package_version; /* [package].version, NULL if missing */
+    const char *package_name;    /* [package].name, NULL if missing */
+    const char *package_version; /* [package].version, NULL if missing */
+    const char *lib_name;        /* [lib].name, NULL if missing */
     bool is_workspace_root;      /* [workspace] section seen */
 
     CBMCargoDep deps[CBM_CARGO_MAX_DEPS];
@@ -57,8 +60,14 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
  * paths. */
 bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head);
 
-/* Find a workspace member by crate name. Returns NULL if absent. */
-const CBMCargoMember* cbm_cargo_find_member(const CBMCargoManifest* m,
-    const char* name);
+/* Find a workspace member by the head of a Rust path: its directory name,
+ * its [package].name or its [lib].name, comparing `-` and `_` as equal.
+ * Returns NULL if absent. */
+const CBMCargoMember *cbm_cargo_find_member(const CBMCargoManifest *m, const char *name);
+
+/* Record the member manifest's package and lib names on the workspace
+ * member entry so `crate_name::item` paths can be routed to the member. */
+void cbm_cargo_set_member_names(CBMCargoMember *member, const char *crate_name,
+                                const char *lib_name);
 
 #endif /* CBM_LSP_RUST_CARGO_H */

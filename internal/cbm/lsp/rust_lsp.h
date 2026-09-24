@@ -78,14 +78,31 @@ typedef struct {
 
     const char **glob_module_qns;
     int glob_count;
+    /* Globs declared at file level; any glob beyond this index belongs to an
+     * enclosing block and shadows the module's own items. */
+    int file_glob_count;
 
     /* Exact names from top-level out-of-line `mod name;` declarations. A
      * relative scoped type may be project-qualified only when its head is in
      * this set; coincidentally same-named indexed modules stay external. */
     CBMIdxMemo declared_modules;
 
+    /* Raw `use` paths of every Rust file in the project, keyed by that file's
+     * module QN and the imported local name (pipeline-owned). Lets
+     * `crate_root::Item` follow a `pub use` re-export and lets `super::*`
+     * see the parent module's imports. NULL outside the pipeline. */
+    const struct CBMRustImportSource *imports;
+    int export_depth;
+    CBMIdxMemo export_memo; /* "<module>\x1f<name>" -> 0 (miss) or 1-based export_values slot */
+    const char **export_values;
+    int export_value_count;
+
     /* Module-qualified name for this file (e.g. "<project>.<crate>.foo"). */
     const char *module_qn;
+    /* Lazily derived from module_qn: the crate's `<project>.<dirs>.<src>`
+     * prefix and the module directory this file owns. */
+    const char *crate_root_prefix;
+    const char *module_dir_qn;
 
     /* Enclosing function context. `enclosing_func_qn` is the QN we attach
      * to every emitted CBMResolvedCall as `caller_qn`. */
@@ -99,6 +116,7 @@ typedef struct {
      * implementations over the trait method when only one impl exists. */
     const char *self_type_qn;
     const char *self_trait_qn;
+    const char *self_trait_spelling; /* raw `impl <Trait> for` text, NULL outside trait impls */
 
     /* Closure parameter inference: when the call resolver descends into a
      * call's argument list and the callee is a method like
@@ -344,11 +362,19 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
  * boundary (`crate_a::foo` → the def inside crate_a). Wired from the
  * cross-file LSP pass (pass_lsp_cross.c) which builds the manifest once from
  * the project root Cargo.toml. */
+/* Pipeline-owned lookup of another file's raw `use` path: (file module QN,
+ * local name) -> path text, or NULL. */
+typedef struct CBMRustImportSource {
+    const char *(*lookup)(void *ctx, const char *file_module_qn, const char *local_name);
+    void *ctx;
+} CBMRustImportSource;
+
 void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
                                           const char *module_qn, CBMRustLSPDef *defs, int def_count,
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
+                                          const CBMRustImportSource *imports,
                                           CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 /* Tier-2: build the project-wide Rust cross registry ONCE from all defs, finalize,
@@ -367,6 +393,7 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
+                                          const CBMRustImportSource *imports,
                                           CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 /* Per-file input for batch cross-file Rust LSP processing. */
