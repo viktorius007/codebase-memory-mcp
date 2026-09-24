@@ -7082,6 +7082,58 @@ TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes) {
     PASS();
 }
 
+/* A call bound through a re-export in an UNCHANGED file (`pub use
+ * inner::helper;` in lib.rs, `crate::helper()` in user.rs) must survive an
+ * incremental re-index of the caller. The closure route parses only user.rs;
+ * lib.rs's `use` table comes from its persisted surface. Discriminator: only
+ * user.rs is edited, so a route that drops unchanged files' imports publishes
+ * no CALLS edge at all. */
+TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_reexport_incr_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"reexport\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod inner;\npub mod user;\npub use inner::helper;\n");
+    write_temp_file(tmp, "src/inner.rs", "pub fn helper() -> u32 { 1 }\n");
+    write_temp_file(tmp, "src/user.rs", "pub fn use_it() -> u32 {\n    crate::helper()\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/reexport.db", tmp);
+
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int full_rc = full ? cbm_pipeline_run(full) : -1;
+    bool full_edge = false;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (store && full) {
+        full_edge = cross_file_call_exists(store, cbm_pipeline_project_name(full), "use_it", "helper");
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(full);
+
+    char user_path[512];
+    snprintf(user_path, sizeof(user_path), "%s/src/user.rs", tmp);
+    int append_rc = th_append_file(user_path, "\n// touched\n");
+
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int incremental_rc = incremental ? cbm_pipeline_run(incremental) : -1;
+    bool incremental_edge = false;
+    store = cbm_store_open_path(db_path);
+    if (store && incremental) {
+        incremental_edge = cross_file_call_exists(store, cbm_pipeline_project_name(incremental),
+                                                  "use_it", "helper");
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(incremental);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_TRUE(full_edge); /* control: the full build binds the re-export */
+    ASSERT_EQ(append_rc, 0);
+    ASSERT_EQ(incremental_rc, 0);
+    ASSERT_TRUE(incremental_edge);
+    PASS();
+}
+
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static int sqlite_scalar(sqlite3 *db, const char *sql, const char *project) {
     sqlite3_stmt *stmt = NULL;
@@ -14960,7 +15012,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":1") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":2") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -15848,6 +15900,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes);
+    RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);

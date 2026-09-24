@@ -4,13 +4,15 @@
  * A file's SURFACE is everything another file's resolution can consume from
  * it: the CBMLSPDefs pass_lsp_cross registers into the cross registries,
  * plus the registry-only symbols (labels the name registry serves that
- * pxc_map_label drops — Field, today). Serialized to canonical JSON, hashed,
+ * pxc_map_label drops — Field, today), plus a Rust file's `use` table
+ * (local name -> module path), which rust_module_export consults when a
+ * path crosses this file's re-exports. Serialized to canonical JSON, hashed,
  * and persisted per file (store: lsp_surface rows) at publication, so an
  * incremental run can (a) detect that an edit left a file's surface
  * unchanged — a body edit — and skip recomputing its dependents, and
  * (b) rehydrate the cross registries for files it does not re-parse.
  *
- * The JSON is a versioned object {"v":1,"lsp":[...],"reg":[...]}. Field
+ * The JSON is a versioned object {"v":2,"lsp":[...],"reg":[...],"imp":[...]}. Field
  * order and array order are fixed by the writer, so byte equality of the
  * serialization is surface equality; the sha256 of these bytes is the
  * stored surface_sha. Rows written by a different codec version fail the
@@ -39,5 +41,12 @@ int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *projec
  * 0 for an empty surface, or -1 when the JSON is missing, malformed, or a
  * different codec version — callers route that to a full rebuild. */
 int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLSPDef **out_defs);
+
+/* Decode one row's Rust `use` table back into the CBMImport array
+ * cbm_pipeline_rust_imports_add consumes. Strings are arena-allocated.
+ * Returns the import count, 0 for a file without one (every non-Rust file),
+ * or -1 on the same conditions as cbm_lsp_surface_defs_from_json. */
+int cbm_lsp_surface_imports_from_json(CBMArena *arena, const char *defs_json,
+                                      CBMImport **out_imports);
 
 #endif /* CBM_PIPELINE_LSP_SURFACE_H */

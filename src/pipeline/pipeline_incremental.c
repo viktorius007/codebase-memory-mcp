@@ -1533,9 +1533,11 @@ typedef struct {
     int row_count;
     int worker_id;
     int worker_count;
-    CBMArena *arena;      /* this worker's arena (owned by cr) */
-    CBMLSPDef **row_defs; /* per-row result pointers */
-    int *row_counts;      /* per-row def counts; -1 = decode failure */
+    CBMArena *arena;         /* this worker's arena (owned by cr) */
+    CBMLSPDef **row_defs;    /* per-row result pointers */
+    int *row_counts;         /* per-row def counts; -1 = decode failure */
+    CBMImport **row_imports; /* per-row Rust `use` tables */
+    int *row_import_counts;  /* per-row import counts; -1 = decode failure */
 } rehydrate_worker_t;
 
 static void *rehydrate_worker(void *arg) {
@@ -1545,6 +1547,10 @@ static void *rehydrate_worker(void *arg) {
         int count = cbm_lsp_surface_defs_from_json(w->arena, w->rows[i]->defs_json, &defs);
         w->row_defs[i] = defs;
         w->row_counts[i] = count;
+        CBMImport *imports = NULL;
+        w->row_import_counts[i] =
+            cbm_lsp_surface_imports_from_json(w->arena, w->rows[i]->defs_json, &imports);
+        w->row_imports[i] = imports;
     }
     return NULL;
 }
@@ -1975,6 +1981,12 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int manifest_count = 0;
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
+    /* Persisted surfaces of the files this run does not re-parse, and their
+     * decoded Rust `use` tables (strings live in cr.rehydrate_arenas). */
+    const cbm_lsp_surface_row_t **elig = NULL;
+    int elig_count = 0;
+    CBMImport **row_imports = NULL;
+    int *row_import_counts = NULL;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_stage_clone(db_path, &stage) != 0) {
@@ -2048,12 +2060,11 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     {
         /* Eligible rows first (skip everything being re-parsed or deleted),
          * then fan the JSON decode out across workers. */
-        const cbm_lsp_surface_row_t **elig = (const cbm_lsp_surface_row_t **)calloc(
+        elig = (const cbm_lsp_surface_row_t **)calloc(
             (size_t)(plan->stored_count ? plan->stored_count : 1), sizeof(*elig));
         if (!elig) {
             goto out;
         }
-        int elig_count = 0;
         for (int i = 0; i < plan->stored_count; i++) {
             const cbm_lsp_surface_row_t *row = &plan->stored_rows[i];
             if (!cbm_ht_get(stale_surface_set, row->rel_path)) {
@@ -2067,14 +2078,16 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         if (workers > elig_count) {
             workers = elig_count ? elig_count : 1;
         }
-        CBMLSPDef **row_defs =
-            (CBMLSPDef **)calloc((size_t)(elig_count ? elig_count : 1), sizeof(*row_defs));
-        int *row_counts = (int *)calloc((size_t)(elig_count ? elig_count : 1), sizeof(int));
+        size_t slots = (size_t)(elig_count ? elig_count : 1);
+        CBMLSPDef **row_defs = (CBMLSPDef **)calloc(slots, sizeof(*row_defs));
+        int *row_counts = (int *)calloc(slots, sizeof(int));
+        row_imports = (CBMImport **)cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*row_imports));
+        row_import_counts = (int *)cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(int));
         cr.rehydrate_arenas = (CBMArena *)calloc((size_t)workers, sizeof(CBMArena));
         cbm_thread_t *threads = (cbm_thread_t *)calloc((size_t)workers, sizeof(cbm_thread_t));
         rehydrate_worker_t *wargs = (rehydrate_worker_t *)calloc((size_t)workers, sizeof(*wargs));
-        if (!row_defs || !row_counts || !cr.rehydrate_arenas || !threads || !wargs) {
-            free(elig);
+        if (!row_defs || !row_counts || !row_imports || !row_import_counts ||
+            !cr.rehydrate_arenas || !threads || !wargs) {
             free(row_defs);
             free(row_counts);
             free(threads);
@@ -2093,7 +2106,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                                             .worker_count = workers,
                                             .arena = &cr.rehydrate_arenas[w],
                                             .row_defs = row_defs,
-                                            .row_counts = row_counts};
+                                            .row_counts = row_counts,
+                                            .row_imports = row_imports,
+                                            .row_import_counts = row_import_counts};
             if (cbm_thread_create(&threads[w], 0, rehydrate_worker, &wargs[w]) != 0) {
                 break;
             }
@@ -2110,7 +2125,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         bool decode_ok = true;
         int64_t total = 0;
         for (int i = 0; i < elig_count; i++) {
-            if (row_counts[i] < 0) {
+            if (row_counts[i] < 0 || row_import_counts[i] < 0) {
                 cbm_log_error("delta.rehydrate_failed", "path", elig[i]->rel_path);
                 decode_ok = false;
                 break;
@@ -2132,7 +2147,6 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                 }
             }
         }
-        free(elig);
         free(row_defs);
         free(row_counts);
         if (!decode_ok) {
@@ -2171,6 +2185,17 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
             cbm_gbuf_upsert_node(gbuf, "File", basename, file_qn, rel, 0, 0, props);
             free(file_qn);
+        }
+    }
+
+    /* A path that crosses a re-export (`pub use inner::helper;` in an
+     * unchanged lib.rs) resolves through that file's `use` table. The full
+     * build fills the table from every file; this route fills it from the
+     * fresh parses (pass_definitions) plus the persisted surfaces here, so
+     * both publish the same edge for the same source. */
+    for (int i = 0; i < elig_count; i++) {
+        for (int j = 0; j < row_import_counts[i]; j++) {
+            cbm_pipeline_rust_imports_add(&ctx, elig[i]->rel_path, &row_imports[i][j]);
         }
     }
 
@@ -2387,6 +2412,9 @@ out:
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
     free(cov);
     free(purge_paths);
+    free(elig);
+    cbm_free(CBM_MEM_CLASS_OTHER, row_imports);
+    cbm_free(CBM_MEM_CLASS_OTHER, row_import_counts);
     if (registry) {
         cbm_registry_free(registry);
     }

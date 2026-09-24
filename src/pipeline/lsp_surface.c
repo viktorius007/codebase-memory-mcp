@@ -27,7 +27,7 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 1 };
+enum { SURFACE_CODEC_VERSION = 2 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -71,8 +71,8 @@ static void add_str_array_or_null(yyjson_mut_doc *doc, yyjson_mut_val *obj, cons
 
 /* Serialize one file's surface: its slice of all_defs plus the registry-only
  * symbols from its raw extraction defs. Returns a malloc'd JSON string. */
-static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *defs,
-                                  int def_count) {
+static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *defs, int def_count,
+                                  bool rust_imports) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return NULL;
@@ -123,6 +123,19 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
     }
     yyjson_mut_obj_add_val(doc, root, "reg", reg);
 
+    yyjson_mut_val *imp = yyjson_mut_arr(doc);
+    for (int i = 0; result && rust_imports && i < result->imports.count; i++) {
+        const CBMImport *im = &result->imports.items[i];
+        if (!im->local_name || !im->module_path) {
+            continue;
+        }
+        yyjson_mut_val *o = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, o, "l", im->local_name);
+        yyjson_mut_obj_add_str(doc, o, "p", im->module_path);
+        yyjson_mut_arr_add_val(imp, o);
+    }
+    yyjson_mut_obj_add_val(doc, root, "imp", imp);
+
     char *json = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);
     return json;
@@ -154,7 +167,8 @@ int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *projec
         }
         int start = def_starts ? def_starts[i] : 0;
         int end = def_starts ? def_starts[i + 1] : 0;
-        char *json = surface_file_to_json(fr, all_defs ? all_defs + start : NULL, end - start);
+        char *json = surface_file_to_json(fr, all_defs ? all_defs + start : NULL, end - start,
+                                          files[i].language == CBM_LANG_RUST);
         cbm_pipeline_result_release(fr, loaded);
         if (!json) {
             cbm_store_free_lsp_surfaces(rows, n);
@@ -272,5 +286,43 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
     }
     yyjson_doc_free(doc);
     *out_defs = defs;
+    return count;
+}
+
+int cbm_lsp_surface_imports_from_json(CBMArena *arena, const char *defs_json,
+                                      CBMImport **out_imports) {
+    *out_imports = NULL;
+    if (!defs_json) {
+        return -1;
+    }
+    yyjson_doc *doc = yyjson_read(defs_json, strlen(defs_json), 0);
+    if (!doc) {
+        return -1;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *ver = root ? yyjson_obj_get(root, "v") : NULL;
+    yyjson_val *imp = root ? yyjson_obj_get(root, "imp") : NULL;
+    if (!ver || yyjson_get_int(ver) != SURFACE_CODEC_VERSION || !imp || !yyjson_is_arr(imp)) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    int count = (int)yyjson_arr_size(imp);
+    if (count == 0) {
+        yyjson_doc_free(doc);
+        return 0;
+    }
+    CBMImport *imports = cbm_arena_alloc(arena, (size_t)count * sizeof(CBMImport));
+    if (!imports) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    memset(imports, 0, (size_t)count * sizeof(CBMImport));
+    for (int i = 0; i < count; i++) {
+        yyjson_val *o = yyjson_arr_get(imp, (size_t)i);
+        imports[i].local_name = arena_str_or_null(arena, yyjson_obj_get(o, "l"));
+        imports[i].module_path = arena_str_or_null(arena, yyjson_obj_get(o, "p"));
+    }
+    yyjson_doc_free(doc);
+    *out_imports = imports;
     return count;
 }
