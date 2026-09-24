@@ -6415,11 +6415,13 @@ TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier) {
     PASS();
 }
 
-/* Rust built-in macro arguments can expose a cross-file call candidate, but
- * neither pipeline may materialize it as a definite CALLS edge without trusted
- * semantic provenance. The exact same 55-file fixture exercises the sequential
- * and parallel paths so their final-graph result must remain equivalent. */
-TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes) {
+/* A call hidden inside a built-in macro argument (`format!("{}", lib::render())`)
+ * has no parser carrier; the resolver injects one at the exact source span and
+ * binds it through the module path (lsp_direct). Both pipelines publish that
+ * edge: the corpus lane measured such sites at 99.9% (2026-09-25, 10,037
+ * sites). The exact same 55-file fixture exercises the sequential and parallel
+ * paths so their final-graph result must remain equivalent. */
+TEST(pipeline_rust_macro_hidden_call_publishes_with_exact_admitted_resolution_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_syn_par_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
@@ -6500,9 +6502,8 @@ TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes) {
     ASSERT_EQ(run_rc, 0);
     ASSERT_TRUE(store_opened);
     ASSERT_TRUE(render_target_present); /* target is present in the parallel graph */
-    ASSERT_FALSE(seq_hidden_to_render);
-    ASSERT_FALSE(hidden_to_render);
-    ASSERT_EQ(seq_hidden_to_render, hidden_to_render);
+    ASSERT_TRUE(seq_hidden_to_render);
+    ASSERT_TRUE(hidden_to_render);
     PASS();
 }
 
@@ -15665,7 +15666,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
-    RUN_TEST(pipeline_rust_macro_hidden_call_needs_trusted_provenance_in_both_modes);
+    RUN_TEST(pipeline_rust_macro_hidden_call_publishes_with_exact_admitted_resolution_in_both_modes);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);

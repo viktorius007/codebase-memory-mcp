@@ -389,53 +389,69 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
  * 1.98.1): exact registry hits for free functions, imports, workspace-member
  * paths, inherent/trait/deref method dispatch, constructors and UFCS paths.
  * Sole-impl trait UFCS (`Default::default()`) measured 63% and stays closed,
- * as do prelude guesses, macro carriers, bound dispatch and callable aliases. */
+ * as do prelude guesses, macro carriers, bound dispatch and callable aliases.
+ * Operator-trait dispatch (`a + b` on a user type) had no site on the corpus
+ * and stays closed until a corpus lane measures it. */
 static inline bool cbm_pipeline_rust_strategy_admitted(const char *strategy) {
     return strcmp(strategy, "lsp_direct") == 0 || strcmp(strategy, "lsp_import_alias") == 0 ||
            strcmp(strategy, "lsp_glob_import") == 0 || strcmp(strategy, "lsp_cross_crate") == 0 ||
            strcmp(strategy, "lsp_method_dispatch") == 0 ||
            strcmp(strategy, "lsp_trait_dispatch") == 0 ||
            strcmp(strategy, "lsp_deref_dispatch") == 0 ||
-           strcmp(strategy, "lsp_constructor") == 0 || strcmp(strategy, "lsp_ufcs") == 0 ||
-           strcmp(strategy, "lsp_operator_trait") == 0;
+           strcmp(strategy, "lsp_constructor") == 0 || strcmp(strategy, "lsp_ufcs") == 0;
 }
 
-/* Rust CALLS admission. Floor for every class: a real parsed call site (never
- * a synthetic semantic candidate) whose caller is a function or method declared
- * in this file, whose resolution joined by exact source occurrence, and whose
- * published callee leaf equals the source callee leaf after removing a
- * `[Trait<...>]` provenance suffix. On top of that floor only the measured
- * strategies above are admitted; the target must still exist as a graph node
- * (both pipelines drop Rust calls without an exact LSP target).
+/* Rust CALLS admission. Returns NULL when the site is published, otherwise the
+ * closure reason (a stable identifier the CBM_RUST_RESOLVE_DUMP lane records
+ * per site). Floor for every class: a call carrier whose caller is a function
+ * or method declared in this file, whose resolution joined by exact source
+ * occurrence, and whose published callee leaf equals the source callee leaf
+ * after removing a `[Trait<...>]` provenance suffix. A carrier the resolver
+ * injected for a call hidden inside a built-in macro argument
+ * (`assert_eq!(f(x), 1)`) is bound by the same rules as a parsed one: it
+ * exists only because the resolver emitted the record it joins, and the
+ * corpus lane measured those sites at 99.9% (2026-09-25, 10,037 sites). On top
+ * of that floor only the measured strategies above are admitted; the target
+ * must still exist as a graph node (both pipelines drop Rust calls without an
+ * exact LSP target).
  *
  * Expansion identities still need their separate repairs. */
-static inline bool cbm_pipeline_plain_call_admitted(CBMLanguage lang, const CBMCall *call,
-                                                    const CBMResolvedCall *resolved,
-                                                    const char *module_qn) {
+static inline const char *cbm_pipeline_plain_call_closure(CBMLanguage lang, const CBMCall *call,
+                                                          const CBMResolvedCall *resolved,
+                                                          const char *module_qn) {
     if (lang != CBM_LANG_RUST) {
-        return true;
+        return NULL;
     }
-    if (!call || !resolved || !module_qn || !resolved->callee_qn || !call->callee_name ||
-        !call->enclosing_func_qn || !resolved->strategy || call->requires_lsp_resolution) {
-        return false;
+    if (!call || !module_qn || !call->callee_name || !call->enclosing_func_qn) {
+        return "malformed_carrier";
+    }
+    if (!resolved || !resolved->callee_qn || !resolved->strategy) {
+        return "no_resolution";
     }
     size_t module_len = strlen(module_qn);
     bool caller_in_file = strncmp(call->enclosing_func_qn, module_qn, module_len) == 0 &&
                           call->enclosing_func_qn[module_len] == '.' &&
                           call->enclosing_func_qn[module_len + 1] != '\0';
-    if (!caller_in_file ||
-        !cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte) ||
-        !cbm_pipeline_source_occurrence_eq(call->site_start_byte, call->site_end_byte,
+    if (!caller_in_file) {
+        return "caller_outside_file";
+    }
+    if (!cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte)) {
+        return "site_absent";
+    }
+    if (!cbm_pipeline_source_occurrence_eq(call->site_start_byte, call->site_end_byte,
                                            call->source_origin, resolved->site_start_byte,
                                            resolved->site_end_byte, resolved->source_origin)) {
-        return false;
+        return "occurrence_mismatch";
     }
     if (!cbm_pipeline_rust_strategy_admitted(resolved->strategy)) {
-        return false;
+        return "strategy_closed";
     }
     /* The published leaf must equal the source leaf; an aliased import
      * (`use a::b as c; c()`) carries the source spelling in `reason`. */
-    return cbm_pipeline_invocation_leaf_matches(resolved, call, 2);
+    if (!cbm_pipeline_invocation_leaf_matches(resolved, call, 2)) {
+        return "leaf_mismatch";
+    }
+    return NULL;
 }
 
 /* Look up the highest-confidence LSP-resolved call entry whose caller QN

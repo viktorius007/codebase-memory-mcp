@@ -1507,6 +1507,120 @@ TEST(rustlsp_known_std_macro_carriers_join_exact_sites) {
     PASS();
 }
 
+/* A call hidden inside a built-in macro argument has no parser carrier; the
+ * resolver injects one at the mapped source span. The gate must publish it
+ * under the same rules as a parsed carrier. Discriminator: the parser-produced
+ * carrier count is zero, so an admitted verdict can only come from the
+ * synthetic carrier joining its own exact record. */
+TEST(rustlsp_macro_argument_call_carrier_is_admitted_with_exact_resolution) {
+    const char *source = "fn helper() -> i32 { 1 }\n"
+                         "fn run() {\n"
+                         "    assert_eq!(helper(), 1);\n"
+                         "}\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+
+    const char *site = strstr(source, "assert_eq!(helper()");
+    site = site ? site + strlen("assert_eq!(") : NULL;
+    const uint32_t site_start = site ? (uint32_t)(site - source) : 0;
+    const uint32_t site_end = site_start + (uint32_t)strlen("helper()");
+    const CBMCall *carrier = NULL;
+    int parsed_carriers = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->callee_name || strcmp(call->callee_name, "helper") != 0) {
+            continue;
+        }
+        if (call->requires_lsp_resolution) {
+            carrier = call;
+        } else {
+            parsed_carriers++;
+        }
+    }
+    const CBMResolvedCall *joined =
+        carrier ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, carrier, false)
+                : NULL;
+    const char *closure = joined ? cbm_pipeline_plain_call_closure(CBM_LANG_RUST, carrier, joined,
+                                                                   "test.src.main")
+                                 : "no_resolution";
+    const bool exact_site = carrier && carrier->site_start_byte == site_start &&
+                            carrier->site_end_byte == site_end;
+    const bool direct = joined && joined->strategy && strcmp(joined->strategy, "lsp_direct") == 0;
+    if (closure) {
+        printf("  closure=%s carrier=%p joined=%p strategy=%s\n", closure, (const void *)carrier,
+               (const void *)joined, joined && joined->strategy ? joined->strategy : "(null)");
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(parsed_carriers, 0);
+    ASSERT_TRUE(exact_site);
+    ASSERT_TRUE(direct);
+    ASSERT_NULL(closure);
+    PASS();
+}
+
+/* Each refusal names the rule that closed the site. The expectation table is
+ * test-owned; every row varies exactly one field of the admitted fixture. */
+TEST(rustlsp_call_closure_names_the_refusing_rule) {
+    CBMResolvedCall admitted_resolved = {0};
+    admitted_resolved.caller_qn = "test.src.main.run";
+    admitted_resolved.callee_qn = "test.src.main.helper";
+    admitted_resolved.strategy = "lsp_direct";
+    admitted_resolved.kind = CBM_RESOLVED_INVOCATION;
+    admitted_resolved.site_start_byte = 40;
+    admitted_resolved.site_end_byte = 48;
+    CBMCall admitted_call = {0};
+    admitted_call.enclosing_func_qn = "test.src.main.run";
+    admitted_call.callee_name = "helper";
+    admitted_call.site_start_byte = 40;
+    admitted_call.site_end_byte = 48;
+    admitted_call.requires_lsp_resolution = true;
+    ASSERT_NULL(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &admitted_call,
+                                                &admitted_resolved, "test.src.main"));
+    ASSERT_NULL(cbm_pipeline_plain_call_closure(CBM_LANG_PYTHON, &admitted_call, NULL, NULL));
+
+    CBMCall outside = admitted_call;
+    outside.enclosing_func_qn = "test.src.other.run";
+    ASSERT_STR_EQ(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &outside, &admitted_resolved,
+                                                  "test.src.main"),
+                  "caller_outside_file");
+
+    CBMCall no_site = admitted_call;
+    no_site.site_start_byte = 0;
+    no_site.site_end_byte = 0;
+    ASSERT_STR_EQ(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &no_site, &admitted_resolved,
+                                                  "test.src.main"),
+                  "site_absent");
+
+    CBMCall shifted = admitted_call;
+    shifted.site_end_byte = 49;
+    ASSERT_STR_EQ(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &shifted, &admitted_resolved,
+                                                  "test.src.main"),
+                  "occurrence_mismatch");
+
+    CBMResolvedCall macro_resolved = admitted_resolved;
+    macro_resolved.strategy = "lsp_macro";
+    ASSERT_STR_EQ(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &admitted_call, &macro_resolved,
+                                                  "test.src.main"),
+                  "strategy_closed");
+
+    CBMResolvedCall operator_resolved = admitted_resolved;
+    operator_resolved.strategy = "lsp_operator_trait";
+    ASSERT_STR_EQ(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &admitted_call,
+                                                  &operator_resolved, "test.src.main"),
+                  "strategy_closed");
+
+    CBMResolvedCall other_leaf = admitted_resolved;
+    other_leaf.callee_qn = "test.src.main.render";
+    ASSERT_STR_EQ(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &admitted_call, &other_leaf,
+                                                  "test.src.main"),
+                  "leaf_mismatch");
+
+    ASSERT_STR_EQ(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &admitted_call, NULL,
+                                                  "test.src.main"),
+                  "no_resolution");
+    PASS();
+}
+
 /* A local macro_rules! definition has lexical precedence over a prelude macro
  * with the same name.  Expanding it must reveal the local target and must not
  * also fabricate the canonical std macro semantic. */
@@ -7166,6 +7280,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_macro_operator_has_one_exact_carrier);
     RUN_TEST(rustlsp_known_std_macro_resolutions_have_exact_sites);
     RUN_TEST(rustlsp_known_std_macro_carriers_join_exact_sites);
+    RUN_TEST(rustlsp_macro_argument_call_carrier_is_admitted_with_exact_resolution);
+    RUN_TEST(rustlsp_call_closure_names_the_refusing_rule);
     RUN_TEST(rustlsp_local_macro_shadows_known_std_macro);
     RUN_TEST(rustlsp_later_macro_does_not_shadow_earlier_std_macro);
     RUN_TEST(rustlsp_nested_macro_scope_does_not_leak);

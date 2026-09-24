@@ -194,7 +194,7 @@ void cbm_pxc_rust_dump_open(void);
 void cbm_pxc_rust_dump_close(void);
 void cbm_pxc_rust_dump_file(const char *rel, const CBMFileResult *result);
 void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const CBMResolvedCall *lsp,
-                            bool admitted);
+                            const char *closure);
 
 /* Per-thread borrow of the pipeline's Rust import table (pipeline_internal.h),
  * installed and cleared beside the manifest. */

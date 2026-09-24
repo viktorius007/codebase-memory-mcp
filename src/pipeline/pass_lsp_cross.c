@@ -1214,7 +1214,8 @@ static void pxc_rust_dump_field(char *buf, size_t cap, size_t *len, const char *
 
 static void pxc_rust_dump_row(FILE *dump, const char *rel, const char *kind, uint32_t start,
                               uint32_t end, const char *a, const char *b, const char *c,
-                              const char *d, float confidence, const char *e, const char *f) {
+                              const char *d, float confidence, const char *e, const char *f,
+                              const char *g) {
     char line[CBM_SZ_2K];
     size_t len = (size_t)snprintf(line, sizeof(line), "%s\t%s\t%u\t%u\t", kind, rel, start, end);
     if (len >= sizeof(line)) {
@@ -1229,9 +1230,13 @@ static void pxc_rust_dump_row(FILE *dump, const char *rel, const char *kind, uin
     if (len + 4 >= sizeof(line)) {
         return;
     }
-    pxc_rust_dump_field(line, sizeof(line), &len, e);
-    line[len++] = '\t';
-    pxc_rust_dump_field(line, sizeof(line), &len, f);
+    const char *tail[] = {e, f, g};
+    for (size_t i = 0; i < sizeof(tail) / sizeof(tail[0]); i++) {
+        if (i > 0) {
+            line[len++] = '\t';
+        }
+        pxc_rust_dump_field(line, sizeof(line), &len, tail[i]);
+    }
     if (len + 2 >= sizeof(line)) {
         return;
     }
@@ -1240,15 +1245,16 @@ static void pxc_rust_dump_row(FILE *dump, const char *rel, const char *kind, uin
     fputs(line, dump);
 }
 
-/* One R row per resolver record, then one C row per parser call site with the
- * joined resolution and the admission verdict. */
+/* One R row per resolver record, then one C row per call carrier with the
+ * joined resolution, the admission verdict and the closure reason
+ * (cbm_pipeline_plain_call_closure; `-` when admitted). */
 static void pxc_rust_dump_rows(FILE *dump, const char *rel, const CBMFileResult *result) {
     for (int i = 0; i < result->resolved_calls.count; i++) {
         const CBMResolvedCall *r = &result->resolved_calls.items[i];
         pxc_rust_dump_row(dump, rel, "R", r->site_start_byte, r->site_end_byte, r->caller_qn,
                           r->callee_qn, r->strategy, r->reason, r->confidence,
                           r->kind == CBM_RESOLVED_INVOCATION ? "invocation" : "reference",
-                          r->callee_impl_key);
+                          r->callee_impl_key, NULL);
     }
 }
 
@@ -1259,14 +1265,14 @@ void cbm_pxc_rust_dump_file(const char *rel, const CBMFileResult *result) {
 }
 
 void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const CBMResolvedCall *lsp,
-                            bool admitted) {
+                            const char *closure) {
     if (!g_pxc_rust_dump || !rel || !call) {
         return;
     }
     pxc_rust_dump_row(g_pxc_rust_dump, rel, "C", call->site_start_byte, call->site_end_byte,
                       call->enclosing_func_qn, call->callee_name, lsp ? lsp->callee_qn : NULL,
                       lsp ? lsp->strategy : NULL, lsp ? lsp->confidence : 0.0f,
-                      admitted ? "admitted" : "closed", lsp ? lsp->callee_impl_key : NULL);
+                      closure ? "closed" : "admitted", lsp ? lsp->callee_impl_key : NULL, closure);
 }
 
 void cbm_pxc_set_rust_manifest(const CBMCargoManifest *m) {

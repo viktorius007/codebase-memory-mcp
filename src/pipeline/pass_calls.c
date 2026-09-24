@@ -556,11 +556,11 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
-    bool admitted = cbm_pipeline_plain_call_admitted(lang, call, lsp, module_qn);
+    const char *closure = cbm_pipeline_plain_call_closure(lang, call, lsp, module_qn);
     if (lang == CBM_LANG_RUST) {
-        cbm_pxc_rust_dump_call(rel, call, lsp, admitted);
+        cbm_pxc_rust_dump_call(rel, call, lsp, closure);
     }
-    if (!admitted) {
+    if (closure) {
         return 0;
     }
     if (lsp) {

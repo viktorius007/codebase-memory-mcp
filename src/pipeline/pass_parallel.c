@@ -2789,11 +2789,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         const CBMResolvedCall *lsp =
             find_indexed_lsp_call(rc, result, call, lsp_exact_idx, lsp_legacy_idx,
                                   lsp_exact_idx_complete, lsp_legacy_idx_complete, allow_tail);
-        bool admitted = cbm_pipeline_plain_call_admitted(lang, call, lsp, module_qn);
+        const char *closure = cbm_pipeline_plain_call_closure(lang, call, lsp, module_qn);
         if (lang == CBM_LANG_RUST) {
-            cbm_pxc_rust_dump_call(rel, call, lsp, admitted);
+            cbm_pxc_rust_dump_call(rel, call, lsp, closure);
         }
-        if (!admitted) {
+        if (closure) {
             continue;
         }
         const cbm_gbuf_node_t *lsp_target = resolve_file_call_target(
