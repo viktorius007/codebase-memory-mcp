@@ -2349,7 +2349,7 @@ static char *lsp_idx_key(const char *caller_qn, const char *leaf, bool exact_sit
         return NULL;
     }
     size_t cap = caller_len + 1U + leaf_len + suffix_len + 1U;
-    char *key = (char *)malloc(cap);
+    char *key = (char *)cbm_alloc(CBM_MEM_CLASS_HASH_TABLE, cap);
     if (!key) {
         return NULL;
     }
@@ -2358,7 +2358,7 @@ static char *lsp_idx_key(const char *caller_qn, const char *leaf, bool exact_sit
                                  site_end_byte, (unsigned)source_origin)
                       : snprintf(key, cap, "%s|%s|%u", caller_qn, leaf, (unsigned)source_origin);
     if (written <= 0 || (size_t)written >= cap) {
-        free(key);
+        cbm_free(CBM_MEM_CLASS_HASH_TABLE, key);
         return NULL;
     }
     return key;
@@ -2384,7 +2384,7 @@ static bool lsp_idx_insert_leaf(CBMHashTable *index, CBMResolvedCall *candidate,
         return false;
     }
     bool inserted = lsp_idx_keep_best(index, key, candidate, gbuf, project_name, allow_tail_match);
-    free(key);
+    cbm_free(CBM_MEM_CLASS_HASH_TABLE, key);
     free(normalized_leaf);
     return inserted;
 }
@@ -2413,7 +2413,7 @@ static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CB
         *key_built = true;
     }
     const CBMResolvedCall *candidate = (const CBMResolvedCall *)cbm_ht_get(index, key);
-    free(key);
+    cbm_free(CBM_MEM_CLASS_HASH_TABLE, key);
     if (candidate == LSP_IDX_AMBIGUOUS) {
         if (ambiguous) {
             *ambiguous = true;

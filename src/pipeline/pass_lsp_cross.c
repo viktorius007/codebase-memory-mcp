@@ -31,6 +31,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
+#include "foundation/mem_core.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
@@ -87,7 +88,7 @@ static char *pxc_read_file(const char *path, int *out_len) {
     }
     /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
     enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = (char *)malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
+    char *buf = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)size + CBM_TS_LOOKAHEAD_PAD);
     if (!buf) {
         (void)fclose(f);
         return NULL;
@@ -1275,7 +1276,7 @@ void cbm_pxc_set_rust_manifest(const CBMCargoManifest *m) {
 static char *pxc_rust_imports_key(const char *module_qn, const char *local_name) {
     size_t ml = strlen(module_qn);
     size_t nl = strlen(local_name);
-    char *key = (char *)malloc(ml + nl + 2);
+    char *key = (char *)cbm_alloc(CBM_MEM_CLASS_HASH_TABLE, ml + nl + 2);
     if (!key) {
         return NULL;
     }
@@ -1306,20 +1307,20 @@ void cbm_pipeline_rust_imports_add(cbm_pipeline_ctx_t *ctx, const char *rel,
     if (!key) {
         return;
     }
-    char *path = strdup(import->module_path);
+    char *path = cbm_mem_strdup(CBM_MEM_CLASS_HASH_TABLE, import->module_path);
     if (!path) {
-        free(key);
+        cbm_free(CBM_MEM_CLASS_HASH_TABLE, key);
         return;
     }
     /* The table borrows key strings: keep the first key alive for the
      * table's lifetime and reuse it when the same local name repeats. */
     const char *stored_key = cbm_ht_get_key(ctx->rust_imports, key);
     if (stored_key) {
-        free(key);
+        cbm_free(CBM_MEM_CLASS_HASH_TABLE, key);
         key = (char *)stored_key;
     }
     char *previous = (char *)cbm_ht_set(ctx->rust_imports, key, path);
-    free(previous);
+    cbm_free(CBM_MEM_CLASS_HASH_TABLE, previous);
 }
 
 typedef struct {
@@ -1340,16 +1341,18 @@ void cbm_pipeline_rust_imports_free(cbm_pipeline_ctx_t *ctx) {
     /* The table borrows keys, so collect every key and value first and free
      * them only after the table (and its iteration) is gone. */
     uint32_t entries = cbm_ht_count(ctx->rust_imports);
-    pxc_owned_ptrs_t owned = {.items = calloc((size_t)entries * 2 + 1, sizeof(void *)), .count = 0};
+    size_t owned_bytes = ((size_t)entries * 2 + 1) * sizeof(void *);
+    pxc_owned_ptrs_t owned = {.items = cbm_calloc(CBM_MEM_CLASS_HASH_TABLE, owned_bytes),
+                              .count = 0};
     if (owned.items) {
         cbm_ht_foreach(ctx->rust_imports, pxc_rust_imports_collect_entry, &owned);
     }
     cbm_ht_free(ctx->rust_imports);
     ctx->rust_imports = NULL;
     for (uint32_t i = 0; owned.items && i < owned.count; i++) {
-        free(owned.items[i]);
+        cbm_free(CBM_MEM_CLASS_HASH_TABLE, owned.items[i]);
     }
-    free(owned.items);
+    cbm_free(CBM_MEM_CLASS_HASH_TABLE, owned.items);
 }
 
 static const char *pxc_rust_import_lookup(void *table, const char *module_qn,
@@ -1362,7 +1365,7 @@ static const char *pxc_rust_import_lookup(void *table, const char *module_qn,
         return NULL;
     }
     const char *path = (const char *)cbm_ht_get((const CBMHashTable *)table, key);
-    free(key);
+    cbm_free(CBM_MEM_CLASS_HASH_TABLE, key);
     return path;
 }
 
@@ -1745,12 +1748,12 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     int toml_len = 0;
     char *toml = pxc_read_file(path, &toml_len);
     if (!toml || toml_len <= 0) {
-        free(toml);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, toml);
         return false;
     }
     memset(out_m, 0, sizeof(*out_m));
     cbm_cargo_parse(marena, toml, toml_len, out_m);
-    free(toml); /* cargo parser copies into marena */
+    cbm_free(CBM_MEM_CLASS_EXTRACT, toml); /* cargo parser copies into marena */
     /* Rust code names a member by its package (or lib) name, which need not
      * equal its directory: read each member manifest so `codex_core::x` can
      * route to `core/`. A missing or unreadable member manifest leaves the
@@ -1767,12 +1770,12 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
         int member_len = 0;
         char *member_toml = pxc_read_file(path, &member_len);
         if (!member_toml || member_len <= 0) {
-            free(member_toml);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, member_toml);
             continue;
         }
         CBMCargoManifest member_manifest;
         cbm_cargo_parse(marena, member_toml, member_len, &member_manifest);
-        free(member_toml);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, member_toml);
         cbm_cargo_set_member_names(member, member_manifest.package_name, member_manifest.lib_name);
     }
     return true;
@@ -1881,7 +1884,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         int source_len = 0;
         char *source = pxc_read_file(files[i].path, &source_len);
         if (!source || source_len <= 0) {
-            free(source);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
             skipped_no_source++;
             continue;
         }
@@ -1909,7 +1912,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         processed++;
 
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
 
     cbm_pxc_free_module_def_index(module_def_index);

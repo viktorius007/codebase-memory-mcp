@@ -22,7 +22,7 @@ src/cli/client_adapter.c	3
 src/cli/config_edit_path.c	2
 src/cli/config_json_like.c	142
 src/cli/config_text_edit.c	72
-src/cli/config_toml_edit.c	85
+src/cli/config_toml_edit.c	82
 src/cli/config_yaml_edit.c	117
 src/cli/hook_augment.c	31
 src/cypher/cypher.c	132
@@ -52,7 +52,7 @@ src/git/git_context.c	18
 src/main.c	32
 src/mcp/compact_out.c	39
 src/mcp/index_supervisor.c	8
-src/mcp/mcp.c	814
+src/mcp/mcp.c	812
 src/pipeline/artifact.c	38
 src/pipeline/fqn.c	23
 src/pipeline/lsp_resolve.h	4
@@ -70,8 +70,8 @@ src/pipeline/pass_githistory.c	27
 src/pipeline/pass_importance.c	4
 src/pipeline/pass_infrascan.c	2
 src/pipeline/pass_k8s.c	13
-src/pipeline/pass_lsp_cross.c	50
-src/pipeline/pass_parallel.c	31
+src/pipeline/pass_lsp_cross.c	46
+src/pipeline/pass_parallel.c	30
 src/pipeline/pass_pkgmap.c	82
 src/pipeline/pass_semantic.c	3
 src/pipeline/pass_tests.c	3
