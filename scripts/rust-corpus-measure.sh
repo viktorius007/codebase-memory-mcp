@@ -21,8 +21,8 @@ NAME="corpus"
 { time CBM_CACHE_DIR="$OUT/cache" CBM_RUNTIME_DIR="$RT" CBM_RUST_RESOLVE_DUMP="$OUT/dump.tsv" \
     "$BIN" cli index_repository --repo-path "$CORPUS" --mode full --name "$NAME"; } \
     > "$OUT/index.log" 2>&1 || { echo "index failed; see $OUT/index.log" >&2; exit 1; }
-DB="$(ls "$OUT"/cache/*.db 2>/dev/null | grep -v '/_config\.db$' | head -1 || true)"
-[[ -n "$DB" ]] || { echo "no graph db under $OUT/cache" >&2; exit 1; }
+DB="$OUT/cache/$NAME.db"
+[[ -s "$DB" ]] || { echo "graph db missing or empty: $DB" >&2; exit 1; }
 python3 "$ROOT/scripts/scip-site-join.py" --corpus "$CORPUS" --dump "$OUT/dump.tsv" \
     --db "$DB" --scip "$SCIP" --out "$OUT/join" > "$OUT/report.txt" 2>&1 || \
     { echo "join failed; see $OUT/report.txt" >&2; exit 1; }
