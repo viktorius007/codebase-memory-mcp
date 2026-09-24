@@ -938,32 +938,6 @@ static const char *rust_enclosing_impl_trait(CBMExtractCtx *ctx, TSNode func_nod
     return trait_text && trait_text[0] ? trait_text : NULL;
 }
 
-/* The def side folds a leading `#[cfg(...)]` attribute into a Rust free
- * function's qualified name (cbm_rust_cfg_qualified_name); the body's scope
- * must carry the same name or its calls source to the File node. */
-static const char *rust_cfg_scope_qn(CBMExtractCtx *ctx, TSNode func_node, const char *plain) {
-    const char *decorators[CBM_SZ_16 + 1];
-    int count = 0;
-    for (TSNode prev = ts_node_prev_named_sibling(func_node);
-         !ts_node_is_null(prev) && count < CBM_SZ_16; prev = ts_node_prev_named_sibling(prev)) {
-        if (strcmp(ts_node_type(prev), "attribute_item") != 0) {
-            break;
-        }
-        decorators[count++] = cbm_node_text(ctx->arena, prev, ctx->source);
-    }
-    if (count == 0) {
-        return plain;
-    }
-    /* Definition order: nearest attribute last, as extract_decorators emits. */
-    for (int i = 0; i < count / 2; i++) {
-        const char *tmp = decorators[i];
-        decorators[i] = decorators[count - 1 - i];
-        decorators[count - 1 - i] = tmp;
-    }
-    decorators[count] = NULL;
-    return cbm_rust_cfg_qualified_name(ctx->arena, plain, decorators);
-}
-
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
     (void)spec;
@@ -1163,7 +1137,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     const char *plain = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
                                                     qn_name, ctx->language);
     if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "function_item") == 0) {
-        return rust_cfg_scope_qn(ctx, node, plain);
+        return cbm_rust_cfg_scope_qn(ctx->arena, node, ctx->source, plain);
     }
     return plain;
 }
@@ -1209,18 +1183,12 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
         return NULL;
     }
 
-    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    const char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
     if (!name || !name[0]) {
         return NULL;
     }
-    /* The def side (extract_rust_impl) keys the implementing type by its base
-     * name: `Wrapper<T>` -> `Wrapper`. Mirror that so in-body calls source to
-     * the published Method node instead of the File node. */
     if (rust_impl) {
-        char *lt = strchr(name, '<');
-        if (lt) {
-            *lt = '\0';
-        }
+        name = cbm_rust_impl_owner_name(ctx->arena, name);
     }
 
     /* Nested class: prefix with the enclosing class QN (Outer.Inner) so this

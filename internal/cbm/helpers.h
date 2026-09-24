@@ -247,9 +247,22 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
 const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source);
 
 /* Rust: fold a `#[cfg(...)]` predicate into a definition's qualified name so
- * cfg-gated twins stay distinct (extract_defs.c). Call-side scope naming
- * (extract_unified.c) applies the same rule so bodies attach to their node. */
+ * cfg-gated twins stay distinct (extract_defs.c). */
 const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
                                         const char *const *decorators);
+
+/* Rust cfg-gated function identity: `plain_qn` with the function's `#[cfg]`
+ * attribute folded in exactly as the Method/Function node was named
+ * (extract_decorators + cbm_rust_cfg_qualified_name; comments between the
+ * attribute and the item are transparent). The body scope (extract_unified.c)
+ * and the resolver caller (rust_lsp.c) take their identity from here so the
+ * rule has one owner. */
+const char *cbm_rust_cfg_scope_qn(CBMArena *a, TSNode func_node, const char *source,
+                                  const char *plain_qn);
+
+/* Rust impl owner identity: the implementing type's base name with generic
+ * arguments stripped (`Buffer<T>` -> `Buffer`). Method nodes, body scopes and
+ * resolver callers all key the owner by it. */
+const char *cbm_rust_impl_owner_name(CBMArena *a, const char *type_text);
 
 #endif // CBM_HELPERS_H

@@ -6905,6 +6905,183 @@ TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes) {
     PASS();
 }
 
+/* Both publication modes over one 55-file Rust fixture; the observation is
+ * whether the exact (source QN, target QN) CALLS edge exists. */
+typedef struct {
+    const char *source_suffix;
+    const char *target_suffix;
+} RustExactCallPair;
+
+typedef struct {
+    int run_rc;
+    bool found[4];
+    bool file_node_calls_target;
+} RustExactCallObservation;
+
+static RustExactCallObservation observe_rust_exact_calls(const char *root, const char *db_name,
+                                                         const RustExactCallPair *pairs,
+                                                         int pair_count,
+                                                         const char *target_leaf) {
+    RustExactCallObservation observation = {.run_rc = -1};
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", root, db_name);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    observation.run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        for (int i = 0; i < pair_count && i < 4; i++) {
+            char source_qn[512];
+            char target_qn[512];
+            snprintf(source_qn, sizeof(source_qn), "%s.%s", project, pairs[i].source_suffix);
+            snprintf(target_qn, sizeof(target_qn), "%s.%s", project, pairs[i].target_suffix);
+            observation.found[i] = exact_call_qns_exist(store, project, source_qn, target_qn);
+        }
+        observation.file_node_calls_target =
+            cross_file_call_exists(store, project, "__file__", target_leaf);
+        cbm_store_close(store);
+    } else if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return observation;
+}
+
+static void write_rust_pad_files(const char *tmp, int count) {
+    for (int i = 0; i < count; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/rust_pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+typedef struct {
+    RustExactCallObservation sequential;
+    RustExactCallObservation parallel;
+} RustBothModesObservation;
+
+static RustBothModesObservation observe_rust_exact_calls_in_both_modes(
+    const char *tmp, const RustExactCallPair *pairs, int pair_count, const char *target_leaf) {
+    char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
+    char *saved_single =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    RustBothModesObservation result;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    result.sequential =
+        observe_rust_exact_calls(tmp, "sequential.db", pairs, pair_count, target_leaf);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    result.parallel = observe_rust_exact_calls(tmp, "parallel.db", pairs, pair_count, target_leaf);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    return result;
+}
+
+/* The Method node of an impl method is keyed by the file's module and the
+ * implementing type's base name (`ops.G.area[Shape]`, `ops.Widget.draw`);
+ * the resolver's caller identity must be the same string or no call inside
+ * `impl<T> ... for G<T>` or inside an impl of a type declared elsewhere ever
+ * joins. Discriminators: the generic receiver `G<T>` and the foreign type
+ * `Widget` (declared in shapes.rs); the non-generic same-file `P.area[Shape]`
+ * pair is the control that proves the fixture resolves at all. */
+TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_owner_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"implowner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod shapes;\npub mod ops;\n");
+    write_temp_file(tmp, "src/shapes.rs",
+                    "pub struct Widget;\n"
+                    "pub fn render() -> u8 { 1 }\n");
+    write_temp_file(tmp, "src/ops.rs",
+                    "use crate::shapes::Widget;\n"
+                    "use crate::shapes::render;\n"
+                    "pub struct P;\n"
+                    "pub struct G<T>(pub T);\n"
+                    "pub trait Shape { fn area(&self) -> u8; }\n"
+                    "impl Shape for P { fn area(&self) -> u8 { render() } }\n"
+                    "impl<T> Shape for G<T> { fn area(&self) -> u8 { render() } }\n"
+                    "impl<T> G<T> { pub fn inherent(&self) -> u8 { render() } }\n"
+                    "impl Widget { pub fn draw(&self) -> u8 { render() } }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustExactCallPair pairs[4] = {
+        {"src.ops.P.area[Shape]", "src.shapes.render"},
+        {"src.ops.G.area[Shape]", "src.shapes.render"},
+        {"src.ops.G.inherent", "src.shapes.render"},
+        {"src.ops.Widget.draw", "src.shapes.render"},
+    };
+    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "render");
+    th_rmtree(tmp);
+
+    ASSERT_EQ(observed.sequential.run_rc, 0);
+    ASSERT_EQ(observed.parallel.run_rc, 0);
+    ASSERT_TRUE(observed.sequential.found[0]); /* control */
+    ASSERT_TRUE(observed.parallel.found[0]);
+    ASSERT_TRUE(observed.sequential.found[1]);
+    ASSERT_TRUE(observed.parallel.found[1]);
+    ASSERT_TRUE(observed.sequential.found[2]);
+    ASSERT_TRUE(observed.parallel.found[2]);
+    ASSERT_TRUE(observed.sequential.found[3]);
+    ASSERT_TRUE(observed.parallel.found[3]);
+    PASS();
+}
+
+/* A cfg-gated function is published as `<name>#cfg(..)]` from the attribute
+ * nearest the item, and a comment between attribute and item is transparent
+ * (extract_decorators). The body's caller identity must be the same string;
+ * otherwise the calls attach to the File node. Discriminators: the comment
+ * line and the double attribute; `single` is the control. */
+TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_cfg_owner_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"cfgowner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub fn target() -> u8 { 1 }\n"
+                    "#[cfg(unix)]\n"
+                    "pub fn single() -> u8 { target() }\n"
+                    "#[cfg(unix)]\n"
+                    "// a comment between the attribute and the item\n"
+                    "pub fn commented() -> u8 { target() }\n"
+                    "#[cfg(unix)]\n"
+                    "#[cfg(not(test))]\n"
+                    "pub fn double() -> u8 { target() }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustExactCallPair pairs[3] = {
+        {"src.lib.single#cfg(unix)]", "src.lib.target"},
+        {"src.lib.commented#cfg(unix)]", "src.lib.target"},
+        {"src.lib.double#cfg(not(test))]", "src.lib.target"},
+    };
+    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 3, "target");
+    th_rmtree(tmp);
+
+    ASSERT_EQ(observed.sequential.run_rc, 0);
+    ASSERT_EQ(observed.parallel.run_rc, 0);
+    ASSERT_TRUE(observed.sequential.found[0]); /* control */
+    ASSERT_TRUE(observed.parallel.found[0]);
+    ASSERT_TRUE(observed.sequential.found[1]);
+    ASSERT_TRUE(observed.parallel.found[1]);
+    ASSERT_TRUE(observed.sequential.found[2]);
+    ASSERT_TRUE(observed.parallel.found[2]);
+    ASSERT_FALSE(observed.sequential.file_node_calls_target);
+    ASSERT_FALSE(observed.parallel.file_node_calls_target);
+    PASS();
+}
+
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static int sqlite_scalar(sqlite3 *db, const char *sql, const char *project) {
     sqlite3_stmt *stmt = NULL;
@@ -15669,6 +15846,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_macro_hidden_call_publishes_with_exact_admitted_resolution_in_both_modes);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
+    RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
+    RUN_TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);

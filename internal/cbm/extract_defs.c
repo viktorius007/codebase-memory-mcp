@@ -2027,6 +2027,18 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     return result;
 }
 
+const char *cbm_rust_impl_owner_name(CBMArena *a, const char *type_text) {
+    const char *lt = type_text ? strchr(type_text, '<') : NULL;
+    return lt ? cbm_arena_strndup(a, type_text, (size_t)(lt - type_text)) : type_text;
+}
+
+const char *cbm_rust_cfg_scope_qn(CBMArena *a, TSNode func_node, const char *source,
+                                  const char *plain_qn) {
+    const char **decorators =
+        extract_decorators(a, func_node, source, CBM_LANG_RUST, cbm_lang_spec(CBM_LANG_RUST));
+    return cbm_rust_cfg_qualified_name(a, plain_qn, decorators);
+}
+
 /* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
  * attributes both parse as distinct function_item nodes and otherwise receive
  * the SAME qualified_name, so the second graph upsert silently overwrites the
@@ -5121,15 +5133,8 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (!receiver_name || !receiver_name[0]) {
         return;
     }
-    char *type_name = receiver_name;
-    /* Strip generic args from the implementing type: `Buffer<T>` → `Buffer`,
-     * `Wrapper<T>` → `Wrapper`. The struct identity is the base name. */
-    char *lt = strchr(receiver_name, '<');
-    if (lt) {
-        type_name = cbm_arena_strndup(a, receiver_name, (size_t)(lt - receiver_name));
-    }
-
-    const char *type_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, type_name);
+    const char *type_qn =
+        cbm_fqn_compute(a, ctx->project, ctx->rel_path, cbm_rust_impl_owner_name(a, receiver_name));
 
     // Check for "impl Trait for Struct" pattern
     const char *impl_trait = NULL;

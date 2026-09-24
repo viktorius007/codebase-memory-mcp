@@ -5685,31 +5685,14 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
     const char *prefix = parent_qn ? parent_qn : ctx->module_qn;
     /* A trait-impl method is published as `<Type>.<name>[<Trait>]` and a
      * cfg-gated free function as `<name>#cfg(..)]` (extract_rust_impl,
-     * cbm_rust_cfg_qualified_name); the caller identity must match that node. */
+     * cbm_rust_cfg_scope_qn); the caller identity must match that node. */
     ctx->enclosing_func_qn =
         parent_qn && ctx->self_trait_spelling
             ? cbm_arena_sprintf(ctx->arena, "%s.%s[%s]", prefix, name, ctx->self_trait_spelling)
             : cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
     if (!parent_qn) {
-        const char *decorators[17];
-        int count = 0;
-        for (TSNode prev = ts_node_prev_named_sibling(func_node);
-             !ts_node_is_null(prev) && count < 16; prev = ts_node_prev_named_sibling(prev)) {
-            if (strcmp(ts_node_type(prev), "attribute_item") != 0) {
-                break;
-            }
-            decorators[count++] = rust_node_text(ctx, prev);
-        }
-        if (count > 0) {
-            for (int i = 0; i < count / 2; i++) {
-                const char *tmp = decorators[i];
-                decorators[i] = decorators[count - 1 - i];
-                decorators[count - 1 - i] = tmp;
-            }
-            decorators[count] = NULL;
-            ctx->enclosing_func_qn =
-                cbm_rust_cfg_qualified_name(ctx->arena, ctx->enclosing_func_qn, decorators);
-        }
+        ctx->enclosing_func_qn =
+            cbm_rust_cfg_scope_qn(ctx->arena, func_node, ctx->source, ctx->enclosing_func_qn);
     }
 
     CBMScope *saved = ctx->current_scope;
@@ -6004,6 +5987,12 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
         }
     }
 
+    /* The Method node is keyed by this file's module and the implementing
+     * type's base name (extract_rust_impl), not by the resolved receiver:
+     * `impl<T> Shape for G<T>` in ops.rs owns `ops.G.area[Shape]` even when
+     * `G` is declared in another module. */
+    const char *owner_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn,
+                                             cbm_rust_impl_owner_name(ctx->arena, type_text));
     TSNode body = ts_node_child_by_field_name(impl_node, "body", 4);
     if (!ts_node_is_null(body)) {
         uint32_t nc = ts_node_child_count(body);
@@ -6013,7 +6002,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
                 continue;
             const char *ck = ts_node_type(c);
             if (strcmp(ck, "function_item") == 0) {
-                rust_process_function(ctx, c, effective_recv);
+                rust_process_function(ctx, c, owner_qn);
             }
         }
     }
