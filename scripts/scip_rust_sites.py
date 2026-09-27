@@ -84,6 +84,7 @@ class RecallOccurrence(NamedTuple):
     callee_start_byte: int
     callee_end_byte: int
     oracle_caller_symbol: str | None
+    caller_category: str
     oracle_symbol: str
     call_form: str
     strategy: str
@@ -335,8 +336,11 @@ def _previous_identifier(code, cursor):
 
 def _is_matches_open(code, cursor):
     bang = _previous_code_byte(code, cursor)
-    return bang >= 0 and code[bang] == ord("!") and (
-        _previous_identifier(code, bang) == b"matches"
+    if bang < 0 or code[bang] != ord("!"):
+        return False
+    identifier = _previous_identifier(code, bang)
+    return (
+        identifier == b"matches" or identifier.endswith(b"_matches")
     )
 
 
@@ -404,9 +408,33 @@ def _matches_pattern_ranges(code):
     return ranges
 
 
+def _macro_argument_segments(code):
+    pairs = {ord("("): ord(")"), ord("["): ord("]"), ord("{"): ord("}")}
+    ranges = []
+    for start, end in _delimited_ranges(code, _is_macro_open):
+        stack = []
+        segment_start = _skip_space(code, start)
+        for cursor in range(start, end):
+            byte = code[cursor]
+            if byte in pairs:
+                stack.append(pairs[byte])
+            elif stack and byte == stack[-1]:
+                stack.pop()
+            elif byte == ord(",") and not stack:
+                segment_end = _previous_code_byte(code, cursor) + 1
+                if segment_start < segment_end:
+                    ranges.append((segment_start, segment_end))
+                segment_start = _skip_space(code, cursor + 1)
+        segment_end = _previous_code_byte(code, end) + 1
+        if segment_start < segment_end:
+            ranges.append((segment_start, segment_end))
+    return ranges
+
+
 def _rust_syntax_ranges(sources):
     callees = defaultdict(set)
     patterns = defaultdict(set)
+    pattern_candidates = defaultdict(set)
     call_prefix = b"fn __cbm(){ __cbm("
     call_suffix = b"); }"
     pattern_prefix = b"fn __cbm(){ match __value { "
@@ -416,15 +444,21 @@ def _rust_syntax_ranges(sources):
         temporary_path = Path(temporary)
         input_number = 0
 
-        def add_input(content, source_range):
+        def add_input(
+            content, source_range, definite_pattern=False, allow_call=True,
+            allow_pattern=True, full_pattern=False,
+        ):
             nonlocal input_number
             path = temporary_path / f"{input_number}.rs"
             path.write_bytes(content)
-            inputs[str(path)] = source_range
+            inputs[str(path)] = (
+                *source_range, definite_pattern, allow_call, allow_pattern,
+                full_pattern,
+            )
             input_number += 1
 
         for relative_path, source in sources.items():
-            add_input(source, (relative_path, 0, len(source), 0))
+            add_input(source, (relative_path, 0, len(source), 0), True)
             code = _masked_source(source)
             token_ranges = set(_delimited_ranges(code, _is_macro_open))
             token_ranges.update(_delimited_ranges(code, _is_attribute_open))
@@ -432,11 +466,32 @@ def _rust_syntax_ranges(sources):
                 add_input(
                     call_prefix + source[start:end] + call_suffix,
                     (relative_path, start, end, len(call_prefix)),
+                    False,
+                    True,
+                    False,
                 )
             for start, end in _matches_pattern_ranges(code):
                 add_input(
                     pattern_prefix + source[start:end] + pattern_suffix,
                     (relative_path, start, end, len(pattern_prefix)),
+                    True,
+                    False,
+                )
+            for start, end in _macro_argument_segments(code):
+                segment = code[start:end]
+                if (
+                    b"=>" in segment
+                    or b"=" in segment
+                    or re.search(rb"\|\s*_\s*(?:,|\|)", segment)
+                ):
+                    continue
+                add_input(
+                    pattern_prefix + source[start:end] + pattern_suffix,
+                    (relative_path, start, end, len(pattern_prefix)),
+                    False,
+                    False,
+                    True,
+                    True,
                 )
         queries = (
             ("call", "--pattern", "$F($$$ARGS)"),
@@ -462,9 +517,14 @@ def _rust_syntax_ranges(sources):
                     if query == "call"
                     else record
                 )
-                relative_path, source_start, source_end, wrapper_length = inputs[
-                    record["file"]
-                ]
+                (
+                    relative_path, source_start, source_end, wrapper_length,
+                    definite_pattern, allow_call, allow_pattern, full_pattern,
+                ) = inputs[record["file"]]
+                if query == "call" and not allow_call:
+                    continue
+                if query == "pattern" and not allow_pattern:
+                    continue
                 start = (
                     source_start
                     + node["range"]["byteOffset"]["start"]
@@ -487,7 +547,32 @@ def _rust_syntax_ranges(sources):
                         )
                     )
                 else:
-                    patterns[relative_path].add((start, end))
+                    if full_pattern:
+                        full_start = _skip_space(
+                            sources[relative_path], source_start
+                        )
+                        full_end = source_end
+                        while (
+                            full_end > full_start
+                            and sources[relative_path][
+                                full_end - 1 : full_end
+                            ].isspace()
+                        ):
+                            full_end -= 1
+                        if (start, end) != (full_start, full_end):
+                            continue
+                    text = _masked_source(sources[relative_path][start:end])
+                    pattern_only = re.search(
+                        rb"(?<![A-Za-z0-9_])_(?![A-Za-z0-9_])|"
+                        rb"(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*@",
+                        text,
+                    )
+                    if definite_pattern:
+                        patterns[relative_path].add((start, end))
+                    elif pattern_only is not None:
+                        pattern_candidates[relative_path].add((start, end))
+        for relative_path, items in pattern_candidates.items():
+            patterns[relative_path].update(items)
     return (
         {relative_path: sorted(items) for relative_path, items in callees.items()},
         {
@@ -539,6 +624,23 @@ def _byte_range(source, starts, source_range):
 
 def _constructor_symbol(symbol):
     return _DECODER.descriptor_of(symbol).endswith("#")
+
+
+def _self_constructor_symbol(symbol):
+    parts = symbol.split(" ", 4)
+    if len(parts) < 5:
+        return None
+    descriptor = parts[4]
+    marker = "impl#["
+    impl_start = descriptor.find(marker)
+    if impl_start < 0:
+        return None
+    owner_start = impl_start + len(marker)
+    owner_end = descriptor.find("]", owner_start)
+    if owner_end < 0:
+        return None
+    owner = descriptor[owner_start:owner_end]
+    return " ".join(parts[:4]) + " " + descriptor[:impl_start] + owner + "#"
 
 
 def _truth(symbols, project_packages):
@@ -608,7 +710,7 @@ def _callee_position(code, end):
 
 
 def _completeness_counts(
-    references, definition_sites, sources, records, project_packages
+    references, definition_sites, sources, records, project_packages, patterns
 ):
     inventory_keys = {
         (site.relative_path, site.callee_start_byte, site.callee_end_byte)
@@ -637,6 +739,8 @@ def _completeness_counts(
         macro_starts = [start for start, _ in macro_ranges]
         attribute_ranges = _attribute_ranges(code)
         attribute_starts = [start for start, _ in attribute_ranges]
+        pattern_ranges = patterns.get(relative_path, ())
+        pattern_starts = [start for start, _ in pattern_ranges]
         for source_range in grouped:
             if source_range in definition_ranges:
                 counts["excluded_definition_site"] += 1
@@ -646,6 +750,20 @@ def _completeness_counts(
                 counts["excluded_invalid_range"] += 1
                 continue
             start, end = byte_range
+            pattern_constructor = any(
+                _constructor_symbol(symbol)
+                or _self_constructor_symbol(symbol) is not None
+                for symbol in grouped[source_range]
+            )
+            if (
+                pattern_constructor
+                and _inside_ranges(pattern_ranges, pattern_starts, start)
+            ):
+                counts["excluded_pattern"] += 1
+                continue
+            if _previous_identifier(code, start) == b"fn":
+                counts["excluded_function_definition"] += 1
+                continue
             if not _callee_position(code, end):
                 counts["excluded_not_callee_position"] += 1
                 continue
@@ -654,13 +772,15 @@ def _completeness_counts(
             elif _inside_ranges(attribute_ranges, attribute_starts, start):
                 counts["excluded_attribute_syntax"] += 1
             elif _inside_ranges(macro_ranges, macro_starts, start):
-                counts["excluded_macro_argument_parse_failure"] += 1
+                counts["excluded_macro_argument_call_parser_failure"] += 1
             else:
-                counts["excluded_rust_parse_failure"] += 1
+                counts["excluded_call_parser_failure"] += 1
     categories = (
         "inventory_found",
-        "excluded_macro_argument_parse_failure",
-        "excluded_rust_parse_failure",
+        "excluded_pattern",
+        "excluded_function_definition",
+        "excluded_macro_argument_call_parser_failure",
+        "excluded_call_parser_failure",
         "excluded_attribute_syntax",
         "excluded_definition_site",
         "excluded_not_callee_position",
@@ -708,6 +828,14 @@ def _call_inventory(corpus_root, scip_path):
             if byte_range is None:
                 continue
             start, end = byte_range
+            truth_symbols = symbols
+            if source[start:end] == b"Self" and len(symbols) == 1:
+                self_constructor = _self_constructor_symbol(next(iter(symbols)))
+                if self_constructor is not None:
+                    truth_symbols = {self_constructor}
+            constructor = len(truth_symbols) == 1 and _constructor_symbol(
+                next(iter(truth_symbols))
+            )
             in_macro = _inside_ranges(macro_ranges, macro_starts, start)
             in_attribute = _inside_ranges(
                 attribute_ranges, attribute_starts, start
@@ -716,7 +844,10 @@ def _call_inventory(corpus_root, scip_path):
                 continue
             if not _invoked_leaf(code, start, end):
                 continue
-            if _inside_ranges(pattern_ranges, pattern_starts, start):
+            if (
+                constructor
+                and _inside_ranges(pattern_ranges, pattern_starts, start)
+            ):
                 continue
             matches = [
                 callee
@@ -734,15 +865,12 @@ def _call_inventory(corpus_root, scip_path):
                 _, _, parenthesized = min(
                     matches, key=lambda callee: callee[1] - callee[0]
                 )
-            constructor = (
-                len(symbols) == 1 and _constructor_symbol(next(iter(symbols)))
-            )
             records.append(
                 CallSite(
                     relative_path,
                     start,
                     end,
-                    _truth(symbols, project_packages),
+                    _truth(truth_symbols, project_packages),
                     (
                         "constructor"
                         if constructor
@@ -754,7 +882,8 @@ def _call_inventory(corpus_root, scip_path):
             )
     records = sorted(records)
     completeness = _completeness_counts(
-        references, definition_sites, sources, records, project_packages
+        references, definition_sites, sources, records, project_packages,
+        parsed_patterns,
     )
     return records, completeness
 
@@ -1258,9 +1387,13 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
             if site_callers:
                 rank = {"correct": 0, "unscorable": 1, "wrong": 2}
                 caller = min(site_callers, key=lambda item: rank[item.outcome])
-            if caller is not None and caller.outcome == "unscorable":
+            if caller is not None and caller.reason == "caller_cfg_inactive":
                 continue
             oracle_caller_symbol = raw_caller
+            caller_category = "scip_callable"
+            if caller is not None and caller.outcome == "unscorable":
+                gap = caller.reason.removeprefix("caller_oracle_gap:")
+                caller_category = f"caller_gap:{gap}"
             found = any(edge.outcome == "correct" for edge in site_edges)
             if not found and oracle_caller_symbol is not None:
                 found = (
@@ -1275,14 +1408,16 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
                 for outcome in outcomes
             ):
                 continue
-            caller_symbols = {
-                outcome.symbol
-                for outcome in outcomes
-                if outcome is not None and outcome.status == "matched"
-            }
-            oracle_caller_symbol = (
-                next(iter(caller_symbols)) if len(caller_symbols) == 1 else None
-            )
+            source_caller = source_callers.get(key)
+            if source_caller is None:
+                oracle_caller_symbol = "caller_gap:no_enclosing_function_item"
+                caller_category = "caller_gap:no_enclosing_function_item"
+            else:
+                start, end, name, _, _ = source_caller
+                oracle_caller_symbol = (
+                    f"source:{site.relative_path}:{start}:{end}:{name}"
+                )
+                caller_category = "source_function_item"
             target_names = graph_names_by_symbol.get(site.resolved_symbol, ())
             found = any(
                 (caller_name, target_name) in graph_pairs
@@ -1294,8 +1429,8 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         recall.append(
             RecallOccurrence(
                 site.relative_path, site.callee_start_byte, site.callee_end_byte,
-                oracle_caller_symbol, site.resolved_symbol, site.call_form, strategy,
-                "found" if found else "missed",
+                oracle_caller_symbol, caller_category, site.resolved_symbol,
+                site.call_form, strategy, "found" if found else "missed",
             )
         )
     non_rust = sum(not edge.target_path.endswith(".rs") for edge in graph_calls)
@@ -1326,7 +1461,7 @@ def write_score_details(output_directory, report):
     )
     missed_header = (
         "relative_path", "callee_start_byte", "callee_end_byte", "strategy",
-        "call_form", "oracle_symbol",
+        "call_form", "oracle_caller_symbol", "caller_category", "oracle_symbol",
     )
     wrong_rows = [
         (
@@ -1363,6 +1498,7 @@ def write_score_details(output_directory, report):
         (
             occurrence.relative_path, occurrence.callee_start_byte,
             occurrence.callee_end_byte, occurrence.strategy, occurrence.call_form,
+            occurrence.oracle_caller_symbol or "-", occurrence.caller_category,
             occurrence.oracle_symbol,
         )
         for occurrence in report.recall if occurrence.outcome == "missed"
