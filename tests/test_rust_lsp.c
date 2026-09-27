@@ -588,6 +588,23 @@ TEST(rustlsp_ufcs_trait_method) {
     PASS();
 }
 
+TEST(rustlsp_type_qualified_call_with_ambiguous_from_impls_is_unresolved) {
+    CBMFileResult *r = extract_rust(
+        "trait From<T> { fn from(value: T) -> Self; }\n"
+        "struct HyperlinkLine;\n"
+        "impl From<&'static str> for HyperlinkLine {\n"
+        "    fn from(_value: &'static str) -> Self { Self }\n"
+        "}\n"
+        "impl From<String> for HyperlinkLine {\n"
+        "    fn from(_value: String) -> Self { Self }\n"
+        "}\n"
+        "fn run() { let _ = HyperlinkLine::from(\"text\"); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(-1, find_confident(&r->resolved_calls, "run", "HyperlinkLine.from"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Category 10: Cross-file resolution ──────────────────────── */
 
 TEST(rustlsp_crossfile_method_dispatch) {
@@ -7263,6 +7280,7 @@ void suite_rust_lsp(void) {
     /* Self::, UFCS */
     RUN_TEST(rustlsp_self_uppercase);
     RUN_TEST(rustlsp_ufcs_trait_method);
+    RUN_TEST(rustlsp_type_qualified_call_with_ambiguous_from_impls_is_unresolved);
 
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);

@@ -3061,6 +3061,20 @@ static const CBMRegisteredFunc *rust_registry_lookup_inherent_method_aliased(
     return NULL;
 }
 
+static const CBMRegisteredFunc *rust_registry_lookup_unique_method(
+    const CBMTypeRegistry *reg, const char *receiver_qn, const char *method_name) {
+    const CBMRegisteredFunc *only = NULL;
+    CBMMethodIter it;
+    cbm_registry_methods_chain(reg, receiver_qn, method_name, &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        if (only) {
+            return NULL;
+        }
+        only = &it.reg->funcs[index];
+    }
+    return only;
+}
+
 const char *cbm_rust_impl_key(CBMArena *arena, const char *receiver_qn,
                               const char *receiver_spelling, const char *trait_spelling) {
     if (!arena || !receiver_qn || !receiver_spelling || !trait_spelling) {
@@ -5129,10 +5143,14 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 m = cbm_registry_lookup_method_aliased(ctx->registry, full_head, short_name);
             }
             if (m) {
-                rust_emit_resolved_call(ctx, m->qualified_name, m->impl_key,
-                                        strcmp(short_name, "new") == 0 ? "lsp_constructor"
-                                                                       : "lsp_ufcs",
-                                        CBM_RUST_CONF_UFCS);
+                const CBMRegisteredFunc *unique = rust_registry_lookup_unique_method(
+                    ctx->registry, m->receiver_type, m->short_name);
+                if (unique) {
+                    rust_emit_resolved_call(ctx, unique->qualified_name, unique->impl_key,
+                                            strcmp(short_name, "new") == 0 ? "lsp_constructor"
+                                                                           : "lsp_ufcs",
+                                            CBM_RUST_CONF_UFCS);
+                }
                 return;
             }
             /* Trait method through single-impl dispatch. */
