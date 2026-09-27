@@ -17,6 +17,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import sqlite3
 import subprocess
+import tempfile
 from typing import NamedTuple
 
 
@@ -93,6 +94,7 @@ class ScoreReport(NamedTuple):
     recall: tuple[RecallOccurrence, ...]
     inventory: tuple[CallSite, ...]
     integrity: tuple[IntegrityError, ...]
+    completeness: tuple[tuple[str, int], ...]
 
 
 _DECODER_PATH = Path(__file__).with_name("scip-call-edges.py")
@@ -260,62 +262,55 @@ def _attribute_ranges(code):
     return _merged_ranges(_delimited_ranges(code, _is_attribute_open))
 
 
-def _rust_parser_source(source):
-    code = _masked_source(source)
-    parser_source = bytearray(source)
-    # Macro arguments are token trees, so make invocations call-shaped without
-    # moving bytes before asking the Rust parser to identify nested calls.
-    for start, end in _delimited_ranges(code, _is_macro_open):
-        opening = start - 1
-        bang = _previous_code_byte(code, opening)
-        parser_source[bang] = ord(" ")
-        if code[opening] in (ord("["), ord("{")):
-            parser_source[opening] = ord("(")
-            parser_source[end] = ord(")")
-    return bytes(parser_source)
-
-
 def _rust_call_callees(sources):
-    callees = defaultdict(list)
-    entries = list(sources.items())
-    for offset in range(0, len(entries), 64):
-        batch = entries[offset : offset + 64]
-        combined = bytearray()
-        starts = []
-        for relative_path, source in batch:
-            if combined:
-                combined.extend(b"\n")
-            starts.append((len(combined), relative_path, len(source)))
-            combined.extend(_rust_parser_source(source))
+    callees = defaultdict(set)
+    prefix = b"fn __cbm(){ __cbm("
+    suffix = b"); }"
+    with tempfile.TemporaryDirectory(prefix="cbm-rust-call-sites-") as temporary:
+        inputs = {}
+        temporary_path = Path(temporary)
+        input_number = 0
+        for relative_path, source in sources.items():
+            raw_path = temporary_path / f"{input_number}.rs"
+            raw_path.write_bytes(source)
+            inputs[str(raw_path)] = (relative_path, 0, len(source), 0)
+            input_number += 1
+            code = _masked_source(source)
+            for start, end in _delimited_ranges(code, _is_macro_open):
+                macro_path = temporary_path / f"{input_number}.rs"
+                macro_path.write_bytes(prefix + source[start:end] + suffix)
+                inputs[str(macro_path)] = (relative_path, start, end, len(prefix))
+                input_number += 1
         result = subprocess.run(
             (
-                "ast-grep", "run", "--stdin", "--lang", "rust",
-                "--pattern", "$F($$$ARGS)", "--json=stream",
+                "ast-grep", "run", "--lang", "rust", "--pattern",
+                "$F($$$ARGS)", "--json=stream", str(temporary_path),
             ),
-            input=bytes(combined),
             stdout=subprocess.PIPE,
             check=False,
         )
         if result.returncode not in (0, 1):
             raise subprocess.CalledProcessError(result.returncode, result.args)
-        batch_starts = [start for start, _, _ in starts]
         for line in result.stdout.splitlines():
             record = json.loads(line)
             callee = record["metaVariables"]["single"]["F"]
-            start = callee["range"]["byteOffset"]["start"]
-            end = callee["range"]["byteOffset"]["end"]
-            index = bisect.bisect_right(batch_starts, start) - 1
-            base, relative_path, source_length = starts[index]
-            if end <= base + source_length:
+            relative_path, source_start, source_end, wrapper_length = inputs[
+                record["file"]
+            ]
+            start = source_start + callee["range"]["byteOffset"]["start"]
+            end = source_start + callee["range"]["byteOffset"]["end"]
+            start -= wrapper_length
+            end -= wrapper_length
+            if source_start <= start and end <= source_end:
                 text = callee["text"]
-                callees[relative_path].append(
+                callees[relative_path].add(
                     (
-                        start - base,
-                        end - base,
+                        start,
+                        end,
                         text.startswith("(") and text.endswith(")"),
                     )
                 )
-    return callees
+    return {relative_path: sorted(items) for relative_path, items in callees.items()}
 
 
 def _inside_ranges(ranges, starts, offset):
@@ -368,10 +363,118 @@ def _callable_symbol(symbol):
     return symbol.startswith("local ") or _DECODER.descriptor_of(symbol).endswith("().")
 
 
-def call_sites(corpus_root, scip_path):
-    """Return source call occurrences resolved by the supplied SCIP oracle."""
+def _skip_space(code, cursor):
+    while cursor < len(code) and code[cursor : cursor + 1].isspace():
+        cursor += 1
+    return cursor
+
+
+def _callee_position(code, end):
+    cursor = _skip_space(code, end)
+    if code[cursor : cursor + 2] == b"::":
+        cursor = _skip_space(code, cursor + 2)
+        if code[cursor : cursor + 1] == b"<":
+            depth = 1
+            delimiters = [0, 0, 0]
+            cursor += 1
+            while cursor < len(code) and depth:
+                byte = code[cursor]
+                if byte == ord("("):
+                    delimiters[0] += 1
+                elif byte == ord(")"):
+                    delimiters[0] -= 1
+                elif byte == ord("["):
+                    delimiters[1] += 1
+                elif byte == ord("]"):
+                    delimiters[1] -= 1
+                elif byte == ord("{"):
+                    delimiters[2] += 1
+                elif byte == ord("}"):
+                    delimiters[2] -= 1
+                elif byte == ord("<") and not any(delimiters):
+                    depth += 1
+                elif (
+                    byte == ord(">")
+                    and not any(delimiters)
+                    and code[cursor - 1 : cursor] != b"-"
+                ):
+                    depth -= 1
+                cursor += 1
+            if depth:
+                return False
+            cursor = _skip_space(code, cursor)
+    return code[cursor : cursor + 1] == b"("
+
+
+def _completeness_counts(
+    references, definition_sites, sources, records, workspace_crates
+):
+    inventory_keys = {
+        (site.relative_path, site.callee_start_byte, site.callee_end_byte)
+        for site in records
+    }
+    counts = Counter()
+    for relative_path, occurrences in references.items():
+        grouped = defaultdict(set)
+        for source_range, symbol in occurrences:
+            if (
+                _callable_symbol(symbol)
+                and _DECODER.crate_of(symbol) in workspace_crates
+            ):
+                grouped[source_range].add(symbol)
+        definition_ranges = {
+            source_range
+            for source_range, _, _ in definition_sites.get(relative_path, ())
+        }
+        source = sources.get(relative_path)
+        if source is None:
+            counts["excluded_source_missing"] += len(grouped)
+            continue
+        code = _masked_source(source)
+        starts = _line_starts(source)
+        macro_ranges = _macro_argument_ranges(code)
+        macro_starts = [start for start, _ in macro_ranges]
+        attribute_ranges = _attribute_ranges(code)
+        attribute_starts = [start for start, _ in attribute_ranges]
+        for source_range in grouped:
+            if source_range in definition_ranges:
+                counts["excluded_definition_site"] += 1
+                continue
+            byte_range = _byte_range(source, starts, source_range)
+            if byte_range is None:
+                counts["excluded_invalid_range"] += 1
+                continue
+            start, end = byte_range
+            if not _callee_position(code, end):
+                counts["excluded_not_callee_position"] += 1
+                continue
+            if _inside_ranges(attribute_ranges, attribute_starts, start):
+                counts["excluded_attribute_syntax"] += 1
+                continue
+            if (relative_path, start, end) in inventory_keys:
+                counts["inventory_found"] += 1
+            elif _inside_ranges(macro_ranges, macro_starts, start):
+                counts["excluded_macro_argument_parse_failure"] += 1
+            else:
+                counts["excluded_rust_parse_failure"] += 1
+    categories = (
+        "inventory_found",
+        "excluded_macro_argument_parse_failure",
+        "excluded_rust_parse_failure",
+        "excluded_attribute_syntax",
+        "excluded_definition_site",
+        "excluded_not_callee_position",
+        "excluded_invalid_range",
+        "excluded_source_missing",
+    )
+    return tuple((category, counts[category]) for category in categories)
+
+
+def _call_inventory(corpus_root, scip_path):
     corpus_root = Path(corpus_root)
-    _, definitions, references, _ = _DECODER.parse_with_definition_sites(scip_path)
+    _, definitions, references, definition_sites = (
+        _DECODER.parse_with_definition_sites(scip_path)
+    )
     workspace_crates = {
         crate
         for entries in definitions.values()
@@ -427,7 +530,17 @@ def call_sites(corpus_root, scip_path):
                     _call_form(code, start, parenthesized, macro_ranges, macro_starts),
                 )
             )
-    return sorted(records)
+    records = sorted(records)
+    completeness = _completeness_counts(
+        references, definition_sites, sources, records, workspace_crates
+    )
+    return records, completeness
+
+
+def call_sites(corpus_root, scip_path):
+    """Return source call occurrences resolved by the supplied SCIP oracle."""
+    records, _ = _call_inventory(corpus_root, scip_path)
+    return records
 
 
 def _oracle_callers(corpus_root, scip_path, sites):
@@ -588,7 +701,8 @@ def _score_edge(call, site, oracle_caller_symbol, identities):
 
 def score_calls(corpus_root, scip_file, graph_database, dump_path):
     """Score published edges and independent internal-call recall by occurrence."""
-    inventory = tuple(call_sites(corpus_root, scip_file))
+    inventory_records, completeness = _call_inventory(corpus_root, scip_file)
+    inventory = tuple(inventory_records)
     sites = {
         (site.relative_path, site.callee_start_byte, site.callee_end_byte): site
         for site in inventory
@@ -697,7 +811,18 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
                 "found" if found else "missed",
             )
         )
-    return ScoreReport(tuple(edges), tuple(recall), inventory, tuple(integrity))
+    return ScoreReport(
+        tuple(edges), tuple(recall), inventory, tuple(integrity), completeness
+    )
+
+
+def format_completeness(completeness):
+    """Format the exhaustive oracle-reference accounting for scorer output."""
+    total = sum(count for _, count in completeness)
+    categories = " ".join(
+        f"{category}={count}" for category, count in completeness
+    )
+    return f"call_site_completeness total={total} {categories}"
 
 
 def write_score_details(output_directory, report):
@@ -755,10 +880,12 @@ def main():
     parser.add_argument("corpus")
     parser.add_argument("scip")
     args = parser.parse_args()
-    counts = Counter(site.call_form for site in call_sites(args.corpus, args.scip))
+    inventory, completeness = _call_inventory(args.corpus, args.scip)
+    counts = Counter(site.call_form for site in inventory)
     print(f"total: {sum(counts.values())}")
     for call_form in ("plain_path", "method", "qualified_path", "macro_argument"):
         print(f"{call_form}: {counts[call_form]}")
+    print(format_completeness(completeness))
 
 
 if __name__ == "__main__":

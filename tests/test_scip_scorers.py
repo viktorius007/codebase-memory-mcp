@@ -648,6 +648,53 @@ class ScipScorerTests(unittest.TestCase):
             [tuple(record) for record in records],
         )
 
+    def test_inventory_parses_each_file_in_isolation(self):
+        source = b"fn caller() { target(); }\n"
+        spec = importlib.util.spec_from_file_location(
+            "scip_rust_sites", SITES_INVENTORY
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        callees = module._rust_call_callees(
+            {"broken.rs": b"/*", "valid.rs": source}
+        )
+
+        start = source.index(b"target")
+        self.assertIn((start, start + len(b"target"), False), callees["valid.rs"])
+
+    def test_inventory_keeps_ordinary_call_after_invalid_macro_rewrite(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "fn caller() {\n"
+            "    tokio::select! { value = async {} => {} }\n"
+            "    target();\n"
+            "}\n"
+        )
+        start, end = byte_span(source, "target")
+
+        records = inventory_records(source, "target", symbol("fixture/target()."))
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, symbol("fixture/target()."), "plain_path")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_finds_macro_argument_call_when_another_file_is_invalid(self):
+        source = b"fn caller() { assert!(target()); }\n"
+        spec = importlib.util.spec_from_file_location(
+            "scip_rust_sites", SITES_INVENTORY
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        callees = module._rust_call_callees(
+            {"broken.rs": b"/*", "valid.rs": source}
+        )
+
+        start = source.index(b"target")
+        self.assertIn((start, start + len(b"target"), False), callees["valid.rs"])
+
     def test_inventory_marks_local_closure_call(self):
         source = (
             "fn package_anchor() {}\n"

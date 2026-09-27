@@ -9,6 +9,7 @@ from scip_rust_sites import (
     AMBIGUOUS,
     EXTERNAL,
     LOCAL,
+    format_completeness,
     score_calls,
     write_score_details,
 )
@@ -117,6 +118,7 @@ def main():
     print_integrity(report)
     print_recall(report)
     print_non_internal_inventory(report)
+    print(format_completeness(report.completeness))
     return 1 if report.integrity else 0
 
 
