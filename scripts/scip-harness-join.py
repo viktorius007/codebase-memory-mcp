@@ -14,6 +14,7 @@ from scip_rust_sites import (
     AMBIGUOUS,
     EXTERNAL,
     LOCAL,
+    format_completeness,
     score_calls,
     write_score_details,
 )
@@ -266,6 +267,7 @@ def main():
         f"oracle_local={inventory[LOCAL]} oracle_external={inventory[EXTERNAL]} "
         f"oracle_ambiguous={inventory[AMBIGUOUS]} imports={len(imports)}"
     )
+    print(format_completeness(report.completeness))
     print_breakdowns(report)
 
     violations = []
