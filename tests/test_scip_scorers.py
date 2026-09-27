@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Occurrence- and definition-exact contracts for the Rust SCIP scorers."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SITE_SCORER = ROOT / "scripts" / "scip-site-join.py"
 HARNESS_SCORER = ROOT / "scripts" / "scip-harness-join.py"
+SITES_INVENTORY = ROOT / "scripts" / "scip_rust_sites.py"
 
 
 def varint(value):
@@ -82,6 +84,33 @@ def make_executable(path, contents):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def inventory_records(source, needle, target, ordinal=0):
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        corpus = root / "corpus"
+        (corpus / "src").mkdir(parents=True)
+        (corpus / "src" / "lib.rs").write_text(source, encoding="utf-8")
+        scip = root / "fixture.scip"
+        anchor = symbol("fixture/package_anchor().")
+        write_scip(
+            scip,
+            "src/lib.rs",
+            (
+                occurrence(
+                    range_for(source, "package_anchor"),
+                    anchor,
+                    1,
+                    line_range(source, 0),
+                ),
+                occurrence(range_for(source, needle, ordinal), target),
+            ),
+        )
+        spec = importlib.util.spec_from_file_location("scip_rust_sites", SITES_INVENTORY)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.call_sites(corpus, scip)
+
+
 class ScorerFixture:
     def __init__(self, temporary, source):
         self.root = Path(temporary)
@@ -146,6 +175,113 @@ class ScorerFixture:
 
 
 class ScipScorerTests(unittest.TestCase):
+    def test_inventory_finds_callee_after_string_with_open_parenthesis(self):
+        source = 'fn package_anchor() {}\nfn caller() { sink("(", target()); }\n'
+        start, end = byte_span(source, "target")
+
+        records = inventory_records(source, "target", symbol("fixture/target()."))
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, symbol("fixture/target()."), "plain_path")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_finds_parenthesized_callee(self):
+        source = "fn package_anchor() {}\nfn caller() { (target)(); }\n"
+        start, end = byte_span(source, "target")
+
+        records = inventory_records(source, "target", symbol("fixture/target()."))
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, symbol("fixture/target()."), "plain_path")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_classifies_method_call(self):
+        source = "fn package_anchor() {}\nfn caller(value: Thing) { value.run(); }\n"
+        start, end = byte_span(source, "run")
+
+        records = inventory_records(source, "run", symbol("fixture/impl#[Thing]run()."))
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, symbol("fixture/impl#[Thing]run()."), "method")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_classifies_type_qualified_method_call(self):
+        source = "fn package_anchor() {}\nfn caller() { Type::method(); }\n"
+        start, end = byte_span(source, "method")
+
+        records = inventory_records(source, "method", symbol("fixture/impl#[Type]method()."))
+
+        self.assertEqual(
+            [
+                (
+                    "src/lib.rs",
+                    start,
+                    end,
+                    symbol("fixture/impl#[Type]method()."),
+                    "qualified_path",
+                )
+            ],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_classifies_trait_qualified_method_call(self):
+        source = "fn package_anchor() {}\nfn caller() { <T as Trait>::method(); }\n"
+        start, end = byte_span(source, "method")
+        target = symbol("fixture/impl#[T][Trait]method().")
+
+        records = inventory_records(source, "method", target)
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, target, "qualified_path")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_classifies_call_inside_format_argument(self):
+        source = 'fn package_anchor() {}\nfn caller() { format!("{}", target()); }\n'
+        start, end = byte_span(source, "target")
+
+        records = inventory_records(source, "target", symbol("fixture/target()."))
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, symbol("fixture/target()."), "macro_argument")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_marks_local_closure_call(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "fn caller() { let closure = || (); closure(); }\n"
+        )
+        start, end = byte_span(source, "closure", 1)
+
+        records = inventory_records(source, "closure", "local 42", 1)
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, "local", "plain_path")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_finds_nested_function_call_inside_long_function(self):
+        padding = "".join(f"    let value_{index} = {index};\n" for index in range(120))
+        source = (
+            "fn package_anchor() {}\n"
+            "fn outer() {\n"
+            f"{padding}"
+            "    fn nested() { target(); }\n"
+            "}\n"
+        )
+        start, end = byte_span(source, "target")
+
+        records = inventory_records(source, "target", symbol("fixture/target()."))
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, symbol("fixture/target()."), "plain_path")],
+            [tuple(record) for record in records],
+        )
+
     def test_multiple_oracle_symbols_at_one_site_are_ambiguous(self):
         source = "fn target() {}\nfn target() {}\nfn caller() { target(); }\n"
         with tempfile.TemporaryDirectory() as temporary:
