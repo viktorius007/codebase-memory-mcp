@@ -339,7 +339,68 @@ class ScipScorerTests(unittest.TestCase):
                 result.stdout,
             )
             self.assertIn(
-                "truth sites 0 found correct 0 recall=0.00%", result.stdout
+                "truth relations 1 found correct 0 recall=0.00%", result.stdout
+            )
+            self.assertIn(
+                "truth sites 1 found correct 0 recall=0.00%", result.stdout
+            )
+            self.assertIn(
+                "caller_category=caller_gap:proc_macro_output "
+                "outcome=missed count=1",
+                result.stdout,
+            )
+
+    def test_active_call_with_unmapped_callable_caller_stays_in_recall_truth(self):
+        source = "fn target() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    (
+                        "fixture.caller", "src/lib.rs", "caller",
+                        "Function", 2, 2,
+                    ),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "truth relations 1 found correct 0 recall=0.00%", result.stdout
+            )
+            self.assertIn(
+                "truth sites 1 found correct 0 recall=0.00%", result.stdout
+            )
+            self.assertIn(
+                "caller_category=caller_gap:oracle_definition_missing "
+                "outcome=missed count=1",
+                result.stdout,
             )
 
     def test_callable_caller_without_identity_is_wrong_when_source_disagrees(self):
@@ -498,6 +559,45 @@ class ScipScorerTests(unittest.TestCase):
             )
             self.assertIn(
                 "truth sites 1 found correct 1 recall=100.00%", result.stdout
+            )
+
+    def test_source_function_caller_is_carried_into_relation_truth(self):
+        source = "fn target() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (symbol_information(target, 17, "target"),),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 2, 2),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "truth relations 1 found correct 1 recall=100.00%", result.stdout
+            )
+            self.assertIn(
+                "caller_category=source_function_item outcome=found count=1",
+                result.stdout,
             )
 
     def test_reference_truth_without_target_definition_is_not_wrong(self):
@@ -1114,6 +1214,31 @@ class ScipScorerTests(unittest.TestCase):
             [tuple(record) for record in records],
         )
 
+    def test_inventory_resolves_self_tuple_constructor_to_type_constructor(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "struct Wrapper(u8);\n"
+            "impl Wrapper { fn new(value: u8) -> Self { Self(value) } }\n"
+        )
+        start, end = byte_span(source, "Self", 1)
+
+        records = inventory_records(
+            source, "Self", symbol("fixture/impl#[Wrapper]"), (0, 1)
+        )
+
+        self.assertEqual(
+            [
+                (
+                    "src/lib.rs",
+                    start,
+                    end,
+                    symbol("fixture/Wrapper#"),
+                    "constructor",
+                )
+            ],
+            [tuple(record) for record in records],
+        )
+
     def test_inventory_counts_static_function_pointer_as_call_through_value(self):
         source = (
             "fn package_anchor() {}\n"
@@ -1261,6 +1386,59 @@ class ScipScorerTests(unittest.TestCase):
             ],
             [tuple(record) for record in records],
         )
+
+    def test_inventory_excludes_tuple_pattern_in_custom_macro(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "enum Event { Done(u8) }\n"
+            "fn caller(event: Event) { check_pattern!(event, Event::Done(_)); }\n"
+        )
+
+        records = inventory_records(
+            source, "Done", symbol("fixture/Event#Done#"), (1,)
+        )
+
+        self.assertEqual([], records)
+
+    def test_completeness_reports_tuple_pattern_as_pattern_not_parse_failure(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "enum Event { Done(u8) }\n"
+            "fn caller(event: Event) { match event { Event::Done(_) => {} } }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "corpus"
+            (corpus / "src").mkdir(parents=True)
+            (corpus / "src" / "lib.rs").write_text(source, encoding="utf-8")
+            scip = root / "fixture.scip"
+            write_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "package_anchor"),
+                        symbol("fixture/package_anchor()."),
+                        1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "Done", 1),
+                        symbol("fixture/Event#Done#"),
+                    ),
+                ),
+            )
+            spec = importlib.util.spec_from_file_location(
+                "scip_rust_sites", SITES_INVENTORY
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            _, completeness = module._call_inventory(corpus, scip)
+
+            counts = dict(completeness)
+            self.assertEqual(1, counts["excluded_pattern"])
+            self.assertEqual(0, counts["excluded_call_parser_failure"])
 
     def test_inventory_parses_each_file_in_isolation(self):
         source = b"fn caller() { target(); }\n"
