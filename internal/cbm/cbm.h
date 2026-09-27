@@ -264,6 +264,8 @@ typedef struct {
     int start_line;                // 1-based source line of the call (for def range-match)
     uint32_t site_start_byte;      // exact AST occurrence span; end > start when present
     uint32_t site_end_byte;        // exclusive byte offset in the source file
+    uint32_t callee_start_byte;    // exact terminal callee-identifier span when present
+    uint32_t callee_end_byte;      // exclusive byte offset in the source file
     CBMSourceOrigin source_origin; // raw source or C-family preprocessed buffer
     bool is_method;                // method/member call with an UNRESOLVED receiver. Perl:
                                    // arrow/method call ($obj->m). TS/JS/TSX: member call

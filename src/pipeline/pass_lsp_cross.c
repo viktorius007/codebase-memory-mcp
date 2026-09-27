@@ -1181,12 +1181,17 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
 static _Thread_local const CBMCargoManifest *g_pxc_rust_manifest = NULL;
 
 /* ── CBM_RUST_RESOLVE_DUMP: development oracle lane ───────────────────
- * When the variable names a file, every Rust resolver record (R rows) and
- * every parsed Rust call site with its joined resolution and admission
- * verdict (C rows) is appended as TSV so an external rust-analyzer SCIP
- * join can score each strategy before the gate (scripts/rust-scanner-scip.sh).
- * Both pipelines write through one handle; each row is a single fputs so the
- * stdio lock keeps concurrent worker rows intact. */
+ * When the variable names a file, rows use this one TSV layout:
+ * kind, source_file, occurrence_start, occurrence_end, source_qn, source_callee,
+ * target_qn, strategy, confidence, verdict_or_kind, callee_impl_key, reason,
+ * callee_identifier_start, callee_identifier_end.
+ *
+ * R rows describe resolver output; their final identifier columns are zero.
+ * C rows are written only after a Rust CALLS insertion succeeds. Their source
+ * and target QNs come from the graph nodes used by that insertion, verdict is
+ * "admitted", reason is "-", and the final columns are the parser-owned exact
+ * identifier span. Both pipelines write through one handle; each row is a
+ * single fputs so the stdio lock keeps concurrent worker rows intact. */
 static FILE *g_pxc_rust_dump = NULL;
 
 void cbm_pxc_rust_dump_open(void) {
@@ -1215,7 +1220,7 @@ static void pxc_rust_dump_field(char *buf, size_t cap, size_t *len, const char *
 static void pxc_rust_dump_row(FILE *dump, const char *rel, const char *kind, uint32_t start,
                               uint32_t end, const char *a, const char *b, const char *c,
                               const char *d, float confidence, const char *e, const char *f,
-                              const char *g) {
+                              const char *g, uint32_t callee_start, uint32_t callee_end) {
     char line[CBM_SZ_2K];
     size_t len = (size_t)snprintf(line, sizeof(line), "%s\t%s\t%u\t%u\t", kind, rel, start, end);
     if (len >= sizeof(line)) {
@@ -1237,6 +1242,11 @@ static void pxc_rust_dump_row(FILE *dump, const char *rel, const char *kind, uin
         }
         pxc_rust_dump_field(line, sizeof(line), &len, tail[i]);
     }
+    int range_len = snprintf(line + len, sizeof(line) - len, "\t%u\t%u", callee_start, callee_end);
+    if (range_len < 0 || (size_t)range_len >= sizeof(line) - len) {
+        return;
+    }
+    len += (size_t)range_len;
     if (len + 2 >= sizeof(line)) {
         return;
     }
@@ -1245,16 +1255,13 @@ static void pxc_rust_dump_row(FILE *dump, const char *rel, const char *kind, uin
     fputs(line, dump);
 }
 
-/* One R row per resolver record, then one C row per call carrier with the
- * joined resolution, the admission verdict and the closure reason
- * (cbm_pipeline_plain_call_closure; `-` when admitted). */
 static void pxc_rust_dump_rows(FILE *dump, const char *rel, const CBMFileResult *result) {
     for (int i = 0; i < result->resolved_calls.count; i++) {
         const CBMResolvedCall *r = &result->resolved_calls.items[i];
         pxc_rust_dump_row(dump, rel, "R", r->site_start_byte, r->site_end_byte, r->caller_qn,
                           r->callee_qn, r->strategy, r->reason, r->confidence,
                           r->kind == CBM_RESOLVED_INVOCATION ? "invocation" : "reference",
-                          r->callee_impl_key, NULL);
+                          r->callee_impl_key, NULL, 0, 0);
     }
 }
 
@@ -1264,15 +1271,15 @@ void cbm_pxc_rust_dump_file(const char *rel, const CBMFileResult *result) {
     }
 }
 
-void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const CBMResolvedCall *lsp,
-                            const char *closure) {
-    if (!g_pxc_rust_dump || !rel || !call) {
+void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const char *source_qn,
+                            const char *target_qn, const CBMResolvedCall *lsp) {
+    if (!g_pxc_rust_dump || !rel || !call || !source_qn || !target_qn || !lsp) {
         return;
     }
     pxc_rust_dump_row(g_pxc_rust_dump, rel, "C", call->site_start_byte, call->site_end_byte,
-                      call->enclosing_func_qn, call->callee_name, lsp ? lsp->callee_qn : NULL,
-                      lsp ? lsp->strategy : NULL, lsp ? lsp->confidence : 0.0f,
-                      closure ? "closed" : "admitted", lsp ? lsp->callee_impl_key : NULL, closure);
+                      source_qn, call->callee_name, target_qn, lsp->strategy, lsp->confidence,
+                      "admitted", lsp->callee_impl_key, NULL, call->callee_start_byte,
+                      call->callee_end_byte);
 }
 
 void cbm_pxc_set_rust_manifest(const CBMCargoManifest *m) {

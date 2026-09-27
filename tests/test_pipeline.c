@@ -6507,6 +6507,183 @@ TEST(pipeline_rust_macro_hidden_call_publishes_with_exact_admitted_resolution_in
     PASS();
 }
 
+typedef struct {
+    int run_rc;
+    int graph_calls;
+    int dump_calls;
+    bool exact_rows;
+    bool nested_target_range;
+} RustPublishedCallDumpObservation;
+
+static int split_dump_fields(char *line, char **fields, int capacity) {
+    int count = 0;
+    char *field = line;
+    while (count < capacity) {
+        fields[count++] = field;
+        char *tab = strchr(field, '\t');
+        if (!tab) {
+            break;
+        }
+        *tab = '\0';
+        field = tab + 1;
+    }
+    fields[count - 1][strcspn(fields[count - 1], "\r\n")] = '\0';
+    return count;
+}
+
+static void observe_rust_published_call_rows(const char *dump_path, const char *project,
+                                             uint32_t target_start, uint32_t target_end,
+                                             RustPublishedCallDumpObservation *observation) {
+    FILE *dump = cbm_fopen(dump_path, "rb");
+    if (!dump) {
+        return;
+    }
+    char caller_qn[512];
+    char sink_qn[512];
+    char target_qn[512];
+    snprintf(caller_qn, sizeof(caller_qn), "%s.lib.caller", project);
+    snprintf(sink_qn, sizeof(sink_qn), "%s.lib.sink", project);
+    snprintf(target_qn, sizeof(target_qn), "%s.lib.target", project);
+    observation->exact_rows = true;
+    char line[CBM_SZ_2K];
+    while (fgets(line, sizeof(line), dump)) {
+        if (strncmp(line, "C\t", 2) != 0) {
+            continue;
+        }
+        char *fields[16];
+        int count = split_dump_fields(line, fields, 16);
+        observation->dump_calls++;
+        bool known_target =
+            count >= 14 && (strcmp(fields[6], sink_qn) == 0 || strcmp(fields[6], target_qn) == 0);
+        observation->exact_rows =
+            observation->exact_rows && known_target && strcmp(fields[1], "lib.rs") == 0 &&
+            strcmp(fields[4], caller_qn) == 0 && strcmp(fields[7], "lsp_direct") == 0;
+        if (known_target && strcmp(fields[6], target_qn) == 0) {
+            observation->nested_target_range = strtoul(fields[12], NULL, 10) == target_start &&
+                                               strtoul(fields[13], NULL, 10) == target_end;
+        }
+    }
+    fclose(dump);
+}
+
+static RustPublishedCallDumpObservation observe_rust_published_call_dump(const char *root,
+                                                                         const char *db_name,
+                                                                         const char *dump_name,
+                                                                         uint32_t target_start,
+                                                                         uint32_t target_end) {
+    RustPublishedCallDumpObservation observation = {.run_rc = -1, .graph_calls = -1};
+    char db_path[512];
+    char dump_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", root, db_name);
+    snprintf(dump_path, sizeof(dump_path), "%s/%s", root, dump_name);
+    cbm_setenv("CBM_RUST_RESOLVE_DUMP", dump_path, 1);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    observation.run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        observation.graph_calls = cbm_store_count_edges_by_type(store, project, "CALLS");
+        observe_rust_published_call_rows(dump_path, project, target_start, target_end,
+                                         &observation);
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return observation;
+}
+
+static RustPublishedCallDumpObservation observe_rust_calls_without_dump(const char *root,
+                                                                        const char *db_name) {
+    RustPublishedCallDumpObservation observation = {.run_rc = -1, .graph_calls = -1};
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", root, db_name);
+    cbm_unsetenv("CBM_RUST_RESOLVE_DUMP");
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    observation.run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (store && pipeline) {
+        observation.graph_calls =
+            cbm_store_count_edges_by_type(store, cbm_pipeline_project_name(pipeline), "CALLS");
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return observation;
+}
+
+TEST(pipeline_rust_dump_records_only_published_calls_in_both_modes) {
+    static const char source[] = "pub fn target() -> u8 { 1 }\n"
+                                 "pub fn sink(_marker: &str, value: u8) -> u8 { value }\n"
+                                 "pub fn recursive() { recursive(); }\n"
+                                 "pub struct S;\n"
+                                 "impl Default for S { fn default() -> Self { S } }\n"
+                                 "pub fn closed() -> S { Default::default() }\n"
+                                 "pub fn caller() -> u8 { sink(\"(\", target()); sink(\"(\", target()) }\n";
+    const char *nested_target = strstr(source, "target())");
+    ASSERT_NOT_NULL(nested_target);
+    uint32_t target_start = (uint32_t)(nested_target - source);
+    uint32_t target_end = target_start + (uint32_t)strlen("target");
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_dump_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib.rs", source);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "rust_dump_pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_dump_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *saved_dump =
+        getenv("CBM_RUST_RESOLVE_DUMP") ? strdup(getenv("CBM_RUST_RESOLVE_DUMP")) : NULL;
+    char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
+    char *saved_single =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    RustPublishedCallDumpObservation sequential = observe_rust_published_call_dump(
+        tmp, "dump-sequential.db", "sequential.tsv", target_start, target_end);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    RustPublishedCallDumpObservation parallel = observe_rust_published_call_dump(
+        tmp, "dump-parallel.db", "parallel.tsv", target_start, target_end);
+    cbm_unsetenv("CBM_RUST_RESOLVE_DUMP");
+    RustPublishedCallDumpObservation without_dump =
+        observe_rust_calls_without_dump(tmp, "without-dump.db");
+
+    if (saved_dump) {
+        cbm_setenv("CBM_RUST_RESOLVE_DUMP", saved_dump, 1);
+        free(saved_dump);
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    const RustPublishedCallDumpObservation *modes[] = {&sequential, &parallel};
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        ASSERT_EQ(modes[i]->run_rc, 0);
+        ASSERT_EQ(modes[i]->graph_calls, 2);
+        ASSERT_EQ(modes[i]->dump_calls, modes[i]->graph_calls);
+        ASSERT_TRUE(modes[i]->exact_rows);
+        ASSERT_TRUE(modes[i]->nested_target_range);
+    }
+    ASSERT_EQ(without_dump.run_rc, 0);
+    ASSERT_EQ(without_dump.graph_calls, sequential.graph_calls);
+    PASS();
+}
+
 static int rust_instantiated_method_nodes_are_exact(cbm_store_t *store, const char *project) {
     cbm_node_t *nodes = NULL;
     int count = 0;
@@ -15896,6 +16073,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_rust_macro_hidden_call_publishes_with_exact_admitted_resolution_in_both_modes);
+    RUN_TEST(pipeline_rust_dump_records_only_published_calls_in_both_modes);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
