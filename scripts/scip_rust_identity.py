@@ -164,12 +164,19 @@ def _generated_outcome(node, outcomes_by_qn, oracle_symbols):
     )
 
 
-def _identity_for_node(node, definitions, roots, included_sources):
+def _identity_for_node(node, definitions, roots, included_sources, derive_owner):
     node_id, project, label, name, _, file_path, start_line, end_line, properties = node
     del node_id
     path = _relative_path(file_path, project, roots)
     allowed_kinds = SCIP_KINDS_BY_GRAPH_LABEL.get(label, ())
     entries = definitions.get(path, ())
+    values = _parse_properties(properties)
+    decorators = values.get("decorators", ())
+    if not isinstance(decorators, list):
+        decorators = ()
+    declaration_lines = (
+        range(start_line - 1, end_line) if derive_owner else (start_line - 1,)
+    )
     if label == "Module":
         candidates = {
             symbol
@@ -182,7 +189,7 @@ def _identity_for_node(node, definitions, roots, included_sources):
         candidates = {
             symbol
             for rng, symbol, scip_name, symbol_kind in entries
-            if start_line - 1 <= rng[0] <= end_line - 1
+            if rng[0] in declaration_lines
             and scip_name == name
             and symbol_kind in allowed_kinds
         }
@@ -197,10 +204,6 @@ def _identity_for_node(node, definitions, roots, included_sources):
         )
     if not allowed_kinds:
         return IdentityOutcome(status="oracle_gap", reason="unsupported_node_kind")
-    values = _parse_properties(properties)
-    decorators = values.get("decorators", ())
-    if not isinstance(decorators, list):
-        decorators = ()
     if (project, path) in included_sources:
         return IdentityOutcome(status="oracle_gap", reason="included_source")
     host_target_os = {"darwin": "macos", "linux": "linux", "win32": "windows"}.get(
@@ -241,7 +244,7 @@ def _identity_for_node(node, definitions, roots, included_sources):
         kind_matches = {
             scip_name
             for rng, _, scip_name, symbol_kind in entries
-            if start_line - 1 <= rng[0] <= end_line - 1
+            if rng[0] in declaration_lines
             and symbol_kind in allowed_kinds
         }
     if kind_matches:
@@ -301,10 +304,18 @@ def map_rust_graph_nodes(graph_database, scip_file):
         else:
             regular_nodes.append(node)
 
+    derive_owners = set()
+    for node in generated_nodes:
+        owner = _parse_properties(node[8]).get("rust_derive_owner")
+        if isinstance(owner, str):
+            derive_owners.add(owner)
+
     outcomes = {}
     outcomes_by_qn = defaultdict(list)
     for node in regular_nodes:
-        outcome = _identity_for_node(node, definitions, roots, included_sources)
+        outcome = _identity_for_node(
+            node, definitions, roots, included_sources, node[4] in derive_owners
+        )
         outcomes[node[0]] = outcome
         outcomes_by_qn[node[4]].append(outcome)
 

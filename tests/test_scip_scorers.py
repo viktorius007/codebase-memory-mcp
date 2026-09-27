@@ -342,6 +342,53 @@ class ScipScorerTests(unittest.TestCase):
                 "truth sites 0 found correct 0 recall=0.00%", result.stdout
             )
 
+    def test_callable_caller_without_identity_is_wrong_when_source_disagrees(self):
+        source = "fn target() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    (
+                        "fixture.caller", "src/lib.rs", "not_caller", "Function",
+                        2, 2,
+                    ),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
+            )
+            self.assertIn("caller_source_mismatch", result.stdout)
+
     def test_inactive_cfg_caller_is_unscorable_and_absent_from_recall(self):
         source = "#[cfg(any())]\nfn caller() { target(); }\nfn target() {}\n"
         with tempfile.TemporaryDirectory() as temporary:
@@ -629,6 +676,59 @@ class ScipScorerTests(unittest.TestCase):
                 "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
             )
             self.assertIn("wrong_occurrences=1", result.stdout)
+
+    def test_pair_label_is_wrong_when_contradicted_and_unscorable(self):
+        source = "fn target() {}\nfn other() {}\nfn caller() { other(); ghost(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            other = symbol("fixture/other().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target"), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "other", 0), other, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "other", 1), other),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(other, 17, "other"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 3, 3),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(
+                (
+                    ("other()", 1, "fixture.target", "direct", "admitted"),
+                    ("ghost()", 0, "fixture.target", "direct", "admitted"),
+                )
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
+            )
+            self.assertIn("target_identity_mismatch", result.stdout)
 
     def test_missing_edges_table_is_a_named_integrity_error(self):
         source = "fn target() {}\nfn caller() { target(); }\n"
@@ -1269,6 +1369,108 @@ class ScipScorerTests(unittest.TestCase):
             identities = load_identity_module().map_rust_graph_nodes(database, scip)
 
             self.assertEqual(identities[1].symbol, outer)
+
+    def test_nested_same_name_definition_does_not_identify_enclosing_node(self):
+        source = "#[instrument]\nfn target() {\n    fn target() {}\n    target();\n}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            nested = symbol("fixture/target/target().")
+            write_identity_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 1), nested, 1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "target", 2), nested),
+                ),
+                (symbol_information(nested, 17, "target"),),
+            )
+            create_identity_database(
+                database,
+                ((
+                    1, "fixture", "Function", "target", "fixture.target",
+                    "src/lib.rs", 1, 5,
+                    json.dumps({"decorators": ["#[instrument]"]}),
+                ),),
+            )
+
+            identity = load_identity_module()
+            identities = identity.map_rust_graph_nodes(database, scip)
+
+            self.assertEqual(
+                identities[1],
+                identity.IdentityOutcome(
+                    status="oracle_gap", reason="proc_macro_output"
+                ),
+            )
+
+    def test_duplicate_symbol_target_in_wrong_document_is_wrong(self):
+        source_a = "fn helper() {}\nfn caller() { helper(); }\n"
+        source_b = "fn helper() {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source_a)
+            (fixture.corpus / "src" / "a.rs").write_text(
+                source_a, encoding="utf-8"
+            )
+            (fixture.corpus / "src" / "b.rs").write_text(
+                source_b, encoding="utf-8"
+            )
+            shared = symbol("fixture/helper().")
+            caller = symbol("fixture/caller().")
+            document_a = field(1, 2, b"src/a.rs")
+            document_a += b"".join((
+                occurrence(
+                    range_for(source_a, "helper", 0), shared, 1,
+                    line_range(source_a, 0),
+                ),
+                occurrence(
+                    range_for(source_a, "caller"), caller, 1,
+                    line_range(source_a, 1),
+                ),
+                occurrence(range_for(source_a, "helper", 1), shared),
+                symbol_information(shared, 17, "helper"),
+                symbol_information(caller, 17, "caller"),
+            ))
+            document_b = field(1, 2, b"src/b.rs")
+            document_b += b"".join((
+                occurrence(
+                    range_for(source_b, "helper"), shared, 1,
+                    line_range(source_b, 0),
+                ),
+                symbol_information(shared, 17, "helper"),
+            ))
+            fixture.scip.write_bytes(
+                field(2, 2, document_a) + field(2, 2, document_b)
+            )
+            target = "fixture.b.helper"
+            fixture.create_database(
+                (
+                    (target, "src/b.rs", "helper", "Function", 1, 1),
+                    ("fixture.a.caller", "src/a.rs", "caller", "Function", 2, 2),
+                ),
+                edges=(("fixture.a.caller", target),),
+            )
+            start, end = byte_span(source_a, "helper", 1)
+            fixture.dump.write_text(
+                "\t".join((
+                    "C", "src/a.rs", str(start), str(end + 2),
+                    "fixture.a.caller", "helper", target, "direct", "1.0",
+                    "admitted", "-", "-", str(start), str(end),
+                )) + "\n",
+                encoding="utf-8",
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
+            )
+            self.assertIn("target_identity_mismatch", result.stdout)
 
     def test_file_nodes_are_excluded_from_identity_outcomes(self):
         source = "fn target() {}\n"

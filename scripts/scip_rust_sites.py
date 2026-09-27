@@ -989,6 +989,11 @@ def _score_caller(call, oracle_caller_symbol, source_caller, identities):
         )
     if _callable_symbol(oracle_caller_symbol or ""):
         if caller_symbol is None:
+            if _source_caller_matches(call, source_caller, caller_node) is False:
+                return CallerOutcome(
+                    caller_symbol, oracle_caller_symbol, "wrong",
+                    "caller_source_mismatch",
+                )
             return CallerOutcome(
                 caller_symbol, oracle_caller_symbol, "unscorable", caller_reason
             )
@@ -1024,6 +1029,13 @@ def _target_is_contradicted(
     locations = definition_locations.get(expected_target, ())
     if not locations:
         return site.resolved_symbol == EXTERNAL
+    if len({relative_path for relative_path, _ in locations}) > 1:
+        locations = tuple(
+            location for location in locations
+            if location[0] == site.relative_path
+        )
+        if len(locations) != 1:
+            return None
     _, _, _, node_path, start_line, end_line = target_node
     return not any(
         (
@@ -1085,6 +1097,15 @@ def _score_edge(
             unknown.append("oracle_target_missing")
         elif target_symbol != expected_target:
             contradictions.append("target_identity_mismatch")
+        else:
+            location_contradiction = _target_is_contradicted(
+                site, expected_target, target_reason, target_node,
+                definition_locations,
+            )
+            if location_contradiction is True:
+                contradictions.append("target_identity_mismatch")
+            elif location_contradiction is None:
+                unknown.append("oracle_target_location_ambiguous")
     if contradictions:
         outcome = "wrong"
         reason = "+".join(contradictions)
@@ -1148,11 +1169,22 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
     edges = []
     scored_occurrences = []
     integrity = list(integrity)
-    source_candidates = [
-        site
-        for key, site in sites.items()
+    source_candidate_keys = {
+        key for key in sites
         if not _callable_symbol(oracle_callers.get(key) or "")
-    ]
+    }
+    for call in calls:
+        key = (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+        if key not in sites or not _callable_symbol(oracle_callers.get(key) or ""):
+            continue
+        caller_symbol, caller_reason, _ = _single_identity(
+            identities, call.caller_qualified_name, "caller"
+        )
+        if caller_symbol is None and caller_reason != (
+            "caller_not_in_oracle_configuration:cfg_inactive"
+        ):
+            source_candidate_keys.add(key)
+    source_candidates = [sites[key] for key in source_candidate_keys]
     source_callers = _source_callers(corpus_root, source_candidates)
     graph_source_nodes = defaultdict(list)
     for qualified_name, nodes in identities.items():
@@ -1227,7 +1259,7 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
             for call in provenance
         ]
         scored_occurrences.extend(scores)
-        rank = {"correct": 0, "unscorable": 1, "wrong": 2}
+        rank = {"correct": 0, "wrong": 1, "unscorable": 2}
         edges.append(min(scores, key=lambda score: rank[score.outcome]))
     for call in calls:
         key = (call.caller_qualified_name, call.target_qualified_name)
