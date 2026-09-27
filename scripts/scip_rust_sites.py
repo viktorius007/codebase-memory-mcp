@@ -42,6 +42,14 @@ class PublishedCall(NamedTuple):
     strategy: str
 
 
+class GraphCall(NamedTuple):
+    source_id: int
+    target_id: int
+    source_path: str
+    caller_qualified_name: str
+    target_qualified_name: str
+
+
 class ScoredEdge(NamedTuple):
     relative_path: str
     callee_start_byte: int
@@ -52,6 +60,7 @@ class ScoredEdge(NamedTuple):
     target_symbol: str | None
     strategy: str
     call_form: str
+    oracle_caller_symbol: str | None
     oracle_symbol: str | None
     outcome: str
     reason: str
@@ -67,10 +76,20 @@ class RecallOccurrence(NamedTuple):
     outcome: str
 
 
+class IntegrityError(NamedTuple):
+    category: str
+    relative_path: str
+    callee_start_byte: int
+    callee_end_byte: int
+    caller_qualified_name: str
+    target_qualified_name: str
+
+
 class ScoreReport(NamedTuple):
     edges: tuple[ScoredEdge, ...]
     recall: tuple[RecallOccurrence, ...]
     inventory: tuple[CallSite, ...]
+    integrity: tuple[IntegrityError, ...]
 
 
 _DECODER_PATH = Path(__file__).with_name("scip-call-edges.py")
@@ -414,6 +433,32 @@ def call_sites(corpus_root, scip_path):
     return sorted(records)
 
 
+def _oracle_callers(corpus_root, scip_path, sites):
+    _, definitions, references, _ = _DECODER.parse_with_definition_sites(scip_path)
+    wanted = defaultdict(set)
+    for site in sites:
+        wanted[site.relative_path].add(
+            (site.relative_path, site.callee_start_byte, site.callee_end_byte)
+        )
+    callers = {}
+    for relative_path, occurrences in references.items():
+        path_sites = wanted.get(relative_path)
+        if not path_sites:
+            continue
+        source = (Path(corpus_root) / relative_path).read_bytes()
+        starts = _line_starts(source)
+        for source_range, _ in occurrences:
+            byte_range = _byte_range(source, starts, source_range)
+            if byte_range is None:
+                continue
+            key = (relative_path, byte_range[0], byte_range[1])
+            if key in path_sites:
+                callers[key] = _DECODER.innermost(
+                    definitions[relative_path], (source_range[0], source_range[1])
+                )
+    return callers
+
+
 def published_calls(dump_path):
     """Return only published CALLS rows from a resolver dump."""
     records = []
@@ -468,51 +513,79 @@ def _node_identities(graph_database, scip_file):
     return by_name
 
 
-def _single_identity(by_name, qualified_name):
+def _single_identity(by_name, qualified_name, endpoint):
     outcomes = by_name.get(qualified_name, ())
     if not outcomes:
-        return None, "target_node_missing"
+        return None, f"{endpoint}_node_missing"
     if len(outcomes) != 1:
-        return None, "target_qualified_name_is_not_unique"
+        return None, f"{endpoint}_qualified_name_is_not_unique"
     outcome = outcomes[0]
     if outcome.status == "matched":
         return outcome.symbol, "-"
-    return None, f"target_{outcome.status}:{outcome.reason}"
+    return None, f"{endpoint}_{outcome.status}:{outcome.reason}"
 
 
-def _score_edge(call, site, identities):
-    caller_symbol, _ = _single_identity(identities, call.caller_qualified_name)
+def _rust_call_edges(graph_database):
+    connection = sqlite3.connect(graph_database)
+    try:
+        exists = connection.execute(
+            "select 1 from sqlite_master where type='table' and name='edges'"
+        ).fetchone()
+        if exists is None:
+            return None
+        rows = connection.execute(
+            "select e.source_id, e.target_id, source.file_path, "
+            "source.qualified_name, target.qualified_name "
+            "from edges e "
+            "join nodes source on source.id = e.source_id "
+            "join nodes target on target.id = e.target_id "
+            "where e.type = 'CALLS' and source.file_path glob '*.rs' "
+            "and target.file_path glob '*.rs' order by e.source_id, e.target_id"
+        )
+        return tuple(GraphCall(*row) for row in rows)
+    finally:
+        connection.close()
+
+
+def _score_edge(call, site, oracle_caller_symbol, identities):
+    caller_symbol, caller_reason = _single_identity(
+        identities, call.caller_qualified_name, "caller"
+    )
     target_symbol, target_reason = _single_identity(
-        identities, call.target_qualified_name
+        identities, call.target_qualified_name, "target"
     )
     if site is None:
         return ScoredEdge(
             call.relative_path, call.callee_start_byte, call.callee_end_byte,
             call.caller_qualified_name, caller_symbol, call.target_qualified_name,
-            target_symbol, call.strategy, "no_oracle_site", None, "unscorable",
-            "no_oracle_truth",
+            target_symbol, call.strategy, "no_oracle_site", None, None,
+            "unscorable", "no_oracle_truth",
         )
     if site.resolved_symbol in (LOCAL, EXTERNAL, AMBIGUOUS):
         return ScoredEdge(
             call.relative_path, call.callee_start_byte, call.callee_end_byte,
             call.caller_qualified_name, caller_symbol, call.target_qualified_name,
-            target_symbol, call.strategy, site.call_form, site.resolved_symbol,
-            "unscorable", f"oracle_{site.resolved_symbol}",
+            target_symbol, call.strategy, site.call_form, oracle_caller_symbol,
+            site.resolved_symbol, "unscorable", f"oracle_{site.resolved_symbol}",
         )
+    reasons = []
+    if caller_symbol is None:
+        reasons.append(caller_reason)
+    elif oracle_caller_symbol is None:
+        reasons.append("oracle_caller_missing")
+    elif caller_symbol != oracle_caller_symbol:
+        reasons.append("caller_identity_mismatch")
     if target_symbol is None:
-        return ScoredEdge(
-            call.relative_path, call.callee_start_byte, call.callee_end_byte,
-            call.caller_qualified_name, caller_symbol, call.target_qualified_name,
-            None, call.strategy, site.call_form, site.resolved_symbol,
-            "unscorable", target_reason,
-        )
-    outcome = "correct" if target_symbol == site.resolved_symbol else "wrong"
-    reason = "-" if outcome == "correct" else "definition_identity_mismatch"
+        reasons.append(target_reason)
+    elif target_symbol != site.resolved_symbol:
+        reasons.append("target_identity_mismatch")
+    outcome = "wrong" if reasons else "correct"
+    reason = "+".join(reasons) if reasons else "-"
     return ScoredEdge(
         call.relative_path, call.callee_start_byte, call.callee_end_byte,
         call.caller_qualified_name, caller_symbol, call.target_qualified_name,
-        target_symbol, call.strategy, site.call_form, site.resolved_symbol,
-        outcome, reason,
+        target_symbol, call.strategy, site.call_form, oracle_caller_symbol,
+        site.resolved_symbol, outcome, reason,
     )
 
 
@@ -523,19 +596,77 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         (site.relative_path, site.callee_start_byte, site.callee_end_byte): site
         for site in inventory
     }
+    oracle_callers = _oracle_callers(corpus_root, scip_file, inventory)
     identities = _node_identities(graph_database, scip_file)
-    edges = tuple(
-        _score_edge(
-            call,
-            sites.get(
-                (call.relative_path, call.callee_start_byte, call.callee_end_byte)
-            ),
-            identities,
-        )
-        for call in published_calls(dump_path)
-    )
+    calls = published_calls(dump_path)
+    graph_calls = _rust_call_edges(graph_database)
+    edges_table_missing = graph_calls is None
+    if edges_table_missing:
+        integrity = (IntegrityError("missing_edges_table", "-", -1, -1, "-", "-"),)
+        graph_calls = ()
+    else:
+        integrity = ()
+    calls_by_edge = defaultdict(list)
+    for call in calls:
+        calls_by_edge[(call.caller_qualified_name, call.target_qualified_name)].append(call)
+    graph_pairs = {
+        (edge.caller_qualified_name, edge.target_qualified_name)
+        for edge in graph_calls
+    }
+    edges = []
+    scored_occurrences = []
+    integrity = list(integrity)
+    for edge in graph_calls:
+        key = (edge.caller_qualified_name, edge.target_qualified_name)
+        provenance = calls_by_edge.get(key, ())
+        if not provenance:
+            caller_symbol, _ = _single_identity(
+                identities, edge.caller_qualified_name, "caller"
+            )
+            target_symbol, _ = _single_identity(
+                identities, edge.target_qualified_name, "target"
+            )
+            edges.append(
+                ScoredEdge(
+                    edge.source_path, -1, -1, edge.caller_qualified_name,
+                    caller_symbol, edge.target_qualified_name, target_symbol,
+                    "no_dump_provenance", "no_provenance", None, None,
+                    "integrity_error", "edge_without_dump",
+                )
+            )
+            integrity.append(
+                IntegrityError(
+                    "edge_without_dump", edge.source_path, -1, -1,
+                    edge.caller_qualified_name, edge.target_qualified_name,
+                )
+            )
+            continue
+        scores = [
+            _score_edge(
+                call,
+                sites.get((call.relative_path, call.callee_start_byte, call.callee_end_byte)),
+                oracle_callers.get(
+                    (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+                ),
+                identities,
+            )
+            for call in provenance
+        ]
+        scored_occurrences.extend(scores)
+        rank = {"correct": 0, "wrong": 1, "unscorable": 2}
+        edges.append(min(scores, key=lambda score: rank[score.outcome]))
+    for call in calls:
+        key = (call.caller_qualified_name, call.target_qualified_name)
+        if not edges_table_missing and key not in graph_pairs:
+            integrity.append(
+                IntegrityError(
+                    "dump_without_edge", call.relative_path, call.callee_start_byte,
+                    call.callee_end_byte, call.caller_qualified_name,
+                    call.target_qualified_name,
+                )
+            )
     edges_by_site = defaultdict(list)
-    for edge in edges:
+    for edge in scored_occurrences:
         edges_by_site[
             (edge.relative_path, edge.callee_start_byte, edge.callee_end_byte)
         ].append(edge)
@@ -555,7 +686,7 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
                 "found" if found else "missed",
             )
         )
-    return ScoreReport(edges, tuple(recall), inventory)
+    return ScoreReport(tuple(edges), tuple(recall), inventory, tuple(integrity))
 
 
 def write_score_details(output_directory, report):
@@ -565,7 +696,8 @@ def write_score_details(output_directory, report):
     wrong_header = (
         "relative_path", "callee_start_byte", "callee_end_byte", "strategy",
         "call_form", "caller_qualified_name", "caller_symbol",
-        "target_qualified_name", "target_symbol", "oracle_symbol", "reason",
+        "oracle_caller_symbol", "target_qualified_name", "target_symbol",
+        "oracle_symbol", "reason",
     )
     missed_header = (
         "relative_path", "callee_start_byte", "callee_end_byte", "strategy",
@@ -575,7 +707,8 @@ def write_score_details(output_directory, report):
         (
             edge.relative_path, edge.callee_start_byte, edge.callee_end_byte,
             edge.strategy, edge.call_form, edge.caller_qualified_name,
-            edge.caller_symbol or "-", edge.target_qualified_name,
+            edge.caller_symbol or "-", edge.oracle_caller_symbol or "-",
+            edge.target_qualified_name,
             edge.target_symbol or "-", edge.oracle_symbol or "-", edge.reason,
         )
         for edge in report.edges if edge.outcome == "wrong"
@@ -591,6 +724,14 @@ def write_score_details(output_directory, report):
     for name, header, rows in (
         ("wrong-edges.tsv", wrong_header, wrong_rows),
         ("missed-occurrences.tsv", missed_header, missed_rows),
+        (
+            "integrity-errors.tsv",
+            (
+                "category", "relative_path", "callee_start_byte", "callee_end_byte",
+                "caller_qualified_name", "target_qualified_name",
+            ),
+            report.integrity,
+        ),
     ):
         with (output / name).open("w", encoding="utf-8") as handle:
             handle.write("\t".join(header) + "\n")

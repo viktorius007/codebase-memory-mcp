@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Score published Rust CALLS edges and call-occurrence recall against SCIP.
-
-Precision is evaluated only for published ``C`` rows carrying the parser's
-exact callee byte range. Recall starts from the independent source/SCIP call
-inventory, so an occurrence the indexer never recorded remains a miss.
-"""
+"""Score graph Rust CALLS edges and call-occurrence recall against SCIP."""
 
 import argparse
 from collections import Counter, defaultdict
+import sys
 
 from scip_rust_sites import (
     AMBIGUOUS,
@@ -25,7 +21,7 @@ def print_precision(report):
     print(
         f"published_edges={len(report.edges)} correct={counts['correct']} "
         f"wrong={counts['wrong']} unscorable={counts['unscorable']} "
-        f"precision={precision:.2f}%"
+        f"precision={precision:.2f}% integrity_errors={len(report.integrity)}"
     )
     print("=== precision by resolution strategy and call form ===")
     breakdown = defaultdict(Counter)
@@ -44,6 +40,20 @@ def print_precision(report):
         for reason, count in sorted(values.items()):
             if reason not in ("correct", "wrong", "unscorable"):
                 print(f"  unscorable_reason={reason} count={count}")
+    categories = Counter(
+        edge.reason for edge in report.edges if edge.outcome == "unscorable"
+    )
+    print("=== unscorable categories ===")
+    for category, count in sorted(categories.items()):
+        print(f"unscorable_category={category} count={count}")
+
+
+def print_integrity(report):
+    print("=== integrity errors ===")
+    for category, count in sorted(
+        Counter(error.category for error in report.integrity).items()
+    ):
+        print(f"integrity_error={category} count={count}")
 
 
 def print_recall(report):
@@ -90,9 +100,11 @@ def main():
     if args.out:
         write_score_details(args.out, report)
     print_precision(report)
+    print_integrity(report)
     print_recall(report)
     print_non_internal_inventory(report)
+    return 1 if report.integrity else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

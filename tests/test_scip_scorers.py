@@ -166,7 +166,7 @@ class ScorerFixture:
             "#!/bin/sh\nprintf '%s\\n' '{\"packages\":[{\"name\":\"fixture\"}]}'\n",
         )
 
-    def create_database(self, nodes):
+    def create_database(self, nodes, edges=(), with_edges=True):
         connection = sqlite3.connect(self.database)
         connection.execute(
             "create table nodes (id integer primary key, project text, label text, "
@@ -179,6 +179,18 @@ class ScorerFixture:
             in enumerate(nodes, 1)
         )
         connection.executemany("insert into nodes values (?,?,?,?,?,?,?,?,?)", expanded)
+        if with_edges:
+            connection.execute(
+                "create table edges (source_id integer, target_id integer, type text)"
+            )
+            node_ids = {
+                qualified_name: index
+                for index, (qualified_name, *_rest) in enumerate(nodes, 1)
+            }
+            connection.executemany(
+                "insert into edges values (?, ?, 'CALLS')",
+                ((node_ids[source], node_ids[target]) for source, target in edges),
+            )
         connection.commit()
         connection.close()
 
@@ -215,27 +227,199 @@ class ScorerFixture:
 
 
 class ScipScorerTests(unittest.TestCase):
+    def test_missing_edges_table_is_a_named_integrity_error(self):
+        source = "fn target() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 2, 2),
+                ),
+                with_edges=False,
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("integrity_error=missing_edges_table count=1", result.stdout)
+            self.assertNotIn("correct=1", result.stdout)
+
+    def test_graph_and_dump_mismatches_are_distinct_integrity_errors(self):
+        source = "fn target() {}\nfn other() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            other = symbol("fixture/other().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "other"), other, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(other, 17, "other"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.other", "src/lib.rs", "other", "Function", 2, 2),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 3, 3),
+                ),
+                edges=(("fixture.caller", "fixture.other"),),
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("integrity_error=edge_without_dump count=1", result.stdout)
+            self.assertIn("integrity_error=dump_without_edge count=1", result.stdout)
+            self.assertNotIn("correct=1", result.stdout)
+
+    def test_wrong_caller_edge_is_scored_wrong(self):
+        source = (
+            "fn target() {}\n"
+            "fn real_caller() { target(); }\n"
+            "fn wrong_caller() {}\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            real_caller = symbol("fixture/real_caller().")
+            wrong_caller = symbol("fixture/wrong_caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "real_caller"), real_caller, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(
+                        range_for(source, "wrong_caller"), wrong_caller, 1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(real_caller, 17, "real_caller"),
+                    symbol_information(wrong_caller, 17, "wrong_caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    (
+                        "fixture.real_caller", "src/lib.rs", "real_caller",
+                        "Function", 2, 2,
+                    ),
+                    (
+                        "fixture.wrong_caller", "src/lib.rs", "wrong_caller",
+                        "Function", 3, 3,
+                    ),
+                ),
+                edges=(("fixture.wrong_caller", "fixture.target"),),
+            )
+            start, end = byte_span(source, "target", 1)
+            fixture.dump.write_text(
+                "\t".join(
+                    (
+                        "C", "src/lib.rs", str(start), str(end + 2),
+                        "fixture.wrong_caller", "target", "fixture.target",
+                        "direct", "1.0", "admitted", "-", "-", str(start),
+                        str(end),
+                    )
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
+            )
+            self.assertIn(
+                "caller_identity_mismatch",
+                (fixture.detail / "wrong-edges.tsv").read_text(encoding="utf-8"),
+            )
+
     def test_published_wrong_edge_is_scored_wrong(self):
         source = 'fn target(_: &str) {}\nfn wrong() {}\nfn caller() { target("("); }\n'
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
             truth = symbol("fixture/target().")
             wrong = symbol("fixture/wrong().")
+            caller = symbol("fixture/caller().")
             write_identity_scip(
                 fixture.scip,
                 "src/lib.rs",
                 (
                     occurrence(range_for(source, "target", 0), truth, 1, line_range(source, 0)),
                     occurrence(range_for(source, "wrong"), wrong, 1, line_range(source, 1)),
+                    occurrence(range_for(source, "caller"), caller, 1, line_range(source, 2)),
                     occurrence(range_for(source, "target", 1), truth),
                 ),
                 (
                     symbol_information(truth, 17, "target"),
                     symbol_information(wrong, 17, "wrong"),
+                    symbol_information(caller, 17, "caller"),
                 ),
             )
             fixture.create_database(
-                (("fixture.wrong", "src/lib.rs", "wrong", "Function", 2, 2),)
+                (
+                    ("fixture.wrong", "src/lib.rs", "wrong", "Function", 2, 2),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 3, 3),
+                ),
+                edges=(("fixture.caller", "fixture.wrong"),),
             )
             site_start, site_end = byte_span(source, 'target("(")')
             callee_start, callee_end = byte_span(source, "target", 1)
@@ -348,7 +532,11 @@ class ScipScorerTests(unittest.TestCase):
                 ),
             )
             fixture.create_database(
-                (("fixture.target", "src/lib.rs", "target", "Function", 2, 5),)
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 2, 5),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 6, 6),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
             )
             fixture.write_dump(
                 (("target()", 1, "fixture.target", "direct", "admitted"),)
@@ -671,7 +859,11 @@ class ScipScorerTests(unittest.TestCase):
                 ),
             )
             fixture.create_database(
-                (("fixture.src.lib.target", "src/lib.rs", "target", "Function", 2, 2),)
+                (
+                    ("fixture.src.lib.target", "src/lib.rs", "target", "Function", 2, 2),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 3, 3),
+                ),
+                edges=(("fixture.caller", "fixture.src.lib.target"),),
             )
             fixture.write_dump((("target()", 2, "fixture.src.lib.target", "exact", "admitted"),))
 
@@ -704,7 +896,11 @@ class ScipScorerTests(unittest.TestCase):
                 ),
             )
             fixture.create_database(
-                (("fixture.src.lib.Thing.run", "src/lib.rs", "run", "Method", 2, 2),)
+                (
+                    ("fixture.src.lib.Thing.run", "src/lib.rs", "run", "Method", 2, 2),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 3, 3),
+                ),
+                edges=(("fixture.caller", "fixture.src.lib.Thing.run"),),
             )
             fixture.write_dump((("run()", 2, "fixture.src.lib.Thing.run", "method", "admitted"),))
 
@@ -736,7 +932,11 @@ class ScipScorerTests(unittest.TestCase):
                 ),
             )
             fixture.create_database(
-                (("fixture.src.lib.Thing.run", "src/lib.rs", "run", "Function", 2, 2),)
+                (
+                    ("fixture.src.lib.Thing.run", "src/lib.rs", "run", "Function", 2, 2),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 3, 3),
+                ),
+                edges=(("fixture.caller", "fixture.src.lib.Thing.run"),),
             )
             fixture.write_dump((("run()", 2, "fixture.src.lib.Thing.run", "owner", "admitted"),))
 
@@ -753,18 +953,27 @@ class ScipScorerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
             truth = symbol("fixture/target().")
+            caller = symbol("fixture/caller().")
             write_identity_scip(
                 fixture.scip,
                 "src/lib.rs",
                 (
                     occurrence(range_for(source, "target", 0), truth, 1, line_range(source, 0)),
+                    occurrence(range_for(source, "caller"), caller, 1, line_range(source, 1)),
                     occurrence(range_for(source, "target", 1), truth),
                     occurrence(range_for(source, "target", 2), truth),
                 ),
-                (symbol_information(truth, 17, "target"),),
+                (
+                    symbol_information(truth, 17, "target"),
+                    symbol_information(caller, 17, "caller"),
+                ),
             )
             fixture.create_database(
-                (("fixture.src.lib.target", "src/lib.rs", "target", "Function", 1, 1),)
+                (
+                    ("fixture.src.lib.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 2, 2),
+                ),
+                edges=(("fixture.caller", "fixture.src.lib.target"),),
             )
             fixture.write_dump(
                 (
@@ -807,10 +1016,11 @@ class ScipScorerTests(unittest.TestCase):
                         "Function", 2, 2,
                     ),
                     (
-                        "fixture.src.lib.caller", "src/lib.rs", "caller",
+                        "fixture.caller", "src/lib.rs", "caller",
                         "Function", 3, 3,
                     ),
-                )
+                ),
+                edges=(("fixture.caller", "fixture.src.lib.wrong.target"),),
             )
             fixture.write_dump(
                 ((
@@ -860,7 +1070,7 @@ print(json.dumps({'rows': rows, 'has_more': False}))
             self.assertIn("oracle_only=1", result.stdout, result.stderr)
             self.assertIn(
                 "precision strategy=direct call_form=plain_path "
-                "outcome=wrong reason=- count=1",
+                "outcome=wrong reason=target_identity_mismatch count=1",
                 result.stdout,
             )
             self.assertIn(

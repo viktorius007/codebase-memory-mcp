@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Gate published Rust CALLS edges against exact SCIP occurrence truth.
-
-The gate scores only published dump rows. It builds recall from the independent
-source/SCIP call inventory, reports non-internal oracle resolutions separately,
-and preserves the fixture's historical strict/non-strict expectation split.
-"""
+"""Gate graph Rust CALLS edges against exact SCIP occurrence truth."""
 
 import argparse
 from collections import Counter
@@ -163,7 +158,8 @@ def edge_detail(edge):
     return (
         edge.relative_path, edge.callee_start_byte, edge.callee_end_byte,
         edge.strategy, edge.call_form, edge.caller_symbol or "-",
-        edge.target_symbol or "-", edge.oracle_symbol or "-",
+        edge.oracle_caller_symbol or "-", edge.target_symbol or "-",
+        edge.oracle_symbol or "-",
         edge.target_qualified_name, edge.reason,
     )
 
@@ -180,7 +176,7 @@ def print_breakdowns(report):
     precision = Counter(
         (
             edge.strategy, edge.call_form, edge.outcome,
-            edge.reason if edge.outcome == "unscorable" else "-",
+            edge.reason if edge.outcome != "correct" else "-",
         )
         for edge in report.edges
     )
@@ -218,6 +214,9 @@ def main():
     correct = [edge for edge in report.edges if edge.outcome == "correct"]
     wrong = [edge for edge in report.edges if edge.outcome == "wrong"]
     unscorable = [edge for edge in report.edges if edge.outcome == "unscorable"]
+    integrity_edges = [
+        edge for edge in report.edges if edge.outcome == "integrity_error"
+    ]
     matched = [
         edge for edge in correct
         if (edge.caller_symbol, edge.oracle_symbol) in strict
@@ -242,6 +241,8 @@ def main():
         f"calls_graph={len(report.edges)} correct={len(correct)} wrong={len(wrong)} "
         f"unscorable={len(unscorable)} matched={len(matched)} "
         f"graph_only_referenced={len(graph_only)} fabricated={len(wrong)} "
+        f"integrity_edges={len(integrity_edges)} "
+        f"integrity_errors={len(report.integrity)} "
         f"oracle_internal={len(report.recall)} oracle_only={len(missed)} "
         f"oracle_local={inventory[LOCAL]} oracle_external={inventory[EXTERNAL]} "
         f"oracle_ambiguous={inventory[AMBIGUOUS]} imports={len(imports)}"
@@ -253,6 +254,13 @@ def main():
         violations.append(
             f"violation: fabricated expected=0 got={len(wrong)} "
             "detail=calls-fabricated.tsv"
+        )
+    if report.integrity:
+        categories = Counter(error.category for error in report.integrity)
+        violations.append(
+            f"violation: call_integrity expected=0 got={len(report.integrity)} "
+            f"categories={dict(sorted(categories.items()))} "
+            "detail=integrity-errors.tsv"
         )
     for label, count, key, detail in (
         ("matched", len(matched), "calls_matched", "calls-matched.tsv"),
