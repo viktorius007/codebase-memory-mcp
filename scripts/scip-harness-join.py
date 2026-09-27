@@ -12,8 +12,8 @@ import sys
 
 from scip_rust_sites import (
     AMBIGUOUS,
+    CALL_THROUGH_VALUE,
     EXTERNAL,
-    LOCAL,
     score_calls,
     write_score_details,
 )
@@ -263,7 +263,8 @@ def main():
         f"oracle_internal={len(report.recall)} oracle_only={len(missed)} "
         f"occurrences_found={occurrence_found} "
         f"occurrence_recall={occurrence_recall:.2f}% "
-        f"oracle_local={inventory[LOCAL]} oracle_external={inventory[EXTERNAL]} "
+        f"oracle_call_through_value={inventory[CALL_THROUGH_VALUE]} "
+        f"oracle_external={inventory[EXTERNAL]} "
         f"oracle_ambiguous={inventory[AMBIGUOUS]} imports={len(imports)}"
     )
     print_breakdowns(report)

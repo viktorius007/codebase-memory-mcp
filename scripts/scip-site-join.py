@@ -6,9 +6,7 @@ from collections import Counter, defaultdict
 import sys
 
 from scip_rust_sites import (
-    AMBIGUOUS,
-    EXTERNAL,
-    LOCAL,
+    NON_INTERNAL_TRUTH,
     score_calls,
     write_score_details,
 )
@@ -94,7 +92,7 @@ def print_non_internal_inventory(report):
     counts = Counter(
         (site.resolved_symbol, site.call_form)
         for site in report.inventory
-        if site.resolved_symbol in (LOCAL, EXTERNAL, AMBIGUOUS)
+        if site.resolved_symbol in NON_INTERNAL_TRUTH
     )
     print("=== oracle-resolved non-internal and ambiguous occurrences ===")
     for (truth_class, call_form), count in sorted(counts.items()):

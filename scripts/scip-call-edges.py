@@ -209,6 +209,13 @@ def crate_of(symbol):
     return match.group(1) if match else None
 
 
+def package_of(symbol):
+    parts = symbol.split(" ", 4)
+    if len(parts) != 5 or parts[:2] != ["rust-analyzer", "cargo"]:
+        return None
+    return " ".join(parts[:4])
+
+
 def descriptor_of(symbol):
     parts = symbol.split(" ", 4)
     return parts[4] if len(parts) > 4 else ""
