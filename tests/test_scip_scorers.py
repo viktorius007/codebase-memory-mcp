@@ -51,6 +51,18 @@ def write_scip(path, relative_path, occurrences):
     path.write_bytes(field(2, 2, document))
 
 
+def symbol_information(identity, kind, display_name):
+    encoded = field(1, 2, identity.encode()) + field(5, 0, kind)
+    encoded += field(6, 2, display_name.encode())
+    return field(3, 2, encoded)
+
+
+def write_identity_scip(path, relative_path, occurrences, symbols):
+    document = field(1, 2, relative_path.encode())
+    document += b"".join(occurrences) + b"".join(symbols)
+    path.write_bytes(field(2, 2, document))
+
+
 def line_col(source, offset):
     prefix = source[:offset]
     return prefix.count("\n"), len(prefix.rsplit("\n", 1)[-1])
@@ -109,6 +121,26 @@ def inventory_records(source, needle, target, ordinal=0):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module.call_sites(corpus, scip)
+
+
+def load_identity_module():
+    path = ROOT / "scripts" / "scip_rust_identity.py"
+    spec = importlib.util.spec_from_file_location("scip_rust_identity", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def create_identity_database(path, nodes):
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "create table nodes (id integer primary key, project text, label text, "
+        "name text, qualified_name text, file_path text, start_line integer, "
+        "end_line integer, properties text)"
+    )
+    connection.executemany("insert into nodes values (?,?,?,?,?,?,?,?,?)", nodes)
+    connection.commit()
+    connection.close()
 
 
 class ScorerFixture:
@@ -281,6 +313,191 @@ class ScipScorerTests(unittest.TestCase):
             [("src/lib.rs", start, end, symbol("fixture/target()."), "plain_path")],
             [tuple(record) for record in records],
         )
+
+    def test_long_function_maps_from_its_own_name_occurrence(self):
+        source = "fn outer() {\n    let before = 1;\n    fn nested() {}\n    let after = 2;\n}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            outer = symbol("fixture/outer().")
+            nested = symbol("fixture/outer/nested().")
+            write_identity_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(range_for(source, "outer"), outer, 1, [0, 0, 4, 1]),
+                    occurrence(range_for(source, "nested"), nested, 1, line_range(source, 2)),
+                ),
+                (
+                    symbol_information(outer, 17, "outer"),
+                    symbol_information(nested, 17, "nested"),
+                ),
+            )
+            create_identity_database(
+                database,
+                ((1, "fixture", "Function", "outer", "fixture.outer", "src/lib.rs", 1, 5, "{}"),),
+            )
+
+            identities = load_identity_module().map_rust_graph_nodes(database, scip)
+
+            self.assertEqual(identities[1].symbol, outer)
+
+    def test_nested_functions_each_map_from_their_own_name_occurrence(self):
+        source = "fn outer() {\n    fn left() {}\n    fn right() {}\n}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            left = symbol("fixture/outer/left().")
+            right = symbol("fixture/outer/right().")
+            write_identity_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(range_for(source, "left"), left, 1, line_range(source, 1)),
+                    occurrence(range_for(source, "right"), right, 1, line_range(source, 2)),
+                ),
+                (
+                    symbol_information(left, 17, "left"),
+                    symbol_information(right, 17, "right"),
+                ),
+            )
+            create_identity_database(
+                database,
+                (
+                    (
+                        1, "fixture", "Function", "left", "fixture.outer.left",
+                        "src/lib.rs", 2, 2, "{}",
+                    ),
+                    (
+                        2, "fixture", "Function", "right", "fixture.outer.right",
+                        "src/lib.rs", 3, 3, "{}",
+                    ),
+                ),
+            )
+
+            identities = load_identity_module().map_rust_graph_nodes(database, scip)
+
+            self.assertEqual((identities[1].symbol, identities[2].symbol), (left, right))
+
+    def test_same_named_methods_in_different_trait_impls_map_apart(self):
+        source = (
+            "impl First for Thing {\n    fn run(&self) {}\n}\n"
+            "impl Second for Thing {\n    fn run(&self) {}\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            first = symbol("fixture/impl#[Thing][First]run().")
+            second = symbol("fixture/impl#[Thing][Second]run().")
+            write_identity_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(range_for(source, "run", 0), first, 1, line_range(source, 1)),
+                    occurrence(range_for(source, "run", 1), second, 1, line_range(source, 4)),
+                ),
+                (
+                    symbol_information(first, 26, "run"),
+                    symbol_information(second, 26, "run"),
+                ),
+            )
+            create_identity_database(
+                database,
+                (
+                    (
+                        1, "fixture", "Method", "run", "fixture.Thing.run[First]",
+                        "src/lib.rs", 2, 2, "{}",
+                    ),
+                    (
+                        2, "fixture", "Method", "run", "fixture.Thing.run[Second]",
+                        "src/lib.rs", 5, 5, "{}",
+                    ),
+                ),
+            )
+
+            identities = load_identity_module().map_rust_graph_nodes(database, scip)
+
+            self.assertEqual((identities[1].symbol, identities[2].symbol), (first, second))
+
+    def test_inherent_and_trait_methods_with_the_same_name_map_apart(self):
+        source = (
+            "impl Thing {\n    fn run(&self) {}\n}\n"
+            "impl Trait for Thing {\n    fn run(&self) {}\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            inherent = symbol("fixture/impl#[Thing]run().")
+            trait_method = symbol("fixture/impl#[Thing][Trait]run().")
+            write_identity_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(range_for(source, "run", 0), inherent, 1, line_range(source, 1)),
+                    occurrence(
+                        range_for(source, "run", 1), trait_method, 1, line_range(source, 4)
+                    ),
+                ),
+                (
+                    symbol_information(inherent, 26, "run"),
+                    symbol_information(trait_method, 26, "run"),
+                ),
+            )
+            create_identity_database(
+                database,
+                (
+                    (1, "fixture", "Method", "run", "fixture.Thing.run", "src/lib.rs", 2, 2, "{}"),
+                    (
+                        2, "fixture", "Method", "run", "fixture.Thing.run[Trait]",
+                        "src/lib.rs", 5, 5, "{}",
+                    ),
+                ),
+            )
+
+            identities = load_identity_module().map_rust_graph_nodes(database, scip)
+
+            self.assertEqual(
+                (identities[1].symbol, identities[2].symbol), (inherent, trait_method)
+            )
+
+    def test_derive_generated_method_maps_to_explicit_generated_identity(self):
+        source = "#[derive(Clone)]\nstruct Thing;\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            owner = symbol("fixture/Thing#")
+            write_identity_scip(
+                scip,
+                "src/lib.rs",
+                (occurrence(range_for(source, "Thing"), owner, 1, line_range(source, 1)),),
+                (symbol_information(owner, 49, "Thing"),),
+            )
+            create_identity_database(
+                database,
+                ((
+                    1, "fixture", "Method", "clone", "fixture.Thing.clone[Clone]",
+                    "src/lib.rs", 1, 2,
+                    json.dumps({"rust_derive": "Clone", "rust_derive_owner": "fixture.Thing"}),
+                ),),
+            )
+
+            identity = load_identity_module()
+            identities = identity.map_rust_graph_nodes(database, scip)
+
+            self.assertEqual(
+                identities[1],
+                identity.IdentityOutcome(
+                    status="generated_by_derive",
+                    reason="generated by derive Clone for fixture.Thing",
+                    derive="Clone",
+                    owner="fixture.Thing",
+                ),
+            )
 
     def test_multiple_oracle_symbols_at_one_site_are_ambiguous(self):
         source = "fn target() {}\nfn target() {}\nfn caller() { target(); }\n"
