@@ -31,6 +31,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
+#include "foundation/str_util.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -1152,34 +1153,60 @@ static void surface_name_set_free(CBMHashTable *set) {
 }
 
 typedef struct {
-    CBMHashTable *stored_set;
-    bool added;
-} surface_added_check_t;
+    CBMHashTable *reference_set;
+    bool missing;
+} surface_name_check_t;
 
-static void surface_added_visitor(const char *key, void *value, void *userdata) {
+static void surface_name_check_visitor(const char *key, void *value, void *userdata) {
     (void)value;
-    surface_added_check_t *check = (surface_added_check_t *)userdata;
-    if (!check->added && !cbm_ht_get(check->stored_set, key)) {
-        check->added = true;
+    surface_name_check_t *check = (surface_name_check_t *)userdata;
+    if (!check->missing && !cbm_ht_get(check->reference_set, key)) {
+        check->missing = true;
     }
 }
 
-/* Does `fresh_json` define any short name absent from `stored_json`? An
- * added name can re-route references in files that have NO edge into this
- * file yet (call-the-helper-you-just-wrote, shadowing), which the
- * edge-derived dependent set cannot see — those cases go to FULL. */
-static int surface_added_names(const char *stored_json, const char *fresh_json, bool *out_added) {
+/* Find short definition names added to or removed from a surface. Either
+ * change can re-route references in files with no existing edge into this
+ * file, which the edge-derived dependent set cannot see. */
+static int surface_name_changes(const char *stored_json, const char *fresh_json, bool *out_added,
+                                bool *out_removed) {
     *out_added = true; /* fail closed */
+    *out_removed = true;
     CBMHashTable *stored_set = surface_name_set(stored_json);
     CBMHashTable *fresh_set = surface_name_set(fresh_json);
     int rc = (stored_set && fresh_set) ? 0 : -1;
     if (rc == 0) {
-        surface_added_check_t check = {.stored_set = stored_set, .added = false};
-        cbm_ht_foreach(fresh_set, surface_added_visitor, &check);
-        *out_added = check.added;
+        surface_name_check_t added = {.reference_set = stored_set, .missing = false};
+        surface_name_check_t removed = {.reference_set = fresh_set, .missing = false};
+        cbm_ht_foreach(fresh_set, surface_name_check_visitor, &added);
+        cbm_ht_foreach(stored_set, surface_name_check_visitor, &removed);
+        *out_added = added.missing;
+        *out_removed = removed.missing;
     }
     surface_name_set_free(stored_set);
     surface_name_set_free(fresh_set);
+    return rc;
+}
+
+static int surface_imports_equal(const char *stored_json, const char *fresh_json, bool *out_equal) {
+    *out_equal = false;
+    yyjson_doc *stored_doc = yyjson_read(stored_json, strlen(stored_json), 0);
+    yyjson_doc *fresh_doc = yyjson_read(fresh_json, strlen(fresh_json), 0);
+    if (!stored_doc || !fresh_doc) {
+        yyjson_doc_free(stored_doc);
+        yyjson_doc_free(fresh_doc);
+        return -1;
+    }
+    yyjson_val *stored_root = yyjson_doc_get_root(stored_doc);
+    yyjson_val *fresh_root = yyjson_doc_get_root(fresh_doc);
+    yyjson_val *stored_imports = stored_root ? yyjson_obj_get(stored_root, "imp") : NULL;
+    yyjson_val *fresh_imports = fresh_root ? yyjson_obj_get(fresh_root, "imp") : NULL;
+    int rc = yyjson_is_arr(stored_imports) && yyjson_is_arr(fresh_imports) ? 0 : -1;
+    if (rc == 0) {
+        *out_equal = yyjson_equals(stored_imports, fresh_imports);
+    }
+    yyjson_doc_free(stored_doc);
+    yyjson_doc_free(fresh_doc);
     return rc;
 }
 
@@ -1768,6 +1795,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
                 governed_seeded = true;
                 continue;
             }
+            if (cbm_str_ends_with(stored[i].rel_path, ".rs")) {
+                decline = "rust_file_deleted";
+                goto done;
+            }
             /* Gone from the manifest: deleted or newly ignored. Its nodes
              * will be purged; files with edges into it must re-resolve. */
             changed_paths[n_changed + n_deleted] = (char *)stored[i].rel_path;
@@ -1848,12 +1879,23 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         if (strcmp(stored_row->surface_sha, fresh_row->surface_sha) == 0) {
             continue; /* body edit: the file re-resolves, nobody else does */
         }
-        bool added = false;
-        if (surface_added_names(stored_row->defs_json, fresh_row->defs_json, &added) != 0 ||
-            added) {
+        bool imports_equal = false;
+        if (surface_imports_equal(stored_row->defs_json, fresh_row->defs_json, &imports_equal) !=
+                0 ||
+            !imports_equal) {
             free(dep_targets);
             cbm_ht_free(rows_by_path);
-            decline = "added_definition_names";
+            decline = "imports_changed";
+            goto done;
+        }
+        bool added = false;
+        bool removed = false;
+        if (surface_name_changes(stored_row->defs_json, fresh_row->defs_json, &added, &removed) !=
+                0 ||
+            added || (removed && cbm_str_ends_with(changed_paths[i], ".rs"))) {
+            free(dep_targets);
+            cbm_ht_free(rows_by_path);
+            decline = "definition_names_changed";
             goto done;
         }
         n_surface_changed++;

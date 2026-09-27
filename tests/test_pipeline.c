@@ -7148,6 +7148,146 @@ static int sqlite_scalar(sqlite3 *db, const char *sql, const char *project) {
     return value;
 }
 
+TEST(pipeline_rust_reexport_retarget_incremental_calls_match_fresh_full) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_reexport_retarget_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"reexport\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub mod inner;\npub mod user;\npub use inner::helper;\n");
+    write_temp_file(tmp, "src/inner.rs",
+                    "pub fn helper() -> u32 { 1 }\npub fn other() -> u32 { 2 }\n");
+    write_temp_file(tmp, "src/user.rs",
+                    "pub fn use_it() -> u32 {\n    crate::helper()\n}\n");
+
+    char incremental_db[512];
+    char fresh_db[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/incremental.db", tmp);
+    snprintf(fresh_db, sizeof(fresh_db), "%s/fresh.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    int baseline_rc = cbm_pipeline_run(baseline);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    cbm_store_t *store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(store);
+    bool baseline_edge = cross_file_call_exists(store, project, "use_it", "helper");
+    cbm_store_close(store);
+
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub mod inner;\npub mod user;\npub use inner::other as helper;\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    int incremental_rc = cbm_pipeline_run(incremental);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incremental);
+
+    cbm_pipeline_t *fresh = cbm_pipeline_new(tmp, fresh_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(fresh);
+    int fresh_rc = cbm_pipeline_run(fresh);
+    cbm_pipeline_free(fresh);
+
+    sqlite3 *db = NULL;
+    sqlite3_stmt *attach = NULL;
+    ASSERT_EQ(sqlite3_open_v2(incremental_db, &db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(db, "ATTACH DATABASE ?1 AS fresh", -1, &attach, NULL), SQLITE_OK);
+    sqlite3_bind_text(attach, 1, fresh_db, -1, SQLITE_STATIC);
+    ASSERT_EQ(sqlite3_step(attach), SQLITE_DONE);
+    sqlite3_finalize(attach);
+    static const char incremental_minus_fresh[] =
+        "SELECT count(*) FROM (SELECT source.qualified_name,target.qualified_name,"
+        "edge.properties,count(*) FROM main.edges edge JOIN main.nodes source ON "
+        "source.id=edge.source_id JOIN main.nodes target ON target.id=edge.target_id WHERE "
+        "edge.project=?1 AND edge.type='CALLS' GROUP BY 1,2,3 EXCEPT SELECT "
+        "source.qualified_name,target.qualified_name,edge.properties,count(*) FROM fresh.edges "
+        "edge JOIN fresh.nodes source ON source.id=edge.source_id JOIN fresh.nodes target ON "
+        "target.id=edge.target_id WHERE edge.project=?1 AND edge.type='CALLS' GROUP BY 1,2,3)";
+    static const char fresh_minus_incremental[] =
+        "SELECT count(*) FROM (SELECT source.qualified_name,target.qualified_name,"
+        "edge.properties,count(*) FROM fresh.edges edge JOIN fresh.nodes source ON "
+        "source.id=edge.source_id JOIN fresh.nodes target ON target.id=edge.target_id WHERE "
+        "edge.project=?1 AND edge.type='CALLS' GROUP BY 1,2,3 EXCEPT SELECT "
+        "source.qualified_name,target.qualified_name,edge.properties,count(*) FROM main.edges "
+        "edge JOIN main.nodes source ON source.id=edge.source_id JOIN main.nodes target ON "
+        "target.id=edge.target_id WHERE edge.project=?1 AND edge.type='CALLS' GROUP BY 1,2,3)";
+    int extra_calls = sqlite_scalar(db, incremental_minus_fresh, project);
+    int missing_calls = sqlite_scalar(db, fresh_minus_incremental, project);
+    sqlite3_close(db);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(baseline_rc, 0);
+    ASSERT_TRUE(baseline_edge);
+    ASSERT_EQ(incremental_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(fresh_rc, 0);
+    ASSERT_EQ(extra_calls, 0);
+    ASSERT_EQ(missing_calls, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_removed_definition_rebinds_unresolved_glob_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_removed_definition_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"removed_definition\"\nversion = \"0.1.0\"\nedition = "
+                    "\"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod a;\npub mod b;\npub mod user;\n");
+    write_temp_file(tmp, "src/a.rs", "pub fn helper() -> u32 { 1 }\n");
+    write_temp_file(tmp, "src/b.rs", "pub fn helper() -> u32 { 2 }\n");
+    write_temp_file(tmp, "src/user.rs",
+                    "use crate::a::*;\nuse crate::b::*;\n\npub fn use_it() -> u32 { helper() }\n");
+
+    char incremental_db[512];
+    char fresh_db[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/incremental.db", tmp);
+    snprintf(fresh_db, sizeof(fresh_db), "%s/fresh.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    int baseline_rc = cbm_pipeline_run(baseline);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    cbm_store_t *store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(store);
+    bool baseline_edge = cross_file_call_exists(store, project, "use_it", "helper");
+    cbm_store_close(store);
+
+    write_temp_file(tmp, "src/b.rs", "// helper removed\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    int incremental_rc = cbm_pipeline_run(incremental);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incremental);
+    store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(store);
+    bool incremental_edge = cross_file_call_exists(store, project, "use_it", "helper");
+    cbm_store_close(store);
+
+    cbm_pipeline_t *fresh = cbm_pipeline_new(tmp, fresh_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(fresh);
+    int fresh_rc = cbm_pipeline_run(fresh);
+    cbm_pipeline_free(fresh);
+    store = cbm_store_open_path(fresh_db);
+    ASSERT_NOT_NULL(store);
+    bool fresh_edge = cross_file_call_exists(store, project, "use_it", "helper");
+    cbm_store_close(store);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(baseline_rc, 0);
+    ASSERT_FALSE(baseline_edge);
+    ASSERT_EQ(incremental_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_TRUE(incremental_edge);
+    ASSERT_EQ(fresh_rc, 0);
+    ASSERT_TRUE(fresh_edge);
+    PASS();
+}
+
 static int rust_impl_graph_difference_count(const char *actual_db, const char *reference_db,
                                             const char *project) {
     sqlite3 *db = NULL;
@@ -15882,6 +16022,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_closure_restore_preserves_rust_calls_but_rejects_impls);
     RUN_TEST(pipeline_legacy_restore_keeps_rust_impl_identity_equal_to_full);
     RUN_TEST(pipeline_closure_restore_keeps_rust_impl_identity_equal_to_full);
+    RUN_TEST(pipeline_rust_reexport_retarget_incremental_calls_match_fresh_full);
+    RUN_TEST(pipeline_rust_removed_definition_rebinds_unresolved_glob_call);
     RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
