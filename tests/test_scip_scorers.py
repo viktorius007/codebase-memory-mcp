@@ -96,7 +96,7 @@ def make_executable(path, contents):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def inventory_records(source, needle, target, ordinal=0):
+def inventory_records(source, needle, target, ordinals=(0,)):
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         corpus = root / "corpus"
@@ -114,7 +114,10 @@ def inventory_records(source, needle, target, ordinal=0):
                     1,
                     line_range(source, 0),
                 ),
-                occurrence(range_for(source, needle, ordinal), target),
+                *(
+                    occurrence(range_for(source, needle, ordinal), target)
+                    for ordinal in ordinals
+                ),
             ),
         )
         spec = importlib.util.spec_from_file_location("scip_rust_sites", SITES_INVENTORY)
@@ -549,14 +552,26 @@ class ScipScorerTests(unittest.TestCase):
                 "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
             )
 
-    def test_inventory_finds_callee_after_string_with_open_parenthesis(self):
-        source = 'fn package_anchor() {}\nfn caller() { sink("(", target()); }\n'
-        start, end = byte_span(source, "target")
+    def test_inventory_uses_rust_syntax_for_complex_calls(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "fn target<T>() {}\n"
+            "fn caller() {\n"
+            "    target::<{ 2 > 1 }>();\n"
+            "    target::<fn() -> u8>();\n"
+            '    sink("(", target());\n'
+            "}\n"
+        )
+        target = symbol("fixture/target().")
+        spans = [byte_span(source, "target", ordinal) for ordinal in (1, 2, 3)]
 
-        records = inventory_records(source, "target", symbol("fixture/target()."))
+        records = inventory_records(source, "target", target, (1, 2, 3))
 
         self.assertEqual(
-            [("src/lib.rs", start, end, symbol("fixture/target()."), "plain_path")],
+            [
+                ("src/lib.rs", start, end, target, "plain_path")
+                for start, end in spans
+            ],
             [tuple(record) for record in records],
         )
 
@@ -631,7 +646,7 @@ class ScipScorerTests(unittest.TestCase):
         )
         start, end = byte_span(source, "closure", 1)
 
-        records = inventory_records(source, "closure", "local 42", 1)
+        records = inventory_records(source, "closure", "local 42", (1,))
 
         self.assertEqual(
             [("src/lib.rs", start, end, "local", "plain_path")],
@@ -948,7 +963,7 @@ class ScipScorerTests(unittest.TestCase):
                 result.stdout,
             )
 
-    def test_recall_counts_sibling_call_occurrences_separately(self):
+    def test_recall_counts_repeated_same_pair_call_as_found(self):
         source = "fn target() {}\nfn caller() { target(); target(); }\n"
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
@@ -985,7 +1000,12 @@ class ScipScorerTests(unittest.TestCase):
             result = fixture.run_site()
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("truth sites 2 found correct 1 recall=50.00%", result.stdout)
+            self.assertIn(
+                "truth relations 1 found correct 1 recall=100.00%", result.stdout
+            )
+            self.assertIn(
+                "truth sites 2 found correct 2 recall=100.00%", result.stdout
+            )
 
     def test_harness_compares_full_definition_identity_not_short_names(self):
         source = "fn target() {}\nfn target() {}\nfn caller() { target(); }\n"

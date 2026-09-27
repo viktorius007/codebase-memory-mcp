@@ -223,6 +223,21 @@ def main():
     ]
     graph_only = [edge for edge in correct if edge not in matched]
     missed = [item for item in report.recall if item.outcome == "missed"]
+    relation_outcomes = {
+        (item.oracle_caller_symbol, item.oracle_symbol): item.outcome
+        for item in report.recall
+        if item.oracle_caller_symbol is not None
+    }
+    relation_found = sum(
+        outcome == "found" for outcome in relation_outcomes.values()
+    )
+    occurrence_found = len(report.recall) - len(missed)
+    relation_recall = (
+        relation_found / len(relation_outcomes) * 100 if relation_outcomes else 0.0
+    )
+    occurrence_recall = (
+        occurrence_found / len(report.recall) * 100 if report.recall else 0.0
+    )
     imports = sorted(set(graph_edges(args.cbm, args.project, "IMPORTS")))
     inventory = Counter(site.resolved_symbol for site in report.inventory)
 
@@ -243,7 +258,11 @@ def main():
         f"graph_only_referenced={len(graph_only)} fabricated={len(wrong)} "
         f"integrity_edges={len(integrity_edges)} "
         f"integrity_errors={len(report.integrity)} "
+        f"oracle_relations={len(relation_outcomes)} "
+        f"relations_found={relation_found} relation_recall={relation_recall:.2f}% "
         f"oracle_internal={len(report.recall)} oracle_only={len(missed)} "
+        f"occurrences_found={occurrence_found} "
+        f"occurrence_recall={occurrence_recall:.2f}% "
         f"oracle_local={inventory[LOCAL]} oracle_external={inventory[EXTERNAL]} "
         f"oracle_ambiguous={inventory[AMBIGUOUS]} imports={len(imports)}"
     )

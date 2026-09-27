@@ -60,6 +60,16 @@ def print_recall(report):
     counts = Counter(occurrence.outcome for occurrence in report.recall)
     total = len(report.recall)
     value = counts["found"] / total * 100 if total else 0.0
+    relations = {
+        (occurrence.oracle_caller_symbol, occurrence.oracle_symbol): occurrence.outcome
+        for occurrence in report.recall
+        if occurrence.oracle_caller_symbol is not None
+    }
+    relation_counts = Counter(relations.values())
+    relation_total = len(relations)
+    relation_value = (
+        relation_counts["found"] / relation_total * 100 if relation_total else 0.0
+    )
     print("=== recall by resolution strategy and call form ===")
     breakdown = Counter(
         (occurrence.strategy, occurrence.call_form, occurrence.outcome)
@@ -71,6 +81,10 @@ def print_recall(report):
             f"strategy={strategy} call_form={call_form} "
             f"outcome={outcome} count={count}"
         )
+    print(
+        f"truth relations {relation_total} found correct "
+        f"{relation_counts['found']} recall={relation_value:.2f}%"
+    )
     print(
         f"truth sites {total} found correct {counts['found']} recall={value:.2f}%"
     )

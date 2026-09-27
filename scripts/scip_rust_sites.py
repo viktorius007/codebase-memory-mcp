@@ -12,9 +12,11 @@ literal marker strings. Call forms are ``plain_path``, ``method``,
 import argparse
 import bisect
 import importlib.util
+import json
 from collections import Counter, defaultdict
 from pathlib import Path
 import sqlite3
+import subprocess
 from typing import NamedTuple
 
 
@@ -70,6 +72,7 @@ class RecallOccurrence(NamedTuple):
     relative_path: str
     callee_start_byte: int
     callee_end_byte: int
+    oracle_caller_symbol: str | None
     oracle_symbol: str
     call_form: str
     strategy: str
@@ -236,8 +239,12 @@ def _delimited_ranges(code, selected_open):
             _, start, selected = stack.pop()
             if selected:
                 ranges.append((start + 1, cursor))
+    return sorted(ranges)
+
+
+def _merged_ranges(ranges):
     merged = []
-    for start, end in sorted(ranges):
+    for start, end in ranges:
         if merged and start <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
@@ -246,91 +253,69 @@ def _delimited_ranges(code, selected_open):
 
 
 def _macro_argument_ranges(code):
-    return _delimited_ranges(code, _is_macro_open)
+    return _merged_ranges(_delimited_ranges(code, _is_macro_open))
 
 
 def _attribute_ranges(code):
-    return _delimited_ranges(code, _is_attribute_open)
+    return _merged_ranges(_delimited_ranges(code, _is_attribute_open))
 
 
-def _next_code_byte(code, cursor):
-    while cursor < len(code) and code[cursor : cursor + 1].isspace():
-        cursor += 1
-    return cursor
+def _rust_parser_source(source):
+    code = _masked_source(source)
+    parser_source = bytearray(source)
+    # Macro arguments are token trees, so make invocations call-shaped without
+    # moving bytes before asking the Rust parser to identify nested calls.
+    for start, end in _delimited_ranges(code, _is_macro_open):
+        opening = start - 1
+        bang = _previous_code_byte(code, opening)
+        parser_source[bang] = ord(" ")
+        if code[opening] in (ord("["), ord("{")):
+            parser_source[opening] = ord("(")
+            parser_source[end] = ord(")")
+    return bytes(parser_source)
 
 
-def _skip_turbofish(code, cursor):
-    if code[cursor : cursor + 2] != b"::":
-        return cursor
-    opening = _next_code_byte(code, cursor + 2)
-    if code[opening : opening + 1] != b"<":
-        return cursor
-    depth = 0
-    cursor = opening
-    while cursor < len(code):
-        if code[cursor] == ord("<"):
-            depth += 1
-        elif code[cursor] == ord(">"):
-            depth -= 1
-            if depth == 0:
-                return cursor + 1
-        cursor += 1
-    return opening
-
-
-def _matching_open_parenthesis(code, close):
-    depth = 1
-    cursor = close - 1
-    while cursor >= 0:
-        if code[cursor] == ord(")"):
-            depth += 1
-        elif code[cursor] == ord("("):
-            depth -= 1
-            if depth == 0:
-                return cursor
-        cursor -= 1
-    return None
-
-
-def _grouping_parenthesis(code, opening):
-    previous = _previous_code_byte(code, opening)
-    if previous < 0:
-        return True
-    byte = code[previous]
-    if byte >= 0x80 or chr(byte).isalnum() or byte == ord("_"):
-        end = previous + 1
-        start = previous
-        while start > 0 and (
-            code[start - 1] >= 0x80
-            or chr(code[start - 1]).isalnum()
-            or code[start - 1] == ord("_")
-        ):
-            start -= 1
-        return code[start:end] in {b"break", b"if", b"match", b"return", b"while", b"yield"}
-    return byte not in (ord("!"), ord(")"), ord("]"), ord(">"), ord("."))
-
-
-def _callee_prefix(prefix):
-    prefix = prefix.strip()
-    while prefix[:1] in (b"&", b"*"):
-        prefix = prefix[1:].lstrip()
-    allowed = b"_:.<> \t\r\n"
-    return all(byte >= 0x80 or chr(byte).isalnum() or byte in allowed for byte in prefix)
-
-
-def _call_syntax(code, identifier_start, identifier_end):
-    cursor = _next_code_byte(code, identifier_end)
-    cursor = _next_code_byte(code, _skip_turbofish(code, cursor))
-    parenthesized = False
-    while code[cursor : cursor + 1] == b")":
-        opening = _matching_open_parenthesis(code, cursor)
-        if opening is None or not _grouping_parenthesis(code, opening):
-            return False, False
-        if not parenthesized and not _callee_prefix(code[opening + 1 : identifier_start]):
-            return False, False
-        parenthesized = True
-        cursor = _next_code_byte(code, cursor + 1)
-    return code[cursor : cursor + 1] == b"(", parenthesized
+def _rust_call_callees(sources):
+    callees = defaultdict(list)
+    entries = list(sources.items())
+    for offset in range(0, len(entries), 64):
+        batch = entries[offset : offset + 64]
+        combined = bytearray()
+        starts = []
+        for relative_path, source in batch:
+            if combined:
+                combined.extend(b"\n")
+            starts.append((len(combined), relative_path, len(source)))
+            combined.extend(_rust_parser_source(source))
+        result = subprocess.run(
+            (
+                "ast-grep", "run", "--stdin", "--lang", "rust",
+                "--pattern", "$F($$$ARGS)", "--json=stream",
+            ),
+            input=bytes(combined),
+            stdout=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode not in (0, 1):
+            raise subprocess.CalledProcessError(result.returncode, result.args)
+        batch_starts = [start for start, _, _ in starts]
+        for line in result.stdout.splitlines():
+            record = json.loads(line)
+            callee = record["metaVariables"]["single"]["F"]
+            start = callee["range"]["byteOffset"]["start"]
+            end = callee["range"]["byteOffset"]["end"]
+            index = bisect.bisect_right(batch_starts, start) - 1
+            base, relative_path, source_length = starts[index]
+            if end <= base + source_length:
+                text = callee["text"]
+                callees[relative_path].append(
+                    (
+                        start - base,
+                        end - base,
+                        text.startswith("(") and text.endswith(")"),
+                    )
+                )
+    return callees
 
 
 def _inside_ranges(ranges, starts, offset):
@@ -393,12 +378,17 @@ def call_sites(corpus_root, scip_path):
         for _, symbol in entries
         if (crate := _DECODER.crate_of(symbol)) is not None
     }
+    sources = {
+        relative_path: source_path.read_bytes()
+        for relative_path in references
+        if (source_path := corpus_root / relative_path).is_file()
+    }
+    parsed_callees = _rust_call_callees(sources)
     records = []
     for relative_path, occurrences in references.items():
-        source_path = corpus_root / relative_path
-        if not source_path.is_file():
+        source = sources.get(relative_path)
+        if source is None:
             continue
-        source = source_path.read_bytes()
         code = _masked_source(source)
         macro_ranges = _macro_argument_ranges(code)
         macro_starts = [start for start, _ in macro_ranges]
@@ -418,9 +408,16 @@ def call_sites(corpus_root, scip_path):
             start, end = byte_range
             if _inside_ranges(attribute_ranges, attribute_starts, start):
                 continue
-            is_call, parenthesized = _call_syntax(code, start, end)
-            if not is_call:
+            matches = [
+                callee
+                for callee in parsed_callees.get(relative_path, ())
+                if callee[0] <= start and end <= callee[1]
+            ]
+            if not matches:
                 continue
+            _, _, parenthesized = min(
+                matches, key=lambda callee: callee[1] - callee[0]
+            )
             records.append(
                 CallSite(
                     relative_path,
@@ -613,6 +610,16 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         (edge.caller_qualified_name, edge.target_qualified_name)
         for edge in graph_calls
     }
+    graph_relations = set()
+    for edge in graph_calls:
+        caller_symbol, _ = _single_identity(
+            identities, edge.caller_qualified_name, "caller"
+        )
+        target_symbol, _ = _single_identity(
+            identities, edge.target_qualified_name, "target"
+        )
+        if caller_symbol is not None and target_symbol is not None:
+            graph_relations.add((caller_symbol, target_symbol))
     edges = []
     scored_occurrences = []
     integrity = list(integrity)
@@ -676,13 +683,17 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
             continue
         key = (site.relative_path, site.callee_start_byte, site.callee_end_byte)
         site_edges = edges_by_site.get(key, ())
-        found = any(edge.outcome == "correct" for edge in site_edges)
+        oracle_caller_symbol = oracle_callers.get(key)
+        found = (
+            oracle_caller_symbol is not None
+            and (oracle_caller_symbol, site.resolved_symbol) in graph_relations
+        )
         strategies = sorted({edge.strategy for edge in site_edges})
         strategy = "+".join(strategies) if strategies else "no_published_edge"
         recall.append(
             RecallOccurrence(
                 site.relative_path, site.callee_start_byte, site.callee_end_byte,
-                site.resolved_symbol, site.call_form, strategy,
+                oracle_caller_symbol, site.resolved_symbol, site.call_form, strategy,
                 "found" if found else "missed",
             )
         )
