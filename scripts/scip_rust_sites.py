@@ -4,9 +4,9 @@
 ``call_sites(corpus_root, scip_path)`` returns one ``CallSite`` per resolved
 source call. Byte offsets are absolute, zero-based, and end-exclusive, matching
 the resolver dump's callee-identifier columns. Internal symbols retain their
-complete SCIP identity; local, external, and ambiguous resolutions use those
-literal marker strings. Call forms are ``plain_path``, ``method``,
-``qualified_path``, and ``macro_argument``.
+complete SCIP identity; call-through-value, external, and ambiguous resolutions
+use those literal marker strings. Call forms are ``plain_path``, ``method``,
+``qualified_path``, ``macro_argument``, and ``constructor``.
 """
 
 import argparse
@@ -21,9 +21,10 @@ import tempfile
 from typing import NamedTuple
 
 
-LOCAL = "local"
+CALL_THROUGH_VALUE = "call_through_value"
 EXTERNAL = "external"
 AMBIGUOUS = "ambiguous"
+NON_INTERNAL_TRUTH = frozenset((CALL_THROUGH_VALUE, EXTERNAL, AMBIGUOUS))
 
 
 class CallSite(NamedTuple):
@@ -208,6 +209,87 @@ def _previous_code_byte(code, cursor):
     return cursor
 
 
+def _skip_space(code, cursor):
+    while code[cursor : cursor + 1].isspace():
+        cursor += 1
+    return cursor
+
+
+def _skip_turbofish(code, cursor):
+    if code[cursor : cursor + 2] != b"::":
+        return cursor
+    opening = _skip_space(code, cursor + 2)
+    if code[opening : opening + 1] != b"<":
+        return cursor
+    cursor = opening + 1
+    while cursor < len(code):
+        if code[cursor] == ord(">"):
+            call_open = _skip_space(code, cursor + 1)
+            if code[call_open : call_open + 1] == b"(":
+                return cursor + 1
+        cursor += 1
+    return opening
+
+
+def _matching_open_parenthesis(code, close):
+    depth = 1
+    cursor = close - 1
+    while cursor >= 0:
+        if code[cursor] == ord(")"):
+            depth += 1
+        elif code[cursor] == ord("("):
+            depth -= 1
+            if depth == 0:
+                return cursor
+        cursor -= 1
+    return None
+
+
+def _grouping_parenthesis(code, opening):
+    previous = _previous_code_byte(code, opening)
+    if previous < 0:
+        return True
+    byte = code[previous]
+    if byte >= 0x80 or chr(byte).isalnum() or byte == ord("_"):
+        end = previous + 1
+        start = previous
+        while start > 0 and (
+            code[start - 1] >= 0x80
+            or chr(code[start - 1]).isalnum()
+            or code[start - 1] == ord("_")
+        ):
+            start -= 1
+        return code[start:end] in {
+            b"break", b"if", b"match", b"return", b"while", b"yield"
+        }
+    return byte not in (ord("!"), ord(")"), ord("]"), ord(">"), ord("."))
+
+
+def _callee_prefix(prefix):
+    prefix = prefix.strip()
+    while prefix[:1] in (b"&", b"*"):
+        prefix = prefix[1:].lstrip()
+    allowed = b"_:.<> \t\r\n"
+    return all(
+        byte >= 0x80 or chr(byte).isalnum() or byte in allowed for byte in prefix
+    )
+
+
+def _invoked_leaf(code, start, end):
+    cursor = _skip_space(code, end)
+    cursor = _skip_space(code, _skip_turbofish(code, cursor))
+    parenthesized = False
+    while code[cursor : cursor + 1] == b")":
+        opening = _matching_open_parenthesis(code, cursor)
+        if opening is None or not _grouping_parenthesis(code, opening):
+            return False
+        if not parenthesized and not _callee_prefix(code[opening + 1 : start]):
+            return False
+        parenthesized = True
+        cursor = _skip_space(code, cursor + 1)
+    return code[cursor : cursor + 1] == b"("
+
+
 def _is_macro_open(code, cursor):
     bang = _previous_code_byte(code, cursor)
     if bang < 0 or code[bang] != ord("!"):
@@ -348,19 +430,31 @@ def _byte_range(source, starts, source_range):
     return start, end
 
 
-def _truth(symbols, workspace_crates):
+def _constructor_symbol(symbol):
+    return _DECODER.descriptor_of(symbol).endswith("#")
+
+
+def _truth(symbols, project_packages):
     if len(symbols) != 1:
         return AMBIGUOUS
     symbol = next(iter(symbols))
     if symbol.startswith("local "):
-        return LOCAL
-    if _DECODER.crate_of(symbol) not in workspace_crates:
+        return CALL_THROUGH_VALUE
+    descriptor = _DECODER.descriptor_of(symbol)
+    if not descriptor.endswith("().") and not _constructor_symbol(symbol):
+        return CALL_THROUGH_VALUE
+    if _DECODER.package_of(symbol) not in project_packages:
         return EXTERNAL
     return symbol
 
 
 def _callable_symbol(symbol):
-    return symbol.startswith("local ") or _DECODER.descriptor_of(symbol).endswith("().")
+    descriptor = _DECODER.descriptor_of(symbol)
+    return (
+        symbol.startswith("local ")
+        or descriptor.endswith("().")
+        or _constructor_symbol(symbol)
+    )
 
 
 def _skip_space(code, cursor):
@@ -407,7 +501,7 @@ def _callee_position(code, end):
 
 
 def _completeness_counts(
-    references, definition_sites, sources, records, workspace_crates
+    references, definition_sites, sources, records, project_packages
 ):
     inventory_keys = {
         (site.relative_path, site.callee_start_byte, site.callee_end_byte)
@@ -419,7 +513,7 @@ def _completeness_counts(
         for source_range, symbol in occurrences:
             if (
                 _callable_symbol(symbol)
-                and _DECODER.crate_of(symbol) in workspace_crates
+                and _DECODER.package_of(symbol) in project_packages
             ):
                 grouped[source_range].add(symbol)
         definition_ranges = {
@@ -475,11 +569,11 @@ def _call_inventory(corpus_root, scip_path):
     _, definitions, references, definition_sites = (
         _DECODER.parse_with_definition_sites(scip_path)
     )
-    workspace_crates = {
-        crate
+    project_packages = {
+        package
         for entries in definitions.values()
         for _, symbol in entries
-        if (crate := _DECODER.crate_of(symbol)) is not None
+        if (package := _DECODER.package_of(symbol)) is not None
     }
     sources = {
         relative_path: source_path.read_bytes()
@@ -502,14 +596,13 @@ def _call_inventory(corpus_root, scip_path):
             grouped[source_range].add(symbol)
         starts = _line_starts(source)
         for source_range, symbols in grouped.items():
-            symbols = {symbol for symbol in symbols if _callable_symbol(symbol)}
-            if not symbols:
-                continue
             byte_range = _byte_range(source, starts, source_range)
             if byte_range is None:
                 continue
             start, end = byte_range
             if _inside_ranges(attribute_ranges, attribute_starts, start):
+                continue
+            if not _invoked_leaf(code, start, end):
                 continue
             matches = [
                 callee
@@ -521,18 +614,27 @@ def _call_inventory(corpus_root, scip_path):
             _, _, parenthesized = min(
                 matches, key=lambda callee: callee[1] - callee[0]
             )
+            constructor = (
+                len(symbols) == 1 and _constructor_symbol(next(iter(symbols)))
+            )
             records.append(
                 CallSite(
                     relative_path,
                     start,
                     end,
-                    _truth(symbols, workspace_crates),
-                    _call_form(code, start, parenthesized, macro_ranges, macro_starts),
+                    _truth(symbols, project_packages),
+                    (
+                        "constructor"
+                        if constructor
+                        else _call_form(
+                            code, start, parenthesized, macro_ranges, macro_starts
+                        )
+                    ),
                 )
             )
     records = sorted(records)
     completeness = _completeness_counts(
-        references, definition_sites, sources, records, workspace_crates
+        references, definition_sites, sources, records, project_packages
     )
     return records, completeness
 
@@ -671,7 +773,7 @@ def _score_edge(call, site, oracle_caller_symbol, identities):
             target_symbol, call.strategy, "no_oracle_site", None, None,
             "unscorable", "no_oracle_truth",
         )
-    if site.resolved_symbol in (LOCAL, EXTERNAL, AMBIGUOUS):
+    if site.resolved_symbol in NON_INTERNAL_TRUTH:
         return ScoredEdge(
             call.relative_path, call.callee_start_byte, call.callee_end_byte,
             call.caller_qualified_name, caller_symbol, call.target_qualified_name,
@@ -793,7 +895,7 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         ].append(edge)
     recall = []
     for site in inventory:
-        if site.resolved_symbol in (LOCAL, EXTERNAL, AMBIGUOUS):
+        if site.resolved_symbol in NON_INTERNAL_TRUTH:
             continue
         key = (site.relative_path, site.callee_start_byte, site.callee_end_byte)
         site_edges = edges_by_site.get(key, ())
@@ -883,7 +985,9 @@ def main():
     inventory, completeness = _call_inventory(args.corpus, args.scip)
     counts = Counter(site.call_form for site in inventory)
     print(f"total: {sum(counts.values())}")
-    for call_form in ("plain_path", "method", "qualified_path", "macro_argument"):
+    for call_form in (
+        "plain_path", "method", "qualified_path", "macro_argument", "constructor"
+    ):
         print(f"{call_form}: {counts[call_form]}")
     print(format_completeness(completeness))
 

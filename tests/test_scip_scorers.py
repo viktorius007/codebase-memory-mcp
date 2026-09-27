@@ -595,6 +595,63 @@ class ScipScorerTests(unittest.TestCase):
             [tuple(record) for record in records],
         )
 
+    def test_inventory_excludes_function_reference_that_is_not_invoked_leaf(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "fn caller(values: Values) { "
+            "values.iter().map(Type::target).collect(); }\n"
+        )
+
+        records = inventory_records(
+            source, "target", symbol("fixture/Type/target().")
+        )
+
+        self.assertEqual([], records)
+
+    def test_inventory_includes_tuple_constructor_as_constructor_call(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "fn caller(value: Value) { RemoteState::Ice(value); }\n"
+        )
+        start, end = byte_span(source, "Ice")
+        target = symbol("fixture/RemoteState#Ice#")
+
+        records = inventory_records(source, "Ice", target)
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, target, "constructor")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_counts_static_function_pointer_as_call_through_value(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "static CALLBACK: fn(Value) = target;\n"
+            "fn caller(value: Value) { CALLBACK(value); }\n"
+        )
+        start, end = byte_span(source, "CALLBACK", 1)
+
+        records = inventory_records(
+            source, "CALLBACK", symbol("fixture/CALLBACK."), (1,)
+        )
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, "call_through_value", "plain_path")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_keeps_same_name_external_package_external(self):
+        source = "fn package_anchor() {}\nfn caller() { target(); }\n"
+        start, end = byte_span(source, "target")
+        external = "rust-analyzer cargo fixture 9.9.9 dependency/target()."
+
+        records = inventory_records(source, "target", external)
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, "external", "plain_path")],
+            [tuple(record) for record in records],
+        )
+
     def test_inventory_classifies_method_call(self):
         source = "fn package_anchor() {}\nfn caller(value: Thing) { value.run(); }\n"
         start, end = byte_span(source, "run")
@@ -705,7 +762,7 @@ class ScipScorerTests(unittest.TestCase):
         records = inventory_records(source, "closure", "local 42", (1,))
 
         self.assertEqual(
-            [("src/lib.rs", start, end, "local", "plain_path")],
+            [("src/lib.rs", start, end, "call_through_value", "plain_path")],
             [tuple(record) for record in records],
         )
 
