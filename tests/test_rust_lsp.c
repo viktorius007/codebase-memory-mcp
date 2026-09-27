@@ -672,6 +672,65 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     PASS();
 }
 
+TEST(rustlsp_duplicate_free_function_qn_stays_unresolved) {
+    const char *source = "use super::*;\nfn check() { compressed_rollout_path(); }\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    for (int i = 0; i < 2; i++) {
+        defs[i].qualified_name = "test.src.compression.compressed_rollout_path";
+        defs[i].short_name = "compressed_rollout_path";
+        defs[i].label = "Function";
+        defs[i].def_module_qn = "test.src.compression";
+        defs[i].lang = CBM_LANG_RUST;
+    }
+
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(registry);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "test.src.compression_tests",
+        "test.src.compression.tests", registry, NULL, NULL, 0, NULL, NULL, NULL, &out, NULL);
+
+    ASSERT_LT(find_confident(&out, "check", "compressed_rollout_path"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_path_module_child_call_does_not_flatten_to_parent) {
+    const char *source =
+        "use super::manual_update::run as manual_update_once;\n"
+        "fn check() { manual_update_once(); }\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.src.update_loop.run";
+    defs[0].short_name = "run";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.src.update_loop";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.src.manual_update.run";
+    defs[1].short_name = "run";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "test.src.manual_update";
+    defs[1].lang = CBM_LANG_RUST;
+
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(registry);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "test.src.update_loop_tests",
+        "test.src.update_loop.tests", registry, NULL, NULL, 0, NULL, NULL, NULL, &out, NULL);
+
+    ASSERT_LT(find_confident(&out, "check", "update_loop.run"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(rustlsp_instantiated_impl_trait_links_canonical_declaration) {
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -7273,6 +7332,8 @@ void suite_rust_lsp(void) {
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
+    RUN_TEST(rustlsp_duplicate_free_function_qn_stays_unresolved);
+    RUN_TEST(rustlsp_path_module_child_call_does_not_flatten_to_parent);
     RUN_TEST(rustlsp_instantiated_impl_trait_links_canonical_declaration);
     RUN_TEST(rustlsp_internal_impl_identity_is_exact_and_ambiguous_unqualified);
     RUN_TEST(rustlsp_resolved_calls_carry_exact_impl_identity_local_and_shared);

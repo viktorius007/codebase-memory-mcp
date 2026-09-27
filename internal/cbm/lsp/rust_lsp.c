@@ -766,13 +766,26 @@ static void rust_qn_probe(RustLSPContext *ctx, const char *candidate, bool want_
         }
         return;
     }
-    const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, candidate);
-    if (!f) {
+    const char *leaf_dot = strrchr(candidate, '.');
+    const char *leaf = leaf_dot ? leaf_dot + 1 : candidate;
+    const CBMRegisteredFunc *f = NULL;
+    CBMFreeFuncIter exact_it;
+    cbm_registry_free_funcs_by_short_name_chain(ctx->registry, leaf, &exact_it);
+    int exact_matches = 0;
+    for (int i; exact_matches < 2 && (i = cbm_free_func_iter_next(&exact_it)) >= 0;) {
+        const CBMRegisteredFunc *cand = &exact_it.reg->funcs[i];
+        if (cand->qualified_name && strcmp(cand->qualified_name, candidate) == 0) {
+            f = cand;
+            exact_matches++;
+        }
+    }
+    if (exact_matches != 1) {
+        f = NULL;
+    }
+    if (exact_matches == 0) {
         /* A cfg-gated free function is published as `<qn>#cfg(...)]`. One
          * such twin is an exact answer; two are a cfg decision this resolver
          * cannot make. */
-        const char *leaf_dot = strrchr(candidate, '.');
-        const char *leaf = leaf_dot ? leaf_dot + 1 : candidate;
         size_t len = strlen(candidate);
         CBMFreeFuncIter it;
         cbm_registry_free_funcs_by_short_name_chain(ctx->registry, leaf, &it);
@@ -846,7 +859,9 @@ static void rust_qn_variants(RustLSPContext *ctx, const char *qn, bool want_type
         }
         /* Inline `mod name { ... }` items are extracted under the file itself. */
         const char *parent_dot = strrchr(parent, '.');
-        if (parent_dot && (size_t)(parent_dot - parent) > prefix_len) {
+        bool physical_identity = ctx->relative_module_qn && ctx->module_qn &&
+                                 strcmp(ctx->relative_module_qn, ctx->module_qn) == 0;
+        if (physical_identity && parent_dot && (size_t)(parent_dot - parent) > prefix_len) {
             rust_qn_probe(
                 ctx,
                 cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)(parent_dot - parent), parent, leaf),
