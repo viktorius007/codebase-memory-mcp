@@ -284,7 +284,7 @@ class ScipScorerTests(unittest.TestCase):
             )
             self.assertIn("target_identity_mismatch", result.stdout)
 
-    def test_proc_macro_caller_uses_source_function_truth(self):
+    def test_callable_oracle_caller_does_not_use_source_function_fallback(self):
         source = "#[rstest]\nfn caller() { target(); }\nfn target() {}\n"
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
@@ -332,14 +332,17 @@ class ScipScorerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
+                "published_edges=1 correct=0 wrong=0 unscorable=1", result.stdout
             )
             self.assertIn(
-                "label_category=source_caller:proc_macro_output count=1",
+                "unscorable_category=caller_oracle_gap:proc_macro_output count=1",
                 result.stdout,
             )
+            self.assertIn(
+                "truth sites 0 found correct 0 recall=0.00%", result.stdout
+            )
 
-    def test_inactive_cfg_caller_is_unscorable(self):
+    def test_inactive_cfg_caller_is_unscorable_and_absent_from_recall(self):
         source = "#[cfg(any())]\nfn caller() { target(); }\nfn target() {}\n"
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
@@ -384,8 +387,11 @@ class ScipScorerTests(unittest.TestCase):
             self.assertIn(
                 "unscorable_category=caller_cfg_inactive count=1", result.stdout
             )
+            self.assertIn(
+                "truth sites 0 found correct 0 recall=0.00%", result.stdout
+            )
 
-    def test_static_initializer_does_not_replace_source_function_caller(self):
+    def test_noncallable_oracle_caller_uses_source_function_for_recall(self):
         source = "fn target() {}\nfn caller() { static CELL: i32 = target(); }\n"
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
@@ -440,6 +446,12 @@ class ScipScorerTests(unittest.TestCase):
                 "label_category=source_caller:non_callable_oracle count=1",
                 result.stdout,
             )
+            self.assertIn(
+                "truth relations 1 found correct 1 recall=100.00%", result.stdout
+            )
+            self.assertIn(
+                "truth sites 1 found correct 1 recall=100.00%", result.stdout
+            )
 
     def test_reference_truth_without_target_definition_is_not_wrong(self):
         source = "fn target() {}\nfn caller() { target(); }\n"
@@ -484,7 +496,7 @@ class ScipScorerTests(unittest.TestCase):
                 result.stdout,
             )
 
-    def test_non_rust_target_is_selected_on_graph_and_dump_sides(self):
+    def test_resolved_oracle_target_rejects_nonsemantic_graph_target(self):
         source = "fn caller() { target(); }\n"
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
@@ -517,8 +529,9 @@ class ScipScorerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                "published_edges=1 correct=0 wrong=0 unscorable=1", result.stdout
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
             )
+            self.assertIn("target_identity_mismatch", result.stdout)
             self.assertIn("non_rust_target_edges=1", result.stdout)
             self.assertIn("integrity_errors=0", result.stdout)
 
@@ -1080,6 +1093,72 @@ class ScipScorerTests(unittest.TestCase):
 
         self.assertEqual(
             [("src/lib.rs", start, end, symbol("fixture/target()."), "macro_argument")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_includes_call_inside_attribute_arguments(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "#[tracing::instrument(fields(value = target()))]\n"
+            "fn caller() {}\n"
+        )
+        start, end = byte_span(source, "target")
+        target = symbol("fixture/target().")
+
+        records = inventory_records(source, "target", target)
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, target, "plain_path")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_recovers_call_from_complex_macro_arguments(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "fn caller() { let expected = json!({\n"
+            '    "account": {"type": "chatgpt", "planType": plan_type},\n'
+            '    "workspaceRouting": routing("selected", "https://example.com")\n'
+            "}); }\n"
+        )
+        start, end = byte_span(source, "routing")
+        target = symbol("fixture/routing().")
+
+        records = inventory_records(source, "routing", target)
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, target, "macro_argument")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_excludes_tuple_patterns(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "enum Event { Done(u8) }\n"
+            "fn caller(event: Event) {\n"
+            "    let constructed = Event::Done(1);\n"
+            "    let Event::Done(from_let) = event else { return; };\n"
+            "    if let Event::Done(from_if_let) = event {}\n"
+            "    match event { Event::Done(from_match) => {} }\n"
+            "    let matched = matches!(event, Event::Done(_));\n"
+            "}\n"
+        )
+        target = symbol("fixture/Event#Done#")
+        construction = byte_span(source, "Done", 1)
+
+        records = inventory_records(
+            source, "Done", target, (1, 2, 3, 4, 5)
+        )
+
+        self.assertEqual(
+            [
+                (
+                    "src/lib.rs",
+                    construction[0],
+                    construction[1],
+                    target,
+                    "constructor",
+                )
+            ],
             [tuple(record) for record in records],
         )
 
