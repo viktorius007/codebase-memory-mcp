@@ -72,6 +72,13 @@ class ScoredEdge(NamedTuple):
     reason: str
 
 
+class CallerOutcome(NamedTuple):
+    graph_symbol: str | None
+    oracle_symbol: str | None
+    outcome: str
+    reason: str
+
+
 class RecallOccurrence(NamedTuple):
     relative_path: str
     callee_start_byte: int
@@ -650,7 +657,9 @@ def call_sites(corpus_root, scip_path):
 
 
 def _oracle_occurrences(corpus_root, scip_path, sites):
-    _, definitions, references, _ = _DECODER.parse_with_definition_sites(scip_path)
+    _, definitions, references, definition_sites = (
+        _DECODER.parse_with_definition_sites(scip_path)
+    )
     wanted = defaultdict(set)
     for site in sites:
         wanted[site.relative_path].add(
@@ -679,7 +688,11 @@ def _oracle_occurrences(corpus_root, scip_path, sites):
         for key, symbols in targets.items()
         if len(symbols) == 1
     }
-    return callers, exact_targets
+    definition_locations = defaultdict(list)
+    for relative_path, entries in definition_sites.items():
+        for definition_range, _, symbol in entries:
+            definition_locations[symbol].append((relative_path, definition_range))
+    return callers, exact_targets, definition_locations
 
 
 def published_calls(dump_path):
@@ -857,19 +870,73 @@ def _source_caller_matches(call, source_caller, node):
     )
 
 
-def _score_edge(
-    call, site, oracle_caller_symbol, oracle_target_symbol, source_caller, identities,
-):
+def _score_caller(call, oracle_caller_symbol, source_caller, identities):
     caller_symbol, caller_reason, caller_node = _single_identity(
         identities, call.caller_qualified_name, "caller"
     )
-    target_symbol, target_reason, _ = _single_identity(
+    if caller_reason == "caller_not_in_oracle_configuration:cfg_inactive":
+        return CallerOutcome(
+            caller_symbol, None, "unscorable", "caller_cfg_inactive"
+        )
+    if _callable_symbol(oracle_caller_symbol or ""):
+        if caller_symbol is None:
+            return CallerOutcome(
+                caller_symbol, oracle_caller_symbol, "unscorable", caller_reason
+            )
+        if caller_symbol != oracle_caller_symbol:
+            return CallerOutcome(
+                caller_symbol, oracle_caller_symbol, "wrong",
+                "caller_identity_mismatch",
+            )
+        return CallerOutcome(caller_symbol, oracle_caller_symbol, "correct", "-")
+    source_match = _source_caller_matches(call, source_caller, caller_node)
+    if source_match is True:
+        category = caller_reason.rpartition(":")[2]
+        if caller_symbol is not None:
+            category = "non_callable_oracle"
+        return CallerOutcome(
+            caller_symbol, caller_symbol, "correct", f"source_caller:{category}"
+        )
+    if source_match is False:
+        return CallerOutcome(
+            caller_symbol, None, "wrong", "caller_source_mismatch"
+        )
+    reason = caller_reason if caller_symbol is None else "source_caller_missing"
+    return CallerOutcome(caller_symbol, None, "unscorable", reason)
+
+
+def _target_is_contradicted(
+    site, expected_target, target_reason, target_node, definition_locations,
+):
+    if expected_target is None or target_node is None:
+        return False
+    if target_reason == "target_node_not_semantic":
+        return True
+    locations = definition_locations.get(expected_target, ())
+    if not locations:
+        return site.resolved_symbol == EXTERNAL
+    _, _, _, node_path, start_line, end_line = target_node
+    return not any(
+        (
+            node_path == relative_path
+            or node_path.endswith("/" + relative_path)
+        )
+        and start_line - 1 <= definition_range[0] <= end_line - 1
+        for relative_path, definition_range in locations
+    )
+
+
+def _score_edge(
+    call, site, oracle_target_symbol, caller, identities, definition_locations,
+):
+    target_symbol, target_reason, target_node = _single_identity(
         identities, call.target_qualified_name, "target"
     )
     if site is None:
         return ScoredEdge(
             call.relative_path, call.callee_start_byte, call.callee_end_byte,
-            call.caller_qualified_name, caller_symbol, call.target_qualified_name,
+            call.caller_qualified_name, caller.graph_symbol,
+            call.target_qualified_name,
             target_symbol, call.strategy, "no_oracle_site", None, None,
             "unscorable", "no_oracle_truth",
         )
@@ -877,40 +944,34 @@ def _score_edge(
         oracle_target_symbol if site.resolved_symbol == EXTERNAL
         else site.resolved_symbol
     )
-    if caller_reason == "caller_not_in_oracle_configuration:cfg_inactive":
+    if caller.reason == "caller_cfg_inactive":
         return ScoredEdge(
             call.relative_path, call.callee_start_byte, call.callee_end_byte,
-            call.caller_qualified_name, caller_symbol, call.target_qualified_name,
-            target_symbol, call.strategy, site.call_form, oracle_caller_symbol,
+            call.caller_qualified_name, caller.graph_symbol,
+            call.target_qualified_name,
+            target_symbol, call.strategy, site.call_form, caller.oracle_symbol,
             expected_target, "unscorable", "caller_cfg_inactive",
         )
-    source_match = _source_caller_matches(call, source_caller, caller_node)
-    use_source = (
-        caller_symbol is None
-        or not _callable_symbol(oracle_caller_symbol or "")
-    )
     unknown = []
     contradictions = []
     caller_basis = "-"
-    if use_source:
-        if source_match is True:
-            category = caller_reason.rpartition(":")[2]
-            if caller_symbol is not None:
-                category = "non_callable_oracle"
-            caller_basis = f"source_caller:{category}"
-        elif source_match is False:
-            contradictions.append("caller_source_mismatch")
-        else:
-            unknown.append(
-                caller_reason if caller_symbol is None else "source_caller_missing"
-            )
-    elif caller_symbol != oracle_caller_symbol:
-        contradictions.append("caller_identity_mismatch")
+    if caller.outcome == "wrong":
+        contradictions.append(caller.reason)
+    elif caller.outcome == "unscorable":
+        unknown.append(caller.reason)
+    else:
+        caller_basis = caller.reason
     if site.resolved_symbol in (CALL_THROUGH_VALUE, AMBIGUOUS):
         unknown.append(f"oracle_{site.resolved_symbol}")
     else:
         if target_symbol is None:
-            unknown.append(target_reason)
+            if _target_is_contradicted(
+                site, expected_target, target_reason, target_node,
+                definition_locations,
+            ):
+                contradictions.append("target_identity_mismatch")
+            else:
+                unknown.append(target_reason)
         elif expected_target is None:
             unknown.append("oracle_target_missing")
         elif target_symbol != expected_target:
@@ -926,8 +987,9 @@ def _score_edge(
         reason = caller_basis
     return ScoredEdge(
         call.relative_path, call.callee_start_byte, call.callee_end_byte,
-        call.caller_qualified_name, caller_symbol, call.target_qualified_name,
-        target_symbol, call.strategy, site.call_form, oracle_caller_symbol,
+        call.caller_qualified_name, caller.graph_symbol,
+        call.target_qualified_name, target_symbol, call.strategy, site.call_form,
+        caller.oracle_symbol,
         expected_target, outcome, reason,
     )
 
@@ -940,7 +1002,7 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         (site.relative_path, site.callee_start_byte, site.callee_end_byte): site
         for site in inventory
     }
-    oracle_callers, oracle_targets = _oracle_occurrences(
+    oracle_callers, oracle_targets, definition_locations = _oracle_occurrences(
         corpus_root, scip_file, inventory
     )
     identities = _node_identities(graph_database, scip_file)
@@ -960,6 +1022,7 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         for edge in graph_calls
     }
     graph_relations = set()
+    graph_names_by_symbol = defaultdict(set)
     for edge in graph_calls:
         caller_symbol, _, _ = _single_identity(
             identities, edge.caller_qualified_name, "caller"
@@ -969,24 +1032,45 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         )
         if caller_symbol is not None and target_symbol is not None:
             graph_relations.add((caller_symbol, target_symbol))
+    for qualified_name in identities:
+        symbol, _, _ = _single_identity(identities, qualified_name, "node")
+        if symbol is not None:
+            graph_names_by_symbol[symbol].add(qualified_name)
     edges = []
     scored_occurrences = []
     integrity = list(integrity)
-    source_candidates = []
+    source_candidates = [
+        site
+        for key, site in sites.items()
+        if not _callable_symbol(oracle_callers.get(key) or "")
+    ]
+    source_callers = _source_callers(corpus_root, source_candidates)
+    graph_source_nodes = defaultdict(list)
+    for qualified_name, nodes in identities.items():
+        if len(nodes) != 1:
+            continue
+        node = nodes[0]
+        _, label, name, _, _, _ = node
+        if label in ("Function", "Method"):
+            graph_source_nodes[name].append((qualified_name, node))
+    source_nodes_by_site = {}
+    for key, source_caller in source_callers.items():
+        site = sites[key]
+        source_nodes_by_site[key] = tuple(
+            (qualified_name, node)
+            for qualified_name, node in graph_source_nodes[source_caller[2]]
+            if _source_caller_matches(site, source_caller, node)
+        )
+    caller_outcomes = {}
+    callers_by_site = defaultdict(list)
     for call in calls:
         key = (call.relative_path, call.callee_start_byte, call.callee_end_byte)
-        caller_symbol, _, _ = _single_identity(
-            identities, call.caller_qualified_name, "caller"
+        caller = _score_caller(
+            call, oracle_callers.get(key), source_callers.get(key), identities
         )
-        if (
-            key in sites
-            and (
-                caller_symbol is None
-                or not _callable_symbol(oracle_callers.get(key) or "")
-            )
-        ):
-            source_candidates.append(call)
-    source_callers = _source_callers(corpus_root, source_candidates)
+        caller_outcomes[call] = caller
+        if key in sites:
+            callers_by_site[key].append(caller)
     for edge in graph_calls:
         key = (edge.caller_qualified_name, edge.target_qualified_name)
         provenance = calls_by_edge.get(key, ())
@@ -1015,17 +1099,21 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         scores = [
             _score_edge(
                 call,
-                sites.get((call.relative_path, call.callee_start_byte, call.callee_end_byte)),
-                oracle_callers.get(
-                    (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+                sites.get(
+                    (
+                        call.relative_path, call.callee_start_byte,
+                        call.callee_end_byte,
+                    )
                 ),
                 oracle_targets.get(
-                    (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+                    (
+                        call.relative_path, call.callee_start_byte,
+                        call.callee_end_byte,
+                    )
                 ),
-                source_callers.get(
-                    (call.relative_path, call.callee_start_byte, call.callee_end_byte)
-                ),
+                caller_outcomes[call],
                 identities,
+                definition_locations,
             )
             for call in provenance
         ]
@@ -1053,11 +1141,45 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
             continue
         key = (site.relative_path, site.callee_start_byte, site.callee_end_byte)
         site_edges = edges_by_site.get(key, ())
-        oracle_caller_symbol = oracle_callers.get(key)
-        found = (
-            oracle_caller_symbol is not None
-            and (oracle_caller_symbol, site.resolved_symbol) in graph_relations
-        )
+        site_callers = callers_by_site.get(key, ())
+        raw_caller = oracle_callers.get(key)
+        found = False
+        if _callable_symbol(raw_caller or ""):
+            caller = None
+            if site_callers:
+                rank = {"correct": 0, "unscorable": 1, "wrong": 2}
+                caller = min(site_callers, key=lambda item: rank[item.outcome])
+            if caller is not None and caller.outcome == "unscorable":
+                continue
+            oracle_caller_symbol = raw_caller
+            found = any(edge.outcome == "correct" for edge in site_edges)
+            if not found and oracle_caller_symbol is not None:
+                found = (
+                    oracle_caller_symbol, site.resolved_symbol
+                ) in graph_relations
+        else:
+            source_nodes = source_nodes_by_site.get(key, ())
+            outcomes = [node[0] for _, node in source_nodes]
+            if outcomes and all(
+                outcome is not None
+                and outcome.status == "not_in_oracle_configuration"
+                for outcome in outcomes
+            ):
+                continue
+            caller_symbols = {
+                outcome.symbol
+                for outcome in outcomes
+                if outcome is not None and outcome.status == "matched"
+            }
+            oracle_caller_symbol = (
+                next(iter(caller_symbols)) if len(caller_symbols) == 1 else None
+            )
+            target_names = graph_names_by_symbol.get(site.resolved_symbol, ())
+            found = any(
+                (caller_name, target_name) in graph_pairs
+                for caller_name, _ in source_nodes
+                for target_name in target_names
+            )
         strategies = sorted({edge.strategy for edge in site_edges})
         strategy = "+".join(strategies) if strategies else "no_published_edge"
         recall.append(
