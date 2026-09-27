@@ -7,11 +7,11 @@ resolution, admission verdict and closure reason), the graph SQLite database of 
 index, the corpus root, and the SCIP index of that corpus.
 
 For each `C` row the callee identifier is located inside the call span; the
-SCIP occurrence starting at that identifier is the truth. Truths are classed
+sole SCIP occurrence starting at that identifier is the truth. Truths are classed
 as internal (a workspace function), external, local (closure / fn value),
 constructor, or unknown (no occurrence, e.g. cfg-inactive code). The resolver's
-callee is mapped to a graph node and compared with the truth definition by
-file, leaf name, owner type and trait. The report prints, per strategy, how
+callee is mapped to the sole SCIP definition inside that graph node's source
+span and compared as a complete symbol identity. The report prints, per strategy, how
 often the resolver was correct or wrong on internal truths, why each resolved
 site was closed by the gate, why an admitted internal target has no graph node,
 the classes of internal truths the resolver produced nothing for, and
@@ -39,7 +39,7 @@ _spec = importlib.util.spec_from_file_location(
     "scip_call_edges", os.path.join(os.path.dirname(os.path.abspath(__file__)), "scip-call-edges.py"))
 _decoder = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_decoder)
-_, defs, refs = _decoder.parse(args.scip)
+_, defs, refs, definition_sites = _decoder.parse_with_definition_sites(args.scip)
 meta = json.loads(subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
                                  cwd=CORPUS, capture_output=True, text=True, check=True).stdout)
 workspace = {p["name"] for p in meta["packages"]}
@@ -93,11 +93,7 @@ occ_index = {}
 for path, entries in refs.items():
     d = occ_index.setdefault(path, {})
     for rng, sym in entries:
-        d.setdefault((rng[0], rng[1]), []).append(sym)
-for path, entries in defs.items():
-    d = occ_index.setdefault(path, {})
-    for rng, sym in entries:
-        d.setdefault((rng[0], rng[1]), []).append(sym)
+        d.setdefault((rng[0], rng[1]), set()).add(sym)
 
 # unresolved reasons keyed by site
 site_reason = {}
@@ -111,11 +107,18 @@ for line in open(DUMP, encoding="utf8", errors="replace"):
 con = sqlite3.connect(DB)
 nodes = {}
 node_labels = {}
-for qn, fp, name, label, sl in con.execute(
-        "select qualified_name, file_path, name, label, start_line from nodes"):
+for qn, fp, name, label, sl, el in con.execute(
+        "select qualified_name, file_path, name, label, start_line, end_line from nodes"):
     node_labels.setdefault(qn, set()).add(label)
     if label in ("Function", "Method"):
-        nodes[qn] = (fp, name, label, sl)
+        if os.path.isabs(fp):
+            try:
+                fp = os.path.relpath(fp, CORPUS)
+            except ValueError:
+                pass
+        fp = fp.replace(os.sep, "/")
+        identity = _decoder.definition_symbol_for_node(definition_sites, fp, sl, el)
+        nodes[qn] = (fp, name, label, sl, el, identity)
 
 DERIVED_DEF = re.compile(rb"^\s*(#\[|pub(\([a-z]+\))?\s+(struct|enum|union)\b|(struct|enum|union)\b)")
 
@@ -137,18 +140,6 @@ def no_node_class(truth, rqn):
         if DERIVED_DEF.match(data[starts[line]:end]):
             return "derive_generated"
     return "qn_not_in_graph"
-
-def graph_owner(qn):
-    base = qn.split("[", 1)[0]
-    segs = base.split(".")
-    if len(segs) >= 3 and segs[-2][:1].isupper():
-        return segs[-2]
-    return None
-
-def graph_trait(qn):
-    if qn.endswith("]") and "[" in qn:
-        return qn[qn.index("[") + 1:-1]
-    return None
 
 sources = {}
 def source(rel):
@@ -218,7 +209,7 @@ samples = collections.defaultdict(list)
 wrong_detail = collections.Counter()
 missed_truth = collections.Counter()
 missed_internal_files = collections.Counter()
-edge_truth = set()   # (rel, caller, truth symbol) for internal fn truth
+edge_truth = set()   # (file, byte start/end, caller, truth symbol)
 edge_found = set()
 n = 0
 for line in open(DUMP, encoding="utf8", errors="replace"):
@@ -239,8 +230,15 @@ for line in open(DUMP, encoding="utf8", errors="replace"):
     if rel not in occ_index:
         rows[(strategy, verdict, "no_scip_file", "-")] += 1
         continue
-    syms = occ_index.get(rel, {}).get(lc, [])
-    fn_syms = [s for s in syms if descriptor_of(s).endswith("().") ]
+    syms = sorted(occ_index.get(rel, {}).get(lc, ()))
+    if len(syms) > 1:
+        rows[(strategy, verdict, "ambiguous", "ambiguous_oracle")] += 1
+        if len(samples[(strategy, "ambiguous_oracle")]) < 25:
+            samples[(strategy, "ambiguous_oracle")].append(
+                (rel, start, end, caller, callee, rqn, syms)
+            )
+        continue
+    fn_syms = [s for s in syms if descriptor_of(s).endswith("().")]
     if not syms:
         truth_class = "no_occurrence"
     elif any(s.startswith("local ") for s in syms):
@@ -253,8 +251,9 @@ for line in open(DUMP, encoding="utf8", errors="replace"):
         d = descriptor_of(syms[0])
         truth_class = "ctor" if (d.endswith("#") or d.endswith(".")) else "other"
     truth = fn_syms[0] if fn_syms else (syms[0] if syms else None)
+    site = (rel, start, end, caller, truth)
     if truth_class == "internal":
-        edge_truth.add((rel, caller, truth))
+        edge_truth.add(site)
     if rqn == "-":
         rows[(strategy, verdict, truth_class, "none")] += 1
         if truth_class == "internal":
@@ -287,36 +286,44 @@ for line in open(DUMP, encoding="utf8", errors="replace"):
         outcome = "wrong_" + truth_class
         rows[(strategy, verdict, truth_class, outcome)] += 1
         if verdict == "closed": closures[(strategy, closure, truth_class, outcome)] += 1
+        wrong_detail[(strategy, outcome)] += 1
+        graph_identity = node[5]
+        if len(samples[("wrong", strategy, outcome)]) < 25:
+            samples[("wrong", strategy, outcome)].append(
+                (rel, start, end, caller, callee, rqn, truth, graph_identity)
+            )
         if len(samples[(strategy, outcome)]) < 15: samples[(strategy, outcome)].append((rel, caller, callee, rqn, truth, syms[:2]))
         continue
-    leaf, owner, trait, kind = parse_descriptor(descriptor_of(truth))
-    tfiles = def_files.get(truth, set())
-    gfile, gname, glabel, gline = node
-    tfile = gfile if gfile in tfiles else def_file.get(truth)
-    gowner = graph_owner(rqn)
-    gtrait = graph_trait(rqn)
-    if tfile == gfile and gname == leaf and (owner or "") .split("<")[0] == (gowner or ""):
-        if trait and gtrait and trait.split("<")[0] != gtrait.split("<")[0]:
-            outcome = "wrong_trait"
-        else:
-            outcome = "correct"
-            if verdict == "admitted":
-                edge_found.add((rel, caller, truth))
-    elif tfile == gfile and gname == leaf:
-        outcome = "wrong_owner"
-    elif gname == leaf:
-        outcome = "wrong_file"
+    gfile, gname, glabel, gline, gend, graph_identity = node
+    if graph_identity == truth:
+        outcome = "correct"
+        if verdict == "admitted":
+            edge_found.add(site)
+    elif graph_identity is None:
+        outcome = "wrong_unmapped_definition"
     else:
-        outcome = "wrong_name"
+        outcome = "wrong_definition"
     rows[(strategy, verdict, truth_class, outcome)] += 1
     if verdict == "closed":
         closures[(strategy, closure, truth_class, outcome)] += 1
         if len(samples[("closed", strategy, closure)]) < 12:
             samples[("closed", strategy, closure)].append((rel, caller, callee, rqn, truth))
     if outcome != "correct":
-        wrong_detail[(strategy, outcome)] += 1
-        if len(samples[(strategy, outcome)]) < 25:
-            samples[(strategy, outcome)].append((rel, caller, callee, rqn, truth, tfile, gfile))
+        cause = outcome
+        if graph_identity is not None:
+            _, truth_owner, truth_trait, _ = parse_descriptor(descriptor_of(truth))
+            _, graph_owner, graph_trait, _ = parse_descriptor(descriptor_of(graph_identity))
+            if bool(truth_trait) != bool(graph_trait):
+                cause = "trait_inherent_definition"
+            elif truth_owner != graph_owner:
+                cause = "different_owner_definition"
+            else:
+                cause = "different_definition"
+        wrong_detail[(strategy, cause)] += 1
+        if len(samples[("wrong", strategy, cause)]) < 25:
+            samples[("wrong", strategy, cause)].append(
+                (rel, start, end, caller, callee, rqn, truth, graph_identity)
+            )
 
 # ---- report
 print("=== per strategy / verdict / truth class / outcome ===")
@@ -338,6 +345,9 @@ for k, v in sorted(closures.items(), key=lambda kv: -kv[1]):
 print()
 print("=== admitted internal targets without a callable graph node (strategy, class) ===")
 for k, v in no_node_detail.most_common(): print(v, k)
+print()
+print("=== wrong-edge causes (strategy, cause) ===")
+for k, v in wrong_detail.most_common(): print(v, k)
 print()
 print("=== resolver-missed internal truths (no resolution) ===")
 for k, v in missed_truth.most_common(): print(v, k)

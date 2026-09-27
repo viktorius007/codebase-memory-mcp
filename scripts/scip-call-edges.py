@@ -76,9 +76,10 @@ def norm_range(values):
     return (values[0], values[1], values[2], values[3])
 
 
-def parse(path):
+def parse_with_definition_sites(path):
     data = open(path, "rb").read()
     definitions = defaultdict(list)
+    definition_sites = defaultdict(list)
     references = defaultdict(list)
     documents = 0
     for number, (kind, payload) in fields(data, 0, len(data)):
@@ -108,10 +109,42 @@ def parse(path):
             if symbol is None or rng is None:
                 continue
             if roles & DEFINITION_ROLE:
-                definitions[doc_path].append((norm_range(enclosing or rng), symbol))
+                definition_range = norm_range(rng)
+                enclosing_range = norm_range(enclosing or rng)
+                definitions[doc_path].append((enclosing_range, symbol))
+                definition_sites[doc_path].append(
+                    (definition_range, enclosing_range, symbol)
+                )
             else:
                 references[doc_path].append((norm_range(rng), symbol))
+    return documents, definitions, references, definition_sites
+
+
+def parse(path):
+    documents, definitions, references, _ = parse_with_definition_sites(path)
     return documents, definitions, references
+
+
+def definition_symbol_for_node(definition_sites, path, start_line, end_line):
+    """Return the sole SCIP definition inside a 1-based graph node span."""
+    entries = definition_sites.get(path, ())
+    node_start = start_line - 1
+    node_end = end_line - 1
+    exact = {
+        symbol
+        for _, enclosing, symbol in entries
+        if enclosing[0] == node_start and enclosing[2] == node_end
+        and descriptor_of(symbol).endswith("().")
+    }
+    if len(exact) == 1:
+        return next(iter(exact))
+    contained = {
+        symbol
+        for definition, _, symbol in entries
+        if node_start <= definition[0] <= node_end
+        and descriptor_of(symbol).endswith("().")
+    }
+    return next(iter(contained)) if len(contained) == 1 else None
 
 
 def innermost(intervals, position):

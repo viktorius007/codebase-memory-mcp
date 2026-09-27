@@ -7,7 +7,7 @@ expectation file. The SCIP derivation (protobuf decode, definition intervals,
 innermost attribution, descriptor predicates) is imported unchanged from
 scripts/scip-call-edges.py, the committed oracle.
 
-Edge classes, keyed on (caller file, caller short name, callee short name):
+Edge classes, keyed on complete SCIP caller and callee definition symbols:
 
 - fabricated (must-not-exist, unconditional): graph CALLS edge whose key has no
   attributed reference anywhere in the SCIP index. Any count above zero rejects
@@ -59,14 +59,6 @@ def load_decoder():
     return module
 
 
-def short_name(decoder, symbol):
-    descriptor = decoder.descriptor_of(symbol)
-    if descriptor.endswith("()."):
-        descriptor = descriptor[:-3]
-    identifiers = re.findall(r"[A-Za-z0-9_]+", descriptor)
-    return identifiers[-1] if identifiers else None
-
-
 def load_expectation(path):
     values = {}
     with open(path, encoding="utf-8") as handle:
@@ -98,7 +90,9 @@ def load_expectation(path):
 def graph_edges(cbm, project, edge_type):
     query = (
         f"MATCH (a)-[:{edge_type}]->(b) "
-        "RETURN a.file_path AS af, a.name AS an, b.name AS bn LIMIT 1000000"
+        "RETURN a.file_path AS af, a.start_line AS asl, a.end_line AS ael, "
+        "a.qualified_name AS aqn, b.file_path AS bf, b.start_line AS bsl, "
+        "b.end_line AS bel, b.qualified_name AS bqn LIMIT 1000000"
     )
     rows, offset = [], 0
     while True:
@@ -128,14 +122,22 @@ def graph_edges(cbm, project, edge_type):
 
 
 def oracle_sets(decoder, scip_path, corpus, cargo):
-    _, definitions, references = decoder.parse(scip_path)
+    _, definitions, references, definition_sites = decoder.parse_with_definition_sites(scip_path)
     edges = set()
+    ambiguous = set()
     for path, refs in references.items():
         intervals = definitions[path]
+        by_site = {}
         for rng, symbol in refs:
+            by_site.setdefault(tuple(rng), set()).add(symbol)
+        for rng, symbols in by_site.items():
+            if len(symbols) != 1:
+                ambiguous.add((path,) + rng + tuple(sorted(symbols)))
+                continue
+            symbol = next(iter(symbols))
             caller = decoder.innermost(intervals, (rng[0], rng[1]))
             if caller and caller != symbol:
-                edges.add((caller, symbol, path))
+                edges.add((caller, symbol))
 
     result = subprocess.run(
         [cargo, "metadata", "--no-deps", "--format-version", "1"],
@@ -159,39 +161,52 @@ def oracle_sets(decoder, scip_path, corpus, cargo):
         return descriptor.endswith("().") and "#" not in descriptor
 
     referenced, strict = set(), set()
-    for caller, target, path in edges:
-        caller_name = short_name(decoder, caller)
-        target_name = short_name(decoder, target)
-        if caller_name is None or target_name is None:
-            continue
-        referenced.add((path, caller_name, target_name))
+    for caller, target in edges:
+        referenced.add((caller, target))
         if (
             is_free_function(caller)
             and is_free_function(target)
             and decoder.crate_of(caller) in workspace
             and decoder.crate_of(target) in workspace
-            and defining_file.get(caller) == path
-            and defining_file.get(target) == path
+            and defining_file.get(caller) == defining_file.get(target)
         ):
-            strict.add((path, caller_name, target_name))
-    return referenced, strict
+            strict.add((caller, target))
+    return referenced, strict, definition_sites, ambiguous
 
 
-def normalize_calls(rows, corpus):
+def normalize_calls(decoder, rows, corpus, definition_sites):
     prefix = os.path.abspath(corpus) + os.sep
     edges = set()
-    for file_path, caller, callee in rows:
-        if file_path.startswith(prefix):
-            file_path = file_path[len(prefix):]
-        if file_path.endswith(".rs"):
-            edges.add((file_path, caller, callee))
-    return edges
+    unidentified = set()
+    for source_file, source_start, source_end, source_qn, target_file, target_start, target_end, target_qn in rows:
+        files = [source_file, target_file]
+        for index, file_path in enumerate(files):
+            if file_path.startswith(prefix):
+                file_path = file_path[len(prefix):]
+            files[index] = file_path.replace(os.sep, "/")
+        source_file, target_file = files
+        source_symbol = decoder.definition_symbol_for_node(
+            definition_sites, source_file, int(source_start), int(source_end)
+        )
+        target_symbol = decoder.definition_symbol_for_node(
+            definition_sites, target_file, int(target_start), int(target_end)
+        )
+        if source_symbol is not None and target_symbol is not None:
+            edges.add((source_symbol, target_symbol))
+        else:
+            unidentified.add(
+                tuple(str(value) for value in (
+                    source_file, source_start, source_end, source_qn,
+                    target_file, target_start, target_end, target_qn,
+                ))
+            )
+    return edges, unidentified
 
 
 def write_detail(detail_dir, name, edges):
     with open(os.path.join(detail_dir, name), "w", encoding="utf-8") as handle:
         for edge in sorted(edges):
-            handle.write("\t".join(edge) + "\n")
+            handle.write("\t".join(str(value) for value in edge) + "\n")
 
 
 def main():
@@ -207,14 +222,19 @@ def main():
 
     expected = load_expectation(args.expected)
     decoder = load_decoder()
-    referenced, strict = oracle_sets(decoder, args.scip, args.corpus, args.cargo)
-    calls = normalize_calls(graph_edges(args.cbm, args.project, "CALLS"), args.corpus)
+    referenced, strict, definition_sites, ambiguous = oracle_sets(
+        decoder, args.scip, args.corpus, args.cargo
+    )
+    calls, unidentified = normalize_calls(
+        decoder, graph_edges(args.cbm, args.project, "CALLS"),
+        args.corpus, definition_sites,
+    )
     imports = sorted(set(graph_edges(args.cbm, args.project, "IMPORTS")))
 
     matched = calls & strict
     graph_only = calls - strict
     graph_only_referenced = graph_only & referenced
-    fabricated = graph_only - referenced
+    fabricated = (graph_only - referenced) | unidentified
     oracle_only = strict - calls
 
     write_detail(args.detail_dir, "calls-matched.tsv", matched)
@@ -224,10 +244,11 @@ def main():
     write_detail(args.detail_dir, "imports.tsv", imports)
 
     print(
-        f"calls_graph={len(calls)} matched={len(matched)} "
+        f"calls_graph={len(calls) + len(unidentified)} matched={len(matched)} "
         f"graph_only_referenced={len(graph_only_referenced)} "
         f"fabricated={len(fabricated)} oracle_strict={len(strict)} "
-        f"oracle_only={len(oracle_only)} imports={len(imports)}"
+        f"oracle_only={len(oracle_only)} oracle_ambiguous={len(ambiguous)} "
+        f"imports={len(imports)}"
     )
     violations = []
     if fabricated:
