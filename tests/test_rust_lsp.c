@@ -661,8 +661,9 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
 
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
-    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller", reg,
-                                         imp_names, imp_qns, 1, NULL, /*manifest=*/NULL,
+    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller",
+                                         "test.caller", reg, imp_names, imp_qns, 1, NULL,
+                                         /*manifest=*/NULL,
                                          /*imports=*/NULL, &out, /*synthetic_calls=*/NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
@@ -911,8 +912,9 @@ TEST(rustlsp_resolved_calls_carry_exact_impl_identity_local_and_shared) {
         cbm_rust_build_cross_registry(&arena, defs, result->defs.count);
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray shared = {0};
-    cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.src.main",
-                                         registry, NULL, NULL, 0, NULL, NULL, NULL, &shared, NULL);
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "test.src.main", "test.src.main", registry, NULL,
+        NULL, 0, NULL, NULL, NULL, &shared, NULL);
     ASSERT_TRUE(rustlsp_impl_identity_rows_are_exact(&shared));
 
     CBMFileResult merged;
@@ -973,8 +975,9 @@ TEST(rustlsp_relative_type_requires_declared_module) {
     CBMTypeRegistry *registry = rustlsp_default_trait_registry(&arena, false);
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
-                                         NULL, NULL, 0, NULL, NULL, NULL, &out, NULL);
+    cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main",
+                                         "test.main", registry, NULL, NULL, 0, NULL, NULL, NULL,
+                                         &out, NULL);
     int stolen = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(stolen, 0);
@@ -989,8 +992,9 @@ TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed) {
     CBMTypeRegistry *registry = rustlsp_default_trait_registry(&arena, true);
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
-    cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
-                                         NULL, NULL, 0, NULL, NULL, NULL, &out, NULL);
+    cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main",
+                                         "test.main", registry, NULL, NULL, 0, NULL, NULL, NULL,
+                                         &out, NULL);
     int guessed = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(guessed, 0);
@@ -1023,7 +1027,8 @@ TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier) {
     ASSERT_NOT_NULL(reg);
 
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
-                                         reg, imp_names, imp_qns, 1, NULL, /*manifest=*/NULL,
+                                         "test.main", reg, imp_names, imp_qns, 1, NULL,
+                                         /*manifest=*/NULL,
                                          /*imports=*/NULL, &result.resolved_calls, &result.calls);
 
     int resolved = find_confident(&result.resolved_calls, "hidden", "lib.render");
@@ -1259,7 +1264,8 @@ TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact) {
     CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&result.arena, defs, 2);
     ASSERT_NOT_NULL(reg);
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
-                                         reg, imp_names, imp_qns, 2, NULL, /*manifest=*/NULL,
+                                         "test.main", reg, imp_names, imp_qns, 2, NULL,
+                                         /*manifest=*/NULL,
                                          /*imports=*/NULL, &result.resolved_calls, &result.calls);
 
     const char *a_site = strstr(caller, "a::render()");
