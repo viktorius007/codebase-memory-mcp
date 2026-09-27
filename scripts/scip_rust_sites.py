@@ -15,6 +15,7 @@ import importlib.util
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -50,6 +51,7 @@ class GraphCall(NamedTuple):
     source_id: int
     target_id: int
     source_path: str
+    target_path: str
     caller_qualified_name: str
     target_qualified_name: str
 
@@ -92,10 +94,12 @@ class IntegrityError(NamedTuple):
 
 class ScoreReport(NamedTuple):
     edges: tuple[ScoredEdge, ...]
+    occurrences: tuple[ScoredEdge, ...]
     recall: tuple[RecallOccurrence, ...]
     inventory: tuple[CallSite, ...]
     integrity: tuple[IntegrityError, ...]
     completeness: tuple[tuple[str, int], ...]
+    non_rust_target_edges: int
 
 
 _DECODER_PATH = Path(__file__).with_name("scip-call-edges.py")
@@ -645,7 +649,7 @@ def call_sites(corpus_root, scip_path):
     return records
 
 
-def _oracle_callers(corpus_root, scip_path, sites):
+def _oracle_occurrences(corpus_root, scip_path, sites):
     _, definitions, references, _ = _DECODER.parse_with_definition_sites(scip_path)
     wanted = defaultdict(set)
     for site in sites:
@@ -653,13 +657,14 @@ def _oracle_callers(corpus_root, scip_path, sites):
             (site.relative_path, site.callee_start_byte, site.callee_end_byte)
         )
     callers = {}
+    targets = defaultdict(set)
     for relative_path, occurrences in references.items():
         path_sites = wanted.get(relative_path)
         if not path_sites:
             continue
         source = (Path(corpus_root) / relative_path).read_bytes()
         starts = _line_starts(source)
-        for source_range, _ in occurrences:
+        for source_range, target in occurrences:
             byte_range = _byte_range(source, starts, source_range)
             if byte_range is None:
                 continue
@@ -668,7 +673,13 @@ def _oracle_callers(corpus_root, scip_path, sites):
                 callers[key] = _DECODER.innermost(
                     definitions[relative_path], (source_range[0], source_range[1])
                 )
-    return callers
+                targets[key].add(target)
+    exact_targets = {
+        key: next(iter(symbols))
+        for key, symbols in targets.items()
+        if len(symbols) == 1
+    }
+    return callers, exact_targets
 
 
 def published_calls(dump_path):
@@ -715,26 +726,33 @@ def _node_identities(graph_database, scip_file):
     outcomes = identity.map_rust_graph_nodes(graph_database, scip_file)
     connection = sqlite3.connect(graph_database)
     try:
-        rows = connection.execute("select id, qualified_name from nodes")
+        rows = connection.execute(
+            "select id, qualified_name, label, name, file_path, start_line, end_line "
+            "from nodes"
+        )
         by_name = defaultdict(list)
-        for node_id, qualified_name in rows:
-            if node_id in outcomes:
-                by_name[qualified_name].append(outcomes[node_id])
+        for node_id, qualified_name, label, name, path, start, end in rows:
+            by_name[qualified_name].append(
+                (outcomes.get(node_id), label, name, path, start, end)
+            )
     finally:
         connection.close()
     return by_name
 
 
 def _single_identity(by_name, qualified_name, endpoint):
-    outcomes = by_name.get(qualified_name, ())
-    if not outcomes:
-        return None, f"{endpoint}_node_missing"
-    if len(outcomes) != 1:
-        return None, f"{endpoint}_qualified_name_is_not_unique"
-    outcome = outcomes[0]
+    nodes = by_name.get(qualified_name, ())
+    if not nodes:
+        return None, f"{endpoint}_node_missing", None
+    if len(nodes) != 1:
+        return None, f"{endpoint}_qualified_name_is_not_unique", None
+    node = nodes[0]
+    outcome = node[0]
+    if outcome is None:
+        return None, f"{endpoint}_node_not_semantic", node
     if outcome.status == "matched":
-        return outcome.symbol, "-"
-    return None, f"{endpoint}_{outcome.status}:{outcome.reason}"
+        return outcome.symbol, "-", node
+    return None, f"{endpoint}_{outcome.status}:{outcome.reason}", node
 
 
 def _rust_call_edges(graph_database):
@@ -746,24 +764,106 @@ def _rust_call_edges(graph_database):
         if exists is None:
             return None
         rows = connection.execute(
-            "select e.source_id, e.target_id, source.file_path, "
+            "select e.source_id, e.target_id, source.file_path, target.file_path, "
             "source.qualified_name, target.qualified_name "
             "from edges e "
             "join nodes source on source.id = e.source_id "
             "join nodes target on target.id = e.target_id "
             "where e.type = 'CALLS' and source.file_path glob '*.rs' "
-            "and target.file_path glob '*.rs' order by e.source_id, e.target_id"
+            "order by e.source_id, e.target_id"
         )
         return tuple(GraphCall(*row) for row in rows)
     finally:
         connection.close()
 
 
-def _score_edge(call, site, oracle_caller_symbol, identities):
-    caller_symbol, caller_reason = _single_identity(
+def _rust_function_items(sources):
+    functions = defaultdict(list)
+    entries = list(sources.items())
+    for offset in range(0, len(entries), 64):
+        batch = entries[offset : offset + 64]
+        combined = bytearray()
+        starts = []
+        for relative_path, source in batch:
+            if combined:
+                combined.extend(b"\n")
+            starts.append((len(combined), relative_path, len(source)))
+            combined.extend(source)
+        result = subprocess.run(
+            (
+                "ast-grep", "run", "--stdin", "--lang", "rust",
+                "--kind", "function_item", "--json=stream",
+            ),
+            input=bytes(combined), stdout=subprocess.PIPE, check=False,
+        )
+        if result.returncode not in (0, 1):
+            raise subprocess.CalledProcessError(result.returncode, result.args)
+        batch_starts = [start for start, _, _ in starts]
+        for line in result.stdout.splitlines():
+            record = json.loads(line)
+            span = record["range"]
+            start = span["byteOffset"]["start"]
+            end = span["byteOffset"]["end"]
+            index = bisect.bisect_right(batch_starts, start) - 1
+            base, relative_path, source_length = starts[index]
+            match = re.search(r"\bfn\s+(?:r#)?([^\W\d]\w*)", record["text"])
+            if match is not None and end <= base + source_length:
+                local_start = start - base
+                local_end = end - base
+                source = sources[relative_path]
+                functions[relative_path].append(
+                    (
+                        local_start, local_end, match.group(1),
+                        source.count(b"\n", 0, local_start) + 1,
+                        source.count(b"\n", 0, local_end) + 1,
+                    )
+                )
+    return functions
+
+
+def _source_callers(corpus_root, calls):
+    root = Path(corpus_root)
+    sources = {
+        path: source_path.read_bytes()
+        for path in {call.relative_path for call in calls}
+        if (source_path := root / path).is_file()
+    }
+    functions = _rust_function_items(sources)
+    callers = {}
+    for call in calls:
+        candidates = [
+            item for item in functions.get(call.relative_path, ())
+            if item[0] <= call.callee_start_byte < item[1]
+        ]
+        if candidates:
+            callers[
+                (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+            ] = min(candidates, key=lambda item: item[1] - item[0])
+    return callers
+
+
+def _source_caller_matches(call, source_caller, node):
+    if source_caller is None or node is None:
+        return None
+    _, label, name, path, start_line, end_line = node
+    _, _, source_name, source_start_line, source_end_line = source_caller
+    same_path = path == call.relative_path or path.endswith("/" + call.relative_path)
+    return (
+        label in ("Function", "Method")
+        and same_path
+        and name == source_name
+        and start_line <= source_start_line
+        and source_end_line <= end_line
+    )
+
+
+def _score_edge(
+    call, site, oracle_caller_symbol, oracle_target_symbol, source_caller, identities,
+):
+    caller_symbol, caller_reason, caller_node = _single_identity(
         identities, call.caller_qualified_name, "caller"
     )
-    target_symbol, target_reason = _single_identity(
+    target_symbol, target_reason, _ = _single_identity(
         identities, call.target_qualified_name, "target"
     )
     if site is None:
@@ -773,31 +873,62 @@ def _score_edge(call, site, oracle_caller_symbol, identities):
             target_symbol, call.strategy, "no_oracle_site", None, None,
             "unscorable", "no_oracle_truth",
         )
-    if site.resolved_symbol in NON_INTERNAL_TRUTH:
+    expected_target = (
+        oracle_target_symbol if site.resolved_symbol == EXTERNAL
+        else site.resolved_symbol
+    )
+    if caller_reason == "caller_not_in_oracle_configuration:cfg_inactive":
         return ScoredEdge(
             call.relative_path, call.callee_start_byte, call.callee_end_byte,
             call.caller_qualified_name, caller_symbol, call.target_qualified_name,
             target_symbol, call.strategy, site.call_form, oracle_caller_symbol,
-            site.resolved_symbol, "unscorable", f"oracle_{site.resolved_symbol}",
+            expected_target, "unscorable", "caller_cfg_inactive",
         )
-    reasons = []
-    if caller_symbol is None:
-        reasons.append(caller_reason)
-    elif oracle_caller_symbol is None:
-        reasons.append("oracle_caller_missing")
+    source_match = _source_caller_matches(call, source_caller, caller_node)
+    use_source = (
+        caller_symbol is None
+        or not _callable_symbol(oracle_caller_symbol or "")
+    )
+    unknown = []
+    contradictions = []
+    caller_basis = "-"
+    if use_source:
+        if source_match is True:
+            category = caller_reason.rpartition(":")[2]
+            if caller_symbol is not None:
+                category = "non_callable_oracle"
+            caller_basis = f"source_caller:{category}"
+        elif source_match is False:
+            contradictions.append("caller_source_mismatch")
+        else:
+            unknown.append(
+                caller_reason if caller_symbol is None else "source_caller_missing"
+            )
     elif caller_symbol != oracle_caller_symbol:
-        reasons.append("caller_identity_mismatch")
-    if target_symbol is None:
-        reasons.append(target_reason)
-    elif target_symbol != site.resolved_symbol:
-        reasons.append("target_identity_mismatch")
-    outcome = "wrong" if reasons else "correct"
-    reason = "+".join(reasons) if reasons else "-"
+        contradictions.append("caller_identity_mismatch")
+    if site.resolved_symbol in (CALL_THROUGH_VALUE, AMBIGUOUS):
+        unknown.append(f"oracle_{site.resolved_symbol}")
+    else:
+        if target_symbol is None:
+            unknown.append(target_reason)
+        elif expected_target is None:
+            unknown.append("oracle_target_missing")
+        elif target_symbol != expected_target:
+            contradictions.append("target_identity_mismatch")
+    if contradictions:
+        outcome = "wrong"
+        reason = "+".join(contradictions)
+    elif unknown:
+        outcome = "unscorable"
+        reason = "+".join(unknown)
+    else:
+        outcome = "correct"
+        reason = caller_basis
     return ScoredEdge(
         call.relative_path, call.callee_start_byte, call.callee_end_byte,
         call.caller_qualified_name, caller_symbol, call.target_qualified_name,
         target_symbol, call.strategy, site.call_form, oracle_caller_symbol,
-        site.resolved_symbol, outcome, reason,
+        expected_target, outcome, reason,
     )
 
 
@@ -809,7 +940,9 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         (site.relative_path, site.callee_start_byte, site.callee_end_byte): site
         for site in inventory
     }
-    oracle_callers = _oracle_callers(corpus_root, scip_file, inventory)
+    oracle_callers, oracle_targets = _oracle_occurrences(
+        corpus_root, scip_file, inventory
+    )
     identities = _node_identities(graph_database, scip_file)
     calls = published_calls(dump_path)
     graph_calls = _rust_call_edges(graph_database)
@@ -828,10 +961,10 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
     }
     graph_relations = set()
     for edge in graph_calls:
-        caller_symbol, _ = _single_identity(
+        caller_symbol, _, _ = _single_identity(
             identities, edge.caller_qualified_name, "caller"
         )
-        target_symbol, _ = _single_identity(
+        target_symbol, _, _ = _single_identity(
             identities, edge.target_qualified_name, "target"
         )
         if caller_symbol is not None and target_symbol is not None:
@@ -839,14 +972,29 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
     edges = []
     scored_occurrences = []
     integrity = list(integrity)
+    source_candidates = []
+    for call in calls:
+        key = (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+        caller_symbol, _, _ = _single_identity(
+            identities, call.caller_qualified_name, "caller"
+        )
+        if (
+            key in sites
+            and (
+                caller_symbol is None
+                or not _callable_symbol(oracle_callers.get(key) or "")
+            )
+        ):
+            source_candidates.append(call)
+    source_callers = _source_callers(corpus_root, source_candidates)
     for edge in graph_calls:
         key = (edge.caller_qualified_name, edge.target_qualified_name)
         provenance = calls_by_edge.get(key, ())
         if not provenance:
-            caller_symbol, _ = _single_identity(
+            caller_symbol, _, _ = _single_identity(
                 identities, edge.caller_qualified_name, "caller"
             )
-            target_symbol, _ = _single_identity(
+            target_symbol, _, _ = _single_identity(
                 identities, edge.target_qualified_name, "target"
             )
             edges.append(
@@ -854,7 +1002,7 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
                     edge.source_path, -1, -1, edge.caller_qualified_name,
                     caller_symbol, edge.target_qualified_name, target_symbol,
                     "no_dump_provenance", "no_provenance", None, None,
-                    "integrity_error", "edge_without_dump",
+                    "unscorable", "edge_without_dump",
                 )
             )
             integrity.append(
@@ -871,12 +1019,18 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
                 oracle_callers.get(
                     (call.relative_path, call.callee_start_byte, call.callee_end_byte)
                 ),
+                oracle_targets.get(
+                    (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+                ),
+                source_callers.get(
+                    (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+                ),
                 identities,
             )
             for call in provenance
         ]
         scored_occurrences.extend(scores)
-        rank = {"correct": 0, "wrong": 1, "unscorable": 2}
+        rank = {"correct": 0, "unscorable": 1, "wrong": 2}
         edges.append(min(scores, key=lambda score: rank[score.outcome]))
     for call in calls:
         key = (call.caller_qualified_name, call.target_qualified_name)
@@ -913,8 +1067,10 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
                 "found" if found else "missed",
             )
         )
+    non_rust = sum(not edge.target_path.endswith(".rs") for edge in graph_calls)
     return ScoreReport(
-        tuple(edges), tuple(recall), inventory, tuple(integrity), completeness
+        tuple(edges), tuple(scored_occurrences), tuple(recall), inventory,
+        tuple(integrity), completeness, non_rust,
     )
 
 
@@ -951,6 +1107,27 @@ def write_score_details(output_directory, report):
         )
         for edge in report.edges if edge.outcome == "wrong"
     ]
+    edge_rows = [
+        (
+            edge.relative_path, edge.callee_start_byte, edge.callee_end_byte,
+            edge.strategy, edge.call_form, edge.caller_qualified_name,
+            edge.caller_symbol or "-", edge.oracle_caller_symbol or "-",
+            edge.target_qualified_name,
+            edge.target_symbol or "-", edge.oracle_symbol or "-", edge.outcome,
+            edge.reason,
+        )
+        for edge in report.edges
+    ]
+    wrong_occurrence_rows = [
+        (
+            edge.relative_path, edge.callee_start_byte, edge.callee_end_byte,
+            edge.strategy, edge.call_form, edge.caller_qualified_name,
+            edge.caller_symbol or "-", edge.oracle_caller_symbol or "-",
+            edge.target_qualified_name,
+            edge.target_symbol or "-", edge.oracle_symbol or "-", edge.reason,
+        )
+        for edge in report.occurrences if edge.outcome == "wrong"
+    ]
     missed_rows = [
         (
             occurrence.relative_path, occurrence.callee_start_byte,
@@ -960,7 +1137,13 @@ def write_score_details(output_directory, report):
         for occurrence in report.recall if occurrence.outcome == "missed"
     ]
     for name, header, rows in (
+        (
+            "edge-outcomes.tsv",
+            wrong_header[:-1] + ("outcome", "reason"),
+            edge_rows,
+        ),
         ("wrong-edges.tsv", wrong_header, wrong_rows),
+        ("wrong-occurrences.tsv", wrong_header, wrong_occurrence_rows),
         ("missed-occurrences.tsv", missed_header, missed_rows),
         (
             "integrity-errors.tsv",
