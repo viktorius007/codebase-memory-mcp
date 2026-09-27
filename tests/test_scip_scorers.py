@@ -239,6 +239,384 @@ class ScorerFixture:
 
 
 class ScipScorerTests(unittest.TestCase):
+    def test_external_oracle_target_is_compared_with_published_target(self):
+        source = "fn target() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            caller = symbol("fixture/caller().")
+            external = "rust-analyzer cargo dependency 1.0.0 dependency/target()."
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(range_for(source, "target", 1), external),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 2, 2),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
+            )
+            self.assertIn("target_identity_mismatch", result.stdout)
+
+    def test_proc_macro_caller_uses_source_function_truth(self):
+        source = "#[rstest]\nfn caller() { target(); }\nfn target() {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            generated = symbol("fixture/generated_case().")
+            target = symbol("fixture/target().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "caller"), generated, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(
+                        range_for(source, "target", 1), target, 1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "target", 0), target),
+                ),
+                (
+                    symbol_information(generated, 17, "generated_case"),
+                    symbol_information(target, 17, "target"),
+                ),
+            )
+            create_identity_database(
+                fixture.database,
+                (
+                    (
+                        1, "fixture", "Function", "caller", "fixture.caller",
+                        "src/lib.rs", 1, 2,
+                        json.dumps({"decorators": ["#[rstest]"]}),
+                    ),
+                    (
+                        2, "fixture", "Function", "target", "fixture.target",
+                        "src/lib.rs", 3, 3, "{}",
+                    ),
+                ),
+                ((1, 2),),
+            )
+            fixture.write_dump(
+                (("target()", 0, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
+            )
+            self.assertIn(
+                "label_category=source_caller:proc_macro_output count=1",
+                result.stdout,
+            )
+
+    def test_inactive_cfg_caller_is_unscorable(self):
+        source = "#[cfg(any())]\nfn caller() { target(); }\nfn target() {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 1), target, 1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "target", 0), target),
+                ),
+                (symbol_information(target, 17, "target"),),
+            )
+            create_identity_database(
+                fixture.database,
+                (
+                    (
+                        1, "fixture", "Function", "caller", "fixture.caller",
+                        "src/lib.rs", 1, 2,
+                        json.dumps({"decorators": ["#[cfg(any())]"]}),
+                    ),
+                    (
+                        2, "fixture", "Function", "target", "fixture.target",
+                        "src/lib.rs", 3, 3, "{}",
+                    ),
+                ),
+                ((1, 2),),
+            )
+            fixture.write_dump(
+                (("target()", 0, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=0 unscorable=1", result.stdout
+            )
+            self.assertIn(
+                "unscorable_category=caller_cfg_inactive count=1", result.stdout
+            )
+
+    def test_static_initializer_does_not_replace_source_function_caller(self):
+        source = "fn target() {}\nfn caller() { static CELL: i32 = target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            caller = symbol("fixture/caller().")
+            cell = symbol("fixture/caller/CELL.")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(
+                        range_for(source, "CELL"), cell, 1,
+                        [
+                            1, source.splitlines()[1].index("static"),
+                            1, len(source.splitlines()[1]) - 2,
+                        ],
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(caller, 17, "caller"),
+                    symbol_information(cell, 37, "CELL"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 2, 2),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
+            )
+            self.assertIn(
+                "label_category=source_caller:non_callable_oracle count=1",
+                result.stdout,
+            )
+
+    def test_reference_truth_without_target_definition_is_not_wrong(self):
+        source = "fn target() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 2, 2),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=0 unscorable=1", result.stdout
+            )
+            self.assertIn(
+                "unscorable_category=target_oracle_gap:oracle_definition_missing count=1",
+                result.stdout,
+            )
+
+    def test_non_rust_target_is_selected_on_graph_and_dump_sides(self):
+        source = "fn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            caller = symbol("fixture/caller().")
+            external = "rust-analyzer cargo dependency 1.0.0 dependency/target()."
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(range_for(source, "target"), external),
+                ),
+                (symbol_information(caller, 17, "caller"),),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 1, 1),
+                    ("__route__ANY__/target", "", "target", "Route", 0, 0),
+                ),
+                edges=(("fixture.caller", "__route__ANY__/target"),),
+            )
+            fixture.write_dump(
+                (("target()", 0, "__route__ANY__/target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=0 unscorable=1", result.stdout
+            )
+            self.assertIn("non_rust_target_edges=1", result.stdout)
+            self.assertIn("integrity_errors=0", result.stdout)
+
+    def test_edge_without_provenance_is_unscorable_and_in_totals(self):
+        source = "fn target() {}\nfn caller() {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target"), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 1),
+                    ),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 2, 2),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(())
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=0 unscorable=1", result.stdout
+            )
+            self.assertIn("integrity_error=edge_without_dump count=1", result.stdout)
+
+    def test_pair_label_is_correct_while_wrong_occurrence_is_counted(self):
+        source = "fn target() {}\nfn other() {}\nfn caller() { target(); other(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            other = symbol("fixture/other().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target", 0), target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "other", 0), other, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "target", 1), target),
+                    occurrence(range_for(source, "other", 1), other),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(other, 17, "other"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.target", "src/lib.rs", "target", "Function", 1, 1),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 3, 3),
+                ),
+                edges=(("fixture.caller", "fixture.target"),),
+            )
+            fixture.write_dump(
+                (
+                    ("target()", 1, "fixture.target", "direct", "admitted"),
+                    ("other()", 1, "fixture.target", "direct", "admitted"),
+                )
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
+            )
+            self.assertIn("wrong_occurrences=1", result.stdout)
+
     def test_missing_edges_table_is_a_named_integrity_error(self):
         source = "fn target() {}\nfn caller() { target(); }\n"
         with tempfile.TemporaryDirectory() as temporary:

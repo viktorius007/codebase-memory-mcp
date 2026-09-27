@@ -176,7 +176,7 @@ def print_breakdowns(report):
     precision = Counter(
         (
             edge.strategy, edge.call_form, edge.outcome,
-            edge.reason if edge.outcome != "correct" else "-",
+            edge.reason,
         )
         for edge in report.edges
     )
@@ -214,9 +214,9 @@ def main():
     correct = [edge for edge in report.edges if edge.outcome == "correct"]
     wrong = [edge for edge in report.edges if edge.outcome == "wrong"]
     unscorable = [edge for edge in report.edges if edge.outcome == "unscorable"]
-    integrity_edges = [
-        edge for edge in report.edges if edge.outcome == "integrity_error"
-    ]
+    wrong_occurrences = sum(
+        edge.outcome == "wrong" for edge in report.occurrences
+    )
     matched = [
         edge for edge in correct
         if (edge.caller_symbol, edge.oracle_symbol) in strict
@@ -256,7 +256,8 @@ def main():
         f"calls_graph={len(report.edges)} correct={len(correct)} wrong={len(wrong)} "
         f"unscorable={len(unscorable)} matched={len(matched)} "
         f"graph_only_referenced={len(graph_only)} fabricated={len(wrong)} "
-        f"integrity_edges={len(integrity_edges)} "
+        f"wrong_occurrences={wrong_occurrences} "
+        f"non_rust_target_edges={report.non_rust_target_edges} "
         f"integrity_errors={len(report.integrity)} "
         f"oracle_relations={len(relation_outcomes)} "
         f"relations_found={relation_found} relation_recall={relation_recall:.2f}% "

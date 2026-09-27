@@ -16,12 +16,17 @@ from scip_rust_sites import (
 
 def print_precision(report):
     counts = Counter(edge.outcome for edge in report.edges)
+    wrong_occurrences = sum(
+        edge.outcome == "wrong" for edge in report.occurrences
+    )
     judged = counts["correct"] + counts["wrong"]
     precision = counts["correct"] / judged * 100 if judged else 0.0
     print(
         f"published_edges={len(report.edges)} correct={counts['correct']} "
         f"wrong={counts['wrong']} unscorable={counts['unscorable']} "
-        f"precision={precision:.2f}% integrity_errors={len(report.integrity)}"
+        f"precision={precision:.2f}% wrong_occurrences={wrong_occurrences} "
+        f"integrity_errors={len(report.integrity)} "
+        f"non_rust_target_edges={report.non_rust_target_edges}"
     )
     print("=== precision by resolution strategy and call form ===")
     breakdown = defaultdict(Counter)
@@ -46,6 +51,12 @@ def print_precision(report):
     print("=== unscorable categories ===")
     for category, count in sorted(categories.items()):
         print(f"unscorable_category={category} count={count}")
+    print("=== published edge label categories ===")
+    label_categories = Counter(
+        edge.reason for edge in report.edges if edge.reason != "-"
+    )
+    for category, count in sorted(label_categories.items()):
+        print(f"label_category={category} count={count}")
 
 
 def print_integrity(report):
