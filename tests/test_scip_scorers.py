@@ -134,7 +134,7 @@ def load_identity_module():
     return module
 
 
-def create_identity_database(path, nodes):
+def create_identity_database(path, nodes, edges=()):
     connection = sqlite3.connect(path)
     connection.execute(
         "create table nodes (id integer primary key, project text, label text, "
@@ -142,6 +142,14 @@ def create_identity_database(path, nodes):
         "end_line integer, properties text)"
     )
     connection.executemany("insert into nodes values (?,?,?,?,?,?,?,?,?)", nodes)
+    if edges:
+        connection.execute(
+            "create table edges (source_id integer, target_id integer, type text)"
+        )
+        connection.executemany(
+            "insert into edges values (?, ?, 'CALLS')",
+            edges,
+        )
     connection.commit()
     connection.close()
 
@@ -201,7 +209,8 @@ class ScorerFixture:
         rows = []
         for needle, ordinal, target, strategy, verdict in calls:
             start, end = byte_span(self.source, needle, ordinal)
-            callee_start, callee_end = byte_span(self.source, needle[:-2], ordinal)
+            callee_start = start
+            callee_end = start + len(needle) - 2
             rows.append(
                 "\t".join(
                     (
@@ -899,14 +908,24 @@ class ScipScorerTests(unittest.TestCase):
             fixture = ScorerFixture(temporary, source)
             owner = symbol("fixture/Thing#")
             derived = symbol("fixture/impl#[Thing][Clone]clone().")
+            caller = symbol("fixture/use_clone().")
             write_identity_scip(
                 fixture.scip,
                 "src/lib.rs",
                 (
                     occurrence(range_for(source, "Thing"), owner, 1, line_range(source, 1)),
-                    occurrence(range_for(source, "clone"), derived),
+                    occurrence(
+                        range_for(source, "use_clone"),
+                        caller,
+                        1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "clone", 1), derived),
                 ),
-                (symbol_information(owner, 49, "Thing"),),
+                (
+                    symbol_information(owner, 49, "Thing"),
+                    symbol_information(caller, 17, "use_clone"),
+                ),
             )
             create_identity_database(
                 fixture.database,
@@ -922,7 +941,12 @@ class ScipScorerTests(unittest.TestCase):
                             {"rust_derive": "Clone", "rust_derive_owner": "fixture.Thing"}
                         ),
                     ),
+                    (
+                        3, "fixture", "Function", "use_clone", "fixture.caller",
+                        "src/lib.rs", 3, 3, "{}",
+                    ),
                 ),
+                ((3, 2),),
             )
 
             identity = load_identity_module()

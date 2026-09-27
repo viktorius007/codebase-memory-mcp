@@ -875,9 +875,8 @@ TEST(lrp_rust_s8_field_call) {
     PASS();
 }
 
-/* The visible `lib::render()` resolves; the same call inside `format!` still
- * has no trusted carrier and stays closed. DEFINES proves the fixture was
- * indexed rather than accepting an empty graph. */
+/* rust-analyzer resolves `lib::render()` both directly and as an expression inside
+ * `format!`, so each caller publishes one edge. DEFINES proves the fixture was indexed. */
 TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
     static const LRP_File f[] = {
         {"lib.rs", "pub fn render() -> &'static str { \"ok\" }\n"},
@@ -890,17 +889,17 @@ TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
     int visible_to_render = lrp_exact_calls_by_name(store, lp.project, "visible", "render");
     int hidden_to_render = lrp_exact_calls_by_name(store, lp.project, "hidden", "render");
     int definitions = store ? cbm_store_count_edges_by_type(store, lp.project, "DEFINES") : -1;
-    if (visible_to_render != 1 || hidden_to_render != 0) {
+    if (visible_to_render != 1 || hidden_to_render != 1) {
         fprintf(stderr,
                 "  [LRP] rust/macro_hidden_carrier visible->render=%d "
-                "hidden->render=%d (expected 1 and 0)\n",
+                "hidden->render=%d (expected 1 and 1)\n",
                 visible_to_render, hidden_to_render);
         lrp_diag(store, lp.project, "rust/macro_hidden_carrier");
     }
     lrp_cleanup(&lp, store);
 
     ASSERT_EQ(visible_to_render, 1);
-    ASSERT_EQ(hidden_to_render, 0);
+    ASSERT_EQ(hidden_to_render, 1);
     ASSERT_GTE(definitions, 1);
     PASS();
 }

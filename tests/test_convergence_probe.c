@@ -1090,9 +1090,8 @@ TEST(cp_enum_variant_kotlin_sealed) {
     PASS();
 }
 
-/* D6b — Rust enum with impl.
- * EXPECTED UNCERTAIN: `v.label()` where v: Direction is a call_expression;
- * the name-based resolver should find label() if it's unique. */
+/* D6b — Rust enum with impl. rust-analyzer resolves all three method sites;
+ * caller-target deduplication leaves the label and opposite edges. */
 TEST(cp_enum_variant_rust_impl) {
     static const CP_File f[] = {
         {"direction.rs",
@@ -1114,11 +1113,11 @@ TEST(cp_enum_variant_rust_impl) {
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls   = cp_edges(store, lp.project, "CALLS");
     int methods = cp_count_label(store, lp.project, "Method");
-    if (calls != 0 || methods < 1)
+    if (calls != 2 || methods < 1)
         cp_diag(store, lp.project, "enum_variant/rust_impl");
     cp_cleanup(&lp, store);
     ASSERT_TRUE(methods >= 1);  /* label + opposite must be Method nodes */
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 2);
     PASS();
 }
 
