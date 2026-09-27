@@ -15,6 +15,7 @@
  */
 #include "pipeline/pass_lsp_cross.h"
 
+#include "helpers.h"
 #include "pipeline/lsp_surface.h"
 #include "result_spill.h"
 #include "pipeline/pipeline_internal.h"
@@ -48,6 +49,8 @@ enum {
     PXC_MAX_FILE_BYTES_FACTOR = 100, /* same cap pass_calls.c uses for source size */
     PXC_ITOA_BUF = 16,
 };
+
+extern const TSLanguage *tree_sitter_rust(void);
 
 /* Format an int into a thread-local rotating buffer for log key=value emission.
  * Mirrors the itoa_log helper in pass_calls.c — kept local so passes don't
@@ -100,6 +103,190 @@ static char *pxc_read_file(const char *path, int *out_len) {
     memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
     *out_len = (int)nread;
     return buf;
+}
+
+static char *pxc_rust_path_attribute(CBMArena *arena, const char *source, TSNode mod_item) {
+    for (TSNode item = ts_node_prev_named_sibling(mod_item); !ts_node_is_null(item);
+         item = ts_node_prev_named_sibling(item)) {
+        if (strcmp(ts_node_type(item), "attribute_item") != 0) {
+            break;
+        }
+        TSNode attribute = cbm_find_child_by_kind(item, "attribute");
+        if (ts_node_is_null(attribute) || ts_node_named_child_count(attribute) < 2) {
+            continue;
+        }
+        TSNode name = ts_node_named_child(attribute, 0);
+        size_t name_length = ts_node_end_byte(name) - ts_node_start_byte(name);
+        if (name_length != 4 || memcmp(source + ts_node_start_byte(name), "path", 4) != 0) {
+            continue;
+        }
+        TSNode literal = ts_node_named_child(attribute, 1);
+        const char *literal_kind = ts_node_type(literal);
+        if (strcmp(literal_kind, "string_literal") != 0 &&
+            strcmp(literal_kind, "raw_string_literal") != 0) {
+            return NULL;
+        }
+        TSNode content = cbm_find_child_by_kind(literal, "string_content");
+        if (ts_node_is_null(content)) {
+            return cbm_arena_strdup(arena, "");
+        }
+        uint32_t start = ts_node_start_byte(content);
+        size_t length = ts_node_end_byte(content) - start;
+        if (strcmp(literal_kind, "string_literal") == 0 && memchr(source + start, '\\', length)) {
+            return NULL;
+        }
+        return cbm_arena_strndup(arena, source + start, length);
+    }
+    return NULL;
+}
+
+static int pxc_rust_path_target_index(const cbm_file_info_t *files, int file_count,
+                                      int parent_index, const char *path) {
+    char joined[CBM_SZ_4K];
+    const char *parent_path = files[parent_index].path;
+    const char *slash = strrchr(parent_path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(parent_path, '\\');
+    if (!slash || (backslash && backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    bool absolute = path[0] == '/' || path[0] == '\\' || (path[0] && path[1] == ':');
+    int written = absolute ? snprintf(joined, sizeof(joined), "%s", path)
+                           : snprintf(joined, sizeof(joined), "%.*s/%s",
+                                      slash ? (int)(slash - parent_path) : 0, parent_path, path);
+    char target[CBM_SZ_4K];
+    if (written < 0 || written >= (int)sizeof(joined) ||
+        !cbm_canonical_path(joined, target, sizeof(target))) {
+        return -1;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language != CBM_LANG_RUST) {
+            continue;
+        }
+        char candidate[CBM_SZ_4K];
+        if (cbm_canonical_path(files[i].path, candidate, sizeof(candidate)) &&
+            strcmp(candidate, target) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static char *pxc_rust_declared_module(const char *parent_module, const char *name) {
+    if (!parent_module || !parent_module[0] || !name || !name[0]) {
+        return NULL;
+    }
+    size_t parent_length = strlen(parent_module);
+    const char *last = strrchr(parent_module, '.');
+    if (last && (strcmp(last + 1, "mod") == 0 || strcmp(last + 1, "lib") == 0 ||
+                 strcmp(last + 1, "main") == 0)) {
+        parent_length = (size_t)(last - parent_module);
+    }
+    size_t length = parent_length + 1 + strlen(name) + 1;
+    char *module = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, length);
+    if (module) {
+        snprintf(module, length, "%.*s.%s", (int)parent_length, parent_module, name);
+    }
+    return module;
+}
+
+static void pxc_apply_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
+                                        const cbm_file_info_t *files, int file_count,
+                                        char *const *def_modules) {
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language == CBM_LANG_RUST && cache[i]) {
+            cache[i]->rust_relative_module_qn = "";
+        }
+    }
+    char **declared = (char **)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(char *));
+    bool *seen = (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(bool));
+    if (!declared || !seen) {
+        cbm_free(CBM_MEM_CLASS_OTHER, declared);
+        cbm_free(CBM_MEM_CLASS_OTHER, seen);
+        return;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language == CBM_LANG_RUST && cache[i]) {
+            cache[i]->rust_relative_module_qn = NULL;
+        }
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language != CBM_LANG_RUST) {
+            continue;
+        }
+        int source_len = 0;
+        char *owned_source = NULL;
+        const char *source = cache[i] ? cache[i]->source : NULL;
+        if (source) {
+            source_len = cache[i]->source_len;
+        } else {
+            owned_source = pxc_read_file(files[i].path, &source_len);
+            source = owned_source;
+        }
+        TSTree *owned_tree = NULL;
+        TSTree *tree = cache[i] ? cache[i]->cached_tree : NULL;
+        TSParser *parser = NULL;
+        if (source && source_len > 0 && !tree) {
+            parser = ts_parser_new();
+            if (parser && ts_parser_set_language(parser, tree_sitter_rust())) {
+                owned_tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+                tree = owned_tree;
+            }
+        }
+        if (source && tree) {
+            TSNode root = ts_tree_root_node(tree);
+            uint32_t count = ts_node_named_child_count(root);
+            for (uint32_t child = 0; child < count; child++) {
+                TSNode item = ts_node_named_child(root, child);
+                if (strcmp(ts_node_type(item), "mod_item") != 0 ||
+                    !ts_node_is_null(ts_node_child_by_field_name(item, "body", 4))) {
+                    continue;
+                }
+                char *path = pxc_rust_path_attribute(arena, source, item);
+                TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
+                if (!path || ts_node_is_null(name_node)) {
+                    continue;
+                }
+                int target = pxc_rust_path_target_index(files, file_count, i, path);
+                if (target < 0) {
+                    continue;
+                }
+                char *name = cbm_node_text(arena, name_node, source);
+                char *candidate = pxc_rust_declared_module(def_modules[i], name);
+                if (!candidate) {
+                    continue;
+                }
+                if (!seen[target]) {
+                    declared[target] = candidate;
+                    seen[target] = true;
+                } else if (declared[target][0] && strcmp(declared[target], candidate) != 0) {
+                    cbm_free(CBM_MEM_CLASS_OTHER, declared[target]);
+                    candidate[0] = '\0';
+                    declared[target] = candidate;
+                } else {
+                    cbm_free(CBM_MEM_CLASS_OTHER, candidate);
+                }
+            }
+        }
+        if (owned_tree) {
+            ts_tree_delete(owned_tree);
+        }
+        if (parser) {
+            ts_parser_delete(parser);
+        }
+        cbm_free(CBM_MEM_CLASS_EXTRACT, owned_source);
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (seen[i] && cache[i]) {
+            const char *module =
+                declared[i][0] ? cbm_arena_strdup(&cache[i]->arena, declared[i]) : "";
+            cache[i]->rust_relative_module_qn = module ? module : "";
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, declared[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, declared);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
 }
 
 /* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP registrars
@@ -593,6 +780,10 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         }
         return NULL;
     }
+    for (int fi = 0; fi < file_count; fi++) {
+        def_modules[fi] = cbm_pipeline_fqn_module_dir(project_name, files[fi].rel_path,
+                                                      pxc_module_is_dir(files[fi].language));
+    }
     int idx = 0;
     for (int fi = 0; fi < file_count; fi++) {
         if (out_def_starts) {
@@ -607,10 +798,6 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         }
         if (!fr)
             continue;
-        if (!def_modules[fi]) {
-            def_modules[fi] = cbm_pipeline_fqn_module_dir(project_name, files[fi].rel_path,
-                                                          pxc_module_is_dir(files[fi].language));
-        }
         const char *namespace_name = fr->namespace_name;
         if ((!namespace_name || !namespace_name[0]) && files[fi].rel_path) {
             namespace_name = pxc_infer_jvm_namespace(arena, files[fi].rel_path, files[fi].language);
@@ -659,6 +846,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
     if (out_def_starts) {
         out_def_starts[file_count] = idx;
     }
+    pxc_apply_rust_path_modules(arena, cache, files, file_count, def_modules);
     *out_count = idx;
     return defs;
 }
@@ -1481,10 +1669,14 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
          * workspace manifest (set once by the sequential driver) lets
          * `crate_a::foo` route across the crate boundary (#56). */
         CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
-        cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
-                                             def_count, imp_names, imp_qns, imp_count, tree,
-                                             g_pxc_rust_manifest, cbm_pxc_get_rust_import_source(),
-                                             &out, &synthetic_calls);
+        const char *source_module_qn = r->module_qn ? r->module_qn : module_qn;
+        const char *declared_module_qn = r->rust_relative_module_qn;
+        const char *relative_module_qn =
+            declared_module_qn ? (declared_module_qn[0] ? declared_module_qn : NULL) : module_qn;
+        cbm_run_rust_lsp_cross_with_manifest(
+            &scratch, source, source_len, source_module_qn, relative_module_qn, rdefs, def_count,
+            imp_names, imp_qns, imp_count, tree, g_pxc_rust_manifest,
+            cbm_pxc_get_rust_import_source(), &out, &synthetic_calls);
         break;
     }
     default:
@@ -1718,10 +1910,15 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_arena_init(&scratch);
             CBMResolvedCallArray out = {0};
             CBMCallArray synthetic_calls = {0};
+            const char *source_module_qn = result->module_qn ? result->module_qn : def_module;
+            const char *declared_module_qn = result->rust_relative_module_qn;
+            const char *relative_module_qn =
+                declared_module_qn ? (declared_module_qn[0] ? declared_module_qn : NULL)
+                                   : def_module;
             cbm_run_rust_lsp_cross_with_registry(
-                &scratch, source, source_len, def_module, shared, imp_keys, imp_vals, imp_count,
-                result->cached_tree, cbm_pxc_get_rust_manifest(), cbm_pxc_get_rust_import_source(),
-                &out, &synthetic_calls);
+                &scratch, source, source_len, source_module_qn, relative_module_qn, shared,
+                imp_keys, imp_vals, imp_count, result->cached_tree, cbm_pxc_get_rust_manifest(),
+                cbm_pxc_get_rust_import_source(), &out, &synthetic_calls);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             cbm_arena_destroy(&scratch);
