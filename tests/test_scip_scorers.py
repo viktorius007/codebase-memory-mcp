@@ -700,6 +700,74 @@ class ScipScorerTests(unittest.TestCase):
 
             self.assertEqual(identities[1].symbol, outer)
 
+    def test_file_nodes_are_excluded_from_identity_outcomes(self):
+        source = "fn target() {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            target = symbol("fixture/target().")
+            write_identity_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "target"), target, 1, line_range(source, 0)
+                    ),
+                ),
+                (symbol_information(target, 17, "target"),),
+            )
+            create_identity_database(
+                database,
+                (
+                    (
+                        1, "fixture", "File", "lib.rs", "fixture.src.lib",
+                        "src/lib.rs", 1, 1, "{}",
+                    ),
+                    (
+                        2, "fixture", "Function", "target", "fixture.target",
+                        "src/lib.rs", 1, 1, "{}",
+                    ),
+                ),
+            )
+
+            identities = load_identity_module().map_rust_graph_nodes(database, scip)
+
+            self.assertEqual(set(identities), {2})
+
+    def test_path_named_module_maps_to_scip_module_definition(self):
+        source = "mod network_rule_saved {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            module_symbol = symbol("fixture/network_rule_saved/")
+            write_identity_scip(
+                scip,
+                "src/network_rule_saved.rs",
+                (
+                    occurrence(
+                        range_for(source, "network_rule_saved"),
+                        module_symbol,
+                        1,
+                        line_range(source, 0),
+                    ),
+                ),
+                (symbol_information(module_symbol, 29, "network_rule_saved"),),
+            )
+            create_identity_database(
+                database,
+                ((
+                    1, "fixture", "Module", "src/network_rule_saved.rs",
+                    "fixture.src.network_rule_saved", "src/network_rule_saved.rs",
+                    1, 1, "{}",
+                ),),
+            )
+
+            identities = load_identity_module().map_rust_graph_nodes(database, scip)
+
+            self.assertEqual(identities[1].symbol, module_symbol)
+
     def test_nested_functions_each_map_from_their_own_name_occurrence(self):
         source = "fn outer() {\n    fn left() {}\n    fn right() {}\n}\n"
         with tempfile.TemporaryDirectory() as temporary:
@@ -822,38 +890,161 @@ class ScipScorerTests(unittest.TestCase):
             )
 
     def test_derive_generated_method_maps_to_explicit_generated_identity(self):
-        source = "#[derive(Clone)]\nstruct Thing;\n"
+        source = (
+            "#[derive(Clone)]\n"
+            "struct Thing;\n"
+            "fn use_clone(value: &Thing) { value.clone(); }\n"
+        )
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            scip = root / "fixture.scip"
-            database = root / "graph.db"
+            fixture = ScorerFixture(temporary, source)
             owner = symbol("fixture/Thing#")
+            derived = symbol("fixture/impl#[Thing][Clone]clone().")
             write_identity_scip(
-                scip,
+                fixture.scip,
                 "src/lib.rs",
-                (occurrence(range_for(source, "Thing"), owner, 1, line_range(source, 1)),),
+                (
+                    occurrence(range_for(source, "Thing"), owner, 1, line_range(source, 1)),
+                    occurrence(range_for(source, "clone"), derived),
+                ),
                 (symbol_information(owner, 49, "Thing"),),
             )
             create_identity_database(
-                database,
-                ((
-                    1, "fixture", "Method", "clone", "fixture.Thing.clone[Clone]",
-                    "src/lib.rs", 1, 2,
-                    json.dumps({"rust_derive": "Clone", "rust_derive_owner": "fixture.Thing"}),
-                ),),
+                fixture.database,
+                (
+                    (
+                        1, "fixture", "Struct", "Thing", "fixture.Thing",
+                        "src/lib.rs", 1, 2, "{}",
+                    ),
+                    (
+                        2, "fixture", "Method", "clone", "fixture.Thing.clone[Clone]",
+                        "src/lib.rs", 1, 2,
+                        json.dumps(
+                            {"rust_derive": "Clone", "rust_derive_owner": "fixture.Thing"}
+                        ),
+                    ),
+                ),
             )
+
+            identity = load_identity_module()
+            identities = identity.map_rust_graph_nodes(fixture.database, fixture.scip)
+
+            self.assertEqual(
+                identities[2],
+                identity.IdentityOutcome(
+                    status="matched",
+                    symbol=derived,
+                    derive="Clone",
+                    owner="fixture.Thing",
+                ),
+            )
+            fixture.write_dump(
+                ((
+                    "clone()", 0, "fixture.Thing.clone[Clone]", "derive",
+                    "admitted",
+                ),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=1 wrong=0 unscorable=0",
+                result.stdout,
+            )
+
+    def test_missing_definitions_use_closed_specific_reasons(self):
+        source = "fn actual() {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "corpus"
+            (corpus / "src").mkdir(parents=True)
+            (corpus / "src" / "root.rs").write_text(
+                'include!("bindings.rs");\n', encoding="utf-8"
+            )
+            (corpus / "src" / "bindings.rs").write_text(
+                "pub type Binding = i32;\n", encoding="utf-8"
+            )
+            scip = root / "fixture.scip"
+            database = root / "graph.db"
+            actual = symbol("fixture/actual().")
+            write_identity_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "actual"), actual, 1, line_range(source, 0)
+                    ),
+                ),
+                (symbol_information(actual, 17, "actual"),),
+            )
+            create_identity_database(
+                database,
+                (
+                    (
+                        1, "fixture", "Function", "expected", "fixture.expected",
+                        "src/lib.rs", 1, 1, "{}",
+                    ),
+                    (
+                        2, "fixture", "Macro", "generated", "fixture.generated",
+                        "src/lib.rs", 1, 1, "{}",
+                    ),
+                    (
+                        3, "fixture", "Function", "inactive", "fixture.inactive",
+                        "src/inactive.rs", 1, 1,
+                        json.dumps({"decorators": ["#[cfg(any())]"]}),
+                    ),
+                    (
+                        4, "fixture", "Function", "generated_test",
+                        "fixture.generated_test",
+                        "src/proc.rs", 1, 1,
+                        json.dumps({"decorators": ["#[tokio::test]"]}),
+                    ),
+                    (
+                        5, "fixture", "Type", "Binding", "fixture.Binding",
+                        "src/bindings.rs", 1, 1, "{}",
+                    ),
+                    (
+                        6, "fixture", "Function", "missing", "fixture.missing",
+                        "src/missing.rs", 1, 1, "{}",
+                    ),
+                    (
+                        7, "fixture", "Function", "active", "fixture.active",
+                        "src/active.rs", 1, 1,
+                        json.dumps({"decorators": ["#[cfg(all())]"]}),
+                    ),
+                ),
+            )
+            connection = sqlite3.connect(database)
+            connection.execute("create table projects (name text, root_path text)")
+            connection.execute(
+                "insert into projects values (?, ?)", ("fixture", str(corpus))
+            )
+            connection.commit()
+            connection.close()
 
             identity = load_identity_module()
             identities = identity.map_rust_graph_nodes(database, scip)
 
             self.assertEqual(
-                identities[1],
-                identity.IdentityOutcome(
-                    status="generated_by_derive",
-                    reason="generated by derive Clone for fixture.Thing",
-                    derive="Clone",
-                    owner="fixture.Thing",
-                ),
+                {
+                    node_id: (outcome.status, outcome.reason)
+                    for node_id, outcome in identities.items()
+                },
+                {
+                    1: ("oracle_gap", "name_mismatch"),
+                    2: ("oracle_gap", "unsupported_node_kind"),
+                    3: ("not_in_oracle_configuration", "cfg_inactive"),
+                    4: ("oracle_gap", "proc_macro_output"),
+                    5: ("oracle_gap", "included_source"),
+                    6: ("oracle_gap", "oracle_document_missing"),
+                    7: ("oracle_gap", "oracle_document_missing"),
+                },
+            )
+            self.assertTrue(
+                all(
+                    outcome.reason in identity.IDENTITY_REASONS
+                    for outcome in identities.values()
+                )
             )
 
     def test_multiple_oracle_symbols_at_one_site_are_ambiguous(self):
