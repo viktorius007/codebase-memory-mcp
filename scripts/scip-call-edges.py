@@ -120,6 +120,53 @@ def parse_with_definition_sites(path):
     return documents, definitions, references, definition_sites
 
 
+def parse_definition_identities(path):
+    """Return SCIP definition occurrences with their declared name and kind."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    definitions = defaultdict(list)
+    for number, (kind, payload) in fields(data, 0, len(data)):
+        if number != 2 or kind != "bytes":
+            continue
+        doc_path, occurrences, symbols = None, [], {}
+        for dnum, (dkind, dpayload) in fields(payload, 0, len(payload)):
+            if dnum == 1 and dkind == "bytes":
+                doc_path = dpayload.decode()
+            elif dnum == 2 and dkind == "bytes":
+                occurrences.append(dpayload)
+            elif dnum == 3 and dkind == "bytes":
+                identity = display_name = None
+                symbol_kind = 0
+                for snum, (skind, spayload) in fields(dpayload, 0, len(dpayload)):
+                    if snum == 1 and skind == "bytes":
+                        identity = spayload.decode("utf8", "replace")
+                    elif snum == 5 and skind == "varint":
+                        symbol_kind = spayload
+                    elif snum == 6 and skind == "bytes":
+                        display_name = spayload.decode("utf8", "replace")
+                if identity is not None:
+                    symbols[identity] = (display_name, symbol_kind)
+        if doc_path is None:
+            continue
+        for occurrence in occurrences:
+            rng = identity = None
+            roles = 0
+            for onum, (okind, opayload) in fields(occurrence, 0, len(occurrence)):
+                if onum == 1 and okind == "bytes":
+                    rng = packed_ints(opayload)
+                elif onum == 2 and okind == "bytes":
+                    identity = opayload.decode("utf8", "replace")
+                elif onum == 3 and okind == "varint":
+                    roles = opayload
+            information = symbols.get(identity)
+            if roles & DEFINITION_ROLE and rng is not None and information is not None:
+                display_name, symbol_kind = information
+                definitions[doc_path].append(
+                    (norm_range(rng), identity, display_name, symbol_kind)
+                )
+    return definitions
+
+
 def parse(path):
     documents, definitions, references, _ = parse_with_definition_sites(path)
     return documents, definitions, references
