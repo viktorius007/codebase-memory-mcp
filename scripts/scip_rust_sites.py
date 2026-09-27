@@ -315,6 +315,24 @@ def _is_attribute_open(code, cursor):
     return marker >= 0 and code[marker] == ord("#")
 
 
+def _previous_identifier(code, cursor):
+    end = _previous_code_byte(code, cursor) + 1
+    start = end
+    while start > 0:
+        byte = code[start - 1]
+        if byte < 0x80 and not chr(byte).isalnum() and byte != ord("_"):
+            break
+        start -= 1
+    return code[start:end]
+
+
+def _is_matches_open(code, cursor):
+    bang = _previous_code_byte(code, cursor)
+    return bang >= 0 and code[bang] == ord("!") and (
+        _previous_identifier(code, bang) == b"matches"
+    )
+
+
 def _delimited_ranges(code, selected_open):
     pairs = {ord("("): ord(")"), ord("["): ord("]"), ord("{"): ord("}")}
     closers = set(pairs.values())
@@ -348,55 +366,133 @@ def _attribute_ranges(code):
     return _merged_ranges(_delimited_ranges(code, _is_attribute_open))
 
 
-def _rust_call_callees(sources):
+def _matches_pattern_ranges(code):
+    pairs = {ord("("): ord(")"), ord("["): ord("]"), ord("{"): ord("}")}
+    ranges = []
+    for start, end in _delimited_ranges(code, _is_matches_open):
+        stack = []
+        separator = None
+        for cursor in range(start, end):
+            byte = code[cursor]
+            if byte in pairs:
+                stack.append(pairs[byte])
+            elif stack and byte == stack[-1]:
+                stack.pop()
+            elif byte == ord(",") and not stack:
+                separator = cursor
+                break
+        if separator is None:
+            continue
+        pattern_start = _skip_space(code, separator + 1)
+        pattern_end = end
+        while (
+            pattern_end > pattern_start
+            and code[pattern_end - 1 : pattern_end].isspace()
+        ):
+            pattern_end -= 1
+        if code[pattern_end - 1 : pattern_end] == b",":
+            pattern_end = _previous_code_byte(code, pattern_end - 1) + 1
+        if pattern_start < pattern_end:
+            ranges.append((pattern_start, pattern_end))
+    return ranges
+
+
+def _rust_syntax_ranges(sources):
     callees = defaultdict(set)
-    prefix = b"fn __cbm(){ __cbm("
-    suffix = b"); }"
+    patterns = defaultdict(set)
+    call_prefix = b"fn __cbm(){ __cbm("
+    call_suffix = b"); }"
+    pattern_prefix = b"fn __cbm(){ match __value { "
+    pattern_suffix = b" => (), _ => () } }"
     with tempfile.TemporaryDirectory(prefix="cbm-rust-call-sites-") as temporary:
         inputs = {}
         temporary_path = Path(temporary)
         input_number = 0
-        for relative_path, source in sources.items():
-            raw_path = temporary_path / f"{input_number}.rs"
-            raw_path.write_bytes(source)
-            inputs[str(raw_path)] = (relative_path, 0, len(source), 0)
+
+        def add_input(content, source_range):
+            nonlocal input_number
+            path = temporary_path / f"{input_number}.rs"
+            path.write_bytes(content)
+            inputs[str(path)] = source_range
             input_number += 1
+
+        for relative_path, source in sources.items():
+            add_input(source, (relative_path, 0, len(source), 0))
             code = _masked_source(source)
-            for start, end in _delimited_ranges(code, _is_macro_open):
-                macro_path = temporary_path / f"{input_number}.rs"
-                macro_path.write_bytes(prefix + source[start:end] + suffix)
-                inputs[str(macro_path)] = (relative_path, start, end, len(prefix))
-                input_number += 1
-        result = subprocess.run(
-            (
-                "ast-grep", "run", "--lang", "rust", "--pattern",
-                "$F($$$ARGS)", "--json=stream", str(temporary_path),
-            ),
-            stdout=subprocess.PIPE,
-            check=False,
-        )
-        if result.returncode not in (0, 1):
-            raise subprocess.CalledProcessError(result.returncode, result.args)
-        for line in result.stdout.splitlines():
-            record = json.loads(line)
-            callee = record["metaVariables"]["single"]["F"]
-            relative_path, source_start, source_end, wrapper_length = inputs[
-                record["file"]
-            ]
-            start = source_start + callee["range"]["byteOffset"]["start"]
-            end = source_start + callee["range"]["byteOffset"]["end"]
-            start -= wrapper_length
-            end -= wrapper_length
-            if source_start <= start and end <= source_end:
-                text = callee["text"]
-                callees[relative_path].add(
-                    (
-                        start,
-                        end,
-                        text.startswith("(") and text.endswith(")"),
-                    )
+            token_ranges = set(_delimited_ranges(code, _is_macro_open))
+            token_ranges.update(_delimited_ranges(code, _is_attribute_open))
+            for start, end in sorted(token_ranges):
+                add_input(
+                    call_prefix + source[start:end] + call_suffix,
+                    (relative_path, start, end, len(call_prefix)),
                 )
-    return {relative_path: sorted(items) for relative_path, items in callees.items()}
+            for start, end in _matches_pattern_ranges(code):
+                add_input(
+                    pattern_prefix + source[start:end] + pattern_suffix,
+                    (relative_path, start, end, len(pattern_prefix)),
+                )
+        queries = (
+            ("call", "--pattern", "$F($$$ARGS)"),
+            ("pattern", "--kind", "tuple_struct_pattern"),
+        )
+        for query, option, value in queries:
+            result = subprocess.run(
+                (
+                    "ast-grep", "run", "--lang", "rust", option, value,
+                    "--json=stream", str(temporary_path),
+                ),
+                stdout=subprocess.PIPE,
+                check=False,
+            )
+            if result.returncode not in (0, 1):
+                raise subprocess.CalledProcessError(
+                    result.returncode, result.args
+                )
+            for line in result.stdout.splitlines():
+                record = json.loads(line)
+                node = (
+                    record["metaVariables"]["single"]["F"]
+                    if query == "call"
+                    else record
+                )
+                relative_path, source_start, source_end, wrapper_length = inputs[
+                    record["file"]
+                ]
+                start = (
+                    source_start
+                    + node["range"]["byteOffset"]["start"]
+                    - wrapper_length
+                )
+                end = (
+                    source_start
+                    + node["range"]["byteOffset"]["end"]
+                    - wrapper_length
+                )
+                if not (source_start <= start and end <= source_end):
+                    continue
+                if query == "call":
+                    text = node["text"]
+                    callees[relative_path].add(
+                        (
+                            start,
+                            end,
+                            text.startswith("(") and text.endswith(")"),
+                        )
+                    )
+                else:
+                    patterns[relative_path].add((start, end))
+    return (
+        {relative_path: sorted(items) for relative_path, items in callees.items()},
+        {
+            relative_path: _merged_ranges(sorted(items))
+            for relative_path, items in patterns.items()
+        },
+    )
+
+
+def _rust_call_callees(sources):
+    callees, _ = _rust_syntax_ranges(sources)
+    return callees
 
 
 def _inside_ranges(ranges, starts, offset):
@@ -546,11 +642,10 @@ def _completeness_counts(
             if not _callee_position(code, end):
                 counts["excluded_not_callee_position"] += 1
                 continue
-            if _inside_ranges(attribute_ranges, attribute_starts, start):
-                counts["excluded_attribute_syntax"] += 1
-                continue
             if (relative_path, start, end) in inventory_keys:
                 counts["inventory_found"] += 1
+            elif _inside_ranges(attribute_ranges, attribute_starts, start):
+                counts["excluded_attribute_syntax"] += 1
             elif _inside_ranges(macro_ranges, macro_starts, start):
                 counts["excluded_macro_argument_parse_failure"] += 1
             else:
@@ -584,7 +679,7 @@ def _call_inventory(corpus_root, scip_path):
         for relative_path in references
         if (source_path := corpus_root / relative_path).is_file()
     }
-    parsed_callees = _rust_call_callees(sources)
+    parsed_callees, parsed_patterns = _rust_syntax_ranges(sources)
     records = []
     for relative_path, occurrences in references.items():
         source = sources.get(relative_path)
@@ -595,6 +690,8 @@ def _call_inventory(corpus_root, scip_path):
         macro_starts = [start for start, _ in macro_ranges]
         attribute_ranges = _attribute_ranges(code)
         attribute_starts = [start for start, _ in attribute_ranges]
+        pattern_ranges = parsed_patterns.get(relative_path, ())
+        pattern_starts = [start for start, _ in pattern_ranges]
         grouped = defaultdict(set)
         for source_range, symbol in occurrences:
             grouped[source_range].add(symbol)
@@ -604,9 +701,15 @@ def _call_inventory(corpus_root, scip_path):
             if byte_range is None:
                 continue
             start, end = byte_range
-            if _inside_ranges(attribute_ranges, attribute_starts, start):
+            in_macro = _inside_ranges(macro_ranges, macro_starts, start)
+            in_attribute = _inside_ranges(
+                attribute_ranges, attribute_starts, start
+            )
+            if in_attribute and not any(_callable_symbol(item) for item in symbols):
                 continue
             if not _invoked_leaf(code, start, end):
+                continue
+            if _inside_ranges(pattern_ranges, pattern_starts, start):
                 continue
             matches = [
                 callee
@@ -614,10 +717,16 @@ def _call_inventory(corpus_root, scip_path):
                 if callee[0] <= start and end <= callee[1]
             ]
             if not matches:
-                continue
-            _, _, parenthesized = min(
-                matches, key=lambda callee: callee[1] - callee[0]
-            )
+                if (
+                    not (in_macro or in_attribute)
+                    or _previous_identifier(code, start) == b"fn"
+                ):
+                    continue
+                parenthesized = False
+            else:
+                _, _, parenthesized = min(
+                    matches, key=lambda callee: callee[1] - callee[0]
+                )
             constructor = (
                 len(symbols) == 1 and _constructor_symbol(next(iter(symbols)))
             )

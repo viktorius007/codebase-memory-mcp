@@ -1083,6 +1083,72 @@ class ScipScorerTests(unittest.TestCase):
             [tuple(record) for record in records],
         )
 
+    def test_inventory_includes_call_inside_attribute_arguments(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "#[tracing::instrument(fields(value = target()))]\n"
+            "fn caller() {}\n"
+        )
+        start, end = byte_span(source, "target")
+        target = symbol("fixture/target().")
+
+        records = inventory_records(source, "target", target)
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, target, "plain_path")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_recovers_call_from_complex_macro_arguments(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "fn caller() { let expected = json!({\n"
+            '    "account": {"type": "chatgpt", "planType": plan_type},\n'
+            '    "workspaceRouting": routing("selected", "https://example.com")\n'
+            "}); }\n"
+        )
+        start, end = byte_span(source, "routing")
+        target = symbol("fixture/routing().")
+
+        records = inventory_records(source, "routing", target)
+
+        self.assertEqual(
+            [("src/lib.rs", start, end, target, "macro_argument")],
+            [tuple(record) for record in records],
+        )
+
+    def test_inventory_excludes_tuple_patterns(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "enum Event { Done(u8) }\n"
+            "fn caller(event: Event) {\n"
+            "    let constructed = Event::Done(1);\n"
+            "    let Event::Done(from_let) = event else { return; };\n"
+            "    if let Event::Done(from_if_let) = event {}\n"
+            "    match event { Event::Done(from_match) => {} }\n"
+            "    let matched = matches!(event, Event::Done(_));\n"
+            "}\n"
+        )
+        target = symbol("fixture/Event#Done#")
+        construction = byte_span(source, "Done", 1)
+
+        records = inventory_records(
+            source, "Done", target, (1, 2, 3, 4, 5)
+        )
+
+        self.assertEqual(
+            [
+                (
+                    "src/lib.rs",
+                    construction[0],
+                    construction[1],
+                    target,
+                    "constructor",
+                )
+            ],
+            [tuple(record) for record in records],
+        )
+
     def test_inventory_parses_each_file_in_isolation(self):
         source = b"fn caller() { target(); }\n"
         spec = importlib.util.spec_from_file_location(
