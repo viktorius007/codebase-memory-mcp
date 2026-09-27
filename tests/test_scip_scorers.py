@@ -169,10 +169,16 @@ class ScorerFixture:
     def create_database(self, nodes):
         connection = sqlite3.connect(self.database)
         connection.execute(
-            "create table nodes (qualified_name text, file_path text, name text, "
-            "label text, start_line integer, end_line integer)"
+            "create table nodes (id integer primary key, project text, label text, "
+            "name text, qualified_name text, file_path text, start_line integer, "
+            "end_line integer, properties text)"
         )
-        connection.executemany("insert into nodes values (?,?,?,?,?,?)", nodes)
+        expanded = (
+            (index, "fixture", label, name, qualified_name, file_path, start, end, "{}")
+            for index, (qualified_name, file_path, name, label, start, end)
+            in enumerate(nodes, 1)
+        )
+        connection.executemany("insert into nodes values (?,?,?,?,?,?,?,?,?)", expanded)
         connection.commit()
         connection.close()
 
@@ -180,11 +186,13 @@ class ScorerFixture:
         rows = []
         for needle, ordinal, target, strategy, verdict in calls:
             start, end = byte_span(self.source, needle, ordinal)
+            callee_start, callee_end = byte_span(self.source, needle[:-2], ordinal)
             rows.append(
                 "\t".join(
                     (
                         "C", "src/lib.rs", str(start), str(end), "fixture.caller",
                         needle[:-2], target, strategy, "1.0", verdict, "-", "-",
+                        str(callee_start), str(callee_end),
                     )
                 )
             )
@@ -197,7 +205,7 @@ class ScorerFixture:
             (
                 "python3", str(SITE_SCORER), "--corpus", str(self.corpus),
                 "--dump", str(self.dump), "--db", str(self.database),
-                "--scip", str(self.scip),
+                "--scip", str(self.scip), "--out", str(self.detail),
             ),
             text=True,
             capture_output=True,
@@ -207,6 +215,152 @@ class ScorerFixture:
 
 
 class ScipScorerTests(unittest.TestCase):
+    def test_published_wrong_edge_is_scored_wrong(self):
+        source = 'fn target(_: &str) {}\nfn wrong() {}\nfn caller() { target("("); }\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            truth = symbol("fixture/target().")
+            wrong = symbol("fixture/wrong().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(range_for(source, "target", 0), truth, 1, line_range(source, 0)),
+                    occurrence(range_for(source, "wrong"), wrong, 1, line_range(source, 1)),
+                    occurrence(range_for(source, "target", 1), truth),
+                ),
+                (
+                    symbol_information(truth, 17, "target"),
+                    symbol_information(wrong, 17, "wrong"),
+                ),
+            )
+            fixture.create_database(
+                (("fixture.wrong", "src/lib.rs", "wrong", "Function", 2, 2),)
+            )
+            site_start, site_end = byte_span(source, 'target("(")')
+            callee_start, callee_end = byte_span(source, "target", 1)
+            fixture.dump.write_text(
+                "\t".join(
+                    (
+                        "C", "src/lib.rs", str(site_start), str(site_end),
+                        "fixture.caller", "target", "fixture.wrong", "direct",
+                        "1.0", "admitted", "-", "-", str(callee_start),
+                        str(callee_end),
+                    )
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
+            )
+            wrong_rows = (fixture.detail / "wrong-edges.tsv").read_text(encoding="utf-8")
+            self.assertIn("fixture.wrong", wrong_rows)
+            self.assertIn(truth, wrong_rows)
+
+    def test_closed_resolution_is_absent_from_precision(self):
+        source = "fn target() {}\nfn wrong() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            truth = symbol("fixture/target().")
+            wrong = symbol("fixture/wrong().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(range_for(source, "target", 0), truth, 1, line_range(source, 0)),
+                    occurrence(range_for(source, "wrong"), wrong, 1, line_range(source, 1)),
+                    occurrence(range_for(source, "target", 1), truth),
+                ),
+                (
+                    symbol_information(truth, 17, "target"),
+                    symbol_information(wrong, 17, "wrong"),
+                ),
+            )
+            fixture.create_database(
+                (("fixture.wrong", "src/lib.rs", "wrong", "Function", 2, 2),)
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.wrong", "direct", "closed"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=0 correct=0 wrong=0 unscorable=0", result.stdout
+            )
+
+    def test_oracle_call_without_indexer_record_is_missed(self):
+        source = "fn target() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            truth = symbol("fixture/target().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(range_for(source, "target", 0), truth, 1, line_range(source, 0)),
+                    occurrence(range_for(source, "target", 1), truth),
+                ),
+                (symbol_information(truth, 17, "target"),),
+            )
+            fixture.create_database(())
+            fixture.write_dump(())
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("truth sites 1 found correct 0 recall=0.00%", result.stdout)
+            missed = (fixture.detail / "missed-occurrences.tsv").read_text(encoding="utf-8")
+            self.assertIn(truth, missed)
+
+    def test_long_function_with_nested_function_scores_correct(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "fn target() {\n"
+            "    let before = 1;\n"
+            "    fn nested() {}\n"
+            "}\n"
+            "fn caller() { target(); }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/target().")
+            nested = symbol("fixture/target/nested().")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(range_for(source, "target", 0), target, 1, line_range(source, 1)),
+                    occurrence(range_for(source, "nested"), nested, 1, line_range(source, 3)),
+                    occurrence(range_for(source, "caller"), caller, 1, line_range(source, 5)),
+                    occurrence(range_for(source, "target", 1), target),
+                ),
+                (
+                    symbol_information(target, 17, "target"),
+                    symbol_information(nested, 17, "nested"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (("fixture.target", "src/lib.rs", "target", "Function", 2, 5),)
+            )
+            fixture.write_dump(
+                (("target()", 1, "fixture.target", "direct", "admitted"),)
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
+            )
+
     def test_inventory_finds_callee_after_string_with_open_parenthesis(self):
         source = 'fn package_anchor() {}\nfn caller() { sink("(", target()); }\n'
         start, end = byte_span(source, "target")
@@ -524,8 +678,11 @@ class ScipScorerTests(unittest.TestCase):
             result = fixture.run_site()
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("('exact', 'admitted', 'ambiguous', 'ambiguous_oracle')", result.stdout)
-            self.assertNotIn("correct=      1", result.stdout)
+            self.assertIn(
+                "strategy=exact call_form=plain_path correct=0 wrong=0 unscorable=1",
+                result.stdout,
+            )
+            self.assertIn("unscorable_reason=oracle_ambiguous count=1", result.stdout)
 
     def test_trait_method_truth_does_not_match_inherent_method_definition(self):
         source = "fn trait_run() {}\nfn inherent_run() {}\nfn caller() { run(); }\n"
@@ -533,13 +690,17 @@ class ScipScorerTests(unittest.TestCase):
             fixture = ScorerFixture(temporary, source)
             truth = symbol("fixture/impl#[Thing][Trait]run().")
             inherent = symbol("fixture/impl#[Thing]run().")
-            write_scip(
+            write_identity_scip(
                 fixture.scip,
                 "src/lib.rs",
                 (
                     occurrence(range_for(source, "trait_run"), truth, 1, line_range(source, 0)),
                     occurrence(range_for(source, "inherent_run"), inherent, 1, line_range(source, 1)),
                     occurrence(range_for(source, "run", 2), truth),
+                ),
+                (
+                    symbol_information(truth, 26, "run"),
+                    symbol_information(inherent, 26, "run"),
                 ),
             )
             fixture.create_database(
@@ -550,8 +711,10 @@ class ScipScorerTests(unittest.TestCase):
             result = fixture.run_site()
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("('method', 'admitted', 'internal', 'wrong_definition')", result.stdout)
-            self.assertNotIn("correct=      1", result.stdout)
+            self.assertIn(
+                "strategy=method call_form=plain_path correct=0 wrong=1 unscorable=0",
+                result.stdout,
+            )
 
     def test_uppercase_module_name_is_not_treated_as_method_owner_identity(self):
         source = "fn method_run() {}\nfn module_run() {}\nfn caller() { run(); }\n"
@@ -559,13 +722,17 @@ class ScipScorerTests(unittest.TestCase):
             fixture = ScorerFixture(temporary, source)
             truth = symbol("fixture/impl#[Thing]run().")
             module_function = symbol("fixture/Thing/run().")
-            write_scip(
+            write_identity_scip(
                 fixture.scip,
                 "src/lib.rs",
                 (
                     occurrence(range_for(source, "method_run"), truth, 1, line_range(source, 0)),
                     occurrence(range_for(source, "module_run"), module_function, 1, line_range(source, 1)),
                     occurrence(range_for(source, "run", 2), truth),
+                ),
+                (
+                    symbol_information(truth, 26, "run"),
+                    symbol_information(module_function, 17, "run"),
                 ),
             )
             fixture.create_database(
@@ -576,15 +743,17 @@ class ScipScorerTests(unittest.TestCase):
             result = fixture.run_site()
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("('owner', 'admitted', 'internal', 'wrong_definition')", result.stdout)
-            self.assertNotIn("correct=      1", result.stdout)
+            self.assertIn(
+                "strategy=owner call_form=plain_path correct=0 wrong=1 unscorable=0",
+                result.stdout,
+            )
 
     def test_recall_counts_sibling_call_occurrences_separately(self):
         source = "fn target() {}\nfn caller() { target(); target(); }\n"
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
             truth = symbol("fixture/target().")
-            write_scip(
+            write_identity_scip(
                 fixture.scip,
                 "src/lib.rs",
                 (
@@ -592,6 +761,7 @@ class ScipScorerTests(unittest.TestCase):
                     occurrence(range_for(source, "target", 1), truth),
                     occurrence(range_for(source, "target", 2), truth),
                 ),
+                (symbol_information(truth, 17, "target"),),
             )
             fixture.create_database(
                 (("fixture.src.lib.target", "src/lib.rs", "target", "Function", 1, 1),)
@@ -615,7 +785,7 @@ class ScipScorerTests(unittest.TestCase):
             truth = symbol("fixture/right/target().")
             wrong = symbol("fixture/wrong/target().")
             caller = symbol("fixture/caller().")
-            write_scip(
+            write_identity_scip(
                 fixture.scip,
                 "src/lib.rs",
                 (
@@ -624,6 +794,29 @@ class ScipScorerTests(unittest.TestCase):
                     occurrence(range_for(source, "caller"), caller, 1, line_range(source, 2)),
                     occurrence(range_for(source, "target", 2), truth),
                 ),
+                (
+                    symbol_information(truth, 17, "target"),
+                    symbol_information(wrong, 17, "target"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    (
+                        "fixture.src.lib.wrong.target", "src/lib.rs", "target",
+                        "Function", 2, 2,
+                    ),
+                    (
+                        "fixture.src.lib.caller", "src/lib.rs", "caller",
+                        "Function", 3, 3,
+                    ),
+                )
+            )
+            fixture.write_dump(
+                ((
+                    "target()", 2, "fixture.src.lib.wrong.target", "direct",
+                    "admitted",
+                ),)
             )
             expected = fixture.root / "expected.txt"
             expected.write_text(
@@ -653,6 +846,7 @@ print(json.dumps({'rows': rows, 'has_more': False}))
                     "python3", str(HARNESS_SCORER), "--cbm", str(fixture.tools / "cbm"),
                     "--project", "fixture", "--corpus", str(fixture.corpus),
                     "--scip", str(fixture.scip), "--cargo", str(fixture.tools / "cargo"),
+                    "--db", str(fixture.database), "--dump", str(fixture.dump),
                     "--expected", str(expected), "--detail-dir", str(fixture.detail),
                 ),
                 text=True,
@@ -664,6 +858,21 @@ print(json.dumps({'rows': rows, 'has_more': False}))
             self.assertIn("matched=0", result.stdout, result.stderr)
             self.assertIn("fabricated=1", result.stdout, result.stderr)
             self.assertIn("oracle_only=1", result.stdout, result.stderr)
+            self.assertIn(
+                "precision strategy=direct call_form=plain_path "
+                "outcome=wrong reason=- count=1",
+                result.stdout,
+            )
+            self.assertIn(
+                "fixture.src.lib.wrong.target",
+                (fixture.detail / "wrong-edges.tsv").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                truth,
+                (fixture.detail / "missed-occurrences.tsv").read_text(
+                    encoding="utf-8"
+                ),
+            )
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import bisect
 import importlib.util
 from collections import Counter, defaultdict
 from pathlib import Path
+import sqlite3
 from typing import NamedTuple
 
 
@@ -28,6 +29,48 @@ class CallSite(NamedTuple):
     callee_end_byte: int
     resolved_symbol: str
     call_form: str
+
+
+class PublishedCall(NamedTuple):
+    relative_path: str
+    site_start_byte: int
+    site_end_byte: int
+    callee_start_byte: int
+    callee_end_byte: int
+    caller_qualified_name: str
+    target_qualified_name: str
+    strategy: str
+
+
+class ScoredEdge(NamedTuple):
+    relative_path: str
+    callee_start_byte: int
+    callee_end_byte: int
+    caller_qualified_name: str
+    caller_symbol: str | None
+    target_qualified_name: str
+    target_symbol: str | None
+    strategy: str
+    call_form: str
+    oracle_symbol: str | None
+    outcome: str
+    reason: str
+
+
+class RecallOccurrence(NamedTuple):
+    relative_path: str
+    callee_start_byte: int
+    callee_end_byte: int
+    oracle_symbol: str
+    call_form: str
+    strategy: str
+    outcome: str
+
+
+class ScoreReport(NamedTuple):
+    edges: tuple[ScoredEdge, ...]
+    recall: tuple[RecallOccurrence, ...]
+    inventory: tuple[CallSite, ...]
 
 
 _DECODER_PATH = Path(__file__).with_name("scip-call-edges.py")
@@ -369,6 +412,190 @@ def call_sites(corpus_root, scip_path):
                 )
             )
     return sorted(records)
+
+
+def published_calls(dump_path):
+    """Return only published CALLS rows from a resolver dump."""
+    records = []
+    with open(dump_path, encoding="utf-8", errors="replace") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.startswith("C\t"):
+                continue
+            fields = raw.rstrip("\n").split("\t")
+            if len(fields) < 14:
+                raise ValueError(
+                    f"{dump_path}:{line_number}: published C row has {len(fields)} fields; "
+                    "expected at least 14"
+                )
+            if fields[9] != "admitted":
+                continue
+            try:
+                site_start, site_end = int(fields[2]), int(fields[3])
+                callee_start, callee_end = int(fields[12]), int(fields[13])
+            except ValueError as error:
+                raise ValueError(
+                    f"{dump_path}:{line_number}: call ranges must be decimal byte offsets"
+                ) from error
+            records.append(
+                PublishedCall(
+                    fields[1], site_start, site_end, callee_start, callee_end,
+                    fields[4], fields[6], fields[7],
+                )
+            )
+    return tuple(records)
+
+
+def _load_identity_module():
+    path = Path(__file__).with_name("scip_rust_identity.py")
+    spec = importlib.util.spec_from_file_location("scip_rust_identity", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _node_identities(graph_database, scip_file):
+    identity = _load_identity_module()
+    outcomes = identity.map_rust_graph_nodes(graph_database, scip_file)
+    connection = sqlite3.connect(graph_database)
+    try:
+        rows = connection.execute("select id, qualified_name from nodes")
+        by_name = defaultdict(list)
+        for node_id, qualified_name in rows:
+            if node_id in outcomes:
+                by_name[qualified_name].append(outcomes[node_id])
+    finally:
+        connection.close()
+    return by_name
+
+
+def _single_identity(by_name, qualified_name):
+    outcomes = by_name.get(qualified_name, ())
+    if not outcomes:
+        return None, "target_node_missing"
+    if len(outcomes) != 1:
+        return None, "target_qualified_name_is_not_unique"
+    outcome = outcomes[0]
+    if outcome.status == "matched":
+        return outcome.symbol, "-"
+    return None, f"target_{outcome.status}:{outcome.reason}"
+
+
+def _score_edge(call, site, identities):
+    caller_symbol, _ = _single_identity(identities, call.caller_qualified_name)
+    target_symbol, target_reason = _single_identity(
+        identities, call.target_qualified_name
+    )
+    if site is None:
+        return ScoredEdge(
+            call.relative_path, call.callee_start_byte, call.callee_end_byte,
+            call.caller_qualified_name, caller_symbol, call.target_qualified_name,
+            target_symbol, call.strategy, "no_oracle_site", None, "unscorable",
+            "no_oracle_truth",
+        )
+    if site.resolved_symbol in (LOCAL, EXTERNAL, AMBIGUOUS):
+        return ScoredEdge(
+            call.relative_path, call.callee_start_byte, call.callee_end_byte,
+            call.caller_qualified_name, caller_symbol, call.target_qualified_name,
+            target_symbol, call.strategy, site.call_form, site.resolved_symbol,
+            "unscorable", f"oracle_{site.resolved_symbol}",
+        )
+    if target_symbol is None:
+        return ScoredEdge(
+            call.relative_path, call.callee_start_byte, call.callee_end_byte,
+            call.caller_qualified_name, caller_symbol, call.target_qualified_name,
+            None, call.strategy, site.call_form, site.resolved_symbol,
+            "unscorable", target_reason,
+        )
+    outcome = "correct" if target_symbol == site.resolved_symbol else "wrong"
+    reason = "-" if outcome == "correct" else "definition_identity_mismatch"
+    return ScoredEdge(
+        call.relative_path, call.callee_start_byte, call.callee_end_byte,
+        call.caller_qualified_name, caller_symbol, call.target_qualified_name,
+        target_symbol, call.strategy, site.call_form, site.resolved_symbol,
+        outcome, reason,
+    )
+
+
+def score_calls(corpus_root, scip_file, graph_database, dump_path):
+    """Score published edges and independent internal-call recall by occurrence."""
+    inventory = tuple(call_sites(corpus_root, scip_file))
+    sites = {
+        (site.relative_path, site.callee_start_byte, site.callee_end_byte): site
+        for site in inventory
+    }
+    identities = _node_identities(graph_database, scip_file)
+    edges = tuple(
+        _score_edge(
+            call,
+            sites.get(
+                (call.relative_path, call.callee_start_byte, call.callee_end_byte)
+            ),
+            identities,
+        )
+        for call in published_calls(dump_path)
+    )
+    edges_by_site = defaultdict(list)
+    for edge in edges:
+        edges_by_site[
+            (edge.relative_path, edge.callee_start_byte, edge.callee_end_byte)
+        ].append(edge)
+    recall = []
+    for site in inventory:
+        if site.resolved_symbol in (LOCAL, EXTERNAL, AMBIGUOUS):
+            continue
+        key = (site.relative_path, site.callee_start_byte, site.callee_end_byte)
+        site_edges = edges_by_site.get(key, ())
+        found = any(edge.outcome == "correct" for edge in site_edges)
+        strategies = sorted({edge.strategy for edge in site_edges})
+        strategy = "+".join(strategies) if strategies else "no_published_edge"
+        recall.append(
+            RecallOccurrence(
+                site.relative_path, site.callee_start_byte, site.callee_end_byte,
+                site.resolved_symbol, site.call_form, strategy,
+                "found" if found else "missed",
+            )
+        )
+    return ScoreReport(edges, tuple(recall), inventory)
+
+
+def write_score_details(output_directory, report):
+    """Write every wrong published edge and missed internal occurrence as TSV."""
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    wrong_header = (
+        "relative_path", "callee_start_byte", "callee_end_byte", "strategy",
+        "call_form", "caller_qualified_name", "caller_symbol",
+        "target_qualified_name", "target_symbol", "oracle_symbol", "reason",
+    )
+    missed_header = (
+        "relative_path", "callee_start_byte", "callee_end_byte", "strategy",
+        "call_form", "oracle_symbol",
+    )
+    wrong_rows = [
+        (
+            edge.relative_path, edge.callee_start_byte, edge.callee_end_byte,
+            edge.strategy, edge.call_form, edge.caller_qualified_name,
+            edge.caller_symbol or "-", edge.target_qualified_name,
+            edge.target_symbol or "-", edge.oracle_symbol or "-", edge.reason,
+        )
+        for edge in report.edges if edge.outcome == "wrong"
+    ]
+    missed_rows = [
+        (
+            occurrence.relative_path, occurrence.callee_start_byte,
+            occurrence.callee_end_byte, occurrence.strategy, occurrence.call_form,
+            occurrence.oracle_symbol,
+        )
+        for occurrence in report.recall if occurrence.outcome == "missed"
+    ]
+    for name, header, rows in (
+        ("wrong-edges.tsv", wrong_header, wrong_rows),
+        ("missed-occurrences.tsv", missed_header, missed_rows),
+    ):
+        with (output / name).open("w", encoding="utf-8") as handle:
+            handle.write("\t".join(header) + "\n")
+            for row in sorted(rows):
+                handle.write("\t".join(str(value) for value in row) + "\n")
 
 
 def main():
