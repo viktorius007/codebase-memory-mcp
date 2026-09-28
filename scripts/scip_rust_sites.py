@@ -432,9 +432,25 @@ def _macro_argument_segments(code):
 
 
 def _rust_syntax_ranges(sources):
+    if len(sources) > 128:
+        entries = list(sources.items())
+        results = [
+            _rust_syntax_ranges(dict(entries[offset : offset + 128]))
+            for offset in range(0, len(entries), 128)
+        ]
+        return tuple(
+            {
+                relative_path: ranges
+                for result in results
+                for relative_path, ranges in result[index].items()
+            }
+            for index in range(4)
+        )
     callees = defaultdict(set)
     patterns = defaultdict(set)
     pattern_candidates = defaultdict(set)
+    undetermined_patterns = defaultdict(set)
+    imports = defaultdict(set)
     call_prefix = b"fn __cbm(){ __cbm("
     call_suffix = b"); }"
     pattern_prefix = b"fn __cbm(){ match __value { "
@@ -442,14 +458,19 @@ def _rust_syntax_ranges(sources):
     with tempfile.TemporaryDirectory(prefix="cbm-rust-call-sites-") as temporary:
         inputs = {}
         temporary_path = Path(temporary)
+        source_path = temporary_path / "sources"
+        fragment_path = temporary_path / "fragments"
+        source_path.mkdir()
+        fragment_path.mkdir()
         input_number = 0
 
         def add_input(
             content, source_range, definite_pattern=False, allow_call=True,
-            allow_pattern=True, full_pattern=False,
+            allow_pattern=True, full_pattern=False, full_source=False,
         ):
             nonlocal input_number
-            path = temporary_path / f"{input_number}.rs"
+            directory = source_path if full_source else fragment_path
+            path = directory / f"{input_number}.rs"
             path.write_bytes(content)
             inputs[str(path)] = (
                 *source_range, definite_pattern, allow_call, allow_pattern,
@@ -458,7 +479,10 @@ def _rust_syntax_ranges(sources):
             input_number += 1
 
         for relative_path, source in sources.items():
-            add_input(source, (relative_path, 0, len(source), 0), True)
+            add_input(
+                source, (relative_path, 0, len(source), 0), True,
+                full_source=True,
+            )
             code = _masked_source(source)
             token_ranges = set(_delimited_ranges(code, _is_macro_open))
             token_ranges.update(_delimited_ranges(code, _is_attribute_open))
@@ -494,14 +518,15 @@ def _rust_syntax_ranges(sources):
                     True,
                 )
         queries = (
-            ("call", "--pattern", "$F($$$ARGS)"),
-            ("pattern", "--kind", "tuple_struct_pattern"),
+            ("call", "--pattern", "$F($$$ARGS)", temporary_path),
+            ("pattern", "--kind", "tuple_struct_pattern", temporary_path),
+            ("import", "--kind", "use_declaration", source_path),
         )
-        for query, option, value in queries:
+        for query, option, value, query_path in queries:
             result = subprocess.run(
                 (
                     "ast-grep", "run", "--lang", "rust", option, value,
-                    "--json=stream", str(temporary_path),
+                    "--json=stream", str(query_path),
                 ),
                 stdout=subprocess.PIPE,
                 check=False,
@@ -525,6 +550,8 @@ def _rust_syntax_ranges(sources):
                     continue
                 if query == "pattern" and not allow_pattern:
                     continue
+                if query == "import" and wrapper_length:
+                    continue
                 start = (
                     source_start
                     + node["range"]["byteOffset"]["start"]
@@ -546,7 +573,7 @@ def _rust_syntax_ranges(sources):
                             text.startswith("(") and text.endswith(")"),
                         )
                     )
-                else:
+                elif query == "pattern":
                     if full_pattern:
                         full_start = _skip_space(
                             sources[relative_path], source_start
@@ -571,6 +598,10 @@ def _rust_syntax_ranges(sources):
                         patterns[relative_path].add((start, end))
                     elif pattern_only is not None:
                         pattern_candidates[relative_path].add((start, end))
+                    else:
+                        undetermined_patterns[relative_path].add((start, end))
+                else:
+                    imports[relative_path].add((start, end))
         for relative_path, items in pattern_candidates.items():
             patterns[relative_path].update(items)
     return (
@@ -579,11 +610,19 @@ def _rust_syntax_ranges(sources):
             relative_path: _merged_ranges(sorted(items))
             for relative_path, items in patterns.items()
         },
+        {
+            relative_path: _merged_ranges(sorted(items))
+            for relative_path, items in undetermined_patterns.items()
+        },
+        {
+            relative_path: _merged_ranges(sorted(items))
+            for relative_path, items in imports.items()
+        },
     )
 
 
 def _rust_call_callees(sources):
-    callees, _ = _rust_syntax_ranges(sources)
+    callees, _, _, _ = _rust_syntax_ranges(sources)
     return callees
 
 
@@ -710,7 +749,8 @@ def _callee_position(code, end):
 
 
 def _completeness_counts(
-    references, definition_sites, sources, records, project_packages, patterns
+    references, definition_sites, sources, records, project_packages, patterns,
+    undetermined_patterns, imports,
 ):
     inventory_keys = {
         (site.relative_path, site.callee_start_byte, site.callee_end_byte)
@@ -720,10 +760,7 @@ def _completeness_counts(
     for relative_path, occurrences in references.items():
         grouped = defaultdict(set)
         for source_range, symbol in occurrences:
-            if (
-                _callable_symbol(symbol)
-                and _DECODER.package_of(symbol) in project_packages
-            ):
+            if _DECODER.package_of(symbol) in project_packages:
                 grouped[source_range].add(symbol)
         definition_ranges = {
             source_range
@@ -741,6 +778,10 @@ def _completeness_counts(
         attribute_starts = [start for start, _ in attribute_ranges]
         pattern_ranges = patterns.get(relative_path, ())
         pattern_starts = [start for start, _ in pattern_ranges]
+        undetermined_ranges = undetermined_patterns.get(relative_path, ())
+        undetermined_starts = [start for start, _ in undetermined_ranges]
+        import_ranges = imports.get(relative_path, ())
+        import_starts = [start for start, _ in import_ranges]
         for source_range in grouped:
             if source_range in definition_ranges:
                 counts["excluded_definition_site"] += 1
@@ -750,10 +791,16 @@ def _completeness_counts(
                 counts["excluded_invalid_range"] += 1
                 continue
             start, end = byte_range
+            symbols = grouped[source_range]
+            truth_symbols = symbols
+            if source[start:end] == b"Self" and len(symbols) == 1:
+                self_constructor = _self_constructor_symbol(next(iter(symbols)))
+                if self_constructor is not None:
+                    truth_symbols = {self_constructor}
             pattern_constructor = any(
                 _constructor_symbol(symbol)
                 or _self_constructor_symbol(symbol) is not None
-                for symbol in grouped[source_range]
+                for symbol in symbols
             )
             if (
                 pattern_constructor
@@ -761,15 +808,48 @@ def _completeness_counts(
             ):
                 counts["excluded_pattern"] += 1
                 continue
-            if _previous_identifier(code, start) == b"fn":
-                counts["excluded_function_definition"] += 1
-                continue
-            if not _callee_position(code, end):
-                counts["excluded_not_callee_position"] += 1
+            if pattern_constructor and _inside_ranges(
+                undetermined_ranges, undetermined_starts, start
+            ):
+                counts["excluded_macro_argument_tuple_undetermined"] += 1
                 continue
             if (relative_path, start, end) in inventory_keys:
                 counts["inventory_found"] += 1
-            elif _inside_ranges(attribute_ranges, attribute_starts, start):
+                continue
+            if _previous_identifier(code, start) == b"fn":
+                counts["excluded_function_definition"] += 1
+                continue
+            if _inside_ranges(import_ranges, import_starts, start):
+                counts["excluded_import_or_reexport"] += 1
+                continue
+            descriptors = [_DECODER.descriptor_of(item) for item in truth_symbols]
+            if (
+                not re.fullmatch(
+                    rb"(?:r#)?[A-Za-z_][A-Za-z0-9_]*", source[start:end]
+                )
+                and any(item.endswith("().") for item in descriptors)
+            ):
+                counts["excluded_operator_resolution_reference"] += 1
+                continue
+            if all(item.endswith("#") for item in descriptors):
+                counts["excluded_type_or_variant_reference"] += 1
+                continue
+            if not all(item.endswith("().") for item in descriptors):
+                endings = {item[-1:] for item in descriptors}
+                ending = next(iter(endings)) if len(endings) == 1 else None
+                category = {
+                    "/": "excluded_namespace_reference",
+                    ".": "excluded_value_reference",
+                    "]": "excluded_type_parameter_or_impl_reference",
+                    "!": "excluded_macro_reference",
+                    ":": "excluded_trait_reference",
+                }.get(ending, "excluded_ambiguous_project_reference")
+                counts[category] += 1
+                continue
+            if not _callee_position(code, end):
+                counts["excluded_function_reference_not_invoked"] += 1
+                continue
+            if _inside_ranges(attribute_ranges, attribute_starts, start):
                 counts["excluded_attribute_syntax"] += 1
             elif _inside_ranges(macro_ranges, macro_starts, start):
                 counts["excluded_macro_argument_call_parser_failure"] += 1
@@ -778,12 +858,22 @@ def _completeness_counts(
     categories = (
         "inventory_found",
         "excluded_pattern",
+        "excluded_macro_argument_tuple_undetermined",
         "excluded_function_definition",
+        "excluded_import_or_reexport",
+        "excluded_function_reference_not_invoked",
+        "excluded_type_or_variant_reference",
+        "excluded_namespace_reference",
+        "excluded_value_reference",
+        "excluded_type_parameter_or_impl_reference",
+        "excluded_macro_reference",
+        "excluded_trait_reference",
+        "excluded_ambiguous_project_reference",
+        "excluded_operator_resolution_reference",
         "excluded_macro_argument_call_parser_failure",
         "excluded_call_parser_failure",
         "excluded_attribute_syntax",
         "excluded_definition_site",
-        "excluded_not_callee_position",
         "excluded_invalid_range",
         "excluded_source_missing",
     )
@@ -806,7 +896,12 @@ def _call_inventory(corpus_root, scip_path):
         for relative_path in references
         if (source_path := corpus_root / relative_path).is_file()
     }
-    parsed_callees, parsed_patterns = _rust_syntax_ranges(sources)
+    (
+        parsed_callees,
+        parsed_patterns,
+        undetermined_patterns,
+        import_ranges,
+    ) = _rust_syntax_ranges(sources)
     records = []
     for relative_path, occurrences in references.items():
         source = sources.get(relative_path)
@@ -819,6 +914,8 @@ def _call_inventory(corpus_root, scip_path):
         attribute_starts = [start for start, _ in attribute_ranges]
         pattern_ranges = parsed_patterns.get(relative_path, ())
         pattern_starts = [start for start, _ in pattern_ranges]
+        undetermined_ranges = undetermined_patterns.get(relative_path, ())
+        undetermined_starts = [start for start, _ in undetermined_ranges]
         grouped = defaultdict(set)
         for source_range, symbol in occurrences:
             grouped[source_range].add(symbol)
@@ -847,6 +944,10 @@ def _call_inventory(corpus_root, scip_path):
             if (
                 constructor
                 and _inside_ranges(pattern_ranges, pattern_starts, start)
+            ):
+                continue
+            if constructor and _inside_ranges(
+                undetermined_ranges, undetermined_starts, start
             ):
                 continue
             matches = [
@@ -883,7 +984,7 @@ def _call_inventory(corpus_root, scip_path):
     records = sorted(records)
     completeness = _completeness_counts(
         references, definition_sites, sources, records, project_packages,
-        parsed_patterns,
+        parsed_patterns, undetermined_patterns, import_ranges,
     )
     return records, completeness
 
@@ -1030,43 +1131,36 @@ def _rust_call_edges(graph_database):
 
 def _rust_function_items(sources):
     functions = defaultdict(list)
-    entries = list(sources.items())
-    for offset in range(0, len(entries), 64):
-        batch = entries[offset : offset + 64]
-        combined = bytearray()
-        starts = []
-        for relative_path, source in batch:
-            if combined:
-                combined.extend(b"\n")
-            starts.append((len(combined), relative_path, len(source)))
-            combined.extend(source)
+    with tempfile.TemporaryDirectory(prefix="cbm-rust-callers-") as temporary:
+        inputs = {}
+        temporary_path = Path(temporary)
+        for input_number, (relative_path, source) in enumerate(sources.items()):
+            path = temporary_path / f"{input_number}.rs"
+            path.write_bytes(source)
+            inputs[str(path)] = (relative_path, source)
         result = subprocess.run(
             (
-                "ast-grep", "run", "--stdin", "--lang", "rust",
-                "--kind", "function_item", "--json=stream",
+                "ast-grep", "run", "--lang", "rust", "--kind",
+                "function_item", "--json=stream", str(temporary_path),
             ),
-            input=bytes(combined), stdout=subprocess.PIPE, check=False,
+            stdout=subprocess.PIPE,
+            check=False,
         )
         if result.returncode not in (0, 1):
             raise subprocess.CalledProcessError(result.returncode, result.args)
-        batch_starts = [start for start, _, _ in starts]
         for line in result.stdout.splitlines():
             record = json.loads(line)
             span = record["range"]
             start = span["byteOffset"]["start"]
             end = span["byteOffset"]["end"]
-            index = bisect.bisect_right(batch_starts, start) - 1
-            base, relative_path, source_length = starts[index]
+            relative_path, source = inputs[record["file"]]
             match = re.search(r"\bfn\s+(?:r#)?([^\W\d]\w*)", record["text"])
-            if match is not None and end <= base + source_length:
-                local_start = start - base
-                local_end = end - base
-                source = sources[relative_path]
+            if match is not None:
                 functions[relative_path].append(
                     (
-                        local_start, local_end, match.group(1),
-                        source.count(b"\n", 0, local_start) + 1,
-                        source.count(b"\n", 0, local_end) + 1,
+                        start, end, match.group(1),
+                        source.count(b"\n", 0, start) + 1,
+                        source.count(b"\n", 0, end) + 1,
                     )
                 )
     return functions

@@ -1400,6 +1400,64 @@ class ScipScorerTests(unittest.TestCase):
 
         self.assertEqual([], records)
 
+    def test_literal_tuple_macro_argument_is_undetermined_not_truth(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "enum Event { Done(u8) }\n"
+            "fn caller(event: Event) { check_pattern!(event, Event::Done(1)); }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "corpus"
+            (corpus / "src").mkdir(parents=True)
+            (corpus / "src" / "lib.rs").write_text(source, encoding="utf-8")
+            scip = root / "fixture.scip"
+            write_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "package_anchor"),
+                        symbol("fixture/package_anchor()."),
+                        1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "Done", 1),
+                        symbol("fixture/Event#Done#"),
+                    ),
+                ),
+            )
+            spec = importlib.util.spec_from_file_location(
+                "scip_rust_sites", SITES_INVENTORY
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            records, completeness = module._call_inventory(corpus, scip)
+
+            self.assertEqual([], records)
+            self.assertEqual(
+                1,
+                dict(completeness)[
+                    "excluded_macro_argument_tuple_undetermined"
+                ],
+            )
+
+    def test_binding_tuple_macro_argument_is_undetermined_not_truth(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "enum Event { Done(u8) }\n"
+            "fn caller(event: Event) { "
+            "check_pattern!(event, Event::Done(value)); }\n"
+        )
+
+        records = inventory_records(
+            source, "Done", symbol("fixture/Event#Done#"), (1,)
+        )
+
+        self.assertEqual([], records)
+
     def test_completeness_reports_tuple_pattern_as_pattern_not_parse_failure(self):
         source = (
             "fn package_anchor() {}\n"
@@ -1440,6 +1498,117 @@ class ScipScorerTests(unittest.TestCase):
             self.assertEqual(1, counts["excluded_pattern"])
             self.assertEqual(0, counts["excluded_call_parser_failure"])
 
+    def test_completeness_names_non_call_reference_categories(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "struct Thing;\n"
+            "fn target() {}\n"
+            "pub use crate::Thing as Exported;\n"
+            "fn caller(value: Thing, left: Thing, right: Thing) {\n"
+            "    let callback: fn() = target;\n"
+            "    if left == (right) {}\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "corpus"
+            (corpus / "src").mkdir(parents=True)
+            (corpus / "src" / "lib.rs").write_text(source, encoding="utf-8")
+            scip = root / "fixture.scip"
+            write_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "package_anchor"),
+                        symbol("fixture/package_anchor()."),
+                        1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "Thing", 0),
+                        symbol("fixture/Thing#"),
+                        1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(
+                        range_for(source, "target", 0),
+                        symbol("fixture/target()."),
+                        1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(
+                        range_for(source, "Thing", 1),
+                        symbol("fixture/Thing#"),
+                    ),
+                    occurrence(
+                        range_for(source, "Thing", 2),
+                        symbol("fixture/Thing#"),
+                    ),
+                    occurrence(
+                        range_for(source, "target", 1),
+                        symbol("fixture/target()."),
+                    ),
+                    occurrence(
+                        range_for(source, "=="),
+                        symbol("fixture/impl#[Thing][PartialEq]eq()."),
+                    ),
+                ),
+            )
+            spec = importlib.util.spec_from_file_location(
+                "scip_rust_sites", SITES_INVENTORY
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            _, completeness = module._call_inventory(corpus, scip)
+
+            counts = dict(completeness)
+            self.assertEqual(1, counts["excluded_import_or_reexport"])
+            self.assertEqual(1, counts["excluded_type_or_variant_reference"])
+            self.assertEqual(1, counts["excluded_function_reference_not_invoked"])
+            self.assertEqual(1, counts["excluded_operator_resolution_reference"])
+
+    def test_completeness_counts_self_constructor_inventory_reference(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "struct Wrapper(u8);\n"
+            "impl Wrapper { fn new(value: u8) -> Self { Self(value) } }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "corpus"
+            (corpus / "src").mkdir(parents=True)
+            (corpus / "src" / "lib.rs").write_text(source, encoding="utf-8")
+            scip = root / "fixture.scip"
+            write_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "package_anchor"),
+                        symbol("fixture/package_anchor()."),
+                        1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "Self", 1),
+                        symbol("fixture/impl#[Wrapper]"),
+                    ),
+                ),
+            )
+            spec = importlib.util.spec_from_file_location(
+                "scip_rust_sites", SITES_INVENTORY
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            records, completeness = module._call_inventory(corpus, scip)
+
+            self.assertEqual(1, len(records))
+            self.assertEqual(1, dict(completeness)["inventory_found"])
+            self.assertEqual(1, sum(count for _, count in completeness))
+
     def test_inventory_parses_each_file_in_isolation(self):
         source = b"fn caller() { target(); }\n"
         spec = importlib.util.spec_from_file_location(
@@ -1454,6 +1623,22 @@ class ScipScorerTests(unittest.TestCase):
 
         start = source.index(b"target")
         self.assertIn((start, start + len(b"target"), False), callees["valid.rs"])
+
+    def test_caller_functions_parse_each_file_in_isolation(self):
+        source = b"fn caller() { target(); }\n"
+        spec = importlib.util.spec_from_file_location(
+            "scip_rust_sites", SITES_INVENTORY
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        functions = module._rust_function_items(
+            {"broken.rs": b"/*", "valid.rs": source}
+        )
+
+        self.assertEqual(
+            [(0, len(source) - 1, "caller", 1, 1)], functions["valid.rs"]
+        )
 
     def test_inventory_keeps_ordinary_call_after_invalid_macro_rewrite(self):
         source = (
