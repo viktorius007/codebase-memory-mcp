@@ -3,7 +3,7 @@
 
 import argparse
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import importlib.util
 import json
 import os
@@ -63,6 +63,10 @@ class IdentityOutcome:
     candidates: tuple[str, ...] = ()
     derive: str | None = None
     owner: str | None = None
+    definition_path: str | None = field(default=None, compare=False)
+    definition_range: tuple[int, int, int, int] | None = field(
+        default=None, compare=False
+    )
 
 
 def _load_decoder():
@@ -151,6 +155,8 @@ def _generated_outcome(node, outcomes_by_qn, oracle_symbols):
             symbol=next(iter(candidates)),
             derive=derive,
             owner=owner,
+            definition_path=owner_outcomes[0].definition_path,
+            definition_range=owner_outcomes[0].definition_range,
         )
     ordered = tuple(sorted(candidates))
     return IdentityOutcome(
@@ -178,25 +184,31 @@ def _identity_for_node(node, definitions, roots, included_sources, derive_owner)
         range(start_line - 1, end_line) if derive_owner else (start_line - 1,)
     )
     if label == "Module":
-        candidates = {
-            symbol
+        matches = {
+            (symbol, rng)
             for rng, symbol, _, symbol_kind in entries
             if rng[0] == start_line - 1
             and rng[2] == end_line - 1
             and symbol_kind in allowed_kinds
         }
     else:
-        candidates = {
-            symbol
+        matches = {
+            (symbol, rng)
             for rng, symbol, scip_name, symbol_kind in entries
             if rng[0] in declaration_lines
             and scip_name == name
             and symbol_kind in allowed_kinds
         }
-    if len(candidates) == 1:
-        return IdentityOutcome(status="matched", symbol=next(iter(candidates)))
-    if len(candidates) > 1:
-        ordered = tuple(sorted(candidates))
+    if len(matches) == 1:
+        symbol, definition_range = next(iter(matches))
+        return IdentityOutcome(
+            status="matched",
+            symbol=symbol,
+            definition_path=path,
+            definition_range=definition_range,
+        )
+    if len(matches) > 1:
+        ordered = tuple(sorted(symbol for symbol, _ in matches))
         return IdentityOutcome(
             status="ambiguous",
             reason="multiple_compatible_definitions",
@@ -252,6 +264,8 @@ def _identity_for_node(node, definitions, roots, included_sources, derive_owner)
     return IdentityOutcome(
         status="oracle_gap",
         reason=("oracle_definition_missing" if entries else "oracle_document_missing"),
+        definition_path=path,
+        definition_range=(start_line - 1, 0, start_line - 1, 0),
     )
 
 

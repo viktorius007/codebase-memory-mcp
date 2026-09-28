@@ -15,6 +15,7 @@ from scip_rust_sites import (
     CALL_THROUGH_VALUE,
     EXTERNAL,
     format_completeness,
+    recall_relation_key,
     score_calls,
     write_score_details,
 )
@@ -107,8 +108,7 @@ def graph_edges(cbm, project, edge_type):
         offset += len(page)
 
 
-def strict_call_pairs(decoder, scip_path, corpus, cargo):
-    _, definitions, references, _ = decoder.parse_with_definition_sites(scip_path)
+def strict_call_pairs(decoder, report, corpus, cargo):
     result = subprocess.run(
         [cargo, "metadata", "--no-deps", "--format-version", "1"],
         cwd=corpus, capture_output=True, text=True,
@@ -120,32 +120,26 @@ def strict_call_pairs(decoder, scip_path, corpus, cargo):
         )
     metadata = json.loads(result.stdout)
     workspace = {package["name"] for package in metadata["packages"]}
-    defining_file = {}
-    for path, entries in definitions.items():
-        for _, symbol in entries:
-            defining_file.setdefault(symbol, path)
     strict = set()
-    for path, occurrences in references.items():
-        intervals = definitions[path]
-        for source_range, target in occurrences:
-            caller = decoder.innermost(
-                intervals, (source_range[0], source_range[1])
-            )
-            caller_descriptor = decoder.descriptor_of(caller or "")
-            target_descriptor = decoder.descriptor_of(target)
-            if (
-                caller
-                and caller != target
-                and caller_descriptor.endswith("().")
-                and "#" not in caller_descriptor
-                and target_descriptor.endswith("().")
-                and "#" not in target_descriptor
-                and decoder.crate_of(caller) in workspace
-                and decoder.crate_of(target) in workspace
-                and defining_file.get(caller) == path
-                and defining_file.get(target) == path
-            ):
-                strict.add((caller, target))
+    for occurrence in report.recall:
+        caller = occurrence.oracle_caller_identity
+        target = occurrence.oracle_target_identity
+        if caller is None or target is None:
+            continue
+        caller_descriptor = decoder.descriptor_of(caller.symbol)
+        target_descriptor = decoder.descriptor_of(target.symbol)
+        if (
+            caller != target
+            and caller_descriptor.endswith("().")
+            and "#" not in caller_descriptor
+            and target_descriptor.endswith("().")
+            and "#" not in target_descriptor
+            and decoder.crate_of(caller.symbol) in workspace
+            and decoder.crate_of(target.symbol) in workspace
+            and caller.relative_path == occurrence.relative_path
+            and target.relative_path == occurrence.relative_path
+        ):
+            strict.add((caller, target))
     return strict
 
 
@@ -211,7 +205,7 @@ def main():
 
     expected = load_expectation(args.expected)
     report = score_calls(args.corpus, args.scip, args.db, args.dump)
-    strict = strict_call_pairs(load_decoder(), args.scip, args.corpus, args.cargo)
+    strict = strict_call_pairs(load_decoder(), report, args.corpus, args.cargo)
     correct = [edge for edge in report.edges if edge.outcome == "correct"]
     wrong = [edge for edge in report.edges if edge.outcome == "wrong"]
     unscorable = [edge for edge in report.edges if edge.outcome == "unscorable"]
@@ -220,12 +214,12 @@ def main():
     )
     matched = [
         edge for edge in correct
-        if (edge.caller_symbol, edge.oracle_symbol) in strict
+        if (edge.caller_identity, edge.oracle_target_identity) in strict
     ]
     graph_only = [edge for edge in correct if edge not in matched]
     missed = [item for item in report.recall if item.outcome == "missed"]
     relation_outcomes = {
-        (item.oracle_caller_symbol, item.oracle_symbol): item.outcome
+        recall_relation_key(item): item.outcome
         for item in report.recall
         if item.oracle_caller_symbol is not None
     }

@@ -27,6 +27,12 @@ EXTERNAL = "external"
 AMBIGUOUS = "ambiguous"
 NON_INTERNAL_TRUTH = frozenset((CALL_THROUGH_VALUE, EXTERNAL, AMBIGUOUS))
 
+_DECODER_PATH = Path(__file__).with_name("scip-call-edges.py")
+_DECODER_SPEC = importlib.util.spec_from_file_location("scip_call_edges", _DECODER_PATH)
+_DECODER = importlib.util.module_from_spec(_DECODER_SPEC)
+_DECODER_SPEC.loader.exec_module(_DECODER)
+DefinitionIdentity = _DECODER.DefinitionIdentity
+
 
 class CallSite(NamedTuple):
     relative_path: str
@@ -70,6 +76,10 @@ class ScoredEdge(NamedTuple):
     oracle_symbol: str | None
     outcome: str
     reason: str
+    caller_identity: DefinitionIdentity | None = None
+    oracle_caller_identity: DefinitionIdentity | None = None
+    target_identity: DefinitionIdentity | None = None
+    oracle_target_identity: DefinitionIdentity | None = None
 
 
 class CallerOutcome(NamedTuple):
@@ -77,6 +87,13 @@ class CallerOutcome(NamedTuple):
     oracle_symbol: str | None
     outcome: str
     reason: str
+    graph_identity: DefinitionIdentity | None = None
+    oracle_identity: DefinitionIdentity | None = None
+
+
+class OracleDefinition(NamedTuple):
+    symbol: str
+    identity: DefinitionIdentity | None
 
 
 class RecallOccurrence(NamedTuple):
@@ -89,6 +106,8 @@ class RecallOccurrence(NamedTuple):
     call_form: str
     strategy: str
     outcome: str
+    oracle_caller_identity: DefinitionIdentity | None = None
+    oracle_target_identity: DefinitionIdentity | None = None
 
 
 class IntegrityError(NamedTuple):
@@ -108,12 +127,6 @@ class ScoreReport(NamedTuple):
     integrity: tuple[IntegrityError, ...]
     completeness: tuple[tuple[str, int], ...]
     non_rust_target_edges: int
-
-
-_DECODER_PATH = Path(__file__).with_name("scip-call-edges.py")
-_DECODER_SPEC = importlib.util.spec_from_file_location("scip_call_edges", _DECODER_PATH)
-_DECODER = importlib.util.module_from_spec(_DECODER_SPEC)
-_DECODER_SPEC.loader.exec_module(_DECODER)
 
 
 def _fill_spaces(masked, start, end):
@@ -903,6 +916,21 @@ def _oracle_occurrences(corpus_root, scip_path, sites):
         wanted[site.relative_path].add(
             (site.relative_path, site.callee_start_byte, site.callee_end_byte)
         )
+    definitions_by_symbol = defaultdict(list)
+    definitions_by_symbol_path = defaultdict(list)
+    definition_locations = defaultdict(list)
+    for relative_path, entries in definition_sites.items():
+        for definition_range, enclosing_range, symbol in entries:
+            identity = DefinitionIdentity(symbol, relative_path, definition_range)
+            definitions_by_symbol[symbol].append((identity, enclosing_range))
+            definitions_by_symbol_path[(symbol, relative_path)].append(
+                (identity, enclosing_range)
+            )
+            definition_locations[symbol].append((relative_path, definition_range))
+    identities_by_symbol = {
+        symbol: frozenset(identity for identity, _ in entries)
+        for symbol, entries in definitions_by_symbol.items()
+    }
     callers = {}
     targets = defaultdict(set)
     for relative_path, occurrences in references.items():
@@ -917,19 +945,87 @@ def _oracle_occurrences(corpus_root, scip_path, sites):
                 continue
             key = (relative_path, byte_range[0], byte_range[1])
             if key in path_sites:
-                callers[key] = _DECODER.innermost(
+                position = (source_range[0], source_range[1])
+                caller_symbol = _DECODER.innermost(
                     definitions[relative_path], (source_range[0], source_range[1])
                 )
-                targets[key].add(target)
+                caller_candidates = [
+                    (identity, enclosing_range)
+                    for identity, enclosing_range in definitions_by_symbol_path.get(
+                        (caller_symbol, relative_path), ()
+                    )
+                    if (enclosing_range[0], enclosing_range[1]) <= position
+                    <= (enclosing_range[2], enclosing_range[3])
+                ]
+                caller_identity = None
+                caller_scope = None
+                if caller_candidates:
+                    smallest = min(
+                        (enclosing[2] - enclosing[0], enclosing[3] - enclosing[1])
+                        for _, enclosing in caller_candidates
+                    )
+                    closest = {
+                        identity
+                        for identity, enclosing in caller_candidates
+                        if (
+                            enclosing[2] - enclosing[0],
+                            enclosing[3] - enclosing[1],
+                        ) == smallest
+                    }
+                    if len(closest) == 1:
+                        caller_identity = next(iter(closest))
+                        caller_scope = next(
+                            enclosing
+                            for identity, enclosing in caller_candidates
+                            if identity == caller_identity
+                        )
+                if caller_symbol is not None:
+                    callers[key] = OracleDefinition(
+                        caller_symbol, caller_identity
+                    )
+
+                target_entries = definitions_by_symbol_path.get(
+                    (target, relative_path), ()
+                )
+                target_identities = identities_by_symbol.get(target, ())
+                target_identity = None
+                if len(target_identities) == 1:
+                    target_identity = next(iter(target_identities))
+                else:
+                    same_file = {
+                        identity
+                        for identity, _ in target_entries
+                    }
+                    if len(same_file) == 1:
+                        target_identity = next(iter(same_file))
+                    else:
+                        caller_local = {
+                            identity
+                            for identity in same_file
+                            if caller_scope is not None
+                            and (caller_scope[0], caller_scope[1])
+                            <= (
+                                identity.definition_range[0],
+                                identity.definition_range[1],
+                            )
+                            <= (caller_scope[2], caller_scope[3])
+                        }
+                        enclosing = {
+                            identity
+                            for identity, owner_range in target_entries
+                            if (owner_range[0], owner_range[1]) <= position
+                            <= (owner_range[2], owner_range[3])
+                        }
+                        if len(caller_local) == 1:
+                            target_identity = next(iter(caller_local))
+                        elif len(enclosing) == 1:
+                            target_identity = next(iter(enclosing))
+                targets[key].add(OracleDefinition(target, target_identity))
     exact_targets = {
-        key: next(iter(symbols))
-        for key, symbols in targets.items()
-        if len(symbols) == 1
+        key: next(iter(definitions))
+        for key, definitions in targets.items()
+        if len(definitions) == 1
     }
-    definition_locations = defaultdict(list)
-    for relative_path, entries in definition_sites.items():
-        for definition_range, _, symbol in entries:
-            definition_locations[symbol].append((relative_path, definition_range))
     return callers, exact_targets, definition_locations
 
 
@@ -1002,7 +1098,11 @@ def _single_identity(by_name, qualified_name, endpoint):
     if outcome is None:
         return None, f"{endpoint}_node_not_semantic", node
     if outcome.status == "matched":
-        return outcome.symbol, "-", node
+        if outcome.definition_path is None or outcome.definition_range is None:
+            return None, f"{endpoint}_definition_location_missing", node
+        return DefinitionIdentity(
+            outcome.symbol, outcome.definition_path, outcome.definition_range
+        ), "-", node
     return None, f"{endpoint}_{outcome.status}:{outcome.reason}", node
 
 
@@ -1108,44 +1208,65 @@ def _source_caller_matches(call, source_caller, node):
     )
 
 
-def _score_caller(call, oracle_caller_symbol, source_caller, identities):
-    caller_symbol, caller_reason, caller_node = _single_identity(
+def _score_caller(call, oracle_caller, source_caller, identities):
+    caller_identity, caller_reason, caller_node = _single_identity(
         identities, call.caller_qualified_name, "caller"
+    )
+    caller_symbol = caller_identity.symbol if caller_identity is not None else None
+    oracle_caller_symbol = oracle_caller.symbol if oracle_caller is not None else None
+    oracle_caller_identity = (
+        oracle_caller.identity if oracle_caller is not None else None
     )
     if caller_reason == "caller_not_in_oracle_configuration:cfg_inactive":
         return CallerOutcome(
-            caller_symbol, None, "unscorable", "caller_cfg_inactive"
+            caller_symbol, None, "unscorable", "caller_cfg_inactive",
+            caller_identity, None,
         )
     if _callable_symbol(oracle_caller_symbol or ""):
-        if caller_symbol is None:
+        if caller_identity is None:
             if _source_caller_matches(call, source_caller, caller_node) is False:
                 return CallerOutcome(
                     caller_symbol, oracle_caller_symbol, "wrong",
                     "caller_source_mismatch",
+                    caller_identity, oracle_caller_identity,
                 )
             return CallerOutcome(
-                caller_symbol, oracle_caller_symbol, "unscorable", caller_reason
+                caller_symbol, oracle_caller_symbol, "unscorable", caller_reason,
+                caller_identity, oracle_caller_identity,
             )
-        if caller_symbol != oracle_caller_symbol:
+        if oracle_caller_identity is None:
+            return CallerOutcome(
+                caller_symbol, oracle_caller_symbol, "unscorable",
+                "caller_oracle_definition_location_missing", caller_identity, None,
+            )
+        if caller_identity != oracle_caller_identity:
             return CallerOutcome(
                 caller_symbol, oracle_caller_symbol, "wrong",
                 "caller_identity_mismatch",
+                caller_identity, oracle_caller_identity,
             )
-        return CallerOutcome(caller_symbol, oracle_caller_symbol, "correct", "-")
+        return CallerOutcome(
+            caller_symbol, oracle_caller_symbol, "correct", "-",
+            caller_identity, oracle_caller_identity,
+        )
     source_match = _source_caller_matches(call, source_caller, caller_node)
     if source_match is True:
         category = caller_reason.rpartition(":")[2]
         if caller_symbol is not None:
             category = "non_callable_oracle"
         return CallerOutcome(
-            caller_symbol, caller_symbol, "correct", f"source_caller:{category}"
+            caller_symbol, caller_symbol, "correct", f"source_caller:{category}",
+            caller_identity, caller_identity,
         )
     if source_match is False:
         return CallerOutcome(
-            caller_symbol, None, "wrong", "caller_source_mismatch"
+            caller_symbol, None, "wrong", "caller_source_mismatch",
+            caller_identity, None,
         )
     reason = caller_reason if caller_symbol is None else "source_caller_missing"
-    return CallerOutcome(caller_symbol, None, "unscorable", reason)
+    return CallerOutcome(
+        caller_symbol, None, "unscorable", reason, caller_identity, None
+    )
 
 
 def _target_is_contradicted(
@@ -1176,12 +1297,64 @@ def _target_is_contradicted(
     )
 
 
-def _score_edge(
-    call, site, oracle_target_symbol, caller, identities, definition_locations,
+def _compare_target_identity(
+    site, expected_target, expected_identity, target_identity, target_reason,
+    target_node, definition_locations,
 ):
-    target_symbol, target_reason, target_node = _single_identity(
+    if expected_identity is not None:
+        if target_identity is not None:
+            if target_identity == expected_identity:
+                return target_identity, expected_identity, "correct", "-"
+            return (
+                target_identity, expected_identity, "wrong",
+                "target_identity_mismatch",
+            )
+        if _target_is_contradicted(
+            site, expected_target, target_reason, target_node, definition_locations
+        ):
+            return None, expected_identity, "wrong", "target_identity_mismatch"
+        return None, expected_identity, "unscorable", target_reason
+
+    locations = definition_locations.get(expected_target, ())
+    if locations:
+        contradicted = _target_is_contradicted(
+            site, expected_target, target_reason, target_node, definition_locations
+        )
+        if contradicted is True:
+            return target_identity, None, "wrong", "target_identity_mismatch"
+        return target_identity, None, "unscorable", "oracle_target_location_ambiguous"
+    if target_identity is not None:
+        if target_identity.symbol != expected_target:
+            return target_identity, None, "wrong", "target_identity_mismatch"
+        return target_identity, target_identity, "correct", "-"
+
+    outcome = target_node[0] if target_node is not None else None
+    if (
+        target_reason in (
+            "target_oracle_gap:oracle_definition_missing",
+            "target_oracle_gap:oracle_document_missing",
+        )
+        and outcome.definition_path is not None
+        and outcome.definition_range is not None
+    ):
+        identity = DefinitionIdentity(
+            expected_target, outcome.definition_path, outcome.definition_range
+        )
+        return identity, identity, "correct", "-"
+    if _target_is_contradicted(
+        site, expected_target, target_reason, target_node, definition_locations
+    ):
+        return None, None, "wrong", "target_identity_mismatch"
+    return None, None, "unscorable", target_reason
+
+
+def _score_edge(
+    call, site, oracle_target, caller, identities, definition_locations,
+):
+    target_identity, target_reason, target_node = _single_identity(
         identities, call.target_qualified_name, "target"
     )
+    target_symbol = target_identity.symbol if target_identity is not None else None
     if site is None:
         return ScoredEdge(
             call.relative_path, call.callee_start_byte, call.callee_end_byte,
@@ -1189,11 +1362,17 @@ def _score_edge(
             call.target_qualified_name,
             target_symbol, call.strategy, "no_oracle_site", None, None,
             "unscorable", "no_oracle_truth",
+            caller.graph_identity, caller.oracle_identity, target_identity, None,
         )
+    oracle_target_symbol = oracle_target.symbol if oracle_target is not None else None
     expected_target = (
-        oracle_target_symbol if site.resolved_symbol == EXTERNAL
+        oracle_target_symbol
+        if site.resolved_symbol == EXTERNAL
         else site.resolved_symbol
     )
+    expected_target_identity = None
+    if oracle_target is not None and oracle_target.symbol == expected_target:
+        expected_target_identity = oracle_target.identity
     if caller.reason == "caller_cfg_inactive":
         return ScoredEdge(
             call.relative_path, call.callee_start_byte, call.callee_end_byte,
@@ -1201,6 +1380,8 @@ def _score_edge(
             call.target_qualified_name,
             target_symbol, call.strategy, site.call_form, caller.oracle_symbol,
             expected_target, "unscorable", "caller_cfg_inactive",
+            caller.graph_identity, caller.oracle_identity, target_identity,
+            expected_target_identity,
         )
     unknown = []
     contradictions = []
@@ -1213,28 +1394,22 @@ def _score_edge(
         caller_basis = caller.reason
     if site.resolved_symbol in (CALL_THROUGH_VALUE, AMBIGUOUS):
         unknown.append(f"oracle_{site.resolved_symbol}")
+    elif expected_target is None:
+        unknown.append("oracle_target_missing")
     else:
-        if target_symbol is None:
-            if _target_is_contradicted(
-                site, expected_target, target_reason, target_node,
-                definition_locations,
-            ):
-                contradictions.append("target_identity_mismatch")
-            else:
-                unknown.append(target_reason)
-        elif expected_target is None:
-            unknown.append("oracle_target_missing")
-        elif target_symbol != expected_target:
-            contradictions.append("target_identity_mismatch")
-        else:
-            location_contradiction = _target_is_contradicted(
-                site, expected_target, target_reason, target_node,
-                definition_locations,
+        target_identity, expected_target_identity, status, target_reason = (
+            _compare_target_identity(
+                site, expected_target, expected_target_identity, target_identity,
+                target_reason, target_node, definition_locations,
             )
-            if location_contradiction is True:
-                contradictions.append("target_identity_mismatch")
-            elif location_contradiction is None:
-                unknown.append("oracle_target_location_ambiguous")
+        )
+        target_symbol = (
+            target_identity.symbol if target_identity is not None else None
+        )
+        if status == "wrong":
+            contradictions.append(target_reason)
+        elif status == "unscorable":
+            unknown.append(target_reason)
     if contradictions:
         outcome = "wrong"
         reason = "+".join(contradictions)
@@ -1250,6 +1425,8 @@ def _score_edge(
         call.target_qualified_name, target_symbol, call.strategy, site.call_form,
         caller.oracle_symbol,
         expected_target, outcome, reason,
+        caller.graph_identity, caller.oracle_identity, target_identity,
+        expected_target_identity,
     )
 
 
@@ -1281,35 +1458,39 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         for edge in graph_calls
     }
     graph_relations = set()
-    graph_names_by_symbol = defaultdict(set)
+    graph_names_by_identity = defaultdict(set)
     for edge in graph_calls:
-        caller_symbol, _, _ = _single_identity(
+        caller_identity, _, _ = _single_identity(
             identities, edge.caller_qualified_name, "caller"
         )
-        target_symbol, _, _ = _single_identity(
+        target_identity, _, _ = _single_identity(
             identities, edge.target_qualified_name, "target"
         )
-        if caller_symbol is not None and target_symbol is not None:
-            graph_relations.add((caller_symbol, target_symbol))
+        if caller_identity is not None and target_identity is not None:
+            graph_relations.add((caller_identity, target_identity))
     for qualified_name in identities:
-        symbol, _, _ = _single_identity(identities, qualified_name, "node")
-        if symbol is not None:
-            graph_names_by_symbol[symbol].add(qualified_name)
+        identity, _, _ = _single_identity(identities, qualified_name, "node")
+        if identity is not None:
+            graph_names_by_identity[identity].add(qualified_name)
     edges = []
     scored_occurrences = []
     integrity = list(integrity)
     source_candidate_keys = {
         key for key in sites
-        if not _callable_symbol(oracle_callers.get(key) or "")
+        if not _callable_symbol(
+            oracle_callers[key].symbol if key in oracle_callers else ""
+        )
     }
     for call in calls:
         key = (call.relative_path, call.callee_start_byte, call.callee_end_byte)
-        if key not in sites or not _callable_symbol(oracle_callers.get(key) or ""):
+        if key not in sites or not _callable_symbol(
+            oracle_callers[key].symbol if key in oracle_callers else ""
+        ):
             continue
-        caller_symbol, caller_reason, _ = _single_identity(
+        caller_identity, caller_reason, _ = _single_identity(
             identities, call.caller_qualified_name, "caller"
         )
-        if caller_symbol is None and caller_reason != (
+        if caller_identity is None and caller_reason != (
             "caller_not_in_oracle_configuration:cfg_inactive"
         ):
             source_candidate_keys.add(key)
@@ -1345,18 +1526,21 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         key = (edge.caller_qualified_name, edge.target_qualified_name)
         provenance = calls_by_edge.get(key, ())
         if not provenance:
-            caller_symbol, _, _ = _single_identity(
+            caller_identity, _, _ = _single_identity(
                 identities, edge.caller_qualified_name, "caller"
             )
-            target_symbol, _, _ = _single_identity(
+            target_identity, _, _ = _single_identity(
                 identities, edge.target_qualified_name, "target"
             )
             edges.append(
                 ScoredEdge(
                     edge.source_path, -1, -1, edge.caller_qualified_name,
-                    caller_symbol, edge.target_qualified_name, target_symbol,
+                    caller_identity.symbol if caller_identity is not None else None,
+                    edge.target_qualified_name,
+                    target_identity.symbol if target_identity is not None else None,
                     "no_dump_provenance", "no_provenance", None, None,
                     "unscorable", "edge_without_dump",
+                    caller_identity, None, target_identity, None,
                 )
             )
             integrity.append(
@@ -1414,24 +1598,34 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
         site_callers = callers_by_site.get(key, ())
         raw_caller = oracle_callers.get(key)
         found = False
-        if _callable_symbol(raw_caller or ""):
+        if _callable_symbol(raw_caller.symbol if raw_caller is not None else ""):
             caller = None
             if site_callers:
                 rank = {"correct": 0, "unscorable": 1, "wrong": 2}
                 caller = min(site_callers, key=lambda item: rank[item.outcome])
             if caller is not None and caller.reason == "caller_cfg_inactive":
                 continue
-            oracle_caller_symbol = raw_caller
+            oracle_caller_symbol = raw_caller.symbol
+            oracle_caller_identity = raw_caller.identity
             caller_category = "scip_callable"
             if caller is not None and caller.outcome == "unscorable":
                 gap = caller.reason.removeprefix("caller_oracle_gap:")
                 caller_category = f"caller_gap:{gap}"
             found = any(edge.outcome == "correct" for edge in site_edges)
-            if not found and oracle_caller_symbol is not None:
+            oracle_target = oracle_targets.get(key)
+            oracle_target_identity = (
+                oracle_target.identity if oracle_target is not None else None
+            )
+            if (
+                not found
+                and oracle_caller_identity is not None
+                and oracle_target_identity is not None
+            ):
                 found = (
-                    oracle_caller_symbol, site.resolved_symbol
+                    oracle_caller_identity, oracle_target_identity
                 ) in graph_relations
         else:
+            oracle_caller_identity = None
             source_nodes = source_nodes_by_site.get(key, ())
             outcomes = [node[0] for _, node in source_nodes]
             if outcomes and all(
@@ -1450,7 +1644,13 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
                     f"source:{site.relative_path}:{start}:{end}:{name}"
                 )
                 caller_category = "source_function_item"
-            target_names = graph_names_by_symbol.get(site.resolved_symbol, ())
+            oracle_target = oracle_targets.get(key)
+            oracle_target_identity = (
+                oracle_target.identity if oracle_target is not None else None
+            )
+            target_names = graph_names_by_identity.get(
+                oracle_target_identity, ()
+            )
             found = any(
                 (caller_name, target_name) in graph_pairs
                 for caller_name, _ in source_nodes
@@ -1463,6 +1663,7 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
                 site.relative_path, site.callee_start_byte, site.callee_end_byte,
                 oracle_caller_symbol, caller_category, site.resolved_symbol,
                 site.call_form, strategy, "found" if found else "missed",
+                oracle_caller_identity, oracle_target_identity,
             )
         )
     non_rust = sum(not edge.target_path.endswith(".rs") for edge in graph_calls)
@@ -1479,6 +1680,13 @@ def format_completeness(completeness):
         f"{category}={count}" for category, count in completeness
     )
     return f"call_site_completeness total={total} {categories}"
+
+
+def recall_relation_key(occurrence):
+    """Return the declaration-exact caller/target key for one truth occurrence."""
+    caller = occurrence.oracle_caller_identity or occurrence.oracle_caller_symbol
+    target = occurrence.oracle_target_identity or occurrence.oracle_symbol
+    return caller, target
 
 
 def write_score_details(output_directory, report):

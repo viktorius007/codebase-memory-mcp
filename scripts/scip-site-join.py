@@ -8,6 +8,7 @@ import sys
 from scip_rust_sites import (
     format_completeness,
     NON_INTERNAL_TRUTH,
+    recall_relation_key,
     score_calls,
     write_score_details,
 )
@@ -71,7 +72,7 @@ def print_recall(report):
     total = len(report.recall)
     value = counts["found"] / total * 100 if total else 0.0
     relations = {
-        (occurrence.oracle_caller_symbol, occurrence.oracle_symbol): occurrence.outcome
+        recall_relation_key(occurrence): occurrence.outcome
         for occurrence in report.recall
         if occurrence.oracle_caller_symbol is not None
     }

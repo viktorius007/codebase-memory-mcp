@@ -25,8 +25,15 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from typing import NamedTuple
 
 DEFINITION_ROLE = 0x1
+
+
+class DefinitionIdentity(NamedTuple):
+    symbol: str
+    relative_path: str
+    definition_range: tuple[int, int, int, int]
 
 
 def varint(buf, i):

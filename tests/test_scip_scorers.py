@@ -600,7 +600,7 @@ class ScipScorerTests(unittest.TestCase):
                 result.stdout,
             )
 
-    def test_reference_truth_without_target_definition_is_not_wrong(self):
+    def test_reference_truth_without_target_definition_uses_graph_declaration(self):
         source = "fn target() {}\nfn caller() { target(); }\n"
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ScorerFixture(temporary, source)
@@ -636,12 +636,133 @@ class ScipScorerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                "published_edges=1 correct=0 wrong=0 unscorable=1", result.stdout
+                "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
             )
+
+    def test_duplicate_caller_symbol_at_another_declaration_is_wrong(self):
+        source_a = "fn target() {}\nfn caller() { target(); }\n"
+        source_b = "fn caller() {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source_a)
+            (fixture.corpus / "src" / "a.rs").write_text(
+                source_a, encoding="utf-8"
+            )
+            (fixture.corpus / "src" / "b.rs").write_text(
+                source_b, encoding="utf-8"
+            )
+            target = symbol("fixture/target().")
+            shared_caller = symbol("fixture/caller().")
+            document_a = field(1, 2, b"src/a.rs") + b"".join((
+                occurrence(
+                    range_for(source_a, "target", 0), target, 1,
+                    line_range(source_a, 0),
+                ),
+                occurrence(
+                    range_for(source_a, "caller"), shared_caller, 1,
+                    line_range(source_a, 1),
+                ),
+                occurrence(range_for(source_a, "target", 1), target),
+                symbol_information(target, 17, "target"),
+                symbol_information(shared_caller, 17, "caller"),
+            ))
+            document_b = field(1, 2, b"src/b.rs") + b"".join((
+                occurrence(
+                    range_for(source_b, "caller"), shared_caller, 1,
+                    line_range(source_b, 0),
+                ),
+                symbol_information(shared_caller, 17, "caller"),
+            ))
+            fixture.scip.write_bytes(
+                field(2, 2, document_a) + field(2, 2, document_b)
+            )
+            fixture.create_database(
+                (
+                    ("fixture.a.target", "src/a.rs", "target", "Function", 1, 1),
+                    ("fixture.b.caller", "src/b.rs", "caller", "Function", 1, 1),
+                ),
+                edges=(("fixture.b.caller", "fixture.a.target"),),
+            )
+            start, end = byte_span(source_a, "target", 1)
+            fixture.dump.write_text(
+                "\t".join((
+                    "C", "src/a.rs", str(start), str(end + 2),
+                    "fixture.b.caller", "target", "fixture.a.target", "direct",
+                    "1.0", "admitted", "-", "-", str(start), str(end),
+                )) + "\n",
+                encoding="utf-8",
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                "unscorable_category=target_oracle_gap:oracle_definition_missing count=1",
-                result.stdout,
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
             )
+            self.assertIn("caller_identity_mismatch", result.stdout)
+
+    def test_same_file_duplicate_target_symbol_at_wrong_declaration_is_wrong(self):
+        source = (
+            "fn first() {\n"
+            "    struct Local(u8);\n"
+            "    let _ = Local(1);\n"
+            "}\n"
+            "fn second() {\n"
+            "    struct Local(u8);\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            caller = symbol("fixture/first().")
+            shared_target = symbol("fixture/Local#")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "first"), caller, 1, [0, 0, 3, 1]
+                    ),
+                    occurrence(
+                        range_for(source, "Local", 0), shared_target, 1,
+                        [0, 0, 3, 1],
+                    ),
+                    occurrence(range_for(source, "Local", 1), shared_target),
+                    occurrence(
+                        range_for(source, "Local", 2), shared_target, 1,
+                        [4, 0, 6, 1],
+                    ),
+                ),
+                (
+                    symbol_information(caller, 17, "first"),
+                    symbol_information(shared_target, 49, "Local"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.first", "src/lib.rs", "first", "Function", 1, 4),
+                    (
+                        "fixture.second.Local", "src/lib.rs", "Local",
+                        "Struct", 6, 6,
+                    ),
+                ),
+                edges=(("fixture.first", "fixture.second.Local"),),
+            )
+            start, end = byte_span(source, "Local", 1)
+            fixture.dump.write_text(
+                "\t".join((
+                    "C", "src/lib.rs", str(start), str(end + 3),
+                    "fixture.first", "Local", "fixture.second.Local", "direct",
+                    "1.0", "admitted", "-", "-", str(start), str(end),
+                )) + "\n",
+                encoding="utf-8",
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "published_edges=1 correct=0 wrong=1 unscorable=0", result.stdout
+            )
+            self.assertIn("target_identity_mismatch", result.stdout)
 
     def test_resolved_oracle_target_rejects_nonsemantic_graph_target(self):
         source = "fn caller() { target(); }\n"
@@ -2161,6 +2282,111 @@ class ScipScorerTests(unittest.TestCase):
             )
             self.assertIn(
                 "truth sites 2 found correct 2 recall=100.00%", result.stdout
+            )
+
+    def test_recall_relations_include_definition_locations(self):
+        source = "fn target() {}\nfn caller() { target(); }\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            (fixture.corpus / "src" / "a.rs").write_text(
+                source, encoding="utf-8"
+            )
+            (fixture.corpus / "src" / "b.rs").write_text(
+                source, encoding="utf-8"
+            )
+            shared_target = symbol("fixture/target().")
+            shared_caller = symbol("fixture/caller().")
+            documents = []
+            for relative_path in (b"src/a.rs", b"src/b.rs"):
+                document = field(1, 2, relative_path) + b"".join((
+                    occurrence(
+                        range_for(source, "target", 0), shared_target, 1,
+                        line_range(source, 0),
+                    ),
+                    occurrence(
+                        range_for(source, "caller"), shared_caller, 1,
+                        line_range(source, 1),
+                    ),
+                    occurrence(range_for(source, "target", 1), shared_target),
+                    symbol_information(shared_target, 17, "target"),
+                    symbol_information(shared_caller, 17, "caller"),
+                ))
+                documents.append(field(2, 2, document))
+            fixture.scip.write_bytes(b"".join(documents))
+            fixture.create_database(())
+            fixture.dump.write_text("", encoding="utf-8")
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "truth relations 2 found correct 0 recall=0.00%", result.stdout
+            )
+            self.assertIn(
+                "truth sites 2 found correct 0 recall=0.00%", result.stdout
+            )
+
+    def test_wrong_location_relation_is_not_credited_as_found(self):
+        source_a = "fn helper() {}\nfn caller() { helper(); }\n"
+        source_b = "fn helper() {}\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source_a)
+            (fixture.corpus / "src" / "a.rs").write_text(
+                source_a, encoding="utf-8"
+            )
+            (fixture.corpus / "src" / "b.rs").write_text(
+                source_b, encoding="utf-8"
+            )
+            shared_target = symbol("fixture/helper().")
+            caller = symbol("fixture/caller().")
+            document_a = field(1, 2, b"src/a.rs") + b"".join((
+                occurrence(
+                    range_for(source_a, "helper", 0), shared_target, 1,
+                    line_range(source_a, 0),
+                ),
+                occurrence(
+                    range_for(source_a, "caller"), caller, 1,
+                    line_range(source_a, 1),
+                ),
+                occurrence(range_for(source_a, "helper", 1), shared_target),
+                symbol_information(shared_target, 17, "helper"),
+                symbol_information(caller, 17, "caller"),
+            ))
+            document_b = field(1, 2, b"src/b.rs") + b"".join((
+                occurrence(
+                    range_for(source_b, "helper"), shared_target, 1,
+                    line_range(source_b, 0),
+                ),
+                symbol_information(shared_target, 17, "helper"),
+            ))
+            fixture.scip.write_bytes(
+                field(2, 2, document_a) + field(2, 2, document_b)
+            )
+            fixture.create_database(
+                (
+                    ("fixture.a.caller", "src/a.rs", "caller", "Function", 2, 2),
+                    ("fixture.b.helper", "src/b.rs", "helper", "Function", 1, 1),
+                ),
+                edges=(("fixture.a.caller", "fixture.b.helper"),),
+            )
+            start, end = byte_span(source_a, "helper", 1)
+            fixture.dump.write_text(
+                "\t".join((
+                    "C", "src/a.rs", str(start), str(end + 2),
+                    "fixture.a.caller", "helper", "fixture.b.helper", "direct",
+                    "1.0", "admitted", "-", "-", str(start), str(end),
+                )) + "\n",
+                encoding="utf-8",
+            )
+
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "truth relations 1 found correct 0 recall=0.00%", result.stdout
+            )
+            self.assertIn(
+                "truth sites 1 found correct 0 recall=0.00%", result.stdout
             )
 
     def test_harness_compares_full_definition_identity_not_short_names(self):
