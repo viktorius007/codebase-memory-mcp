@@ -25,8 +25,15 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from typing import NamedTuple
 
 DEFINITION_ROLE = 0x1
+
+
+class DefinitionIdentity(NamedTuple):
+    symbol: str
+    relative_path: str
+    definition_range: tuple[int, int, int, int]
 
 
 def varint(buf, i):
@@ -76,9 +83,10 @@ def norm_range(values):
     return (values[0], values[1], values[2], values[3])
 
 
-def parse(path):
+def parse_with_definition_sites(path):
     data = open(path, "rb").read()
     definitions = defaultdict(list)
+    definition_sites = defaultdict(list)
     references = defaultdict(list)
     documents = 0
     for number, (kind, payload) in fields(data, 0, len(data)):
@@ -108,10 +116,89 @@ def parse(path):
             if symbol is None or rng is None:
                 continue
             if roles & DEFINITION_ROLE:
-                definitions[doc_path].append((norm_range(enclosing or rng), symbol))
+                definition_range = norm_range(rng)
+                enclosing_range = norm_range(enclosing or rng)
+                definitions[doc_path].append((enclosing_range, symbol))
+                definition_sites[doc_path].append(
+                    (definition_range, enclosing_range, symbol)
+                )
             else:
                 references[doc_path].append((norm_range(rng), symbol))
+    return documents, definitions, references, definition_sites
+
+
+def parse_definition_identities(path):
+    """Return SCIP definition occurrences with their declared name and kind."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    definitions = defaultdict(list)
+    for number, (kind, payload) in fields(data, 0, len(data)):
+        if number != 2 or kind != "bytes":
+            continue
+        doc_path, occurrences, symbols = None, [], {}
+        for dnum, (dkind, dpayload) in fields(payload, 0, len(payload)):
+            if dnum == 1 and dkind == "bytes":
+                doc_path = dpayload.decode()
+            elif dnum == 2 and dkind == "bytes":
+                occurrences.append(dpayload)
+            elif dnum == 3 and dkind == "bytes":
+                identity = display_name = None
+                symbol_kind = 0
+                for snum, (skind, spayload) in fields(dpayload, 0, len(dpayload)):
+                    if snum == 1 and skind == "bytes":
+                        identity = spayload.decode("utf8", "replace")
+                    elif snum == 5 and skind == "varint":
+                        symbol_kind = spayload
+                    elif snum == 6 and skind == "bytes":
+                        display_name = spayload.decode("utf8", "replace")
+                if identity is not None:
+                    symbols[identity] = (display_name, symbol_kind)
+        if doc_path is None:
+            continue
+        for occurrence in occurrences:
+            rng = identity = None
+            roles = 0
+            for onum, (okind, opayload) in fields(occurrence, 0, len(occurrence)):
+                if onum == 1 and okind == "bytes":
+                    rng = packed_ints(opayload)
+                elif onum == 2 and okind == "bytes":
+                    identity = opayload.decode("utf8", "replace")
+                elif onum == 3 and okind == "varint":
+                    roles = opayload
+            information = symbols.get(identity)
+            if roles & DEFINITION_ROLE and rng is not None and information is not None:
+                display_name, symbol_kind = information
+                definitions[doc_path].append(
+                    (norm_range(rng), identity, display_name, symbol_kind)
+                )
+    return definitions
+
+
+def parse(path):
+    documents, definitions, references, _ = parse_with_definition_sites(path)
     return documents, definitions, references
+
+
+def definition_symbol_for_node(definition_sites, path, start_line, end_line):
+    """Return the sole SCIP definition inside a 1-based graph node span."""
+    entries = definition_sites.get(path, ())
+    node_start = start_line - 1
+    node_end = end_line - 1
+    exact = {
+        symbol
+        for _, enclosing, symbol in entries
+        if enclosing[0] == node_start and enclosing[2] == node_end
+        and descriptor_of(symbol).endswith("().")
+    }
+    if len(exact) == 1:
+        return next(iter(exact))
+    contained = {
+        symbol
+        for definition, _, symbol in entries
+        if node_start <= definition[0] <= node_end
+        and descriptor_of(symbol).endswith("().")
+    }
+    return next(iter(contained)) if len(contained) == 1 else None
 
 
 def innermost(intervals, position):
@@ -127,6 +214,13 @@ def innermost(intervals, position):
 def crate_of(symbol):
     match = re.match(r"rust-analyzer cargo ([^\s]+) ", symbol)
     return match.group(1) if match else None
+
+
+def package_of(symbol):
+    parts = symbol.split(" ", 4)
+    if len(parts) != 5 or parts[:2] != ["rust-analyzer", "cargo"]:
+        return None
+    return " ".join(parts[:4])
 
 
 def descriptor_of(symbol):

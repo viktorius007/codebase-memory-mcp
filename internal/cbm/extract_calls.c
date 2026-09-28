@@ -3660,6 +3660,10 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
             call.site_start_byte = ts_node_start_byte(node);
             call.site_end_byte = ts_node_end_byte(node);
+            if (!ts_node_is_null(callee.leaf)) {
+                call.callee_start_byte = ts_node_start_byte(callee.leaf);
+                call.callee_end_byte = ts_node_end_byte(callee.leaf);
+            }
             // Perl-only: flag arrow/method calls ($obj->m / Class->m). The
             // generic short-name resolver cannot place a method without a known
             // receiver type, so the call-resolution pass suppresses those edges.

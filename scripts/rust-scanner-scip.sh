@@ -112,7 +112,8 @@ export CBM_RUNTIME_DIR
 mkdir -p "$CBM_CACHE_DIR"
 chmod 700 "$CBM_CACHE_DIR" "$CBM_RUNTIME_DIR"
 printf '%s\n' "$CBM_RUNTIME_DIR" >"$ARTIFACT_DIR/runtime-dir.txt"
-if ! "$PROD_BIN" cli index_repository --repo-path "$BUILD_ROOT/corpus" \
+if ! CBM_RUST_RESOLVE_DUMP="$ARTIFACT_DIR/resolver.tsv" \
+        "$PROD_BIN" cli index_repository --repo-path "$BUILD_ROOT/corpus" \
         --mode full --name scip-lane >"$ARTIFACT_DIR/index.log" 2>&1; then
     fail_bounded "index_repository failed on the corpus: $(tail -c 300 "$ARTIFACT_DIR/index.log")"
     exit 1
@@ -131,6 +132,7 @@ join_status=0
 "$PYTHON_BIN" "$ROOT/scripts/scip-harness-join.py" \
     --cbm "$PROD_BIN" --project scip-lane --corpus "$BUILD_ROOT/corpus" \
     --scip "$ARTIFACT_DIR/index.scip" --cargo "$CARGO_BIN" \
+    --db "$CBM_CACHE_DIR/scip-lane.db" --dump "$ARTIFACT_DIR/resolver.tsv" \
     --expected "$EXPECTED_FILE" --detail-dir "$ARTIFACT_DIR" \
     >"$JOIN_OUT" 2>"$ARTIFACT_DIR/join.log" || join_status=$?
 

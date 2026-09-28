@@ -216,6 +216,8 @@ typedef struct {
      * substitution is not position-preserving. */
     uint32_t emit_site_start_byte;
     uint32_t emit_site_end_byte;
+    uint32_t emit_callee_start_byte;
+    uint32_t emit_callee_end_byte;
     bool site_map_active;
     uint32_t site_map_synthetic_start_byte;
     uint32_t site_map_synthetic_end_byte;

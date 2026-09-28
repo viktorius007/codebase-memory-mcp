@@ -284,6 +284,7 @@ bash "$ROOT/tests/test_semantic_epoch_contract.sh"
 echo "=== Step 0z: Rust scanner harness contracts ==="
 bash "$ROOT/tests/test_rust_scanner_mutation.sh"
 bash "$ROOT/tests/test_rust_scanner_coverage.sh"
+python3 "$ROOT/tests/test_scip_scorers.py"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"

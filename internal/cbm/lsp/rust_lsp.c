@@ -4682,6 +4682,8 @@ static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn) {
     if (ctx->emit_site_end_byte > ctx->emit_site_start_byte) {
         call.site_start_byte = ctx->emit_site_start_byte;
         call.site_end_byte = ctx->emit_site_end_byte;
+        call.callee_start_byte = ctx->emit_callee_start_byte;
+        call.callee_end_byte = ctx->emit_callee_end_byte;
         call.requires_lsp_resolution = true;
     }
     cbm_calls_push(ctx->syn_calls, ctx->arena, call);
@@ -5270,6 +5272,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
 static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
     uint32_t saved_start = ctx->emit_site_start_byte;
     uint32_t saved_end = ctx->emit_site_end_byte;
+    uint32_t saved_callee_start = ctx->emit_callee_start_byte;
+    uint32_t saved_callee_end = ctx->emit_callee_end_byte;
     uint32_t mapped_start = 0;
     uint32_t mapped_end = 0;
     if (rust_map_source_range(ctx, ts_node_start_byte(node), ts_node_end_byte(node), &mapped_start,
@@ -5280,9 +5284,31 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
         ctx->emit_site_start_byte = 0;
         ctx->emit_site_end_byte = 0;
     }
+    ctx->emit_callee_start_byte = 0;
+    ctx->emit_callee_end_byte = 0;
+    TSNode callee = ts_node_child_by_field_name(node, "function", 8);
+    if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "generic_function") == 0) {
+        TSNode inner = ts_node_child_by_field_name(callee, "function", 8);
+        if (!ts_node_is_null(inner)) {
+            callee = inner;
+        }
+    }
+    if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "field_expression") == 0) {
+        callee = ts_node_child_by_field_name(callee, "field", 5);
+    } else if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "scoped_identifier") == 0) {
+        callee = ts_node_child_by_field_name(callee, "name", 4);
+    }
+    if (!ts_node_is_null(callee) &&
+        rust_map_source_range(ctx, ts_node_start_byte(callee), ts_node_end_byte(callee),
+                              &mapped_start, &mapped_end)) {
+        ctx->emit_callee_start_byte = mapped_start;
+        ctx->emit_callee_end_byte = mapped_end;
+    }
     rust_resolve_call_expression_inner(ctx, node);
     ctx->emit_site_start_byte = saved_start;
     ctx->emit_site_end_byte = saved_end;
+    ctx->emit_callee_start_byte = saved_callee_start;
+    ctx->emit_callee_end_byte = saved_callee_end;
 }
 
 /* Walk every node in a function body, recording calls and refining scope

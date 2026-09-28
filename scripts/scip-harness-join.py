@@ -1,42 +1,25 @@
 #!/usr/bin/env python3
-"""Join production-graph Rust edges against a rust-analyzer SCIP oracle.
-
-Consumes an already-built graph project and an already-generated SCIP index of
-the same corpus, classifies every Rust CALLS edge, and gates the result on an
-expectation file. The SCIP derivation (protobuf decode, definition intervals,
-innermost attribution, descriptor predicates) is imported unchanged from
-scripts/scip-call-edges.py, the committed oracle.
-
-Edge classes, keyed on (caller file, caller short name, callee short name):
-
-- fabricated (must-not-exist, unconditional): graph CALLS edge whose key has no
-  attributed reference anywhere in the SCIP index. Any count above zero rejects
-  the run regardless of the expectation file, because such an edge can only
-  come from name guessing or emission bypasses, never from source.
-- matched (must-match): graph CALLS edge present in the oracle's strict
-  same-file free-function call set -- the subset the graph documents as
-  supported. The expectation pins the exact count.
-- graph_only_referenced (may-exceed): graph CALLS edge outside the strict set
-  but attested by an oracle reference (method calls, cross-file calls,
-  function-value references). Allowed because SCIP's "()." descriptor also
-  matches non-call references; bounded by the expectation.
-- oracle_only: strict-set oracle edges absent from the graph. The expectation
-  pins the exact count so coverage loss fails loudly.
-
-IMPORTS edges are counted (not oracle-joined) and pinned by the expectation.
-
-Prints one counts line to stdout, then one "violation: ..." line per rejected
-constraint. Edge-level detail lands in --detail-dir as sorted TSV files.
-Exit 0 accept, 1 reject, 2 harness error.
-"""
+"""Gate graph Rust CALLS edges against exact SCIP occurrence truth."""
 
 import argparse
+from collections import Counter
 import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+
+from scip_rust_sites import (
+    AMBIGUOUS,
+    CALL_THROUGH_VALUE,
+    EXTERNAL,
+    format_completeness,
+    recall_relation_key,
+    score_calls,
+    write_score_details,
+)
+
 
 EXPECTED_KEYS = (
     "calls_matched",
@@ -59,14 +42,6 @@ def load_decoder():
     return module
 
 
-def short_name(decoder, symbol):
-    descriptor = decoder.descriptor_of(symbol)
-    if descriptor.endswith("()."):
-        descriptor = descriptor[:-3]
-    identifiers = re.findall(r"[A-Za-z0-9_]+", descriptor)
-    return identifiers[-1] if identifiers else None
-
-
 def load_expectation(path):
     values = {}
     with open(path, encoding="utf-8") as handle:
@@ -77,16 +52,20 @@ def load_expectation(path):
             key, separator, value = line.partition("=")
             where = f"{path}:{line_number}"
             if not separator:
-                raise HarnessError(f"expectation {where}: expected key=value, got {line!r}")
+                raise HarnessError(
+                    f"expectation {where}: expected key=value, got {line!r}"
+                )
             if key not in EXPECTED_KEYS:
                 raise HarnessError(
-                    f"expectation {where}: unknown key {key!r}, expected one of {EXPECTED_KEYS}"
+                    f"expectation {where}: unknown key {key!r}, "
+                    f"expected one of {EXPECTED_KEYS}"
                 )
             if key in values:
                 raise HarnessError(f"expectation {where}: duplicate key {key!r}")
             if not re.fullmatch(r"[0-9]+", value):
                 raise HarnessError(
-                    f"expectation {where}: key {key!r} given {value!r}, expected a non-negative integer"
+                    f"expectation {where}: key {key!r} given {value!r}, "
+                    "expected a non-negative integer"
                 )
             values[key] = int(value)
     missing = [key for key in EXPECTED_KEYS if key not in values]
@@ -98,7 +77,9 @@ def load_expectation(path):
 def graph_edges(cbm, project, edge_type):
     query = (
         f"MATCH (a)-[:{edge_type}]->(b) "
-        "RETURN a.file_path AS af, a.name AS an, b.name AS bn LIMIT 1000000"
+        "RETURN a.file_path AS af, a.start_line AS asl, a.end_line AS ael, "
+        "a.qualified_name AS aqn, b.file_path AS bf, b.start_line AS bsl, "
+        "b.end_line AS bel, b.qualified_name AS bqn LIMIT 1000000"
     )
     rows, offset = [], 0
     while True:
@@ -127,16 +108,7 @@ def graph_edges(cbm, project, edge_type):
         offset += len(page)
 
 
-def oracle_sets(decoder, scip_path, corpus, cargo):
-    _, definitions, references = decoder.parse(scip_path)
-    edges = set()
-    for path, refs in references.items():
-        intervals = definitions[path]
-        for rng, symbol in refs:
-            caller = decoder.innermost(intervals, (rng[0], rng[1]))
-            if caller and caller != symbol:
-                edges.add((caller, symbol, path))
-
+def strict_call_pairs(decoder, report, corpus, cargo):
     result = subprocess.run(
         [cargo, "metadata", "--no-deps", "--format-version", "1"],
         cwd=corpus, capture_output=True, text=True,
@@ -148,97 +120,179 @@ def oracle_sets(decoder, scip_path, corpus, cargo):
         )
     metadata = json.loads(result.stdout)
     workspace = {package["name"] for package in metadata["packages"]}
-
-    defining_file = {}
-    for path, entries in definitions.items():
-        for _, symbol in entries:
-            defining_file.setdefault(symbol, path)
-
-    def is_free_function(symbol):
-        descriptor = decoder.descriptor_of(symbol)
-        return descriptor.endswith("().") and "#" not in descriptor
-
-    referenced, strict = set(), set()
-    for caller, target, path in edges:
-        caller_name = short_name(decoder, caller)
-        target_name = short_name(decoder, target)
-        if caller_name is None or target_name is None:
+    strict = set()
+    for occurrence in report.recall:
+        caller = occurrence.oracle_caller_identity
+        target = occurrence.oracle_target_identity
+        if caller is None or target is None:
             continue
-        referenced.add((path, caller_name, target_name))
+        caller_descriptor = decoder.descriptor_of(caller.symbol)
+        target_descriptor = decoder.descriptor_of(target.symbol)
         if (
-            is_free_function(caller)
-            and is_free_function(target)
-            and decoder.crate_of(caller) in workspace
-            and decoder.crate_of(target) in workspace
-            and defining_file.get(caller) == path
-            and defining_file.get(target) == path
+            caller != target
+            and caller_descriptor.endswith("().")
+            and "#" not in caller_descriptor
+            and target_descriptor.endswith("().")
+            and "#" not in target_descriptor
+            and decoder.crate_of(caller.symbol) in workspace
+            and decoder.crate_of(target.symbol) in workspace
+            and caller.relative_path == occurrence.relative_path
+            and target.relative_path == occurrence.relative_path
         ):
-            strict.add((path, caller_name, target_name))
-    return referenced, strict
+            strict.add((caller, target))
+    return strict
 
 
-def normalize_calls(rows, corpus):
-    prefix = os.path.abspath(corpus) + os.sep
-    edges = set()
-    for file_path, caller, callee in rows:
-        if file_path.startswith(prefix):
-            file_path = file_path[len(prefix):]
-        if file_path.endswith(".rs"):
-            edges.add((file_path, caller, callee))
-    return edges
-
-
-def write_detail(detail_dir, name, edges):
+def write_detail(detail_dir, name, rows):
     with open(os.path.join(detail_dir, name), "w", encoding="utf-8") as handle:
-        for edge in sorted(edges):
-            handle.write("\t".join(edge) + "\n")
+        for row in sorted(rows):
+            handle.write("\t".join(str(value) for value in row) + "\n")
+
+
+def edge_detail(edge):
+    return (
+        edge.relative_path, edge.callee_start_byte, edge.callee_end_byte,
+        edge.strategy, edge.call_form, edge.caller_symbol or "-",
+        edge.oracle_caller_symbol or "-", edge.target_symbol or "-",
+        edge.oracle_symbol or "-",
+        edge.target_qualified_name, edge.reason,
+    )
+
+
+def recall_detail(occurrence):
+    return (
+        occurrence.relative_path, occurrence.callee_start_byte,
+        occurrence.callee_end_byte, occurrence.strategy,
+        occurrence.call_form, occurrence.oracle_symbol,
+    )
+
+
+def print_breakdowns(report):
+    precision = Counter(
+        (
+            edge.strategy, edge.call_form, edge.outcome,
+            edge.reason,
+        )
+        for edge in report.edges
+    )
+    for (strategy, call_form, outcome, reason), count in sorted(precision.items()):
+        print(
+            f"precision strategy={strategy} call_form={call_form} "
+            f"outcome={outcome} reason={reason} count={count}"
+        )
+    recall = Counter(
+        (item.strategy, item.call_form, item.outcome) for item in report.recall
+    )
+    for (strategy, call_form, outcome), count in sorted(recall.items()):
+        print(
+            f"recall strategy={strategy} call_form={call_form} "
+            f"outcome={outcome} count={count}"
+        )
+    targets = Counter(
+        (item.target_category, item.outcome) for item in report.recall
+    )
+    for (category, outcome), count in sorted(targets.items()):
+        print(
+            f"recall target_category={category} outcome={outcome} count={count}"
+        )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cbm", required=True, help="production binary")
     parser.add_argument("--project", required=True, help="indexed project name")
-    parser.add_argument("--corpus", required=True, help="corpus root the graph and SCIP index describe")
-    parser.add_argument("--scip", required=True, help="rust-analyzer SCIP index file")
-    parser.add_argument("--cargo", required=True, help="cargo binary for workspace identity")
-    parser.add_argument("--expected", required=True, help="expectation file")
-    parser.add_argument("--detail-dir", required=True, help="directory for edge-level TSV detail")
+    parser.add_argument("--corpus", required=True)
+    parser.add_argument("--scip", required=True)
+    parser.add_argument("--db", required=True, help="graph SQLite database")
+    parser.add_argument("--dump", required=True, help="published Rust call dump")
+    parser.add_argument("--cargo", required=True)
+    parser.add_argument("--expected", required=True)
+    parser.add_argument("--detail-dir", required=True)
     args = parser.parse_args()
 
     expected = load_expectation(args.expected)
-    decoder = load_decoder()
-    referenced, strict = oracle_sets(decoder, args.scip, args.corpus, args.cargo)
-    calls = normalize_calls(graph_edges(args.cbm, args.project, "CALLS"), args.corpus)
+    report = score_calls(args.corpus, args.scip, args.db, args.dump)
+    strict = strict_call_pairs(load_decoder(), report, args.corpus, args.cargo)
+    correct = [edge for edge in report.edges if edge.outcome == "correct"]
+    wrong = [edge for edge in report.edges if edge.outcome == "wrong"]
+    unscorable = [edge for edge in report.edges if edge.outcome == "unscorable"]
+    wrong_occurrences = sum(
+        edge.outcome == "wrong" for edge in report.occurrences
+    )
+    matched = [
+        edge for edge in correct
+        if (edge.caller_identity, edge.oracle_target_identity) in strict
+    ]
+    graph_only = [edge for edge in correct if edge not in matched]
+    missed = [item for item in report.recall if item.outcome == "missed"]
+    relation_outcomes = {
+        recall_relation_key(item): item.outcome
+        for item in report.recall
+        if item.oracle_caller_symbol is not None
+    }
+    relation_found = sum(
+        outcome == "found" for outcome in relation_outcomes.values()
+    )
+    occurrence_found = len(report.recall) - len(missed)
+    relation_recall = (
+        relation_found / len(relation_outcomes) * 100 if relation_outcomes else 0.0
+    )
+    occurrence_recall = (
+        occurrence_found / len(report.recall) * 100 if report.recall else 0.0
+    )
     imports = sorted(set(graph_edges(args.cbm, args.project, "IMPORTS")))
+    inventory = Counter(site.resolved_symbol for site in report.inventory)
 
-    matched = calls & strict
-    graph_only = calls - strict
-    graph_only_referenced = graph_only & referenced
-    fabricated = graph_only - referenced
-    oracle_only = strict - calls
-
-    write_detail(args.detail_dir, "calls-matched.tsv", matched)
-    write_detail(args.detail_dir, "calls-graph-only-referenced.tsv", graph_only_referenced)
-    write_detail(args.detail_dir, "calls-fabricated.tsv", fabricated)
-    write_detail(args.detail_dir, "calls-oracle-only.tsv", oracle_only)
+    write_score_details(args.detail_dir, report)
+    write_detail(args.detail_dir, "calls-matched.tsv", map(edge_detail, matched))
+    write_detail(
+        args.detail_dir, "calls-graph-only-referenced.tsv",
+        map(edge_detail, graph_only),
+    )
+    write_detail(args.detail_dir, "calls-fabricated.tsv", map(edge_detail, wrong))
+    write_detail(args.detail_dir, "calls-unscorable.tsv", map(edge_detail, unscorable))
+    write_detail(args.detail_dir, "calls-oracle-only.tsv", map(recall_detail, missed))
     write_detail(args.detail_dir, "imports.tsv", imports)
 
     print(
-        f"calls_graph={len(calls)} matched={len(matched)} "
-        f"graph_only_referenced={len(graph_only_referenced)} "
-        f"fabricated={len(fabricated)} oracle_strict={len(strict)} "
-        f"oracle_only={len(oracle_only)} imports={len(imports)}"
+        f"calls_graph={len(report.edges)} correct={len(correct)} wrong={len(wrong)} "
+        f"unscorable={len(unscorable)} matched={len(matched)} "
+        f"graph_only_referenced={len(graph_only)} fabricated={len(wrong)} "
+        f"wrong_occurrences={wrong_occurrences} "
+        f"non_rust_target_edges={report.non_rust_target_edges} "
+        f"integrity_errors={len(report.integrity)} "
+        f"oracle_relations={len(relation_outcomes)} "
+        f"relations_found={relation_found} relation_recall={relation_recall:.2f}% "
+        f"oracle_internal={len(report.recall)} oracle_only={len(missed)} "
+        f"occurrences_found={occurrence_found} "
+        f"occurrence_recall={occurrence_recall:.2f}% "
+        f"oracle_call_through_value={inventory[CALL_THROUGH_VALUE]} "
+        f"oracle_external={inventory[EXTERNAL]} "
+        f"oracle_ambiguous={inventory[AMBIGUOUS]} imports={len(imports)}"
     )
+    print(format_completeness(report.completeness))
+    print_breakdowns(report)
+
     violations = []
-    if fabricated:
+    if wrong:
         violations.append(
-            f"violation: fabricated expected=0 got={len(fabricated)} detail=calls-fabricated.tsv"
+            f"violation: fabricated expected=0 got={len(wrong)} "
+            "detail=calls-fabricated.tsv"
+        )
+    if report.integrity:
+        categories = Counter(error.category for error in report.integrity)
+        violations.append(
+            f"violation: call_integrity expected=0 got={len(report.integrity)} "
+            f"categories={dict(sorted(categories.items()))} "
+            "detail=integrity-errors.tsv"
         )
     for label, count, key, detail in (
         ("matched", len(matched), "calls_matched", "calls-matched.tsv"),
-        ("graph_only_referenced", len(graph_only_referenced),
-         "calls_graph_only_referenced", "calls-graph-only-referenced.tsv"),
-        ("oracle_only", len(oracle_only), "calls_oracle_only", "calls-oracle-only.tsv"),
+        (
+            "graph_only_referenced", len(graph_only),
+            "calls_graph_only_referenced", "calls-graph-only-referenced.tsv",
+        ),
+        ("oracle_only", len(missed), "calls_oracle_only", "calls-oracle-only.tsv"),
         ("imports", len(imports), "imports", "imports.tsv"),
     ):
         if count != expected[key]:
@@ -253,6 +307,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except HarnessError as error:
+    except (HarnessError, ValueError) as error:
         print(error, file=sys.stderr)
         sys.exit(2)

@@ -206,9 +206,10 @@ static void free_import_map(const char **keys, const char **vals, int count) {
 }
 
 /* Handle a route registration call: create Route node + HANDLES edge. */
-static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
-                                      const cbm_gbuf_node_t *source_node, const char *module_qn,
-                                      const char **imp_keys, const char **imp_vals, int imp_count) {
+static int64_t handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                                         const cbm_gbuf_node_t *source_node, const char *module_qn,
+                                         const char **imp_keys, const char **imp_vals,
+                                         int imp_count) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
@@ -226,7 +227,9 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_fa);
-    cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
+    int edge_count = cbm_gbuf_edge_count(ctx->gbuf);
+    int64_t edge_id = cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
+    bool inserted = edge_id > 0 && cbm_gbuf_edge_count(ctx->gbuf) > edge_count;
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
                                                      module_qn, imp_keys, imp_vals, imp_count);
@@ -242,6 +245,7 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
             }
         }
     }
+    return inserted ? route_id : 0;
 }
 
 /* Emit an HTTP/async route edge for a service call. */
@@ -331,8 +335,8 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
     }
 }
 
-static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
-                            char *props, size_t cap, const CBMCall *call) {
+static int64_t calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
+                               char *props, size_t cap, const CBMCall *call) {
     if (call && call->start_line > 0 && strcmp(type, "CALLS") == 0) {
         size_t len = strlen(props);
         if (len >= SKIP_ONE && props[len - SKIP_ONE] == '}' && len + CBM_SZ_32 < cap) {
@@ -343,13 +347,15 @@ static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const ch
     if (call && strcmp(type, "CALLS") == 0) {
         calls_append_args(props, cap, call);
     }
-    cbm_gbuf_insert_edge(gbuf, src, tgt, type, props);
+    int edge_count = cbm_gbuf_edge_count(gbuf);
+    int64_t edge_id = cbm_gbuf_insert_edge(gbuf, src, tgt, type, props);
+    return edge_id > 0 && cbm_gbuf_edge_count(gbuf) > edge_count ? edge_id : 0;
 }
 
-static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
-                                 const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
-                                 const cbm_resolution_t *res, cbm_svc_kind_t svc,
-                                 bool suppress_plain_calls) {
+static int64_t emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                                    const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
+                                    const cbm_resolution_t *res, cbm_svc_kind_t svc,
+                                    bool suppress_plain_calls) {
     const char *url_or_topic = call->first_string_arg;
     bool is_url = (url_or_topic && url_or_topic[0] != '\0' &&
                    (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL));
@@ -367,7 +373,7 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
          * target->id into a null dereference (clang-analyzer traced exactly
          * that), and with no callee node there is nothing to emit anyway. */
         if (suppress_plain_calls || !target) {
-            return;
+            return 0;
         }
         char esc_callee[CBM_SZ_256];
         cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
@@ -376,8 +382,10 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                  "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
                  esc_callee, res->confidence, res->strategy ? res->strategy : "unknown",
                  res->candidate_count);
-        calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
-        return;
+        return calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props),
+                               call) > 0
+                   ? target->id
+                   : 0;
     }
     const char *edge_type = (svc == CBM_SVC_HTTP) ? "HTTP_CALLS" : "ASYNC_CALLS";
     const char *method =
@@ -408,6 +416,7 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         props[n + 1] = '\0';
     }
     calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
+    return 0;
 }
 
 /* Classify a resolved call and emit the appropriate edge. */
@@ -415,19 +424,18 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
  * classifications below still run. Only the plain CALLS fall-through is
  * skipped, whether suppression comes from a weak member match or language
  * admission policy. */
-static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
-                                 const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
-                                 const cbm_resolution_t *res, const char *module_qn,
-                                 const char **imp_keys, const char **imp_vals, int imp_count,
-                                 bool suppress_plain_calls) {
+static int64_t emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                                    const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
+                                    const cbm_resolution_t *res, const char *module_qn,
+                                    const char **imp_keys, const char **imp_vals, int imp_count,
+                                    bool suppress_plain_calls) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
-        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
-        return;
+        return handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals,
+                                         imp_count);
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
-        emit_http_async_edge(ctx, call, source, target, res, svc, suppress_plain_calls);
-        return;
+        return emit_http_async_edge(ctx, call, source, target, res, svc, suppress_plain_calls);
     }
     if (svc == CBM_SVC_CONFIG) {
         char esc_c[CBM_SZ_256];
@@ -439,10 +447,10 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                  esc_c, esc_k, res->confidence);
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props, sizeof(props),
                         call);
-        return;
+        return 0;
     }
     if (suppress_plain_calls) {
-        return;
+        return 0;
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
@@ -451,7 +459,10 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
              "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
              esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
              res->candidate_count);
-    calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
+    return calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call) >
+                   0
+               ? target->id
+               : 0;
 }
 
 /* Find source node for a call: enclosing function or file node. */
@@ -557,9 +568,6 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
     const char *closure = cbm_pipeline_plain_call_closure(lang, call, lsp, module_qn);
-    if (lang == CBM_LANG_RUST) {
-        cbm_pxc_rust_dump_call(rel, call, lsp, closure);
-    }
     if (closure) {
         return 0;
     }
@@ -578,8 +586,17 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.confidence = lsp->confidence;
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
-            emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                                 imp_vals, imp_count, false);
+            int64_t published_target_id =
+                emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
+                                     imp_vals, imp_count, false);
+            if (lang == CBM_LANG_RUST && published_target_id > 0) {
+                const cbm_gbuf_node_t *published_target =
+                    cbm_gbuf_find_by_id(ctx->gbuf, published_target_id);
+                if (published_target) {
+                    cbm_pxc_rust_dump_call(rel, call, source_node->qualified_name,
+                                           published_target->qualified_name, lsp);
+                }
+            }
             return SKIP_ONE;
         }
     }

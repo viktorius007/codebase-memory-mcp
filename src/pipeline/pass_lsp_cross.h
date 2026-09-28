@@ -193,8 +193,8 @@ const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 void cbm_pxc_rust_dump_open(void);
 void cbm_pxc_rust_dump_close(void);
 void cbm_pxc_rust_dump_file(const char *rel, const CBMFileResult *result);
-void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const CBMResolvedCall *lsp,
-                            const char *closure);
+void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const char *source_qn,
+                            const char *target_qn, const CBMResolvedCall *lsp);
 
 /* Per-thread borrow of the pipeline's Rust import table (pipeline_internal.h),
  * installed and cleared beside the manifest. */
