@@ -6993,6 +6993,86 @@ TEST(pipeline_rust_path_module_glob_rejects_cfg_collision) {
     PASS();
 }
 
+TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_path_inline_scope_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub fn shadowed() {}\n"
+                    "#[path = \"mounted/parent.rs\"]\n"
+                    "mod mounted;\n");
+    write_temp_file(tmp, "src/mounted/parent.rs",
+                    "pub fn shadowed() {}\n"
+                    "mod nested {\n"
+                    "    pub fn invoke() { super::shadowed(); }\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/path-inline-scope.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    bool wrong_edge = false;
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        char caller[512];
+        char wrong_target[512];
+        snprintf(caller, sizeof(caller), "%s.src.mounted.parent.invoke", project);
+        snprintf(wrong_target, sizeof(wrong_target), "%s.src.lib.shadowed", project);
+        wrong_edge = exact_call_qns_exist(store, project, caller, wrong_target);
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_FALSE(wrong_edge);
+    PASS();
+}
+
+TEST(pipeline_rust_path_module_chain_does_not_use_physical_parent) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_path_chain_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs", "#[path = \"foo/lib.rs\"]\nmod bar;\n");
+    write_temp_file(tmp, "src/foo/lib.rs",
+                    "pub fn target() {}\n"
+                    "#[path = \"../other.rs\"]\n"
+                    "mod child;\n");
+    write_temp_file(tmp, "src/other.rs",
+                    "use super::target;\n"
+                    "pub fn invoke() { target(); }\n");
+    write_temp_file(tmp, "src/foo.rs", "pub fn target() {}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/path-chain.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    bool wrong_edge = false;
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        char caller[512];
+        char wrong_target[512];
+        snprintf(caller, sizeof(caller), "%s.src.other.invoke", project);
+        snprintf(wrong_target, sizeof(wrong_target), "%s.src.foo.target", project);
+        wrong_edge = exact_call_qns_exist(store, project, caller, wrong_target);
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_FALSE(wrong_edge);
+    PASS();
+}
+
 TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_trait_calls_XXXXXX");
@@ -16188,6 +16268,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
     RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
+    RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);
+    RUN_TEST(pipeline_rust_path_module_chain_does_not_use_physical_parent);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);

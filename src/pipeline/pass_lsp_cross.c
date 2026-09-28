@@ -191,26 +191,38 @@ static char *pxc_rust_declared_module(const char *parent_module, const char *nam
     return module;
 }
 
-static void pxc_apply_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
-                                        const cbm_file_info_t *files, int file_count,
-                                        char *const *def_modules) {
-    for (int i = 0; i < file_count; i++) {
-        if (files[i].language == CBM_LANG_RUST && cache[i]) {
-            cache[i]->rust_relative_module_qn = "";
+typedef struct {
+    int parent_index;
+    int target_index;
+    char *name;
+} PXCRustPathModule;
+
+typedef struct {
+    PXCRustPathModule *items;
+    int count;
+    int capacity;
+} PXCRustPathModules;
+
+static bool pxc_rust_path_modules_push(PXCRustPathModules *modules, int parent_index,
+                                       int target_index, char *name) {
+    if (modules->count >= modules->capacity) {
+        int capacity = modules->capacity ? modules->capacity * 2 : 16;
+        PXCRustPathModule *items = (PXCRustPathModule *)cbm_realloc(
+            CBM_MEM_CLASS_OTHER, modules->items, (size_t)capacity * sizeof(*items));
+        if (!items) {
+            return false;
         }
+        modules->items = items;
+        modules->capacity = capacity;
     }
-    char **declared = (char **)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(char *));
-    bool *seen = (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(bool));
-    if (!declared || !seen) {
-        cbm_free(CBM_MEM_CLASS_OTHER, declared);
-        cbm_free(CBM_MEM_CLASS_OTHER, seen);
-        return;
-    }
-    for (int i = 0; i < file_count; i++) {
-        if (files[i].language == CBM_LANG_RUST && cache[i]) {
-            cache[i]->rust_relative_module_qn = NULL;
-        }
-    }
+    modules->items[modules->count++] = (PXCRustPathModule){
+        .parent_index = parent_index, .target_index = target_index, .name = name};
+    return true;
+}
+
+static bool pxc_collect_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
+                                          const cbm_file_info_t *files, int file_count,
+                                          PXCRustPathModules *modules, bool *has_inline_scope) {
     for (int i = 0; i < file_count; i++) {
         if (files[i].language != CBM_LANG_RUST) {
             continue;
@@ -234,13 +246,17 @@ static void pxc_apply_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
                 tree = owned_tree;
             }
         }
+        bool complete = true;
         if (source && tree) {
             TSNode root = ts_tree_root_node(tree);
             uint32_t count = ts_node_named_child_count(root);
             for (uint32_t child = 0; child < count; child++) {
                 TSNode item = ts_node_named_child(root, child);
-                if (strcmp(ts_node_type(item), "mod_item") != 0 ||
-                    !ts_node_is_null(ts_node_child_by_field_name(item, "body", 4))) {
+                if (strcmp(ts_node_type(item), "mod_item") != 0) {
+                    continue;
+                }
+                if (!ts_node_is_null(ts_node_child_by_field_name(item, "body", 4))) {
+                    has_inline_scope[i] = true;
                     continue;
                 }
                 char *path = pxc_rust_path_attribute(arena, source, item);
@@ -249,23 +265,10 @@ static void pxc_apply_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
                     continue;
                 }
                 int target = pxc_rust_path_target_index(files, file_count, i, path);
-                if (target < 0) {
-                    continue;
-                }
                 char *name = cbm_node_text(arena, name_node, source);
-                char *candidate = pxc_rust_declared_module(def_modules[i], name);
-                if (!candidate) {
-                    continue;
-                }
-                if (!seen[target]) {
-                    declared[target] = candidate;
-                    seen[target] = true;
-                } else if (declared[target][0] && strcmp(declared[target], candidate) != 0) {
-                    cbm_free(CBM_MEM_CLASS_OTHER, declared[target]);
-                    candidate[0] = '\0';
-                    declared[target] = candidate;
-                } else {
-                    cbm_free(CBM_MEM_CLASS_OTHER, candidate);
+                if (target >= 0 && name && !pxc_rust_path_modules_push(modules, i, target, name)) {
+                    complete = false;
+                    break;
                 }
             }
         }
@@ -276,17 +279,139 @@ static void pxc_apply_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
             ts_parser_delete(parser);
         }
         cbm_free(CBM_MEM_CLASS_EXTRACT, owned_source);
+        if (!complete) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void pxc_merge_rust_path_module(char **declared, bool *resolved, int target,
+                                       char *candidate) {
+    if (!resolved[target]) {
+        declared[target] = candidate;
+        resolved[target] = true;
+    } else if (declared[target][0] && strcmp(declared[target], candidate) != 0) {
+        cbm_free(CBM_MEM_CLASS_OTHER, declared[target]);
+        candidate[0] = '\0';
+        declared[target] = candidate;
+    } else {
+        cbm_free(CBM_MEM_CLASS_OTHER, candidate);
+    }
+}
+
+static bool pxc_resolve_rust_path_modules(const PXCRustPathModules *modules,
+                                          char *const *def_modules, int file_count,
+                                          const bool *mounted, const bool *has_inline_scope,
+                                          char ***out_declared, bool **out_resolved) {
+    char **declared = (char **)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(char *));
+    char **next = (char **)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(char *));
+    bool *resolved = (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(bool));
+    bool *next_resolved =
+        (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(bool));
+    if (!declared || !next || !resolved || !next_resolved) {
+        cbm_free(CBM_MEM_CLASS_OTHER, declared);
+        cbm_free(CBM_MEM_CLASS_OTHER, next);
+        cbm_free(CBM_MEM_CLASS_OTHER, resolved);
+        cbm_free(CBM_MEM_CLASS_OTHER, next_resolved);
+        return false;
+    }
+    for (int depth = 0; depth <= file_count; depth++) {
+        for (int i = 0; i < modules->count; i++) {
+            const PXCRustPathModule *module = &modules->items[i];
+            const char *parent = def_modules[module->parent_index];
+            if (mounted[module->parent_index]) {
+                if (!resolved[module->parent_index] || has_inline_scope[module->parent_index]) {
+                    continue;
+                }
+                parent = declared[module->parent_index];
+            }
+            char *candidate = pxc_rust_declared_module(parent, module->name);
+            if (candidate) {
+                pxc_merge_rust_path_module(next, next_resolved, module->target_index, candidate);
+            }
+        }
+        bool unchanged = true;
+        for (int i = 0; i < file_count; i++) {
+            if (resolved[i] != next_resolved[i] ||
+                (resolved[i] && strcmp(declared[i], next[i]) != 0)) {
+                unchanged = false;
+            }
+        }
+        if (unchanged) {
+            for (int i = 0; i < file_count; i++) {
+                cbm_free(CBM_MEM_CLASS_OTHER, next[i]);
+            }
+            break;
+        }
+        for (int i = 0; i < file_count; i++) {
+            cbm_free(CBM_MEM_CLASS_OTHER, declared[i]);
+            declared[i] = NULL;
+            resolved[i] = false;
+        }
+        char **swap_declared = declared;
+        declared = next;
+        next = swap_declared;
+        bool *swap_resolved = resolved;
+        resolved = next_resolved;
+        next_resolved = swap_resolved;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, next);
+    cbm_free(CBM_MEM_CLASS_OTHER, next_resolved);
+    *out_declared = declared;
+    *out_resolved = resolved;
+    return true;
+}
+
+static void pxc_apply_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
+                                        const cbm_file_info_t *files, int file_count,
+                                        char *const *def_modules) {
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language == CBM_LANG_RUST && cache[i]) {
+            cache[i]->rust_relative_module_qn = "";
+        }
+    }
+    bool *mounted = (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(bool));
+    bool *has_inline_scope =
+        (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(bool));
+    PXCRustPathModules modules = {0};
+    if (!mounted || !has_inline_scope ||
+        !pxc_collect_rust_path_modules(arena, cache, files, file_count, &modules,
+                                       has_inline_scope)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, mounted);
+        cbm_free(CBM_MEM_CLASS_OTHER, has_inline_scope);
+        cbm_free(CBM_MEM_CLASS_OTHER, modules.items);
+        return;
     }
     for (int i = 0; i < file_count; i++) {
-        if (seen[i] && cache[i]) {
+        if (files[i].language == CBM_LANG_RUST && cache[i]) {
+            cache[i]->rust_relative_module_qn = NULL;
+        }
+    }
+    for (int i = 0; i < modules.count; i++) {
+        mounted[modules.items[i].target_index] = true;
+    }
+    char **declared = NULL;
+    bool *resolved = NULL;
+    bool resolution_ok = pxc_resolve_rust_path_modules(&modules, def_modules, file_count, mounted,
+                                                       has_inline_scope, &declared, &resolved);
+    for (int i = 0; i < file_count; i++) {
+        if (mounted[i] && cache[i]) {
             const char *module =
-                declared[i][0] ? cbm_arena_strdup(&cache[i]->arena, declared[i]) : "";
+                resolution_ok && resolved[i] && declared[i][0] && !has_inline_scope[i]
+                    ? cbm_arena_strdup(&cache[i]->arena, declared[i])
+                    : "";
             cache[i]->rust_relative_module_qn = module ? module : "";
         }
-        cbm_free(CBM_MEM_CLASS_OTHER, declared[i]);
+        if (resolution_ok) {
+            cbm_free(CBM_MEM_CLASS_OTHER, declared[i]);
+        }
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, modules.items);
+    cbm_free(CBM_MEM_CLASS_OTHER, mounted);
+    cbm_free(CBM_MEM_CLASS_OTHER, has_inline_scope);
     cbm_free(CBM_MEM_CLASS_OTHER, declared);
-    cbm_free(CBM_MEM_CLASS_OTHER, seen);
+    cbm_free(CBM_MEM_CLASS_OTHER, resolved);
 }
 
 /* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP registrars
