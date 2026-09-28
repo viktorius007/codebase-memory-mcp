@@ -78,6 +78,7 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->root_source = source;
     ctx->registry = registry;
     ctx->module_qn = module_qn;
+    ctx->relative_module_qn = module_qn;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
@@ -686,10 +687,15 @@ static const char *rust_module_dir_qn(RustLSPContext *ctx) {
 
 /* QN of the parent module for `super::`. */
 static const char *rust_super_module_qn(RustLSPContext *ctx) {
-    const char *dir = rust_module_dir_qn(ctx);
-    if (!dir) {
+    if (!ctx || !ctx->relative_module_qn) {
         return NULL;
     }
+    const char *module = ctx->relative_module_qn;
+    const char *module_dot = strrchr(module, '.');
+    bool physical_identity = ctx->module_qn && strcmp(module, ctx->module_qn) == 0;
+    const char *dir = physical_identity && module_dot && rust_stem_owns_directory(module_dot + 1)
+                          ? cbm_arena_strndup(ctx->arena, module, (size_t)(module_dot - module))
+                          : module;
     const char *dot = strrchr(dir, '.');
     return dot ? cbm_arena_strndup(ctx->arena, dir, (size_t)(dot - dir)) : NULL;
 }
@@ -760,28 +766,26 @@ static void rust_qn_probe(RustLSPContext *ctx, const char *candidate, bool want_
         }
         return;
     }
-    const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, candidate);
-    if (!f) {
-        /* A cfg-gated free function is published as `<qn>#cfg(...)]`. One
-         * such twin is an exact answer; two are a cfg decision this resolver
-         * cannot make. */
-        const char *leaf_dot = strrchr(candidate, '.');
-        const char *leaf = leaf_dot ? leaf_dot + 1 : candidate;
-        size_t len = strlen(candidate);
-        CBMFreeFuncIter it;
-        cbm_registry_free_funcs_by_short_name_chain(ctx->registry, leaf, &it);
-        int twins = 0;
-        for (int i; (i = cbm_free_func_iter_next(&it)) >= 0;) {
-            const CBMRegisteredFunc *cand = &it.reg->funcs[i];
-            if (cand->qualified_name && strncmp(cand->qualified_name, candidate, len) == 0 &&
-                cand->qualified_name[len] == '#') {
-                f = cand;
-                twins++;
-            }
+    const char *leaf_dot = strrchr(candidate, '.');
+    const char *leaf = leaf_dot ? leaf_dot + 1 : candidate;
+    const CBMRegisteredFunc *f = NULL;
+    size_t len = strlen(candidate);
+    CBMFreeFuncIter it;
+    cbm_registry_free_funcs_by_short_name_chain(ctx->registry, leaf, &it);
+    int matches = 0;
+    for (int i; matches < 2 && (i = cbm_free_func_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *cand = &it.reg->funcs[i];
+        bool exact = cand->qualified_name && strcmp(cand->qualified_name, candidate) == 0;
+        bool cfg_twin = cand->qualified_name &&
+                        strncmp(cand->qualified_name, candidate, len) == 0 &&
+                        cand->qualified_name[len] == '#';
+        if (exact || cfg_twin) {
+            f = cand;
+            matches++;
         }
-        if (twins != 1) {
-            f = NULL;
-        }
+    }
+    if (matches != 1) {
+        f = NULL;
     }
     if (f && f != m->func) {
         m->func = f;
@@ -840,7 +844,9 @@ static void rust_qn_variants(RustLSPContext *ctx, const char *qn, bool want_type
         }
         /* Inline `mod name { ... }` items are extracted under the file itself. */
         const char *parent_dot = strrchr(parent, '.');
-        if (parent_dot && (size_t)(parent_dot - parent) > prefix_len) {
+        bool physical_identity = ctx->relative_module_qn && ctx->module_qn &&
+                                 strcmp(ctx->relative_module_qn, ctx->module_qn) == 0;
+        if (physical_identity && parent_dot && (size_t)(parent_dot - parent) > prefix_len) {
             rust_qn_probe(
                 ctx,
                 cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)(parent_dot - parent), parent, leaf),
@@ -1128,8 +1134,8 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
     if (strcmp(path, "Self") == 0 && ctx->self_type_qn) {
         return ctx->self_type_qn;
     }
-    if (strncmp(path, "self::", 6) == 0 && ctx->module_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn,
+    if (strncmp(path, "self::", 6) == 0 && ctx->relative_module_qn) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->relative_module_qn,
                                  convert_path_to_qn(ctx->arena, path + 6));
     }
 
@@ -1145,7 +1151,7 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
 
     /* super:: → the parent module's directory; `mod.rs`, `lib.rs` and
      * `main.rs` already stand for their directory. Repeated `super::` climbs. */
-    if (strncmp(path, "super::", 7) == 0 && ctx->module_qn) {
+    if (strncmp(path, "super::", 7) == 0 && ctx->relative_module_qn) {
         const char *parent = rust_super_module_qn(ctx);
         const char *rest = path + 7;
         while (parent && strncmp(rest, "super::", 7) == 0) {
@@ -6189,6 +6195,11 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
                     }
                 } else if (strcmp(imp->local_name, "_") != 0) {
                     const char *path = imp->module_path;
+                    bool needs_relative_module =
+                        strncmp(path, "self::", 6) == 0 || strncmp(path, "super::", 7) == 0;
+                    if (needs_relative_module && !ctx->relative_module_qn) {
+                        continue;
+                    }
                     if (strncmp(path, "self::", 6) == 0 || strncmp(path, "super::", 7) == 0 ||
                         strncmp(path, "crate::", 7) == 0) {
                         path = rust_resolve_path_expr(ctx, path);
@@ -7047,17 +7058,20 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
 /* Resolve one Rust file against an ALREADY-built (per-file or shared) registry. */
 static void rust_resolve_against_registry(
     CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
-    int import_count, TSNode root, const struct CBMCargoManifest *manifest,
+    const char *relative_module_qn, const CBMTypeRegistry *reg, const char **import_names,
+    const char **import_qns, int import_count, TSNode root, const struct CBMCargoManifest *manifest,
     const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
     RustLSPContext ctx;
     rust_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
+    ctx.relative_module_qn = relative_module_qn;
     ctx.cargo_manifest = manifest;
     ctx.imports = imports;
     ctx.syn_calls = synthetic_calls;
-    for (int i = 0; i < import_count; i++) {
-        if (import_names[i] && import_qns[i]) {
-            rust_lsp_add_use(&ctx, import_names[i], import_qns[i]);
+    if (relative_module_qn) {
+        for (int i = 0; i < import_count; i++) {
+            if (import_names[i] && import_qns[i]) {
+                rust_lsp_add_use(&ctx, import_names[i], import_qns[i]);
+            }
         }
     }
     /* Source bindings take precedence over heuristic graph import targets. */
@@ -7110,9 +7124,10 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
  * per-file registry build; just parse + resolve. Mirrors cbm_run_c_lsp_cross_with_registry. */
 void cbm_run_rust_lsp_cross_with_registry(
     CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    const CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
-    int import_count, TSTree *cached_tree, const struct CBMCargoManifest *manifest,
-    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
+    const char *relative_module_qn, const CBMTypeRegistry *reg, const char **import_names,
+    const char **import_qns, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, const CBMRustImportSource *imports,
+    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
     if (!source || source_len <= 0 || !out || !reg)
         return;
     TSParser *parser = NULL;
@@ -7131,9 +7146,9 @@ void cbm_run_rust_lsp_cross_with_registry(
         }
     }
     TSNode root = ts_tree_root_node(tree);
-    rust_resolve_against_registry(arena, source, source_len, module_qn, reg, import_names,
-                                  import_qns, import_count, root, manifest, imports, out,
-                                  synthetic_calls);
+    rust_resolve_against_registry(arena, source, source_len, module_qn, relative_module_qn, reg,
+                                  import_names, import_qns, import_count, root, manifest, imports,
+                                  out, synthetic_calls);
     if (owns_tree) {
         ts_tree_delete(tree);
         if (parser)
@@ -7142,10 +7157,11 @@ void cbm_run_rust_lsp_cross_with_registry(
 }
 
 void cbm_run_rust_lsp_cross_with_manifest(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMRustLSPDef *defs,
-    int def_count, const char **import_names, const char **import_qns, int import_count,
-    TSTree *cached_tree, const struct CBMCargoManifest *manifest,
-    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    const char *relative_module_qn, CBMRustLSPDef *defs, int def_count, const char **import_names,
+    const char **import_qns, int import_count, TSTree *cached_tree,
+    const struct CBMCargoManifest *manifest, const CBMRustImportSource *imports,
+    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
     if (!source || source_len <= 0 || !out)
         return;
 
@@ -7170,9 +7186,9 @@ void cbm_run_rust_lsp_cross_with_manifest(
     CBMTypeRegistry reg;
     rust_populate_cross_registry(&reg, arena, defs, def_count, module_qn);
 
-    rust_resolve_against_registry(arena, source, source_len, module_qn, &reg, import_names,
-                                  import_qns, import_count, root, manifest, imports, out,
-                                  synthetic_calls);
+    rust_resolve_against_registry(arena, source, source_len, module_qn, relative_module_qn, &reg,
+                                  import_names, import_qns, import_count, root, manifest, imports,
+                                  out, synthetic_calls);
 
     if (owns_tree) {
         ts_tree_delete(tree);
@@ -7188,9 +7204,9 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMRustLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, CBMResolvedCallArray *out) {
-    cbm_run_rust_lsp_cross_with_manifest(arena, source, source_len, module_qn, defs, def_count,
-                                         import_names, import_qns, import_count, cached_tree, NULL,
-                                         NULL, out, NULL);
+    cbm_run_rust_lsp_cross_with_manifest(arena, source, source_len, module_qn, module_qn, defs,
+                                         def_count, import_names, import_qns, import_count,
+                                         cached_tree, NULL, NULL, out, NULL);
 }
 
 void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int file_count,

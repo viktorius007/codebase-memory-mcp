@@ -99,6 +99,10 @@ typedef struct {
 
     /* Module-qualified name for this file (e.g. "<project>.<crate>.foo"). */
     const char *module_qn;
+    /* Rust module identity used only for `self::` / `super::` imports. It
+     * differs from module_qn when #[path] gives a file a non-physical name;
+     * NULL means that identity was ambiguous and relative imports stay open. */
+    const char *relative_module_qn;
     /* Lazily derived from module_qn: the crate's `<project>.<dirs>.<src>`
      * prefix and the module directory this file owns. */
     const char *crate_root_prefix;
@@ -363,7 +367,8 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
  * is a workspace member / declared dependency route across the crate
  * boundary (`crate_a::foo` → the def inside crate_a). Wired from the
  * cross-file LSP pass (pass_lsp_cross.c) which builds the manifest once from
- * the project root Cargo.toml. */
+ * the project root Cargo.toml. `relative_module_qn` is the declared module
+ * identity for `self::` / `super::`; NULL suppresses those imports. */
 /* Pipeline-owned lookup of another file's raw `use` path: (file module QN,
  * local name) -> path text, or NULL. */
 typedef struct CBMRustImportSource {
@@ -372,7 +377,8 @@ typedef struct CBMRustImportSource {
 } CBMRustImportSource;
 
 void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn, CBMRustLSPDef *defs, int def_count,
+                                          const char *module_qn, const char *relative_module_qn,
+                                          CBMRustLSPDef *defs, int def_count,
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
@@ -391,9 +397,10 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
  * proc-macros are handled by the graph's DECORATES + USAGE semantic passes, not
  * by this resolver. */
 void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn, const CBMTypeRegistry *reg,
-                                          const char **import_names, const char **import_qns,
-                                          int import_count, TSTree *cached_tree,
+                                          const char *module_qn, const char *relative_module_qn,
+                                          const CBMTypeRegistry *reg, const char **import_names,
+                                          const char **import_qns, int import_count,
+                                          TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
                                           const CBMRustImportSource *imports,
                                           CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);

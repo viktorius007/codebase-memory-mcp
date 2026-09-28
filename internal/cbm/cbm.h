@@ -516,7 +516,10 @@ typedef struct CBMFileResult {
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
 
-    const char *module_qn;      // module qualified name
+    const char *module_qn; // module qualified name
+    /* Rust #[path] module identity for resolving self::/super::. NULL means
+     * the physical module_qn applies; "" means declarations were ambiguous. */
+    const char *rust_relative_module_qn;
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none
     const char **exports;       // NULL-terminated (NULL if none)
     const char **constants;     // NULL-terminated (NULL if none)
