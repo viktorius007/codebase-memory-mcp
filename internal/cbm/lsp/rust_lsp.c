@@ -769,38 +769,23 @@ static void rust_qn_probe(RustLSPContext *ctx, const char *candidate, bool want_
     const char *leaf_dot = strrchr(candidate, '.');
     const char *leaf = leaf_dot ? leaf_dot + 1 : candidate;
     const CBMRegisteredFunc *f = NULL;
-    CBMFreeFuncIter exact_it;
-    cbm_registry_free_funcs_by_short_name_chain(ctx->registry, leaf, &exact_it);
-    int exact_matches = 0;
-    for (int i; exact_matches < 2 && (i = cbm_free_func_iter_next(&exact_it)) >= 0;) {
-        const CBMRegisteredFunc *cand = &exact_it.reg->funcs[i];
-        if (cand->qualified_name && strcmp(cand->qualified_name, candidate) == 0) {
+    size_t len = strlen(candidate);
+    CBMFreeFuncIter it;
+    cbm_registry_free_funcs_by_short_name_chain(ctx->registry, leaf, &it);
+    int matches = 0;
+    for (int i; matches < 2 && (i = cbm_free_func_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *cand = &it.reg->funcs[i];
+        bool exact = cand->qualified_name && strcmp(cand->qualified_name, candidate) == 0;
+        bool cfg_twin = cand->qualified_name &&
+                        strncmp(cand->qualified_name, candidate, len) == 0 &&
+                        cand->qualified_name[len] == '#';
+        if (exact || cfg_twin) {
             f = cand;
-            exact_matches++;
+            matches++;
         }
     }
-    if (exact_matches != 1) {
+    if (matches != 1) {
         f = NULL;
-    }
-    if (exact_matches == 0) {
-        /* A cfg-gated free function is published as `<qn>#cfg(...)]`. One
-         * such twin is an exact answer; two are a cfg decision this resolver
-         * cannot make. */
-        size_t len = strlen(candidate);
-        CBMFreeFuncIter it;
-        cbm_registry_free_funcs_by_short_name_chain(ctx->registry, leaf, &it);
-        int twins = 0;
-        for (int i; (i = cbm_free_func_iter_next(&it)) >= 0;) {
-            const CBMRegisteredFunc *cand = &it.reg->funcs[i];
-            if (cand->qualified_name && strncmp(cand->qualified_name, candidate, len) == 0 &&
-                cand->qualified_name[len] == '#') {
-                f = cand;
-                twins++;
-            }
-        }
-        if (twins != 1) {
-            f = NULL;
-        }
     }
     if (f && f != m->func) {
         m->func = f;

@@ -6914,6 +6914,85 @@ TEST(pipeline_rust_path_module_super_resolves_from_declared_parent) {
     PASS();
 }
 
+TEST(pipeline_rust_path_module_glob_rejects_cfg_collision) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_path_cfg_collision_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod compression;\n");
+    write_temp_file(tmp, "src/compression.rs",
+                    "use std::path::Path;\n"
+                    "use std::path::PathBuf;\n"
+                    "\n"
+                    "#[cfg(test)]\n"
+                    "pub(crate) fn compressed_rollout_path(path: &Path) -> PathBuf {\n"
+                    "    path::compressed_rollout_path(path)\n"
+                    "}\n"
+                    "\n"
+                    "mod path {\n"
+                    "    use std::path::Path;\n"
+                    "    use std::path::PathBuf;\n"
+                    "\n"
+                    "    pub(super) fn compressed_rollout_path(path: &Path) -> PathBuf {\n"
+                    "        path.to_path_buf()\n"
+                    "    }\n"
+                    "}\n"
+                    "\n"
+                    "#[cfg(test)]\n"
+                    "#[path = \"compression_tests.rs\"]\n"
+                    "mod tests;\n");
+    write_temp_file(tmp, "src/compression_tests.rs",
+                    "use super::*;\n"
+                    "use std::path::Path;\n"
+                    "pub fn check(path: &Path) { let _ = compressed_rollout_path(path); }\n");
+
+    char *saved_single =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/path-cfg-collision.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    int nested_nodes = -1;
+    int wrong_edges = -1;
+    if (store && pipeline) {
+        sqlite3_stmt *stmt = NULL;
+        const char *sql =
+            "SELECT count(*), "
+            "sum(EXISTS(SELECT 1 FROM edges e JOIN nodes s ON s.id=e.source_id "
+            "WHERE e.target_id=t.id AND e.type='CALLS' "
+            "AND s.file_path='src/compression_tests.rs' AND s.name='check')) "
+            "FROM nodes t WHERE t.project=?1 AND t.file_path='src/compression.rs' "
+            "AND t.name='compressed_rollout_path' AND t.start_line=13";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, cbm_pipeline_project_name(pipeline), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                nested_nodes = sqlite3_column_int(stmt, 0);
+                wrong_edges = sqlite3_column_int(stmt, 1);
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(nested_nodes, 1);
+    ASSERT_EQ(wrong_edges, 0);
+    PASS();
+}
+
 TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_trait_calls_XXXXXX");
@@ -16108,6 +16187,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
+    RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
