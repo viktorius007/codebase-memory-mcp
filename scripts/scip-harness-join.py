@@ -188,6 +188,13 @@ def print_breakdowns(report):
             f"recall strategy={strategy} call_form={call_form} "
             f"outcome={outcome} count={count}"
         )
+    targets = Counter(
+        (item.target_category, item.outcome) for item in report.recall
+    )
+    for (category, outcome), count in sorted(targets.items()):
+        print(
+            f"recall target_category={category} outcome={outcome} count={count}"
+        )
 
 
 def main():

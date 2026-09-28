@@ -100,6 +100,14 @@ def print_recall(report):
         print(
             f"caller_category={category} outcome={outcome} count={count}"
         )
+    target_categories = Counter(
+        (occurrence.target_category, occurrence.outcome)
+        for occurrence in report.recall
+    )
+    for (category, outcome), count in sorted(target_categories.items()):
+        print(
+            f"target_category={category} outcome={outcome} count={count}"
+        )
     print(
         f"truth relations {relation_total} found correct "
         f"{relation_counts['found']} recall={relation_value:.2f}%"

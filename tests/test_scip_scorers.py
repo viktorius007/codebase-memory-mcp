@@ -639,6 +639,70 @@ class ScipScorerTests(unittest.TestCase):
                 "published_edges=1 correct=1 wrong=0 unscorable=0", result.stdout
             )
 
+    def test_truth_without_target_definition_has_explicit_no_location_identity(self):
+        source = (
+            "macro_rules! generated { ($name:ident) => { enum $name { Value(u8) } }; }\n"
+            "generated!(Generated);\n"
+            "fn caller() { Generated::Value(1); }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ScorerFixture(temporary, source)
+            target = symbol("fixture/Generated#Value#")
+            caller = symbol("fixture/caller().")
+            write_identity_scip(
+                fixture.scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "caller"), caller, 1,
+                        line_range(source, 2),
+                    ),
+                    occurrence(range_for(source, "Value", 1), target),
+                ),
+                (
+                    symbol_information(target, 49, "Value"),
+                    symbol_information(caller, 17, "caller"),
+                ),
+            )
+            fixture.create_database(
+                (
+                    ("fixture.Value", "src/lib.rs", "Value", "Field", 2, 2),
+                    ("fixture.caller", "src/lib.rs", "caller", "Function", 3, 3),
+                ),
+                edges=(("fixture.caller", "fixture.Value"),),
+            )
+            start, end = byte_span(source, "Value", 1)
+            fixture.dump.write_text(
+                "\t".join((
+                    "C", "src/lib.rs", str(start), str(end + 3),
+                    "fixture.caller", "Value", "fixture.Value", "direct",
+                    "1.0", "admitted", "-", "-", str(start), str(end),
+                )) + "\n",
+                encoding="utf-8",
+            )
+            spec = importlib.util.spec_from_file_location(
+                "scip_rust_sites", SITES_INVENTORY
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            report = module.score_calls(
+                fixture.corpus, fixture.scip, fixture.database, fixture.dump
+            )
+            result = fixture.run_site()
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(1, len(report.recall))
+            self.assertEqual(
+                (target, "no_oracle_location"),
+                module.recall_relation_key(report.recall[0])[1],
+            )
+            self.assertEqual("no_oracle_location", report.recall[0].target_category)
+            self.assertIn(
+                "target_category=no_oracle_location outcome=found count=1",
+                result.stdout,
+            )
+
     def test_duplicate_caller_symbol_at_another_declaration_is_wrong(self):
         source_a = "fn target() {}\nfn caller() { target(); }\n"
         source_b = "fn caller() {}\n"
@@ -1578,6 +1642,67 @@ class ScipScorerTests(unittest.TestCase):
         )
 
         self.assertEqual([], records)
+
+    def test_macro_tuple_kind_uses_known_expression_and_pattern_contracts(self):
+        source = (
+            "fn package_anchor() {}\n"
+            "enum Event { Done(u8) }\n"
+            "macro_rules! expression { ($value:expr $(,)?) => { $value }; }\n"
+            "macro_rules! pattern { ($value:pat $(,)?) => { () }; }\n"
+            "fn caller() {\n"
+            "    assert_eq!(Event::Done(1), Event::Done(2));\n"
+            "    expression!(Event::Done(3));\n"
+            "    pattern!(Event::Done(bound));\n"
+            "    unknown!(Event::Done(other));\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "corpus"
+            (corpus / "src").mkdir(parents=True)
+            (corpus / "src" / "lib.rs").write_text(source, encoding="utf-8")
+            scip = root / "fixture.scip"
+            target = symbol("fixture/Event#Done#")
+            write_scip(
+                scip,
+                "src/lib.rs",
+                (
+                    occurrence(
+                        range_for(source, "package_anchor"),
+                        symbol("fixture/package_anchor()."),
+                        1,
+                        line_range(source, 0),
+                    ),
+                    *(
+                        occurrence(range_for(source, "Done", ordinal), target)
+                        for ordinal in range(1, 6)
+                    ),
+                ),
+            )
+            spec = importlib.util.spec_from_file_location(
+                "scip_rust_sites", SITES_INVENTORY
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            records, completeness = module._call_inventory(corpus, scip)
+
+            expected_spans = [
+                byte_span(source, "Done", ordinal) for ordinal in range(1, 4)
+            ]
+            self.assertEqual(
+                expected_spans,
+                [
+                    (record.callee_start_byte, record.callee_end_byte)
+                    for record in records
+                ],
+            )
+            counts = dict(completeness)
+            self.assertEqual(3, counts["inventory_found"])
+            self.assertEqual(1, counts["excluded_pattern"])
+            self.assertEqual(
+                1, counts["excluded_macro_argument_tuple_undetermined"]
+            )
 
     def test_completeness_reports_tuple_pattern_as_pattern_not_parse_failure(self):
         source = (

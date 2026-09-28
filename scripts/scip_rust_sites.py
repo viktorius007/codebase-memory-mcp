@@ -26,6 +26,54 @@ CALL_THROUGH_VALUE = "call_through_value"
 EXTERNAL = "external"
 AMBIGUOUS = "ambiguous"
 NON_INTERNAL_TRUTH = frozenset((CALL_THROUGH_VALUE, EXTERNAL, AMBIGUOUS))
+NO_ORACLE_LOCATION = "no_oracle_location"
+
+_EXPRESSION_MACROS = frozenset(
+    (
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "dbg",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "eprint",
+        "eprintln",
+        "format",
+        "format_args",
+        "format_args_nl",
+        "panic",
+        "pin",
+        "print",
+        "println",
+        "ready",
+        "todo",
+        "try",
+        "unimplemented",
+        "unreachable",
+        "vec",
+        "write",
+        "writeln",
+    )
+)
+_MACRO_DEFINITION = re.compile(
+    rb"(?<![A-Za-z0-9_])macro_rules\s*!\s*"
+    rb"((?:r#)?[A-Za-z_][A-Za-z0-9_]*)\s*([({[])"
+)
+_FRAGMENT_SPEC = (
+    rb"\$\s*(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*:\s*"
+    rb"(expr(?:_2021)?|pat(?:_param)?)\b"
+)
+_OPTIONAL_TRAILING_COMMA = rb"(?:\s*\$\s*\(\s*,\s*\)\s*\?)?"
+_DIRECT_MACRO_FRAGMENT = re.compile(
+    rb"\s*" + _FRAGMENT_SPEC + _OPTIONAL_TRAILING_COMMA + rb"\s*"
+)
+_REPEATED_MACRO_FRAGMENT = re.compile(
+    rb"\s*\$\s*[({[]\s*" + _FRAGMENT_SPEC
+    + rb"\s*[)}\]]\s*[,;]?\s*[*+?]"
+    + _OPTIONAL_TRAILING_COMMA + rb"\s*",
+    re.DOTALL,
+)
 
 _DECODER_PATH = Path(__file__).with_name("scip-call-edges.py")
 _DECODER_SPEC = importlib.util.spec_from_file_location("scip_call_edges", _DECODER_PATH)
@@ -108,6 +156,7 @@ class RecallOccurrence(NamedTuple):
     outcome: str
     oracle_caller_identity: DefinitionIdentity | None = None
     oracle_target_identity: DefinitionIdentity | None = None
+    target_category: str = "scip_definition"
 
 
 class IntegrityError(NamedTuple):
@@ -382,6 +431,145 @@ def _merged_ranges(ranges):
     return merged
 
 
+def _matching_delimiter(code, opening):
+    pairs = {ord("("): ord(")"), ord("["): ord("]"), ord("{"): ord("}")}
+    if code[opening] not in pairs:
+        return None
+    stack = [pairs[code[opening]]]
+    for cursor in range(opening + 1, len(code)):
+        byte = code[cursor]
+        if byte in pairs:
+            stack.append(pairs[byte])
+        elif stack and byte == stack[-1]:
+            stack.pop()
+            if not stack:
+                return cursor
+    return None
+
+
+def _comma_segments(code, start, end):
+    pairs = {ord("("): ord(")"), ord("["): ord("]"), ord("{"): ord("}")}
+    stack = []
+    ranges = []
+    segment_start = _skip_space(code, start)
+    for cursor in range(start, end):
+        byte = code[cursor]
+        if byte in pairs:
+            stack.append(pairs[byte])
+        elif stack and byte == stack[-1]:
+            stack.pop()
+        elif byte == ord(",") and not stack:
+            segment_end = _previous_code_byte(code, cursor) + 1
+            if segment_start < segment_end:
+                ranges.append((segment_start, segment_end))
+            segment_start = _skip_space(code, cursor + 1)
+    segment_end = _previous_code_byte(code, end) + 1
+    if segment_start < segment_end:
+        ranges.append((segment_start, segment_end))
+    return ranges
+
+
+def _direct_fragment_kind(code):
+    match = _DIRECT_MACRO_FRAGMENT.fullmatch(code)
+    if match is None:
+        return None
+    return "pat" if match.group(1).startswith(b"pat") else "expr"
+
+
+def _matcher_contract(matcher):
+    repeated = _REPEATED_MACRO_FRAGMENT.fullmatch(matcher)
+    if repeated is not None:
+        kind = "pat" if repeated.group(1).startswith(b"pat") else "expr"
+        return (kind,), kind, True
+    segments = _comma_segments(matcher, 0, len(matcher))
+    signature = tuple(
+        _direct_fragment_kind(matcher[start:end]) for start, end in segments
+    )
+    kinds = set(signature)
+    uniform = next(iter(kinds)) if len(kinds) == 1 else None
+    return signature, uniform, False
+
+
+def _macro_rule_contracts(sources):
+    contracts = defaultdict(list)
+    for source in sources.values():
+        code = _masked_source(source)
+        for definition in _MACRO_DEFINITION.finditer(code):
+            name = definition.group(1).removeprefix(b"r#").decode()
+            body_open = definition.end() - 1
+            body_close = _matching_delimiter(code, body_open)
+            if body_close is None:
+                continue
+            cursor = body_open + 1
+            while cursor < body_close:
+                cursor = _skip_space(code, cursor)
+                if code[cursor : cursor + 1] not in (b"(", b"[", b"{"):
+                    cursor += 1
+                    continue
+                matcher_close = _matching_delimiter(code, cursor)
+                if matcher_close is None or matcher_close > body_close:
+                    break
+                after = _skip_space(code, matcher_close + 1)
+                if code[after : after + 2] == b"=>":
+                    contracts[name].append(
+                        _matcher_contract(code[cursor + 1 : matcher_close])
+                    )
+                cursor = matcher_close + 1
+    return contracts
+
+
+def _argument_kinds(path, count, contracts):
+    parts = path.split("::")
+    name = parts[-1]
+    standard = len(parts) > 1 and parts[0] in ("alloc", "core", "std")
+    unshadowed = len(parts) == 1 and name not in contracts
+    if name in _EXPRESSION_MACROS and (standard or unshadowed):
+        return ("expr",) * count
+    if count and (standard or unshadowed) and (
+        name == "matches" or name.endswith("_matches")
+    ):
+        return ("expr",) + (None,) * (count - 1)
+    project_contracts = contracts.get(name, ()) if len(parts) == 1 else ()
+    applicable = [
+        contract for contract in project_contracts
+        if len(contract[0]) == count or contract[2]
+    ]
+    kinds = []
+    for index in range(count):
+        candidates = {
+            signature[index] if len(signature) == count else uniform
+            for signature, uniform, _ in applicable
+        }
+        kind = next(iter(candidates)) if len(candidates) == 1 else None
+        kinds.append(kind)
+    return tuple(kinds)
+
+
+def _macro_path(code, bang):
+    cursor = _previous_code_byte(code, bang) + 1
+    parts = []
+    while cursor > 0:
+        start = cursor
+        while start > 0:
+            byte = code[start - 1]
+            if (
+                byte < 0x80
+                and not chr(byte).isalnum()
+                and byte not in (ord("_"), ord("#"))
+            ):
+                break
+            start -= 1
+        part = code[start:cursor].removeprefix(b"r#")
+        if not part:
+            break
+        parts.append(part.decode())
+        separator = _previous_code_byte(code, start)
+        if separator < 1 or code[separator - 1 : separator + 1] != b"::":
+            break
+        cursor = _previous_code_byte(code, separator - 1) + 1
+    return "::".join(reversed(parts))
+
+
 def _macro_argument_ranges(code):
     return _merged_ranges(_delimited_ranges(code, _is_macro_open))
 
@@ -421,34 +609,30 @@ def _matches_pattern_ranges(code):
     return ranges
 
 
-def _macro_argument_segments(code):
-    pairs = {ord("("): ord(")"), ord("["): ord("]"), ord("{"): ord("}")}
+def _macro_argument_segments(code, contracts):
     ranges = []
     for start, end in _delimited_ranges(code, _is_macro_open):
-        stack = []
-        segment_start = _skip_space(code, start)
-        for cursor in range(start, end):
-            byte = code[cursor]
-            if byte in pairs:
-                stack.append(pairs[byte])
-            elif stack and byte == stack[-1]:
-                stack.pop()
-            elif byte == ord(",") and not stack:
-                segment_end = _previous_code_byte(code, cursor) + 1
-                if segment_start < segment_end:
-                    ranges.append((segment_start, segment_end))
-                segment_start = _skip_space(code, cursor + 1)
-        segment_end = _previous_code_byte(code, end) + 1
-        if segment_start < segment_end:
-            ranges.append((segment_start, segment_end))
+        segments = _comma_segments(code, start, end)
+        opening = start - 1
+        bang = _previous_code_byte(code, opening)
+        path = _macro_path(code, bang)
+        kinds = _argument_kinds(path, len(segments), contracts)
+        ranges.extend(
+            (segment_start, segment_end, kind)
+            for (segment_start, segment_end), kind in zip(segments, kinds)
+        )
     return ranges
 
 
-def _rust_syntax_ranges(sources):
+def _rust_syntax_ranges(sources, macro_contracts=None):
+    if macro_contracts is None:
+        macro_contracts = _macro_rule_contracts(sources)
     if len(sources) > 128:
         entries = list(sources.items())
         results = [
-            _rust_syntax_ranges(dict(entries[offset : offset + 128]))
+            _rust_syntax_ranges(
+                dict(entries[offset : offset + 128]), macro_contracts
+            )
             for offset in range(0, len(entries), 128)
         ]
         return tuple(
@@ -514,7 +698,19 @@ def _rust_syntax_ranges(sources):
                     True,
                     False,
                 )
-            for start, end in _macro_argument_segments(code):
+            for start, end, argument_kind in _macro_argument_segments(
+                code, macro_contracts
+            ):
+                if argument_kind == "expr":
+                    continue
+                if argument_kind == "pat":
+                    add_input(
+                        pattern_prefix + source[start:end] + pattern_suffix,
+                        (relative_path, start, end, len(pattern_prefix)),
+                        True,
+                        False,
+                    )
+                    continue
                 segment = code[start:end]
                 if (
                     b"=>" in segment
@@ -1752,12 +1948,21 @@ def score_calls(corpus_root, scip_file, graph_database, dump_path):
             )
         strategies = sorted({edge.strategy for edge in site_edges})
         strategy = "+".join(strategies) if strategies else "no_published_edge"
+        target_category = (
+            "scip_definition"
+            if oracle_target_identity is not None
+            else (
+                "oracle_location_ambiguous"
+                if definition_locations.get(site.resolved_symbol)
+                else NO_ORACLE_LOCATION
+            )
+        )
         recall.append(
             RecallOccurrence(
                 site.relative_path, site.callee_start_byte, site.callee_end_byte,
                 oracle_caller_symbol, caller_category, site.resolved_symbol,
                 site.call_form, strategy, "found" if found else "missed",
-                oracle_caller_identity, oracle_target_identity,
+                oracle_caller_identity, oracle_target_identity, target_category,
             )
         )
     non_rust = sum(not edge.target_path.endswith(".rs") for edge in graph_calls)
@@ -1779,7 +1984,9 @@ def format_completeness(completeness):
 def recall_relation_key(occurrence):
     """Return the declaration-exact caller/target key for one truth occurrence."""
     caller = occurrence.oracle_caller_identity or occurrence.oracle_caller_symbol
-    target = occurrence.oracle_target_identity or occurrence.oracle_symbol
+    target = occurrence.oracle_target_identity
+    if target is None:
+        target = (occurrence.oracle_symbol, occurrence.target_category)
     return caller, target
 
 
