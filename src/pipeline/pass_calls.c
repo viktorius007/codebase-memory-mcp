@@ -424,6 +424,21 @@ static int64_t emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call
  * classifications below still run. Only the plain CALLS fall-through is
  * skipped, whether suppression comes from a weak member match or language
  * admission policy. */
+static int64_t emit_plain_call_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                                    const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
+                                    const cbm_resolution_t *res) {
+    char esc_c[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    char props[CBM_SZ_512];
+    snprintf(props, sizeof(props),
+             "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}", esc_c,
+             res->confidence, res->strategy ? res->strategy : "unknown", res->candidate_count);
+    return calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call) >
+                   0
+               ? target->id
+               : 0;
+}
+
 static int64_t emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                     const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
                                     const cbm_resolution_t *res, const char *module_qn,
@@ -452,17 +467,7 @@ static int64_t emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call
     if (suppress_plain_calls) {
         return 0;
     }
-    char esc_c2[CBM_SZ_256];
-    cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
-    char props[CBM_SZ_512];
-    snprintf(props, sizeof(props),
-             "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
-             esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
-             res->candidate_count);
-    return calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call) >
-                   0
-               ? target->id
-               : 0;
+    return emit_plain_call_edge(ctx, call, source, target, res);
 }
 
 /* Find source node for a call: enclosing function or file node. */
@@ -587,8 +592,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
             int64_t published_target_id =
-                emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                                     imp_vals, imp_count, false);
+                lang == CBM_LANG_RUST
+                    ? emit_plain_call_edge(ctx, call, source_node, target_node, &res)
+                    : emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn,
+                                           imp_keys, imp_vals, imp_count, false);
             if (lang == CBM_LANG_RUST && published_target_id > 0) {
                 const cbm_gbuf_node_t *published_target =
                     cbm_gbuf_find_by_id(ctx->gbuf, published_target_id);

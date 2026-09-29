@@ -2646,6 +2646,23 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
                                     const char *module_qn, const char **imp_keys,
                                     const char **imp_vals, int imp_count, CBMLanguage lang,
                                     const CBMResolvedCall *lsp) {
+    if (lang == CBM_LANG_RUST && lsp_target) {
+        if (source_node->id == lsp_target->id) {
+            return;
+        }
+        uint64_t rust_t0 = extract_now_ns();
+        res.qualified_name = lsp_target->qualified_name;
+        int64_t published_target_id =
+            emit_normal_calls_edge(ws->local_edge_buf, source_node, lsp_target, call, &res);
+        if (published_target_id > 0) {
+            cbm_pxc_rust_dump_call(rel, call, source_node->qualified_name,
+                                   lsp_target->qualified_name, lsp);
+        }
+        atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - rust_t0,
+                                  memory_order_relaxed);
+        ws->calls_resolved++;
+        return;
+    }
 
     uint64_t _rc_t0 = extract_now_ns();
     try_field_type_hint(rc, &res, call->callee_name, source_node->id);

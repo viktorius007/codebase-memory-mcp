@@ -608,11 +608,9 @@ TEST(handles_rails_ruby) {
     PASS();
 }
 
-/* Actix-web (Rust) — route registration via SAME-FILE wrapper functions whose
- * names carry the "actix_web" substring, called by bare name with an identifier
- * handler.  Same-file Rust calls resolve (cf. probe_rust_calls_edge); a
- * cross-file `actix_web::get` would NOT (Rust lsp_cross unwired + '::' path not
- * resolved by the generic resolver). */
+/* Actix-web-like names on resolver-proven local Rust functions are not route
+ * evidence. The calls stay ordinary CALLS to those functions, with no synthetic
+ * Route CALLS edge or HANDLES/HTTP_CALLS classification. */
 TEST(handles_actix_rust) {
     static const EtFile f[] = {
         {"actix_web_app.rs",
@@ -624,7 +622,45 @@ TEST(handles_actix_rust) {
          "fn main() {\n"
          "    actix_web_get(\"/widgets\", list_widgets);\n"
          "    actix_web_post(\"/widgets\", create_widget);\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, f, 1);
+    cbm_node_t *callers = NULL;
+    cbm_node_t *get_targets = NULL;
+    cbm_node_t *post_targets = NULL;
+    int caller_count = 0;
+    int get_count = 0;
+    int post_count = 0;
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    bool exact_calls = false;
+    if (store &&
+        cbm_store_find_nodes_by_name(store, lp.project, "main", &callers, &caller_count) ==
+            CBM_STORE_OK &&
+        cbm_store_find_nodes_by_name(store, lp.project, "actix_web_get", &get_targets,
+                                     &get_count) == CBM_STORE_OK &&
+        cbm_store_find_nodes_by_name(store, lp.project, "actix_web_post", &post_targets,
+                                     &post_count) == CBM_STORE_OK &&
+        caller_count == 1 && get_count == 1 && post_count == 1 &&
+        cbm_store_find_edges_by_source_type(store, callers[0].id, "CALLS", &edges, &edge_count) ==
+            CBM_STORE_OK) {
+        bool calls_get = false;
+        bool calls_post = false;
+        for (int i = 0; i < edge_count; i++) {
+            calls_get |= edges[i].target_id == get_targets[0].id;
+            calls_post |= edges[i].target_id == post_targets[0].id;
+        }
+        exact_calls = edge_count == 2 && calls_get && calls_post;
+    }
+    int handles = store ? cbm_store_count_edges_by_type(store, lp.project, "HANDLES") : -1;
+    int http_calls = store ? cbm_store_count_edges_by_type(store, lp.project, "HTTP_CALLS") : -1;
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_free_nodes(callers, caller_count);
+    cbm_store_free_nodes(get_targets, get_count);
+    cbm_store_free_nodes(post_targets, post_count);
+    et_cleanup(&lp, store);
+    ASSERT_TRUE(exact_calls);
+    ASSERT_EQ(handles, 0);
+    ASSERT_EQ(http_calls, 0);
     PASS();
 }
 
@@ -801,11 +837,9 @@ TEST(http_calls_guzzle_php) {
     PASS();
 }
 
-/* reqwest (Rust) — Rust lsp_cross is not wired AND the generic resolver cannot
- * resolve a `::`-qualified cross-file path (cbm_registry_resolve splits on '.',
- * not '::'), so reqwest::get never resolved.  Use SAME-FILE bare-name wrapper
- * functions whose names carry the "reqwest" substring (same-file Rust calls do
- * resolve, cf. probe_rust_calls_edge) → QN contains "reqwest" → HTTP_CALLS. */
+/* Reqwest-like names on resolver-proven local Rust functions are not HTTP client
+ * evidence. Each caller keeps an ordinary CALLS edge to its wrapper, with no
+ * synthetic Route CALLS edge or HANDLES/HTTP_CALLS classification. */
 TEST(http_calls_reqwest_rust) {
     static const EtFile f[] = {
         {"reqwest_api.rs",
@@ -813,7 +847,51 @@ TEST(http_calls_reqwest_rust) {
          "pub fn reqwest_post(url: &str, body: &str) -> String {\n    format!(\"{}{}\", url, body)\n}\n\n"
          "pub fn fetch_items() -> String {\n    reqwest_get(\"/api/items\")\n}\n\n"
          "pub fn push_item(body: &str) -> String {\n    reqwest_post(\"/api/items\", body)\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 1, "HTTP_CALLS", 1));
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, f, 1);
+    cbm_node_t *fetch_callers = NULL;
+    cbm_node_t *push_callers = NULL;
+    cbm_node_t *get_targets = NULL;
+    cbm_node_t *post_targets = NULL;
+    int fetch_count = 0;
+    int push_count = 0;
+    int get_count = 0;
+    int post_count = 0;
+    cbm_edge_t *fetch_edges = NULL;
+    cbm_edge_t *push_edges = NULL;
+    int fetch_edge_count = 0;
+    int push_edge_count = 0;
+    bool exact_calls = false;
+    if (store &&
+        cbm_store_find_nodes_by_name(store, lp.project, "fetch_items", &fetch_callers,
+                                     &fetch_count) == CBM_STORE_OK &&
+        cbm_store_find_nodes_by_name(store, lp.project, "push_item", &push_callers, &push_count) ==
+            CBM_STORE_OK &&
+        cbm_store_find_nodes_by_name(store, lp.project, "reqwest_get", &get_targets, &get_count) ==
+            CBM_STORE_OK &&
+        cbm_store_find_nodes_by_name(store, lp.project, "reqwest_post", &post_targets,
+                                     &post_count) == CBM_STORE_OK &&
+        fetch_count == 1 && push_count == 1 && get_count == 1 && post_count == 1 &&
+        cbm_store_find_edges_by_source_type(store, fetch_callers[0].id, "CALLS", &fetch_edges,
+                                            &fetch_edge_count) == CBM_STORE_OK &&
+        cbm_store_find_edges_by_source_type(store, push_callers[0].id, "CALLS", &push_edges,
+                                            &push_edge_count) == CBM_STORE_OK) {
+        exact_calls = fetch_edge_count == 1 && push_edge_count == 1 &&
+                      fetch_edges[0].target_id == get_targets[0].id &&
+                      push_edges[0].target_id == post_targets[0].id;
+    }
+    int handles = store ? cbm_store_count_edges_by_type(store, lp.project, "HANDLES") : -1;
+    int http_calls = store ? cbm_store_count_edges_by_type(store, lp.project, "HTTP_CALLS") : -1;
+    cbm_store_free_edges(fetch_edges, fetch_edge_count);
+    cbm_store_free_edges(push_edges, push_edge_count);
+    cbm_store_free_nodes(fetch_callers, fetch_count);
+    cbm_store_free_nodes(push_callers, push_count);
+    cbm_store_free_nodes(get_targets, get_count);
+    cbm_store_free_nodes(post_targets, post_count);
+    et_cleanup(&lp, store);
+    ASSERT_TRUE(exact_calls);
+    ASSERT_EQ(handles, 0);
+    ASSERT_EQ(http_calls, 0);
     PASS();
 }
 

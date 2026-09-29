@@ -1033,6 +1033,111 @@ static int count_calls_edges_to_tail(const cbm_gbuf_t *gbuf, const char *target_
     return count;
 }
 
+static cbm_gbuf_t *run_rust_service_preemption_fixture(bool parallel, char *tmpdir,
+                                                       size_t tmpdir_size) {
+    static const char *sources[] = {
+        "mod gin;\n"
+        "mod reqwest;\n"
+        "mod async_nats;\n"
+        "mod dotenvy;\n"
+        "fn caller() {\n"
+        "    gin::post(\"/route\");\n"
+        "    reqwest::get(\"https://example.test/api\");\n"
+        "    async_nats::publish(\"events.topic\");\n"
+        "    dotenvy::var(\"API_KEY\");\n"
+        "}\n",
+        "pub fn post(_: &str) {}\n",
+        "pub fn get(_: &str) {}\n",
+        "pub fn publish(_: &str) {}\n",
+        "pub fn var(_: &str) {}\n",
+    };
+    static const char *rels[] = {"src/lib.rs", "src/gin.rs", "src/reqwest.rs", "src/async_nats.rs",
+                                 "src/dotenvy.rs"};
+    snprintf(tmpdir, tmpdir_size, "/tmp/cbm_rust_service_preemption_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        return NULL;
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/src", tmpdir);
+    if (cbm_mkdir(path) != 0) {
+        th_rmtree(tmpdir);
+        return NULL;
+    }
+    snprintf(path, sizeof(path), "%s/Cargo.toml", tmpdir);
+    if (th_write_file(path, "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\n") != 0) {
+        th_rmtree(tmpdir);
+        return NULL;
+    }
+    char paths[5][512];
+    cbm_file_info_t files[5] = {{0}};
+    for (size_t i = 0; i < sizeof(rels) / sizeof(rels[0]); i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], sources[i]) != 0) {
+            th_rmtree(tmpdir);
+            return NULL;
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_RUST;
+    }
+    if (parallel) {
+        return run_parallel_with_extract_opts_and_mutator("rust_service_preemption", tmpdir, files,
+                                                          5, 1, NULL, NULL, NULL, true);
+    }
+    return run_sequential_with_lsp_cross_and_mutator("rust_service_preemption", tmpdir, files, 5,
+                                                     NULL, NULL, true);
+}
+
+static int rust_service_preemption_graph_is_exact(const cbm_gbuf_t *gbuf) {
+    const cbm_gbuf_node_t *caller =
+        find_unique_node_by_name_label_qn_suffix(gbuf, "caller", "Function", "caller");
+    ASSERT_NOT_NULL(caller);
+    static const char *target_suffixes[] = {"gin.post", "reqwest.get", "async_nats.publish",
+                                            "dotenvy.var"};
+    for (size_t i = 0; i < sizeof(target_suffixes) / sizeof(target_suffixes[0]); i++) {
+        const char *name = strrchr(target_suffixes[i], '.');
+        ASSERT_NOT_NULL(name);
+        const cbm_gbuf_node_t *target = find_unique_node_by_name_label_qn_suffix(
+            gbuf, name + 1, "Function", target_suffixes[i]);
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(count_edges_between_nodes(gbuf, caller, target, "CALLS"), 1);
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gbuf, caller->id, "CALLS", &edges, &count), 0);
+    ASSERT_EQ(count, 4);
+    static const char *service_types[] = {"HTTP_CALLS", "ASYNC_CALLS", "CONFIGURES"};
+    for (size_t i = 0; i < sizeof(service_types) / sizeof(service_types[0]); i++) {
+        ASSERT_EQ(
+            cbm_gbuf_find_edges_by_source_type(gbuf, caller->id, service_types[i], &edges, &count),
+            0);
+        ASSERT_EQ(count, 0);
+    }
+    return 0;
+}
+
+TEST(parallel_rust_proven_target_preempts_service_classification) {
+    char tmpdir[256];
+    cbm_gbuf_t *gbuf = run_rust_service_preemption_fixture(true, tmpdir, sizeof(tmpdir));
+    ASSERT_NOT_NULL(gbuf);
+    int result = rust_service_preemption_graph_is_exact(gbuf);
+    cbm_gbuf_free(gbuf);
+    th_rmtree(tmpdir);
+    ASSERT_EQ(result, 0);
+    PASS();
+}
+
+TEST(sequential_rust_proven_target_preempts_service_classification) {
+    char tmpdir[256];
+    cbm_gbuf_t *gbuf = run_rust_service_preemption_fixture(false, tmpdir, sizeof(tmpdir));
+    ASSERT_NOT_NULL(gbuf);
+    int result = rust_service_preemption_graph_is_exact(gbuf);
+    cbm_gbuf_free(gbuf);
+    th_rmtree(tmpdir);
+    ASSERT_EQ(result, 0);
+    PASS();
+}
+
 TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
     static const struct {
         const char *tag;
@@ -4586,6 +4691,8 @@ SUITE(parallel) {
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_workspace_manifest_routes_call_to_declared_member_only);
     RUN_TEST(parallel_rust_local_shadow_loses_to_workspace_manifest_provenance);
+    RUN_TEST(parallel_rust_proven_target_preempts_service_classification);
+    RUN_TEST(sequential_rust_proven_target_preempts_service_classification);
     RUN_TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes);
     RUN_TEST(parallel_rust_known_macro_does_not_fallback_to_local_function);
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);
