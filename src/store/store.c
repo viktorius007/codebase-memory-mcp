@@ -6009,12 +6009,13 @@ int cbm_store_bfs_with_edge_limit(cbm_store_t *s, int64_t start_id, const char *
                      false, max_edges, out);
 }
 
-/* Multi-source BFS: one recursive CTE anchored on ALL seeds (via a temp
+/* Multi-source BFS: one recursive query anchored on ALL seeds (via a temp
  * table — never a per-seed loop, which re-walks overlapping hub subgraphs
  * seed_count times). Semantics for impact analysis:
  *   - shortest-path MIN(hop) across the whole seed set;
  *   - SEEDS ARE EXCLUDED from the result: a seed reached from another seed
  *     (changed files call each other constantly) is not "impact";
+ *   - "both" is the exact union of independent inbound and outbound walks;
  *   - uncapped counting up to max_results as a memory-safety ceiling only —
  *     *truncated reports when it was hit (never a silent cap);
  *   - canonical (hop, id) order.
@@ -6054,27 +6055,52 @@ int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
     char types_clause[CBM_SZ_512];
     bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause));
 
-    const char *join_cond;
-    const char *next_id;
+    char cte[CBM_SZ_2K];
     bool is_inbound = (direction != NULL) && (strcmp(direction, "inbound") == 0);
-    if (is_inbound) {
-        join_cond = "e.target_id = bfs.node_id";
-        next_id = "e.source_id";
+    bool is_both = (direction != NULL) && (strcmp(direction, "both") == 0);
+    if (is_both) {
+        snprintf(cte, sizeof(cte),
+                 "WITH RECURSIVE inbound_bfs(node_id, hop) AS ("
+                 "  SELECT id, 0 FROM bfs_seeds"
+                 "  UNION"
+                 "  SELECT e.source_id, inbound_bfs.hop + 1"
+                 "  FROM inbound_bfs"
+                 "  JOIN edges e ON e.target_id = inbound_bfs.node_id"
+                 "  WHERE e.type IN (%s) AND inbound_bfs.hop < %d"
+                 "),"
+                 "outbound_bfs(node_id, hop) AS ("
+                 "  SELECT id, 0 FROM bfs_seeds"
+                 "  UNION"
+                 "  SELECT e.target_id, outbound_bfs.hop + 1"
+                 "  FROM outbound_bfs"
+                 "  JOIN edges e ON e.source_id = outbound_bfs.node_id"
+                 "  WHERE e.type IN (%s) AND outbound_bfs.hop < %d"
+                 "),"
+                 "bfs(node_id, hop) AS ("
+                 "  SELECT node_id, hop FROM inbound_bfs"
+                 "  UNION"
+                 "  SELECT node_id, hop FROM outbound_bfs"
+                 ")",
+                 types_clause, max_depth, types_clause, max_depth);
     } else {
-        join_cond = "e.source_id = bfs.node_id";
-        next_id = "e.target_id";
+        const char *join_cond =
+            is_inbound ? "e.target_id = bfs.node_id" : "e.source_id = bfs.node_id";
+        const char *next_id = is_inbound ? "e.source_id" : "e.target_id";
+        snprintf(cte, sizeof(cte),
+                 "WITH RECURSIVE bfs(node_id, hop) AS ("
+                 "  SELECT id, 0 FROM bfs_seeds"
+                 "  UNION"
+                 "  SELECT %s, bfs.hop + 1"
+                 "  FROM bfs"
+                 "  JOIN edges e ON %s"
+                 "  WHERE e.type IN (%s) AND bfs.hop < %d"
+                 ")",
+                 next_id, join_cond, types_clause, max_depth);
     }
 
     char sql[CBM_SZ_4K];
     snprintf(sql, sizeof(sql),
-             "WITH RECURSIVE bfs(node_id, hop) AS ("
-             "  SELECT id, 0 FROM bfs_seeds"
-             "  UNION"
-             "  SELECT %s, bfs.hop + 1"
-             "  FROM bfs"
-             "  JOIN edges e ON %s"
-             "  WHERE e.type IN (%s) AND bfs.hop < %d"
-             ")"
+             "%s"
              "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
              "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
              "FROM bfs "
@@ -6085,7 +6111,7 @@ int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
              "GROUP BY n.id "
              "ORDER BY hop, n.id "
              "LIMIT %d;",
-             next_id, join_cond, types_clause, max_depth, max_results + SKIP_ONE);
+             cte, max_results + SKIP_ONE);
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {

@@ -742,9 +742,10 @@ int cbm_store_bfs_with_edge_limit(cbm_store_t *s, int64_t start_id, const char *
                                   const char **edge_types, int edge_type_count, int max_depth,
                                   int max_results, int max_edges, cbm_traverse_result_t *out);
 
-/* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
+/* Multi-source BFS from ALL seed ids at once (one query, temp-table anchored).
  * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the
- * seed set; canonical (hop,id) order; *truncated set when the max_results
+ * seed set; direction "both" is the exact union of independent inbound and
+ * outbound walks; canonical (hop,id) order; *truncated set when the max_results
  * memory-safety ceiling was hit (counting is otherwise uncapped). */
 int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
                         const char *direction, const char **edge_types, int edge_type_count,

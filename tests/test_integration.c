@@ -708,6 +708,76 @@ TEST(store_bfs_multi_excludes_seeds_and_takes_min_hop) {
     PASS();
 }
 
+TEST(store_bfs_multi_both_is_directed_union_without_zigzag) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "impact_both", "/tmp/impact_both"), CBM_STORE_OK);
+
+    enum { NODE_COUNT = 7 };
+    const char *names[NODE_COUNT] = {"seed", "up_one",   "up_two", "down_one",
+                                    "down_two", "shared", "trap"};
+    int64_t ids[NODE_COUNT];
+    for (int i = 0; i < NODE_COUNT; i++) {
+        char qn[48];
+        snprintf(qn, sizeof(qn), "impact_both.%s", names[i]);
+        cbm_node_t node = {.project = "impact_both",
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qn,
+                           .file_path = "both.c",
+                           .start_line = 1,
+                           .end_line = 2};
+        ids[i] = cbm_store_upsert_node(s, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+
+    enum { SEED, UP_ONE, UP_TWO, DOWN_ONE, DOWN_TWO, SHARED, TRAP };
+    struct {
+        int from;
+        int to;
+    } edges[] = {{UP_TWO, UP_ONE}, {UP_ONE, SEED},      {SEED, DOWN_ONE},
+                 {DOWN_ONE, DOWN_TWO}, {UP_ONE, TRAP}, {SHARED, SEED},
+                 {DOWN_ONE, SHARED}};
+    for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+        cbm_edge_t edge = {.project = "impact_both",
+                           .source_id = ids[edges[i].from],
+                           .target_id = ids[edges[i].to],
+                           .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    }
+
+    cbm_traverse_result_t result = {0};
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_bfs_multi(s, &ids[SEED], 1, "both", NULL, 0, 3, 100, &result,
+                                  &truncated),
+              CBM_STORE_OK);
+    ASSERT_FALSE(truncated);
+    ASSERT_EQ(result.visited_count, 5);
+
+    int hops[NODE_COUNT];
+    for (int i = 0; i < NODE_COUNT; i++) {
+        hops[i] = -1;
+    }
+    for (int i = 0; i < result.visited_count; i++) {
+        for (int j = 0; j < NODE_COUNT; j++) {
+            if (result.visited[i].node.id == ids[j]) {
+                hops[j] = result.visited[i].hop;
+            }
+        }
+    }
+    ASSERT_EQ(hops[UP_ONE], 1);
+    ASSERT_EQ(hops[UP_TWO], 2);
+    ASSERT_EQ(hops[DOWN_ONE], 1);
+    ASSERT_EQ(hops[DOWN_TWO], 2);
+    ASSERT_EQ(hops[SHARED], 1);
+    ASSERT_EQ(hops[SEED], -1);
+    ASSERT_EQ(hops[TRAP], -1);
+
+    cbm_store_traverse_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* The memory-safety ceiling reports truncation instead of silently capping.
  * A star of N callees from one seed, ceiling = N/2, must return exactly N/2
  * rows with *truncated = true. */
@@ -840,6 +910,7 @@ SUITE(integration) {
     RUN_TEST(integ_store_bfs_traversal);
     RUN_TEST(store_bfs_edges_survive_large_visited_set);
     RUN_TEST(store_bfs_multi_excludes_seeds_and_takes_min_hop);
+    RUN_TEST(store_bfs_multi_both_is_directed_union_without_zigzag);
     RUN_TEST(store_bfs_multi_reports_truncation_at_ceiling);
 
     /* Pipeline API tests (no db needed) */
