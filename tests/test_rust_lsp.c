@@ -135,6 +135,22 @@ static int count_confident_strategy(const CBMResolvedCallArray *arr, const char 
     return count;
 }
 
+typedef struct {
+    const char *module_qn;
+    const char *local_name;
+    const char *path;
+} RustImportFixture;
+
+static const char *rustlsp_import_fixture_lookup(void *fixture, const char *module_qn,
+                                                 const char *local_name) {
+    const RustImportFixture *entry = (const RustImportFixture *)fixture;
+    if (entry && strcmp(entry->module_qn, module_qn) == 0 &&
+        strcmp(entry->local_name, local_name) == 0) {
+        return entry->path;
+    }
+    return NULL;
+}
+
 /* ── Category 1: Free function calls + module path ─────────────── */
 
 TEST(rustlsp_free_function_call) {
@@ -478,6 +494,19 @@ TEST(rustlsp_match_arm_binding) {
     int hits = (find_resolved(r, "dispatch", "A.aa") >= 0 ? 1 : 0)
              + (find_resolved(r, "dispatch", "B.bb") >= 0 ? 1 : 0);
     ASSERT_GTE(hits, 0);  /* lenient — pattern type narrowing is best-effort */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_match_payload_shadows_outer_binding) {
+    CBMFileResult *r = extract_rust(
+        "struct Outer; impl Outer { fn wrong(&self) {} }\n"
+        "enum Event { Inner(String) }\n"
+        "fn run(error: Outer, event: Event) {\n"
+        "    match event { Event::Inner(error) => error.wrong() }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "run", "Outer.wrong"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -5414,6 +5443,16 @@ TEST(rustlsp_cov_async_await_chain) {
     ASSERT_GTE(require_resolved(r, "run", "fetch"), 0);
     cbm_free_result(r); PASS();
 }
+TEST(rustlsp_await_preserves_declared_async_output) {
+    CBMFileResult *r = extract_rust(
+        "struct Item;\n"
+        "async fn fetch() -> Option<Item> { None }\n"
+        "async fn run() -> bool { let item = fetch().await; item.is_some() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Option.is_some"), 0);
+    cbm_free_result(r);
+    PASS();
+}
 TEST(rustlsp_cov_async_block) {
     CBMFileResult *r = extract_rust(
         "fn run() -> impl std::future::Future<Output = ()> {\n    async { let _ = 42; }\n}\n");
@@ -7056,6 +7095,263 @@ TEST(rustlsp_extra_cargo_wires_external_dep) {
     PASS();
 }
 
+TEST(rustlsp_cargo_dependency_path_never_selects_binary_target) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.dep.src.main.launch";
+    defs[0].short_name = "launch";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.dep.src.main";
+    defs[0].lang = CBM_LANG_RUST;
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 1);
+    ASSERT_NOT_NULL(registry);
+
+    CBMCargoTarget app_targets[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+    };
+    CBMCargoTarget dep_targets[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+        {.kind = CBM_CARGO_TARGET_BIN, .path = "src/main.rs"},
+    };
+    CBMCargoMember members[] = {
+        {.member_path = "app", .member_name = "app", .crate_name = "app",
+         .targets = app_targets, .target_count = 1},
+        {.member_path = "dep", .member_name = "dep", .crate_name = "dep",
+         .targets = dep_targets, .target_count = 2},
+    };
+    CBMCargoManifest manifest = {0};
+    memcpy(manifest.members, members, sizeof(members));
+    manifest.member_count = 2;
+    const char *source = "fn run() { dep::launch(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "test.app.src.lib", "test.app.src.lib", registry,
+        NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL);
+
+    ASSERT_LT(find_confident(&out, "run", "dep.src.main.launch"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_declared_module_shadows_workspace_crate_name) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.tui.src.mermaid.render";
+    defs[0].short_name = "render";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.tui.src.mermaid";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.mermaid.src.lib.render";
+    defs[1].short_name = "render";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "test.mermaid.src.lib";
+    defs[1].lang = CBM_LANG_RUST;
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(registry);
+
+    CBMCargoTarget tui_target[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+    };
+    CBMCargoTarget mermaid_target[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+    };
+    CBMCargoMember members[] = {
+        {.member_path = "tui", .member_name = "tui", .crate_name = "tui",
+         .targets = tui_target, .target_count = 1},
+        {.member_path = "mermaid", .member_name = "mermaid", .crate_name = "mermaid",
+         .targets = mermaid_target, .target_count = 1},
+    };
+    CBMCargoManifest manifest = {0};
+    memcpy(manifest.members, members, sizeof(members));
+    manifest.member_count = 2;
+    const char *source = "mod mermaid; fn run() { mermaid::render(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "test.tui.src.lib", "test.tui.src.lib", registry,
+        NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL);
+
+    ASSERT_GTE(find_confident(&out, "run", "tui.src.mermaid.render"), 0);
+    ASSERT_LT(find_confident(&out, "run", "test.mermaid"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_super_glob_module_alias_shadows_workspace_crate_name) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.dep.src.connectors.list";
+    defs[0].short_name = "list";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.dep.src.connectors";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.connectors.src.lib.list";
+    defs[1].short_name = "list";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "test.connectors.src.lib";
+    defs[1].lang = CBM_LANG_RUST;
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(registry);
+
+    CBMCargoTarget app_target[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+    };
+    CBMCargoTarget dep_target[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+    };
+    CBMCargoTarget connectors_target[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+    };
+    CBMCargoMember members[] = {
+        {.member_path = "app", .member_name = "app", .crate_name = "app",
+         .targets = app_target, .target_count = 1},
+        {.member_path = "dep", .member_name = "dep", .crate_name = "dep",
+         .targets = dep_target, .target_count = 1},
+        {.member_path = "connectors", .member_name = "connectors", .crate_name = "connectors",
+         .targets = connectors_target, .target_count = 1},
+    };
+    CBMCargoManifest manifest = {0};
+    memcpy(manifest.members, members, sizeof(members));
+    manifest.member_count = 3;
+    RustImportFixture fixture = {
+        .module_qn = "test.app.src",
+        .local_name = "connectors",
+        .path = "dep::connectors",
+    };
+    CBMRustImportSource imports = {
+        .lookup = rustlsp_import_fixture_lookup,
+        .ctx = &fixture,
+    };
+    const char *source = "use super::*; fn run() { connectors::list(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "test.app.src.child", "test.app.src.child", registry,
+        NULL, NULL, 0, NULL, &manifest, &imports, &out, NULL);
+
+    ASSERT_GTE(find_confident(&out, "run", "dep.src.connectors.list"), 0);
+    ASSERT_LT(find_confident(&out, "run", "test.connectors"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_target_root_declared_module_uses_registered_physical_path) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.pkg.examples.enabled_extensions.shared.install";
+    defs[0].short_name = "install";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.pkg.examples.enabled_extensions.shared";
+    defs[0].lang = CBM_LANG_RUST;
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 1);
+    ASSERT_NOT_NULL(registry);
+
+    CBMCargoTarget example_target[] = {
+        {.kind = CBM_CARGO_TARGET_EXAMPLE, .path = "examples/enabled_extensions.rs"},
+    };
+    CBMCargoMember member = {
+        .member_path = "pkg", .member_name = "pkg", .crate_name = "pkg",
+        .targets = example_target, .target_count = 1,
+    };
+    CBMCargoManifest manifest = {0};
+    manifest.members[0] = member;
+    manifest.member_count = 1;
+    const char *source =
+        "#[path = \"enabled_extensions/shared.rs\"] mod shared;\n"
+        "fn run() { shared::install(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "test.pkg.examples.enabled_extensions",
+        "test.pkg.examples.enabled_extensions", registry, NULL, NULL, 0, NULL, &manifest, NULL,
+        &out, NULL);
+
+    ASSERT_GTE(find_confident(&out, "run", "enabled_extensions.shared.install"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    defs[0] = (CBMLSPDef){.qualified_name = "test.dep.src.lib.Store", .short_name = "Store",
+                          .label = "Struct", .def_module_qn = "test.dep.src.lib",
+                          .lang = CBM_LANG_RUST};
+    defs[1] = (CBMLSPDef){.qualified_name = "test.dep.src.lib.StoreTrait",
+                          .short_name = "StoreTrait", .label = "Trait",
+                          .def_module_qn = "test.dep.src.lib", .is_interface = true,
+                          .lang = CBM_LANG_RUST};
+    defs[2] = (CBMLSPDef){.qualified_name = "test.dep.src.lib.Store.act",
+                          .short_name = "act", .label = "Method",
+                          .receiver_type = "test.dep.src.lib.Store",
+                          .receiver_spelling = "Store", .def_module_qn = "test.dep.src.lib",
+                          .lang = CBM_LANG_RUST};
+    defs[3] = (CBMLSPDef){.qualified_name = "test.dep.src.lib.Store.act",
+                          .short_name = "act", .label = "Method",
+                          .receiver_type = "test.dep.src.lib.Store",
+                          .receiver_spelling = "Store", .def_module_qn = "test.dep.src.lib",
+                          .trait_qn = "test.dep.src.lib.StoreTrait", .lang = CBM_LANG_RUST};
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 4);
+    ASSERT_NOT_NULL(registry);
+
+    CBMCargoTarget caller_target[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+    };
+    CBMCargoTarget dep_target[] = {
+        {.kind = CBM_CARGO_TARGET_LIB, .path = "src/lib.rs"},
+    };
+    CBMCargoMember members[] = {
+        {.member_path = "caller", .member_name = "caller", .crate_name = "caller",
+         .targets = caller_target, .target_count = 1},
+        {.member_path = "dep", .member_name = "dep", .crate_name = "dep",
+         .targets = dep_target, .target_count = 1},
+    };
+    CBMCargoManifest manifest = {0};
+    memcpy(manifest.members, members, sizeof(members));
+    manifest.member_count = 2;
+    const char *source = "fn run(store: &dep::Store) { store.act(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(
+        &arena, source, (int)strlen(source), "test.caller.src.lib", "test.caller.src.lib",
+        registry, NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL);
+
+    ASSERT_LT(find_confident(&out, "run", "Store.act"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_inline_module_body_without_caller_node_is_not_published) {
+    CBMFileResult *r = extract_rust(
+        "fn helper() {}\n"
+        "fn work() {}\n"
+        "mod imp { use super::*; fn work() { helper(); } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "work", "helper"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_cfg_duplicate_method_body_without_unique_caller_is_not_published) {
+    CBMFileResult *r = extract_rust(
+        "fn first() {} fn second() {} struct Worker;\n"
+        "impl Worker {\n"
+        "  #[cfg(unix)] fn run(&self) { first(); }\n"
+        "  #[cfg(not(unix))] fn run(&self) { second(); }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "Worker.run", "first"), 0);
+    ASSERT_LT(find_confident(&r->resolved_calls, "Worker.run", "second"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Proc-macro attributes stay on the definition. The semantic graph passes
  * consume this field to emit DECORATES + USAGE; Rust LSP must not invent calls
  * to implementation details that only executing the proc-macro could prove. */
@@ -7332,6 +7628,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_if_let_some);
     RUN_TEST(rustlsp_for_loop_vec);
     RUN_TEST(rustlsp_match_arm_binding);
+    RUN_TEST(rustlsp_match_payload_shadows_outer_binding);
 
     /* Macros */
     RUN_TEST(rustlsp_println_macro);
@@ -7743,6 +8040,7 @@ void suite_rust_lsp(void) {
     /* Cov §R: Async / Future */
     RUN_TEST(rustlsp_cov_async_fn_decl);
     RUN_TEST(rustlsp_cov_async_await_chain);
+    RUN_TEST(rustlsp_await_preserves_declared_async_output);
     RUN_TEST(rustlsp_cov_async_block);
     RUN_TEST(rustlsp_cov_async_move);
     RUN_TEST(rustlsp_cov_async_join_call);
@@ -7900,6 +8198,13 @@ void suite_rust_lsp(void) {
     /* EXTRA: Cargo manifest wiring, proc-macro attrs, rustdoc JSON */
     RUN_TEST(rustlsp_extra_cargo_wires_workspace_member);
     RUN_TEST(rustlsp_extra_cargo_wires_external_dep);
+    RUN_TEST(rustlsp_cargo_dependency_path_never_selects_binary_target);
+    RUN_TEST(rustlsp_declared_module_shadows_workspace_crate_name);
+    RUN_TEST(rustlsp_super_glob_module_alias_shadows_workspace_crate_name);
+    RUN_TEST(rustlsp_target_root_declared_module_uses_registered_physical_path);
+    RUN_TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved);
+    RUN_TEST(rustlsp_inline_module_body_without_caller_node_is_not_published);
+    RUN_TEST(rustlsp_cfg_duplicate_method_body_without_unique_caller_is_not_published);
     RUN_TEST(rustlsp_extra_proc_macro_tokio_main);
     RUN_TEST(rustlsp_extra_proc_macro_tokio_test);
     RUN_TEST(rustlsp_extra_proc_macro_tracing_instrument);

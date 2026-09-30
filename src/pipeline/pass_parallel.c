@@ -3549,7 +3549,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     if (have_rust) {
         cbm_arena_init(&rust_manifest_arena);
         rust_manifest_arena_live = true;
-        if (cbm_pxc_build_rust_manifest(ctx, &rust_manifest_arena, &rust_manifest)) {
+        if (cbm_pxc_build_rust_manifest(ctx, &rust_manifest_arena, &rust_manifest, files,
+                                        file_count)) {
             rust_manifest_ptr = &rust_manifest;
         }
     }

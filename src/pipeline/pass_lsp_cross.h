@@ -185,7 +185,8 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
  * immutable pointer in its own TLS slot before dispatch and clear it afterward. */
 struct CBMCargoManifest;
 bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manifest_arena,
-                                 struct CBMCargoManifest *out_manifest);
+                                 struct CBMCargoManifest *out_manifest,
+                                 const cbm_file_info_t *files, int file_count);
 void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 

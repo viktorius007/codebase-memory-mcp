@@ -11,6 +11,6 @@
 # There is no key for wrong published edges: scripts/scip-harness-join.py
 # reports them as fabricated and rejects them unconditionally.
 calls_matched=5
-calls_graph_only_referenced=2
-calls_oracle_only=1
+calls_graph_only_referenced=3
+calls_oracle_only=0
 imports=3

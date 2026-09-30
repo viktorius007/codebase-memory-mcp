@@ -32,7 +32,7 @@ static int skip_ws_and_comment(const char* s, int len, int from) {
 
 static bool is_ident_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_' || c == '-';
+           (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
 }
 
 /* Parse a bare key (ident-like). Stores arena-allocated copy in *out. */
@@ -71,6 +71,18 @@ static int parse_string(CBMArena* a, const char* s, int len, int from,
     }
     *out = cbm_arena_strndup(a, s + start, (size_t)(from - start));
     if (from < len) from++;
+    return from;
+}
+
+static int parse_bool(const char *s, int len, int from, bool *out) {
+    if (from + 4 <= len && strncmp(s + from, "true", 4) == 0) {
+        *out = true;
+        return from + 4;
+    }
+    if (from + 5 <= len && strncmp(s + from, "false", 5) == 0) {
+        *out = false;
+        return from + 5;
+    }
     return from;
 }
 
@@ -131,6 +143,27 @@ static int parse_section(CBMArena* a, const char* s, int len, int from,
     if (from < len) from++;
     if (array_of_tables && from < len && s[from] == ']') from++;
     return from;
+}
+
+static CBMCargoTarget *append_target(CBMArena *arena, CBMCargoManifest *manifest,
+                                     CBMCargoTargetKind kind) {
+    if (manifest->target_count == manifest->target_capacity) {
+        int capacity = manifest->target_capacity ? manifest->target_capacity * 2 : 8;
+        CBMCargoTarget *targets = (CBMCargoTarget *)cbm_arena_alloc(
+            arena, (size_t)capacity * sizeof(*targets));
+        if (!targets)
+            return NULL;
+        if (manifest->target_count > 0) {
+            memcpy(targets, manifest->targets,
+                   (size_t)manifest->target_count * sizeof(*targets));
+        }
+        manifest->targets = targets;
+        manifest->target_capacity = capacity;
+    }
+    CBMCargoTarget *target = &manifest->targets[manifest->target_count++];
+    memset(target, 0, sizeof(*target));
+    target->kind = kind;
+    return target;
 }
 
 /* For the `[dependencies]` / `[dev-dependencies]` / `[workspace.dependencies]`
@@ -202,13 +235,35 @@ static int parse_package_kv(CBMArena* a, const char* s, int len, int from,
         from = parse_string(a, s, len, from, &out->package_name);
     } else if (key && strcmp(key, "version") == 0) {
         from = parse_string(a, s, len, from, &out->package_version);
+    } else if (key && strcmp(key, "edition") == 0) {
+        from = parse_string(a, s, len, from, &out->edition);
+    } else if (key && strcmp(key, "edition.workspace") == 0) {
+        from = parse_bool(s, len, from, &out->edition_inherited);
     } else {
-        from = skip_value(s, len, from);
+        static const char *const auto_keys[] = {
+            "autolib", "autobins", "autotests", "autoexamples", "autobenches",
+        };
+        int auto_index = -1;
+        for (int i = 0; i < 5; i++) {
+            if (key && strcmp(key, auto_keys[i]) == 0) {
+                auto_index = i;
+                break;
+            }
+        }
+        int parsed = auto_index >= 0 ? parse_bool(s, len, from, &out->auto_targets[auto_index])
+                                     : from;
+        if (parsed != from) {
+            out->auto_target_overrides |= 1u << auto_index;
+            from = parsed;
+        } else {
+            from = skip_value(s, len, from);
+        }
     }
     return from;
 }
 
-static int parse_lib_kv(CBMArena *a, const char *s, int len, int from, CBMCargoManifest *out) {
+static int parse_target_kv(CBMArena *a, const char *s, int len, int from,
+                           CBMCargoManifest *out, CBMCargoTarget *target) {
     from = skip_ws_and_comment(s, len, from);
     if (from >= len || s[from] == '[')
         return from;
@@ -220,11 +275,32 @@ static int parse_lib_kv(CBMArena *a, const char *s, int len, int from, CBMCargoM
         from = skip_ws_and_comment(s, len, from);
     }
     if (key && strcmp(key, "name") == 0) {
-        from = parse_string(a, s, len, from, &out->lib_name);
+        from = parse_string(a, s, len, from, &target->name);
+        if (target->kind == CBM_CARGO_TARGET_LIB)
+            out->lib_name = target->name;
+    } else if (key && strcmp(key, "path") == 0) {
+        from = parse_string(a, s, len, from, &target->path);
     } else {
         from = skip_value(s, len, from);
     }
     return from;
+}
+
+static int parse_workspace_package_kv(CBMArena *a, const char *s, int len, int from,
+                                      CBMCargoManifest *out) {
+    from = skip_ws_and_comment(s, len, from);
+    if (from >= len || s[from] == '[')
+        return from;
+    const char *key = NULL;
+    from = parse_key(a, s, len, from, &key);
+    from = skip_ws_and_comment(s, len, from);
+    if (from < len && s[from] == '=') {
+        from++;
+        from = skip_ws_and_comment(s, len, from);
+    }
+    if (key && strcmp(key, "edition") == 0)
+        return parse_string(a, s, len, from, &out->workspace_edition);
+    return skip_value(s, len, from);
 }
 
 static int parse_workspace_kv(CBMArena *a, const char *s, int len, int from,
@@ -272,11 +348,14 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     CBMCargoManifest* out) {
     if (!arena || !src || !out) return;
     memset(out, 0, sizeof(*out));
+    for (int i = 0; i < 5; i++)
+        out->auto_targets[i] = true;
     if (src_len <= 0) src_len = (int)strlen(src);
 
     int from = 0;
     /* Default: pre-header content treated as [package]. */
     const char* section = "package";
+    CBMCargoTarget *target = NULL;
 
     while (from < src_len) {
         from = skip_ws_and_comment(src, src_len, from);
@@ -285,6 +364,17 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
             const char* hdr = NULL;
             from = parse_section(arena, src, src_len, from, &hdr);
             section = hdr ? hdr : "";
+            target = NULL;
+            if (strcmp(section, "lib") == 0)
+                target = append_target(arena, out, CBM_CARGO_TARGET_LIB);
+            else if (strcmp(section, "bin") == 0)
+                target = append_target(arena, out, CBM_CARGO_TARGET_BIN);
+            else if (strcmp(section, "test") == 0)
+                target = append_target(arena, out, CBM_CARGO_TARGET_TEST);
+            else if (strcmp(section, "example") == 0)
+                target = append_target(arena, out, CBM_CARGO_TARGET_EXAMPLE);
+            else if (strcmp(section, "bench") == 0)
+                target = append_target(arena, out, CBM_CARGO_TARGET_BENCH);
             continue;
         }
         if (!section) {
@@ -293,10 +383,12 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
         }
         if (strcmp(section, "package") == 0) {
             from = parse_package_kv(arena, src, src_len, from, out);
-        } else if (strcmp(section, "lib") == 0) {
-            from = parse_lib_kv(arena, src, src_len, from, out);
+        } else if (target) {
+            from = parse_target_kv(arena, src, src_len, from, out, target);
         } else if (strcmp(section, "workspace") == 0) {
             from = parse_workspace_kv(arena, src, src_len, from, out);
+        } else if (strcmp(section, "workspace.package") == 0) {
+            from = parse_workspace_package_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "dependencies") == 0 ||
                    strcmp(section, "dev-dependencies") == 0 ||
                    strcmp(section, "build-dependencies") == 0 ||
@@ -309,6 +401,40 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
             }
         }
     }
+}
+
+static bool target_auto_enabled(const CBMCargoManifest *manifest, CBMCargoTargetKind kind,
+                                const char *inherited_edition) {
+    if (manifest->auto_target_overrides & (1u << kind))
+        return manifest->auto_targets[kind];
+    const char *edition = manifest->edition_inherited ? inherited_edition : manifest->edition;
+    bool modern = edition && strcmp(edition, "2018") >= 0;
+    return modern || manifest->target_count == 0;
+}
+
+void cbm_cargo_record_discovered_target(CBMArena *arena, CBMCargoManifest *manifest,
+                                        CBMCargoTargetKind kind, const char *name,
+                                        const char *path, const char *inherited_edition) {
+    if (!arena || !manifest || !path)
+        return;
+    for (int i = 0; i < manifest->target_count; i++) {
+        CBMCargoTarget *target = &manifest->targets[i];
+        bool same_name = target->name && name && strcmp(target->name, name) == 0;
+        if (target->kind == kind && !target->path &&
+            (kind == CBM_CARGO_TARGET_LIB || same_name)) {
+            target->path = cbm_arena_strdup(arena, path);
+            return;
+        }
+        if (target->kind == kind && target->path && strcmp(target->path, path) == 0)
+            return;
+    }
+    if (!target_auto_enabled(manifest, kind, inherited_edition))
+        return;
+    CBMCargoTarget *target = append_target(arena, manifest, kind);
+    if (!target)
+        return;
+    target->name = name ? cbm_arena_strdup(arena, name) : NULL;
+    target->path = cbm_arena_strdup(arena, path);
 }
 
 bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head) {
@@ -352,9 +478,12 @@ const CBMCargoMember* cbm_cargo_find_member(const CBMCargoManifest* m,
 }
 
 void cbm_cargo_set_member_names(CBMCargoMember *member, const char *crate_name,
-                                const char *lib_name) {
+                                const char *lib_name, const CBMCargoTarget *targets,
+                                int target_count) {
     if (!member)
         return;
     member->crate_name = crate_name;
     member->lib_name = lib_name;
+    member->targets = targets;
+    member->target_count = target_count;
 }

@@ -2072,8 +2072,103 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     free(filtered);
 }
 
+static bool pxc_cargo_path_prefix(const char *path, const char *prefix) {
+    while (strncmp(prefix, "./", 2) == 0)
+        prefix += 2;
+    size_t len = strlen(prefix);
+    return len == 0 || (strncmp(path, prefix, len) == 0 && path[len] == '/');
+}
+
+static const char *pxc_cargo_package_rel(const CBMCargoManifest *workspace,
+                                         const char *package_path, const char *rel_path) {
+    const char *owner = NULL;
+    size_t owner_len = 0;
+    for (int i = 0; i < workspace->member_count; i++) {
+        const char *candidate = workspace->members[i].member_path;
+        if (!candidate)
+            continue;
+        while (strncmp(candidate, "./", 2) == 0)
+            candidate += 2;
+        size_t len = strlen(candidate);
+        if (len > owner_len && pxc_cargo_path_prefix(rel_path, candidate)) {
+            owner = candidate;
+            owner_len = len;
+        }
+    }
+    while (package_path && strncmp(package_path, "./", 2) == 0)
+        package_path += 2;
+    if (owner) {
+        if (!package_path || strlen(package_path) != owner_len ||
+            strncmp(package_path, owner, owner_len) != 0)
+            return NULL;
+        return rel_path + owner_len + 1;
+    }
+    return package_path && package_path[0] ? NULL : rel_path;
+}
+
+static bool pxc_cargo_named_default(const char *rel, const char *prefix, CBMCargoTargetKind kind,
+                                    CBMCargoTargetKind *out_kind, char *name, size_t name_size) {
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(rel, prefix, prefix_len) != 0)
+        return false;
+    const char *tail = rel + prefix_len;
+    const char *slash = strchr(tail, '/');
+    size_t name_len = 0;
+    if (!slash) {
+        size_t len = strlen(tail);
+        if (len <= 3 || strcmp(tail + len - 3, ".rs") != 0)
+            return false;
+        name_len = len - 3;
+    } else if (strcmp(slash, "/main.rs") == 0) {
+        name_len = (size_t)(slash - tail);
+    }
+    if (name_len == 0 || name_len >= name_size)
+        return false;
+    memcpy(name, tail, name_len);
+    name[name_len] = '\0';
+    *out_kind = kind;
+    return true;
+}
+
+static bool pxc_cargo_default_target(const char *rel, const CBMCargoManifest *manifest,
+                                     CBMCargoTargetKind *kind, char *name, size_t name_size) {
+    if (strcmp(rel, "src/lib.rs") == 0) {
+        *kind = CBM_CARGO_TARGET_LIB;
+        const char *lib_name = manifest->lib_name ? manifest->lib_name : manifest->package_name;
+        snprintf(name, name_size, "%s", lib_name ? lib_name : "");
+        return true;
+    }
+    if (strcmp(rel, "src/main.rs") == 0) {
+        *kind = CBM_CARGO_TARGET_BIN;
+        snprintf(name, name_size, "%s", manifest->package_name ? manifest->package_name : "");
+        return true;
+    }
+    return pxc_cargo_named_default(rel, "src/bin/", CBM_CARGO_TARGET_BIN, kind, name, name_size) ||
+           pxc_cargo_named_default(rel, "tests/", CBM_CARGO_TARGET_TEST, kind, name, name_size) ||
+           pxc_cargo_named_default(rel, "examples/", CBM_CARGO_TARGET_EXAMPLE, kind, name,
+                                   name_size) ||
+           pxc_cargo_named_default(rel, "benches/", CBM_CARGO_TARGET_BENCH, kind, name, name_size);
+}
+
+static void pxc_cargo_discover_targets(CBMArena *arena, const CBMCargoManifest *workspace,
+                                       CBMCargoManifest *manifest, const char *package_path,
+                                       const cbm_file_info_t *files, int file_count,
+                                       const char *inherited_edition) {
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language != CBM_LANG_RUST || !files[i].rel_path)
+            continue;
+        const char *rel = pxc_cargo_package_rel(workspace, package_path, files[i].rel_path);
+        CBMCargoTargetKind kind;
+        char name[CBM_SZ_1K];
+        if (!rel || !pxc_cargo_default_target(rel, manifest, &kind, name, sizeof(name)))
+            continue;
+        cbm_cargo_record_discovered_target(arena, manifest, kind, name, rel, inherited_edition);
+    }
+}
+
 bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
-                                 CBMCargoManifest *out_m) {
+                                 CBMCargoManifest *out_m, const cbm_file_info_t *files,
+                                 int file_count) {
     if (!ctx || !ctx->repo_path || !marena || !out_m)
         return false;
     char path[1024];
@@ -2089,6 +2184,8 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     memset(out_m, 0, sizeof(*out_m));
     cbm_cargo_parse(marena, toml, toml_len, out_m);
     cbm_free(CBM_MEM_CLASS_EXTRACT, toml); /* cargo parser copies into marena */
+    pxc_cargo_discover_targets(marena, out_m, out_m, "", files, file_count,
+                               out_m->workspace_edition);
     /* Rust code names a member by its package (or lib) name, which need not
      * equal its directory: read each member manifest so `codex_core::x` can
      * route to `core/`. A missing or unreadable member manifest leaves the
@@ -2111,7 +2208,10 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
         CBMCargoManifest member_manifest;
         cbm_cargo_parse(marena, member_toml, member_len, &member_manifest);
         cbm_free(CBM_MEM_CLASS_EXTRACT, member_toml);
-        cbm_cargo_set_member_names(member, member_manifest.package_name, member_manifest.lib_name);
+        pxc_cargo_discover_targets(marena, out_m, &member_manifest, member->member_path, files,
+                                   file_count, out_m->workspace_edition);
+        cbm_cargo_set_member_names(member, member_manifest.package_name, member_manifest.lib_name,
+                                   member_manifest.targets, member_manifest.target_count);
     }
     return true;
 }
@@ -2139,7 +2239,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     bool have_manifest = false;
     if (have_rust) {
         cbm_arena_init(&cargo_arena);
-        have_manifest = cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
+        have_manifest =
+            cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest, files, file_count);
         cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
         cbm_pxc_set_rust_imports(ctx->rust_imports);
     }

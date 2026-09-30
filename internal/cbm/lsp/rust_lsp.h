@@ -130,6 +130,12 @@ typedef struct {
      * `vec.iter().map(|x| x.method())` resolves `x.method()` correctly. */
     const CBMType *pending_closure_param_type;
 
+    /* Scrutinee type inherited by the match arms currently being walked.
+     * Even when an enum payload's exact field type is unavailable, binding
+     * its pattern as unknown prevents an outer same-named local from leaking
+     * into the arm. */
+    const CBMType *pending_match_type;
+
     /* User-defined `macro_rules!` definitions collected during the
      * pre-walk phase. Each rule stores its pattern + transcriber text;
      * `macro_invocation` resolution attempts to match the invocation

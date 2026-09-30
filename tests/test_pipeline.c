@@ -7958,6 +7958,7 @@ TEST(pipeline_closure_restore_keeps_rust_impl_identity_equal_to_full) {
 typedef struct {
     int run_rc;
     bool store_opened;
+    int alpha_crate_calls;
     int alpha_target_calls;
     int alpha_decoy_calls;
     int gamma_target_calls;
@@ -7965,14 +7966,24 @@ typedef struct {
 } RustCargoRouteObservation;
 
 static int setup_rust_cargo_route_repo(const char *tmp) {
-    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/alpha")), 0);
     ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/beta/src")), 0);
     ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/gamma/src")), 0);
     write_temp_file(tmp, "Cargo.toml",
                     "[workspace]\n"
                     "members = [\"crates/alpha\", \"crates/beta\", \"crates/gamma\"]\n"
                     "resolver = \"2\"\n");
-    write_temp_file(tmp, "crates/alpha/src/lib.rs", "pub fn alphaCargoRouteTarget() -> u8 { 1 }\n");
+    write_temp_file(tmp, "crates/alpha/Cargo.toml",
+                    "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n"
+                    "[lib]\npath = \"lib.rs\"\n");
+    write_temp_file(tmp, "crates/beta/Cargo.toml",
+                    "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "crates/gamma/Cargo.toml",
+                    "[package]\nname = \"gamma\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "crates/alpha/lib.rs",
+                    "mod inner;\n"
+                    "pub fn alphaCargoRouteTarget() -> u8 { crate::inner::customRootLeaf() }\n");
+    write_temp_file(tmp, "crates/alpha/inner.rs", "pub fn customRootLeaf() -> u8 { 1 }\n");
     write_temp_file(tmp, "crates/gamma/src/lib.rs", "pub fn gammaCargoRouteTarget() -> u8 { 2 }\n");
     write_temp_file(tmp, "crates/beta/src/local.rs",
                     "pub fn alphaCargoRouteTarget() -> u8 { 91 }\n"
@@ -8005,9 +8016,12 @@ static RustCargoRouteObservation observe_rust_cargo_route(const char *tmp, const
     cbm_store_t *store = cbm_store_open_path(db_path);
     observation.store_opened = store != NULL;
     if (store && project) {
+        observation.alpha_crate_calls =
+            named_edge_to_file_count(store, project, "CALLS", "alphaCargoRouteTarget",
+                                     "customRootLeaf", "crates/alpha/inner.rs");
         observation.alpha_target_calls =
             named_edge_to_file_count(store, project, "CALLS", "cargoRouteCaller",
-                                     "alphaCargoRouteTarget", "crates/alpha/src/lib.rs");
+                                     "alphaCargoRouteTarget", "crates/alpha/lib.rs");
         observation.alpha_decoy_calls =
             named_edge_to_file_count(store, project, "CALLS", "cargoRouteCaller",
                                      "alphaCargoRouteTarget", "crates/beta/src/local.rs");
@@ -8026,6 +8040,7 @@ static RustCargoRouteObservation observe_rust_cargo_route(const char *tmp, const
 static int assert_rust_cargo_route(const RustCargoRouteObservation *observation) {
     ASSERT_EQ(observation->run_rc, 0);
     ASSERT_TRUE(observation->store_opened);
+    ASSERT_EQ(observation->alpha_crate_calls, 1);
     ASSERT_EQ(observation->alpha_target_calls, 1);
     ASSERT_EQ(observation->alpha_decoy_calls, 0);
     ASSERT_EQ(observation->gamma_target_calls, 1);
