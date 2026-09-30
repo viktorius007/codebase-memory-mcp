@@ -383,6 +383,117 @@ TEST(pipeline_structure_edges) {
     PASS();
 }
 
+static int structure_parent_errors(cbm_store_t *store, const char *project, int *folder_count,
+                                   int *file_count) {
+    char branch_qn[1024];
+    snprintf(branch_qn, sizeof(branch_qn), "%s.__branch__.working-tree", project);
+    cbm_node_t branch = {0};
+    if (cbm_store_find_node_by_qn(store, project, branch_qn, &branch) != CBM_STORE_OK) {
+        return -1;
+    }
+
+    const char *labels[] = {"Folder", "File"};
+    const char *edge_types[] = {"CONTAINS_FOLDER", "CONTAINS_FILE"};
+    int errors = 0;
+    for (int kind = 0; kind < 2; kind++) {
+        cbm_node_t *nodes = NULL;
+        int node_count = 0;
+        if (cbm_store_find_nodes_by_label(store, project, labels[kind], &nodes, &node_count) !=
+            CBM_STORE_OK) {
+            errors++;
+            continue;
+        }
+        *(kind == 0 ? folder_count : file_count) = node_count;
+        for (int i = 0; i < node_count; i++) {
+            int64_t expected_parent_id = branch.id;
+            char parent_path[1024];
+            snprintf(parent_path, sizeof(parent_path), "%s", nodes[i].file_path);
+            char *slash = strrchr(parent_path, '/');
+            if (slash) {
+                *slash = '\0';
+                char *parent_qn = cbm_pipeline_fqn_folder(project, parent_path);
+                cbm_node_t parent = {0};
+                if (!parent_qn ||
+                    cbm_store_find_node_by_qn(store, project, parent_qn, &parent) != CBM_STORE_OK) {
+                    errors++;
+                    free(parent_qn);
+                    continue;
+                }
+                expected_parent_id = parent.id;
+                cbm_node_free_fields(&parent);
+                free(parent_qn);
+            }
+
+            cbm_edge_t *incoming = NULL;
+            int incoming_count = 0;
+            int rc = cbm_store_find_edges_by_target_type(store, nodes[i].id, edge_types[kind],
+                                                         &incoming, &incoming_count);
+            if (rc != CBM_STORE_OK || incoming_count != 1 ||
+                incoming[0].source_id != expected_parent_id) {
+                errors++;
+            }
+            cbm_store_free_edges(incoming, incoming_count);
+        }
+        cbm_store_free_nodes(nodes, node_count);
+    }
+    cbm_node_free_fields(&branch);
+    return errors;
+}
+
+TEST(pipeline_structure_every_child_has_exact_parent) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    const char *paths[] = {"siblings/leaf.rs", "siblings/leaf.py", "deep/one/two/leaf.go",
+                           "deep/one/two/leaf.js", "container/Dockerfile"};
+    const char *sources[] = {"fn rust_leaf() {}\n", "def py_leaf():\n    return 1\n",
+                             "package deep\nfunc GoLeaf() {}\n", "function jsLeaf() {}\n",
+                             "FROM scratch\n"};
+    char path[512];
+    for (int i = 0; i < 5; i++) {
+        snprintf(path, sizeof(path), "%s/%s", g_tmpdir, paths[i]);
+        ASSERT_EQ(th_write_file(path, sources[i]), 0);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/exact_parent.db", g_tmpdir);
+    cbm_pipeline_t *full = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    const char *project = cbm_pipeline_project_name(full);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    int full_folders = 0;
+    int full_files = 0;
+    ASSERT_EQ(structure_parent_errors(store, project, &full_folders, &full_files), 0);
+    ASSERT_EQ(full_folders, 7);
+    ASSERT_EQ(full_files, 8);
+    cbm_store_close(store);
+    cbm_pipeline_free(full);
+
+    snprintf(path, sizeof(path), "%s/deep/one/two/leaf.js", g_tmpdir);
+    ASSERT_EQ(th_append_file(path, "// incremental body edit\n"), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incremental = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    project = cbm_pipeline_project_name(incremental);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    int incremental_folders = 0;
+    int incremental_files = 0;
+    ASSERT_EQ(structure_parent_errors(store, project, &incremental_folders, &incremental_files), 0);
+    ASSERT_EQ(incremental_folders, full_folders);
+    ASSERT_EQ(incremental_files, full_files);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(incremental);
+    teardown_test_repo();
+    PASS();
+}
+
 TEST(pipeline_branch_root_structure) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -16389,6 +16500,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_structure_edges);
+    RUN_TEST(pipeline_structure_every_child_has_exact_parent);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
     RUN_TEST(pipeline_fast_mode);
