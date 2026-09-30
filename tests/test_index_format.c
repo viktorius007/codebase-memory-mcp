@@ -42,6 +42,10 @@ static const RFile k_files[] = {
 };
 static const int k_nfiles = (int)(sizeof(k_files) / sizeof(k_files[0]));
 
+static const RFile k_g15_files[] = {
+    {"nested/leaf/item.py", "def item():\n    return 1\n"},
+};
+
 /* ── Log capture: the routing decision is only visible in the log ───── */
 
 enum { IF_LOG_BUF = 8192 };
@@ -243,7 +247,74 @@ TEST(index_format_legacy_index_rebuilds_and_repairs) {
     PASS();
 }
 
+static int g15_folder_invariant_errors(cbm_store_t *store, const char *project) {
+    cbm_node_t *folders = NULL;
+    int folder_count = 0;
+    if (cbm_store_find_nodes_by_label(store, project, "Folder", &folders, &folder_count) !=
+        CBM_STORE_OK) {
+        return 1;
+    }
+    int64_t parent_id = 0;
+    int64_t child_id = 0;
+    for (int i = 0; i < folder_count; i++) {
+        if (strcmp(folders[i].file_path, "nested") == 0) {
+            parent_id = folders[i].id;
+        } else if (strcmp(folders[i].file_path, "nested/leaf") == 0) {
+            child_id = folders[i].id;
+        }
+    }
+    cbm_store_free_nodes(folders, folder_count);
+
+    int errors = parent_id == 0 || child_id == 0;
+    cbm_edge_t *incoming = NULL;
+    int incoming_count = 0;
+    if (!errors &&
+        cbm_store_find_edges_by_target_type(store, child_id, "CONTAINS_FOLDER", &incoming,
+                                            &incoming_count) != CBM_STORE_OK) {
+        errors++;
+    } else if (!errors && (incoming_count != 1 || incoming[0].source_id != parent_id)) {
+        errors++;
+    }
+    cbm_store_free_edges(incoming, incoming_count);
+    return errors;
+}
+
+TEST(format_v2_generation_rebuilds_to_v3_with_folder_invariant) {
+    RProj lp;
+    cbm_store_t *initial = rh_index_files(&lp, k_g15_files, 1);
+    ASSERT_NOT_NULL(initial);
+    cbm_store_close(initial);
+
+    cbm_store_t *v2 = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(v2);
+    ASSERT_EQ(cbm_store_exec(v2,
+                             "DELETE FROM edges WHERE type='CONTAINS_FOLDER' AND target_id IN ("
+                             "SELECT id FROM nodes WHERE label='Folder' AND "
+                             "file_path='nested/leaf');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_format_version(v2, 2), CBM_STORE_OK);
+    ASSERT_EQ(g15_folder_invariant_errors(v2, lp.project), 1);
+    cbm_store_close(v2);
+
+    char *resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(g_log_buf, "format_change_reindex"));
+    ASSERT_NOT_NULL(strstr(resp, "\"format_migration\":true"));
+    free(resp);
+
+    cbm_store_t *rebuilt = cbm_store_open_path_query(lp.dbpath);
+    ASSERT_NOT_NULL(rebuilt);
+    int format_version = 0;
+    ASSERT_EQ(cbm_store_get_format_version(rebuilt, &format_version), CBM_STORE_OK);
+    ASSERT_EQ(format_version, 3);
+    ASSERT_EQ(g15_folder_invariant_errors(rebuilt, lp.project), 0);
+
+    rh_cleanup(&lp, rebuilt);
+    PASS();
+}
+
 SUITE(index_format) {
     RUN_TEST(index_format_siblings_distinct_and_searchable);
     RUN_TEST(index_format_legacy_index_rebuilds_and_repairs);
+    RUN_TEST(format_v2_generation_rebuilds_to_v3_with_folder_invariant);
 }
