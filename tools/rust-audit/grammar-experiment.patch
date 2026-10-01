@@ -1,0 +1,203 @@
+diff --git a/grammar.js b/grammar.js
+index 4a0ff4b..6ec663f 100644
+--- a/grammar.js
++++ b/grammar.js
+@@ -52,7 +52,7 @@ const TOKEN_TREE_NON_SPECIAL_PUNCTUATION = [
+   '+', '-', '*', '/', '%', '^', '!', '&', '|', '&&', '||', '<<',
+   '>>', '+=', '-=', '*=', '/=', '%=', '^=', '&=', '|=', '<<=',
+   '>>=', '=', '==', '!=', '>', '<', '>=', '<=', '@', '_', '.',
+-  '..', '...', '..=', ',', ';', ':', '::', '->', '=>', '#', '?',
++  '..', '...', '..=', ',', ';', ':', '::', '->', '=>', '#', '?', '~',
+ ];
+ 
+ const primitiveTypes = numericTypes.concat(['bool', 'str', 'char']);
+@@ -112,6 +112,8 @@ module.exports = grammar({
+     [$.visibility_modifier],
+     [$.visibility_modifier, $.scoped_identifier, $.scoped_type_identifier],
+     [$.foreign_mod_item, $.function_modifiers],
++    [$.range_expression],
++    [$.generic_type_with_turbofish, $.generic_pattern],
+   ],
+ 
+   word: $ => $.identifier,
+@@ -137,6 +139,7 @@ module.exports = grammar({
+     _declaration_statement: $ => choice(
+       $.const_item,
+       $.macro_invocation,
++      alias($.brace_macro_statement, $.macro_invocation),
+       $.macro_definition,
+       $.empty_statement,
+       $.attribute_item,
+@@ -406,6 +409,7 @@ module.exports = grammar({
+ 
+     static_item: $ => seq(
+       optional($.visibility_modifier),
++      optional(choice('safe', 'unsafe')),
+       'static',
+ 
+       // Not actual rust syntax, but made popular by the lazy_static crate.
+@@ -463,6 +467,7 @@ module.exports = grammar({
+       'default',
+       'const',
+       'unsafe',
++      'safe',
+       $.extern_modifier,
+     )),
+ 
+@@ -477,15 +482,8 @@ module.exports = grammar({
+     where_predicate: $ => seq(
+       field('left', choice(
+         $.lifetime,
+-        $._type_identifier,
+-        $.scoped_type_identifier,
+-        $.generic_type,
+-        $.reference_type,
+-        $.pointer_type,
+-        $.tuple_type,
+-        $.array_type,
++        $._type,
+         $.higher_ranked_trait_bound,
+-        alias(choice(...primitiveTypes), $.primitive_type),
+       )),
+       field('bounds', $.trait_bounds),
+     ),
+@@ -520,6 +518,7 @@ module.exports = grammar({
+     ),
+ 
+     associated_type: $ => seq(
++      optional($.visibility_modifier),
+       'type',
+       field('name', $._type_identifier),
+       field('type_parameters', optional($.type_parameters)),
+@@ -662,7 +661,7 @@ module.exports = grammar({
+     parameters: $ => seq(
+       '(',
+       sepBy(',', seq(
+-        optional($.attribute_item),
++        repeat($.attribute_item),
+         choice(
+           $.parameter,
+           $.self_parameter,
+@@ -742,6 +741,8 @@ module.exports = grammar({
+       $.bounded_type,
+       $.removed_trait_bound,
+       alias(choice(...primitiveTypes), $.primitive_type),
++      alias(choice('default', 'union', 'gen', 'raw'), $.type_identifier),
++      alias($.generic_type_with_turbofish, $.generic_type),
+     ),
+ 
+     bracketed_type: $ => seq(
+@@ -809,6 +810,7 @@ module.exports = grammar({
+     generic_function: $ => prec(1, seq(
+       field('function', choice(
+         $.identifier,
++        alias(choice(...primitiveTypes), $.identifier),
+         $.scoped_identifier,
+         $.field_expression,
+       )),
+@@ -862,6 +864,7 @@ module.exports = grammar({
+           $.type_binding,
+           $.lifetime,
+           $._literal,
++          $.negative_literal,
+           $.block,
+         ),
+         optional($.trait_bounds),
+@@ -980,11 +983,25 @@ module.exports = grammar({
+         $.scoped_identifier,
+         $.identifier,
+         $._reserved_identifier,
++        alias(choice(...primitiveTypes, 'try'), $.identifier),
+       )),
+       '!',
+       alias($.delim_token_tree, $.token_tree),
+     ),
+ 
++    brace_macro_statement: $ => prec(2, seq(
++      field('macro', choice(
++        $.scoped_identifier,
++        $.identifier,
++        $._reserved_identifier,
++        alias(choice(...primitiveTypes, 'try'), $.identifier),
++      )),
++      '!',
++      alias($.brace_token_tree, $.token_tree),
++    )),
++
++    brace_token_tree: $ => prec(2, seq('{', repeat($._delim_tokens), '}')),
++
+     delim_token_tree: $ => choice(
+       seq('(', repeat($._delim_tokens), ')'),
+       seq('[', repeat($._delim_tokens), ']'),
+@@ -1032,12 +1049,12 @@ module.exports = grammar({
+       field('name', $._type_identifier),
+     ),
+ 
+-    range_expression: $ => prec.left(PREC.range, choice(
+-      seq($._expression, choice('..', '...', '..='), $._expression),
+-      seq($._expression, '..'),
+-      seq('..', $._expression),
+-      '..',
+-    )),
++    range_expression: $ => choice(
++      prec.dynamic(1, prec.left(PREC.range, seq($._expression, choice('..', '...', '..='), $._expression))),
++      prec(PREC.range, seq($._expression, '..')),
++      prec.left(PREC.range, seq(choice('..', '..='), $._expression)),
++      prec(PREC.range, '..'),
++    ),
+ 
+     unary_expression: $ => prec(PREC.unary, seq(
+       choice('-', '*', '!'),
+@@ -1147,8 +1164,8 @@ module.exports = grammar({
+       '(',
+       repeat($.attribute_item),
+       seq($._expression, ','),
+-      repeat(seq($._expression, ',')),
+-      optional($._expression),
++      repeat(seq(repeat($.attribute_item), $._expression, ',')),
++      optional(seq(repeat($.attribute_item), $._expression)),
+       ')',
+     ),
+ 
+@@ -1308,16 +1325,20 @@ module.exports = grammar({
+ 
+     closure_parameters: $ => seq(
+       '|',
+-      sepBy(',', choice(
++      sepBy(',', seq(repeat($.attribute_item), choice(
+         $._pattern,
+         $.parameter,
+-      )),
++      ))),
++      optional(','),
+       '|',
+     ),
+ 
+     label: $ => seq('\'', $.identifier),
+ 
+-    break_expression: $ => prec.left(seq('break', optional($.label), optional($._expression))),
++    break_expression: $ => choice(
++      prec.left(seq('break', optional($.label), $._expression)),
++      prec(-1, seq('break', optional($.label))),
++    ),
+ 
+     continue_expression: $ => prec.left(seq('continue', optional($.label))),
+ 
+@@ -1434,7 +1455,7 @@ module.exports = grammar({
+         $.scoped_type_identifier,
+       )),
+       '{',
+-      sepBy(',', choice($.field_pattern, $.remaining_field_pattern)),
++      sepBy(',', seq(repeat($.attribute_item), choice($.field_pattern, $.remaining_field_pattern))),
+       optional(','),
+       '}',
+     ),
+@@ -1491,7 +1512,7 @@ module.exports = grammar({
+     ),
+ 
+     captured_pattern: $ => seq(
+-      $.identifier,
++      choice($.identifier, $._reserved_identifier),
+       '@',
+       $._pattern,
+     ),

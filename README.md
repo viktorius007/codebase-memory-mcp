@@ -229,7 +229,7 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - **158 vendored tree-sitter grammars** compiled into the binary
 - **Generic package / module resolution** — bare specifiers like `@myorg/pkg`, `github.com/foo/bar`, `use my_crate::foo` resolved via manifest scanning (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `pubspec.yaml`, `pom.xml`, `build.gradle`, `mix.exs`, `*.gemspec`)
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, Kustomize overlays as graph nodes
-- **[Hybrid LSP semantic type resolution](#hybrid-lsp)** for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — embedded C resolvers with language-specific coverage. Rust currently publishes only a [bounded file-local free-function call subset](docs/RUST_CODEGRAPH_TRUTH_PLAN.md); method, cross-file and implementation relationships remain gated.
+- **[Hybrid LSP semantic type resolution](#hybrid-lsp)** for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — embedded C resolvers with language-specific coverage. Rust call links are precise but incomplete: 52% of in-repository call sites and 34% of method calls on the measurement corpus, with no trait-implementation links; see [measured Rust state and direction](docs/RUST_GRAPH_STATUS.md).
 - **RAM-first pipeline**: LZ4 compression, in-memory SQLite, single dump at end. Memory released after.
 
 ### Distribution & operation
@@ -806,7 +806,7 @@ codebase-memory-mcp embeds language-specific C type resolvers in the native exec
 | **C / C++** | pre-built per-language cross-file registry shared across C and C++; C side handles macros + `typedef` chains + header-vs-source linking; C++ side handles templates, namespaces, `auto` inference, and method resolution via class hierarchy |
 | **Java** | imports (single-type, on-demand, static), class hierarchies with `this` / `super` dispatch, generics, annotations, overload matching by arity and parameter types, lambdas / method references bound to functional interfaces, field-type inference, common JDK stdlib |
 | **Kotlin** | imports + same-package resolution, classes / objects / companion objects, extension functions, data classes, nullable-type unwrapping, scope functions (`let` / `apply` / `run` / `also` / `with`), infix calls, common stdlib |
-| **Rust** | Exact use-tree bindings and source-site-matched bare calls between file-local free functions, with derived attributed TESTS. Methods, cross-file/expanded calls and IMPLEMENTS/OVERRIDE remain gated. [Coverage and remaining work](docs/RUST_CODEGRAPH_TRUTH_PLAN.md). |
+| **Rust** | Resolver-proven calls (path, method, constructor, UFCS, cross-crate) with derived TESTS; no trait-implementation links; USAGE and IMPORTS still come from name matching. [Measured coverage and direction](docs/RUST_GRAPH_STATUS.md). |
 | **Perl** | packages + `@ISA` / `use parent` / `use base` inheritance with method-resolution-order dispatch, `SUPER::` calls, Exporter (`use Foo qw(...)`) import maps, `bless` / `ref($class)\|\|$class` self-type inference, qualified `Pkg::sub` static calls, curated perlfunc + CPAN OOP stdlib; unresolved receivers emit no edge (zero-edge guarantee) |
 
 **Two-layer architecture:**
@@ -814,7 +814,7 @@ codebase-memory-mcp embeds language-specific C type resolvers in the native exec
 1. **Tree-sitter pass** — fast, syntactic, runs for every one of the 162 languages. Extracts definitions, calls, imports.
 2. **Hybrid LSP pass** — type-aware, runs above the tree-sitter pass per-language. Refines call edges using the import graph plus a per-file or pre-built cross-file definition registry. Textual fallback is language-specific; Rust does not guess a target when semantic binding is missing.
 
-Use `index_status` and `check_index_coverage` alongside relationship queries. Partial coverage means a missing edge or zero-result trace is not proof of absence. Rust's [regression evidence](docs/RUST_REPAIR_EVIDENCE.md) distinguishes the verified subset from unmeasured corpus completeness and performance.
+Use `index_status` and `check_index_coverage` alongside relationship queries. Partial coverage means a missing edge or zero-result trace is not proof of absence. Rust's measured recall and precision per link family are in [docs/RUST_GRAPH_STATUS.md](docs/RUST_GRAPH_STATUS.md).
 
 ## Language Support
 

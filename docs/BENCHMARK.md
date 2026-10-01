@@ -5,8 +5,7 @@ tree. Historical grades, corpus counts and per-run transcripts live in Git;
 they are not current capability guarantees. Parser availability does not imply
 complete semantic relationships.
 
-For Rust, consult the [supported subset and remaining work](RUST_CODEGRAPH_TRUTH_PLAN.md)
-and [regression verification](RUST_REPAIR_EVIDENCE.md). A passing repository test
+For Rust, consult the [measured state and direction](RUST_GRAPH_STATUS.md). A passing repository test
 gate is not a full-language benchmark, full-corpus parity result, or warm-update
 latency measurement.
 

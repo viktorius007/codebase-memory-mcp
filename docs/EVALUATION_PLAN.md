@@ -8,7 +8,7 @@
 > supported-language inventory (162). Reconcile the cohort and resolver capabilities with the
 > tested build before execution. The nine-language deep-dive group is a selection, not an
 > exhaustive list of Hybrid LSP languages or a semantic-completeness claim. In particular,
-> [Rust coverage is partial](RUST_CODEGRAPH_TRUTH_PLAN.md); unsupported relationships must be
+> [Rust coverage is partial](RUST_GRAPH_STATUS.md); unsupported relationships must be
 > reported as coverage gaps, not inferred from absent edges.
 >
 > **Outputs:** Each run writes one flat `eval-results/` tree. Commit evidence before replacing

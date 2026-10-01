@@ -1,0 +1,15 @@
+[package]
+name = "tsdiff"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+syntax = { path = "../../../../rust-analyzer/crates/syntax" }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+debug = 1
+
+[workspace]
