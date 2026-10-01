@@ -57,7 +57,8 @@ and the time and memory in "rust-analyzer cost" below.
 - Oracle: `rust-analyzer scip .` with toolchain 1.95.0 on
   `aarch64-apple-darwin`, default features (`private/rust-s3/codex.scip`,
   356 MB). 4,486 documents, 3,415,976 occurrences, 108,923 global
-  definitions. A fresh run on 2026-10-01 reproduced the same counts.
+  definitions. A fresh run on 2026-10-01 produced the same document and
+  occurrence counts.
 - Published graph: index of the corpus by main's lineage at `a44f6b73`
   (`/tmp/cbm-rust/s3/work/cargo-roots/measure-final2.kF9hgj/cache/corpus.db`,
   99,549 CALLS edges). Re-index with
@@ -231,7 +232,7 @@ error nodes. Out of scope.
 | codex-rs | 1,879,640 | 470 s | 22.2 GB | 356 MB | 978 MB |
 | nextest | 120,254 | 49 s | 3.3 GB | 18 MB | not measured |
 
-The tool's own full index of codex-rs takes about 1 minute. `rust-analyzer
+The tool's own full index of codex-rs takes 58 s. `rust-analyzer
 scip` is a batch command with no incremental mode. In a directory without
 `Cargo.toml` it exits with an error and writes no index (verified); that case
 must take the fallback path.
