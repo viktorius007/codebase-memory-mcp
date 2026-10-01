@@ -247,6 +247,21 @@ type (`accepted_stdin_write_ids.lock().await` then `.contains(..)`,
 `exec-server/src/local_process.rs:673`). The figure is an upper bound that
 assumes that machinery exists. It was not reproduced.
 
+## Reach of the C resolver without rust-analyzer
+
+Derived from the receiver table; an estimate, not a measurement. Explicit
+in-corpus call sites total 189,905.
+
+| Capability built in C | Explicit sites reachable | Share |
+|---|---|---|
+| Complete name resolution (all path calls) | 101,519 | 53.5% |
+| plus receivers with a written type: `self`, typed parameter, typed `let`, struct literal, field of `self` | 126,891 | 66.8% |
+| plus return types of path calls, including `?` and `.await` | 148,868 | 78.4% |
+| plus method-call results, chains, fields of locals, pattern and closure bindings | needs generic substitution, `Deref` and trait lookup | not estimated |
+
+Today's figure on the same base is 106,148 (55.9%). The 40,041 macro-argument
+sites follow the same receiver mix and add re-parsing of macro arguments.
+
 ## Work, in order
 
 Each step lands only when its gate passes on the corpus.
