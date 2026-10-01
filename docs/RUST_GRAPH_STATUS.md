@@ -82,7 +82,9 @@ function (`tools/rust-audit/join.py`):
 | All | 119,996 | 229,946 | 52.2% |
 
 Another 458,262 call sites target the standard library or dependencies; the
-graph has no nodes for those targets.
+graph has no nodes for those targets. Of the 229,946 sites above, 243 have a
+caller and 573 a callee with no graph node at that file, line and name, so
+99.6% of oracle call sites map onto existing nodes.
 
 Published Rust function-to-function CALLS pairs, 98,915
 (`tools/rust-audit/precision.py`):
@@ -223,7 +225,9 @@ error nodes. Out of scope.
 | nextest | 120,254 | 49 s | 3.3 GB | 18 MB | not measured |
 
 The tool's own full index of codex-rs takes about 1 minute. `rust-analyzer
-scip` is a batch command with no incremental mode.
+scip` is a batch command with no incremental mode. In a directory without
+`Cargo.toml` it exits with an error and writes no index (verified); that case
+must take the fallback path.
 
 ## The retired ceiling claim
 
@@ -272,8 +276,8 @@ Each step lands only when its gate passes on the corpus.
 - `s3/proof` (`e67af2a4`) and its candidate graph.
 - The installed binary `~/.local/bin/codebase-memory-mcp` reports `dev`; its
   commit is unknown.
-- rust-analyzer behaviour when `cargo metadata` fails, on workspaces with
-  several target platforms, and with non-default features.
+- rust-analyzer behaviour when a manifest exists but `cargo metadata` fails,
+  on workspaces with several target platforms, and with non-default features.
 - Refresh strategy after edits.
 - Languages other than Rust.
 
