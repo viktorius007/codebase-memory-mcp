@@ -9,8 +9,10 @@ Do not act on them.
 
 ## Direction
 
-Set by the tech lead on 2026-10-01 under the owner's delegation. It replaces
-the rule of 2026-09-27 that Rust resolution must not use rust-analyzer.
+The owner decided on 2026-09-30: no rust-analyzer at index time; show only
+links provable without a compiler. That decision stands until the owner
+changes it. The measurements below show it caps Rust call coverage far below
+what the owner wants from the tool, so the tech lead recommends changing it:
 
 1. Rust semantic links (calls, imports, usages, trait implementations, method
    ownership) come from a rust-analyzer SCIP index of the repository, mapped
@@ -19,8 +21,13 @@ the rule of 2026-09-27 that Rust resolution must not use rust-analyzer.
    definitions) and as the fallback for files rust-analyzer does not cover.
    Fallback links carry a marker that tells the reader they are partial.
 3. The C "proof-only" rebuild (`s3/proof` and its lanes I, F, L, S, plus the
-   parked macro, G17 and Stage 2 lanes) stops. Its branches stay unmerged.
+   parked macro, G17 and Stage 2 lanes) is paused and stays unmerged. If the
+   owner keeps the 2026-09-30 decision, only its name-resolution part
+   resumes, as step 5 of "Work, in order"; type propagation in C does not.
 4. The Rust grammar is forked and fixed, gated by `tools/rust-audit`.
+
+Step 1 of "Work, in order" waits for the owner. Steps 2 to 5 hold under
+either decision and may start.
 
 Why, in measured terms:
 
@@ -38,7 +45,7 @@ Why, in measured terms:
 - The parser is not the obstacle: grammar defects lose no definition, call,
   import or impl on the measurement corpus.
 
-Cost the owner accepts with this direction: the accurate mode needs a Rust
+Cost the owner would accept with the recommendation: the accurate mode needs a Rust
 toolchain with rust-analyzer, a repository whose `cargo metadata` succeeds,
 and the time and memory in "rust-analyzer cost" below.
 
@@ -244,7 +251,7 @@ assumes that machinery exists. It was not reproduced.
 
 Each step lands only when its gate passes on the corpus.
 
-1. **SCIP ingestion.** Add a pass that reads a SCIP index for the repository
+1. **SCIP ingestion (needs the owner's decision).** Add a pass that reads a SCIP index for the repository
    (given by path, or produced by running `rust-analyzer scip`), maps each
    occurrence to graph nodes by file and line, and publishes CALLS, IMPORTS,
    USAGE, trait-implementation and method-owner links for covered files.
