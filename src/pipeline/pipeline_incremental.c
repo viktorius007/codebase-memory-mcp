@@ -1740,18 +1740,23 @@ static void closure_seed_governed(CBMHashTable *closure_set, const cbm_file_info
 }
 
 /* Edge budget: the file-count budget above prices every file alike, but the
- * closure route's cost follows the rows it rewrites. The purge deletes, and
- * the patch re-inserts, every stored edge with an endpoint in a closure file
- * — two row-level index writes per incident edge — on top of re-running
- * extraction and resolution for those files. A full rebuild writes each of
- * the project's edges once, in bulk. Once the incident edges are half the
- * graph, the route's edge writes equal the rebuild's and its remaining work
- * (graph-wide proxy load, rehydration, post-passes) cannot be repaid, so it
- * declines. Both counts are facts of the stored generation, read before any
- * work starts. Measured on a 1.9M-line Rust corpus: an 836-file closure
- * touching 47.5% of edges refreshed at 0.95x the full rebuild; a 1-file
- * body edit (0.4%) at 0.3x. Returns true and sets *decline when exceeded or
- * when the counts cannot be read (fail closed to the full rebuild). */
+ * closure route's cost follows the edges it rewrites. For every stored edge
+ * with an endpoint in a closure file the route deletes the row (purge),
+ * re-derives it (repair) and re-inserts it row by row (patch); a full
+ * rebuild derives and bulk-writes each of the project's edges once. On top,
+ * the route pays graph-wide work no closure size removes (proxy load, surface
+ * rehydration, post-passes, importance). So route ~ G + c_r*I and rebuild ~
+ * c_f*T, with I the incident edges and T all edges — both facts of the stored
+ * generation, read before any work starts, and a ratio rather than a size so
+ * the rule carries across project scales. Measured on a 1.9M-line Rust
+ * corpus: c_r ~ 1.4*c_f, G ~ 0.25 of a rebuild, break-even near I/T = 0.5,
+ * and an 836-file closure at I/T = 0.475 ran at 0.94-1.06x the rebuild. The
+ * budget is I/T <= 1/3: there the model puts the route at ~0.72 of a
+ * rebuild, still below parity if either coefficient is off by 30%, while
+ * single-file edits sit near I/T = 0.004. Returns true and sets *decline
+ * when exceeded or when the counts cannot be read (fail closed to the full
+ * rebuild). */
+enum { CLOSURE_EDGE_BUDGET_DIVISOR = 3 };
 static bool closure_edge_budget_exceeded(cbm_store_t *store, const char *project,
                                          const cbm_file_info_t *files, int file_count,
                                          CBMHashTable *closure_set,
@@ -1783,7 +1788,7 @@ static bool closure_edge_budget_exceeded(cbm_store_t *store, const char *project
     }
     cbm_log_info("incremental.closure_edges", "incident", itoa_buf((int)incident), "total",
                  itoa_buf((int)total));
-    if (incident * 2 > total) {
+    if (incident * CLOSURE_EDGE_BUDGET_DIVISOR > total) {
         *decline = "edge_budget_exceeded";
         return true;
     }

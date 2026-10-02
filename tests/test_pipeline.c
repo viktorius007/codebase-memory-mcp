@@ -8933,7 +8933,8 @@ TEST(pipeline_rust_closure_repair_folder_sibling_modules_keep_unique_ids) {
                                    "    Some(p.to_string())\n}\n";
     write_temp_file(tmp, "crates/util/src/lib.rs", util_old);
     /* Only the sibling files call util, so the closure holds them and util
-     * alone; the files inside each folder keep it under the closure budget. */
+     * alone; the files inside each folder, each with its own call, keep it
+     * under the closure budgets (file count and incident edges). */
     static const char *const children[CHILDREN] = {"a", "b", "c", "d"};
     char lib_rs[SIBLINGS * 16 + 1];
     int lib_len = 0;
@@ -8950,8 +8951,10 @@ TEST(pipeline_rust_closure_repair_folder_sibling_modules_keep_unique_ids) {
         write_temp_file(tmp, rel, source);
         for (int c = 0; c < CHILDREN; c++) {
             snprintf(rel, sizeof(rel), "crates/app/src/m%02d/%s.rs", i, children[c]);
-            snprintf(source, sizeof(source), "pub fn child_%02d_%s() -> usize {\n    %d\n}\n", i,
-                     children[c], c);
+            snprintf(source, sizeof(source),
+                     "pub fn child_%02d_%s() -> usize {\n    %d\n}\n"
+                     "pub fn child_%02d_%s_twice() -> usize {\n    child_%02d_%s() * 2\n}\n",
+                     i, children[c], c, i, children[c], i, children[c]);
             write_temp_file(tmp, rel, source);
         }
         lib_len += snprintf(lib_rs + lib_len, sizeof(lib_rs) - (size_t)lib_len, "pub mod m%02d;\n",
