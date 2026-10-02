@@ -392,6 +392,18 @@ typedef struct {
     const char *struct_qn;
 } CBMImplTrait;
 
+/* Rust: one `impl` block whose header names resolved to registered
+ * definitions (cross-file resolver). type_qn is the implementing type;
+ * trait_qn is the implemented trait, NULL for an inherent impl or when the
+ * trait did not resolve to a registered trait. Lines bound the block so the
+ * methods it declares can be linked to type_qn. */
+typedef struct {
+    const char *type_qn;
+    const char *trait_qn;
+    uint32_t start_line;
+    uint32_t end_line;
+} CBMRustImplLink;
+
 typedef enum {
     CBM_RESOLVED_INVOCATION = 0,
     CBM_RESOLVED_CALL_REFERENCE,
@@ -510,6 +522,12 @@ typedef struct {
 } CBMRustPathFacts;
 
 typedef struct {
+    CBMRustImplLink *items;
+    int count;
+    int cap;
+} CBMRustImplLinkArray;
+
+typedef struct {
     CBMChannel *items;
     int count;
     int cap;
@@ -529,6 +547,7 @@ typedef struct CBMFileResult {
     CBMEnvAccessArray env_accesses;
     CBMTypeAssignArray type_assigns;
     CBMImplTraitArray impl_traits;       // Rust: impl Trait for Struct pairs
+    CBMRustImplLinkArray rust_impl_links; // Rust: resolved impl headers (cross-file LSP)
     CBMResolvedCallArray resolved_calls; // LSP-resolved invocations/references (high confidence)
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
@@ -851,6 +870,7 @@ void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta)
 void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
 void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
+void cbm_rustimpllink_push(CBMRustImplLinkArray *arr, CBMArena *a, CBMRustImplLink link);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 

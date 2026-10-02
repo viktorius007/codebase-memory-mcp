@@ -1471,6 +1471,18 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
  * resolved very many cross-calls turned the whole append into O(n^2) and could
  * peg a core for minutes (observed: an index hung in pxc_append_results/strcmp).
  * The key strings live in a scratch arena that is destroyed after the table. */
+/* Replace a file's Rust impl links with this run's (strings copied into the
+ * result arena; the resolver's scratch arena dies with the call). */
+static void pxc_store_rust_impl_links(CBMFileResult *r, const CBMRustImplLinkArray *links) {
+    r->rust_impl_links.count = 0;
+    for (int i = 0; i < links->count; i++) {
+        CBMRustImplLink link = links->items[i];
+        link.type_qn = link.type_qn ? cbm_arena_strdup(&r->arena, link.type_qn) : NULL;
+        link.trait_qn = link.trait_qn ? cbm_arena_strdup(&r->arena, link.trait_qn) : NULL;
+        cbm_rustimpllink_push(&r->rust_impl_links, &r->arena, link);
+    }
+}
+
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
@@ -1983,10 +1995,12 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         const char *declared_module_qn = r->rust_relative_module_qn;
         const char *relative_module_qn =
             declared_module_qn ? (declared_module_qn[0] ? declared_module_qn : NULL) : module_qn;
+        CBMRustImplLinkArray impl_links = {0};
         cbm_run_rust_lsp_cross_with_manifest(
             &scratch, source, source_len, source_module_qn, relative_module_qn, rdefs, def_count,
             imp_names, imp_qns, imp_count, tree, g_pxc_rust_manifest,
-            cbm_pxc_get_rust_import_source(), &out, &synthetic_calls);
+            cbm_pxc_get_rust_import_source(), &out, &synthetic_calls, &impl_links);
+        pxc_store_rust_impl_links(r, &impl_links);
         break;
     }
     default:
@@ -2220,6 +2234,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_arena_init(&scratch);
             CBMResolvedCallArray out = {0};
             CBMCallArray synthetic_calls = {0};
+            CBMRustImplLinkArray impl_links = {0};
             const char *source_module_qn = result->module_qn ? result->module_qn : def_module;
             const char *declared_module_qn = result->rust_relative_module_qn;
             const char *relative_module_qn =
@@ -2228,8 +2243,9 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_run_rust_lsp_cross_with_registry(
                 &scratch, source, source_len, source_module_qn, relative_module_qn, shared,
                 imp_keys, imp_vals, imp_count, result->cached_tree, cbm_pxc_get_rust_manifest(),
-                cbm_pxc_get_rust_import_source(), &out, &synthetic_calls);
+                cbm_pxc_get_rust_import_source(), &out, &synthetic_calls, &impl_links);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
+            pxc_store_rust_impl_links(result, &impl_links);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             cbm_arena_destroy(&scratch);
         } else {

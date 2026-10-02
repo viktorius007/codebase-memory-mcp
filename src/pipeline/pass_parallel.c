@@ -1324,7 +1324,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
 /* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns edge count. */
 static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
-                                 int *reg_entries) {
+                                 CBMLanguage lang, int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
@@ -1343,7 +1343,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         edges++;
     }
     free(file_qn);
-    if (def->parent_class && strcmp(def->label, "Method") == 0) {
+    if (def->parent_class && strcmp(def->label, "Method") == 0 &&
+        !cbm_pipeline_is_rust_impl_method(def, lang)) {
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
         if (parent && def_node) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, def_node->id, "DEFINES_METHOD", "{}");
@@ -1470,7 +1471,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
         for (int d = 0; d < result->defs.count; d++) {
-            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
+            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel,
+                                                   files[i].language, &reg_entries);
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map,
@@ -3137,7 +3139,12 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         resolve_def_inherits(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
     }
-    for (int t = 0; language != CBM_LANG_RUST && t < result->impl_traits.count; t++) {
+    if (language == CBM_LANG_RUST) {
+        ws->semantic_resolved +=
+            cbm_pipeline_rust_impl_edges(rc->main_gbuf, ws->local_edge_buf, result);
+        return;
+    }
+    for (int t = 0; t < result->impl_traits.count; t++) {
         CBMImplTrait *it = &result->impl_traits.items[t];
         if (!it->trait_name || !it->struct_name) {
             continue;

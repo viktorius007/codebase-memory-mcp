@@ -184,6 +184,11 @@ void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it) {
     arr->items[arr->count++] = it;
 }
 
+void cbm_rustimpllink_push(CBMRustImplLinkArray *arr, CBMArena *a, CBMRustImplLink link) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = link;
+}
+
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = rc;

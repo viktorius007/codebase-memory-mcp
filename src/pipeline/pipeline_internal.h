@@ -370,6 +370,24 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
  * creates IMPLEMENTS + OVERRIDE edges. Returns edge count created. */
 int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx);
 
+/* A Rust method declared in an `impl` block. Its owner is the impl's
+ * resolved self type (cbm_pipeline_rust_impl_edges), not the same-file
+ * namesake its extraction parent_class names, so the definitions phase
+ * leaves its DEFINES_METHOD edge to the semantic phase. */
+static inline bool cbm_pipeline_is_rust_impl_method(const CBMDefinition *def, CBMLanguage lang) {
+    return lang == CBM_LANG_RUST && def && def->receiver && def->label &&
+           strcmp(def->label, "Method") == 0;
+}
+
+/* Publish one Rust file's resolved impl links (result->rust_impl_links):
+ * IMPLEMENTS Type -> Trait for each `impl Trait for Type` whose type and
+ * trait resolved to graph nodes, and DEFINES_METHOD Type -> Method for every
+ * method of the innermost resolved impl block enclosing it. Nodes are looked
+ * up in `nodes`; edges go to `edges` (the same buffer on the serial path, a
+ * worker-local buffer on the parallel path). Returns edges inserted. */
+int cbm_pipeline_rust_impl_edges(const cbm_gbuf_t *nodes, cbm_gbuf_t *edges,
+                                 const CBMFileResult *result);
+
 /* Edge type for an explicit base-class relation, keyed off the resolved
  * TARGET node's label: Interface → IMPLEMENTS, anything else → INHERITS.
  * The single decision point for BOTH the sequential semantic pass and the

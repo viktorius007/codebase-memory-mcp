@@ -644,20 +644,120 @@ TEST(es_inherits_crossfile_kotlin_red) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * FAMILY 3: IMPLEMENTS cross-file (Rust trait + struct)
+ * FAMILY 3: IMPLEMENTS cross-file (Rust trait + struct) and Rust method owners
  *
- * Trait defined in a.rs, impl block in b.rs.
- * Textual trait/type name matching is not sufficient semantic provenance.
+ * Trait and type are resolved as Rust paths at the impl block's scope; a
+ * textual leaf-name match is never enough.
  * ══════════════════════════════════════════════════════════════════ */
 
-/* Rust cross-file IMPLEMENTS: trait in trait.rs, impl in impl.rs. */
+/* Count `edge_type` edges from the node named `source_name` in `source_file`
+ * to the node named `target_name` in `target_file`; -1 when either node is
+ * not unique in its file. */
+static int es_edge_between_in_files(const ES_LangFile *files, int nfiles, const char *edge_type,
+                                    const char *source_name, const char *source_file,
+                                    const char *target_name, const char *target_file) {
+    ES_LangProj lp;
+    cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
+    const char *names[2] = {source_name, target_name};
+    const char *paths[2] = {source_file, target_file};
+    int64_t ids[2] = {0, 0};
+    int matches = -1;
+    for (int k = 0; store && k < 2; k++) {
+        cbm_node_t *nodes = NULL;
+        int count = 0;
+        int hits = 0;
+        if (cbm_store_find_nodes_by_name(store, lp.project, names[k], &nodes, &count) ==
+            CBM_STORE_OK) {
+            for (int i = 0; i < count; i++) {
+                if (nodes[i].file_path && strcmp(nodes[i].file_path, paths[k]) == 0) {
+                    ids[k] = nodes[i].id;
+                    hits++;
+                }
+            }
+        }
+        cbm_store_free_nodes(nodes, count);
+        if (hits != 1) {
+            ids[k] = 0;
+        }
+    }
+    if (store && ids[0] && ids[1]) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(store, ids[0], edge_type, &edges, &edge_count) ==
+            CBM_STORE_OK) {
+            matches = 0;
+            for (int i = 0; i < edge_count; i++) {
+                matches += edges[i].target_id == ids[1];
+            }
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    es_lang_cleanup(&lp, store);
+    return matches;
+}
+
+#define ES_RUST_CARGO {"Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n"}
+
+/* Rust cross-file IMPLEMENTS: trait in greet.rs, impl in english.rs. */
 TEST(es_implements_crossfile_rust) {
     static const ES_LangFile f[] = {
-        {"trait.rs", "pub trait Greet {\n    fn hello(&self) -> String;\n}\n"},
-        {"impl.rs", "use crate::trait::Greet;\n\npub struct English;\n\n"
-                    "impl Greet for English {\n"
-                    "    fn hello(&self) -> String {\n        String::from(\"hi\")\n    }\n}\n"}};
-    ASSERT_FALSE(es_edge_present(f, 2, "IMPLEMENTS", 1));
+        ES_RUST_CARGO,
+        {"src/lib.rs", "pub mod english;\npub mod greet;\n"},
+        {"src/greet.rs", "pub trait Greet {\n    fn hello(&self) -> String;\n}\n"},
+        {"src/english.rs", "use crate::greet::Greet;\n\npub struct English;\n\n"
+                           "impl Greet for English {\n"
+                           "    fn hello(&self) -> String {\n        String::from(\"hi\")\n    }\n}\n"}};
+    ASSERT_EQ(es_edge_between_in_files(f, 4, "IMPLEMENTS", "English", "src/english.rs", "Greet",
+                                       "src/greet.rs"),
+              1);
+    PASS();
+}
+
+/* The implementing type named in the header is the one in scope: a
+ * same-named type of another module is not linked. */
+TEST(es_implements_rust_resolves_scoped_type) {
+    static const ES_LangFile f[] = {
+        ES_RUST_CARGO,
+        {"src/lib.rs", "pub mod a;\npub mod b;\npub trait Paint { fn paint(&self); }\n"},
+        {"src/a.rs", "pub struct Widget;\n"},
+        {"src/b.rs", "pub struct Widget;\n\nimpl crate::Paint for crate::a::Widget {\n"
+                     "    fn paint(&self) {}\n}\n"}};
+    ASSERT_EQ(es_edge_between_in_files(f, 4, "IMPLEMENTS", "Widget", "src/a.rs", "Paint",
+                                       "src/lib.rs"),
+              1);
+    ASSERT_EQ(es_edge_between_in_files(f, 4, "IMPLEMENTS", "Widget", "src/b.rs", "Paint",
+                                       "src/lib.rs"),
+              0);
+    PASS();
+}
+
+/* A type declared inside a function body shadows the module-level namesake
+ * for impls in that body. */
+TEST(es_implements_rust_block_local_type_not_linked) {
+    static const ES_LangFile f[] = {
+        ES_RUST_CARGO,
+        {"src/lib.rs", "pub trait Paint { fn paint(&self); }\npub struct Gadget;\n"
+                       "pub fn build() {\n    struct Gadget;\n"
+                       "    impl Paint for Gadget { fn paint(&self) {} }\n}\n"}};
+    ASSERT_EQ(es_edge_present(f, 2, "IMPLEMENTS", 1), 0);
+    PASS();
+}
+
+/* A method's owner is the impl's resolved self type, even in another file,
+ * and never the same-file namesake the impl does not name. */
+TEST(es_defines_method_rust_owner_crossfile) {
+    static const ES_LangFile f[] = {
+        ES_RUST_CARGO,
+        {"src/lib.rs", "pub mod a;\npub mod b;\n"},
+        {"src/a.rs", "pub struct Widget;\n"},
+        {"src/b.rs", "pub struct Widget;\n\nimpl crate::a::Widget {\n"
+                     "    pub fn grow(&self) {}\n}\n"}};
+    ASSERT_EQ(es_edge_between_in_files(f, 4, "DEFINES_METHOD", "Widget", "src/a.rs", "grow",
+                                       "src/b.rs"),
+              1);
+    ASSERT_EQ(es_edge_between_in_files(f, 4, "DEFINES_METHOD", "Widget", "src/b.rs", "grow",
+                                       "src/b.rs"),
+              0);
     PASS();
 }
 
@@ -948,9 +1048,11 @@ SUITE(edge_structural) {
     RUN_TEST(es_inherits_crossfile_php_red);
     RUN_TEST(es_inherits_crossfile_kotlin_red);
 
-    /* ── FAMILY 3: IMPLEMENTS cross-file (Rust) ──────────────── */
-    /* Expected GREEN: project-wide registry covers both files. */
+    /* ── FAMILY 3: IMPLEMENTS cross-file (Rust) + method owners ── */
     RUN_TEST(es_implements_crossfile_rust);
+    RUN_TEST(es_implements_rust_resolves_scoped_type);
+    RUN_TEST(es_implements_rust_block_local_type_not_linked);
+    RUN_TEST(es_defines_method_rust_owner_crossfile);
 
     /* ── FAMILY 4: IMPLEMENTS same-file interface ────────────── */
     /* Uncertain: depends on semantic pass distinguishing Class vs Interface. */

@@ -49,7 +49,13 @@ dup=collections.Counter((f,name,kind) for f,line,kind,name,desc in defs if kind=
 owner={}
 for l in open(D+'g_DEFINES_METHOD.tsv'):
     s,t=map(int,l.split('\t')); owner[t]=s
-C=collections.Counter()
+# The oracle names the self type as spelled; `use path::Owner as Alias` spells
+# the owner's definition under another name.
+def owner_alias_ok(f,owner_name,want):
+    try: text=open(os.path.join(os.environ.get('AUDIT_CORPUS',''),f),errors='replace').read()
+    except OSError: return False
+    return re.search(r'\b'+re.escape(owner_name)+r'\s+as\s+'+re.escape(want)+r'\b',text) is not None
+C=collections.Counter(); alias_ok=0
 for f,line,kind,name,desc in defs:
     if kind!='fn': continue
     m=re.search(r'impl#\[`?([^\]`<]+)',desc); tr=re.search(r'([A-Za-z_0-9]+)#[^#]*\(\)\.$',desc)
@@ -59,9 +65,11 @@ for f,line,kind,name,desc in defs:
     want=(m.group(1) if m else tr.group(1) if tr else '?').split('::')[-1].strip('&').strip()
     if i not in owner: C['method has no owner link']+=1
     elif nodes.get(owner[i],('','?'))[1]==want: C['owner link correct']+=1
+    elif owner_alias_ok(f,nodes.get(owner[i],('','?'))[1],want): C['owner link correct']+=1; alias_ok+=1
     else: C['owner link names another type']+=1
 print('\nMETHOD OWNERSHIP (truth methods)'); 
 for k,v in C.most_common(): print(f'  {v:>7} {100*v/sum(C.values()):5.1f}%  {k}')
+print(f'  (correct includes {alias_ok} whose self type is spelled through `use Owner as Alias`)')
 # 3. imports
 imp=collections.defaultdict(set)
 for l in open(D+'g_IMPORTS.tsv'):
@@ -113,6 +121,59 @@ for a,ts in fnrefs.items():
         k=nodes[b][0]; bykind[k]+=1; bykind_hit[k]+= (b in gus.get(a,())) or (b in calls.get(a,()))
 print('  truth: function references in-corpus item -> any USAGE/CALLS link published')
 for k,v in bykind.most_common(): print(f'    {k:<10}{bykind_hit[k]:>8} / {v:<8} {100*bykind_hit[k]/v:.1f}%')
-# 5. impl relations
+# 5. impl relations: `impl Trait for Type` -> IMPLEMENTS edge Type -> Trait.
+# Truth: the impl header's in-corpus references (refs.tsv R rows on the header
+# lines) whose name is the written self-type / trait leaf give the exact
+# definitions; both must map onto graph nodes for the block to count.
 ti=[i for i in impls if i[3]!='-']
-print(f'\nIMPL BLOCKS in oracle files: {len(impls)}; trait impls: {len(ti)}; graph Rust trait-implementation links: 0 (no IMPLEMENTS edges, INHERITS has none for Rust)')
+CORPUS=os.environ.get('AUDIT_CORPUS','')
+src_cache={}
+def src_lines(f):
+    if f not in src_cache:
+        try: src_cache[f]=open(os.path.join(CORPUS,f),errors='replace').read().split('\n')
+        except OSError: src_cache[f]=[]
+    return src_cache[f]
+def header_range(f,line):
+    ls=src_lines(f); i=line-1
+    while i<len(ls) and not re.search(r'\bimpl\b',ls[i]): i+=1
+    j=i
+    while j<len(ls) and '{' not in ls[j] and not ls[j].rstrip().endswith(';'): j+=1
+    return line,j+1
+def leaf(t):
+    t=re.sub(r'^(unsafe|const)\s+','',t.strip())
+    if re.match(r'^[&*(\[!?]|^(dyn|impl)\b',t): return None
+    t=t.split('<',1)[0]
+    return t.split('::')[-1].strip() or None
+refs_at=collections.defaultdict(list)
+for f,line,ctx,el,en,df,dl,kind,name in refs:
+    if kind=='type': refs_at[(f,int(line))].append((df,int(dl),name))
+TLAB=LAB['type']; I=collections.Counter(); want_pairs=set(); all_pairs=set(); sample=[]
+impl_edges=set()
+if os.path.exists(D+'g_IMPLEMENTS.tsv'):
+    for l in open(D+'g_IMPLEMENTS.tsv'):
+        s,t=map(int,l.split('\t')); impl_edges.add((s,t))
+for f,line,st,tr in ti:
+    a,b=header_range(f,int(line)); sl,tl=leaf(st),leaf(tr)
+    def node_for(nm):
+        if nm is None: return None
+        hits={(df,dl,n) for k in range(a,b+1) for df,dl,n in refs_at.get((f,k),()) if n==nm}
+        if len(hits)!=1: return None
+        df,dl,n=hits.pop(); return find(df,dl,n,TLAB)
+    sn,tn=node_for(sl),node_for(tl)
+    if sn is None or tn is None: I['type or trait not defined in corpus (or no graph node)']+=1; continue
+    all_pairs.add((sn,tn)); I['in corpus']+=1
+    if (sn,tn) in impl_edges: I['in corpus, PUBLISHED']+=1
+    else: I['in corpus, missing']+=1; sample.append((f,line,st,tr))
+ok=I['in corpus, PUBLISHED']; tot=I['in corpus']
+print(f'\nIMPL BLOCKS in oracle files: {len(impls)}; trait impls: {len(ti)}')
+print(f'impl links published {ok} / {tot} {100*ok/max(tot,1):.1f}%  (impl Trait for Type, both defined in corpus -> IMPLEMENTS Type->Trait)')
+for k,v in I.most_common(): print(f'  {v:>7}  {k}')
+good=bad=unver=0; badrows=[]
+for s,t in impl_edges:
+    if s not in nodes or not nodes[s][2].endswith('.rs'): continue
+    if nodes[s][2] not in scip_files: unver+=1
+    elif (s,t) in all_pairs: good+=1
+    else: bad+=1; badrows.append((nodes[s][1],nodes[s][2],nodes.get(t,('','?'))[1]))
+print(f'  published Rust IMPLEMENTS: confirmed {good}, not confirmed {bad}, unverifiable(platform) {unver}')
+for r in badrows[:10]: print('    not confirmed:',r)
+for r in random.sample(sample,min(10,len(sample))): print('    missing:',r)

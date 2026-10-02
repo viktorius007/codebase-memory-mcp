@@ -510,6 +510,71 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
     return r;
 }
 
+static bool rust_node_has_label(const cbm_gbuf_node_t *node, const char *label) {
+    return node && node->label && strcmp(node->label, label) == 0 &&
+           cbm_str_ends_with(node->file_path, ".rs");
+}
+
+static bool rust_node_is_trait(const cbm_gbuf_node_t *node) {
+    return rust_node_has_label(node, "Interface");
+}
+
+/* A nominal Rust type an impl can own. A type alias (`Type`) is excluded:
+ * its impls belong to the aliased type, which the alias node does not name. */
+static bool rust_node_is_impl_owner(const cbm_gbuf_node_t *node) {
+    return rust_node_has_label(node, "Struct") || rust_node_has_label(node, "Enum");
+}
+
+/* Innermost impl block of `links` containing `line`, or NULL. */
+static const CBMRustImplLink *rust_innermost_impl(const CBMRustImplLinkArray *links,
+                                                  uint32_t line) {
+    const CBMRustImplLink *best = NULL;
+    for (int i = 0; i < links->count; i++) {
+        const CBMRustImplLink *link = &links->items[i];
+        if (link->start_line <= line && line <= link->end_line &&
+            (!best || link->end_line - link->start_line < best->end_line - best->start_line)) {
+            best = link;
+        }
+    }
+    return best;
+}
+
+int cbm_pipeline_rust_impl_edges(const cbm_gbuf_t *nodes, cbm_gbuf_t *edges,
+                                 const CBMFileResult *result) {
+    int count = 0;
+    const CBMRustImplLinkArray *links = &result->rust_impl_links;
+    for (int i = 0; i < links->count; i++) {
+        const CBMRustImplLink *link = &links->items[i];
+        if (!link->type_qn || !link->trait_qn) {
+            continue;
+        }
+        const cbm_gbuf_node_t *type = cbm_gbuf_find_by_qn(nodes, link->type_qn);
+        const cbm_gbuf_node_t *trait = cbm_gbuf_find_by_qn(nodes, link->trait_qn);
+        if (type && trait && rust_node_is_impl_owner(type) &&
+            rust_node_is_trait(trait)) {
+            cbm_gbuf_insert_edge(edges, type->id, trait->id, "IMPLEMENTS", "{}");
+            count++;
+        }
+    }
+    for (int d = 0; d < result->defs.count; d++) {
+        const CBMDefinition *def = &result->defs.items[d];
+        if (!cbm_pipeline_is_rust_impl_method(def, CBM_LANG_RUST) || !def->qualified_name) {
+            continue;
+        }
+        const CBMRustImplLink *link = rust_innermost_impl(links, def->start_line);
+        if (!link || !link->type_qn) {
+            continue;
+        }
+        const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_qn(nodes, link->type_qn);
+        const cbm_gbuf_node_t *method = cbm_gbuf_find_by_qn(nodes, def->qualified_name);
+        if (rust_node_has_label(method, "Method") && rust_node_is_impl_owner(owner)) {
+            cbm_gbuf_insert_edge(edges, owner->id, method->id, "DEFINES_METHOD", "{}");
+            count++;
+        }
+    }
+    return count;
+}
+
 /* Resolve Rust impl traits for one file's extraction results. */
 static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
@@ -582,6 +647,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         if (files[i].language != CBM_LANG_RUST) {
             implements_count +=
                 resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
+        } else {
+            implements_count += cbm_pipeline_rust_impl_edges(ctx->gbuf, ctx->gbuf, result);
         }
 
         free(module_qn);

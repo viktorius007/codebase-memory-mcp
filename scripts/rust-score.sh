@@ -38,7 +38,7 @@ else
     q() { sqlite3 -separator $'\t' "$DB" "$1"; }
     q "select id,label,name,file_path,start_line,end_line from nodes where file_path like '%.rs'" > "$OUT/g_nodes.tsv"
     q "select source_id,target_id,coalesce(json_extract(properties,'\$.strategy'),'') from edges where type='CALLS'" > "$OUT/g_calls.tsv"
-    for t in IMPORTS DEFINES_METHOD USAGE; do
+    for t in IMPORTS DEFINES_METHOD IMPLEMENTS USAGE; do
         q "select source_id,target_id from edges where type='$t'" > "$OUT/g_$t.tsv"
     done
     q "select type,count(*) from edges group by 1 order by 1" > "$OUT/edge_types.tsv"
@@ -68,7 +68,7 @@ print(f'calls wrong-or-unconfirmed pairs: {wrong}')
 blind = sum(int(m.group(1)) for l in open(out + '/precision.txt')
             if (m := re.match(r'\s*(\d+)\s+[\d.]+%\s+unverifiable: (oracle left|no oracle record)', l)))
 print(f'calls unverifiable pairs (oracle has no record at the call site): {blind}')
-keep = re.compile(r'^\s+(macro|module|term:|type|fn:)|owner link correct|^IMPORTS|published Rust File|^\s+(Enum|Field|Function|Interface|Method|Struct|Type|Variable)\s+\d')
+keep = re.compile(r'^\s+(macro|module|term:|type|fn:)|owner link correct|^impl links published|^IMPORTS|published Rust File|^\s+(Enum|Field|Function|Interface|Method|Struct|Type|Variable)\s+\d')
 for l in open(out + '/families.txt'):
     if keep.search(l): print(l.rstrip()[:150])
 EOF

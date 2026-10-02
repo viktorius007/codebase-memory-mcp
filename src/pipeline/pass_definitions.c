@@ -323,7 +323,8 @@ void cbm_pipeline_build_def_props(char *buf, size_t bufsize, const CBMDefinition
 }
 
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
-static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel) {
+static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
+                        CBMLanguage lang) {
     if (!def->qualified_name || !def->name) {
         return;
     }
@@ -346,7 +347,8 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "DEFINES", "{}");
     }
     free(file_qn);
-    if (def->parent_class && def->label && strcmp(def->label, "Method") == 0) {
+    if (def->parent_class && def->label && strcmp(def->label, "Method") == 0 &&
+        !cbm_pipeline_is_rust_impl_method(def, lang)) {
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
         if (parent && node_id > 0) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
@@ -865,7 +867,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Create nodes for each definition */
         for (int d = 0; d < result->defs.count; d++) {
-            process_def(ctx, &result->defs.items[d], rel);
+            process_def(ctx, &result->defs.items[d], rel, files[i].language);
             total_defs++;
         }
 

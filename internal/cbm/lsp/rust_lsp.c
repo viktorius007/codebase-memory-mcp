@@ -7376,12 +7376,289 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
     cbm_registry_finalize(reg);
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ * 12. Impl-header links: `impl [Trait for] Type` → registered identities
+ * ════════════════════════════════════════════════════════════════════
+ *
+ * Each impl block's self type and trait are resolved with the same path
+ * rules as every other Rust path (source `use` bindings, globs, `crate::`,
+ * `super::`, workspace crates), at the block's own lexical scope: inline
+ * `mod` bodies and function bodies add their own `use` declarations, and a
+ * bare name declared as an item in an enclosing block is local to that
+ * block, so it never resolves to a module-level namesake. Only an exact
+ * registered type (trait for the trait position, non-trait for the self
+ * position) is accepted; anything else leaves the field NULL. */
+
+#define RUST_IMPL_LINK_MAX_DEPTH 512
+
+typedef struct {
+    const char **names; /* item names declared in enclosing blocks */
+    int count;
+    int cap;
+    /* Type-namespace items the file declares outside function bodies (inline
+     * module items included: they are extracted under the file's module QN). */
+    CBMIdxMemo file_items;
+} RustBlockItems;
+
+static bool rust_block_items_has(const RustBlockItems *items, const char *name, size_t len) {
+    for (int i = 0; i < items->count; i++) {
+        if (strlen(items->names[i]) == len && strncmp(items->names[i], name, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rust_block_items_add(RustLSPContext *ctx, RustBlockItems *items, const char *name) {
+    if (items->count == items->cap) {
+        int cap = items->cap ? items->cap * 2 : 8;
+        const char **grown = (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(char *));
+        if (!grown) {
+            return;
+        }
+        if (items->count > 0) {
+            memcpy(grown, items->names, (size_t)items->count * sizeof(char *));
+        }
+        items->names = grown;
+        items->cap = cap;
+    }
+    items->names[items->count++] = name;
+}
+
+static const char *const RUST_TYPE_ITEM_KINDS[] = {"struct_item", "enum_item", "union_item",
+                                                   "type_item",   "trait_item", NULL};
+
+static bool rust_is_type_item(const char *kind) {
+    for (int k = 0; RUST_TYPE_ITEM_KINDS[k]; k++) {
+        if (strcmp(kind, RUST_TYPE_ITEM_KINDS[k]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Record the type-namespace items a block declares directly. */
+static void rust_block_items_collect(RustLSPContext *ctx, TSNode block, RustBlockItems *items) {
+    uint32_t count = ts_node_named_child_count(block);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(block, i);
+        const char *kind = ts_node_type(child);
+        if (rust_is_type_item(kind) || strcmp(kind, "mod_item") == 0) {
+            char *name = rust_node_text(ctx, ts_node_child_by_field_name(child, "name", 4));
+            if (name && name[0]) {
+                rust_block_items_add(ctx, items, name);
+            }
+        }
+    }
+}
+
+/* Record the type items of a module scope (file root or inline module body). */
+static void rust_file_items_collect(RustLSPContext *ctx, TSNode scope, RustBlockItems *items,
+                                    int depth) {
+    if (depth > RUST_IMPL_LINK_MAX_DEPTH) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(scope);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(scope, i);
+        const char *kind = ts_node_type(child);
+        if (rust_is_type_item(kind)) {
+            char *name = rust_node_text(ctx, ts_node_child_by_field_name(child, "name", 4));
+            if (name && name[0]) {
+                cbm_idxmemo_put_if_absent(&items->file_items, ctx->arena, name, 1);
+            }
+        } else if (strcmp(kind, "mod_item") == 0) {
+            TSNode body = ts_node_child_by_field_name(child, "body", 4);
+            if (!ts_node_is_null(body)) {
+                rust_file_items_collect(ctx, body, items, depth + 1);
+            }
+        }
+    }
+}
+
+/* QN a bare name denotes at module scope, following Rust's order: an explicit
+ * `use` or an item of this file, then exactly one glob import, then the
+ * prelude. Registry presence alone cannot stand for "declared here": the
+ * registry also carries receiver QNs synthesized from impl blocks. */
+static const char *rust_impl_bare_name_qn(RustLSPContext *ctx, const RustBlockItems *items,
+                                          const char *name) {
+    const char *used = rust_resolve_use(ctx, name);
+    if (used) {
+        return convert_path_to_qn(ctx->arena, used);
+    }
+    if (ctx->module_qn && cbm_idxmemo_get(&items->file_items, name) >= 0) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    }
+    const CBMRegisteredType *glob = rust_resolve_glob_type(ctx, name);
+    if (glob) {
+        return glob->qualified_name;
+    }
+    return rust_lookup_prelude(name);
+}
+
+/* Registered QN of one impl-header type position, or NULL. */
+static const char *rust_impl_header_qn(RustLSPContext *ctx, TSNode impl_node, TSNode type_node,
+                                       bool want_trait, const RustBlockItems *block_items) {
+    if (ts_node_is_null(type_node)) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(type_node), "generic_type") == 0) {
+        type_node = ts_node_child_by_field_name(type_node, "type", 4);
+        if (ts_node_is_null(type_node)) {
+            return NULL;
+        }
+    }
+    const char *kind = ts_node_type(type_node);
+    bool bare = strcmp(kind, "type_identifier") == 0;
+    if (!bare && strcmp(kind, "scoped_type_identifier") != 0) {
+        return NULL;
+    }
+    char *path = rust_node_text(ctx, type_node);
+    if (!path || !path[0] || strcmp(path, "Self") == 0 || strncmp(path, "Self::", 6) == 0) {
+        return NULL;
+    }
+    const char *sep = strstr(path, "::");
+    size_t head_len = sep ? (size_t)(sep - path) : strlen(path);
+    if (rust_block_items_has(block_items, path, head_len)) {
+        return NULL;
+    }
+    if (bare && rust_impl_has_type_param(ctx, impl_node, path)) {
+        return NULL;
+    }
+    const char *qn = bare ? rust_impl_bare_name_qn(ctx, block_items, path)
+                          : rust_resolve_path_expr(ctx, path);
+    if (!qn || !ctx->registry) {
+        return NULL;
+    }
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
+    if (!type) {
+        type = rust_lookup_type_variants(ctx, qn);
+    }
+    if (!type || !type->qualified_name || type->is_interface != want_trait) {
+        return NULL;
+    }
+    return type->qualified_name;
+}
+
+static void rust_record_impl_link(RustLSPContext *ctx, TSNode impl_node,
+                                  const RustBlockItems *block_items, CBMRustImplLinkArray *out) {
+    CBMRustImplLink link = {0};
+    link.type_qn = rust_impl_header_qn(ctx, impl_node,
+                                       ts_node_child_by_field_name(impl_node, "type", 4), false,
+                                       block_items);
+    TSNode trait_node = ts_node_child_by_field_name(impl_node, "trait", 5);
+    if (link.type_qn && !ts_node_is_null(trait_node)) {
+        link.trait_qn = rust_impl_header_qn(ctx, impl_node, trait_node, true, block_items);
+    }
+    link.start_line = ts_node_start_point(impl_node).row + 1;
+    link.end_line = ts_node_end_point(impl_node).row + 1;
+    /* Unresolved blocks are recorded too: their methods must not fall to an
+     * enclosing block's owner. */
+    cbm_rustimpllink_push(out, ctx->arena, link);
+}
+
+static void rust_collect_impl_links_in(RustLSPContext *ctx, TSNode node, RustBlockItems *block_items,
+                                       int depth, CBMRustImplLinkArray *out);
+
+/* Walk a scope that may carry its own `use` declarations (inline module body
+ * or block), restoring the enclosing bindings afterwards. */
+static void rust_collect_impl_links_scoped(RustLSPContext *ctx, TSNode scope,
+                                           const char *relative_module_qn, bool is_block,
+                                           RustBlockItems *block_items, int depth,
+                                           CBMRustImplLinkArray *out) {
+    int saved_uses = ctx->use_count;
+    int saved_globs = ctx->glob_count;
+    int saved_items = block_items->count;
+    const char *saved_relative = ctx->relative_module_qn;
+    ctx->relative_module_qn = relative_module_qn;
+    rust_collect_uses(ctx, scope);
+    if (is_block) {
+        rust_block_items_collect(ctx, scope, block_items);
+    }
+    rust_collect_impl_links_in(ctx, scope, block_items, depth + 1, out);
+    ctx->relative_module_qn = saved_relative;
+    ctx->use_count = saved_uses;
+    ctx->glob_count = saved_globs;
+    block_items->count = saved_items;
+}
+
+static void rust_collect_impl_links_in(RustLSPContext *ctx, TSNode node, RustBlockItems *block_items,
+                                       int depth, CBMRustImplLinkArray *out) {
+    if (depth > RUST_IMPL_LINK_MAX_DEPTH) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "impl_item") == 0) {
+            rust_record_impl_link(ctx, child, block_items, out);
+            rust_collect_impl_links_in(ctx, child, block_items, depth + 1, out);
+        } else if (strcmp(kind, "mod_item") == 0) {
+            TSNode body = ts_node_child_by_field_name(child, "body", 4);
+            char *name = rust_node_text(ctx, ts_node_child_by_field_name(child, "name", 4));
+            if (ts_node_is_null(body) || !name) {
+                continue;
+            }
+            /* Inline module items are extracted under the file's module QN;
+             * only `self::` / `super::` see the extra module level. */
+            const char *relative =
+                ctx->relative_module_qn
+                    ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->relative_module_qn, name)
+                    : NULL;
+            rust_collect_impl_links_scoped(ctx, body, relative, false, block_items, depth, out);
+        } else if (strcmp(kind, "block") == 0) {
+            rust_collect_impl_links_scoped(ctx, child, ctx->relative_module_qn, true, block_items,
+                                           depth, out);
+        } else {
+            rust_collect_impl_links_in(ctx, child, block_items, depth + 1, out);
+        }
+    }
+}
+
+static void rust_collect_impl_links(CBMArena *arena, const char *source, int source_len,
+                                    const char *module_qn, const char *relative_module_qn,
+                                    const CBMTypeRegistry *reg, TSNode root,
+                                    const struct CBMCargoManifest *manifest,
+                                    const CBMRustImportSource *imports,
+                                    CBMRustImplLinkArray *out) {
+    RustLSPContext ctx;
+    rust_lsp_init(&ctx, arena, source, source_len, reg, module_qn, NULL);
+    ctx.relative_module_qn = relative_module_qn;
+    ctx.cargo_manifest = manifest;
+    ctx.imports = imports;
+    /* `mod name;` declarations make `name::Item` a child-module path. */
+    uint32_t root_count = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < root_count; i++) {
+        TSNode item = ts_node_named_child(root, i);
+        if (strcmp(ts_node_type(item), "mod_item") != 0 ||
+            !ts_node_is_null(ts_node_child_by_field_name(item, "body", 4))) {
+            continue;
+        }
+        char *name = rust_node_text(&ctx, ts_node_child_by_field_name(item, "name", 4));
+        if (name) {
+            cbm_idxmemo_put_if_absent(&ctx.declared_modules, arena, name, 1);
+        }
+    }
+    /* Source `use` bindings only: graph IMPORTS targets are name matches. */
+    rust_collect_uses(&ctx, root);
+    ctx.file_glob_count = ctx.glob_count;
+    RustBlockItems block_items = {0};
+    rust_file_items_collect(&ctx, root, &block_items, 0);
+    rust_collect_impl_links_in(&ctx, root, &block_items, 0, out);
+}
+
 /* Resolve one Rust file against an ALREADY-built (per-file or shared) registry. */
 static void rust_resolve_against_registry(
     CBMArena *arena, const char *source, int source_len, const char *module_qn,
     const char *relative_module_qn, const CBMTypeRegistry *reg, const char **import_names,
     const char **import_qns, int import_count, TSNode root, const struct CBMCargoManifest *manifest,
-    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
+    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+    CBMRustImplLinkArray *impl_links) {
+    if (impl_links) {
+        rust_collect_impl_links(arena, source, source_len, module_qn, relative_module_qn, reg, root,
+                                manifest, imports, impl_links);
+    }
     RustLSPContext ctx;
     rust_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
     ctx.relative_module_qn = relative_module_qn;
@@ -7448,7 +7725,8 @@ void cbm_run_rust_lsp_cross_with_registry(
     const char *relative_module_qn, const CBMTypeRegistry *reg, const char **import_names,
     const char **import_qns, int import_count, TSTree *cached_tree,
     const struct CBMCargoManifest *manifest, const CBMRustImportSource *imports,
-    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
+    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+    CBMRustImplLinkArray *impl_links) {
     if (!source || source_len <= 0 || !out || !reg)
         return;
     TSParser *parser = NULL;
@@ -7469,7 +7747,7 @@ void cbm_run_rust_lsp_cross_with_registry(
     TSNode root = ts_tree_root_node(tree);
     rust_resolve_against_registry(arena, source, source_len, module_qn, relative_module_qn, reg,
                                   import_names, import_qns, import_count, root, manifest, imports,
-                                  out, synthetic_calls);
+                                  out, synthetic_calls, impl_links);
     if (owns_tree) {
         ts_tree_delete(tree);
         if (parser)
@@ -7482,7 +7760,8 @@ void cbm_run_rust_lsp_cross_with_manifest(
     const char *relative_module_qn, CBMRustLSPDef *defs, int def_count, const char **import_names,
     const char **import_qns, int import_count, TSTree *cached_tree,
     const struct CBMCargoManifest *manifest, const CBMRustImportSource *imports,
-    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
+    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+    CBMRustImplLinkArray *impl_links) {
     if (!source || source_len <= 0 || !out)
         return;
 
@@ -7509,7 +7788,7 @@ void cbm_run_rust_lsp_cross_with_manifest(
 
     rust_resolve_against_registry(arena, source, source_len, module_qn, relative_module_qn, &reg,
                                   import_names, import_qns, import_count, root, manifest, imports,
-                                  out, synthetic_calls);
+                                  out, synthetic_calls, impl_links);
 
     if (owns_tree) {
         ts_tree_delete(tree);
@@ -7527,7 +7806,7 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             TSTree *cached_tree, CBMResolvedCallArray *out) {
     cbm_run_rust_lsp_cross_with_manifest(arena, source, source_len, module_qn, module_qn, defs,
                                          def_count, import_names, import_qns, import_count,
-                                         cached_tree, NULL, NULL, out, NULL);
+                                         cached_tree, NULL, NULL, out, NULL, NULL);
 }
 
 void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int file_count,

@@ -331,6 +331,12 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->impl_traits.items[i].struct_name);
         cr_str(c, &r->impl_traits.items[i].struct_qn);
     }
+    cr_array(c, (void **)&r->rust_impl_links.items, r->rust_impl_links.count,
+             sizeof(CBMRustImplLink));
+    for (int i = 0; i < r->rust_impl_links.count && r->rust_impl_links.items; i++) {
+        cr_str(c, &r->rust_impl_links.items[i].type_qn);
+        cr_str(c, &r->rust_impl_links.items[i].trait_qn);
+    }
     cr_array(c, (void **)&r->resolved_calls.items, r->resolved_calls.count,
              sizeof(CBMResolvedCall));
     for (int i = 0; i < r->resolved_calls.count && r->resolved_calls.items; i++) {
@@ -445,6 +451,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.env_accesses.cap = tmp.env_accesses.count;
     tmp.type_assigns.cap = tmp.type_assigns.count;
     tmp.impl_traits.cap = tmp.impl_traits.count;
+    tmp.rust_impl_links.cap = tmp.rust_impl_links.count;
     tmp.resolved_calls.cap = tmp.resolved_calls.count;
     tmp.string_refs.cap = tmp.string_refs.count;
     tmp.infra_bindings.cap = tmp.infra_bindings.count;

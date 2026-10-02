@@ -389,7 +389,12 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
                                           const CBMRustImportSource *imports,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMRustImplLinkArray *impl_links);
+
+/* Both cross entry points take an optional `impl_links` output (arena-owned,
+ * NULL to skip): one record per `impl` block whose header names resolved to
+ * registered definitions (see CBMRustImplLink). */
 
 /* Tier-2: build the project-wide Rust cross registry ONCE from all defs, finalize,
  * and seal read-only. Shared across every Rust file's resolve (mirrors C/py/cs/ts).
@@ -409,7 +414,8 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
                                           TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
                                           const CBMRustImportSource *imports,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMRustImplLinkArray *impl_links);
 
 /* Per-file input for batch cross-file Rust LSP processing. */
 typedef struct {
