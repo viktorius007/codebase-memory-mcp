@@ -52,14 +52,16 @@ typedef enum {
     CBM_RUST_PATH_FUNCTION,     /* `qn` is a free function */
     CBM_RUST_PATH_ASSOC,        /* `qn` is a type or trait; `assoc` is its associated item */
     CBM_RUST_PATH_NOT_FUNCTION, /* proven to name no in-project function (variable, type,
-                                 * constant, variant, external crate item) */
+                                 * constant, variant, external crate item); for a type
+                                 * query: proven to name a type outside the project */
+    CBM_RUST_PATH_TYPE,         /* type query: `qn` is a type or trait declared in the project */
 } CBMRustPathKind;
 
 typedef struct {
     CBMRustPathKind kind;
-    const char *qn;    /* FUNCTION: function QN; ASSOC: type or trait QN */
+    const char *qn;    /* FUNCTION: function QN; ASSOC, TYPE: type or trait QN */
     const char *assoc; /* ASSOC: the associated item name */
-    bool is_trait;     /* ASSOC: `qn` is a trait */
+    bool is_trait;     /* ASSOC, TYPE: `qn` is a trait */
 } CBMRustPathResult;
 
 CBMRustModTree *cbm_rust_modtree_new(void);
@@ -113,5 +115,21 @@ CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena 
  * block's self type) gets the same answer as its source position. */
 const char *cbm_rust_modtree_resolve_nominal_type(const CBMRustModTree *tree, CBMArena *arena,
                                                   const char *module_qn, const char *path);
+
+/* Resolve a path written in a type position (`T`, `a::b::T`, `crate::m::T`)
+ * in the type namespace, with the same scoping as cbm_rust_modtree_resolve.
+ * TYPE when it names exactly one type, enum, union, alias or trait of the
+ * project; NOT_FUNCTION when it names an item outside the project, with `qn`
+ * the dotted path the `use` graph reaches it by (NULL when unknown); UNKNOWN
+ * otherwise (generic parameters, associated types, undecidable names). */
+CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMArena *arena,
+                                                const char *module_qn, uint32_t offset,
+                                                const char *path, const char *const *extra_names,
+                                                const char *const *extra_paths, int extra_count);
+
+/* Same as cbm_rust_modtree_resolve_type for a type spelled somewhere in the
+ * file without a known offset: every module of the file must agree. */
+CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tree, CBMArena *arena,
+                                                        const char *module_qn, const char *path);
 
 #endif /* CBM_LSP_RUST_MODTREE_H */

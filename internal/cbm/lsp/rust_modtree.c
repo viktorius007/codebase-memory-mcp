@@ -28,7 +28,8 @@ typedef enum {
     RMT_ENUM,
     RMT_ALIAS, /* `type X = ..;`: names another type, owns no impls */
     RMT_VALUE,
-    RMT_EXTERNAL, /* an item of a crate outside the project, or of the language */
+    RMT_EXTERNAL, /* an item of a crate outside the project, or of the language; its
+                   * qn is the dotted path it was reached by, NULL when unknown */
     RMT_OPAQUE,   /* declared but not modelled (an unloadable `mod x;`) */
 } RmtKind;
 
@@ -802,6 +803,9 @@ static bool rmt_same_def(const RmtDef *a, const RmtDef *b) {
     if (a->kind == RMT_MODULE) {
         return a->module == b->module;
     }
+    if (a->kind == RMT_EXTERNAL) {
+        return true; /* one name outside the project, whatever path spelled it */
+    }
     if (!a->qn || !b->qn) {
         return a->qn == b->qn;
     }
@@ -812,6 +816,10 @@ static void rmt_defs_add(RmtDefs *defs, const RmtDef *def) {
     for (int i = 0; i < defs->count; i++) {
         if (rmt_same_def(&defs->defs[i], def)) {
             defs->defs[i].ns |= def->ns;
+            const char *qn = defs->defs[i].qn;
+            if (def->kind == RMT_EXTERNAL && (!qn || !def->qn || strcmp(qn, def->qn) != 0)) {
+                defs->defs[i].qn = NULL; /* two spellings: the path is unknown */
+            }
             return;
         }
     }
@@ -832,8 +840,9 @@ static void rmt_defs_merge(RmtDefs *into, const RmtDefs *from, uint8_t ns) {
 }
 
 static void rmt_resolve_import(CBMRustModTree *tree, int import);
-static void rmt_resolve_path(CBMRustModTree *tree, int module, const char *const *segs, int count,
-                             uint8_t final_ns, bool is_use, RmtDefs *out, bool building);
+static void rmt_resolve_path(CBMRustModTree *tree, CBMArena *arena, int module,
+                             const char *const *segs, int count, uint8_t final_ns, bool is_use,
+                             RmtDefs *out, bool building);
 
 static bool rmt_visit(RmtVisit *visit, int module) {
     for (int i = 0; i < visit->count; i++) {
@@ -922,7 +931,7 @@ static void rmt_resolve_import(CBMRustModTree *tree, int import) {
     }
     imp->state = RMT_IMPORT_ACTIVE;
     RmtDefs result = {0};
-    rmt_resolve_path(tree, imp->module, imp->segs, imp->seg_count,
+    rmt_resolve_path(tree, &tree->arena, imp->module, imp->segs, imp->seg_count,
                      imp->glob ? RMT_NS_TYPE : RMT_NS_ALL, true, &result, true);
     imp = &tree->imports[import];
     if (result.assoc) {
@@ -968,7 +977,7 @@ static bool rmt_extern_prelude(const CBMRustModTree *tree, int crate, const char
         return true;
     }
     if (target == 0 || rmt_in_list(RMT_LANGUAGE_CRATES, name)) {
-        *out = (RmtDef){.kind = RMT_EXTERNAL, .ns = RMT_NS_ALL, .module = -1};
+        *out = (RmtDef){.kind = RMT_EXTERNAL, .ns = RMT_NS_ALL, .module = -1, .qn = name};
         return true;
     }
     return false;
@@ -1027,8 +1036,23 @@ static int rmt_start(CBMRustModTree *tree, int module, const char *const *segs, 
     return 1;
 }
 
-static void rmt_resolve_path(CBMRustModTree *tree, int module, const char *const *segs, int count,
-                             uint8_t final_ns, bool is_use, RmtDefs *out, bool building) {
+/* `prefix.segs[from..count)` in `arena`: the dotted path of an item reached
+ * through an external one. */
+static const char *rmt_external_path(CBMArena *arena, const char *prefix, const char *const *segs,
+                                     int from, int count) {
+    if (!prefix) {
+        return NULL;
+    }
+    const char *path = prefix;
+    for (int i = from; i < count; i++) {
+        path = cbm_arena_sprintf(arena, "%s.%s", path, segs[i]);
+    }
+    return path;
+}
+
+static void rmt_resolve_path(CBMRustModTree *tree, CBMArena *arena, int module,
+                             const char *const *segs, int count, uint8_t final_ns, bool is_use,
+                             RmtDefs *out, bool building) {
     RmtDefs cur = {0};
     int i = rmt_start(tree, module, segs, count, final_ns, is_use, &cur, building);
     if (i < 0) {
@@ -1043,6 +1067,7 @@ static void rmt_resolve_path(CBMRustModTree *tree, int module, const char *const
         RmtDef def = cur.defs[0];
         bool last = i == count - 1;
         if (def.kind == RMT_EXTERNAL) {
+            cur.defs[0].qn = rmt_external_path(arena, def.qn, segs, i, count);
             break;
         }
         if (def.kind == RMT_TYPE || def.kind == RMT_TRAIT || def.kind == RMT_ENUM ||
@@ -1185,8 +1210,28 @@ static int rmt_apply_block_uses(CBMArena *arena, const char **segs, int count,
     return count;
 }
 
-CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena *arena,
-                                           const char *module_qn, uint32_t offset, const char *path,
+static CBMRustPathResult rmt_classify_type(const RmtDefs *defs) {
+    CBMRustPathResult unknown = {.kind = CBM_RUST_PATH_UNKNOWN};
+    if (defs->open || defs->count != 1 || defs->assoc) {
+        return unknown;
+    }
+    const RmtDef *def = &defs->defs[0];
+    if (def->kind == RMT_TYPE || def->kind == RMT_ENUM || def->kind == RMT_TRAIT ||
+        def->kind == RMT_ALIAS) {
+        return (CBMRustPathResult){
+            .kind = CBM_RUST_PATH_TYPE, .qn = def->qn, .is_trait = def->kind == RMT_TRAIT};
+    }
+    if (def->kind == RMT_EXTERNAL) {
+        return (CBMRustPathResult){.kind = CBM_RUST_PATH_NOT_FUNCTION, .qn = def->qn};
+    }
+    return unknown;
+}
+
+/* Resolve `path` in every module of `module_qn`'s file selected by
+ * `offset` (all of them when `every_module`); the modules must agree. */
+static CBMRustPathResult rmt_resolve_query(const CBMRustModTree *tree, CBMArena *arena,
+                                           const char *module_qn, uint32_t offset,
+                                           bool every_module, const char *path, uint8_t ns,
                                            const char *const *extra_names,
                                            const char *const *extra_paths, int extra_count) {
     CBMRustPathResult unknown = {.kind = CBM_RUST_PATH_UNKNOWN};
@@ -1208,12 +1253,14 @@ CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena 
      * shared tree is only read here. */
     CBMRustModTree *readonly = (CBMRustModTree *)tree;
     for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
-        if (!rmt_contains(&tree->modules[m], offset) || !rmt_innermost(tree, file, m, offset)) {
+        if (!every_module &&
+            (!rmt_contains(&tree->modules[m], offset) || !rmt_innermost(tree, file, m, offset))) {
             continue;
         }
         RmtDefs defs = {0};
-        rmt_resolve_path(readonly, m, segs, count, RMT_NS_VALUE, false, &defs, false);
-        CBMRustPathResult result = rmt_classify(&defs);
+        rmt_resolve_path(readonly, arena, m, segs, count, ns, false, &defs, false);
+        CBMRustPathResult result =
+            ns == RMT_NS_TYPE ? rmt_classify_type(&defs) : rmt_classify(&defs);
         if (result.kind == CBM_RUST_PATH_UNKNOWN || (any && !rmt_same_result(&agreed, &result))) {
             return unknown;
         }
@@ -1238,7 +1285,7 @@ const char *cbm_rust_modtree_resolve_nominal_type(const CBMRustModTree *tree, CB
     CBMRustModTree *readonly = (CBMRustModTree *)tree;
     for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
         RmtDefs defs = {0};
-        rmt_resolve_path(readonly, m, segs, count, RMT_NS_TYPE, false, &defs, false);
+        rmt_resolve_path(readonly, arena, m, segs, count, RMT_NS_TYPE, false, &defs, false);
         if (!defs.open && defs.count == 0) {
             continue; /* the name is not in scope here, so no impl here can name it */
         }
@@ -1251,4 +1298,25 @@ const char *cbm_rust_modtree_resolve_nominal_type(const CBMRustModTree *tree, CB
         agreed = def->qn;
     }
     return agreed;
+}
+
+CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena *arena,
+                                           const char *module_qn, uint32_t offset, const char *path,
+                                           const char *const *extra_names,
+                                           const char *const *extra_paths, int extra_count) {
+    return rmt_resolve_query(tree, arena, module_qn, offset, false, path, RMT_NS_VALUE, extra_names,
+                             extra_paths, extra_count);
+}
+
+CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMArena *arena,
+                                                const char *module_qn, uint32_t offset,
+                                                const char *path, const char *const *extra_names,
+                                                const char *const *extra_paths, int extra_count) {
+    return rmt_resolve_query(tree, arena, module_qn, offset, false, path, RMT_NS_TYPE, extra_names,
+                             extra_paths, extra_count);
+}
+
+CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tree, CBMArena *arena,
+                                                        const char *module_qn, const char *path) {
+    return rmt_resolve_query(tree, arena, module_qn, 0, true, path, RMT_NS_TYPE, NULL, NULL, 0);
 }
