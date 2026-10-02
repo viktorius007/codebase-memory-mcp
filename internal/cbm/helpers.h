@@ -251,10 +251,11 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
  * shape that server-side route paths already use. NULL when empty/oversized. */
 const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source);
 
-/* Rust: fold a `#[cfg(...)]` predicate into a definition's qualified name so
- * cfg-gated twins stay distinct (extract_defs.c). */
-const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
-                                        const char *const *decorators);
+/* Rust: fold a `#[cfg(...)]` predicate into the qualified name of a cfg twin
+ * (a function with a same-named sibling item) so twins stay distinct; a lone
+ * cfg-gated function keeps `base_qn` (extract_defs.c). */
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, TSNode func_node, const char *source,
+                                        const char *base_qn, const char *const *decorators);
 
 /* Rust cfg-gated function identity: `plain_qn` with the function's `#[cfg]`
  * attribute folded in exactly as the Method/Function node was named

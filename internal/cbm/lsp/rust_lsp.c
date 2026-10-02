@@ -6838,7 +6838,7 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
 
     const char *prefix = parent_qn ? parent_qn : ctx->module_qn;
     /* A trait-impl method is published as `<Type>.<name>[<Trait>]` and a
-     * cfg-gated free function as `<name>#cfg(..)]` (extract_rust_impl,
+     * cfg twin free function as `<name>#cfg(..)]` (extract_rust_impl,
      * cbm_rust_cfg_scope_qn); the caller identity must match that node. */
     ctx->enclosing_func_qn =
         parent_qn && ctx->self_trait_spelling

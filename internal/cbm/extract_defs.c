@@ -2036,17 +2036,49 @@ const char *cbm_rust_cfg_scope_qn(CBMArena *a, TSNode func_node, const char *sou
                                   const char *plain_qn) {
     const char **decorators =
         extract_decorators(a, func_node, source, CBM_LANG_RUST, cbm_lang_spec(CBM_LANG_RUST));
-    return cbm_rust_cfg_qualified_name(a, plain_qn, decorators);
+    return cbm_rust_cfg_qualified_name(a, func_node, source, plain_qn, decorators);
+}
+
+/* True when another item of the same kind and name sits beside `func_node` in
+ * its enclosing item list: the only way two Rust functions get one plain QN. */
+static bool rust_fn_has_same_named_sibling(TSNode func_node, const char *source) {
+    TSNode name = ts_node_child_by_field_name(func_node, "name", 4);
+    TSNode parent = ts_node_parent(func_node);
+    if (ts_node_is_null(name) || ts_node_is_null(parent) || !source) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(name);
+    uint32_t len = ts_node_end_byte(name) - start;
+    TSSymbol kind = ts_node_symbol(func_node);
+    uint32_t n = ts_node_named_child_count(parent);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode sib = ts_node_named_child(parent, i);
+        if (ts_node_eq(sib, func_node) || ts_node_symbol(sib) != kind) {
+            continue;
+        }
+        TSNode sib_name = ts_node_child_by_field_name(sib, "name", 4);
+        if (ts_node_is_null(sib_name)) {
+            continue;
+        }
+        uint32_t sib_start = ts_node_start_byte(sib_name);
+        if (ts_node_end_byte(sib_name) - sib_start == len &&
+            memcmp(source + sib_start, source + start, len) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
- * attributes both parse as distinct function_item nodes and otherwise receive
- * the SAME qualified_name, so the second graph upsert silently overwrites the
- * first and one branch is lost (#495). Fold the cfg predicate into the QN so
- * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
- * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
-const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
-                                        const char *const *decorators) {
+ * attributes ("cfg twins") both parse as distinct function_item nodes and
+ * otherwise receive the SAME qualified_name, so one branch is lost (#495).
+ * A twin folds its cfg predicate into the QN so each gets a DISTINCT,
+ * predicate-encoding QN; a call path names neither predicate, so the resolver
+ * links a call to a twin only when exactly one candidate shares the plain QN.
+ * A cfg-gated function with no same-named sibling keeps its plain QN: that is
+ * the QN every path to it spells. */
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, TSNode func_node, const char *source,
+                                        const char *base_qn, const char *const *decorators) {
     if (!decorators) {
         return base_qn;
     }
@@ -2054,6 +2086,9 @@ const char *cbm_rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
         const char *cfg = strstr(decorators[i], "cfg(");
         if (!cfg) {
             continue;
+        }
+        if (!rust_fn_has_same_named_sibling(func_node, source)) {
+            return base_qn;
         }
         /* Build a compact predicate suffix from the cfg(...) text, dropping
          * whitespace and quotes so the QN stays readable and stable. */
@@ -3768,9 +3803,10 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
-    // predicate into the QN so both branches survive the graph upsert (#495).
+    // predicate into a twin's QN so both branches survive the upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = cbm_rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
+        def.qualified_name = cbm_rust_cfg_qualified_name(a, node, ctx->source, def.qualified_name,
+                                                         def.decorators);
         def.is_test = cbm_rust_definition_has_test_attribute(&def);
     }
 
