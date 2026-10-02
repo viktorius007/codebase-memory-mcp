@@ -7139,6 +7139,187 @@ TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes) {
     PASS();
 }
 
+/* Caller QN, callee QN (both without the project prefix), and whether the
+ * declared module tree must publish the call. */
+typedef struct {
+    const char *what;
+    const char *src;
+    const char *dst;
+    bool expected;
+} RustModTreeCallCase;
+
+static const RustModTreeCallCase rust_modtree_call_cases[] = {
+    {"re-export from a private module", "core.src.lib.root_fn", "util.src.inner.helper", true},
+    {"member crate inline module path", "core.src.lib.root_fn", "util.src.lib.normalize", true},
+    {"child module path", "core.src.exec_policy.load", "core.src.exec_policy.model_policy.permit",
+     true},
+    {"#[path] file imports its parent's item", "core.src.exec_policy.model_policy_tests.t",
+     "core.src.exec_policy.model_policy.permit", true},
+    {"#[path] file uses its parent's import", "core.src.exec_policy.model_policy_tests.t",
+     "core.src.exec_policy.ExecPolicyManager.new", true},
+    {"crate:: from a #[path] file", "core.src.exec_policy.model_policy_tests.t",
+     "core.src.lib.root_fn", true},
+    {"child module of a file module", "core.src.tools.tool_root", "core.src.tools.spec.build",
+     true},
+    {"super:: from an inline module", "core.src.tools.deep", "core.src.tools.spec.build", true},
+    {"inline module sibling", "core.src.tools.caller", "core.src.tools.deep", true},
+    {"use of a crate:: item", "core.src.tools.spec.build", "core.src.exec_policy.load", true},
+    {"path-dependency import", "core.tests.suite.cases.case", "core.tests.common.responses.sse",
+     true},
+    {"path-dependency root item", "core.tests.suite.cases.case",
+     "core.tests.common.lib.wait_for_event", true},
+    {"path-dependency module path", "core.tests.suite.cases.case",
+     "core.tests.common.responses.mount", true},
+    {"own library from a test target", "core.tests.suite.cases.case", "core.src.lib.root_fn",
+     true},
+    {"external import shadows a project name", "core.tests.suite.cases.ext",
+     "core.src.exec_policy.load", false},
+};
+#define RUST_MODTREE_CALL_CASES \
+    ((int)(sizeof(rust_modtree_call_cases) / sizeof(rust_modtree_call_cases[0])))
+
+typedef struct {
+    int run_rc;
+    bool found[RUST_MODTREE_CALL_CASES];
+} RustModTreeCallObservation;
+
+static RustModTreeCallObservation observe_rust_modtree_calls(const char *root,
+                                                             const char *db_name) {
+    RustModTreeCallObservation o = {.run_rc = -1};
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", root, db_name);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    o.run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (store && pipeline) {
+        const char *p = cbm_pipeline_project_name(pipeline);
+        for (int i = 0; i < RUST_MODTREE_CALL_CASES; i++) {
+            char src[512];
+            char dst[512];
+            snprintf(src, sizeof(src), "%s.%s", p, rust_modtree_call_cases[i].src);
+            snprintf(dst, sizeof(dst), "%s.%s", p, rust_modtree_call_cases[i].dst);
+            o.found[i] = exact_call_qns_exist(store, p, src, dst);
+        }
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return o;
+}
+
+/* A Cargo workspace whose module identities differ from the file layout:
+ * private re-exports, `#[path]` files, inline modules, a path dependency that
+ * is not a workspace member, and a test target reached through
+ * `tests/all.rs`. Every path call follows the declared module tree in both
+ * pipelines; a name the tree binds outside the project stays unlinked. */
+TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_modtree_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nmembers = [\"core\", \"util\"]\n"
+                    "[workspace.dependencies]\n"
+                    "core_test_support = { path = \"core/tests/common\" }\n"
+                    "codex-util = { path = \"util\" }\n");
+    write_temp_file(tmp, "core/Cargo.toml",
+                    "[package]\nname = \"codex-core\"\nedition = \"2021\"\n"
+                    "[dependencies]\ncodex-util = { workspace = true }\n"
+                    "[dev-dependencies]\ncore_test_support = { workspace = true }\n"
+                    "ext_dep = \"1\"\n");
+    write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
+    /* write_temp_file creates one directory level: parents come first. */
+    write_temp_file(tmp, "core/tests/all.rs", "mod suite;\n");
+    write_temp_file(tmp, "core/tests/common/Cargo.toml",
+                    "[package]\nname = \"core_test_support\"\nedition = \"2021\"\n"
+                    "[lib]\npath = \"lib.rs\"\n");
+    write_temp_file(tmp, "util/src/lib.rs",
+                    "mod inner;\npub use inner::helper;\n"
+                    "pub mod paths {\n    pub fn normalize() -> u8 { 1 }\n}\n");
+    write_temp_file(tmp, "util/src/inner.rs", "pub fn helper() -> u8 { 2 }\n");
+    write_temp_file(tmp, "core/src/lib.rs",
+                    "mod exec_policy;\npub mod tools;\npub use exec_policy::ExecPolicyManager;\n"
+                    "pub fn root_fn() -> u8 { codex_util::helper() + "
+                    "codex_util::paths::normalize() }\n");
+    write_temp_file(tmp, "core/src/exec_policy.rs",
+                    "mod model_policy;\npub struct ExecPolicyManager;\n"
+                    "impl ExecPolicyManager {\n    pub fn new() -> Self { ExecPolicyManager }\n}\n"
+                    "pub fn load() -> u8 { model_policy::permit() }\n");
+    write_temp_file(tmp, "core/src/exec_policy/model_policy.rs",
+                    "use super::ExecPolicyManager;\npub fn permit() -> u8 { 3 }\n"
+                    "#[cfg(test)]\n#[path = \"model_policy_tests.rs\"]\nmod tests;\n");
+    write_temp_file(tmp, "core/src/exec_policy/model_policy_tests.rs",
+                    "use super::ExecPolicyManager;\nuse super::permit;\n"
+                    "fn t() { let _m = ExecPolicyManager::new(); permit(); crate::root_fn(); }\n");
+    write_temp_file(tmp, "core/src/tools.rs",
+                    "pub mod spec;\npub fn tool_root() -> u8 { spec::build() }\n"
+                    "mod inline_mod {\n    pub fn deep() -> u8 { super::spec::build() }\n"
+                    "    fn caller() -> u8 { deep() }\n}\n");
+    write_temp_file(tmp, "core/src/tools/spec.rs",
+                    "use crate::exec_policy::load;\npub fn build() -> u8 { load() }\n");
+    write_temp_file(tmp, "core/tests/common/lib.rs",
+                    "pub mod responses;\npub fn wait_for_event() -> u8 { 4 }\n");
+    write_temp_file(tmp, "core/tests/common/responses.rs",
+                    "pub fn sse() -> u8 { 5 }\npub fn mount() -> u8 { sse() }\n");
+    write_temp_file(tmp, "core/tests/suite/mod.rs", "mod cases;\n");
+    write_temp_file(tmp, "core/tests/suite/cases.rs",
+                    "use core_test_support::responses::sse;\n"
+                    "use core_test_support::wait_for_event;\n"
+                    "use core_test_support::responses;\n"
+                    "use ext_dep::load;\n"
+                    "fn case() { sse(); wait_for_event(); responses::mount(); "
+                    "codex_core::root_fn(); }\n"
+                    "fn ext() -> u8 { load() }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "util/src/pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_modtree_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
+    char *saved_single =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    RustModTreeCallObservation sequential = observe_rust_modtree_calls(tmp, "modtree-seq.db");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    RustModTreeCallObservation parallel = observe_rust_modtree_calls(tmp, "modtree-par.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential.run_rc, 0);
+    ASSERT_EQ(parallel.run_rc, 0);
+    const RustModTreeCallObservation *modes[2] = {&sequential, &parallel};
+    int mismatches = 0;
+    for (int m = 0; m < 2; m++) {
+        for (int i = 0; i < RUST_MODTREE_CALL_CASES; i++) {
+            if (modes[m]->found[i] != rust_modtree_call_cases[i].expected) {
+                printf("  Rust module-tree mismatch: mode=%s case=\"%s\" %s -> %s found=%d\n",
+                       m == 0 ? "sequential" : "parallel", rust_modtree_call_cases[i].what,
+                       rust_modtree_call_cases[i].src, rust_modtree_call_cases[i].dst,
+                       modes[m]->found[i]);
+                mismatches++;
+            }
+        }
+    }
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
 TEST(pipeline_rust_path_module_super_resolves_from_declared_parent) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_path_module_XXXXXX");
@@ -16717,6 +16898,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
+    RUN_TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes);
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
     RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
     RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);

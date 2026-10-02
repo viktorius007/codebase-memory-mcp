@@ -7003,6 +7003,60 @@ TEST(rustlsp_partial_cargo_handles_comments_and_quirks) {
     PASS();
 }
 
+/* A bare value closing an inline table (`{ workspace = true }`) must end at
+ * the `}`: the dependencies declared after it stay known, with their paths. */
+TEST(rustlsp_cargo_bare_inline_value_keeps_following_deps) {
+    CBMArena a; cbm_arena_init(&a);
+    const char *toml =
+        "[package]\n"
+        "name = \"core\"\n"
+        "\n"
+        "[dependencies]\n"
+        "codex-util = { workspace = true }\n"
+        "flagged = { optional = true, path = \"../flagged\" }\n"
+        "local = { path = \"../local\" }\n";
+    CBMCargoManifest m;
+    cbm_cargo_parse(&a, toml, (int)strlen(toml), &m);
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "codex-util"));
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "flagged"));
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "local"));
+    const char *flagged_path = NULL;
+    const char *local_path = NULL;
+    for (int i = 0; i < m.dep_count; i++) {
+        if (strcmp(m.deps[i].name, "flagged") == 0) flagged_path = m.deps[i].path;
+        if (strcmp(m.deps[i].name, "local") == 0) local_path = m.deps[i].path;
+    }
+    ASSERT_STR_EQ("../flagged", flagged_path ? flagged_path : "");
+    ASSERT_STR_EQ("../local", local_path ? local_path : "");
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+/* `[target.'cfg(..)'.dependencies]` sections declare dependencies like
+ * `[dependencies]`; other `[target.…]` tables do not. */
+TEST(rustlsp_cargo_reads_target_cfg_dependency_sections) {
+    CBMArena a; cbm_arena_init(&a);
+    const char *toml =
+        "[package]\n"
+        "name = \"core\"\n"
+        "\n"
+        "[target.'cfg(unix)'.dependencies]\n"
+        "unix_only = { path = \"../unix_only\" }\n"
+        "\n"
+        "[target.'cfg(target_os = \"linux\")'.dev-dependencies]\n"
+        "linux_dev = \"1\"\n"
+        "\n"
+        "[target.'cfg(windows)'.metadata]\n"
+        "not_a_dep = \"1\"\n";
+    CBMCargoManifest m;
+    cbm_cargo_parse(&a, toml, (int)strlen(toml), &m);
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "unix_only"));
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "linux_dev"));
+    ASSERT_EQ(false, cbm_cargo_is_known_dep(&m, "not_a_dep"));
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 /* Chalk-lite: T: Clone bound dispatch. */
 TEST(rustlsp_partial_chalk_lite_clone_bound) {
     /* This was an aspirational test before; now it should pass via
@@ -8275,6 +8329,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_partial_cargo_parses_simple);
     RUN_TEST(rustlsp_partial_cargo_parses_workspace);
     RUN_TEST(rustlsp_partial_cargo_handles_comments_and_quirks);
+    RUN_TEST(rustlsp_cargo_bare_inline_value_keeps_following_deps);
+    RUN_TEST(rustlsp_cargo_reads_target_cfg_dependency_sections);
     RUN_TEST(rustlsp_partial_chalk_lite_clone_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_display_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_multi_bound);
