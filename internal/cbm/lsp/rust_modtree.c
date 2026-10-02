@@ -381,130 +381,6 @@ static int rmt_file_id(const CBMRustModTree *tree, const char *rel) {
 }
 
 typedef struct {
-    CBMRustModTree *tree;
-    const CBMRustSourceLoader *loader;
-    int crate;
-    int file;
-    const char *source;
-} RmtWalk;
-
-static void rmt_load_module_file(RmtWalk *outer, int module, int file, const char *child_dir,
-                                 int depth);
-static void rmt_walk_items(RmtWalk *walk, TSNode container, int module, const char *child_dir,
-                           bool inline_scope, int depth);
-
-/* `mod name;` → the declared file: `#[path]` relative to the declaring
- * file's directory (or the inline module's directory), else `name.rs` or
- * `name/mod.rs` in the declaring module's child directory. */
-static int rmt_out_of_line_file(RmtWalk *walk, TSNode item, const char *name, const char *child_dir,
-                                bool inline_scope, const char **out_children_dir) {
-    CBMRustModTree *tree = walk->tree;
-    const char *attr = cbm_rust_path_attribute(&tree->arena, walk->source, item);
-    if (attr) {
-        const char *base = inline_scope ? child_dir : tree->files[walk->file].dir;
-        const char *target = rmt_join_path(&tree->arena, base, attr);
-        int file = rmt_file_id(tree, target);
-        if (file >= 0) {
-            *out_children_dir = tree->files[file].dir;
-        }
-        return file;
-    }
-    const char *flat_dir = child_dir[0] ? cbm_arena_sprintf(&tree->arena, "%s/", child_dir) : "";
-    int flat = rmt_file_id(tree, cbm_arena_sprintf(&tree->arena, "%s%s.rs", flat_dir, name));
-    int nested = rmt_file_id(tree, cbm_arena_sprintf(&tree->arena, "%s%s/mod.rs", flat_dir, name));
-    if ((flat >= 0) == (nested >= 0)) {
-        return -1;
-    }
-    *out_children_dir = cbm_arena_sprintf(&tree->arena, "%s%s", flat_dir, name);
-    return flat >= 0 ? flat : nested;
-}
-
-static void rmt_walk_mod(RmtWalk *walk, TSNode item, int module, const char *child_dir,
-                         bool inline_scope, int depth) {
-    CBMRustModTree *tree = walk->tree;
-    TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
-    if (ts_node_is_null(name_node)) {
-        return;
-    }
-    char *name = cbm_node_text(&tree->arena, name_node, walk->source);
-    TSNode body = ts_node_child_by_field_name(item, "body", 4);
-    const char *dir = child_dir[0] ? cbm_arena_sprintf(&tree->arena, "%s/%s", child_dir, name)
-                                   : cbm_arena_strdup(&tree->arena, name);
-    if (!ts_node_is_null(body)) {
-        int child = rmt_new_module(tree, walk->crate, module, walk->file, ts_node_start_byte(body),
-                                   ts_node_end_byte(body));
-        if (child < 0) {
-            return;
-        }
-        rmt_add_item(tree, module, name, RMT_MODULE, RMT_NS_TYPE, child);
-        rmt_walk_items(walk, body, child, dir, true, depth + 1);
-        return;
-    }
-    const char *children_dir = NULL;
-    int file = rmt_out_of_line_file(walk, item, name, child_dir, inline_scope, &children_dir);
-    if (file < 0 || depth >= RMT_MAX_DEPTH) {
-        rmt_add_item(tree, module, name, RMT_OPAQUE, RMT_NS_TYPE, -1);
-        return;
-    }
-    int child = rmt_new_module(tree, walk->crate, module, file, 0, UINT32_MAX);
-    if (child < 0) {
-        return;
-    }
-    rmt_add_item(tree, module, name, RMT_MODULE, RMT_NS_TYPE, child);
-    rmt_load_module_file(walk, child, file, children_dir, depth + 1);
-}
-
-static void rmt_walk_use(RmtWalk *walk, TSNode item, int module) {
-    CBMRustModTree *tree = walk->tree;
-    CBMImportArray imports = {0};
-    cbm_extract_rust_use_tree(&tree->arena, ts_node_child_by_field_name(item, "argument", 8),
-                              walk->source, &imports);
-    for (int i = 0; i < imports.count; i++) {
-        const CBMImport *imp = &imports.items[i];
-        if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, "_") == 0) {
-            continue;
-        }
-        if (strcmp(imp->local_name, "*") == 0) {
-            size_t len = strlen(imp->module_path);
-            if (len > 3) {
-                (void)rmt_add_import(tree, module, NULL,
-                                     cbm_arena_strndup(&tree->arena, imp->module_path, len - 3),
-                                     true);
-            }
-            continue;
-        }
-        (void)rmt_add_import(tree, module, imp->local_name, imp->module_path, false);
-    }
-}
-
-/* `extern crate name [as alias];` binds the alias to that crate's root. */
-static void rmt_walk_extern_crate(RmtWalk *walk, TSNode item, int module) {
-    CBMRustModTree *tree = walk->tree;
-    const char *name = NULL;
-    const char *alias = NULL;
-    uint32_t count = ts_node_named_child_count(item);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_named_child(item, i);
-        const char *kind = ts_node_type(child);
-        if (strcmp(kind, "identifier") != 0 && strcmp(kind, "self") != 0) {
-            continue;
-        }
-        const char *text = cbm_node_text(&tree->arena, child, walk->source);
-        if (!name) {
-            name = text;
-        } else {
-            alias = text;
-        }
-    }
-    if (!name) {
-        return;
-    }
-    const char *path =
-        strcmp(name, "self") == 0 ? "crate" : cbm_arena_sprintf(&tree->arena, "::%s", name);
-    (void)rmt_add_import(tree, module, alias ? alias : name, path, false);
-}
-
-typedef struct {
     const char *node_kind;
     RmtKind kind;
     uint8_t ns;
@@ -517,17 +393,137 @@ static const RmtItemKind RMT_ITEM_KINDS[] = {
     {"const_item", RMT_VALUE, RMT_NS_VALUE}, {"static_item", RMT_VALUE, RMT_NS_VALUE},
 };
 
-static void rmt_walk_item(RmtWalk *walk, TSNode item, int module, const char *child_dir,
-                          bool inline_scope, int depth) {
+/* One fact of a file, in source order. Inline module bodies are bracketed
+ * by RMF_MOD_OPEN and RMF_MOD_CLOSE. */
+typedef enum {
+    RMF_ITEM = 1,  /* `name` is a named item of kind RMT_ITEM_KINDS[item] */
+    RMF_MOD_DECL,  /* `mod name;`, `text` its `#[path]` value or NULL */
+    RMF_MOD_OPEN,  /* `mod name { .. }`, body bytes [start, end) */
+    RMF_MOD_CLOSE, /* end of the innermost open inline module */
+    RMF_IMPORT,    /* `use` / `extern crate` binding `name` (NULL when glob) to `text` */
+    RMF_MACRO,     /* an item-position macro call */
+} RmfOp;
+
+typedef struct {
+    uint8_t op;
+    uint8_t item;
+    bool glob;
+    uint32_t start;
+    uint32_t end;
+    const char *name;
+    const char *text;
+} RmfRecord;
+
+struct CBMRustModFacts {
+    CBMArena arena;
+    RmfRecord *records;
+    int count, cap;
+};
+
+typedef struct {
+    CBMRustModFacts *facts;
+    const char *source;
+    bool failed;
+} RmfScan;
+
+static int rmf_grow(CBMRustModFacts *facts) {
+    RMT_GROW(facts, records, count, cap);
+    return 0;
+}
+
+static void rmf_push(RmfScan *scan, RmfRecord record) {
+    if (scan->failed || rmf_grow(scan->facts) != 0) {
+        scan->failed = true;
+        return;
+    }
+    scan->facts->records[scan->facts->count++] = record;
+}
+
+static void rmf_scan_items(RmfScan *scan, TSNode container);
+
+static void rmf_scan_mod(RmfScan *scan, TSNode item) {
+    CBMArena *arena = &scan->facts->arena;
+    TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+    const char *name = cbm_node_text(arena, name_node, scan->source);
+    TSNode body = ts_node_child_by_field_name(item, "body", 4);
+    if (ts_node_is_null(body)) {
+        rmf_push(scan, (RmfRecord){.op = RMF_MOD_DECL,
+                                   .name = name,
+                                   .text = cbm_rust_path_attribute(arena, scan->source, item)});
+        return;
+    }
+    rmf_push(scan, (RmfRecord){.op = RMF_MOD_OPEN,
+                               .name = name,
+                               .start = ts_node_start_byte(body),
+                               .end = ts_node_end_byte(body)});
+    rmf_scan_items(scan, body);
+    rmf_push(scan, (RmfRecord){.op = RMF_MOD_CLOSE});
+}
+
+static void rmf_scan_use(RmfScan *scan, TSNode item) {
+    CBMArena *arena = &scan->facts->arena;
+    CBMImportArray imports = {0};
+    cbm_extract_rust_use_tree(arena, ts_node_child_by_field_name(item, "argument", 8), scan->source,
+                              &imports);
+    for (int i = 0; i < imports.count; i++) {
+        const CBMImport *imp = &imports.items[i];
+        if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, "_") == 0) {
+            continue;
+        }
+        if (strcmp(imp->local_name, "*") == 0) {
+            size_t len = strlen(imp->module_path);
+            if (len > 3) {
+                rmf_push(scan, (RmfRecord){.op = RMF_IMPORT,
+                                           .glob = true,
+                                           .text = cbm_arena_strndup(arena, imp->module_path,
+                                                                     len - 3)});
+            }
+            continue;
+        }
+        rmf_push(scan,
+                 (RmfRecord){.op = RMF_IMPORT, .name = imp->local_name, .text = imp->module_path});
+    }
+}
+
+/* `extern crate name [as alias];` binds the alias to that crate's root. */
+static void rmf_scan_extern_crate(RmfScan *scan, TSNode item) {
+    CBMArena *arena = &scan->facts->arena;
+    const char *name = NULL;
+    const char *alias = NULL;
+    uint32_t count = ts_node_named_child_count(item);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(item, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "identifier") != 0 && strcmp(kind, "self") != 0) {
+            continue;
+        }
+        const char *text = cbm_node_text(arena, child, scan->source);
+        if (!name) {
+            name = text;
+        } else {
+            alias = text;
+        }
+    }
+    if (!name) {
+        return;
+    }
+    const char *path = strcmp(name, "self") == 0 ? "crate" : cbm_arena_sprintf(arena, "::%s", name);
+    rmf_push(scan, (RmfRecord){.op = RMF_IMPORT, .name = alias ? alias : name, .text = path});
+}
+
+static void rmf_scan_item(RmfScan *scan, TSNode item) {
     const char *kind = ts_node_type(item);
     if (strcmp(kind, "mod_item") == 0) {
-        rmt_walk_mod(walk, item, module, child_dir, inline_scope, depth);
+        rmf_scan_mod(scan, item);
     } else if (strcmp(kind, "use_declaration") == 0) {
-        rmt_walk_use(walk, item, module);
+        rmf_scan_use(scan, item);
     } else if (strcmp(kind, "extern_crate_declaration") == 0) {
-        rmt_walk_extern_crate(walk, item, module);
+        rmf_scan_extern_crate(scan, item);
     } else if (strcmp(kind, "macro_invocation") == 0) {
-        walk->tree->modules[module].macro_items = true;
+        rmf_push(scan, (RmfRecord){.op = RMF_MACRO});
     } else {
         for (size_t i = 0; i < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); i++) {
             if (strcmp(kind, RMT_ITEM_KINDS[i].node_kind) != 0) {
@@ -535,54 +531,181 @@ static void rmt_walk_item(RmtWalk *walk, TSNode item, int module, const char *ch
             }
             TSNode name = ts_node_child_by_field_name(item, "name", 4);
             if (!ts_node_is_null(name)) {
-                rmt_add_item(walk->tree, module,
-                             cbm_node_text(&walk->tree->arena, name, walk->source),
-                             RMT_ITEM_KINDS[i].kind, RMT_ITEM_KINDS[i].ns, -1);
+                rmf_push(scan, (RmfRecord){.op = RMF_ITEM,
+                                           .item = (uint8_t)i,
+                                           .name = cbm_node_text(&scan->facts->arena, name,
+                                                                 scan->source)});
             }
             return;
         }
     }
 }
 
-static void rmt_walk_items(RmtWalk *walk, TSNode container, int module, const char *child_dir,
-                           bool inline_scope, int depth) {
+static void rmf_scan_items(RmfScan *scan, TSNode container) {
     uint32_t count = ts_node_named_child_count(container);
-    for (uint32_t i = 0; i < count; i++) {
-        rmt_walk_item(walk, ts_node_named_child(container, i), module, child_dir, inline_scope,
-                      depth);
+    for (uint32_t i = 0; i < count && !scan->failed; i++) {
+        rmf_scan_item(scan, ts_node_named_child(container, i));
     }
 }
 
-static void rmt_load_module_file(RmtWalk *outer, int module, int file, const char *child_dir,
-                                 int depth) {
-    int len = 0;
-    const char *source = outer->loader->load(outer->loader->ctx, file, &len);
-    if (!source) {
-        outer->tree->modules[module].macro_items = true;
+void cbm_rust_modfacts_free(CBMRustModFacts *facts) {
+    if (!facts) {
         return;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, facts->records);
+    cbm_arena_destroy(&facts->arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, facts);
+}
+
+CBMRustModFacts *cbm_rust_modfacts_scan(const char *source, int len) {
+    if (!source || len < 0) {
+        return NULL;
     }
     TSParser *parser = ts_parser_new();
     TSTree *ts_tree = NULL;
     if (parser && ts_parser_set_language(parser, tree_sitter_rust())) {
         ts_tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)len);
     }
-    if (ts_tree) {
-        RmtWalk walk = {.tree = outer->tree,
-                        .loader = outer->loader,
-                        .crate = outer->crate,
-                        .file = file,
-                        .source = source};
-        rmt_walk_items(&walk, ts_tree_root_node(ts_tree), module, child_dir, false, depth);
-        ts_tree_delete(ts_tree);
-    } else {
-        outer->tree->modules[module].macro_items = true;
-    }
     if (parser) {
         ts_parser_delete(parser);
     }
-    if (outer->loader->release) {
-        outer->loader->release(outer->loader->ctx, file, source);
+    if (!ts_tree) {
+        return NULL;
     }
+    CBMRustModFacts *facts = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*facts));
+    if (facts) {
+        cbm_arena_init(&facts->arena);
+        RmfScan scan = {.facts = facts, .source = source};
+        rmf_scan_items(&scan, ts_tree_root_node(ts_tree));
+        if (scan.failed) {
+            cbm_rust_modfacts_free(facts);
+            facts = NULL;
+        }
+    }
+    ts_tree_delete(ts_tree);
+    return facts;
+}
+
+/* ── Tree construction from facts ─────────────────────────────────── */
+
+typedef struct {
+    CBMRustModTree *tree;
+    const CBMRustModFacts *const *facts;
+    int crate;
+    int file;
+} RmtBuild;
+
+static void rmt_build_file(const RmtBuild *outer, int module, int file, const char *child_dir,
+                           int depth);
+
+/* `mod name;` → the declared file: `#[path]` relative to the declaring
+ * file's directory (or the inline module's directory), else `name.rs` or
+ * `name/mod.rs` in the declaring module's child directory. */
+static int rmt_out_of_line_file(const RmtBuild *build, const RmfRecord *decl, const char *child_dir,
+                                bool inline_scope, const char **out_children_dir) {
+    CBMRustModTree *tree = build->tree;
+    if (decl->text) {
+        const char *base = inline_scope ? child_dir : tree->files[build->file].dir;
+        const char *target = rmt_join_path(&tree->arena, base, decl->text);
+        int file = rmt_file_id(tree, target);
+        if (file >= 0) {
+            *out_children_dir = tree->files[file].dir;
+        }
+        return file;
+    }
+    const char *flat_dir = child_dir[0] ? cbm_arena_sprintf(&tree->arena, "%s/", child_dir) : "";
+    int flat = rmt_file_id(tree, cbm_arena_sprintf(&tree->arena, "%s%s.rs", flat_dir, decl->name));
+    int nested =
+        rmt_file_id(tree, cbm_arena_sprintf(&tree->arena, "%s%s/mod.rs", flat_dir, decl->name));
+    if ((flat >= 0) == (nested >= 0)) {
+        return -1;
+    }
+    *out_children_dir = cbm_arena_sprintf(&tree->arena, "%s%s", flat_dir, decl->name);
+    return flat >= 0 ? flat : nested;
+}
+
+static void rmt_build_mod_decl(const RmtBuild *build, const RmfRecord *decl, int module,
+                               const char *child_dir, bool inline_scope, int depth) {
+    CBMRustModTree *tree = build->tree;
+    const char *children_dir = NULL;
+    int file = rmt_out_of_line_file(build, decl, child_dir, inline_scope, &children_dir);
+    if (file < 0 || depth >= RMT_MAX_DEPTH) {
+        rmt_add_item(tree, module, decl->name, RMT_OPAQUE, RMT_NS_TYPE, -1);
+        return;
+    }
+    int child = rmt_new_module(tree, build->crate, module, file, 0, UINT32_MAX);
+    if (child < 0) {
+        return;
+    }
+    rmt_add_item(tree, module, decl->name, RMT_MODULE, RMT_NS_TYPE, child);
+    rmt_build_file(build, child, file, children_dir, depth + 1);
+}
+
+/* Index just past the RMF_MOD_CLOSE matching the inline module opened
+ * before `at`. */
+static int rmf_skip_body(const CBMRustModFacts *facts, int at) {
+    for (int open = 1; at < facts->count && open > 0; at++) {
+        open += facts->records[at].op == RMF_MOD_OPEN    ? 1
+                : facts->records[at].op == RMF_MOD_CLOSE ? -1
+                                                         : 0;
+    }
+    return at;
+}
+
+/* Apply the facts from `at` to `module` up to the close of its body (or the
+ * end of the file); returns the index after the last fact applied. */
+static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, int at, int module,
+                           const char *child_dir, bool inline_scope, int depth) {
+    CBMRustModTree *tree = build->tree;
+    while (at < facts->count) {
+        const RmfRecord *record = &facts->records[at++];
+        switch (record->op) {
+        case RMF_MOD_CLOSE:
+            return at;
+        case RMF_MOD_OPEN: {
+            const char *dir =
+                child_dir[0] ? cbm_arena_sprintf(&tree->arena, "%s/%s", child_dir, record->name)
+                             : cbm_arena_strdup(&tree->arena, record->name);
+            int child = rmt_new_module(tree, build->crate, module, build->file, record->start,
+                                       record->end);
+            if (child < 0) {
+                at = rmf_skip_body(facts, at);
+                break;
+            }
+            rmt_add_item(tree, module, record->name, RMT_MODULE, RMT_NS_TYPE, child);
+            at = rmt_build_items(build, facts, at, child, dir, true, depth + 1);
+            break;
+        }
+        case RMF_MOD_DECL:
+            rmt_build_mod_decl(build, record, module, child_dir, inline_scope, depth);
+            break;
+        case RMF_IMPORT:
+            (void)rmt_add_import(tree, module, record->name, record->text, record->glob);
+            break;
+        case RMF_MACRO:
+            tree->modules[module].macro_items = true;
+            break;
+        case RMF_ITEM:
+            rmt_add_item(tree, module, record->name, RMT_ITEM_KINDS[record->item].kind,
+                         RMT_ITEM_KINDS[record->item].ns, -1);
+            break;
+        default:
+            break;
+        }
+    }
+    return at;
+}
+
+static void rmt_build_file(const RmtBuild *outer, int module, int file, const char *child_dir,
+                           int depth) {
+    const CBMRustModFacts *facts = outer->facts[file];
+    if (!facts) {
+        outer->tree->modules[module].macro_items = true;
+        return;
+    }
+    RmtBuild build = *outer;
+    build.file = file;
+    (void)rmt_build_items(&build, facts, 0, module, child_dir, false, depth);
 }
 
 /* ── Per-file tree facts digest ───────────────────────────────────── */
@@ -948,8 +1071,12 @@ static void rmt_resolve_path(CBMRustModTree *tree, int module, const char *const
     rmt_defs_merge(out, &cur, RMT_NS_ALL);
 }
 
-void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustSourceLoader *loader) {
-    if (!tree || !loader || !loader->load) {
+int cbm_rust_modtree_file_count(const CBMRustModTree *tree) {
+    return tree ? tree->file_count : 0;
+}
+
+void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const *facts) {
+    if (!tree || !facts) {
         return;
     }
     for (int c = 0; c < tree->crate_count; c++) {
@@ -962,8 +1089,8 @@ void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustSourceLoader *lo
             return;
         }
         tree->crates[c].root_module = root;
-        RmtWalk walk = {.tree = tree, .loader = loader, .crate = c, .file = file};
-        rmt_load_module_file(&walk, root, file, tree->files[file].dir, 0);
+        RmtBuild build = {.tree = tree, .facts = facts, .crate = c, .file = file};
+        rmt_build_file(&build, root, file, tree->files[file].dir, 0);
     }
     for (int i = 0; i < tree->import_count; i++) {
         rmt_resolve_import(tree, i);

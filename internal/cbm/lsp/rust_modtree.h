@@ -35,13 +35,17 @@ char *cbm_rust_path_attribute(CBMArena *arena, const char *source, TSNode mod_it
  * tree. `root` is the file's tree-sitter root node. */
 uint64_t cbm_rust_modtree_file_digest(const char *source, TSNode root);
 
-/* Supplies a file's source text. Returns a buffer the tree borrows until
- * `release` is called with it, or NULL when the file cannot be read. */
-typedef struct {
-    const char *(*load)(const void *ctx, int file_id, int *out_len);
-    void (*release)(const void *ctx, int file_id, const char *source);
-    const void *ctx;
-} CBMRustSourceLoader;
+/* The facts one file contributes to the tree, in source order: its `mod`,
+ * `use` and `extern crate` items, named items and item-position macro calls,
+ * at every inline-module depth. A pure function of the file's bytes, so
+ * files are scanned independently (and concurrently) before the tree is
+ * built from them. */
+typedef struct CBMRustModFacts CBMRustModFacts;
+
+/* Parse `source` and collect its tree facts. NULL when it cannot be parsed.
+ * Safe to call from several threads at once. */
+CBMRustModFacts *cbm_rust_modfacts_scan(const char *source, int len);
+void cbm_rust_modfacts_free(CBMRustModFacts *facts);
 
 typedef enum {
     CBM_RUST_PATH_UNKNOWN = 0,  /* the tree cannot decide; caller may try other evidence */
@@ -77,8 +81,14 @@ int cbm_rust_modtree_add_crate(CBMRustModTree *tree, const char *root_rel_path,
 void cbm_rust_modtree_add_extern(CBMRustModTree *tree, int crate_id, const char *name,
                                  int target_crate);
 
-/* Build every crate's module tree and resolve every `use`. */
-void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustSourceLoader *loader);
+/* Number of registered files; file ids are 0 .. count-1. */
+int cbm_rust_modtree_file_count(const CBMRustModTree *tree);
+
+/* Build every crate's module tree and resolve every `use`. `facts[id]` holds
+ * file `id`'s scanned facts, NULL when the file could not be read or parsed
+ * (its modules may then declare unseen names). The tree keeps no pointer
+ * into `facts`. */
+void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const *facts);
 
 /* True when the file with this graph module QN belongs to at least one crate. */
 bool cbm_rust_modtree_has_file(const CBMRustModTree *tree, const char *module_qn);

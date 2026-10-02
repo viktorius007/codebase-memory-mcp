@@ -36,6 +36,7 @@
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
+#include "pipeline/worker_pool.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -2643,18 +2644,39 @@ static void pxc_rust_add_crates(PXCRustCrates *crates, CBMRustModTree *tree) {
 
 typedef struct {
     const cbm_file_info_t *files;
-    const int *file_index; /* modtree file id -> files[] index */
-} PXCRustSourceCtx;
+    const int *file_index;    /* modtree file id -> files[] index */
+    CBMRustModFacts **facts; /* modtree file id -> scanned facts */
+} PXCRustScanCtx;
 
-static const char *pxc_rust_load_source(const void *ctx, int file_id, int *out_len) {
-    const PXCRustSourceCtx *sources = ctx;
-    return pxc_read_file(sources->files[sources->file_index[file_id]].path, out_len);
+/* cbm_parallel_for body: read and scan one registered file. */
+static void pxc_rust_scan_file(int file_id, void *arg) {
+    PXCRustScanCtx *scan = arg;
+    int len = 0;
+    char *source = pxc_read_file(scan->files[scan->file_index[file_id]].path, &len);
+    if (source) {
+        scan->facts[file_id] = cbm_rust_modfacts_scan(source, len);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+    }
 }
 
-static void pxc_rust_release_source(const void *ctx, int file_id, const char *source) {
-    (void)ctx;
-    (void)file_id;
-    cbm_free(CBM_MEM_CLASS_EXTRACT, (void *)source);
+/* Read and parse every registered file across worker threads (parsing is
+ * the tree's whole cost), then build the tree from the facts in one thread,
+ * so the result does not depend on scheduling. */
+static void pxc_rust_finish_modtree(CBMRustModTree *tree, const cbm_file_info_t *files,
+                                    const int *file_index) {
+    int count = cbm_rust_modtree_file_count(tree);
+    CBMRustModFacts **facts =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)(count > 0 ? count : 1) * sizeof(*facts));
+    if (!facts) {
+        return;
+    }
+    PXCRustScanCtx scan = {.files = files, .file_index = file_index, .facts = facts};
+    cbm_parallel_for(count, pxc_rust_scan_file, &scan, (cbm_parallel_for_opts_t){0});
+    cbm_rust_modtree_finish(tree, (const CBMRustModFacts *const *)facts);
+    for (int i = 0; i < count; i++) {
+        cbm_rust_modfacts_free(facts[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, facts);
 }
 
 CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
@@ -2694,10 +2716,7 @@ CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
         .arena = &arena, .ctx = ctx, .files = files, .file_count = file_count, .root = root};
     pxc_rust_collect_packages(&crates);
     pxc_rust_add_crates(&crates, tree);
-    PXCRustSourceCtx sources = {.files = files, .file_index = file_index};
-    CBMRustSourceLoader loader = {
-        .load = pxc_rust_load_source, .release = pxc_rust_release_source, .ctx = &sources};
-    cbm_rust_modtree_finish(tree, &loader);
+    pxc_rust_finish_modtree(tree, files, file_index);
     cbm_free(CBM_MEM_CLASS_OTHER, crates.packages);
     cbm_arena_destroy(&arena);
     cbm_free(CBM_MEM_CLASS_OTHER, file_index);
