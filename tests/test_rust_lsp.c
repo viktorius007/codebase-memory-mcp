@@ -733,6 +733,84 @@ TEST(rustlsp_crossfile_method_dispatch) {
     PASS();
 }
 
+/* Cross-file fixture: `demo::Conn` with methods `reopen` (async when
+ * `async_reopen`, returning `Result<Conn, String>`), `renamed` returning
+ * `Result<Self, String>`, and `ping`; `demo::Other` also has `ping`, so only
+ * a typed receiver can pick `Conn.ping`. */
+static void rustlsp_conn_fixture(CBMRustLSPDef defs[6], bool async_reopen) {
+    memset(defs, 0, 6 * sizeof(defs[0]));
+    const char *types[] = {"Conn", "Other"};
+    for (int i = 0; i < 2; i++) {
+        defs[i].qualified_name = i == 0 ? "test.demo.Conn" : "test.demo.Other";
+        defs[i].short_name = types[i];
+        defs[i].label = "Type";
+        defs[i].def_module_qn = "test.demo";
+    }
+    const char *mqn[] = {"test.demo.Conn.reopen", "test.demo.Conn.renamed",
+                         "test.demo.Conn.ping", "test.demo.Other.ping"};
+    const char *mname[] = {"reopen", "renamed", "ping", "ping"};
+    const char *mrecv[] = {"test.demo.Conn", "test.demo.Conn", "test.demo.Conn",
+                           "test.demo.Other"};
+    const char *mret[] = {"Result<Conn, String>", "Result<Self, String>", "bool", "bool"};
+    for (int i = 0; i < 4; i++) {
+        CBMRustLSPDef *d = &defs[2 + i];
+        d->qualified_name = mqn[i];
+        d->short_name = mname[i];
+        d->label = "Method";
+        d->receiver_type = mrecv[i];
+        d->def_module_qn = "test.demo";
+        d->return_types = mret[i];
+    }
+    defs[2].is_async = async_reopen;
+}
+
+static int rustlsp_conn_fixture_ping_target(const char *caller, bool async_reopen,
+                                            const char *callee) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[6];
+    rustlsp_conn_fixture(defs, async_reopen);
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, 6, imp_names,
+                           imp_qns, 1, NULL, &out);
+    int idx = find_confident(&out, "run", callee);
+    cbm_arena_destroy(&a);
+    return idx;
+}
+
+/* `.await` on a cross-file async fn keeps its declared `Result<T>` output:
+ * `.expect(..)` and `?` then reach T. */
+TEST(rustlsp_crossfile_await_async_result_then_expect_and_try) {
+    const char *by_expect =
+        "async fn run(c: &demo::Conn) -> bool { c.reopen().await.expect(\"x\").ping() }\n";
+    const char *by_try = "async fn run(c: &demo::Conn) -> Result<bool, String> {\n"
+                         "    Ok(c.reopen().await?.ping())\n}\n";
+    ASSERT_GTE(rustlsp_conn_fixture_ping_target(by_expect, true, "Conn.ping"), 0);
+    ASSERT_GTE(rustlsp_conn_fixture_ping_target(by_try, true, "Conn.ping"), 0);
+    PASS();
+}
+
+/* The async flag is what keeps the output: the same declared return on a
+ * non-async fn is a future type whose output is its first argument. */
+TEST(rustlsp_crossfile_await_non_async_peels_future_output) {
+    const char *by_expect =
+        "async fn run(c: &demo::Conn) -> bool { c.reopen().await.expect(\"x\").ping() }\n";
+    ASSERT_EQ(rustlsp_conn_fixture_ping_target(by_expect, false, "Conn.ping"), -1);
+    PASS();
+}
+
+/* A cross-file method returning `Result<Self, E>` types `?` as the receiver. */
+TEST(rustlsp_crossfile_method_result_self_return) {
+    const char *caller = "fn run(c: &demo::Conn) -> Result<bool, String> {\n"
+                         "    Ok(c.renamed()?.ping())\n}\n";
+    ASSERT_GTE(rustlsp_conn_fixture_ping_target(caller, false, "Conn.ping"), 0);
+    ASSERT_EQ(rustlsp_conn_fixture_ping_target(caller, false, "Other.ping"), -1);
+    PASS();
+}
+
 /* F4 Tier-2: the build-once shared registry path (cbm_rust_build_cross_registry +
  * cbm_run_rust_lsp_cross_with_registry) must resolve IDENTICALLY to the per-file
  * cbm_run_rust_lsp_cross — same fixture as rustlsp_crossfile_method_dispatch. Also
@@ -5908,23 +5986,6 @@ TEST(rustlsp_await_future_returning_fn_yields_output) {
     PASS();
 }
 
-/* A method's `Result<Self>` return names the receiver type through `?`. */
-TEST(rustlsp_method_result_self_return_types_chain) {
-    CBMFileResult *r = extract_rust(
-        "struct Builder;\n"
-        "impl Builder {\n"
-        "    fn new() -> Builder { Builder }\n"
-        "    fn with_name(self, n: &str) -> Result<Self, String> { Ok(self) }\n"
-        "    fn build(self) -> u32 { 0 }\n"
-        "}\n"
-        "fn run() -> Result<u32, String> { Ok(Builder::new().with_name(\"x\")?.build()) }\n");
-    ASSERT_NOT_NULL(r);
-    ASSERT_GTE(require_resolved(r, "run", "Builder.with_name"), 0);
-    ASSERT_GTE(require_resolved(r, "run", "Builder.build"), 0);
-    cbm_free_result(r);
-    PASS();
-}
-
 TEST(rustlsp_cov_async_block) {
     CBMFileResult *r = extract_rust(
         "fn run() -> impl std::future::Future<Output = ()> {\n    async { let _ = 42; }\n}\n");
@@ -8251,6 +8312,9 @@ void suite_rust_lsp(void) {
 
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
+    RUN_TEST(rustlsp_crossfile_await_async_result_then_expect_and_try);
+    RUN_TEST(rustlsp_crossfile_await_non_async_peels_future_output);
+    RUN_TEST(rustlsp_crossfile_method_result_self_return);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_duplicate_free_function_qn_stays_unresolved);
     RUN_TEST(rustlsp_path_module_child_call_does_not_flatten_to_parent);
@@ -8657,7 +8721,6 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_await_preserves_declared_async_output);
     RUN_TEST(rustlsp_await_async_fn_result_then_expect_and_try);
     RUN_TEST(rustlsp_await_future_returning_fn_yields_output);
-    RUN_TEST(rustlsp_method_result_self_return_types_chain);
     RUN_TEST(rustlsp_cov_async_block);
     RUN_TEST(rustlsp_cov_async_move);
     RUN_TEST(rustlsp_cov_async_join_call);
