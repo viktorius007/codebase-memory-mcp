@@ -5629,6 +5629,43 @@ TEST(rustlsp_cov_xf_caller_with_let) {
     ASSERT_GTE(find_confident(&out, "run", "Thing.use_it"), 0);
     cbm_arena_destroy(&a); PASS();
 }
+/* A return type written across lines (rustfmt's layout for a long tuple or
+ * generic) carries newlines, indentation, a trailing comma and comments in
+ * its stored text. The element types must still name the declared types, so
+ * a method call on the destructured or unwrapped value resolves. */
+TEST(rustlsp_xf_multiline_return_type_text) {
+    const char *src = "fn run() {\n"
+                      "    let (pair, _n) = util::make_pair();\n"
+                      "    pair.use_it();\n"
+                      "    util::maybe().unwrap().use_it();\n"
+                      "}\n";
+    CBMArena a; cbm_arena_init(&a);
+    CBMRustLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "p.util.Thing";
+    defs[0].short_name = "Thing"; defs[0].label = "Type"; defs[0].def_module_qn = "p.util";
+    defs[1].qualified_name = "p.util.make_pair";
+    defs[1].short_name = "make_pair"; defs[1].label = "Function"; defs[1].def_module_qn = "p.util";
+    defs[1].return_types = "(\n    Thing, // the value\n    /* count */ usize,\n)";
+    defs[2].qualified_name = "p.util.maybe";
+    defs[2].short_name = "maybe"; defs[2].label = "Function"; defs[2].def_module_qn = "p.util";
+    defs[2].return_types = "Option<\r\n\tThing,\r\n>";
+    defs[3].qualified_name = "p.util.Thing.use_it";
+    defs[3].short_name = "use_it"; defs[3].label = "Method"; defs[3].receiver_type = "p.util.Thing"; defs[3].def_module_qn = "p.util";
+    const char *imp_n[] = {"util"}; const char *imp_q[] = {"p::util"};
+    CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 4, imp_n, imp_q, 1, NULL, &out);
+    int hits = 0;
+    for (int i = 0; i < out.count; i++) {
+        const CBMResolvedCall *rc = &out.items[i];
+        if (rc->callee_qn && strcmp(rc->callee_qn, "p.util.Thing.use_it") == 0 &&
+            rc->confidence >= 0.6f) {
+            hits++;
+        }
+    }
+    ASSERT_EQ(hits, 2);
+    cbm_arena_destroy(&a); PASS();
+}
 TEST(rustlsp_cov_xf_no_imports) {
     const char *src = "fn run() {}\n";
     CBMArena a; cbm_arena_init(&a);
@@ -8779,6 +8816,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_xf_with_stdlib_chain);
     RUN_TEST(rustlsp_cov_xf_with_def_and_method);
     RUN_TEST(rustlsp_cov_xf_caller_with_let);
+    RUN_TEST(rustlsp_xf_multiline_return_type_text);
     RUN_TEST(rustlsp_cov_xf_no_imports);
 
     /* Cov §O: Robustness / negative */
