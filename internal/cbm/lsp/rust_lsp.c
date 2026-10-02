@@ -5884,14 +5884,15 @@ static const char *rust_std_sum_type(const char *qn) {
 /* The type of payload position `pos` of variant (or tuple struct) `leaf`
  * of the matched value `base`: `Some`/`Ok`/`Err` of std's Option and Result
  * from the template arguments; a corpus enum variant from its registered
- * payload field `<Variant>.<pos>`; a tuple struct from its field `<pos>`.
- * Unknown when the position's type is not known. */
+ * payload field `<Variant>.<pos>`; a tuple struct, or a tuple alias matched
+ * by a tuple pattern (`leaf` NULL), from its field `<pos>`. Unknown when the
+ * position's type is not known. */
 static const CBMType *rust_tuple_variant_field(RustLSPContext *ctx, const CBMType *base,
                                                const char *leaf, int pos) {
-    if (!base || !leaf || pos < 0) {
+    if (!base || pos < 0) {
         return cbm_type_unknown();
     }
-    if (base->kind == CBM_TYPE_TEMPLATE) {
+    if (base->kind == CBM_TYPE_TEMPLATE && leaf) {
         const char *sum = rust_std_sum_type(base->data.template_type.template_name);
         int argc = base->data.template_type.arg_count;
         if (sum && pos == 0) {
@@ -5916,7 +5917,7 @@ static const CBMType *rust_tuple_variant_field(RustLSPContext *ctx, const CBMTyp
     }
     const char *dot = strrchr(owner, '.');
     const char *owner_leaf = dot ? dot + 1 : owner;
-    const char *field = strcmp(leaf, owner_leaf) == 0 || strcmp(leaf, "Self") == 0
+    const char *field = !leaf || strcmp(leaf, owner_leaf) == 0 || strcmp(leaf, "Self") == 0
                             ? cbm_arena_sprintf(ctx->arena, "%d", pos)
                             : cbm_arena_sprintf(ctx->arena, "%s.%d", leaf, pos);
     const CBMType *ft = rust_lookup_field(ctx, owner, field, 0);
@@ -6031,10 +6032,11 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
         const char *leaf = strcmp(kind, "tuple_struct_pattern") == 0
                                ? rust_pattern_path_leaf(ctx, pattern)
                                : NULL;
+        bool slice = strcmp(kind, "slice_pattern") == 0;
         int total = -1;
         if (rest >= 0 && base && base->kind == CBM_TYPE_TUPLE && !leaf) {
             total = base->data.tuple.count;
-        } else if (rest >= 0 && leaf) {
+        } else if (rest >= 0 && !slice) {
             total = rust_tuple_variant_arity(ctx, base, leaf);
         }
         for (int i = 0; i < count; i++) {
@@ -6042,7 +6044,7 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
                 continue;
             }
             const CBMType *part = cbm_type_unknown();
-            if (strcmp(kind, "slice_pattern") == 0) {
+            if (slice) {
                 if (base && base->kind == CBM_TYPE_SLICE) {
                     part = base->data.slice.elem;
                 }
@@ -6056,11 +6058,12 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
                 }
             } else {
                 int pos = rust_pattern_position(i, count, rest, total);
-                if (leaf) {
+                if (!leaf && base && base->kind == CBM_TYPE_TUPLE) {
+                    if (pos >= 0 && pos < base->data.tuple.count) {
+                        part = base->data.tuple.elems[pos];
+                    }
+                } else {
                     part = rust_tuple_variant_field(ctx, base, leaf, pos);
-                } else if (base && base->kind == CBM_TYPE_TUPLE && pos >= 0 &&
-                           pos < base->data.tuple.count) {
-                    part = base->data.tuple.elems[pos];
                 }
             }
             rust_bind_pattern(ctx, elems[i], rust_pattern_bind_through(ctx, part, by_ref));

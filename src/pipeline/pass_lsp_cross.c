@@ -1006,8 +1006,9 @@ static const char *pxc_field_defs_append(CBMArena *arena, const char *list, cons
 }
 
 /* Rust: a tuple struct's positions and an enum's variant payloads are fields
- * a pattern destructures. A tuple struct `W(A, B)` (its def carries the
- * payload as param_types) gains fields `0:A|1:B`; an enum gains, per variant
+ * a pattern destructures. A tuple struct `W(A, B)` or a tuple alias
+ * `type W = (A, B);` (its def carries the elements as param_types) gains
+ * fields `0:A|1:B`; an enum gains, per variant
  * `V`, `V.0:A` for a tuple payload and `V.f:T` for a named field `f` (the
  * Field defs scoped by the variant's QN). A field name holding a `.` never
  * matches a member access, so the enum's own member lookup is unchanged. */
@@ -1019,7 +1020,8 @@ static void pxc_fold_rust_payload_fields(CBMArena *arena, const CBMFileResult *r
     for (int si = start; si < end; si++) {
         CBMLSPDef *dst = &defs[si];
         if (!dst->label || !dst->qualified_name ||
-            (strcmp(dst->label, "Struct") != 0 && strcmp(dst->label, "Enum") != 0)) {
+            (strcmp(dst->label, "Struct") != 0 && strcmp(dst->label, "Type") != 0 &&
+             strcmp(dst->label, "Enum") != 0)) {
             continue;
         }
         bool is_enum = strcmp(dst->label, "Enum") == 0;
@@ -1031,7 +1033,7 @@ static void pxc_fold_rust_payload_fields(CBMArena *arena, const CBMFileResult *r
                 continue;
             }
             if (!is_enum) {
-                if (strcmp(d->label, "Struct") == 0 && d->param_types &&
+                if (strcmp(d->label, dst->label) == 0 && d->param_types &&
                     strcmp(d->qualified_name, dst->qualified_name) == 0) {
                     for (int p = 0; d->param_types[p]; p++) {
                         list = pxc_field_defs_append(arena, list, cbm_arena_sprintf(arena, "%d", p),

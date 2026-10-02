@@ -4704,7 +4704,8 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
-    if (ctx->language == CBM_LANG_RUST && strcmp(kind, "struct_item") == 0) {
+    if (ctx->language == CBM_LANG_RUST &&
+        (strcmp(kind, "struct_item") == 0 || strcmp(kind, "type_item") == 0)) {
         def.param_types = rust_tuple_payload_types(a, node, ctx->source);
     }
 
@@ -5598,13 +5599,22 @@ static bool is_enum_member_kind(const char *kind) {
            strcmp(kind, "enumerator") == 0;
 }
 
-/* The payload types of a Rust tuple struct or tuple variant (`W(A, B)`),
- * in position order, as written; NULL when `item` has no positional body.
- * A tuple payload is its constructor's parameter list. */
+/* The payload types of a Rust tuple struct or tuple variant (`W(A, B)`), or
+ * the elements of a type alias naming a tuple (`type T = (A, B);`), in
+ * position order, as written; NULL when `item` has no positional body. A
+ * tuple payload is its constructor's parameter list. */
 static const char **rust_tuple_payload_types(CBMArena *a, TSNode item, const char *source) {
     TSNode body = ts_node_child_by_field_name(item, TS_FIELD("body"));
-    if (ts_node_is_null(body) ||
-        strcmp(ts_node_type(body), "ordered_field_declaration_list") != 0) {
+    bool alias = false;
+    if (strcmp(ts_node_type(item), "type_item") == 0) {
+        /* `type T = (A, B);` names a tuple: same positions. */
+        body = ts_node_child_by_field_name(item, TS_FIELD("type"));
+        alias = true;
+        if (ts_node_is_null(body) || strcmp(ts_node_type(body), "tuple_type") != 0) {
+            return NULL;
+        }
+    } else if (ts_node_is_null(body) ||
+               strcmp(ts_node_type(body), "ordered_field_declaration_list") != 0) {
         return NULL;
     }
     uint32_t nc = ts_node_child_count(body);
@@ -5612,7 +5622,8 @@ static const char **rust_tuple_payload_types(CBMArena *a, TSNode item, const cha
     int n = 0;
     for (uint32_t i = 0; i < nc; i++) {
         const char *field = ts_node_field_name_for_child(body, i);
-        if (!field || strcmp(field, "type") != 0) {
+        if (alias ? !ts_node_is_named(ts_node_child(body, i))
+                  : (!field || strcmp(field, "type") != 0)) {
             continue;
         }
         char *text = cbm_node_text(a, ts_node_child(body, i), source);
