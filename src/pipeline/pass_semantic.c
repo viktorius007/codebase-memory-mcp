@@ -550,8 +550,7 @@ int cbm_pipeline_rust_impl_edges(const cbm_gbuf_t *nodes, cbm_gbuf_t *edges,
         }
         const cbm_gbuf_node_t *type = cbm_gbuf_find_by_qn(nodes, link->type_qn);
         const cbm_gbuf_node_t *trait = cbm_gbuf_find_by_qn(nodes, link->trait_qn);
-        if (type && trait && rust_node_is_impl_owner(type) &&
-            rust_node_is_trait(trait)) {
+        if (type && trait && rust_node_is_impl_owner(type) && rust_node_is_trait(trait)) {
             cbm_gbuf_insert_edge(edges, type->id, trait->id, "IMPLEMENTS", "{}");
             count++;
         }

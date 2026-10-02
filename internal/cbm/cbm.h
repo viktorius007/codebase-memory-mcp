@@ -546,12 +546,12 @@ typedef struct CBMFileResult {
     CBMTypeRefArray type_refs;
     CBMEnvAccessArray env_accesses;
     CBMTypeAssignArray type_assigns;
-    CBMImplTraitArray impl_traits;       // Rust: impl Trait for Struct pairs
+    CBMImplTraitArray impl_traits;        // Rust: impl Trait for Struct pairs
     CBMRustImplLinkArray rust_impl_links; // Rust: resolved impl headers (cross-file LSP)
-    CBMResolvedCallArray resolved_calls; // LSP-resolved invocations/references (high confidence)
-    CBMStringRefArray string_refs;       // URL/config string literals from AST
-    CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
-    CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
+    CBMResolvedCallArray resolved_calls;  // LSP-resolved invocations/references (high confidence)
+    CBMStringRefArray string_refs;        // URL/config string literals from AST
+    CBMInfraBindingArray infra_bindings;  // topic→URL pairs from IaC configs
+    CBMChannelArray channels;             // Socket.IO / EventEmitter pub/sub participation
 
     const char *module_qn; // module qualified name
     /* Rust #[path] module identity for resolving self::/super::. NULL means
