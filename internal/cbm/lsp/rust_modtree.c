@@ -47,9 +47,15 @@ typedef struct {
     const char *assoc; /* set when the path ends in an associated item of defs[0] */
 } RmtDefs;
 
+/* Who may name an item or import: every module (RMT_VIS_PUB), or the
+ * modules at or below `vis` (a module id). Facts carry it unresolved: a
+ * count of levels above the declaring module, or RMT_VIS_PUB/RMT_VIS_CRATE. */
+enum { RMT_VIS_PUB = -1, RMT_VIS_CRATE = -2 };
+
 typedef struct {
     int next;
     int import; /* -1 for a declared item */
+    int vis;
     RmtDef def;
 } RmtEntry;
 
@@ -58,6 +64,7 @@ typedef enum { RMT_IMPORT_PENDING = 0, RMT_IMPORT_ACTIVE, RMT_IMPORT_DONE } RmtI
 typedef struct {
     int module;
     int next_glob;
+    int vis;
     const char **segs;
     int seg_count;
     bool glob;
@@ -213,10 +220,10 @@ static int rmt_new_module(CBMRustModTree *tree, int crate, int parent, int file,
 /* Chain a new entry behind the first one for `name`, keeping the memo's
  * first-put slot as the chain head. */
 static int rmt_add_entry(CBMRustModTree *tree, int module, const char *name, RmtDef def,
-                         int import) {
+                         int import, int vis) {
     RMT_GROW(tree, entries, entry_count, entry_cap);
     int id = tree->entry_count++;
-    tree->entries[id] = (RmtEntry){.next = -1, .import = import, .def = def};
+    tree->entries[id] = (RmtEntry){.next = -1, .import = import, .vis = vis, .def = def};
     const char *key = cbm_arena_sprintf(&tree->arena, "%d\x1f%s", module, name);
     int32_t head = cbm_idxmemo_get(&tree->names, key);
     if (head < 0) {
@@ -228,15 +235,30 @@ static int rmt_add_entry(CBMRustModTree *tree, int module, const char *name, Rmt
     return id;
 }
 
+/* The module whose subtree may name an item declared in `module` with
+ * the fact visibility `levels` (see RMT_VIS_PUB). */
+static int rmt_vis_scope(const CBMRustModTree *tree, int module, int levels) {
+    if (levels == RMT_VIS_PUB) {
+        return RMT_VIS_PUB;
+    }
+    if (levels == RMT_VIS_CRATE) {
+        return tree->crates[tree->modules[module].crate].root_module;
+    }
+    for (int i = 0; i < levels && tree->modules[module].parent >= 0; i++) {
+        module = tree->modules[module].parent;
+    }
+    return module;
+}
+
 static void rmt_add_item(CBMRustModTree *tree, int module, const char *name, RmtKind kind,
-                         uint8_t ns, int target_module) {
+                         uint8_t ns, int target_module, int vis) {
     const char *qn = NULL;
     if (kind != RMT_MODULE && kind != RMT_OPAQUE) {
         qn = cbm_arena_sprintf(&tree->arena, "%s.%s", tree->files[tree->modules[module].file].qn,
                                name);
     }
     RmtDef def = {.kind = (uint8_t)kind, .ns = ns, .module = target_module, .qn = qn};
-    (void)rmt_add_entry(tree, module, name, def, -1);
+    (void)rmt_add_entry(tree, module, name, def, -1, rmt_vis_scope(tree, module, vis));
 }
 
 /* Split `a::b::c` into segments; a leading `::` yields an empty first one. */
@@ -272,7 +294,7 @@ static int rmt_split_path(CBMArena *arena, const char *path, const char **segs, 
 }
 
 static int rmt_add_import(CBMRustModTree *tree, int module, const char *local, const char *path,
-                          bool glob) {
+                          bool glob, int vis) {
     const char *segs[RMT_MAX_SEGS];
     int count = rmt_split_path(&tree->arena, path, segs, RMT_MAX_SEGS);
     if (count <= 0) {
@@ -286,14 +308,19 @@ static int rmt_add_import(CBMRustModTree *tree, int module, const char *local, c
         return -1;
     }
     memcpy(owned, segs, (size_t)count * sizeof(*owned));
-    tree->imports[id] = (RmtImport){
-        .module = module, .next_glob = -1, .segs = owned, .seg_count = count, .glob = glob};
+    int scope = rmt_vis_scope(tree, module, vis);
+    tree->imports[id] = (RmtImport){.module = module,
+                                    .next_glob = -1,
+                                    .vis = scope,
+                                    .segs = owned,
+                                    .seg_count = count,
+                                    .glob = glob};
     if (glob) {
         tree->imports[id].next_glob = tree->modules[module].first_glob;
         tree->modules[module].first_glob = id;
     } else {
         RmtDef none = {0};
-        (void)rmt_add_entry(tree, module, local, none, id);
+        (void)rmt_add_entry(tree, module, local, none, id, scope);
     }
     return id;
 }
@@ -409,6 +436,7 @@ typedef struct {
     uint8_t op;
     uint8_t item;
     bool glob;
+    int8_t vis; /* levels above the declaring module, RMT_VIS_PUB or RMT_VIS_CRATE */
     uint32_t start;
     uint32_t end;
     const char *name;
@@ -442,6 +470,53 @@ static void rmf_push(RmfScan *scan, RmfRecord record) {
 
 static void rmf_scan_items(RmfScan *scan, TSNode container);
 
+static TSNode rmt_visibility_node(TSNode item) {
+    return cbm_find_child_by_kind(item, "visibility_modifier");
+}
+
+/* An item's `pub(..)` as a fact visibility. `pub(in path)` other than
+ * `self`/`super`/`crate` counts as crate-wide: wider than declared, so a
+ * name it hides can only add a rival candidate, never be chosen alone. */
+static int8_t rmf_visibility(const char *source, TSNode item) {
+    TSNode node = rmt_visibility_node(item);
+    if (ts_node_is_null(node)) {
+        return 0;
+    }
+    char text[RMT_KEY_MAX];
+    size_t used = 0;
+    for (uint32_t i = ts_node_start_byte(node); i < ts_node_end_byte(node); i++) {
+        if (source[i] != ' ' && source[i] != '\t' && source[i] != '\n' && source[i] != '\r') {
+            if (used + 1 >= sizeof(text)) {
+                return RMT_VIS_CRATE;
+            }
+            text[used++] = source[i];
+        }
+    }
+    text[used] = '\0';
+    if (strcmp(text, "pub") == 0) {
+        return RMT_VIS_PUB;
+    }
+    const char *inner = strncmp(text, "pub(", 4) == 0 ? text + 4 : NULL;
+    if (!inner) {
+        return RMT_VIS_CRATE; /* the 2015 `crate` modifier */
+    }
+    if (strncmp(inner, "in", 2) == 0 && strcmp(inner, "in)") != 0) {
+        inner += 2;
+    }
+    if (strcmp(inner, "self)") == 0) {
+        return 0;
+    }
+    int8_t levels = 0;
+    while (strncmp(inner, "super", 5) == 0 && levels < INT8_MAX) {
+        levels++;
+        inner += 5;
+        if (strncmp(inner, "::", 2) == 0) {
+            inner += 2;
+        }
+    }
+    return levels > 0 && strcmp(inner, ")") == 0 ? levels : RMT_VIS_CRATE;
+}
+
 static void rmf_scan_mod(RmfScan *scan, TSNode item) {
     CBMArena *arena = &scan->facts->arena;
     TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
@@ -452,11 +527,13 @@ static void rmf_scan_mod(RmfScan *scan, TSNode item) {
     TSNode body = ts_node_child_by_field_name(item, "body", 4);
     if (ts_node_is_null(body)) {
         rmf_push(scan, (RmfRecord){.op = RMF_MOD_DECL,
+                                   .vis = rmf_visibility(scan->source, item),
                                    .name = name,
                                    .text = cbm_rust_path_attribute(arena, scan->source, item)});
         return;
     }
     rmf_push(scan, (RmfRecord){.op = RMF_MOD_OPEN,
+                               .vis = rmf_visibility(scan->source, item),
                                .name = name,
                                .start = ts_node_start_byte(body),
                                .end = ts_node_end_byte(body)});
@@ -469,6 +546,7 @@ static void rmf_scan_use(RmfScan *scan, TSNode item) {
     CBMImportArray imports = {0};
     cbm_extract_rust_use_tree(arena, ts_node_child_by_field_name(item, "argument", 8), scan->source,
                               &imports);
+    int8_t vis = rmf_visibility(scan->source, item);
     for (int i = 0; i < imports.count; i++) {
         const CBMImport *imp = &imports.items[i];
         if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, "_") == 0) {
@@ -479,13 +557,16 @@ static void rmf_scan_use(RmfScan *scan, TSNode item) {
             if (len > 3) {
                 rmf_push(scan, (RmfRecord){.op = RMF_IMPORT,
                                            .glob = true,
+                                           .vis = vis,
                                            .text = cbm_arena_strndup(arena, imp->module_path,
                                                                      len - 3)});
             }
             continue;
         }
-        rmf_push(scan,
-                 (RmfRecord){.op = RMF_IMPORT, .name = imp->local_name, .text = imp->module_path});
+        rmf_push(scan, (RmfRecord){.op = RMF_IMPORT,
+                                   .vis = vis,
+                                   .name = imp->local_name,
+                                   .text = imp->module_path});
     }
 }
 
@@ -512,7 +593,10 @@ static void rmf_scan_extern_crate(RmfScan *scan, TSNode item) {
         return;
     }
     const char *path = strcmp(name, "self") == 0 ? "crate" : cbm_arena_sprintf(arena, "::%s", name);
-    rmf_push(scan, (RmfRecord){.op = RMF_IMPORT, .name = alias ? alias : name, .text = path});
+    rmf_push(scan, (RmfRecord){.op = RMF_IMPORT,
+                               .vis = rmf_visibility(scan->source, item),
+                               .name = alias ? alias : name,
+                               .text = path});
 }
 
 static void rmf_scan_item(RmfScan *scan, TSNode item) {
@@ -534,6 +618,7 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
             if (!ts_node_is_null(name)) {
                 rmf_push(scan, (RmfRecord){.op = RMF_ITEM,
                                            .item = (uint8_t)i,
+                                           .vis = rmf_visibility(scan->source, item),
                                            .name = cbm_node_text(&scan->facts->arena, name,
                                                                  scan->source)});
             }
@@ -631,14 +716,14 @@ static void rmt_build_mod_decl(const RmtBuild *build, const RmfRecord *decl, int
     const char *children_dir = NULL;
     int file = rmt_out_of_line_file(build, decl, child_dir, inline_scope, &children_dir);
     if (file < 0 || depth >= RMT_MAX_DEPTH) {
-        rmt_add_item(tree, module, decl->name, RMT_OPAQUE, RMT_NS_TYPE, -1);
+        rmt_add_item(tree, module, decl->name, RMT_OPAQUE, RMT_NS_TYPE, -1, decl->vis);
         return;
     }
     int child = rmt_new_module(tree, build->crate, module, file, 0, UINT32_MAX);
     if (child < 0) {
         return;
     }
-    rmt_add_item(tree, module, decl->name, RMT_MODULE, RMT_NS_TYPE, child);
+    rmt_add_item(tree, module, decl->name, RMT_MODULE, RMT_NS_TYPE, child, decl->vis);
     rmt_build_file(build, child, file, children_dir, depth + 1);
 }
 
@@ -673,7 +758,7 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
                 at = rmf_skip_body(facts, at);
                 break;
             }
-            rmt_add_item(tree, module, record->name, RMT_MODULE, RMT_NS_TYPE, child);
+            rmt_add_item(tree, module, record->name, RMT_MODULE, RMT_NS_TYPE, child, record->vis);
             at = rmt_build_items(build, facts, at, child, dir, true, depth + 1);
             break;
         }
@@ -681,14 +766,15 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
             rmt_build_mod_decl(build, record, module, child_dir, inline_scope, depth);
             break;
         case RMF_IMPORT:
-            (void)rmt_add_import(tree, module, record->name, record->text, record->glob);
+            (void)rmt_add_import(tree, module, record->name, record->text, record->glob,
+                                 record->vis);
             break;
         case RMF_MACRO:
             tree->modules[module].macro_items = true;
             break;
         case RMF_ITEM:
             rmt_add_item(tree, module, record->name, RMT_ITEM_KINDS[record->item].kind,
-                         RMT_ITEM_KINDS[record->item].ns, -1);
+                         RMT_ITEM_KINDS[record->item].ns, -1, record->vis);
             break;
         default:
             break;
@@ -752,6 +838,7 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
         const char *kind = ts_node_type(item);
         if (strcmp(kind, "mod_item") == 0) {
             rmt_digest_str(d, "mod");
+            rmt_digest_node(d, rmt_visibility_node(item));
             rmt_digest_node(d, ts_node_child_by_field_name(item, "name", 4));
             const char *attr = cbm_rust_path_attribute(arena, d->source, item);
             rmt_digest_str(d, attr ? "path" : "nopath");
@@ -764,6 +851,7 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
             }
         } else if (strcmp(kind, "use_declaration") == 0) {
             rmt_digest_str(d, "use");
+            rmt_digest_node(d, rmt_visibility_node(item));
             rmt_digest_node(d, ts_node_child_by_field_name(item, "argument", 8));
         } else if (strcmp(kind, "extern_crate_declaration") == 0) {
             rmt_digest_str(d, "extern");
@@ -774,6 +862,7 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
             for (size_t k = 0; k < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); k++) {
                 if (strcmp(kind, RMT_ITEM_KINDS[k].node_kind) == 0) {
                     rmt_digest_str(d, kind);
+                    rmt_digest_node(d, rmt_visibility_node(item));
                     rmt_digest_node(d, ts_node_child_by_field_name(item, "name", 4));
                     break;
                 }
@@ -873,13 +962,57 @@ static void rmt_import_defs(CBMRustModTree *tree, int import, bool building, uin
     rmt_defs_merge(out, &imp->result, ns);
 }
 
-/* Names that come through `use path::*`: a module's own names, recursively. */
+/* True when `module` may name what is declared with visibility scope `vis`. */
+static bool rmt_sees(const CBMRustModTree *tree, int vis, int module) {
+    if (vis == RMT_VIS_PUB) {
+        return true;
+    }
+    for (int m = module; m >= 0; m = tree->modules[m].parent) {
+        if (m == vis) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The modules a glob-imported name must be visible to: the importer of
+ * every glob on the way to it (a name re-exported by `pub use m::*` is no
+ * wider than the item itself nor than the glob). */
+typedef struct {
+    int items[RMT_VISIT_MAX];
+    int count;
+} RmtSeers;
+
+static bool rmt_seen(const CBMRustModTree *tree, int vis, const RmtSeers *seers) {
+    for (int i = 0; seers && i < seers->count; i++) {
+        if (!rmt_sees(tree, vis, seers->items[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Names that come through `use path::*`: every name of the source module
+ * the importers may see, its own glob imports included, recursively. */
 static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns, RmtDefs *out,
-                       RmtVisit *visit, bool building);
+                       RmtVisit *visit, bool building, const RmtSeers *seers);
 
 static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name, uint8_t ns,
-                             RmtDefs *out, RmtVisit *visit, bool building) {
+                             RmtDefs *out, RmtVisit *visit, bool building,
+                             const RmtSeers *seers) {
+    RmtSeers chain = {.count = 0};
+    if (seers) {
+        chain = *seers;
+    }
+    if (chain.count >= RMT_VISIT_MAX) {
+        out->open = true;
+        return;
+    }
+    chain.items[chain.count++] = module;
     for (int g = tree->modules[module].first_glob; g >= 0; g = tree->imports[g].next_glob) {
+        if (!rmt_seen(tree, tree->imports[g].vis, seers)) {
+            continue;
+        }
         if (building) {
             rmt_resolve_import(tree, g);
         }
@@ -894,31 +1027,42 @@ static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name,
             continue;
         }
         RmtDefs found = {0};
-        rmt_lookup(tree, source->module, name, ns, &found, visit, building);
+        rmt_lookup(tree, source->module, name, ns, &found, visit, building, &chain);
         rmt_defs_merge(out, &found, ns);
     }
 }
 
+/* `name` in `module`'s own scope; with `seers`, only what each of them may
+ * see. A declaration or import they may not see still shadows the
+ * module's globs, as it does for the module itself. */
 static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns, RmtDefs *out,
-                       RmtVisit *visit, bool building) {
+                       RmtVisit *visit, bool building, const RmtSeers *seers) {
     char key[RMT_KEY_MAX];
     int written = snprintf(key, sizeof(key), "%d\x1f%s", module, name);
     if (written < 0 || written >= (int)sizeof(key)) {
         out->open = true;
         return;
     }
+    bool hidden = false;
     for (int e = cbm_idxmemo_get(&tree->names, key); e >= 0; e = tree->entries[e].next) {
         const RmtEntry *entry = &tree->entries[e];
-        if (entry->import >= 0) {
-            rmt_import_defs(tree, entry->import, building, ns, out);
-        } else if (entry->def.ns & ns) {
-            rmt_defs_add(out, &entry->def);
+        bool seen = rmt_seen(tree, entry->vis, seers);
+        RmtDefs *into = out;
+        RmtDefs unseen = {0};
+        if (!seen) {
+            into = &unseen;
         }
+        if (entry->import >= 0) {
+            rmt_import_defs(tree, entry->import, building, ns, into);
+        } else if (entry->def.ns & ns) {
+            rmt_defs_add(into, &entry->def);
+        }
+        hidden |= unseen.count > 0 || unseen.open;
     }
-    if (out->count > 0 || out->open || !rmt_visit(visit, module)) {
+    if (out->count > 0 || out->open || hidden || !rmt_visit(visit, module)) {
         return;
     }
-    rmt_lookup_globs(tree, module, name, ns, out, visit, building);
+    rmt_lookup_globs(tree, module, name, ns, out, visit, building, seers);
     if (out->count == 0 && tree->modules[module].macro_items) {
         out->open = true;
     }
@@ -989,7 +1133,7 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
     RmtVisit visit = {.count = 0};
     int scope =
         is_use && tree->crates[crate].edition_2015 ? tree->crates[crate].root_module : module;
-    rmt_lookup(tree, scope, head, ns, out, &visit, building);
+    rmt_lookup(tree, scope, head, ns, out, &visit, building, NULL);
     if (out->count > 0 || out->open) {
         return;
     }
@@ -1087,7 +1231,7 @@ static void rmt_resolve_path(CBMRustModTree *tree, CBMArena *arena, int module,
         RmtVisit visit = {.count = 0};
         cur = (RmtDefs){0};
         rmt_lookup(tree, def.module, segs[i], last ? final_ns : RMT_NS_TYPE, &cur, &visit,
-                   building);
+                   building, NULL);
         if (cur.count == 0 && !cur.open) {
             out->open = true;
             return;
