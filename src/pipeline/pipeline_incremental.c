@@ -903,7 +903,9 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
  * re-link them AFTER re-resolution + post-passes. Notes:
  *   - Only edges whose target is in a changed file and whose source is NOT
  *     are snapshotted; edges out of a changed file are regenerated when that
- *     file is re-resolved.
+ *     file is re-resolved. Rust impl links are the exception: their producer
+ *     is the impl block's file, so they are also carried out of a changed
+ *     owner (cbm_pipeline_persisted_edge_outlives_reparse).
  *   - Edge types recomputed wholesale by post-passes (SIMILAR_TO,
  *     SEMANTICALLY_RELATED) are skipped — re-linking a stale snapshot could
  *     add edges a full reindex would not produce.
@@ -938,14 +940,12 @@ static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdat
         !tgt->file_path) {
         return;
     }
-    if (!cbm_pipeline_persisted_edge_is_restorable(src->file_path, edge->type)) {
-        return;
-    }
-    /* Keep only edges that the purge would orphan permanently: target is in a
-     * changed file (its node is deleted + re-created), source is NOT (its file
-     * is never re-parsed, so the resolver won't regenerate the edge). */
-    if (!cbm_ht_get(cap->changed_paths, tgt->file_path) ||
-        cbm_ht_get(cap->changed_paths, src->file_path)) {
+    /* Keep only edges that the purge would orphan permanently: an endpoint is
+     * in a changed file (its node is deleted + re-created) and the edge's
+     * producer is never re-parsed, so the resolver won't regenerate it. */
+    if (!cbm_pipeline_persisted_edge_outlives_reparse(
+            src->file_path, edge->type, cbm_ht_get(cap->changed_paths, src->file_path) != NULL,
+            cbm_ht_get(cap->changed_paths, tgt->file_path) != NULL)) {
         return;
     }
     if (cap->count >= cap->cap) {
@@ -981,7 +981,8 @@ static int incr_restore_inbound_edges(cbm_gbuf_t *gbuf, cbm_edge_capture_t *cap)
         cbm_saved_edge_t *s = &cap->items[i];
         const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(gbuf, s->source_qn);
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(gbuf, s->target_qn);
-        if (src && tgt) {
+        if (src && tgt &&
+            cbm_pipeline_carried_edge_fits(src->file_path, s->type, src->label, tgt->label)) {
             cbm_gbuf_insert_edge(gbuf, src->id, tgt->id, s->type, s->props);
             restored++;
         }
@@ -2104,8 +2105,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         purge_paths[ci + i] = deleted[i];
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    if (cbm_delta_snapshot_inbound(staging, project, purge_paths, purge_count, &snapshot,
-                                   &snapshot_count) != 0) {
+    if (cbm_delta_snapshot_carried_edges(staging, project, purge_paths, purge_count, &snapshot,
+                                         &snapshot_count) != 0) {
         goto out;
     }
     if (cbm_delta_purge(staging, project, purge_paths, purge_count) != 0) {
@@ -2826,9 +2827,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_store_close(store);
 
-    /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
-     * the cascade delete doesn't permanently drop edges whose source lives in
-     * an unchanged (never-re-parsed) file. Re-linked after re-resolution. */
+    /* Snapshot the cross-file edges no re-parse regenerates BEFORE purging, so
+     * the cascade delete doesn't permanently drop edges whose producer lives
+     * in an unchanged (never-re-parsed) file. Re-linked after re-resolution. */
     cbm_edge_capture_t edge_cap = {0};
     edge_cap.gbuf = existing;
     {

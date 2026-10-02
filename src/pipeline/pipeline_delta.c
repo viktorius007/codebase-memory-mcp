@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include "foundation/compat_fs.h"
+#include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "sqlite3.h"
 #include "store/store.h"
@@ -89,8 +90,119 @@ int cbm_delta_stage_clone(const char *final_db_path, char **out_stage_path) {
     return 0;
 }
 
-int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const char *const *paths,
-                               int path_count, cbm_delta_saved_edge_t **out, int *out_count) {
+/* Append the current row (source QN, target QN, type, properties) to the
+ * snapshot. Returns false on allocation failure. */
+static bool delta_snapshot_push(cbm_delta_saved_edge_t **items, int *count, int *cap,
+                                sqlite3_stmt *stmt) {
+    if (*count >= *cap) {
+        int ncap = *cap ? *cap * 2 : 64;
+        cbm_delta_saved_edge_t *grown = realloc(*items, (size_t)ncap * sizeof(**items));
+        if (!grown) {
+            return false;
+        }
+        *items = grown;
+        *cap = ncap;
+    }
+    const char *sq = (const char *)sqlite3_column_text(stmt, 0);
+    const char *tq = (const char *)sqlite3_column_text(stmt, 1);
+    const char *type = (const char *)sqlite3_column_text(stmt, 2);
+    const char *props = (const char *)sqlite3_column_text(stmt, 3);
+    cbm_delta_saved_edge_t *e = &(*items)[*count];
+    e->source_qn = strdup(sq ? sq : "");
+    e->target_qn = strdup(tq ? tq : "");
+    e->type = strdup(type ? type : "");
+    e->props = strdup(props ? props : "{}");
+    if (!e->source_qn || !e->target_qn || !e->type || !e->props) {
+        free(e->source_qn);
+        free(e->target_qn);
+        free(e->type);
+        free(e->props);
+        return false;
+    }
+    (*count)++;
+    return true;
+}
+
+typedef enum {
+    DELTA_SNAPSHOT_INBOUND,  /* target re-parsed, source not */
+    DELTA_SNAPSHOT_OUTBOUND, /* source re-parsed, producer may not be */
+} delta_snapshot_side_t;
+
+/* Snapshot one chunk of re-parsed paths from one side. Rows carry the source
+ * file in column 4 and the target file in column 5; `reparsed` holds every
+ * re-parsed path, not only this chunk's. Returns 0 or CBM_NOT_FOUND. */
+static int delta_snapshot_chunk(sqlite3 *db, const char *project, const char *const *paths,
+                                int chunk, delta_snapshot_side_t side, const CBMHashTable *reparsed,
+                                cbm_delta_saved_edge_t **items, int *count, int *cap) {
+    char ph[2 * DELTA_IN_CHUNK + 1];
+    delta_placeholders(ph, chunk);
+    char sql[CBM_SZ_4K];
+    int n;
+    if (side == DELTA_SNAPSHOT_INBOUND) {
+        n = snprintf(sql, sizeof(sql),
+                     /* CROSS JOIN pins nodes-first: the planner otherwise walks
+                      * EVERY project edge through the url_path index prefix
+                      * (measured 14.6s vs 4ms at kernel scale). */
+                     "SELECT src.qualified_name, tgt.qualified_name, e.type, e.properties,"
+                     " src.file_path, tgt.file_path"
+                     " FROM nodes tgt"
+                     " CROSS JOIN edges e ON e.target_id = tgt.id"
+                     " CROSS JOIN nodes src ON e.source_id = src.id"
+                     " WHERE tgt.project = ?1 AND tgt.file_path IN (%s)"
+                     " AND src.file_path NOT IN (%s)"
+                     " AND src.file_path <> '' AND src.file_path IS NOT NULL",
+                     ph, ph);
+    } else {
+        /* Only impl links can outlive their source's re-parse; the type
+         * filter keeps the walk on the (source_id, type) index. */
+        n = snprintf(sql, sizeof(sql),
+                     "SELECT src.qualified_name, tgt.qualified_name, e.type, e.properties,"
+                     " src.file_path, tgt.file_path"
+                     " FROM nodes src"
+                     " CROSS JOIN edges e ON e.source_id = src.id"
+                     " CROSS JOIN nodes tgt ON e.target_id = tgt.id"
+                     " WHERE src.project = ?1 AND src.file_path IN (%s)"
+                     " AND e.type IN ('IMPLEMENTS', 'DEFINES_METHOD')",
+                     ph);
+    }
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    for (int i = 0; i < chunk; i++) {
+        sqlite3_bind_text(stmt, 2 + i, paths[i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        if (side == DELTA_SNAPSHOT_INBOUND) {
+            sqlite3_bind_text(stmt, 2 + chunk + i, paths[i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        }
+    }
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *type = (const char *)sqlite3_column_text(stmt, 2);
+        const char *source_file_path = (const char *)sqlite3_column_text(stmt, 4);
+        const char *target_file_path = (const char *)sqlite3_column_text(stmt, 5);
+        bool source_reparsed = side == DELTA_SNAPSHOT_OUTBOUND;
+        bool target_reparsed = side == DELTA_SNAPSHOT_INBOUND ||
+                               (target_file_path && cbm_ht_get(reparsed, target_file_path));
+        if (!cbm_pipeline_persisted_edge_outlives_reparse(source_file_path, type, source_reparsed,
+                                                          target_reparsed)) {
+            continue;
+        }
+        if (!delta_snapshot_push(items, count, cap, stmt)) {
+            sqlite3_finalize(stmt);
+            return CBM_NOT_FOUND;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return step_rc == SQLITE_DONE ? 0 : CBM_NOT_FOUND;
+}
+
+int cbm_delta_snapshot_carried_edges(cbm_store_t *store, const char *project,
+                                     const char *const *paths, int path_count,
+                                     cbm_delta_saved_edge_t **out, int *out_count) {
     *out = NULL;
     *out_count = 0;
     if (path_count <= 0) {
@@ -100,86 +212,32 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
     if (!db) {
         return CBM_NOT_FOUND;
     }
+    CBMHashTable *reparsed = cbm_ht_create((uint32_t)path_count * 2U + CBM_SZ_64);
+    if (!reparsed) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < path_count; i++) {
+        cbm_ht_set(reparsed, paths[i], (void *)paths[i]);
+    }
     cbm_delta_saved_edge_t *items = NULL;
     int count = 0;
     int cap = 0;
-    for (int off = 0; off < path_count; off += DELTA_IN_CHUNK) {
-        int chunk = path_count - off;
-        if (chunk > DELTA_IN_CHUNK) {
-            chunk = DELTA_IN_CHUNK;
-        }
-        char ph[2 * DELTA_IN_CHUNK + 1];
-        delta_placeholders(ph, chunk);
-        char sql[CBM_SZ_4K];
-        int n = snprintf(sql, sizeof(sql),
-                         /* CROSS JOIN pins nodes-first: the planner otherwise walks
-                          * EVERY project edge through the url_path index prefix
-                          * (measured 14.6s vs 4ms at kernel scale). */
-                         "SELECT src.qualified_name, tgt.qualified_name, e.type, e.properties,"
-                         " src.file_path"
-                         " FROM nodes tgt"
-                         " CROSS JOIN edges e ON e.target_id = tgt.id"
-                         " CROSS JOIN nodes src ON e.source_id = src.id"
-                         " WHERE tgt.project = ?1 AND tgt.file_path IN (%s)"
-                         " AND src.file_path NOT IN (%s)"
-                         " AND src.file_path <> '' AND src.file_path IS NOT NULL",
-                         ph, ph);
-        if (n < 0 || (size_t)n >= sizeof(sql)) {
-            cbm_delta_free_snapshot(items, count);
-            return CBM_NOT_FOUND;
-        }
-        sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-            cbm_delta_free_snapshot(items, count);
-            return CBM_NOT_FOUND;
-        }
-        sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        for (int i = 0; i < chunk; i++) {
-            sqlite3_bind_text(stmt, 2 + i, paths[off + i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 2 + chunk + i, paths[off + i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        }
-        int step_rc;
-        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-            const char *type = (const char *)sqlite3_column_text(stmt, 2);
-            const char *source_file_path = (const char *)sqlite3_column_text(stmt, 4);
-            if (!cbm_pipeline_persisted_edge_is_restorable(source_file_path, type)) {
-                continue;
+    int rc = 0;
+    static const delta_snapshot_side_t sides[] = {DELTA_SNAPSHOT_INBOUND, DELTA_SNAPSHOT_OUTBOUND};
+    for (size_t s = 0; rc == 0 && s < sizeof(sides) / sizeof(sides[0]); s++) {
+        for (int off = 0; rc == 0 && off < path_count; off += DELTA_IN_CHUNK) {
+            int chunk = path_count - off;
+            if (chunk > DELTA_IN_CHUNK) {
+                chunk = DELTA_IN_CHUNK;
             }
-            if (count >= cap) {
-                int ncap = cap ? cap * 2 : 64;
-                cbm_delta_saved_edge_t *grown = realloc(items, (size_t)ncap * sizeof(*items));
-                if (!grown) {
-                    sqlite3_finalize(stmt);
-                    cbm_delta_free_snapshot(items, count);
-                    return CBM_NOT_FOUND;
-                }
-                items = grown;
-                cap = ncap;
-            }
-            const char *sq = (const char *)sqlite3_column_text(stmt, 0);
-            const char *tq = (const char *)sqlite3_column_text(stmt, 1);
-            const char *props = (const char *)sqlite3_column_text(stmt, 3);
-            cbm_delta_saved_edge_t *e = &items[count];
-            e->source_qn = strdup(sq ? sq : "");
-            e->target_qn = strdup(tq ? tq : "");
-            e->type = strdup(type ? type : "");
-            e->props = strdup(props ? props : "{}");
-            if (!e->source_qn || !e->target_qn || !e->type || !e->props) {
-                free(e->source_qn);
-                free(e->target_qn);
-                free(e->type);
-                free(e->props);
-                sqlite3_finalize(stmt);
-                cbm_delta_free_snapshot(items, count);
-                return CBM_NOT_FOUND;
-            }
-            count++;
+            rc = delta_snapshot_chunk(db, project, paths + off, chunk, sides[s], reparsed, &items,
+                                      &count, &cap);
         }
-        sqlite3_finalize(stmt);
-        if (step_rc != SQLITE_DONE) {
-            cbm_delta_free_snapshot(items, count);
-            return CBM_NOT_FOUND;
-        }
+    }
+    cbm_ht_free(reparsed);
+    if (rc != 0) {
+        cbm_delta_free_snapshot(items, count);
+        return CBM_NOT_FOUND;
     }
     *out = items;
     *out_count = count;
@@ -464,38 +522,65 @@ static void delta_patch_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     ctx->edges++;
 }
 
-/* Re-link the snapshotted inbound edges by qualified name. A target whose QN
- * no longer exists simply matches no row — full-reindex semantics for deleted
- * symbols, dedup by the UNIQUE edge constraint. Returns false on failure.
+/* Re-link the snapshotted edges by qualified name. An endpoint whose QN no
+ * longer exists simply matches no row — full-reindex semantics for deleted
+ * symbols, dedup by the UNIQUE edge constraint — and an endpoint pair the
+ * edge's producer would no longer link (cbm_pipeline_carried_edge_fits) is
+ * dropped. Returns false on failure.
  *
  * Extracted from cbm_delta_patch to keep that function inside the
- * cognitive-complexity budget; behaviour is unchanged. */
+ * cognitive-complexity budget. */
 static bool delta_relink_snapshot(sqlite3 *db, const char *project,
                                   const cbm_delta_saved_edge_t *snapshot, int snapshot_count) {
+    sqlite3_stmt *endpoints = NULL;
     sqlite3_stmt *relink = NULL;
     if (sqlite3_prepare_v2(db,
+                           "SELECT s.id, s.file_path, s.label, t.id, t.label"
+                           " FROM nodes s, nodes t"
+                           " WHERE s.project = ?1 AND s.qualified_name = ?2"
+                           " AND t.project = ?1 AND t.qualified_name = ?3",
+                           CBM_NOT_FOUND, &endpoints, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
                            "INSERT OR IGNORE INTO edges (project, source_id, target_id,"
-                           " type, properties)"
-                           " SELECT ?1, s.id, t.id, ?2, ?3 FROM nodes s, nodes t"
-                           " WHERE s.project = ?1 AND s.qualified_name = ?4"
-                           " AND t.project = ?1 AND t.qualified_name = ?5",
+                           " type, properties) VALUES (?1, ?2, ?3, ?4, ?5)",
                            CBM_NOT_FOUND, &relink, NULL) != SQLITE_OK) {
+        sqlite3_finalize(endpoints);
         return false;
     }
     bool ok = true;
     for (int i = 0; i < snapshot_count && ok; i++) {
+        sqlite3_reset(endpoints);
+        sqlite3_bind_text(endpoints, DELTA_BIND_1, project, CBM_NOT_FOUND, DELTA_SQLITE_TRANSIENT);
+        sqlite3_bind_text(endpoints, DELTA_BIND_2, snapshot[i].source_qn, CBM_NOT_FOUND,
+                          DELTA_SQLITE_TRANSIENT);
+        sqlite3_bind_text(endpoints, DELTA_BIND_3, snapshot[i].target_qn, CBM_NOT_FOUND,
+                          DELTA_SQLITE_TRANSIENT);
+        int step_rc = sqlite3_step(endpoints);
+        if (step_rc == SQLITE_DONE) {
+            continue;
+        }
+        if (step_rc != SQLITE_ROW) {
+            ok = false;
+            break;
+        }
+        const char *source_file = (const char *)sqlite3_column_text(endpoints, 1);
+        const char *source_label = (const char *)sqlite3_column_text(endpoints, 2);
+        const char *target_label = (const char *)sqlite3_column_text(endpoints, 4);
+        if (!cbm_pipeline_carried_edge_fits(source_file, snapshot[i].type, source_label,
+                                            target_label)) {
+            continue;
+        }
         sqlite3_reset(relink);
         sqlite3_bind_text(relink, DELTA_BIND_1, project, CBM_NOT_FOUND, DELTA_SQLITE_TRANSIENT);
-        sqlite3_bind_text(relink, DELTA_BIND_2, snapshot[i].type, CBM_NOT_FOUND,
+        sqlite3_bind_int64(relink, DELTA_BIND_2, sqlite3_column_int64(endpoints, 0));
+        sqlite3_bind_int64(relink, DELTA_BIND_3, sqlite3_column_int64(endpoints, 3));
+        sqlite3_bind_text(relink, DELTA_BIND_4, snapshot[i].type, CBM_NOT_FOUND,
                           DELTA_SQLITE_TRANSIENT);
-        sqlite3_bind_text(relink, DELTA_BIND_3, snapshot[i].props, CBM_NOT_FOUND,
-                          DELTA_SQLITE_TRANSIENT);
-        sqlite3_bind_text(relink, DELTA_BIND_4, snapshot[i].source_qn, CBM_NOT_FOUND,
-                          DELTA_SQLITE_TRANSIENT);
-        sqlite3_bind_text(relink, DELTA_BIND_5, snapshot[i].target_qn, CBM_NOT_FOUND,
+        sqlite3_bind_text(relink, DELTA_BIND_5, snapshot[i].props, CBM_NOT_FOUND,
                           DELTA_SQLITE_TRANSIENT);
         ok = sqlite3_step(relink) == SQLITE_DONE;
     }
+    sqlite3_finalize(endpoints);
     sqlite3_finalize(relink);
     return ok;
 }
