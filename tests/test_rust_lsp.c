@@ -1472,6 +1472,73 @@ TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact) {
     PASS();
 }
 
+/* `vec!` evaluates its arguments as an array-expression body: a list
+ * `vec![a, b]` or a repeat `vec![x; n]`. Calls in either form, and calls in a
+ * built-in macro nested inside `vec!`, must reach their targets at their exact
+ * original-source occurrence. */
+static const CBMResolvedCall *rustlsp_vec_arg_hit(const CBMFileResult *result, const char *source,
+                                                  const char *site_text, const char *leaf) {
+    const char *site = strstr(source, site_text);
+    if (!site)
+        return NULL;
+    uint32_t start = (uint32_t)(site - source);
+    uint32_t end = start + (uint32_t)strlen(site_text);
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, leaf) == 0 &&
+            call->site_start_byte == start && call->site_end_byte == end)
+            return cbm_pipeline_find_lsp_resolution(&result->resolved_calls, call, false);
+    }
+    return NULL;
+}
+
+TEST(rustlsp_vec_macro_args_resolve_in_both_forms) {
+    const char *caller = "fn hidden() {\n"
+                         "    let _ = vec![a::one(), a::two()];\n"
+                         "    let _ = vec![a::three(); a::count()];\n"
+                         "    let _ = vec![format!(\"{}\", a::four())];\n"
+                         "}\n";
+    const char *leaves[] = {"one", "two", "three", "count", "four"};
+    const char *sites[] = {"a::one()", "a::two()", "a::three()", "a::count()", "a::four()"};
+    enum { N = 5 };
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMLSPDef defs[N];
+    memset(defs, 0, sizeof(defs));
+    for (int i = 0; i < N; i++) {
+        defs[i].qualified_name = cbm_arena_sprintf(&result.arena, "test.a.%s", leaves[i]);
+        defs[i].short_name = leaves[i];
+        defs[i].label = "Function";
+        defs[i].def_module_qn = "test.a";
+        defs[i].return_types = "usize";
+        defs[i].lang = CBM_LANG_RUST;
+    }
+    const char *imp_names[] = {"a"};
+    const char *imp_qns[] = {"test::a"};
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&result.arena, defs, N);
+    ASSERT_NOT_NULL(reg);
+    cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
+                                         "test.main", reg, imp_names, imp_qns, 1, NULL,
+                                         /*manifest=*/NULL,
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL);
+
+    bool resolved[N];
+    for (int i = 0; i < N; i++) {
+        const CBMResolvedCall *hit = rustlsp_vec_arg_hit(&result, caller, sites[i], leaves[i]);
+        resolved[i] = hit && hit->callee_qn && strcmp(hit->callee_qn, defs[i].qualified_name) == 0;
+    }
+
+    cbm_arena_destroy(&result.arena);
+    ASSERT_TRUE(resolved[0]); /* list form, first element */
+    ASSERT_TRUE(resolved[1]); /* list form, second element */
+    ASSERT_TRUE(resolved[2]); /* repeat form, element */
+    ASSERT_TRUE(resolved[3]); /* repeat form, length */
+    ASSERT_TRUE(resolved[4]); /* format! nested inside vec! */
+    PASS();
+}
+
 /* Rust operator desugaring has the same carrier join hazard. With two `add`
  * targets in one caller, zero-span carriers both join the first semantic
  * record. Exact spans must preserve one Alpha edge and one Beta edge. */
@@ -7852,6 +7919,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_shared_dispatch_merges_existing_exact_occurrence);
     RUN_TEST(rustlsp_scratch_cross_macro_carrier_survives_copy);
     RUN_TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact);
+    RUN_TEST(rustlsp_vec_macro_args_resolve_in_both_forms);
     RUN_TEST(rustlsp_operator_carriers_are_occurrence_exact);
     RUN_TEST(rustlsp_macro_operator_has_one_exact_carrier);
     RUN_TEST(rustlsp_known_std_macro_resolutions_have_exact_sites);

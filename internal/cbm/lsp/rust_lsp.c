@@ -4561,8 +4561,16 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
  * resolving calls in it is sound — it recovers exactly the calls the program
  * makes. We wrap the args in a block so each comma-separated argument parses
  * as its own statement; the current scope (params/locals) is preserved so
- * typed receivers still resolve. */
-static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation) {
+ * typed receivers still resolve. `form` names the syntax the arguments obey:
+ * a comma-separated expression list, or an array-expression body (`vec!`'s
+ * `a, b` and `x; n`). */
+typedef enum {
+    RUST_MACRO_ARGS_EXPR_LIST,
+    RUST_MACRO_ARGS_ARRAY_BODY,
+} RustMacroArgForm;
+
+static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation,
+                                         RustMacroArgForm form) {
     if (!ctx || ts_node_is_null(invocation))
         return;
     if (ctx->macro_expand_depth >= 8)
@@ -4611,8 +4619,11 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation)
      * thing parses as one valid expression (a trailing format-spec arg like
      * `width = w` would otherwise break statement parsing). Calls inside any
      * element are still walked. */
-    static const char macro_arg_prefix[] = "fn __cbm_macro_args() { let _ = (";
-    char *wrapped = cbm_arena_sprintf(ctx->arena, "%s%s); }\n", macro_arg_prefix, arg_text);
+    bool array_body = form == RUST_MACRO_ARGS_ARRAY_BODY;
+    const char *macro_arg_prefix =
+        array_body ? "fn __cbm_macro_args() { let _ = [" : "fn __cbm_macro_args() { let _ = (";
+    char *wrapped = cbm_arena_sprintf(ctx->arena, "%s%s%s; }\n", macro_arg_prefix, arg_text,
+                                      array_body ? "]" : ")");
     if (!wrapped)
         return;
 
@@ -5854,7 +5865,9 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                         strcmp(mname, "debug_assert_eq") == 0 ||
                         strcmp(mname, "debug_assert_ne") == 0 || strcmp(mname, "dbg") == 0;
                     if (expr_arg_macro) {
-                        rust_resolve_macro_arg_exprs(ctx, node);
+                        rust_resolve_macro_arg_exprs(ctx, node, RUST_MACRO_ARGS_EXPR_LIST);
+                    } else if (strcmp(mname, "vec") == 0) {
+                        rust_resolve_macro_arg_exprs(ctx, node, RUST_MACRO_ARGS_ARRAY_BODY);
                     }
                     if (strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
                         strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
