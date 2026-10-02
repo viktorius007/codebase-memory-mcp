@@ -7713,6 +7713,77 @@ TEST(rustlsp_followup_b_pathological_no_hang) {
     cbm_free_result(r); PASS();
 }
 
+/* ── Crate module tree built from scanned per-file facts ──────── */
+
+typedef struct {
+    CBMRustModTree *tree;
+    CBMArena arena;
+} RustModTreeFixture;
+
+/* lib.rs declares `a` and `b` out of line and `inner` inline, and imports
+ * a::f as h. `b_readable` false stands for a file that could not be read:
+ * its facts are NULL. Facts are freed before any query, so a resolve that
+ * still pointed into them would fault under ASan. */
+static RustModTreeFixture rust_modtree_from_facts(bool b_readable) {
+    static const char *const rels[] = {"src/lib.rs", "src/a.rs", "src/b.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.a", "p.src.b"};
+    static const char *const sources[] = {
+        "mod a;\nmod b;\npub mod inner { pub fn g() {} }\nuse a::f as h;\n",
+        "pub fn f() {}\n",
+        "pub const X: u8 = 0;\n",
+    };
+    RustModTreeFixture fx = {.tree = cbm_rust_modtree_new()};
+    cbm_arena_init(&fx.arena);
+    CBMRustModFacts *facts[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        (void)cbm_rust_modtree_add_file(fx.tree, rels[i], qns[i]);
+        if (i != 2 || b_readable) {
+            facts[i] = cbm_rust_modfacts_scan(sources[i], (int)strlen(sources[i]));
+        }
+    }
+    (void)cbm_rust_modtree_add_crate(fx.tree, "src/lib.rs", "p", false);
+    cbm_rust_modtree_finish(fx.tree, (const CBMRustModFacts *const *)facts);
+    for (int i = 0; i < 3; i++) {
+        cbm_rust_modfacts_free(facts[i]);
+    }
+    return fx;
+}
+
+static CBMRustPathResult rust_modtree_lookup(RustModTreeFixture *fx, const char *path) {
+    return cbm_rust_modtree_resolve(fx->tree, &fx->arena, "p.src.lib", 0, path, NULL, NULL, 0);
+}
+
+static void rust_modtree_fixture_free(RustModTreeFixture *fx) {
+    cbm_rust_modtree_free(fx->tree);
+    cbm_arena_destroy(&fx->arena);
+}
+
+TEST(rustlsp_modtree_built_from_scanned_facts) {
+    RustModTreeFixture fx = rust_modtree_from_facts(true);
+    ASSERT_EQ(cbm_rust_modtree_file_count(fx.tree), 3);
+    CBMRustPathResult out_of_line = rust_modtree_lookup(&fx, "a::f");
+    ASSERT_EQ(out_of_line.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(out_of_line.qn, "p.src.a.f");
+    CBMRustPathResult imported = rust_modtree_lookup(&fx, "h");
+    ASSERT_EQ(imported.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(imported.qn, "p.src.a.f");
+    CBMRustPathResult inline_item = rust_modtree_lookup(&fx, "inner::g");
+    ASSERT_EQ(inline_item.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(inline_item.qn, "p.src.lib.g");
+    ASSERT_EQ(rust_modtree_lookup(&fx, "b::X").kind, CBM_RUST_PATH_NOT_FUNCTION);
+    rust_modtree_fixture_free(&fx);
+    PASS();
+}
+
+TEST(rustlsp_modtree_unscanned_file_leaves_names_open) {
+    /* With no facts for b.rs the tree cannot prove what b::X names. */
+    RustModTreeFixture fx = rust_modtree_from_facts(false);
+    ASSERT_EQ(rust_modtree_lookup(&fx, "b::X").kind, CBM_RUST_PATH_UNKNOWN);
+    ASSERT_EQ(rust_modtree_lookup(&fx, "a::f").kind, CBM_RUST_PATH_FUNCTION);
+    rust_modtree_fixture_free(&fx);
+    PASS();
+}
+
 void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
@@ -8354,4 +8425,8 @@ void suite_rust_lsp(void) {
 
     /* FOLLOWUP B: eval-step hardening */
     RUN_TEST(rustlsp_followup_b_pathological_no_hang);
+
+    /* Crate module tree from scanned facts */
+    RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
+    RUN_TEST(rustlsp_modtree_unscanned_file_leaves_names_open);
 }
