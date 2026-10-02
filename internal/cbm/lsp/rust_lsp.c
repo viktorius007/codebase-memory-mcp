@@ -4731,8 +4731,11 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
     }
     if (strcmp(kind, "ref_pattern") == 0 || strcmp(kind, "mut_pattern") == 0 ||
         strcmp(kind, "reference_pattern") == 0) {
-        if (ts_node_named_child_count(pattern) > 0) {
-            rust_bind_pattern(ctx, ts_node_named_child(pattern, 0), type);
+        /* The sub-pattern is the last named child: `mut x` and `&mut x`
+         * carry a `mutable_specifier` before it. */
+        uint32_t nc = ts_node_named_child_count(pattern);
+        if (nc > 0) {
+            rust_bind_pattern(ctx, ts_node_named_child(pattern, nc - 1), type);
         }
         return;
     }

@@ -464,6 +464,63 @@ TEST(rustlsp_if_let_some) {
     PASS();
 }
 
+/* `mut x` inside a pattern: the name follows a `mutable_specifier` child and
+ * must still be bound to the matched type. */
+TEST(rustlsp_mut_pattern_if_let_some) {
+    CBMFileResult *r = extract_rust(
+        "struct Foo;\n"
+        "impl Foo { fn bar(&mut self) {} }\n"
+        "fn run(x: Option<Foo>) {\n"
+        "    if let Some(mut f) = x { f.bar(); }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Foo.bar"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_mut_pattern_match_ok_ref_mut) {
+    CBMFileResult *r = extract_rust(
+        "struct Foo;\n"
+        "impl Foo { fn bar(&mut self) {} fn baz(&mut self) {} }\n"
+        "fn run(x: Result<Foo, ()>, y: Option<Foo>) {\n"
+        "    match x { Ok(mut f) => f.bar(), Err(_) => {} }\n"
+        "    if let Some(ref mut g) = y { g.baz(); }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Foo.bar"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "Foo.baz"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_mut_pattern_let_tuple) {
+    CBMFileResult *r = extract_rust(
+        "struct A; impl A { fn aa(&mut self) {} }\n"
+        "struct B; impl B { fn bb(&mut self) {} }\n"
+        "fn run(p: (A, B)) {\n"
+        "    let (mut a, mut b) = p;\n"
+        "    a.aa();\n"
+        "    b.bb();\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "A.aa"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "B.bb"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_mut_pattern_closure_param) {
+    CBMFileResult *r = extract_rust(
+        "struct Foo;\n"
+        "impl Foo { fn bar(&mut self) -> u8 { 0 } }\n"
+        "fn run(o: Option<Foo>) -> Option<u8> { o.map(|mut f| f.bar()) }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Foo.bar"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_for_loop_vec) {
     CBMFileResult *r = extract_rust(
         "struct Item;\n"
@@ -7886,6 +7943,10 @@ void suite_rust_lsp(void) {
     /* Patterns + control flow */
     RUN_TEST(rustlsp_let_pattern_simple);
     RUN_TEST(rustlsp_if_let_some);
+    RUN_TEST(rustlsp_mut_pattern_if_let_some);
+    RUN_TEST(rustlsp_mut_pattern_match_ok_ref_mut);
+    RUN_TEST(rustlsp_mut_pattern_let_tuple);
+    RUN_TEST(rustlsp_mut_pattern_closure_param);
     RUN_TEST(rustlsp_for_loop_vec);
     RUN_TEST(rustlsp_match_arm_binding);
     RUN_TEST(rustlsp_match_payload_shadows_outer_binding);
