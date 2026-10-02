@@ -7095,7 +7095,9 @@ TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes) {
                     "pub fn spawn(host: Arc<dyn Host>) { host.notify(); }\n"
                     "pub fn helper() -> u8 { 2 }\n"
                     "#[cfg(unix)]\n"
-                    "pub fn os_name() -> u8 { helper() }\n");
+                    "pub fn os_name() -> u8 { helper() }\n"
+                    "#[cfg(not(unix))]\n"
+                    "pub fn os_name() -> u8 { 0 }\n");
     write_temp_file(tmp, "src/b.rs",
                     "use crate::a::Runtime;\n"
                     "use crate::a::helper;\n"
@@ -7987,11 +7989,13 @@ TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes
     PASS();
 }
 
-/* A cfg-gated function is published as `<name>#cfg(..)]` from the attribute
- * nearest the item, and a comment between attribute and item is transparent
- * (extract_decorators). The body's caller identity must be the same string;
- * otherwise the calls attach to the File node. Discriminators: the comment
- * line and the double attribute; `single` is the control. */
+/* A cfg-gated function with no same-named sibling keeps its plain QN: the QN
+ * every path spells, so a path call to it links. A comment between attribute
+ * and item is transparent (extract_decorators) and the body's caller identity
+ * is the same string; otherwise the calls attach to the File node.
+ * Discriminators: the path call from user.rs (lost while the node carried a
+ * `#cfg(..)]` suffix), the comment line and the double attribute; `plain` is
+ * the control. */
 TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_cfg_owner_XXXXXX");
@@ -7999,34 +8003,77 @@ TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes) {
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"cfgowner\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
+                    "pub mod user;\n"
                     "pub fn target() -> u8 { 1 }\n"
-                    "#[cfg(unix)]\n"
-                    "pub fn single() -> u8 { target() }\n"
+                    "pub fn plain() -> u8 { target() }\n"
                     "#[cfg(unix)]\n"
                     "// a comment between the attribute and the item\n"
                     "pub fn commented() -> u8 { target() }\n"
                     "#[cfg(unix)]\n"
                     "#[cfg(not(test))]\n"
                     "pub fn double() -> u8 { target() }\n");
+    write_temp_file(tmp, "src/user.rs", "pub fn use_lone() -> u8 { crate::double() }\n");
     write_rust_pad_files(tmp, 52);
-    const RustExactCallPair pairs[3] = {
-        {"src.lib.single#cfg(unix)]", "src.lib.target"},
-        {"src.lib.commented#cfg(unix)]", "src.lib.target"},
-        {"src.lib.double#cfg(not(test))]", "src.lib.target"},
+    const RustExactCallPair pairs[4] = {
+        {"src.lib.plain", "src.lib.target"},
+        {"src.lib.commented", "src.lib.target"},
+        {"src.lib.double", "src.lib.target"},
+        {"src.user.use_lone", "src.lib.double"},
     };
-    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 3, "target");
+    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "target");
     th_rmtree(tmp);
 
-    ASSERT_EQ(observed.sequential.run_rc, 0);
-    ASSERT_EQ(observed.parallel.run_rc, 0);
-    ASSERT_TRUE(observed.sequential.found[0]); /* control */
-    ASSERT_TRUE(observed.parallel.found[0]);
-    ASSERT_TRUE(observed.sequential.found[1]);
-    ASSERT_TRUE(observed.parallel.found[1]);
-    ASSERT_TRUE(observed.sequential.found[2]);
-    ASSERT_TRUE(observed.parallel.found[2]);
-    ASSERT_FALSE(observed.sequential.file_node_calls_target);
-    ASSERT_FALSE(observed.parallel.file_node_calls_target);
+    const RustExactCallObservation *modes[2] = {&observed.sequential, &observed.parallel};
+    for (int m = 0; m < 2; m++) {
+        ASSERT_EQ(modes[m]->run_rc, 0);
+        ASSERT_TRUE(modes[m]->found[0]); /* control */
+        ASSERT_TRUE(modes[m]->found[1]);
+        ASSERT_TRUE(modes[m]->found[2]);
+        ASSERT_TRUE(modes[m]->found[3]);
+        ASSERT_FALSE(modes[m]->file_node_calls_target);
+    }
+    PASS();
+}
+
+/* cfg twins (two same-named fns under different `cfg`) keep distinct
+ * `<name>#cfg(..)]` QNs and each owns its own body's calls. A path call names
+ * no predicate, so it cannot be attributed to one twin: it publishes no edge
+ * to either. Discriminators: `fallback` is called only by the `not(unix)`
+ * twin, so a merged node would own both calls; the twin call from user.rs. */
+TEST(pipeline_rust_cfg_twins_stay_distinct_and_unattributed_calls_publish_nothing) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_cfg_twins_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"cfgtwins\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub mod user;\n"
+                    "pub fn target() -> u8 { 1 }\n"
+                    "pub fn fallback() -> u8 { 0 }\n"
+                    "#[cfg(unix)]\n"
+                    "pub fn os_name() -> u8 { target() }\n"
+                    "#[cfg(not(unix))]\n"
+                    "pub fn os_name() -> u8 { fallback() }\n");
+    write_temp_file(tmp, "src/user.rs", "pub fn use_twin() -> u8 { crate::os_name() }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustExactCallPair pairs[4] = {
+        {"src.lib.os_name#cfg(unix)]", "src.lib.target"},
+        {"src.lib.os_name#cfg(not(unix))]", "src.lib.fallback"},
+        {"src.user.use_twin", "src.lib.os_name#cfg(unix)]"},
+        {"src.user.use_twin", "src.lib.os_name#cfg(not(unix))]"},
+    };
+    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "target");
+    th_rmtree(tmp);
+
+    const RustExactCallObservation *modes[2] = {&observed.sequential, &observed.parallel};
+    for (int m = 0; m < 2; m++) {
+        ASSERT_EQ(modes[m]->run_rc, 0);
+        ASSERT_TRUE(modes[m]->found[0]);
+        ASSERT_TRUE(modes[m]->found[1]);
+        ASSERT_FALSE(modes[m]->found[2]);
+        ASSERT_FALSE(modes[m]->found[3]);
+        ASSERT_FALSE(modes[m]->file_node_calls_target);
+    }
     PASS();
 }
 
@@ -17351,6 +17398,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes);
     RUN_TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes);
+    RUN_TEST(pipeline_rust_cfg_twins_stay_distinct_and_unattributed_calls_publish_nothing);
     RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
     RUN_TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes);

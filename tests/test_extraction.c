@@ -911,6 +911,41 @@ TEST(rust_calls_to_fns_named_like_builtin_macros) {
     PASS();
 }
 
+/* A cfg-gated function keeps the plain QN that every path to it spells; only
+ * cfg twins (same-named siblings) fold their predicate into the QN. The lone
+ * fn in `inner` shares its name with a twin outside that module, so the
+ * sibling scope, not the file, decides. */
+TEST(rust_cfg_suffix_only_on_same_named_siblings) {
+    CBMFileResult *r = extract("#[cfg(unix)]\n"
+                               "pub fn lone() -> u8 { 1 }\n"
+                               "#[cfg(unix)]\n"
+                               "pub fn twin() -> u8 { 1 }\n"
+                               "#[cfg(not(unix))]\n"
+                               "pub fn twin() -> u8 { 0 }\n"
+                               "mod inner {\n"
+                               "    #[cfg(test)]\n"
+                               "    pub fn twin() -> u8 { 2 }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def_qn(r, "t.lib.lone"));
+    ASSERT(has_def_qn(r, "t.lib.twin#cfg(unix)]"));
+    ASSERT(has_def_qn(r, "t.lib.twin#cfg(not(unix))]"));
+    ASSERT_EQ(count_defs_named(r, "Function", "twin"), 3);
+    int inner_twin = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->start_line == 9 && strcmp(d->name, "twin") == 0) {
+            inner_twin++;
+            ASSERT_NULL(strchr(d->qualified_name, '#'));
+        }
+    }
+    ASSERT_EQ(inner_twin, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_struct) {
     CBMFileResult *r = extract("pub struct Point { pub x: f64, pub y: f64 }\nimpl Point { pub fn "
                                "new(x: f64, y: f64) -> Self { Point { x, y } } }\n",
@@ -7857,6 +7892,7 @@ SUITE(extraction) {
     /* Systems */
     RUN_TEST(rust_function);
     RUN_TEST(rust_calls_to_fns_named_like_builtin_macros);
+    RUN_TEST(rust_cfg_suffix_only_on_same_named_siblings);
     RUN_TEST(rust_struct);
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
