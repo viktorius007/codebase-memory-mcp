@@ -1582,6 +1582,28 @@ static char *gather_scoped_path(RustLSPContext *ctx, TSNode node) {
     return rust_node_text(ctx, node);
 }
 
+static bool rust_original_offset(const RustLSPContext *ctx, TSNode node, uint32_t *out);
+
+/* The type a path in a type position names, resolved through the crate's
+ * declared module tree and `use` graph exactly as a call path is: the
+ * declaring definition's QN, or NULL when the tree does not settle it on a
+ * project type (generic parameter, item outside the project, undecidable). */
+static const char *rust_type_qn_by_module_tree(RustLSPContext *ctx, TSNode node, const char *path) {
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    uint32_t offset = 0;
+    if (!tree || !ctx->module_qn || !path || ctx->glob_count > ctx->file_glob_count ||
+        !rust_original_offset(ctx, node, &offset)) {
+        return NULL;
+    }
+    int block_uses = ctx->use_count > ctx->file_use_count ? ctx->use_count - ctx->file_use_count : 0;
+    CBMRustPathResult r =
+        cbm_rust_modtree_resolve_type(tree, ctx->arena, ctx->module_qn, offset, path,
+                                      block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
+                                      block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL,
+                                      block_uses);
+    return r.kind == CBM_RUST_PATH_TYPE ? r.qn : NULL;
+}
+
 /* Resolve a textual Rust path (with `::`) into a registered type's QN, or
  * NULL if no match. */
 static const char *resolve_path_to_type_qn(RustLSPContext *ctx, const char *path) {
@@ -1640,8 +1662,8 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         if (strcmp(name, "Self") == 0 && ctx->self_type_qn) {
             return cbm_type_named(ctx->arena, ctx->self_type_qn);
         }
-        const char *qn = rust_resolve_path_expr(ctx, name);
-        return cbm_type_named(ctx->arena, qn);
+        const char *qn = rust_type_qn_by_module_tree(ctx, node, name);
+        return cbm_type_named(ctx->arena, qn ? qn : rust_resolve_path_expr(ctx, name));
     }
 
     /* scoped_type_identifier: A::B::C */
@@ -1650,8 +1672,8 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         if (!path) {
             return cbm_type_unknown();
         }
-        const char *qn = resolve_path_to_type_qn(ctx, path);
-        return cbm_type_named(ctx->arena, qn);
+        const char *qn = rust_type_qn_by_module_tree(ctx, node, path);
+        return cbm_type_named(ctx->arena, qn ? qn : resolve_path_to_type_qn(ctx, path));
     }
 
     /* reference_type: &T or &mut T */
@@ -1737,7 +1759,10 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         if (!head) {
             return cbm_type_unknown();
         }
-        const char *head_qn = resolve_path_to_type_qn(ctx, head);
+        const char *head_qn = rust_type_qn_by_module_tree(ctx, tn, head);
+        if (!head_qn) {
+            head_qn = resolve_path_to_type_qn(ctx, head);
+        }
 
         /* Gather type_arguments. */
         TSNode args = ts_node_child_by_field_name(node, "type_arguments", 14);
@@ -1811,8 +1836,28 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
  * area that tree-sitter would produce in `rust_parse_type_node` but
  * without a parser. This is the same trade-off `cbm_rust_parse_return_type_text`
  * makes for Go. */
+/* The type a path spelled in `module_qn`'s file names, through the crate
+ * module tree: a project type's QN, or an outside item's path as the `use`
+ * graph spells it (a bare prelude name takes its canonical path). NULL when
+ * there is no tree or it does not settle the name. */
+static const char *rust_text_type_qn_by_module_tree(const CBMRustModTree *tree, CBMArena *arena,
+                                                    const char *module_qn, const char *path) {
+    if (!tree || !module_qn) {
+        return NULL;
+    }
+    CBMRustPathResult r = cbm_rust_modtree_resolve_type_in_file(tree, arena, module_qn, path);
+    if (r.kind == CBM_RUST_PATH_TYPE) {
+        return r.qn;
+    }
+    if (r.kind != CBM_RUST_PATH_NOT_FUNCTION) {
+        return NULL;
+    }
+    return r.qn ? r.qn : rust_lookup_prelude(path);
+}
+
 static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *text,
-                                                  const char *module_qn, const char **type_params) {
+                                                  const char *module_qn, const char **type_params,
+                                                  const CBMRustModTree *tree) {
     if (!text || !text[0]) {
         return cbm_type_unknown();
     }
@@ -1870,7 +1915,7 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
         if (strncmp(p, "mut ", 4) == 0) {
             p += 4;
         }
-        const CBMType *elem = parse_type_text_with_params(arena, p, module_qn, type_params);
+        const CBMType *elem = parse_type_text_with_params(arena, p, module_qn, type_params, tree);
         return cbm_type_reference(arena, elem);
     }
 
@@ -1883,7 +1928,7 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
             p += 4;
         }
         return cbm_type_pointer(arena,
-                                parse_type_text_with_params(arena, p, module_qn, type_params));
+                                parse_type_text_with_params(arena, p, module_qn, type_params, tree));
     }
 
     /* Slice: [T] */
@@ -1903,7 +1948,7 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
             }
         }
         return cbm_type_slice(arena,
-                              parse_type_text_with_params(arena, inner, module_qn, type_params));
+                              parse_type_text_with_params(arena, inner, module_qn, type_params, tree));
     }
 
     /* Unit / never */
@@ -1933,7 +1978,7 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
             }
         }
         if (!has_comma) {
-            return parse_type_text_with_params(arena, inner, module_qn, type_params);
+            return parse_type_text_with_params(arena, inner, module_qn, type_params, tree);
         }
         /* Split by top-level commas. */
         const CBMType *elems[16];
@@ -1953,7 +1998,7 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
                     start++;
                 if (count < 15 && *start) {
                     elems[count++] =
-                        parse_type_text_with_params(arena, start, module_qn, type_params);
+                        parse_type_text_with_params(arena, start, module_qn, type_params, tree);
                 }
                 if (save == '\0')
                     break;
@@ -1995,14 +2040,17 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
                     /* Skip lifetime args. */
                     if (*start != '\'' && *start && targ_count < 15) {
                         targs[targ_count++] =
-                            parse_type_text_with_params(arena, start, module_qn, type_params);
+                            parse_type_text_with_params(arena, start, module_qn, type_params, tree);
                     }
                     if (save == '\0')
                         break;
                     start = q + 1;
                 }
             }
-            const char *head_qn = head;
+            const char *head_qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, head);
+            if (!head_qn) {
+                head_qn = head;
+            }
             if (is_rust_primitive(head)) {
                 /* Primitives don't take generics in practice except for str ref — pass through. */
                 return cbm_type_builtin(arena, head);
@@ -2029,6 +2077,12 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
     }
     /* Has `::` → absolute path; treat dotted paths as already-qualified
      * QNs (cross-file callers pass module-qualified text directly). */
+    if (!strchr(text, '.')) {
+        const char *declared = rust_text_type_qn_by_module_tree(tree, arena, module_qn, text);
+        if (declared) {
+            return cbm_type_named(arena, declared);
+        }
+    }
     if (strstr(text, "::")) {
         return cbm_type_named(arena, convert_path_to_qn(arena, text));
     }
@@ -2041,18 +2095,27 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
 /* Public-ish helper used by the cross-file path. */
 static const CBMType *rust_parse_return_type_text(CBMArena *arena, const char *text,
                                                   const char *module_qn) {
-    return parse_type_text_with_params(arena, text, module_qn, NULL);
+    return parse_type_text_with_params(arena, text, module_qn, NULL, NULL);
+}
+
+/* A type spelled in the file of `module_qn`, its names resolved through the
+ * crate module tree when one is given. */
+static const CBMType *rust_parse_def_type_text(CBMArena *arena, const char *text,
+                                               const char *module_qn, const CBMRustModTree *tree) {
+    return parse_type_text_with_params(arena, text, module_qn, NULL, tree);
 }
 
 typedef struct {
     const char *module_qn;
+    const CBMRustModTree *tree;
 } RustSignatureParamParserContext;
 
 static const CBMType *rust_signature_param_type_adapter(CBMArena *arena, const char *text,
                                                         void *parser_ctx) {
     const RustSignatureParamParserContext *ctx =
         (const RustSignatureParamParserContext *)parser_ctx;
-    return rust_parse_return_type_text(arena, text, ctx ? ctx->module_qn : NULL);
+    return rust_parse_def_type_text(arena, text, ctx ? ctx->module_qn : NULL,
+                                    ctx ? ctx->tree : NULL);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -8085,7 +8148,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                     if (colon && colon > entry && colon[1]) {
                         *colon = '\0';
                         names[n] = entry;
-                        types[n] = rust_parse_return_type_text(arena, colon + 1, def_mod);
+                        types[n] = rust_parse_def_type_text(arena, colon + 1, def_mod, tree);
                         n++;
                     }
                     entry = bar ? bar + 1 : NULL;
@@ -8132,7 +8195,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                         char save = *p;
                         *p = '\0';
                         if (start[0]) {
-                            ret_types[idx++] = rust_parse_return_type_text(arena, start, def_mod);
+                            ret_types[idx++] =
+                                rust_parse_def_type_text(arena, start, def_mod, tree);
                         }
                         if (save == '\0')
                             break;
@@ -8141,7 +8205,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                 }
                 ret_types[idx] = NULL;
             }
-            RustSignatureParamParserContext parser_ctx = {.module_qn = def_mod};
+            RustSignatureParamParserContext parser_ctx = {.module_qn = def_mod, .tree = tree};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 rust_signature_param_type_adapter, &parser_ctx);
