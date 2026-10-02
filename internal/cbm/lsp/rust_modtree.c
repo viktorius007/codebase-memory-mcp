@@ -993,7 +993,11 @@ static bool rmt_seen(const CBMRustModTree *tree, int vis, const RmtSeers *seers)
 }
 
 /* Names that come through `use path::*`: every name of the source module
- * the importers may see, its own glob imports included, recursively. */
+ * the importers may see, its own glob imports included, recursively.
+ * Code that compiles never uses a name two globs supply as different items,
+ * so a glob whose contents are unknown (an external module, an enum, an
+ * undecided path) cannot change a name a modelled glob supplies: it only
+ * leaves a name no modelled glob supplies undecided. */
 static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns, RmtDefs *out,
                        RmtVisit *visit, bool building, const RmtSeers *seers);
 
@@ -1009,6 +1013,8 @@ static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name,
         return;
     }
     chain.items[chain.count++] = module;
+    bool unknown_source = false;
+    RmtDefs supplied = {0};
     for (int g = tree->modules[module].first_glob; g >= 0; g = tree->imports[g].next_glob) {
         if (!rmt_seen(tree, tree->imports[g].vis, seers)) {
             continue;
@@ -1017,18 +1023,25 @@ static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name,
             rmt_resolve_import(tree, g);
         }
         const RmtImport *imp = &tree->imports[g];
-        if (imp->state != RMT_IMPORT_DONE || imp->result.open || imp->result.count != 1) {
-            out->open = true;
-            continue;
+        if (imp->state == RMT_IMPORT_ACTIVE) {
+            continue; /* a glob never supplies a name its own path depends on */
         }
-        const RmtDef *source = &imp->result.defs[0];
-        if (source->kind != RMT_MODULE) {
-            out->open = true; /* enum variants, external modules: not modelled */
+        if (imp->state != RMT_IMPORT_DONE || imp->result.open || imp->result.count != 1 ||
+            imp->result.defs[0].kind != RMT_MODULE) {
+            unknown_source = true;
             continue;
         }
         RmtDefs found = {0};
-        rmt_lookup(tree, source->module, name, ns, &found, visit, building, &chain);
-        rmt_defs_merge(out, &found, ns);
+        rmt_lookup(tree, imp->result.defs[0].module, name, ns, &found, visit, building, &chain);
+        if (found.count == 0) {
+            unknown_source |= found.open;
+            continue;
+        }
+        rmt_defs_merge(&supplied, &found, ns);
+    }
+    rmt_defs_merge(out, &supplied, ns);
+    if (supplied.count == 0 && unknown_source) {
+        out->open = true;
     }
 }
 

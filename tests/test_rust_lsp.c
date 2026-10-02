@@ -8359,11 +8359,15 @@ TEST(rustlsp_modtree_built_from_scanned_facts) {
     PASS();
 }
 
-TEST(rustlsp_modtree_unscanned_file_leaves_names_open) {
-    /* With no facts for b.rs, `use b::*` may bring in another `f`, so the
-     * glob candidate from `a` is no longer proven; a path into `a` still is. */
+TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open) {
+    /* With no facts for b.rs, `use b::*` may bring in any name. A name the
+     * `a` glob supplies stays `a`'s (b supplying another `f` would make the
+     * use an ambiguity error); a name only b could supply stays open. */
     RustModTreeFixture fx = rust_modtree_from_facts(false);
-    ASSERT_EQ(rust_modtree_lookup(&fx, "f").kind, CBM_RUST_PATH_UNKNOWN);
+    CBMRustPathResult glob = rust_modtree_lookup(&fx, "f");
+    ASSERT_EQ(glob.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(glob.qn, "p.src.a.f");
+    ASSERT_EQ(rust_modtree_lookup(&fx, "X").kind, CBM_RUST_PATH_UNKNOWN);
     ASSERT_EQ(rust_modtree_lookup(&fx, "a::f").kind, CBM_RUST_PATH_FUNCTION);
     rust_modtree_fixture_free(&fx);
     PASS();
@@ -8455,6 +8459,163 @@ TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved) {
     CBMRustPathResult r =
         cbm_rust_modtree_resolve_type(tree, &arena, "p.src.user", 0, "Y", NULL, NULL, 0);
     ASSERT_EQ(r.kind, CBM_RUST_PATH_UNKNOWN);
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Two project crates: `p` rooted at files[0], `q` at files[q_root]. Both
+ * see `ext`, a crate outside the project; `p` also sees `q`. */
+static CBMRustModTree *rust_modtree_two_crates(const char *const *rels, const char *const *qns,
+                                               const char *const *sources, int count,
+                                               int q_root) {
+    CBMRustModTree *tree = cbm_rust_modtree_new();
+    CBMRustModFacts *facts[8] = {0};
+    for (int i = 0; i < count && i < 8; i++) {
+        (void)cbm_rust_modtree_add_file(tree, rels[i], qns[i]);
+        facts[i] = cbm_rust_modfacts_scan(sources[i], (int)strlen(sources[i]));
+    }
+    int p = cbm_rust_modtree_add_crate(tree, rels[0], "p", false);
+    int q = cbm_rust_modtree_add_crate(tree, rels[q_root], "q", false);
+    cbm_rust_modtree_add_extern(tree, p, "q", q);
+    cbm_rust_modtree_add_extern(tree, p, "ext", -1);
+    cbm_rust_modtree_add_extern(tree, q, "ext", -1);
+    cbm_rust_modtree_finish(tree, (const CBMRustModFacts *const *)facts);
+    for (int i = 0; i < count && i < 8; i++) {
+        cbm_rust_modfacts_free(facts[i]);
+    }
+    return tree;
+}
+
+TEST(rustlsp_modtree_module_reexport_names_definition) {
+    /* `pub(crate) use q::config;` re-exports another crate's module: a path
+     * through it names the item where `q` defines it. */
+    static const char *const rels[] = {"p/src/lib.rs", "p/src/user.rs", "q/src/lib.rs",
+                                       "q/src/config.rs"};
+    static const char *const qns[] = {"w.p.src.lib", "w.p.src.user", "w.q.src.lib",
+                                      "w.q.src.config"};
+    static const char *const sources[] = {
+        "pub(crate) use q::config;\nmod user;\n",
+        "use crate::config::Config;\n",
+        "pub mod config;\n",
+        "pub struct Config;\npub fn load() {}\n",
+    };
+    CBMRustModTree *tree = rust_modtree_two_crates(rels, qns, sources, 4, 2);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustPathResult type =
+        cbm_rust_modtree_resolve_type(tree, &arena, "w.p.src.user", 0, "Config", NULL, NULL, 0);
+    ASSERT_EQ(type.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(type.qn, "w.q.src.config.Config");
+    CBMRustPathResult call = cbm_rust_modtree_resolve(tree, &arena, "w.p.src.user", 0,
+                                                      "crate::config::load", NULL, NULL, 0);
+    ASSERT_EQ(call.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(call.qn, "w.q.src.config.load");
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_modtree_renamed_reexport_names_definition) {
+    /* `pub use a::B as C;`: `C` is `B`, and `C::new` is `B`'s item. */
+    static const char *const rels[] = {"p/src/lib.rs", "q/src/lib.rs", "q/src/a.rs"};
+    static const char *const qns[] = {"w.p.src.lib", "w.q.src.lib", "w.q.src.a"};
+    static const char *const sources[] = {
+        "use q::C;\n",
+        "mod a;\npub use a::B as C;\n",
+        "pub struct B;\n",
+    };
+    CBMRustModTree *tree = rust_modtree_two_crates(rels, qns, sources, 3, 1);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustPathResult type =
+        cbm_rust_modtree_resolve_type(tree, &arena, "w.p.src.lib", 0, "C", NULL, NULL, 0);
+    ASSERT_EQ(type.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(type.qn, "w.q.src.a.B");
+    CBMRustPathResult call =
+        cbm_rust_modtree_resolve(tree, &arena, "w.p.src.lib", 0, "C::new", NULL, NULL, 0);
+    ASSERT_EQ(call.kind, CBM_RUST_PATH_ASSOC);
+    ASSERT_STR_EQ(call.qn, "w.q.src.a.B");
+    ASSERT_STR_EQ(call.assoc, "new");
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_modtree_two_hop_reexport_names_definition) {
+    /* `p::api` re-exports `q::Handle`, itself `q`'s re-export of `q::h::Inner`. */
+    static const char *const rels[] = {"p/src/lib.rs", "p/src/api.rs", "q/src/lib.rs",
+                                       "q/src/h.rs"};
+    static const char *const qns[] = {"w.p.src.lib", "w.p.src.api", "w.q.src.lib", "w.q.src.h"};
+    static const char *const sources[] = {
+        "pub mod api;\n",
+        "pub use q::Handle as Api;\n",
+        "mod h;\npub use h::Inner as Handle;\npub use h::run;\n",
+        "pub struct Inner;\npub fn run() {}\n",
+    };
+    CBMRustModTree *tree = rust_modtree_two_crates(rels, qns, sources, 4, 2);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustPathResult type =
+        cbm_rust_modtree_resolve_type(tree, &arena, "w.p.src.lib", 0, "api::Api", NULL, NULL, 0);
+    ASSERT_EQ(type.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(type.qn, "w.q.src.h.Inner");
+    CBMRustPathResult call =
+        cbm_rust_modtree_resolve(tree, &arena, "w.p.src.lib", 0, "q::run", NULL, NULL, 0);
+    ASSERT_EQ(call.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(call.qn, "w.q.src.h.run");
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_modtree_glob_of_extern_crate_names_its_items) {
+    /* `use q::*;` heads at the extern prelude: the glob being resolved is
+     * not a source of its own head `q`. */
+    static const char *const rels[] = {"p/src/lib.rs", "q/src/lib.rs", "q/src/a.rs"};
+    static const char *const qns[] = {"w.p.src.lib", "w.q.src.lib", "w.q.src.a"};
+    static const char *const sources[] = {
+        "use q::*;\n",
+        "mod a;\npub use a::B;\n",
+        "pub struct B;\n",
+    };
+    CBMRustModTree *tree = rust_modtree_two_crates(rels, qns, sources, 3, 1);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustPathResult r =
+        cbm_rust_modtree_resolve_type(tree, &arena, "w.p.src.lib", 0, "B", NULL, NULL, 0);
+    ASSERT_EQ(r.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(r.qn, "w.q.src.a.B");
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_modtree_external_glob_leaves_only_unsupplied_names_open) {
+    /* Beside `use ext::prelude::*;`, a name a project glob supplies is that
+     * item (a second glob supplying it would make every use an error); a
+     * name no project glob supplies may come from `ext` and stays open. */
+    static const char *const rels[] = {"p/src/lib.rs", "p/src/m.rs", "q/src/lib.rs"};
+    static const char *const qns[] = {"w.p.src.lib", "w.p.src.m", "w.q.src.lib"};
+    static const char *const sources[] = {
+        "mod m;\nuse ext::prelude::*;\nuse crate::m::*;\n",
+        "pub struct S;\npub fn f() {}\n",
+        "\n",
+    };
+    CBMRustModTree *tree = rust_modtree_two_crates(rels, qns, sources, 3, 2);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustPathResult supplied =
+        cbm_rust_modtree_resolve_type(tree, &arena, "w.p.src.lib", 0, "S", NULL, NULL, 0);
+    ASSERT_EQ(supplied.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(supplied.qn, "w.p.src.m.S");
+    CBMRustPathResult call =
+        cbm_rust_modtree_resolve(tree, &arena, "w.p.src.lib", 0, "f", NULL, NULL, 0);
+    ASSERT_EQ(call.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(call.qn, "w.p.src.m.f");
+    CBMRustPathResult unsupplied =
+        cbm_rust_modtree_resolve_type(tree, &arena, "w.p.src.lib", 0, "Widget", NULL, NULL, 0);
+    ASSERT_EQ(unsupplied.kind, CBM_RUST_PATH_UNKNOWN);
     cbm_rust_modtree_free(tree);
     cbm_arena_destroy(&arena);
     PASS();
@@ -9183,10 +9344,15 @@ void suite_rust_lsp(void) {
 
     /* Crate module tree from scanned facts */
     RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
-    RUN_TEST(rustlsp_modtree_unscanned_file_leaves_names_open);
+    RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
     RUN_TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer);
     RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);
+    RUN_TEST(rustlsp_modtree_module_reexport_names_definition);
+    RUN_TEST(rustlsp_modtree_renamed_reexport_names_definition);
+    RUN_TEST(rustlsp_modtree_two_hop_reexport_names_definition);
+    RUN_TEST(rustlsp_modtree_glob_of_extern_crate_names_its_items);
+    RUN_TEST(rustlsp_modtree_external_glob_leaves_only_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_digest_tracks_visibility);
     RUN_TEST(rustlsp_modtree_use_head_names_extern_crate_past_external_glob);
 }
