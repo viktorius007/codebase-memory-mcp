@@ -2523,6 +2523,31 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
     return result;
 }
 
+/* Rust `trait T: A + b::B<X> + 'a + ?Sized` -> "A|b::B<X>": the supertrait
+ * bounds of the trait's `bounds` field, "|"-separated. A lifetime or a
+ * `?Trait` relaxation adds no supertrait. NULL when there is none. */
+static const char *extract_rust_supertraits(CBMArena *a, TSNode trait_node, const char *source) {
+    TSNode bounds = ts_node_child_by_field_name(trait_node, TS_FIELD("bounds"));
+    if (ts_node_is_null(bounds)) {
+        return NULL;
+    }
+    const char *joined = NULL;
+    uint32_t nc = ts_node_named_child_count(bounds);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode b = ts_node_named_child(bounds, i);
+        const char *bk = ts_node_type(b);
+        if (strcmp(bk, "lifetime") == 0 || strcmp(bk, "removed_trait_bound") == 0) {
+            continue;
+        }
+        char *text = cbm_node_text(a, b, source);
+        if (!text || !text[0]) {
+            continue;
+        }
+        joined = joined ? cbm_arena_sprintf(a, "%s|%s", joined, text) : text;
+    }
+    return joined;
+}
+
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
@@ -4616,6 +4641,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    if (ctx->language == CBM_LANG_RUST && strcmp(kind, "trait_item") == 0) {
+        def.supertraits = extract_rust_supertraits(a, node, ctx->source);
+    }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 

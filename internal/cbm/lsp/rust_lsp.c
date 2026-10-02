@@ -63,6 +63,12 @@ static char *rust_node_text(RustLSPContext *ctx, TSNode node);
 static const char *convert_path_to_qn(CBMArena *arena, const char *path);
 static bool rust_type_derefs_to_first_arg(const char *type_qn);
 static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t);
+static bool rust_bound_is_marker(const char *bound, size_t len);
+static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBMTypeRegistry *reg,
+                                                                       const char *receiver_qn,
+                                                                       const char *trait_qn,
+                                                                       const char *method_name,
+                                                                       bool *out_ambiguous);
 static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char *name);
 static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text);
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
@@ -1831,9 +1837,22 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         return rust_parse_type_node(ctx, inner);
     }
 
-    /* bounded_type: T + Trait + 'a — take the first child */
-    if (strcmp(kind, "bounded_type") == 0 && ts_node_named_child_count(node) > 0) {
-        return rust_parse_type_node(ctx, ts_node_named_child(node, 0));
+    /* bounded_type: `A + Send + 'a` — the principal trait, the first bound
+     * that is not a lifetime, `?Sized` or an auto trait. */
+    if (strcmp(kind, "bounded_type") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode b = ts_node_named_child(node, i);
+            char *btext = rust_node_text(ctx, b);
+            if (!btext) {
+                continue;
+            }
+            const char *bt = strncmp(btext, "dyn ", 4) == 0 ? btext + 4 : btext;
+            if (!rust_bound_is_marker(bt, strlen(bt))) {
+                return rust_parse_type_node(ctx, b);
+            }
+        }
+        return cbm_type_unknown();
     }
 
     /* parenthesized_type or wrapped types */
@@ -1875,6 +1894,73 @@ static const char *rust_text_type_qn_by_module_tree(const CBMRustModTree *tree, 
         return NULL;
     }
     return r.qn ? r.qn : rust_lookup_prelude(path);
+}
+
+/* A bound in a `+` list that adds no methods a call could reach: a
+ * lifetime, a `?Sized` relaxation, or an auto trait. */
+static bool rust_bound_is_marker(const char *bound, size_t len) {
+    if (len == 0 || bound[0] == '\'' || bound[0] == '?') {
+        return true;
+    }
+    static const char *const auto_traits[] = {"Send", "Sync", "Unpin", "UnwindSafe",
+                                              "RefUnwindSafe", NULL};
+    size_t start = len;
+    while (start > 0 && bound[start - 1] != ':' && bound[start - 1] != ' ') {
+        start--;
+    }
+    for (const char *const *p = auto_traits; *p; p++) {
+        if (strlen(*p) == len - start && strncmp(bound + start, *p, len - start) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The principal trait of a bound list spelled as text, `A + Send + 'a` ->
+ * `A`, trimmed; `text` itself when it has no top-level `+`; "" when every
+ * bound is a marker. A `->` inside an `Fn(..) -> R` bound is not a
+ * closing bracket. */
+static const char *rust_principal_bound_text(CBMArena *arena, const char *text) {
+    const char *principal = NULL;
+    size_t principal_len = 0;
+    bool split = false;
+    int depth = 0;
+    const char *start = text;
+    for (const char *q = text;; q++) {
+        if (*q == '-' && q[1] == '>') {
+            q++;
+            continue;
+        }
+        if (*q == '<' || *q == '(' || *q == '[') {
+            depth++;
+        } else if (*q == '>' || *q == ')' || *q == ']') {
+            depth--;
+        }
+        if (!(*q == '\0' || (*q == '+' && depth == 0))) {
+            continue;
+        }
+        split = split || *q == '+';
+        const char *b = start;
+        const char *e = q;
+        while (b < e && isspace((unsigned char)*b)) {
+            b++;
+        }
+        while (e > b && isspace((unsigned char)e[-1])) {
+            e--;
+        }
+        if (!principal && !rust_bound_is_marker(b, (size_t)(e - b))) {
+            principal = b;
+            principal_len = (size_t)(e - b);
+        }
+        if (*q == '\0') {
+            break;
+        }
+        start = q + 1;
+    }
+    if (!split) {
+        return text;
+    }
+    return principal ? cbm_arena_strndup(arena, principal, principal_len) : "";
 }
 
 static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *text,
@@ -1920,6 +2006,24 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
         text = p;
         if (!*text)
             return cbm_type_unknown();
+    }
+
+    /* Trait object: the value has the type of its principal trait, so a
+     * method call on it reaches that trait's declaration. Text types are
+     * fields, returns and signatures; a return-position `impl Trait` hides a
+     * concrete type, so `impl` is left unparsed here. */
+    if (strncmp(text, "impl ", 5) == 0) {
+        return cbm_type_unknown();
+    }
+    const char *bound = rust_principal_bound_text(arena, text);
+    if (!*bound) {
+        return cbm_type_unknown();
+    }
+    if (bound != text) {
+        return parse_type_text_with_params(arena, bound, module_qn, type_params, tree);
+    }
+    if (strncmp(text, "dyn ", 4) == 0) {
+        return parse_type_text_with_params(arena, text + 4, module_qn, type_params, tree);
     }
 
     /* Reference: &T or &'a T or &mut T or &'a mut T */
@@ -3462,25 +3566,62 @@ static bool rust_type_derefs_to_first_arg(const char *type_qn) {
     return false;
 }
 
+/* One QN per std Deref wrapper (`std.sync.Arc` and `alloc.sync.Arc` are the
+ * same type): the prelude's when it names one, else `qn`. NULL when `qn` is
+ * not a wrapper. */
+static const char *rust_std_wrapper_canonical(const char *qn) {
+    if (!rust_type_derefs_to_first_arg(qn)) {
+        return NULL;
+    }
+    const char *dot = strrchr(qn, '.');
+    const char *prelude = rust_lookup_prelude(dot ? dot + 1 : qn);
+    return prelude && rust_type_derefs_to_first_arg(prelude) ? prelude : qn;
+}
+
 /* A template head as written (`Arc`, `std::sync::Arc`, or a name some
  * signature recorded under its defining module) names a std Deref wrapper
  * once it is resolved like any other type name: through the file's `use`
  * map and the registry, then the prelude for a bare name nothing else
  * claims. A user type that shares the name resolves to itself. */
-static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head) {
+static const char *rust_wrapper_head_qn(RustLSPContext *ctx, const char *head) {
     if (rust_type_derefs_to_first_arg(head)) {
-        return true;
+        return rust_std_wrapper_canonical(head);
     }
     const char *qn = convert_path_to_qn(ctx->arena, head);
     if (rust_type_derefs_to_first_arg(qn)) {
-        return true;
+        return rust_std_wrapper_canonical(qn);
     }
     const char *registered = rust_registered_type_qn(ctx, qn);
     if (registered) {
-        return rust_type_derefs_to_first_arg(registered);
+        return rust_std_wrapper_canonical(registered);
     }
-    return !strchr(qn, '.') && !rust_resolve_use(ctx, qn) &&
-           rust_type_derefs_to_first_arg(rust_lookup_prelude(qn));
+    return !strchr(qn, '.') && !rust_resolve_use(ctx, qn)
+               ? rust_std_wrapper_canonical(rust_lookup_prelude(qn))
+               : NULL;
+}
+
+static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head) {
+    return rust_wrapper_head_qn(ctx, head) != NULL;
+}
+
+/* A trait impl in the corpus on the std wrapper `base` that provides
+ * `method` (`impl<T: X + ?Sized> X for Box<T>`). rustc finds it on the
+ * wrapper before it derefs to the target; whether that impl applies to
+ * this wrapper's argument is not decided here, so the caller links
+ * neither it nor the target. */
+static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMType *base,
+                                                 const char *method) {
+    if (!base || base->kind != CBM_TYPE_TEMPLATE || !base->data.template_type.template_name) {
+        return false;
+    }
+    const char *wrapper = rust_wrapper_head_qn(ctx, base->data.template_type.template_name);
+    if (!wrapper) {
+        return false;
+    }
+    bool ambiguous = false;
+    return rust_registry_lookup_trait_impl_method(ctx->registry, wrapper, NULL, method,
+                                                  &ambiguous) != NULL ||
+           ambiguous;
 }
 
 /* Returns the inner type after one Deref step. For NAMED types we check
@@ -3721,10 +3862,55 @@ const CBMRegisteredFunc *rust_lookup_method(RustLSPContext *ctx, const char *typ
     return rust_lookup_method_depth(ctx, type_qn, member_name, 0);
 }
 
+/* Marks a trait's `embedded_types` entry as a supertrait QN. Kept apart
+ * from impl entries, which name traits a type implements. */
+#define RUST_SUPERTRAIT_PREFIX "Super:"
+enum { RUST_SUPERTRAIT_PREFIX_LEN = sizeof(RUST_SUPERTRAIT_PREFIX) - 1 };
+
+static const CBMRegisteredFunc *rust_lookup_method_in_trait_own(RustLSPContext *ctx,
+                                                                const char *trait_qn,
+                                                                const char *method_name,
+                                                                bool allow_abstract);
+
+/* `method_name` declared by `trait_qn` itself, else by the first of its
+ * supertraits (declaration order, depth first) that declares it. */
+static const CBMRegisteredFunc *rust_lookup_method_in_trait_depth(RustLSPContext *ctx,
+                                                                  const char *trait_qn,
+                                                                  const char *method_name,
+                                                                  bool allow_abstract, int depth) {
+    const CBMRegisteredFunc *f =
+        rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, allow_abstract);
+    if (f || !ctx || !trait_qn || depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
+        return f;
+    }
+    for (const CBMTypeRegistry *r = ctx->registry; r; r = r->fallback) {
+        const CBMRegisteredType *t = cbm_registry_lookup_type(r, trait_qn);
+        for (int i = 0; t && t->is_interface && t->embedded_types && t->embedded_types[i]; i++) {
+            const char *e = t->embedded_types[i];
+            if (strncmp(e, RUST_SUPERTRAIT_PREFIX, RUST_SUPERTRAIT_PREFIX_LEN) != 0) {
+                continue;
+            }
+            f = rust_lookup_method_in_trait_depth(ctx, e + RUST_SUPERTRAIT_PREFIX_LEN,
+                                                  method_name, allow_abstract, depth + 1);
+            if (f) {
+                return f;
+            }
+        }
+    }
+    return NULL;
+}
+
 static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
                                                             const char *trait_qn,
                                                             const char *method_name,
                                                             bool allow_abstract) {
+    return rust_lookup_method_in_trait_depth(ctx, trait_qn, method_name, allow_abstract, 0);
+}
+
+static const CBMRegisteredFunc *rust_lookup_method_in_trait_own(RustLSPContext *ctx,
+                                                                const char *trait_qn,
+                                                                const char *method_name,
+                                                                bool allow_abstract) {
     if (!ctx || !trait_qn || !method_name)
         return NULL;
     const CBMTypeRegistry *reg = ctx->registry;
@@ -3752,7 +3938,8 @@ static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
     if (reg->fallback) {
         RustLSPContext fallback_ctx = *ctx;
         fallback_ctx.registry = reg->fallback;
-        return rust_lookup_method_in_trait(&fallback_ctx, trait_qn, method_name, allow_abstract);
+        return rust_lookup_method_in_trait_own(&fallback_ctx, trait_qn, method_name,
+                                               allow_abstract);
     }
     return NULL;
 }
@@ -3858,7 +4045,7 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
                 continue;
             }
             const CBMRegisteredFunc *candidate =
-                rust_lookup_method_in_trait(ctx, trait_qn, method_name, false);
+                rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, false);
             if (!candidate) {
                 continue;
             }
@@ -6092,6 +6279,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             type_qn = "core.slice";
         }
 
+        if (rust_wrapper_has_corpus_trait_method(ctx, base, mname)) {
+            return;
+        }
         if (type_qn) {
             const char *registered = rust_registered_type_qn(ctx, type_qn);
             if (registered) {
@@ -6134,6 +6324,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 }
                 if (!next)
                     break;
+                if (rust_wrapper_has_corpus_trait_method(ctx, next, mname))
+                    return;
                 const char *next_qn = NULL;
                 if (next->kind == CBM_TYPE_NAMED)
                     next_qn = next->data.named.qualified_name;
@@ -7107,6 +7299,17 @@ static const char *rust_impl_declared_self(const CBMRustModTree *tree, CBMArena 
     }
     const CBMRegisteredType *type = lookup(lookup_ctx, declared);
     return type && !type->is_interface ? type->qualified_name : NULL;
+}
+
+/* The std Deref wrapper (`alloc.boxed.Box`, `alloc.sync.Arc`, ...) an impl
+ * self type spelled `Box<T>` / `Arc<dyn X>` names, or NULL. A method of such
+ * an impl is a method of the wrapper: rustc finds it on the wrapper before it
+ * derefs to the target. */
+static const char *rust_impl_std_wrapper_self(const CBMRustModTree *tree, CBMArena *arena,
+                                              const char *module_qn, const char *spelling) {
+    const char *path = spelling ? rust_impl_self_path(arena, spelling) : NULL;
+    const char *qn = path ? rust_text_type_qn_by_module_tree(tree, arena, module_qn, path) : NULL;
+    return qn ? rust_std_wrapper_canonical(qn) : NULL;
 }
 
 static const CBMRegisteredType *rust_impl_registry_type(const void *reg, const char *qn) {
@@ -8101,12 +8304,43 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
         const char *self = rust_impl_declared_self(tree, arena, def_mod, d->receiver_type,
                                                    d->receiver_spelling, rust_declared_type,
                                                    &declared);
+        if (!self && !d->is_rust_impl_relation) {
+            self = rust_impl_std_wrapper_self(tree, arena, def_mod, d->receiver_spelling);
+        }
         if (self) {
             receivers[i] = self;
         }
         cbm_idxmemo_put_if_absent(&seen, arena, d->receiver_type, i);
     }
     return receivers;
+}
+
+/* Record on `trait` each supertrait in `spellings` ("|"-separated bounds as
+ * written in `module_qn`) that names a trait declared in the corpus: by the
+ * module tree, else by the canonical trait-name index. Marker bounds and
+ * names that settle on no registered trait are dropped. */
+static void rust_register_supertraits(CBMArena *arena, const CBMTypeRegistry *reg,
+                                      const CBMIdxMemo *type_idx, const RustTraitNameIndex *names,
+                                      const CBMRustModTree *tree, CBMRegisteredType *trait,
+                                      const char *spellings, const char *module_qn) {
+    char *buf = cbm_arena_strdup(arena, spellings);
+    for (char *save = NULL, *s = buf ? strtok_r(buf, "|", &save) : NULL; s;
+         s = strtok_r(NULL, "|", &save)) {
+        if (rust_bound_is_marker(s, strlen(s))) {
+            continue;
+        }
+        const char *lt = strchr(s, '<');
+        const char *path = lt ? cbm_arena_strndup(arena, s, (size_t)(lt - s)) : s;
+        const char *qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, path);
+        int32_t index = qn ? cbm_idxmemo_get(type_idx, qn) : -1;
+        if (index < 0 || !reg->types[index].is_interface) {
+            qn = rust_canonical_impl_trait(arena, reg, names, s, module_qn);
+        }
+        if (qn && strcmp(qn, trait->qualified_name) != 0) {
+            rust_registered_type_add_embedded(
+                arena, trait, cbm_arena_sprintf(arena, "%s%s", RUST_SUPERTRAIT_PREFIX, qn));
+        }
+    }
 }
 
 static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
@@ -8157,6 +8391,18 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
 
     RustTraitNameIndex trait_names;
     rust_trait_name_index_build(&trait_names, arena, reg);
+
+    for (int i = 0; i < def_count; i++) {
+        CBMRustLSPDef *d = &defs[i];
+        int32_t type_index = d->embedded_types && d->qualified_name
+                                 ? cbm_idxmemo_get(&type_idx, d->qualified_name)
+                                 : -1;
+        if (type_index >= 0 && reg->types[type_index].is_interface) {
+            rust_register_supertraits(arena, reg, &type_idx, &trait_names, tree,
+                                      &reg->types[type_index], d->embedded_types,
+                                      d->def_module_qn ? d->def_module_qn : module_qn);
+        }
+    }
 
     /* Materialize independent impl relations first, including empty impls. */
     for (int i = 0; i < def_count; i++) {
