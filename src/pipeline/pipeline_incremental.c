@@ -1739,6 +1739,57 @@ static void closure_seed_governed(CBMHashTable *closure_set, const cbm_file_info
     }
 }
 
+/* Edge budget: the file-count budget above prices every file alike, but the
+ * closure route's cost follows the rows it rewrites. The purge deletes, and
+ * the patch re-inserts, every stored edge with an endpoint in a closure file
+ * — two row-level index writes per incident edge — on top of re-running
+ * extraction and resolution for those files. A full rebuild writes each of
+ * the project's edges once, in bulk. Once the incident edges are half the
+ * graph, the route's edge writes equal the rebuild's and its remaining work
+ * (graph-wide proxy load, rehydration, post-passes) cannot be repaid, so it
+ * declines. Both counts are facts of the stored generation, read before any
+ * work starts. Measured on a 1.9M-line Rust corpus: an 836-file closure
+ * touching 47.5% of edges refreshed at 0.95x the full rebuild; a 1-file
+ * body edit (0.4%) at 0.3x. Returns true and sets *decline when exceeded or
+ * when the counts cannot be read (fail closed to the full rebuild). */
+static bool closure_edge_budget_exceeded(cbm_store_t *store, const char *project,
+                                         const cbm_file_info_t *files, int file_count,
+                                         CBMHashTable *closure_set,
+                                         const char *const *deleted_paths, int n_deleted,
+                                         const char **decline) {
+    int member_count = (int)cbm_ht_count(closure_set) + n_deleted;
+    const char **members =
+        (const char **)calloc((size_t)(member_count ? member_count : 1), sizeof(char *));
+    if (!members) {
+        *decline = "alloc";
+        return true;
+    }
+    int n = 0;
+    for (int i = 0; i < file_count && n < member_count; i++) {
+        if (cbm_ht_get(closure_set, files[i].rel_path)) {
+            members[n++] = files[i].rel_path;
+        }
+    }
+    for (int i = 0; i < n_deleted && n < member_count; i++) {
+        members[n++] = deleted_paths[i];
+    }
+    int64_t incident = 0;
+    int64_t total = 0;
+    int rc = cbm_store_count_incident_edges(store, project, members, n, &incident, &total);
+    free(members);
+    if (rc != CBM_STORE_OK) {
+        *decline = "edge_count_failed";
+        return true;
+    }
+    cbm_log_info("incremental.closure_edges", "incident", itoa_buf((int)incident), "total",
+                 itoa_buf((int)total));
+    if (incident * 2 > total) {
+        *decline = "edge_budget_exceeded";
+        return true;
+    }
+    return false;
+}
+
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
@@ -1986,6 +2037,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         decline = "budget_exceeded";
         goto done;
     }
+    if (closure_count > CLOSURE_BUDGET_FLOOR_FILES &&
+        closure_edge_budget_exceeded(store, project, files, file_count, closure_set,
+                                     (const char *const *)changed_paths + n_changed, n_deleted,
+                                     &decline)) {
+        goto done;
+    }
 
     plan->files = (cbm_file_info_t *)calloc((size_t)(closure_count ? closure_count : 1),
                                             sizeof(cbm_file_info_t));
@@ -2087,7 +2144,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_log_info("delta.clone", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     staging = cbm_store_open_path(stage);
-    if (!staging) {
+    if (!staging || cbm_delta_stage_size_cache(staging, stage) != 0) {
         goto out;
     }
     cbm_log_info("delta.staging_open", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
@@ -2109,11 +2166,14 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                                          &snapshot_count) != 0) {
         goto out;
     }
+    cbm_log_info("delta.snapshot", "captured", itoa_buf(snapshot_count), "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_purge(staging, project, purge_paths, purge_count) != 0) {
         goto out;
     }
-    cbm_log_info("delta.snapshot_purge", "captured", itoa_buf(snapshot_count), "purged_files",
-                 itoa_buf(purge_count), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    cbm_log_info("delta.purge", "purged_files", itoa_buf(purge_count), "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
 
     /* Small graph: proxies with real ids, then the name registry from them. */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);

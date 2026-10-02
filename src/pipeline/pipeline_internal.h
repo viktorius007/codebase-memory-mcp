@@ -959,6 +959,10 @@ typedef struct {
 } cbm_delta_saved_edge_t;
 
 int cbm_delta_stage_clone(const char *final_db_path, char **out_stage_path);
+/* Size the staging connection's page cache to the staged file, so the purge
+ * and patch rewrite index pages in memory instead of evicting and re-reading
+ * them per row. Returns 0, or CBM_NOT_FOUND when the pragma cannot be set. */
+int cbm_delta_stage_size_cache(cbm_store_t *staging, const char *stage_path);
 /* Snapshot, by endpoint QN, every edge touching the re-parsed `paths` that
  * no re-parse regenerates (cbm_pipeline_persisted_edge_outlives_reparse), so
  * cbm_delta_patch can re-link it after the purge. */

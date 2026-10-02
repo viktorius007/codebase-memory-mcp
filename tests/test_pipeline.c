@@ -3301,6 +3301,72 @@ TEST(pipeline_closure_repair_budget_declines_to_full) {
     PASS();
 }
 
+/* 10 "dense" files (a 20-function call chain each) and 30 "sparse" files (one
+ * function each), then a body edit of 10 files of one kind. Both closures are
+ * 10 of 40 files — over the absolute floor, under the 30%% file budget — so
+ * only the stored edges they touch tell the two apart. */
+static cbm_incremental_route_t closure_edge_budget_route(bool edit_dense) {
+    enum { DENSE = 10, SPARSE = 30, CHAIN = 20 };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_edges_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return CBM_INCREMENTAL_ROUTE_NONE;
+    }
+    char name[64];
+    char body[4096];
+    for (int round = 0; round < 2; round++) {
+        for (int f = 0; f < DENSE; f++) {
+            if (round == 1 && !edit_dense) {
+                break;
+            }
+            int pos = 0;
+            for (int k = 0; k < CHAIN; k++) {
+                pos += snprintf(body + pos, sizeof(body) - (size_t)pos,
+                                "export function dense%02d_%02d(): number {\n  return %d;\n}\n",
+                                f, k, round);
+                if (k + 1 < CHAIN) {
+                    pos += snprintf(body + pos, sizeof(body) - (size_t)pos,
+                                    "export function denseCall%02d_%02d(): number {\n"
+                                    "  return dense%02d_%02d() + dense%02d_%02d();\n}\n",
+                                    f, k, f, k, f, k + 1);
+                }
+            }
+            snprintf(name, sizeof(name), "dense_%02d.ts", f);
+            write_temp_file(tmp, name, body);
+        }
+        for (int f = 0; f < SPARSE; f++) {
+            if (round == 1 && (edit_dense || f >= DENSE)) {
+                break;
+            }
+            snprintf(body, sizeof(body), "export function sparse%02d(): number {\n  return %d;\n}\n",
+                     f, round);
+            snprintf(name, sizeof(name), "sparse_%02d.ts", f);
+            write_temp_file(tmp, name, body);
+        }
+        char db[512];
+        snprintf(db, sizeof(db), "%s/closure.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        if (!p || cbm_pipeline_run(p) != 0) {
+            cbm_pipeline_free(p);
+            th_rmtree(tmp);
+            return CBM_INCREMENTAL_ROUTE_NONE;
+        }
+        cbm_pipeline_free(p);
+    }
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return route;
+}
+
+TEST(pipeline_closure_repair_edge_budget_declines_dense_closure) {
+    /* The dense closure carries most of the graph's edges: rewriting them row
+     * by row costs more than the rebuild, so the planner concedes. */
+    ASSERT_EQ(closure_edge_budget_route(true), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    /* The same file count over sparse files stays on the repair route. */
+    ASSERT_EQ(closure_edge_budget_route(false), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    PASS();
+}
+
 TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_ref_tsconfig_incr_XXXXXX");
@@ -17835,6 +17901,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
     RUN_TEST(pipeline_closure_repair_new_file_declines_to_full);
     RUN_TEST(pipeline_closure_repair_budget_declines_to_full);
+    RUN_TEST(pipeline_closure_repair_edge_budget_declines_dense_closure);
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     RUN_TEST(pipeline_publication_stamps_full_and_delta_generations);
