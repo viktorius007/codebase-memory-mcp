@@ -7720,15 +7720,15 @@ typedef struct {
     CBMArena arena;
 } RustModTreeFixture;
 
-/* lib.rs declares `a` and `b` out of line and `inner` inline, and imports
- * a::f as h. `b_readable` false stands for a file that could not be read:
- * its facts are NULL. Facts are freed before any query, so a resolve that
+/* lib.rs declares `a` and `b` out of line and `inner` inline, imports
+ * a::f as h and glob-imports both `a` and `b`. `b_readable` false stands
+ * for a file that could not be read: its facts are NULL. Facts are freed before any query, so a resolve that
  * still pointed into them would fault under ASan. */
 static RustModTreeFixture rust_modtree_from_facts(bool b_readable) {
     static const char *const rels[] = {"src/lib.rs", "src/a.rs", "src/b.rs"};
     static const char *const qns[] = {"p.src.lib", "p.src.a", "p.src.b"};
     static const char *const sources[] = {
-        "mod a;\nmod b;\npub mod inner { pub fn g() {} }\nuse a::f as h;\n",
+        "mod a;\nmod b;\npub mod inner { pub fn g() {} }\nuse a::f as h;\nuse a::*;\nuse b::*;\n",
         "pub fn f() {}\n",
         "pub const X: u8 = 0;\n",
     };
@@ -7770,15 +7770,19 @@ TEST(rustlsp_modtree_built_from_scanned_facts) {
     CBMRustPathResult inline_item = rust_modtree_lookup(&fx, "inner::g");
     ASSERT_EQ(inline_item.kind, CBM_RUST_PATH_FUNCTION);
     ASSERT_STR_EQ(inline_item.qn, "p.src.lib.g");
+    CBMRustPathResult glob = rust_modtree_lookup(&fx, "f");
+    ASSERT_EQ(glob.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(glob.qn, "p.src.a.f");
     ASSERT_EQ(rust_modtree_lookup(&fx, "b::X").kind, CBM_RUST_PATH_NOT_FUNCTION);
     rust_modtree_fixture_free(&fx);
     PASS();
 }
 
 TEST(rustlsp_modtree_unscanned_file_leaves_names_open) {
-    /* With no facts for b.rs the tree cannot prove what b::X names. */
+    /* With no facts for b.rs, `use b::*` may bring in another `f`, so the
+     * glob candidate from `a` is no longer proven; a path into `a` still is. */
     RustModTreeFixture fx = rust_modtree_from_facts(false);
-    ASSERT_EQ(rust_modtree_lookup(&fx, "b::X").kind, CBM_RUST_PATH_UNKNOWN);
+    ASSERT_EQ(rust_modtree_lookup(&fx, "f").kind, CBM_RUST_PATH_UNKNOWN);
     ASSERT_EQ(rust_modtree_lookup(&fx, "a::f").kind, CBM_RUST_PATH_FUNCTION);
     rust_modtree_fixture_free(&fx);
     PASS();
