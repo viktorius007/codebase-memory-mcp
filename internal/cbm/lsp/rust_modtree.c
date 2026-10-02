@@ -26,6 +26,7 @@ typedef enum {
     RMT_TYPE,
     RMT_TRAIT,
     RMT_ENUM,
+    RMT_ALIAS, /* `type X = ..;`: names another type, owns no impls */
     RMT_VALUE,
     RMT_EXTERNAL, /* an item of a crate outside the project, or of the language */
     RMT_OPAQUE,   /* declared but not modelled (an unloadable `mod x;`) */
@@ -512,7 +513,7 @@ typedef struct {
 static const RmtItemKind RMT_ITEM_KINDS[] = {
     {"function_item", RMT_FN, RMT_NS_VALUE}, {"struct_item", RMT_TYPE, RMT_NS_ALL},
     {"union_item", RMT_TYPE, RMT_NS_TYPE},   {"enum_item", RMT_ENUM, RMT_NS_TYPE},
-    {"trait_item", RMT_TRAIT, RMT_NS_TYPE},  {"type_item", RMT_TYPE, RMT_NS_TYPE},
+    {"trait_item", RMT_TRAIT, RMT_NS_TYPE},  {"type_item", RMT_ALIAS, RMT_NS_TYPE},
     {"const_item", RMT_VALUE, RMT_NS_VALUE}, {"static_item", RMT_VALUE, RMT_NS_VALUE},
 };
 
@@ -921,7 +922,8 @@ static void rmt_resolve_path(CBMRustModTree *tree, int module, const char *const
         if (def.kind == RMT_EXTERNAL) {
             break;
         }
-        if (def.kind == RMT_TYPE || def.kind == RMT_TRAIT || def.kind == RMT_ENUM) {
+        if (def.kind == RMT_TYPE || def.kind == RMT_TRAIT || def.kind == RMT_ENUM ||
+            def.kind == RMT_ALIAS) {
             if (!last) {
                 out->open = true;
                 return;
@@ -1090,6 +1092,36 @@ CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena 
         }
         agreed = result;
         any = true;
+    }
+    return agreed;
+}
+
+const char *cbm_rust_modtree_resolve_nominal_type(const CBMRustModTree *tree, CBMArena *arena,
+                                                  const char *module_qn, const char *path) {
+    if (!tree || !arena || !module_qn || !path) {
+        return NULL;
+    }
+    int file = cbm_idxmemo_get(&tree->file_by_qn, module_qn);
+    const char *segs[RMT_MAX_SEGS];
+    int count = file >= 0 ? rmt_split_path(arena, path, segs, RMT_MAX_SEGS) : -1;
+    if (count <= 0) {
+        return NULL;
+    }
+    const char *agreed = NULL;
+    CBMRustModTree *readonly = (CBMRustModTree *)tree;
+    for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
+        RmtDefs defs = {0};
+        rmt_resolve_path(readonly, m, segs, count, RMT_NS_TYPE, false, &defs, false);
+        if (!defs.open && defs.count == 0) {
+            continue; /* the name is not in scope here, so no impl here can name it */
+        }
+        const RmtDef *def = &defs.defs[0];
+        if (defs.open || defs.count != 1 || defs.assoc || !def->qn ||
+            (def->kind != RMT_TYPE && def->kind != RMT_ENUM) ||
+            (agreed && strcmp(agreed, def->qn) != 0)) {
+            return NULL;
+        }
+        agreed = def->qn;
     }
     return agreed;
 }

@@ -3183,7 +3183,8 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
     if (!p) {
         cbm_arena_init(&rc->rust_shared_arena);
         rc->rust_shared_arena_live = true;
-        p = cbm_rust_build_cross_registry(&rc->rust_shared_arena, rc->all_defs, rc->def_count);
+        p = cbm_rust_build_cross_registry_with_modtree(&rc->rust_shared_arena, rc->all_defs,
+                                                       rc->def_count, rc->rust_modtree);
         if (p) {
             char sb[96];
             snprintf(sb, sizeof(sb), "types=%d funcs=%d", p->type_count, p->func_count);

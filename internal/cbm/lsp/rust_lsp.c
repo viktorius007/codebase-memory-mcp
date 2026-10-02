@@ -6334,6 +6334,69 @@ static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text)
     }
 }
 
+/* ── Impl self type declared in another file ───────────────────────
+ * Extraction keys an impl block's self type and methods by the impl file's
+ * module (`<impl file module>.App`, see extract_rust_impl). When that QN is
+ * not a declared type and the crate module tree proves the self type path
+ * names a struct, enum or union declared elsewhere, the block belongs to
+ * that declared type. One rule serves the registry (methods registered on
+ * the declared type), the per-file walk (`Self` inside the block) and the
+ * impl-header link (the method owner), so a method is looked up on the same
+ * type its owner link names. The answer depends only on the registry, the
+ * module tree, the file and the self type spelling, so every site computes
+ * the same one. */
+
+typedef const CBMRegisteredType *(*RustImplTypeLookup)(const void *ctx, const char *qn);
+
+/* The self type spelling as a path (`App`, `super::App`), generic arguments
+ * dropped; NULL for references, tuples, slices, trait objects and the like. */
+static const char *rust_impl_self_path(CBMArena *arena, const char *spelling) {
+    const char *path = cbm_rust_impl_owner_name(arena, spelling);
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    for (const char *p = path; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != ':') {
+            return NULL;
+        }
+    }
+    return path;
+}
+
+static const char *rust_impl_declared_self(const CBMRustModTree *tree, CBMArena *arena,
+                                           const char *module_qn, const char *receiver_qn,
+                                           const char *spelling, RustImplTypeLookup lookup,
+                                           const void *lookup_ctx) {
+    if (!tree || !module_qn || !receiver_qn || !spelling || lookup(lookup_ctx, receiver_qn)) {
+        return NULL;
+    }
+    const char *path = rust_impl_self_path(arena, spelling);
+    const char *declared =
+        path ? cbm_rust_modtree_resolve_nominal_type(tree, arena, module_qn, path) : NULL;
+    if (!declared || strcmp(declared, receiver_qn) == 0) {
+        return NULL;
+    }
+    const CBMRegisteredType *type = lookup(lookup_ctx, declared);
+    return type && !type->is_interface ? type->qualified_name : NULL;
+}
+
+static const CBMRegisteredType *rust_impl_registry_type(const void *reg, const char *qn) {
+    return cbm_registry_lookup_type((const CBMTypeRegistry *)reg, qn);
+}
+
+/* Declared self type of an impl block whose self type is spelled
+ * `type_text` in this file, or NULL to keep the extracted receiver. */
+static const char *rust_impl_declared_self_in_file(RustLSPContext *ctx, const char *type_text) {
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    if (!tree || !ctx->registry || !ctx->module_qn || !type_text) {
+        return NULL;
+    }
+    const char *receiver_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn,
+                                                cbm_rust_impl_owner_name(ctx->arena, type_text));
+    return rust_impl_declared_self(tree, ctx->arena, ctx->module_qn, receiver_qn, type_text,
+                                   rust_impl_registry_type, ctx->registry);
+}
+
 /* Helper: does `name` appear in the impl's `<T, U, ...>` type
  * parameter list? Used to detect blanket impls (impl<T: Trait> X for T). */
 static bool rust_impl_has_type_param(RustLSPContext *ctx, TSNode impl_node, const char *name) {
@@ -6406,7 +6469,10 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
         if (tt)
             effective_recv = rust_resolve_path_expr(ctx, tt);
     } else {
-        effective_recv = rust_resolve_path_expr(ctx, type_text);
+        effective_recv = rust_impl_declared_self_in_file(ctx, type_text);
+        if (!effective_recv) {
+            effective_recv = rust_resolve_path_expr(ctx, type_text);
+        }
     }
     if (!effective_recv)
         return;
@@ -7262,9 +7328,61 @@ extern const TSLanguage *tree_sitter_rust(void);
  * `module_qn` is ONLY the fallback used to qualify a def's return type when that def
  * carries no def_module_qn; pass NULL for the shared build (all_defs always carry
  * def_module_qn — verified: 0 NULL across the C + Rust kernel corpora). */
+typedef struct {
+    const CBMTypeRegistry *reg;
+    const CBMIdxMemo *type_idx;
+} RustDeclaredTypes;
+
+static const CBMRegisteredType *rust_declared_type(const void *ctx, const char *qn) {
+    const RustDeclaredTypes *declared = (const RustDeclaredTypes *)ctx;
+    int32_t index = cbm_idxmemo_get(declared->type_idx, qn);
+    return index >= 0 ? &declared->reg->types[index] : NULL;
+}
+
+/* Receiver each Method / impl-relation def is registered on: its declared
+ * self type when the impl sits in another file (rust_impl_declared_self),
+ * else the extracted receiver. Runs while `type_idx` holds declared types
+ * only, which is what the final registry answers for these QNs at walk time:
+ * a receiver left unmoved is auto-registered below, one moved never is. */
+static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegistry *reg,
+                                              const CBMIdxMemo *type_idx,
+                                              const CBMRustModTree *tree, CBMRustLSPDef *defs,
+                                              int def_count, const char *module_qn) {
+    const char **receivers =
+        (const char **)cbm_arena_alloc(arena, (size_t)(def_count > 0 ? def_count : 1) *
+                                                  sizeof(const char *));
+    if (!receivers) {
+        return NULL;
+    }
+    RustDeclaredTypes declared = {.reg = reg, .type_idx = type_idx};
+    CBMIdxMemo seen = {0}; /* receiver QN -> index of the def that decided it */
+    for (int i = 0; i < def_count; i++) {
+        CBMRustLSPDef *d = &defs[i];
+        receivers[i] = d->receiver_type;
+        bool owns_methods = d->is_rust_impl_relation || (d->label && strcmp(d->label, "Method") == 0);
+        if (!tree || !owns_methods || !d->receiver_type || !d->receiver_spelling) {
+            continue;
+        }
+        int32_t decided = cbm_idxmemo_get(&seen, d->receiver_type);
+        if (decided >= 0) {
+            receivers[i] = receivers[decided];
+            continue;
+        }
+        const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        const char *self = rust_impl_declared_self(tree, arena, def_mod, d->receiver_type,
+                                                   d->receiver_spelling, rust_declared_type,
+                                                   &declared);
+        if (self) {
+            receivers[i] = self;
+        }
+        cbm_idxmemo_put_if_absent(&seen, arena, d->receiver_type, i);
+    }
+    return receivers;
+}
+
 static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                                          CBMRustLSPDef *defs, int def_count,
-                                         const char *module_qn) {
+                                         const char *module_qn, const CBMRustModTree *tree) {
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 
@@ -7305,13 +7423,17 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
     }
 
+    const char **receivers =
+        rust_registered_receivers(arena, reg, &type_idx, tree, defs, def_count, module_qn);
+
     RustTraitNameIndex trait_names;
     rust_trait_name_index_build(&trait_names, arena, reg);
 
     /* Materialize independent impl relations first, including empty impls. */
     for (int i = 0; i < def_count; i++) {
         CBMRustLSPDef *d = &defs[i];
-        if (!d->is_rust_impl_relation || !d->receiver_type || !d->trait_qn) {
+        const char *receiver = receivers ? receivers[i] : d->receiver_type;
+        if (!d->is_rust_impl_relation || !receiver || !d->trait_qn) {
             continue;
         }
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
@@ -7320,12 +7442,12 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         if (!trait_qn) {
             continue;
         }
-        int32_t type_index = cbm_idxmemo_get(&type_idx, d->receiver_type);
+        int32_t type_index = cbm_idxmemo_get(&type_idx, receiver);
         if (type_index < 0) {
             CBMRegisteredType auto_t;
             memset(&auto_t, 0, sizeof(auto_t));
-            auto_t.qualified_name = cbm_arena_strdup(arena, d->receiver_type);
-            const char *dot = strrchr(d->receiver_type, '.');
+            auto_t.qualified_name = cbm_arena_strdup(arena, receiver);
+            const char *dot = strrchr(receiver, '.');
             auto_t.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : auto_t.qualified_name;
             cbm_registry_add_type(reg, auto_t);
             type_index = reg->type_count - 1;
@@ -7428,13 +7550,14 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                 rust_signature_param_type_adapter, &parser_ctx);
             rf.signature = cbm_type_func(arena, NULL, param_types, ret_types);
 
-            if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
-                rf.receiver_type = cbm_arena_strdup(arena, d->receiver_type);
+            const char *receiver = receivers ? receivers[i] : d->receiver_type;
+            if (strcmp(d->label, "Method") == 0 && receiver && receiver[0]) {
+                rf.receiver_type = cbm_arena_strdup(arena, receiver);
                 if (cbm_idxmemo_get(&type_idx, rf.receiver_type) < 0) {
                     CBMRegisteredType auto_t;
                     memset(&auto_t, 0, sizeof(auto_t));
                     auto_t.qualified_name = rf.receiver_type;
-                    const char *dot = strrchr(d->receiver_type, '.');
+                    const char *dot = strrchr(receiver, '.');
                     auto_t.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : rf.receiver_type;
                     cbm_registry_add_type(reg, auto_t);
                     cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name,
@@ -7735,10 +7858,16 @@ static const char *rust_impl_header_qn(RustLSPContext *ctx, TSNode impl_node, TS
 static void rust_record_impl_link(RustLSPContext *ctx, TSNode impl_node,
                                   const RustFileItems *items, CBMRustImplLinkArray *out) {
     CBMRustImplLink link = {0};
-    link.type_qn = rust_impl_header_qn(ctx, impl_node,
-                                       ts_node_child_by_field_name(impl_node, "type", 4), false,
-                                       items, &link.type_line);
+    TSNode type_node = ts_node_child_by_field_name(impl_node, "type", 4);
     TSNode trait_node = ts_node_child_by_field_name(impl_node, "trait", 5);
+    /* The type rust_process_impl walks the block as, and the registry files
+     * its methods under, is the owner (see rust_impl_declared_self). */
+    char *type_text = ts_node_is_null(type_node) ? NULL : rust_node_text(ctx, type_node);
+    bool blanket = !ts_node_is_null(trait_node) && rust_impl_has_type_param(ctx, impl_node, type_text);
+    link.type_qn = blanket ? NULL : rust_impl_declared_self_in_file(ctx, type_text);
+    if (!link.type_qn) {
+        link.type_qn = rust_impl_header_qn(ctx, impl_node, type_node, false, items, &link.type_line);
+    }
     if (link.type_qn && !ts_node_is_null(trait_node)) {
         link.trait_qn =
             rust_impl_header_qn(ctx, impl_node, trait_node, true, items, &link.trait_line);
@@ -7876,6 +8005,12 @@ static void rust_resolve_against_registry(
  * pass_lsp_cross.c's pxc_lspdefs_to_rust, including proven trait provenance).
  * module_qn=NULL is byte-identical because all_defs always carry def_module_qn. */
 CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count) {
+    return cbm_rust_build_cross_registry_with_modtree(arena, defs, def_count, NULL);
+}
+
+CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBMLSPDef *defs,
+                                                            int def_count,
+                                                            const CBMRustModTree *modtree) {
     if (!arena)
         return NULL;
     CBMTypeRegistry *reg = (CBMTypeRegistry *)cbm_arena_alloc(arena, sizeof(*reg));
@@ -7905,7 +8040,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
             rdefs[i].is_abstract = defs[i].is_abstract;
         }
     }
-    rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL);
+    rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL, modtree);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
@@ -7976,7 +8111,8 @@ void cbm_run_rust_lsp_cross_with_manifest(
 
     /* Build registry from cross-file defs + stdlib (per-file). */
     CBMTypeRegistry reg;
-    rust_populate_cross_registry(&reg, arena, defs, def_count, module_qn);
+    rust_populate_cross_registry(&reg, arena, defs, def_count, module_qn,
+                                 imports ? imports->modtree : NULL);
 
     rust_resolve_against_registry(arena, source, source_len, module_qn, relative_module_qn, &reg,
                                   import_names, import_qns, import_count, root, manifest, imports,

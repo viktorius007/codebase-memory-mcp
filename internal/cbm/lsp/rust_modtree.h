@@ -94,4 +94,14 @@ CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena 
                                            const char *const *extra_names,
                                            const char *const *extra_paths, int extra_count);
 
+/* QN of the struct, enum or union that type path `path` names in the file
+ * with graph module QN `module_qn`, from every module of that file in which
+ * the path's head is in scope. NULL unless all of them name the same one: an
+ * alias, a trait, an item outside the project or an undecidable name gives
+ * NULL. The answer does not depend on where in the file the path is
+ * written, so an extracted definition that carries no byte offset (an impl
+ * block's self type) gets the same answer as its source position. */
+const char *cbm_rust_modtree_resolve_nominal_type(const CBMRustModTree *tree, CBMArena *arena,
+                                                  const char *module_qn, const char *path);
+
 #endif /* CBM_LSP_RUST_MODTREE_H */

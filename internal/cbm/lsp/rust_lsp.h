@@ -411,6 +411,13 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
  * Def-driven → byte-identical entries to the per-file build. */
 CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count);
 
+/* Same, with the crate module tree: an impl block whose self type is declared
+ * in another file registers its methods on that declared type. NULL keeps
+ * every method on its extracted receiver. */
+CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBMLSPDef *defs,
+                                                            int def_count,
+                                                            const CBMRustModTree *modtree);
+
 /* Cross-file Rust resolve using a pre-built shared registry (Tier-2). Skips the
  * per-file registry build; just parse + resolve. `manifest` = the same Cargo manifest
  * the per-file path uses (cross-crate #56). `synthetic_calls` is an optional,
