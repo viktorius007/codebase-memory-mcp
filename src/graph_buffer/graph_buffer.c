@@ -1501,7 +1501,8 @@ static void free_remap_entry(const char *key, void *val, void *ud) {
 /* Handle QN collision: update dst node fields (src wins), record remap if IDs differ.
  * label/file_path are re-interned into dst's pool (sn's pointers belong to src). */
 static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
-                                  const cbm_gbuf_node_t *sn, CBMHashTable **remap) {
+                                  const cbm_gbuf_node_t *sn, _Atomic int64_t *src_ids,
+                                  CBMHashTable **remap) {
     /* Same guard as cbm_gbuf_upsert_node: a per-file "Module" def coming from a
      * worker-local gbuf must not touch the structural directory node ("Project"
      * root or "Folder") that shares its QN in a directory-based-module language
@@ -1516,9 +1517,25 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
         existing->label && sn->label && strcmp(sn->label, "Module") == 0 &&
         (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0);
     if (module_on_container) {
+        /* The sibling Module is a node this merge mints, not one it copies.
+         * dst's own counter only clears the ids merged so far; a worker
+         * buffer not yet merged may hold the next one, since every worker
+         * drew from the shared allocator. Mint from that allocator too, then
+         * keep dst's counter above everything it has handed out. */
+        _Atomic int64_t *own_ids = dst->shared_ids;
+        if (src_ids) {
+            dst->shared_ids = src_ids;
+        }
         upsert_folder_sibling_module(dst, existing, sn->label, sn->name, sn->qualified_name,
                                      sn->file_path, sn->start_line, sn->end_line,
                                      sn->properties_json);
+        dst->shared_ids = own_ids;
+        if (src_ids && !own_ids) {
+            int64_t shared_next = atomic_load(src_ids);
+            if (shared_next > dst->next_id) {
+                dst->next_id = shared_next;
+            }
+        }
     } else {
         /* Canonical collision winner (determinism) — mirrors
          * cbm_gbuf_upsert_node exactly. Distinct source entities can share a
@@ -1670,7 +1687,7 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
 
         cbm_gbuf_node_t *existing = cbm_ht_get(dst->node_by_qn, sn->qualified_name);
         if (existing) {
-            merge_update_existing(dst, existing, sn, &remap);
+            merge_update_existing(dst, existing, sn, src->shared_ids, &remap);
         } else {
             merge_copy_new_node(dst, sn);
         }
