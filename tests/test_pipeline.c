@@ -7214,13 +7214,16 @@ static const RustModTreeCallCase rust_modtree_call_cases[] = {
 #define RUST_MODTREE_CALL_CASES \
     ((int)(sizeof(rust_modtree_call_cases) / sizeof(rust_modtree_call_cases[0])))
 
+enum { RUST_MODTREE_MAX_CASES = 32 };
+
 typedef struct {
     int run_rc;
-    bool found[RUST_MODTREE_CALL_CASES];
+    bool found[RUST_MODTREE_MAX_CASES];
 } RustModTreeCallObservation;
 
-static RustModTreeCallObservation observe_rust_modtree_calls(const char *root,
-                                                             const char *db_name) {
+static RustModTreeCallObservation observe_rust_modtree_calls(const char *root, const char *db_name,
+                                                             const RustModTreeCallCase *cases,
+                                                             int case_count) {
     RustModTreeCallObservation o = {.run_rc = -1};
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/%s", root, db_name);
@@ -7229,11 +7232,11 @@ static RustModTreeCallObservation observe_rust_modtree_calls(const char *root,
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (store && pipeline) {
         const char *p = cbm_pipeline_project_name(pipeline);
-        for (int i = 0; i < RUST_MODTREE_CALL_CASES; i++) {
+        for (int i = 0; i < case_count && i < RUST_MODTREE_MAX_CASES; i++) {
             char src[512];
             char dst[512];
-            snprintf(src, sizeof(src), "%s.%s", p, rust_modtree_call_cases[i].src);
-            snprintf(dst, sizeof(dst), "%s.%s", p, rust_modtree_call_cases[i].dst);
+            snprintf(src, sizeof(src), "%s.%s", p, cases[i].src);
+            snprintf(dst, sizeof(dst), "%s.%s", p, cases[i].dst);
             o.found[i] = exact_call_qns_exist(store, p, src, dst);
         }
     }
@@ -7242,6 +7245,52 @@ static RustModTreeCallObservation observe_rust_modtree_calls(const char *root,
     }
     cbm_pipeline_free(pipeline);
     return o;
+}
+
+/* Index `root` sequentially and in parallel; the number of cases whose
+ * published call differs from its expectation, -1 when a run fails. */
+static int check_rust_modtree_calls_in_both_modes(const char *root,
+                                                  const RustModTreeCallCase *cases,
+                                                  int case_count) {
+    char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
+    char *saved_single =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    RustModTreeCallObservation sequential =
+        observe_rust_modtree_calls(root, "modtree-seq.db", cases, case_count);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    RustModTreeCallObservation parallel =
+        observe_rust_modtree_calls(root, "modtree-par.db", cases, case_count);
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (sequential.run_rc != 0 || parallel.run_rc != 0) {
+        return -1;
+    }
+    const RustModTreeCallObservation *modes[2] = {&sequential, &parallel};
+    int mismatches = 0;
+    for (int m = 0; m < 2; m++) {
+        for (int i = 0; i < case_count && i < RUST_MODTREE_MAX_CASES; i++) {
+            if (modes[m]->found[i] != cases[i].expected) {
+                printf("  Rust module-tree mismatch: mode=%s case=\"%s\" %s -> %s found=%d\n",
+                       m == 0 ? "sequential" : "parallel", cases[i].what, cases[i].src,
+                       cases[i].dst, modes[m]->found[i]);
+                mismatches++;
+            }
+        }
+    }
+    return mismatches;
 }
 
 /* A Cargo workspace whose module identities differ from the file layout:
@@ -7314,44 +7363,93 @@ TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes) {
         write_temp_file(tmp, name, body);
     }
 
-    char *saved_workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
-    char *saved_single =
-        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
-    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
-    RustModTreeCallObservation sequential = observe_rust_modtree_calls(tmp, "modtree-seq.db");
-    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
-    cbm_setenv("CBM_WORKERS", "4", 1);
-    RustModTreeCallObservation parallel = observe_rust_modtree_calls(tmp, "modtree-par.db");
-
-    if (saved_workers) {
-        cbm_setenv("CBM_WORKERS", saved_workers, 1);
-        free(saved_workers);
-    } else {
-        cbm_unsetenv("CBM_WORKERS");
-    }
-    if (saved_single) {
-        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
-        free(saved_single);
-    } else {
-        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
-    }
+    int mismatches = check_rust_modtree_calls_in_both_modes(tmp, rust_modtree_call_cases,
+                                                            RUST_MODTREE_CALL_CASES);
     th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
 
-    ASSERT_EQ(sequential.run_rc, 0);
-    ASSERT_EQ(parallel.run_rc, 0);
-    const RustModTreeCallObservation *modes[2] = {&sequential, &parallel};
-    int mismatches = 0;
-    for (int m = 0; m < 2; m++) {
-        for (int i = 0; i < RUST_MODTREE_CALL_CASES; i++) {
-            if (modes[m]->found[i] != rust_modtree_call_cases[i].expected) {
-                printf("  Rust module-tree mismatch: mode=%s case=\"%s\" %s -> %s found=%d\n",
-                       m == 0 ? "sequential" : "parallel", rust_modtree_call_cases[i].what,
-                       rust_modtree_call_cases[i].src, rust_modtree_call_cases[i].dst,
-                       modes[m]->found[i]);
-                mismatches++;
-            }
-        }
+/* Method calls on a value whose type is written in a type position (a
+ * parameter, or a return type read from the def's signature text): the type
+ * name resolves through the declared module tree to the definition a call
+ * path naming it would. `impl Widget` blocks outside `model` and a second
+ * `Widget` leave no other source of the right identity. */
+static const RustModTreeCallCase rust_modtree_type_cases[] = {
+    {"return type imported by `use`", "core.src.by_use.use_widget_ret",
+     "core.src.model.mod.Widget.spin", true},
+    {"param type imported by `use super::*`", "core.src.by_use_tests.glob_widget",
+     "core.src.model.mod.Widget.spin", true},
+    {"return type imported by `use super::*`", "core.src.by_use_tests.glob_widget_ret",
+     "core.src.model.mod.Widget.spin", true},
+    {"crate-qualified param type", "core.src.by_use.crate_param", "support.harness.Harness.run",
+     true},
+    {"crate-qualified return type", "core.src.by_use.crate_ret", "support.harness.Harness.run",
+     true},
+    {"smart pointer return type around an imported type", "core.src.by_use.returned",
+     "core.src.model.mod.Widget.spin", true},
+    {"type imported from outside the project", "core.src.by_ext.shadowed",
+     "core.src.model.mod.Widget.spin", false},
+    {"type imported from outside the project (namesake)", "core.src.by_ext.shadowed",
+     "core.src.other.Widget.spin", false},
+};
+
+TEST(pipeline_rust_type_names_resolve_through_declared_module_tree) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_modtree_types_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"core\", \"util\"]\n");
+    write_temp_file(tmp, "core/Cargo.toml",
+                    "[package]\nname = \"codex-core\"\nedition = \"2021\"\n"
+                    "[dependencies]\ncore_test_support = { path = \"../support\" }\n"
+                    "ext_dep = \"1\"\n");
+    write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
+    /* A path dependency outside the workspace, named by its crate name. */
+    write_temp_file(tmp, "support/Cargo.toml",
+                    "[package]\nname = \"core_test_support\"\nedition = \"2021\"\n"
+                    "[lib]\npath = \"lib.rs\"\n");
+    write_temp_file(tmp, "support/lib.rs", "pub mod harness;\n");
+    write_temp_file(tmp, "support/harness.rs",
+                    "pub struct Harness;\nimpl Harness {\n    pub fn run(&self) -> u8 { 4 }\n}\n");
+    /* write_temp_file creates one directory level: parents come first. */
+    write_temp_file(tmp, "core/src/lib.rs", "mod model;\nmod other;\nmod by_use;\nmod by_ext;\n");
+    write_temp_file(tmp, "core/src/model/mod.rs",
+                    "pub struct Widget;\nimpl Widget {\n    pub fn spin(&self) -> u8 { 2 }\n}\n");
+    write_temp_file(tmp, "core/src/other.rs",
+                    "pub struct Widget;\nimpl Widget {\n    pub fn spin(&self) -> u8 { 3 }\n}\n");
+    write_temp_file(tmp, "core/src/by_use.rs",
+                    "use crate::model::Widget;\nuse std::sync::Arc;\n"
+                    "impl Widget {\n    pub fn extra(&self) -> u8 { 5 }\n}\n"
+                    "pub fn widget_made() -> Widget { Widget }\n"
+                    "pub fn use_widget_ret() -> u8 { let w = widget_made(); w.spin() }\n"
+                    "pub fn harness() -> core_test_support::harness::Harness {\n"
+                    "    core_test_support::harness::Harness\n}\n"
+                    "pub fn crate_ret() -> u8 { let h = harness(); h.run() }\n"
+                    "pub fn crate_param(h: &core_test_support::harness::Harness) -> u8 { h.run() }\n"
+                    "pub fn make() -> Arc<Widget> { Arc::new(Widget) }\n"
+                    "pub fn returned() -> u8 { let w = make(); w.spin() }\n"
+                    "#[cfg(test)]\n#[path = \"by_use_tests.rs\"]\nmod tests;\n");
+    write_temp_file(tmp, "core/src/by_use_tests.rs",
+                    "use super::*;\n"
+                    "impl Widget {\n    fn test_only(&self) -> u8 { 9 }\n}\n"
+                    "fn glob_widget(w: &Widget) -> u8 { w.spin() }\n"
+                    "fn widget_here() -> Widget { Widget }\n"
+                    "fn glob_widget_ret() -> u8 { let w = widget_here(); w.spin() }\n");
+    write_temp_file(tmp, "core/src/by_ext.rs",
+                    "use ext_dep::Widget;\nfn shadowed(w: Widget) -> u8 { w.spin() }\n");
+    write_temp_file(tmp, "util/src/lib.rs", "pub fn util_root() -> u8 { 0 }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "util/src/pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_modtree_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
     }
+
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, rust_modtree_type_cases,
+        (int)(sizeof(rust_modtree_type_cases) / sizeof(rust_modtree_type_cases[0])));
+    th_rmtree(tmp);
     ASSERT_EQ(0, mismatches);
     PASS();
 }
@@ -17152,6 +17250,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
     RUN_TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes);
     RUN_TEST(pipeline_rust_method_on_path_call_result_uses_published_producer);
+    RUN_TEST(pipeline_rust_type_names_resolve_through_declared_module_tree);
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
     RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
     RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);
