@@ -160,6 +160,13 @@ int cbm_store_get_dependent_files(cbm_store_t *s, const char *project,
                                   int *out_count);
 void cbm_store_free_dependent_files(char **files, int count);
 
+/* Closure-route cost fact: *incident gets the number of distinct project
+ * edges with at least one endpoint in a node of `files` (the rows a purge
+ * deletes and a patch re-inserts); *total gets the project's edge count.
+ * Served by idx_nodes_file + the edge endpoint indexes. */
+int cbm_store_count_incident_edges(cbm_store_t *s, const char *project, const char *const *files,
+                                   int file_count, int64_t *incident, int64_t *total);
+
 /* Find edges whose properties contain a url_path matching the keyword. */
 int cbm_store_find_edges_by_url_path(cbm_store_t *s, const char *project, const char *keyword,
                                      cbm_edge_t **out, int *count);

@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "foundation/compat_fs.h"
 #include "foundation/hash_table.h"
@@ -88,6 +89,31 @@ int cbm_delta_stage_clone(const char *final_db_path, char **out_stage_path) {
     }
     *out_stage_path = stage;
     return 0;
+}
+
+/* The store's default page cache (~2 MB) is sized for queries. The purge
+ * deletes every edge incident to the closure through the edge table's
+ * secondary indexes, and the patch re-inserts them: random row-level writes
+ * across B-trees as large as the file. With a small cache each write evicts
+ * and re-reads index pages (measured 11.4 s for an 841-file purge on a
+ * 460 MB graph, against 3.8 s once the pages stay resident). A cache the
+ * size of the staged file bounds that working set; it is still smaller than
+ * the in-memory graph the full rebuild — this route's only alternative —
+ * holds, and SQLite allocates cache pages only as they are touched. */
+int cbm_delta_stage_size_cache(cbm_store_t *staging, const char *stage_path) {
+    enum { KIB = 1024, DEFAULT_CACHE_KIB = 2000 };
+    sqlite3 *db = cbm_store_get_db(staging);
+    if (!db) {
+        return CBM_NOT_FOUND;
+    }
+    struct stat st;
+    long long cache_kib = DEFAULT_CACHE_KIB;
+    if (stat(stage_path, &st) == 0 && (long long)st.st_size / KIB > cache_kib) {
+        cache_kib = (long long)st.st_size / KIB;
+    }
+    char sql[CBM_SZ_64];
+    snprintf(sql, sizeof(sql), "PRAGMA cache_size = -%lld;", cache_kib);
+    return sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK ? 0 : CBM_NOT_FOUND;
 }
 
 /* Append the current row (source QN, target QN, type, properties) to the

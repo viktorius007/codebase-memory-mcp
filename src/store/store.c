@@ -5058,6 +5058,102 @@ int cbm_store_get_dependent_files(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
+/* One chunk of the incident-edge count. Outbound edges of the chunk's nodes
+ * are counted whole; inbound edges only when their source lies outside the
+ * full file set, so an edge between two member files counts once. */
+static int incident_edges_chunk(cbm_store_t *s, const char *project, const char *const *files,
+                                int chunk_count, const CBMHashTable *members, int64_t *incident) {
+    static const char *const heads[] = {
+        "SELECT '', count(*) FROM nodes n CROSS JOIN edges e ON e.source_id = n.id"
+        " WHERE n.project = ?1 AND n.file_path IN (",
+        "SELECT src.file_path, count(*) FROM nodes tgt"
+        " CROSS JOIN edges e ON e.target_id = tgt.id"
+        " CROSS JOIN nodes src ON e.source_id = src.id"
+        " WHERE tgt.project = ?1 AND tgt.file_path IN (",
+    };
+    static const char *const tails[] = {")", ") GROUP BY src.file_path"};
+    for (size_t side = 0; side < sizeof(heads) / sizeof(heads[0]); side++) {
+        char sql[CBM_SZ_4K];
+        int pos = snprintf(sql, sizeof(sql), "%s", heads[side]);
+        for (int i = 0; i < chunk_count && (size_t)pos < sizeof(sql); i++) {
+            pos +=
+                snprintf(sql + pos, sizeof(sql) - (size_t)pos, "%s?%d", i ? "," : "", i + ST_COL_2);
+        }
+        if ((size_t)pos < sizeof(sql)) {
+            pos += snprintf(sql + pos, sizeof(sql) - (size_t)pos, "%s", tails[side]);
+        }
+        if ((size_t)pos >= sizeof(sql)) {
+            return CBM_STORE_ERR;
+        }
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "incident_edges prepare");
+            return CBM_STORE_ERR;
+        }
+        bind_text(stmt, ST_COL_1, project);
+        for (int i = 0; i < chunk_count; i++) {
+            bind_text(stmt, i + ST_COL_2, files[i]);
+        }
+        int step_rc;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            const char *src_path = (const char *)sqlite3_column_text(stmt, 0);
+            bool internal = side > 0 && src_path && cbm_ht_get(members, src_path);
+            if (!internal) {
+                *incident += sqlite3_column_int64(stmt, 1);
+            }
+        }
+        sqlite3_finalize(stmt);
+        if (step_rc != SQLITE_DONE) {
+            return CBM_STORE_ERR;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_count_incident_edges(cbm_store_t *s, const char *project, const char *const *files,
+                                   int file_count, int64_t *incident, int64_t *total) {
+    *incident = 0;
+    *total = 0;
+    if (!s || !project || file_count < 0) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "SELECT count(*) FROM edges WHERE project = ?1", CBM_NOT_FOUND,
+                           &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "edge_count prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
+        *total = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_ROW) {
+        return CBM_STORE_ERR;
+    }
+    CBMHashTable *members = cbm_ht_create((size_t)file_count * PAIR_LEN + ST_INIT_CAP_8);
+    if (!members) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < file_count; i++) {
+        cbm_ht_set(members, files[i], (void *)files[i]);
+    }
+    int rc = CBM_STORE_OK;
+    for (int off = 0; off < file_count && rc == CBM_STORE_OK; off += DEPFILE_CHUNK) {
+        int chunk = file_count - off;
+        if (chunk > DEPFILE_CHUNK) {
+            chunk = DEPFILE_CHUNK;
+        }
+        rc = incident_edges_chunk(s, project, files + off, chunk, members, incident);
+    }
+    cbm_ht_free(members);
+    if (rc != CBM_STORE_OK) {
+        *incident = 0;
+    }
+    return rc;
+}
+
 void cbm_store_free_dependent_files(char **files, int count) {
     if (!files) {
         return;
