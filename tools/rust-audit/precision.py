@@ -1,18 +1,86 @@
 #!/usr/bin/env python3
 """Classify published Rust CALLS pairs against the independent truth."""
-import collections, random
+import collections, random, re
 import os
 D=os.environ.get('AUDIT_DIR','/tmp/ts-audit')+'/'
+CORPUS=os.environ.get('AUDIT_CORPUS',os.path.expanduser('~/.cache/cbm-rust-bench/codex/codex-rs'))+'/'
+UNRESOLVED='unverifiable: oracle left every call site unresolved (dev-dependency cycle, inactive cfg)'
+UNEXPANDED='unverifiable: no oracle record in the macro holding the call (unexpanded, or arguments unresolved)'
 nodes={}
 for l in open(D+'g_nodes.tsv',errors='replace'):
     i,label,name,f,s,e=l.rstrip('\n').split('\t'); nodes[int(i)]=(label,name,f,int(s),int(e))
-scip_files=set(); callers=collections.defaultdict(lambda: collections.defaultdict(set))  # (file) -> list of (line,name) -> callee name -> {(df,dl,kind)}
-bycaller=collections.defaultdict(lambda: collections.defaultdict(set))
+scip_files=set()
+bycaller=collections.defaultdict(lambda: collections.defaultdict(set))  # (caller file, line, name) -> callee name -> {(df,dl,kind)}
+at_line=collections.defaultdict(list)  # (file, line) -> [(kind, callee name or '-')]: every oracle record on that line
 for l in open(D+'truth.tsv',errors='replace'):
     f,line,kind,cf,cl,cn,sym,df,dl,shape,wr=l.rstrip('\n').split('\t'); scip_files.add(f)
+    cname='-'
+    if sym!='-':
+        cname=sym.rsplit('().',1)[0]; cname=cname[max(cname.rfind(']'),cname.rfind('/'),cname.rfind('#'),cname.rfind(' '))+1:]
+    at_line[(f,int(line))].append((kind,cname))
     if kind.endswith('unresolved') or cf=='-': continue
-    cname=sym.rsplit('().',1)[0]; cname=cname[max(cname.rfind(']'),cname.rfind('/'),cname.rfind('#'),cname.rfind(' '))+1:]
     bycaller[(cf,int(cl),cn)][cname].add((df,dl,kind))
+src={}
+def source(f):
+    if f not in src:
+        try: src[f]=open(CORPUS+f,errors='replace').read().split('\n')
+        except OSError: src[f]=[]
+    return src[f]
+def macro_lines(lines,lo,hi):
+    """Lines in [lo,hi] that lie inside the token tree of a `name!(...)`/`name![...]`/`name!{...}` invocation."""
+    inside=set(); depth=0; text='\n'.join(lines[lo-1:hi]); ln=lo; i=0; opener=re.compile(r'\b[A-Za-z_]\w*!\s*[(\[{]')
+    while i<len(text):
+        m=opener.match(text,i) if depth==0 else None
+        if m:
+            depth=1; i=m.end(); continue
+        c=text[i]
+        if depth:
+            inside.add(ln)
+            if c in '([{': depth+=1
+            elif c in ')]}': depth-=1
+        if c=='\n': ln+=1
+        i+=1
+    return inside
+def no_oracle_data(a,b):
+    """Why the oracle cannot judge the published call a -> b, or None when it can.
+
+    Every textual call of b's name inside a's span is located in the corpus source. The
+    pair is unverifiable only when the oracle recorded no resolution for any of them: no
+    record on the site line names b, and every other resolved call record on that line
+    names a different call written on the same line (so none can be b's call resolved
+    under another name). UNRESOLVED: each site line carries an unresolved record of the
+    site's form (path or method). UNEXPANDED: some site carries no record at all, which
+    is legitimate only inside a macro token tree that produced no record on any of its
+    lines, and only when the name is not bound locally (a closure call has no record)."""
+    lines=source(a[2]); n=b[1]
+    if not lines: return None
+    call=re.compile(r'(\.\s*)?(?<![\w$])'+re.escape(n)+r'\s*(::\s*<[^()]*>\s*)?\(')
+    local=re.compile(r'(\blet\s+(mut\s+)?|[|,(]\s*(mut\s+)?)'+re.escape(n)+r'\b\s*[:=|,)]')
+    sites=[]
+    for ln in range(a[3],min(a[4],len(lines))+1):
+        t=re.sub(r'(^|\s)//.*','',lines[ln-1])
+        if re.search(r'\bfn\s+'+re.escape(n)+r'\b',t): continue
+        if local.search(t): return None
+        for m in call.finditer(t):
+            sites.append((ln,'method' if m.group(1) else 'path'))
+    if not sites: return None
+    macro=None; why=UNRESOLVED
+    for ln,form in sites:
+        recs=at_line.get((a[2],ln),[])
+        t=lines[ln-1]
+        if any(nm==n for _,nm in recs): return None
+        for kind,nm in recs:
+            if kind in('path','method','ref_in_macro') and not re.search(r'(?<![\w$])'+re.escape(nm)+r'\b',t): return None
+        if any(kind==form+'_unresolved' for kind,_ in recs): continue
+        if recs: return None
+        if macro is None: macro=macro_lines(lines,a[3],a[4])
+        if ln not in macro: return None
+        lo=hi=ln
+        while lo-1 in macro: lo-=1
+        while hi+1 in macro: hi+=1
+        if any((a[2],x) in at_line for x in range(lo,hi+1)): return None
+        why=UNEXPANDED
+    return why
 idx=collections.defaultdict(list)
 for (cf,cl,cn) in bycaller: idx[cf].append((cl,cn))
 C=collections.Counter(); S=collections.defaultdict(list); strat=collections.Counter()
@@ -27,7 +95,7 @@ for l in open(D+'g_calls.tsv'):
         if key is None: k='unverifiable: caller has no oracle data (inactive cfg or no calls)'
         else:
             tg=bycaller[key].get(b[1])
-            if not tg: k='NOT IN TRUTH: caller never references a function of that name'
+            if not tg: k=no_oracle_data(a,b) or 'NOT IN TRUTH: caller never references a function of that name'
             else:
                 exact=[x for x in tg if x[0]==b[2] and x[1]!='-' and b[3]<=int(x[1])<=b[4]]
                 if exact:
