@@ -2903,6 +2903,110 @@ TEST(rustlsp_strict_arc_deref_to_inner) {
     PASS();
 }
 
+/* Cross-file fixture for Deref through a field: `p.demo.Holder` declares
+ * `state: Arc<State>` and `inner: Box<Inner>` in its own module, so the
+ * caller sees the wrapper heads as written (`Arc`, `Box`) without the
+ * defining file's imports. */
+static int rustlsp_deref_fixture(CBMRustLSPDef *defs) {
+    int n = 0;
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Holder",
+                                .short_name = "Holder",
+                                .label = "Type",
+                                .def_module_qn = "p.demo",
+                                .field_defs = "state:Arc<State>|inner:Box<Inner>"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.State",
+                                .short_name = "State",
+                                .label = "Type",
+                                .def_module_qn = "p.demo"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.State.ping",
+                                .short_name = "ping",
+                                .label = "Method",
+                                .receiver_type = "p.demo.State",
+                                .def_module_qn = "p.demo"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.State.downgrade",
+                                .short_name = "downgrade",
+                                .label = "Method",
+                                .receiver_type = "p.demo.State",
+                                .def_module_qn = "p.demo"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.State.eq",
+                                .short_name = "eq",
+                                .label = "Method",
+                                .receiver_type = "p.demo.State",
+                                .receiver_spelling = "State",
+                                .def_module_qn = "p.demo",
+                                .trait_qn = "PartialEq"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Inner",
+                                .short_name = "Inner",
+                                .label = "Type",
+                                .def_module_qn = "p.demo",
+                                .field_defs = "leaf:Leaf"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Leaf",
+                                .short_name = "Leaf",
+                                .label = "Type",
+                                .def_module_qn = "p.demo"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Leaf.go",
+                                .short_name = "go",
+                                .label = "Method",
+                                .receiver_type = "p.demo.Leaf",
+                                .def_module_qn = "p.demo"};
+    return n;
+}
+
+static void rustlsp_run_deref_fixture(CBMArena *a, const char *src, CBMResolvedCallArray *out) {
+    CBMRustLSPDef defs[8];
+    int n = rustlsp_deref_fixture(defs);
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    memset(out, 0, sizeof(*out));
+    cbm_run_rust_lsp_cross(a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           out);
+}
+
+TEST(rustlsp_deref_method_through_arc_field_from_other_module) {
+    /* `Arc` reaches the caller as the bare head the defining module wrote;
+     * it is still std's Arc, so `ping` is found on its target `State`. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_deref_fixture(&a, "fn run(h: demo::Holder) { h.state.ping(); }\n", &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.State.ping"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_deref_field_through_box) {
+    /* `h.inner.leaf` reads field `leaf` of `Inner` through `Box<Inner>`. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_deref_fixture(&a, "fn run(h: demo::Holder) { h.inner.leaf.go(); }\n", &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.Leaf.go"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_deref_wrapper_method_wins_over_target) {
+    /* `Arc` has its own `downgrade` and implements `PartialEq::eq`; both
+     * shadow the same-named methods of `State` behind it. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_deref_fixture(&a,
+                              "use std::sync::Arc;\n"
+                              "fn run(h: demo::Holder, o: demo::Holder) {\n"
+                              "    h.state.downgrade();\n"
+                              "    h.state.eq(&o.state);\n"
+                              "    h.state.ping();\n"
+                              "}\n",
+                              &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.State.ping"), 0);
+    ASSERT_GTE(find_confident(&out, "run", "alloc.sync.Arc.downgrade"), 0);
+    ASSERT_EQ(find_confident(&out, "run", "p.demo.State.downgrade"), -1);
+    ASSERT_EQ(find_confident(&out, "run", "p.demo.State.eq"), -1);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(rustlsp_strict_refcell_borrow) {
     CBMFileResult *r = extract_rust(
         "use std::cell::RefCell;\n"
@@ -8176,6 +8280,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_strict_box_deref_to_inner);
     RUN_TEST(rustlsp_strict_rc_deref_to_inner);
     RUN_TEST(rustlsp_strict_arc_deref_to_inner);
+    RUN_TEST(rustlsp_deref_method_through_arc_field_from_other_module);
+    RUN_TEST(rustlsp_deref_field_through_box);
+    RUN_TEST(rustlsp_deref_wrapper_method_wins_over_target);
     RUN_TEST(rustlsp_strict_refcell_borrow);
     RUN_TEST(rustlsp_strict_iter_map_closure);
     RUN_TEST(rustlsp_strict_option_map_closure);

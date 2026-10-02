@@ -62,6 +62,7 @@ static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
 static char *rust_node_text(RustLSPContext *ctx, TSNode node);
 static const char *convert_path_to_qn(CBMArena *arena, const char *path);
 static bool rust_type_derefs_to_first_arg(const char *type_qn);
+static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t);
 static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char *name);
 static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text);
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
@@ -221,43 +222,64 @@ static bool is_string_macro(const char *name) {
            strcmp(name, "include_str") == 0;
 }
 
-/* Prelude trait names whose method short-names we treat as universally
- * available (for emit-on-best-effort when we cannot pin down the trait
- * impl). Borrowed from `core::prelude::v1`. */
-static bool is_prelude_trait_method(const char *method_name) {
+/* Autoderef bound, the rust-analyzer cap. */
+enum { RUST_DEREF_MAX_HOPS = 8 };
+
+static bool rust_method_in(const char *const *names, const char *method_name) {
     if (!method_name) {
         return false;
     }
-    static const char *m[] = {/* Clone / Copy / Default */
-                              "clone", "default",
-                              /* PartialEq / Eq / PartialOrd / Ord */
-                              "eq", "ne", "cmp", "partial_cmp", "lt", "le", "gt", "ge",
-                              /* Hash */
-                              "hash",
-                              /* Display / Debug */
-                              "fmt", "to_string",
-                              /* From / Into / TryFrom / TryInto */
-                              "from", "into", "try_from", "try_into",
-                              /* AsRef / AsMut / Borrow / BorrowMut */
-                              "as_ref", "as_mut", "borrow", "borrow_mut",
-                              /* Deref */
-                              "deref", "deref_mut",
-                              /* Drop */
-                              "drop",
-                              /* Iterator (most-used subset) */
-                              "next", "iter", "iter_mut", "into_iter", "map", "filter", "fold",
-                              "for_each", "collect", "count", "sum", "max", "min", "any", "all",
-                              "find", "position", "enumerate", "zip", "chain", "take", "skip",
-                              "rev", "cloned", "copied", "by_ref", "step_by", "flat_map", "flatten",
-                              "filter_map", "peekable",
-                              /* Future */
-                              "poll", NULL};
-    for (const char **p = m; *p; p++) {
+    for (const char *const *p = names; *p; p++) {
         if (strcmp(*p, method_name) == 0) {
             return true;
         }
     }
     return false;
+}
+
+/* Trait methods that the std Deref wrappers (`Box`, `Rc`, `Arc`, guards)
+ * implement on themselves. Method lookup tries the wrapper before its
+ * target, so such a call never reaches the target through Deref.
+ * `Borrow`/`BorrowMut` are not in the prelude: without an explicit import,
+ * `rc.borrow()` derefs to `RefCell::borrow`, so they are not listed. */
+static const char *const RUST_WRAPPER_TRAIT_METHODS[] = {
+    /* Clone / Copy / Default */
+    "clone", "default",
+    /* PartialEq / Eq / PartialOrd / Ord */
+    "eq", "ne", "cmp", "partial_cmp", "lt", "le", "gt", "ge",
+    /* Hash */
+    "hash",
+    /* Display / Debug */
+    "fmt", "to_string",
+    /* From / Into / TryFrom / TryInto */
+    "from", "into", "try_from", "try_into",
+    /* AsRef / AsMut */
+    "as_ref", "as_mut",
+    /* Deref */
+    "deref", "deref_mut",
+    /* Drop */
+    "drop", NULL};
+
+static bool rust_is_wrapper_trait_method(const char *method_name) {
+    return rust_method_in(RUST_WRAPPER_TRAIT_METHODS, method_name);
+}
+
+/* Prelude trait names whose method short-names we treat as universally
+ * available (for emit-on-best-effort when we cannot pin down the trait
+ * impl). Borrowed from `core::prelude::v1`. */
+static bool is_prelude_trait_method(const char *method_name) {
+    static const char *const iterator_future[] = {
+        /* Iterator (most-used subset) */
+        "next", "iter", "iter_mut", "into_iter", "map", "filter", "fold", "for_each", "collect",
+        "count", "sum", "max", "min", "any", "all", "find", "position", "enumerate", "zip", "chain",
+        "take", "skip", "rev", "cloned", "copied", "by_ref", "step_by", "flat_map", "flatten",
+        "filter_map", "peekable",
+        /* Future */
+        "poll",
+        /* Borrow / BorrowMut */
+        "borrow", "borrow_mut", NULL};
+    return rust_is_wrapper_trait_method(method_name) ||
+           rust_method_in(iterator_future, method_name);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -2296,7 +2318,7 @@ static const CBMType *rust_eval_literal_type(RustLSPContext *ctx, const char *ki
  * access. Order: inherent method → field → trait method (with single-impl
  * preference). */
 static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType *recv,
-                                              const char *member);
+                                              const char *member, bool method_call);
 
 /* `t` with every `Self` replaced by `self_qn`, through references, tuples
  * and generic arguments (`Result<Self>`, `Option<&Self>`). */
@@ -2486,7 +2508,7 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         if (!fname) {
             return cbm_type_unknown();
         }
-        return rust_eval_member_access(ctx, recv, fname);
+        return rust_eval_member_access(ctx, recv, fname, false);
     }
 
     /* call_expression: any callable invocation. */
@@ -2837,7 +2859,7 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
                      * return type so chains like
                      * `String::new().to_uppercase().len()` keep typing
                      * across each link. */
-                    const CBMType *t = rust_eval_member_access(ctx, recv, mname);
+                    const CBMType *t = rust_eval_member_access(ctx, recv, mname, true);
                     if (t && t->kind == CBM_TYPE_FUNC && t->data.func.return_types &&
                         t->data.func.return_types[0]) {
                         const CBMType *ret = t->data.func.return_types[0];
@@ -3210,9 +3232,33 @@ const CBMType *rust_eval_expr_typed(RustLSPContext *ctx, TSNode node, const CBMT
 }
 
 /* Member access type: returns the CBMType for `recv.field_or_method`.
- * Methods return their FUNC signature; fields return the field type. */
+ * Methods return their FUNC signature; fields return the field type. A
+ * member the receiver lacks is looked up on its Deref target, hop by hop,
+ * as rustc's autoderef does; a method call keeps a wrapper-level prelude
+ * trait method on the wrapper. */
+static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMType *recv,
+                                                 const char *member, bool method_call, int hop);
+
 static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType *recv,
-                                              const char *member) {
+                                              const char *member, bool method_call) {
+    return rust_eval_member_access_at(ctx, recv, member, method_call, 0);
+}
+
+static const CBMType *rust_eval_member_access_deref(RustLSPContext *ctx, const CBMType *base,
+                                                    const char *member, bool method_call,
+                                                    int hop) {
+    if (hop >= RUST_DEREF_MAX_HOPS || (method_call && rust_is_wrapper_trait_method(member))) {
+        return cbm_type_unknown();
+    }
+    const CBMType *next = rust_deref_step(ctx, base);
+    if (!next) {
+        return cbm_type_unknown();
+    }
+    return rust_eval_member_access_at(ctx, next, member, method_call, hop + 1);
+}
+
+static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMType *recv,
+                                                 const char *member, bool method_call, int hop) {
     if (!recv || !member)
         return cbm_type_unknown();
     /* Auto-deref through references. */
@@ -3289,7 +3335,7 @@ static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType
         }
         return ft;
     }
-    return cbm_type_unknown();
+    return rust_eval_member_access_deref(ctx, base, member, method_call, hop);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -3353,6 +3399,27 @@ static bool rust_type_derefs_to_first_arg(const char *type_qn) {
     return false;
 }
 
+/* A template head as written (`Arc`, `std::sync::Arc`, or a name some
+ * signature recorded under its defining module) names a std Deref wrapper
+ * once it is resolved like any other type name: through the file's `use`
+ * map and the registry, then the prelude for a bare name nothing else
+ * claims. A user type that shares the name resolves to itself. */
+static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head) {
+    if (rust_type_derefs_to_first_arg(head)) {
+        return true;
+    }
+    const char *qn = convert_path_to_qn(ctx->arena, head);
+    if (rust_type_derefs_to_first_arg(qn)) {
+        return true;
+    }
+    const char *registered = rust_registered_type_qn(ctx, qn);
+    if (registered) {
+        return rust_type_derefs_to_first_arg(registered);
+    }
+    return !strchr(qn, '.') && !rust_resolve_use(ctx, qn) &&
+           rust_type_derefs_to_first_arg(rust_lookup_prelude(qn));
+}
+
 /* Returns the inner type after one Deref step. For NAMED types we check
  * for a registered `embedded_types` entry whose tail is "Target=<U>" or,
  * for stdlib smart pointers, peel the first template arg. Returns NULL
@@ -3363,7 +3430,7 @@ static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t) {
     /* Smart pointers: Box<T>, Rc<T>, Arc<T>, etc. The grammar gives us a
      * TEMPLATE; the inner type is the first template arg. */
     if (t->kind == CBM_TYPE_TEMPLATE && t->data.template_type.template_name) {
-        if (rust_type_derefs_to_first_arg(t->data.template_type.template_name)) {
+        if (rust_wrapper_head_derefs(ctx, t->data.template_type.template_name)) {
             if (t->data.template_type.arg_count > 0) {
                 return t->data.template_type.template_args[0];
             }
@@ -5692,6 +5759,7 @@ static void rust_resolve_callable_argument_references(RustLSPContext *ctx, TSNod
     }
 }
 
+
 static void rust_emit_unresolved_call(RustLSPContext *ctx, const char *expr_text,
                                       const char *reason) {
     if (!ctx || !ctx->resolved_calls || !ctx->enclosing_func_qn)
@@ -5990,7 +6058,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
              * `Rc<RefCell<T>>::method` peels two levels, etc. We bound
              * the chain at 8 hops to mirror the rust-analyzer cap. */
             const CBMType *cur = base;
-            for (int hop = 0; hop < 8; hop++) {
+            for (int hop = 0; hop < RUST_DEREF_MAX_HOPS && !rust_is_wrapper_trait_method(mname);
+                 hop++) {
                 const CBMType *next = rust_deref_step(ctx, cur);
                 if (!next)
                     break;
