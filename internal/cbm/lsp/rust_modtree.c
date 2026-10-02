@@ -111,17 +111,17 @@ typedef struct {
     int count;
 } RmtVisit;
 
-#define RMT_GROW(tree, field, count, cap)                                                         \
-    do {                                                                                          \
-        if ((tree)->count >= (tree)->cap) {                                                       \
-            int grown = (tree)->cap ? (tree)->cap * 2 : 64;                                       \
-            void *next = cbm_realloc(CBM_MEM_CLASS_OTHER, (tree)->field,                          \
-                                     (size_t)grown * sizeof(*(tree)->field));                     \
-            if (!next)                                                                            \
-                return -1;                                                                        \
-            (tree)->field = next;                                                                 \
-            (tree)->cap = grown;                                                                  \
-        }                                                                                         \
+#define RMT_GROW(tree, field, count, cap)                                     \
+    do {                                                                      \
+        if ((tree)->count >= (tree)->cap) {                                   \
+            int grown = (tree)->cap ? (tree)->cap * 2 : 64;                   \
+            void *next = cbm_realloc(CBM_MEM_CLASS_OTHER, (tree)->field,      \
+                                     (size_t)grown * sizeof(*(tree)->field)); \
+            if (!next)                                                        \
+                return -1;                                                    \
+            (tree)->field = next;                                             \
+            (tree)->cap = grown;                                              \
+        }                                                                     \
     } while (0)
 
 /* ── Construction ─────────────────────────────────────────────────── */
@@ -395,9 +395,8 @@ static void rmt_walk_items(RmtWalk *walk, TSNode container, int module, const ch
 /* `mod name;` → the declared file: `#[path]` relative to the declaring
  * file's directory (or the inline module's directory), else `name.rs` or
  * `name/mod.rs` in the declaring module's child directory. */
-static int rmt_out_of_line_file(RmtWalk *walk, TSNode item, const char *name,
-                                const char *child_dir, bool inline_scope,
-                                const char **out_children_dir) {
+static int rmt_out_of_line_file(RmtWalk *walk, TSNode item, const char *name, const char *child_dir,
+                                bool inline_scope, const char **out_children_dir) {
     CBMRustModTree *tree = walk->tree;
     const char *attr = cbm_rust_path_attribute(&tree->arena, walk->source, item);
     if (attr) {
@@ -499,7 +498,8 @@ static void rmt_walk_extern_crate(RmtWalk *walk, TSNode item, int module) {
     if (!name) {
         return;
     }
-    const char *path = strcmp(name, "self") == 0 ? "crate" : cbm_arena_sprintf(&tree->arena, "::%s", name);
+    const char *path =
+        strcmp(name, "self") == 0 ? "crate" : cbm_arena_sprintf(&tree->arena, "::%s", name);
     (void)rmt_add_import(tree, module, alias ? alias : name, path, false);
 }
 
@@ -510,14 +510,10 @@ typedef struct {
 } RmtItemKind;
 
 static const RmtItemKind RMT_ITEM_KINDS[] = {
-    {"function_item", RMT_FN, RMT_NS_VALUE},
-    {"struct_item", RMT_TYPE, RMT_NS_ALL},
-    {"union_item", RMT_TYPE, RMT_NS_TYPE},
-    {"enum_item", RMT_ENUM, RMT_NS_TYPE},
-    {"trait_item", RMT_TRAIT, RMT_NS_TYPE},
-    {"type_item", RMT_TYPE, RMT_NS_TYPE},
-    {"const_item", RMT_VALUE, RMT_NS_VALUE},
-    {"static_item", RMT_VALUE, RMT_NS_VALUE},
+    {"function_item", RMT_FN, RMT_NS_VALUE}, {"struct_item", RMT_TYPE, RMT_NS_ALL},
+    {"union_item", RMT_TYPE, RMT_NS_TYPE},   {"enum_item", RMT_ENUM, RMT_NS_TYPE},
+    {"trait_item", RMT_TRAIT, RMT_NS_TYPE},  {"type_item", RMT_TYPE, RMT_NS_TYPE},
+    {"const_item", RMT_VALUE, RMT_NS_VALUE}, {"static_item", RMT_VALUE, RMT_NS_VALUE},
 };
 
 static void rmt_walk_item(RmtWalk *walk, TSNode item, int module, const char *child_dir,
@@ -745,8 +741,8 @@ static void rmt_import_defs(CBMRustModTree *tree, int import, bool building, uin
 }
 
 /* Names that come through `use path::*`: a module's own names, recursively. */
-static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns,
-                       RmtDefs *out, RmtVisit *visit, bool building);
+static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns, RmtDefs *out,
+                       RmtVisit *visit, bool building);
 
 static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name, uint8_t ns,
                              RmtDefs *out, RmtVisit *visit, bool building) {
@@ -770,8 +766,8 @@ static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name,
     }
 }
 
-static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns,
-                       RmtDefs *out, RmtVisit *visit, bool building) {
+static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns, RmtDefs *out,
+                       RmtVisit *visit, bool building) {
     char key[RMT_KEY_MAX];
     int written = snprintf(key, sizeof(key), "%d\x1f%s", module, name);
     if (written < 0 || written >= (int)sizeof(key)) {
@@ -812,18 +808,20 @@ static void rmt_resolve_import(CBMRustModTree *tree, int import) {
     imp->state = RMT_IMPORT_DONE;
 }
 
-static const char *const RMT_LANGUAGE_CRATES[] = {"std", "core", "alloc", "proc_macro", "test",
-                                                  NULL};
+static const char *const RMT_LANGUAGE_CRATES[] = {"std",        "core", "alloc",
+                                                  "proc_macro", "test", NULL};
 
 /* Names every module sees through the standard prelude or as primitive
  * types; a path headed by one names no project item unless shadowed. */
 static const char *const RMT_PRELUDE[] = {
-    "Some", "None", "Ok", "Err", "Option", "Result", "Vec", "String", "Box", "ToString",
-    "ToOwned", "Clone", "Copy", "Default", "Drop", "Eq", "PartialEq", "Ord", "PartialOrd",
-    "Fn", "FnMut", "FnOnce", "From", "Into", "TryFrom", "TryInto", "AsRef", "AsMut",
-    "Iterator", "IntoIterator", "Extend", "Send", "Sync", "Sized", "Unpin", "drop",
-    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
-    "f32", "f64", "bool", "char", "str", NULL};
+    "Some",     "None",         "Ok",        "Err",     "Option",     "Result", "Vec",
+    "String",   "Box",          "ToString",  "ToOwned", "Clone",      "Copy",   "Default",
+    "Drop",     "Eq",           "PartialEq", "Ord",     "PartialOrd", "Fn",     "FnMut",
+    "FnOnce",   "From",         "Into",      "TryFrom", "TryInto",    "AsRef",  "AsMut",
+    "Iterator", "IntoIterator", "Extend",    "Send",    "Sync",       "Sized",  "Unpin",
+    "drop",     "i8",           "i16",       "i32",     "i64",        "i128",   "isize",
+    "u8",       "u16",          "u32",       "u64",     "u128",       "usize",  "f32",
+    "f64",      "bool",         "char",      "str",     NULL};
 
 static bool rmt_in_list(const char *const *list, const char *name) {
     for (const char *const *p = list; *p; p++) {
@@ -838,13 +836,11 @@ static bool rmt_extern_prelude(const CBMRustModTree *tree, int crate, const char
                                RmtDef *out) {
     char key[RMT_KEY_MAX];
     int written = snprintf(key, sizeof(key), "%d\x1f%s", crate, name);
-    int32_t target = written > 0 && written < (int)sizeof(key)
-                         ? cbm_idxmemo_get(&tree->externs, key)
-                         : -1;
+    int32_t target =
+        written > 0 && written < (int)sizeof(key) ? cbm_idxmemo_get(&tree->externs, key) : -1;
     if (target > 0 && tree->crates[target - 1].root_module >= 0) {
-        *out = (RmtDef){.kind = RMT_MODULE,
-                        .ns = RMT_NS_TYPE,
-                        .module = tree->crates[target - 1].root_module};
+        *out = (RmtDef){
+            .kind = RMT_MODULE, .ns = RMT_NS_TYPE, .module = tree->crates[target - 1].root_module};
         return true;
     }
     if (target == 0 || rmt_in_list(RMT_LANGUAGE_CRATES, name)) {
@@ -858,8 +854,8 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
                              bool is_use, RmtDefs *out, bool building) {
     int crate = tree->modules[module].crate;
     RmtVisit visit = {.count = 0};
-    int scope = is_use && tree->crates[crate].edition_2015 ? tree->crates[crate].root_module
-                                                           : module;
+    int scope =
+        is_use && tree->crates[crate].edition_2015 ? tree->crates[crate].root_module : module;
     rmt_lookup(tree, scope, head, ns, out, &visit, building);
     if (out->count > 0 || out->open) {
         return;
@@ -1061,8 +1057,8 @@ static int rmt_apply_block_uses(CBMArena *arena, const char **segs, int count,
 }
 
 CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena *arena,
-                                           const char *module_qn, uint32_t offset,
-                                           const char *path, const char *const *extra_names,
+                                           const char *module_qn, uint32_t offset, const char *path,
+                                           const char *const *extra_names,
                                            const char *const *extra_paths, int extra_count) {
     CBMRustPathResult unknown = {.kind = CBM_RUST_PATH_UNKNOWN};
     if (!tree || !arena || !module_qn || !path || path[0] == '<') {

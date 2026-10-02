@@ -38,15 +38,15 @@ uint64_t cbm_rust_modtree_file_digest(const char *source, TSNode root);
 /* Supplies a file's source text. Returns a buffer the tree borrows until
  * `release` is called with it, or NULL when the file cannot be read. */
 typedef struct {
-    const char *(*load)(void *ctx, int file_id, int *out_len);
-    void (*release)(void *ctx, int file_id, const char *source);
-    void *ctx;
+    const char *(*load)(const void *ctx, int file_id, int *out_len);
+    void (*release)(const void *ctx, int file_id, const char *source);
+    const void *ctx;
 } CBMRustSourceLoader;
 
 typedef enum {
-    CBM_RUST_PATH_UNKNOWN = 0, /* the tree cannot decide; caller may try other evidence */
-    CBM_RUST_PATH_FUNCTION,    /* `qn` is a free function */
-    CBM_RUST_PATH_ASSOC,       /* `qn` is a type or trait; `assoc` is its associated item */
+    CBM_RUST_PATH_UNKNOWN = 0,  /* the tree cannot decide; caller may try other evidence */
+    CBM_RUST_PATH_FUNCTION,     /* `qn` is a free function */
+    CBM_RUST_PATH_ASSOC,        /* `qn` is a type or trait; `assoc` is its associated item */
     CBM_RUST_PATH_NOT_FUNCTION, /* proven to name no in-project function (variable, type,
                                  * constant, variant, external crate item) */
 } CBMRustPathKind;
@@ -90,8 +90,8 @@ bool cbm_rust_modtree_has_file(const CBMRustModTree *tree, const char *module_qn
  * same identity in each, otherwise the result is UNKNOWN. Strings in the
  * result live in `arena` or the tree. */
 CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena *arena,
-                                           const char *module_qn, uint32_t offset,
-                                           const char *path, const char *const *extra_names,
+                                           const char *module_qn, uint32_t offset, const char *path,
+                                           const char *const *extra_names,
                                            const char *const *extra_paths, int extra_count);
 
 #endif /* CBM_LSP_RUST_MODTREE_H */

@@ -289,8 +289,8 @@ static bool pxc_rust_file_path_facts(CBMArena *arena, const CBMFileResult *cache
     }
     out->mods = mods;
     out->known = complete;
-    out->tree_digest = source && tree ? cbm_rust_modtree_file_digest(source, ts_tree_root_node(tree))
-                                      : 0;
+    out->tree_digest =
+        source && tree ? cbm_rust_modtree_file_digest(source, ts_tree_root_node(tree)) : 0;
     if (owned_tree) {
         ts_tree_delete(owned_tree);
     }
@@ -1240,14 +1240,14 @@ static char *pxc_python_import_from_metadata(const cbm_gbuf_t *gbuf, const char 
     const char *last_dot = strrchr(module_path, '.');
     if (last_dot && last_dot > module_path) {
         size_t module_len = (size_t)(last_dot - module_path);
-        char *module = (char *)malloc(module_len + 1);
+        char *module = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, module_len + 1);
         if (!module)
             return NULL;
         memcpy(module, module_path, module_len);
         module[module_len] = '\0';
         const cbm_gbuf_node_t *module_node =
             cbm_pipeline_lsp_target_node(gbuf, project_name, module, false);
-        free(module);
+        cbm_free(CBM_MEM_CLASS_OTHER, module);
         if (module_node && module_node->qualified_name && module_node->label &&
             (strcmp(module_node->label, "Module") == 0 ||
              strcmp(module_node->label, "Folder") == 0)) {
@@ -1469,8 +1469,8 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         const CBMResolvedCall *src = &src_out->items[j];
         bool supersedes = src->strategy && (strcmp(src->strategy, "lsp_cross_crate") == 0 ||
                                             strcmp(src->strategy, "lsp_module_path") == 0);
-        if (!supersedes || !src->caller_qn ||
-            !src->callee_qn || src->site_end_byte <= src->site_start_byte) {
+        if (!supersedes || !src->caller_qn || !src->callee_qn ||
+            src->site_end_byte <= src->site_start_byte) {
             continue;
         }
         for (int i = 0; i < dst_calls->count; i++) {
@@ -2646,12 +2646,12 @@ typedef struct {
     const int *file_index; /* modtree file id -> files[] index */
 } PXCRustSourceCtx;
 
-static const char *pxc_rust_load_source(void *ctx, int file_id, int *out_len) {
+static const char *pxc_rust_load_source(const void *ctx, int file_id, int *out_len) {
     const PXCRustSourceCtx *sources = ctx;
     return pxc_read_file(sources->files[sources->file_index[file_id]].path, out_len);
 }
 
-static void pxc_rust_release_source(void *ctx, int file_id, const char *source) {
+static void pxc_rust_release_source(const void *ctx, int file_id, const char *source) {
     (void)ctx;
     (void)file_id;
     cbm_free(CBM_MEM_CLASS_EXTRACT, (void *)source);
