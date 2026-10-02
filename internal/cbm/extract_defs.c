@@ -2921,6 +2921,24 @@ static char *resolve_param_name(CBMArena *a, TSNode param, const char *source) {
     return NULL;
 }
 
+/* Rust: the function item carries `async` among its function_modifiers. */
+static bool rust_fn_is_async(TSNode fn) {
+    uint32_t n = ts_node_child_count(fn);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_child(fn, i);
+        if (strcmp(ts_node_type(c), "function_modifiers") != 0) {
+            continue;
+        }
+        uint32_t m = ts_node_child_count(c);
+        for (uint32_t j = 0; j < m; j++) {
+            if (strcmp(ts_node_type(ts_node_child(c, j)), "async") == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static const char **extract_param_names(CBMArena *a, TSNode params, const char *source,
                                         CBMLanguage lang) {
     (void)lang;
@@ -3678,6 +3696,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(node), "function_signature_item") == 0) {
         def.is_abstract = true;
+    }
+    if (ctx->language == CBM_LANG_RUST) {
+        def.is_async = rust_fn_is_async(node);
     }
 
     // Parameters — use func_node (inner function for templates)
@@ -4932,6 +4953,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         strcmp(ts_node_type(child), "function_signature_item") == 0) {
         def.is_abstract = true;
     }
+    if (ctx->language == CBM_LANG_RUST) {
+        def.is_async = rust_fn_is_async(child);
+    }
 
     TSNode params = find_function_params(child, ctx->language);
     if (!ts_node_is_null(params)) {
@@ -5227,6 +5251,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         def.receiver = receiver_name;
         def.parent_class = type_qn;
         def.impl_trait = impl_trait;
+        def.is_async = rust_fn_is_async(child);
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
         def.is_exported = cbm_is_exported(name, ctx->language);

@@ -5874,6 +5874,57 @@ TEST(rustlsp_await_preserves_declared_async_output) {
     cbm_free_result(r);
     PASS();
 }
+/* An async fn's recorded return is its output: `.await` must not peel
+ * Result<T> to T, so `.expect(..)` and `?` reach T's methods. */
+TEST(rustlsp_await_async_fn_result_then_expect_and_try) {
+    CBMFileResult *r = extract_rust(
+        "struct Conn;\n"
+        "impl Conn {\n"
+        "    async fn open() -> Result<Conn, String> { Ok(Conn) }\n"
+        "    fn ping(&self) -> bool { true }\n"
+        "    fn close(&self) {}\n"
+        "}\n"
+        "async fn by_expect() -> bool { Conn::open().await.expect(\"open\").ping() }\n"
+        "async fn by_try() -> Result<(), String> { Conn::open().await?.close(); Ok(()) }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "by_expect", "Conn.ping"), 0);
+    ASSERT_GTE(require_resolved(r, "by_try", "Conn.close"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A non-async fn returning a future type: `.await` yields the future's
+ * output, the same declared shape an async fn would not be peeled from. */
+TEST(rustlsp_await_future_returning_fn_yields_output) {
+    CBMFileResult *r = extract_rust(
+        "struct Conn;\n"
+        "struct Pending<T>(T);\n"
+        "impl Conn { fn ping(&self) -> bool { true } }\n"
+        "fn open() -> Pending<Conn> { Pending(Conn) }\n"
+        "async fn run() -> bool { open().await.ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Conn.ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A method's `Result<Self>` return names the receiver type through `?`. */
+TEST(rustlsp_method_result_self_return_types_chain) {
+    CBMFileResult *r = extract_rust(
+        "struct Builder;\n"
+        "impl Builder {\n"
+        "    fn new() -> Builder { Builder }\n"
+        "    fn with_name(self, n: &str) -> Result<Self, String> { Ok(self) }\n"
+        "    fn build(self) -> u32 { 0 }\n"
+        "}\n"
+        "fn run() -> Result<u32, String> { Ok(Builder::new().with_name(\"x\")?.build()) }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Builder.with_name"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "Builder.build"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_cov_async_block) {
     CBMFileResult *r = extract_rust(
         "fn run() -> impl std::future::Future<Output = ()> {\n    async { let _ = 42; }\n}\n");
@@ -8604,6 +8655,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_async_fn_decl);
     RUN_TEST(rustlsp_cov_async_await_chain);
     RUN_TEST(rustlsp_await_preserves_declared_async_output);
+    RUN_TEST(rustlsp_await_async_fn_result_then_expect_and_try);
+    RUN_TEST(rustlsp_await_future_returning_fn_yields_output);
+    RUN_TEST(rustlsp_method_result_self_return_types_chain);
     RUN_TEST(rustlsp_cov_async_block);
     RUN_TEST(rustlsp_cov_async_move);
     RUN_TEST(rustlsp_cov_async_join_call);

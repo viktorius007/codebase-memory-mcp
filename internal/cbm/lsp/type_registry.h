@@ -14,7 +14,7 @@ typedef enum {
     CBM_FUNC_FLAG_STATICMETHOD = 1 << 2,    // @staticmethod -> no implicit self/cls
     CBM_FUNC_FLAG_ABSTRACTMETHOD = 1 << 3,  // @abstractmethod -> still callable for resolution
     CBM_FUNC_FLAG_OVERLOAD = 1 << 4,        // @overload entry — non-implementation stub
-    CBM_FUNC_FLAG_ASYNC = 1 << 5,           // async def — return is Coroutine[..., T]
+    CBM_FUNC_FLAG_ASYNC = 1 << 5,           // Python async def; Rust async fn (return = output)
     CBM_FUNC_FLAG_GENERATOR = 1 << 6,       // contains yield — return is Generator[T, ...]
     CBM_FUNC_FLAG_FINAL = 1 << 7,           // @final — overrides not allowed
     CBM_FUNC_FLAG_RUST_TRAIT_IMPL = 1 << 8, // exact method from impl Trait for Type
