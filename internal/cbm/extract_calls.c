@@ -261,6 +261,15 @@ static char *extract_constructor_callee(CBMArena *a, TSNode node, const char *so
 static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *source) {
     // Try "function" field
     TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    /* Rust turbofish `f::<T>(..)` / `x.m::<T>(..)` / `T::f::<U>(..)`: the
+     * `function` field is a generic_function whose own `function` field is the
+     * callee path. The type arguments are not part of the callee name. */
+    if (!ts_node_is_null(func_node) && strcmp(ts_node_type(func_node), "generic_function") == 0) {
+        TSNode inner = ts_node_child_by_field_name(func_node, TS_FIELD("function"));
+        if (!ts_node_is_null(inner)) {
+            func_node = inner;
+        }
+    }
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
         if (strcmp(fk, "selector_expression") == 0) {
