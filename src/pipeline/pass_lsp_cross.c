@@ -2644,7 +2644,7 @@ static void pxc_rust_add_crates(PXCRustCrates *crates, CBMRustModTree *tree) {
 
 typedef struct {
     const cbm_file_info_t *files;
-    const int *file_index;    /* modtree file id -> files[] index */
+    const int *file_index;   /* modtree file id -> files[] index */
     CBMRustModFacts **facts; /* modtree file id -> scanned facts */
 } PXCRustScanCtx;
 
