@@ -2114,17 +2114,95 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
     return cbm_type_named(arena, cbm_arena_sprintf(arena, "%s.%s", module_qn, text));
 }
 
+/* A byte that can sit inside an identifier, keyword or lifetime. */
+static bool rust_type_text_word_byte(unsigned char c) {
+    return isalnum(c) || c == '_' || c == '\'' || c >= 0x80;
+}
+
+/* Skip one comment starting at `p` (`//` to end of line, or a nestable
+ * block comment); returns `p` itself when no comment starts there. */
+static const char *rust_type_text_skip_comment(const char *p) {
+    if (p[0] != '/') {
+        return p;
+    }
+    if (p[1] == '/') {
+        while (*p && *p != '\n') {
+            p++;
+        }
+        return p;
+    }
+    if (p[1] != '*') {
+        return p;
+    }
+    int depth = 0;
+    while (*p) {
+        if (p[0] == '/' && p[1] == '*') {
+            depth++;
+            p += 2;
+        } else if (p[0] == '*' && p[1] == '/') {
+            p += 2;
+            if (--depth == 0) {
+                return p;
+            }
+        } else {
+            p++;
+        }
+    }
+    return p;
+}
+
+/* Type text as source spelled it may span lines (rustfmt breaks a long tuple
+ * or generic argument list) and carry comments. The parser below splits on
+ * punctuation and trims only spaces, so reduce the text to one spelling:
+ * comments dropped, and a run of whitespace kept as one space only between
+ * two word bytes (`&'a mut T`, `dyn Trait`), removed everywhere else. */
+static const char *rust_type_text_canonical(CBMArena *arena, const char *text) {
+    if (!text || !strpbrk(text, " \t\r\n\f\v/")) {
+        return text;
+    }
+    size_t len = strlen(text);
+    char *out = (char *)cbm_arena_alloc(arena, len + 1);
+    if (!out) {
+        return text;
+    }
+    size_t n = 0;
+    bool gap = false;
+    for (const char *p = text; *p;) {
+        const char *after = rust_type_text_skip_comment(p);
+        if (after != p) {
+            gap = true;
+            p = after;
+            continue;
+        }
+        if (isspace((unsigned char)*p)) {
+            gap = true;
+            p++;
+            continue;
+        }
+        if (gap && n > 0 && rust_type_text_word_byte((unsigned char)out[n - 1]) &&
+            rust_type_text_word_byte((unsigned char)*p)) {
+            out[n++] = ' ';
+        }
+        gap = false;
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+    return out;
+}
+
 /* Public-ish helper used by the cross-file path. */
 static const CBMType *rust_parse_return_type_text(CBMArena *arena, const char *text,
                                                   const char *module_qn) {
-    return parse_type_text_with_params(arena, text, module_qn, NULL, NULL);
+    return parse_type_text_with_params(arena, rust_type_text_canonical(arena, text), module_qn,
+                                       NULL, NULL);
 }
 
 /* A type spelled in the file of `module_qn`, its names resolved through the
  * crate module tree when one is given. */
 static const CBMType *rust_parse_def_type_text(CBMArena *arena, const char *text,
                                                const char *module_qn, const CBMRustModTree *tree) {
-    return parse_type_text_with_params(arena, text, module_qn, NULL, tree);
+    return parse_type_text_with_params(arena, rust_type_text_canonical(arena, text), module_qn,
+                                       NULL, tree);
 }
 
 typedef struct {
