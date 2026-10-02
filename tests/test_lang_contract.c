@@ -1155,7 +1155,8 @@ TEST(contract_edge_inherits) {
     PASS();
 }
 
-/* Rust impl names remain omitted without trusted HIR/rustc identities. */
+/* IMPLEMENTS — Rust `impl Trait for Type` whose header paths resolve at the
+ * impl block's scope to in-repository Struct/Enum and trait nodes. */
 TEST(contract_edge_implements) {
     static const LangFile f[] = {{"shapes.rs",
                                   "trait Greet {\n    fn hello(&self) -> String;\n}\n\n"
@@ -1167,7 +1168,8 @@ TEST(contract_edge_implements) {
                                   "        self.side * self.side\n    }\n}\n\n"
                                   "impl Greet for Square {\n    fn hello(&self) -> String {\n"
                                   "        String::from(\"square\")\n    }\n}\n"}};
-    ASSERT_FALSE(edge_present(f, 1, "IMPLEMENTS", 1));
+    /* English->Greet, Square->Area, Square->Greet */
+    ASSERT_TRUE(edge_present(f, 1, "IMPLEMENTS", 3));
     PASS();
 }
 
