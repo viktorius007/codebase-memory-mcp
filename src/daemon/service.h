@@ -65,13 +65,18 @@ bool cbm_daemon_build_fingerprint_file(const char *path,
 /* Remember computed fingerprints under <cache_dir>/build-fingerprints so the
  * next process of the same executable skips the whole-image hash. An entry is
  * keyed by the hashed file's kernel identity: device, inode, size, mtime and
- * ctime (nanoseconds). Any write, truncate, rename-over or metadata change
- * gives the file a new ctime, which no unprivileged caller can set, so a
- * replaced binary (also in place at the same path and inode) misses the memo
- * and is hashed again. An entry is recorded only once its ctime is a few
- * seconds old, so a write in the same coarse clock tick as the recorded state
- * cannot follow it unnoticed. Call once during startup, before any thread
- * hashes; NULL disables. POSIX only: Windows always hashes. */
+ * ctime (nanoseconds). The memo answers only for files on a writable mount of
+ * a filesystem whose kernel stamps ctime on every write, truncate, rename-over
+ * or metadata change and lets no caller set it (APFS; ext4, xfs, btrfs,
+ * tmpfs). There a replaced binary (also in place at the same path and inode)
+ * misses the memo and is hashed again. Files anywhere else — read-only and
+ * image filesystems, FAT/exFAT, network and FUSE mounts — are always hashed,
+ * since a different file there can present the same key. An entry is
+ * recorded only once its ctime is a few seconds old, so a write in the same
+ * clock tick as the recorded state cannot follow it unnoticed. The memo
+ * directory is read and written only when owned by the caller with mode
+ * 0700. Call once during startup, before any thread hashes; NULL disables.
+ * POSIX only: Windows always hashes. */
 bool cbm_daemon_build_fingerprint_memo_configure(const char *cache_dir);
 
 cbm_daemon_hello_status_t cbm_daemon_hello_compare(const cbm_daemon_build_identity_t *active,

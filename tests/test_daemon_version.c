@@ -316,6 +316,10 @@ TEST(daemon_build_fingerprint_memo_misses_after_in_place_replacement) {
                     version_test_write_file(reference, "exact-build-bytes-BBBB") &&
                     cbm_daemon_build_fingerprint_file(reference, replacement_bytes) &&
                     cbm_daemon_build_fingerprint_memo_configure_settle(dir, 0);
+    if (setup_ok && !cbm_daemon_build_fingerprint_memo_file_trusted(image)) {
+        version_test_memo_cleanup(dir, memo_dir, slot, image, reference);
+        SKIP_PLATFORM("temporary directory is not on a filesystem the memo serves");
+    }
     bool first_ok = setup_ok && cbm_daemon_build_fingerprint_file(image, original);
     bool recorded = first_ok && version_test_only_memo_slot(memo_dir, slot);
     char *digest_field =
@@ -372,7 +376,84 @@ TEST(daemon_build_fingerprint_memo_skips_recently_changed_file) {
     ASSERT_FALSE(memoized);
     PASS();
 }
+
+/* A planted memo record is answered only while the memo directory is private:
+ * the same record under a group-accessible directory is ignored and the file
+ * is hashed. */
+TEST(daemon_build_fingerprint_memo_ignores_non_private_directory) {
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char memo_dir[VERSION_TEST_PATH_CAP] = {0};
+    char slot[VERSION_TEST_PATH_CAP] = {0};
+    char image[VERSION_TEST_PATH_CAP] = {0};
+    char record[VERSION_TEST_FILE_CAP] = {0};
+    char original[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char shared[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char private_again[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool setup_ok = version_test_temp_dir(dir, "fingerprint-memo-dir") &&
+                    version_test_child_path(image, dir, "image.bin") &&
+                    version_test_child_path(memo_dir, dir, "build-fingerprints") &&
+                    version_test_write_file(image, "exact-build-bytes-AAAA") &&
+                    cbm_daemon_build_fingerprint_memo_configure_settle(dir, 0);
+    if (setup_ok && !cbm_daemon_build_fingerprint_memo_file_trusted(image)) {
+        version_test_memo_cleanup(dir, memo_dir, slot, image, NULL);
+        SKIP_PLATFORM("temporary directory is not on a filesystem the memo serves");
+    }
+    bool recorded = setup_ok && cbm_daemon_build_fingerprint_file(image, original) &&
+                    version_test_only_memo_slot(memo_dir, slot);
+    char *digest_field =
+        recorded && version_test_read_file(slot, record) ? strstr(record, " sha256=") : NULL;
+    bool planted = digest_field && strlen(digest_field) == strlen(" sha256=") + 64U + 1U;
+    if (planted) {
+        memset(digest_field + strlen(" sha256="), 'c', 64U);
+        planted = version_test_write_file(slot, record);
+    }
+    bool shared_ok =
+        planted && chmod(memo_dir, 0750) == 0 && cbm_daemon_build_fingerprint_file(image, shared);
+    bool private_ok = shared_ok && chmod(memo_dir, 0700) == 0 &&
+                      cbm_daemon_build_fingerprint_file(image, private_again);
+    version_test_memo_cleanup(dir, memo_dir, slot, image, NULL);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(recorded);
+    ASSERT_TRUE(planted);
+    ASSERT_TRUE(shared_ok);
+    ASSERT_STR_EQ(shared, original);
+    ASSERT_TRUE(private_ok);
+    ASSERT_STR_EQ(private_again, BUILD_C);
+    PASS();
+}
 #endif
+
+/* BROKEN-1 of the memo review: a read-only image mounted where an earlier
+ * image was presents the same device, inode, size and stored times for
+ * different bytes. The memo must not answer on any read-only mount (ISO 9660,
+ * UDF, a read-only APFS image), while a writable APFS volume still qualifies. */
+TEST(daemon_build_fingerprint_memo_refuses_read_only_image_volumes) {
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("cd9660", true, 0));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("udf", true, 0));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("cd9660", false, 123456789));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("squashfs", false, 123456789));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("apfs", true, 123456789));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("ext4", true, 123456789));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_memo_volume_trusted("apfs", false, 123456789));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_memo_volume_trusted("ext4", false, 123456789));
+    PASS();
+}
+
+/* BROKEN-2 of the memo review: FAT16 and exFAT report ctime = mtime, which
+ * any writer can restore after an in-place rewrite. The memo must not answer
+ * on a filesystem without a kernel-stamped ctime, nor for a ctime with no
+ * sub-second part (a coarse clock or a normalised image timestamp). */
+TEST(daemon_build_fingerprint_memo_refuses_volumes_without_kernel_ctime) {
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("msdos", false, 0));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("msdos", false, 123456789));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("exfat", false, 123456789));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("smbfs", false, 123456789));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted(NULL, false, 123456789));
+    ASSERT_FALSE(cbm_daemon_build_fingerprint_memo_volume_trusted("apfs", false, 0));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_memo_volume_trusted("apfs", false, 1));
+    PASS();
+}
 
 TEST(daemon_hello_accepts_only_the_exact_active_build_identity) {
     cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
@@ -745,7 +826,10 @@ SUITE(daemon_version) {
 #ifndef _WIN32
     RUN_TEST(daemon_build_fingerprint_memo_misses_after_in_place_replacement);
     RUN_TEST(daemon_build_fingerprint_memo_skips_recently_changed_file);
+    RUN_TEST(daemon_build_fingerprint_memo_ignores_non_private_directory);
 #endif
+    RUN_TEST(daemon_build_fingerprint_memo_refuses_read_only_image_volumes);
+    RUN_TEST(daemon_build_fingerprint_memo_refuses_volumes_without_kernel_ctime);
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);

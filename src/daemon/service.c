@@ -345,6 +345,23 @@ bool cbm_daemon_build_fingerprint_memo_configure(const char *cache_dir) {
         cache_dir, CBM_DAEMON_BUILD_FINGERPRINT_MEMO_SETTLE_SECONDS);
 }
 
+bool cbm_daemon_build_fingerprint_memo_volume_trusted(const char *fs_type, bool read_only,
+                                                      long ctime_nsec) {
+    /* Each listed filesystem stamps ctime from the kernel clock with
+     * sub-second resolution on every data or metadata change and offers no
+     * call that sets it. */
+    static const char *const trusted[] = {"apfs", "ext4", "xfs", "btrfs", "tmpfs"};
+    if (!fs_type || read_only || ctime_nsec == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(trusted) / sizeof(trusted[0]); i++) {
+        if (strcmp(fs_type, trusted[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 #ifndef _WIN32
 
 #include <fcntl.h>
@@ -352,6 +369,13 @@ bool cbm_daemon_build_fingerprint_memo_configure(const char *cache_dir) {
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#include <sys/param.h>
+#elif defined(__linux__)
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
+#endif
 
 static bool fd_cloexec(int fd) {
     int flags = fcntl(fd, F_GETFD);
@@ -433,26 +457,107 @@ static bool fingerprint_memo_key_text(const struct stat *status, char *out, size
 
 /* One slot per (device, inode): a file rewritten in place overwrites its own
  * entry; a slot collision only costs a re-hash. */
-static bool fingerprint_memo_slot_path(const struct stat *status, const char *suffix, char *out,
+static bool fingerprint_memo_slot_name(const struct stat *status, const char *suffix, char *out,
                                        size_t out_size) {
     uint64_t mixed = (uint64_t)status->st_ino ^ ((uint64_t)status->st_dev * 0x9e3779b97f4a7c15ULL);
     unsigned slot = (unsigned)(mixed % FINGERPRINT_MEMO_SLOTS);
-    int written = snprintf(out, out_size, "%s/slot-%02u%s", g_fingerprint_memo_dir, slot,
-                           suffix ? suffix : "");
+    int written = snprintf(out, out_size, "slot-%02u%s", slot, suffix ? suffix : "");
     return written > 0 && (size_t)written < out_size;
+}
+
+/* The memo directory, opened without following a link and accepted only when
+ * it is a directory owned by the effective user with no group or other
+ * access; -1 otherwise. Slots are reached through this descriptor, so a
+ * directory swapped after the check is never read or written. */
+static int fingerprint_memo_directory_open(bool create) {
+    if (!g_fingerprint_memo_dir[0] ||
+        (create && mkdir(g_fingerprint_memo_dir, 0700) != 0 && errno != EEXIST)) {
+        return -1;
+    }
+    int fd = open(g_fingerprint_memo_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat status;
+    if (fd >= 0 && (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode) ||
+                    status.st_uid != geteuid() || (status.st_mode & 077) != 0)) {
+        (void)close(fd);
+        fd = -1;
+    }
+    return fd;
+}
+
+/* Whether the memo may answer for this file: only where every change to the
+ * file's bytes is guaranteed to change its key (see
+ * cbm_daemon_build_fingerprint_memo_volume_trusted). Elsewhere it is hashed. */
+static bool fingerprint_memo_volume_trusted(int fd, const struct stat *status) {
+    struct timespec mtime;
+    struct timespec ctime_value;
+    fingerprint_memo_times(status, &mtime, &ctime_value);
+#if defined(__APPLE__)
+    struct statfs volume;
+    if (fstatfs(fd, &volume) != 0) {
+        return false;
+    }
+    volume.f_fstypename[sizeof(volume.f_fstypename) - 1] = '\0';
+    return cbm_daemon_build_fingerprint_memo_volume_trusted(
+        volume.f_fstypename, (volume.f_flags & MNT_RDONLY) != 0, (long)ctime_value.tv_nsec);
+#elif defined(__linux__)
+    struct statfs volume;
+    struct statvfs flags;
+    if (fstatfs(fd, &volume) != 0 || fstatvfs(fd, &flags) != 0) {
+        return false;
+    }
+    const char *type = NULL;
+    switch ((unsigned long)volume.f_type) {
+    case 0xEF53UL: /* EXT4_SUPER_MAGIC, also ext2/ext3 driven by ext4 */
+        type = "ext4";
+        break;
+    case 0x58465342UL: /* XFS_SUPER_MAGIC */
+        type = "xfs";
+        break;
+    case 0x9123683EUL: /* BTRFS_SUPER_MAGIC */
+        type = "btrfs";
+        break;
+    case 0x01021994UL: /* TMPFS_MAGIC */
+        type = "tmpfs";
+        break;
+    default:
+        break;
+    }
+    return cbm_daemon_build_fingerprint_memo_volume_trusted(type, (flags.f_flag & ST_RDONLY) != 0,
+                                                            (long)ctime_value.tv_nsec);
+#else
+    (void)fd;
+    (void)ctime_value;
+    return false;
+#endif
+}
+
+bool cbm_daemon_build_fingerprint_memo_file_trusted(const char *path) {
+    int fd = path ? open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
+    struct stat status;
+    bool trusted =
+        fd >= 0 && fd_regular(fd, &status) && fingerprint_memo_volume_trusted(fd, &status);
+    if (fd >= 0) {
+        (void)close(fd);
+    }
+    return trusted;
 }
 
 static bool fingerprint_memo_lookup(const struct stat *status,
                                     char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
     char key[FINGERPRINT_MEMO_RECORD_CAP];
     size_t key_length = 0;
-    char path[DAEMON_SERVICE_PATH_CAP + 16];
+    char name[32];
     if (!g_fingerprint_memo_dir[0] ||
         !fingerprint_memo_key_text(status, key, sizeof(key), &key_length) ||
-        !fingerprint_memo_slot_path(status, NULL, path, sizeof(path))) {
+        !fingerprint_memo_slot_name(status, NULL, name, sizeof(name))) {
         return false;
     }
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    int dir_fd = fingerprint_memo_directory_open(false);
+    if (dir_fd < 0) {
+        return false;
+    }
+    int fd = openat(dir_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    (void)close(dir_fd);
     if (fd < 0) {
         return false;
     }
@@ -479,15 +584,6 @@ static bool fingerprint_memo_lookup(const struct stat *status,
     return true;
 }
 
-static bool fingerprint_memo_directory_ready(void) {
-    if (mkdir(g_fingerprint_memo_dir, 0700) != 0 && errno != EEXIST) {
-        return false;
-    }
-    struct stat status;
-    return lstat(g_fingerprint_memo_dir, &status) == 0 && S_ISDIR(status.st_mode) &&
-           status.st_uid == geteuid() && (status.st_mode & 077) == 0;
-}
-
 /* Best effort: a failed record only means the next process hashes again. */
 static void fingerprint_memo_record(const struct stat *status,
                                     const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
@@ -502,33 +598,36 @@ static void fingerprint_memo_record(const struct stat *status,
     char record[FINGERPRINT_MEMO_RECORD_CAP];
     size_t key_length = 0;
     char suffix[32];
-    char temporary[DAEMON_SERVICE_PATH_CAP + 48];
-    char path[DAEMON_SERVICE_PATH_CAP + 16];
+    char temporary[64];
+    char name[32];
     int suffix_written = snprintf(suffix, sizeof(suffix), ".%ld.tmp", (long)getpid());
     if (!fingerprint_memo_key_text(status, record, sizeof(record), &key_length) ||
         key_length + CBM_SHA256_HEX_LEN + 1U > sizeof(record) || suffix_written <= 0 ||
         (size_t)suffix_written >= sizeof(suffix) ||
-        !fingerprint_memo_slot_path(status, NULL, path, sizeof(path)) ||
-        !fingerprint_memo_slot_path(status, suffix, temporary, sizeof(temporary)) ||
-        !fingerprint_memo_directory_ready()) {
+        !fingerprint_memo_slot_name(status, NULL, name, sizeof(name)) ||
+        !fingerprint_memo_slot_name(status, suffix, temporary, sizeof(temporary))) {
+        return;
+    }
+    int dir_fd = fingerprint_memo_directory_open(true);
+    if (dir_fd < 0) {
         return;
     }
     memcpy(record + key_length, digest, CBM_SHA256_HEX_LEN);
     size_t length = key_length + CBM_SHA256_HEX_LEN;
     record[length++] = '\n';
-    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0) {
-        return;
+    int fd = openat(dir_fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd >= 0) {
+        ssize_t written = -1;
+        do {
+            written = write(fd, record, length);
+        } while (written < 0 && errno == EINTR);
+        bool ok = written == (ssize_t)length;
+        ok = close(fd) == 0 && ok;
+        if (!ok || renameat(dir_fd, temporary, dir_fd, name) != 0) {
+            (void)unlinkat(dir_fd, temporary, 0);
+        }
     }
-    ssize_t written = -1;
-    do {
-        written = write(fd, record, length);
-    } while (written < 0 && errno == EINTR);
-    bool ok = written == (ssize_t)length;
-    ok = close(fd) == 0 && ok;
-    if (!ok || rename(temporary, path) != 0) {
-        (void)unlink(temporary);
-    }
+    (void)close(dir_fd);
 }
 
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
@@ -545,7 +644,8 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     if (fd < 0 || !fd_regular(fd, &before) || before.st_size < 0) {
         return false;
     }
-    if (fingerprint_memo_lookup(&before, out)) {
+    bool memo_trusted = g_fingerprint_memo_dir[0] && fingerprint_memo_volume_trusted(fd, &before);
+    if (memo_trusted && fingerprint_memo_lookup(&before, out)) {
         return true;
     }
 
@@ -579,7 +679,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&context, digest);
     digest_to_hex(digest, out);
-    if (fingerprint_memo_key_same(&before, &after)) {
+    if (memo_trusted && fingerprint_memo_key_same(&before, &after)) {
         fingerprint_memo_record(&after, out);
     }
     return true;
@@ -846,6 +946,11 @@ static bool posix_log_append(const char *log_path, const char *record, size_t re
 #include <wchar.h>
 
 #include "foundation/win_utf8.h"
+
+bool cbm_daemon_build_fingerprint_memo_file_trusted(const char *path) {
+    (void)path;
+    return false;
+}
 
 static bool windows_same_file_identity(const BY_HANDLE_FILE_INFORMATION *first,
                                        const BY_HANDLE_FILE_INFORMATION *second) {

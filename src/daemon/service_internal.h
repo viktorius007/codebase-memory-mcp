@@ -29,6 +29,21 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
 bool cbm_daemon_build_fingerprint_memo_configure_settle(const char *cache_dir,
                                                         int64_t settle_seconds);
 
+/* Whether the memo may answer for a file on a volume of filesystem type
+ * fs_type (the platform's name: "apfs", "ext4", "xfs", "btrfs", "tmpfs"; NULL
+ * when unknown), mounted read_only or not, whose ctime has nanosecond part
+ * ctime_nsec. True only where every change to the file's bytes is guaranteed
+ * to change its key: a writable mount of a filesystem that stamps ctime from
+ * the kernel clock and lets no caller set it. A read-only mount can only
+ * change by being replaced with another volume, which may present the same
+ * device, inode and stored times; a ctime with no sub-second part was not
+ * stamped by such a clock (coarse filesystem or normalised image). */
+bool cbm_daemon_build_fingerprint_memo_volume_trusted(const char *fs_type, bool read_only,
+                                                      long ctime_nsec);
+
+/* The same decision for the file at path as it stands now. */
+bool cbm_daemon_build_fingerprint_memo_file_trusted(const char *path);
+
 typedef enum {
     CBM_DAEMON_CONFLICT_LOG_BEFORE_SERIALIZATION_LOCK = 1,
     CBM_DAEMON_CONFLICT_LOG_AFTER_SERIALIZATION_LOCK,
