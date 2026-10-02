@@ -8102,6 +8102,152 @@ TEST(pipeline_rust_cargo_manifest_converges_across_routes) {
     PASS();
 }
 
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+/* Edges present in exactly one of two generations, compared by edge type and
+ * both endpoints' (file, qualified name, label); a duplicated edge counts once
+ * per extra copy. Returns -1 when either database cannot be read. */
+static int graph_edge_difference_count(const char *actual_db, const char *reference_db,
+                                       const char *project) {
+    static const char sql[] =
+        "WITH a AS (SELECT e.type t, s.file_path sf, s.qualified_name sq, s.label sl, "
+        "d.file_path df, d.qualified_name dq, d.label dl, count(*) n FROM main.edges e "
+        "JOIN main.nodes s ON s.id=e.source_id JOIN main.nodes d ON d.id=e.target_id "
+        "WHERE e.project=?1 GROUP BY 1,2,3,4,5,6,7), "
+        "b AS (SELECT e.type t, s.file_path sf, s.qualified_name sq, s.label sl, "
+        "d.file_path df, d.qualified_name dq, d.label dl, count(*) n FROM ref.edges e "
+        "JOIN ref.nodes s ON s.id=e.source_id JOIN ref.nodes d ON d.id=e.target_id "
+        "WHERE e.project=?1 GROUP BY 1,2,3,4,5,6,7) "
+        "SELECT (SELECT coalesce(sum(abs(a.n-coalesce(b.n,0))),0) FROM a LEFT JOIN b USING "
+        "(t,sf,sq,sl,df,dq,dl)) + (SELECT coalesce(sum(b.n),0) FROM b LEFT JOIN a USING "
+        "(t,sf,sq,sl,df,dq,dl) WHERE a.n IS NULL)";
+    sqlite3 *db = NULL;
+    sqlite3_stmt *attach = NULL;
+    int diff = -1;
+    if (sqlite3_open_v2(actual_db, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
+        sqlite3_prepare_v2(db, "ATTACH DATABASE ?1 AS ref", -1, &attach, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(attach, 1, reference_db, -1, SQLITE_STATIC);
+        if (sqlite3_step(attach) == SQLITE_DONE) {
+            diff = sqlite_scalar(db, sql, project);
+        }
+    }
+    sqlite3_finalize(attach);
+    sqlite3_close(db);
+    return diff;
+}
+
+typedef struct {
+    int run_rc;
+    cbm_incremental_route_t route;
+    int fresh_rc;
+    int difference;
+} RustIncrementalEquivalence;
+
+/* Re-index `tmp` into the live database (incremental route), then build the
+ * same files from scratch into `fresh_name` and count differing edges. */
+static RustIncrementalEquivalence rust_incremental_vs_fresh(const char *tmp, const char *live_db,
+                                                            const char *fresh_name,
+                                                            const char *project) {
+    RustIncrementalEquivalence observed = {.run_rc = -1, .fresh_rc = -1, .difference = -1};
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, live_db, CBM_MODE_FULL);
+    if (incremental) {
+        observed.run_rc = cbm_pipeline_run(incremental);
+        observed.route = cbm_pipeline_incremental_test_last_route();
+        cbm_pipeline_free(incremental);
+    }
+    char fresh_db[512];
+    snprintf(fresh_db, sizeof(fresh_db), "%s/%s", tmp, fresh_name);
+    cbm_pipeline_t *fresh = cbm_pipeline_new(tmp, fresh_db, CBM_MODE_FULL);
+    if (fresh) {
+        observed.fresh_rc = cbm_pipeline_run(fresh);
+        cbm_pipeline_free(fresh);
+    }
+    observed.difference = graph_edge_difference_count(live_db, fresh_db, project);
+    return observed;
+}
+
+/* Closure repair re-resolves a subset of the workspace, but Cargo target roots
+ * and `#[path]` module identities are facts of the WHOLE file set. A crate
+ * whose `[lib]` table omits `path` is only rooted by discovering its
+ * src/lib.rs; a `#[path]` test module is only named by its declaring parent.
+ * Neither the root nor the parent is re-parsed by these edits, yet the
+ * repaired graph must equal a fresh full build edge for edge. */
+TEST(pipeline_rust_closure_repair_matches_fresh_full_across_crates) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_closure_equiv_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/util/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/fs/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/app/src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\n"
+                    "members = [\"crates/util\", \"crates/fs\", \"crates/app\"]\n"
+                    "resolver = \"2\"\n");
+    write_temp_file(tmp, "crates/util/Cargo.toml",
+                    "[package]\nname = \"util\"\nversion = \"0.1.0\"\n[lib]\ndoctest = false\n");
+    write_temp_file(tmp, "crates/fs/Cargo.toml",
+                    "[package]\nname = \"fs-kit\"\nversion = \"0.1.0\"\n[lib]\ntest = false\n");
+    write_temp_file(tmp, "crates/app/Cargo.toml",
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[lib]\ntest = false\n");
+    write_temp_file(tmp, "crates/util/src/lib.rs",
+                    "pub fn normalize(p: &str) -> Option<String> {\n    Some(p.to_string())\n}\n");
+    write_temp_file(tmp, "crates/fs/src/lib.rs",
+                    "pub fn read_text(p: &str) -> String {\n    p.to_string()\n}\n");
+    write_temp_file(tmp, "crates/app/src/lib.rs", "pub mod loader;\n");
+    write_temp_file(tmp, "crates/app/src/loader.rs",
+                    "pub fn load(p: &str) -> String {\n    fs_kit::read_text(p)\n}\n\n"
+                    "#[cfg(test)]\n#[path = \"loader_tests.rs\"]\nmod tests;\n");
+    write_temp_file(tmp, "crates/app/src/loader_tests.rs",
+                    "pub fn check_load() -> String {\n    let _ = util::normalize(\"y\");\n"
+                    "    super::load(\"x\")\n}\n");
+
+    char live_db[512];
+    snprintf(live_db, sizeof(live_db), "%s/live.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, live_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    int baseline_rc = cbm_pipeline_run(baseline);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    cbm_store_t *store = cbm_store_open_path(live_db);
+    ASSERT_NOT_NULL(store);
+    int root_call = named_edge_to_file_count(store, project, "CALLS", "load", "read_text",
+                                             "crates/fs/src/lib.rs");
+    int super_call = named_edge_to_file_count(store, project, "CALLS", "check_load", "load",
+                                              "crates/app/src/loader.rs");
+    cbm_store_close(store);
+
+    /* Body edit: only loader.rs re-resolves; fs-kit's lib root is elsewhere. */
+    write_temp_file(tmp, "crates/app/src/loader.rs",
+                    "pub fn load(p: &str) -> String {\n    let _probe = 1;\n"
+                    "    fs_kit::read_text(p)\n}\n\n"
+                    "#[cfg(test)]\n#[path = \"loader_tests.rs\"]\nmod tests;\n");
+    RustIncrementalEquivalence body = rust_incremental_vs_fresh(tmp, live_db, "body.db", project);
+
+    /* Signature edit: util's surface changes, so its dependent loader_tests.rs
+     * re-resolves while its declaring parent loader.rs does not. */
+    write_temp_file(tmp, "crates/util/src/lib.rs",
+                    "pub fn normalize(p: &str) -> Option<std::string::String> {\n"
+                    "    Some(p.to_string())\n}\n");
+    RustIncrementalEquivalence signature =
+        rust_incremental_vs_fresh(tmp, live_db, "signature.db", project);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(baseline_rc, 0);
+    ASSERT_EQ(root_call, 1);  /* control: fs-kit's discovered lib root */
+    ASSERT_EQ(super_call, 1); /* control: declared identity app::loader::tests */
+    ASSERT_EQ(body.run_rc, 0);
+    ASSERT_EQ(body.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(body.fresh_rc, 0);
+    ASSERT_EQ(body.difference, 0);
+    ASSERT_EQ(signature.run_rc, 0);
+    ASSERT_EQ(signature.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(signature.fresh_rc, 0);
+    ASSERT_EQ(signature.difference, 0);
+    PASS();
+}
+#endif
+
 /* Slash-prefixed call arguments are not necessarily HTTP routes. Keep the
  * parallel arg-url heuristic from minting Route nodes for filesystem paths or
  * regex-replacement operands, while preserving a genuine API path. */
@@ -15677,7 +15823,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":2") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":3") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -16576,6 +16722,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);
     RUN_TEST(pipeline_rust_path_module_chain_does_not_use_physical_parent);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    RUN_TEST(pipeline_rust_closure_repair_matches_fresh_full_across_crates);
+#endif
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);

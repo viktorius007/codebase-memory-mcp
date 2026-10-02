@@ -27,7 +27,7 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 2 };
+enum { SURFACE_CODEC_VERSION = 3 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -135,6 +135,27 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         yyjson_mut_arr_add_val(imp, o);
     }
     yyjson_mut_obj_add_val(doc, root, "imp", imp);
+
+    /* Rust `#[path]` module facts: a closure repair rebuilds every file's
+     * declared identity from these instead of re-parsing the project. JSON
+     * null when they were never recorded (the reader then fails closed). */
+    if (rust_imports) {
+        const CBMRustPathFacts *facts = result ? &result->rust_path_facts : NULL;
+        if (facts && facts->known) {
+            yyjson_mut_val *pm = yyjson_mut_arr(doc);
+            for (int i = 0; i < facts->count; i++) {
+                yyjson_mut_val *pair = yyjson_mut_arr(doc);
+                yyjson_mut_arr_add_str(doc, pair, facts->mods[i].name);
+                yyjson_mut_arr_add_str(doc, pair, facts->mods[i].path);
+                yyjson_mut_arr_add_val(pm, pair);
+            }
+            yyjson_mut_obj_add_val(doc, root, "pm", pm);
+            yyjson_mut_obj_add_bool(doc, root, "si", facts->inline_scope);
+        } else {
+            yyjson_mut_obj_add_null(doc, root, "pm");
+            yyjson_mut_obj_add_null(doc, root, "si");
+        }
+    }
 
     char *json = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);
@@ -325,4 +346,49 @@ int cbm_lsp_surface_imports_from_json(CBMArena *arena, const char *defs_json,
     yyjson_doc_free(doc);
     *out_imports = imports;
     return count;
+}
+
+int cbm_lsp_surface_rust_path_facts_from_json(CBMArena *arena, const char *defs_json,
+                                              CBMRustPathFacts *out) {
+    memset(out, 0, sizeof(*out));
+    if (!defs_json) {
+        return -1;
+    }
+    yyjson_doc *doc = yyjson_read(defs_json, strlen(defs_json), 0);
+    if (!doc) {
+        return -1;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *ver = root ? yyjson_obj_get(root, "v") : NULL;
+    yyjson_val *pm = root ? yyjson_obj_get(root, "pm") : NULL;
+    yyjson_val *si = root ? yyjson_obj_get(root, "si") : NULL;
+    if (!ver || yyjson_get_int(ver) != SURFACE_CODEC_VERSION || !yyjson_is_arr(pm) ||
+        !yyjson_is_bool(si)) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    int count = (int)yyjson_arr_size(pm);
+    CBMRustPathMod *mods =
+        count > 0 ? cbm_arena_alloc(arena, (size_t)count * sizeof(CBMRustPathMod)) : NULL;
+    if (count > 0 && !mods) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    for (int i = 0; i < count; i++) {
+        yyjson_val *pair = yyjson_arr_get(pm, (size_t)i);
+        const char *name = yyjson_get_str(yyjson_arr_get(pair, 0));
+        const char *path = yyjson_get_str(yyjson_arr_get(pair, 1));
+        mods[i].name = name ? cbm_arena_strdup(arena, name) : NULL;
+        mods[i].path = path ? cbm_arena_strdup(arena, path) : NULL;
+        if (!mods[i].name || !mods[i].path) {
+            yyjson_doc_free(doc);
+            return -1;
+        }
+    }
+    out->mods = mods;
+    out->count = count;
+    out->inline_scope = yyjson_get_bool(si);
+    out->known = true;
+    yyjson_doc_free(doc);
+    return 0;
 }

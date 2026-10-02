@@ -138,6 +138,18 @@ typedef struct {
     char **excluded_dirs;
     int excluded_count;
 
+    /* Every file discovered for this run, when the passes resolve only a
+     * subset of it (closure repair). NULL when the resolved files ARE the
+     * project. Facts of the whole file set — Cargo target roots, `#[path]`
+     * module identities — are derived from this list, never from the
+     * subset, so a partial re-resolve sees the same facts a full build does.
+     * Borrowed from the caller's discovery array. */
+    const cbm_file_info_t *project_files;
+    int project_file_count;
+    /* Persisted `#[path]` module facts (CBMRustPathFacts *) of the project
+     * files NOT re-parsed this run, keyed by rel_path. Closure repair only. */
+    const CBMHashTable *rust_path_facts;
+
     /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
      * shared per-language registries here; resolved_calls entries may BORROW
      * strings owned by these registries, and the later calls pass still

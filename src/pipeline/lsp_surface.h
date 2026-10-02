@@ -49,4 +49,10 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
 int cbm_lsp_surface_imports_from_json(CBMArena *arena, const char *defs_json,
                                       CBMImport **out_imports);
 
+/* Decode one Rust row's `#[path]` module facts (strings arena-allocated).
+ * Returns 0 with out->known set, or -1 when the row carries no recorded facts
+ * (non-Rust row, facts never recorded, malformed, other codec version). */
+int cbm_lsp_surface_rust_path_facts_from_json(CBMArena *arena, const char *defs_json,
+                                              CBMRustPathFacts *out);
+
 #endif /* CBM_PIPELINE_LSP_SURFACE_H */

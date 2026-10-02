@@ -491,6 +491,24 @@ typedef struct {
     int cap;
 } CBMImplTraitArray;
 
+/* One out-of-line Rust `#[path = "..."] mod name;` item: the module name and
+ * the raw path literal, relative to the declaring file's directory. */
+typedef struct {
+    const char *name;
+    const char *path;
+} CBMRustPathMod;
+
+/* The `#[path]` module facts of one Rust file, a pure function of its bytes:
+ * its top-level path-attributed `mod` items in source order and whether it
+ * declares any top-level inline `mod x { }` scope. `known` is false when the
+ * facts were never recorded (no result to record them on). */
+typedef struct {
+    const CBMRustPathMod *mods;
+    int count;
+    bool inline_scope;
+    bool known;
+} CBMRustPathFacts;
+
 typedef struct {
     CBMChannel *items;
     int count;
@@ -520,6 +538,10 @@ typedef struct CBMFileResult {
     /* Rust #[path] module identity for resolving self::/super::. NULL means
      * the physical module_qn applies; "" means declarations were ambiguous. */
     const char *rust_relative_module_qn;
+    /* Recorded beside rust_relative_module_qn and persisted in the LSP
+     * surface, so a partial re-resolve can rebuild every file's declared
+     * identity without re-parsing the files it does not repair. */
+    CBMRustPathFacts rust_path_facts;
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none
     const char **exports;       // NULL-terminated (NULL if none)
     const char **constants;     // NULL-terminated (NULL if none)

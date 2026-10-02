@@ -182,7 +182,9 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
 /* Build and borrow the Rust Cargo manifest used for cross-crate (#56) routing.
  * The manifest owns strings in manifest_arena; callers keep that arena alive
  * until every resolver worker has joined.  Each worker must install the shared
- * immutable pointer in its own TLS slot before dispatch and clear it afterward. */
+ * immutable pointer in its own TLS slot before dispatch and clear it afterward.
+ * Cargo target roots are discovered from ctx->project_files when set, else
+ * from `files` (the resolved set is then the whole project). */
 struct CBMCargoManifest;
 bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manifest_arena,
                                  struct CBMCargoManifest *out_manifest,

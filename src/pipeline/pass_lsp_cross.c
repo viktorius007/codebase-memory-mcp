@@ -140,10 +140,57 @@ static char *pxc_rust_path_attribute(CBMArena *arena, const char *source, TSNode
     return NULL;
 }
 
-static int pxc_rust_path_target_index(const cbm_file_info_t *files, int file_count,
-                                      int parent_index, const char *path) {
+/* Canonical path of a Rust file in scope → the first scope index carrying it.
+ * The record owns its key so one free per value releases the table. */
+typedef struct {
+    int index;
+    char key[];
+} PXCRustCanonicalEntry;
+
+static void pxc_rust_canonical_entry_free(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+}
+
+static void pxc_rust_canonical_index_free(CBMHashTable *index) {
+    if (index) {
+        cbm_ht_foreach(index, pxc_rust_canonical_entry_free, NULL);
+        cbm_ht_free(index);
+    }
+}
+
+/* NULL on allocation failure. One canonicalization per file instead of one per
+ * (declaration, file) pair; first index wins, as a linear scan would. */
+static CBMHashTable *pxc_rust_canonical_index(const cbm_file_info_t *files, int file_count) {
+    CBMHashTable *index = cbm_ht_create((uint32_t)file_count * 2U + CBM_SZ_64);
+    if (!index) {
+        return NULL;
+    }
+    for (int i = 0; i < file_count; i++) {
+        char canonical[CBM_SZ_4K];
+        if (files[i].language != CBM_LANG_RUST || !files[i].path ||
+            !cbm_canonical_path(files[i].path, canonical, sizeof(canonical)) ||
+            cbm_ht_get(index, canonical)) {
+            continue;
+        }
+        size_t length = strlen(canonical) + 1;
+        PXCRustCanonicalEntry *entry = (PXCRustCanonicalEntry *)cbm_alloc(
+            CBM_MEM_CLASS_OTHER, sizeof(PXCRustCanonicalEntry) + length);
+        if (!entry) {
+            pxc_rust_canonical_index_free(index);
+            return NULL;
+        }
+        entry->index = i;
+        memcpy(entry->key, canonical, length);
+        cbm_ht_set(index, entry->key, entry);
+    }
+    return index;
+}
+
+static int pxc_rust_path_target_index(const CBMHashTable *index, const char *parent_path,
+                                      const char *path) {
     char joined[CBM_SZ_4K];
-    const char *parent_path = files[parent_index].path;
     const char *slash = strrchr(parent_path, '/');
 #ifdef _WIN32
     const char *backslash = strrchr(parent_path, '\\');
@@ -160,17 +207,8 @@ static int pxc_rust_path_target_index(const cbm_file_info_t *files, int file_cou
         !cbm_canonical_path(joined, target, sizeof(target))) {
         return -1;
     }
-    for (int i = 0; i < file_count; i++) {
-        if (files[i].language != CBM_LANG_RUST) {
-            continue;
-        }
-        char candidate[CBM_SZ_4K];
-        if (cbm_canonical_path(files[i].path, candidate, sizeof(candidate)) &&
-            strcmp(candidate, target) == 0) {
-            return i;
-        }
-    }
-    return -1;
+    const PXCRustCanonicalEntry *entry = (const PXCRustCanonicalEntry *)cbm_ht_get(index, target);
+    return entry ? entry->index : -1;
 }
 
 static char *pxc_rust_declared_module(const char *parent_module, const char *name) {
@@ -220,70 +258,80 @@ static bool pxc_rust_path_modules_push(PXCRustPathModules *modules, int parent_i
     return true;
 }
 
-static bool pxc_collect_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
-                                          const cbm_file_info_t *files, int file_count,
-                                          PXCRustPathModules *modules, bool *has_inline_scope) {
-    for (int i = 0; i < file_count; i++) {
-        if (files[i].language != CBM_LANG_RUST) {
-            continue;
+/* Record one Rust file's `#[path]` module facts (strings in `arena`). Reads
+ * and parses the file when no cached result carries its source or tree.
+ * Returns false on allocation failure; an unreadable file has empty facts. */
+static bool pxc_rust_file_path_facts(CBMArena *arena, const CBMFileResult *cached,
+                                     const char *abs_path, CBMRustPathFacts *out) {
+    memset(out, 0, sizeof(*out));
+    int source_len = 0;
+    char *owned_source = NULL;
+    const char *source = cached ? cached->source : NULL;
+    if (source) {
+        source_len = cached->source_len;
+    } else if (abs_path) {
+        owned_source = pxc_read_file(abs_path, &source_len);
+        source = owned_source;
+    }
+    TSTree *owned_tree = NULL;
+    TSTree *tree = cached ? cached->cached_tree : NULL;
+    TSParser *parser = NULL;
+    if (source && source_len > 0 && !tree) {
+        parser = ts_parser_new();
+        if (parser && ts_parser_set_language(parser, tree_sitter_rust())) {
+            owned_tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+            tree = owned_tree;
         }
-        int source_len = 0;
-        char *owned_source = NULL;
-        const char *source = cache[i] ? cache[i]->source : NULL;
-        if (source) {
-            source_len = cache[i]->source_len;
-        } else {
-            owned_source = pxc_read_file(files[i].path, &source_len);
-            source = owned_source;
-        }
-        TSTree *owned_tree = NULL;
-        TSTree *tree = cache[i] ? cache[i]->cached_tree : NULL;
-        TSParser *parser = NULL;
-        if (source && source_len > 0 && !tree) {
-            parser = ts_parser_new();
-            if (parser && ts_parser_set_language(parser, tree_sitter_rust())) {
-                owned_tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
-                tree = owned_tree;
+    }
+    bool complete = true;
+    CBMRustPathMod *mods = NULL;
+    int capacity = 0;
+    if (source && tree) {
+        TSNode root = ts_tree_root_node(tree);
+        uint32_t count = ts_node_named_child_count(root);
+        for (uint32_t child = 0; complete && child < count; child++) {
+            TSNode item = ts_node_named_child(root, child);
+            if (strcmp(ts_node_type(item), "mod_item") != 0) {
+                continue;
             }
-        }
-        bool complete = true;
-        if (source && tree) {
-            TSNode root = ts_tree_root_node(tree);
-            uint32_t count = ts_node_named_child_count(root);
-            for (uint32_t child = 0; child < count; child++) {
-                TSNode item = ts_node_named_child(root, child);
-                if (strcmp(ts_node_type(item), "mod_item") != 0) {
-                    continue;
-                }
-                if (!ts_node_is_null(ts_node_child_by_field_name(item, "body", 4))) {
-                    has_inline_scope[i] = true;
-                    continue;
-                }
-                char *path = pxc_rust_path_attribute(arena, source, item);
-                TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
-                if (!path || ts_node_is_null(name_node)) {
-                    continue;
-                }
-                int target = pxc_rust_path_target_index(files, file_count, i, path);
-                char *name = cbm_node_text(arena, name_node, source);
-                if (target >= 0 && name && !pxc_rust_path_modules_push(modules, i, target, name)) {
+            if (!ts_node_is_null(ts_node_child_by_field_name(item, "body", 4))) {
+                out->inline_scope = true;
+                continue;
+            }
+            char *path = pxc_rust_path_attribute(arena, source, item);
+            TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
+            char *name = path && !ts_node_is_null(name_node)
+                             ? cbm_node_text(arena, name_node, source)
+                             : NULL;
+            if (!name) {
+                continue;
+            }
+            if (out->count >= capacity) {
+                capacity = capacity ? capacity * 2 : 4;
+                CBMRustPathMod *grown = (CBMRustPathMod *)cbm_arena_alloc(
+                    arena, (size_t)capacity * sizeof(CBMRustPathMod));
+                if (!grown) {
                     complete = false;
                     break;
                 }
+                if (out->count > 0) {
+                    memcpy(grown, mods, (size_t)out->count * sizeof(CBMRustPathMod));
+                }
+                mods = grown;
             }
-        }
-        if (owned_tree) {
-            ts_tree_delete(owned_tree);
-        }
-        if (parser) {
-            ts_parser_delete(parser);
-        }
-        cbm_free(CBM_MEM_CLASS_EXTRACT, owned_source);
-        if (!complete) {
-            return false;
+            mods[out->count++] = (CBMRustPathMod){.name = name, .path = path};
         }
     }
-    return true;
+    out->mods = mods;
+    out->known = complete;
+    if (owned_tree) {
+        ts_tree_delete(owned_tree);
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, owned_source);
+    return complete;
 }
 
 static void pxc_merge_rust_path_module(char **declared, bool *resolved, int target,
@@ -363,24 +411,154 @@ static bool pxc_resolve_rust_path_modules(const PXCRustPathModules *modules,
     return true;
 }
 
-static void pxc_apply_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
-                                        const cbm_file_info_t *files, int file_count,
+/* Scratch for one identity computation over the scope (the project). Index j
+ * is a scope index; subset_of[j] is the resolved-subset index or -1. */
+typedef struct {
+    const cbm_file_info_t *scope;
+    int count;
+    int *subset_of;
+    CBMRustPathFacts *facts;
+    char **modules;     /* per-scope module QN; borrowed for subset files */
+    bool *owned_module; /* modules[j] is heap-owned here */
+    bool *mounted;
+    bool *has_inline_scope;
+} PXCRustPathScope;
+
+static void pxc_rust_path_scope_free(PXCRustPathScope *s) {
+    for (int j = 0; s->modules && s->owned_module && j < s->count; j++) {
+        if (s->owned_module[j]) {
+            free(s->modules[j]);
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, s->subset_of);
+    cbm_free(CBM_MEM_CLASS_OTHER, s->facts);
+    cbm_free(CBM_MEM_CLASS_OTHER, s->modules);
+    cbm_free(CBM_MEM_CLASS_OTHER, s->owned_module);
+    cbm_free(CBM_MEM_CLASS_OTHER, s->mounted);
+    cbm_free(CBM_MEM_CLASS_OTHER, s->has_inline_scope);
+}
+
+/* Map scope ↔ subset, and gather every scope file's facts: fresh parses for
+ * the subset (recorded on their results for the surface), persisted facts for
+ * the rest. False when any Rust file's facts are unavailable — the caller then
+ * fails every identity closed rather than guess a parent. */
+static bool pxc_rust_path_scope_load(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                     CBMFileResult **cache, const cbm_file_info_t *files,
+                                     int file_count, const char *project_name,
+                                     char *const *def_modules, PXCRustPathScope *s) {
+    bool project_scope = ctx && ctx->project_files;
+    s->scope = project_scope ? ctx->project_files : files;
+    s->count = project_scope ? ctx->project_file_count : file_count;
+    size_t n = (size_t)(s->count > 0 ? s->count : 1);
+    s->subset_of = (int *)cbm_alloc(CBM_MEM_CLASS_OTHER, n * sizeof(int));
+    s->facts = (CBMRustPathFacts *)cbm_calloc(CBM_MEM_CLASS_OTHER, n * sizeof(CBMRustPathFacts));
+    s->modules = (char **)cbm_calloc(CBM_MEM_CLASS_OTHER, n * sizeof(char *));
+    s->owned_module = (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, n * sizeof(bool));
+    s->mounted = (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, n * sizeof(bool));
+    s->has_inline_scope = (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, n * sizeof(bool));
+    if (!s->subset_of || !s->facts || !s->modules || !s->owned_module || !s->mounted ||
+        !s->has_inline_scope) {
+        return false;
+    }
+    for (int j = 0; j < s->count; j++) {
+        s->subset_of[j] = project_scope ? -1 : j;
+    }
+    if (project_scope) {
+        CBMHashTable *by_path = cbm_ht_create((uint32_t)s->count * 2U + CBM_SZ_64);
+        if (!by_path) {
+            return false;
+        }
+        for (int j = 0; j < s->count; j++) {
+            cbm_ht_set(by_path, s->scope[j].rel_path, &s->subset_of[j]);
+        }
+        bool mapped = true;
+        for (int i = 0; i < file_count && mapped; i++) {
+            int *slot = (int *)cbm_ht_get(by_path, files[i].rel_path);
+            if (slot) {
+                *slot = i;
+            } else {
+                mapped = false; /* a resolved file outside discovery */
+            }
+        }
+        cbm_ht_free(by_path);
+        if (!mapped) {
+            return false;
+        }
+    }
+    for (int j = 0; j < s->count; j++) {
+        if (s->scope[j].language != CBM_LANG_RUST) {
+            continue;
+        }
+        int i = s->subset_of[j];
+        if (i >= 0) {
+            CBMArena *owner = cache[i] ? &cache[i]->arena : arena;
+            if (!pxc_rust_file_path_facts(owner, cache[i], files[i].path, &s->facts[j])) {
+                return false;
+            }
+            if (cache[i]) {
+                cache[i]->rust_path_facts = s->facts[j];
+            }
+            s->modules[j] = def_modules[i];
+        } else {
+            const CBMRustPathFacts *stored =
+                ctx->rust_path_facts ? (const CBMRustPathFacts *)cbm_ht_get(ctx->rust_path_facts,
+                                                                            s->scope[j].rel_path)
+                                     : NULL;
+            if (!stored || !stored->known) {
+                return false;
+            }
+            s->facts[j] = *stored;
+            s->modules[j] = cbm_pipeline_fqn_module_dir(project_name, s->scope[j].rel_path,
+                                                        pxc_module_is_dir(s->scope[j].language));
+            if (!s->modules[j]) {
+                return false;
+            }
+            s->owned_module[j] = true;
+        }
+        s->has_inline_scope[j] = s->facts[j].inline_scope;
+    }
+    return true;
+}
+
+/* Declared module identity of every resolved Rust file, computed over the
+ * whole project (ctx->project_files) when the resolved files are a subset of
+ * it, so a re-parsed `#[path]` target whose declaring parent is not
+ * re-parsed still receives the identity a full build gives it. */
+static void pxc_apply_rust_path_modules(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                        CBMFileResult **cache, const cbm_file_info_t *files,
+                                        int file_count, const char *project_name,
                                         char *const *def_modules) {
     for (int i = 0; i < file_count; i++) {
         if (files[i].language == CBM_LANG_RUST && cache[i]) {
             cache[i]->rust_relative_module_qn = "";
         }
     }
-    bool *mounted = (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(bool));
-    bool *has_inline_scope =
-        (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(bool));
+    PXCRustPathScope s = {0};
     PXCRustPathModules modules = {0};
-    if (!mounted || !has_inline_scope ||
-        !pxc_collect_rust_path_modules(arena, cache, files, file_count, &modules,
-                                       has_inline_scope)) {
-        cbm_free(CBM_MEM_CLASS_OTHER, mounted);
-        cbm_free(CBM_MEM_CLASS_OTHER, has_inline_scope);
+    CBMHashTable *canonical = NULL;
+    bool ok = pxc_rust_path_scope_load(ctx, arena, cache, files, file_count, project_name,
+                                       def_modules, &s);
+    bool any_declaration = false;
+    for (int j = 0; ok && j < s.count; j++) {
+        any_declaration = any_declaration || s.facts[j].count > 0;
+    }
+    if (ok && any_declaration) {
+        canonical = pxc_rust_canonical_index(s.scope, s.count);
+        ok = canonical != NULL;
+    }
+    for (int j = 0; ok && any_declaration && j < s.count; j++) {
+        for (int m = 0; ok && m < s.facts[j].count; m++) {
+            const CBMRustPathMod *mod = &s.facts[j].mods[m];
+            int target = pxc_rust_path_target_index(canonical, s.scope[j].path, mod->path);
+            if (target >= 0) {
+                ok = pxc_rust_path_modules_push(&modules, j, target, (char *)mod->name);
+            }
+        }
+    }
+    pxc_rust_canonical_index_free(canonical);
+    if (!ok) {
         cbm_free(CBM_MEM_CLASS_OTHER, modules.items);
+        pxc_rust_path_scope_free(&s);
         return;
     }
     for (int i = 0; i < file_count; i++) {
@@ -389,29 +567,29 @@ static void pxc_apply_rust_path_modules(CBMArena *arena, CBMFileResult **cache,
         }
     }
     for (int i = 0; i < modules.count; i++) {
-        mounted[modules.items[i].target_index] = true;
+        s.mounted[modules.items[i].target_index] = true;
     }
     char **declared = NULL;
     bool *resolved = NULL;
-    bool resolution_ok = pxc_resolve_rust_path_modules(&modules, def_modules, file_count, mounted,
-                                                       has_inline_scope, &declared, &resolved);
-    for (int i = 0; i < file_count; i++) {
-        if (mounted[i] && cache[i]) {
+    bool resolution_ok = pxc_resolve_rust_path_modules(&modules, s.modules, s.count, s.mounted,
+                                                       s.has_inline_scope, &declared, &resolved);
+    for (int j = 0; j < s.count; j++) {
+        int i = s.subset_of[j];
+        if (i >= 0 && s.mounted[j] && cache[i]) {
             const char *module =
-                resolution_ok && resolved[i] && declared[i][0] && !has_inline_scope[i]
-                    ? cbm_arena_strdup(&cache[i]->arena, declared[i])
+                resolution_ok && resolved[j] && declared[j][0] && !s.has_inline_scope[j]
+                    ? cbm_arena_strdup(&cache[i]->arena, declared[j])
                     : "";
             cache[i]->rust_relative_module_qn = module ? module : "";
         }
         if (resolution_ok) {
-            cbm_free(CBM_MEM_CLASS_OTHER, declared[i]);
+            cbm_free(CBM_MEM_CLASS_OTHER, declared[j]);
         }
     }
     cbm_free(CBM_MEM_CLASS_OTHER, modules.items);
-    cbm_free(CBM_MEM_CLASS_OTHER, mounted);
-    cbm_free(CBM_MEM_CLASS_OTHER, has_inline_scope);
     cbm_free(CBM_MEM_CLASS_OTHER, declared);
     cbm_free(CBM_MEM_CLASS_OTHER, resolved);
+    pxc_rust_path_scope_free(&s);
 }
 
 /* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP registrars
@@ -971,7 +1149,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
     if (out_def_starts) {
         out_def_starts[file_count] = idx;
     }
-    pxc_apply_rust_path_modules(arena, cache, files, file_count, def_modules);
+    pxc_apply_rust_path_modules(ctx, arena, cache, files, file_count, project_name, def_modules);
     *out_count = idx;
     return defs;
 }
@@ -2171,6 +2349,13 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
                                  int file_count) {
     if (!ctx || !ctx->repo_path || !marena || !out_m)
         return false;
+    /* Target roots are discovered from the project's files: a partial
+     * re-resolve must still see the src/lib.rs of a crate it does not
+     * re-parse, or every call into that crate loses its root. */
+    if (ctx->project_files) {
+        files = ctx->project_files;
+        file_count = ctx->project_file_count;
+    }
     char path[1024];
     int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->repo_path);
     if (n <= 0 || (size_t)n >= sizeof(path))
@@ -2621,7 +2806,8 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
         return NULL;
     }
 
-    bool *selected = (bool *)calloc((size_t)idx->def_count, sizeof(*selected));
+    bool *selected =
+        (bool *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)idx->def_count * sizeof(*selected));
     if (!selected) {
         return NULL;
     }
@@ -2638,14 +2824,14 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     }
 
     if (total == 0) {
-        free(selected);
+        cbm_free(CBM_MEM_CLASS_OTHER, selected);
         *out_success = true;
         return NULL;
     }
 
     CBMLSPDef *out = (CBMLSPDef *)malloc((size_t)total * sizeof(CBMLSPDef));
     if (!out) {
-        free(selected);
+        cbm_free(CBM_MEM_CLASS_OTHER, selected);
         return NULL;
     }
 
@@ -2657,6 +2843,6 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     }
     *out_count = n;
     *out_success = true;
-    free(selected);
+    cbm_free(CBM_MEM_CLASS_OTHER, selected);
     return out;
 }

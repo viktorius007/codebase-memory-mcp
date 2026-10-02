@@ -1188,6 +1188,33 @@ static int surface_name_changes(const char *stored_json, const char *fresh_json,
     return rc;
 }
 
+/* Do two surfaces carry the same Rust `#[path]` module facts ("pm", "si";
+ * both absent on non-Rust rows)? A changed declaration or inline-scope flag
+ * re-names the declared files, which hold no edge into this one, so the
+ * edge-derived dependent set cannot see them. */
+static int surface_rust_path_facts_equal(const char *stored_json, const char *fresh_json,
+                                         bool *out_equal) {
+    *out_equal = false;
+    yyjson_doc *stored_doc = yyjson_read(stored_json, strlen(stored_json), 0);
+    yyjson_doc *fresh_doc = yyjson_read(fresh_json, strlen(fresh_json), 0);
+    int rc = stored_doc && fresh_doc ? 0 : -1;
+    if (rc == 0) {
+        yyjson_val *stored_root = yyjson_doc_get_root(stored_doc);
+        yyjson_val *fresh_root = yyjson_doc_get_root(fresh_doc);
+        bool equal = true;
+        static const char *const keys[] = {"pm", "si"};
+        for (size_t k = 0; equal && k < sizeof(keys) / sizeof(keys[0]); k++) {
+            yyjson_val *a = stored_root ? yyjson_obj_get(stored_root, keys[k]) : NULL;
+            yyjson_val *b = fresh_root ? yyjson_obj_get(fresh_root, keys[k]) : NULL;
+            equal = (!a && !b) || (a && b && yyjson_equals(a, b));
+        }
+        *out_equal = equal;
+    }
+    yyjson_doc_free(stored_doc);
+    yyjson_doc_free(fresh_doc);
+    return rc;
+}
+
 static int surface_imports_equal(const char *stored_json, const char *fresh_json, bool *out_equal) {
     *out_equal = false;
     yyjson_doc *stored_doc = yyjson_read(stored_json, strlen(stored_json), 0);
@@ -1560,11 +1587,12 @@ typedef struct {
     int row_count;
     int worker_id;
     int worker_count;
-    CBMArena *arena;         /* this worker's arena (owned by cr) */
-    CBMLSPDef **row_defs;    /* per-row result pointers */
-    int *row_counts;         /* per-row def counts; -1 = decode failure */
-    CBMImport **row_imports; /* per-row Rust `use` tables */
-    int *row_import_counts;  /* per-row import counts; -1 = decode failure */
+    CBMArena *arena;                  /* this worker's arena (owned by cr) */
+    CBMLSPDef **row_defs;             /* per-row result pointers */
+    int *row_counts;                  /* per-row def counts; -1 = decode failure */
+    CBMImport **row_imports;          /* per-row Rust `use` tables */
+    int *row_import_counts;           /* per-row import counts; -1 = decode failure */
+    CBMRustPathFacts *row_path_facts; /* per-row `#[path]` facts (Rust rows) */
 } rehydrate_worker_t;
 
 static void *rehydrate_worker(void *arg) {
@@ -1572,6 +1600,13 @@ static void *rehydrate_worker(void *arg) {
     for (int i = w->worker_id; i < w->row_count; i += w->worker_count) {
         CBMLSPDef *defs = NULL;
         int count = cbm_lsp_surface_defs_from_json(w->arena, w->rows[i]->defs_json, &defs);
+        /* A Rust row without recorded `#[path]` facts cannot name the
+         * modules it declares: treat it as undecodable (→ full rebuild). */
+        if (count >= 0 && cbm_str_ends_with(w->rows[i]->rel_path, ".rs") &&
+            cbm_lsp_surface_rust_path_facts_from_json(w->arena, w->rows[i]->defs_json,
+                                                      &w->row_path_facts[i]) != 0) {
+            count = -1;
+        }
         w->row_defs[i] = defs;
         w->row_counts[i] = count;
         CBMImport *imports = NULL;
@@ -1880,12 +1915,21 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             continue; /* body edit: the file re-resolves, nobody else does */
         }
         bool imports_equal = false;
+        bool path_facts_equal = false;
+        const char *surface_decline = NULL;
         if (surface_imports_equal(stored_row->defs_json, fresh_row->defs_json, &imports_equal) !=
                 0 ||
             !imports_equal) {
+            surface_decline = "imports_changed";
+        } else if (surface_rust_path_facts_equal(stored_row->defs_json, fresh_row->defs_json,
+                                                 &path_facts_equal) != 0 ||
+                   !path_facts_equal) {
+            surface_decline = "rust_path_modules_changed";
+        }
+        if (surface_decline) {
             free(dep_targets);
             cbm_ht_free(rows_by_path);
-            decline = "imports_changed";
+            decline = surface_decline;
             goto done;
         }
         bool added = false;
@@ -2000,7 +2044,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                              closure_plan_t *plan, cbm_file_info_t *changed_files, int ci,
                              char **deleted, int deleted_count, cbm_file_hash_t *mode_skipped,
                              int mode_skipped_count, cbm_coverage_row_t *old_cov, int old_cov_count,
-                             cbm_store_t *route_store, struct timespec t0) {
+                             cbm_store_t *route_store, const cbm_file_info_t *project_files,
+                             int project_file_count, struct timespec t0) {
     struct timespec t;
     cbm_store_close(route_store);
 
@@ -2029,6 +2074,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int elig_count = 0;
     CBMImport **row_imports = NULL;
     int *row_import_counts = NULL;
+    /* Their `#[path]` module facts, by rel_path (values in row_path_facts). */
+    CBMRustPathFacts *row_path_facts = NULL;
+    CBMHashTable *path_facts_by_file = NULL;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_stage_clone(db_path, &stage) != 0) {
@@ -2125,10 +2173,12 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         int *row_counts = (int *)calloc(slots, sizeof(int));
         row_imports = (CBMImport **)cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*row_imports));
         row_import_counts = (int *)cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(int));
+        row_path_facts =
+            (CBMRustPathFacts *)cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*row_path_facts));
         cr.rehydrate_arenas = (CBMArena *)calloc((size_t)workers, sizeof(CBMArena));
         cbm_thread_t *threads = (cbm_thread_t *)calloc((size_t)workers, sizeof(cbm_thread_t));
         rehydrate_worker_t *wargs = (rehydrate_worker_t *)calloc((size_t)workers, sizeof(*wargs));
-        if (!row_defs || !row_counts || !row_imports || !row_import_counts ||
+        if (!row_defs || !row_counts || !row_imports || !row_import_counts || !row_path_facts ||
             !cr.rehydrate_arenas || !threads || !wargs) {
             free(row_defs);
             free(row_counts);
@@ -2150,7 +2200,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                                             .row_defs = row_defs,
                                             .row_counts = row_counts,
                                             .row_imports = row_imports,
-                                            .row_import_counts = row_import_counts};
+                                            .row_import_counts = row_import_counts,
+                                            .row_path_facts = row_path_facts};
             if (cbm_thread_create(&threads[w], 0, rehydrate_worker, &wargs[w]) != 0) {
                 break;
             }
@@ -2214,8 +2265,20 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
+        .project_files = project_files,
+        .project_file_count = project_file_count,
     };
     live_ctx = &ctx;
+    path_facts_by_file = cbm_ht_create((uint32_t)elig_count * 2U + CBM_SZ_64);
+    if (!path_facts_by_file) {
+        goto out;
+    }
+    for (int i = 0; i < elig_count; i++) {
+        if (row_path_facts[i].known) {
+            cbm_ht_set(path_facts_by_file, elig[i]->rel_path, &row_path_facts[i]);
+        }
+    }
+    ctx.rust_path_facts = path_facts_by_file;
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
         if (file_qn) {
@@ -2457,6 +2520,8 @@ out:
     free(elig);
     cbm_free(CBM_MEM_CLASS_OTHER, row_imports);
     cbm_free(CBM_MEM_CLASS_OTHER, row_import_counts);
+    cbm_free(CBM_MEM_CLASS_OTHER, row_path_facts);
+    cbm_ht_free(path_facts_by_file);
     if (registry) {
         cbm_registry_free(registry);
     }
@@ -2691,7 +2756,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return run_closure_delta(p, db_path, project, baseline_manifest, baseline_count,
                                  &closure_plan, changed_files, ci, deleted, deleted_count,
                                  mode_skipped, mode_skipped_count, old_cov, old_cov_count, store,
-                                 t0);
+                                 files, file_count, t0);
     }
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
