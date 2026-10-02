@@ -230,6 +230,9 @@ typedef struct {
     /* Rust only: declared `async fn`. Its recorded return type is the
      * declared output, so `.await` on a call to it yields that type as is. */
     bool is_async;
+    /* Rust only: a trait's supertrait bounds as written (`Base<T>|std::fmt::Debug`),
+     * "|"-separated, lifetimes and `?Sized` dropped. NULL for every other def. */
+    const char *supertraits;
 } CBMDefinition;
 
 /* Argument captured from a call expression */

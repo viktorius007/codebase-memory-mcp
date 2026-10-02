@@ -3195,6 +3195,99 @@ TEST(rustlsp_deref_wrapper_method_wins_over_target) {
     PASS();
 }
 
+/* Cross-file fixture for trait objects: `p.demo.Holder` declares
+ * `svc: Arc<dyn Service + Send + Sync>`; `Service: Named + Send` carries its
+ * supertrait bounds as written; `Real` is the one implementation. */
+static int rustlsp_dyn_fixture(CBMRustLSPDef *defs) {
+    int n = 0;
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Holder",
+                                .short_name = "Holder",
+                                .label = "Type",
+                                .def_module_qn = "p.demo",
+                                .field_defs = "svc:Arc<dyn Service + Send + Sync>"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Named",
+                                .short_name = "Named",
+                                .label = "Trait",
+                                .def_module_qn = "p.demo",
+                                .is_interface = true};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Named.name",
+                                .short_name = "name",
+                                .label = "Method",
+                                .receiver_type = "p.demo.Named",
+                                .def_module_qn = "p.demo",
+                                .is_abstract = true};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Service",
+                                .short_name = "Service",
+                                .label = "Trait",
+                                .def_module_qn = "p.demo",
+                                .embedded_types = "Named|Send",
+                                .is_interface = true};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Service.call",
+                                .short_name = "call",
+                                .label = "Method",
+                                .receiver_type = "p.demo.Service",
+                                .def_module_qn = "p.demo",
+                                .is_abstract = true};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Real",
+                                .short_name = "Real",
+                                .label = "Type",
+                                .def_module_qn = "p.demo"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Real.call",
+                                .short_name = "call",
+                                .label = "Method",
+                                .receiver_type = "p.demo.Real",
+                                .receiver_spelling = "Real",
+                                .def_module_qn = "p.demo",
+                                .trait_qn = "Service"};
+    return n;
+}
+
+static void rustlsp_run_dyn_fixture(CBMArena *a, const char *src, CBMResolvedCallArray *out) {
+    CBMRustLSPDef defs[8];
+    int n = rustlsp_dyn_fixture(defs);
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    memset(out, 0, sizeof(*out));
+    cbm_run_rust_lsp_cross(a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           out);
+}
+
+TEST(rustlsp_dyn_trait_field_links_trait_declaration) {
+    /* The field's text names `dyn Service + Send + Sync`; the call reaches
+     * the method `Service` declares, not its one implementation. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_dyn_fixture(&a, "fn run(h: demo::Holder) { h.svc.call(); }\n", &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.Service.call"), 0);
+    ASSERT_EQ(find_confident(&out, "run", "p.demo.Real.call"), -1);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_dyn_trait_supertrait_method) {
+    /* `name` is declared by the supertrait `Named`, not by `Service`. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_dyn_fixture(&a, "fn run(h: demo::Holder) { h.svc.name(); }\n", &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.Named.name"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_dyn_trait_param_principal_after_marker) {
+    /* `&(dyn Send + Service)`: the auto trait adds no method; the principal
+     * trait is the bound after it. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_dyn_fixture(&a, "fn run(s: &(dyn Send + demo::Service)) { s.call(); }\n", &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.Service.call"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(rustlsp_strict_refcell_borrow) {
     CBMFileResult *r = extract_rust(
         "use std::cell::RefCell;\n"
@@ -8661,6 +8754,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_multiline_tuple_return_elements_name_their_types);
     RUN_TEST(rustlsp_deref_field_through_box);
     RUN_TEST(rustlsp_deref_wrapper_method_wins_over_target);
+    RUN_TEST(rustlsp_dyn_trait_field_links_trait_declaration);
+    RUN_TEST(rustlsp_dyn_trait_supertrait_method);
+    RUN_TEST(rustlsp_dyn_trait_param_principal_after_marker);
     RUN_TEST(rustlsp_strict_refcell_borrow);
     RUN_TEST(rustlsp_strict_iter_map_closure);
     RUN_TEST(rustlsp_strict_option_map_closure);
