@@ -7456,6 +7456,85 @@ TEST(pipeline_rust_type_names_resolve_through_declared_module_tree) {
     PASS();
 }
 
+/* A method call on a trait object links to the method the trait (or a
+ * supertrait) declares, never to its one implementation. The holder types
+ * are declared in another file, so the caller reads their field types as
+ * written there. */
+static const RustModTreeCallCase rust_dyn_trait_cases[] = {
+    {"Arc<dyn Trait + Send + Sync> field", "core.src.calls.via_field", "core.src.svc.Service.call",
+     true},
+    {"Arc<dyn Trait> field: not the one implementation", "core.src.calls.via_field",
+     "core.src.svc.Real.call", false},
+    {"&(dyn Trait + Send) parameter", "core.src.calls.via_param", "core.src.svc.Service.call",
+     true},
+    {"&(dyn Send + Trait) parameter: the principal trait", "core.src.calls.via_param_marker_first",
+     "core.src.svc.Service.call", true},
+    {"supertrait method through Arc<dyn Trait>", "core.src.calls.via_super",
+     "core.src.svc.Named.name", true},
+    {"Box<dyn Trait> whose Box has its own impl of the trait", "core.src.calls.via_box",
+     "core.src.out.Out.log", false},
+    /* `impl<S: Sink> Sink for Box<S>` needs S: Sized, so it does not apply to
+     * Box<dyn Sink>: the wrapper's impl is not linked by guess. */
+    {"Box<dyn Trait> beside a Box impl that needs Sized", "core.src.calls.via_sink",
+     "core.src.out.Box.put[Sink]", false},
+    {"return-position impl Trait is not a trait object", "core.src.calls.via_ret",
+     "core.src.svc.Service.call", false},
+};
+
+TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_dyn_trait_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"core\", \"util\"]\n");
+    write_temp_file(tmp, "core/Cargo.toml",
+                    "[package]\nname = \"codex-core\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "core/src/lib.rs", "mod svc;\nmod out;\nmod holder;\nmod calls;\n");
+    write_temp_file(tmp, "core/src/svc.rs",
+                    "pub trait Named {\n    fn name(&self) -> u8;\n}\n"
+                    "pub trait Service: Named + Send + Sync + 'static {\n"
+                    "    fn call(&self) -> u8;\n}\n"
+                    "pub struct Real;\n"
+                    "impl Named for Real {\n    fn name(&self) -> u8 { 1 }\n}\n"
+                    "impl Service for Real {\n    fn call(&self) -> u8 { 2 }\n}\n"
+                    "pub fn make_svc() -> impl Service { Real }\n");
+    write_temp_file(tmp, "core/src/out.rs",
+                    "pub trait Out {\n    fn log(&self) -> u8;\n}\n"
+                    "impl<T: Out + ?Sized> Out for Box<T> {\n"
+                    "    fn log(&self) -> u8 { (**self).log() }\n}\n"
+                    "pub trait Sink {\n    fn put(&self) -> u8;\n}\n"
+                    "impl<S: Sink> Sink for Box<S> {\n"
+                    "    fn put(&self) -> u8 { (**self).put() }\n}\n");
+    write_temp_file(tmp, "core/src/holder.rs",
+                    "use std::sync::Arc;\nuse crate::out::{Out, Sink};\nuse crate::svc::Service;\n"
+                    "pub struct Holder {\n    pub svc: Arc<dyn Service + Send + Sync>,\n"
+                    "    pub out: Box<dyn Out>,\n    pub sink: Box<dyn Sink>,\n}\n");
+    write_temp_file(tmp, "core/src/calls.rs",
+                    "use crate::holder::Holder;\nuse crate::svc::{make_svc, Service};\n"
+                    "pub fn via_field(h: &Holder) -> u8 { h.svc.call() }\n"
+                    "pub fn via_param(s: &(dyn Service + Send)) -> u8 { s.call() }\n"
+                    "pub fn via_param_marker_first(s: &(dyn Send + Service)) -> u8 { s.call() }\n"
+                    "pub fn via_super(h: &Holder) -> u8 { h.svc.name() }\n"
+                    "pub fn via_box(h: &Holder) -> u8 { h.out.log() }\n"
+                    "pub fn via_sink(h: &Holder) -> u8 { h.sink.put() }\n"
+                    "pub fn via_ret() -> u8 { make_svc().call() }\n");
+    write_temp_file(tmp, "util/src/lib.rs", "pub fn util_root() -> u8 { 0 }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "util/src/pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_dyn_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, rust_dyn_trait_cases,
+        (int)(sizeof(rust_dyn_trait_cases) / sizeof(rust_dyn_trait_cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
 /* A method call on the value of a path call is typed from the target the call
  * step published for that producer. The producers here live in a path
  * dependency outside the workspace (`[lib] path`, a module below its root)
@@ -7527,6 +7606,84 @@ TEST(pipeline_rust_method_on_path_call_result_uses_published_producer) {
     ASSERT_TRUE(method_linked[0]); /* `Type::new()` returning Self */
     ASSERT_TRUE(method_linked[1]); /* `Type::open()?` returning Result<Self, E> */
     ASSERT_TRUE(method_linked[2]); /* imported free fn returning a named type */
+    PASS();
+}
+
+/* Whether `run` -> `Conn.ping` is linked in the graph at db_path. */
+static bool rust_await_ping_linked(const char *db_path, const char *project) {
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return false;
+    }
+    char src[512];
+    char dst[512];
+    snprintf(src, sizeof(src), "%s.src.caller.run", project);
+    snprintf(dst, sizeof(dst), "%s.src.conn.Conn.ping", project);
+    bool linked = exact_call_qns_exist(store, project, src, dst);
+    cbm_store_close(store);
+    return linked;
+}
+
+/* `.await` on an async fn defined in another file keeps its declared
+ * `Result<Conn, E>`, so `.expect(..)` reaches `Conn.ping` (`Other.ping`
+ * makes the name ambiguous). The async fact travels with the stored surface:
+ * a body edit of the caller, repaired from the defining file's surface, must
+ * link the same call as a fresh full build. */
+TEST(pipeline_rust_await_async_fn_output_survives_closure_repair) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_await_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod conn;\npub mod caller;\n");
+    write_temp_file(tmp, "src/conn.rs",
+                    "pub struct Conn;\n"
+                    "pub struct Other;\n"
+                    "impl Conn {\n"
+                    "    pub async fn reopen(&self) -> Result<Conn, String> { Ok(Conn) }\n"
+                    "    pub fn ping(&self) -> bool { true }\n"
+                    "}\n"
+                    "impl Other { pub fn ping(&self) -> bool { false } }\n");
+    write_temp_file(tmp, "src/caller.rs",
+                    "use crate::conn::Conn;\n"
+                    "pub async fn run(c: &Conn) -> bool { c.reopen().await.expect(\"x\").ping() }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/await.db", tmp);
+
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    bool full_linked = rust_await_ping_linked(db, project);
+
+    write_temp_file(tmp, "src/caller.rs",
+                    "use crate::conn::Conn;\n"
+                    "pub async fn run(c: &Conn) -> bool {\n"
+                    "    let ok = c.reopen().await.expect(\"x\").ping();\n"
+                    "    ok\n"
+                    "}\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incr = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incr);
+    ASSERT_EQ(cbm_pipeline_run(incr), 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incr);
+    bool repaired_linked = rust_await_ping_linked(db, project);
+
+    char full_db[512];
+    snprintf(full_db, sizeof(full_db), "%s/reference-full.db", tmp);
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    cbm_pipeline_free(full);
+    bool fresh_linked = rust_await_ping_linked(full_db, project);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(full_linked);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(repaired_linked);
+    ASSERT_TRUE(fresh_linked);
     PASS();
 }
 
@@ -16632,7 +16789,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":4") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -17532,6 +17689,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes);
     RUN_TEST(pipeline_rust_method_on_path_call_result_uses_published_producer);
     RUN_TEST(pipeline_rust_type_names_resolve_through_declared_module_tree);
+    RUN_TEST(pipeline_rust_await_async_fn_output_survives_closure_repair);
+    RUN_TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration);
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
     RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
     RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);

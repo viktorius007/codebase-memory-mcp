@@ -95,6 +95,7 @@ typedef struct {
     const char *receiver_spelling; // Rust-only exact impl receiver; registry identity input
     bool is_rust_impl_relation; // independent type-level impl record (empty impls survive)
     bool is_abstract;           // Rust required trait method; false for defaults
+    bool is_async;              // Rust `async fn`: recorded return is the awaited output
     /* Python-only raw decorator syntax, borrowed from CBMDefinition.  The
      * resolver must retain it across fused/cross-file registry construction:
      * a decorator rebinds the function name, so the undecorated definition is

@@ -820,6 +820,84 @@ TEST(rustlsp_crossfile_trait_provided_constructor_types_value) {
     PASS();
 }
 
+/* Cross-file fixture: `demo::Conn` with methods `reopen` (async when
+ * `async_reopen`, returning `Result<Conn, String>`), `renamed` returning
+ * `Result<Self, String>`, and `ping`; `demo::Other` also has `ping`, so only
+ * a typed receiver can pick `Conn.ping`. */
+static void rustlsp_conn_fixture(CBMRustLSPDef defs[6], bool async_reopen) {
+    memset(defs, 0, 6 * sizeof(defs[0]));
+    const char *types[] = {"Conn", "Other"};
+    for (int i = 0; i < 2; i++) {
+        defs[i].qualified_name = i == 0 ? "test.demo.Conn" : "test.demo.Other";
+        defs[i].short_name = types[i];
+        defs[i].label = "Type";
+        defs[i].def_module_qn = "test.demo";
+    }
+    const char *mqn[] = {"test.demo.Conn.reopen", "test.demo.Conn.renamed",
+                         "test.demo.Conn.ping", "test.demo.Other.ping"};
+    const char *mname[] = {"reopen", "renamed", "ping", "ping"};
+    const char *mrecv[] = {"test.demo.Conn", "test.demo.Conn", "test.demo.Conn",
+                           "test.demo.Other"};
+    const char *mret[] = {"Result<Conn, String>", "Result<Self, String>", "bool", "bool"};
+    for (int i = 0; i < 4; i++) {
+        CBMRustLSPDef *d = &defs[2 + i];
+        d->qualified_name = mqn[i];
+        d->short_name = mname[i];
+        d->label = "Method";
+        d->receiver_type = mrecv[i];
+        d->def_module_qn = "test.demo";
+        d->return_types = mret[i];
+    }
+    defs[2].is_async = async_reopen;
+}
+
+static int rustlsp_conn_fixture_ping_target(const char *caller, bool async_reopen,
+                                            const char *callee) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[6];
+    rustlsp_conn_fixture(defs, async_reopen);
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, 6, imp_names,
+                           imp_qns, 1, NULL, &out);
+    int idx = find_confident(&out, "run", callee);
+    cbm_arena_destroy(&a);
+    return idx;
+}
+
+/* `.await` on a cross-file async fn keeps its declared `Result<T>` output:
+ * `.expect(..)` and `?` then reach T. */
+TEST(rustlsp_crossfile_await_async_result_then_expect_and_try) {
+    const char *by_expect =
+        "async fn run(c: &demo::Conn) -> bool { c.reopen().await.expect(\"x\").ping() }\n";
+    const char *by_try = "async fn run(c: &demo::Conn) -> Result<bool, String> {\n"
+                         "    Ok(c.reopen().await?.ping())\n}\n";
+    ASSERT_GTE(rustlsp_conn_fixture_ping_target(by_expect, true, "Conn.ping"), 0);
+    ASSERT_GTE(rustlsp_conn_fixture_ping_target(by_try, true, "Conn.ping"), 0);
+    PASS();
+}
+
+/* The async flag is what keeps the output: the same declared return on a
+ * non-async fn is a future type whose output is its first argument. */
+TEST(rustlsp_crossfile_await_non_async_peels_future_output) {
+    const char *by_expect =
+        "async fn run(c: &demo::Conn) -> bool { c.reopen().await.expect(\"x\").ping() }\n";
+    ASSERT_EQ(rustlsp_conn_fixture_ping_target(by_expect, false, "Conn.ping"), -1);
+    PASS();
+}
+
+/* A cross-file method returning `Result<Self, E>` types `?` as the receiver. */
+TEST(rustlsp_crossfile_method_result_self_return) {
+    const char *caller = "fn run(c: &demo::Conn) -> Result<bool, String> {\n"
+                         "    Ok(c.renamed()?.ping())\n}\n";
+    ASSERT_GTE(rustlsp_conn_fixture_ping_target(caller, false, "Conn.ping"), 0);
+    ASSERT_EQ(rustlsp_conn_fixture_ping_target(caller, false, "Other.ping"), -1);
+    PASS();
+}
+
 /* F4 Tier-2: the build-once shared registry path (cbm_rust_build_cross_registry +
  * cbm_run_rust_lsp_cross_with_registry) must resolve IDENTICALLY to the per-file
  * cbm_run_rust_lsp_cross — same fixture as rustlsp_crossfile_method_dispatch. Also
@@ -3190,6 +3268,99 @@ TEST(rustlsp_deref_wrapper_method_wins_over_target) {
     ASSERT_GTE(find_confident(&out, "run", "alloc.sync.Arc.downgrade"), 0);
     ASSERT_EQ(find_confident(&out, "run", "p.demo.State.downgrade"), -1);
     ASSERT_EQ(find_confident(&out, "run", "p.demo.State.eq"), -1);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+/* Cross-file fixture for trait objects: `p.demo.Holder` declares
+ * `svc: Arc<dyn Service + Send + Sync>`; `Service: Named + Send` carries its
+ * supertrait bounds as written; `Real` is the one implementation. */
+static int rustlsp_dyn_fixture(CBMRustLSPDef *defs) {
+    int n = 0;
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Holder",
+                                .short_name = "Holder",
+                                .label = "Type",
+                                .def_module_qn = "p.demo",
+                                .field_defs = "svc:Arc<dyn Service + Send + Sync>"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Named",
+                                .short_name = "Named",
+                                .label = "Trait",
+                                .def_module_qn = "p.demo",
+                                .is_interface = true};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Named.name",
+                                .short_name = "name",
+                                .label = "Method",
+                                .receiver_type = "p.demo.Named",
+                                .def_module_qn = "p.demo",
+                                .is_abstract = true};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Service",
+                                .short_name = "Service",
+                                .label = "Trait",
+                                .def_module_qn = "p.demo",
+                                .embedded_types = "Named|Send",
+                                .is_interface = true};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Service.call",
+                                .short_name = "call",
+                                .label = "Method",
+                                .receiver_type = "p.demo.Service",
+                                .def_module_qn = "p.demo",
+                                .is_abstract = true};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Real",
+                                .short_name = "Real",
+                                .label = "Type",
+                                .def_module_qn = "p.demo"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Real.call",
+                                .short_name = "call",
+                                .label = "Method",
+                                .receiver_type = "p.demo.Real",
+                                .receiver_spelling = "Real",
+                                .def_module_qn = "p.demo",
+                                .trait_qn = "Service"};
+    return n;
+}
+
+static void rustlsp_run_dyn_fixture(CBMArena *a, const char *src, CBMResolvedCallArray *out) {
+    CBMRustLSPDef defs[8];
+    int n = rustlsp_dyn_fixture(defs);
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    memset(out, 0, sizeof(*out));
+    cbm_run_rust_lsp_cross(a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           out);
+}
+
+TEST(rustlsp_dyn_trait_field_links_trait_declaration) {
+    /* The field's text names `dyn Service + Send + Sync`; the call reaches
+     * the method `Service` declares, not its one implementation. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_dyn_fixture(&a, "fn run(h: demo::Holder) { h.svc.call(); }\n", &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.Service.call"), 0);
+    ASSERT_EQ(find_confident(&out, "run", "p.demo.Real.call"), -1);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_dyn_trait_supertrait_method) {
+    /* `name` is declared by the supertrait `Named`, not by `Service`. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_dyn_fixture(&a, "fn run(h: demo::Holder) { h.svc.name(); }\n", &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.Named.name"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_dyn_trait_param_principal_after_marker) {
+    /* `&(dyn Send + Service)`: the auto trait adds no method; the principal
+     * trait is the bound after it. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    rustlsp_run_dyn_fixture(&a, "fn run(s: &(dyn Send + demo::Service)) { s.call(); }\n", &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.Service.call"), 0);
     cbm_arena_destroy(&a);
     PASS();
 }
@@ -6098,6 +6269,40 @@ TEST(rustlsp_await_preserves_declared_async_output) {
     cbm_free_result(r);
     PASS();
 }
+/* An async fn's recorded return is its output: `.await` must not peel
+ * Result<T> to T, so `.expect(..)` and `?` reach T's methods. */
+TEST(rustlsp_await_async_fn_result_then_expect_and_try) {
+    CBMFileResult *r = extract_rust(
+        "struct Conn;\n"
+        "impl Conn {\n"
+        "    async fn open() -> Result<Conn, String> { Ok(Conn) }\n"
+        "    fn ping(&self) -> bool { true }\n"
+        "    fn close(&self) {}\n"
+        "}\n"
+        "async fn by_expect() -> bool { Conn::open().await.expect(\"open\").ping() }\n"
+        "async fn by_try() -> Result<(), String> { Conn::open().await?.close(); Ok(()) }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "by_expect", "Conn.ping"), 0);
+    ASSERT_GTE(require_resolved(r, "by_try", "Conn.close"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A non-async fn returning a future type: `.await` yields the future's
+ * output, the same declared shape an async fn would not be peeled from. */
+TEST(rustlsp_await_future_returning_fn_yields_output) {
+    CBMFileResult *r = extract_rust(
+        "struct Conn;\n"
+        "struct Pending<T>(T);\n"
+        "impl Conn { fn ping(&self) -> bool { true } }\n"
+        "fn open() -> Pending<Conn> { Pending(Conn) }\n"
+        "async fn run() -> bool { open().await.ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Conn.ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_cov_async_block) {
     CBMFileResult *r = extract_rust(
         "fn run() -> impl std::future::Future<Output = ()> {\n    async { let _ = 42; }\n}\n");
@@ -8578,6 +8783,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_method_dispatch);
     RUN_TEST(rustlsp_crossfile_derived_default_types_value);
     RUN_TEST(rustlsp_crossfile_trait_provided_constructor_types_value);
+    RUN_TEST(rustlsp_crossfile_await_async_result_then_expect_and_try);
+    RUN_TEST(rustlsp_crossfile_await_non_async_peels_future_output);
+    RUN_TEST(rustlsp_crossfile_method_result_self_return);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_duplicate_free_function_qn_stays_unresolved);
     RUN_TEST(rustlsp_path_module_child_call_does_not_flatten_to_parent);
@@ -8664,6 +8872,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_multiline_tuple_return_elements_name_their_types);
     RUN_TEST(rustlsp_deref_field_through_box);
     RUN_TEST(rustlsp_deref_wrapper_method_wins_over_target);
+    RUN_TEST(rustlsp_dyn_trait_field_links_trait_declaration);
+    RUN_TEST(rustlsp_dyn_trait_supertrait_method);
+    RUN_TEST(rustlsp_dyn_trait_param_principal_after_marker);
     RUN_TEST(rustlsp_strict_refcell_borrow);
     RUN_TEST(rustlsp_strict_iter_map_closure);
     RUN_TEST(rustlsp_strict_option_map_closure);
@@ -8986,6 +9197,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_async_fn_decl);
     RUN_TEST(rustlsp_cov_async_await_chain);
     RUN_TEST(rustlsp_await_preserves_declared_async_output);
+    RUN_TEST(rustlsp_await_async_fn_result_then_expect_and_try);
+    RUN_TEST(rustlsp_await_future_returning_fn_yields_output);
     RUN_TEST(rustlsp_cov_async_block);
     RUN_TEST(rustlsp_cov_async_move);
     RUN_TEST(rustlsp_cov_async_join_call);

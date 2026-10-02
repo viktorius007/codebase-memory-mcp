@@ -880,6 +880,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
                               ? pxc_join_base_qns(arena, src->base_classes, reg, module_qn,
                                                   imp_keys, imp_vals, imp_count)
                               : pxc_join_pipe(arena, src->base_classes);
+    /* A Rust trait's supertrait bounds, as written: the Rust registrar
+     * resolves them in the trait's module. */
+    if (lang == CBM_LANG_RUST && src->supertraits) {
+        dst->embedded_types = cbm_arena_strdup(arena, src->supertraits);
+    }
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
     if (src->signature_param_types && src->signature_param_count > 0) {
@@ -918,6 +923,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->trait_qn = src->impl_trait ? cbm_arena_strdup(arena, src->impl_trait) : NULL;
         dst->receiver_spelling = src->receiver ? cbm_arena_strdup(arena, src->receiver) : NULL;
         dst->is_abstract = src->is_abstract;
+        dst->is_async = src->is_async;
     }
     return 0;
 }
@@ -1900,6 +1906,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].is_interface = defs[i].is_interface;
         out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
         out[i].is_abstract = defs[i].is_abstract;
+        out[i].is_async = defs[i].is_async;
     }
     return out;
 }
