@@ -8775,6 +8775,111 @@ TEST(pipeline_rust_closure_repair_resolves_through_project_module_tree) {
     ASSERT_EQ(unmount.difference, 0);
     PASS();
 }
+
+/* A Rust file beside a folder of its stem (`mNN.rs` next to `mNN/`) gets its
+ * own `<qn>#module` node, minted while the parallel workers' buffers merge
+ * into the main buffer. That node must take an id no worker holds: the
+ * closure route patches every fresh node by id, so an id shared with a worker
+ * node fails the patch on `nodes.id` and the run falls back to a full
+ * rebuild. The signature edit and its undo both re-extract every sibling
+ * file, and both must stay on the closure route and converge with a fresh
+ * full build. */
+TEST(pipeline_rust_closure_repair_folder_sibling_modules_keep_unique_ids) {
+    enum { SIBLINGS = 16, CHILDREN = 4 };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_closure_sibling_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/util/src")), 0);
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nmembers = [\"crates/util\", \"crates/app\"]\n");
+    write_temp_file(tmp, "crates/util/Cargo.toml",
+                    "[package]\nname = \"util\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "crates/app/Cargo.toml",
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+                    "[dependencies]\nutil = { path = \"../util\" }\n");
+    static const char util_old[] = "pub fn normalize(p: &str) -> Option<String> {\n"
+                                   "    Some(p.to_string())\n}\n";
+    static const char util_new[] = "pub fn normalize(p: &str) -> Option<std::string::String> {\n"
+                                   "    Some(p.to_string())\n}\n";
+    write_temp_file(tmp, "crates/util/src/lib.rs", util_old);
+    /* Only the sibling files call util, so the closure holds them and util
+     * alone; the files inside each folder keep it under the closure budget. */
+    static const char *const children[CHILDREN] = {"a", "b", "c", "d"};
+    char lib_rs[SIBLINGS * 16 + 1];
+    int lib_len = 0;
+    for (int i = 0; i < SIBLINGS; i++) {
+        char rel[64];
+        char source[256];
+        snprintf(rel, sizeof(rel), "crates/app/src/m%02d", i);
+        ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, rel)), 0);
+        snprintf(rel, sizeof(rel), "crates/app/src/m%02d.rs", i);
+        snprintf(source, sizeof(source),
+                 "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub fn outer_%02d() -> usize {\n"
+                 "    util::normalize(\"a\").map(|s| s.len()).unwrap_or(0)\n}\n",
+                 i);
+        write_temp_file(tmp, rel, source);
+        for (int c = 0; c < CHILDREN; c++) {
+            snprintf(rel, sizeof(rel), "crates/app/src/m%02d/%s.rs", i, children[c]);
+            snprintf(source, sizeof(source), "pub fn child_%02d_%s() -> usize {\n    %d\n}\n", i,
+                     children[c], c);
+            write_temp_file(tmp, rel, source);
+        }
+        lib_len += snprintf(lib_rs + lib_len, sizeof(lib_rs) - (size_t)lib_len, "pub mod m%02d;\n",
+                            i);
+    }
+    write_temp_file(tmp, "crates/app/src/lib.rs", lib_rs);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char live_db[512];
+    snprintf(live_db, sizeof(live_db), "%s/live.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, live_db, CBM_MODE_FULL);
+    int baseline_rc = -1;
+    char project[256] = "";
+    int sibling_modules = -1;
+    if (baseline) {
+        baseline_rc = cbm_pipeline_run(baseline);
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+        cbm_pipeline_free(baseline);
+        sqlite3 *db = NULL;
+        if (sqlite3_open_v2(live_db, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+            sibling_modules = sqlite_scalar(db,
+                                            "SELECT count(*) FROM nodes WHERE project = ?1"
+                                            " AND label = 'Module' AND qualified_name LIKE "
+                                            "'%#module'",
+                                            project);
+        }
+        sqlite3_close(db);
+    }
+
+    write_temp_file(tmp, "crates/util/src/lib.rs", util_new);
+    RustIncrementalEquivalence signature =
+        rust_incremental_vs_fresh(tmp, live_db, "signature.db", project);
+    write_temp_file(tmp, "crates/util/src/lib.rs", util_old);
+    RustIncrementalEquivalence undo = rust_incremental_vs_fresh(tmp, live_db, "undo.db", project);
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(baseline_rc, 0);
+    ASSERT_EQ(sibling_modules, SIBLINGS); /* control: every mNN.rs has its own Module */
+    ASSERT_EQ(signature.run_rc, 0);
+    ASSERT_EQ(signature.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(signature.fresh_rc, 0);
+    ASSERT_EQ(signature.difference, 0);
+    ASSERT_EQ(undo.run_rc, 0);
+    ASSERT_EQ(undo.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(undo.fresh_rc, 0);
+    ASSERT_EQ(undo.difference, 0);
+    PASS();
+}
 #endif
 
 /* Slash-prefixed call arguments are not necessarily HTTP routes. Keep the
@@ -17259,6 +17364,7 @@ SUITE(pipeline) {
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     RUN_TEST(pipeline_rust_closure_repair_matches_fresh_full_across_crates);
     RUN_TEST(pipeline_rust_closure_repair_resolves_through_project_module_tree);
+    RUN_TEST(pipeline_rust_closure_repair_folder_sibling_modules_keep_unique_ids);
 #endif
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
