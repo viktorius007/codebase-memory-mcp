@@ -3529,7 +3529,7 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     return selection;
 }
 
-static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx,
+static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx, TSNode site,
                                            const CBMPrimaryCalleeSelection *callee) {
     if (!callee->name || !callee->name[0]) {
         return false;
@@ -3537,6 +3537,11 @@ static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx,
     if (!cbm_is_keyword(callee->name, ctx->language) ||
         cbm_is_resolvable_builtin(callee->name, ctx->language)) {
         return true;
+    }
+    /* Rust macro and attribute names are not reserved words: only a
+     * macro_invocation names the built-in macro; a call_expression names a fn. */
+    if (ctx->language == CBM_LANG_RUST && cbm_rust_is_macro_or_attribute_name(callee->name)) {
+        return strcmp(ts_node_type(site), "call_expression") == 0;
     }
     /* CSS function names occupy a grammar-proven callable role. Generic keyword
      * vocabulary includes `var`, but that must not erase `var(...)`. */
@@ -3651,7 +3656,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
         CBMPrimaryCalleeSelection callee = select_primary_callee(ctx, node, state);
         // Keyword-filter callees, but keep builtins we mint a node for (len, str,
         // ...) so the LSP-resolved builtin call still forms a CALLS edge.
-        if (primary_callee_name_is_allowed(ctx, &callee)) {
+        if (primary_callee_name_is_allowed(ctx, node, &callee)) {
             CBMCall call = {0};
             call.callee_name = callee.name;
             call.enclosing_func_qn = state->enclosing_func_qn;
