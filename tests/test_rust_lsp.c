@@ -3072,6 +3072,29 @@ TEST(rustlsp_deref_field_through_box) {
     PASS();
 }
 
+TEST(rustlsp_multiline_tuple_return_elements_name_their_types) {
+    /* A signature written over several lines reaches the caller with its
+     * line breaks; each tuple element still names its type. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[9];
+    int n = rustlsp_deref_fixture(defs);
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.make",
+                                .short_name = "make",
+                                .label = "Function",
+                                .def_module_qn = "p.demo",
+                                .return_types = "(\n    Leaf,\n    u8,\n)"};
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    const char *src = "fn run() { let (leaf, _n) = demo::make(); leaf.go(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.Leaf.go"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(rustlsp_deref_wrapper_method_wins_over_target) {
     /* `Arc` has its own `downgrade` and implements `PartialEq::eq`; both
      * shadow the same-named methods of `State` behind it. */
@@ -8232,6 +8255,119 @@ TEST(rustlsp_modtree_unscanned_file_leaves_names_open) {
     PASS();
 }
 
+/* A crate of `count` files under `p`, the first being src/lib.rs. */
+static CBMRustModTree *rust_modtree_from_sources(const char *const *rels, const char *const *qns,
+                                                 const char *const *sources, int count) {
+    CBMRustModTree *tree = cbm_rust_modtree_new();
+    CBMRustModFacts *facts[8] = {0};
+    for (int i = 0; i < count && i < 8; i++) {
+        (void)cbm_rust_modtree_add_file(tree, rels[i], qns[i]);
+        facts[i] = cbm_rust_modfacts_scan(sources[i], (int)strlen(sources[i]));
+    }
+    (void)cbm_rust_modtree_add_crate(tree, rels[0], "p", false);
+    cbm_rust_modtree_finish(tree, (const CBMRustModFacts *const *)facts);
+    for (int i = 0; i < count && i < 8; i++) {
+        cbm_rust_modfacts_free(facts[i]);
+    }
+    return tree;
+}
+
+TEST(rustlsp_modtree_super_glob_sees_parent_private_import) {
+    /* `svc` only imports `Session`, privately. Its child's `use super::*`
+     * may see that import; a sibling's `use crate::svc::*` may not. */
+    static const char *const rels[] = {"src/lib.rs", "src/state.rs", "src/svc.rs",
+                                       "src/svc/child.rs", "src/other.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.state", "p.src.svc", "p.src.svc.child",
+                                      "p.src.other"};
+    static const char *const sources[] = {
+        "mod state;\nmod svc;\nmod other;\n",
+        "pub struct Session;\n",
+        "use crate::state::Session;\nmod child;\n",
+        "use super::*;\n",
+        "use crate::svc::*;\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 5);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustPathResult child =
+        cbm_rust_modtree_resolve_type(tree, &arena, "p.src.svc.child", 0, "Session", NULL, NULL, 0);
+    ASSERT_EQ(child.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(child.qn, "p.src.state.Session");
+    CBMRustPathResult sibling =
+        cbm_rust_modtree_resolve_type(tree, &arena, "p.src.other", 0, "Session", NULL, NULL, 0);
+    ASSERT_NEQ(sibling.kind, CBM_RUST_PATH_TYPE);
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer) {
+    /* `b` re-exports `a::X`, `c` re-exports all of `b`; `user` globs `c`. */
+    static const char *const rels[] = {"src/lib.rs", "src/a.rs", "src/b.rs", "src/c.rs",
+                                       "src/user.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.a", "p.src.b", "p.src.c", "p.src.user"};
+    static const char *const sources[] = {
+        "mod a;\nmod b;\nmod c;\nmod user;\n",
+        "pub struct X;\n",
+        "pub use crate::a::X;\n",
+        "pub use crate::b::*;\n",
+        "use crate::c::*;\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 5);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustPathResult r =
+        cbm_rust_modtree_resolve_type(tree, &arena, "p.src.user", 0, "X", NULL, NULL, 0);
+    ASSERT_EQ(r.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(r.qn, "p.src.a.X");
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved) {
+    /* Two globs bring two different `Y`s: the name is ambiguous. */
+    static const char *const rels[] = {"src/lib.rs", "src/m1.rs", "src/m2.rs", "src/user.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.m1", "p.src.m2", "p.src.user"};
+    static const char *const sources[] = {
+        "mod m1;\nmod m2;\nmod user;\n",
+        "pub struct Y;\n",
+        "pub struct Y;\n",
+        "use crate::m1::*;\nuse crate::m2::*;\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 4);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustPathResult r =
+        cbm_rust_modtree_resolve_type(tree, &arena, "p.src.user", 0, "Y", NULL, NULL, 0);
+    ASSERT_EQ(r.kind, CBM_RUST_PATH_UNKNOWN);
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+static uint64_t rust_modtree_digest_of(const char *source) {
+    extern const TSLanguage *tree_sitter_rust(void);
+    TSParser *parser = ts_parser_new();
+    ts_parser_set_language(parser, tree_sitter_rust());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    uint64_t digest = cbm_rust_modtree_file_digest(source, ts_tree_root_node(tree));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    return digest;
+}
+
+TEST(rustlsp_modtree_digest_tracks_visibility) {
+    /* Visibility decides what a glob import brings in elsewhere, so an edit
+     * to it must change the digest; a comment edit must not. */
+    uint64_t base = rust_modtree_digest_of("use a::*;\nstruct S;\nmod m;\n");
+    ASSERT_NEQ(base, rust_modtree_digest_of("pub use a::*;\nstruct S;\nmod m;\n"));
+    ASSERT_NEQ(base, rust_modtree_digest_of("use a::*;\npub(crate) struct S;\nmod m;\n"));
+    ASSERT_NEQ(base, rust_modtree_digest_of("use a::*;\nstruct S;\npub mod m;\n"));
+    ASSERT_EQ(base, rust_modtree_digest_of("use a::*;\n// note\nstruct S;\nmod m;\n"));
+    PASS();
+}
+
 void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
@@ -8370,6 +8506,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_strict_rc_deref_to_inner);
     RUN_TEST(rustlsp_strict_arc_deref_to_inner);
     RUN_TEST(rustlsp_deref_method_through_arc_field_from_other_module);
+    RUN_TEST(rustlsp_multiline_tuple_return_elements_name_their_types);
     RUN_TEST(rustlsp_deref_field_through_box);
     RUN_TEST(rustlsp_deref_wrapper_method_wins_over_target);
     RUN_TEST(rustlsp_strict_refcell_borrow);
@@ -8891,4 +9028,8 @@ void suite_rust_lsp(void) {
     /* Crate module tree from scanned facts */
     RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_names_open);
+    RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
+    RUN_TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer);
+    RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);
+    RUN_TEST(rustlsp_modtree_digest_tracks_visibility);
 }

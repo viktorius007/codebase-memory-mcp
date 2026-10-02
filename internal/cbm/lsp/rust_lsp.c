@@ -1879,15 +1879,50 @@ static const char *rust_text_type_qn_by_module_tree(const CBMRustModTree *tree, 
     return r.qn ? r.qn : rust_lookup_prelude(path);
 }
 
+/* Type text as written in source may span lines (`(\n    A,\n    B,\n)`).
+ * Fold every whitespace run to one space and drop it at both ends, so an
+ * element or argument is the bare type it spells. Clean text is returned
+ * as is. */
+static const char *rust_type_text_fold_space(CBMArena *arena, const char *text) {
+    bool clean = !isspace((unsigned char)text[0]);
+    size_t len = 0;
+    for (const char *p = text; *p; p++, len++) {
+        bool space = isspace((unsigned char)*p);
+        if (space && (*p != ' ' || !p[1] || isspace((unsigned char)p[1]))) {
+            clean = false;
+        }
+    }
+    if (clean) {
+        return text;
+    }
+    char *out = cbm_arena_alloc(arena, len + 1);
+    if (!out) {
+        return text;
+    }
+    size_t used = 0;
+    for (const char *p = text; *p; p++) {
+        if (!isspace((unsigned char)*p)) {
+            out[used++] = *p;
+        } else if (used > 0 && out[used - 1] != ' ') {
+            out[used++] = ' ';
+        }
+    }
+    if (used > 0 && out[used - 1] == ' ') {
+        used--;
+    }
+    out[used] = '\0';
+    return out;
+}
+
 static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *text,
                                                   const char *module_qn, const char **type_params,
                                                   const CBMRustModTree *tree) {
     if (!text || !text[0]) {
         return cbm_type_unknown();
     }
-    /* Skip leading whitespace + lifetime + mut markers. */
-    while (*text == ' ' || *text == '\t') {
-        text++;
+    text = rust_type_text_fold_space(arena, text);
+    if (!text[0]) {
+        return cbm_type_unknown();
     }
 
     /* HRTB: `for<'a, 'b> Fn(&'a T) -> R` — strip the higher-rank
