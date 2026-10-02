@@ -3585,9 +3585,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .rust_manifest = rust_manifest_ptr,
     };
     CBMRustModTree *rust_modtree =
-        have_rust ? cbm_pxc_build_rust_modtree(ctx, rust_manifest_ptr, files, file_count,
-                                               def_modules)
-                  : NULL;
+        have_rust ? cbm_pxc_build_rust_modtree(ctx, rust_manifest_ptr, files, file_count) : NULL;
     rc.rust_modtree = rust_modtree;
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);

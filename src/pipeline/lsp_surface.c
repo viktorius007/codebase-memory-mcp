@@ -27,7 +27,7 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 3 };
+enum { SURFACE_CODEC_VERSION = 4 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -151,9 +151,13 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
             }
             yyjson_mut_obj_add_val(doc, root, "pm", pm);
             yyjson_mut_obj_add_bool(doc, root, "si", facts->inline_scope);
+            char digest[CBM_SZ_32];
+            snprintf(digest, sizeof(digest), "%016llx", (unsigned long long)facts->tree_digest);
+            yyjson_mut_obj_add_strcpy(doc, root, "mt", digest);
         } else {
             yyjson_mut_obj_add_null(doc, root, "pm");
             yyjson_mut_obj_add_null(doc, root, "si");
+            yyjson_mut_obj_add_null(doc, root, "mt");
         }
     }
 
@@ -362,8 +366,9 @@ int cbm_lsp_surface_rust_path_facts_from_json(CBMArena *arena, const char *defs_
     yyjson_val *ver = root ? yyjson_obj_get(root, "v") : NULL;
     yyjson_val *pm = root ? yyjson_obj_get(root, "pm") : NULL;
     yyjson_val *si = root ? yyjson_obj_get(root, "si") : NULL;
+    const char *mt = root ? yyjson_get_str(yyjson_obj_get(root, "mt")) : NULL;
     if (!ver || yyjson_get_int(ver) != SURFACE_CODEC_VERSION || !yyjson_is_arr(pm) ||
-        !yyjson_is_bool(si)) {
+        !yyjson_is_bool(si) || !mt) {
         yyjson_doc_free(doc);
         return -1;
     }
@@ -388,6 +393,7 @@ int cbm_lsp_surface_rust_path_facts_from_json(CBMArena *arena, const char *defs_
     out->mods = mods;
     out->count = count;
     out->inline_scope = yyjson_get_bool(si);
+    out->tree_digest = strtoull(mt, NULL, CBM_SZ_16);
     out->known = true;
     yyjson_doc_free(doc);
     return 0;

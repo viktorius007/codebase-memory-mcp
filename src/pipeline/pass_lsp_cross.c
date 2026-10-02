@@ -289,6 +289,8 @@ static bool pxc_rust_file_path_facts(CBMArena *arena, const CBMFileResult *cache
     }
     out->mods = mods;
     out->known = complete;
+    out->tree_digest = source && tree ? cbm_rust_modtree_file_digest(source, ts_tree_root_node(tree))
+                                      : 0;
     if (owned_tree) {
         ts_tree_delete(owned_tree);
     }
@@ -2657,9 +2659,14 @@ static void pxc_rust_release_source(void *ctx, int file_id, const char *source) 
 
 CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
                                            const CBMCargoManifest *root,
-                                           const cbm_file_info_t *files, int file_count,
-                                           char *const *def_modules) {
-    if (!ctx || !ctx->repo_path || !files || file_count <= 0 || !def_modules) {
+                                           const cbm_file_info_t *files, int file_count) {
+    /* The tree is a fact of the whole project: a partial re-resolve builds
+     * it from every discovered file, read from disk, as a full build does. */
+    if (ctx && ctx->project_files) {
+        files = ctx->project_files;
+        file_count = ctx->project_file_count;
+    }
+    if (!ctx || !ctx->repo_path || !files || file_count <= 0) {
         return NULL;
     }
     CBMRustModTree *tree = cbm_rust_modtree_new();
@@ -2670,10 +2677,13 @@ CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
         return NULL;
     }
     for (int i = 0; i < file_count; i++) {
-        if (files[i].language != CBM_LANG_RUST || !files[i].rel_path || !def_modules[i]) {
+        if (files[i].language != CBM_LANG_RUST || !files[i].rel_path) {
             continue;
         }
-        int id = cbm_rust_modtree_add_file(tree, files[i].rel_path, def_modules[i]);
+        char *module = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
+                                                   pxc_module_is_dir(files[i].language));
+        int id = module ? cbm_rust_modtree_add_file(tree, files[i].rel_path, module) : -1;
+        free(module);
         if (id >= 0) {
             file_index[id] = i;
         }
@@ -2745,7 +2755,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     CBMRustModTree *rust_modtree = NULL;
     if (have_rust) {
         rust_modtree = cbm_pxc_build_rust_modtree(ctx, have_manifest ? &cargo_manifest : NULL,
-                                                  files, file_count, def_modules);
+                                                  files, file_count);
         cbm_pxc_set_rust_imports(ctx->rust_imports, rust_modtree);
     }
     /* Same seam as the parallel driver: serialize per-file surfaces while the

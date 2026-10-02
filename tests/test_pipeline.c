@@ -8427,6 +8427,97 @@ TEST(pipeline_rust_closure_repair_matches_fresh_full_across_crates) {
     ASSERT_EQ(signature.difference, 0);
     PASS();
 }
+
+/* Path calls resolve through the crate module tree, which is a fact of the
+ * whole project: the crate root declaring an inline module and the manifest
+ * of a path dependency that is not a workspace member lie outside a closure
+ * that re-parses only the caller. A closure repair must build the same tree
+ * a full build does, and a change to one file's tree facts that alters no
+ * name or import (dropping a `mod` declaration) must not be repaired from
+ * the edge-derived closure, which cannot see the callers it re-routes. */
+TEST(pipeline_rust_closure_repair_resolves_through_project_module_tree) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_closure_modtree_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "crates/app/src")), 0);
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmp, "support/src")), 0);
+    write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"crates/app\"]\n");
+    write_temp_file(tmp, "crates/app/Cargo.toml",
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "[dependencies]\nsupport = { path = \"../../support\" }\n");
+    write_temp_file(tmp, "support/Cargo.toml",
+                    "[package]\nname = \"support\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "support/src/lib.rs", "pub fn wait_ready() -> u8 {\n    2\n}\n");
+    static const char lib_rs[] = "pub mod caller;\npub mod extra;\n"
+                                 "mod inner {\n    pub fn helper() -> u8 {\n        1\n    }\n}\n"
+                                 "pub fn root_fn() -> u8 {\n    0\n}\n";
+    write_temp_file(tmp, "crates/app/src/lib.rs", lib_rs);
+    write_temp_file(tmp, "crates/app/src/extra.rs", "pub fn extra_fn() -> u8 {\n    3\n}\n");
+    write_temp_file(tmp, "crates/app/src/caller.rs",
+                    "pub fn run() -> u8 {\n    crate::inner::helper() + support::wait_ready()\n"
+                    "        + crate::extra::extra_fn()\n}\n");
+
+    char live_db[512];
+    snprintf(live_db, sizeof(live_db), "%s/live.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, live_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    int baseline_rc = cbm_pipeline_run(baseline);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    cbm_store_t *store = cbm_store_open_path(live_db);
+    ASSERT_NOT_NULL(store);
+    int inline_call = named_edge_to_file_count(store, project, "CALLS", "run", "helper",
+                                               "crates/app/src/lib.rs");
+    int path_dep_call = named_edge_to_file_count(store, project, "CALLS", "run", "wait_ready",
+                                                 "support/src/lib.rs");
+    int module_call = named_edge_to_file_count(store, project, "CALLS", "run", "extra_fn",
+                                               "crates/app/src/extra.rs");
+    cbm_store_close(store);
+
+    /* Body edit: only caller.rs re-resolves; lib.rs and support/ do not. */
+    write_temp_file(tmp, "crates/app/src/caller.rs",
+                    "pub fn run() -> u8 {\n    let _probe = 1;\n"
+                    "    crate::inner::helper() + support::wait_ready()\n"
+                    "        + crate::extra::extra_fn()\n}\n");
+    RustIncrementalEquivalence body = rust_incremental_vs_fresh(tmp, live_db, "body.db", project);
+
+    /* Signature edit in the crate root: its surface changes, its tree facts
+     * do not, so the closure route still applies. */
+    write_temp_file(tmp, "crates/app/src/lib.rs",
+                    "pub mod caller;\npub mod extra;\n"
+                    "mod inner {\n    pub fn helper() -> u8 {\n        1\n    }\n}\n"
+                    "pub fn root_fn() -> std::primitive::u8 {\n    0\n}\n");
+    RustIncrementalEquivalence signature =
+        rust_incremental_vs_fresh(tmp, live_db, "signature.db", project);
+
+    /* Dropping `pub mod extra;` un-mounts extra.rs; caller.rs holds no edge
+     * into lib.rs, so only a full rebuild drops its call to extra_fn. */
+    write_temp_file(tmp, "crates/app/src/lib.rs",
+                    "pub mod caller;\n"
+                    "mod inner {\n    pub fn helper() -> u8 {\n        1\n    }\n}\n"
+                    "pub fn root_fn() -> std::primitive::u8 {\n    0\n}\n");
+    RustIncrementalEquivalence unmount =
+        rust_incremental_vs_fresh(tmp, live_db, "unmount.db", project);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(baseline_rc, 0);
+    ASSERT_EQ(inline_call, 1);   /* control: inline module of the crate root */
+    ASSERT_EQ(path_dep_call, 1); /* control: path dependency, not a member */
+    ASSERT_EQ(module_call, 1);   /* control: declared out-of-line module */
+    ASSERT_EQ(body.run_rc, 0);
+    ASSERT_EQ(body.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(body.fresh_rc, 0);
+    ASSERT_EQ(body.difference, 0);
+    ASSERT_EQ(signature.run_rc, 0);
+    ASSERT_EQ(signature.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(signature.fresh_rc, 0);
+    ASSERT_EQ(signature.difference, 0);
+    ASSERT_EQ(unmount.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(unmount.fresh_rc, 0);
+    ASSERT_EQ(unmount.difference, 0);
+    PASS();
+}
 #endif
 
 /* Slash-prefixed call arguments are not necessarily HTTP routes. Keep the
@@ -16004,7 +16095,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":3") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":4") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -16906,6 +16997,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     RUN_TEST(pipeline_rust_closure_repair_matches_fresh_full_across_crates);
+    RUN_TEST(pipeline_rust_closure_repair_resolves_through_project_module_tree);
 #endif
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);

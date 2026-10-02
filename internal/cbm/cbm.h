@@ -513,12 +513,16 @@ typedef struct {
 /* The `#[path]` module facts of one Rust file, a pure function of its bytes:
  * its top-level path-attributed `mod` items in source order and whether it
  * declares any top-level inline `mod x { }` scope. `known` is false when the
- * facts were never recorded (no result to record them on). */
+ * facts were never recorded (no result to record them on). `tree_digest`
+ * covers every fact the file contributes to the crate module tree
+ * (cbm_rust_modtree_file_digest): a closure repair declines when it changes,
+ * because callers in other files may then resolve differently. */
 typedef struct {
     const CBMRustPathMod *mods;
     int count;
     bool inline_scope;
     bool known;
+    uint64_t tree_digest;
 } CBMRustPathFacts;
 
 typedef struct {

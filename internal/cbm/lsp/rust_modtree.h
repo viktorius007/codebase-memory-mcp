@@ -28,6 +28,13 @@ typedef struct CBMRustModTree CBMRustModTree;
  * literal, NULL when absent or not a plain string. */
 char *cbm_rust_path_attribute(CBMArena *arena, const char *source, TSNode mod_item);
 
+/* Digest of every fact one file contributes to the tree (its `mod`, `use`,
+ * `extern crate` and named items, at every inline-module depth, and whether
+ * it has item-position macro calls), independent of byte offsets. Equal
+ * digests mean an edit cannot change how another file resolves through the
+ * tree. `root` is the file's tree-sitter root node. */
+uint64_t cbm_rust_modtree_file_digest(const char *source, TSNode root);
+
 /* Supplies a file's source text. Returns a buffer the tree borrows until
  * `release` is called with it, or NULL when the file cannot be read. */
 typedef struct {

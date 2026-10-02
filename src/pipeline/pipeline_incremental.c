@@ -1188,10 +1188,11 @@ static int surface_name_changes(const char *stored_json, const char *fresh_json,
     return rc;
 }
 
-/* Do two surfaces carry the same Rust `#[path]` module facts ("pm", "si";
- * both absent on non-Rust rows)? A changed declaration or inline-scope flag
- * re-names the declared files, which hold no edge into this one, so the
- * edge-derived dependent set cannot see them. */
+/* Do two surfaces carry the same Rust module facts ("pm", "si", "mt"; all
+ * absent on non-Rust rows)? A changed `#[path]` declaration or inline-scope
+ * flag re-names the declared files, and a changed crate module tree digest
+ * ("mt") can re-route path calls in files that hold no edge into this one,
+ * so the edge-derived dependent set cannot see either. */
 static int surface_rust_path_facts_equal(const char *stored_json, const char *fresh_json,
                                          bool *out_equal) {
     *out_equal = false;
@@ -1202,7 +1203,7 @@ static int surface_rust_path_facts_equal(const char *stored_json, const char *fr
         yyjson_val *stored_root = yyjson_doc_get_root(stored_doc);
         yyjson_val *fresh_root = yyjson_doc_get_root(fresh_doc);
         bool equal = true;
-        static const char *const keys[] = {"pm", "si"};
+        static const char *const keys[] = {"pm", "si", "mt"};
         for (size_t k = 0; equal && k < sizeof(keys) / sizeof(keys[0]); k++) {
             yyjson_val *a = stored_root ? yyjson_obj_get(stored_root, keys[k]) : NULL;
             yyjson_val *b = fresh_root ? yyjson_obj_get(fresh_root, keys[k]) : NULL;

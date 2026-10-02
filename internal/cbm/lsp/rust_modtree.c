@@ -588,6 +588,91 @@ static void rmt_load_module_file(RmtWalk *outer, int module, int file, const cha
     }
 }
 
+/* ── Per-file tree facts digest ───────────────────────────────────── */
+
+typedef struct {
+    uint64_t hash;
+    const char *source;
+} RmtDigest;
+
+enum { RMT_TOKEN_END = 0xff };
+static const uint64_t RMT_FNV_PRIME = 0x100000001b3ULL;
+static const uint64_t RMT_FNV_OFFSET = 0xcbf29ce484222325ULL;
+
+static void rmt_digest_bytes(RmtDigest *d, const char *bytes, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        d->hash ^= (uint8_t)bytes[i];
+        d->hash *= RMT_FNV_PRIME;
+    }
+    d->hash ^= RMT_TOKEN_END; /* token boundary: "ab"+"c" differs from "a"+"bc" */
+    d->hash *= RMT_FNV_PRIME;
+}
+
+static void rmt_digest_str(RmtDigest *d, const char *text) {
+    rmt_digest_bytes(d, text, strlen(text));
+}
+
+static void rmt_digest_node(RmtDigest *d, TSNode node) {
+    if (ts_node_is_null(node)) {
+        rmt_digest_str(d, "");
+        return;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    rmt_digest_bytes(d, d->source + start, ts_node_end_byte(node) - start);
+}
+
+/* Every fact rmt_walk_item reads from an item, without byte offsets: an edit
+ * that leaves the digest unchanged leaves every other file's resolution
+ * through the tree unchanged. */
+static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, int depth) {
+    uint32_t count = ts_node_named_child_count(container);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(container, i);
+        const char *kind = ts_node_type(item);
+        if (strcmp(kind, "mod_item") == 0) {
+            rmt_digest_str(d, "mod");
+            rmt_digest_node(d, ts_node_child_by_field_name(item, "name", 4));
+            const char *attr = cbm_rust_path_attribute(arena, d->source, item);
+            rmt_digest_str(d, attr ? "path" : "nopath");
+            rmt_digest_str(d, attr ? attr : "");
+            TSNode body = ts_node_child_by_field_name(item, "body", 4);
+            if (!ts_node_is_null(body) && depth < RMT_MAX_DEPTH) {
+                rmt_digest_str(d, "{");
+                rmt_digest_items(d, arena, body, depth + 1);
+                rmt_digest_str(d, "}");
+            }
+        } else if (strcmp(kind, "use_declaration") == 0) {
+            rmt_digest_str(d, "use");
+            rmt_digest_node(d, ts_node_child_by_field_name(item, "argument", 8));
+        } else if (strcmp(kind, "extern_crate_declaration") == 0) {
+            rmt_digest_str(d, "extern");
+            rmt_digest_node(d, item);
+        } else if (strcmp(kind, "macro_invocation") == 0) {
+            rmt_digest_str(d, "macro");
+        } else {
+            for (size_t k = 0; k < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); k++) {
+                if (strcmp(kind, RMT_ITEM_KINDS[k].node_kind) == 0) {
+                    rmt_digest_str(d, kind);
+                    rmt_digest_node(d, ts_node_child_by_field_name(item, "name", 4));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+uint64_t cbm_rust_modtree_file_digest(const char *source, TSNode root) {
+    RmtDigest d = {.hash = RMT_FNV_OFFSET, .source = source};
+    if (!source || ts_node_is_null(root)) {
+        return d.hash;
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    rmt_digest_items(&d, &arena, root, 0);
+    cbm_arena_destroy(&arena);
+    return d.hash;
+}
+
 /* ── Name resolution ──────────────────────────────────────────────── */
 
 static bool rmt_same_def(const RmtDef *a, const RmtDef *b) {
