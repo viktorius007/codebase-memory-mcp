@@ -1763,8 +1763,8 @@ static bool closure_edge_budget_exceeded(cbm_store_t *store, const char *project
                                          const char *const *deleted_paths, int n_deleted,
                                          const char **decline) {
     int member_count = (int)cbm_ht_count(closure_set) + n_deleted;
-    const char **members =
-        (const char **)calloc((size_t)(member_count ? member_count : 1), sizeof(char *));
+    const char **members = (const char **)cbm_calloc(
+        CBM_MEM_CLASS_OTHER, (size_t)(member_count ? member_count : 1) * sizeof(char *));
     if (!members) {
         *decline = "alloc";
         return true;
@@ -1781,7 +1781,7 @@ static bool closure_edge_budget_exceeded(cbm_store_t *store, const char *project
     int64_t incident = 0;
     int64_t total = 0;
     int rc = cbm_store_count_incident_edges(store, project, members, n, &incident, &total);
-    free(members);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)members);
     if (rc != CBM_STORE_OK) {
         *decline = "edge_count_failed";
         return true;
