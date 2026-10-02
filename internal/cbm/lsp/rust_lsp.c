@@ -2496,7 +2496,8 @@ static const CBMType *rust_eval_literal_type(RustLSPContext *ctx, const char *ki
  * access. Order: inherent method → field → trait method (with single-impl
  * preference). */
 static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType *recv,
-                                              const char *member, bool method_call);
+                                              const char *member, bool method_call,
+                                              const CBMRegisteredFunc **out_method);
 
 /* `t` with every `Self` replaced by `self_qn`, through references, tuples
  * and generic arguments (`Result<Self>`, `Option<&Self>`). */
@@ -2541,9 +2542,11 @@ static const CBMType *rust_subst_self(RustLSPContext *ctx, const CBMType *t, con
 /* Type a path call `f(..)` / `Type::f(..)` from the same target the call
  * step publishes for it. True when the module tree settles the path as a
  * function: `*out` is then the target's declared return type, unknown when
- * the target is not registered. False leaves the call to other evidence. */
+ * the target is not registered, and `*out_fn` the registered target or NULL.
+ * False leaves the call to other evidence. */
 static bool rust_eval_path_call_by_target(RustLSPContext *ctx, TSNode func_node,
-                                          const CBMType **out) {
+                                          const CBMType **out,
+                                          const CBMRegisteredFunc **out_fn) {
     TSNode callee = func_node;
     if (strcmp(ts_node_type(callee), "generic_function") == 0) {
         callee = ts_node_child_by_field_name(callee, "function", 8);
@@ -2571,12 +2574,400 @@ static bool rust_eval_path_call_by_target(RustLSPContext *ctx, TSNode func_node,
     }
     const CBMRegisteredFunc *f = target.func;
     *out = cbm_type_unknown();
+    *out_fn = f;
     if (f && f->signature && f->signature->kind == CBM_TYPE_FUNC &&
         f->signature->data.func.return_types && f->signature->data.func.return_types[0]) {
         const char *self_qn = target.receiver_qn ? target.receiver_qn : f->receiver_type;
         *out = rust_subst_self(ctx, f->signature->data.func.return_types[0], self_qn);
     }
     return true;
+}
+
+/* Type of a call expression. `*callee`, when the call names a registered
+ * function or method, is that function: `.await` reads its async flag. */
+static const CBMType *rust_eval_call_type(RustLSPContext *ctx, TSNode node,
+                                          const CBMRegisteredFunc **callee) {
+    *callee = NULL;
+    TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
+    TSNode args_node = ts_node_child_by_field_name(node, "arguments", 9);
+    if (ts_node_is_null(func_node)) {
+        return cbm_type_unknown();
+    }
+    const char *fk = ts_node_type(func_node);
+
+    const CBMType *produced = NULL;
+    if (rust_eval_path_call_by_target(ctx, func_node, &produced, callee)) {
+        return produced;
+    }
+
+    /* Constructor of a tuple struct, unit-like struct, or stdlib
+     * factory invoked via path. Try the registry; on miss, also try
+     * UFCS-style method lookup to catch `String::new()`,
+     * `Vec::new()`, etc. */
+    if (strcmp(fk, "identifier") == 0 || strcmp(fk, "scoped_identifier") == 0) {
+        char *path = rust_node_text(ctx, func_node);
+        if (path) {
+            /* Strip ALL turbofish (`::<...>`) so the lookup below
+             * ignores explicit type arguments — handles forms like
+             * `Vec::<i32>::new` and `parse::<u32>`. */
+            rust_strip_turbofish(path);
+            const char *qn = rust_resolve_path_expr(ctx, path);
+            if (qn) {
+                const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
+                if (rt) {
+                    return cbm_type_named(ctx->arena, qn);
+                }
+                const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, qn);
+                if (f && f->signature && f->signature->kind == CBM_TYPE_FUNC) {
+                    const CBMType *const *rt_arr = f->signature->data.func.return_types;
+                    if (rt_arr && rt_arr[0]) {
+                        *callee = f;
+                        const CBMType *ret = rt_arr[0];
+                        /* Constructor-style on a stdlib receiver with
+                         * `unknown` return — substitute the receiver
+                         * type so chains keep typing. The heuristic
+                         * matches `new`, `default`, anything starting
+                         * with `from_` / `with_`, plus a small list of
+                         * common factory verbs.
+                         *
+                         * For smart-pointer factories (`Box::new`,
+                         * `Rc::new`, `Arc::new`, `RefCell::new`,
+                         * `Pin::new`, `Mutex::new`, `RwLock::new`)
+                         * we also try to capture the first call
+                         * argument's type as a TEMPLATE arg so the
+                         * Deref chain has something to peel. */
+                        if (f->receiver_type && cbm_type_is_unknown(ret) && f->short_name &&
+                            (strcmp(f->short_name, "new") == 0 ||
+                             strcmp(f->short_name, "default") == 0 ||
+                             strcmp(f->short_name, "open") == 0 ||
+                             strcmp(f->short_name, "create") == 0 ||
+                             strcmp(f->short_name, "create_new") == 0 ||
+                             strcmp(f->short_name, "bind") == 0 ||
+                             strcmp(f->short_name, "connect") == 0 ||
+                             strcmp(f->short_name, "spawn") == 0 ||
+                             strcmp(f->short_name, "now") == 0 ||
+                             strncmp(f->short_name, "from_", 5) == 0 ||
+                             strncmp(f->short_name, "with_", 5) == 0 ||
+                             strcmp(f->short_name, "from") == 0)) {
+                            /* Detect smart-pointer wrappers and
+                             * capture the first arg's type so
+                             * `let b = Box::new(x); b.method()`
+                             * dispatches via Deref. */
+                            bool is_wrapper = strcmp(f->short_name, "new") == 0 &&
+                                              rust_type_derefs_to_first_arg(f->receiver_type);
+                            if (is_wrapper && !ts_node_is_null(args_node)) {
+                                uint32_t anc = ts_node_named_child_count(args_node);
+                                if (anc > 0) {
+                                    const CBMType *arg_t = rust_eval_expr_type(
+                                        ctx, ts_node_named_child(args_node, 0));
+                                    if (arg_t && !cbm_type_is_unknown(arg_t)) {
+                                        return cbm_type_template(ctx->arena, f->receiver_type,
+                                                                 &arg_t, 1);
+                                    }
+                                }
+                            }
+                            return cbm_type_named(ctx->arena, f->receiver_type);
+                        }
+                        /* Self -> receiver_type substitution. */
+                        return rust_subst_self(ctx, ret, f->receiver_type);
+                    }
+                }
+                /* UFCS path lookup: split off short name and try
+                 * `cbm_registry_lookup_method`. */
+                const char *dot = strrchr(qn, '.');
+                if (dot) {
+                    char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
+                    const char *short_name = dot + 1;
+                    const CBMRegisteredFunc *m =
+                        cbm_registry_lookup_method_aliased(ctx->registry, head, short_name);
+                    if (!m && ctx->module_qn) {
+                        const char *full_head =
+                            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
+                        m = cbm_registry_lookup_method_aliased(ctx->registry, full_head,
+                                                               short_name);
+                        if (m)
+                            head = (char *)full_head;
+                    }
+                    if (!m) {
+                        const CBMType *provided = rust_trait_assoc_fn_type(ctx, head, short_name);
+                        if (provided) {
+                            return provided;
+                        }
+                    }
+                    if (m && m->signature && m->signature->kind == CBM_TYPE_FUNC &&
+                        m->signature->data.func.return_types &&
+                        m->signature->data.func.return_types[0]) {
+                        const CBMType *ret = m->signature->data.func.return_types[0];
+                        *callee = m;
+                        /* Substitute Self / unknown returns with the
+                         * receiver type so chained calls keep typing. */
+                        if (!cbm_type_is_unknown(ret)) {
+                            return rust_subst_self(ctx, ret, head);
+                        }
+                        if (cbm_type_is_unknown(ret) &&
+                            (strcmp(short_name, "new") == 0 ||
+                             strcmp(short_name, "default") == 0 ||
+                             strcmp(short_name, "with_capacity") == 0 ||
+                             strcmp(short_name, "from") == 0)) {
+                            /* Smart-pointer wrap: capture first arg
+                             * type into a TEMPLATE so Deref can peel. */
+                            if (strcmp(short_name, "new") == 0 &&
+                                rust_type_derefs_to_first_arg(head) &&
+                                !ts_node_is_null(args_node)) {
+                                uint32_t anc = ts_node_named_child_count(args_node);
+                                if (anc > 0) {
+                                    const CBMType *arg_t = rust_eval_expr_type(
+                                        ctx, ts_node_named_child(args_node, 0));
+                                    if (arg_t && !cbm_type_is_unknown(arg_t)) {
+                                        return cbm_type_template(ctx->arena, head, &arg_t, 1);
+                                    }
+                                }
+                            }
+                            return cbm_type_named(ctx->arena, head);
+                        }
+                        return ret;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Method call expressed as field_expression callee. */
+    if (strcmp(fk, "field_expression") == 0) {
+        TSNode value = ts_node_child_by_field_name(func_node, "value", 5);
+        TSNode field = ts_node_child_by_field_name(func_node, "field", 5);
+        if (!ts_node_is_null(value) && !ts_node_is_null(field)) {
+            const CBMType *recv = rust_eval_expr_type(ctx, value);
+            char *mname = rust_node_text(ctx, field);
+            if (mname && recv) {
+                const CBMType *base = recv;
+                while (base && base->kind == CBM_TYPE_REFERENCE) {
+                    base = base->data.reference.elem;
+                }
+                /* Template Vec<T> method handling */
+                if (base && base->kind == CBM_TYPE_TEMPLATE) {
+                    const char *tname = base->data.template_type.template_name;
+                    /* Iterator-producing methods on Vec/&[T]/Option/Result/HashMap. */
+                    if (strstr(tname, "Vec") || strstr(tname, "VecDeque") ||
+                        strstr(tname, "HashSet") || strstr(tname, "BTreeSet")) {
+                        if (strcmp(mname, "iter") == 0 || strcmp(mname, "iter_mut") == 0 ||
+                            strcmp(mname, "into_iter") == 0 || strcmp(mname, "drain") == 0) {
+                            /* Iterator<Item=T> — represent loosely as the elem type for our
+                             * downstream chain calls. Even when the elem type is not
+                             * known, return Iterator (with no args) so further chain calls
+                             * can still attribute via Iterator's registered methods. */
+                            if (base->data.template_type.arg_count > 0) {
+                                return cbm_type_template(
+                                    ctx->arena, "core.iter.Iterator",
+                                    &base->data.template_type.template_args[0], 1);
+                            }
+                            return cbm_type_template(ctx->arena, "core.iter.Iterator", NULL, 0);
+                        }
+                        /* Methods returning the element type directly. */
+                        if (strcmp(mname, "remove") == 0 || strcmp(mname, "swap_remove") == 0) {
+                            if (base->data.template_type.arg_count > 0) {
+                                return base->data.template_type.template_args[0];
+                            }
+                        }
+                        if (strcmp(mname, "len") == 0 || strcmp(mname, "capacity") == 0) {
+                            return cbm_type_builtin(ctx->arena, "usize");
+                        }
+                        if (strcmp(mname, "is_empty") == 0 || strcmp(mname, "contains") == 0) {
+                            return cbm_type_builtin(ctx->arena, "bool");
+                        }
+                        if (strcmp(mname, "first") == 0 || strcmp(mname, "last") == 0 ||
+                            strcmp(mname, "get") == 0 || strcmp(mname, "pop") == 0) {
+                            if (base->data.template_type.arg_count > 0) {
+                                const CBMType *opt_args[1] = {
+                                    base->data.template_type.template_args[0]};
+                                return cbm_type_template(ctx->arena, "core.option.Option",
+                                                         opt_args, 1);
+                            }
+                        }
+                        if (strcmp(mname, "as_slice") == 0) {
+                            if (base->data.template_type.arg_count > 0) {
+                                return cbm_type_reference(
+                                    ctx->arena,
+                                    cbm_type_slice(ctx->arena,
+                                                   base->data.template_type.template_args[0]));
+                            }
+                        }
+                    }
+                    if (strstr(tname, "Option")) {
+                        if (strcmp(mname, "unwrap") == 0 || strcmp(mname, "expect") == 0 ||
+                            strcmp(mname, "unwrap_or") == 0 ||
+                            strcmp(mname, "unwrap_or_default") == 0 ||
+                            strcmp(mname, "unwrap_or_else") == 0) {
+                            if (base->data.template_type.arg_count > 0) {
+                                return base->data.template_type.template_args[0];
+                            }
+                        }
+                        if (strcmp(mname, "is_some") == 0 || strcmp(mname, "is_none") == 0) {
+                            return cbm_type_builtin(ctx->arena, "bool");
+                        }
+                        if (strcmp(mname, "as_ref") == 0) {
+                            if (base->data.template_type.arg_count > 0) {
+                                const CBMType *arg0 = cbm_type_reference(
+                                    ctx->arena, base->data.template_type.template_args[0]);
+                                return cbm_type_template(ctx->arena, "core.option.Option",
+                                                         &arg0, 1);
+                            }
+                        }
+                    }
+                    if (strstr(tname, "Result")) {
+                        if (strcmp(mname, "unwrap") == 0 || strcmp(mname, "expect") == 0 ||
+                            strcmp(mname, "unwrap_or") == 0) {
+                            if (base->data.template_type.arg_count > 0) {
+                                return base->data.template_type.template_args[0];
+                            }
+                        }
+                        if (strcmp(mname, "ok") == 0 &&
+                            base->data.template_type.arg_count > 0) {
+                            const CBMType *a0 = base->data.template_type.template_args[0];
+                            return cbm_type_template(ctx->arena, "core.option.Option", &a0, 1);
+                        }
+                        if (strcmp(mname, "err") == 0 &&
+                            base->data.template_type.arg_count > 1) {
+                            const CBMType *a1 = base->data.template_type.template_args[1];
+                            return cbm_type_template(ctx->arena, "core.option.Option", &a1, 1);
+                        }
+                        if (strcmp(mname, "is_ok") == 0 || strcmp(mname, "is_err") == 0) {
+                            return cbm_type_builtin(ctx->arena, "bool");
+                        }
+                    }
+                    if (strstr(tname, "Iterator")) {
+                        /* map/filter/take/skip/rev/chain → Iterator (with the relevant elem) */
+                        if (strcmp(mname, "collect") == 0) {
+                            /* Often Vec<Item>; without turbofish info we model as Vec<elem>. */
+                            if (base->data.template_type.arg_count > 0) {
+                                return cbm_type_template(ctx->arena, "alloc.vec.Vec",
+                                                         base->data.template_type.template_args,
+                                                         base->data.template_type.arg_count);
+                            }
+                        }
+                        if (strcmp(mname, "count") == 0 || strcmp(mname, "len") == 0) {
+                            return cbm_type_builtin(ctx->arena, "usize");
+                        }
+                        if (strcmp(mname, "next") == 0 || strcmp(mname, "last") == 0 ||
+                            strcmp(mname, "nth") == 0 || strcmp(mname, "find") == 0 ||
+                            strcmp(mname, "max") == 0 || strcmp(mname, "min") == 0 ||
+                            strcmp(mname, "max_by") == 0 || strcmp(mname, "min_by") == 0) {
+                            if (base->data.template_type.arg_count > 0) {
+                                const CBMType *a0 = base->data.template_type.template_args[0];
+                                return cbm_type_template(ctx->arena, "core.option.Option", &a0,
+                                                         1);
+                            }
+                        }
+                        if (strcmp(mname, "filter") == 0 || strcmp(mname, "take") == 0 ||
+                            strcmp(mname, "skip") == 0 || strcmp(mname, "rev") == 0 ||
+                            strcmp(mname, "cloned") == 0 || strcmp(mname, "copied") == 0 ||
+                            strcmp(mname, "step_by") == 0 || strcmp(mname, "fuse") == 0 ||
+                            strcmp(mname, "peekable") == 0 || strcmp(mname, "by_ref") == 0 ||
+                            strcmp(mname, "take_while") == 0 ||
+                            strcmp(mname, "skip_while") == 0 || strcmp(mname, "inspect") == 0) {
+                            return base; /* preserves Iterator<Item> */
+                        }
+                        if ((strcmp(mname, "sum") == 0 || strcmp(mname, "product") == 0 ||
+                             strcmp(mname, "fold") == 0 || strcmp(mname, "reduce") == 0) &&
+                            base->data.template_type.arg_count > 0) {
+                            return base->data.template_type.template_args[0];
+                        }
+                        if (strcmp(mname, "any") == 0 || strcmp(mname, "all") == 0) {
+                            return cbm_type_builtin(ctx->arena, "bool");
+                        }
+                        if (strcmp(mname, "position") == 0) {
+                            const CBMType *usize = cbm_type_builtin(ctx->arena, "usize");
+                            return cbm_type_template(ctx->arena, "core.option.Option", &usize,
+                                                     1);
+                        }
+                        if (strcmp(mname, "enumerate") == 0 &&
+                            base->data.template_type.arg_count > 0) {
+                            /* Iterator<(usize, T)>. */
+                            const CBMType *pair[2] = {
+                                cbm_type_builtin(ctx->arena, "usize"),
+                                base->data.template_type.template_args[0]};
+                            const CBMType *tup = cbm_type_tuple(ctx->arena, pair, 2);
+                            return cbm_type_template(ctx->arena, "core.iter.Iterator", &tup, 1);
+                        }
+                    }
+                    /* HashMap<K, V> / BTreeMap<K, V> generics. */
+                    if (strstr(tname, "HashMap") || strstr(tname, "BTreeMap")) {
+                        if (strcmp(mname, "len") == 0) {
+                            return cbm_type_builtin(ctx->arena, "usize");
+                        }
+                        if (strcmp(mname, "is_empty") == 0 ||
+                            strcmp(mname, "contains_key") == 0) {
+                            return cbm_type_builtin(ctx->arena, "bool");
+                        }
+                        if (strcmp(mname, "get") == 0 || strcmp(mname, "get_mut") == 0 ||
+                            strcmp(mname, "remove") == 0) {
+                            if (base->data.template_type.arg_count > 1) {
+                                const CBMType *v = base->data.template_type.template_args[1];
+                                return cbm_type_template(ctx->arena, "core.option.Option", &v,
+                                                         1);
+                            }
+                        }
+                        if (strcmp(mname, "iter") == 0 || strcmp(mname, "iter_mut") == 0) {
+                            /* Iterator<(K, V)>. */
+                            if (base->data.template_type.arg_count > 1) {
+                                const CBMType *pair[2] = {
+                                    base->data.template_type.template_args[0],
+                                    base->data.template_type.template_args[1]};
+                                const CBMType *tup = cbm_type_tuple(ctx->arena, pair, 2);
+                                return cbm_type_template(ctx->arena, "core.iter.Iterator", &tup,
+                                                         1);
+                            }
+                        }
+                        if (strcmp(mname, "keys") == 0 &&
+                            base->data.template_type.arg_count > 0) {
+                            return cbm_type_template(ctx->arena, "core.iter.Iterator",
+                                                     &base->data.template_type.template_args[0],
+                                                     1);
+                        }
+                        if (strcmp(mname, "values") == 0 &&
+                            base->data.template_type.arg_count > 1) {
+                            return cbm_type_template(ctx->arena, "core.iter.Iterator",
+                                                     &base->data.template_type.template_args[1],
+                                                     1);
+                        }
+                    }
+                }
+                /* Fall through: registered method on the named type.
+                 * Unwrap the resulting FUNC signature to its first
+                 * return type so chains like
+                 * `String::new().to_uppercase().len()` keep typing
+                 * across each link. */
+                const CBMType *t = rust_eval_member_access(ctx, recv, mname, true, callee);
+                if (t && t->kind == CBM_TYPE_FUNC && t->data.func.return_types &&
+                    t->data.func.return_types[0]) {
+                    const CBMType *ret = t->data.func.return_types[0];
+                    /* Self -> receiver. */
+                    if (ret->kind == CBM_TYPE_NAMED &&
+                        strcmp(ret->data.named.qualified_name, "Self") == 0) {
+                        const CBMType *rb = recv;
+                        while (rb && rb->kind == CBM_TYPE_REFERENCE)
+                            rb = rb->data.reference.elem;
+                        if (rb && rb->kind == CBM_TYPE_NAMED) {
+                            return cbm_type_named(ctx->arena, rb->data.named.qualified_name);
+                        }
+                    }
+                    return ret;
+                }
+                return t;
+            }
+        }
+    }
+
+    /* Fallback: function expression's return type. */
+    const CBMType *func_type = rust_eval_expr_type(ctx, func_node);
+    if (func_type && func_type->kind == CBM_TYPE_FUNC && func_type->data.func.return_types &&
+        func_type->data.func.return_types[0]) {
+        return func_type->data.func.return_types[0];
+    }
+    if (func_type && func_type->kind == CBM_TYPE_NAMED) {
+        return func_type;
+    }
+    return cbm_type_unknown();
 }
 
 const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
@@ -2686,395 +3077,13 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         if (!fname) {
             return cbm_type_unknown();
         }
-        return rust_eval_member_access(ctx, recv, fname, false);
+        return rust_eval_member_access(ctx, recv, fname, false, NULL);
     }
 
     /* call_expression: any callable invocation. */
     if (strcmp(kind, "call_expression") == 0) {
-        TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
-        TSNode args_node = ts_node_child_by_field_name(node, "arguments", 9);
-        if (ts_node_is_null(func_node)) {
-            return cbm_type_unknown();
-        }
-        const char *fk = ts_node_type(func_node);
-
-        const CBMType *produced = NULL;
-        if (rust_eval_path_call_by_target(ctx, func_node, &produced)) {
-            return produced;
-        }
-
-        /* Constructor of a tuple struct, unit-like struct, or stdlib
-         * factory invoked via path. Try the registry; on miss, also try
-         * UFCS-style method lookup to catch `String::new()`,
-         * `Vec::new()`, etc. */
-        if (strcmp(fk, "identifier") == 0 || strcmp(fk, "scoped_identifier") == 0) {
-            char *path = rust_node_text(ctx, func_node);
-            if (path) {
-                /* Strip ALL turbofish (`::<...>`) so the lookup below
-                 * ignores explicit type arguments — handles forms like
-                 * `Vec::<i32>::new` and `parse::<u32>`. */
-                rust_strip_turbofish(path);
-                const char *qn = rust_resolve_path_expr(ctx, path);
-                if (qn) {
-                    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
-                    if (rt) {
-                        return cbm_type_named(ctx->arena, qn);
-                    }
-                    const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, qn);
-                    if (f && f->signature && f->signature->kind == CBM_TYPE_FUNC) {
-                        const CBMType *const *rt_arr = f->signature->data.func.return_types;
-                        if (rt_arr && rt_arr[0]) {
-                            const CBMType *ret = rt_arr[0];
-                            /* Constructor-style on a stdlib receiver with
-                             * `unknown` return — substitute the receiver
-                             * type so chains keep typing. The heuristic
-                             * matches `new`, `default`, anything starting
-                             * with `from_` / `with_`, plus a small list of
-                             * common factory verbs.
-                             *
-                             * For smart-pointer factories (`Box::new`,
-                             * `Rc::new`, `Arc::new`, `RefCell::new`,
-                             * `Pin::new`, `Mutex::new`, `RwLock::new`)
-                             * we also try to capture the first call
-                             * argument's type as a TEMPLATE arg so the
-                             * Deref chain has something to peel. */
-                            if (f->receiver_type && cbm_type_is_unknown(ret) && f->short_name &&
-                                (strcmp(f->short_name, "new") == 0 ||
-                                 strcmp(f->short_name, "default") == 0 ||
-                                 strcmp(f->short_name, "open") == 0 ||
-                                 strcmp(f->short_name, "create") == 0 ||
-                                 strcmp(f->short_name, "create_new") == 0 ||
-                                 strcmp(f->short_name, "bind") == 0 ||
-                                 strcmp(f->short_name, "connect") == 0 ||
-                                 strcmp(f->short_name, "spawn") == 0 ||
-                                 strcmp(f->short_name, "now") == 0 ||
-                                 strncmp(f->short_name, "from_", 5) == 0 ||
-                                 strncmp(f->short_name, "with_", 5) == 0 ||
-                                 strcmp(f->short_name, "from") == 0)) {
-                                /* Detect smart-pointer wrappers and
-                                 * capture the first arg's type so
-                                 * `let b = Box::new(x); b.method()`
-                                 * dispatches via Deref. */
-                                bool is_wrapper = strcmp(f->short_name, "new") == 0 &&
-                                                  rust_type_derefs_to_first_arg(f->receiver_type);
-                                if (is_wrapper && !ts_node_is_null(args_node)) {
-                                    uint32_t anc = ts_node_named_child_count(args_node);
-                                    if (anc > 0) {
-                                        const CBMType *arg_t = rust_eval_expr_type(
-                                            ctx, ts_node_named_child(args_node, 0));
-                                        if (arg_t && !cbm_type_is_unknown(arg_t)) {
-                                            return cbm_type_template(ctx->arena, f->receiver_type,
-                                                                     &arg_t, 1);
-                                        }
-                                    }
-                                }
-                                return cbm_type_named(ctx->arena, f->receiver_type);
-                            }
-                            /* Self -> receiver_type substitution. */
-                            if (f->receiver_type && ret->kind == CBM_TYPE_NAMED &&
-                                strcmp(ret->data.named.qualified_name, "Self") == 0) {
-                                return cbm_type_named(ctx->arena, f->receiver_type);
-                            }
-                            return ret;
-                        }
-                    }
-                    /* UFCS path lookup: split off short name and try
-                     * `cbm_registry_lookup_method`. */
-                    const char *dot = strrchr(qn, '.');
-                    if (dot) {
-                        char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
-                        const char *short_name = dot + 1;
-                        const CBMRegisteredFunc *m =
-                            cbm_registry_lookup_method_aliased(ctx->registry, head, short_name);
-                        if (!m && ctx->module_qn) {
-                            const char *full_head =
-                                cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
-                            m = cbm_registry_lookup_method_aliased(ctx->registry, full_head,
-                                                                   short_name);
-                            if (m)
-                                head = (char *)full_head;
-                        }
-                        if (!m) {
-                            const CBMType *provided =
-                                rust_trait_assoc_fn_type(ctx, head, short_name);
-                            if (provided) {
-                                return provided;
-                            }
-                        }
-                        if (m && m->signature && m->signature->kind == CBM_TYPE_FUNC &&
-                            m->signature->data.func.return_types &&
-                            m->signature->data.func.return_types[0]) {
-                            const CBMType *ret = m->signature->data.func.return_types[0];
-                            /* Substitute Self / unknown returns with the
-                             * receiver type so chained calls keep typing. */
-                            if (ret->kind == CBM_TYPE_NAMED &&
-                                strcmp(ret->data.named.qualified_name, "Self") == 0) {
-                                return cbm_type_named(ctx->arena, head);
-                            }
-                            if (cbm_type_is_unknown(ret) &&
-                                (strcmp(short_name, "new") == 0 ||
-                                 strcmp(short_name, "default") == 0 ||
-                                 strcmp(short_name, "with_capacity") == 0 ||
-                                 strcmp(short_name, "from") == 0)) {
-                                /* Smart-pointer wrap: capture first arg
-                                 * type into a TEMPLATE so Deref can peel. */
-                                if (strcmp(short_name, "new") == 0 &&
-                                    rust_type_derefs_to_first_arg(head) &&
-                                    !ts_node_is_null(args_node)) {
-                                    uint32_t anc = ts_node_named_child_count(args_node);
-                                    if (anc > 0) {
-                                        const CBMType *arg_t = rust_eval_expr_type(
-                                            ctx, ts_node_named_child(args_node, 0));
-                                        if (arg_t && !cbm_type_is_unknown(arg_t)) {
-                                            return cbm_type_template(ctx->arena, head, &arg_t, 1);
-                                        }
-                                    }
-                                }
-                                return cbm_type_named(ctx->arena, head);
-                            }
-                            return ret;
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Method call expressed as field_expression callee. */
-        if (strcmp(fk, "field_expression") == 0) {
-            TSNode value = ts_node_child_by_field_name(func_node, "value", 5);
-            TSNode field = ts_node_child_by_field_name(func_node, "field", 5);
-            if (!ts_node_is_null(value) && !ts_node_is_null(field)) {
-                const CBMType *recv = rust_eval_expr_type(ctx, value);
-                char *mname = rust_node_text(ctx, field);
-                if (mname && recv) {
-                    const CBMType *base = recv;
-                    while (base && base->kind == CBM_TYPE_REFERENCE) {
-                        base = base->data.reference.elem;
-                    }
-                    /* Template Vec<T> method handling */
-                    if (base && base->kind == CBM_TYPE_TEMPLATE) {
-                        const char *tname = base->data.template_type.template_name;
-                        /* Iterator-producing methods on Vec/&[T]/Option/Result/HashMap. */
-                        if (strstr(tname, "Vec") || strstr(tname, "VecDeque") ||
-                            strstr(tname, "HashSet") || strstr(tname, "BTreeSet")) {
-                            if (strcmp(mname, "iter") == 0 || strcmp(mname, "iter_mut") == 0 ||
-                                strcmp(mname, "into_iter") == 0 || strcmp(mname, "drain") == 0) {
-                                /* Iterator<Item=T> — represent loosely as the elem type for our
-                                 * downstream chain calls. Even when the elem type is not
-                                 * known, return Iterator (with no args) so further chain calls
-                                 * can still attribute via Iterator's registered methods. */
-                                if (base->data.template_type.arg_count > 0) {
-                                    return cbm_type_template(
-                                        ctx->arena, "core.iter.Iterator",
-                                        &base->data.template_type.template_args[0], 1);
-                                }
-                                return cbm_type_template(ctx->arena, "core.iter.Iterator", NULL, 0);
-                            }
-                            /* Methods returning the element type directly. */
-                            if (strcmp(mname, "remove") == 0 || strcmp(mname, "swap_remove") == 0) {
-                                if (base->data.template_type.arg_count > 0) {
-                                    return base->data.template_type.template_args[0];
-                                }
-                            }
-                            if (strcmp(mname, "len") == 0 || strcmp(mname, "capacity") == 0) {
-                                return cbm_type_builtin(ctx->arena, "usize");
-                            }
-                            if (strcmp(mname, "is_empty") == 0 || strcmp(mname, "contains") == 0) {
-                                return cbm_type_builtin(ctx->arena, "bool");
-                            }
-                            if (strcmp(mname, "first") == 0 || strcmp(mname, "last") == 0 ||
-                                strcmp(mname, "get") == 0 || strcmp(mname, "pop") == 0) {
-                                if (base->data.template_type.arg_count > 0) {
-                                    const CBMType *opt_args[1] = {
-                                        base->data.template_type.template_args[0]};
-                                    return cbm_type_template(ctx->arena, "core.option.Option",
-                                                             opt_args, 1);
-                                }
-                            }
-                            if (strcmp(mname, "as_slice") == 0) {
-                                if (base->data.template_type.arg_count > 0) {
-                                    return cbm_type_reference(
-                                        ctx->arena,
-                                        cbm_type_slice(ctx->arena,
-                                                       base->data.template_type.template_args[0]));
-                                }
-                            }
-                        }
-                        if (strstr(tname, "Option")) {
-                            if (strcmp(mname, "unwrap") == 0 || strcmp(mname, "expect") == 0 ||
-                                strcmp(mname, "unwrap_or") == 0 ||
-                                strcmp(mname, "unwrap_or_default") == 0 ||
-                                strcmp(mname, "unwrap_or_else") == 0) {
-                                if (base->data.template_type.arg_count > 0) {
-                                    return base->data.template_type.template_args[0];
-                                }
-                            }
-                            if (strcmp(mname, "is_some") == 0 || strcmp(mname, "is_none") == 0) {
-                                return cbm_type_builtin(ctx->arena, "bool");
-                            }
-                            if (strcmp(mname, "as_ref") == 0) {
-                                if (base->data.template_type.arg_count > 0) {
-                                    const CBMType *arg0 = cbm_type_reference(
-                                        ctx->arena, base->data.template_type.template_args[0]);
-                                    return cbm_type_template(ctx->arena, "core.option.Option",
-                                                             &arg0, 1);
-                                }
-                            }
-                        }
-                        if (strstr(tname, "Result")) {
-                            if (strcmp(mname, "unwrap") == 0 || strcmp(mname, "expect") == 0 ||
-                                strcmp(mname, "unwrap_or") == 0) {
-                                if (base->data.template_type.arg_count > 0) {
-                                    return base->data.template_type.template_args[0];
-                                }
-                            }
-                            if (strcmp(mname, "ok") == 0 &&
-                                base->data.template_type.arg_count > 0) {
-                                const CBMType *a0 = base->data.template_type.template_args[0];
-                                return cbm_type_template(ctx->arena, "core.option.Option", &a0, 1);
-                            }
-                            if (strcmp(mname, "err") == 0 &&
-                                base->data.template_type.arg_count > 1) {
-                                const CBMType *a1 = base->data.template_type.template_args[1];
-                                return cbm_type_template(ctx->arena, "core.option.Option", &a1, 1);
-                            }
-                            if (strcmp(mname, "is_ok") == 0 || strcmp(mname, "is_err") == 0) {
-                                return cbm_type_builtin(ctx->arena, "bool");
-                            }
-                        }
-                        if (strstr(tname, "Iterator")) {
-                            /* map/filter/take/skip/rev/chain → Iterator (with the relevant elem) */
-                            if (strcmp(mname, "collect") == 0) {
-                                /* Often Vec<Item>; without turbofish info we model as Vec<elem>. */
-                                if (base->data.template_type.arg_count > 0) {
-                                    return cbm_type_template(ctx->arena, "alloc.vec.Vec",
-                                                             base->data.template_type.template_args,
-                                                             base->data.template_type.arg_count);
-                                }
-                            }
-                            if (strcmp(mname, "count") == 0 || strcmp(mname, "len") == 0) {
-                                return cbm_type_builtin(ctx->arena, "usize");
-                            }
-                            if (strcmp(mname, "next") == 0 || strcmp(mname, "last") == 0 ||
-                                strcmp(mname, "nth") == 0 || strcmp(mname, "find") == 0 ||
-                                strcmp(mname, "max") == 0 || strcmp(mname, "min") == 0 ||
-                                strcmp(mname, "max_by") == 0 || strcmp(mname, "min_by") == 0) {
-                                if (base->data.template_type.arg_count > 0) {
-                                    const CBMType *a0 = base->data.template_type.template_args[0];
-                                    return cbm_type_template(ctx->arena, "core.option.Option", &a0,
-                                                             1);
-                                }
-                            }
-                            if (strcmp(mname, "filter") == 0 || strcmp(mname, "take") == 0 ||
-                                strcmp(mname, "skip") == 0 || strcmp(mname, "rev") == 0 ||
-                                strcmp(mname, "cloned") == 0 || strcmp(mname, "copied") == 0 ||
-                                strcmp(mname, "step_by") == 0 || strcmp(mname, "fuse") == 0 ||
-                                strcmp(mname, "peekable") == 0 || strcmp(mname, "by_ref") == 0 ||
-                                strcmp(mname, "take_while") == 0 ||
-                                strcmp(mname, "skip_while") == 0 || strcmp(mname, "inspect") == 0) {
-                                return base; /* preserves Iterator<Item> */
-                            }
-                            if ((strcmp(mname, "sum") == 0 || strcmp(mname, "product") == 0 ||
-                                 strcmp(mname, "fold") == 0 || strcmp(mname, "reduce") == 0) &&
-                                base->data.template_type.arg_count > 0) {
-                                return base->data.template_type.template_args[0];
-                            }
-                            if (strcmp(mname, "any") == 0 || strcmp(mname, "all") == 0) {
-                                return cbm_type_builtin(ctx->arena, "bool");
-                            }
-                            if (strcmp(mname, "position") == 0) {
-                                const CBMType *usize = cbm_type_builtin(ctx->arena, "usize");
-                                return cbm_type_template(ctx->arena, "core.option.Option", &usize,
-                                                         1);
-                            }
-                            if (strcmp(mname, "enumerate") == 0 &&
-                                base->data.template_type.arg_count > 0) {
-                                /* Iterator<(usize, T)>. */
-                                const CBMType *pair[2] = {
-                                    cbm_type_builtin(ctx->arena, "usize"),
-                                    base->data.template_type.template_args[0]};
-                                const CBMType *tup = cbm_type_tuple(ctx->arena, pair, 2);
-                                return cbm_type_template(ctx->arena, "core.iter.Iterator", &tup, 1);
-                            }
-                        }
-                        /* HashMap<K, V> / BTreeMap<K, V> generics. */
-                        if (strstr(tname, "HashMap") || strstr(tname, "BTreeMap")) {
-                            if (strcmp(mname, "len") == 0) {
-                                return cbm_type_builtin(ctx->arena, "usize");
-                            }
-                            if (strcmp(mname, "is_empty") == 0 ||
-                                strcmp(mname, "contains_key") == 0) {
-                                return cbm_type_builtin(ctx->arena, "bool");
-                            }
-                            if (strcmp(mname, "get") == 0 || strcmp(mname, "get_mut") == 0 ||
-                                strcmp(mname, "remove") == 0) {
-                                if (base->data.template_type.arg_count > 1) {
-                                    const CBMType *v = base->data.template_type.template_args[1];
-                                    return cbm_type_template(ctx->arena, "core.option.Option", &v,
-                                                             1);
-                                }
-                            }
-                            if (strcmp(mname, "iter") == 0 || strcmp(mname, "iter_mut") == 0) {
-                                /* Iterator<(K, V)>. */
-                                if (base->data.template_type.arg_count > 1) {
-                                    const CBMType *pair[2] = {
-                                        base->data.template_type.template_args[0],
-                                        base->data.template_type.template_args[1]};
-                                    const CBMType *tup = cbm_type_tuple(ctx->arena, pair, 2);
-                                    return cbm_type_template(ctx->arena, "core.iter.Iterator", &tup,
-                                                             1);
-                                }
-                            }
-                            if (strcmp(mname, "keys") == 0 &&
-                                base->data.template_type.arg_count > 0) {
-                                return cbm_type_template(ctx->arena, "core.iter.Iterator",
-                                                         &base->data.template_type.template_args[0],
-                                                         1);
-                            }
-                            if (strcmp(mname, "values") == 0 &&
-                                base->data.template_type.arg_count > 1) {
-                                return cbm_type_template(ctx->arena, "core.iter.Iterator",
-                                                         &base->data.template_type.template_args[1],
-                                                         1);
-                            }
-                        }
-                    }
-                    /* Fall through: registered method on the named type.
-                     * Unwrap the resulting FUNC signature to its first
-                     * return type so chains like
-                     * `String::new().to_uppercase().len()` keep typing
-                     * across each link. */
-                    const CBMType *t = rust_eval_member_access(ctx, recv, mname, true);
-                    if (t && t->kind == CBM_TYPE_FUNC && t->data.func.return_types &&
-                        t->data.func.return_types[0]) {
-                        const CBMType *ret = t->data.func.return_types[0];
-                        /* Self -> receiver. */
-                        if (ret->kind == CBM_TYPE_NAMED &&
-                            strcmp(ret->data.named.qualified_name, "Self") == 0) {
-                            const CBMType *rb = recv;
-                            while (rb && rb->kind == CBM_TYPE_REFERENCE)
-                                rb = rb->data.reference.elem;
-                            if (rb && rb->kind == CBM_TYPE_NAMED) {
-                                return cbm_type_named(ctx->arena, rb->data.named.qualified_name);
-                            }
-                        }
-                        return ret;
-                    }
-                    return t;
-                }
-            }
-        }
-
-        /* Fallback: function expression's return type. */
-        const CBMType *func_type = rust_eval_expr_type(ctx, func_node);
-        if (func_type && func_type->kind == CBM_TYPE_FUNC && func_type->data.func.return_types &&
-            func_type->data.func.return_types[0]) {
-            return func_type->data.func.return_types[0];
-        }
-        if (func_type && func_type->kind == CBM_TYPE_NAMED) {
-            return func_type;
-        }
-        return cbm_type_unknown();
+        const CBMRegisteredFunc *callee = NULL;
+        return rust_eval_call_type(ctx, node, &callee);
     }
 
     /* macro_invocation: vec!, format!, … */
@@ -3221,13 +3230,19 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         return inner;
     }
 
-    /* Function signatures already record an async function's declared output,
-     * not the compiler-generated Future wrapper.  Preserve Option<T>, whose
-     * first argument is a value rather than an awaitable output.  Other
-     * template shapes retain the established approximation until their async
-     * provenance is represented explicitly. */
+    /* `e.await`. A call to an `async fn` is typed with the function's
+     * declared output, which is what awaiting it yields. Any other awaited
+     * value is a future type: its output is approximated by the first
+     * generic argument, except Option<T>, which no future type spells. */
     if (strcmp(kind, "await_expression") == 0 && ts_node_named_child_count(node) > 0) {
-        const CBMType *inner = rust_eval_expr_type(ctx, ts_node_named_child(node, 0));
+        TSNode awaited = ts_node_named_child(node, 0);
+        const CBMRegisteredFunc *callee = NULL;
+        const CBMType *inner = strcmp(ts_node_type(awaited), "call_expression") == 0
+                                   ? rust_eval_call_type(ctx, awaited, &callee)
+                                   : rust_eval_expr_type(ctx, awaited);
+        if (callee && (callee->flags & CBM_FUNC_FLAG_ASYNC) != 0) {
+            return inner;
+        }
         if (inner && inner->kind == CBM_TYPE_TEMPLATE) {
             const char *name = inner->data.template_type.template_name;
             if (name && strstr(name, "Option"))
@@ -3416,22 +3431,55 @@ const CBMType *rust_eval_expr_typed(RustLSPContext *ctx, TSNode node, const CBMT
     return synth;
 }
 
+/* `sig` with every `Self` in its first return type replaced by `self_qn`. */
+static const CBMType *rust_sig_subst_self(RustLSPContext *ctx, const CBMType *sig,
+                                          const char *self_qn) {
+    if (!sig || sig->kind != CBM_TYPE_FUNC || !sig->data.func.return_types ||
+        !sig->data.func.return_types[0]) {
+        return sig;
+    }
+    const CBMType *ret = sig->data.func.return_types[0];
+    const CBMType *sub = rust_subst_self(ctx, ret, self_qn);
+    if (sub == ret) {
+        return sig;
+    }
+    int n = 0;
+    while (sig->data.func.return_types[n]) {
+        n++;
+    }
+    const CBMType **rets = cbm_arena_alloc(ctx->arena, sizeof(*rets) * (size_t)(n + 1));
+    for (int i = 0; i < n; i++) {
+        rets[i] = sig->data.func.return_types[i];
+    }
+    rets[0] = sub;
+    rets[n] = NULL;
+    return cbm_type_func(ctx->arena, sig->data.func.param_names, sig->data.func.param_types,
+                         rets);
+}
+
 /* Member access type: returns the CBMType for `recv.field_or_method`.
- * Methods return their FUNC signature; fields return the field type. A
- * member the receiver lacks is looked up on its Deref target, hop by hop,
- * as rustc's autoderef does; a method call keeps a wrapper-level prelude
- * trait method on the wrapper. */
+ * Methods return their FUNC signature with `Self` replaced by the type that
+ * declares them; fields return the field type. A member the receiver lacks
+ * is looked up on its Deref target, hop by hop, as rustc's autoderef does; a
+ * method call keeps a wrapper-level prelude trait method on the wrapper.
+ * `*out_method`, when given, is the registered method found, else NULL. */
 static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMType *recv,
-                                                 const char *member, bool method_call, int hop);
+                                                 const char *member, bool method_call, int hop,
+                                                 const CBMRegisteredFunc **out_method);
 
 static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType *recv,
-                                              const char *member, bool method_call) {
-    return rust_eval_member_access_at(ctx, recv, member, method_call, 0);
+                                              const char *member, bool method_call,
+                                              const CBMRegisteredFunc **out_method) {
+    if (out_method) {
+        *out_method = NULL;
+    }
+    return rust_eval_member_access_at(ctx, recv, member, method_call, 0, out_method);
 }
 
 static const CBMType *rust_eval_member_access_deref(RustLSPContext *ctx, const CBMType *base,
                                                     const char *member, bool method_call,
-                                                    int hop) {
+                                                    int hop,
+                                                    const CBMRegisteredFunc **out_method) {
     if (hop >= RUST_DEREF_MAX_HOPS || (method_call && rust_is_wrapper_trait_method(member))) {
         return cbm_type_unknown();
     }
@@ -3439,11 +3487,12 @@ static const CBMType *rust_eval_member_access_deref(RustLSPContext *ctx, const C
     if (!next) {
         return cbm_type_unknown();
     }
-    return rust_eval_member_access_at(ctx, next, member, method_call, hop + 1);
+    return rust_eval_member_access_at(ctx, next, member, method_call, hop + 1, out_method);
 }
 
 static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMType *recv,
-                                                 const char *member, bool method_call, int hop) {
+                                                 const char *member, bool method_call, int hop,
+                                                 const CBMRegisteredFunc **out_method) {
     if (!recv || !member)
         return cbm_type_unknown();
     /* Auto-deref through references. */
@@ -3493,23 +3542,15 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
     /* Check inherent method first. */
     const CBMRegisteredFunc *method = rust_lookup_method(ctx, type_qn, member);
     if (method && method->signature) {
+        if (out_method) {
+            *out_method = method;
+        }
+        const CBMType *sig = method->signature;
         if (template_args && method->type_param_names) {
             template_params = method->type_param_names;
-            const CBMType *sub =
-                rust_substitute_type(ctx->arena, method->signature, template_params, template_args);
-            return sub;
+            sig = rust_substitute_type(ctx->arena, sig, template_params, template_args);
         }
-        /* Substitute any Self placeholder on the return type. */
-        const CBMType *sig = method->signature;
-        if (sig && sig->kind == CBM_TYPE_FUNC && sig->data.func.return_types &&
-            sig->data.func.return_types[0]) {
-            const CBMType *ret = sig->data.func.return_types[0];
-            if (ret && ret->kind == CBM_TYPE_NAMED &&
-                strcmp(ret->data.named.qualified_name, "Self") == 0) {
-                return cbm_type_named(ctx->arena, type_qn);
-            }
-        }
-        return method->signature;
+        return rust_sig_subst_self(ctx, sig, type_qn);
     }
 
     /* Field on the type's RegisteredType. */
@@ -3520,7 +3561,7 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
         }
         return ft;
     }
-    return rust_eval_member_access_deref(ctx, base, member, method_call, hop);
+    return rust_eval_member_access_deref(ctx, base, member, method_call, hop, out_method);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -7812,6 +7853,9 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             if (d->is_abstract) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_ABSTRACT;
             }
+            if (d->is_async) {
+                rf.flags |= CBM_FUNC_FLAG_ASYNC;
+            }
             if (d->impl_trait) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
                 rf.impl_trait_qn =
@@ -8398,6 +8442,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             if (d->is_abstract) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_ABSTRACT;
             }
+            if (d->is_async) {
+                rf.flags |= CBM_FUNC_FLAG_ASYNC;
+            }
             if (d->trait_qn && d->trait_qn[0]) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
                 rf.impl_trait_qn =
@@ -8927,6 +8974,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].is_interface = defs[i].is_interface;
             rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
             rdefs[i].is_abstract = defs[i].is_abstract;
+            rdefs[i].is_async = defs[i].is_async;
         }
     }
     rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL, modtree);

@@ -227,6 +227,9 @@ typedef struct {
      * that declared this method.  Kept at the tail so zero-initialised
      * callers in every other language remain ABI/source compatible. */
     const char *impl_trait;
+    /* Rust only: declared `async fn`. Its recorded return type is the
+     * declared output, so `.await` on a call to it yields that type as is. */
+    bool is_async;
 } CBMDefinition;
 
 /* Argument captured from a call expression */

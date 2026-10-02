@@ -918,6 +918,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->trait_qn = src->impl_trait ? cbm_arena_strdup(arena, src->impl_trait) : NULL;
         dst->receiver_spelling = src->receiver ? cbm_arena_strdup(arena, src->receiver) : NULL;
         dst->is_abstract = src->is_abstract;
+        dst->is_async = src->is_async;
     }
     return 0;
 }
@@ -1900,6 +1901,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].is_interface = defs[i].is_interface;
         out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
         out[i].is_abstract = defs[i].is_abstract;
+        out[i].is_async = defs[i].is_async;
     }
     return out;
 }
