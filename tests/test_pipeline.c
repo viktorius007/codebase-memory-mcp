@@ -7356,6 +7356,80 @@ TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes) {
     PASS();
 }
 
+/* A method call on the value of a path call is typed from the target the call
+ * step published for that producer. The producers here live in a path
+ * dependency outside the workspace (`[lib] path`, a module below its root)
+ * and are imported by a test target under the dependency's crate name, which
+ * only the module tree resolves: `Type::f()` returning `Self`, `Type::f()?`
+ * returning `Result<Self, E>`, and an imported free function. */
+TEST(pipeline_rust_method_on_path_call_result_uses_published_producer) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_producer_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nmembers = [\"core\"]\n"
+                    "[workspace.dependencies]\nsupport = { path = \"core/tests/common\" }\n");
+    write_temp_file(tmp, "core/Cargo.toml",
+                    "[package]\nname = \"codex-core\"\nedition = \"2021\"\n"
+                    "[dev-dependencies]\nsupport = { workspace = true }\n");
+    /* write_temp_file creates one directory level: parents come first. */
+    write_temp_file(tmp, "core/src/lib.rs", "pub fn unused() {}\n");
+    write_temp_file(tmp, "core/tests/all.rs",
+                    "use support::factory::make_worker;\nuse support::Worker;\n"
+                    "fn assoc() -> u8 { let w = Worker::new(); w.run() }\n"
+                    "fn fallible() -> Result<u8, ()> { let w = Worker::open()?; Ok(w.run()) }\n"
+                    "fn imported() -> u8 { let w = make_worker(); w.run() }\n");
+    write_temp_file(tmp, "core/tests/common/Cargo.toml",
+                    "[package]\nname = \"support\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n");
+    write_temp_file(tmp, "core/tests/common/lib.rs",
+                    "pub mod factory;\n"
+                    "pub struct Worker;\n"
+                    "impl Worker {\n"
+                    "    pub fn new() -> Self { Worker }\n"
+                    "    pub fn open() -> Result<Self, ()> { Ok(Worker) }\n"
+                    "    pub fn run(&self) -> u8 { 1 }\n"
+                    "}\n");
+    write_temp_file(tmp, "core/tests/common/factory.rs",
+                    "use crate::Worker;\npub fn make_worker() -> Worker { Worker }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/producer.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int rc = cbm_pipeline_run(pipeline);
+    char p[256];
+    snprintf(p, sizeof(p), "%s", cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    static const char *const callers[] = {"assoc", "fallible", "imported"};
+    static const char *const producers[] = {"core.tests.common.lib.Worker.new",
+                                            "core.tests.common.lib.Worker.open",
+                                            "core.tests.common.factory.make_worker"};
+    bool producer_linked[3];
+    bool method_linked[3];
+    char src[512];
+    char dst[512];
+    for (int i = 0; i < 3; i++) {
+        snprintf(src, sizeof(src), "%s.core.tests.all.%s", p, callers[i]);
+        snprintf(dst, sizeof(dst), "%s.%s", p, producers[i]);
+        producer_linked[i] = exact_call_qns_exist(store, p, src, dst);
+        snprintf(dst, sizeof(dst), "%s.core.tests.common.lib.Worker.run", p);
+        method_linked[i] = exact_call_qns_exist(store, p, src, dst);
+    }
+    cbm_store_close(store);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc, 0);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(producer_linked[i]); /* control: the producer call itself links */
+    }
+    ASSERT_TRUE(method_linked[0]); /* `Type::new()` returning Self */
+    ASSERT_TRUE(method_linked[1]); /* `Type::open()?` returning Result<Self, E> */
+    ASSERT_TRUE(method_linked[2]); /* imported free fn returning a named type */
+    PASS();
+}
+
 TEST(pipeline_rust_path_module_super_resolves_from_declared_parent) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_path_module_XXXXXX");
@@ -17077,6 +17151,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
     RUN_TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes);
+    RUN_TEST(pipeline_rust_method_on_path_call_result_uses_published_producer);
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
     RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
     RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);
