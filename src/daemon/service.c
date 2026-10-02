@@ -319,6 +319,32 @@ static bool conflict_log_record(const cbm_daemon_conflict_t *conflict,
     return true;
 }
 
+/* Directory of the build-fingerprint memo; empty while disabled. Written only
+ * by the startup configure call, before any thread hashes. */
+static char g_fingerprint_memo_dir[DAEMON_SERVICE_PATH_CAP];
+static int64_t g_fingerprint_memo_settle_seconds = CBM_DAEMON_BUILD_FINGERPRINT_MEMO_SETTLE_SECONDS;
+
+bool cbm_daemon_build_fingerprint_memo_configure_settle(const char *cache_dir,
+                                                        int64_t settle_seconds) {
+    g_fingerprint_memo_dir[0] = '\0';
+    if (!cache_dir || !cache_dir[0] || settle_seconds < 0) {
+        return false;
+    }
+    int written = snprintf(g_fingerprint_memo_dir, sizeof(g_fingerprint_memo_dir),
+                           "%s/build-fingerprints", cache_dir);
+    if (written <= 0 || (size_t)written >= sizeof(g_fingerprint_memo_dir)) {
+        g_fingerprint_memo_dir[0] = '\0';
+        return false;
+    }
+    g_fingerprint_memo_settle_seconds = settle_seconds;
+    return true;
+}
+
+bool cbm_daemon_build_fingerprint_memo_configure(const char *cache_dir) {
+    return cbm_daemon_build_fingerprint_memo_configure_settle(
+        cache_dir, CBM_DAEMON_BUILD_FINGERPRINT_MEMO_SETTLE_SECONDS);
+}
+
 #ifndef _WIN32
 
 #include <fcntl.h>
@@ -355,6 +381,156 @@ static bool fd_regular(int fd, struct stat *status_out) {
     return true;
 }
 
+enum {
+    FINGERPRINT_MEMO_SLOTS = 64,
+    FINGERPRINT_MEMO_RECORD_CAP = 256,
+};
+
+static void fingerprint_memo_times(const struct stat *status, struct timespec *mtime,
+                                   struct timespec *ctime_out) {
+#ifdef __APPLE__
+    *mtime = status->st_mtimespec;
+    *ctime_out = status->st_ctimespec;
+#else
+    *mtime = status->st_mtim;
+    *ctime_out = status->st_ctim;
+#endif
+}
+
+/* The memo key: every field the kernel changes when the file's bytes can have
+ * changed. ctime is the load-bearing one — an unprivileged caller cannot set it. */
+static bool fingerprint_memo_key_same(const struct stat *first, const struct stat *second) {
+    struct timespec first_mtime;
+    struct timespec first_ctime;
+    struct timespec second_mtime;
+    struct timespec second_ctime;
+    fingerprint_memo_times(first, &first_mtime, &first_ctime);
+    fingerprint_memo_times(second, &second_mtime, &second_ctime);
+    return first->st_dev == second->st_dev && first->st_ino == second->st_ino &&
+           first->st_size == second->st_size && first_mtime.tv_sec == second_mtime.tv_sec &&
+           first_mtime.tv_nsec == second_mtime.tv_nsec &&
+           first_ctime.tv_sec == second_ctime.tv_sec && first_ctime.tv_nsec == second_ctime.tv_nsec;
+}
+
+/* The record is this key text followed by the 64-hex digest and a newline. */
+static bool fingerprint_memo_key_text(const struct stat *status, char *out, size_t out_size,
+                                      size_t *length_out) {
+    struct timespec mtime;
+    struct timespec ctime_value;
+    fingerprint_memo_times(status, &mtime, &ctime_value);
+    int written = snprintf(out, out_size,
+                           "cbm-build-fingerprint-memo-v1 dev=%llu ino=%llu size=%lld "
+                           "mtime=%lld.%09ld ctime=%lld.%09ld sha256=",
+                           (unsigned long long)status->st_dev, (unsigned long long)status->st_ino,
+                           (long long)status->st_size, (long long)mtime.tv_sec, (long)mtime.tv_nsec,
+                           (long long)ctime_value.tv_sec, (long)ctime_value.tv_nsec);
+    if (written <= 0 || (size_t)written >= out_size) {
+        return false;
+    }
+    *length_out = (size_t)written;
+    return true;
+}
+
+/* One slot per (device, inode): a file rewritten in place overwrites its own
+ * entry; a slot collision only costs a re-hash. */
+static bool fingerprint_memo_slot_path(const struct stat *status, const char *suffix, char *out,
+                                       size_t out_size) {
+    uint64_t mixed = (uint64_t)status->st_ino ^ ((uint64_t)status->st_dev * 0x9e3779b97f4a7c15ULL);
+    unsigned slot = (unsigned)(mixed % FINGERPRINT_MEMO_SLOTS);
+    int written = snprintf(out, out_size, "%s/slot-%02u%s", g_fingerprint_memo_dir, slot,
+                           suffix ? suffix : "");
+    return written > 0 && (size_t)written < out_size;
+}
+
+static bool fingerprint_memo_lookup(const struct stat *status,
+                                    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    char key[FINGERPRINT_MEMO_RECORD_CAP];
+    size_t key_length = 0;
+    char path[DAEMON_SERVICE_PATH_CAP + 16];
+    if (!g_fingerprint_memo_dir[0] ||
+        !fingerprint_memo_key_text(status, key, sizeof(key), &key_length) ||
+        !fingerprint_memo_slot_path(status, NULL, path, sizeof(path))) {
+        return false;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        return false;
+    }
+    char record[FINGERPRINT_MEMO_RECORD_CAP] = {0};
+    ssize_t count = -1;
+    if (fd_regular_current_user(fd, NULL)) {
+        do {
+            count = read(fd, record, sizeof(record));
+        } while (count < 0 && errno == EINTR);
+    }
+    (void)close(fd);
+    size_t expected = key_length + CBM_SHA256_HEX_LEN + 1U;
+    if (count < 0 || (size_t)count != expected || memcmp(record, key, key_length) != 0 ||
+        record[expected - 1U] != '\n') {
+        return false;
+    }
+    char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    memcpy(digest, record + key_length, CBM_SHA256_HEX_LEN);
+    digest[CBM_SHA256_HEX_LEN] = '\0';
+    if (!fingerprint_valid(digest)) {
+        return false;
+    }
+    memcpy(out, digest, CBM_DAEMON_BUILD_FINGERPRINT_SIZE);
+    return true;
+}
+
+static bool fingerprint_memo_directory_ready(void) {
+    if (mkdir(g_fingerprint_memo_dir, 0700) != 0 && errno != EEXIST) {
+        return false;
+    }
+    struct stat status;
+    return lstat(g_fingerprint_memo_dir, &status) == 0 && S_ISDIR(status.st_mode) &&
+           status.st_uid == geteuid() && (status.st_mode & 077) == 0;
+}
+
+/* Best effort: a failed record only means the next process hashes again. */
+static void fingerprint_memo_record(const struct stat *status,
+                                    const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    struct timespec mtime;
+    struct timespec ctime_value;
+    fingerprint_memo_times(status, &mtime, &ctime_value);
+    time_t now = time(NULL);
+    if (!g_fingerprint_memo_dir[0] || now == (time_t)-1 ||
+        (int64_t)ctime_value.tv_sec > (int64_t)now - g_fingerprint_memo_settle_seconds) {
+        return;
+    }
+    char record[FINGERPRINT_MEMO_RECORD_CAP];
+    size_t key_length = 0;
+    char suffix[32];
+    char temporary[DAEMON_SERVICE_PATH_CAP + 48];
+    char path[DAEMON_SERVICE_PATH_CAP + 16];
+    int suffix_written = snprintf(suffix, sizeof(suffix), ".%ld.tmp", (long)getpid());
+    if (!fingerprint_memo_key_text(status, record, sizeof(record), &key_length) ||
+        key_length + CBM_SHA256_HEX_LEN + 1U > sizeof(record) || suffix_written <= 0 ||
+        (size_t)suffix_written >= sizeof(suffix) ||
+        !fingerprint_memo_slot_path(status, NULL, path, sizeof(path)) ||
+        !fingerprint_memo_slot_path(status, suffix, temporary, sizeof(temporary)) ||
+        !fingerprint_memo_directory_ready()) {
+        return;
+    }
+    memcpy(record + key_length, digest, CBM_SHA256_HEX_LEN);
+    size_t length = key_length + CBM_SHA256_HEX_LEN;
+    record[length++] = '\n';
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        return;
+    }
+    ssize_t written = -1;
+    do {
+        written = write(fd, record, length);
+    } while (written < 0 && errno == EINTR);
+    bool ok = written == (ssize_t)length;
+    ok = close(fd) == 0 && ok;
+    if (!ok || rename(temporary, path) != 0) {
+        (void)unlink(temporary);
+    }
+}
+
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
                                               char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
     if (!out) {
@@ -368,6 +544,9 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     struct stat before;
     if (fd < 0 || !fd_regular(fd, &before) || before.st_size < 0) {
         return false;
+    }
+    if (fingerprint_memo_lookup(&before, out)) {
+        return true;
     }
 
     cbm_sha256_ctx context;
@@ -400,6 +579,9 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&context, digest);
     digest_to_hex(digest, out);
+    if (fingerprint_memo_key_same(&before, &after)) {
+        fingerprint_memo_record(&after, out);
+    }
     return true;
 }
 

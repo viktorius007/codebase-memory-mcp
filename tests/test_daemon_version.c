@@ -22,6 +22,7 @@
 #include <string.h>
 
 #ifndef _WIN32
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -242,6 +243,136 @@ TEST(daemon_build_fingerprint_hashes_exact_executable_bytes) {
     version_test_cleanup(dir, first_path, second_path, NULL);
     PASS();
 }
+
+#ifndef _WIN32
+/* Path of the single memo slot under memo_dir, or false when there is not
+ * exactly one. */
+static bool version_test_only_memo_slot(const char *memo_dir, char out[VERSION_TEST_PATH_CAP]) {
+    DIR *directory = opendir(memo_dir);
+    if (!directory) {
+        return false;
+    }
+    int slots = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strncmp(entry->d_name, "slot-", 5) == 0) {
+            slots++;
+            (void)version_test_child_path(out, memo_dir, entry->d_name);
+        }
+    }
+    (void)closedir(directory);
+    return slots == 1;
+}
+
+static bool version_test_overwrite_in_place(const char *path, const char *contents) {
+    FILE *file = cbm_fopen(path, "r+b");
+    if (!file) {
+        return false;
+    }
+    size_t length = strlen(contents);
+    bool wrote = fwrite(contents, 1, length, file) == length;
+    bool closed = fclose(file) == 0;
+    return wrote && closed;
+}
+
+static void version_test_memo_cleanup(const char *dir, const char *memo_dir, const char *slot,
+                                      const char *image, const char *reference) {
+    (void)cbm_daemon_build_fingerprint_memo_configure(NULL);
+    if (slot && slot[0]) {
+        (void)cbm_unlink(slot);
+    }
+    if (memo_dir && memo_dir[0]) {
+        (void)cbm_rmdir(memo_dir);
+    }
+    if (reference && reference[0]) {
+        (void)cbm_unlink(reference);
+    }
+    version_test_cleanup(dir, image, NULL, NULL);
+}
+
+/* The memo must be consulted (a planted digest is returned for the unchanged
+ * file) and must never outlive the bytes: the same path and inode rewritten
+ * in place with same-size different bytes is hashed again. */
+TEST(daemon_build_fingerprint_memo_misses_after_in_place_replacement) {
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char memo_dir[VERSION_TEST_PATH_CAP] = {0};
+    char slot[VERSION_TEST_PATH_CAP] = {0};
+    char image[VERSION_TEST_PATH_CAP] = {0};
+    char reference[VERSION_TEST_PATH_CAP] = {0};
+    char record[VERSION_TEST_FILE_CAP] = {0};
+    char original[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char memoized[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char replaced[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char replacement_bytes[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    struct stat before_replace;
+    struct stat after_replace;
+    /* Settle window 0: record immediately, so the planted entry is in place
+     * before the rewrite (production waits 2 s; see service.h). */
+    bool setup_ok = version_test_temp_dir(dir, "fingerprint-memo") &&
+                    version_test_child_path(image, dir, "image.bin") &&
+                    version_test_child_path(reference, dir, "reference.bin") &&
+                    version_test_child_path(memo_dir, dir, "build-fingerprints") &&
+                    version_test_write_file(image, "exact-build-bytes-AAAA") &&
+                    version_test_write_file(reference, "exact-build-bytes-BBBB") &&
+                    cbm_daemon_build_fingerprint_file(reference, replacement_bytes) &&
+                    cbm_daemon_build_fingerprint_memo_configure_settle(dir, 0);
+    bool first_ok = setup_ok && cbm_daemon_build_fingerprint_file(image, original);
+    bool recorded = first_ok && version_test_only_memo_slot(memo_dir, slot);
+    char *digest_field =
+        recorded && version_test_read_file(slot, record) ? strstr(record, " sha256=") : NULL;
+    bool planted = digest_field && strlen(digest_field) == strlen(" sha256=") + 64U + 1U;
+    if (planted) {
+        memset(digest_field + strlen(" sha256="), 'c', 64U);
+        planted = version_test_write_file(slot, record);
+    }
+    bool memo_hit = planted && cbm_daemon_build_fingerprint_file(image, memoized);
+    /* Let the clock move past the recorded ctime on coarse-tick filesystems. */
+    cbm_usleep(50000);
+    bool rewritten = memo_hit && stat(image, &before_replace) == 0 &&
+                     version_test_overwrite_in_place(image, "exact-build-bytes-BBBB") &&
+                     stat(image, &after_replace) == 0;
+    bool replaced_ok = rewritten && cbm_daemon_build_fingerprint_file(image, replaced);
+    version_test_memo_cleanup(dir, memo_dir, slot, image, reference);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(first_ok);
+    ASSERT_TRUE(recorded);
+    ASSERT_TRUE(planted);
+    ASSERT_TRUE(memo_hit);
+    ASSERT_STR_EQ(memoized, BUILD_C);
+    ASSERT_TRUE(rewritten);
+    ASSERT_EQ(before_replace.st_ino, after_replace.st_ino);
+    ASSERT_EQ(before_replace.st_size, after_replace.st_size);
+    ASSERT_TRUE(replaced_ok);
+    ASSERT_STR_EQ(replaced, replacement_bytes);
+    ASSERT_STR_NEQ(replaced, original);
+    PASS();
+}
+
+/* A file changed within the settle window is hashed but not memoized, so a
+ * second write in the same clock tick cannot hide behind the entry. */
+TEST(daemon_build_fingerprint_memo_skips_recently_changed_file) {
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char memo_dir[VERSION_TEST_PATH_CAP] = {0};
+    char slot[VERSION_TEST_PATH_CAP] = {0};
+    char image[VERSION_TEST_PATH_CAP] = {0};
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool setup_ok = version_test_temp_dir(dir, "fingerprint-settle") &&
+                    version_test_child_path(image, dir, "image.bin") &&
+                    version_test_child_path(memo_dir, dir, "build-fingerprints") &&
+                    version_test_write_file(image, "fresh-build-bytes") &&
+                    cbm_daemon_build_fingerprint_memo_configure(dir);
+    bool hashed = setup_ok && cbm_daemon_build_fingerprint_file(image, fingerprint);
+    bool memoized = version_test_only_memo_slot(memo_dir, slot);
+    version_test_memo_cleanup(dir, memo_dir, slot, image, NULL);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(hashed);
+    ASSERT_TRUE(version_test_is_sha256(fingerprint));
+    ASSERT_FALSE(memoized);
+    PASS();
+}
+#endif
 
 TEST(daemon_hello_accepts_only_the_exact_active_build_identity) {
     cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
@@ -611,6 +742,10 @@ TEST(daemon_conflict_log_windows_concurrent_appends_are_not_dropped) {
 SUITE(daemon_version) {
     RUN_TEST(daemon_rendezvous_key_is_stable_and_version_independent);
     RUN_TEST(daemon_build_fingerprint_hashes_exact_executable_bytes);
+#ifndef _WIN32
+    RUN_TEST(daemon_build_fingerprint_memo_misses_after_in_place_replacement);
+    RUN_TEST(daemon_build_fingerprint_memo_skips_recently_changed_file);
+#endif
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);

@@ -62,6 +62,18 @@ bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]);
 bool cbm_daemon_build_fingerprint_file(const char *path,
                                        char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
+/* Remember computed fingerprints under <cache_dir>/build-fingerprints so the
+ * next process of the same executable skips the whole-image hash. An entry is
+ * keyed by the hashed file's kernel identity: device, inode, size, mtime and
+ * ctime (nanoseconds). Any write, truncate, rename-over or metadata change
+ * gives the file a new ctime, which no unprivileged caller can set, so a
+ * replaced binary (also in place at the same path and inode) misses the memo
+ * and is hashed again. An entry is recorded only once its ctime is a few
+ * seconds old, so a write in the same coarse clock tick as the recorded state
+ * cannot follow it unnoticed. Call once during startup, before any thread
+ * hashes; NULL disables. POSIX only: Windows always hashes. */
+bool cbm_daemon_build_fingerprint_memo_configure(const char *cache_dir);
+
 cbm_daemon_hello_status_t cbm_daemon_hello_compare(const cbm_daemon_build_identity_t *active,
                                                    const cbm_daemon_build_identity_t *requested,
                                                    cbm_daemon_conflict_t *conflict_out);

@@ -1394,13 +1394,6 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
     if (!identity) {
         return MAIN_BUILD_IDENTITY_INVALID_OUTPUT;
     }
-    if (!cbm_index_supervisor_capture_build_fingerprint()) {
-        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
-    }
-    const char *fingerprint = cbm_index_supervisor_build_fingerprint();
-    if (!fingerprint) {
-        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
-    }
     const char *cache = cbm_resolve_cache_dir();
     char canonical_cache[MAIN_PATH_CAP];
     static char cache_fingerprint[CBM_SHA256_HEX_LEN + 1];
@@ -1435,6 +1428,17 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * while the process still advertises the old canonical root. */
     if (cbm_setenv("CBM_CACHE_DIR", canonical_cache, 1) != 0) {
         return MAIN_BUILD_IDENTITY_CACHE_ENVIRONMENT;
+    }
+    /* Every CLI, daemon and worker process hashes its own image here. The
+     * memo in the private cache root lets all but the first process of an
+     * unchanged binary skip that whole-image hash (see service.h). */
+    (void)cbm_daemon_build_fingerprint_memo_configure(canonical_cache);
+    if (!cbm_index_supervisor_capture_build_fingerprint()) {
+        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
+    }
+    const char *fingerprint = cbm_index_supervisor_build_fingerprint();
+    if (!fingerprint) {
+        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
     }
     cbm_sha256_hex(canonical_cache, strlen(canonical_cache), cache_fingerprint);
     *identity = (cbm_daemon_build_identity_t){

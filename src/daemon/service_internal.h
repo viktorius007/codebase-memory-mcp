@@ -21,6 +21,14 @@
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
                                               char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
+/* cbm_daemon_build_fingerprint_memo_configure with an explicit settle window:
+ * an entry is recorded only when the file's ctime is at least settle_seconds
+ * older than the wall clock. Production uses
+ * CBM_DAEMON_BUILD_FINGERPRINT_MEMO_SETTLE_SECONDS. */
+#define CBM_DAEMON_BUILD_FINGERPRINT_MEMO_SETTLE_SECONDS 2
+bool cbm_daemon_build_fingerprint_memo_configure_settle(const char *cache_dir,
+                                                        int64_t settle_seconds);
+
 typedef enum {
     CBM_DAEMON_CONFLICT_LOG_BEFORE_SERIALIZATION_LOCK = 1,
     CBM_DAEMON_CONFLICT_LOG_AFTER_SERIALIZATION_LOCK,
