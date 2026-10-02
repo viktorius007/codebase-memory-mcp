@@ -3,7 +3,8 @@
 # codex-rs corpus. Indexes the corpus into a private cache, runs the
 # tools/rust-audit scripts, prints a summary and leaves full output in out-dir.
 #
-#   scripts/rust-score.sh <binary> [out-dir]
+#   scripts/rust-score.sh <binary> [out-dir]   (reuse one out-dir under /tmp:
+#       each run is about 450 MB and replaces the previous index there)
 #   scripts/rust-score.sh --rescore <out-dir>   re-run the audit scripts on the
 #       graph tables an earlier run left in out-dir (no indexing)
 #
@@ -27,6 +28,10 @@ if [[ "${1:-}" == --rescore ]]; then
 else
     BIN="$1"; OUT="${2:-$(mktemp -d /tmp/cbm-score.XXXXXX)}"
     [[ -x "$BIN" ]] || { echo "binary not executable: $BIN" >&2; exit 2; }
+    # A reused out-dir must not keep its old index: an unchanged corpus is a
+    # no-op refresh, so a new binary would be scored on the old graph.
+    case "$OUT" in /tmp/*|/private/tmp/*) rm -rf "$OUT/cache" "$OUT/rt" ;;
+        *) [[ ! -e "$OUT/cache" ]] || { echo "out-dir outside /tmp already has an index: $OUT" >&2; exit 2; } ;; esac
     mkdir -p "$OUT/cache" "$OUT/rt"
     ln -sf "$BENCH/truth.tsv" "$BENCH/refs.tsv" "$OUT/"
     SECONDS=0
