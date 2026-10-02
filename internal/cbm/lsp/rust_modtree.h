@@ -1,0 +1,90 @@
+/* rust_modtree.h — Rust crate module tree and path name resolution.
+ *
+ * Rust module identity is declared, not inferred from file layout: each crate
+ * root grows a tree through `mod` declarations (out-of-line `mod x;` loading
+ * `x.rs` / `x/mod.rs` or a `#[path]` file, and inline `mod x { .. }`), and
+ * names enter a module through its items, `use` imports (named and glob) and
+ * `extern crate`. This layer builds that tree once per project from the
+ * crate roots Cargo declares and answers "what does path `a::b::f` name, as
+ * written in file F at byte B" by walking the tree and the `use` graph.
+ *
+ * Graph identities: an item declared in a module (inline or not) is
+ * published as `<file module QN>.<name>`, so a resolved function or type is
+ * reported by that QN; the caller verifies it against the registry.
+ *
+ * The tree is immutable after cbm_rust_modtree_finish(): resolution is
+ * read-only and safe to call from several threads. */
+#ifndef CBM_LSP_RUST_MODTREE_H
+#define CBM_LSP_RUST_MODTREE_H
+
+#include "../arena.h"
+#include "../cbm.h"
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef struct CBMRustModTree CBMRustModTree;
+
+/* The `#[path = "..."]` value attached to a `mod` item, "" for an empty
+ * literal, NULL when absent or not a plain string. */
+char *cbm_rust_path_attribute(CBMArena *arena, const char *source, TSNode mod_item);
+
+/* Supplies a file's source text. Returns a buffer the tree borrows until
+ * `release` is called with it, or NULL when the file cannot be read. */
+typedef struct {
+    const char *(*load)(void *ctx, int file_id, int *out_len);
+    void (*release)(void *ctx, int file_id, const char *source);
+    void *ctx;
+} CBMRustSourceLoader;
+
+typedef enum {
+    CBM_RUST_PATH_UNKNOWN = 0, /* the tree cannot decide; caller may try other evidence */
+    CBM_RUST_PATH_FUNCTION,    /* `qn` is a free function */
+    CBM_RUST_PATH_ASSOC,       /* `qn` is a type or trait; `assoc` is its associated item */
+    CBM_RUST_PATH_NOT_FUNCTION, /* proven to name no in-project function (variable, type,
+                                 * constant, variant, external crate item) */
+} CBMRustPathKind;
+
+typedef struct {
+    CBMRustPathKind kind;
+    const char *qn;    /* FUNCTION: function QN; ASSOC: type or trait QN */
+    const char *assoc; /* ASSOC: the associated item name */
+    bool is_trait;     /* ASSOC: `qn` is a trait */
+} CBMRustPathResult;
+
+CBMRustModTree *cbm_rust_modtree_new(void);
+void cbm_rust_modtree_free(CBMRustModTree *tree);
+
+/* Register a Rust source file. `rel_path` is '/'-separated and relative to
+ * the project root; `module_qn` is the file's graph module QN. Returns the
+ * file id used by the loader. */
+int cbm_rust_modtree_add_file(CBMRustModTree *tree, const char *rel_path, const char *module_qn);
+
+/* Register a crate root. `extern_name` is the name other crates use for it
+ * (NULL for targets nobody can depend on: binaries, tests, examples). The
+ * returned crate id receives extern-prelude entries below. */
+int cbm_rust_modtree_add_crate(CBMRustModTree *tree, const char *root_rel_path,
+                               const char *extern_name, bool edition_2015);
+
+/* Make `name` visible in `crate_id`'s extern prelude. `target_crate` is the
+ * library crate it names, or -1 for a crate outside the project. */
+void cbm_rust_modtree_add_extern(CBMRustModTree *tree, int crate_id, const char *name,
+                                 int target_crate);
+
+/* Build every crate's module tree and resolve every `use`. */
+void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustSourceLoader *loader);
+
+/* True when the file with this graph module QN belongs to at least one crate. */
+bool cbm_rust_modtree_has_file(const CBMRustModTree *tree, const char *module_qn);
+
+/* Resolve a call path (`f`, `a::b::f`, `crate::m::f`, `Type::f`) written at
+ * byte `offset` of the file whose graph module QN is `module_qn`. `extra_uses`
+ * are `use` bindings declared in enclosing blocks (local name, path text),
+ * innermost last. A file reached from several crates must resolve to the
+ * same identity in each, otherwise the result is UNKNOWN. Strings in the
+ * result live in `arena` or the tree. */
+CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena *arena,
+                                           const char *module_qn, uint32_t offset,
+                                           const char *path, const char *const *extra_names,
+                                           const char *const *extra_paths, int extra_count);
+
+#endif /* CBM_LSP_RUST_MODTREE_H */

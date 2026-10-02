@@ -122,8 +122,11 @@ static int skip_value(const char* s, int len, int from) {
         }
         return from;
     }
-    /* Bare value: skip to end of line. */
-    while (from < len && s[from] != '\n' && s[from] != '#') from++;
+    /* Bare value (`true`, `1`): ends at the line, or at the delimiter of the
+     * inline table or array holding it. */
+    while (from < len && s[from] != '\n' && s[from] != '#' && s[from] != ',' &&
+           s[from] != '}' && s[from] != ']')
+        from++;
     return from;
 }
 
@@ -344,6 +347,23 @@ static int parse_workspace_kv(CBMArena *a, const char *s, int len, int from,
     return from;
 }
 
+/* `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, their
+ * `[target.<cfg>.…]` forms, and `[workspace.dependencies]`. */
+static bool cargo_is_dependency_section(const char *section) {
+    static const char *const kinds[] = {"dependencies", "dev-dependencies", "build-dependencies"};
+    const char *tail = section;
+    if (strncmp(section, "target.", 7) == 0) {
+        tail = strrchr(section, '.');
+        tail = tail ? tail + 1 : section;
+    }
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        if (strcmp(tail, kinds[i]) == 0) {
+            return true;
+        }
+    }
+    return strcmp(section, "workspace.dependencies") == 0;
+}
+
 void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     CBMCargoManifest* out) {
     if (!arena || !src || !out) return;
@@ -389,10 +409,7 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
             from = parse_workspace_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "workspace.package") == 0) {
             from = parse_workspace_package_kv(arena, src, src_len, from, out);
-        } else if (strcmp(section, "dependencies") == 0 ||
-                   strcmp(section, "dev-dependencies") == 0 ||
-                   strcmp(section, "build-dependencies") == 0 ||
-                   strcmp(section, "workspace.dependencies") == 0) {
+        } else if (cargo_is_dependency_section(section)) {
             from = parse_dep_entry(arena, src, src_len, from, out);
         } else {
             /* Section we don't care about — skip the line. */

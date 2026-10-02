@@ -388,6 +388,8 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
  * at >= 98.7% site precision on the codex-rs corpus (2026-09-24, rust-analyzer
  * 1.98.1): exact registry hits for free functions, imports, workspace-member
  * paths, inherent/trait/deref method dispatch, constructors and UFCS paths.
+ * `lsp_module_path` is a free function named through the crate's declared
+ * module tree and `use` graph (rust_modtree.h).
  * Sole-impl trait UFCS (`Default::default()`) measured 63% and stays closed,
  * as do prelude guesses, macro carriers, bound dispatch and callable aliases.
  * Operator-trait dispatch (`a + b` on a user type) had no site on the corpus
@@ -398,7 +400,8 @@ static inline bool cbm_pipeline_rust_strategy_admitted(const char *strategy) {
            strcmp(strategy, "lsp_method_dispatch") == 0 ||
            strcmp(strategy, "lsp_trait_dispatch") == 0 ||
            strcmp(strategy, "lsp_deref_dispatch") == 0 ||
-           strcmp(strategy, "lsp_constructor") == 0 || strcmp(strategy, "lsp_ufcs") == 0;
+           strcmp(strategy, "lsp_constructor") == 0 || strcmp(strategy, "lsp_ufcs") == 0 ||
+           strcmp(strategy, "lsp_module_path") == 0;
 }
 
 /* Rust CALLS admission. Returns NULL when the site is published, otherwise the

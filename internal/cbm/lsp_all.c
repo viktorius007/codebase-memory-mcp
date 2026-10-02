@@ -26,6 +26,7 @@
 #include "lsp/generated/rust_stdlib_data.c"
 #include "lsp/generated/rust_crates_seed.c"
 #include "lsp/rust_cargo.c"
+#include "lsp/rust_modtree.c"
 #include "lsp/rust_proc_macros.c"
 #include "lsp/rust_rustdoc.c"
 #include "lsp/rust_lsp.c"

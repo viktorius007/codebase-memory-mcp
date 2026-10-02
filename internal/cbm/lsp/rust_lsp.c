@@ -97,18 +97,23 @@ void rust_lsp_add_use(RustLSPContext *ctx, const char *local_name, const char *m
             (const char **)cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(char *));
         const char **np =
             (const char **)cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(char *));
-        if (!nl || !np) {
+        const char **nr =
+            (const char **)cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(char *));
+        if (!nl || !np || !nr) {
             return;
         }
         if (ctx->use_local_names && ctx->use_count > 0) {
             memcpy(nl, ctx->use_local_names, ctx->use_count * sizeof(char *));
             memcpy(np, ctx->use_module_paths, ctx->use_count * sizeof(char *));
+            memcpy(nr, ctx->use_raw_paths, ctx->use_count * sizeof(char *));
         }
         ctx->use_local_names = nl;
         ctx->use_module_paths = np;
+        ctx->use_raw_paths = nr;
     }
     ctx->use_local_names[ctx->use_count] = cbm_arena_strdup(ctx->arena, local_name);
     ctx->use_module_paths[ctx->use_count] = cbm_arena_strdup(ctx->arena, module_path);
+    ctx->use_raw_paths[ctx->use_count] = ctx->use_module_paths[ctx->use_count];
     ctx->use_count++;
 }
 
@@ -5130,6 +5135,152 @@ static void rust_emit_unresolved_call(RustLSPContext *ctx, const char *expr_text
 /* Entry hook implementation: classify a call_expression and emit the best
  * edge we can. The wrapper below establishes the exact original occurrence
  * for every return path through this function. */
+/* UFCS form `T::method` / `Trait::method` for a path already resolved to
+ * `<type or trait QN>.<method>`. True when the call was settled (emitted or
+ * deliberately left open); false when no type or trait answers. */
+static bool rust_resolve_ufcs_path(RustLSPContext *ctx, const char *qn) {
+    const char *dot = strrchr(qn, '.');
+    if (dot) {
+        char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
+        const char *short_name = dot + 1;
+        /* If `head` is a trait, `Trait::method` UFCS resolves to the sole
+         * concrete impl (lsp_trait_ufcs), NEVER the trait's own abstract
+         * method that the inherent lookup below would find. Resolve the trait
+         * QN (head or module-qualified) via its is_interface flag — set at
+         * type-registration time, so it is reliable even on an early pass
+         * before impl links are wired. When the impl isn't known yet, emit
+         * nothing: a partial-pass lsp_ufcs to the abstract method would
+         * otherwise outrank (higher conf) the real trait_ufcs from the
+         * complete pass and win the join. */
+        const char *trait_qn = NULL;
+        const CBMRegisteredType *head_t = cbm_registry_lookup_type(ctx->registry, head);
+        if (!head_t) {
+            head_t = rust_lookup_type_variants(ctx, head);
+            if (head_t) {
+                head = cbm_arena_strdup(ctx->arena, head_t->qualified_name);
+            }
+        }
+        if (head_t && head_t->is_interface) {
+            trait_qn = head;
+        } else if (ctx->module_qn) {
+            const char *fh = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
+            const CBMRegisteredType *ft = cbm_registry_lookup_type(ctx->registry, fh);
+            if (ft && ft->is_interface)
+                trait_qn = fh;
+        }
+        if (trait_qn) {
+            int tn = 0;
+            const CBMRegisteredFunc *ti_m =
+                rust_find_sole_trait_impl(ctx, trait_qn, short_name, &tn);
+            if (tn == 1) {
+                rust_emit_resolved_call(
+                    ctx,
+                    ti_m ? ti_m->qualified_name
+                         : cbm_arena_sprintf(ctx->arena, "%s.%s", trait_qn, short_name),
+                    ti_m ? ti_m->impl_key : NULL, "lsp_trait_ufcs", CBM_RUST_CONF_TRAIT_SOLE);
+            }
+            return true;
+        }
+        const CBMRegisteredFunc *m =
+            cbm_registry_lookup_method_aliased(ctx->registry, head, short_name);
+        if (!m && ctx->module_qn) {
+            /* Fall back to module-qualified head: `Logger.new` →
+             * `<module>.Logger.new`. */
+            const char *full_head =
+                cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
+            m = cbm_registry_lookup_method_aliased(ctx->registry, full_head, short_name);
+        }
+        if (m) {
+            const CBMRegisteredFunc *unique = rust_registry_lookup_unique_method(
+                ctx->registry, m->receiver_type, m->short_name);
+            if (unique) {
+                rust_emit_resolved_call(ctx, unique->qualified_name, unique->impl_key,
+                                        strcmp(short_name, "new") == 0 ? "lsp_constructor"
+                                                                       : "lsp_ufcs",
+                                        CBM_RUST_CONF_UFCS);
+            }
+            return true;
+        }
+        /* Trait method through single-impl dispatch. */
+        int impls = 0;
+        const CBMRegisteredFunc *tm =
+            rust_resolve_trait_method(ctx, head, short_name, &impls, NULL);
+        if (!tm && ctx->module_qn) {
+            const char *full_head =
+                cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
+            tm = rust_resolve_trait_method(ctx, full_head, short_name, &impls, NULL);
+        }
+        if (tm && impls == 1) {
+            /* `Type::method()` names the receiver explicitly, so its sole
+             * trait implementation is exact; only a trait-headed path
+             * (`Trait::method()`) depends on inference and stays a guess. */
+            rust_emit_resolved_call(ctx, tm->qualified_name, tm->impl_key,
+                                    head_t && !head_t->is_interface ? "lsp_ufcs"
+                                                                    : "lsp_trait_ufcs",
+                                    CBM_RUST_CONF_TRAIT_SOLE);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Offset of `node` in the original file: identity in the root buffer,
+ * mapped for reparsed macro arguments, the invocation site inside a
+ * macro_rules! expansion. */
+static bool rust_original_offset(const RustLSPContext *ctx, TSNode node, uint32_t *out) {
+    uint32_t end = 0;
+    if (rust_map_source_range(ctx, ts_node_start_byte(node), ts_node_end_byte(node), out, &end)) {
+        return true;
+    }
+    if (ctx->macro_origin_valid) {
+        *out = ctx->macro_origin_byte;
+        return true;
+    }
+    return false;
+}
+
+/* Resolve a call path through the crate's declared module tree and `use`
+ * graph. True when the tree settled the call; false leaves it to the
+ * file-layout fallbacks (file outside every crate, undecidable name). */
+static bool rust_resolve_call_by_module_tree(RustLSPContext *ctx, TSNode callee, const char *path) {
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    uint32_t offset = 0;
+    if (!tree || !ctx->module_qn || ctx->glob_count > ctx->file_glob_count ||
+        !rust_original_offset(ctx, callee, &offset)) {
+        return false;
+    }
+    int block_uses = ctx->use_count > ctx->file_use_count ? ctx->use_count - ctx->file_use_count : 0;
+    CBMRustPathResult r =
+        cbm_rust_modtree_resolve(tree, ctx->arena, ctx->module_qn, offset, path,
+                                 block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
+                                 block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL,
+                                 block_uses);
+    switch (r.kind) {
+    case CBM_RUST_PATH_FUNCTION: {
+        RustQnMatch m = {0};
+        rust_qn_probe(ctx, r.qn, false, &m);
+        if (m.func && !m.func->receiver_type) {
+            rust_emit_resolved_call_reason(ctx, m.func->qualified_name, NULL, "lsp_module_path",
+                                           CBM_RUST_CONF_DIRECT, path);
+        } else {
+            rust_emit_unresolved_call(ctx, r.qn, "module_function_not_registered");
+        }
+        return true;
+    }
+    case CBM_RUST_PATH_ASSOC: {
+        const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", r.qn, r.assoc);
+        if (!rust_resolve_ufcs_path(ctx, qn)) {
+            rust_emit_unresolved_call(ctx, qn, "associated_item_not_registered");
+        }
+        return true;
+    }
+    case CBM_RUST_PATH_NOT_FUNCTION:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node) {
     TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
     TSNode args_node = ts_node_child_by_field_name(node, "arguments", 9);
@@ -5335,6 +5486,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             }
         }
 
+        if (rust_resolve_call_by_module_tree(ctx, actual_func, path))
+            return;
         const char *qn = rust_resolve_path_expr(ctx, path);
         if (!qn)
             return;
@@ -5358,89 +5511,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             }
         }
 
-        /* UFCS form: T::method or trait_qn::method. */
-        const char *dot = strrchr(qn, '.');
-        if (dot) {
-            char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
-            const char *short_name = dot + 1;
-            /* If `head` is a trait, `Trait::method` UFCS resolves to the sole
-             * concrete impl (lsp_trait_ufcs), NEVER the trait's own abstract
-             * method that the inherent lookup below would find. Resolve the trait
-             * QN (head or module-qualified) via its is_interface flag — set at
-             * type-registration time, so it is reliable even on an early pass
-             * before impl links are wired. When the impl isn't known yet, emit
-             * nothing: a partial-pass lsp_ufcs to the abstract method would
-             * otherwise outrank (higher conf) the real trait_ufcs from the
-             * complete pass and win the join. */
-            const char *trait_qn = NULL;
-            const CBMRegisteredType *head_t = cbm_registry_lookup_type(ctx->registry, head);
-            if (!head_t) {
-                head_t = rust_lookup_type_variants(ctx, head);
-                if (head_t) {
-                    head = cbm_arena_strdup(ctx->arena, head_t->qualified_name);
-                }
-            }
-            if (head_t && head_t->is_interface) {
-                trait_qn = head;
-            } else if (ctx->module_qn) {
-                const char *fh = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
-                const CBMRegisteredType *ft = cbm_registry_lookup_type(ctx->registry, fh);
-                if (ft && ft->is_interface)
-                    trait_qn = fh;
-            }
-            if (trait_qn) {
-                int tn = 0;
-                const CBMRegisteredFunc *ti_m =
-                    rust_find_sole_trait_impl(ctx, trait_qn, short_name, &tn);
-                if (tn == 1) {
-                    rust_emit_resolved_call(
-                        ctx,
-                        ti_m ? ti_m->qualified_name
-                             : cbm_arena_sprintf(ctx->arena, "%s.%s", trait_qn, short_name),
-                        ti_m ? ti_m->impl_key : NULL, "lsp_trait_ufcs", CBM_RUST_CONF_TRAIT_SOLE);
-                }
-                return;
-            }
-            const CBMRegisteredFunc *m =
-                cbm_registry_lookup_method_aliased(ctx->registry, head, short_name);
-            if (!m && ctx->module_qn) {
-                /* Fall back to module-qualified head: `Logger.new` →
-                 * `<module>.Logger.new`. */
-                const char *full_head =
-                    cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
-                m = cbm_registry_lookup_method_aliased(ctx->registry, full_head, short_name);
-            }
-            if (m) {
-                const CBMRegisteredFunc *unique = rust_registry_lookup_unique_method(
-                    ctx->registry, m->receiver_type, m->short_name);
-                if (unique) {
-                    rust_emit_resolved_call(ctx, unique->qualified_name, unique->impl_key,
-                                            strcmp(short_name, "new") == 0 ? "lsp_constructor"
-                                                                           : "lsp_ufcs",
-                                            CBM_RUST_CONF_UFCS);
-                }
-                return;
-            }
-            /* Trait method through single-impl dispatch. */
-            int impls = 0;
-            const CBMRegisteredFunc *tm =
-                rust_resolve_trait_method(ctx, head, short_name, &impls, NULL);
-            if (!tm && ctx->module_qn) {
-                const char *full_head =
-                    cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
-                tm = rust_resolve_trait_method(ctx, full_head, short_name, &impls, NULL);
-            }
-            if (tm && impls == 1) {
-                /* `Type::method()` names the receiver explicitly, so its sole
-                 * trait implementation is exact; only a trait-headed path
-                 * (`Trait::method()`) depends on inference and stays a guess. */
-                rust_emit_resolved_call(ctx, tm->qualified_name, tm->impl_key,
-                                        head_t && !head_t->is_interface ? "lsp_ufcs"
-                                                                        : "lsp_trait_ufcs",
-                                        CBM_RUST_CONF_TRAIT_SOLE);
-                return;
-            }
-        }
+        if (rust_resolve_ufcs_path(ctx, qn))
+            return;
 
         const char *workspace_path = path;
         if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
@@ -6525,7 +6597,11 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
                         strncmp(path, "crate::", 7) == 0) {
                         path = rust_resolve_path_expr(ctx, path);
                     }
+                    int before = ctx->use_count;
                     rust_lsp_add_use(ctx, imp->local_name, path);
+                    if (ctx->use_count > before) {
+                        ctx->use_raw_paths[before] = imp->module_path;
+                    }
                 }
             }
         }
@@ -7149,6 +7225,7 @@ void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, cons
 
     rust_collect_uses(&ctx, root);
     ctx.file_glob_count = ctx.glob_count;
+    ctx.file_use_count = ctx.use_count;
     rust_lsp_process_file(&ctx, root);
 }
 
@@ -7675,6 +7752,7 @@ static void rust_resolve_against_registry(
     /* Source bindings take precedence over heuristic graph import targets. */
     rust_collect_uses(&ctx, root);
     ctx.file_glob_count = ctx.glob_count;
+    ctx.file_use_count = ctx.use_count;
     rust_lsp_process_file(&ctx, root);
 }
 

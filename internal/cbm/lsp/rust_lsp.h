@@ -30,6 +30,7 @@
 #include "lsp_neg_memo.h"
 #include "../cbm.h"
 #include "go_lsp.h" // for CBMLSPDef (pipeline def), used by the Tier-2 builder
+#include "rust_modtree.h"
 
 /* Forward declaration — defined in rust_cargo.h. We keep it forward
  * here to avoid pulling rust_cargo.h into every consumer that only
@@ -74,7 +75,9 @@ typedef struct {
      * `crate::foo::Bar`). Glob imports go in `glob_module_qns` instead. */
     const char **use_local_names;
     const char **use_module_paths;
+    const char **use_raw_paths; /* the path as written, for module-tree resolution */
     int use_count;
+    int file_use_count; /* entries below this index are file-level, above are block `use`s */
 
     const char **glob_module_qns;
     int glob_count;
@@ -380,6 +383,9 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
 typedef struct CBMRustImportSource {
     const char *(*lookup)(void *ctx, const char *file_module_qn, const char *local_name);
     void *ctx;
+    /* The project's crate module tree; NULL when none was built. Path calls
+     * it settles take precedence over the file-layout fallbacks. */
+    const struct CBMRustModTree *modtree;
 } CBMRustImportSource;
 
 void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,

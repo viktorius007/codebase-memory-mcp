@@ -1,0 +1,1014 @@
+/* rust_modtree.c — Rust crate module tree and path name resolution.
+ * See rust_modtree.h for the contract. */
+#include "rust_modtree.h"
+#include "lsp_neg_memo.h"
+#include "../helpers.h"
+#include "../../../src/foundation/mem_core.h"
+#include <stdio.h>
+#include <string.h>
+
+extern const TSLanguage *tree_sitter_rust(void);
+
+enum {
+    RMT_NS_TYPE = 1,
+    RMT_NS_VALUE = 2,
+    RMT_NS_ALL = 3,
+    RMT_MAX_DEFS = 4,
+    RMT_MAX_SEGS = 32,
+    RMT_MAX_DEPTH = 48,
+    RMT_VISIT_MAX = 64,
+    RMT_KEY_MAX = 512,
+};
+
+typedef enum {
+    RMT_MODULE = 1,
+    RMT_FN,
+    RMT_TYPE,
+    RMT_TRAIT,
+    RMT_ENUM,
+    RMT_VALUE,
+    RMT_EXTERNAL, /* an item of a crate outside the project, or of the language */
+    RMT_OPAQUE,   /* declared but not modelled (an unloadable `mod x;`) */
+} RmtKind;
+
+typedef struct {
+    uint8_t kind;
+    uint8_t ns;
+    int32_t module;
+    const char *qn;
+} RmtDef;
+
+typedef struct {
+    int count;
+    bool open; /* some source of the name could not be decided */
+    RmtDef defs[RMT_MAX_DEFS];
+    const char *assoc; /* set when the path ends in an associated item of defs[0] */
+} RmtDefs;
+
+typedef struct {
+    int next;
+    int import; /* -1 for a declared item */
+    RmtDef def;
+} RmtEntry;
+
+typedef enum { RMT_IMPORT_PENDING = 0, RMT_IMPORT_ACTIVE, RMT_IMPORT_DONE } RmtImportState;
+
+typedef struct {
+    int module;
+    int next_glob;
+    const char **segs;
+    int seg_count;
+    bool glob;
+    uint8_t state;
+    RmtDefs result;
+} RmtImport;
+
+typedef struct {
+    int crate;
+    int parent;
+    int file;
+    int next_in_file;
+    int first_glob;
+    uint32_t start;
+    uint32_t end;
+    bool macro_items; /* item-position macro calls may declare unseen names */
+} RmtModule;
+
+typedef struct {
+    const char *root_rel;
+    const char *extern_name;
+    bool edition_2015;
+    int root_module;
+} RmtCrate;
+
+typedef struct {
+    const char *rel;
+    const char *qn;
+    const char *dir;
+    int first_module;
+} RmtFile;
+
+struct CBMRustModTree {
+    CBMArena arena;
+    RmtFile *files;
+    int file_count, file_cap;
+    RmtCrate *crates;
+    int crate_count, crate_cap;
+    RmtModule *modules;
+    int module_count, module_cap;
+    RmtEntry *entries;
+    int entry_count, entry_cap;
+    RmtImport *imports;
+    int import_count, import_cap;
+    CBMIdxMemo file_by_rel;
+    CBMIdxMemo file_by_qn;
+    CBMIdxMemo names;   /* "<module>\x1f<name>" -> first entry */
+    CBMIdxMemo externs; /* "<crate>\x1f<name>" -> target crate + 1, 0 = outside project */
+};
+
+typedef struct {
+    int items[RMT_VISIT_MAX];
+    int count;
+} RmtVisit;
+
+#define RMT_GROW(tree, field, count, cap)                                                         \
+    do {                                                                                          \
+        if ((tree)->count >= (tree)->cap) {                                                       \
+            int grown = (tree)->cap ? (tree)->cap * 2 : 64;                                       \
+            void *next = cbm_realloc(CBM_MEM_CLASS_OTHER, (tree)->field,                          \
+                                     (size_t)grown * sizeof(*(tree)->field));                     \
+            if (!next)                                                                            \
+                return -1;                                                                        \
+            (tree)->field = next;                                                                 \
+            (tree)->cap = grown;                                                                  \
+        }                                                                                         \
+    } while (0)
+
+/* ── Construction ─────────────────────────────────────────────────── */
+
+CBMRustModTree *cbm_rust_modtree_new(void) {
+    CBMRustModTree *tree = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*tree));
+    if (tree) {
+        cbm_arena_init(&tree->arena);
+    }
+    return tree;
+}
+
+void cbm_rust_modtree_free(CBMRustModTree *tree) {
+    if (!tree) {
+        return;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, tree->files);
+    cbm_free(CBM_MEM_CLASS_OTHER, tree->crates);
+    cbm_free(CBM_MEM_CLASS_OTHER, tree->modules);
+    cbm_free(CBM_MEM_CLASS_OTHER, tree->entries);
+    cbm_free(CBM_MEM_CLASS_OTHER, tree->imports);
+    cbm_arena_destroy(&tree->arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, tree);
+}
+
+static const char *rmt_dirname(CBMArena *arena, const char *rel) {
+    const char *slash = strrchr(rel, '/');
+    return slash ? cbm_arena_strndup(arena, rel, (size_t)(slash - rel)) : "";
+}
+
+int cbm_rust_modtree_add_file(CBMRustModTree *tree, const char *rel_path, const char *module_qn) {
+    if (!tree || !rel_path || !module_qn) {
+        return -1;
+    }
+    RMT_GROW(tree, files, file_count, file_cap);
+    int id = tree->file_count++;
+    RmtFile *file = &tree->files[id];
+    file->rel = cbm_arena_strdup(&tree->arena, rel_path);
+    file->qn = cbm_arena_strdup(&tree->arena, module_qn);
+    file->dir = rmt_dirname(&tree->arena, file->rel);
+    file->first_module = -1;
+    cbm_idxmemo_put_if_absent(&tree->file_by_rel, &tree->arena, file->rel, id);
+    cbm_idxmemo_put_if_absent(&tree->file_by_qn, &tree->arena, file->qn, id);
+    return id;
+}
+
+int cbm_rust_modtree_add_crate(CBMRustModTree *tree, const char *root_rel_path,
+                               const char *extern_name, bool edition_2015) {
+    if (!tree || !root_rel_path) {
+        return -1;
+    }
+    RMT_GROW(tree, crates, crate_count, crate_cap);
+    int id = tree->crate_count++;
+    tree->crates[id] = (RmtCrate){
+        .root_rel = cbm_arena_strdup(&tree->arena, root_rel_path),
+        .extern_name = extern_name ? cbm_arena_strdup(&tree->arena, extern_name) : NULL,
+        .edition_2015 = edition_2015,
+        .root_module = -1,
+    };
+    return id;
+}
+
+void cbm_rust_modtree_add_extern(CBMRustModTree *tree, int crate_id, const char *name,
+                                 int target_crate) {
+    if (!tree || crate_id < 0 || crate_id >= tree->crate_count || !name || !name[0]) {
+        return;
+    }
+    const char *key = cbm_arena_sprintf(&tree->arena, "%d\x1f%s", crate_id, name);
+    cbm_idxmemo_put_if_absent(&tree->externs, &tree->arena, key, target_crate + 1);
+}
+
+static int rmt_new_module(CBMRustModTree *tree, int crate, int parent, int file, uint32_t start,
+                          uint32_t end) {
+    RMT_GROW(tree, modules, module_count, module_cap);
+    int id = tree->module_count++;
+    tree->modules[id] = (RmtModule){.crate = crate,
+                                    .parent = parent,
+                                    .file = file,
+                                    .next_in_file = tree->files[file].first_module,
+                                    .first_glob = -1,
+                                    .start = start,
+                                    .end = end};
+    tree->files[file].first_module = id;
+    return id;
+}
+
+/* Chain a new entry behind the first one for `name`, keeping the memo's
+ * first-put slot as the chain head. */
+static int rmt_add_entry(CBMRustModTree *tree, int module, const char *name, RmtDef def,
+                         int import) {
+    RMT_GROW(tree, entries, entry_count, entry_cap);
+    int id = tree->entry_count++;
+    tree->entries[id] = (RmtEntry){.next = -1, .import = import, .def = def};
+    const char *key = cbm_arena_sprintf(&tree->arena, "%d\x1f%s", module, name);
+    int32_t head = cbm_idxmemo_get(&tree->names, key);
+    if (head < 0) {
+        cbm_idxmemo_put_if_absent(&tree->names, &tree->arena, key, id);
+    } else {
+        tree->entries[id].next = tree->entries[head].next;
+        tree->entries[head].next = id;
+    }
+    return id;
+}
+
+static void rmt_add_item(CBMRustModTree *tree, int module, const char *name, RmtKind kind,
+                         uint8_t ns, int target_module) {
+    const char *qn = NULL;
+    if (kind != RMT_MODULE && kind != RMT_OPAQUE) {
+        qn = cbm_arena_sprintf(&tree->arena, "%s.%s", tree->files[tree->modules[module].file].qn,
+                               name);
+    }
+    RmtDef def = {.kind = (uint8_t)kind, .ns = ns, .module = target_module, .qn = qn};
+    (void)rmt_add_entry(tree, module, name, def, -1);
+}
+
+/* Split `a::b::c` into segments; a leading `::` yields an empty first one. */
+static int rmt_split_path(CBMArena *arena, const char *path, const char **segs, int max) {
+    int count = 0;
+    const char *p = path;
+    while (*p == ' ') {
+        p++;
+    }
+    if (strncmp(p, "::", 2) == 0) {
+        segs[count++] = "";
+        p += 2;
+    }
+    while (*p && count < max) {
+        const char *sep = strstr(p, "::");
+        size_t len = sep ? (size_t)(sep - p) : strlen(p);
+        while (len > 0 && p[len - 1] == ' ') {
+            len--;
+        }
+        if (len == 0) {
+            return -1;
+        }
+        segs[count++] = cbm_arena_strndup(arena, p, len);
+        if (!sep) {
+            return count;
+        }
+        p = sep + 2;
+        while (*p == ' ') {
+            p++;
+        }
+    }
+    return *p ? -1 : count;
+}
+
+static int rmt_add_import(CBMRustModTree *tree, int module, const char *local, const char *path,
+                          bool glob) {
+    const char *segs[RMT_MAX_SEGS];
+    int count = rmt_split_path(&tree->arena, path, segs, RMT_MAX_SEGS);
+    if (count <= 0) {
+        return -1;
+    }
+    RMT_GROW(tree, imports, import_count, import_cap);
+    int id = tree->import_count++;
+    const char **owned = cbm_arena_alloc(&tree->arena, (size_t)count * sizeof(*owned));
+    if (!owned) {
+        tree->import_count--;
+        return -1;
+    }
+    memcpy(owned, segs, (size_t)count * sizeof(*owned));
+    tree->imports[id] = (RmtImport){
+        .module = module, .next_glob = -1, .segs = owned, .seg_count = count, .glob = glob};
+    if (glob) {
+        tree->imports[id].next_glob = tree->modules[module].first_glob;
+        tree->modules[module].first_glob = id;
+    } else {
+        RmtDef none = {0};
+        (void)rmt_add_entry(tree, module, local, none, id);
+    }
+    return id;
+}
+
+/* ── Source walk ──────────────────────────────────────────────────── */
+
+char *cbm_rust_path_attribute(CBMArena *arena, const char *source, TSNode mod_item) {
+    for (TSNode item = ts_node_prev_named_sibling(mod_item); !ts_node_is_null(item);
+         item = ts_node_prev_named_sibling(item)) {
+        if (strcmp(ts_node_type(item), "attribute_item") != 0) {
+            break;
+        }
+        TSNode attribute = cbm_find_child_by_kind(item, "attribute");
+        if (ts_node_is_null(attribute) || ts_node_named_child_count(attribute) < 2) {
+            continue;
+        }
+        TSNode name = ts_node_named_child(attribute, 0);
+        size_t name_length = ts_node_end_byte(name) - ts_node_start_byte(name);
+        if (name_length != 4 || memcmp(source + ts_node_start_byte(name), "path", 4) != 0) {
+            continue;
+        }
+        TSNode literal = ts_node_named_child(attribute, 1);
+        const char *literal_kind = ts_node_type(literal);
+        if (strcmp(literal_kind, "string_literal") != 0 &&
+            strcmp(literal_kind, "raw_string_literal") != 0) {
+            return NULL;
+        }
+        TSNode content = cbm_find_child_by_kind(literal, "string_content");
+        if (ts_node_is_null(content)) {
+            return cbm_arena_strdup(arena, "");
+        }
+        uint32_t start = ts_node_start_byte(content);
+        size_t length = ts_node_end_byte(content) - start;
+        if (strcmp(literal_kind, "string_literal") == 0 && memchr(source + start, '\\', length)) {
+            return NULL;
+        }
+        return cbm_arena_strndup(arena, source + start, length);
+    }
+    return NULL;
+}
+
+/* Join `dir` and a relative path, folding `.` and `..`. NULL when the path
+ * leaves the project root or is absolute. */
+static const char *rmt_join_path(CBMArena *arena, const char *dir, const char *rel) {
+    if (!rel || !rel[0] || rel[0] == '/' || rel[0] == '\\' || (rel[0] && rel[1] == ':')) {
+        return NULL;
+    }
+    const char *joined = dir[0] ? cbm_arena_sprintf(arena, "%s/%s", dir, rel) : rel;
+    size_t len = strlen(joined);
+    char *out = cbm_arena_alloc(arena, len + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t used = 0;
+    for (const char *p = joined; *p;) {
+        const char *end = p;
+        while (*end && *end != '/' && *end != '\\') {
+            end++;
+        }
+        size_t seg = (size_t)(end - p);
+        if (seg == 2 && p[0] == '.' && p[1] == '.') {
+            if (used == 0) {
+                return NULL;
+            }
+            while (used > 0 && out[used - 1] != '/') {
+                used--;
+            }
+            if (used > 0) {
+                used--;
+            }
+        } else if (seg > 0 && !(seg == 1 && p[0] == '.')) {
+            if (used > 0) {
+                out[used++] = '/';
+            }
+            memcpy(out + used, p, seg);
+            used += seg;
+        }
+        p = *end ? end + 1 : end;
+    }
+    out[used] = '\0';
+    return out;
+}
+
+static int rmt_file_id(const CBMRustModTree *tree, const char *rel) {
+    return rel ? cbm_idxmemo_get(&tree->file_by_rel, rel) : -1;
+}
+
+typedef struct {
+    CBMRustModTree *tree;
+    const CBMRustSourceLoader *loader;
+    int crate;
+    int file;
+    const char *source;
+} RmtWalk;
+
+static void rmt_load_module_file(RmtWalk *outer, int module, int file, const char *child_dir,
+                                 int depth);
+static void rmt_walk_items(RmtWalk *walk, TSNode container, int module, const char *child_dir,
+                           bool inline_scope, int depth);
+
+/* `mod name;` → the declared file: `#[path]` relative to the declaring
+ * file's directory (or the inline module's directory), else `name.rs` or
+ * `name/mod.rs` in the declaring module's child directory. */
+static int rmt_out_of_line_file(RmtWalk *walk, TSNode item, const char *name,
+                                const char *child_dir, bool inline_scope,
+                                const char **out_children_dir) {
+    CBMRustModTree *tree = walk->tree;
+    const char *attr = cbm_rust_path_attribute(&tree->arena, walk->source, item);
+    if (attr) {
+        const char *base = inline_scope ? child_dir : tree->files[walk->file].dir;
+        const char *target = rmt_join_path(&tree->arena, base, attr);
+        int file = rmt_file_id(tree, target);
+        if (file >= 0) {
+            *out_children_dir = tree->files[file].dir;
+        }
+        return file;
+    }
+    const char *flat_dir = child_dir[0] ? cbm_arena_sprintf(&tree->arena, "%s/", child_dir) : "";
+    int flat = rmt_file_id(tree, cbm_arena_sprintf(&tree->arena, "%s%s.rs", flat_dir, name));
+    int nested = rmt_file_id(tree, cbm_arena_sprintf(&tree->arena, "%s%s/mod.rs", flat_dir, name));
+    if ((flat >= 0) == (nested >= 0)) {
+        return -1;
+    }
+    *out_children_dir = cbm_arena_sprintf(&tree->arena, "%s%s", flat_dir, name);
+    return flat >= 0 ? flat : nested;
+}
+
+static void rmt_walk_mod(RmtWalk *walk, TSNode item, int module, const char *child_dir,
+                         bool inline_scope, int depth) {
+    CBMRustModTree *tree = walk->tree;
+    TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+    char *name = cbm_node_text(&tree->arena, name_node, walk->source);
+    TSNode body = ts_node_child_by_field_name(item, "body", 4);
+    const char *dir = child_dir[0] ? cbm_arena_sprintf(&tree->arena, "%s/%s", child_dir, name)
+                                   : cbm_arena_strdup(&tree->arena, name);
+    if (!ts_node_is_null(body)) {
+        int child = rmt_new_module(tree, walk->crate, module, walk->file, ts_node_start_byte(body),
+                                   ts_node_end_byte(body));
+        if (child < 0) {
+            return;
+        }
+        rmt_add_item(tree, module, name, RMT_MODULE, RMT_NS_TYPE, child);
+        rmt_walk_items(walk, body, child, dir, true, depth + 1);
+        return;
+    }
+    const char *children_dir = NULL;
+    int file = rmt_out_of_line_file(walk, item, name, child_dir, inline_scope, &children_dir);
+    if (file < 0 || depth >= RMT_MAX_DEPTH) {
+        rmt_add_item(tree, module, name, RMT_OPAQUE, RMT_NS_TYPE, -1);
+        return;
+    }
+    int child = rmt_new_module(tree, walk->crate, module, file, 0, UINT32_MAX);
+    if (child < 0) {
+        return;
+    }
+    rmt_add_item(tree, module, name, RMT_MODULE, RMT_NS_TYPE, child);
+    rmt_load_module_file(walk, child, file, children_dir, depth + 1);
+}
+
+static void rmt_walk_use(RmtWalk *walk, TSNode item, int module) {
+    CBMRustModTree *tree = walk->tree;
+    CBMImportArray imports = {0};
+    cbm_extract_rust_use_tree(&tree->arena, ts_node_child_by_field_name(item, "argument", 8),
+                              walk->source, &imports);
+    for (int i = 0; i < imports.count; i++) {
+        const CBMImport *imp = &imports.items[i];
+        if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, "_") == 0) {
+            continue;
+        }
+        if (strcmp(imp->local_name, "*") == 0) {
+            size_t len = strlen(imp->module_path);
+            if (len > 3) {
+                (void)rmt_add_import(tree, module, NULL,
+                                     cbm_arena_strndup(&tree->arena, imp->module_path, len - 3),
+                                     true);
+            }
+            continue;
+        }
+        (void)rmt_add_import(tree, module, imp->local_name, imp->module_path, false);
+    }
+}
+
+/* `extern crate name [as alias];` binds the alias to that crate's root. */
+static void rmt_walk_extern_crate(RmtWalk *walk, TSNode item, int module) {
+    CBMRustModTree *tree = walk->tree;
+    const char *name = NULL;
+    const char *alias = NULL;
+    uint32_t count = ts_node_named_child_count(item);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(item, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "identifier") != 0 && strcmp(kind, "self") != 0) {
+            continue;
+        }
+        const char *text = cbm_node_text(&tree->arena, child, walk->source);
+        if (!name) {
+            name = text;
+        } else {
+            alias = text;
+        }
+    }
+    if (!name) {
+        return;
+    }
+    const char *path = strcmp(name, "self") == 0 ? "crate" : cbm_arena_sprintf(&tree->arena, "::%s", name);
+    (void)rmt_add_import(tree, module, alias ? alias : name, path, false);
+}
+
+typedef struct {
+    const char *node_kind;
+    RmtKind kind;
+    uint8_t ns;
+} RmtItemKind;
+
+static const RmtItemKind RMT_ITEM_KINDS[] = {
+    {"function_item", RMT_FN, RMT_NS_VALUE},
+    {"struct_item", RMT_TYPE, RMT_NS_ALL},
+    {"union_item", RMT_TYPE, RMT_NS_TYPE},
+    {"enum_item", RMT_ENUM, RMT_NS_TYPE},
+    {"trait_item", RMT_TRAIT, RMT_NS_TYPE},
+    {"type_item", RMT_TYPE, RMT_NS_TYPE},
+    {"const_item", RMT_VALUE, RMT_NS_VALUE},
+    {"static_item", RMT_VALUE, RMT_NS_VALUE},
+};
+
+static void rmt_walk_item(RmtWalk *walk, TSNode item, int module, const char *child_dir,
+                          bool inline_scope, int depth) {
+    const char *kind = ts_node_type(item);
+    if (strcmp(kind, "mod_item") == 0) {
+        rmt_walk_mod(walk, item, module, child_dir, inline_scope, depth);
+    } else if (strcmp(kind, "use_declaration") == 0) {
+        rmt_walk_use(walk, item, module);
+    } else if (strcmp(kind, "extern_crate_declaration") == 0) {
+        rmt_walk_extern_crate(walk, item, module);
+    } else if (strcmp(kind, "macro_invocation") == 0) {
+        walk->tree->modules[module].macro_items = true;
+    } else {
+        for (size_t i = 0; i < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); i++) {
+            if (strcmp(kind, RMT_ITEM_KINDS[i].node_kind) != 0) {
+                continue;
+            }
+            TSNode name = ts_node_child_by_field_name(item, "name", 4);
+            if (!ts_node_is_null(name)) {
+                rmt_add_item(walk->tree, module,
+                             cbm_node_text(&walk->tree->arena, name, walk->source),
+                             RMT_ITEM_KINDS[i].kind, RMT_ITEM_KINDS[i].ns, -1);
+            }
+            return;
+        }
+    }
+}
+
+static void rmt_walk_items(RmtWalk *walk, TSNode container, int module, const char *child_dir,
+                           bool inline_scope, int depth) {
+    uint32_t count = ts_node_named_child_count(container);
+    for (uint32_t i = 0; i < count; i++) {
+        rmt_walk_item(walk, ts_node_named_child(container, i), module, child_dir, inline_scope,
+                      depth);
+    }
+}
+
+static void rmt_load_module_file(RmtWalk *outer, int module, int file, const char *child_dir,
+                                 int depth) {
+    int len = 0;
+    const char *source = outer->loader->load(outer->loader->ctx, file, &len);
+    if (!source) {
+        outer->tree->modules[module].macro_items = true;
+        return;
+    }
+    TSParser *parser = ts_parser_new();
+    TSTree *ts_tree = NULL;
+    if (parser && ts_parser_set_language(parser, tree_sitter_rust())) {
+        ts_tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)len);
+    }
+    if (ts_tree) {
+        RmtWalk walk = {.tree = outer->tree,
+                        .loader = outer->loader,
+                        .crate = outer->crate,
+                        .file = file,
+                        .source = source};
+        rmt_walk_items(&walk, ts_tree_root_node(ts_tree), module, child_dir, false, depth);
+        ts_tree_delete(ts_tree);
+    } else {
+        outer->tree->modules[module].macro_items = true;
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    if (outer->loader->release) {
+        outer->loader->release(outer->loader->ctx, file, source);
+    }
+}
+
+/* ── Name resolution ──────────────────────────────────────────────── */
+
+static bool rmt_same_def(const RmtDef *a, const RmtDef *b) {
+    if (a->kind != b->kind) {
+        return false;
+    }
+    if (a->kind == RMT_MODULE) {
+        return a->module == b->module;
+    }
+    if (!a->qn || !b->qn) {
+        return a->qn == b->qn;
+    }
+    return strcmp(a->qn, b->qn) == 0;
+}
+
+static void rmt_defs_add(RmtDefs *defs, const RmtDef *def) {
+    for (int i = 0; i < defs->count; i++) {
+        if (rmt_same_def(&defs->defs[i], def)) {
+            defs->defs[i].ns |= def->ns;
+            return;
+        }
+    }
+    if (defs->count >= RMT_MAX_DEFS) {
+        defs->open = true;
+        return;
+    }
+    defs->defs[defs->count++] = *def;
+}
+
+static void rmt_defs_merge(RmtDefs *into, const RmtDefs *from, uint8_t ns) {
+    into->open |= from->open;
+    for (int i = 0; i < from->count; i++) {
+        if (from->defs[i].ns & ns) {
+            rmt_defs_add(into, &from->defs[i]);
+        }
+    }
+}
+
+static void rmt_resolve_import(CBMRustModTree *tree, int import);
+static void rmt_resolve_path(CBMRustModTree *tree, int module, const char *const *segs, int count,
+                             uint8_t final_ns, bool is_use, RmtDefs *out, bool building);
+
+static bool rmt_visit(RmtVisit *visit, int module) {
+    for (int i = 0; i < visit->count; i++) {
+        if (visit->items[i] == module) {
+            return false;
+        }
+    }
+    if (visit->count >= RMT_VISIT_MAX) {
+        return false;
+    }
+    visit->items[visit->count++] = module;
+    return true;
+}
+
+static void rmt_import_defs(CBMRustModTree *tree, int import, bool building, uint8_t ns,
+                            RmtDefs *out) {
+    if (building) {
+        rmt_resolve_import(tree, import);
+    }
+    const RmtImport *imp = &tree->imports[import];
+    if (imp->state == RMT_IMPORT_ACTIVE) {
+        return; /* an import never names itself: `use tracing;` heads at the extern prelude */
+    }
+    if (imp->state != RMT_IMPORT_DONE) {
+        out->open = true;
+        return;
+    }
+    rmt_defs_merge(out, &imp->result, ns);
+}
+
+/* Names that come through `use path::*`: a module's own names, recursively. */
+static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns,
+                       RmtDefs *out, RmtVisit *visit, bool building);
+
+static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name, uint8_t ns,
+                             RmtDefs *out, RmtVisit *visit, bool building) {
+    for (int g = tree->modules[module].first_glob; g >= 0; g = tree->imports[g].next_glob) {
+        if (building) {
+            rmt_resolve_import(tree, g);
+        }
+        const RmtImport *imp = &tree->imports[g];
+        if (imp->state != RMT_IMPORT_DONE || imp->result.open || imp->result.count != 1) {
+            out->open = true;
+            continue;
+        }
+        const RmtDef *source = &imp->result.defs[0];
+        if (source->kind != RMT_MODULE) {
+            out->open = true; /* enum variants, external modules: not modelled */
+            continue;
+        }
+        RmtDefs found = {0};
+        rmt_lookup(tree, source->module, name, ns, &found, visit, building);
+        rmt_defs_merge(out, &found, ns);
+    }
+}
+
+static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns,
+                       RmtDefs *out, RmtVisit *visit, bool building) {
+    char key[RMT_KEY_MAX];
+    int written = snprintf(key, sizeof(key), "%d\x1f%s", module, name);
+    if (written < 0 || written >= (int)sizeof(key)) {
+        out->open = true;
+        return;
+    }
+    for (int e = cbm_idxmemo_get(&tree->names, key); e >= 0; e = tree->entries[e].next) {
+        const RmtEntry *entry = &tree->entries[e];
+        if (entry->import >= 0) {
+            rmt_import_defs(tree, entry->import, building, ns, out);
+        } else if (entry->def.ns & ns) {
+            rmt_defs_add(out, &entry->def);
+        }
+    }
+    if (out->count > 0 || out->open || !rmt_visit(visit, module)) {
+        return;
+    }
+    rmt_lookup_globs(tree, module, name, ns, out, visit, building);
+    if (out->count == 0 && tree->modules[module].macro_items) {
+        out->open = true;
+    }
+}
+
+static void rmt_resolve_import(CBMRustModTree *tree, int import) {
+    RmtImport *imp = &tree->imports[import];
+    if (imp->state != RMT_IMPORT_PENDING) {
+        return;
+    }
+    imp->state = RMT_IMPORT_ACTIVE;
+    RmtDefs result = {0};
+    rmt_resolve_path(tree, imp->module, imp->segs, imp->seg_count,
+                     imp->glob ? RMT_NS_TYPE : RMT_NS_ALL, true, &result, true);
+    imp = &tree->imports[import];
+    if (result.assoc) {
+        result = (RmtDefs){.open = true};
+    }
+    imp->result = result;
+    imp->state = RMT_IMPORT_DONE;
+}
+
+static const char *const RMT_LANGUAGE_CRATES[] = {"std", "core", "alloc", "proc_macro", "test",
+                                                  NULL};
+
+/* Names every module sees through the standard prelude or as primitive
+ * types; a path headed by one names no project item unless shadowed. */
+static const char *const RMT_PRELUDE[] = {
+    "Some", "None", "Ok", "Err", "Option", "Result", "Vec", "String", "Box", "ToString",
+    "ToOwned", "Clone", "Copy", "Default", "Drop", "Eq", "PartialEq", "Ord", "PartialOrd",
+    "Fn", "FnMut", "FnOnce", "From", "Into", "TryFrom", "TryInto", "AsRef", "AsMut",
+    "Iterator", "IntoIterator", "Extend", "Send", "Sync", "Sized", "Unpin", "drop",
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+    "f32", "f64", "bool", "char", "str", NULL};
+
+static bool rmt_in_list(const char *const *list, const char *name) {
+    for (const char *const *p = list; *p; p++) {
+        if (strcmp(*p, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rmt_extern_prelude(const CBMRustModTree *tree, int crate, const char *name,
+                               RmtDef *out) {
+    char key[RMT_KEY_MAX];
+    int written = snprintf(key, sizeof(key), "%d\x1f%s", crate, name);
+    int32_t target = written > 0 && written < (int)sizeof(key)
+                         ? cbm_idxmemo_get(&tree->externs, key)
+                         : -1;
+    if (target > 0 && tree->crates[target - 1].root_module >= 0) {
+        *out = (RmtDef){.kind = RMT_MODULE,
+                        .ns = RMT_NS_TYPE,
+                        .module = tree->crates[target - 1].root_module};
+        return true;
+    }
+    if (target == 0 || rmt_in_list(RMT_LANGUAGE_CRATES, name)) {
+        *out = (RmtDef){.kind = RMT_EXTERNAL, .ns = RMT_NS_ALL, .module = -1};
+        return true;
+    }
+    return false;
+}
+
+static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head, uint8_t ns,
+                             bool is_use, RmtDefs *out, bool building) {
+    int crate = tree->modules[module].crate;
+    RmtVisit visit = {.count = 0};
+    int scope = is_use && tree->crates[crate].edition_2015 ? tree->crates[crate].root_module
+                                                           : module;
+    rmt_lookup(tree, scope, head, ns, out, &visit, building);
+    if (out->count > 0 || out->open) {
+        return;
+    }
+    RmtDef def = {.kind = RMT_EXTERNAL, .ns = RMT_NS_ALL, .module = -1};
+    if (((ns & RMT_NS_TYPE) && rmt_extern_prelude(tree, crate, head, &def)) ||
+        rmt_in_list(RMT_PRELUDE, head)) {
+        rmt_defs_add(out, &def);
+    }
+}
+
+/* Resolve the keyword or name heading a path; returns the index of the
+ * first segment still to walk, or -1 when the head is unresolvable. */
+static int rmt_start(CBMRustModTree *tree, int module, const char *const *segs, int count,
+                     uint8_t final_ns, bool is_use, RmtDefs *cur, bool building) {
+    const char *head = segs[0];
+    int crate = tree->modules[module].crate;
+    if (head[0] == '\0') {
+        RmtDef def;
+        if (count < 2 || !rmt_extern_prelude(tree, crate, segs[1], &def)) {
+            return -1;
+        }
+        rmt_defs_add(cur, &def);
+        return 2;
+    }
+    if (strcmp(head, "crate") == 0 || strcmp(head, "self") == 0 || strcmp(head, "super") == 0) {
+        int target = strcmp(head, "crate") == 0 ? tree->crates[crate].root_module : module;
+        int i = strcmp(head, "super") == 0 ? 0 : 1;
+        for (; i < count && strcmp(segs[i], "super") == 0 && target >= 0; i++) {
+            target = tree->modules[target].parent;
+        }
+        if (target < 0) {
+            return -1;
+        }
+        RmtDef def = {.kind = RMT_MODULE, .ns = RMT_NS_TYPE, .module = target};
+        rmt_defs_add(cur, &def);
+        return i;
+    }
+    if (strcmp(head, "Self") == 0) {
+        cur->open = true;
+        return -1;
+    }
+    rmt_resolve_head(tree, module, head, count == 1 ? final_ns : RMT_NS_TYPE, is_use, cur,
+                     building);
+    return 1;
+}
+
+static void rmt_resolve_path(CBMRustModTree *tree, int module, const char *const *segs, int count,
+                             uint8_t final_ns, bool is_use, RmtDefs *out, bool building) {
+    RmtDefs cur = {0};
+    int i = rmt_start(tree, module, segs, count, final_ns, is_use, &cur, building);
+    if (i < 0) {
+        out->open = true;
+        return;
+    }
+    for (; i < count; i++) {
+        if (cur.open || cur.count != 1) {
+            out->open = true;
+            return;
+        }
+        RmtDef def = cur.defs[0];
+        bool last = i == count - 1;
+        if (def.kind == RMT_EXTERNAL) {
+            break;
+        }
+        if (def.kind == RMT_TYPE || def.kind == RMT_TRAIT || def.kind == RMT_ENUM) {
+            if (!last) {
+                out->open = true;
+                return;
+            }
+            rmt_defs_add(out, &def);
+            out->assoc = segs[i];
+            return;
+        }
+        if (def.kind != RMT_MODULE) {
+            out->open = true;
+            return;
+        }
+        RmtVisit visit = {.count = 0};
+        cur = (RmtDefs){0};
+        rmt_lookup(tree, def.module, segs[i], last ? final_ns : RMT_NS_TYPE, &cur, &visit,
+                   building);
+        if (cur.count == 0 && !cur.open) {
+            out->open = true;
+            return;
+        }
+    }
+    rmt_defs_merge(out, &cur, RMT_NS_ALL);
+}
+
+void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustSourceLoader *loader) {
+    if (!tree || !loader || !loader->load) {
+        return;
+    }
+    for (int c = 0; c < tree->crate_count; c++) {
+        int file = rmt_file_id(tree, tree->crates[c].root_rel);
+        if (file < 0) {
+            continue;
+        }
+        int root = rmt_new_module(tree, c, -1, file, 0, UINT32_MAX);
+        if (root < 0) {
+            return;
+        }
+        tree->crates[c].root_module = root;
+        RmtWalk walk = {.tree = tree, .loader = loader, .crate = c, .file = file};
+        rmt_load_module_file(&walk, root, file, tree->files[file].dir, 0);
+    }
+    for (int i = 0; i < tree->import_count; i++) {
+        rmt_resolve_import(tree, i);
+    }
+}
+
+/* ── Queries ──────────────────────────────────────────────────────── */
+
+bool cbm_rust_modtree_has_file(const CBMRustModTree *tree, const char *module_qn) {
+    if (!tree || !module_qn) {
+        return false;
+    }
+    int file = cbm_idxmemo_get(&tree->file_by_qn, module_qn);
+    return file >= 0 && tree->files[file].first_module >= 0;
+}
+
+static bool rmt_is_ancestor(const CBMRustModTree *tree, int ancestor, int module) {
+    for (int m = tree->modules[module].parent; m >= 0; m = tree->modules[m].parent) {
+        if (m == ancestor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rmt_contains(const RmtModule *module, uint32_t offset) {
+    return module->start <= offset && offset < module->end;
+}
+
+/* True when no other module of the file at `offset` nests inside `module`. */
+static bool rmt_innermost(const CBMRustModTree *tree, int file, int module, uint32_t offset) {
+    for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
+        if (m != module && rmt_contains(&tree->modules[m], offset) &&
+            rmt_is_ancestor(tree, module, m)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static CBMRustPathResult rmt_classify(const RmtDefs *defs) {
+    CBMRustPathResult unknown = {.kind = CBM_RUST_PATH_UNKNOWN};
+    if (defs->open || defs->count == 0) {
+        return unknown;
+    }
+    if (defs->assoc) {
+        const RmtDef *owner = &defs->defs[0];
+        return (CBMRustPathResult){.kind = CBM_RUST_PATH_ASSOC,
+                                   .qn = owner->qn,
+                                   .assoc = defs->assoc,
+                                   .is_trait = owner->kind == RMT_TRAIT};
+    }
+    if (defs->count != 1) {
+        return unknown;
+    }
+    const RmtDef *def = &defs->defs[0];
+    if (def->kind == RMT_OPAQUE) {
+        return unknown;
+    }
+    if (def->kind == RMT_FN) {
+        return (CBMRustPathResult){.kind = CBM_RUST_PATH_FUNCTION, .qn = def->qn};
+    }
+    return (CBMRustPathResult){.kind = CBM_RUST_PATH_NOT_FUNCTION};
+}
+
+static bool rmt_same_result(const CBMRustPathResult *a, const CBMRustPathResult *b) {
+    if (a->kind != b->kind || a->is_trait != b->is_trait) {
+        return false;
+    }
+    bool same_qn = (!a->qn && !b->qn) || (a->qn && b->qn && strcmp(a->qn, b->qn) == 0);
+    bool same_assoc =
+        (!a->assoc && !b->assoc) || (a->assoc && b->assoc && strcmp(a->assoc, b->assoc) == 0);
+    return same_qn && same_assoc;
+}
+
+/* Replace a head bound by an enclosing block's `use` with that use's path. */
+static int rmt_apply_block_uses(CBMArena *arena, const char **segs, int count,
+                                const char *const *names, const char *const *paths, int extra) {
+    for (int i = extra - 1; i >= 0; i--) {
+        if (!names[i] || !paths[i] || strcmp(names[i], segs[0]) != 0) {
+            continue;
+        }
+        const char *head[RMT_MAX_SEGS];
+        int head_count = rmt_split_path(arena, paths[i], head, RMT_MAX_SEGS);
+        if (head_count <= 0 || head_count + count - 1 > RMT_MAX_SEGS) {
+            return -1;
+        }
+        memmove(segs + head_count, segs + 1, (size_t)(count - 1) * sizeof(*segs));
+        memcpy(segs, head, (size_t)head_count * sizeof(*segs));
+        return head_count + count - 1;
+    }
+    return count;
+}
+
+CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena *arena,
+                                           const char *module_qn, uint32_t offset,
+                                           const char *path, const char *const *extra_names,
+                                           const char *const *extra_paths, int extra_count) {
+    CBMRustPathResult unknown = {.kind = CBM_RUST_PATH_UNKNOWN};
+    if (!tree || !arena || !module_qn || !path || path[0] == '<') {
+        return unknown;
+    }
+    int file = cbm_idxmemo_get(&tree->file_by_qn, module_qn);
+    const char *segs[RMT_MAX_SEGS];
+    int count = file >= 0 ? rmt_split_path(arena, path, segs, RMT_MAX_SEGS) : -1;
+    if (count > 0) {
+        count = rmt_apply_block_uses(arena, segs, count, extra_names, extra_paths, extra_count);
+    }
+    if (count <= 0) {
+        return unknown;
+    }
+    CBMRustPathResult agreed = unknown;
+    bool any = false;
+    /* Queries never resolve an import (all are DONE after finish), so the
+     * shared tree is only read here. */
+    CBMRustModTree *readonly = (CBMRustModTree *)tree;
+    for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
+        if (!rmt_contains(&tree->modules[m], offset) || !rmt_innermost(tree, file, m, offset)) {
+            continue;
+        }
+        RmtDefs defs = {0};
+        rmt_resolve_path(readonly, m, segs, count, RMT_NS_VALUE, false, &defs, false);
+        CBMRustPathResult result = rmt_classify(&defs);
+        if (result.kind == CBM_RUST_PATH_UNKNOWN || (any && !rmt_same_result(&agreed, &result))) {
+            return unknown;
+        }
+        agreed = result;
+        any = true;
+    }
+    return agreed;
+}

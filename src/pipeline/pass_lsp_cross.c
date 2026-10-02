@@ -105,41 +105,6 @@ static char *pxc_read_file(const char *path, int *out_len) {
     return buf;
 }
 
-static char *pxc_rust_path_attribute(CBMArena *arena, const char *source, TSNode mod_item) {
-    for (TSNode item = ts_node_prev_named_sibling(mod_item); !ts_node_is_null(item);
-         item = ts_node_prev_named_sibling(item)) {
-        if (strcmp(ts_node_type(item), "attribute_item") != 0) {
-            break;
-        }
-        TSNode attribute = cbm_find_child_by_kind(item, "attribute");
-        if (ts_node_is_null(attribute) || ts_node_named_child_count(attribute) < 2) {
-            continue;
-        }
-        TSNode name = ts_node_named_child(attribute, 0);
-        size_t name_length = ts_node_end_byte(name) - ts_node_start_byte(name);
-        if (name_length != 4 || memcmp(source + ts_node_start_byte(name), "path", 4) != 0) {
-            continue;
-        }
-        TSNode literal = ts_node_named_child(attribute, 1);
-        const char *literal_kind = ts_node_type(literal);
-        if (strcmp(literal_kind, "string_literal") != 0 &&
-            strcmp(literal_kind, "raw_string_literal") != 0) {
-            return NULL;
-        }
-        TSNode content = cbm_find_child_by_kind(literal, "string_content");
-        if (ts_node_is_null(content)) {
-            return cbm_arena_strdup(arena, "");
-        }
-        uint32_t start = ts_node_start_byte(content);
-        size_t length = ts_node_end_byte(content) - start;
-        if (strcmp(literal_kind, "string_literal") == 0 && memchr(source + start, '\\', length)) {
-            return NULL;
-        }
-        return cbm_arena_strndup(arena, source + start, length);
-    }
-    return NULL;
-}
-
 /* Canonical path of a Rust file in scope → the first scope index carrying it.
  * The record owns its key so one free per value releases the table. */
 typedef struct {
@@ -298,7 +263,7 @@ static bool pxc_rust_file_path_facts(CBMArena *arena, const CBMFileResult *cache
                 out->inline_scope = true;
                 continue;
             }
-            char *path = pxc_rust_path_attribute(arena, source, item);
+            char *path = cbm_rust_path_attribute(arena, source, item);
             TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
             char *name = path && !ts_node_is_null(name_node)
                              ? cbm_node_text(arena, name_node, source)
@@ -1500,7 +1465,9 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
      * preventing the stale local result from out-ranking manifest evidence. */
     for (int j = 0; j < src_out->count; j++) {
         const CBMResolvedCall *src = &src_out->items[j];
-        if (!src->strategy || strcmp(src->strategy, "lsp_cross_crate") != 0 || !src->caller_qn ||
+        bool supersedes = src->strategy && (strcmp(src->strategy, "lsp_cross_crate") == 0 ||
+                                            strcmp(src->strategy, "lsp_module_path") == 0);
+        if (!supersedes || !src->caller_qn ||
             !src->callee_qn || src->site_end_byte <= src->site_start_byte) {
             continue;
         }
@@ -1887,13 +1854,14 @@ static const char *pxc_rust_import_lookup(void *table, const char *module_qn,
 
 static _Thread_local CBMRustImportSource g_pxc_rust_imports = {0};
 
-void cbm_pxc_set_rust_imports(const CBMHashTable *imports) {
+void cbm_pxc_set_rust_imports(const CBMHashTable *imports, const CBMRustModTree *modtree) {
     g_pxc_rust_imports.lookup = imports ? pxc_rust_import_lookup : NULL;
     g_pxc_rust_imports.ctx = (void *)imports;
+    g_pxc_rust_imports.modtree = modtree;
 }
 
 const CBMRustImportSource *cbm_pxc_get_rust_import_source(void) {
-    return g_pxc_rust_imports.lookup ? &g_pxc_rust_imports : NULL;
+    return g_pxc_rust_imports.lookup || g_pxc_rust_imports.modtree ? &g_pxc_rust_imports : NULL;
 }
 
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void) {
@@ -2417,6 +2385,315 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     return true;
 }
 
+/* ── Rust crate graph → module tree ──────────────────────────────────
+ * Every package Cargo can build from this repository — the root package,
+ * workspace members and the path dependencies they reach — contributes its
+ * targets as crate roots; each crate's extern prelude holds its declared
+ * dependencies (a path dependency names the in-project library crate) and,
+ * for non-library targets, the package's own library. */
+
+typedef struct {
+    const char *dir; /* package directory relative to the repository root, "" for the root */
+    CBMCargoManifest *manifest;
+    int lib_crate;
+    int first_crate; /* targets are crates [first_crate, first_crate + crate_count) */
+    int crate_count;
+} PXCRustPackage;
+
+typedef struct {
+    CBMArena *arena;
+    const cbm_pipeline_ctx_t *ctx;
+    const cbm_file_info_t *files;
+    int file_count;
+    PXCRustPackage *packages;
+    int package_count;
+    int package_cap;
+    const CBMCargoManifest *root;
+} PXCRustCrates;
+
+/* Join a package-relative path onto a repository-relative directory,
+ * folding `.` and `..` segments. */
+static const char *pxc_rel_join(CBMArena *arena, const char *dir, const char *rel) {
+    while (strncmp(rel, "./", 2) == 0) {
+        rel += 2;
+    }
+    char *out = dir[0] ? cbm_arena_sprintf(arena, "%s/%s", dir, rel) : cbm_arena_strdup(arena, rel);
+    size_t used = 0;
+    for (char *p = out; *p;) {
+        char *end = strchr(p, '/');
+        size_t seg = end ? (size_t)(end - p) : strlen(p);
+        if (seg == 2 && p[0] == '.' && p[1] == '.') {
+            while (used > 0 && out[used - 1] != '/') {
+                used--;
+            }
+            if (used > 0) {
+                used--;
+            }
+        } else if (seg > 0 && !(seg == 1 && p[0] == '.')) {
+            if (used > 0) {
+                out[used++] = '/';
+            }
+            memmove(out + used, p, seg);
+            used += seg;
+        }
+        p = end ? end + 1 : p + seg;
+    }
+    out[used] = '\0';
+    return out;
+}
+
+static int pxc_rust_package_index(const PXCRustCrates *crates, const char *dir) {
+    for (int i = 0; i < crates->package_count; i++) {
+        if (strcmp(crates->packages[i].dir, dir) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Parse `<dir>/Cargo.toml` and append it as a package; -1 when absent or
+ * not a package manifest. */
+static int pxc_rust_add_package(PXCRustCrates *crates, const char *dir) {
+    int existing = pxc_rust_package_index(crates, dir);
+    if (existing >= 0) {
+        return existing;
+    }
+    char path[CBM_SZ_4K];
+    int n = snprintf(path, sizeof(path), "%s%s%s/Cargo.toml", crates->ctx->repo_path,
+                     dir[0] ? "/" : "", dir);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    int len = 0;
+    char *toml = pxc_read_file(path, &len);
+    if (!toml) {
+        return -1;
+    }
+    CBMCargoManifest *manifest = cbm_arena_calloc(crates->arena, sizeof(*manifest));
+    if (manifest) {
+        cbm_cargo_parse(crates->arena, toml, len, manifest);
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, toml);
+    if (!manifest || !manifest->package_name) {
+        return -1;
+    }
+    if (crates->package_count >= crates->package_cap) {
+        int cap = crates->package_cap ? crates->package_cap * 2 : 64;
+        PXCRustPackage *grown =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, crates->packages, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return -1;
+        }
+        crates->packages = grown;
+        crates->package_cap = cap;
+    }
+    crates->packages[crates->package_count] =
+        (PXCRustPackage){.dir = cbm_arena_strdup(crates->arena, dir),
+                         .manifest = manifest,
+                         .lib_crate = -1,
+                         .first_crate = -1};
+    return crates->package_count++;
+}
+
+/* The directory a dependency of `package` points at: its own `path`, or the
+ * workspace dependency of the same key. NULL for registry dependencies. */
+static const char *pxc_rust_dep_dir(const PXCRustCrates *crates, const PXCRustPackage *package,
+                                    const CBMCargoDep *dep) {
+    if (dep->path) {
+        return pxc_rel_join(crates->arena, package->dir, dep->path);
+    }
+    for (int i = 0; crates->root && dep->name && i < crates->root->dep_count; i++) {
+        const CBMCargoDep *ws = &crates->root->deps[i];
+        if (ws->path && ws->name && strcmp(ws->name, dep->name) == 0) {
+            return pxc_rel_join(crates->arena, "", ws->path);
+        }
+    }
+    return NULL;
+}
+
+/* A `members` glob ending in a star: every directory directly under its
+ * prefix that holds a package manifest and Rust sources. */
+static void pxc_rust_add_member_glob(PXCRustCrates *crates, const char *member) {
+    const char *prefix = pxc_rel_join(crates->arena, "", member);
+    size_t plen = strlen(prefix) - 1; /* keeps the '/' before '*' */
+    for (int f = 0; f < crates->file_count; f++) {
+        const char *rel = crates->files[f].rel_path;
+        if (!rel || strncmp(rel, prefix, plen) != 0) {
+            continue;
+        }
+        const char *slash = strchr(rel + plen, '/');
+        if (slash) {
+            (void)pxc_rust_add_package(
+                crates, cbm_arena_strndup(crates->arena, rel, (size_t)(slash - rel)));
+        }
+    }
+}
+
+/* The root package, workspace members and, transitively, path dependencies. */
+static void pxc_rust_collect_packages(PXCRustCrates *crates) {
+    (void)pxc_rust_add_package(crates, "");
+    for (int i = 0; crates->root && i < crates->root->member_count; i++) {
+        const char *member = crates->root->members[i].member_path;
+        size_t len = member ? strlen(member) : 0;
+        if (len >= 2 && strcmp(member + len - 2, "/*") == 0) {
+            pxc_rust_add_member_glob(crates, member);
+        } else if (member) {
+            (void)pxc_rust_add_package(crates, pxc_rel_join(crates->arena, "", member));
+        }
+    }
+    for (int p = 0; p < crates->package_count; p++) {
+        for (int d = 0; d < crates->packages[p].manifest->dep_count; d++) {
+            const char *dir = pxc_rust_dep_dir(crates, &crates->packages[p],
+                                               &crates->packages[p].manifest->deps[d]);
+            if (dir) {
+                (void)pxc_rust_add_package(crates, dir);
+            }
+        }
+    }
+}
+
+/* Cargo exposes package `a-b` to Rust code as `a_b`. */
+static char *pxc_rust_crate_name(CBMArena *arena, const char *name) {
+    char *out = cbm_arena_strdup(arena, name);
+    for (char *p = out; p && *p; p++) {
+        if (*p == '-') {
+            *p = '_';
+        }
+    }
+    return out;
+}
+
+static bool pxc_rust_edition_2015(const CBMCargoManifest *manifest, const char *inherited) {
+    const char *edition = manifest->edition_inherited ? inherited : manifest->edition;
+    return !edition || strcmp(edition, "2015") == 0;
+}
+
+static void pxc_rust_add_package_crates(PXCRustCrates *crates, PXCRustPackage *package,
+                                        const CBMCargoManifest *owners, const char *inherited,
+                                        CBMRustModTree *tree) {
+    CBMCargoManifest *m = package->manifest;
+    pxc_cargo_discover_targets(crates->arena, owners, m, package->dir, crates->files,
+                               crates->file_count, inherited);
+    bool e2015 = pxc_rust_edition_2015(m, inherited);
+    for (int t = 0; t < m->target_count; t++) {
+        const CBMCargoTarget *target = &m->targets[t];
+        if (!target->path) {
+            continue;
+        }
+        bool lib = target->kind == CBM_CARGO_TARGET_LIB;
+        const char *name =
+            lib ? pxc_rust_crate_name(crates->arena, m->lib_name ? m->lib_name : m->package_name)
+                : NULL;
+        int id = cbm_rust_modtree_add_crate(
+            tree, pxc_rel_join(crates->arena, package->dir, target->path), name, e2015);
+        if (id < 0) {
+            continue;
+        }
+        if (lib) {
+            package->lib_crate = id;
+        }
+        if (package->first_crate < 0) {
+            package->first_crate = id;
+        }
+        package->crate_count = id - package->first_crate + 1;
+    }
+}
+
+static void pxc_rust_add_package_externs(PXCRustCrates *crates, const PXCRustPackage *package,
+                                         CBMRustModTree *tree) {
+    const CBMCargoManifest *m = package->manifest;
+    const char *own =
+        pxc_rust_crate_name(crates->arena, m->lib_name ? m->lib_name : m->package_name);
+    int end = package->first_crate + package->crate_count;
+    for (int c = package->first_crate; c >= 0 && c < end; c++) {
+        if (c != package->lib_crate && package->lib_crate >= 0) {
+            cbm_rust_modtree_add_extern(tree, c, own, package->lib_crate);
+        }
+        for (int d = 0; d < m->dep_count; d++) {
+            const CBMCargoDep *dep = &m->deps[d];
+            const char *dir = pxc_rust_dep_dir(crates, package, dep);
+            int target = dir ? pxc_rust_package_index(crates, dir) : -1;
+            cbm_rust_modtree_add_extern(tree, c, pxc_rust_crate_name(crates->arena, dep->name),
+                                        target >= 0 ? crates->packages[target].lib_crate : -1);
+        }
+    }
+}
+
+/* Register every target of every package as a crate root, then fill each
+ * crate's extern prelude. Target discovery attributes a file to the
+ * innermost package directory holding it. */
+static void pxc_rust_add_crates(PXCRustCrates *crates, CBMRustModTree *tree) {
+    CBMCargoManifest *owners = cbm_arena_calloc(crates->arena, sizeof(*owners));
+    if (!owners) {
+        return;
+    }
+    for (int p = 0; p < crates->package_count && p < CBM_CARGO_MAX_MEMBERS; p++) {
+        owners->members[owners->member_count++].member_path = crates->packages[p].dir;
+    }
+    const char *inherited = crates->root ? crates->root->workspace_edition : NULL;
+    for (int p = 0; p < crates->package_count; p++) {
+        pxc_rust_add_package_crates(crates, &crates->packages[p], owners, inherited, tree);
+    }
+    for (int p = 0; p < crates->package_count; p++) {
+        pxc_rust_add_package_externs(crates, &crates->packages[p], tree);
+    }
+}
+
+typedef struct {
+    const cbm_file_info_t *files;
+    const int *file_index; /* modtree file id -> files[] index */
+} PXCRustSourceCtx;
+
+static const char *pxc_rust_load_source(void *ctx, int file_id, int *out_len) {
+    const PXCRustSourceCtx *sources = ctx;
+    return pxc_read_file(sources->files[sources->file_index[file_id]].path, out_len);
+}
+
+static void pxc_rust_release_source(void *ctx, int file_id, const char *source) {
+    (void)ctx;
+    (void)file_id;
+    cbm_free(CBM_MEM_CLASS_EXTRACT, (void *)source);
+}
+
+CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
+                                           const CBMCargoManifest *root,
+                                           const cbm_file_info_t *files, int file_count,
+                                           char *const *def_modules) {
+    if (!ctx || !ctx->repo_path || !files || file_count <= 0 || !def_modules) {
+        return NULL;
+    }
+    CBMRustModTree *tree = cbm_rust_modtree_new();
+    int *file_index = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(int));
+    if (!tree || !file_index) {
+        cbm_rust_modtree_free(tree);
+        cbm_free(CBM_MEM_CLASS_OTHER, file_index);
+        return NULL;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language != CBM_LANG_RUST || !files[i].rel_path || !def_modules[i]) {
+            continue;
+        }
+        int id = cbm_rust_modtree_add_file(tree, files[i].rel_path, def_modules[i]);
+        if (id >= 0) {
+            file_index[id] = i;
+        }
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    PXCRustCrates crates = {
+        .arena = &arena, .ctx = ctx, .files = files, .file_count = file_count, .root = root};
+    pxc_rust_collect_packages(&crates);
+    pxc_rust_add_crates(&crates, tree);
+    PXCRustSourceCtx sources = {.files = files, .file_index = file_index};
+    CBMRustSourceLoader loader = {
+        .load = pxc_rust_load_source, .release = pxc_rust_release_source, .ctx = &sources};
+    cbm_rust_modtree_finish(tree, &loader);
+    cbm_free(CBM_MEM_CLASS_OTHER, crates.packages);
+    cbm_arena_destroy(&arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, file_index);
+    return tree;
+}
+
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                 int file_count, CBMFileResult **cache) {
     if (!ctx || !files || file_count <= 0 || !cache)
@@ -2443,7 +2720,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         have_manifest =
             cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest, files, file_count);
         cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
-        cbm_pxc_set_rust_imports(ctx->rust_imports);
+        cbm_pxc_set_rust_imports(ctx->rust_imports, NULL);
     }
 
     /* Per-file module QN cache so we don't recompute it once per def + once
@@ -2465,6 +2742,12 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     CBMLSPDef *all_defs =
         cbm_pxc_collect_all_defs(ctx, &ctx->seq_cross_arena, cache, files, file_count,
                                  ctx->project_name, def_modules, &def_count, def_starts);
+    CBMRustModTree *rust_modtree = NULL;
+    if (have_rust) {
+        rust_modtree = cbm_pxc_build_rust_modtree(ctx, have_manifest ? &cargo_manifest : NULL,
+                                                  files, file_count, def_modules);
+        cbm_pxc_set_rust_imports(ctx->rust_imports, rust_modtree);
+    }
     /* Same seam as the parallel driver: serialize per-file surfaces while the
      * result cache is alive. Failure only degrades to a full rebuild on the
      * next incremental run. */
@@ -2567,7 +2850,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
      * pass (or a stale thread-local) can never read freed manifest memory. */
     if (have_rust) {
         cbm_pxc_set_rust_manifest(NULL);
-        cbm_pxc_set_rust_imports(NULL);
+        cbm_pxc_set_rust_imports(NULL, NULL);
+        cbm_rust_modtree_free(rust_modtree);
         cbm_arena_destroy(&cargo_arena);
     }
     (void)have_manifest;

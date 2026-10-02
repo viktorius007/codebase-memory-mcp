@@ -199,9 +199,19 @@ void cbm_pxc_rust_dump_file(const char *rel, const CBMFileResult *result);
 void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const char *source_qn,
                             const char *target_qn, const CBMResolvedCall *lsp);
 
-/* Per-thread borrow of the pipeline's Rust import table (pipeline_internal.h),
- * installed and cleared beside the manifest. */
-void cbm_pxc_set_rust_imports(const CBMHashTable *imports);
+/* Build the project's Rust crate module tree: crate roots from every package
+ * Cargo can build here (root, workspace members, path dependencies), module
+ * trees from their `mod` declarations, names from their `use` graph.
+ * `def_modules[i]` is files[i]'s graph module QN. NULL when nothing could be
+ * built; free with cbm_rust_modtree_free after every worker has joined. */
+CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
+                                           const struct CBMCargoManifest *root,
+                                           const cbm_file_info_t *files, int file_count,
+                                           char *const *def_modules);
+
+/* Per-thread borrow of the pipeline's Rust import table (pipeline_internal.h)
+ * and crate module tree, installed and cleared beside the manifest. */
+void cbm_pxc_set_rust_imports(const CBMHashTable *imports, const CBMRustModTree *modtree);
 const struct CBMRustImportSource *cbm_pxc_get_rust_import_source(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
