@@ -1596,6 +1596,132 @@ TEST(rustlsp_vec_macro_args_resolve_in_both_forms) {
     PASS();
 }
 
+/* Resolve `caller` against free functions `test.a.<leaf>` (imported as `a`)
+ * and record, per leaf, whether the call written as `sites[i]` resolved at
+ * that exact source span to `test.a.<leaves[i]>`. */
+static void rustlsp_macro_arg_sites_resolve(const char *caller, const char *const *leaves,
+                                            const char *const *sites, int n, bool *resolved) {
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMLSPDef *defs = cbm_arena_alloc(&result.arena, sizeof(CBMLSPDef) * (size_t)n);
+    memset(defs, 0, sizeof(CBMLSPDef) * (size_t)n);
+    for (int i = 0; i < n; i++) {
+        defs[i].qualified_name = cbm_arena_sprintf(&result.arena, "test.a.%s", leaves[i]);
+        defs[i].short_name = leaves[i];
+        defs[i].label = "Function";
+        defs[i].def_module_qn = "test.a";
+        defs[i].return_types = "usize";
+        defs[i].lang = CBM_LANG_RUST;
+    }
+    const char *imp_names[] = {"a"};
+    const char *imp_qns[] = {"test::a"};
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&result.arena, defs, n);
+    cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
+                                         "test.main", reg, imp_names, imp_qns, 1, NULL,
+                                         /*manifest=*/NULL,
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL);
+    for (int i = 0; i < n; i++) {
+        const CBMResolvedCall *hit = rustlsp_vec_arg_hit(&result, caller, sites[i], leaves[i]);
+        resolved[i] = reg && hit && hit->callee_qn &&
+                      strcmp(hit->callee_qn, defs[i].qualified_name) == 0;
+    }
+    cbm_arena_destroy(&result.arena);
+}
+
+/* `json!` takes a JSON value whose leaves are Rust expressions: object
+ * values, array elements, nested objects, and a bare top-level value. */
+TEST(rustlsp_json_macro_values_resolve) {
+    const char *caller =
+        "fn hidden() {\n"
+        "    let _ = serde_json::json!({\"a\": a::one(), \"b::c\": [a::two(), {\"d\": a::three()}]});\n"
+        "    let _ = json!(a::four());\n"
+        "}\n";
+    const char *const leaves[] = {"one", "two", "three", "four"};
+    const char *const sites[] = {"a::one()", "a::two()", "a::three()", "a::four()"};
+    bool resolved[4];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 4, resolved);
+    ASSERT_TRUE(resolved[0]); /* object value */
+    ASSERT_TRUE(resolved[1]); /* array element under a key holding `::` */
+    ASSERT_TRUE(resolved[2]); /* nested object value */
+    ASSERT_TRUE(resolved[3]); /* bare value */
+    PASS();
+}
+
+/* `matches!` / `assert_matches!` evaluate the scrutinee and the guard; the
+ * pattern and an assert message are not the scrutinee. */
+TEST(rustlsp_matches_macro_scrutinee_and_guard_resolve) {
+    const char *caller = "fn hidden() {\n"
+                         "    let _ = matches!(a::one(), Some(_));\n"
+                         "    assert_matches!(a::two(), Ok(v) if a::three(v), \"m {}\", a::four());\n"
+                         "}\n";
+    const char *const leaves[] = {"one", "two", "three"};
+    const char *const sites[] = {"a::one()", "a::two()", "a::three(v)"};
+    bool resolved[3];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 3, resolved);
+    ASSERT_TRUE(resolved[0]); /* matches! scrutinee */
+    ASSERT_TRUE(resolved[1]); /* assert_matches! scrutinee */
+    ASSERT_TRUE(resolved[2]); /* guard */
+    PASS();
+}
+
+/* `tokio::select!` branches `pat = fut [, if cond] => handler` and the
+ * `else` arm; `join!`/`try_join!` list futures; `pin!` declares. */
+TEST(rustlsp_tokio_macro_branches_resolve) {
+    const char *caller = "async fn hidden() {\n"
+                         "    tokio::select! {\n"
+                         "        biased;\n"
+                         "        Some(v) = a::one() => { a::two(v); }\n"
+                         "        _ = a::three(), if a::four() => a::five(),\n"
+                         "        else => a::six(),\n"
+                         "    }\n"
+                         "    let _ = tokio::join!(a::seven(), a::eight());\n"
+                         "    let _ = tokio::try_join!(biased; a::nine());\n"
+                         "    tokio::pin!(let f = a::ten(););\n"
+                         "}\n";
+    const char *const leaves[] = {"one",   "two",   "three", "four", "five",
+                                  "six",   "seven", "eight", "nine", "ten"};
+    const char *const sites[] = {"a::one()",   "a::two(v)", "a::three()", "a::four()",
+                                 "a::five()",  "a::six()",  "a::seven()", "a::eight()",
+                                 "a::nine()",  "a::ten()"};
+    bool resolved[10];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 10, resolved);
+    ASSERT_TRUE(resolved[0]); /* select! future */
+    ASSERT_TRUE(resolved[1]); /* block handler using the pattern binding */
+    ASSERT_TRUE(resolved[2]); /* future before a precondition */
+    ASSERT_TRUE(resolved[3]); /* precondition */
+    ASSERT_TRUE(resolved[4]); /* expression handler */
+    ASSERT_TRUE(resolved[5]); /* else handler */
+    ASSERT_TRUE(resolved[6]); /* join! */
+    ASSERT_TRUE(resolved[7]);
+    ASSERT_TRUE(resolved[8]); /* try_join! after biased; */
+    ASSERT_TRUE(resolved[9]); /* pin! let form */
+    PASS();
+}
+
+/* tracing / log arguments: labels (`target:`), named fields (`k = %v`,
+ * `a.b = v`), sigils (`?v`), format arguments and log key-values (`k = v;`). */
+TEST(rustlsp_tracing_macro_fields_resolve) {
+    const char *caller =
+        "fn hidden() {\n"
+        "    tracing::info!(target: \"t\", path = %a::one(), ?a::two(), \"m {}\", a::three());\n"
+        "    warn!(field.sub = a::four(), \"x\");\n"
+        "    log::error!(key = a::five(); \"y {}\", a::six());\n"
+        "}\n";
+    const char *const leaves[] = {"one", "two", "three", "four", "five", "six"};
+    const char *const sites[] = {"a::one()", "a::two()", "a::three()",
+                                 "a::four()", "a::five()", "a::six()"};
+    bool resolved[6];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 6, resolved);
+    ASSERT_TRUE(resolved[0]); /* named field with % */
+    ASSERT_TRUE(resolved[1]); /* ? sigil */
+    ASSERT_TRUE(resolved[2]); /* format argument */
+    ASSERT_TRUE(resolved[3]); /* dotted field name */
+    ASSERT_TRUE(resolved[4]); /* log key-value */
+    ASSERT_TRUE(resolved[5]); /* format argument after `;` */
+    PASS();
+}
+
 /* Rust operator desugaring has the same carrier join hazard. With two `add`
  * targets in one caller, zero-span carriers both join the first semantic
  * record. Exact spans must preserve one Alpha edge and one Beta edge. */
@@ -7981,6 +8107,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_scratch_cross_macro_carrier_survives_copy);
     RUN_TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact);
     RUN_TEST(rustlsp_vec_macro_args_resolve_in_both_forms);
+    RUN_TEST(rustlsp_json_macro_values_resolve);
+    RUN_TEST(rustlsp_matches_macro_scrutinee_and_guard_resolve);
+    RUN_TEST(rustlsp_tokio_macro_branches_resolve);
+    RUN_TEST(rustlsp_tracing_macro_fields_resolve);
     RUN_TEST(rustlsp_operator_carriers_are_occurrence_exact);
     RUN_TEST(rustlsp_macro_operator_has_one_exact_carrier);
     RUN_TEST(rustlsp_known_std_macro_resolutions_have_exact_sites);

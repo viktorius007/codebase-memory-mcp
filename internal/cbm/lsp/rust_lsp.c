@@ -4551,23 +4551,424 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     ts_parser_delete(parser);
 }
 
-/* Re-parse the argument list of a built-in expression-macro (format!,
- * println!, assert!, …) as ordinary Rust expressions and walk them for
- * calls. The tree-sitter-rust grammar tokenises macro arguments rather than
- * parsing them as expression AST, so a method call like `format!("{}",
- * d.label())` never appears as a call_expression/field_expression node and
- * rust_walk_macro_tokens cannot recover it. Because these macros DO evaluate
- * their arguments as normal expressions, re-parsing the argument text and
- * resolving calls in it is sound — it recovers exactly the calls the program
- * makes. We wrap the args in a block so each comma-separated argument parses
- * as its own statement; the current scope (params/locals) is preserved so
- * typed receivers still resolve. `form` names the syntax the arguments obey:
- * a comma-separated expression list, or an array-expression body (`vec!`'s
- * `a, b` and `x; n`). */
+/* Re-parse the arguments of a built-in macro whose arguments are ordinary Rust
+ * expressions laid out in a macro-specific grammar (format!, vec!, json!,
+ * matches!, tokio::select!, tracing::info!, …) and walk them for calls. The
+ * tree-sitter-rust grammar tokenises macro arguments rather than parsing them
+ * as expression AST, so a method call like `format!("{}", d.label())` never
+ * appears as a call_expression node and rust_walk_macro_tokens cannot recover
+ * it. Because these macros DO evaluate the expressions, re-parsing them and
+ * resolving calls in them recovers exactly the calls the program makes.
+ *
+ * Each form turns the argument text into one or more regions. A region is a
+ * byte range of the argument text whose non-expression syntax (a JSON key's
+ * `:`, a tracing `%` sigil, a select! future) is masked with bytes of the same
+ * length, wrapped in a prefix and suffix that make it a Rust function body.
+ * Equal lengths keep the single-offset site map exact. The current scope
+ * (params/locals) is preserved so typed receivers still resolve. */
 typedef enum {
-    RUST_MACRO_ARGS_EXPR_LIST,
-    RUST_MACRO_ARGS_ARRAY_BODY,
+    RUST_MACRO_ARGS_EXPR_LIST,   /* format!/assert!: `a, b` as a tuple */
+    RUST_MACRO_ARGS_ARRAY_BODY,  /* vec!: `a, b` or `x; n` */
+    RUST_MACRO_ARGS_JSON,        /* json!: a JSON value with expression leaves */
+    RUST_MACRO_ARGS_MATCHES,     /* matches!/assert_matches!: `expr, pat [if guard]` */
+    RUST_MACRO_ARGS_SELECT,      /* tokio::select!: `pat = fut [, if c] => handler, …` */
+    RUST_MACRO_ARGS_FUTURE_LIST, /* join!/try_join!: `[biased;] a, b` */
+    RUST_MACRO_ARGS_PIN,         /* pin!: `a, b` or `let x = init;` */
+    RUST_MACRO_ARGS_TRACING,     /* tracing/log: `target: t, k = %v, ?v, "fmt", args` */
 } RustMacroArgForm;
+
+static const char RUST_MACRO_ARGS_FN[] = "fn __cbm_macro_args() { ";
+static const char RUST_MACRO_ARGS_TUPLE[] = "fn __cbm_macro_args() { let _ = (";
+static const char RUST_MACRO_ARGS_ARRAY[] = "fn __cbm_macro_args() { let _ = [";
+
+static bool rust_arg_ident_byte(char c) {
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           ((unsigned char)c >= 0x80);
+}
+
+/* End of the lexical unit at `i`: a whole string, raw string, char literal or
+ * comment, so brackets and separators inside it are never seen; otherwise the
+ * next byte. */
+static int rust_arg_lex_unit(const char *s, int len, int i) {
+    char c = s[i];
+    if (c == '/' && i + 1 < len && s[i + 1] == '/') {
+        while (i < len && s[i] != '\n')
+            i++;
+        return i;
+    }
+    if (c == '/' && i + 1 < len && s[i + 1] == '*') {
+        i += 2;
+        while (i + 1 < len && !(s[i] == '*' && s[i + 1] == '/'))
+            i++;
+        return i + 2 < len ? i + 2 : len;
+    }
+    if (c == '"') {
+        i++;
+        while (i < len && s[i] != '"')
+            i += (s[i] == '\\' && i + 1 < len) ? 2 : 1;
+        return i < len ? i + 1 : len;
+    }
+    if (c == 'r' && i + 1 < len && (s[i + 1] == '"' || s[i + 1] == '#')) {
+        int pre = i - 1;
+        if (pre >= 0 && (s[pre] == 'b' || s[pre] == 'c'))
+            pre--;
+        if (pre < 0 || !rust_arg_ident_byte(s[pre])) {
+            int p = i + 1;
+            int hashes = 0;
+            while (p < len && s[p] == '#') {
+                hashes++;
+                p++;
+            }
+            if (p < len && s[p] == '"') {
+                p++;
+                while (p < len) {
+                    if (s[p] == '"') {
+                        int h = 0;
+                        while (h < hashes && p + 1 + h < len && s[p + 1 + h] == '#')
+                            h++;
+                        if (h == hashes)
+                            return p + 1 + hashes;
+                    }
+                    p++;
+                }
+                return len;
+            }
+        }
+        return i + 1;
+    }
+    if (c == '\'') {
+        int q = i + 1;
+        if (q < len && s[q] == '\\') {
+            q += 2;
+            while (q < len && s[q] != '\'')
+                q++;
+            return q < len ? q + 1 : len;
+        }
+        if (q + 1 < len && s[q + 1] == '\'')
+            return q + 2;
+        if (q < len && (unsigned char)s[q] >= 0x80) {
+            int p = q;
+            while (p < len && p < q + 5 && s[p] != '\'')
+                p++;
+            if (p < len && s[p] == '\'')
+                return p + 1;
+        }
+        return i + 1; /* lifetime or label */
+    }
+    return i + 1;
+}
+
+/* First depth-0 index in [from, to) holding `want` (',', ';', ':' or '='),
+ * or `to`. A ':' must not be part of `::`; a '=' must be a lone `=` (not
+ * `==`, `=>`, `<=`, `!=`, `+=`, …). */
+static int rust_arg_find_top(const char *s, int from, int to, char want) {
+    int depth = 0;
+    int i = from;
+    while (i < to) {
+        char c = s[i];
+        int next = rust_arg_lex_unit(s, to, i);
+        if (next != i + 1) {
+            i = next;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            depth--;
+        } else if (depth == 0 && c == want) {
+            char prev = i > from ? s[i - 1] : ' ';
+            char after = i + 1 < to ? s[i + 1] : ' ';
+            if (want == ':' && (prev == ':' || after == ':')) {
+                i += (after == ':') ? 2 : 1;
+                continue;
+            }
+            if (want == '=' && (after == '=' || after == '>' || strchr("=!<>+-*/%^&|", prev))) {
+                i++;
+                continue;
+            }
+            return i;
+        }
+        i++;
+    }
+    return to;
+}
+
+/* First depth-0 `=>` in [from, to), or `to`. */
+static int rust_arg_find_arrow(const char *s, int from, int to) {
+    int depth = 0;
+    int i = from;
+    while (i < to) {
+        char c = s[i];
+        int next = rust_arg_lex_unit(s, to, i);
+        if (next != i + 1) {
+            i = next;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{')
+            depth++;
+        else if (c == ')' || c == ']' || c == '}')
+            depth--;
+        else if (depth == 0 && c == '=' && i + 1 < to && s[i + 1] == '>' &&
+                 (i == from || s[i - 1] != '='))
+            return i;
+        i++;
+    }
+    return to;
+}
+
+/* Index just past the bracket group opening at `open`, or `to`. */
+static int rust_arg_group_end(const char *s, int open, int to) {
+    int depth = 0;
+    int i = open;
+    while (i < to) {
+        char c = s[i];
+        int next = rust_arg_lex_unit(s, to, i);
+        if (next != i + 1) {
+            i = next;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{')
+            depth++;
+        else if (c == ')' || c == ']' || c == '}') {
+            if (--depth == 0)
+                return i + 1;
+        }
+        i++;
+    }
+    return to;
+}
+
+static int rust_arg_skip_ws(const char *s, int from, int to) {
+    while (from < to) {
+        int next = rust_arg_lex_unit(s, to, from);
+        bool comment = next > from + 1 && s[from] == '/';
+        if (!comment && s[from] != ' ' && s[from] != '\t' && s[from] != '\n' && s[from] != '\r')
+            break;
+        from = comment ? next : from + 1;
+    }
+    return from;
+}
+
+/* True when the keyword `kw` stands alone at `at`. */
+static bool rust_arg_keyword_at(const char *s, int at, int to, const char *kw) {
+    int n = (int)strlen(kw);
+    return at + n <= to && strncmp(s + at, kw, (size_t)n) == 0 &&
+           (at + n == to || !rust_arg_ident_byte(s[at + n]));
+}
+
+static void rust_arg_blank(char *s, int from, int to) {
+    for (int i = from; i < to; i++) {
+        if (s[i] != '\n')
+            s[i] = ' ';
+    }
+}
+
+/* A JSON value of json!: `{ key: value, … }` becomes the array `[ key, value,
+ * … ]`, `[ … ]` keeps its elements, and any other value is a Rust expression
+ * that runs as written. */
+static void rust_json_mask_value(char *s, int from, int to) {
+    int p = rust_arg_skip_ws(s, from, to);
+    if (p >= to || (s[p] != '{' && s[p] != '['))
+        return;
+    bool object = s[p] == '{';
+    int end = rust_arg_group_end(s, p, to);
+    if (end > to || s[end - 1] != (object ? '}' : ']'))
+        return;
+    if (object) {
+        s[p] = '[';
+        s[end - 1] = ']';
+    }
+    int entry = p + 1;
+    while (entry < end - 1) {
+        int comma = rust_arg_find_top(s, entry, end - 1, ',');
+        int value = entry;
+        if (object) {
+            int colon = rust_arg_find_top(s, entry, comma, ':');
+            if (colon < comma) {
+                s[colon] = ',';
+                value = colon + 1;
+            }
+        }
+        rust_json_mask_value(s, value, comma);
+        entry = comma + 1;
+    }
+}
+
+/* tracing / log arguments: `target: t`, `parent: p` and `name: n` lose their
+ * label, `field.path = v` and `"field" = v` lose their name, a `%`/`?` sigil
+ * is dropped, and a log key-value `;` separator becomes `,`. */
+static void rust_tracing_mask(char *s, int len) {
+    int seg = 0;
+    while (seg < len) {
+        int comma = rust_arg_find_top(s, seg, len, ',');
+        int semi = rust_arg_find_top(s, seg, comma, ';');
+        int end = semi < comma ? semi : comma;
+        if (semi < comma)
+            s[semi] = ',';
+        int p = rust_arg_skip_ws(s, seg, end);
+        int q = p;
+        if (q < end && s[q] == '"') {
+            q = rust_arg_lex_unit(s, end, q);
+        } else {
+            while (q < end && (rust_arg_ident_byte(s[q]) || s[q] == '.'))
+                q++;
+        }
+        if (q > p) {
+            int after = rust_arg_skip_ws(s, q, end);
+            bool label = after < end && s[after] == ':' && (after + 1 >= end || s[after + 1] != ':') &&
+                         s[p] != '"';
+            bool field = after < end && rust_arg_find_top(s, after, end, '=') == after;
+            if (label || field) {
+                rust_arg_blank(s, p, after + 1);
+                p = rust_arg_skip_ws(s, after + 1, end);
+            }
+        }
+        if (p < end && (s[p] == '%' || s[p] == '?'))
+            s[p] = ' ';
+        seg = end + 1;
+    }
+}
+
+/* Re-parse one region of the argument text. `text` is a masked copy of the
+ * argument text whose byte 0 sits at `src_start` in the current source. */
+static void rust_reparse_macro_region(RustLSPContext *ctx, uint32_t src_start, const char *text,
+                                      int start, int len, const char *prefix, const char *suffix) {
+    if (len <= 0)
+        return;
+    char *region = cbm_arena_strndup(ctx->arena, text + start, (size_t)len);
+    if (!region)
+        return;
+    char *wrapped = cbm_arena_sprintf(ctx->arena, "%s%s%s }\n", prefix, region, suffix);
+    if (!wrapped)
+        return;
+
+    /* Same expansion memo as rust_expand_user_macro (site tag 4), but ONLY
+     * inside a recursion chain (depth > 0): there the identical argument text
+     * is re-parsed on every re-expansion of a self-recursive macro and has no
+     * distinct source site. Top-level invocations (depth 0) always parse —
+     * identical args in different enclosing functions attribute differently
+     * and must all be walked. */
+    if (ctx->macro_expand_depth > 0) {
+        uint64_t am_key = cbm_negmemo_key(4, wrapped, NULL);
+        if (cbm_negmemo_contains(&ctx->macro_memo, am_key))
+            return;
+        cbm_negmemo_insert(&ctx->macro_memo, ctx->arena, am_key);
+    }
+
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return;
+    ts_parser_set_language(parser, tree_sitter_rust());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, wrapped, (uint32_t)strlen(wrapped));
+    if (!tree) {
+        ts_parser_delete(parser);
+        return;
+    }
+    TSNode root = ts_tree_root_node(tree);
+    /* Bail out if the synthetic source failed to parse cleanly — a
+     * format-string-only arg, named args, or other non-expression token
+     * soup must not produce bogus edges. */
+    TSNode top = ts_node_named_child_count(root) == 1 ? ts_node_named_child(root, 0) : (TSNode){0};
+    TSNode body = (!ts_node_is_null(top) && strcmp(ts_node_type(top), "function_item") == 0)
+                      ? ts_node_child_by_field_name(top, "body", 4)
+                      : (TSNode){0};
+    if (!ts_node_has_error(root) && !ts_node_is_null(body)) {
+        ctx->macro_expand_depth++;
+        const char *saved_source = ctx->source;
+        int saved_len = ctx->source_len;
+        bool saved_map_active = ctx->site_map_active;
+        uint32_t saved_map_synthetic_start = ctx->site_map_synthetic_start_byte;
+        uint32_t saved_map_synthetic_end = ctx->site_map_synthetic_end_byte;
+        uint32_t saved_map_original_start = ctx->site_map_original_start_byte;
+
+        /* `region` has the length of its source range, and only masked bytes
+         * differ. Translate that range through any enclosing built-in-macro
+         * map before switching to the synthetic wrapper. If the current source
+         * is macro_rules!-generated, no faithful original occurrence exists
+         * and the new map stays disabled. */
+        uint32_t region_start = src_start + (uint32_t)start;
+        uint32_t original_start = 0;
+        uint32_t original_end = 0;
+        bool mapped = rust_map_source_range(ctx, region_start, region_start + (uint32_t)len,
+                                            &original_start, &original_end);
+        ctx->source = wrapped;
+        ctx->source_len = (int)strlen(wrapped);
+        ctx->site_map_active = mapped;
+        if (mapped) {
+            ctx->site_map_synthetic_start_byte = (uint32_t)strlen(prefix);
+            ctx->site_map_synthetic_end_byte = ctx->site_map_synthetic_start_byte + (uint32_t)len;
+            ctx->site_map_original_start_byte = original_start;
+        }
+        /* The syntactic extractor never produced call nodes for these
+         * macro-hidden expressions, so resolved_calls emitted here have
+         * no CBMCall to pair with. Inject matching synthetic calls. */
+        ctx->inject_syn_calls++;
+        rust_resolve_calls_in_node(ctx, body);
+        ctx->inject_syn_calls--;
+        ctx->source = saved_source;
+        ctx->source_len = saved_len;
+        ctx->site_map_active = saved_map_active;
+        ctx->site_map_synthetic_start_byte = saved_map_synthetic_start;
+        ctx->site_map_synthetic_end_byte = saved_map_synthetic_end;
+        ctx->site_map_original_start_byte = saved_map_original_start;
+        ctx->macro_expand_depth--;
+    }
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+}
+
+/* tokio::select!: each branch `pat = fut [, if cond] => handler` runs `fut`
+ * and `cond` in the enclosing scope, then `handler` with `pat` bound to the
+ * future's output, whose type is not modelled. The branch re-parses as a
+ * match arm on an untyped scrutinee, so `pat`'s names shadow outer locals
+ * without a type. */
+static void rust_reparse_select_branches(RustLSPContext *ctx, uint32_t src_start, char *s,
+                                         int len) {
+    static const char arm_prefix[] = "fn __cbm_macro_args() { match __cbm_select_output { ";
+    int p = rust_arg_skip_ws(s, 0, len);
+    if (rust_arg_keyword_at(s, p, len, "biased")) {
+        int semi = rust_arg_skip_ws(s, p + 6, len);
+        if (semi < len && s[semi] == ';')
+            p = semi + 1;
+    }
+    while ((p = rust_arg_skip_ws(s, p, len)) < len) {
+        int arrow = rust_arg_find_arrow(s, p, len);
+        if (arrow >= len)
+            return;
+        int handler = rust_arg_skip_ws(s, arrow + 2, len);
+        int handler_end = (handler < len && s[handler] == '{')
+                              ? rust_arg_group_end(s, handler, len)
+                              : rust_arg_find_top(s, handler, len, ',');
+        if (rust_arg_keyword_at(s, p, len, "else") && rust_arg_skip_ws(s, p + 4, len) == arrow) {
+            rust_reparse_macro_region(ctx, src_start, s, handler, handler_end - handler,
+                                      RUST_MACRO_ARGS_TUPLE, ");");
+        } else {
+            int eq = rust_arg_find_top(s, p, arrow, '=');
+            if (eq >= arrow)
+                return;
+            int fut_end = arrow;
+            int comma = rust_arg_find_top(s, eq + 1, arrow, ',');
+            if (comma < arrow) {
+                int cond = rust_arg_skip_ws(s, comma + 1, arrow);
+                if (!rust_arg_keyword_at(s, cond, arrow, "if"))
+                    return;
+                fut_end = comma;
+                rust_reparse_macro_region(ctx, src_start, s, cond + 2, arrow - cond - 2,
+                                          RUST_MACRO_ARGS_TUPLE, ");");
+            }
+            rust_reparse_macro_region(ctx, src_start, s, eq + 1, fut_end - eq - 1, RUST_MACRO_ARGS_TUPLE,
+                                      ");");
+            char *arm = cbm_arena_strndup(ctx->arena, s, (size_t)len);
+            if (!arm)
+                return;
+            rust_arg_blank(arm, eq, arrow);
+            rust_reparse_macro_region(ctx, src_start, arm, p, handler_end - p, arm_prefix, " };");
+        }
+        p = rust_arg_skip_ws(s, handler_end, len);
+        if (p < len && s[p] == ',')
+            p++;
+    }
+}
 
 static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation,
                                          RustMacroArgForm form) {
@@ -4593,107 +4994,144 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation,
     if (!at)
         return;
     const char *inner;
-    int inner_len;
-    rust_macro_strip_outer(at, (int)strlen(at), &inner, &inner_len);
-    if (inner_len <= 0)
+    int len;
+    rust_macro_strip_outer(at, (int)strlen(at), &inner, &len);
+    if (len <= 0)
         return;
-    char *arg_text = cbm_arena_strndup(ctx->arena, inner, (size_t)inner_len);
-    if (!arg_text)
+    char *s = cbm_arena_strndup(ctx->arena, inner, (size_t)len);
+    if (!s)
         return;
+    uint32_t src_start = ts_node_start_byte(args_tt) + (uint32_t)(inner - at);
 
-    /* Same expansion memo as rust_expand_user_macro (site tag 4), but ONLY
-     * inside a recursion chain (depth > 0): there the identical argument text
-     * is re-parsed on every re-expansion of a self-recursive macro and has no
-     * distinct source site. Top-level invocations (depth 0) always parse —
-     * identical args in different enclosing functions attribute differently
-     * and must all be walked. */
-    if (ctx->macro_expand_depth > 0) {
-        uint64_t am_key = cbm_negmemo_key(4, arg_text, NULL);
-        if (cbm_negmemo_contains(&ctx->macro_memo, am_key)) {
-            return;
-        }
-        cbm_negmemo_insert(&ctx->macro_memo, ctx->arena, am_key);
+    switch (form) {
+    case RUST_MACRO_ARGS_EXPR_LIST:
+        /* A tuple keeps a trailing format-spec arg like `width = w` valid. */
+        rust_reparse_macro_region(ctx, src_start, s, 0, len, RUST_MACRO_ARGS_TUPLE, ");");
+        break;
+    case RUST_MACRO_ARGS_ARRAY_BODY:
+        rust_reparse_macro_region(ctx, src_start, s, 0, len, RUST_MACRO_ARGS_ARRAY, "];");
+        break;
+    case RUST_MACRO_ARGS_JSON:
+        rust_json_mask_value(s, 0, len);
+        rust_reparse_macro_region(ctx, src_start, s, 0, len, RUST_MACRO_ARGS_ARRAY, "];");
+        break;
+    case RUST_MACRO_ARGS_MATCHES: {
+        /* `expr, pat [if guard] [, message…]` is the match `match expr { pat
+         * [if guard] => () }`: the guard sees the pattern's bindings. */
+        int comma = rust_arg_find_top(s, 0, len, ',');
+        if (comma >= len)
+            break;
+        int pat_end = rust_arg_find_top(s, comma + 1, len, ',');
+        s[comma] = '{';
+        static const char match_prefix[] = "fn __cbm_macro_args() { match ";
+        rust_reparse_macro_region(ctx, src_start, s, 0, pat_end, match_prefix, " => () };");
+        break;
     }
+    case RUST_MACRO_ARGS_SELECT:
+        rust_reparse_select_branches(ctx, src_start, s, len);
+        break;
+    case RUST_MACRO_ARGS_FUTURE_LIST: {
+        int p = rust_arg_skip_ws(s, 0, len);
+        if (rust_arg_keyword_at(s, p, len, "biased")) {
+            int semi = rust_arg_skip_ws(s, p + 6, len);
+            if (semi < len && s[semi] == ';')
+                rust_arg_blank(s, p, semi + 1);
+        }
+        rust_reparse_macro_region(ctx, src_start, s, 0, len, RUST_MACRO_ARGS_TUPLE, ");");
+        break;
+    }
+    case RUST_MACRO_ARGS_PIN: {
+        /* `pin!(let x = init;)` declares; `pin!(a, b)` names expressions. */
+        int p = rust_arg_skip_ws(s, 0, len);
+        if (rust_arg_keyword_at(s, p, len, "let"))
+            rust_reparse_macro_region(ctx, src_start, s, 0, len, RUST_MACRO_ARGS_FN, "");
+        else
+            rust_reparse_macro_region(ctx, src_start, s, 0, len, RUST_MACRO_ARGS_TUPLE, ");");
+        break;
+    }
+    case RUST_MACRO_ARGS_TRACING:
+        rust_tracing_mask(s, len);
+        rust_reparse_macro_region(ctx, src_start, s, 0, len, RUST_MACRO_ARGS_TUPLE, ");");
+        break;
+    }
+}
 
-    /* Wrap the comma-separated arguments in a tuple expression so the whole
-     * thing parses as one valid expression (a trailing format-spec arg like
-     * `width = w` would otherwise break statement parsing). Calls inside any
-     * element are still walked. */
-    bool array_body = form == RUST_MACRO_ARGS_ARRAY_BODY;
-    const char *macro_arg_prefix =
-        array_body ? "fn __cbm_macro_args() { let _ = [" : "fn __cbm_macro_args() { let _ = (";
-    char *wrapped = cbm_arena_sprintf(ctx->arena, "%s%s%s; }\n", macro_arg_prefix, arg_text,
-                                      array_body ? "]" : ")");
-    if (!wrapped)
-        return;
-
-    TSParser *parser = ts_parser_new();
-    if (!parser)
-        return;
-    ts_parser_set_language(parser, tree_sitter_rust());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, wrapped, (uint32_t)strlen(wrapped));
-    if (tree) {
-        TSNode root = ts_tree_root_node(tree);
-        /* Bail out if the synthetic source failed to parse cleanly — a
-         * format-string-only arg, named args, or other non-expression token
-         * soup must not produce bogus edges. */
-        if (!ts_node_has_error(root)) {
-            ctx->macro_expand_depth++;
-            uint32_t rnc = ts_node_child_count(root);
-            for (uint32_t i = 0; i < rnc; i++) {
-                TSNode top = ts_node_child(root, i);
-                if (ts_node_is_null(top))
-                    continue;
-                if (strcmp(ts_node_type(top), "function_item") != 0)
-                    continue;
-                TSNode body = ts_node_child_by_field_name(top, "body", 4);
-                if (ts_node_is_null(body))
-                    continue;
-                const char *saved_source = ctx->source;
-                int saved_len = ctx->source_len;
-                bool saved_map_active = ctx->site_map_active;
-                uint32_t saved_map_synthetic_start = ctx->site_map_synthetic_start_byte;
-                uint32_t saved_map_synthetic_end = ctx->site_map_synthetic_end_byte;
-                uint32_t saved_map_original_start = ctx->site_map_original_start_byte;
-
-                /* `arg_text` is a byte-for-byte copy of the token tree's inner
-                 * text. Translate that inner range through any enclosing
-                 * built-in-macro map before switching to the synthetic wrapper.
-                 * If the current source is macro_rules!-generated, no faithful
-                 * original occurrence exists and the new map stays disabled. */
-                uint32_t inner_start = ts_node_start_byte(args_tt) + (uint32_t)(inner - at);
-                uint32_t inner_end = inner_start + (uint32_t)inner_len;
-                uint32_t original_start = 0;
-                uint32_t original_end = 0;
-                bool mapped = rust_map_source_range(ctx, inner_start, inner_end, &original_start,
-                                                    &original_end);
-                ctx->source = wrapped;
-                ctx->source_len = (int)strlen(wrapped);
-                ctx->site_map_active = mapped;
-                if (mapped) {
-                    ctx->site_map_synthetic_start_byte = (uint32_t)strlen(macro_arg_prefix);
-                    ctx->site_map_synthetic_end_byte =
-                        ctx->site_map_synthetic_start_byte + (uint32_t)inner_len;
-                    ctx->site_map_original_start_byte = original_start;
-                }
-                /* The syntactic extractor never produced call nodes for these
-                 * macro-hidden expressions, so resolved_calls emitted here have
-                 * no CBMCall to pair with. Inject matching synthetic calls. */
-                ctx->inject_syn_calls++;
-                rust_resolve_calls_in_node(ctx, body);
-                ctx->inject_syn_calls--;
-                ctx->source = saved_source;
-                ctx->source_len = saved_len;
-                ctx->site_map_active = saved_map_active;
-                ctx->site_map_synthetic_start_byte = saved_map_synthetic_start;
-                ctx->site_map_synthetic_end_byte = saved_map_synthetic_end;
-                ctx->site_map_original_start_byte = saved_map_original_start;
+/* Argument form of a built-in macro named by `mname` (`json`,
+ * `serde_json::json`, `tokio::select`, …), or false when its arguments are not
+ * plain expressions in a known grammar. The path qualifier must be absent or
+ * name the crate that defines the macro. */
+static bool rust_builtin_macro_arg_form(const char *mname, RustMacroArgForm *form) {
+    if (strncmp(mname, "::", 2) == 0)
+        mname += 2;
+    const char *leaf = mname;
+    for (const char *p = mname; (p = strstr(p, "::")) != NULL; p += 2)
+        leaf = p + 2;
+    size_t qual_len = leaf > mname ? (size_t)(leaf - mname - 2) : 0;
+    static const struct {
+        const char *leaf;
+        const char *quals; /* space-separated crate paths; "" alone = unqualified only */
+        RustMacroArgForm form;
+    } table[] = {
+        {"println", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"eprintln", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"print", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"eprint", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"format", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"write", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"writeln", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"panic", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"assert", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"assert_eq", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"assert_ne", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"debug_assert", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"debug_assert_eq", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"debug_assert_ne", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"dbg", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"vec", "", RUST_MACRO_ARGS_ARRAY_BODY},
+        {"json", "serde_json", RUST_MACRO_ARGS_JSON},
+        {"matches", "std core", RUST_MACRO_ARGS_MATCHES},
+        {"assert_matches", "assert_matches std::assert_matches core::assert_matches",
+         RUST_MACRO_ARGS_MATCHES},
+        {"debug_assert_matches", "assert_matches std::assert_matches core::assert_matches",
+         RUST_MACRO_ARGS_MATCHES},
+        {"select", "tokio futures", RUST_MACRO_ARGS_SELECT},
+        {"join", "tokio futures", RUST_MACRO_ARGS_FUTURE_LIST},
+        {"try_join", "tokio futures", RUST_MACRO_ARGS_FUTURE_LIST},
+        {"pin", "tokio std::pin core::pin", RUST_MACRO_ARGS_PIN},
+        {"trace", "tracing log", RUST_MACRO_ARGS_TRACING},
+        {"debug", "tracing log", RUST_MACRO_ARGS_TRACING},
+        {"info", "tracing log", RUST_MACRO_ARGS_TRACING},
+        {"warn", "tracing log", RUST_MACRO_ARGS_TRACING},
+        {"error", "tracing log", RUST_MACRO_ARGS_TRACING},
+        {"event", "tracing", RUST_MACRO_ARGS_TRACING},
+        {"log", "log", RUST_MACRO_ARGS_TRACING},
+        {"span", "tracing", RUST_MACRO_ARGS_TRACING},
+        {"trace_span", "tracing", RUST_MACRO_ARGS_TRACING},
+        {"debug_span", "tracing", RUST_MACRO_ARGS_TRACING},
+        {"info_span", "tracing", RUST_MACRO_ARGS_TRACING},
+        {"warn_span", "tracing", RUST_MACRO_ARGS_TRACING},
+        {"error_span", "tracing", RUST_MACRO_ARGS_TRACING},
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        if (strcmp(leaf, table[i].leaf) != 0)
+            continue;
+        if (qual_len == 0) {
+            *form = table[i].form;
+            return true;
+        }
+        for (const char *q = table[i].quals; *q;) {
+            size_t n = strcspn(q, " ");
+            if (n == qual_len && strncmp(q, mname, n) == 0) {
+                *form = table[i].form;
+                return true;
             }
-            ctx->macro_expand_depth--;
+            q += n;
+            while (*q == ' ')
+                q++;
         }
-        ts_tree_delete(tree);
+        return false;
     }
-    ts_parser_delete(parser);
+    return false;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -5858,20 +6296,9 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                      * call sites are lost to tree-sitter's macro tokenisation, so
                      * re-parse the args to recover calls like `format!("{}",
                      * d.label())`. */
-                    bool expr_arg_macro =
-                        strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
-                        strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
-                        strcmp(mname, "format") == 0 || strcmp(mname, "write") == 0 ||
-                        strcmp(mname, "writeln") == 0 || strcmp(mname, "panic") == 0 ||
-                        strcmp(mname, "assert") == 0 || strcmp(mname, "assert_eq") == 0 ||
-                        strcmp(mname, "assert_ne") == 0 || strcmp(mname, "debug_assert") == 0 ||
-                        strcmp(mname, "debug_assert_eq") == 0 ||
-                        strcmp(mname, "debug_assert_ne") == 0 || strcmp(mname, "dbg") == 0;
-                    if (expr_arg_macro) {
-                        rust_resolve_macro_arg_exprs(ctx, node, RUST_MACRO_ARGS_EXPR_LIST);
-                    } else if (strcmp(mname, "vec") == 0) {
-                        rust_resolve_macro_arg_exprs(ctx, node, RUST_MACRO_ARGS_ARRAY_BODY);
-                    }
+                    RustMacroArgForm arg_form;
+                    if (rust_builtin_macro_arg_form(mname, &arg_form))
+                        rust_resolve_macro_arg_exprs(ctx, node, arg_form);
                     if (strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
                         strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
                         strcmp(mname, "format") == 0 || strcmp(mname, "write") == 0 ||
