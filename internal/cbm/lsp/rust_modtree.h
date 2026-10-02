@@ -129,8 +129,7 @@ CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMA
 
 /* Same as cbm_rust_modtree_resolve_type for a type spelled somewhere in the
  * file without a known offset: every module of the file must agree. */
-CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tree,
-                                                        CBMArena *arena, const char *module_qn,
-                                                        const char *path);
+CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tree, CBMArena *arena,
+                                                        const char *module_qn, const char *path);
 
 #endif /* CBM_LSP_RUST_MODTREE_H */

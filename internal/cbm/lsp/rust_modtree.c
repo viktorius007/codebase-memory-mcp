@@ -1304,20 +1304,19 @@ CBMRustPathResult cbm_rust_modtree_resolve(const CBMRustModTree *tree, CBMArena 
                                            const char *module_qn, uint32_t offset, const char *path,
                                            const char *const *extra_names,
                                            const char *const *extra_paths, int extra_count) {
-    return rmt_resolve_query(tree, arena, module_qn, offset, false, path, RMT_NS_VALUE,
-                             extra_names, extra_paths, extra_count);
+    return rmt_resolve_query(tree, arena, module_qn, offset, false, path, RMT_NS_VALUE, extra_names,
+                             extra_paths, extra_count);
 }
 
 CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMArena *arena,
                                                 const char *module_qn, uint32_t offset,
                                                 const char *path, const char *const *extra_names,
                                                 const char *const *extra_paths, int extra_count) {
-    return rmt_resolve_query(tree, arena, module_qn, offset, false, path, RMT_NS_TYPE,
-                             extra_names, extra_paths, extra_count);
+    return rmt_resolve_query(tree, arena, module_qn, offset, false, path, RMT_NS_TYPE, extra_names,
+                             extra_paths, extra_count);
 }
 
-CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tree,
-                                                        CBMArena *arena, const char *module_qn,
-                                                        const char *path) {
+CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tree, CBMArena *arena,
+                                                        const char *module_qn, const char *path) {
     return rmt_resolve_query(tree, arena, module_qn, 0, true, path, RMT_NS_TYPE, NULL, NULL, 0);
 }
