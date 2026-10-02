@@ -358,6 +358,9 @@ static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *stra
             strcmp(strategy, "lsp_method_ref_ctor_synth") == 0 ||
             strcmp(strategy, "lsp_dict_dispatch") == 0 ||
             strcmp(strategy, "lsp_import_alias") == 0 ||
+            /* Rust module-tree path: `reason` is the source path, which names
+             * an alias (`use m::f as g; g()`) where the target leaf is `f`. */
+            strcmp(strategy, "lsp_module_path") == 0 ||
             strcmp(strategy, "php_method_dynamic") == 0);
 }
 
