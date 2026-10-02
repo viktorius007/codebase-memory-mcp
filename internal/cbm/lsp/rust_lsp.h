@@ -358,7 +358,8 @@ typedef struct {
     int signature_param_count;          /* positional entries; "?" is unknown */
     const char *trait_qn;               /* raw impl-trait spelling; uniquely canonicalized */
     const char *receiver_spelling;      /* exact impl receiver spelling; registry-only */
-    bool is_interface;            /* true for traits                          */
+    const char **decorators;            /* borrowed attribute texts (`#[derive(..)]`), NULL-ended */
+    bool is_interface;           /* true for traits                          */
     bool is_rust_impl_relation;   /* independent type-level impl record       */
     bool is_abstract;             /* required trait declaration (no default)  */
 } CBMRustLSPDef;

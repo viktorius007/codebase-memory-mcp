@@ -1896,6 +1896,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].signature_param_count = defs[i].signature_param_count;
         out[i].trait_qn = defs[i].trait_qn;
         out[i].receiver_spelling = defs[i].receiver_spelling;
+        out[i].decorators = defs[i].decorators;
         out[i].is_interface = defs[i].is_interface;
         out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
         out[i].is_abstract = defs[i].is_abstract;

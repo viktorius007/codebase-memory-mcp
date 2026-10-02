@@ -68,6 +68,8 @@ static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text)
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
 static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_name,
                                          const char *trait_qn);
+static const CBMType *rust_trait_assoc_fn_type(RustLSPContext *ctx, const char *head,
+                                              const char *fn_name);
 
 /* The target one path call resolves to. The call step publishes it and the
  * expression evaluator types the call's value from it, so the two cannot
@@ -2679,6 +2681,13 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
                             if (m)
                                 head = (char *)full_head;
                         }
+                        if (!m) {
+                            const CBMType *provided =
+                                rust_trait_assoc_fn_type(ctx, head, short_name);
+                            if (provided) {
+                                return provided;
+                            }
+                        }
                         if (m && m->signature && m->signature->kind == CBM_TYPE_FUNC &&
                             m->signature->data.func.return_types &&
                             m->signature->data.func.return_types[0]) {
@@ -3948,6 +3957,69 @@ static const CBMRegisteredFunc *rust_find_sole_trait_impl(RustLSPContext *ctx, c
         cbm_negmemo_insert(&ctx->neg_memo, ctx->arena, nm_key);
     }
     return n == 1 ? first : NULL;
+}
+
+/* True when `t` names `Self` anywhere: such a return is only known once
+ * `Self` is substituted, which is done for a bare `Self` return alone. */
+static bool rust_type_mentions_self(const CBMType *t, int depth) {
+    if (!t || depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
+        return false;
+    }
+    switch (t->kind) {
+    case CBM_TYPE_NAMED:
+        return strcmp(t->data.named.qualified_name, "Self") == 0 ||
+               strncmp(t->data.named.qualified_name, "Self.", 5) == 0;
+    case CBM_TYPE_REFERENCE:
+        return rust_type_mentions_self(t->data.reference.elem, depth + 1);
+    case CBM_TYPE_TEMPLATE:
+        for (int i = 0; i < t->data.template_type.arg_count; i++) {
+            if (rust_type_mentions_self(t->data.template_type.template_args[i], depth + 1)) {
+                return true;
+            }
+        }
+        return strncmp(t->data.template_type.template_name, "Self", 4) == 0;
+    case CBM_TYPE_BUILTIN:
+        return false;
+    default:
+        return true; /* shapes not inspected here are not trusted */
+    }
+}
+
+/* Type of `Type::f(..)` when `f` is not declared on `Type` itself but comes
+ * from a trait `Type` implements: the impl's override or the trait's sole
+ * default (rust_resolve_trait_method). A `Self` return is `Type`; any other
+ * return is taken as written in the trait only when it does not name `Self`.
+ * NULL when no single trait provides `f`. */
+static const CBMType *rust_trait_assoc_fn_type(RustLSPContext *ctx, const char *head,
+                                              const char *fn_name) {
+    if (!ctx || !head || !fn_name) {
+        return NULL;
+    }
+    const char *candidates[2] = {
+        head, ctx->module_qn ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head) : NULL};
+    for (int c = 0; c < 2; c++) {
+        const char *type_qn = candidates[c];
+        const CBMRegisteredType *rt =
+            type_qn ? cbm_registry_lookup_type(ctx->registry, type_qn) : NULL;
+        if (!rt || rt->is_interface) {
+            continue;
+        }
+        int impls = 0;
+        const CBMRegisteredFunc *f = rust_resolve_trait_method(ctx, type_qn, fn_name, &impls, NULL);
+        if (!f || impls != 1 || !f->signature || f->signature->kind != CBM_TYPE_FUNC ||
+            !f->signature->data.func.return_types || !f->signature->data.func.return_types[0]) {
+            return NULL;
+        }
+        const CBMType *ret = f->signature->data.func.return_types[0];
+        if (ret->kind == CBM_TYPE_NAMED && strcmp(ret->data.named.qualified_name, "Self") == 0) {
+            return cbm_type_named(ctx->arena, type_qn);
+        }
+        if (cbm_type_is_unknown(ret) || rust_type_mentions_self(ret, 0)) {
+            return NULL;
+        }
+        return ret;
+    }
+    return NULL;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -7432,6 +7504,153 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
     }
 }
 
+/* Derive-macro synthesis.
+ *
+ * Without expanding proc-macros we still know the impl footprint of the
+ * well-known derives, so `x.clone()` / `MyT::default()` on a derived type
+ * resolve and type their result. Unknown derives are left alone. Each
+ * matching derive registers its methods on the type (static ones such as
+ * `default` / `parse` reached through path lookup) and appends the trait QN
+ * to the type's `embedded_types` so trait dispatch walks it. */
+typedef enum {
+    RUST_DERIVE_RET_UNKNOWN,
+    RUST_DERIVE_RET_SELF,
+    RUST_DERIVE_RET_BOOL,
+    RUST_DERIVE_RET_UNIT,
+} RustDeriveReturn;
+
+typedef struct {
+    const char *short_name;
+    RustDeriveReturn ret;
+} RustDeriveMethod;
+
+#define RUST_DERIVE_MAX_METHODS 4
+
+typedef struct {
+    const char *derive_name;
+    const char *trait_qn;
+    RustDeriveMethod methods[RUST_DERIVE_MAX_METHODS]; /* ends at the first NULL short_name */
+} RustDeriveImpl;
+
+static const RustDeriveImpl RUST_DERIVES[] = {
+    {"Clone", "core.clone.Clone", {{"clone", RUST_DERIVE_RET_SELF}}},
+    {"Copy", "core.marker.Copy", {{NULL}}},
+    {"Debug", "core.fmt.Debug", {{"fmt", RUST_DERIVE_RET_UNKNOWN}}},
+    {"Display", "core.fmt.Display", {{"fmt", RUST_DERIVE_RET_UNKNOWN}}},
+    {"Default", "core.default.Default", {{"default", RUST_DERIVE_RET_SELF}}},
+    {"PartialEq", "core.cmp.PartialEq", {{"eq", RUST_DERIVE_RET_BOOL}, {"ne", RUST_DERIVE_RET_BOOL}}},
+    {"Eq", "core.cmp.Eq", {{NULL}}},
+    {"PartialOrd",
+     "core.cmp.PartialOrd",
+     {{"partial_cmp", RUST_DERIVE_RET_UNKNOWN},
+      {"lt", RUST_DERIVE_RET_BOOL},
+      {"le", RUST_DERIVE_RET_BOOL}}},
+    {"Ord", "core.cmp.Ord", {{"cmp", RUST_DERIVE_RET_UNKNOWN}}},
+    {"Hash", "core.hash.Hash", {{"hash", RUST_DERIVE_RET_UNIT}}},
+    {"Send", "core.marker.Send", {{NULL}}},
+    {"Sync", "core.marker.Sync", {{NULL}}},
+    {"Serialize", "serde.Serialize", {{"serialize", RUST_DERIVE_RET_UNKNOWN}}},
+    {"Deserialize", "serde.Deserialize", {{"deserialize", RUST_DERIVE_RET_UNKNOWN}}},
+    {"Parser",
+     "clap.Parser",
+     {{"parse", RUST_DERIVE_RET_SELF},
+      {"try_parse", RUST_DERIVE_RET_UNKNOWN},
+      {"parse_from", RUST_DERIVE_RET_SELF},
+      {"try_parse_from", RUST_DERIVE_RET_UNKNOWN}}},
+    {"Args", "clap.Args", {{NULL}}},
+    {"Subcommand", "clap.Subcommand", {{NULL}}},
+    {"ValueEnum", "clap.ValueEnum", {{NULL}}},
+    {"Error", "core.error.Error", {{NULL}}},
+};
+
+static const RustDeriveImpl *rust_derive_lookup(const char *name, size_t len) {
+    for (size_t i = 0; i < sizeof(RUST_DERIVES) / sizeof(RUST_DERIVES[0]); i++) {
+        if (strlen(RUST_DERIVES[i].derive_name) == len &&
+            strncmp(RUST_DERIVES[i].derive_name, name, len) == 0) {
+            return &RUST_DERIVES[i];
+        }
+    }
+    return NULL;
+}
+
+static void rust_register_derive_impl(CBMArena *arena, CBMTypeRegistry *reg, int32_t type_index,
+                                      const RustDeriveImpl *impl) {
+    const char *type_qn = reg->types[type_index].qualified_name;
+    rust_registered_type_add_embedded(arena, &reg->types[type_index], impl->trait_qn);
+    for (int mi = 0; mi < RUST_DERIVE_MAX_METHODS && impl->methods[mi].short_name; mi++) {
+        const RustDeriveMethod *dm = &impl->methods[mi];
+        CBMRegisteredFunc rf;
+        memset(&rf, 0, sizeof(rf));
+        rf.short_name = dm->short_name;
+        rf.qualified_name = cbm_arena_sprintf(arena, "%s.%s", type_qn, dm->short_name);
+        rf.receiver_type = type_qn;
+        rf.min_params = -1;
+        rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
+        rf.impl_trait_qn = impl->trait_qn;
+        const CBMType *ret_t = cbm_type_unknown();
+        switch (dm->ret) {
+        case RUST_DERIVE_RET_SELF:
+            ret_t = cbm_type_named(arena, type_qn);
+            break;
+        case RUST_DERIVE_RET_BOOL:
+            ret_t = cbm_type_builtin(arena, "bool");
+            break;
+        case RUST_DERIVE_RET_UNIT:
+            ret_t = cbm_type_builtin(arena, "()");
+            break;
+        case RUST_DERIVE_RET_UNKNOWN:
+            break;
+        }
+        const CBMType **ra = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+        ra[0] = ret_t;
+        ra[1] = NULL;
+        rf.signature = cbm_type_func(arena, NULL, NULL, ra);
+        cbm_registry_add_func(reg, rf);
+    }
+}
+
+/* Register the curated derives named by `#[derive(..)]` decorators on the
+ * registered type at `type_index`. A derive path (`serde::Serialize`) is
+ * matched on its last segment. */
+static void rust_register_derives(CBMArena *arena, CBMTypeRegistry *reg, int32_t type_index,
+                                  const char *const *decorators) {
+    if (!decorators || type_index < 0 || type_index >= reg->type_count ||
+        !reg->types[type_index].qualified_name) {
+        return;
+    }
+    for (int di = 0; decorators[di]; di++) {
+        const char *p = strstr(decorators[di], "derive");
+        const char *lparen = p ? strchr(p, '(') : NULL;
+        const char *rparen = lparen ? strchr(lparen, ')') : NULL;
+        if (!rparen) {
+            continue;
+        }
+        const char *q = lparen + 1;
+        while (q < rparen) {
+            while (q < rparen && (*q == ' ' || *q == ',' || *q == '\n' || *q == '\t')) {
+                q++;
+            }
+            const char *tok_start = q;
+            while (q < rparen && *q != ',' && *q != ' ' && *q != '\n' && *q != '\t') {
+                q++;
+            }
+            if (q == tok_start) {
+                break;
+            }
+            const char *short_start = tok_start;
+            for (const char *r = tok_start; r < q - 1; r++) {
+                if (r[0] == ':' && r[1] == ':') {
+                    short_start = r + 2;
+                }
+            }
+            const RustDeriveImpl *impl = rust_derive_lookup(short_start, (size_t)(q - short_start));
+            if (impl) {
+                rust_register_derive_impl(arena, reg, type_index, impl);
+            }
+        }
+    }
+}
+
 /* Build the registry from the per-file `result->defs`, `result->impl_traits`,
  * and a Rust prelude seed. */
 void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFileResult *result,
@@ -7718,196 +7937,15 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         }
     }
 
-    /* Phase A2: derive-macro synthesis.
-     *
-     * Real Rust code is saturated with `#[derive(Clone, Debug, …)]`.
-     * Without expanding proc-macros we can still synthesize the trait
-     * impl footprint that each well-known derive generates, so calls
-     * like `x.clone()` / `format!("{:?}", x)` / `MyT::default()` on the
-     * derived type actually resolve.
-     *
-     * We only synthesize the curated, high-frequency derives — anything
-     * unknown is left alone (per the FOLLOWUP doc's "no false edge"
-     * policy). Each synthesized impl:
-     *   - registers a method (or static fn for `default`/`parse`) on
-     *     the receiver type with the right short name and return type;
-     *   - appends the trait's QN to the receiver's `embedded_types` so
-     *     trait dispatch via `resolve_trait_method` walks it.
-     */
-    {
-        /* Curated derive → (trait QN, [methods with sig sketch]) table. */
-        struct DeriveMethod {
-            const char *short_name;
-            const char *return_type; /* QN or NULL for unknown */
-            bool is_static;          /* no `self` (e.g. `default`, `parse`) */
-        };
-        struct DeriveImpl {
-            const char *derive_name;
-            const char *trait_qn;
-            struct DeriveMethod methods[4]; /* NULL-terminated by empty short_name */
-        };
-        static const struct DeriveImpl derives[] = {
-            {"Clone", "core.clone.Clone", {{"clone", NULL, false}, {NULL, NULL, false}}},
-            {"Copy", "core.marker.Copy", {{NULL, NULL, false}}}, /* marker — no methods */
-            {"Debug", "core.fmt.Debug", {{"fmt", NULL, false}, {NULL, NULL, false}}},
-            {"Display", "core.fmt.Display", {{"fmt", NULL, false}, {NULL, NULL, false}}},
-            {"Default", "core.default.Default", {{"default", NULL, true}, {NULL, NULL, false}}},
-            {"PartialEq",
-             "core.cmp.PartialEq",
-             {{"eq", "bool", false}, {"ne", "bool", false}, {NULL, NULL, false}}},
-            {"Eq", "core.cmp.Eq", {{NULL, NULL, false}}}, /* marker only */
-            {"PartialOrd",
-             "core.cmp.PartialOrd",
-             {{"partial_cmp", NULL, false},
-              {"lt", "bool", false},
-              {"le", "bool", false},
-              {NULL, NULL, false}}},
-            {"Ord", "core.cmp.Ord", {{"cmp", NULL, false}, {NULL, NULL, false}}},
-            {"Hash", "core.hash.Hash", {{"hash", "()", false}, {NULL, NULL, false}}},
-            {"Send", "core.marker.Send", {{NULL, NULL, false}}},
-            {"Sync", "core.marker.Sync", {{NULL, NULL, false}}},
-            /* serde — extremely common. */
-            {"Serialize", "serde.Serialize", {{"serialize", NULL, false}, {NULL, NULL, false}}},
-            {"Deserialize",
-             "serde.Deserialize",
-             {{"deserialize", NULL, true}, {NULL, NULL, false}}},
-            /* clap derive — synthesizes the Parser interface. */
-            {"Parser",
-             "clap.Parser",
-             {{"parse", NULL, true},
-              {"try_parse", NULL, true},
-              {"parse_from", NULL, true},
-              {"try_parse_from", NULL, true}}},
-            {"Args", "clap.Args", {{NULL, NULL, false}}},
-            {"Subcommand", "clap.Subcommand", {{NULL, NULL, false}}},
-            {"ValueEnum", "clap.ValueEnum", {{NULL, NULL, false}}},
-            /* thiserror — adds the Error impl. */
-            {"Error", "core.error.Error", {{NULL, NULL, false}}},
-        };
-        const int derive_count = (int)(sizeof(derives) / sizeof(derives[0]));
-
-        for (int i = 0; i < result->defs.count; i++) {
-            CBMDefinition *d = &result->defs.items[i];
-            if (!d->qualified_name || !d->name)
-                continue;
-            /* `#[derive(...)]` rides on type-like defs — most often a struct or
-             * enum (now labelled "Struct"/"Enum"), also type aliases. Accept the
-             * whole type-like set so a derive on a struct is not dropped. */
-            if (!cbm_label_is_type_like(d->label))
-                continue;
-            if (!d->decorators)
-                continue;
-
-            /* Scan decorator strings for `#[derive(...)]`. */
-            for (int di = 0; d->decorators[di]; di++) {
-                const char *dec = d->decorators[di];
-                const char *p = strstr(dec, "derive");
-                if (!p)
-                    continue;
-                const char *lparen = strchr(p, '(');
-                if (!lparen)
-                    continue;
-                const char *rparen = strchr(lparen, ')');
-                if (!rparen)
-                    continue;
-                /* Now walk between the parens, splitting on comma. */
-                const char *q = lparen + 1;
-                while (q < rparen) {
-                    while (q < rparen && (*q == ' ' || *q == ','))
-                        q++;
-                    /* Find the end of the identifier (may be qualified
-                     * like `serde::Serialize`). We grab the trailing
-                     * segment as the derive name. */
-                    const char *tok_start = q;
-                    while (q < rparen && *q != ',' && *q != ' ')
-                        q++;
-                    if (q == tok_start)
-                        break;
-                    /* Trailing-segment after the last `::`. */
-                    const char *short_start = tok_start;
-                    for (const char *r = tok_start; r < q - 1; r++) {
-                        if (r[0] == ':' && r[1] == ':')
-                            short_start = r + 2;
-                    }
-                    size_t name_len = (size_t)(q - short_start);
-                    if (name_len == 0 || name_len > 64)
-                        continue;
-                    /* Look up in curated table. */
-                    for (int di2 = 0; di2 < derive_count; di2++) {
-                        const struct DeriveImpl *di_entry = &derives[di2];
-                        size_t entry_len = strlen(di_entry->derive_name);
-                        if (entry_len != name_len)
-                            continue;
-                        if (strncmp(di_entry->derive_name, short_start, name_len) != 0)
-                            continue;
-
-                        /* Found a matching curated derive. Register the
-                         * trait QN as an embedded_type on the receiver
-                         * AND synthesize the method entries. */
-                        CBMRegisteredType *rt = NULL;
-                        for (int ti = 0; ti < reg->type_count; ti++) {
-                            if (reg->types[ti].qualified_name &&
-                                strcmp(reg->types[ti].qualified_name, d->qualified_name) == 0) {
-                                rt = &reg->types[ti];
-                                break;
-                            }
-                        }
-                        if (!rt)
-                            break;
-
-                        /* Append trait QN to embedded_types. */
-                        int existing = 0;
-                        if (rt->embedded_types) {
-                            while (rt->embedded_types[existing])
-                                existing++;
-                        }
-                        const char **new_arr = (const char **)cbm_arena_alloc(
-                            arena, (existing + 2) * sizeof(const char *));
-                        for (int k = 0; k < existing; k++) {
-                            new_arr[k] = rt->embedded_types[k];
-                        }
-                        new_arr[existing] = di_entry->trait_qn;
-                        new_arr[existing + 1] = NULL;
-                        rt->embedded_types = new_arr;
-
-                        /* Synthesize methods. Bound `mi < 4` BEFORE dereferencing
-                         * methods[mi] so we never read methods[4] (OOB). */
-                        for (int mi = 0; mi < 4 && di_entry->methods[mi].short_name; mi++) {
-                            const struct DeriveMethod *dm = &di_entry->methods[mi];
-                            CBMRegisteredFunc rf;
-                            memset(&rf, 0, sizeof(rf));
-                            rf.short_name = dm->short_name;
-                            rf.qualified_name = cbm_arena_sprintf(arena, "%s.%s", d->qualified_name,
-                                                                  dm->short_name);
-                            /* Static methods (default/parse) have no
-                             * receiver; method calls treat them as
-                             * static path lookups via UFCS. */
-                            rf.receiver_type = d->qualified_name;
-                            rf.min_params = -1;
-                            rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
-                            rf.impl_trait_qn = di_entry->trait_qn;
-                            const CBMType *ret_t = cbm_type_unknown();
-                            if (dm->return_type) {
-                                if (strcmp(dm->return_type, "bool") == 0) {
-                                    ret_t = cbm_type_builtin(arena, "bool");
-                                } else if (strcmp(dm->return_type, "()") == 0) {
-                                    ret_t = cbm_type_builtin(arena, "()");
-                                }
-                            } else if (dm->is_static) {
-                                /* `default()`, `parse()` return Self. */
-                                ret_t = cbm_type_named(arena, d->qualified_name);
-                            }
-                            const CBMType **ra = (const CBMType **)cbm_arena_alloc(
-                                arena, 2 * sizeof(const CBMType *));
-                            ra[0] = ret_t;
-                            ra[1] = NULL;
-                            rf.signature = cbm_type_func(arena, NULL, NULL, ra);
-                            cbm_registry_add_func(reg, rf);
-                        }
-                        break;
-                    }
-                }
-            }
+    /* Phase A2: derive-macro synthesis (rust_register_derives). */
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *d = &result->defs.items[i];
+        if (!d->qualified_name || !d->name || !d->decorators || !cbm_label_is_type_like(d->label)) {
+            continue;
+        }
+        int32_t tix = cbm_idxmemo_get(&type_idx, d->qualified_name);
+        if (tix >= 0) {
+            rust_register_derives(arena, reg, tix, (const char *const *)d->decorators);
         }
     }
 
@@ -8150,6 +8188,13 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             d->is_interface || strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Interface") == 0;
         cbm_registry_add_type(reg, rt);
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
+    }
+    for (int i = 0; i < def_count; i++) {
+        CBMRustLSPDef *d = &defs[i];
+        if (d->decorators && d->qualified_name && d->label && cbm_label_is_type_like(d->label)) {
+            rust_register_derives(arena, reg, cbm_idxmemo_get(&type_idx, d->qualified_name),
+                                  (const char *const *)d->decorators);
+        }
     }
 
     const char **receivers =
@@ -8765,6 +8810,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].signature_param_count = defs[i].signature_param_count;
             rdefs[i].trait_qn = defs[i].trait_qn;
             rdefs[i].receiver_spelling = defs[i].receiver_spelling;
+            rdefs[i].decorators = defs[i].decorators;
             rdefs[i].is_interface = defs[i].is_interface;
             rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
             rdefs[i].is_abstract = defs[i].is_abstract;
