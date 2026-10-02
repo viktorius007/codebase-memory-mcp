@@ -1653,15 +1653,18 @@ TEST(rustlsp_json_macro_values_resolve) {
 TEST(rustlsp_matches_macro_scrutinee_and_guard_resolve) {
     const char *caller = "fn hidden() {\n"
                          "    let _ = matches!(a::one(), Some(_));\n"
-                         "    assert_matches!(a::two(), Ok(v) if a::three(v), \"m {}\", a::four());\n"
+                         "    assert_matches!(a::two(), Ok(v) if a::three(v), \"m {}\", 1);\n"
+                         "    assert_matches!(a::four(), Some(w) => { a::five(w); });\n"
                          "}\n";
-    const char *const leaves[] = {"one", "two", "three"};
-    const char *const sites[] = {"a::one()", "a::two()", "a::three(v)"};
-    bool resolved[3];
-    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 3, resolved);
+    const char *const leaves[] = {"one", "two", "three", "four", "five"};
+    const char *const sites[] = {"a::one()", "a::two()", "a::three(v)", "a::four()", "a::five(w)"};
+    bool resolved[5];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 5, resolved);
     ASSERT_TRUE(resolved[0]); /* matches! scrutinee */
     ASSERT_TRUE(resolved[1]); /* assert_matches! scrutinee */
     ASSERT_TRUE(resolved[2]); /* guard */
+    ASSERT_TRUE(resolved[3]); /* scrutinee of the `pat => arm` form */
+    ASSERT_TRUE(resolved[4]); /* arm */
     PASS();
 }
 

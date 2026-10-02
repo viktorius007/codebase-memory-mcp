@@ -5017,14 +5017,19 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation,
         break;
     case RUST_MACRO_ARGS_MATCHES: {
         /* `expr, pat [if guard] [, message…]` is the match `match expr { pat
-         * [if guard] => () }`: the guard sees the pattern's bindings. */
+         * [if guard] => () }`: the guard sees the pattern's bindings.
+         * assert_matches!'s `expr, pat [if guard] => arm` already is one. */
         int comma = rust_arg_find_top(s, 0, len, ',');
         if (comma >= len)
             break;
         int pat_end = rust_arg_find_top(s, comma + 1, len, ',');
+        bool has_arm = rust_arg_find_arrow(s, comma + 1, pat_end) < pat_end;
+        if (has_arm)
+            pat_end = len;
         s[comma] = '{';
         static const char match_prefix[] = "fn __cbm_macro_args() { match ";
-        rust_reparse_macro_region(ctx, src_start, s, 0, pat_end, match_prefix, " => () };");
+        rust_reparse_macro_region(ctx, src_start, s, 0, pat_end, match_prefix,
+                                  has_arm ? " };" : " => () };");
         break;
     }
     case RUST_MACRO_ARGS_SELECT:
