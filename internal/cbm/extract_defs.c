@@ -2032,6 +2032,10 @@ const char *cbm_rust_impl_owner_name(CBMArena *a, const char *type_text) {
     return lt ? cbm_arena_strndup(a, type_text, (size_t)(lt - type_text)) : type_text;
 }
 
+const char *cbm_rust_line_qualified_qn(CBMArena *a, const char *qn, unsigned start_line) {
+    return qn ? cbm_arena_sprintf(a, "%s#L%u", qn, start_line) : NULL;
+}
+
 const char *cbm_rust_cfg_scope_qn(CBMArena *a, TSNode func_node, const char *source,
                                   const char *plain_qn) {
     const char **decorators =
@@ -2979,6 +2983,17 @@ static char *resolve_param_name(CBMArena *a, TSNode param, const char *source) {
         }
     }
     return NULL;
+}
+
+/* Rust: the function item has no `pub`/`pub(..)` visibility modifier. */
+static bool rust_fn_is_private(TSNode fn) {
+    uint32_t n = ts_node_named_child_count(fn);
+    for (uint32_t i = 0; i < n; i++) {
+        if (strcmp(ts_node_type(ts_node_named_child(fn, i)), "visibility_modifier") == 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Rust: the function item carries `async` among its function_modifiers. */
@@ -5316,6 +5331,8 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         def.parent_class = type_qn;
         def.impl_trait = impl_trait;
         def.is_async = rust_fn_is_async(child);
+        /* A trait-impl method takes the trait's visibility, never its own. */
+        def.is_rust_private = !impl_trait && rust_fn_is_private(child);
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
         def.is_exported = cbm_is_exported(name, ctx->language);
@@ -8338,7 +8355,7 @@ static const char *cbm_razor_page_route(CBMArena *a, const char *source, int sou
     return NULL;
 }
 
-static void cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs);
+static int cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs);
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
@@ -8376,7 +8393,7 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
 
     cbm_extract_definitions_without_module(ctx);
     if (ctx->language == CBM_LANG_RUST) {
-        cbm_rust_separate_shared_qns(a, &ctx->result->defs);
+        ctx->rust_line_qualified_defs = cbm_rust_separate_shared_qns(a, &ctx->result->defs);
     }
 }
 
@@ -8432,14 +8449,15 @@ static bool rust_qn_keeps(const CBMDefinition *defs, int a, int b) {
  * same name in two functions. The graph keys nodes by QN, so all but one would
  * be dropped. The one the graph would keep retains the QN; each other gets a
  * line-qualified QN (`<qn>#L<line>`) and so its own node. */
-static void cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs) {
+static int cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs) {
     int n = defs->count;
+    int separated = 0;
     if (n < 2) {
-        return;
+        return 0;
     }
     int *order = (int *)cbm_arena_alloc(a, (size_t)n * sizeof(int));
     if (!order) {
-        return;
+        return 0;
     }
     for (int i = 0; i < n; i++) {
         order[i] = i;
@@ -8464,10 +8482,12 @@ static void cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs) {
             for (int k = lo; k < hi; k++) {
                 CBMDefinition *d = &defs->items[order[k]];
                 if (order[k] != keep) {
-                    d->qualified_name = cbm_arena_sprintf(a, "%s#L%u", qn, d->start_line);
+                    d->qualified_name = cbm_rust_line_qualified_qn(a, qn, d->start_line);
+                    separated++;
                 }
             }
         }
         lo = hi;
     }
+    return separated;
 }

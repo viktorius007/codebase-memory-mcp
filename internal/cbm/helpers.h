@@ -266,6 +266,14 @@ const char *cbm_rust_cfg_qualified_name(CBMArena *a, TSNode func_node, const cha
 const char *cbm_rust_cfg_scope_qn(CBMArena *a, TSNode func_node, const char *source,
                                   const char *plain_qn);
 
+/* Rust same-QN twin identity: `<qn>#L<line>` when the definition of the
+ * function starting at `start_line` was given that line-qualified QN because
+ * another definition in its file shares `qn` (cbm_rust_separate_shared_qns),
+ * else NULL. `qn` is the identity the caller computed for that function
+ * (impl/trait and cfg folds included). The body scope (extract_unified.c)
+ * asks the file's definitions; the resolver (rust_lsp.c) asks its registry. */
+const char *cbm_rust_line_qualified_qn(CBMArena *a, const char *qn, unsigned start_line);
+
 /* Rust impl owner identity: the implementing type's base name with generic
  * arguments stripped (`Buffer<T>` -> `Buffer`). Method nodes, body scopes and
  * resolver callers all key the owner by it. */

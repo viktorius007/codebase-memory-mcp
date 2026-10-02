@@ -233,6 +233,10 @@ typedef struct {
     /* Rust only: a trait's supertrait bounds as written (`Base<T>|std::fmt::Debug`),
      * "|"-separated, lifetimes and `?Sized` dropped. NULL for every other def. */
     const char *supertraits;
+    /* Rust only: an inherent-impl method declared without a visibility
+     * modifier. It is visible only inside the module that declares the impl
+     * and that module's descendants. */
+    bool is_rust_private;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -718,6 +722,9 @@ typedef struct {
      * 2026-09-14). What was extracted before the stop is kept. */
     uint64_t walk_deadline_cpu_ns;
     bool walk_budget_exhausted;
+    /* Rust: definitions of this file given a line-qualified QN because they
+     * share their QN with another definition (cbm_rust_separate_shared_qns). */
+    int rust_line_qualified_defs;
 } CBMExtractCtx;
 
 // --- Public API ---

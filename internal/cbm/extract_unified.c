@@ -938,8 +938,8 @@ static const char *rust_enclosing_impl_trait(CBMExtractCtx *ctx, TSNode func_nod
     return trait_text && trait_text[0] ? trait_text : NULL;
 }
 
-static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
-                                   WalkState *state) {
+static const char *compute_func_qn_shared(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                          WalkState *state) {
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {
         return compute_wolfram_func_qn(ctx, node);
@@ -1140,6 +1140,28 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return cbm_rust_cfg_scope_qn(ctx->arena, node, ctx->source, plain);
     }
     return plain;
+}
+
+/* A Rust function that shares its QN with another definition of the file is
+ * published under its line-qualified QN; its body's calls take that identity
+ * so they source from it rather than from the namesake that kept the QN. */
+static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                   WalkState *state) {
+    const char *qn = compute_func_qn_shared(ctx, node, spec, state);
+    if (!qn || ctx->language != CBM_LANG_RUST || ctx->rust_line_qualified_defs == 0 ||
+        strcmp(ts_node_type(node), "function_item") != 0) {
+        return qn;
+    }
+    unsigned line = ts_node_start_point(node).row + 1;
+    const char *line_qn = cbm_rust_line_qualified_qn(ctx->arena, qn, line);
+    const CBMDefArray *defs = &ctx->result->defs;
+    for (int i = 0; i < defs->count; i++) {
+        const CBMDefinition *d = &defs->items[i];
+        if (d->start_line == line && d->qualified_name && strcmp(d->qualified_name, line_qn) == 0) {
+            return line_qn;
+        }
+    }
+    return qn;
 }
 
 // Compute class QN for scope tracking.
