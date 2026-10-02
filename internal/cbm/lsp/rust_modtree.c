@@ -112,7 +112,8 @@ struct CBMRustModTree {
     CBMIdxMemo file_by_rel;
     CBMIdxMemo file_by_qn;
     CBMIdxMemo names;   /* "<module>\x1f<name>" -> first entry */
-    CBMIdxMemo externs; /* "<crate>\x1f<name>" -> target crate + 1, 0 = outside project */
+    CBMIdxMemo externs;   /* "<crate>\x1f<name>" -> target crate + 1, 0 = outside project */
+    CBMIdxMemo use_heads; /* "<module>\x1f<head>" -> 1 when a `use` declared there starts so */
 };
 
 typedef struct {
@@ -309,6 +310,10 @@ static int rmt_add_import(CBMRustModTree *tree, int module, const char *local, c
     }
     memcpy(owned, segs, (size_t)count * sizeof(*owned));
     int scope = rmt_vis_scope(tree, module, vis);
+    if (owned[0][0] != '\0') {
+        const char *key = cbm_arena_sprintf(&tree->arena, "%d\x1f%s", module, owned[0]);
+        cbm_idxmemo_put_if_absent(&tree->use_heads, &tree->arena, key, 1);
+    }
     tree->imports[id] = (RmtImport){.module = module,
                                     .next_glob = -1,
                                     .vis = scope,
@@ -1140,6 +1145,19 @@ static bool rmt_extern_prelude(const CBMRustModTree *tree, int crate, const char
     return false;
 }
 
+/* Outside `use` paths an unmodelled glob or macro item may shadow an extern
+ * crate silently: E0659 covers only import and macro resolution. A 2018+
+ * `use` declared in the same module and headed by `head` is that check:
+ * it compiles only if no glob or macro-expanded item of the module binds
+ * `head`. With no declared item or import of that name either, a non-use
+ * path headed by `head` in the module names the extern crate too. */
+static bool rmt_use_proves_extern(const CBMRustModTree *tree, int module, const char *head) {
+    char key[RMT_KEY_MAX];
+    int written = snprintf(key, sizeof(key), "%d\x1f%s", module, head);
+    return written > 0 && written < (int)sizeof(key) &&
+           cbm_idxmemo_get(&tree->use_heads, key) >= 0 && cbm_idxmemo_get(&tree->names, key) < 0;
+}
+
 static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head, uint8_t ns,
                              bool is_use, RmtDefs *out, bool building) {
     int crate = tree->modules[module].crate;
@@ -1148,14 +1166,15 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
         is_use && tree->crates[crate].edition_2015 ? tree->crates[crate].root_module : module;
     rmt_lookup(tree, scope, head, ns, out, &visit, building, NULL);
     RmtDef def = {.kind = RMT_EXTERNAL, .ns = RMT_NS_ALL, .module = -1};
-    /* A 2018+ `use` path whose head names both an extern crate and an item
-     * in scope is rejected as ambiguous (E0659), so a head left open only
-     * by an unmodelled glob or macro still names the extern crate. Only a
+    /* A 2018+ `use` path whose head names both an extern crate and a glob
+     * or macro-expanded name in scope is rejected as ambiguous (E0659), so
+     * a head left open only by an unmodelled glob or macro still names the
+     * extern crate; another path does when such a `use` proves it. Only a
      * project crate is settled this way: an outside crate's items publish
      * nothing, and impl receivers keep outside type names file-local. */
-    if (out->open && out->count == 0 && is_use && !tree->crates[crate].edition_2015 &&
-        (ns & RMT_NS_TYPE) && rmt_extern_prelude(tree, crate, head, &def) &&
-        def.kind == RMT_MODULE) {
+    if (out->open && out->count == 0 && !tree->crates[crate].edition_2015 && (ns & RMT_NS_TYPE) &&
+        (is_use || rmt_use_proves_extern(tree, module, head)) &&
+        rmt_extern_prelude(tree, crate, head, &def) && def.kind == RMT_MODULE) {
         *out = (RmtDefs){0};
         rmt_defs_add(out, &def);
         return;

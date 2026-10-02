@@ -8849,8 +8849,8 @@ TEST(rustlsp_modtree_digest_tracks_visibility) {
 }
 
 TEST(rustlsp_modtree_use_head_names_extern_crate_past_external_glob) {
-    /* app's glob from an outside crate could bring any name, so a bare path
-     * head stays open; a 2018 `use` head that is also an extern crate cannot
+    /* app's glob from an outside crate could bring any name; a 2018 `use`
+     * head that is also an extern crate cannot
      * be shadowed by it (rustc rejects the ambiguity), so the import resolves. */
     static const char *const rels[] = {"support/src/lib.rs", "support/src/responses.rs",
                                        "app/src/lib.rs"};
@@ -8880,9 +8880,71 @@ TEST(rustlsp_modtree_use_head_names_extern_crate_past_external_glob) {
         cbm_rust_modtree_resolve(fx.tree, &fx.arena, "s.app.src.lib", 0, "sse", NULL, NULL, 0);
     ASSERT_EQ(imported.kind, CBM_RUST_PATH_FUNCTION);
     ASSERT_STR_EQ(imported.qn, "s.support.src.responses.sse");
-    CBMRustPathResult expr_path = cbm_rust_modtree_resolve(
-        fx.tree, &fx.arena, "s.app.src.lib", 0, "support::responses::sse", NULL, NULL, 0);
-    ASSERT_EQ(expr_path.kind, CBM_RUST_PATH_UNKNOWN);
+    rust_modtree_fixture_free(&fx);
+    PASS();
+}
+
+TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it) {
+    /* Outside `use` paths rustc lets a glob-imported or macro-expanded name
+     * shadow an extern crate without E0659, so an expression-path head behind
+     * an outside glob names the crate only where a `use` of the same module
+     * headed by that name compiles (that use is checked for the ambiguity).
+     * A declared or explicitly imported name of the same spelling still wins:
+     * E0659 does not apply to it, in a use or elsewhere. */
+    enum { N = 8 };
+    static const char *const rels[N] = {
+        "support/src/lib.rs", "support/src/responses.rs", "app/src/lib.rs",
+        "app/src/proved.rs",  "app/src/macro_item.rs",    "app/src/unproved.rs",
+        "app/src/shadowed.rs", "app/src/aliased.rs"};
+    static const char *const qns[N] = {
+        "s.support.src.lib", "s.support.src.responses", "s.app.src.lib",
+        "s.app.src.proved",  "s.app.src.macro_item",    "s.app.src.unproved",
+        "s.app.src.shadowed", "s.app.src.aliased"};
+    static const char *const sources[N] = {
+        "pub mod responses;\n",
+        "pub fn sse() {}\n",
+        "mod proved;\nmod macro_item;\nmod unproved;\nmod shadowed;\nmod aliased;\n",
+        "use ext::prelude::*;\nuse support::responses;\n",
+        "make_items!();\nuse support::responses;\n",
+        "use ext::prelude::*;\n",
+        "use ext::prelude::*;\nmod support { pub mod responses { pub fn sse() {} } }\nuse support::responses;\n",
+        "use ext::prelude::*;\nuse undecided::m as support;\nuse support::responses;\n",
+    };
+    RustModTreeFixture fx = {.tree = cbm_rust_modtree_new()};
+    cbm_arena_init(&fx.arena);
+    CBMRustModFacts *facts[N] = {0};
+    for (int i = 0; i < N; i++) {
+        (void)cbm_rust_modtree_add_file(fx.tree, rels[i], qns[i]);
+        facts[i] = cbm_rust_modfacts_scan(sources[i], (int)strlen(sources[i]));
+    }
+    int support = cbm_rust_modtree_add_crate(fx.tree, "support/src/lib.rs", "support", false);
+    int app = cbm_rust_modtree_add_crate(fx.tree, "app/src/lib.rs", "app", false);
+    cbm_rust_modtree_add_extern(fx.tree, app, "support", support);
+    cbm_rust_modtree_add_extern(fx.tree, app, "ext", -1);
+    cbm_rust_modtree_finish(fx.tree, (const CBMRustModFacts *const *)facts);
+    for (int i = 0; i < N; i++) {
+        cbm_rust_modfacts_free(facts[i]);
+    }
+    const char *path = "support::responses::sse";
+    CBMRustPathResult proved =
+        cbm_rust_modtree_resolve(fx.tree, &fx.arena, "s.app.src.proved", 0, path, NULL, NULL, 0);
+    ASSERT_EQ(proved.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(proved.qn, "s.support.src.responses.sse");
+    CBMRustPathResult macro_item = cbm_rust_modtree_resolve(fx.tree, &fx.arena,
+                                                            "s.app.src.macro_item", 0, path, NULL,
+                                                            NULL, 0);
+    ASSERT_EQ(macro_item.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(macro_item.qn, "s.support.src.responses.sse");
+    CBMRustPathResult unproved =
+        cbm_rust_modtree_resolve(fx.tree, &fx.arena, "s.app.src.unproved", 0, path, NULL, NULL, 0);
+    ASSERT_EQ(unproved.kind, CBM_RUST_PATH_UNKNOWN);
+    CBMRustPathResult shadowed =
+        cbm_rust_modtree_resolve(fx.tree, &fx.arena, "s.app.src.shadowed", 0, path, NULL, NULL, 0);
+    ASSERT_EQ(shadowed.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(shadowed.qn, "s.app.src.shadowed.sse");
+    CBMRustPathResult aliased =
+        cbm_rust_modtree_resolve(fx.tree, &fx.arena, "s.app.src.aliased", 0, path, NULL, NULL, 0);
+    ASSERT_EQ(aliased.kind, CBM_RUST_PATH_UNKNOWN);
     rust_modtree_fixture_free(&fx);
     PASS();
 }
@@ -9568,4 +9630,5 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_external_glob_leaves_only_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_digest_tracks_visibility);
     RUN_TEST(rustlsp_modtree_use_head_names_extern_crate_past_external_glob);
+    RUN_TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it);
 }
