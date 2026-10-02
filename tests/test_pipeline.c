@@ -8590,21 +8590,24 @@ TEST(pipeline_rust_cargo_manifest_converges_across_routes) {
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 /* Edges present in exactly one of two generations, compared by edge type and
  * both endpoints' (file, qualified name, label); a duplicated edge counts once
- * per extra copy. Returns -1 when either database cannot be read. */
-static int graph_edge_difference_count(const char *actual_db, const char *reference_db,
-                                       const char *project) {
-    static const char sql[] =
-        "WITH a AS (SELECT e.type t, s.file_path sf, s.qualified_name sq, s.label sl, "
-        "d.file_path df, d.qualified_name dq, d.label dl, count(*) n FROM main.edges e "
-        "JOIN main.nodes s ON s.id=e.source_id JOIN main.nodes d ON d.id=e.target_id "
-        "WHERE e.project=?1 GROUP BY 1,2,3,4,5,6,7), "
-        "b AS (SELECT e.type t, s.file_path sf, s.qualified_name sq, s.label sl, "
-        "d.file_path df, d.qualified_name dq, d.label dl, count(*) n FROM ref.edges e "
-        "JOIN ref.nodes s ON s.id=e.source_id JOIN ref.nodes d ON d.id=e.target_id "
-        "WHERE e.project=?1 GROUP BY 1,2,3,4,5,6,7) "
-        "SELECT (SELECT coalesce(sum(abs(a.n-coalesce(b.n,0))),0) FROM a LEFT JOIN b USING "
-        "(t,sf,sq,sl,df,dq,dl)) + (SELECT coalesce(sum(b.n),0) FROM b LEFT JOIN a USING "
-        "(t,sf,sq,sl,df,dq,dl) WHERE a.n IS NULL)";
+ * per extra copy. `type_clause` narrows both sides (empty: every edge).
+ * Returns -1 when either database cannot be read. */
+static int edge_difference_count_where(const char *actual_db, const char *reference_db,
+                                       const char *project, const char *type_clause) {
+    char sql[2048];
+    snprintf(sql, sizeof(sql),
+             "WITH a AS (SELECT e.type t, s.file_path sf, s.qualified_name sq, s.label sl, "
+             "d.file_path df, d.qualified_name dq, d.label dl, count(*) n FROM main.edges e "
+             "JOIN main.nodes s ON s.id=e.source_id JOIN main.nodes d ON d.id=e.target_id "
+             "WHERE e.project=?1%s GROUP BY 1,2,3,4,5,6,7), "
+             "b AS (SELECT e.type t, s.file_path sf, s.qualified_name sq, s.label sl, "
+             "d.file_path df, d.qualified_name dq, d.label dl, count(*) n FROM ref.edges e "
+             "JOIN ref.nodes s ON s.id=e.source_id JOIN ref.nodes d ON d.id=e.target_id "
+             "WHERE e.project=?1%s GROUP BY 1,2,3,4,5,6,7) "
+             "SELECT (SELECT coalesce(sum(abs(a.n-coalesce(b.n,0))),0) FROM a LEFT JOIN b USING "
+             "(t,sf,sq,sl,df,dq,dl)) + (SELECT coalesce(sum(b.n),0) FROM b LEFT JOIN a USING "
+             "(t,sf,sq,sl,df,dq,dl) WHERE a.n IS NULL)",
+             type_clause, type_clause);
     sqlite3 *db = NULL;
     sqlite3_stmt *attach = NULL;
     int diff = -1;
@@ -8627,19 +8630,25 @@ typedef struct {
     int difference;
 } RustIncrementalEquivalence;
 
-/* Re-index `tmp` into the live database (incremental route), then build the
- * same files from scratch into `fresh_name` and count differing edges. */
-static RustIncrementalEquivalence rust_incremental_vs_fresh(const char *tmp, const char *live_db,
-                                                            const char *fresh_name,
-                                                            const char *project) {
+/* Re-index `tmp` into the live database (incremental route; the legacy
+ * partial route when `force_legacy`), then build the same files from scratch
+ * into `fresh_name` and count the edges matching `type_clause` that differ. */
+static RustIncrementalEquivalence refresh_vs_fresh_where(const char *tmp, const char *live_db,
+                                                         const char *fresh_name,
+                                                         const char *project, bool force_legacy,
+                                                         const char *type_clause) {
     RustIncrementalEquivalence observed = {.run_rc = -1, .fresh_rc = -1, .difference = -1};
     cbm_pipeline_incremental_test_reset_faults();
+    if (force_legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
     cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, live_db, CBM_MODE_FULL);
     if (incremental) {
         observed.run_rc = cbm_pipeline_run(incremental);
         observed.route = cbm_pipeline_incremental_test_last_route();
         cbm_pipeline_free(incremental);
     }
+    cbm_pipeline_incremental_test_reset_faults();
     char fresh_db[512];
     snprintf(fresh_db, sizeof(fresh_db), "%s/%s", tmp, fresh_name);
     cbm_pipeline_t *fresh = cbm_pipeline_new(tmp, fresh_db, CBM_MODE_FULL);
@@ -8647,8 +8656,16 @@ static RustIncrementalEquivalence rust_incremental_vs_fresh(const char *tmp, con
         observed.fresh_rc = cbm_pipeline_run(fresh);
         cbm_pipeline_free(fresh);
     }
-    observed.difference = graph_edge_difference_count(live_db, fresh_db, project);
+    observed.difference = edge_difference_count_where(live_db, fresh_db, project, type_clause);
     return observed;
+}
+
+/* Re-index `tmp` into the live database (incremental route), then build the
+ * same files from scratch into `fresh_name` and count differing edges. */
+static RustIncrementalEquivalence rust_incremental_vs_fresh(const char *tmp, const char *live_db,
+                                                            const char *fresh_name,
+                                                            const char *project) {
+    return refresh_vs_fresh_where(tmp, live_db, fresh_name, project, false, "");
 }
 
 /* Closure repair re-resolves a subset of the workspace, but Cargo target roots
@@ -8925,6 +8942,117 @@ TEST(pipeline_rust_closure_repair_folder_sibling_modules_keep_unique_ids) {
     ASSERT_EQ(undo.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(undo.fresh_rc, 0);
     ASSERT_EQ(undo.difference, 0);
+    PASS();
+}
+
+/* A Rust impl link is produced by the file holding the impl block, which
+ * need not hold either endpoint: `Square DEFINES_METHOD double` and
+ * `Square IMPLEMENTS Shape` both come from square_impls.rs. Re-parsing only
+ * the owner's file or only the trait's file must leave the same impl links a
+ * fresh full build publishes. */
+typedef struct {
+    int baseline_rc;
+    int implements_shape;
+    int defines_double;
+    RustIncrementalEquivalence owner_edit;
+    RustIncrementalEquivalence trait_edit;
+} RustImplLinkRefreshObservation;
+
+static const char rust_impl_link_clause[] = " AND e.type IN ('IMPLEMENTS','DEFINES_METHOD')";
+
+static RustImplLinkRefreshObservation observe_rust_impl_link_refresh(bool force_legacy) {
+    RustImplLinkRefreshObservation observed = {
+        .baseline_rc = -1, .implements_shape = -1, .defines_double = -1};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_links_XXXXXX");
+    if (!cbm_mkdtemp(tmp) || th_mkdir_p(TH_PATH(tmp, "crates/app/src")) != 0) {
+        return observed;
+    }
+    write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"crates/app\"]\n");
+    write_temp_file(tmp, "crates/app/Cargo.toml",
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "crates/app/src/lib.rs",
+                    "pub mod shape;\npub mod square;\npub mod square_impls;\n");
+    write_temp_file(tmp, "crates/app/src/shape.rs",
+                    "pub trait Shape {\n    fn area(&self) -> u32;\n}\n"
+                    "pub fn shape_probe() -> u32 {\n    1\n}\n");
+    write_temp_file(tmp, "crates/app/src/square.rs",
+                    "pub struct Square {\n    pub side: u32,\n}\n"
+                    "pub fn square_probe() -> u32 {\n    1\n}\n");
+    write_temp_file(tmp, "crates/app/src/square_impls.rs",
+                    "use crate::shape::Shape;\nuse crate::square::Square;\n"
+                    "impl Shape for Square {\n    fn area(&self) -> u32 {\n"
+                    "        self.side * self.side\n    }\n}\n"
+                    "impl Square {\n    pub fn double(&self) -> u32 {\n"
+                    "        self.side * 2\n    }\n}\n");
+
+    char live_db[512];
+    snprintf(live_db, sizeof(live_db), "%s/live.db", tmp);
+    char project[256] = "";
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, live_db, CBM_MODE_FULL);
+    if (baseline) {
+        observed.baseline_rc = cbm_pipeline_run(baseline);
+        snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+        cbm_pipeline_free(baseline);
+    }
+    cbm_store_t *store = cbm_store_open_path(live_db);
+    if (store) {
+        observed.implements_shape = named_edge_to_file_count(
+            store, project, "IMPLEMENTS", "Square", "Shape", "crates/app/src/shape.rs");
+        observed.defines_double = named_edge_to_file_count(
+            store, project, "DEFINES_METHOD", "Square", "double", "crates/app/src/square_impls.rs");
+        cbm_store_close(store);
+    }
+
+    /* Owner's file re-parsed: both links leave Square, neither is produced
+     * by square.rs. */
+    write_temp_file(tmp, "crates/app/src/square.rs",
+                    "pub struct Square {\n    pub side: u32,\n}\n"
+                    "pub fn square_probe() -> u32 {\n    let _probe = 1;\n    1\n}\n");
+    observed.owner_edit = refresh_vs_fresh_where(tmp, live_db, "owner.db", project, force_legacy,
+                                                 rust_impl_link_clause);
+
+    /* Trait's file re-parsed: `Square IMPLEMENTS Shape` enters it. */
+    write_temp_file(tmp, "crates/app/src/shape.rs",
+                    "pub trait Shape {\n    fn area(&self) -> u32;\n}\n"
+                    "pub fn shape_probe() -> u32 {\n    let _probe = 1;\n    1\n}\n");
+    observed.trait_edit = refresh_vs_fresh_where(tmp, live_db, "trait.db", project, force_legacy,
+                                                 rust_impl_link_clause);
+
+    th_rmtree(tmp);
+    return observed;
+}
+
+static int assert_refresh_equivalent(RustIncrementalEquivalence observed,
+                                     cbm_incremental_route_t expected_route) {
+    ASSERT_EQ(observed.run_rc, 0);
+    ASSERT_EQ(observed.route, expected_route);
+    ASSERT_EQ(observed.fresh_rc, 0);
+    ASSERT_EQ(observed.difference, 0);
+    return 0;
+}
+
+static int assert_rust_impl_link_refresh(RustImplLinkRefreshObservation observed,
+                                         cbm_incremental_route_t expected_route) {
+    ASSERT_EQ(observed.baseline_rc, 0);
+    ASSERT_EQ(observed.implements_shape, 1);  /* control: cross-file trait impl */
+    ASSERT_EQ(observed.defines_double, 1);   /* control: cross-file inherent method */
+    ASSERT_EQ(assert_refresh_equivalent(observed.owner_edit, expected_route), 0);
+    ASSERT_EQ(assert_refresh_equivalent(observed.trait_edit, expected_route), 0);
+    return 0;
+}
+
+TEST(pipeline_rust_closure_repair_keeps_impl_links_of_unparsed_impl_files) {
+    ASSERT_EQ(assert_rust_impl_link_refresh(observe_rust_impl_link_refresh(false),
+                                            CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+              0);
+    PASS();
+}
+
+TEST(pipeline_rust_legacy_restore_keeps_impl_links_of_unparsed_impl_files) {
+    ASSERT_EQ(assert_rust_impl_link_refresh(observe_rust_impl_link_refresh(true),
+                                            CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL),
+              0);
     PASS();
 }
 #endif
@@ -17413,6 +17541,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_closure_repair_matches_fresh_full_across_crates);
     RUN_TEST(pipeline_rust_closure_repair_resolves_through_project_module_tree);
     RUN_TEST(pipeline_rust_closure_repair_folder_sibling_modules_keep_unique_ids);
+    RUN_TEST(pipeline_rust_closure_repair_keeps_impl_links_of_unparsed_impl_files);
+    RUN_TEST(pipeline_rust_legacy_restore_keeps_impl_links_of_unparsed_impl_files);
 #endif
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
