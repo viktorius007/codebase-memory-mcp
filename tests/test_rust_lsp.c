@@ -1106,9 +1106,11 @@ TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed) {
     PASS();
 }
 
-/* Impl headers resolve at the block's own scope: a type parameter and a
- * block-local type stay unresolved, and an inline module's `super::` paths
- * and `use` bindings climb from that module. */
+/* Impl headers resolve at the block's own scope: a type parameter stays
+ * unresolved, an item of the file names its own definition (line-qualified
+ * when extraction separated same-QN items: the later block-local `Local`
+ * keeps the plain QN), and an inline module's `super::` paths and `use`
+ * bindings climb from that module. */
 TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
     const char *source = "struct Local;\n"
                          "trait Paint { fn paint(&self); }\n"
@@ -1121,9 +1123,9 @@ TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
                          "}\n";
     CBMArena arena;
     cbm_arena_init(&arena);
-    CBMLSPDef defs[3];
+    CBMLSPDef defs[4];
     memset(defs, 0, sizeof(defs));
-    defs[0].qualified_name = "test.main.Local";
+    defs[0].qualified_name = "test.main.Local#L1";
     defs[0].short_name = "Local";
     defs[0].label = "Struct";
     defs[0].def_module_qn = "test.main";
@@ -1139,7 +1141,12 @@ TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
     defs[2].label = "Struct";
     defs[2].def_module_qn = "test";
     defs[2].lang = CBM_LANG_RUST;
-    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 3);
+    defs[3].qualified_name = "test.main.Local";
+    defs[3].short_name = "Local";
+    defs[3].label = "Struct";
+    defs[3].def_module_qn = "test.main";
+    defs[3].lang = CBM_LANG_RUST;
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 4);
     ASSERT_NOT_NULL(registry);
     CBMResolvedCallArray out = {0};
     CBMRustImplLinkArray links = {0};
@@ -1147,13 +1154,17 @@ TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
                                          "test.main", registry, NULL, NULL, 0, NULL, NULL, NULL,
                                          &out, NULL, &links);
     ASSERT_EQ(links.count, 4);
-    ASSERT_STR_EQ(links.items[0].type_qn, "test.main.Local");
+    ASSERT_STR_EQ(links.items[0].type_qn, "test.main.Local#L1");
+    ASSERT_EQ(links.items[0].type_line, 1);
     ASSERT_STR_EQ(links.items[0].trait_qn, "test.main.Paint");
+    ASSERT_EQ(links.items[0].trait_line, 2);
     ASSERT_EQ(links.items[0].start_line, 3);
     ASSERT_EQ(links.items[0].end_line, 3);
     ASSERT_NULL(links.items[1].type_qn);
-    ASSERT_NULL(links.items[2].type_qn);
+    ASSERT_STR_EQ(links.items[2].type_qn, "test.main.Local");
+    ASSERT_EQ(links.items[2].type_line, 5);
     ASSERT_STR_EQ(links.items[3].type_qn, "test.Other");
+    ASSERT_EQ(links.items[3].type_line, 0);
     ASSERT_STR_EQ(links.items[3].trait_qn, "test.main.Paint");
     cbm_arena_destroy(&arena);
     PASS();

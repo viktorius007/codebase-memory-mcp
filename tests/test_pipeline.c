@@ -6820,6 +6820,42 @@ static int rust_instantiated_method_nodes_are_exact(cbm_store_t *store, const ch
     return feet == 1 && inches == 1 && collapsed == 0;
 }
 
+/* An impl link naming an item of its own file carries the item's line: a
+ * node holding that QN from another line (a same-QN namesake) gets no edge. */
+TEST(pipeline_rust_impl_edges_pin_in_file_items_to_their_line) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("rust-pin", "/tmp/rust-pin");
+    ASSERT_NOT_NULL(gb);
+    int64_t type_id =
+        cbm_gbuf_upsert_node(gb, "Struct", "Local", "rust-pin.src.lib.Local", "src/lib.rs", 2, 2,
+                             "{}");
+    int64_t trait_id =
+        cbm_gbuf_upsert_node(gb, "Interface", "Paint", "rust-pin.src.lib.Paint", "src/lib.rs", 1,
+                             1, "{}");
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMRustImplLink link = {.type_qn = "rust-pin.src.lib.Local",
+                            .trait_qn = "rust-pin.src.lib.Paint",
+                            .start_line = 9,
+                            .end_line = 9,
+                            .type_line = 7,
+                            .trait_line = 1};
+    cbm_rustimpllink_push(&result.rust_impl_links, &result.arena, link);
+    int stale = cbm_pipeline_rust_impl_edges(gb, gb, &result);
+    result.rust_impl_links.items[0].type_line = 2;
+    int pinned = cbm_pipeline_rust_impl_edges(gb, gb, &result);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, type_id, "IMPLEMENTS", &edges, &edge_count);
+    bool to_trait = edge_count == 1 && edges[0]->target_id == trait_id;
+    cbm_arena_destroy(&result.arena);
+    cbm_gbuf_free(gb);
+    ASSERT_EQ(stale, 0);
+    ASSERT_EQ(pinned, 1);
+    ASSERT_TRUE(to_trait);
+    PASS();
+}
+
 TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_nodes_XXXXXX");
@@ -16711,6 +16747,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_rust_macro_hidden_call_publishes_with_exact_admitted_resolution_in_both_modes);
     RUN_TEST(pipeline_rust_dump_records_only_published_calls_in_both_modes);
+    RUN_TEST(pipeline_rust_impl_edges_pin_in_file_items_to_their_line);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
