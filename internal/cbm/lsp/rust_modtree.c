@@ -1329,6 +1329,27 @@ static bool rmt_is_ancestor(const CBMRustModTree *tree, int ancestor, int module
     return false;
 }
 
+bool cbm_rust_modtree_file_outside(const CBMRustModTree *tree, const char *caller_qn,
+                                   const char *owner_qn) {
+    if (!tree || !caller_qn || !owner_qn) {
+        return false;
+    }
+    int caller = cbm_idxmemo_get(&tree->file_by_qn, caller_qn);
+    int owner = cbm_idxmemo_get(&tree->file_by_qn, owner_qn);
+    if (caller < 0 || owner < 0 || tree->files[caller].first_module < 0 ||
+        tree->files[owner].first_module < 0) {
+        return false;
+    }
+    for (int m = tree->files[caller].first_module; m >= 0; m = tree->modules[m].next_in_file) {
+        for (int up = m; up >= 0; up = tree->modules[up].parent) {
+            if (tree->modules[up].file == owner) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool rmt_contains(const RmtModule *module, uint32_t offset) {
     return module->start <= offset && offset < module->end;
 }
@@ -1357,7 +1378,7 @@ static CBMRustPathResult rmt_classify(const RmtDefs *defs) {
                                    .is_trait = owner->kind == RMT_TRAIT};
     }
     if (defs->count != 1) {
-        return unknown;
+        return (CBMRustPathResult){.kind = CBM_RUST_PATH_AMBIGUOUS};
     }
     const RmtDef *def = &defs->defs[0];
     if (def->kind == RMT_OPAQUE) {

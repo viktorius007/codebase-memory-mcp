@@ -7601,6 +7601,135 @@ TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
     PASS();
 }
 
+typedef struct {
+    const char *path;
+    const char *content;
+} RustSourceFile;
+
+/* A two-crate workspace whose `core` crate declares `lib_rs` and holds
+ * `files`; the padding makes the parallel pipeline run. */
+static void write_rust_core_workspace(const char *tmp, const char *lib_rs,
+                                      const RustSourceFile *files, int file_count) {
+    write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"core\", \"util\"]\n");
+    write_temp_file(tmp, "core/Cargo.toml",
+                    "[package]\nname = \"codex-core\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "core/src/lib.rs", lib_rs);
+    for (int i = 0; i < file_count; i++) {
+        write_temp_file(tmp, files[i].path, files[i].content);
+    }
+    write_temp_file(tmp, "util/src/lib.rs", "pub fn util_root() -> u8 { 0 }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "util/src/pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_core_pad_%02d() -> u8 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* A private inherent method is invisible outside its module, so a method call
+ * from another module skips it and reaches the trait implementation; inside
+ * the module the inherent method still wins. */
+static const RustModTreeCallCase rust_private_inherent_cases[] = {
+    {"private inherent method from another module", "core.src.user.via_trait",
+     "core.src.store.S.read", false},
+    {"trait method from another module", "core.src.user.via_trait", "core.src.store.S.read[Tr]",
+     true},
+    {"private inherent method inside its module", "core.src.store.inside", "core.src.store.S.read",
+     true},
+};
+
+TEST(pipeline_rust_private_inherent_method_hidden_outside_its_module) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_private_inherent_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    const RustSourceFile files[] = {
+        {"core/src/store.rs", "pub trait Tr {\n    fn read(&self) -> u8;\n}\npub struct S;\n"
+                              "impl S {\n    fn read(&self) -> u8 { 1 }\n}\n"
+                              "impl Tr for S {\n    fn read(&self) -> u8 { 2 }\n}\n"
+                              "pub fn inside(s: &S) -> u8 { s.read() }\n"},
+        {"core/src/user.rs",
+         "use crate::store::{Tr, S};\npub fn via_trait(s: &S) -> u8 { s.read() }\n"},
+    };
+    write_rust_core_workspace(tmp, "mod store;\nmod user;\n", files,
+                              (int)(sizeof(files) / sizeof(files[0])));
+
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, rust_private_inherent_cases,
+        (int)(sizeof(rust_private_inherent_cases) / sizeof(rust_private_inherent_cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
+/* Two functions of one file share a QN (inline modules are not part of it):
+ * the one published as `<qn>#L<line>` sources the calls of its own body. */
+static const RustModTreeCallCase rust_line_qualified_caller_cases[] = {
+    {"inline-module twin calls from its own node", "core.src.jobs.run#L4", "core.src.jobs.f", true},
+    {"inline-module twin keeps its namesake's calls", "core.src.jobs.run#L4", "core.src.jobs.g",
+     false},
+    {"plain-QN twin calls from its own node", "core.src.jobs.run", "core.src.jobs.g", true},
+    {"plain-QN twin does not take its namesake's calls", "core.src.jobs.run", "core.src.jobs.f",
+     false},
+    {"root fn beside an inline-module namesake", "core.src.solo.run#L1", "core.src.solo.f", true},
+    {"root fn's call not on the inline-module namesake", "core.src.solo.run", "core.src.solo.f",
+     false},
+};
+
+TEST(pipeline_rust_line_qualified_twin_sources_its_own_calls) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_line_twin_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    const RustSourceFile files[] = {
+        {"core/src/jobs.rs", "pub fn f() -> u8 { 1 }\npub fn g() -> u8 { 2 }\n"
+                             "mod x {\n    pub fn run() -> u8 { super::f() }\n}\n"
+                             "mod y {\n    pub fn run() -> u8 { super::g() }\n}\n"},
+        {"core/src/solo.rs",
+         "pub fn run() -> u8 { f() }\npub fn f() -> u8 { 1 }\npub fn g() -> u8 { 2 }\n"
+         "mod job {\n    pub fn run() -> u8 { super::g() }\n}\n"},
+    };
+    write_rust_core_workspace(tmp, "mod jobs;\nmod solo;\n", files,
+                              (int)(sizeof(files) / sizeof(files[0])));
+
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, rust_line_qualified_caller_cases,
+        (int)(sizeof(rust_line_qualified_caller_cases) /
+              sizeof(rust_line_qualified_caller_cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
+/* A name bound in one module by a `#[cfg]` function and a `#[cfg]` import:
+ * which item a call reaches depends on the build, so no link is published. */
+static const RustModTreeCallCase rust_cfg_bound_name_cases[] = {
+    {"cfg twin: the local function", "core.src.plat.call", "core.src.plat.f", false},
+    {"cfg twin: the imported function", "core.src.plat.call", "core.src.win.f", false},
+    {"name bound once in the same caller", "core.src.plat.call", "core.src.plat.other", true},
+};
+
+TEST(pipeline_rust_cfg_dependent_name_links_nothing) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_cfg_name_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    const RustSourceFile files[] = {
+        {"core/src/win.rs", "pub fn f() -> u8 { 1 }\n"},
+        {"core/src/plat.rs",
+         "#[cfg(unix)]\nfn f() -> u8 { 2 }\n#[cfg(windows)]\nuse crate::win::f;\n"
+         "fn other() -> u8 { 3 }\npub fn call() -> u8 { f() + other() }\n"},
+    };
+    write_rust_core_workspace(tmp, "mod plat;\nmod win;\n", files,
+                              (int)(sizeof(files) / sizeof(files[0])));
+
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, rust_cfg_bound_name_cases,
+        (int)(sizeof(rust_cfg_bound_name_cases) / sizeof(rust_cfg_bound_name_cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
 /* A method call on the value of a path call is typed from the target the call
  * step published for that producer. The producers here live in a path
  * dependency outside the workspace (`[lib] path`, a module below its root)
@@ -16858,7 +16987,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":6") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -17760,6 +17889,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_type_names_resolve_through_declared_module_tree);
     RUN_TEST(pipeline_rust_await_async_fn_output_survives_closure_repair);
     RUN_TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration);
+    RUN_TEST(pipeline_rust_private_inherent_method_hidden_outside_its_module);
+    RUN_TEST(pipeline_rust_line_qualified_twin_sources_its_own_calls);
+    RUN_TEST(pipeline_rust_cfg_dependent_name_links_nothing);
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
     RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
     RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);

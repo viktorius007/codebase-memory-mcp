@@ -41,6 +41,10 @@ typedef struct {
      * flag still prevents that method from being mistaken for inherent. */
     const char *impl_trait_qn;
     const char *impl_key; /* Rust-only internal receiver + instantiated-trait identity */
+    /* Rust only: graph module QN of the file declaring a private inherent
+     * method (no visibility modifier). Code outside that file's modules
+     * cannot call it. NULL for every other function. */
+    const char *rust_private_module;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.

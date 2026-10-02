@@ -55,6 +55,10 @@ typedef enum {
                                  * constant, variant, external crate item); for a type
                                  * query: proven to name a type outside the project */
     CBM_RUST_PATH_TYPE,         /* type query: `qn` is a type or trait declared in the project */
+    CBM_RUST_PATH_AMBIGUOUS,    /* value query: two or more distinct items carry the name in
+                                 * this module (only cfg-gated alternatives can, e.g. a local
+                                 * `#[cfg(unix)] fn f` beside `#[cfg(windows)] use w::f`);
+                                 * which one a build sees depends on its configuration */
 } CBMRustPathKind;
 
 typedef struct {
@@ -95,6 +99,14 @@ void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const 
 /* True when the file with this graph module QN belongs to at least one crate. */
 bool cbm_rust_modtree_has_file(const CBMRustModTree *tree, const char *module_qn);
 
+/* Whether every module of the file `caller_qn` lies outside every module of
+ * the file `owner_qn`, in every crate that compiles the caller: no module of
+ * the owner file is the caller's module or one of its ancestors. That is when
+ * an item private to the owner file's modules (a method of an inherent impl
+ * without `pub`) cannot be named by the caller. False when either file
+ * belongs to no crate, or when any caller module sits inside the owner. */
+bool cbm_rust_modtree_file_outside(const CBMRustModTree *tree, const char *caller_qn,
+                                   const char *owner_qn);
 /* Resolve a call path (`f`, `a::b::f`, `crate::m::f`, `Type::f`) written at
  * byte `offset` of the file whose graph module QN is `module_qn`. `extra_uses`
  * are `use` bindings declared in enclosing blocks (local name, path text),

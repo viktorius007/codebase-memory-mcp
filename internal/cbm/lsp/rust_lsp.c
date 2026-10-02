@@ -3830,7 +3830,21 @@ static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t) {
     return NULL;
 }
 
-static const CBMRegisteredFunc *rust_registry_lookup_inherent_method(const CBMTypeRegistry *reg,
+/* A private inherent method the caller cannot name: rustc skips it during
+ * method probing and goes on to trait methods. Proven only by the module
+ * tree; without one every method stays a candidate. */
+static bool rust_method_hidden_from_caller(const RustLSPContext *ctx,
+                                           const CBMRegisteredFunc *method) {
+    if (!ctx || !method->rust_private_module || !ctx->module_qn ||
+        strcmp(method->rust_private_module, ctx->module_qn) == 0) {
+        return false;
+    }
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    return cbm_rust_modtree_file_outside(tree, ctx->module_qn, method->rust_private_module);
+}
+
+static const CBMRegisteredFunc *rust_registry_lookup_inherent_method(const RustLSPContext *ctx,
+                                                                     const CBMTypeRegistry *reg,
                                                                      const char *receiver_qn,
                                                                      const char *method_name) {
     if (!reg || !receiver_qn || !method_name) {
@@ -3842,6 +3856,7 @@ static const CBMRegisteredFunc *rust_registry_lookup_inherent_method(const CBMTy
     for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
         const CBMRegisteredFunc *candidate = &reg->funcs[index];
         if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 &&
+            !rust_method_hidden_from_caller(ctx, candidate) &&
             (best_index < 0 || index < best_index)) {
             best_index = index;
         }
@@ -3849,21 +3864,22 @@ static const CBMRegisteredFunc *rust_registry_lookup_inherent_method(const CBMTy
     if (best_index >= 0) {
         return &reg->funcs[best_index];
     }
-    return reg->fallback
-               ? rust_registry_lookup_inherent_method(reg->fallback, receiver_qn, method_name)
-               : NULL;
+    return reg->fallback ? rust_registry_lookup_inherent_method(ctx, reg->fallback, receiver_qn,
+                                                                method_name)
+                         : NULL;
 }
 
 static const CBMRegisteredFunc *rust_registry_lookup_inherent_method_aliased(
-    const CBMTypeRegistry *reg, const char *receiver_qn, const char *method_name) {
+    const RustLSPContext *ctx, const CBMTypeRegistry *reg, const char *receiver_qn,
+    const char *method_name) {
     const CBMRegisteredFunc *method =
-        rust_registry_lookup_inherent_method(reg, receiver_qn, method_name);
+        rust_registry_lookup_inherent_method(ctx, reg, receiver_qn, method_name);
     if (method) {
         return method;
     }
     const CBMRegisteredType *type = cbm_registry_lookup_type(reg, receiver_qn);
     for (int depth = 0; depth < 16 && type && type->alias_of; depth++) {
-        method = rust_registry_lookup_inherent_method(reg, type->alias_of, method_name);
+        method = rust_registry_lookup_inherent_method(ctx, reg, type->alias_of, method_name);
         if (method) {
             return method;
         }
@@ -3973,7 +3989,7 @@ static const CBMRegisteredFunc *rust_lookup_method_depth(RustLSPContext *ctx, co
 
     /* Direct inherent method lookup. */
     const CBMRegisteredFunc *f =
-        rust_registry_lookup_inherent_method_aliased(ctx->registry, type_qn, member_name);
+        rust_registry_lookup_inherent_method_aliased(ctx, ctx->registry, type_qn, member_name);
     if (f)
         return f;
 
@@ -4139,7 +4155,7 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
      * implementations may share the exact same receiver/name/QN, so the
      * generic registry first-match lookup is not precise enough here. */
     const CBMRegisteredFunc *inh =
-        rust_registry_lookup_inherent_method_aliased(reg, receiver_type_qn, method_name);
+        rust_registry_lookup_inherent_method_aliased(ctx, reg, receiver_type_qn, method_name);
     if (inh) {
         bool trait_ambiguous = false;
         const CBMRegisteredFunc *trait_method = rust_registry_lookup_trait_impl_method(
@@ -6433,6 +6449,11 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
     }
     case CBM_RUST_PATH_NOT_FUNCTION:
         return true;
+    case CBM_RUST_PATH_AMBIGUOUS:
+        /* The name's target depends on the build configuration: no link. */
+        out->open_qn = path;
+        out->open_reason = "cfg_dependent_name";
+        return true;
     default:
         return false;
     }
@@ -7266,6 +7287,15 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
         ctx->enclosing_func_qn =
             cbm_rust_cfg_scope_qn(ctx->arena, func_node, ctx->source, ctx->enclosing_func_qn);
     }
+    {
+        /* A namesake in the same file keeps the plain QN; this function's
+         * node is then line-qualified (cbm_rust_line_qualified_qn). */
+        const char *line_qn = cbm_rust_line_qualified_qn(
+            ctx->arena, ctx->enclosing_func_qn, ts_node_start_point(func_node).row + 1);
+        if (cbm_registry_lookup_func(ctx->registry, line_qn)) {
+            ctx->enclosing_func_qn = line_qn;
+        }
+    }
 
     CBMScope *saved = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
@@ -8063,6 +8093,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
                 rf.impl_trait_qn =
                     rust_canonical_impl_trait(arena, reg, &trait_names, d->impl_trait, module_qn);
+            } else if (d->is_rust_private && module_qn) {
+                rf.rust_private_module = module_qn;
             }
 
             /* Build FUNC sig from return_types / param_types. */
@@ -8695,6 +8727,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
                 rf.impl_trait_qn =
                     rust_canonical_impl_trait(arena, reg, &trait_names, d->trait_qn, def_mod);
+            } else if (d->is_rust_private && def_mod) {
+                rf.rust_private_module = cbm_arena_strdup(arena, def_mod);
             }
 
             /* Build sig from return_types text. */
@@ -9221,6 +9255,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
             rdefs[i].is_abstract = defs[i].is_abstract;
             rdefs[i].is_async = defs[i].is_async;
+            rdefs[i].is_rust_private = defs[i].is_rust_private;
         }
     }
     rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL, modtree);
