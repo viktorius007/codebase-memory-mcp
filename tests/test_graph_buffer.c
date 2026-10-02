@@ -65,6 +65,41 @@ TEST(gbuf_upsert_updates) {
     PASS();
 }
 
+/* A file module beside the folder of its stem (Rust `foo.rs` + `foo/`) shares the
+ * folder's QN. The folder keeps the QN and the returned id; the file module gets
+ * its own Module node under `<qn>#module`. A file INSIDE a folder whose module QN
+ * is the folder's (Go package file) still adds nothing. Both the direct upsert
+ * and the worker-gbuf merge behave alike. */
+TEST(gbuf_folder_sibling_file_module_kept) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("p", "/tmp");
+    int64_t folder = cbm_gbuf_upsert_node(gb, "Folder", "foo", "p.src.foo", "src/foo", 0, 0, "{}");
+    int64_t got =
+        cbm_gbuf_upsert_node(gb, "Module", "src/foo.rs", "p.src.foo", "src/foo.rs", 1, 9, "{}");
+    ASSERT_EQ(got, folder);
+    const cbm_gbuf_node_t *f = cbm_gbuf_find_by_qn(gb, "p.src.foo");
+    ASSERT_STR_EQ(f->label, "Folder");
+    const cbm_gbuf_node_t *m = cbm_gbuf_find_by_qn(gb, "p.src.foo#module");
+    ASSERT_NOT_NULL(m);
+    ASSERT_STR_EQ(m->label, "Module");
+    ASSERT_STR_EQ(m->file_path, "src/foo.rs");
+    ASSERT_EQ(m->start_line, 1);
+
+    (void)cbm_gbuf_upsert_node(gb, "Folder", "pkg", "p.pkg", "pkg", 0, 0, "{}");
+    (void)cbm_gbuf_upsert_node(gb, "Module", "pkg/a.go", "p.pkg", "pkg/a.go", 1, 5, "{}");
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "p.pkg#module"));
+
+    cbm_gbuf_t *worker = cbm_gbuf_new("p", "/tmp");
+    (void)cbm_gbuf_upsert_node(worker, "Module", "src/bar.rs", "p.src.bar", "src/bar.rs", 1, 4,
+                               "{}");
+    (void)cbm_gbuf_upsert_node(gb, "Folder", "bar", "p.src.bar", "src/bar", 0, 0, "{}");
+    ASSERT_EQ(cbm_gbuf_merge(gb, worker), 0);
+    ASSERT_STR_EQ(cbm_gbuf_find_by_qn(gb, "p.src.bar")->label, "Folder");
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "p.src.bar#module"));
+    cbm_gbuf_free(worker);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(gbuf_find_by_id) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t id = cbm_gbuf_upsert_node(gb, "Function", "foo", "pkg.foo", "foo.go", 1, 5, "{}");
@@ -1159,6 +1194,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_free_null);
     RUN_TEST(gbuf_upsert_node);
     RUN_TEST(gbuf_upsert_updates);
+    RUN_TEST(gbuf_folder_sibling_file_module_kept);
     RUN_TEST(gbuf_find_by_id);
     RUN_TEST(gbuf_find_by_label);
     RUN_TEST(gbuf_find_by_name);

@@ -836,6 +836,48 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
 
 /* ── Node operations ─────────────────────────────────────────────── */
 
+/* True when the file at `module_path` is the folder `folder_path` plus an
+ * extension: a file module beside the folder of the same stem (Rust `foo.rs`
+ * next to `foo/`, which holds foo's submodules). Its module QN equals the
+ * folder's, yet it is a separate entity — unlike a Go/Java file inside a package
+ * folder, or a Python `pkg/__init__.py`, whose module IS the folder. */
+static bool module_is_folder_sibling(const char *module_path, const char *folder_path) {
+    if (!module_path || !folder_path) {
+        return false;
+    }
+    const char *slash = strrchr(module_path, '/');
+    const char *dot = strrchr(module_path, '.');
+    if (!dot || (slash && dot < slash)) {
+        return false;
+    }
+    size_t stem_len = (size_t)(dot - module_path);
+    return strlen(folder_path) == stem_len && strncmp(module_path, folder_path, stem_len) == 0;
+}
+
+/* A file module that collides with the sibling folder of its stem keeps the
+ * folder as the holder of the shared QN — every lookup of the module QN still
+ * lands there, as before — and gets its own Module node under `<qn>#module`, so
+ * the file's module exists in the graph at its place. */
+static void upsert_folder_sibling_module(cbm_gbuf_t *gb, const cbm_gbuf_node_t *folder,
+                                         const char *label, const char *name,
+                                         const char *qualified_name, const char *file_path,
+                                         int start_line, int end_line,
+                                         const char *properties_json) {
+    if (strcmp(folder->label, "Folder") != 0 ||
+        !module_is_folder_sibling(file_path, folder->file_path)) {
+        return;
+    }
+    size_t n = strlen(qualified_name) + sizeof("#module");
+    char *qn = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, n);
+    if (!qn) {
+        return;
+    }
+    snprintf(qn, n, "%s#module", qualified_name);
+    (void)cbm_gbuf_upsert_node(gb, label, name, qn, file_path, start_line, end_line,
+                               properties_json);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, qn);
+}
+
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json) {
@@ -861,6 +903,8 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * upsert and the parallel local-gbuf merge route through this function.) */
         if (existing->label && label && strcmp(label, "Module") == 0 &&
             (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0)) {
+            upsert_folder_sibling_module(gb, existing, label, name, qualified_name, file_path,
+                                         start_line, end_line, properties_json);
             return existing->id;
         }
         /* Same-QN arrival: distinct source entities can share a QN (C: a
@@ -1471,7 +1515,11 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
     bool module_on_container =
         existing->label && sn->label && strcmp(sn->label, "Module") == 0 &&
         (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0);
-    if (!module_on_container) {
+    if (module_on_container) {
+        upsert_folder_sibling_module(dst, existing, sn->label, sn->name, sn->qualified_name,
+                                     sn->file_path, sn->start_line, sn->end_line,
+                                     sn->properties_json);
+    } else {
         /* Canonical collision winner (determinism) — mirrors
          * cbm_gbuf_upsert_node exactly. Distinct source entities can share a
          * QN (C: struct/function/macro with one name); unconditional "src

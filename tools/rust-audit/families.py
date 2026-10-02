@@ -20,14 +20,23 @@ for l in open(D+'refs.tsv',errors='replace'):
     elif p[0]=='R': refs.append(p[1:])
     else: impls.append(p[1:])
 # 1. definitions
-LAB={'fn':{'Function','Method'},'type':{'Struct','Enum','Interface','Type','Class'},'term':{'Variable','Field'},'module':{'Module'},'macro':{'Macro','Function'}}
+LAB={'fn':{'Function','Method'},'type':{'Struct','Enum','Interface','Type','Class'},'term':{'Variable','Field','AssociatedConst'},'module':{'Module'},'macro':{'Macro','Function'}}
+# A `type` nested in another (`E#V#`, `impl#[T][Tr]Item#`) is an enum variant or an
+# associated type, which the graph labels EnumVariant / AssociatedType.
+VARIANT_LAB=LAB['type']|{'EnumVariant','AssociatedType'}
+# A file module's truth definition sits on line 1 and carries the module's own name
+# (`crate`, the file stem, or the name of a `#[path]` module); its graph node is the
+# file's Module node, which is named by the file path.
+filemodule={f:i for f,rows in by_file.items() for s,e,n,i,lab in rows if lab=='Module' and n==f and s==1}
 tot=collections.Counter(); hit=collections.Counter(); matched=set(); defnode={}
 for f,line,kind,name,desc in defs:
     sub=kind
     if kind=='term': sub='term:field_or_variant' if '#' in desc else 'term:const_static'
     if kind=='fn': sub='fn:method' if ('impl#' in desc or '#' in desc) else 'fn:free'
     tot[sub]+=1
-    i=find(f,int(line),name,LAB.get(kind))
+    labels=VARIANT_LAB if kind=='type' and '#' in desc.rstrip('#') else LAB.get(kind)
+    i=find(f,int(line),name,labels)
+    if i is None and kind=='module' and line=='1': i=filemodule.get(f)
     if i is not None: hit[sub]+=1; matched.add(i); defnode[(f,int(line),name)]=i
 print('DEFINITIONS (truth definition -> graph node of matching kind at that place)')
 for k in sorted(tot): print(f'  {k:<24}{hit[k]:>7} / {tot[k]:<7} {100*hit[k]/tot[k]:.1f}%')

@@ -5121,6 +5121,38 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
 
 // --- Rust impl block extraction ---
 
+/* An impl's associated `const NAME: T = ..;` (AssociatedConst) or `type Name =
+ * ..;` (AssociatedType), owned by the impl's type and, for a trait impl, keyed by
+ * the trait the way its methods are. Like a variant, an associated item is
+ * reachable only through its type (`T::NAME`, `Self::Item`), so its label is one
+ * the bare-name symbol registry does not admit: as a Type, every `Error` or
+ * `Value` in the corpus would resolve to some impl's `type Error`. */
+static void extract_rust_assoc_item(CBMExtractCtx *ctx, TSNode item, const char *type_qn,
+                                    const char *impl_trait) {
+    CBMArena *a = ctx->arena;
+    TSNode name_node = ts_node_child_by_field_name(item, TS_FIELD("name"));
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+    char *name = cbm_node_text(a, name_node, ctx->source);
+    if (!name || !name[0] || strcmp(name, "_") == 0) {
+        return;
+    }
+    bool is_type = strcmp(ts_node_type(item), "type_item") == 0;
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = impl_trait ? cbm_arena_sprintf(a, "%s.%s[%s]", type_qn, name, impl_trait)
+                                    : cbm_arena_sprintf(a, "%s.%s", type_qn, name);
+    def.label = is_type ? "AssociatedType" : "AssociatedConst";
+    def.file_path = ctx->rel_path;
+    def.start_line = ts_node_start_point(item).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(item).row + TS_LINE_OFFSET;
+    def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
+    def.is_exported = cbm_is_exported(name, ctx->language);
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
 static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -5161,6 +5193,11 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(body, i);
         if (ts_node_is_null(child)) {
+            continue;
+        }
+        if (strcmp(ts_node_type(child), "const_item") == 0 ||
+            strcmp(ts_node_type(child), "type_item") == 0) {
+            extract_rust_assoc_item(ctx, child, type_qn, impl_trait);
             continue;
         }
         if (!cbm_kind_in_set(child, spec->function_node_types)) {
@@ -5468,17 +5505,22 @@ static bool is_enum_member_kind(const char *kind) {
            strcmp(kind, "enumerator") == 0;
 }
 
-/* Extract enum members as Variable nodes (C#, Java, TypeScript, C++). */
+/* Extract enum members as Variable nodes (C#, Java, TypeScript, C++) or Rust
+ * EnumVariant nodes. A Rust variant with named fields (`V { a: T }`) also gets
+ * its fields, scoped by the variant's QN. */
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn) {
     CBMArena *a = ctx->arena;
     TSNode body = find_class_body(node, ctx->language);
     if (ts_node_is_null(body)) {
         return;
     }
+    bool rust = ctx->language == CBM_LANG_RUST;
     uint32_t mc = ts_node_named_child_count(body);
     for (uint32_t mi = 0; mi < mc; mi++) {
         TSNode member = ts_node_named_child(body, mi);
-        if (!is_enum_member_kind(ts_node_type(member))) {
+        const char *member_kind = ts_node_type(member);
+        if (!is_enum_member_kind(member_kind) &&
+            !(rust && strcmp(member_kind, "enum_variant") == 0)) {
             continue;
         }
         TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
@@ -5496,11 +5538,17 @@ static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *cl
         memset(&mdef, 0, sizeof(mdef));
         mdef.name = member_name;
         mdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, member_name);
-        mdef.label = "Variable";
+        /* A Rust variant is reachable only through its enum (`E::V`, or a
+         * `use E::*` import), never by its bare name, so it gets a label the
+         * bare-name symbol registry does not admit. */
+        mdef.label = rust ? "EnumVariant" : "Variable";
         mdef.file_path = ctx->rel_path;
         mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
         mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
         cbm_defs_push(&ctx->result->defs, a, mdef);
+        if (rust) {
+            extract_class_fields(ctx, member, mdef.qualified_name, cbm_lang_spec(ctx->language));
+        }
     }
 }
 
@@ -7718,6 +7766,205 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
     }
 }
 
+/* Rust items a function body or an inline module may declare. */
+static bool rust_is_item_kind(const char *k) {
+    static const char *const items[] = {
+        "function_item",    "const_item",       "static_item", "struct_item", "enum_item",
+        "union_item",       "trait_item",       "type_item",   "impl_item",   "mod_item",
+        "macro_definition", "foreign_mod_item", NULL};
+    for (const char *const *it = items; *it; it++) {
+        if (strcmp(k, *it) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Push every item declared inside a Rust function body, at any block or closure
+ * depth, onto the def walk. A nested item is pushed whole and not searched
+ * here: the walk extracts it, and a nested function's own body is searched when
+ * the walk reaches it. */
+static void rust_push_body_items(CBMExtractCtx *ctx, wd_stack_t *s, TSNode fn,
+                                 const char *enclosing_qn) {
+    TSNode body = ts_node_child_by_field_name(fn, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CBM_SZ_64);
+    ts_nstack_push(&stack, body);
+    while (stack.count > 0) {
+        TSNode cur = ts_nstack_pop(&stack);
+        uint32_t nc = ts_node_named_child_count(cur);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_named_child(cur, i);
+            if (rust_is_item_kind(ts_node_type(child))) {
+                wd_push(s, child, enclosing_qn);
+            } else {
+                ts_nstack_push(&stack, child);
+            }
+        }
+    }
+}
+
+/* Rust `macro_rules! name { ... }` -> a Macro node. */
+static void extract_rust_macro_def(CBMExtractCtx *ctx, TSNode node) {
+    CBMArena *a = ctx->arena;
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+    char *name = cbm_node_text(a, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return;
+    }
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.label = "Macro";
+    def.file_path = ctx->rel_path;
+    def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
+    def.is_exported = true;
+    def.decorators =
+        extract_decorators(a, node, ctx->source, ctx->language, cbm_lang_spec(ctx->language));
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+/* Rust inline `mod name { ... }` -> a Module node named by the module. A body-less
+ * `mod name;` declares a file module, which is the file's own Module node. */
+static void extract_rust_inline_module(CBMExtractCtx *ctx, TSNode node) {
+    CBMArena *a = ctx->arena;
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    if (ts_node_is_null(name_node) || ts_node_is_null(body)) {
+        return;
+    }
+    char *name = cbm_node_text(a, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return;
+    }
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.label = "Module";
+    def.file_path = ctx->rel_path;
+    def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
+    def.is_exported = true;
+    def.is_test = ctx->result->is_test_file;
+    def.decorators =
+        extract_decorators(a, node, ctx->source, ctx->language, cbm_lang_spec(ctx->language));
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+/* True when `node` sits where an item may: file scope or a module body. */
+static bool rust_at_item_position(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent)) {
+        return false;
+    }
+    if (strcmp(ts_node_type(parent), "expression_statement") == 0) { /* `m!(..);` */
+        parent = ts_node_parent(parent);
+        if (ts_node_is_null(parent)) {
+            return false;
+        }
+    }
+    const char *pk = ts_node_type(parent);
+    if (strcmp(pk, "source_file") == 0) {
+        return true;
+    }
+    if (strcmp(pk, "declaration_list") != 0) {
+        return false;
+    }
+    TSNode owner = ts_node_parent(parent);
+    return !ts_node_is_null(owner) && strcmp(ts_node_type(owner), "mod_item") == 0;
+}
+
+/* An item-position macro call whose argument is itself Rust items
+ * (`wrapper!(pub enum E { .. })`, `thread_local! { static X: T = ..; }`,
+ * `bitflags! { pub struct F: u8 { .. } }`): parse the argument, in place, as
+ * Rust source and extract the items it declares, at their own lines. An
+ * argument that does not parse cleanly as Rust is a macro-specific language and
+ * yields nothing. */
+static void extract_rust_macro_items(CBMExtractCtx *ctx, TSNode invocation) {
+    TSNode tt = {0};
+    uint32_t nc = ts_node_named_child_count(invocation);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(invocation, i);
+        if (strcmp(ts_node_type(c), "token_tree") == 0) {
+            tt = c;
+        }
+    }
+    if (ts_node_is_null(tt)) {
+        return;
+    }
+    /* The argument without its delimiters; each delimiter is one byte. */
+    TSPoint sp = ts_node_start_point(tt);
+    TSPoint ep = ts_node_end_point(tt);
+    TSRange range = {
+        .start_point = {sp.row, sp.column + 1},
+        .end_point = {ep.row, ep.column > 0 ? ep.column - 1 : 0},
+        .start_byte = ts_node_start_byte(tt) + 1,
+        .end_byte = ts_node_end_byte(tt) - 1,
+    };
+    if (range.end_byte <= range.start_byte || range.end_byte > (uint32_t)ctx->source_len) {
+        return;
+    }
+    TSParser *parser = ts_parser_new();
+    if (!parser) {
+        return;
+    }
+    TSTree *tree = NULL;
+    if (ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST)) &&
+        ts_parser_set_included_ranges(parser, &range, 1)) {
+        tree = ts_parser_parse_string(parser, NULL, ctx->source, (uint32_t)ctx->source_len);
+    }
+    if (tree) {
+        TSNode root = ts_tree_root_node(tree);
+        if (!ts_node_has_error(root)) {
+            CBMExtractCtx sub = *ctx;
+            sub.root = root;
+            sub.enclosing_class_qn = NULL;
+            cbm_extract_definitions_without_module(&sub);
+        }
+        ts_tree_delete(tree);
+    }
+    ts_parser_delete(parser);
+}
+
+/* Rust items the generic def walk does not model. Returns true when the node is
+ * fully handled and its children must not be walked; a module or a const/static
+ * is still descended as before. File-scope const/static items are
+ * extract_variables' and are left to it. */
+static bool walk_rust_item(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "macro_definition") == 0) {
+        extract_rust_macro_def(ctx, node);
+        return true;
+    }
+    if (strcmp(kind, "mod_item") == 0) {
+        extract_rust_inline_module(ctx, node);
+        return false;
+    }
+    if (strcmp(kind, "macro_invocation") == 0 && rust_at_item_position(node)) {
+        extract_rust_macro_items(ctx, node);
+        return true;
+    }
+    if (strcmp(kind, "const_item") == 0 || strcmp(kind, "static_item") == 0) {
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "source_file") != 0) {
+            extract_var_names(ctx, node, spec);
+        }
+        return false;
+    }
+    return false;
+}
+
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused) {
     (void)depth_unused;
     wd_stack_t s = {0};
@@ -7812,9 +8059,20 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             continue;
         }
 
+        if (ctx->language == CBM_LANG_RUST && walk_rust_item(ctx, node, spec)) {
+            continue;
+        }
+
         if (cbm_kind_in_set(node, spec->function_node_types)) {
             if (!is_template_class_node(node, ctx->language)) {
                 extract_func_def(ctx, node, spec);
+                /* Rust: items declared inside the body (local structs, consts,
+                 * helper fns, macro_rules!) are definitions too. Only those are
+                 * walked; the body's statements are not. */
+                if (ctx->language == CBM_LANG_RUST &&
+                    strcmp(ts_node_type(node), "function_item") == 0) {
+                    rust_push_body_items(ctx, &s, node, frame.enclosing_class_qn);
+                }
                 // Most languages stop here. JS/TS (and Wolfram) descend into the
                 // function body so NESTED named definitions are also captured —
                 // e.g. arrow methods of an object literal returned from a factory
@@ -7842,6 +8100,14 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 
         if (ctx->language == CBM_LANG_RUST && strcmp(kind, "impl_item") == 0) {
             extract_rust_impl(ctx, node, spec);
+            TSNode impl_body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+            uint32_t ic = ts_node_is_null(impl_body) ? 0 : ts_node_named_child_count(impl_body);
+            for (uint32_t ii = 0; ii < ic; ii++) {
+                TSNode member = ts_node_named_child(impl_body, ii);
+                if (strcmp(ts_node_type(member), "function_item") == 0) {
+                    rust_push_body_items(ctx, &s, member, frame.enclosing_class_qn);
+                }
+            }
             continue;
         }
 
@@ -7983,6 +8249,8 @@ static const char *cbm_razor_page_route(CBMArena *a, const char *source, int sou
     return NULL;
 }
 
+static void cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs);
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -8018,4 +8286,99 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     cbm_defs_push(&ctx->result->defs, a, mod);
 
     cbm_extract_definitions_without_module(ctx);
+    if (ctx->language == CBM_LANG_RUST) {
+        cbm_rust_separate_shared_qns(a, &ctx->result->defs);
+    }
+}
+
+/* Rank of a definition for keeping a QN shared with others in its file: the
+ * file's Module first, then callables (calls resolve to them by QN), then the
+ * rest. */
+static int rust_qn_keep_rank(const CBMDefinition *d, int index) {
+    if (index == 0 && d->label && strcmp(d->label, "Module") == 0) {
+        return 0;
+    }
+    if (d->label && (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0)) {
+        return 1;
+    }
+    return 2;
+}
+
+/* qsort has no context argument; extraction runs one file per thread. */
+static _Thread_local const CBMDefinition *t_qn_sort_defs;
+
+static int cmp_def_index_by_qn(const void *pa, const void *pb) {
+    const CBMDefinition *defs = t_qn_sort_defs;
+    int ia = *(const int *)pa;
+    int ib = *(const int *)pb;
+    const char *qa = defs[ia].qualified_name ? defs[ia].qualified_name : "";
+    const char *qb = defs[ib].qualified_name ? defs[ib].qualified_name : "";
+    int c = strcmp(qa, qb);
+    return c != 0 ? c : ia - ib;
+}
+
+/* True when `a` should keep the shared QN over `b`: lower rank, then the order
+ * the graph upsert already uses for same-file collisions (later start line,
+ * then larger name, then larger label), so every node that survived before
+ * keeps its QN. */
+static bool rust_qn_keeps(const CBMDefinition *defs, int a, int b) {
+    int ra = rust_qn_keep_rank(&defs[a], a);
+    int rb = rust_qn_keep_rank(&defs[b], b);
+    if (ra != rb) {
+        return ra < rb;
+    }
+    if (defs[a].start_line != defs[b].start_line) {
+        return defs[a].start_line > defs[b].start_line;
+    }
+    int c = strcmp(defs[a].name ? defs[a].name : "", defs[b].name ? defs[b].name : "");
+    if (c != 0) {
+        return c > 0;
+    }
+    return strcmp(defs[a].label ? defs[a].label : "", defs[b].label ? defs[b].label : "") >= 0;
+}
+
+/* Rust keeps types, values, fields and macros in separate namespaces, so one
+ * file legitimately holds several definitions with one QN: a field and a getter
+ * method, a variant and a constructor fn, cfg-gated twins, local structs of the
+ * same name in two functions. The graph keys nodes by QN, so all but one would
+ * be dropped. The one the graph would keep retains the QN; each other gets a
+ * line-qualified QN (`<qn>#L<line>`) and so its own node. */
+static void cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs) {
+    int n = defs->count;
+    if (n < 2) {
+        return;
+    }
+    int *order = (int *)cbm_arena_alloc(a, (size_t)n * sizeof(int));
+    if (!order) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        order[i] = i;
+    }
+    t_qn_sort_defs = defs->items;
+    qsort(order, (size_t)n, sizeof(int), cmp_def_index_by_qn);
+    t_qn_sort_defs = NULL;
+    for (int lo = 0; lo < n;) {
+        const char *qn = defs->items[order[lo]].qualified_name;
+        int hi = lo + 1;
+        while (hi < n && qn && defs->items[order[hi]].qualified_name &&
+               strcmp(qn, defs->items[order[hi]].qualified_name) == 0) {
+            hi++;
+        }
+        if (qn && hi - lo > 1) {
+            int keep = order[lo];
+            for (int k = lo + 1; k < hi; k++) {
+                if (rust_qn_keeps(defs->items, order[k], keep)) {
+                    keep = order[k];
+                }
+            }
+            for (int k = lo; k < hi; k++) {
+                CBMDefinition *d = &defs->items[order[k]];
+                if (order[k] != keep) {
+                    d->qualified_name = cbm_arena_sprintf(a, "%s#L%u", qn, d->start_line);
+                }
+            }
+        }
+        lo = hi;
+    }
 }

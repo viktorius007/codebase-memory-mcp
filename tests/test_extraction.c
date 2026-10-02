@@ -1968,6 +1968,155 @@ TEST(rust_enum) {
     PASS();
 }
 
+/* Rust: each variant is an EnumVariant scoped by its enum, and a struct-like
+ * variant's named fields are Fields scoped by the variant. A tuple variant's
+ * positional types are not fields. */
+TEST(rust_enum_variants_and_variant_fields) {
+    CBMFileResult *r = extract("pub enum Ev {\n"
+                               "    Plain,\n"
+                               "    Tuple(u32),\n"
+                               "    Named { id: u32, text: String },\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def_qn(r, "t.lib.Ev.Plain"));
+    ASSERT(has_def_qn(r, "t.lib.Ev.Tuple"));
+    ASSERT(has_def_qn(r, "t.lib.Ev.Named"));
+    ASSERT_EQ(count_defs_with_label(r, "EnumVariant"), 3);
+    ASSERT(has_def_qn(r, "t.lib.Ev.Named.id"));
+    ASSERT(has_def_qn(r, "t.lib.Ev.Named.text"));
+    ASSERT_EQ(count_defs_with_label(r, "Field"), 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Rust: items declared inside a function body (at any block depth, including
+ * a method body) and inside an inline module are definitions; a body-less
+ * `mod x;` is not a Module of this file. */
+TEST(rust_nested_items_are_definitions) {
+    CBMFileResult *r = extract("mod inner {\n"
+                               "    const IN_MOD: u32 = 1;\n"
+                               "}\n"
+                               "mod other;\n"
+                               "fn outer() {\n"
+                               "    if true { const DEEP: u8 = 0; }\n"
+                               "    struct Local { w: u32 }\n"
+                               "    fn helper() {}\n"
+                               "}\n"
+                               "struct S;\n"
+                               "impl S {\n"
+                               "    fn m(&self) { enum InMethod { A } }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Module", "inner"));
+    ASSERT_FALSE(has_def(r, "Module", "other"));
+    ASSERT(has_def(r, "Variable", "IN_MOD"));
+    ASSERT(has_def(r, "Variable", "DEEP"));
+    ASSERT(has_def(r, "Struct", "Local"));
+    ASSERT(has_def(r, "Field", "w"));
+    ASSERT(has_def(r, "Function", "helper"));
+    ASSERT(has_def(r, "Enum", "InMethod"));
+    ASSERT(has_def(r, "EnumVariant", "A"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Rust: `macro_rules!` defines a Macro; an impl's associated const and type are
+ * AssociatedConst / AssociatedType owned by the impl's type, keyed by the trait
+ * for a trait impl. */
+TEST(rust_macro_and_associated_items) {
+    CBMFileResult *r = extract("macro_rules! my_mac { () => {}; }\n"
+                               "struct S;\n"
+                               "impl S { pub const LIMIT: usize = 3; }\n"
+                               "impl Iterator for S { type Item = u8;\n"
+                               "    fn next(&mut self) -> Option<u8> { None } }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Macro", "my_mac"));
+    ASSERT(has_def_qn(r, "t.lib.S.LIMIT"));
+    ASSERT(has_def(r, "AssociatedConst", "LIMIT"));
+    ASSERT(has_def_qn(r, "t.lib.S.Item[Iterator]"));
+    ASSERT(has_def(r, "AssociatedType", "Item"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Rust: a field and a method of one type share a QN, as do two local structs of
+ * one name in two functions. Each keeps a node: the callable (or the later
+ * definition) keeps the QN, the other gets a line-qualified one. */
+TEST(rust_shared_qn_definitions_all_survive) {
+    CBMFileResult *r = extract("struct P {\n"
+                               "    capture: u32,\n"
+                               "}\n"
+                               "impl P {\n"
+                               "    fn capture(&self) -> u32 { self.capture }\n"
+                               "}\n"
+                               "fn a() { struct H; }\n"
+                               "fn b() { struct H; }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *field = NULL;
+    const CBMDefinition *method = NULL;
+    int h_count = 0;
+    bool h_plain = false;
+    bool h_line7 = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "capture") == 0 && strcmp(d->label, "Field") == 0) {
+            field = d;
+        }
+        if (strcmp(d->name, "capture") == 0 && strcmp(d->label, "Method") == 0) {
+            method = d;
+        }
+        if (strcmp(d->name, "H") == 0) {
+            h_count++;
+            h_plain = h_plain || strcmp(d->qualified_name, "t.lib.H") == 0;
+            h_line7 = h_line7 || strcmp(d->qualified_name, "t.lib.H#L7") == 0;
+        }
+    }
+    ASSERT_NOT_NULL(field);
+    ASSERT_NOT_NULL(method);
+    ASSERT_STR_EQ(method->qualified_name, "t.lib.P.capture");
+    ASSERT_STR_EQ(field->qualified_name, "t.lib.P.capture#L2");
+    ASSERT_EQ(h_count, 2);
+    ASSERT(h_plain);
+    ASSERT(h_line7);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Rust: an item-position macro call whose argument parses as Rust items yields
+ * those items at their own lines; an argument in a macro-specific language
+ * yields nothing. */
+TEST(rust_item_macro_argument_items) {
+    CBMFileResult *r = extract("wrap!(\n"
+                               "    pub enum Mode {\n"
+                               "        Fast,\n"
+                               "    }\n"
+                               ");\n"
+                               "thread_local! { static COUNTER: u32 = 0; }\n"
+                               "dsl! { pub enum Bad from Core { X } }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mode = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Mode") == 0) {
+            mode = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(mode);
+    ASSERT_STR_EQ(mode->label, "Enum");
+    ASSERT_EQ(mode->start_line, 2);
+    ASSERT(has_def(r, "EnumVariant", "Fast"));
+    ASSERT(has_def(r, "Variable", "COUNTER"));
+    ASSERT_FALSE(has_def_any(r, "Bad"));
+    ASSERT_FALSE(has_def_any(r, "Core"));
+    ASSERT_FALSE(has_def_any(r, "X"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Zig struct --- */
 TEST(zig_struct) {
     CBMFileResult *r = extract("const Point = struct { x: f32, y: f32, pub fn dist(self: Point) "
@@ -5832,7 +5981,8 @@ TEST(extract_rust_test_attributes_match_paths_not_documentation) {
         "#[::tokio::test{}] async fn absolute_braces() {}\n"
         "#[tokio::test[]] async fn brackets() {}\n"
         "#[\xe2\x80\xa8test] fn unicode_space() {}\n";
-    const char *names[] = {"rejects_empty", "accepts_async", "helper", "similar_module", "similar_name", "absolute_braces", "brackets", "unicode_space"};
+    const char *names[] = {"rejects_empty", "accepts_async",   "helper",   "similar_module",
+                           "similar_name",  "absolute_braces", "brackets", "unicode_space"};
     const bool expected[] = {true, true, false, false, false, true, true, true};
     CBMFileResult *r = extract(source, CBM_LANG_RUST, "t", "src/lib.rs");
     ASSERT_NOT_NULL(r);
@@ -7397,11 +7547,10 @@ static bool rust_generic_receivers_are_exact(const CBMFileResult *result) {
 }
 
 TEST(extract_rust_generic_impl_receivers_survive_spill) {
-    const char *source =
-        "trait Render {}\n"
-        "struct Box<T>(T);\n"
-        "impl Render for Box<u32> { fn render(&self) {} }\n"
-        "impl Render for Box<String> { fn render(&self) {} }\n";
+    const char *source = "trait Render {}\n"
+                         "struct Box<T>(T);\n"
+                         "impl Render for Box<u32> { fn render(&self) {} }\n"
+                         "impl Render for Box<String> { fn render(&self) {} }\n";
     CBMFileResult *result = extract(source, CBM_LANG_RUST, "t", "lib.rs");
     ASSERT_NOT_NULL(result);
     ASSERT_TRUE(rust_generic_receivers_are_exact(result));
@@ -7773,6 +7922,11 @@ SUITE(extraction) {
     RUN_TEST(objc_implementation);
     RUN_TEST(dart_top_level_function);
     RUN_TEST(rust_enum);
+    RUN_TEST(rust_enum_variants_and_variant_fields);
+    RUN_TEST(rust_nested_items_are_definitions);
+    RUN_TEST(rust_macro_and_associated_items);
+    RUN_TEST(rust_shared_qn_definitions_all_survive);
+    RUN_TEST(rust_item_macro_argument_items);
     RUN_TEST(zig_struct);
     RUN_TEST(cpp_function);
     RUN_TEST(cpp_gtest_same_name_collision_issue1266);
