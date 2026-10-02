@@ -43,9 +43,19 @@ fn has_let_chain(e: &ast::BinExpr) -> bool {
     }
 }
 
+/// Convention differences that are not defects: rust-analyzer parses the meta items
+/// inside `cfg_attr(..)`, tree-sitter keeps them as a token tree; a negative const
+/// generic argument is a prefix expression in rust-analyzer and a literal in tree-sitter.
+fn is_convention(n: &SyntaxNode) -> bool {
+    let in_generic_args = |p: SyntaxNode| p.kind() == CONST_ARG && p.parent().is_some_and(|g| g.kind() == GENERIC_ARG_LIST);
+    if n.kind() == PREFIX_EXPR && n.parent().is_some_and(in_generic_args) { return true; }
+    n.ancestors().any(|a| a.kind() == CFG_ATTR_META)
+}
+
 fn ra_facts(root: &SyntaxNode, out: &mut Vec<String>) {
     for n in root.descendants() {
         let k = n.kind();
+        if is_convention(&n) { continue; }
         let def = |kind: &str, name: Option<ast::Name>, out: &mut Vec<String>| out.push(format!("DEF {kind} {}", nr(name)));
         match k {
             FN => def("FN", ast::Fn::cast(n).unwrap().name(), out),

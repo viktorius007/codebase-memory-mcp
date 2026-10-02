@@ -30,6 +30,8 @@
 
 #include "test_framework.h"
 #include "cbm.h"
+#include "lang_specs.h" /* cbm_ts_language: direct parse of the Rust audit cases */
+#include "foundation/compat_fs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -879,6 +881,84 @@ TEST(coverage_range_never_ends_past_the_last_line_issue963) {
     PASS();
 }
 
+/* tools/rust-audit/cases/ holds one file per construct where the upstream Rust
+ * grammar disagreed with rust-analyzer's parser on real code. The vendored Rust
+ * parser is generated from the fork in tools/tree-sitter-rust/, which parses all
+ * of them. Each file is parsed directly, so an ERROR or MISSING node anywhere
+ * fails the test, including the zero-width ones that parse_incomplete tolerates. */
+#define RUST_AUDIT_CASES_DIR "tools/rust-audit/cases"
+#define RUST_AUDIT_CASES_MIN 40
+
+static char *pc_read_file(const char *path, long *len_out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    char *buf = NULL;
+    long len = -1;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        len = ftell(f);
+    }
+    if (len >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+        buf = malloc((size_t)len + 1);
+    }
+    if (buf && fread(buf, 1, (size_t)len, f) != (size_t)len) {
+        free(buf);
+        buf = NULL;
+    }
+    fclose(f);
+    if (buf) {
+        buf[len] = '\0';
+        *len_out = len;
+    }
+    return buf;
+}
+
+TEST(rust_audit_cases_parse_without_error_nodes) {
+    const TSLanguage *rust = cbm_ts_language(CBM_LANG_RUST);
+    ASSERT_NOT_NULL(rust);
+    cbm_dir_t *dir = cbm_opendir(RUST_AUDIT_CASES_DIR);
+    ASSERT_NOT_NULL(dir);
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, rust));
+
+    int parsed = 0;
+    int with_errors = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(dir)) != NULL) {
+        size_t n = strlen(ent->name);
+        if (ent->is_dir || n < 4 || strcmp(ent->name + n - 3, ".rs") != 0) {
+            continue;
+        }
+        char path[2048];
+        snprintf(path, sizeof(path), "%s/%s", RUST_AUDIT_CASES_DIR, ent->name);
+        long len = 0;
+        char *src = pc_read_file(path, &len);
+        if (!src) {
+            printf("  unreadable: %s\n", path);
+            with_errors++;
+            continue;
+        }
+        TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)len);
+        if (!tree || ts_node_has_error(ts_tree_root_node(tree))) {
+            printf("  error nodes: %s\n", path);
+            with_errors++;
+        }
+        if (tree) {
+            ts_tree_delete(tree);
+        }
+        free(src);
+        parsed++;
+    }
+    cbm_closedir(dir);
+    ts_parser_delete(parser);
+
+    ASSERT_GTE(parsed, RUST_AUDIT_CASES_MIN);
+    ASSERT_EQ(with_errors, 0);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -917,4 +997,5 @@ SUITE(parse_coverage) {
     RUN_TEST(c_thread_local_grammar_limit_is_pinned_issue963);
     RUN_TEST(coverage_repeated_error_line_reports_one_range_issue963);
     RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
+    RUN_TEST(rust_audit_cases_parse_without_error_nodes);
 }
