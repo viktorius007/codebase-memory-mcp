@@ -25,6 +25,11 @@ bool cbm_rust_definition_has_test_attribute(const CBMDefinition *def);
 // Check if a string is a language keyword (should be skipped as callee/usage).
 bool cbm_is_keyword(const char *name, CBMLanguage lang);
 
+// Rust built-in macro or attribute name (`write`, `format`, `allow`, `test`, ...).
+// A subset of cbm_is_keyword(CBM_LANG_RUST) that Rust does not reserve, so a
+// call_expression naming one is a call to an ordinary function.
+bool cbm_rust_is_macro_or_attribute_name(const char *name);
+
 // Check if a name is a builtin we mint a real graph node for, so a CALL to it
 // must NOT be keyword-filtered out of call extraction (the LSP resolves it to
 // the injected builtin node and forms a CALLS edge). Narrower than

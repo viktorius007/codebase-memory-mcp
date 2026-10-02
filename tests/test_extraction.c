@@ -892,6 +892,25 @@ TEST(rust_function) {
     PASS();
 }
 
+/* Built-in macro and attribute names are not reserved in Rust: a bare
+ * call_expression naming one calls a user fn and must be extracted, while a
+ * macro_invocation of the same name stays filtered. */
+TEST(rust_calls_to_fns_named_like_builtin_macros) {
+    CBMFileResult *r = extract("fn allow() {}\n"
+                               "fn write(n: u8) -> u8 { n }\n"
+                               "fn test() {}\n"
+                               "fn caller() { allow(); write(1); test(); deny!(); }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_named(r, "allow"), 1);
+    ASSERT_EQ(count_calls_named(r, "write"), 1);
+    ASSERT_EQ(count_calls_named(r, "test"), 1);
+    ASSERT_EQ(count_calls_named(r, "deny"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_struct) {
     CBMFileResult *r = extract("pub struct Point { pub x: f64, pub y: f64 }\nimpl Point { pub fn "
                                "new(x: f64, y: f64) -> Self { Point { x, y } } }\n",
@@ -7837,6 +7856,7 @@ SUITE(extraction) {
 
     /* Systems */
     RUN_TEST(rust_function);
+    RUN_TEST(rust_calls_to_fns_named_like_builtin_macros);
     RUN_TEST(rust_struct);
     RUN_TEST(go_function);
     RUN_TEST(go_struct);

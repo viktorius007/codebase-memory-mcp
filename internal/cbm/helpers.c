@@ -217,21 +217,35 @@ static const char *js_keywords[] = {
     "setInterval", "clearTimeout", "clearInterval", NULL};
 
 static const char *rust_keywords[] = {
-    "as",        "async",        "await",    "break",         "const",  "continue",
-    "crate",     "dyn",          "else",     "enum",          "extern", "false",
-    "fn",        "for",          "if",       "impl",          "in",     "let",
-    "loop",      "match",        "mod",      "move",          "mut",    "pub",
-    "ref",       "return",       "self",     "Self",          "static", "struct",
-    "super",     "trait",        "true",     "type",          "unsafe", "use",
-    "where",     "while",        "abstract", "become",        "box",    "do",
-    "final",     "macro",        "override", "priv",          "try",    "typeof",
-    "unsized",   "virtual",      "yield",    "Some",          "None",   "Ok",
-    "Err",       "Vec",          "String",   "Box",           "Rc",     "Arc",
-    "Option",    "Result",       "println",  "eprintln",      "format", "write",
-    "writeln",   "print",        "eprint",   "panic",         "assert", "assert_eq",
-    "assert_ne", "debug_assert", "todo",     "unimplemented", "cfg",    "derive",
-    "test",      "allow",        "deny",     "warn",          "forbid", "deprecated",
-    NULL};
+    "as",    "async",  "await",    "break",   "const",   "continue", "crate",  "dyn",    "else",
+    "enum",  "extern", "false",    "fn",      "for",     "if",       "impl",   "in",     "let",
+    "loop",  "match",  "mod",      "move",    "mut",     "pub",      "ref",    "return", "self",
+    "Self",  "static", "struct",   "super",   "trait",   "true",     "type",   "unsafe", "use",
+    "where", "while",  "abstract", "become",  "box",     "do",       "final",  "macro",  "override",
+    "priv",  "try",    "typeof",   "unsized", "virtual", "yield",    "Some",   "None",   "Ok",
+    "Err",   "Vec",    "String",   "Box",     "Rc",      "Arc",      "Option", "Result", NULL};
+
+// Built-in macro and attribute names. Rust does not reserve them: a user fn
+// may be called `write` or `allow`. They are skipped as macro and usage names,
+// but a call_expression naming one calls an ordinary function.
+static const char *rust_macro_and_attribute_names[] = {
+    "println", "eprintln",      "format", "write",      "writeln",   "print",
+    "eprint",  "panic",         "assert", "assert_eq",  "assert_ne", "debug_assert",
+    "todo",    "unimplemented", "cfg",    "derive",     "test",      "allow",
+    "deny",    "warn",          "forbid", "deprecated", NULL};
+
+static bool name_in_list(const char *name, const char **list) {
+    for (const char **kw = list; *kw; kw++) {
+        if (strcmp(name, *kw) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_rust_is_macro_or_attribute_name(const char *name) {
+    return name && name[0] && name_in_list(name, rust_macro_and_attribute_names);
+}
 
 static const char *java_keywords[] = {
     "abstract",  "assert",       "boolean",     "break",      "byte",    "case",       "catch",
@@ -422,12 +436,8 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
         break;
     }
 
-    for (const char **kw = keywords; *kw; kw++) {
-        if (strcmp(name, *kw) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return name_in_list(name, keywords) ||
+           (lang == CBM_LANG_RUST && cbm_rust_is_macro_or_attribute_name(name));
 }
 
 // Builtins that appear in the keyword set above (so they are suppressed as bare
