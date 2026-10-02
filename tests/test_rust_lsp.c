@@ -733,6 +733,93 @@ TEST(rustlsp_crossfile_method_dispatch) {
     PASS();
 }
 
+/* `Type::default()` on a type defined in another file with `#[derive(Default)]`
+ * returns that type, so a method call on the produced value resolves. Without
+ * the derive the cross registry knows no `default` for the type and the value
+ * stays untyped. */
+static int crossfile_derived_default_resolves(const char **decorators) {
+    const char *caller = "fn run() { let c = demo::Config::default(); c.reload(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.demo.Config";
+    defs[0].short_name = "Config";
+    defs[0].label = "Struct";
+    defs[0].def_module_qn = "test.demo";
+    defs[0].decorators = decorators;
+    defs[1].qualified_name = "test.demo.Config.reload";
+    defs[1].short_name = "reload";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.demo.Config";
+    defs[1].def_module_qn = "test.demo";
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, 2, imp_names,
+                           imp_qns, 1, NULL, &out);
+    int found = find_confident(&out, "run", "Config.reload");
+    cbm_arena_destroy(&a);
+    return found;
+}
+
+TEST(rustlsp_crossfile_derived_default_types_value) {
+    const char *derived[] = {"#[derive(Debug, Default)]", NULL};
+    ASSERT_GTE(crossfile_derived_default_resolves(derived), 0);
+    const char *other[] = {"#[derive(Debug)]", NULL};
+    ASSERT_EQ(-1, crossfile_derived_default_resolves(other));
+    PASS();
+}
+
+/* `Type::build()` where `build` is a default method of a trait `Type`
+ * implements (declared in another file) and returns `Self`: the produced value
+ * is a `Type`, so its inherent method resolves. */
+TEST(rustlsp_crossfile_trait_provided_constructor_types_value) {
+    const char *caller = "fn run() { let b = demo::Baz::build(); b.qux(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[5];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.demo.Make";
+    defs[0].short_name = "Make";
+    defs[0].label = "Trait";
+    defs[0].def_module_qn = "test.demo";
+    defs[0].is_interface = true;
+    defs[1].qualified_name = "test.demo.Make.build";
+    defs[1].short_name = "build";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.demo.Make";
+    defs[1].def_module_qn = "test.demo";
+    defs[1].return_types = "Self";
+    defs[2].qualified_name = "test.demo.Baz";
+    defs[2].short_name = "Baz";
+    defs[2].label = "Struct";
+    defs[2].def_module_qn = "test.demo";
+    defs[3].qualified_name = "test.demo.Baz.qux";
+    defs[3].short_name = "qux";
+    defs[3].label = "Method";
+    defs[3].receiver_type = "test.demo.Baz";
+    defs[3].def_module_qn = "test.demo";
+    defs[4].qualified_name = "test.demo.Baz";
+    defs[4].short_name = "Baz";
+    defs[4].label = "RustImpl";
+    defs[4].receiver_type = "test.demo.Baz";
+    defs[4].def_module_qn = "test.demo";
+    defs[4].trait_qn = "Make";
+    defs[4].receiver_spelling = "Baz";
+    defs[4].is_rust_impl_relation = true;
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, 5, imp_names,
+                           imp_qns, 1, NULL, &out);
+    ASSERT_GTE(find_confident(&out, "run", "Baz.qux"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 /* F4 Tier-2: the build-once shared registry path (cbm_rust_build_cross_registry +
  * cbm_run_rust_lsp_cross_with_registry) must resolve IDENTICALLY to the per-file
  * cbm_run_rust_lsp_cross — same fixture as rustlsp_crossfile_method_dispatch. Also
@@ -8200,6 +8287,8 @@ void suite_rust_lsp(void) {
 
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
+    RUN_TEST(rustlsp_crossfile_derived_default_types_value);
+    RUN_TEST(rustlsp_crossfile_trait_provided_constructor_types_value);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_duplicate_free_function_qn_stays_unresolved);
     RUN_TEST(rustlsp_path_module_child_call_does_not_flatten_to_parent);
