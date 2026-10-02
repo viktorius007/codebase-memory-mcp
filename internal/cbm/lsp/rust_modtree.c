@@ -1134,10 +1134,22 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
     int scope =
         is_use && tree->crates[crate].edition_2015 ? tree->crates[crate].root_module : module;
     rmt_lookup(tree, scope, head, ns, out, &visit, building, NULL);
+    RmtDef def = {.kind = RMT_EXTERNAL, .ns = RMT_NS_ALL, .module = -1};
+    /* A 2018+ `use` path whose head names both an extern crate and an item
+     * in scope is rejected as ambiguous (E0659), so a head left open only
+     * by an unmodelled glob or macro still names the extern crate. Only a
+     * project crate is settled this way: an outside crate's items publish
+     * nothing, and impl receivers keep outside type names file-local. */
+    if (out->open && out->count == 0 && is_use && !tree->crates[crate].edition_2015 &&
+        (ns & RMT_NS_TYPE) && rmt_extern_prelude(tree, crate, head, &def) &&
+        def.kind == RMT_MODULE) {
+        *out = (RmtDefs){0};
+        rmt_defs_add(out, &def);
+        return;
+    }
     if (out->count > 0 || out->open) {
         return;
     }
-    RmtDef def = {.kind = RMT_EXTERNAL, .ns = RMT_NS_ALL, .module = -1};
     if (((ns & RMT_NS_TYPE) && rmt_extern_prelude(tree, crate, head, &def)) ||
         rmt_in_list(RMT_PRELUDE, head)) {
         rmt_defs_add(out, &def);
