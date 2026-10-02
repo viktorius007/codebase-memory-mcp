@@ -3805,8 +3805,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into a twin's QN so both branches survive the upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = cbm_rust_cfg_qualified_name(a, node, ctx->source, def.qualified_name,
-                                                         def.decorators);
+        def.qualified_name =
+            cbm_rust_cfg_qualified_name(a, node, ctx->source, def.qualified_name, def.decorators);
         def.is_test = cbm_rust_definition_has_test_attribute(&def);
     }
 
