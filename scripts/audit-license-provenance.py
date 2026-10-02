@@ -37,6 +37,8 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     "cfscript": "cfmleditor/tree-sitter-cfml",
     "dotenv": "pnx/tree-sitter-dotenv",
     "qml": "yuja/tree-sitter-qmljs",
+    # rust: our fork of tree-sitter-rust v0.24.2; grammar source in tools/tree-sitter-rust/.
+    "rust": "tree-sitter/tree-sitter-rust",
 }
 SPECIAL_NOTICE = {
     "assembly": "RETAINED-MIT (upstream RubixDev/tree-sitter-assembly deleted from GitHub)",

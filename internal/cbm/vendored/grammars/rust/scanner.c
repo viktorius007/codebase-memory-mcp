@@ -14,6 +14,7 @@ enum TokenType {
     BLOCK_INNER_DOC_MARKER,
     BLOCK_COMMENT_CONTENT,
     LINE_DOC_CONTENT,
+    FRONTMATTER,
     ERROR_SENTINEL
 };
 
@@ -332,6 +333,45 @@ static inline bool process_block_comment(TSLexer *lexer, const bool *valid_symbo
     return false;
 }
 
+// Cargo-script frontmatter: a fence of three or more `-` at the start of a line, an
+// optional infostring, then everything up to a line opening with as many `-`. Only
+// valid at the start of a file, after an optional shebang and blank lines.
+static inline bool scan_frontmatter(TSLexer *lexer) {
+    if (lexer->get_column(lexer) != 0) {
+        return false;
+    }
+    unsigned fence = 0;
+    while (lexer->lookahead == '-') {
+        fence++;
+        advance(lexer);
+    }
+    if (fence < 3) {
+        return false;
+    }
+    for (;;) {
+        while (lexer->lookahead != '\n') {
+            if (lexer->eof(lexer)) {
+                return false;
+            }
+            advance(lexer);
+        }
+        advance(lexer);
+        unsigned dashes = 0;
+        while (lexer->lookahead == '-' && dashes < fence) {
+            dashes++;
+            advance(lexer);
+        }
+        if (dashes == fence) {
+            while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
+                advance(lexer);
+            }
+            lexer->mark_end(lexer);
+            lexer->result_symbol = FRONTMATTER;
+            return true;
+        }
+    }
+}
+
 bool tree_sitter_rust_external_scanner_scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
     // The documentation states that if the lexical analysis fails for some reason
     // they will mark every state as valid and pass it to the external scanner
@@ -380,6 +420,10 @@ bool tree_sitter_rust_external_scanner_scan(void *payload, TSLexer *lexer, const
 
     while (iswspace(lexer->lookahead)) {
         skip(lexer);
+    }
+
+    if (valid_symbols[FRONTMATTER] && lexer->lookahead == '-') {
+        return scan_frontmatter(lexer);
     }
 
     if (valid_symbols[RAW_STRING_LITERAL_START] &&

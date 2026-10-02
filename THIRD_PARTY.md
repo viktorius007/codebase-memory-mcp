@@ -60,8 +60,8 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Seven further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `pine`, `qml`) are self-maintained forks that retain
+- Eight further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `pine`, `qml`, `rust`) are self-maintained forks that retain
   their original upstream authors' licenses — see the manifest for per-grammar
   provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
@@ -69,6 +69,10 @@ License summary:
   [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
   base, MIT, (c) 2014 Max Brunsfeld) with (c) 2026 DeusData ArkTS additions;
   its grammar source lives in `tools/tree-sitter-arkts/`.
+  `rust` is a fork of
+  [tree-sitter/tree-sitter-rust](https://github.com/tree-sitter/tree-sitter-rust)
+  (MIT, (c) 2017 Maxim Sokolov) v0.24.2; its grammar source lives in
+  `tools/tree-sitter-rust/`.
 
 ### tree-sitter-plsql
 
