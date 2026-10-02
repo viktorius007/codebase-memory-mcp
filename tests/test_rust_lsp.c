@@ -2136,6 +2136,83 @@ TEST(rustlsp_call_closure_names_the_refusing_rule) {
     PASS();
 }
 
+/* Find the parser carrier (not a resolver-injected one) in `caller` whose
+ * callee text is `callee`, and return the admission verdict of its join. */
+static const char *rustlsp_parsed_carrier_closure(const CBMFileResult *result, const char *caller,
+                                                  const char *callee) {
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->requires_lsp_resolution || !call->enclosing_func_qn || !call->callee_name ||
+            strcmp(call->enclosing_func_qn, caller) != 0 || strcmp(call->callee_name, callee) != 0) {
+            continue;
+        }
+        const CBMResolvedCall *joined =
+            cbm_pipeline_find_lsp_resolution(&result->resolved_calls, call, false);
+        return cbm_pipeline_plain_call_closure(CBM_LANG_RUST, call, joined, "test.src.main");
+    }
+    return "no_carrier";
+}
+
+/* A turbofish call names its callee through a generic_function node. The
+ * parser must emit a carrier named by the path without type arguments, so the
+ * resolver's admitted record at that site joins and publishes. Discriminator:
+ * without the carrier every verdict below is "no_carrier". */
+TEST(rustlsp_turbofish_call_has_admitted_parser_carrier) {
+    const char *source = "struct S;\n"
+                         "impl S {\n"
+                         "    fn parse<T: Default>(x: i32) -> T { let _ = x; T::default() }\n"
+                         "    fn get<T: Default>(&self) -> T { T::default() }\n"
+                         "    fn run(&self) -> i32 {\n"
+                         "        let a: i32 = Self::parse::<i32>(1);\n"
+                         "        let b: i32 = self.get::<i32>();\n"
+                         "        let c: i32 = free::<i32>();\n"
+                         "        a + b + c\n"
+                         "    }\n"
+                         "}\n"
+                         "fn free<T: Default>() -> T { T::default() }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    const char *ufcs = rustlsp_parsed_carrier_closure(result, "test.src.main.S.run", "Self::parse");
+    const char *method = rustlsp_parsed_carrier_closure(result, "test.src.main.S.run", "self.get");
+    const char *path = rustlsp_parsed_carrier_closure(result, "test.src.main.S.run", "free");
+    if (ufcs || method || path) {
+        printf("  turbofish closures: ufcs=%s method=%s path=%s\n", ufcs ? ufcs : "-",
+               method ? method : "-", path ? path : "-");
+    }
+    cbm_free_result(result);
+    ASSERT_NULL(ufcs);
+    ASSERT_NULL(method);
+    ASSERT_NULL(path);
+    PASS();
+}
+
+/* A module-tree path call through an import alias (`use m::f as g; g()`)
+ * records the source path in `reason`; the leaf check must accept the alias
+ * spelling from there, and only from there. */
+TEST(rustlsp_module_path_alias_joins_by_source_path) {
+    CBMResolvedCall resolved = {0};
+    resolved.caller_qn = "test.src.main.run";
+    resolved.callee_qn = "test.src.m.target_fn";
+    resolved.strategy = "lsp_module_path";
+    resolved.reason = "aliased";
+    resolved.kind = CBM_RESOLVED_INVOCATION;
+    resolved.site_start_byte = 40;
+    resolved.site_end_byte = 49;
+    CBMCall call = {0};
+    call.enclosing_func_qn = "test.src.main.run";
+    call.callee_name = "aliased";
+    call.site_start_byte = 40;
+    call.site_end_byte = 49;
+    ASSERT_NULL(cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &call, &resolved, "test.src.main"));
+
+    CBMResolvedCall other_spelling = resolved;
+    other_spelling.reason = "m::other";
+    ASSERT_STR_EQ(
+        cbm_pipeline_plain_call_closure(CBM_LANG_RUST, &call, &other_spelling, "test.src.main"),
+        "leaf_mismatch");
+    PASS();
+}
+
 /* A local macro_rules! definition has lexical precedence over a prelude macro
  * with the same name.  Expanding it must reveal the local target and must not
  * also fabricate the canonical std macro semantic. */
@@ -8486,6 +8563,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_known_std_macro_carriers_join_exact_sites);
     RUN_TEST(rustlsp_macro_argument_call_carrier_is_admitted_with_exact_resolution);
     RUN_TEST(rustlsp_call_closure_names_the_refusing_rule);
+    RUN_TEST(rustlsp_turbofish_call_has_admitted_parser_carrier);
+    RUN_TEST(rustlsp_module_path_alias_joins_by_source_path);
     RUN_TEST(rustlsp_local_macro_shadows_known_std_macro);
     RUN_TEST(rustlsp_later_macro_does_not_shadow_earlier_std_macro);
     RUN_TEST(rustlsp_nested_macro_scope_does_not_leak);
