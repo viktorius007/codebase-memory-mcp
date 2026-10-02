@@ -96,6 +96,10 @@ typedef struct {
      * see the parent module's imports. NULL outside the pipeline. */
     const struct CBMRustImportSource *imports;
     int export_depth;
+    /* Also follow a module file's `use path::*` when it binds no `name`
+     * explicitly. The import table keeps one glob per file (the last), so a
+     * miss stays a miss; set only by impl-header resolution. */
+    bool follow_glob_exports;
     CBMIdxMemo export_memo; /* "<module>\x1f<name>" -> 0 (miss) or 1-based export_values slot */
     const char **export_values;
     int export_value_count;

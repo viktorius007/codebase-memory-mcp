@@ -653,13 +653,14 @@ TEST(es_inherits_crossfile_kotlin_red) {
 /* Count `edge_type` edges from the node named `source_name` in `source_file`
  * to the node named `target_name` in `target_file`; -1 when either node is
  * not unique in its file. */
-static int es_edge_between_in_files(const ES_LangFile *files, int nfiles, const char *edge_type,
-                                    const char *source_name, const char *source_file,
-                                    const char *target_name, const char *target_file) {
+static int es_edge_between_at(const ES_LangFile *files, int nfiles, const char *edge_type,
+                              const char *source_name, const char *source_file, int source_line,
+                              const char *target_name, const char *target_file, int target_line) {
     ES_LangProj lp;
     cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
     const char *names[2] = {source_name, target_name};
     const char *paths[2] = {source_file, target_file};
+    int lines[2] = {source_line, target_line};
     int64_t ids[2] = {0, 0};
     int matches = -1;
     for (int k = 0; store && k < 2; k++) {
@@ -669,7 +670,8 @@ static int es_edge_between_in_files(const ES_LangFile *files, int nfiles, const 
         if (cbm_store_find_nodes_by_name(store, lp.project, names[k], &nodes, &count) ==
             CBM_STORE_OK) {
             for (int i = 0; i < count; i++) {
-                if (nodes[i].file_path && strcmp(nodes[i].file_path, paths[k]) == 0) {
+                if (nodes[i].file_path && strcmp(nodes[i].file_path, paths[k]) == 0 &&
+                    (lines[k] == 0 || nodes[i].start_line == lines[k])) {
                     ids[k] = nodes[i].id;
                     hits++;
                 }
@@ -694,6 +696,14 @@ static int es_edge_between_in_files(const ES_LangFile *files, int nfiles, const 
     }
     es_lang_cleanup(&lp, store);
     return matches;
+}
+
+/* es_edge_between_at with any start line. */
+static int es_edge_between_in_files(const ES_LangFile *files, int nfiles, const char *edge_type,
+                                    const char *source_name, const char *source_file,
+                                    const char *target_name, const char *target_file) {
+    return es_edge_between_at(files, nfiles, edge_type, source_name, source_file, 0, target_name,
+                              target_file, 0);
 }
 
 #define ES_RUST_CARGO {"Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n"}
@@ -732,14 +742,57 @@ TEST(es_implements_rust_resolves_scoped_type) {
 }
 
 /* A type declared inside a function body shadows the module-level namesake
- * for impls in that body. */
-TEST(es_implements_rust_block_local_type_not_linked) {
+ * for impls in that body: the link goes to the local type's own node, also
+ * when several bodies declare the same name. */
+TEST(es_implements_rust_block_local_type_links_own_node) {
     static const ES_LangFile f[] = {
         ES_RUST_CARGO,
         {"src/lib.rs", "pub trait Paint { fn paint(&self); }\npub struct Gadget;\n"
                        "pub fn build() {\n    struct Gadget;\n"
+                       "    impl Paint for Gadget { fn paint(&self) {} }\n}\n"
+                       "pub fn other() {\n    struct Gadget;\n"
                        "    impl Paint for Gadget { fn paint(&self) {} }\n}\n"}};
-    ASSERT_EQ(es_edge_present(f, 2, "IMPLEMENTS", 1), 0);
+    ASSERT_EQ(es_edge_between_at(f, 2, "IMPLEMENTS", "Gadget", "src/lib.rs", 4, "Paint",
+                                 "src/lib.rs", 1),
+              1);
+    ASSERT_EQ(es_edge_between_at(f, 2, "IMPLEMENTS", "Gadget", "src/lib.rs", 8, "Paint",
+                                 "src/lib.rs", 1),
+              1);
+    ASSERT_EQ(es_edge_between_at(f, 2, "IMPLEMENTS", "Gadget", "src/lib.rs", 2, "Paint",
+                                 "src/lib.rs", 1),
+              0);
+    PASS();
+}
+
+/* `module::Trait` naming an inline module of the same file reaches the
+ * module's item, which extraction places under the file's module QN. */
+TEST(es_implements_rust_inline_module_path) {
+    static const ES_LangFile f[] = {
+        ES_RUST_CARGO,
+        {"src/lib.rs", "mod private {\n    pub trait Sealed {}\n}\n"
+                       "pub struct Launcher;\nimpl private::Sealed for Launcher {}\n"}};
+    ASSERT_EQ(es_edge_between_in_files(f, 2, "IMPLEMENTS", "Launcher", "src/lib.rs", "Sealed",
+                                       "src/lib.rs"),
+              1);
+    PASS();
+}
+
+/* A trait reached through another crate's `pub use dep::*` re-export. */
+TEST(es_implements_rust_glob_reexport_across_crates) {
+    static const ES_LangFile f[] = {
+        {"Cargo.toml", "[workspace]\nmembers = [\"proto\", \"facade\", \"app\"]\n"},
+        {"proto/Cargo.toml", "[package]\nname = \"proto\"\nversion = \"0.1.0\"\n"},
+        {"proto/src/lib.rs", "pub trait Hook { fn run(&self); }\n"},
+        {"facade/Cargo.toml", "[package]\nname = \"facade\"\nversion = \"0.1.0\"\n\n"
+                              "[dependencies]\nproto = { path = \"../proto\" }\n"},
+        {"facade/src/lib.rs", "pub use proto::*;\n"},
+        {"app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+                           "[dependencies]\nfacade = { path = \"../facade\" }\n"},
+        {"app/src/lib.rs", "use facade::Hook;\npub struct Probe;\n"
+                           "impl Hook for Probe { fn run(&self) {} }\n"}};
+    ASSERT_EQ(es_edge_between_in_files(f, 7, "IMPLEMENTS", "Probe", "app/src/lib.rs", "Hook",
+                                       "proto/src/lib.rs"),
+              1);
     PASS();
 }
 
@@ -1051,7 +1104,9 @@ SUITE(edge_structural) {
     /* ── FAMILY 3: IMPLEMENTS cross-file (Rust) + method owners ── */
     RUN_TEST(es_implements_crossfile_rust);
     RUN_TEST(es_implements_rust_resolves_scoped_type);
-    RUN_TEST(es_implements_rust_block_local_type_not_linked);
+    RUN_TEST(es_implements_rust_block_local_type_links_own_node);
+    RUN_TEST(es_implements_rust_inline_module_path);
+    RUN_TEST(es_implements_rust_glob_reexport_across_crates);
     RUN_TEST(es_defines_method_rust_owner_crossfile);
 
     /* ── FAMILY 4: IMPLEMENTS same-file interface ────────────── */

@@ -539,6 +539,17 @@ static const CBMRustImplLink *rust_innermost_impl(const CBMRustImplLinkArray *li
     return best;
 }
 
+/* Graph node of a resolved impl-header QN. A QN naming an item of the
+ * linked file carries its definition line, and the node must start there. */
+static const cbm_gbuf_node_t *rust_impl_node(const cbm_gbuf_t *nodes, const char *qn,
+                                             uint32_t line) {
+    const cbm_gbuf_node_t *node = qn ? cbm_gbuf_find_by_qn(nodes, qn) : NULL;
+    if (node && line != 0 && node->start_line != (int)line) {
+        return NULL;
+    }
+    return node;
+}
+
 int cbm_pipeline_rust_impl_edges(const cbm_gbuf_t *nodes, cbm_gbuf_t *edges,
                                  const CBMFileResult *result) {
     int count = 0;
@@ -548,8 +559,8 @@ int cbm_pipeline_rust_impl_edges(const cbm_gbuf_t *nodes, cbm_gbuf_t *edges,
         if (!link->type_qn || !link->trait_qn) {
             continue;
         }
-        const cbm_gbuf_node_t *type = cbm_gbuf_find_by_qn(nodes, link->type_qn);
-        const cbm_gbuf_node_t *trait = cbm_gbuf_find_by_qn(nodes, link->trait_qn);
+        const cbm_gbuf_node_t *type = rust_impl_node(nodes, link->type_qn, link->type_line);
+        const cbm_gbuf_node_t *trait = rust_impl_node(nodes, link->trait_qn, link->trait_line);
         if (type && trait && rust_node_is_impl_owner(type) && rust_node_is_trait(trait)) {
             cbm_gbuf_insert_edge(edges, type->id, trait->id, "IMPLEMENTS", "{}");
             count++;
@@ -564,7 +575,7 @@ int cbm_pipeline_rust_impl_edges(const cbm_gbuf_t *nodes, cbm_gbuf_t *edges,
         if (!link || !link->type_qn) {
             continue;
         }
-        const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_qn(nodes, link->type_qn);
+        const cbm_gbuf_node_t *owner = rust_impl_node(nodes, link->type_qn, link->type_line);
         const cbm_gbuf_node_t *method = cbm_gbuf_find_by_qn(nodes, def->qualified_name);
         if (rust_node_has_label(method, "Method") && rust_node_is_impl_owner(owner)) {
             cbm_gbuf_insert_edge(edges, owner->id, method->id, "DEFINES_METHOD", "{}");

@@ -402,6 +402,10 @@ typedef struct {
     const char *trait_qn;
     uint32_t start_line;
     uint32_t end_line;
+    /* Definition line of type_qn / trait_qn when it names an item of this
+     * file (0 otherwise): the graph node must start there. */
+    uint32_t type_line;
+    uint32_t trait_line;
 } CBMRustImplLink;
 
 typedef enum {
