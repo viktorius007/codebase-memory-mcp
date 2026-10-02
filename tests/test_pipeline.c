@@ -7766,6 +7766,55 @@ TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both
     PASS();
 }
 
+/* An impl block in a child file (`use super::*; impl App { .. }`) belongs to
+ * the `App` its parent declares: its methods are found on that type from any
+ * file, and `self` inside the block has that type's fields. The Method node
+ * keeps its impl-file QN (`src.app.dispatch.App.step`). Discriminators: the
+ * sibling-impl call `self.step()`, the field receiver `self.chat`, the
+ * declared-type receiver in lib.rs, and the unrelated `other::App::step` that
+ * must not take the call. */
+TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_declared_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"impldecl\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "mod app;\nmod other;\n"
+                    "pub fn drive(a: &app::App) { a.step(); }\n");
+    write_temp_file(tmp, "src/app.rs",
+                    "mod dispatch;\n"
+                    "pub struct Chat;\n"
+                    "impl Chat { pub fn clear(&self) {} }\n"
+                    "pub struct App { pub chat: Chat }\n"
+                    "impl App { pub fn run(&self) { self.step(); } }\n");
+    write_temp_file(tmp, "src/app/dispatch.rs",
+                    "use super::*;\n"
+                    "impl App {\n    pub fn step(&self) { self.chat.clear(); }\n}\n");
+    write_temp_file(tmp, "src/other.rs", "pub struct App;\nimpl App { pub fn step(&self) {} }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustExactCallPair pairs[4] = {
+        {"src.app.App.run", "src.app.dispatch.App.step"},
+        {"src.app.dispatch.App.step", "src.app.Chat.clear"},
+        {"src.lib.drive", "src.app.dispatch.App.step"},
+        {"src.lib.drive", "src.other.App.step"},
+    };
+    RustBothModesObservation observed =
+        observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "step");
+    th_rmtree(tmp);
+
+    ASSERT_EQ(observed.sequential.run_rc, 0);
+    ASSERT_EQ(observed.parallel.run_rc, 0);
+    const RustExactCallObservation *modes[2] = {&observed.sequential, &observed.parallel};
+    for (int m = 0; m < 2; m++) {
+        ASSERT_TRUE(modes[m]->found[0]);
+        ASSERT_TRUE(modes[m]->found[1]);
+        ASSERT_TRUE(modes[m]->found[2]);
+        ASSERT_FALSE(modes[m]->found[3]);
+    }
+    PASS();
+}
+
 /* A cfg-gated function is published as `<name>#cfg(..)]` from the attribute
  * nearest the item, and a comment between attribute and item is transparent
  * (extract_decorators). The body's caller identity must be the same string;
@@ -17023,6 +17072,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
+    RUN_TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes);
     RUN_TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
