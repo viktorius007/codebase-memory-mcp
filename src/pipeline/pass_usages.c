@@ -143,6 +143,65 @@ static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const
     return node;
 }
 
+/* The CALLS resolver's admitted invocation record for the call whose callee is
+ * this occurrence: the innermost record in the same function that encloses the
+ * reference token and names the same member leaf. Two records at that site
+ * that disagree on the target prove nothing. */
+static const CBMResolvedCall *rust_member_invocation_record(const CBMResolvedCallArray *rows,
+                                                            const CBMUsage *usage,
+                                                            const cbm_gbuf_t *gbuf,
+                                                            const char *project_name) {
+    if (!rows || !usage->enclosing_func_qn || usage->site_end_byte <= usage->site_start_byte) {
+        return NULL;
+    }
+    const char *ref_leaf = cbm_lsp_bare_segment(usage->ref_name);
+    const CBMResolvedCall *best = NULL;
+    bool ambiguous = false;
+    for (int i = 0; i < rows->count; i++) {
+        const CBMResolvedCall *rc = &rows->items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !rc->strategy || rc->confidence < CBM_LSP_CONFIDENCE_FLOOR ||
+            !cbm_pipeline_rust_strategy_admitted(rc->strategy) ||
+            rc->source_origin != usage->source_origin || rc->site_start_byte > usage->site_start_byte ||
+            rc->site_end_byte < usage->site_end_byte ||
+            strcmp(rc->caller_qn, usage->enclosing_func_qn) != 0 ||
+            !cbm_pipeline_lsp_method_leaf_eq(cbm_lsp_bare_segment(rc->callee_qn), ref_leaf)) {
+            continue;
+        }
+        if (best && rc->site_end_byte - rc->site_start_byte >
+                        best->site_end_byte - best->site_start_byte) {
+            continue;
+        }
+        if (best && rc->site_start_byte == best->site_start_byte &&
+            rc->site_end_byte == best->site_end_byte) {
+            if (!cbm_pipeline_invocation_targets_equal(best->callee_qn, rc->callee_qn, gbuf,
+                                                       project_name, false)) {
+                ambiguous = true;
+            }
+            continue;
+        }
+        best = rc;
+        ambiguous = false;
+    }
+    return ambiguous ? NULL : best;
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(
+    const cbm_gbuf_t *gbuf, const char *project_name, const cbm_registry_t *registry,
+    const CBMResolvedCallArray *rows, const CBMUsage *usage) {
+    if (!usage || !usage->ref_name) {
+        return NULL;
+    }
+    const CBMResolvedCall *record =
+        rust_member_invocation_record(rows, usage, gbuf, project_name);
+    if (record) {
+        return cbm_pipeline_lsp_target_node(gbuf, project_name, record->callee_qn, false);
+    }
+    const char *owned = cbm_registry_rust_owner_member(registry, usage->ref_name,
+                                                       usage->enclosing_func_qn);
+    return owned ? cbm_gbuf_find_by_qn(gbuf, owned) : NULL;
+}
+
 /* Resolve USAGE edges for one file's extracted usages. */
 static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
@@ -225,6 +284,11 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
+            }
+            /* A bare name never proves a Rust type member. */
+            if (tgt && lang == CBM_LANG_RUST && cbm_registry_label_is_type_member(tgt->label)) {
+                tgt = cbm_pipeline_rust_member_usage_target(
+                    ctx->gbuf, ctx->project_name, ctx->registry, &result->resolved_calls, usage);
             }
         }
         if (!tgt || src->id == tgt->id) {

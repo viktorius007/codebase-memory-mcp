@@ -728,6 +728,112 @@ int cbm_registry_size(const cbm_registry_t *r) {
     return r ? (int)cbm_ht_count(r->exact) : 0;
 }
 
+bool cbm_registry_label_is_type_member(const char *label) {
+    return label && (strcmp(label, "Method") == 0 || strcmp(label, "AssociatedConst") == 0);
+}
+
+/* Length of `qn` without a terminal `[Trait<...>]` impl-provenance suffix. */
+static size_t member_qn_len(const char *qn) {
+    size_t len = strlen(qn);
+    if (len == 0 || qn[len - SKIP_ONE] != ']') {
+        return len;
+    }
+    const char *open = strchr(qn, '[');
+    return open ? (size_t)(open - qn) : len;
+}
+
+/* True when `qn` (suffix removed) is exactly `<parent>.<member>` and `parent`
+ * either equals `owner_qn` (exact) or ends in the segment `owner` (written). */
+static bool member_of_owner(const char *qn, const char *member, const char *owner,
+                            size_t owner_len, bool exact_owner) {
+    size_t len = member_qn_len(qn);
+    size_t mlen = strlen(member);
+    if (len < mlen + 2 || strncmp(qn + len - mlen, member, mlen) != 0 ||
+        qn[len - mlen - SKIP_ONE] != '.') {
+        return false;
+    }
+    size_t parent_len = len - mlen - SKIP_ONE;
+    if (exact_owner) {
+        return parent_len == owner_len && strncmp(qn, owner, owner_len) == 0;
+    }
+    if (parent_len < owner_len || strncmp(qn + parent_len - owner_len, owner, owner_len) != 0) {
+        return false;
+    }
+    return parent_len == owner_len || qn[parent_len - owner_len - SKIP_ONE] == '.';
+}
+
+const char *cbm_registry_rust_owner_member(const cbm_registry_t *r, const char *ref_name,
+                                           const char *enclosing_qn) {
+    if (!r || !ref_name) {
+        return NULL;
+    }
+    const char *last = NULL;
+    for (const char *p = ref_name; (p = strstr(p, "::")) != NULL; p += 2) {
+        last = p;
+    }
+    if (!last || last == ref_name) {
+        return NULL;
+    }
+    const char *member = last + 2;
+    const char *owner = last;
+    while (owner > ref_name && !(owner[-1] == ':' && owner - 1 > ref_name && owner[-2] == ':')) {
+        owner--;
+    }
+    size_t owner_len = (size_t)(last - owner);
+    /* The owner is a single written type name; generic arguments, turbofish
+     * and qualified-self forms name no type this check can read. */
+    for (size_t i = 0; i < owner_len; i++) {
+        char c = owner[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_')) {
+            return NULL;
+        }
+    }
+    if (!member[0] || owner_len == 0) {
+        return NULL;
+    }
+    bool exact_owner = false;
+    char self_owner[CBM_SZ_512];
+    if (owner_len == 4 && strncmp(owner, "Self", 4) == 0) {
+        /* `Self` is the type that owns the enclosing method. */
+        if (!enclosing_qn) {
+            return NULL;
+        }
+        size_t elen = member_qn_len(enclosing_qn);
+        const char *dot = NULL;
+        for (size_t i = 0; i < elen; i++) {
+            if (enclosing_qn[i] == '.') {
+                dot = enclosing_qn + i;
+            }
+        }
+        if (!dot || (size_t)(dot - enclosing_qn) >= sizeof(self_owner)) {
+            return NULL;
+        }
+        owner_len = (size_t)(dot - enclosing_qn);
+        memcpy(self_owner, enclosing_qn, owner_len);
+        self_owner[owner_len] = '\0';
+        owner = self_owner;
+        exact_owner = true;
+    }
+    qn_array_t *arr = cbm_ht_get(r->by_name, member);
+    if (!arr) {
+        return NULL;
+    }
+    const char *match = NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const char *qn = arr->items[i];
+        if (!cbm_registry_label_is_type_member(cbm_registry_label_of(r, qn)) ||
+            !member_of_owner(qn, member, owner, owner_len, exact_owner)) {
+            continue;
+        }
+        if (match) {
+            return NULL; /* two types share the written name */
+        }
+        match = qn;
+    }
+    return match;
+}
+
 /* ── Resolution ──────────────────────────────────────────────────── */
 
 /* Callback context for import_map_suffix scan */

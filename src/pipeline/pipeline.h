@@ -321,6 +321,17 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
  * unit-tested in test_registry.c. */
 bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
 
+/* A Rust type member — Method or AssociatedConst — is reachable only through
+ * a receiver (`x.m()`) or an owner path (`T::m`), never as a bare name. */
+bool cbm_registry_label_is_type_member(const char *label);
+
+/* Rust owner path `...::Owner::member`: the single registered Method or
+ * AssociatedConst whose parent segment is the written `Owner` (for `Self`,
+ * exactly the type owning `enclosing_qn`). NULL when the path is not an owner
+ * path, no member matches, or two same-named types both define it. */
+const char *cbm_registry_rust_owner_member(const cbm_registry_t *r, const char *ref_name,
+                                           const char *enclosing_qn);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 
