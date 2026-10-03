@@ -208,11 +208,13 @@ void cbm_pxc_rust_dump_call(const char *rel, const CBMCall *call, const char *so
  * has joined. */
 CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
                                            const struct CBMCargoManifest *root,
-                                           const cbm_file_info_t *files, int file_count);
+                                           const cbm_file_info_t *files, int file_count,
+                                           struct CBMRustMacroTable **out_macros);
 
 /* Per-thread borrow of the pipeline's Rust import table (pipeline_internal.h)
  * and crate module tree, installed and cleared beside the manifest. */
-void cbm_pxc_set_rust_imports(const CBMHashTable *imports, const CBMRustModTree *modtree);
+void cbm_pxc_set_rust_imports(const CBMHashTable *imports, const CBMRustModTree *modtree,
+                              const struct CBMRustMacroTable *macros);
 const struct CBMRustImportSource *cbm_pxc_get_rust_import_source(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends

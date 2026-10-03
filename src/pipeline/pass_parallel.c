@@ -1548,6 +1548,7 @@ typedef struct {
     const CBMCargoManifest *rust_manifest;
     /* The crate module tree, built once on the coordinator; read-only. */
     const CBMRustModTree *rust_modtree;
+    const CBMRustMacroTable *rust_macros;
 
     /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
      * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
@@ -3256,7 +3257,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_worker_state_t *ws = &rc->workers[worker_id];
 
     cbm_pxc_set_rust_manifest(rc->rust_manifest);
-    cbm_pxc_set_rust_imports(rc->pctx->rust_imports, rc->rust_modtree);
+    cbm_pxc_set_rust_imports(rc->pctx->rust_imports, rc->rust_modtree, rc->rust_macros);
 
     if (!ws->local_edge_buf) {
         ws->local_edge_buf = cbm_gbuf_new_worker(rc->project_name, rc->repo_path, rc->shared_ids);
@@ -3517,7 +3518,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         ws->loaded = NULL;
     }
     cbm_pxc_set_rust_manifest(NULL);
-    cbm_pxc_set_rust_imports(NULL, NULL);
+    cbm_pxc_set_rust_imports(NULL, NULL, NULL);
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     cbm_service_pattern_cache_end();
@@ -3585,9 +3586,13 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .cross_registries = cross_registries,
         .rust_manifest = rust_manifest_ptr,
     };
+    CBMRustMacroTable *rust_macros = NULL;
     CBMRustModTree *rust_modtree =
-        have_rust ? cbm_pxc_build_rust_modtree(ctx, rust_manifest_ptr, files, file_count) : NULL;
+        have_rust
+            ? cbm_pxc_build_rust_modtree(ctx, rust_manifest_ptr, files, file_count, &rust_macros)
+            : NULL;
     rc.rust_modtree = rust_modtree;
+    rc.rust_macros = rust_macros;
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
     atomic_init(&rc.lsp_cross_skipped_no_source, 0);
@@ -3615,6 +3620,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     }
     cbm_mutex_destroy(&rc.rust_shared_mu);
     cbm_rust_modtree_free(rust_modtree);
+    cbm_rust_macro_table_free(rust_macros);
     if (rust_manifest_arena_live) {
         cbm_arena_destroy(&rust_manifest_arena);
     }
