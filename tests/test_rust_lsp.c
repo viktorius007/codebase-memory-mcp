@@ -898,6 +898,135 @@ TEST(rustlsp_crossfile_method_result_self_return) {
     PASS();
 }
 
+/* Cross-file fixture for declared returns: types `demo::Conn` and
+ * `demo::Other` with a `ping` each, trait `demo::Pinger` declaring `ping`,
+ * aliases `Shared = Conn` and `Fallible<T> = Result<T, String>`, and one
+ * free fn `demo::make` whose declared return is `ret`. */
+enum { RUSTLSP_RET_DEFS = 9 };
+
+static int rustlsp_declared_return_target(const char *ret, const char *caller,
+                                          const char *callee) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[RUSTLSP_RET_DEFS];
+    memset(defs, 0, sizeof(defs));
+    const char *tqn[] = {"test.demo.Conn", "test.demo.Other", "test.demo.Pinger"};
+    const char *tname[] = {"Conn", "Other", "Pinger"};
+    for (int i = 0; i < 3; i++) {
+        defs[i].qualified_name = tqn[i];
+        defs[i].short_name = tname[i];
+        defs[i].label = i == 2 ? "Trait" : "Struct";
+        defs[i].is_interface = i == 2;
+        defs[i].def_module_qn = "test.demo";
+        CBMRustLSPDef *m = &defs[3 + i];
+        m->qualified_name = i == 0   ? "test.demo.Conn.ping"
+                            : i == 1 ? "test.demo.Other.ping"
+                                     : "test.demo.Pinger.ping";
+        m->short_name = "ping";
+        m->label = "Method";
+        m->receiver_type = tqn[i];
+        m->def_module_qn = "test.demo";
+        m->return_types = "bool";
+        m->is_abstract = i == 2;
+    }
+    static const char *const result_params[] = {"T"};
+    defs[6] = (CBMRustLSPDef){.qualified_name = "test.demo.Shared",
+                              .short_name = "Shared",
+                              .label = "Type",
+                              .def_module_qn = "test.demo",
+                              .return_types = "Conn"};
+    defs[7] = (CBMRustLSPDef){.qualified_name = "test.demo.Fallible",
+                              .short_name = "Fallible",
+                              .label = "Type",
+                              .def_module_qn = "test.demo",
+                              .return_types = "Result<T, String>",
+                              .signature_param_types = (const char **)result_params,
+                              .signature_param_count = 1};
+    defs[8] = (CBMRustLSPDef){.qualified_name = "test.demo.make",
+                              .short_name = "make",
+                              .label = "Function",
+                              .def_module_qn = "test.demo",
+                              .return_types = ret};
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs,
+                           RUSTLSP_RET_DEFS, imp_names, imp_qns, 1, NULL, &out);
+    int idx = find_confident(&out, "run", callee);
+    cbm_arena_destroy(&a);
+    return idx;
+}
+
+/* A project alias in a declared return reads as the type it stands for. */
+TEST(rustlsp_crossfile_return_project_alias) {
+    const char *caller = "fn run() -> bool { demo::make().ping() }\n";
+    ASSERT_GTE(rustlsp_declared_return_target("Shared", caller, "Conn.ping"), 0);
+    ASSERT_EQ(rustlsp_declared_return_target("Shared", caller, "Other.ping"), -1);
+    PASS();
+}
+
+/* A generic alias takes the argument the return writes: `Fallible<Conn>`
+ * is `Result<Conn, String>`, so `?` reaches `Conn`. The return is spelled
+ * as the registry holds a path the module tree settled. */
+TEST(rustlsp_crossfile_return_generic_alias_with_written_argument) {
+    const char *caller = "fn run() -> Result<bool, String> { Ok(demo::make()?.ping()) }\n";
+    const char *conn = "test.demo.Fallible<Conn>";
+    const char *other = "test.demo.Fallible<Other>";
+    ASSERT_GTE(rustlsp_declared_return_target(conn, caller, "Conn.ping"), 0);
+    ASSERT_GTE(rustlsp_declared_return_target(other, caller, "Other.ping"), 0);
+    ASSERT_EQ(rustlsp_declared_return_target(other, caller, "Conn.ping"), -1);
+    PASS();
+}
+
+/* `io::Result<T>` with `?` or `.expect(..)` yields T. */
+TEST(rustlsp_crossfile_return_io_result_then_try) {
+    const char *by_try = "fn run() -> std::io::Result<bool> { Ok(demo::make()?.ping()) }\n";
+    const char *by_expect = "fn run() -> bool { demo::make().expect(\"x\").ping() }\n";
+    ASSERT_GTE(rustlsp_declared_return_target("io::Result<Conn>", by_try, "Conn.ping"), 0);
+    ASSERT_GTE(rustlsp_declared_return_target("std::io::Result<Conn>", by_expect, "Conn.ping"),
+               0);
+    PASS();
+}
+
+/* A generic return with its argument written: `Box<Conn>` derefs to Conn. */
+TEST(rustlsp_crossfile_return_box_with_written_argument) {
+    const char *caller = "fn run() -> bool { demo::make().ping() }\n";
+    ASSERT_GTE(rustlsp_declared_return_target("Box<Conn>", caller, "Conn.ping"), 0);
+    ASSERT_EQ(rustlsp_declared_return_target("Box<Conn>", caller, "Other.ping"), -1);
+    PASS();
+}
+
+/* An opaque `impl Future<Output = T>` awaits to T; an opaque project trait
+ * hides the impl a call on it reaches, so it publishes nothing, while a
+ * trait object reaches the trait's declaration. */
+TEST(rustlsp_crossfile_return_opaque_types) {
+    const char *awaited = "async fn run() -> bool { demo::make().await.ping() }\n";
+    const char *direct = "fn run() -> bool { demo::make().ping() }\n";
+    ASSERT_GTE(rustlsp_declared_return_target("impl Future<Output = Conn> + Send", awaited,
+                                              "Conn.ping"),
+               0);
+    ASSERT_EQ(rustlsp_declared_return_target("impl Pinger", direct, "ping"), -1);
+    ASSERT_GTE(rustlsp_declared_return_target("Box<dyn Pinger>", direct, "Pinger.ping"), 0);
+    PASS();
+}
+
+/* Extraction carries a `type` item's target and the per-file registry
+ * reads a call returning the alias as the aliased type. */
+TEST(rustlsp_same_file_return_project_alias) {
+    CBMFileResult *r = extract_rust("struct Conn;\nstruct Other;\n"
+                                    "impl Conn { fn ping(&self) -> bool { true } }\n"
+                                    "impl Other { fn ping(&self) -> bool { false } }\n"
+                                    "type Shared = Conn;\n"
+                                    "fn make() -> Shared { Conn }\n"
+                                    "fn run() -> bool { make().ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "run", "Conn.ping"), 0);
+    ASSERT_EQ(find_resolved(r, "run", "Other.ping"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* F4 Tier-2: the build-once shared registry path (cbm_rust_build_cross_registry +
  * cbm_run_rust_lsp_cross_with_registry) must resolve IDENTICALLY to the per-file
  * cbm_run_rust_lsp_cross — same fixture as rustlsp_crossfile_method_dispatch. Also
@@ -9338,6 +9467,12 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_await_async_result_then_expect_and_try);
     RUN_TEST(rustlsp_crossfile_await_non_async_peels_future_output);
     RUN_TEST(rustlsp_crossfile_method_result_self_return);
+    RUN_TEST(rustlsp_crossfile_return_project_alias);
+    RUN_TEST(rustlsp_crossfile_return_generic_alias_with_written_argument);
+    RUN_TEST(rustlsp_crossfile_return_io_result_then_try);
+    RUN_TEST(rustlsp_crossfile_return_box_with_written_argument);
+    RUN_TEST(rustlsp_crossfile_return_opaque_types);
+    RUN_TEST(rustlsp_same_file_return_project_alias);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_duplicate_free_function_qn_stays_unresolved);
     RUN_TEST(rustlsp_path_module_child_call_does_not_flatten_to_parent);

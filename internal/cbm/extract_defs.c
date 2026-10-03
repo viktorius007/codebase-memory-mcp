@@ -2588,6 +2588,56 @@ static const char *extract_rust_supertraits(CBMArena *a, TSNode trait_node, cons
     return joined;
 }
 
+/* The name a Rust generic parameter declares: `T` in `T`, `T: Bound`,
+ * `T = Default` or `const T: usize`. NULL for a lifetime, which a type
+ * argument list never spells positionally. */
+static const char *rust_generic_param_name(CBMArena *a, TSNode param, const char *source) {
+    const char *kind = ts_node_type(param);
+    if (strcmp(kind, "type_identifier") == 0) {
+        return cbm_node_text(a, param, source);
+    }
+    if (strcmp(kind, "lifetime_parameter") == 0 || strcmp(kind, "lifetime") == 0) {
+        return NULL;
+    }
+    TSNode name = ts_node_child_by_field_name(param, TS_FIELD("name"));
+    if (ts_node_is_null(name)) {
+        name = cbm_find_child_by_kind(param, "type_identifier");
+    }
+    if (ts_node_is_null(name)) {
+        name = cbm_find_child_by_kind(param, "identifier");
+    }
+    return ts_node_is_null(name) ? NULL : cbm_node_text(a, name, source);
+}
+
+/* Rust `type Name<P..> = Target;`: the target as written and the type
+ * parameter names, in order, into `def`. */
+static void extract_rust_type_alias(CBMArena *a, TSNode item, const char *source,
+                                    CBMDefinition *def) {
+    TSNode target = ts_node_child_by_field_name(item, TS_FIELD("type"));
+    if (ts_node_is_null(target)) {
+        return;
+    }
+    def->type_alias = cbm_node_text(a, target, source);
+    TSNode params = ts_node_child_by_field_name(item, TS_FIELD("type_parameters"));
+    uint32_t nc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+    if (nc == 0) {
+        return;
+    }
+    const char **names = (const char **)cbm_arena_alloc(a, (nc + 1) * sizeof(const char *));
+    if (!names) {
+        return;
+    }
+    int count = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        const char *name = rust_generic_param_name(a, ts_node_named_child(params, i), source);
+        if (name && name[0]) {
+            names[count++] = name;
+        }
+    }
+    names[count] = NULL;
+    def->type_alias_params = count > 0 ? names : NULL;
+}
+
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
@@ -4716,6 +4766,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     if (ctx->language == CBM_LANG_RUST && strcmp(kind, "trait_item") == 0) {
         def.supertraits = extract_rust_supertraits(a, node, ctx->source);
+    }
+    if (ctx->language == CBM_LANG_RUST && strcmp(kind, "type_item") == 0) {
+        extract_rust_type_alias(a, node, ctx->source, &def);
     }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);

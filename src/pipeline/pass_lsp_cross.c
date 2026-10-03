@@ -925,6 +925,23 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->is_abstract = src->is_abstract;
         dst->is_async = src->is_async;
         dst->is_rust_private = src->is_rust_private;
+        /* A type alias carries its target as the type it stands for and its
+         * type parameters as that type's positional parameters. */
+        if (src->type_alias) {
+            dst->return_types = cbm_arena_strdup(arena, src->type_alias);
+            int n = 0;
+            while (src->type_alias_params && src->type_alias_params[n]) {
+                n++;
+            }
+            const char **params =
+                n > 0 ? (const char **)cbm_arena_alloc(arena, (size_t)n * sizeof(const char *))
+                      : NULL;
+            for (int i = 0; params && i < n; i++) {
+                params[i] = cbm_arena_strdup(arena, src->type_alias_params[i]);
+            }
+            dst->signature_param_types = params;
+            dst->signature_param_count = params ? n : 0;
+        }
     }
     return 0;
 }

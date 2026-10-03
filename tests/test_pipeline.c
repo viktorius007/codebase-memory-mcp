@@ -7882,6 +7882,82 @@ TEST(pipeline_rust_await_async_fn_output_survives_closure_repair) {
     PASS();
 }
 
+/* Whether `src.caller.<caller>` -> `Conn.ping` is linked in the graph at db_path. */
+static bool rust_caller_links_conn_ping(const char *db_path, const char *project,
+                                        const char *caller) {
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return false;
+    }
+    char src[512];
+    char dst[512];
+    snprintf(src, sizeof(src), "%s.src.caller.%s", project, caller);
+    snprintf(dst, sizeof(dst), "%s.src.conn.Conn.ping", project);
+    bool linked = exact_call_qns_exist(store, project, src, dst);
+    cbm_store_close(store);
+    return linked;
+}
+
+/* A declared return naming a type alias from another file reads as the
+ * aliased type: `Fallible<Conn>` (generic, argument written) through `?`,
+ * and `Shared = Arc<Conn>` through deref (`Other.ping` makes the name
+ * ambiguous). The alias travels with the stored surface: a body edit of the
+ * caller, repaired from the defining file's surface, links the same calls. */
+TEST(pipeline_rust_return_type_alias_survives_closure_repair) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_alias_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod conn;\npub mod caller;\n");
+    write_temp_file(tmp, "src/conn.rs",
+                    "use std::sync::Arc;\n"
+                    "pub struct Conn;\n"
+                    "pub struct Other;\n"
+                    "pub type Fallible<T> = Result<T, String>;\n"
+                    "pub type Shared = Arc<Conn>;\n"
+                    "impl Conn { pub fn ping(&self) -> bool { true } }\n"
+                    "impl Other { pub fn ping(&self) -> bool { false } }\n"
+                    "pub fn open() -> Fallible<Conn> { Ok(Conn) }\n"
+                    "pub fn shared() -> Shared { Arc::new(Conn) }\n");
+    write_temp_file(tmp, "src/caller.rs",
+                    "use crate::conn::{open, shared};\n"
+                    "pub fn run() -> Result<bool, String> { Ok(open()?.ping()) }\n"
+                    "pub fn run_shared() -> bool { shared().ping() }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/alias.db", tmp);
+
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    bool full_generic = rust_caller_links_conn_ping(db, project, "run");
+    bool full_shared = rust_caller_links_conn_ping(db, project, "run_shared");
+
+    write_temp_file(tmp, "src/caller.rs",
+                    "use crate::conn::{open, shared};\n"
+                    "pub fn run() -> Result<bool, String> {\n"
+                    "    let ok = open()?.ping();\n"
+                    "    Ok(ok)\n"
+                    "}\n"
+                    "pub fn run_shared() -> bool { shared().ping() }\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incr = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incr);
+    ASSERT_EQ(cbm_pipeline_run(incr), 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incr);
+    bool repaired_generic = rust_caller_links_conn_ping(db, project, "run");
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(full_generic);
+    ASSERT_TRUE(full_shared);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(repaired_generic);
+    PASS();
+}
+
 TEST(pipeline_rust_path_module_super_resolves_from_declared_parent) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_path_module_XXXXXX");
@@ -16987,7 +17063,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":6") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":7") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -17888,6 +17964,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_method_on_path_call_result_uses_published_producer);
     RUN_TEST(pipeline_rust_type_names_resolve_through_declared_module_tree);
     RUN_TEST(pipeline_rust_await_async_fn_output_survives_closure_repair);
+    RUN_TEST(pipeline_rust_return_type_alias_survives_closure_repair);
     RUN_TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration);
     RUN_TEST(pipeline_rust_private_inherent_method_hidden_outside_its_module);
     RUN_TEST(pipeline_rust_line_qualified_twin_sources_its_own_calls);
