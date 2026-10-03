@@ -7449,6 +7449,46 @@ TEST(rustlsp_gap_bound_box_dyn_dispatch) {
     cbm_free_result(r); PASS();
 }
 
+/* `dyn Cell + Send` and `dyn Cell` are two types: the Box impl of the first is
+ * found on a `Box<dyn Cell + Send>` before it derefs, and does not apply to a
+ * `Box<dyn Cell>`, whose call derefs to `Cell::height`. */
+TEST(rustlsp_wrapper_impl_on_dyn_with_auto_trait_applies_to_same_bounds) {
+    const char *src = "use demo::Renderable;\n"
+                      "fn via_send(c: Box<dyn demo::Cell + Send>) -> u8 { c.height() }\n"
+                      "fn via_plain(c: Box<dyn demo::Cell>) -> u8 { c.height() }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[5];
+    memset(defs, 0, sizeof(defs));
+    defs[0] = (CBMRustLSPDef){.qualified_name = "p.demo.Cell", .short_name = "Cell",
+                              .label = "Trait", .def_module_qn = "p.demo", .is_interface = true};
+    defs[1] = (CBMRustLSPDef){.qualified_name = "p.demo.Renderable", .short_name = "Renderable",
+                              .label = "Trait", .def_module_qn = "p.demo", .is_interface = true};
+    defs[2] = (CBMRustLSPDef){.qualified_name = "p.demo.Cell.height", .short_name = "height",
+                              .label = "Method", .receiver_type = "p.demo.Cell",
+                              .def_module_qn = "p.demo"};
+    defs[3] = (CBMRustLSPDef){.qualified_name = "p.demo.Renderable.height",
+                              .short_name = "height", .label = "Method",
+                              .receiver_type = "p.demo.Renderable", .def_module_qn = "p.demo"};
+    /* impl Renderable for Box<dyn Cell + Send> { fn height(&self) -> u8 } */
+    defs[4] = (CBMRustLSPDef){.qualified_name = "p.demo.Box.height", .short_name = "height",
+                              .label = "Method", .receiver_type = "alloc.boxed.Box",
+                              .receiver_spelling = "Box<dyn Cell + Send>",
+                              .trait_qn = "p.demo.Renderable", .def_module_qn = "p.demo"};
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 5, imp_n, imp_q, 1, NULL,
+                           &out);
+    ASSERT_GTE(find_confident(&out, "via_send", "p.demo.Box.height"), 0);
+    ASSERT_LT(find_confident(&out, "via_send", "p.demo.Cell.height"), 0);
+    ASSERT_GTE(find_confident(&out, "via_plain", "p.demo.Cell.height"), 0);
+    ASSERT_LT(find_confident(&out, "via_plain", "p.demo.Box.height"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(rustlsp_gap_bound_impl_trait_param) {
     CBMFileResult *r = extract_rust(
         "trait Wave { fn wave(&self); }\n"
@@ -10493,6 +10533,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_bound_where_clause_dispatch);
     RUN_TEST(rustlsp_gap_bound_dyn_trait_method);
     RUN_TEST(rustlsp_gap_bound_box_dyn_dispatch);
+    RUN_TEST(rustlsp_wrapper_impl_on_dyn_with_auto_trait_applies_to_same_bounds);
     RUN_TEST(rustlsp_gap_bound_impl_trait_param);
     RUN_TEST(rustlsp_gap_bound_two_impls_disambig);
     RUN_TEST(rustlsp_gap_bound_supertrait_method);

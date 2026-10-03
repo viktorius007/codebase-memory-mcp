@@ -58,7 +58,13 @@ typedef struct {
 struct CBMType {
     CBMTypeKind kind;
     union {
-        struct { const char* qualified_name; } named;      // NAMED
+        struct {
+            const char* qualified_name;
+            // Rust trait object `dyn Q + M..`: its auto-trait bounds M, sorted and
+            // joined by '+' ("" for none). NULL when the type is no trait object
+            // or the spelling was not read.
+            const char* rust_dyn_markers;
+        } named;                                            // NAMED
         struct { const CBMType* elem; } pointer;            // POINTER
         struct { const CBMType* elem; } slice;              // SLICE
         struct { const CBMType* key; const CBMType* value; } map;  // MAP
