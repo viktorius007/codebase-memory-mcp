@@ -1558,6 +1558,18 @@ bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
     return lang != CBM_LANG_GO;
 }
 
+/* Whether Strategy 3 may bind an import from a file of `lang` to a node with
+ * `label`. A Rust `use` names an item of a module — never an associated fn or
+ * method (stable Rust rejects `use Type::method` and `use Trait::method`,
+ * E0253) — so a same-named Method is always a wrong target there: `use
+ * futures::Stream` must not bind to some `Error::Stream` constructor. */
+static bool import_symbol_label_allowed(CBMLanguage lang, const char *label) {
+    if (!import_targetable_label(label)) {
+        return false;
+    }
+    return !(lang == CBM_LANG_RUST && strcmp(label, "Method") == 0);
+}
+
 static const char *path_leaf(const char *path) {
     const char *leaf = path;
     for (const char *p = path; p && *p; p++) {
@@ -1845,8 +1857,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             src_base = pb + SKIP_ONE;
         }
     }
-    const bool symbol_fallback_allowed =
-        cbm_import_symbol_fallback_allowed(cbm_language_for_filename(src_base));
+    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
+    const bool symbol_fallback_allowed = cbm_import_symbol_fallback_allowed(src_lang);
 
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose
      * import string is a sibling filename or directory (SCSS partials, Just/
@@ -2010,7 +2022,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                 const cbm_gbuf_node_t *best = NULL;
                 for (int i = 0; i < n; i++) {
                     const cbm_gbuf_node_t *cand = hits[i];
-                    if (!cand || !import_targetable_label(cand->label)) {
+                    if (!cand || !import_symbol_label_allowed(src_lang, cand->label)) {
                         continue;
                     }
                     if (source_file_qn && cand->qualified_name &&
