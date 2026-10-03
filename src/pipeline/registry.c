@@ -992,26 +992,28 @@ static bool rust_candidate_in_file(const cbm_registry_t *r, const char *cand,
     return label && strcmp(label, "Module") != 0;
 }
 
-/* The module tree reads bare `name` in the file `module_qn` as `cand`: a
- * function in the value namespace, or a type or trait in the type namespace. */
-static bool rust_tree_names(const CBMRustModTree *tree, const char *module_qn, const char *name,
+/* The module tree reads `path` (a bare name or a `::` path) in the file
+ * `module_qn` as `cand`: a function in the value namespace, or a type or
+ * trait in the type namespace. */
+static bool rust_tree_names(const CBMRustModTree *tree, const char *module_qn, const char *path,
                             const char *cand) {
     CBMArena arena;
     cbm_arena_init(&arena);
-    CBMRustPathResult v = cbm_rust_modtree_resolve(tree, &arena, module_qn, 0, name, NULL, NULL, 0);
+    CBMRustPathResult v = cbm_rust_modtree_resolve(tree, &arena, module_qn, 0, path, NULL, NULL, 0);
     bool hit = v.kind == CBM_RUST_PATH_FUNCTION && v.qn && strcmp(v.qn, cand) == 0;
     if (!hit) {
-        CBMRustPathResult t = cbm_rust_modtree_resolve_type_in_file(tree, &arena, module_qn, name);
+        CBMRustPathResult t = cbm_rust_modtree_resolve_type_in_file(tree, &arena, module_qn, path);
         hit = t.kind == CBM_RUST_PATH_TYPE && t.qn && strcmp(t.qn, cand) == 0;
     }
     cbm_arena_destroy(&arena);
     return hit;
 }
 
-/* A Rust bare `name` in the file `module_qn` can denote `cand`. */
+/* A Rust reference spelled `path` (bare name `name`) in the file `module_qn`
+ * can denote `cand`. */
 static bool rust_name_binds(const cbm_registry_t *r, const CBMRustModTree *tree, const char *cand,
-                            const char *name, const char *module_qn, const char **import_keys,
-                            const char **import_vals, int import_count) {
+                            const char *path, const char *name, const char *module_qn,
+                            const char **import_keys, const char **import_vals, int import_count) {
     if (rust_candidate_in_file(r, cand, module_qn)) {
         return true;
     }
@@ -1021,20 +1023,25 @@ static bool rust_name_binds(const cbm_registry_t *r, const CBMRustModTree *tree,
             return true;
         }
     }
-    return rust_tree_names(tree, module_qn, name, cand);
+    return rust_tree_names(tree, module_qn, path, cand);
 }
 
 /* Strategy 4 for a Rust file: only candidates a `use` or the module binds.
- * None bound means no edge — an import of a sibling item proves nothing. */
+ * None bound means no edge — an import of a sibling item proves nothing —
+ * except a type member (`legacy`, the import-distance pick): a bare name never
+ * proves one, and the usages pass re-routes it through the call record, so it
+ * is handed on unpublished. */
 static cbm_resolution_t resolve_multi_rust(const cbm_registry_t *r, const CBMRustModTree *tree,
-                                           const qn_array_t *arr, const char *name,
-                                           const char *module_qn, const char **import_keys,
-                                           const char **import_vals, int import_count) {
+                                           const qn_array_t *arr, const char *callee_name,
+                                           const char *name, const char *module_qn,
+                                           const char **import_keys, const char **import_vals,
+                                           int import_count, cbm_resolution_t legacy) {
+    const char *path = strstr(callee_name, "::") ? callee_name : name;
     const char *bound[CBM_SZ_256];
     int bcount = 0;
     for (int i = 0; i < arr->count && bcount < CBM_SZ_256; i++) {
-        if (rust_name_binds(r, tree, arr->items[i], name, module_qn, import_keys, import_vals,
-                            import_count)) {
+        if (rust_name_binds(r, tree, arr->items[i], path, name, module_qn, import_keys,
+                            import_vals, import_count)) {
             bound[bcount++] = arr->items[i];
         }
     }
@@ -1042,22 +1049,18 @@ static cbm_resolution_t resolve_multi_rust(const cbm_registry_t *r, const CBMRus
                        : bcount > SKIP_ONE ? best_by_import_distance(bound, bcount, module_qn)
                                            : NULL;
     if (!best) {
-        return empty_result();
+        bool member = legacy.qualified_name &&
+                      cbm_registry_label_is_type_member(cbm_registry_label_of(r, legacy.qualified_name));
+        return member ? legacy : empty_result();
     }
-    double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, bcount == SKIP_ONE ? arr->count : bcount);
-    return (cbm_resolution_t){best, "suffix_match", conf, bcount == SKIP_ONE ? arr->count : bcount};
+    int count = bcount == SKIP_ONE ? arr->count : bcount;
+    double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, count);
+    return (cbm_resolution_t){best, "suffix_match", conf, count};
 }
 
 /* Strategy 4: multiple candidates with import filtering. */
-static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
-                                                   const char *name, const char *module_qn,
-                                                   const char **import_keys,
+static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const char *module_qn,
                                                    const char **import_vals, int import_count) {
-    const CBMRustModTree *tree = rust_file_modtree(module_qn);
-    if (tree) {
-        return resolve_multi_rust(r, tree, arr, name, module_qn, import_keys, import_vals,
-                                  import_count);
-    }
     const char *filtered[CBM_SZ_256];
     int fcount = 0;
     for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
@@ -1259,21 +1262,26 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         return (cbm_resolution_t){arr->items[0], "unique_name", conf, REG_RESOLVED};
     }
 
-    /* Strategy 4: multiple candidates. A Rust file binds by `use` and module
-     * placement even when it has no IMPORTS edge (a glob makes none). */
-    if ((import_vals && import_count > 0) || rust_file_modtree(module_qn)) {
-        return resolve_multi_with_imports(r, arr, lookup, module_qn, import_keys, import_vals,
-                                          import_count);
-    }
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
-    if (best) {
-        if (!receiver_chain_admits(callee_name, best)) {
-            return empty_result();
+    /* Strategy 4: multiple candidates. */
+    cbm_resolution_t legacy = empty_result();
+    if (import_vals && import_count > 0) {
+        legacy = resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
+    } else {
+        const char *best =
+            best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+        if (best && receiver_chain_admits(callee_name, best)) {
+            double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
+            legacy = (cbm_resolution_t){best, "suffix_match", conf, arr->count};
         }
-        double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
-        return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
-    return empty_result();
+    /* A Rust file binds by `use` and module placement, also when it has no
+     * IMPORTS edge (a glob makes none). */
+    const CBMRustModTree *tree = rust_file_modtree(module_qn);
+    if (!tree) {
+        return legacy;
+    }
+    return resolve_multi_rust(r, tree, arr, callee_name, lookup, module_qn, import_keys,
+                              import_vals, import_count, legacy);
 }
 
 /* The strategy chain shared by both public resolve variants (no caching here —
