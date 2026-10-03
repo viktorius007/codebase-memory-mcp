@@ -293,9 +293,10 @@ static bool pxc_rust_file_path_facts(CBMArena *arena, const CBMFileResult *cache
     /* Another file's expansion reads this file's macro_rules! items, so they
      * belong to the facts whose change re-resolves the whole crate. */
     out->tree_digest =
-        source && tree ? cbm_rust_modtree_file_digest(source, ts_tree_root_node(tree)) ^
-                             cbm_rust_macro_facts_digest(source, source_len, ts_tree_root_node(tree))
-                       : 0;
+        source && tree
+            ? cbm_rust_modtree_file_digest(source, ts_tree_root_node(tree)) ^
+                  cbm_rust_macro_facts_digest(source, source_len, ts_tree_root_node(tree))
+            : 0;
     if (owned_tree) {
         ts_tree_delete(owned_tree);
     }
@@ -2732,8 +2733,8 @@ static void pxc_rust_add_crates(PXCRustCrates *crates, CBMRustModTree *tree) {
 
 typedef struct {
     const cbm_file_info_t *files;
-    const int *file_index;   /* modtree file id -> files[] index */
-    CBMRustModFacts **facts; /* modtree file id -> scanned facts */
+    const int *file_index;      /* modtree file id -> files[] index */
+    CBMRustModFacts **facts;    /* modtree file id -> scanned facts */
     CBMRustMacroFacts **macros; /* modtree file id -> file-level macro facts */
 } PXCRustScanCtx;
 
@@ -2771,16 +2772,17 @@ static void pxc_rust_finish_modtree(CBMRustModTree *tree, CBMRustMacroTable *mac
     cbm_rust_modtree_finish(tree, (const CBMRustModFacts *const *)facts);
     for (int i = 0; i < count; i++) {
         cbm_rust_modfacts_free(facts[i]);
-        char *module = macro_facts[i] ? cbm_pipeline_fqn_module_dir(
-                                            project_name, files[file_index[i]].rel_path,
-                                            pxc_module_is_dir(files[file_index[i]].language))
-                                      : NULL;
-        if (macros && module) {
-            cbm_rust_macro_table_add(macros, module, macro_facts[i]);
+        char *module =
+            macros && macro_facts[i]
+                ? cbm_pipeline_fqn_module_dir(project_name, files[file_index[i]].rel_path,
+                                              pxc_module_is_dir(files[file_index[i]].language))
+                : NULL;
+        if (module) {
+            cbm_rust_macro_table_add(macros, module, macro_facts[i]); /* takes the facts */
+            cbm_free(CBM_MEM_CLASS_OTHER, module);
         } else {
             cbm_rust_macro_facts_free(macro_facts[i]);
         }
-        free(module);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, facts);
     cbm_free(CBM_MEM_CLASS_OTHER, macro_facts);

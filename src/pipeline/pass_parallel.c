@@ -3588,9 +3588,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     };
     CBMRustMacroTable *rust_macros = NULL;
     CBMRustModTree *rust_modtree =
-        have_rust ? cbm_pxc_build_rust_modtree(ctx, rust_manifest_ptr, files, file_count,
-                                               &rust_macros)
-                  : NULL;
+        have_rust
+            ? cbm_pxc_build_rust_modtree(ctx, rust_manifest_ptr, files, file_count, &rust_macros)
+            : NULL;
     rc.rust_modtree = rust_modtree;
     rc.rust_macros = rust_macros;
     atomic_init(&rc.next_file_idx, 0);

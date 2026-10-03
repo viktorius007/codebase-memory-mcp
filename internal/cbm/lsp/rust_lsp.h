@@ -423,7 +423,7 @@ uint64_t cbm_rust_macro_facts_digest(const char *source, int len, TSNode root);
  * filled; lookups are read-only and safe from several threads. */
 typedef struct CBMRustMacroTable CBMRustMacroTable;
 CBMRustMacroTable *cbm_rust_macro_table_new(void);
-/* Takes ownership of `facts` (NULL is ignored). */
+/* Copies `module_qn`; takes ownership of `facts` (NULL is ignored). */
 void cbm_rust_macro_table_add(CBMRustMacroTable *table, const char *module_qn,
                               CBMRustMacroFacts *facts);
 void cbm_rust_macro_table_free(CBMRustMacroTable *table);

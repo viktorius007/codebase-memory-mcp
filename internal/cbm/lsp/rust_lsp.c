@@ -28,6 +28,7 @@
 #include "rust_lsp.h"
 #include "rust_cargo.h"
 #include "../helpers.h"
+#include "../../../src/foundation/mem_core.h"
 #include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -4799,11 +4800,11 @@ void cbm_rust_macro_facts_free(CBMRustMacroFacts *facts) {
     if (!facts)
         return;
     cbm_arena_destroy(&facts->arena);
-    free(facts);
+    cbm_free(CBM_MEM_CLASS_OTHER, facts);
 }
 
 static CBMRustMacroFacts *rust_macro_facts_from_root(const char *source, TSNode root) {
-    CBMRustMacroFacts *facts = (CBMRustMacroFacts *)calloc(1, sizeof(*facts));
+    CBMRustMacroFacts *facts = (CBMRustMacroFacts *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*facts));
     if (!facts)
         return NULL;
     cbm_arena_init(&facts->arena);
@@ -4869,25 +4870,26 @@ uint64_t cbm_rust_macro_facts_digest(const char *source, int len, TSNode root) {
 }
 
 CBMRustMacroTable *cbm_rust_macro_table_new(void) {
-    return (CBMRustMacroTable *)calloc(1, sizeof(CBMRustMacroTable));
+    return (CBMRustMacroTable *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(CBMRustMacroTable));
 }
 
 void cbm_rust_macro_table_add(CBMRustMacroTable *table, const char *module_qn,
                               CBMRustMacroFacts *facts) {
     if (!facts)
         return;
-    char *qn = module_qn ? strdup(module_qn) : NULL;
+    char *qn = module_qn ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, module_qn) : NULL;
     if (table && qn && table->count == table->cap) {
         int cap = table->cap ? table->cap * 2 : 16;
         RustMacroTableEntry *grown =
-            (RustMacroTableEntry *)realloc(table->entries, (size_t)cap * sizeof(*grown));
+            (RustMacroTableEntry *)cbm_realloc(CBM_MEM_CLASS_OTHER, table->entries,
+                                                (size_t)cap * sizeof(*grown));
         if (grown) {
             table->entries = grown;
             table->cap = cap;
         }
     }
     if (!table || !qn || table->count == table->cap) {
-        free(qn);
+        cbm_free(CBM_MEM_CLASS_OTHER, qn);
         cbm_rust_macro_facts_free(facts);
         return;
     }
@@ -4898,11 +4900,11 @@ void cbm_rust_macro_table_free(CBMRustMacroTable *table) {
     if (!table)
         return;
     for (int i = 0; i < table->count; i++) {
-        free(table->entries[i].module_qn);
+        cbm_free(CBM_MEM_CLASS_OTHER, table->entries[i].module_qn);
         cbm_rust_macro_facts_free(table->entries[i].facts);
     }
-    free(table->entries);
-    free(table);
+    cbm_free(CBM_MEM_CLASS_OTHER, table->entries);
+    cbm_free(CBM_MEM_CLASS_OTHER, table);
 }
 
 static bool rust_macro_table_defines(const CBMRustMacroTable *table, const char *name) {
