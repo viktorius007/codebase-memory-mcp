@@ -42,6 +42,8 @@
 /* Forward declarations for early callers in the file. */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
 static void rust_process_nested_item(RustLSPContext *ctx, TSNode item);
+static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
+static void rust_process_module(RustLSPContext *ctx, TSNode mod_node, int depth);
 static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path);
 static const char *rust_module_export(RustLSPContext *ctx, const char *module_qn, const char *name);
 static const char *rust_qn_crate_prefix(RustLSPContext *ctx, const char *qn);
@@ -7855,7 +7857,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     ctx->eval_step_count++;
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "function_item") == 0 || strcmp(kind, "impl_item") == 0 ||
-        strcmp(kind, "trait_item") == 0) {
+        strcmp(kind, "trait_item") == 0 || strcmp(kind, "mod_item") == 0) {
         rust_process_nested_item(ctx, node);
         return; /* A nested item's body is not executed by its enclosing function. */
     }
@@ -8756,6 +8758,8 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
         rust_process_impl(ctx, item);
     } else if (strcmp(kind, "trait_item") == 0) {
         rust_process_trait(ctx, item);
+    } else if (strcmp(kind, "mod_item") == 0) {
+        rust_process_module(ctx, item, 0);
     }
 
     ctx->current_scope = saved_scope;
@@ -8767,6 +8771,54 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     ctx->pending_closure_param_type = saved_closure_param;
     ctx->pending_match_type = saved_match;
     ctx->callable_control_flow_depth = saved_flow_depth;
+}
+
+/* Bound on inline-module nesting the walk follows. */
+enum { RUST_INLINE_MOD_MAX_DEPTH = 64 };
+
+/* Walk the items of inline module `mod_node` at nesting `depth`. Its own
+ * `use`s and globs bind its whole body and shadow what the enclosing module
+ * sees; the crate's module tree already knows them as that module's imports,
+ * so they extend the module-level use set, not a block's. `self::` /
+ * `super::` in those `use`s are relative to the inline module. Its items are
+ * extracted under the file's module QN, so bodies keep that identity. */
+static void rust_process_module(RustLSPContext *ctx, TSNode mod_node, int depth) {
+    TSNode body = ts_node_child_by_field_name(mod_node, "body", 4);
+    char *name = rust_node_text(ctx, ts_node_child_by_field_name(mod_node, "name", 4));
+    if (ts_node_is_null(body) || !name || !name[0] || depth > RUST_INLINE_MOD_MAX_DEPTH) {
+        return;
+    }
+    int saved_uses = ctx->use_count;
+    int saved_globs = ctx->glob_count;
+    int saved_file_uses = ctx->file_use_count;
+    int saved_file_globs = ctx->file_glob_count;
+    const char *saved_relative = ctx->relative_module_qn;
+    ctx->relative_module_qn =
+        saved_relative ? cbm_arena_sprintf(ctx->arena, "%s.%s", saved_relative, name) : NULL;
+    rust_collect_uses(ctx, body);
+    ctx->relative_module_qn = saved_relative;
+    ctx->file_use_count = ctx->use_count;
+    ctx->file_glob_count = ctx->glob_count;
+
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(body, i);
+        const char *kind = ts_node_type(item);
+        if (strcmp(kind, "function_item") == 0) {
+            rust_process_function(ctx, item, NULL);
+        } else if (strcmp(kind, "impl_item") == 0) {
+            rust_process_impl(ctx, item);
+        } else if (strcmp(kind, "trait_item") == 0) {
+            rust_process_trait(ctx, item);
+        } else if (strcmp(kind, "mod_item") == 0) {
+            rust_process_module(ctx, item, depth + 1);
+        }
+    }
+
+    ctx->use_count = saved_uses;
+    ctx->glob_count = saved_globs;
+    ctx->file_use_count = saved_file_uses;
+    ctx->file_glob_count = saved_file_globs;
 }
 
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
@@ -8841,22 +8893,7 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
         } else if (strcmp(ck, "trait_item") == 0) {
             rust_process_trait(ctx, c);
         } else if (strcmp(ck, "mod_item") == 0) {
-            TSNode body = ts_node_child_by_field_name(c, "body", 4);
-            if (ts_node_is_null(body))
-                continue;
-            for (uint32_t j = 0; j < ts_node_child_count(body); j++) {
-                TSNode item = ts_node_child(body, j);
-                if (ts_node_is_null(item))
-                    continue;
-                const char *item_kind = ts_node_type(item);
-                if (strcmp(item_kind, "function_item") == 0) {
-                    rust_process_function(ctx, item, NULL);
-                } else if (strcmp(item_kind, "impl_item") == 0) {
-                    rust_process_impl(ctx, item);
-                } else if (strcmp(item_kind, "trait_item") == 0) {
-                    rust_process_trait(ctx, item);
-                }
-            }
+            rust_process_module(ctx, c, 0);
         }
     }
 }
