@@ -23,6 +23,8 @@
 #include "foundation/win_utf8.h"
 #include "foundation/yaml.h"
 
+#include "lsp/rust_cargo.h"
+
 #include <yyjson/yyjson.h>
 
 #include <stdbool.h>
@@ -57,6 +59,10 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
 }
 
 /* ── Constants ─────────────────────────────────────────────────── */
+
+#define RUST_PATH_SEP "::"
+#define RUST_EDITION_2015_SUFFIX "#edition2015"
+#define RUST_EXTERN_CRATE_SUFFIX "#extern"
 
 enum {
     PKGMAP_INIT_CAP = 16,
@@ -381,9 +387,57 @@ static char *build_entry_path(const char *rel_path, const char *suffix) {
     return strdup(buf);
 }
 
-/* Rust: Cargo.toml — [package] name */
+/* Register `ident` as the head of a Rust path into a crate: key "<ident>::"
+ * for a crate this repository builds, "<ident>::#extern" for a dependency
+ * fetched from outside it, with `-` spelled `_`, the way a `use` names it. */
+static void push_rust_crate_head(cbm_pkg_entries_t *entries, const char *ident,
+                                 const char *rel_path, bool external) {
+    if (!ident || !ident[0]) {
+        return;
+    }
+    char key[PKGMAP_LINE_BUF];
+    snprintf(key, sizeof(key), "%s" RUST_PATH_SEP "%s", ident,
+             external ? RUST_EXTERN_CRATE_SUFFIX : "");
+    for (char *c = key; *c; c++) {
+        if (*c == '-') {
+            *c = '_';
+        }
+    }
+    pkg_entries_push(entries, strdup(key), build_entry_path(rel_path, "src/lib"));
+}
+
+/* Rust: Cargo.toml — [package] name, plus every name a `use` can give a crate:
+ * the package name and [lib] name of this manifest and the key of each `path`
+ * dependency (which may rename it) name crates of the repository; the key of
+ * any other dependency names an external crate. The manifest path is
+ * registered as well, and once more with RUST_EDITION_2015_SUFFIX when the
+ * package is on the 2015 edition (no `edition` key), whose `use` paths are
+ * crate-relative. */
 static void parse_cargo_toml(const char *source, int source_len, const char *rel_path,
                              cbm_pkg_entries_t *entries) {
+    CBMCargoManifest *manifest = (CBMCargoManifest *)calloc(1, sizeof(*manifest));
+    if (manifest) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_cargo_parse(&arena, source, source_len, manifest);
+        push_rust_crate_head(entries, manifest->package_name, rel_path, false);
+        push_rust_crate_head(entries, manifest->lib_name, rel_path, false);
+        for (int i = 0; i < manifest->dep_count; i++) {
+            push_rust_crate_head(entries, manifest->deps[i].name, rel_path,
+                                 manifest->deps[i].path == NULL);
+        }
+        if (manifest->package_name) {
+            pkg_entries_push(entries, strdup(rel_path), build_entry_path(rel_path, "src/lib"));
+            if (!manifest->edition && !manifest->edition_inherited) {
+                char key[PKGMAP_PATH_BUF];
+                snprintf(key, sizeof(key), "%s%s", rel_path, RUST_EDITION_2015_SUFFIX);
+                pkg_entries_push(entries, strdup(key), build_entry_path(rel_path, "src/lib"));
+            }
+        }
+        cbm_arena_destroy(&arena);
+        free(manifest);
+    }
+
     const char *section = find_line_value(source, source_len, "[package]");
     if (!section) {
         return;
@@ -1570,6 +1624,158 @@ static bool import_symbol_label_allowed(CBMLanguage lang, const char *label) {
     return !(lang == CBM_LANG_RUST && strcmp(label, "Method") == 0);
 }
 
+/* Whether the graph holds a File node for the source file at `rel`. */
+static bool repo_file_exists(const cbm_pipeline_ctx_t *ctx, const char *rel) {
+    char *qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
+    free(qn);
+    return found;
+}
+
+/* Whether module directory `dir` holds the file of child module `name`
+ * (`<dir>/<name>.rs` or `<dir>/<name>/mod.rs`). */
+static bool rust_child_module_exists(const cbm_pipeline_ctx_t *ctx, const char *dir,
+                                     const char *name) {
+    const char *sep = dir[0] ? "/" : "";
+    char rel[PKGMAP_PATH_BUF];
+    snprintf(rel, sizeof(rel), "%s%s%s.rs", dir, sep, name);
+    if (repo_file_exists(ctx, rel)) {
+        return true;
+    }
+    snprintf(rel, sizeof(rel), "%s%s%s/mod.rs", dir, sep, name);
+    return repo_file_exists(ctx, rel);
+}
+
+/* Whether `name` is a child module of the file `source_rel`: its module
+ * directory is the file's directory for a `mod.rs`, `lib.rs`, `main.rs` or any
+ * other crate root, else `<dir>/<stem>`. Both are accepted, since a crate root
+ * outside `src/` (a test or example target) is not known here. */
+static bool rust_names_child_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                    const char *name) {
+    char *dir = path_dirname(source_rel);
+    bool found = rust_child_module_exists(ctx, dir, name);
+    if (!found) {
+        char *stem_dir = strip_extension(source_rel);
+        found = stem_dir && rust_child_module_exists(ctx, stem_dir, name);
+        free(stem_dir);
+    }
+    free(dir);
+    return found;
+}
+
+/* Whether the file `source_rel` declares an item called `name` (an enum whose
+ * variants a `use Kind::*` brings in, a type, a const). */
+static bool rust_file_declares(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                               const char *name) {
+    char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, source_rel);
+    if (!module_qn) {
+        return false;
+    }
+    char qn[PKGMAP_PATH_BUF];
+    snprintf(qn, sizeof(qn), "%s.%s", module_qn, name);
+    free(module_qn);
+    return cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
+}
+
+/* The manifest of the package nearest above `source_rel` when that package is
+ * on the 2015 edition, written into `pkg_dir` (its directory). */
+static bool rust_file_in_2015_package(const CBMHashTable *pkgmap, const char *source_rel,
+                                      char *pkg_dir, size_t pkg_dir_size) {
+    char dir[PKGMAP_PATH_BUF];
+    snprintf(dir, sizeof(dir), "%s", source_rel);
+    for (;;) {
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+        } else {
+            dir[0] = '\0';
+        }
+        char manifest[PKGMAP_PATH_BUF];
+        snprintf(manifest, sizeof(manifest), "%s%sCargo.toml", dir, dir[0] ? "/" : "");
+        if (cbm_ht_get(pkgmap, manifest)) {
+            char marked[PKGMAP_PATH_BUF];
+            snprintf(marked, sizeof(marked), "%s%s", manifest, RUST_EDITION_2015_SUFFIX);
+            snprintf(pkg_dir, pkg_dir_size, "%s", dir);
+            return cbm_ht_get(pkgmap, marked) != NULL;
+        }
+        if (!dir[0]) {
+            return false;
+        }
+    }
+}
+
+/* Whether a Rust `use` path can name an item of this repository. A path into
+ * the repository starts with `crate`, `self`, `super`, a crate the repository
+ * builds (registered from Cargo.toml as "<name>::"), or a name the importing
+ * module binds itself under 2018+ uniform paths: a child module or an item of
+ * the file; in a 2015-edition package, where paths are crate-relative, also a
+ * module of the crate root. A head that is none of these and is the name of
+ * an external crate — a sysroot crate or a dependency Cargo.toml fetches from
+ * outside the repository — reaches no node (`use
+ * wiremock::matchers::query_param`): such a `use` publishes no IMPORTS edge,
+ * and the symbol-name fallback must not bind it to a same-named repository
+ * item. A head with no such evidence may be bound by a name this layer cannot
+ * see (another `use` of the file, a `#[path]` module) and keeps the fallbacks. */
+static bool rust_use_head_in_repo(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                  const char *module_path) {
+    const char *p = module_path;
+    while (*p == ' ') {
+        p++;
+    }
+    if (*p == '{') {
+        return true; /* `use {a::x, b::y}`: one head per member, not decided here */
+    }
+    char head[PKGMAP_LINE_BUF];
+    size_t n = 0;
+    while (p[n] && p[n] != ':' && p[n] != ' ' && p[n] != '{' && n + 1 < sizeof(head)) {
+        head[n] = p[n];
+        n++;
+    }
+    head[n] = '\0';
+    static const char *const scoped[] = {"crate", "self", "super", "$crate", NULL};
+    for (const char *const *s = scoped; *s; s++) {
+        if (strcmp(head, *s) == 0) {
+            return true;
+        }
+    }
+    const CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    char pkg_dir[PKGMAP_PATH_BUF] = "";
+    bool edition_2015 =
+        pkgmap && source_rel &&
+        rust_file_in_2015_package(pkgmap, source_rel, pkg_dir, sizeof(pkg_dir));
+    if (!head[0]) {
+        return edition_2015; /* `::x`: an extern crate since 2018, the crate root in 2015 */
+    }
+    char crate_key[PKGMAP_LINE_BUF + sizeof(RUST_PATH_SEP)];
+    snprintf(crate_key, sizeof(crate_key), "%s" RUST_PATH_SEP, head);
+    if (pkgmap && cbm_ht_get(pkgmap, crate_key)) {
+        return true;
+    }
+    if (!source_rel) {
+        return true; /* no importing file to scope the name in */
+    }
+    if (rust_names_child_module(ctx, source_rel, head) ||
+        rust_file_declares(ctx, source_rel, head)) {
+        return true;
+    }
+    if (edition_2015) {
+        char src_dir[PKGMAP_PATH_BUF];
+        snprintf(src_dir, sizeof(src_dir), "%s%ssrc", pkg_dir, pkg_dir[0] ? "/" : "");
+        if (rust_child_module_exists(ctx, src_dir, head)) {
+            return true;
+        }
+    }
+    static const char *const sysroot[] = {"std", "core", "alloc", "proc_macro", "test", NULL};
+    for (const char *const *s = sysroot; *s; s++) {
+        if (strcmp(head, *s) == 0) {
+            return false;
+        }
+    }
+    char extern_key[sizeof(crate_key) + sizeof(RUST_EXTERN_CRATE_SUFFIX)];
+    snprintf(extern_key, sizeof(extern_key), "%s" RUST_EXTERN_CRATE_SUFFIX, crate_key);
+    return !(pkgmap && cbm_ht_get(pkgmap, extern_key));
+}
+
 static const char *path_leaf(const char *path) {
     const char *leaf = path;
     for (const char *p = path; p && *p; p++) {
@@ -1808,6 +2014,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         resolve_header_include(ctx, source_rel, source_file_qn, imp->module_path);
     if (header_target) {
         return header_target;
+    }
+
+    if (cbm_language_for_filename(path_leaf(source_rel ? source_rel : "")) == CBM_LANG_RUST &&
+        !rust_use_head_in_repo(ctx, source_rel, imp->module_path)) {
+        return NULL;
     }
 
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go).

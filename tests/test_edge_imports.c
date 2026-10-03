@@ -803,6 +803,23 @@ TEST(ei_rust_use_never_binds_method) {
     PASS();
 }
 
+/* Rust: a `use` whose first segment is an external crate (a dependency
+ * Cargo.toml fetches from outside the repository) publishes no IMPORTS edge:
+ * `use tungstenite::client::response` must not bind to the repository's
+ * `fsmon::response`. The uniform-path `pub use fsmon::response` (head = child
+ * module) keeps its edge, so the relation is exactly one edge (RED without the
+ * rule: count 2). */
+TEST(ei_rust_use_external_head_never_binds) {
+    static const EILangFile f[] = {
+        {"Cargo.toml", "[package]\nname = \"app\"\nedition = \"2021\"\n"
+                       "[dependencies]\ntungstenite = \"0.20\"\n"},
+        {"src/fsmon.rs", "pub fn response() -> u8 { 1 }\n"},
+        {"src/ws.rs", "use tungstenite::client::response;\n\nfn open() { let _ = response; }\n"},
+        {"src/lib.rs", "mod fsmon;\nmod ws;\npub use fsmon::response;\n"}};
+    ASSERT_TRUE(ei_edge_count_is(f, 4, "IMPORTS", 1));
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * RED REPRODUCTION — Kotlin
  *
@@ -1198,6 +1215,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_rust_glob_use);
     RUN_TEST(ei_rust_trait_use);
     RUN_TEST(ei_rust_use_never_binds_method);
+    RUN_TEST(ei_rust_use_external_head_never_binds);
 
     /* ── RED REPRODUCTIONS — Kotlin (expected to FAIL until pipeline fixed) ── */
     RUN_TEST(ei_kotlin_basic_class_import);
