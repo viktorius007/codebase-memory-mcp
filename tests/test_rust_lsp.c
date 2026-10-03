@@ -2713,6 +2713,47 @@ TEST(rustlsp_nested_function_body_is_walked_as_its_own_node) {
     PASS();
 }
 
+/* An inline module's own `use` binds its body: a path through that name is
+ * the imported item, never the crate item of the same name. */
+TEST(rustlsp_inline_module_use_shadows_crate_item) {
+    CBMFileResult *r = extract_rust("pub struct Listener;\n"
+                                    "impl Listener { pub fn bind() -> Self { Listener } }\n"
+                                    "fn top() { Listener::bind(); }\n"
+                                    "mod platform {\n"
+                                    "    use tokio::net::Listener;\n"
+                                    "    pub fn open() { Listener::bind(); }\n"
+                                    "}\n");
+    ASSERT_NOT_NULL(r);
+    bool syn = false;
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.top", "test.src.main.Listener.bind",
+                                 "Listener::bind", &syn),
+              1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.open", "test.src.main.Listener.bind",
+                                 "Listener::bind", &syn),
+              0);
+    ASSERT_TRUE(syn);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A function of an inline module nested two deep is walked under its node. */
+TEST(rustlsp_doubly_nested_inline_module_body_is_walked) {
+    CBMFileResult *r = extract_rust("mod a {\n"
+                                    "    mod b {\n"
+                                    "        fn g() {}\n"
+                                    "        pub fn f() { g(); }\n"
+                                    "    }\n"
+                                    "}\n");
+    ASSERT_NOT_NULL(r);
+    bool syn = false;
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.f"));
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.f", "test.src.main.g", "g", &syn), 1);
+    ASSERT_TRUE(syn);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A trait's default method body is walked under `<Trait>.<name>`; a method
  * called on `self` there is the trait's own declaration. */
 TEST(rustlsp_trait_default_method_body_is_walked) {
@@ -9725,6 +9766,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_later_macro_does_not_shadow_earlier_std_macro);
     RUN_TEST(rustlsp_nested_macro_scope_does_not_leak);
     RUN_TEST(rustlsp_nested_function_body_is_walked_as_its_own_node);
+    RUN_TEST(rustlsp_inline_module_use_shadows_crate_item);
+    RUN_TEST(rustlsp_doubly_nested_inline_module_body_is_walked);
     RUN_TEST(rustlsp_trait_default_method_body_is_walked);
     RUN_TEST(rustlsp_cfg_twin_method_bodies_keep_their_own_identity);
     RUN_TEST(rustlsp_nested_macro_rules_call_does_not_inherit_outer_site_map);
