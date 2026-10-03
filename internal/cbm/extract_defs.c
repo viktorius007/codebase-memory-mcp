@@ -5261,6 +5261,875 @@ static void extract_rust_assoc_item(CBMExtractCtx *ctx, TSNode item, const char 
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 
+/* The type an impl block's members belong to. */
+typedef struct {
+    const char *type_qn;
+    const char *receiver_name;
+    const char *impl_trait;
+} RustImplOwner;
+
+/* One member of an impl body: a method, an associated const or an associated
+ * type. `generated` marks a member a macro expansion produced: it has no source
+ * of its own, so it gets no complexity or similarity fingerprint. */
+static void extract_rust_impl_member(CBMExtractCtx *ctx, TSNode child, const RustImplOwner *owner,
+                                     const CBMLangSpec *spec, bool generated) {
+    CBMArena *a = ctx->arena;
+    if (strcmp(ts_node_type(child), "const_item") == 0 ||
+        strcmp(ts_node_type(child), "type_item") == 0) {
+        extract_rust_assoc_item(ctx, child, owner->type_qn, owner->impl_trait);
+        return;
+    }
+    if (!cbm_kind_in_set(child, spec->function_node_types)) {
+        return;
+    }
+    TSNode name_node = func_name_node(child);
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+    char *name = cbm_node_text(a, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return;
+    }
+    const char *impl_trait = owner->impl_trait;
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = impl_trait
+                             ? cbm_arena_sprintf(a, "%s.%s[%s]", owner->type_qn, name, impl_trait)
+                             : cbm_arena_sprintf(a, "%s.%s", owner->type_qn, name);
+    def.label = "Method";
+    def.file_path = ctx->rel_path;
+    def.receiver = owner->receiver_name;
+    def.parent_class = owner->type_qn;
+    def.impl_trait = impl_trait;
+    def.is_async = rust_fn_is_async(child);
+    /* A trait-impl method takes the trait's visibility, never its own. */
+    def.is_rust_private = !impl_trait && rust_fn_is_private(child);
+    def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+    def.is_exported = cbm_is_exported(name, ctx->language);
+
+    TSNode params = ts_node_child_by_field_name(child, TS_FIELD("parameters"));
+    if (!ts_node_is_null(params)) {
+        def.signature = cbm_node_text(a, params, ctx->source);
+        def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
+        def.signature_param_types = extract_signature_param_types(
+            a, params, ctx->source, ctx->language, true, &def.signature_param_count);
+    }
+
+    TSNode return_type = ts_node_child_by_field_name(child, TS_FIELD("return_type"));
+    if (!ts_node_is_null(return_type)) {
+        def.return_type = cbm_node_text(a, return_type, ctx->source);
+        def.return_types = extract_return_types(a, return_type, ctx->source, ctx->language);
+    }
+
+    if (!generated) {
+        if (spec->branching_node_types && spec->branching_node_types[0]) {
+            set_def_complexity(&def, child, spec);
+        }
+        compute_fingerprint(ctx, &def, child);
+    }
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+/* --- Rust `macro_rules!` expansion of an impl-body invocation ---
+ *
+ * `impl T { m!(A(x: u8), B(y: u16)); }` with `m` a `macro_rules!` of the same
+ * file declares whatever the expansion declares: methods, associated consts and
+ * types of T. The expansion follows the macro_rules matching rules on token
+ * trees: the first rule whose matcher accepts the whole input is transcribed.
+ * A fragment ends where its follow set allows (`expr` at `,` `;` `=>`, `ty`
+ * also at `=` `|` `:` `>` `as` `where` outside angle brackets). Anything the
+ * expander does not model (an `item` fragment, a binding at the wrong
+ * repetition depth, an expansion that does not parse) expands to nothing. */
+
+enum { MX_IDENT, MX_LIFETIME, MX_LIT, MX_PUNCT, MX_OPEN, MX_CLOSE };
+enum {
+    MX_MAX_TOKENS = 1 << 16, /* longest lexed token tree, in tokens */
+    MX_MAX_NESTING = 64,     /* delimiter nesting the lexer follows */
+    MX_MAX_REP_DEPTH = 8,    /* repetition nesting the transcriber follows */
+    MX_MAX_OUTPUT = 1 << 20, /* largest expansion, in bytes */
+};
+
+typedef struct {
+    uint32_t start; /* byte range in the file */
+    uint32_t end;
+    int close; /* MX_OPEN: index of its MX_CLOSE */
+    uint8_t kind;
+} MxTok;
+
+typedef struct {
+    MxTok *t;
+    int n;
+} MxToks;
+
+typedef struct MxFrame MxFrame;
+typedef struct {
+    const MxTok *name; /* the metavariable's name token in the matcher */
+    int ts;            /* bound input tokens [ts, te) */
+    int te;
+} MxBind;
+typedef struct {
+    int pat_start; /* matcher tokens of the repetition body */
+    int pat_end;
+    MxFrame **frames; /* one per matched iteration */
+    int count;
+    int cap;
+} MxRep;
+struct MxFrame {
+    MxBind *binds;
+    int nb;
+    int bcap;
+    MxRep *reps;
+    int nr;
+    int rcap;
+};
+
+typedef struct {
+    CBMArena *arena;
+    const char *src;
+    const MxTok *pat;
+    const MxTok *in;
+} MxMatch;
+
+static bool mx_ident_char(unsigned char c) {
+    return c == '_' || isalnum(c) || c >= 0x80;
+}
+
+static bool mx_is(const char *src, const MxTok *t, const char *text) {
+    size_t n = strlen(text);
+    return t->end - t->start == n && memcmp(src + t->start, text, n) == 0;
+}
+
+static bool mx_same(const char *src, const MxTok *a, const MxTok *b) {
+    uint32_t n = a->end - a->start;
+    return b->end - b->start == n && memcmp(src + a->start, src + b->start, n) == 0;
+}
+
+static bool mx_is_any(const char *src, const MxTok *t, const char *const *texts) {
+    for (const char *const *x = texts; *x; x++) {
+        if (mx_is(src, t, *x)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t mx_skip_trivia(const char *s, uint32_t p, uint32_t end) {
+    while (p < end) {
+        if (isspace((unsigned char)s[p])) {
+            p++;
+        } else if (s[p] == '/' && p + 1 < end && s[p + 1] == '/') {
+            while (p < end && s[p] != '\n') {
+                p++;
+            }
+        } else if (s[p] == '/' && p + 1 < end && s[p + 1] == '*') {
+            int depth = 1;
+            p += 2;
+            while (p < end && depth > 0) {
+                if (s[p] == '/' && p + 1 < end && s[p + 1] == '*') {
+                    depth++;
+                    p += 2;
+                } else if (s[p] == '*' && p + 1 < end && s[p + 1] == '/') {
+                    depth--;
+                    p += 2;
+                } else {
+                    p++;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    return p;
+}
+
+/* End of a quoted literal whose opening quote is at p. */
+static uint32_t mx_skip_quoted(const char *s, uint32_t p, uint32_t end, char quote) {
+    p++;
+    while (p < end && s[p] != quote) {
+        p += (s[p] == '\\' && p + 1 < end) ? 2 : 1;
+    }
+    return p < end ? p + 1 : end;
+}
+
+/* End of a raw string whose `#`s or opening quote start at p; 0 when p does not
+ * start one (`r#ident`). */
+static uint32_t mx_skip_raw(const char *s, uint32_t p, uint32_t end) {
+    uint32_t hashes = 0;
+    while (p < end && s[p] == '#') {
+        hashes++;
+        p++;
+    }
+    if (p >= end || s[p] != '"') {
+        return 0;
+    }
+    for (p++; p < end; p++) {
+        uint32_t h = 0;
+        while (s[p] == '"' && h < hashes && p + 1 + h < end && s[p + 1 + h] == '#') {
+            h++;
+        }
+        if (s[p] == '"' && h == hashes) {
+            return p + 1 + h;
+        }
+    }
+    return end;
+}
+
+static uint32_t mx_lex_quote(const char *s, uint32_t p, uint32_t end, uint8_t *kind) {
+    *kind = MX_LIT;
+    if (p + 1 < end && s[p + 1] == '\\') {
+        return mx_skip_quoted(s, p, end, '\'');
+    }
+    /* `'x'`, or a multi-byte character before the closing quote. */
+    for (uint32_t q = p + 2; q < end && q <= p + 5; q++) {
+        if (s[q] == '\'') {
+            return q + 1;
+        }
+        if ((unsigned char)s[q] < 0x80) {
+            break;
+        }
+    }
+    uint32_t q = p + 1;
+    while (q < end && mx_ident_char((unsigned char)s[q])) {
+        q++;
+    }
+    *kind = MX_LIFETIME;
+    return q > p + 1 ? q : 0;
+}
+
+/* An identifier, or a string literal behind a `r`/`b`/`br`/`c`/`cr` prefix. */
+static uint32_t mx_lex_word(const char *s, uint32_t p, uint32_t end, uint8_t *kind) {
+    uint32_t q = p;
+    while (q < end && mx_ident_char((unsigned char)s[q])) {
+        q++;
+    }
+    uint32_t n = q - p;
+    bool raw = s[q - 1] == 'r';
+    bool prefix = (n == 1 && strchr("rbc", s[p])) ||
+                  (n == 2 && (memcmp(s + p, "br", 2) == 0 || memcmp(s + p, "cr", 2) == 0));
+    *kind = MX_LIT;
+    if (prefix && q < end) {
+        uint32_t r = raw ? mx_skip_raw(s, q, end) : 0;
+        if (r) {
+            return r;
+        }
+        if (!raw && s[q] == '"') {
+            return mx_skip_quoted(s, q, end, '"');
+        }
+        if (n == 1 && s[p] == 'b' && s[q] == '\'') {
+            return mx_skip_quoted(s, q, end, '\'');
+        }
+    }
+    *kind = MX_IDENT;
+    if (n == 1 && s[p] == 'r' && q + 1 < end && s[q] == '#') { /* r#ident */
+        for (q++; q < end && mx_ident_char((unsigned char)s[q]);) {
+            q++;
+        }
+    }
+    return q;
+}
+
+/* One token at p: its end, or 0 when the text is not Rust tokens. */
+static uint32_t mx_lex_one(const char *s, uint32_t p, uint32_t end, uint8_t *kind) {
+    static const char *const puncts[] = {
+        "...", "..=", "<<=", ">>=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||",
+        "+=",  "-=",  "*=",  "/=",  "%=", "^=", "&=", "|=", "<<", ">>", "..", NULL};
+    unsigned char c = (unsigned char)s[p];
+    if (c == '"') {
+        *kind = MX_LIT;
+        return mx_skip_quoted(s, p, end, '"');
+    }
+    if (c == '\'') {
+        return mx_lex_quote(s, p, end, kind);
+    }
+    if (isdigit(c)) {
+        uint32_t q = p;
+        while (q < end && (mx_ident_char((unsigned char)s[q]) ||
+                           (s[q] == '.' && q + 1 < end && isdigit((unsigned char)s[q + 1])))) {
+            q++;
+        }
+        *kind = MX_LIT;
+        return q;
+    }
+    if (mx_ident_char(c)) {
+        return mx_lex_word(s, p, end, kind);
+    }
+    *kind = strchr("([{", c) ? MX_OPEN : strchr(")]}", c) ? MX_CLOSE : MX_PUNCT;
+    if (*kind == MX_PUNCT) {
+        for (const char *const *x = puncts; *x; x++) {
+            size_t n = strlen(*x);
+            if (p + n <= end && memcmp(s + p, *x, n) == 0) {
+                return p + (uint32_t)n;
+            }
+        }
+    }
+    return p + 1;
+}
+
+/* Lex s[from, to) into balanced token trees. False when it does not lex or its
+ * delimiters do not balance. */
+static bool mx_lex(CBMArena *a, const char *s, uint32_t from, uint32_t to, MxToks *out) {
+    if (to < from || to - from > MX_MAX_TOKENS) {
+        return false;
+    }
+    out->t = (MxTok *)cbm_arena_alloc(a, (size_t)(to - from + 1) * sizeof(MxTok));
+    out->n = 0;
+    int open[MX_MAX_NESTING];
+    int depth = 0;
+    if (!out->t) {
+        return false;
+    }
+    for (uint32_t p = mx_skip_trivia(s, from, to); p < to; p = mx_skip_trivia(s, p, to)) {
+        uint8_t kind = MX_PUNCT;
+        uint32_t e = mx_lex_one(s, p, to, &kind);
+        if (e <= p) {
+            return false;
+        }
+        MxTok *t = &out->t[out->n];
+        *t = (MxTok){.start = p, .end = e, .close = -1, .kind = kind};
+        if (kind == MX_OPEN) {
+            if (depth == MX_MAX_NESTING) {
+                return false;
+            }
+            open[depth++] = out->n;
+        } else if (kind == MX_CLOSE) {
+            if (depth == 0) {
+                return false;
+            }
+            char o = s[out->t[open[depth - 1]].start];
+            if (s[p] != (o == '(' ? ')' : o == '[' ? ']' : '}')) {
+                return false;
+            }
+            out->t[open[--depth]].close = out->n;
+        }
+        out->n++;
+        p = e;
+    }
+    return depth == 0;
+}
+
+/* Lex the inside of a delimited node (a token tree without its delimiters). */
+static bool mx_lex_inner(CBMArena *a, const char *s, TSNode node, MxToks *out) {
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    return end >= start + 2 && mx_lex(a, s, start + 1, end - 1, out);
+}
+
+static bool mx_grow(CBMArena *a, void **arr, int *cap, int count, size_t elem) {
+    if (count < *cap) {
+        return true;
+    }
+    int ncap = *cap ? *cap * 2 : 4;
+    void *n = cbm_arena_alloc(a, (size_t)ncap * elem);
+    if (!n) {
+        return false;
+    }
+    if (*arr) {
+        memcpy(n, *arr, (size_t)count * elem);
+    }
+    *arr = n;
+    *cap = ncap;
+    return true;
+}
+
+static MxFrame *mx_frame_new(CBMArena *a) {
+    return (MxFrame *)cbm_arena_calloc(a, sizeof(MxFrame));
+}
+
+/* A repetition `$( body ) sep? op` whose `$` is at index i of toks. */
+typedef struct {
+    int body_start;
+    int body_end;
+    int sep; /* separator token index, or -1 */
+    char op; /* '*', '+' or '?' */
+    int next;
+} MxRepSpec;
+
+static bool mx_rep_spec(const char *src, const MxTok *toks, int i, int end, MxRepSpec *r) {
+    static const char *const ops[] = {"*", "+", "?", NULL};
+    r->body_start = i + 2;
+    r->body_end = toks[i + 1].close;
+    int t = r->body_end + 1;
+    r->sep = -1;
+    if (t < end && toks[t].kind == MX_PUNCT && mx_is_any(src, &toks[t], ops)) {
+        r->op = src[toks[t].start];
+        r->next = t + 1;
+        return true;
+    }
+    if (t + 1 < end && toks[t].kind != MX_OPEN && toks[t].kind != MX_CLOSE &&
+        mx_is_any(src, &toks[t + 1], ops) && !mx_is(src, &toks[t + 1], "?")) {
+        r->sep = t;
+        r->op = src[toks[t + 1].start];
+        r->next = t + 2;
+        return true;
+    }
+    return false;
+}
+
+/* True when the input token at i can end a type, so a following `[` starts
+ * what follows the type rather than continuing it. */
+static bool mx_ends_type(const MxMatch *m, int i) {
+    static const char *const no[] = {"dyn", "impl", "mut", "const", NULL};
+    const MxTok *t = &m->in[i];
+    return t->kind == MX_CLOSE || mx_is(m->src, t, ">") ||
+           (t->kind == MX_IDENT && !mx_is_any(m->src, t, no));
+}
+
+/* End of a variable-length fragment starting at ii: the first token, outside
+ * every group (and, for a type, outside angle brackets), in its follow set. */
+static int mx_scan(const MxMatch *m, int ii, int ie, const char *const *stops, bool type) {
+    int angles = 0;
+    int i = ii;
+    while (i < ie) {
+        const MxTok *t = &m->in[i];
+        if (t->kind == MX_OPEN) {
+            char d = m->src[t->start];
+            if (type && angles == 0 && i > ii &&
+                (d == '{' || (d == '[' && mx_ends_type(m, i - 1)))) {
+                break;
+            }
+            i = t->close + 1;
+            continue;
+        }
+        if (angles == 0 && mx_is_any(m->src, t, stops)) {
+            break;
+        }
+        if (type && mx_is(m->src, t, "<")) {
+            angles++;
+        } else if (type && (mx_is(m->src, t, ">") || mx_is(m->src, t, ">>"))) {
+            int closes = mx_is(m->src, t, ">") ? 1 : 2;
+            if (angles < closes) {
+                break;
+            }
+            angles -= closes;
+        }
+        i++;
+    }
+    return i > ii ? i : -1;
+}
+
+/* End of the fragment `frag` starting at input token ii, or -1. */
+static int mx_fragment_end(const MxMatch *m, const MxTok *frag, int ii, int ie) {
+    static const char *const expr_stops[] = {",", ";", "=>", NULL};
+    static const char *const type_stops[] = {",", ";", "=>", "=", "|", ":", "as", "where", NULL};
+    static const char *const pat_stops[] = {",", ";", "=>", "=", "if", "in", NULL};
+    static const char *const param_stops[] = {",", ";", "=>", "=", "if", "in", "|", NULL};
+    static const char *const expr_frags[] = {"expr", "stmt", "meta", NULL};
+    const char *s = m->src;
+    const MxTok *t = ii < ie ? &m->in[ii] : NULL;
+    if (mx_is(s, frag, "vis")) {
+        if (!t || !mx_is(s, t, "pub")) {
+            return ii;
+        }
+        return ii + 1 < ie && m->in[ii + 1].kind == MX_OPEN && s[m->in[ii + 1].start] == '('
+                   ? m->in[ii + 1].close + 1
+                   : ii + 1;
+    }
+    if (!t || t->kind == MX_CLOSE) {
+        return -1;
+    }
+    if (mx_is(s, frag, "ident")) {
+        return t->kind == MX_IDENT && !mx_is(s, t, "_") ? ii + 1 : -1;
+    }
+    if (mx_is(s, frag, "lifetime")) {
+        return t->kind == MX_LIFETIME ? ii + 1 : -1;
+    }
+    if (mx_is(s, frag, "tt")) {
+        return t->kind == MX_OPEN ? t->close + 1 : ii + 1;
+    }
+    if (mx_is(s, frag, "block")) {
+        return t->kind == MX_OPEN && s[t->start] == '{' ? t->close + 1 : -1;
+    }
+    if (mx_is(s, frag, "literal")) {
+        if (t->kind == MX_LIT || mx_is(s, t, "true") || mx_is(s, t, "false")) {
+            return ii + 1;
+        }
+        return mx_is(s, t, "-") && ii + 1 < ie && m->in[ii + 1].kind == MX_LIT ? ii + 2 : -1;
+    }
+    if (mx_is_any(s, frag, expr_frags)) {
+        return mx_scan(m, ii, ie, expr_stops, false);
+    }
+    if (mx_is(s, frag, "ty") || mx_is(s, frag, "path")) {
+        return mx_scan(m, ii, ie, type_stops, true);
+    }
+    if (mx_is(s, frag, "pat")) {
+        return mx_scan(m, ii, ie, pat_stops, false);
+    }
+    if (mx_is(s, frag, "pat_param")) {
+        return mx_scan(m, ii, ie, param_stops, false);
+    }
+    return -1; /* `item` and unknown fragments are not modelled */
+}
+
+static int mx_match_seq(const MxMatch *m, int pi, int pe, int ii, int ie, MxFrame *f);
+
+/* Match a repetition greedily: iterate while the body matches and makes
+ * progress. A separator is consumed only before a matching iteration. */
+static int mx_match_rep(const MxMatch *m, const MxRepSpec *r, int ii, int ie, MxFrame *f) {
+    if (!mx_grow(m->arena, (void **)&f->reps, &f->rcap, f->nr, sizeof(MxRep))) {
+        return -1;
+    }
+    int rep_index = f->nr++;
+    f->reps[rep_index] = (MxRep){.pat_start = r->body_start, .pat_end = r->body_end};
+    int pos = ii;
+    int count = 0;
+    while (pos <= ie) {
+        int start = pos;
+        if (count > 0 && r->sep >= 0) {
+            if (pos >= ie || !mx_same(m->src, &m->pat[r->sep], &m->in[pos])) {
+                break;
+            }
+            start = pos + 1;
+        }
+        MxFrame *child = mx_frame_new(m->arena);
+        int e = child ? mx_match_seq(m, r->body_start, r->body_end, start, ie, child) : -1;
+        if (e <= start) {
+            break;
+        }
+        MxRep *rep = &f->reps[rep_index];
+        if (!mx_grow(m->arena, (void **)&rep->frames, &rep->cap, rep->count, sizeof(MxFrame *))) {
+            return -1;
+        }
+        rep->frames[rep->count++] = child;
+        pos = e;
+        count++;
+        if (r->op == '?') {
+            break;
+        }
+    }
+    return r->op == '+' && count == 0 ? -1 : pos;
+}
+
+/* Match matcher tokens [pi, pe) against a prefix of input tokens [ii, ie),
+ * binding into f. Returns the end of the matched input, or -1. */
+static int mx_match_seq(const MxMatch *m, int pi, int pe, int ii, int ie, MxFrame *f) {
+    const char *s = m->src;
+    while (pi < pe) {
+        const MxTok *p = &m->pat[pi];
+        if (mx_is(s, p, "$") && pi + 1 < pe) {
+            const MxTok *n = &m->pat[pi + 1];
+            if (n->kind == MX_OPEN && s[n->start] == '(') {
+                MxRepSpec r;
+                if (!mx_rep_spec(s, m->pat, pi, pe, &r)) {
+                    return -1;
+                }
+                ii = mx_match_rep(m, &r, ii, ie, f);
+                if (ii < 0) {
+                    return -1;
+                }
+                pi = r.next;
+                continue;
+            }
+            if (n->kind != MX_IDENT || pi + 3 >= pe || !mx_is(s, &m->pat[pi + 2], ":")) {
+                return -1;
+            }
+            int e = mx_fragment_end(m, &m->pat[pi + 3], ii, ie);
+            if (e < 0 || !mx_grow(m->arena, (void **)&f->binds, &f->bcap, f->nb, sizeof(MxBind))) {
+                return -1;
+            }
+            f->binds[f->nb++] = (MxBind){.name = n, .ts = ii, .te = e};
+            pi += 4;
+            ii = e;
+            continue;
+        }
+        if (ii >= ie || !mx_same(s, p, &m->in[ii])) {
+            return -1;
+        }
+        if (p->kind == MX_OPEN) {
+            const MxTok *in = &m->in[ii];
+            if (mx_match_seq(m, pi + 1, p->close, ii + 1, in->close, f) != in->close) {
+                return -1;
+            }
+            pi = p->close + 1;
+            ii = in->close + 1;
+            continue;
+        }
+        pi++;
+        ii++;
+    }
+    return ii;
+}
+
+/* The expansion text, and where each of its tokens came from in the file. */
+typedef struct {
+    const MxMatch *m;
+    const MxTok *rhs;
+    char *out;
+    uint32_t len;
+    uint32_t cap;
+    uint32_t *out_off; /* token i starts at out[out_off[i]] */
+    uint32_t *src_off; /* and was copied from the file at src_off[i] */
+    int n;
+    int ncap;
+    bool failed;
+} MxEmit;
+
+static void mx_emit(MxEmit *e, const MxTok *t) {
+    uint32_t n = t->end - t->start;
+    if (e->failed || e->len + n + 1 > MX_MAX_OUTPUT) {
+        e->failed = true;
+        return;
+    }
+    while (e->len + n + 2 > e->cap) {
+        uint32_t ncap = e->cap ? e->cap * 2 : 1024;
+        char *buf = (char *)cbm_arena_alloc(e->m->arena, ncap);
+        if (!buf) {
+            e->failed = true;
+            return;
+        }
+        memcpy(buf, e->out, e->len);
+        e->out = buf;
+        e->cap = ncap;
+    }
+    int out_cap = e->ncap; /* both arrays grow together */
+    if (!mx_grow(e->m->arena, (void **)&e->out_off, &out_cap, e->n, sizeof(uint32_t)) ||
+        !mx_grow(e->m->arena, (void **)&e->src_off, &e->ncap, e->n, sizeof(uint32_t))) {
+        e->failed = true;
+        return;
+    }
+    e->out_off[e->n] = e->len;
+    e->src_off[e->n++] = t->start;
+    memcpy(e->out + e->len, e->m->src + t->start, n);
+    e->len += n;
+    e->out[e->len++] = ' ';
+    e->out[e->len] = '\0';
+}
+
+/* True when a matcher range [ps, pe) declares the metavariable named by t. */
+static bool mx_declares(const MxMatch *m, int ps, int pe, const MxTok *t) {
+    for (int i = ps; i + 2 < pe; i++) {
+        if (mx_is(m->src, &m->pat[i], "$") && mx_same(m->src, &m->pat[i + 1], t) &&
+            mx_is(m->src, &m->pat[i + 2], ":")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The repetition of frame f that drives a transcriber repetition body: the
+ * one whose matcher declares a metavariable the body uses. */
+static const MxRep *mx_driving_rep(const MxEmit *e, const MxFrame *f, int bs, int be) {
+    for (int i = bs; i + 1 < be; i++) {
+        const MxTok *n = &e->rhs[i + 1];
+        if (!mx_is(e->m->src, &e->rhs[i], "$") || n->kind != MX_IDENT) {
+            continue;
+        }
+        for (int r = 0; r < f->nr; r++) {
+            if (mx_declares(e->m, f->reps[r].pat_start, f->reps[r].pat_end, n)) {
+                return &f->reps[r];
+            }
+        }
+    }
+    return NULL;
+}
+
+static const MxBind *mx_lookup(const MxEmit *e, MxFrame *const *chain, int depth,
+                               const MxTok *name) {
+    for (int d = depth - 1; d >= 0; d--) {
+        for (int b = 0; b < chain[d]->nb; b++) {
+            if (mx_same(e->m->src, chain[d]->binds[b].name, name)) {
+                return &chain[d]->binds[b];
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Transcribe rhs tokens [ri, re) under the frames chain[0..depth). */
+static void mx_transcribe(MxEmit *e, int ri, int re, MxFrame **chain, int depth) {
+    const char *s = e->m->src;
+    for (int i = ri; i < re && !e->failed;) {
+        const MxTok *t = &e->rhs[i];
+        const MxTok *n = i + 1 < re ? &e->rhs[i + 1] : NULL;
+        if (!mx_is(s, t, "$") || !n) {
+            mx_emit(e, t);
+            i++;
+        } else if (n->kind == MX_OPEN && s[n->start] == '(') {
+            MxRepSpec r;
+            const MxRep *rep = mx_rep_spec(s, e->rhs, i, re, &r) && depth < MX_MAX_REP_DEPTH
+                                   ? mx_driving_rep(e, chain[depth - 1], r.body_start, r.body_end)
+                                   : NULL;
+            if (!rep) {
+                e->failed = true;
+                return;
+            }
+            for (int k = 0; k < rep->count; k++) {
+                if (k > 0 && r.sep >= 0) {
+                    mx_emit(e, &e->rhs[r.sep]);
+                }
+                chain[depth] = rep->frames[k];
+                mx_transcribe(e, r.body_start, r.body_end, chain, depth + 1);
+            }
+            i = r.next;
+        } else if (n->kind == MX_IDENT && mx_is(s, n, "crate")) {
+            mx_emit(e, n);
+            i += 2;
+        } else if (n->kind == MX_IDENT) {
+            const MxBind *b = mx_lookup(e, chain, depth, n);
+            if (!b) {
+                e->failed = true;
+                return;
+            }
+            for (int k = b->ts; k < b->te; k++) {
+                mx_emit(e, &e->m->in[k]);
+            }
+            i += 2;
+        } else {
+            mx_emit(e, t);
+            i++;
+        }
+    }
+}
+
+/* The `macro_rules!` definition an invocation named `name` expands: the last
+ * one of that name textually before it in a scope enclosing it. */
+static TSNode mx_find_macro_rules(const char *src, TSNode invocation, const char *name) {
+    TSNode best = {0};
+    uint32_t at = ts_node_start_byte(invocation);
+    for (TSNode anc = ts_node_parent(invocation); !ts_node_is_null(anc);
+         anc = ts_node_parent(anc)) {
+        uint32_t nc = ts_node_named_child_count(anc);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_named_child(anc, i);
+            if (ts_node_end_byte(c) > at) {
+                break;
+            }
+            if (strcmp(ts_node_type(c), "macro_definition") != 0) {
+                continue;
+            }
+            TSNode n = ts_node_child_by_field_name(c, TS_FIELD("name"));
+            if (ts_node_is_null(n)) {
+                continue;
+            }
+            uint32_t ns = ts_node_start_byte(n);
+            size_t len = strlen(name);
+            if (ts_node_end_byte(n) - ns == len && memcmp(src + ns, name, len) == 0 &&
+                (ts_node_is_null(best) || ts_node_start_byte(c) > ts_node_start_byte(best))) {
+                best = c;
+            }
+        }
+    }
+    return best;
+}
+
+/* Expand `invocation` by the first rule of `def` whose matcher accepts its whole
+ * input. Returns false when no rule matches or the transcription fails. */
+static bool mx_expand(CBMArena *a, const char *src, TSNode def, const MxToks *input, MxEmit *out) {
+    uint32_t nc = ts_node_named_child_count(def);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode rule = ts_node_named_child(def, i);
+        if (strcmp(ts_node_type(rule), "macro_rule") != 0) {
+            continue;
+        }
+        TSNode left = ts_node_child_by_field_name(rule, TS_FIELD("left"));
+        TSNode right = ts_node_child_by_field_name(rule, TS_FIELD("right"));
+        MxToks pat;
+        MxToks rhs;
+        if (ts_node_is_null(left) || ts_node_is_null(right) || !mx_lex_inner(a, src, left, &pat) ||
+            !mx_lex_inner(a, src, right, &rhs)) {
+            continue;
+        }
+        MxMatch *m = (MxMatch *)cbm_arena_alloc(a, sizeof(MxMatch));
+        MxFrame *top = mx_frame_new(a);
+        if (!m || !top) {
+            return false;
+        }
+        *m = (MxMatch){.arena = a, .src = src, .pat = pat.t, .in = input->t};
+        if (mx_match_seq(m, 0, pat.n, 0, input->n, top) != input->n) {
+            continue;
+        }
+        MxFrame *chain[MX_MAX_REP_DEPTH] = {top};
+        *out = (MxEmit){.m = m, .rhs = rhs.t};
+        mx_transcribe(out, 0, rhs.n, chain, 1);
+        return !out->failed && out->len > 0;
+    }
+    return false;
+}
+
+static uint32_t mx_line_of(const char *src, uint32_t off) {
+    uint32_t line = TS_LINE_OFFSET;
+    for (uint32_t i = 0; i < off; i++) {
+        line += src[i] == '\n';
+    }
+    return line;
+}
+
+/* A generated member's lines are those of the invocation tokens it was built
+ * from (`A(x: u8)` for the method `A`), or the whole invocation when none. */
+static void mx_member_lines(const CBMExtractCtx *ctx, const MxEmit *e, TSNode member,
+                            TSNode invocation, uint32_t *start_line, uint32_t *end_line) {
+    uint32_t ms = ts_node_start_byte(member);
+    uint32_t me = ts_node_end_byte(member);
+    uint32_t is = ts_node_start_byte(invocation);
+    uint32_t ie = ts_node_end_byte(invocation);
+    uint32_t lo = UINT32_MAX;
+    uint32_t hi = 0;
+    for (int i = 0; i < e->n; i++) {
+        if (e->out_off[i] >= ms && e->out_off[i] < me && e->src_off[i] >= is &&
+            e->src_off[i] < ie) {
+            lo = e->src_off[i] < lo ? e->src_off[i] : lo;
+            hi = e->src_off[i] > hi ? e->src_off[i] : hi;
+        }
+    }
+    if (lo == UINT32_MAX) {
+        lo = is;
+        hi = ie > is ? ie - 1 : is;
+    }
+    *start_line = mx_line_of(ctx->source, lo);
+    *end_line = mx_line_of(ctx->source, hi);
+}
+
+/* An impl-body `m!(..)` whose `m` is a `macro_rules!` of this file: extract
+ * the members its expansion declares, owned by the impl's type. */
+static void extract_rust_impl_macro(CBMExtractCtx *ctx, TSNode invocation,
+                                    const RustImplOwner *owner, const CBMLangSpec *spec) {
+    CBMArena *a = ctx->arena;
+    TSNode mname = ts_node_child_by_field_name(invocation, TS_FIELD("macro"));
+    TSNode tt = cbm_find_child_by_kind(invocation, "token_tree");
+    if (ts_node_is_null(mname) || ts_node_is_null(tt) ||
+        strcmp(ts_node_type(mname), "identifier") != 0) {
+        return;
+    }
+    char *name = cbm_node_text(a, mname, ctx->source);
+    TSNode def = name ? mx_find_macro_rules(ctx->source, invocation, name) : (TSNode){0};
+    MxToks input;
+    MxEmit e;
+    if (ts_node_is_null(def) || !mx_lex_inner(a, ctx->source, tt, &input) ||
+        !mx_expand(a, ctx->source, def, &input, &e)) {
+        return;
+    }
+    TSParser *parser = ts_parser_new();
+    TSTree *tree = NULL;
+    if (parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST))) {
+        tree = ts_parser_parse_string(parser, NULL, e.out, e.len);
+    }
+    TSNode root = tree ? ts_tree_root_node(tree) : (TSNode){0};
+    if (tree && !ts_node_has_error(root)) {
+        CBMExtractCtx sub = *ctx;
+        sub.source = e.out;
+        sub.source_len = (int)e.len;
+        sub.root = root;
+        uint32_t nc = ts_node_named_child_count(root);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode member = ts_node_named_child(root, i);
+            int before = ctx->result->defs.count;
+            extract_rust_impl_member(&sub, member, owner, spec, true);
+            for (int d = before; d < ctx->result->defs.count; d++) {
+                CBMDefinition *gen = &ctx->result->defs.items[d];
+                mx_member_lines(ctx, &e, member, invocation, &gen->start_line, &gen->end_line);
+                gen->lines = (int)(gen->end_line - gen->start_line + TS_LINE_OFFSET);
+            }
+        }
+    }
+    if (tree) {
+        ts_tree_delete(tree);
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+}
+
 static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -5297,73 +6166,19 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         return;
     }
 
+    RustImplOwner owner = {
+        .type_qn = type_qn, .receiver_name = receiver_name, .impl_trait = impl_trait};
     uint32_t count = ts_node_child_count(body);
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(body, i);
         if (ts_node_is_null(child)) {
             continue;
         }
-        if (strcmp(ts_node_type(child), "const_item") == 0 ||
-            strcmp(ts_node_type(child), "type_item") == 0) {
-            extract_rust_assoc_item(ctx, child, type_qn, impl_trait);
+        if (strcmp(ts_node_type(child), "macro_invocation") == 0) {
+            extract_rust_impl_macro(ctx, child, &owner, spec);
             continue;
         }
-        if (!cbm_kind_in_set(child, spec->function_node_types)) {
-            continue;
-        }
-
-        TSNode name_node = func_name_node(child);
-        if (ts_node_is_null(name_node)) {
-            continue;
-        }
-
-        char *name = cbm_node_text(a, name_node, ctx->source);
-        if (!name || !name[0]) {
-            continue;
-        }
-
-        const char *method_qn = impl_trait
-                                    ? cbm_arena_sprintf(a, "%s.%s[%s]", type_qn, name, impl_trait)
-                                    : cbm_arena_sprintf(a, "%s.%s", type_qn, name);
-
-        CBMDefinition def;
-        memset(&def, 0, sizeof(def));
-        def.name = name;
-        def.qualified_name = method_qn;
-        def.label = "Method";
-        def.file_path = ctx->rel_path;
-        def.receiver = receiver_name;
-        def.parent_class = type_qn;
-        def.impl_trait = impl_trait;
-        def.is_async = rust_fn_is_async(child);
-        /* A trait-impl method takes the trait's visibility, never its own. */
-        def.is_rust_private = !impl_trait && rust_fn_is_private(child);
-        def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
-        def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
-        def.is_exported = cbm_is_exported(name, ctx->language);
-
-        TSNode params = ts_node_child_by_field_name(child, TS_FIELD("parameters"));
-        if (!ts_node_is_null(params)) {
-            def.signature = cbm_node_text(a, params, ctx->source);
-            def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
-            def.signature_param_types = extract_signature_param_types(
-                a, params, ctx->source, ctx->language, true, &def.signature_param_count);
-        }
-
-        TSNode return_type = ts_node_child_by_field_name(child, TS_FIELD("return_type"));
-        if (!ts_node_is_null(return_type)) {
-            def.return_type = cbm_node_text(a, return_type, ctx->source);
-            def.return_types = extract_return_types(a, return_type, ctx->source, ctx->language);
-        }
-
-        if (spec->branching_node_types && spec->branching_node_types[0]) {
-            set_def_complexity(&def, child, spec);
-        }
-
-        // MinHash fingerprint
-        compute_fingerprint(ctx, &def, child);
-
-        cbm_defs_push(&ctx->result->defs, a, def);
+        extract_rust_impl_member(ctx, child, &owner, spec, false);
     }
 }
 

@@ -674,6 +674,29 @@ TEST(rustlsp_ufcs_trait_method) {
     PASS();
 }
 
+/* `T::Name(..)` where `Name` is an associated fn an impl-body macro_rules!
+ * invocation generates (a variant-like constructor): the path call resolves to
+ * that method, and its `Self` return types the chained call. */
+TEST(rustlsp_ufcs_macro_generated_constructor) {
+    CBMFileResult *r = extract_rust(
+        "macro_rules! ctors {\n"
+        "    ($($variant:ident($value:ident: $vt:ty)),* $(,)?) => {\n"
+        "        $( pub fn $variant($value: $vt) -> Self { Fault } )*\n"
+        "    };\n"
+        "}\n"
+        "pub struct Fault;\n"
+        "impl Fault {\n"
+        "    ctors!(NotFound(id: u64), Invalid(message: String),);\n"
+        "    pub fn describe(&self) -> u8 { 0 }\n"
+        "}\n"
+        "fn run() -> u8 { Fault::NotFound(7).describe() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Fault.NotFound"), 0);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Fault.describe"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_type_qualified_call_with_ambiguous_from_impls_is_unresolved) {
     CBMFileResult *r = extract_rust(
         "trait From<T> { fn from(value: T) -> Self; }\n"
@@ -9290,6 +9313,7 @@ void suite_rust_lsp(void) {
     /* Self::, UFCS */
     RUN_TEST(rustlsp_self_uppercase);
     RUN_TEST(rustlsp_ufcs_trait_method);
+    RUN_TEST(rustlsp_ufcs_macro_generated_constructor);
     RUN_TEST(rustlsp_type_qualified_call_with_ambiguous_from_impls_is_unresolved);
 
     /* Cross-file */

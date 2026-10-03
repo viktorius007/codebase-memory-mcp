@@ -2096,6 +2096,53 @@ TEST(rust_macro_and_associated_items) {
     PASS();
 }
 
+/* Rust: an impl-body invocation of a same-file `macro_rules!` declares the
+ * members its expansion declares, each spanning the invocation tokens it was
+ * built from. A macro defined after the invocation is not in scope there. */
+TEST(rust_impl_macro_rules_members) {
+    CBMFileResult *r = extract(
+        "macro_rules! ctors {\n"
+        "    ($($(#[$attr:meta])* $variant:ident($value:ident: $vt:ty)),* $(,)?) => {\n"
+        "        $( $(#[$attr])* pub fn $variant($value: $vt) -> Self { Self::wrap($value) } )*\n"
+        "    };\n"
+        "}\n"
+        "pub struct Fault;\n"
+        "impl Fault {\n"
+        "    ctors!(\n"
+        "        NotFound(id: Vec<u8>),\n"
+        "        #[cfg(test)]\n"
+        "        Invalid(\n"
+        "            message: HashMap<String, u32>),\n"
+        "    );\n"
+        "    later!(Hidden(x: u8));\n"
+        "}\n"
+        "macro_rules! later { ($n:ident($v:ident: $t:ty)) => { pub fn $n($v: $t) {} }; }\n",
+        CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *not_found = NULL;
+    const CBMDefinition *invalid = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *qn = r->defs.items[i].qualified_name;
+        if (qn && strcmp(qn, "t.lib.Fault.NotFound") == 0) {
+            not_found = &r->defs.items[i];
+        } else if (qn && strcmp(qn, "t.lib.Fault.Invalid") == 0) {
+            invalid = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(not_found);
+    ASSERT_STR_EQ(not_found->label, "Method");
+    ASSERT_STR_EQ(not_found->parent_class, "t.lib.Fault");
+    ASSERT_STR_EQ(not_found->return_type, "Self");
+    ASSERT_EQ(not_found->start_line, 9);
+    ASSERT_EQ(not_found->end_line, 9);
+    ASSERT_NOT_NULL(invalid);
+    ASSERT_EQ(invalid->start_line, 11);
+    ASSERT_EQ(invalid->end_line, 12);
+    ASSERT_FALSE(has_def_qn(r, "t.lib.Fault.Hidden"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Rust: a field and a method of one type share a QN, as do two local structs of
  * one name in two functions. Each keeps a node: the callable (or the later
  * definition) keeps the QN, the other gets a line-qualified one. */
@@ -7981,6 +8028,7 @@ SUITE(extraction) {
     RUN_TEST(rust_enum_variants_and_variant_fields);
     RUN_TEST(rust_nested_items_are_definitions);
     RUN_TEST(rust_macro_and_associated_items);
+    RUN_TEST(rust_impl_macro_rules_members);
     RUN_TEST(rust_shared_qn_definitions_all_survive);
     RUN_TEST(rust_item_macro_argument_items);
     RUN_TEST(zig_struct);
