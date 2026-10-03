@@ -290,8 +290,12 @@ static bool pxc_rust_file_path_facts(CBMArena *arena, const CBMFileResult *cache
     }
     out->mods = mods;
     out->known = complete;
+    /* Another file's expansion reads this file's macro_rules! items, so they
+     * belong to the facts whose change re-resolves the whole crate. */
     out->tree_digest =
-        source && tree ? cbm_rust_modtree_file_digest(source, ts_tree_root_node(tree)) : 0;
+        source && tree ? cbm_rust_modtree_file_digest(source, ts_tree_root_node(tree)) ^
+                             cbm_rust_macro_facts_digest(source, source_len, ts_tree_root_node(tree))
+                       : 0;
     if (owned_tree) {
         ts_tree_delete(owned_tree);
     }
@@ -1936,10 +1940,12 @@ static const char *pxc_rust_import_lookup(void *table, const char *module_qn,
 
 static _Thread_local CBMRustImportSource g_pxc_rust_imports = {0};
 
-void cbm_pxc_set_rust_imports(const CBMHashTable *imports, const CBMRustModTree *modtree) {
+void cbm_pxc_set_rust_imports(const CBMHashTable *imports, const CBMRustModTree *modtree,
+                              const CBMRustMacroTable *macros) {
     g_pxc_rust_imports.lookup = imports ? pxc_rust_import_lookup : NULL;
     g_pxc_rust_imports.ctx = (void *)imports;
     g_pxc_rust_imports.modtree = modtree;
+    g_pxc_rust_imports.macros = macros;
 }
 
 const CBMRustImportSource *cbm_pxc_get_rust_import_source(void) {
@@ -2728,6 +2734,7 @@ typedef struct {
     const cbm_file_info_t *files;
     const int *file_index;   /* modtree file id -> files[] index */
     CBMRustModFacts **facts; /* modtree file id -> scanned facts */
+    CBMRustMacroFacts **macros; /* modtree file id -> file-level macro facts */
 } PXCRustScanCtx;
 
 /* cbm_parallel_for body: read and scan one registered file. */
@@ -2737,33 +2744,55 @@ static void pxc_rust_scan_file(int file_id, void *arg) {
     char *source = pxc_read_file(scan->files[scan->file_index[file_id]].path, &len);
     if (source) {
         scan->facts[file_id] = cbm_rust_modfacts_scan(source, len);
+        scan->macros[file_id] = cbm_rust_macro_facts_scan(source, len);
         cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
 }
 
 /* Read and parse every registered file across worker threads (parsing is
  * the tree's whole cost), then build the tree from the facts in one thread,
- * so the result does not depend on scheduling. */
-static void pxc_rust_finish_modtree(CBMRustModTree *tree, const cbm_file_info_t *files,
+ * so the result does not depend on scheduling. Files that define file-level
+ * macros enter `macros`, keyed by their graph module QN. */
+static void pxc_rust_finish_modtree(CBMRustModTree *tree, CBMRustMacroTable *macros,
+                                    const char *project_name, const cbm_file_info_t *files,
                                     const int *file_index) {
     int count = cbm_rust_modtree_file_count(tree);
-    CBMRustModFacts **facts =
-        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)(count > 0 ? count : 1) * sizeof(*facts));
-    if (!facts) {
+    size_t slots = (size_t)(count > 0 ? count : 1);
+    CBMRustModFacts **facts = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*facts));
+    CBMRustMacroFacts **macro_facts = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*macro_facts));
+    if (!facts || !macro_facts) {
+        cbm_free(CBM_MEM_CLASS_OTHER, facts);
+        cbm_free(CBM_MEM_CLASS_OTHER, macro_facts);
         return;
     }
-    PXCRustScanCtx scan = {.files = files, .file_index = file_index, .facts = facts};
+    PXCRustScanCtx scan = {
+        .files = files, .file_index = file_index, .facts = facts, .macros = macro_facts};
     cbm_parallel_for(count, pxc_rust_scan_file, &scan, (cbm_parallel_for_opts_t){0});
     cbm_rust_modtree_finish(tree, (const CBMRustModFacts *const *)facts);
     for (int i = 0; i < count; i++) {
         cbm_rust_modfacts_free(facts[i]);
+        char *module = macro_facts[i] ? cbm_pipeline_fqn_module_dir(
+                                            project_name, files[file_index[i]].rel_path,
+                                            pxc_module_is_dir(files[file_index[i]].language))
+                                      : NULL;
+        if (macros && module) {
+            cbm_rust_macro_table_add(macros, module, macro_facts[i]);
+        } else {
+            cbm_rust_macro_facts_free(macro_facts[i]);
+        }
+        free(module);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, facts);
+    cbm_free(CBM_MEM_CLASS_OTHER, macro_facts);
 }
 
 CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
                                            const CBMCargoManifest *root,
-                                           const cbm_file_info_t *files, int file_count) {
+                                           const cbm_file_info_t *files, int file_count,
+                                           CBMRustMacroTable **out_macros) {
+    if (out_macros) {
+        *out_macros = NULL;
+    }
     /* The tree is a fact of the whole project: a partial re-resolve builds
      * it from every discovered file, read from disk, as a full build does. */
     if (ctx && ctx->project_files) {
@@ -2798,7 +2827,11 @@ CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
         .arena = &arena, .ctx = ctx, .files = files, .file_count = file_count, .root = root};
     pxc_rust_collect_packages(&crates);
     pxc_rust_add_crates(&crates, tree);
-    pxc_rust_finish_modtree(tree, files, file_index);
+    CBMRustMacroTable *macros = out_macros ? cbm_rust_macro_table_new() : NULL;
+    pxc_rust_finish_modtree(tree, macros, ctx->project_name, files, file_index);
+    if (out_macros) {
+        *out_macros = macros;
+    }
     cbm_free(CBM_MEM_CLASS_OTHER, crates.packages);
     cbm_arena_destroy(&arena);
     cbm_free(CBM_MEM_CLASS_OTHER, file_index);
@@ -2831,7 +2864,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         have_manifest =
             cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest, files, file_count);
         cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
-        cbm_pxc_set_rust_imports(ctx->rust_imports, NULL);
+        cbm_pxc_set_rust_imports(ctx->rust_imports, NULL, NULL);
     }
 
     /* Per-file module QN cache so we don't recompute it once per def + once
@@ -2854,10 +2887,11 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cbm_pxc_collect_all_defs(ctx, &ctx->seq_cross_arena, cache, files, file_count,
                                  ctx->project_name, def_modules, &def_count, def_starts);
     CBMRustModTree *rust_modtree = NULL;
+    CBMRustMacroTable *rust_macros = NULL;
     if (have_rust) {
         rust_modtree = cbm_pxc_build_rust_modtree(ctx, have_manifest ? &cargo_manifest : NULL,
-                                                  files, file_count);
-        cbm_pxc_set_rust_imports(ctx->rust_imports, rust_modtree);
+                                                  files, file_count, &rust_macros);
+        cbm_pxc_set_rust_imports(ctx->rust_imports, rust_modtree, rust_macros);
     }
     /* Same seam as the parallel driver: serialize per-file surfaces while the
      * result cache is alive. Failure only degrades to a full rebuild on the
@@ -2961,8 +2995,9 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
      * pass (or a stale thread-local) can never read freed manifest memory. */
     if (have_rust) {
         cbm_pxc_set_rust_manifest(NULL);
-        cbm_pxc_set_rust_imports(NULL, NULL);
+        cbm_pxc_set_rust_imports(NULL, NULL, NULL);
         cbm_rust_modtree_free(rust_modtree);
+        cbm_rust_macro_table_free(rust_macros);
         cbm_arena_destroy(&cargo_arena);
     }
     (void)have_manifest;

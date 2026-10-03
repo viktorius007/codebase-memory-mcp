@@ -8938,6 +8938,55 @@ TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer) {
     PASS();
 }
 
+TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file) {
+    /* `check!` is defined in `parent` before `mod child;`, so it is in
+     * textual scope throughout child.rs; `late!` follows the declaration and
+     * is not. Only the call inside `check!`'s argument may resolve. */
+    static const char *const rels[] = {"src/lib.rs", "src/parent.rs", "src/parent/child.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.parent", "p.src.parent.child"};
+    static const char *const sources[] = {
+        "mod parent;\n",
+        "macro_rules! check { ($e:expr) => { let _ = $e; }; }\n"
+        "mod child;\n"
+        "macro_rules! late { ($e:expr) => { let _ = $e; }; }\n",
+        "fn helper() -> u8 { 0 }\n"
+        "fn other() -> u8 { 0 }\n"
+        "fn run() { check!(helper()); late!(other()); }\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 3);
+    CBMRustMacroTable *macros = cbm_rust_macro_table_new();
+    for (int i = 0; i < 3; i++) {
+        cbm_rust_macro_table_add(macros, qns[i],
+                                 cbm_rust_macro_facts_scan(sources[i], (int)strlen(sources[i])));
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    static const char *const names[] = {"helper", "other"};
+    for (int i = 0; i < 2; i++) {
+        defs[i].qualified_name = cbm_arena_sprintf(&arena, "p.src.parent.child.%s", names[i]);
+        defs[i].short_name = names[i];
+        defs[i].label = "Function";
+        defs[i].def_module_qn = "p.src.parent.child";
+        defs[i].lang = CBM_LANG_RUST;
+    }
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(registry);
+    CBMRustImportSource imports = {.modtree = tree, .macros = macros};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, sources[2], (int)strlen(sources[2]),
+                                         "p.src.parent.child", "p.src.parent.child", registry, NULL,
+                                         NULL, 0, NULL, NULL, &imports, &out, NULL, NULL);
+
+    ASSERT_GTE(find_confident(&out, "run", "p.src.parent.child.helper"), 0);
+    ASSERT_LT(find_confident(&out, "run", "p.src.parent.child.other"), 0);
+    cbm_arena_destroy(&arena);
+    cbm_rust_macro_table_free(macros);
+    cbm_rust_modtree_free(tree);
+    PASS();
+}
+
 TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved) {
     /* Two globs bring two different `Y`s: the name is ambiguous. */
     static const char *const rels[] = {"src/lib.rs", "src/m1.rs", "src/m2.rs", "src/user.rs"};
@@ -9928,6 +9977,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
     RUN_TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer);
+    RUN_TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file);
     RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);
     RUN_TEST(rustlsp_modtree_module_reexport_names_definition);
     RUN_TEST(rustlsp_modtree_renamed_reexport_names_definition);

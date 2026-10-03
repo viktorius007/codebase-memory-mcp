@@ -50,6 +50,14 @@ struct CBMCargoManifest;
 #define CBM_RUST_CONF_MACRO_KNOWN 0.85f /* known std macro mapped to fn */
 #define CBM_RUST_CONF_OPERATOR 0.88f    /* a+b → T::add (operator trait) */
 
+/* Synthetic bytes [synthetic_start, synthetic_end) copy the original file's
+ * bytes from original_start. */
+typedef struct CBMRustSiteWindow {
+    uint32_t synthetic_start;
+    uint32_t synthetic_end;
+    uint32_t original_start;
+} CBMRustSiteWindow;
+
 /* Rust-flavoured LSP context: one per file, lifetime tied to a single
  * `cbm_extract_file()` invocation (or the cross-file caller's arena). */
 typedef struct {
@@ -226,19 +234,18 @@ typedef struct {
     int inject_syn_calls;
 
     /* Current invocation occurrence in ORIGINAL-file coordinates. Ordinary
-     * source calls use their tree-sitter node directly. Calls recovered by
-     * reparsing built-in macro arguments use the affine map below to translate
-     * the synthetic wrapper's offsets back to the copied token-tree span.
-     * macro_rules! transcriber text is intentionally left unmapped because
-     * substitution is not position-preserving. */
+     * source calls use their tree-sitter node directly. While the walk reads
+     * synthetic source (`site_map_active`), only ranges inside one of the
+     * `site_windows` map back: a reparsed built-in macro argument list is one
+     * window, a macro_rules! expansion has one per substituted fragment, and
+     * its transcriber text has none. */
     uint32_t emit_site_start_byte;
     uint32_t emit_site_end_byte;
     uint32_t emit_callee_start_byte;
     uint32_t emit_callee_end_byte;
     bool site_map_active;
-    uint32_t site_map_synthetic_start_byte;
-    uint32_t site_map_synthetic_end_byte;
-    uint32_t site_map_original_start_byte;
+    const struct CBMRustSiteWindow *site_windows;
+    int site_window_count;
 
     /* CBM_LSP_DEBUG=1 in env enables verbose stderr trace. */
     bool debug;
@@ -393,7 +400,33 @@ typedef struct CBMRustImportSource {
     /* The project's crate module tree; NULL when none was built. Path calls
      * it settles take precedence over the file-layout fallbacks. */
     const struct CBMRustModTree *modtree;
+    /* Project-wide file-level `macro_rules!` definitions; NULL when none were
+     * collected. Lets a file expand a macro its ancestor module declared
+     * before the `mod` item that loads it (textual scope across files). */
+    const struct CBMRustMacroTable *macros;
 } CBMRustImportSource;
+
+/* One file's macro facts: its file-level `macro_rules!` definitions and its
+ * out-of-line `mod name;` declarations, in source order. NULL when the file
+ * defines no file-level macro (the common case, decided without parsing).
+ * A pure function of the file's bytes; safe to call from several threads. */
+typedef struct CBMRustMacroFacts CBMRustMacroFacts;
+CBMRustMacroFacts *cbm_rust_macro_facts_scan(const char *source, int len);
+void cbm_rust_macro_facts_free(CBMRustMacroFacts *facts);
+
+/* Digest of the macro facts another file can observe (definition texts and
+ * their order against `mod` declarations), independent of byte offsets; 0
+ * when the file defines no file-level macro. `root` is the file's parse. */
+uint64_t cbm_rust_macro_facts_digest(const char *source, int len, TSNode root);
+
+/* The project's macro facts keyed by file graph module QN. Immutable once
+ * filled; lookups are read-only and safe from several threads. */
+typedef struct CBMRustMacroTable CBMRustMacroTable;
+CBMRustMacroTable *cbm_rust_macro_table_new(void);
+/* Takes ownership of `facts` (NULL is ignored). */
+void cbm_rust_macro_table_add(CBMRustMacroTable *table, const char *module_qn,
+                              CBMRustMacroFacts *facts);
+void cbm_rust_macro_table_free(CBMRustMacroTable *table);
 
 void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
                                           const char *module_qn, const char *relative_module_qn,
