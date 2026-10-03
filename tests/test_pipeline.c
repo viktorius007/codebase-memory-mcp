@@ -8758,6 +8758,44 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
     PASS();
 }
 
+/* A module-level macro invocation (`thread_local!`) in the file of
+ * `impl Ext for Path` must not leave `use std::path::Path` unresolved there:
+ * the impl registers on std.path.Path as it does in a file without the
+ * macro, so a `&Path` receiver in another file links to `Ext::m`. */
+TEST(pipeline_rust_std_impl_beside_module_macro_item_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_macro_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"implmacro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod ext;\npub mod calls;\n");
+    write_temp_file(tmp, "src/ext.rs",
+                    "use std::cell::Cell;\n"
+                    "use std::path::{Path, PathBuf};\n"
+                    "thread_local! { static DEPTH: Cell<u8> = Cell::new(0); }\n"
+                    "pub trait Ext { fn m(&self) -> u8; }\n"
+                    "impl Ext for Path { fn m(&self) -> u8 { 1 } }\n"
+                    "pub trait BufExt { fn n(&self) -> u8; }\n"
+                    "impl BufExt for PathBuf { fn n(&self) -> u8 { 2 } }\n");
+    write_temp_file(tmp, "src/calls.rs",
+                    "use std::path::{Path, PathBuf};\n"
+                    "use crate::ext::{BufExt, Ext};\n"
+                    "pub fn on_path(p: &Path) -> u8 { p.m() }\n"
+                    "pub fn on_buf(p: &PathBuf) -> u8 { p.n() }\n");
+    write_rust_pad_files(tmp, 52);
+    static const RustModTreeCallCase cases[] = {
+        {"&Path receiver, impl beside thread_local!", "src.calls.on_path", "src.ext.Path.m[Ext]",
+         true},
+        {"&PathBuf receiver, impl beside thread_local!", "src.calls.on_buf",
+         "src.ext.PathBuf.n[BufExt]", true},
+    };
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
 /* An impl block in a child file (`use super::*; impl App { .. }`) belongs to
  * the `App` its parent declares: its methods are found on that type from any
  * file, and `self` inside the block has that type's fields. The Method node
@@ -18347,6 +18385,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes);
+    RUN_TEST(pipeline_rust_std_impl_beside_module_macro_item_in_both_modes);
     RUN_TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_cfg_twins_stay_distinct_and_unattributed_calls_publish_nothing);
     RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
