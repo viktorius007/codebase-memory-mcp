@@ -236,6 +236,37 @@ TEST(rustlsp_generic_impl_self_method_and_field_calls) {
     PASS();
 }
 
+TEST(rustlsp_typed_self_receiver_method_and_field_calls) {
+    /* A receiver written as a typed parameter (`self: &Arc<Self>`,
+     * `self: Pin<&mut Self>`) is `self` of the declared type with `Self`
+     * replaced by the impl's type: `self.m()` and `self.field.m()` deref
+     * through the smart pointer as they do for `&self`. */
+    CBMFileResult *r = extract_rust(
+        "use std::pin::Pin;\n"
+        "use std::sync::Arc;\n"
+        "struct Inner;\n"
+        "impl Inner { fn push(&self) {} }\n"
+        "struct Sess { inner: Inner }\n"
+        "impl Sess {\n"
+        "    fn flush(&self) {}\n"
+        "    fn shared(self: &Arc<Self>) {\n"
+        "        self.flush();\n"
+        "        self.inner.push();\n"
+        "    }\n"
+        "    fn pinned(self: Pin<&mut Self>) {\n"
+        "        self.flush();\n"
+        "        self.inner.push();\n"
+        "    }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "Sess.shared", "Sess.flush"), 0);
+    ASSERT_GTE(require_resolved(r, "Sess.shared", "Inner.push"), 0);
+    ASSERT_GTE(require_resolved(r, "Sess.pinned", "Sess.flush"), 0);
+    ASSERT_GTE(require_resolved(r, "Sess.pinned", "Inner.push"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_struct_constructor_self_new) {
     CBMFileResult *r = extract_rust(
         "struct Logger;\n"
@@ -10084,6 +10115,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_struct_method_dispatch);
     RUN_TEST(rustlsp_struct_method_self);
     RUN_TEST(rustlsp_generic_impl_self_method_and_field_calls);
+    RUN_TEST(rustlsp_typed_self_receiver_method_and_field_calls);
     RUN_TEST(rustlsp_struct_constructor_self_new);
     RUN_TEST(rustlsp_method_chain_via_return_type);
 
