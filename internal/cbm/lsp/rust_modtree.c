@@ -1181,12 +1181,15 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
     /* A 2018+ `use` path whose head names both an extern crate and a glob
      * or macro-expanded name in scope is rejected as ambiguous (E0659), so
      * a head left open only by an unmodelled glob or macro still names the
-     * extern crate; another path does when such a `use` proves it. Only a
-     * project crate is settled this way: an outside crate's items publish
-     * nothing, and impl receivers keep outside type names file-local. */
+     * extern crate; another path does when such a `use` proves it. A
+     * project crate and a language crate (`std`, `core`, ...) are settled
+     * this way, so a `use` of either names the same item in every module.
+     * A dependency crate is not: its items publish nothing, and impl
+     * receivers keep its type names file-local. */
     if (out->open && out->count == 0 && !tree->crates[crate].edition_2015 && (ns & RMT_NS_TYPE) &&
         (is_use || rmt_use_proves_extern(tree, module, head)) &&
-        rmt_extern_prelude(tree, crate, head, &def) && def.kind == RMT_MODULE) {
+        rmt_extern_prelude(tree, crate, head, &def) &&
+        (def.kind == RMT_MODULE || rmt_in_list(RMT_LANGUAGE_CRATES, head))) {
         *out = (RmtDefs){0};
         rmt_defs_add(out, &def);
         return;

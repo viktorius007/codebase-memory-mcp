@@ -10171,6 +10171,49 @@ TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it) {
     PASS();
 }
 
+TEST(rustlsp_modtree_std_use_resolves_past_module_macro_item) {
+    /* A module-level macro invocation (`thread_local!`) may expand to any
+     * item, but a 2018 `use` head that is also an extern crate cannot be
+     * shadowed by it (E0659), so `use std::path::{Path, PathBuf}` names the
+     * std types whether or not the module holds such a macro. */
+    static const char *const rels[] = {"app/src/lib.rs", "app/src/plain.rs"};
+    static const char *const qns[] = {"s.app.src.lib", "s.app.src.plain"};
+    static const char *const sources[] = {
+        "mod plain;\nuse std::path::{Path, PathBuf};\n"
+        "thread_local! { static X: u8 = 0; }\n"
+        "pub trait Ext { fn m(&self); }\nimpl Ext for Path { fn m(&self) {} }\n",
+        "use std::path::{Path, PathBuf};\n",
+    };
+    RustModTreeFixture fx = {.tree = cbm_rust_modtree_new()};
+    cbm_arena_init(&fx.arena);
+    CBMRustModFacts *facts[2] = {0};
+    for (int i = 0; i < 2; i++) {
+        (void)cbm_rust_modtree_add_file(fx.tree, rels[i], qns[i]);
+        facts[i] = cbm_rust_modfacts_scan(sources[i], (int)strlen(sources[i]));
+    }
+    (void)cbm_rust_modtree_add_crate(fx.tree, "app/src/lib.rs", "app", false);
+    cbm_rust_modtree_finish(fx.tree, (const CBMRustModFacts *const *)facts);
+    for (int i = 0; i < 2; i++) {
+        cbm_rust_modfacts_free(facts[i]);
+    }
+    for (int i = 0; i < 2; i++) {
+        CBMRustPathResult path =
+            cbm_rust_modtree_resolve_type_in_file(fx.tree, &fx.arena, qns[i], "Path");
+        ASSERT_EQ(path.kind, CBM_RUST_PATH_NOT_FUNCTION);
+        ASSERT_STR_EQ(path.qn, "std.path.Path");
+        CBMRustPathResult buf =
+            cbm_rust_modtree_resolve_type_in_file(fx.tree, &fx.arena, qns[i], "PathBuf");
+        ASSERT_EQ(buf.kind, CBM_RUST_PATH_NOT_FUNCTION);
+        ASSERT_STR_EQ(buf.qn, "std.path.PathBuf");
+    }
+    /* Outside a `use` a macro-expanded name may shadow `std` silently. */
+    CBMRustPathResult bare = cbm_rust_modtree_resolve_type(fx.tree, &fx.arena, "s.app.src.lib", 0,
+                                                           "core::cell::Cell", NULL, NULL, 0);
+    ASSERT_EQ(bare.kind, CBM_RUST_PATH_UNKNOWN);
+    rust_modtree_fixture_free(&fx);
+    PASS();
+}
+
 TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type) {
     /* `Self` in an impl body is the impl's self type, whatever generic
      * arguments the header spells: `Self::helper()` inside `impl<'a> W<'a>`
@@ -11026,6 +11069,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_digest_tracks_visibility);
     RUN_TEST(rustlsp_modtree_use_head_names_extern_crate_past_external_glob);
     RUN_TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it);
+    RUN_TEST(rustlsp_modtree_std_use_resolves_past_module_macro_item);
     RUN_TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type);
     RUN_TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve);
     RUN_TEST(rustlsp_trait_path_first_argument_is_receiver_only_with_self);
