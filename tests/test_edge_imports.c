@@ -788,6 +788,21 @@ TEST(ei_rust_trait_use) {
     PASS();
 }
 
+/* Rust: a `use` names a module item, never an associated fn or method. The
+ * external `use futures::Stream` has no in-graph target, so its only correct
+ * outcome is no edge; Strategy 3's symbol-name fallback bound it to the
+ * same-named method `Fault::Stream`. Exact count: the `use crate::errors::Fault`
+ * edge is the whole IMPORTS relation (RED without the rule: count 2). */
+TEST(ei_rust_use_never_binds_method) {
+    static const EILangFile f[] = {
+        {"errors.rs", "pub struct Fault;\n"
+                      "impl Fault {\n    pub fn Stream() -> Self { Fault }\n}\n"},
+        {"main.rs", "mod errors;\nuse crate::errors::Fault;\nuse futures::Stream;\n\n"
+                    "fn make() -> Fault { Fault::Stream() }\n"}};
+    ASSERT_TRUE(ei_edge_count_is(f, 2, "IMPORTS", 1));
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * RED REPRODUCTION — Kotlin
  *
@@ -1182,6 +1197,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_rust_struct_use);
     RUN_TEST(ei_rust_glob_use);
     RUN_TEST(ei_rust_trait_use);
+    RUN_TEST(ei_rust_use_never_binds_method);
 
     /* ── RED REPRODUCTIONS — Kotlin (expected to FAIL until pipeline fixed) ── */
     RUN_TEST(ei_kotlin_basic_class_import);
