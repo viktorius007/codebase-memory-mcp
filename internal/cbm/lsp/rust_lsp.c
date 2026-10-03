@@ -2872,6 +2872,7 @@ static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
     {RUST_STD_OPTION, "core.option.Option"},  {RUST_STD_OPTION, "std.option.Option"},
     {RUST_STD_RESULT, "core.result.Result"},  {RUST_STD_RESULT, "std.result.Result"},
     {RUST_STD_RESULT, "std.io.Result"},       {RUST_STD_RESULT, "anyhow.Result"},
+    {RUST_STD_RESULT, "std.sync.LockResult"}, {RUST_STD_RESULT, "std.sync.TryLockResult"},
     {RUST_STD_ARC, "alloc.sync.Arc"},         {RUST_STD_ARC, "std.sync.Arc"},
     {RUST_STD_RC, "alloc.rc.Rc"},             {RUST_STD_RC, "std.rc.Rc"},
     {RUST_STD_WEAK_SYNC, "alloc.sync.Weak"},  {RUST_STD_WEAK_SYNC, "std.sync.Weak"},
@@ -3149,9 +3150,19 @@ static RustStdFamily rust_std_family_of_qn(const char *qn) {
     return RUST_STD_NONE;
 }
 
+/* A head whose last segment names a Result: `io::Result`, `fmt::Result`, a
+ * dependency's `Result<T>` alias (T first, its error unknown), and
+ * `LockResult<G>` / `TryLockResult<G>`, which are `Result<G, _>`. */
+static bool rust_std_result_leaf(const char *qn) {
+    static const char *const leaves[] = {"Result", "LockResult", "TryLockResult", NULL};
+    const char *dot = strrchr(qn, '.');
+    return rust_method_in(leaves, dot ? dot + 1 : qn);
+}
+
 /* The std type a written or recorded type head names, resolved like any
  * type name: the head itself, the registry, then for a bare name the
- * file's `use` and the prelude. A project type sharing the name is not std. */
+ * file's `use` and the prelude. A project type sharing the name is not std;
+ * any other head whose last segment is a Result reads as core's Result. */
 static RustStdFamily rust_std_family_of(RustLSPContext *ctx, const char *head) {
     RustStdFamily fam = rust_std_family_of_qn(head);
     if (fam != RUST_STD_NONE || !head) {
@@ -3165,6 +3176,9 @@ static RustStdFamily rust_std_family_of(RustLSPContext *ctx, const char *head) {
     const char *registered = rust_registered_type_qn(ctx, qn);
     if (registered) {
         return rust_std_family_of_qn(registered);
+    }
+    if (rust_std_result_leaf(qn)) {
+        return RUST_STD_RESULT;
     }
     if (strchr(qn, '.')) {
         return RUST_STD_NONE;
