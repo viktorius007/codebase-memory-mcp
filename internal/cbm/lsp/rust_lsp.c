@@ -3015,6 +3015,9 @@ typedef enum {
     RUST_STD_PATH,
     RUST_STD_STRING,
     RUST_STD_VEC,
+    RUST_STD_ANY,
+    RUST_STD_ERROR,
+    RUST_STD_ONCELOCK,
 } RustStdFamily;
 
 typedef struct {
@@ -3039,14 +3042,20 @@ static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
     {RUST_STD_PATHBUF, "std.path.PathBuf"},   {RUST_STD_PATH, "std.path.Path"},
     {RUST_STD_STRING, "alloc.string.String"}, {RUST_STD_STRING, "std.string.String"},
     {RUST_STD_VEC, "alloc.vec.Vec"},          {RUST_STD_VEC, "std.vec.Vec"},
-    {RUST_STD_NONE, NULL}};
+    {RUST_STD_ANY, "core.any.Any"},           {RUST_STD_ANY, "std.any.Any"},
+    {RUST_STD_ERROR, "core.error.Error"},     {RUST_STD_ERROR, "std.error.Error"},
+    {RUST_STD_ONCELOCK, "std.sync.OnceLock"}, {RUST_STD_NONE, NULL}};
 
 /* A std method's declared return, written over the receiver: `Self` is the
  * receiver, `T` / `E` its first / second generic argument, `_` a type the
  * call does not fix, `~X` X with one reference removed, `&X` a reference,
  * `[X]` a slice, `()` unit; a lowercase name is a builtin, a dotted name a
- * std type. `assoc_only` marks an associated function taking the receiver
- * as its first argument (`Arc::downgrade(&a)`), never a method call. */
+ * std type. Over the call: `A` is the first argument's type, `F` what the
+ * first argument returns when it is a closure (its first parameter typed
+ * `T`), `G` the first turbofish argument; `*X` is X's Deref target and `?X`
+ * X's first generic argument. `assoc_only` marks an associated function
+ * taking the receiver as its first argument (`Arc::downgrade(&a)`), never a
+ * method call. */
 typedef struct {
     RustStdFamily family;
     const char *method;
@@ -3059,6 +3068,7 @@ typedef struct {
 #define RS_PATH "std.path.Path"
 #define RS_PATHBUF "std.path.PathBuf"
 #define RS_OSSTR "std.ffi.OsStr"
+#define RS_ITER(x) "core.iter.Iterator<" x ">"
 
 static const RustStdReturn RUST_STD_RETURNS[] = {
     /* Option<T> */
@@ -3091,6 +3101,16 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_OPTION, "get_or_insert", "&T", false},
     {RUST_STD_OPTION, "get_or_insert_with", "&T", false},
     {RUST_STD_OPTION, "get_or_insert_default", "&T", false},
+    {RUST_STD_OPTION, "as_deref", RS_OPT("&*T"), false},
+    {RUST_STD_OPTION, "as_deref_mut", RS_OPT("&*T"), false},
+    {RUST_STD_OPTION, "flatten", "T", false},
+    {RUST_STD_OPTION, "map", RS_OPT("F"), false},
+    {RUST_STD_OPTION, "and_then", RS_OPT("?F"), false},
+    {RUST_STD_OPTION, "map_or", "A", false},
+    {RUST_STD_OPTION, "map_or_else", "F", false},
+    {RUST_STD_OPTION, "iter", RS_ITER("&T"), false},
+    {RUST_STD_OPTION, "iter_mut", RS_ITER("&T"), false},
+    {RUST_STD_OPTION, "into_iter", RS_ITER("T"), false},
     /* Result<T, E> */
     {RUST_STD_RESULT, "unwrap", "T", false},
     {RUST_STD_RESULT, "expect", "T", false},
@@ -3104,9 +3124,12 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_RESULT, "map_err", RS_RES("T", "_"), false},
     {RUST_STD_RESULT, "or", RS_RES("T", "_"), false},
     {RUST_STD_RESULT, "or_else", RS_RES("T", "_"), false},
-    {RUST_STD_RESULT, "map", RS_RES("_", "E"), false},
+    {RUST_STD_RESULT, "map", RS_RES("F", "E"), false},
     {RUST_STD_RESULT, "and", RS_RES("_", "E"), false},
-    {RUST_STD_RESULT, "and_then", RS_RES("_", "E"), false},
+    {RUST_STD_RESULT, "and_then", RS_RES("?F", "E"), false},
+    {RUST_STD_RESULT, "as_deref", RS_RES("&*T", "&E"), false},
+    {RUST_STD_RESULT, "as_deref_mut", RS_RES("&*T", "&E"), false},
+    {RUST_STD_RESULT, "map_or", "A", false},
     {RUST_STD_RESULT, "as_ref", RS_RES("&T", "&E"), false},
     {RUST_STD_RESULT, "as_mut", RS_RES("&T", "&E"), false},
     {RUST_STD_RESULT, "cloned", RS_RES("~T", "E"), false},
@@ -3196,6 +3219,7 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_PATHBUF, "set_file_name", "()", false},
     {RUST_STD_PATHBUF, "capacity", "usize", false},
     {RUST_STD_PATHBUF, "into_os_string", "std.ffi.OsString", false},
+    {RUST_STD_PATHBUF, "into_boxed_path", "alloc.boxed.Box<" RS_PATH ">", false},
     /* Path */
     {RUST_STD_PATH, "join", RS_PATHBUF, false},
     {RUST_STD_PATH, "to_path_buf", RS_PATHBUF, false},
@@ -3221,6 +3245,7 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_PATH, "has_root", "bool", false},
     {RUST_STD_PATH, "starts_with", "bool", false},
     {RUST_STD_PATH, "ends_with", "bool", false},
+    {RUST_STD_PATH, "ancestors", RS_ITER("&" RS_PATH), false},
     /* String */
     {RUST_STD_STRING, "clone", "Self", false},
     {RUST_STD_STRING, "to_owned", "Self", false},
@@ -3273,6 +3298,9 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_VEC, "iter_mut", "core.iter.Iterator<T>", false},
     {RUST_STD_VEC, "into_iter", "core.iter.Iterator<T>", false},
     {RUST_STD_VEC, "drain", "core.iter.Iterator<T>", false},
+    {RUST_STD_VEC, "windows", RS_ITER("&[T]"), false},
+    {RUST_STD_VEC, "chunks", RS_ITER("&[T]"), false},
+    {RUST_STD_VEC, "chunks_mut", RS_ITER("&[T]"), false},
     {RUST_STD_VEC, "push", "()", false},
     {RUST_STD_VEC, "insert", "()", false},
     {RUST_STD_VEC, "clear", "()", false},
@@ -3286,13 +3314,51 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_VEC, "sort_by", "()", false},
     {RUST_STD_VEC, "sort_by_key", "()", false},
     {RUST_STD_VEC, "sort_unstable", "()", false},
+    /* dyn Any / dyn Error: `downcast_ref::<G>()` */
+    {RUST_STD_ANY, "downcast_ref", RS_OPT("&G"), false},
+    {RUST_STD_ANY, "downcast_mut", RS_OPT("&G"), false},
+    {RUST_STD_ANY, "is", "bool", false},
+    {RUST_STD_ERROR, "downcast_ref", RS_OPT("&G"), false},
+    {RUST_STD_ERROR, "downcast_mut", RS_OPT("&G"), false},
+    {RUST_STD_ERROR, "is", "bool", false},
+    /* OnceLock<T> */
+    {RUST_STD_ONCELOCK, "get", RS_OPT("&T"), false},
+    {RUST_STD_ONCELOCK, "get_mut", RS_OPT("&T"), false},
+    {RUST_STD_ONCELOCK, "get_or_init", "&T", false},
+    {RUST_STD_ONCELOCK, "set", RS_RES("()", "T"), false},
+    {RUST_STD_ONCELOCK, "into_inner", RS_OPT("T"), false},
+    {RUST_STD_ONCELOCK, "take", RS_OPT("T"), false},
     {RUST_STD_NONE, NULL, NULL, false}};
+
+/* A std function or associated function whose declared return is written
+ * over its arguments, not a receiver (spec as above, with no `Self`, `T`
+ * or `E`). `path` is its std path without the crate segment: `std::`,
+ * `core::` and `alloc::` re-export one item. */
+typedef struct {
+    const char *path;
+    const char *ret;
+} RustStdProducer;
+
+static const RustStdProducer RUST_STD_PRODUCERS[] = {
+    {"boxed.Box.pin", "core.pin.Pin<alloc.boxed.Box<A>>"},
+    {"sync.Arc.new_cyclic", "alloc.sync.Arc<F>"},
+    {"rc.Rc.new_cyclic", "alloc.rc.Rc<F>"},
+    {"panic.catch_unwind", RS_RES("F", "_")},
+    {"iter.from_fn", RS_ITER("?F")},
+    {"iter.once", RS_ITER("A")},
+    {"pin.Pin.new", "core.pin.Pin<A>"},
+    {"cell.Cell.new", "core.cell.Cell<A>"},
+    {"fs.canonicalize", RS_RES(RS_PATHBUF, "_")},
+    {"collections.VecDeque.from", "std.collections.VecDeque<?A>"},
+    {"mem.ManuallyDrop.into_inner", "?A"},
+    {NULL, NULL}};
 
 #undef RS_OPT
 #undef RS_RES
 #undef RS_PATH
 #undef RS_PATHBUF
 #undef RS_OSSTR
+#undef RS_ITER
 
 static RustStdFamily rust_std_family_of_qn(const char *qn) {
     if (!qn) {
@@ -3357,32 +3423,183 @@ static const RustStdReturn *rust_std_return_entry(RustStdFamily fam, const char 
     return NULL;
 }
 
+
 enum { RUST_STD_SPEC_MAX_ARGS = 4, RUST_STD_SPEC_NAME_MAX = 64 };
 
-/* One type of a RUST_STD_RETURNS spec at `*sp`, written over `self`. */
-static const CBMType *rust_std_spec_parse(RustLSPContext *ctx, const char **sp,
-                                          const CBMType *self) {
+/* The call a spec is read at: its argument list and turbofish (either may
+ * be a null node). */
+typedef struct {
+    TSNode args;
+    TSNode type_args;
+} RustStdCall;
+
+static const char *rust_std_type_head(const CBMType *t);
+static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType *type);
+
+/* The first argument of `call`, skipping comments; a null node if none. */
+static TSNode rust_std_call_first_arg(const RustStdCall *call) {
+    TSNode none = {0};
+    if (!call || ts_node_is_null(call->args)) {
+        return none;
+    }
+    uint32_t n = ts_node_named_child_count(call->args);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(call->args, i);
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "line_comment") != 0 && strcmp(k, "block_comment") != 0) {
+            return c;
+        }
+    }
+    return none;
+}
+
+/* `path` resolved in the file names the std item `std_path` (written
+ * without its crate segment): `std::`, `core::` and `alloc::` re-export it. */
+static bool rust_std_path_names(RustLSPContext *ctx, char *path, const char *std_path) {
+    if (!path) {
+        return false;
+    }
+    rust_strip_turbofish(path);
+    const char *qn = rust_resolve_path_expr(ctx, path);
+    static const char *const crates[] = {"std.", "core.", "alloc.", NULL};
+    for (const char *const *c = crates; qn && *c; c++) {
+        size_t n = strlen(*c);
+        if (strncmp(qn, *c, n) == 0 && strcmp(qn + n, std_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rust_std_closure_is_async(TSNode closure) {
+    for (uint32_t i = 0; i < ts_node_child_count(closure); i++) {
+        if (strcmp(ts_node_type(ts_node_child(closure, i)), "async") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Bind a closure's parameters in the current scope: the first to `first`,
+ * the others unknown, a written type over either. */
+static void rust_std_bind_closure_params(RustLSPContext *ctx, TSNode closure,
+                                         const CBMType *first) {
+    TSNode params = ts_node_child_by_field_name(closure, "parameters", 10);
+    uint32_t pc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < pc; i++) {
+        TSNode p = ts_node_named_child(params, i);
+        TSNode pat = p;
+        const CBMType *bound = i == 0 && first ? first : cbm_type_unknown();
+        if (strcmp(ts_node_type(p), "parameter") == 0) {
+            TSNode tn = ts_node_child_by_field_name(p, "type", 4);
+            TSNode pn = ts_node_child_by_field_name(p, "pattern", 7);
+            pat = ts_node_is_null(pn) ? p : pn;
+            bound = ts_node_is_null(tn) ? bound : rust_parse_type_node(ctx, tn);
+        }
+        rust_bind_pattern(ctx, pat, bound);
+    }
+}
+
+/* What the callable argument `arg` returns when called: a closure's
+ * written return type, else its body's type with the first parameter typed
+ * `param` and the other parameters and the body block's `let`s bound
+ * before it is read. `AssertUnwindSafe(f)` calls `f`. Unknown for anything
+ * else, and for an async closure (it returns a future). */
+static const CBMType *rust_std_callable_return(RustLSPContext *ctx, TSNode arg,
+                                               const CBMType *param) {
+    if (!ts_node_is_null(arg) && strcmp(ts_node_type(arg), "call_expression") == 0) {
+        TSNode fn = ts_node_child_by_field_name(arg, "function", 8);
+        RustStdCall inner = {ts_node_child_by_field_name(arg, "arguments", 9), {0}};
+        if (!ts_node_is_null(fn) &&
+            rust_std_path_names(ctx, rust_node_text(ctx, fn), "panic.AssertUnwindSafe")) {
+            arg = rust_std_call_first_arg(&inner);
+        }
+    }
+    if (ts_node_is_null(arg) || strcmp(ts_node_type(arg), "closure_expression") != 0 ||
+        rust_std_closure_is_async(arg)) {
+        return cbm_type_unknown();
+    }
+    TSNode written = ts_node_child_by_field_name(arg, "return_type", 11);
+    if (!ts_node_is_null(written)) {
+        return rust_parse_type_node(ctx, written);
+    }
+    TSNode body = ts_node_child_by_field_name(arg, "body", 4);
+    if (ts_node_is_null(body)) {
+        return cbm_type_unknown();
+    }
+    CBMScope *saved = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+    rust_std_bind_closure_params(ctx, arg, param);
+    if (strcmp(ts_node_type(body), "block") == 0) {
+        for (uint32_t i = 0; i < ts_node_named_child_count(body); i++) {
+            TSNode c = ts_node_named_child(body, i);
+            if (strcmp(ts_node_type(c), "let_declaration") == 0) {
+                rust_process_statement(ctx, c);
+            }
+        }
+    }
+    const CBMType *t = rust_eval_expr_type(ctx, body);
+    ctx->current_scope = saved;
+    return t ? t : cbm_type_unknown();
+}
+
+/* The type a std type derefs to: `String` to `str`, `PathBuf` to `Path`,
+ * `Vec<T>` to `[T]`, a reference to its referent, a std wrapper to its
+ * argument. NULL when no Deref is known. */
+static const CBMType *rust_std_deref_target(RustLSPContext *ctx, const CBMType *t) {
+    if (t->kind == CBM_TYPE_REFERENCE) {
+        return t->data.reference.elem;
+    }
+    switch (rust_std_family_of(ctx, rust_std_type_head(t))) {
+    case RUST_STD_STRING:
+        return cbm_type_builtin(ctx->arena, "str");
+    case RUST_STD_PATHBUF:
+        return cbm_type_named(ctx->arena, "std.path.Path");
+    case RUST_STD_VEC:
+        return t->kind == CBM_TYPE_TEMPLATE && t->data.template_type.arg_count > 0
+                   ? cbm_type_slice(ctx->arena, t->data.template_type.template_args[0])
+                   : NULL;
+    default:
+        return rust_deref_step(ctx, t);
+    }
+}
+
+/* One type of a RUST_STD_RETURNS spec at `*sp`, written over `self` and
+ * read at `call` (NULL when no call is at hand). */
+static const CBMType *rust_std_spec_parse(RustLSPContext *ctx, const char **sp, const CBMType *self,
+                                          const RustStdCall *call) {
     const char *s = *sp;
     const CBMType *const *args =
         self->kind == CBM_TYPE_TEMPLATE ? self->data.template_type.template_args : NULL;
     int argc = self->kind == CBM_TYPE_TEMPLATE ? self->data.template_type.arg_count : 0;
     const CBMType *out = cbm_type_unknown();
-    if (*s == '&' || *s == '~') {
+    if (*s == '&' || *s == '~' || *s == '*' || *s == '?') {
         char op = *s;
         *sp = s + 1;
-        const CBMType *inner = rust_std_spec_parse(ctx, sp, self);
+        const CBMType *inner = rust_std_spec_parse(ctx, sp, self, call);
         if (cbm_type_is_unknown(inner)) {
             return inner;
         }
         if (op == '&') {
             return cbm_type_reference(ctx->arena, inner);
         }
+        if (op == '*') {
+            const CBMType *target = rust_std_deref_target(ctx, inner);
+            return target ? target : cbm_type_unknown();
+        }
+        if (op == '?') {
+            bool generic =
+                inner->kind == CBM_TYPE_TEMPLATE && inner->data.template_type.arg_count > 0;
+            return generic && inner->data.template_type.template_args[0]
+                       ? inner->data.template_type.template_args[0]
+                       : cbm_type_unknown();
+        }
         return inner->kind == CBM_TYPE_REFERENCE ? inner->data.reference.elem
                                                  : cbm_type_unknown();
     }
     if (*s == '[') {
         *sp = s + 1;
-        const CBMType *elem = rust_std_spec_parse(ctx, sp, self);
+        const CBMType *elem = rust_std_spec_parse(ctx, sp, self, call);
         *sp += **sp == ']' ? 1 : 0;
         return cbm_type_is_unknown(elem) ? elem : cbm_type_slice(ctx->arena, elem);
     }
@@ -3402,7 +3619,7 @@ static const CBMType *rust_std_spec_parse(RustLSPContext *ctx, const char **sp,
         s++;
         while (*s && *s != '>') {
             *sp = s;
-            const CBMType *a = rust_std_spec_parse(ctx, sp, self);
+            const CBMType *a = rust_std_spec_parse(ctx, sp, self, call);
             s = *sp;
             if (targc < RUST_STD_SPEC_MAX_ARGS) {
                 targs[targc++] = a;
@@ -3418,6 +3635,19 @@ static const CBMType *rust_std_spec_parse(RustLSPContext *ctx, const char **sp,
         out = argc > 0 && args[0] ? args[0] : cbm_type_unknown();
     } else if (strcmp(name, "E") == 0) {
         out = argc > 1 && args[1] ? args[1] : cbm_type_unknown();
+    } else if (strcmp(name, "A") == 0) {
+        TSNode a = rust_std_call_first_arg(call);
+        out = ts_node_is_null(a) ? cbm_type_unknown() : rust_eval_expr_type(ctx, a);
+    } else if (strcmp(name, "F") == 0) {
+        out =
+            rust_std_callable_return(ctx, rust_std_call_first_arg(call), argc > 0 ? args[0] : NULL);
+    } else if (strcmp(name, "G") == 0) {
+        TSNode g = {0};
+        if (call && !ts_node_is_null(call->type_args) &&
+            ts_node_named_child_count(call->type_args) > 0) {
+            g = ts_node_named_child(call->type_args, 0);
+        }
+        out = ts_node_is_null(g) ? cbm_type_unknown() : rust_parse_type_node(ctx, g);
     } else if (strcmp(name, "_") == 0 || n == 0) {
         out = cbm_type_unknown();
     } else if (!strchr(name, '.')) {
@@ -3430,12 +3660,13 @@ static const CBMType *rust_std_spec_parse(RustLSPContext *ctx, const char **sp,
     return out;
 }
 
-/* `entry`'s return for the receiver `self`; NULL when the spec reads unknown. */
-static const CBMType *rust_std_return_type(RustLSPContext *ctx, const RustStdReturn *entry,
-                                           const CBMType *self) {
-    const char *sp = entry->ret;
-    const CBMType *t = rust_std_spec_parse(ctx, &sp, self);
-    return cbm_type_is_unknown(t) ? NULL : t;
+/* The return `spec` reads for the receiver `self` at `call`; NULL when it
+ * reads unknown. */
+static const CBMType *rust_std_return_type(RustLSPContext *ctx, const char *spec,
+                                           const CBMType *self, const RustStdCall *call) {
+    const char *sp = spec;
+    const CBMType *t = rust_std_spec_parse(ctx, &sp, self, call);
+    return t && !cbm_type_is_unknown(t) ? t : NULL;
 }
 
 static const char *rust_std_type_head(const CBMType *t) {
@@ -3474,9 +3705,10 @@ static const CBMType *rust_strip_references(const CBMType *t) {
  * std wrappers, as autoderef probes them (PathBuf reaches Path's methods).
  * NULL leaves the call to the registry. A wrapper's own trait methods stop
  * the walk: rustc finds them on the wrapper, not its target, as it does a
- * `Borrow`/`BorrowMut` the file imports. */
+ * `Borrow`/`BorrowMut` the file imports. `call` is the method call's
+ * arguments and turbofish. */
 static const CBMType *rust_std_method_return(RustLSPContext *ctx, const CBMType *recv,
-                                             const char *method) {
+                                             const char *method, const RustStdCall *call) {
     const CBMType *cur = rust_strip_references(recv);
     for (int hop = 0; cur && hop < RUST_DEREF_MAX_HOPS; hop++) {
         RustStdFamily fam = rust_std_family_of(ctx, rust_std_type_head(cur));
@@ -3495,7 +3727,7 @@ static const CBMType *rust_std_method_return(RustLSPContext *ctx, const CBMType 
             e = rust_std_return_entry(RUST_STD_PATH, method, true);
         }
         if (e) {
-            return rust_std_return_type(ctx, e, cur);
+            return rust_std_return_type(ctx, e->ret, cur, call);
         }
         bool own_trait_method = rust_std_is_guard(ctx, head)
                                     ? rust_method_in(RUST_GUARD_TRAIT_METHODS, method)
@@ -3509,14 +3741,42 @@ static const CBMType *rust_std_method_return(RustLSPContext *ctx, const CBMType 
     return NULL;
 }
 
+/* A std function in RUST_STD_PRODUCERS the path `func_node` names: its
+ * declared return over the call's arguments. */
+static const CBMType *rust_std_producer_return(RustLSPContext *ctx, TSNode func_node,
+                                               TSNode args_node) {
+    const char *fk = ts_node_type(func_node);
+    if (strcmp(fk, "scoped_identifier") != 0 && strcmp(fk, "identifier") != 0) {
+        return NULL;
+    }
+    char *path = rust_node_text(ctx, func_node);
+    if (path) {
+        rust_strip_turbofish(path);
+    }
+    const char *leaf = path ? strrchr(path, ':') : NULL;
+    leaf = leaf ? leaf + 1 : path;
+    for (const RustStdProducer *p = RUST_STD_PRODUCERS; leaf && p->path; p++) {
+        const char *dot = strrchr(p->path, '.');
+        if (strcmp(dot ? dot + 1 : p->path, leaf) == 0 && rust_std_path_names(ctx, path, p->path)) {
+            RustStdCall call = {args_node, {0}};
+            return rust_std_return_type(ctx, p->ret, cbm_type_unknown(), &call);
+        }
+    }
+    return NULL;
+}
+
 /* `Type::method(recv, ..)` for a std type in RUST_STD_RETURNS: the declared
  * return over the first argument's type, when that argument is the type
- * the path names (`Arc::clone(&a)`, `Arc::downgrade(&a)`). */
+ * the path names (`Arc::clone(&a)`, `Arc::downgrade(&a)`). A std function
+ * in RUST_STD_PRODUCERS: its declared return over its arguments. */
 static const CBMType *rust_std_path_call_return(RustLSPContext *ctx, TSNode func_node,
                                                 TSNode args_node) {
-    if (strcmp(ts_node_type(func_node), "scoped_identifier") != 0 || ts_node_is_null(args_node) ||
-        ts_node_named_child_count(args_node) == 0) {
+    if (ts_node_is_null(args_node) || ts_node_named_child_count(args_node) == 0) {
         return NULL;
+    }
+    const CBMType *produced = rust_std_producer_return(ctx, func_node, args_node);
+    if (produced || strcmp(ts_node_type(func_node), "scoped_identifier") != 0) {
+        return produced;
     }
     char *path = rust_node_text(ctx, func_node);
     if (!path) {
@@ -3544,7 +3804,7 @@ static const CBMType *rust_std_path_call_return(RustLSPContext *ctx, TSNode func
     if (rust_std_family_of(ctx, rust_std_type_head(recv)) != fam) {
         return NULL;
     }
-    return rust_std_return_type(ctx, e, recv);
+    return rust_std_return_type(ctx, e->ret, recv, NULL);
 }
 
 static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
@@ -3728,7 +3988,8 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                 while (base && base->kind == CBM_TYPE_REFERENCE) {
                     base = base->data.reference.elem;
                 }
-                const CBMType *declared = rust_std_method_return(ctx, recv, mname);
+                RustStdCall call = {args_node, {0}};
+                const CBMType *declared = rust_std_method_return(ctx, recv, mname, &call);
                 if (declared) {
                     return declared;
                 }
@@ -3900,6 +4161,25 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                     return ret;
                 }
                 return t;
+            }
+        }
+    }
+
+    /* `recv.method::<G>(..)` naming a std method: its declared return. */
+    if (strcmp(fk, "generic_function") == 0) {
+        TSNode method = ts_node_child_by_field_name(func_node, "function", 8);
+        if (!ts_node_is_null(method) && strcmp(ts_node_type(method), "field_expression") == 0) {
+            TSNode value = ts_node_child_by_field_name(method, "value", 5);
+            TSNode field = ts_node_child_by_field_name(method, "field", 5);
+            char *mname = ts_node_is_null(field) ? NULL : rust_node_text(ctx, field);
+            RustStdCall call = {args_node,
+                                ts_node_child_by_field_name(func_node, "type_arguments", 14)};
+            const CBMType *declared =
+                mname && !ts_node_is_null(value)
+                    ? rust_std_method_return(ctx, rust_eval_expr_type(ctx, value), mname, &call)
+                    : NULL;
+            if (declared) {
+                return declared;
             }
         }
     }
