@@ -7545,6 +7545,8 @@ static const RustModTreeCallCase rust_dyn_trait_cases[] = {
      "core.src.out.Box.put[Sink]", false},
     {"return-position impl Trait is not a trait object", "core.src.calls.via_ret",
      "core.src.svc.Service.call", false},
+    {"Box<dyn Trait> with the trait out of scope: the trait object's method",
+     "core.src.calls_bare.via_box_bare", "core.src.out.Out.log", true},
 };
 
 TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
@@ -7555,7 +7557,8 @@ TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
     write_temp_file(tmp, "core/Cargo.toml",
                     "[package]\nname = \"codex-core\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
-    write_temp_file(tmp, "core/src/lib.rs", "mod svc;\nmod out;\nmod holder;\nmod calls;\n");
+    write_temp_file(tmp, "core/src/lib.rs",
+                    "mod svc;\nmod out;\nmod holder;\nmod calls;\nmod calls_bare;\n");
     write_temp_file(tmp, "core/src/svc.rs",
                     "pub trait Named {\n    fn name(&self) -> u8;\n}\n"
                     "pub trait Service: Named + Send + Sync + 'static {\n"
@@ -7576,7 +7579,8 @@ TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
                     "pub struct Holder {\n    pub svc: Arc<dyn Service + Send + Sync>,\n"
                     "    pub out: Box<dyn Out>,\n    pub sink: Box<dyn Sink>,\n}\n");
     write_temp_file(tmp, "core/src/calls.rs",
-                    "use crate::holder::Holder;\nuse crate::svc::{make_svc, Service};\n"
+                    "use crate::holder::Holder;\nuse crate::out::{Out, Sink};\n"
+                    "use crate::svc::{make_svc, Service};\n"
                     "pub fn via_field(h: &Holder) -> u8 { h.svc.call() }\n"
                     "pub fn via_param(s: &(dyn Service + Send)) -> u8 { s.call() }\n"
                     "pub fn via_param_marker_first(s: &(dyn Send + Service)) -> u8 { s.call() }\n"
@@ -7584,6 +7588,10 @@ TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
                     "pub fn via_box(h: &Holder) -> u8 { h.out.log() }\n"
                     "pub fn via_sink(h: &Holder) -> u8 { h.sink.put() }\n"
                     "pub fn via_ret() -> u8 { make_svc().call() }\n");
+    /* `Out` is not in scope: the Box impl is no candidate, `dyn Out` is. */
+    write_temp_file(tmp, "core/src/calls_bare.rs",
+                    "use crate::holder::Holder;\n"
+                    "pub fn via_box_bare(h: &Holder) -> u8 { h.out.log() }\n");
     write_temp_file(tmp, "util/src/lib.rs", "pub fn util_root() -> u8 { 0 }\n");
     for (int i = 0; i < 52; i++) {
         char name[64];
