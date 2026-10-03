@@ -8694,6 +8694,70 @@ TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both
     PASS();
 }
 
+/* A trait impl whose self type is a std type (`Path`), a slice (`[Key]`) or
+ * an in-repository alias named through another module (`super::Shown`, an
+ * alias of `model::Ctx`) is found on a receiver of that type: its methods sit
+ * on the QN the resolver types the receiver by (`std.path.Path`,
+ * `core.slice` and `Vec` through its Deref, `model.Ctx`), not on
+ * `<impl module>.Path`. The Method nodes keep their impl-file QNs. A
+ * dependency's type (`dep::Line`) is not placed: its own methods are
+ * unknown, so `line.render()` stays unlinked. */
+TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_foreign_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"implforeign\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "[dependencies]\ndep = \"1\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod ext;\npub mod model;\npub mod calls;\n");
+    write_temp_file(tmp, "src/ext.rs",
+                    "use std::path::Path;\n"
+                    "use dep::Line;\n"
+                    "pub struct Key;\n"
+                    "pub trait PathExt { fn abs(&self) -> u8; }\n"
+                    "impl PathExt for Path { fn abs(&self) -> u8 { 1 } }\n"
+                    "pub trait KeysExt { fn is_pressed(&self) -> bool; }\n"
+                    "impl KeysExt for [Key] { fn is_pressed(&self) -> bool { true } }\n"
+                    "pub trait Draw { fn render(&self) -> u8; }\n"
+                    "impl Draw for Line { fn render(&self) -> u8 { 2 } }\n");
+    write_temp_file(tmp, "src/model.rs",
+                    "pub mod view;\npub struct Ctx;\npub type Shown = Ctx;\n");
+    write_temp_file(tmp, "src/model/view.rs",
+                    "pub trait Entries { fn entries(&self) -> u8; }\n"
+                    "impl Entries for super::Shown { fn entries(&self) -> u8 { 3 } }\n");
+    write_temp_file(tmp, "src/calls.rs",
+                    "use std::path::{Path, PathBuf};\n"
+                    "use dep::Line;\n"
+                    "use crate::ext::{Draw, Key, KeysExt, PathExt};\n"
+                    "use crate::model::Ctx;\n"
+                    "use crate::model::view::Entries;\n"
+                    "pub fn on_path(p: &Path) -> u8 { p.abs() }\n"
+                    "pub fn on_as_path(p: PathBuf) -> u8 { p.as_path().abs() }\n"
+                    "pub fn on_slice(k: &[Key]) -> bool { k.is_pressed() }\n"
+                    "pub fn on_vec(k: Vec<Key>) -> bool { k.is_pressed() }\n"
+                    "pub fn on_ctx(c: Ctx) -> u8 { c.entries() }\n"
+                    "pub fn on_line(l: Line) -> u8 { l.render() }\n");
+    write_rust_pad_files(tmp, 52);
+    static const RustModTreeCallCase cases[] = {
+        {"std self type, &Path receiver", "src.calls.on_path", "src.ext.Path.abs[PathExt]", true},
+        {"std self type, as_path() receiver", "src.calls.on_as_path",
+         "src.ext.Path.abs[PathExt]", true},
+        {"slice self type, &[T] receiver", "src.calls.on_slice",
+         "src.ext.[Key].is_pressed[KeysExt]", true},
+        {"slice self type, Vec<T> receiver", "src.calls.on_vec",
+         "src.ext.[Key].is_pressed[KeysExt]", true},
+        {"super:: alias self type, aliased type receiver", "src.calls.on_ctx",
+         "src.model.view.super::Shown.entries[Entries]", true},
+        {"dependency self type is not placed", "src.calls.on_line", "src.ext.Line.render[Draw]",
+         false},
+    };
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
 /* An impl block in a child file (`use super::*; impl App { .. }`) belongs to
  * the `App` its parent declares: its methods are found on that type from any
  * file, and `self` inside the block has that type's fields. The Method node
@@ -18282,6 +18346,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes);
+    RUN_TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes);
     RUN_TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_cfg_twins_stay_distinct_and_unattributed_calls_publish_nothing);
     RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
