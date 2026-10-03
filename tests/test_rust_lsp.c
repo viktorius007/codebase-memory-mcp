@@ -2621,6 +2621,128 @@ TEST(rustlsp_nested_macro_scope_does_not_leak) {
     PASS();
 }
 
+/* Number of resolved invocations from exactly `caller_qn` to exactly
+ * `callee_qn`, and whether the extractor attributed a syntactic call to
+ * `callee_name` to the same caller: both are needed for a CALLS edge. */
+static int rustlsp_body_calls(const CBMFileResult *r, const char *caller_qn,
+                              const char *callee_qn, const char *callee_name,
+                              bool *syntactic) {
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && rc->callee_qn && strcmp(rc->caller_qn, caller_qn) == 0 &&
+            strcmp(rc->callee_qn, callee_qn) == 0) {
+            n++;
+        }
+    }
+    *syntactic = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->enclosing_func_qn && c->callee_name &&
+            strcmp(c->enclosing_func_qn, caller_qn) == 0 &&
+            strcmp(c->callee_name, callee_name) == 0) {
+            *syntactic = true;
+        }
+    }
+    return n;
+}
+
+static bool rustlsp_has_def(const CBMFileResult *r, const char *qn) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name && strcmp(r->defs.items[i].qualified_name, qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A function declared in another function's body (or in a method's body) is
+ * its own graph node owned by the module; its calls belong to it alone. */
+TEST(rustlsp_nested_function_body_is_walked_as_its_own_node) {
+    CBMFileResult *r = extract_rust("fn helper() {}\n"
+                                    "fn other() {}\n"
+                                    "fn outer() {\n"
+                                    "    fn inner() { helper(); }\n"
+                                    "    other();\n"
+                                    "}\n"
+                                    "struct W;\n"
+                                    "impl W {\n"
+                                    "    fn meth(&self) {\n"
+                                    "        fn in_method() { other(); }\n"
+                                    "    }\n"
+                                    "}\n");
+    ASSERT_NOT_NULL(r);
+    bool syn = false;
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.inner"));
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.inner", "test.src.main.helper", "helper", &syn),
+              1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.outer", "test.src.main.helper", "helper", &syn),
+              0);
+    ASSERT_FALSE(syn);
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.in_method"));
+    ASSERT_EQ(
+        rustlsp_body_calls(r, "test.src.main.in_method", "test.src.main.other", "other", &syn), 1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.W.meth", "test.src.main.other", "other", &syn),
+              0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A trait's default method body is walked under `<Trait>.<name>`; a method
+ * called on `self` there is the trait's own declaration. */
+TEST(rustlsp_trait_default_method_body_is_walked) {
+    CBMFileResult *r = extract_rust("fn helper() -> u32 { 1 }\n"
+                                    "trait Provider {\n"
+                                    "    fn id(&self) -> u32;\n"
+                                    "    fn api(&self) -> u32 { helper() + self.id() }\n"
+                                    "}\n");
+    ASSERT_NOT_NULL(r);
+    bool syn = false;
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.Provider.api"));
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.Provider.api", "test.src.main.helper", "helper",
+                                 &syn),
+              1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.Provider.api", "test.src.main.Provider.id",
+                                 "self.id", &syn),
+              1);
+    ASSERT_TRUE(syn);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Two cfg-gated methods of one impl share a QN; the one the graph does not
+ * keep is `<qn>#L<line>`. Each body is walked once, under its own node. */
+TEST(rustlsp_cfg_twin_method_bodies_keep_their_own_identity) {
+    CBMFileResult *r = extract_rust("fn helper() {}\n"
+                                    "fn other() {}\n"
+                                    "struct W;\n"
+                                    "impl W {\n"
+                                    "    #[cfg(unix)]\n"
+                                    "    fn twin(&self) { helper(); }\n"
+                                    "    #[cfg(not(unix))]\n"
+                                    "    fn twin(&self) { other(); }\n"
+                                    "}\n");
+    ASSERT_NOT_NULL(r);
+    bool syn = false;
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.W.twin#L6"));
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.W.twin"));
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.W.twin#L6", "test.src.main.helper", "helper",
+                                 &syn),
+              1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(
+        rustlsp_body_calls(r, "test.src.main.W.twin", "test.src.main.other", "other", &syn), 1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(
+        rustlsp_body_calls(r, "test.src.main.W.twin", "test.src.main.helper", "helper", &syn), 0);
+    ASSERT_FALSE(syn);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A macro_rules! transcriber is generated source, even when its invocation is
  * discovered while reparsing a built-in macro's real argument tokens. It must
  * not inherit that outer affine map and fabricate an exact occurrence (or a
@@ -8650,18 +8772,31 @@ TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved) {
     PASS();
 }
 
-TEST(rustlsp_inline_module_body_without_caller_node_is_not_published) {
+/* An inline module function shares its QN with a file-level function; the
+ * one the graph does not keep is `<qn>#L<line>`. The module body's calls
+ * belong to its own node, never to the file-level twin. */
+TEST(rustlsp_inline_module_body_attaches_to_its_own_node) {
     CBMFileResult *r = extract_rust(
         "fn helper() {}\n"
         "fn work() {}\n"
         "mod imp { use super::*; fn work() { helper(); } }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_LT(find_confident(&r->resolved_calls, "work", "helper"), 0);
+    bool syn = false;
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.work#L2"));
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.work"));
+    ASSERT_EQ(
+        rustlsp_body_calls(r, "test.src.main.work", "test.src.main.helper", "helper", &syn), 1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.work#L2", "test.src.main.helper", "helper",
+                                 &syn),
+              0);
+    ASSERT_FALSE(syn);
     cbm_free_result(r);
     PASS();
 }
 
-TEST(rustlsp_cfg_duplicate_method_body_without_unique_caller_is_not_published) {
+/* cfg-gated twin methods: each body is walked once, under its own node. */
+TEST(rustlsp_cfg_duplicate_method_bodies_attach_to_their_own_nodes) {
     CBMFileResult *r = extract_rust(
         "fn first() {} fn second() {} struct Worker;\n"
         "impl Worker {\n"
@@ -8669,8 +8804,19 @@ TEST(rustlsp_cfg_duplicate_method_body_without_unique_caller_is_not_published) {
         "  #[cfg(not(unix))] fn run(&self) { second(); }\n"
         "}\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_LT(find_confident(&r->resolved_calls, "Worker.run", "first"), 0);
-    ASSERT_LT(find_confident(&r->resolved_calls, "Worker.run", "second"), 0);
+    bool syn = false;
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.Worker.run#L3", "test.src.main.first", "first",
+                                 &syn),
+              1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.Worker.run", "test.src.main.second", "second",
+                                 &syn),
+              1);
+    ASSERT_TRUE(syn);
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.Worker.run", "test.src.main.first", "first",
+                                 &syn),
+              0);
+    ASSERT_FALSE(syn);
     cbm_free_result(r);
     PASS();
 }
@@ -9505,6 +9651,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_local_macro_shadows_known_std_macro);
     RUN_TEST(rustlsp_later_macro_does_not_shadow_earlier_std_macro);
     RUN_TEST(rustlsp_nested_macro_scope_does_not_leak);
+    RUN_TEST(rustlsp_nested_function_body_is_walked_as_its_own_node);
+    RUN_TEST(rustlsp_trait_default_method_body_is_walked);
+    RUN_TEST(rustlsp_cfg_twin_method_bodies_keep_their_own_identity);
     RUN_TEST(rustlsp_nested_macro_rules_call_does_not_inherit_outer_site_map);
     RUN_TEST(rustlsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(rustlsp_crossfile_free_function);
@@ -10064,8 +10213,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_super_glob_module_alias_shadows_workspace_crate_name);
     RUN_TEST(rustlsp_target_root_declared_module_uses_registered_physical_path);
     RUN_TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved);
-    RUN_TEST(rustlsp_inline_module_body_without_caller_node_is_not_published);
-    RUN_TEST(rustlsp_cfg_duplicate_method_body_without_unique_caller_is_not_published);
+    RUN_TEST(rustlsp_inline_module_body_attaches_to_its_own_node);
+    RUN_TEST(rustlsp_cfg_duplicate_method_bodies_attach_to_their_own_nodes);
     RUN_TEST(rustlsp_extra_proc_macro_tokio_main);
     RUN_TEST(rustlsp_extra_proc_macro_tokio_test);
     RUN_TEST(rustlsp_extra_proc_macro_tracing_instrument);

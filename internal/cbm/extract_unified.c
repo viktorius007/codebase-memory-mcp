@@ -938,6 +938,31 @@ static const char *rust_enclosing_impl_trait(CBMExtractCtx *ctx, TSNode func_nod
     return trait_text && trait_text[0] ? trait_text : NULL;
 }
 
+/* QN of the Function/Method definition extracted from Rust `function_item`
+ * `node`, or NULL. The definition pass already settled every naming rule
+ * (impl owner, trait suffix, cfg twin, `#L<line>` for a shared QN, a nested
+ * function owned by the module), so the body's caller identity is that QN. */
+static const char *rust_function_def_qn(CBMExtractCtx *ctx, TSNode node) {
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    if (ts_node_is_null(name_node) || !ctx->result) {
+        return NULL;
+    }
+    uint32_t line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    uint32_t name_start = ts_node_start_byte(name_node);
+    size_t name_len = ts_node_end_byte(name_node) - name_start;
+    const CBMDefArray *defs = &ctx->result->defs;
+    for (int i = 0; i < defs->count; i++) {
+        const CBMDefinition *d = &defs->items[i];
+        if (d->start_line != line || !d->name || !d->label || !d->qualified_name ||
+            strlen(d->name) != name_len || memcmp(d->name, ctx->source + name_start, name_len) ||
+            (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)) {
+            continue;
+        }
+        return d->qualified_name;
+    }
+    return NULL;
+}
+
 static const char *compute_func_qn_shared(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                           WalkState *state) {
     (void)spec;
@@ -1142,26 +1167,18 @@ static const char *compute_func_qn_shared(CBMExtractCtx *ctx, TSNode node, const
     return plain;
 }
 
-/* A Rust function that shares its QN with another definition of the file is
- * published under its line-qualified QN; its body's calls take that identity
- * so they source from it rather than from the namesake that kept the QN. */
+/* A Rust function_item's body takes the identity of its extracted definition:
+ * that covers a line-qualified twin (`<qn>#L<line>`) as well as a function
+ * nested in a body, so its calls source from its own node. */
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
-    const char *qn = compute_func_qn_shared(ctx, node, spec, state);
-    if (!qn || ctx->language != CBM_LANG_RUST || ctx->rust_line_qualified_defs == 0 ||
-        strcmp(ts_node_type(node), "function_item") != 0) {
-        return qn;
-    }
-    unsigned line = ts_node_start_point(node).row + 1;
-    const char *line_qn = cbm_rust_line_qualified_qn(ctx->arena, qn, line);
-    const CBMDefArray *defs = &ctx->result->defs;
-    for (int i = 0; i < defs->count; i++) {
-        const CBMDefinition *d = &defs->items[i];
-        if (d->start_line == line && d->qualified_name && strcmp(d->qualified_name, line_qn) == 0) {
-            return line_qn;
+    if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "function_item") == 0) {
+        const char *def_qn = rust_function_def_qn(ctx, node);
+        if (def_qn) {
+            return def_qn;
         }
     }
-    return qn;
+    return compute_func_qn_shared(ctx, node, spec, state);
 }
 
 // Compute class QN for scope tracking.

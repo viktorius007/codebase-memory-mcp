@@ -40,6 +40,7 @@
 
 /* Forward declarations for early callers in the file. */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
+static void rust_process_nested_item(RustLSPContext *ctx, TSNode item);
 static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path);
 static const char *rust_module_export(RustLSPContext *ctx, const char *module_qn, const char *name);
 static const char *rust_qn_crate_prefix(RustLSPContext *ctx, const char *qn);
@@ -7347,7 +7348,9 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         return;
     ctx->eval_step_count++;
     const char *kind = ts_node_type(node);
-    if (strcmp(kind, "function_item") == 0) {
+    if (strcmp(kind, "function_item") == 0 || strcmp(kind, "impl_item") == 0 ||
+        strcmp(kind, "trait_item") == 0) {
+        rust_process_nested_item(ctx, node);
         return; /* A nested item's body is not executed by its enclosing function. */
     }
 
@@ -7743,6 +7746,32 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     ctx->pending_match_type = saved_match_type;
 }
 
+/* Graph identity of the function `func_node` named `name`, owned by `parent_qn`
+ * (impl or trait owner) or by the file's module. Extraction publishes a
+ * trait-impl method as `<Type>.<name>[<Trait>]`, a cfg twin free function as
+ * `<name>#cfg(..)]` (extract_rust_impl, cbm_rust_cfg_scope_qn), and every item
+ * of a file whose QN another item of the file also takes, other than the one
+ * the graph keeps, as `<qn>#L<line>` (cbm_rust_separate_shared_qns). */
+static const char *rust_function_node_qn(RustLSPContext *ctx, TSNode func_node, const char *name,
+                                         const char *parent_qn) {
+    const char *prefix = parent_qn ? parent_qn : ctx->module_qn;
+    const char *qn =
+        parent_qn && ctx->self_trait_spelling
+            ? cbm_arena_sprintf(ctx->arena, "%s.%s[%s]", prefix, name, ctx->self_trait_spelling)
+            : cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
+    if (!parent_qn) {
+        qn = cbm_rust_cfg_scope_qn(ctx->arena, func_node, ctx->source, qn);
+    }
+    if (ctx->registry) {
+        const char *line_qn = cbm_rust_line_qualified_qn(ctx->arena, qn,
+                                                         ts_node_start_point(func_node).row + 1);
+        if (cbm_registry_lookup_func(ctx->registry, line_qn)) {
+            return line_qn;
+        }
+    }
+    return qn;
+}
+
 /* Process a single function: bind parameters / `self`, then walk body. */
 static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const char *parent_qn) {
     TSNode name_node = ts_node_child_by_field_name(func_node, "name", 4);
@@ -7752,27 +7781,8 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
     if (!name || !name[0])
         return;
 
-    const char *prefix = parent_qn ? parent_qn : ctx->module_qn;
-    /* A trait-impl method is published as `<Type>.<name>[<Trait>]` and a
-     * cfg twin free function as `<name>#cfg(..)]` (extract_rust_impl,
-     * cbm_rust_cfg_scope_qn); the caller identity must match that node. */
-    ctx->enclosing_func_qn =
-        parent_qn && ctx->self_trait_spelling
-            ? cbm_arena_sprintf(ctx->arena, "%s.%s[%s]", prefix, name, ctx->self_trait_spelling)
-            : cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
-    if (!parent_qn) {
-        ctx->enclosing_func_qn =
-            cbm_rust_cfg_scope_qn(ctx->arena, func_node, ctx->source, ctx->enclosing_func_qn);
-    }
-    {
-        /* A namesake in the same file keeps the plain QN; this function's
-         * node is then line-qualified (cbm_rust_line_qualified_qn). */
-        const char *line_qn = cbm_rust_line_qualified_qn(
-            ctx->arena, ctx->enclosing_func_qn, ts_node_start_point(func_node).row + 1);
-        if (cbm_registry_lookup_func(ctx->registry, line_qn)) {
-            ctx->enclosing_func_qn = line_qn;
-        }
-    }
+    const char *saved_func_qn = ctx->enclosing_func_qn;
+    ctx->enclosing_func_qn = rust_function_node_qn(ctx, func_node, name, parent_qn);
 
     CBMScope *saved = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
@@ -7831,7 +7841,7 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
     }
 
     ctx->current_scope = saved;
-    ctx->enclosing_func_qn = NULL;
+    ctx->enclosing_func_qn = saved_func_qn;
     /* Restore bound-env count so the caller's bounds are unaffected. */
     ctx->type_param_bound_count = saved_bound_count;
 }
@@ -8092,25 +8102,6 @@ static bool rust_impl_has_type_param(RustLSPContext *ctx, TSNode impl_node, cons
     return false;
 }
 
-static bool rust_impl_method_name_is_unique(RustLSPContext *ctx, TSNode body,
-                                            TSNode candidate) {
-    TSNode candidate_name = ts_node_child_by_field_name(candidate, "name", 4);
-    char *name = rust_node_text(ctx, candidate_name);
-    if (!name)
-        return false;
-    int matches = 0;
-    for (uint32_t i = 0; i < ts_node_named_child_count(body); i++) {
-        TSNode child = ts_node_named_child(body, i);
-        if (strcmp(ts_node_type(child), "function_item") != 0)
-            continue;
-        TSNode child_name = ts_node_child_by_field_name(child, "name", 4);
-        char *other = rust_node_text(ctx, child_name);
-        if (other && strcmp(name, other) == 0)
-            matches++;
-    }
-    return matches == 1;
-}
-
 static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     TSNode type_node = ts_node_child_by_field_name(impl_node, "type", 4);
     if (ts_node_is_null(type_node))
@@ -8176,8 +8167,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
             if (ts_node_is_null(c) || !ts_node_is_named(c))
                 continue;
             const char *ck = ts_node_type(c);
-            if (strcmp(ck, "function_item") == 0 &&
-                rust_impl_method_name_is_unique(ctx, body, c)) {
+            if (strcmp(ck, "function_item") == 0) {
                 rust_process_function(ctx, c, owner_qn);
             }
         }
@@ -8189,17 +8179,88 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     ctx->enclosing_impl_key = saved_impl_key;
 }
 
-static bool rust_root_has_function_named(RustLSPContext *ctx, TSNode root, const char *name) {
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        TSNode item = ts_node_named_child(root, i);
-        if (strcmp(ts_node_type(item), "function_item") != 0)
-            continue;
-        TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
-        char *candidate = rust_node_text(ctx, name_node);
-        if (candidate && strcmp(candidate, name) == 0)
-            return true;
+/* Walk the default method bodies of a `trait_item`. Extraction publishes them
+ * as `<module>.<Trait>.<name>`; inside them `self` / `Self` is the trait
+ * itself, so a method called on `self` is that trait's declaration. */
+static void rust_process_trait(RustLSPContext *ctx, TSNode trait_node) {
+    char *name = rust_node_text(ctx, ts_node_child_by_field_name(trait_node, "name", 4));
+    TSNode body = ts_node_child_by_field_name(trait_node, "body", 4);
+    if (!name || !name[0] || ts_node_is_null(body))
+        return;
+    const char *owner_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    const CBMRegisteredType *trait_type =
+        ctx->registry ? cbm_registry_lookup_type(ctx->registry, owner_qn) : NULL;
+
+    const char *saved_self = ctx->self_type_qn;
+    const char *saved_trait = ctx->self_trait_qn;
+    const char *saved_trait_spelling = ctx->self_trait_spelling;
+    const char *saved_impl_key = ctx->enclosing_impl_key;
+    ctx->self_type_qn = trait_type && trait_type->is_interface ? trait_type->qualified_name : NULL;
+    ctx->self_trait_qn = NULL;
+    ctx->self_trait_spelling = NULL;
+    ctx->enclosing_impl_key = NULL;
+    for (uint32_t i = 0; i < ts_node_named_child_count(body); i++) {
+        TSNode item = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(item), "function_item") == 0) {
+            rust_process_function(ctx, item, owner_qn);
+        }
     }
-    return false;
+    ctx->self_type_qn = saved_self;
+    ctx->self_trait_qn = saved_trait;
+    ctx->self_trait_spelling = saved_trait_spelling;
+    ctx->enclosing_impl_key = saved_impl_key;
+}
+
+/* An item declared inside a function body: its own body is not executed by
+ * the enclosing function, so it is walked under its own graph identity. It
+ * sees the module's items and the block's `use`s, but none of the enclosing
+ * function's locals, `Self`, generics or control flow. Items spelled inside a
+ * macro expansion have no graph node and are left unwalked. */
+static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
+    if (ctx->source != ctx->root_source || ctx->macro_expand_depth > 0 || ctx->site_map_active) {
+        return;
+    }
+    CBMScope *saved_scope = ctx->current_scope;
+    const char *saved_self = ctx->self_type_qn;
+    const char *saved_trait = ctx->self_trait_qn;
+    const char *saved_trait_spelling = ctx->self_trait_spelling;
+    const char *saved_impl_key = ctx->enclosing_impl_key;
+    const char *saved_func_qn = ctx->enclosing_func_qn;
+    const CBMType *saved_closure_param = ctx->pending_closure_param_type;
+    const CBMType *saved_match = ctx->pending_match_type;
+    int saved_flow_depth = ctx->callable_control_flow_depth;
+
+    CBMScope *file_scope = ctx->current_scope;
+    while (file_scope && file_scope->parent) {
+        file_scope = file_scope->parent;
+    }
+    ctx->current_scope = file_scope;
+    ctx->self_type_qn = NULL;
+    ctx->self_trait_qn = NULL;
+    ctx->self_trait_spelling = NULL;
+    ctx->enclosing_impl_key = NULL;
+    ctx->pending_closure_param_type = NULL;
+    ctx->pending_match_type = NULL;
+    ctx->callable_control_flow_depth = 0;
+
+    const char *kind = ts_node_type(item);
+    if (strcmp(kind, "function_item") == 0) {
+        rust_process_function(ctx, item, NULL);
+    } else if (strcmp(kind, "impl_item") == 0) {
+        rust_process_impl(ctx, item);
+    } else if (strcmp(kind, "trait_item") == 0) {
+        rust_process_trait(ctx, item);
+    }
+
+    ctx->current_scope = saved_scope;
+    ctx->self_type_qn = saved_self;
+    ctx->self_trait_qn = saved_trait;
+    ctx->self_trait_spelling = saved_trait_spelling;
+    ctx->enclosing_impl_key = saved_impl_key;
+    ctx->enclosing_func_qn = saved_func_qn;
+    ctx->pending_closure_param_type = saved_closure_param;
+    ctx->pending_match_type = saved_match;
+    ctx->callable_control_flow_depth = saved_flow_depth;
 }
 
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
@@ -8271,6 +8332,8 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
             rust_process_function(ctx, c, NULL);
         } else if (strcmp(ck, "impl_item") == 0) {
             rust_process_impl(ctx, c);
+        } else if (strcmp(ck, "trait_item") == 0) {
+            rust_process_trait(ctx, c);
         } else if (strcmp(ck, "mod_item") == 0) {
             TSNode body = ts_node_child_by_field_name(c, "body", 4);
             if (ts_node_is_null(body))
@@ -8281,12 +8344,11 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
                     continue;
                 const char *item_kind = ts_node_type(item);
                 if (strcmp(item_kind, "function_item") == 0) {
-                    TSNode name_node = ts_node_child_by_field_name(item, "name", 4);
-                    char *name = rust_node_text(ctx, name_node);
-                    if (name && !rust_root_has_function_named(ctx, root, name))
-                        rust_process_function(ctx, item, NULL);
+                    rust_process_function(ctx, item, NULL);
                 } else if (strcmp(item_kind, "impl_item") == 0) {
                     rust_process_impl(ctx, item);
+                } else if (strcmp(item_kind, "trait_item") == 0) {
+                    rust_process_trait(ctx, item);
                 }
             }
         }
