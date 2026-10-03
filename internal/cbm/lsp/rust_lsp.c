@@ -2000,6 +2000,58 @@ static const char *rust_principal_bound_text(CBMArena *arena, const char *text) 
     return principal ? cbm_arena_strndup(arena, principal, principal_len) : "";
 }
 
+/* The type an associated-type binding argument names: `X` in
+ * `Output = X` (as in `Future<Output = X>`); `arg` itself otherwise. */
+static const char *rust_assoc_binding_value(const char *arg) {
+    const char *p = arg;
+    if (!(isalpha((unsigned char)*p) || *p == '_')) {
+        return arg;
+    }
+    while (isalnum((unsigned char)*p) || *p == '_') {
+        p++;
+    }
+    while (*p == ' ') {
+        p++;
+    }
+    if (*p != '=' || p[1] == '=') {
+        return arg;
+    }
+    p++;
+    while (*p == ' ') {
+        p++;
+    }
+    return p;
+}
+
+/* True when `t` names an item of the standard library crates. */
+static bool rust_type_is_std_trait(const CBMType *t) {
+    const char *qn = NULL;
+    if (t && t->kind == CBM_TYPE_NAMED) {
+        qn = t->data.named.qualified_name;
+    } else if (t && t->kind == CBM_TYPE_TEMPLATE) {
+        qn = t->data.template_type.template_name;
+    }
+    return qn && (strncmp(qn, "core.", 5) == 0 || strncmp(qn, "alloc.", 6) == 0 ||
+                  strncmp(qn, "std.", 4) == 0);
+}
+
+/* Generic head QN when the module tree does not settle `head`: a path keeps
+ * its segments as a dotted QN, a prelude type its canonical path. */
+static const char *rust_unsettled_generic_head_qn(CBMArena *arena, const char *head) {
+    if (strstr(head, "::")) {
+        return convert_path_to_qn(arena, head);
+    }
+    static const char *const prelude_types[] = {"Box",      "Option",       "Result", "String",
+                                                "Vec",      "Iterator",     "Future", "IntoIterator",
+                                                NULL};
+    for (const char *const *p = prelude_types; *p; p++) {
+        if (strcmp(head, *p) == 0) {
+            return rust_lookup_prelude(head);
+        }
+    }
+    return head;
+}
+
 static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *text,
                                                   const char *module_qn, const char **type_params,
                                                   const CBMRustModTree *tree) {
@@ -2045,12 +2097,16 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
             return cbm_type_unknown();
     }
 
-    /* Trait object: the value has the type of its principal trait, so a
-     * method call on it reaches that trait's declaration. Text types are
-     * fields, returns and signatures; a return-position `impl Trait` hides a
-     * concrete type, so `impl` is left unparsed here. */
+    /* Opaque `impl Trait`: a method called on it resolves to the impl of the
+     * concrete type it hides, which the text does not name, so a project
+     * trait leaves it unknown. A standard-library trait (`Future`,
+     * `Iterator`) keeps the value typed: its methods are outside the project
+     * and its written associated types (`Output = X`, `Item = X`) are what
+     * `.await` and iteration yield. */
     if (strncmp(text, "impl ", 5) == 0) {
-        return cbm_type_unknown();
+        const CBMType *bound_t =
+            parse_type_text_with_params(arena, text + 5, module_qn, type_params, tree);
+        return rust_type_is_std_trait(bound_t) ? bound_t : cbm_type_unknown();
     }
     const char *bound = rust_principal_bound_text(arena, text);
     if (!*bound) {
@@ -2200,6 +2256,7 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
                     *q = '\0';
                     while (*start == ' ')
                         start++;
+                    start = (char *)rust_assoc_binding_value(start);
                     /* Skip lifetime args. */
                     if (*start != '\'' && *start && targ_count < 15) {
                         targs[targ_count++] =
@@ -2212,7 +2269,7 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
             }
             const char *head_qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, head);
             if (!head_qn) {
-                head_qn = head;
+                head_qn = rust_unsettled_generic_head_qn(arena, head);
             }
             if (is_rust_primitive(head)) {
                 /* Primitives don't take generics in practice except for str ref — pass through. */
@@ -2344,6 +2401,34 @@ static const CBMType *rust_parse_def_type_text(CBMArena *arena, const char *text
                                                const char *module_qn, const CBMRustModTree *tree) {
     return parse_type_text_with_params(arena, rust_type_text_canonical(arena, text), module_qn,
                                        NULL, tree);
+}
+
+/* Make `rt` the alias `type Name<params..> = target;` spelled in the file of
+ * `module_qn`: the target's type with each parameter as a TYPE_PARAM, read
+ * through the module tree when one is given. */
+static void rust_register_type_alias(CBMArena *arena, CBMRegisteredType *rt, const char *target,
+                                     const char *const *params, int param_count,
+                                     const char *module_qn, const CBMRustModTree *tree) {
+    if (!target || !target[0]) {
+        return;
+    }
+    const char **names = NULL;
+    if (param_count > 0) {
+        names = (const char **)cbm_arena_alloc(arena, (size_t)(param_count + 1) * sizeof(char *));
+        if (!names) {
+            return;
+        }
+        for (int i = 0; i < param_count; i++) {
+            names[i] = params[i];
+        }
+        names[param_count] = NULL;
+    }
+    const CBMType *t = parse_type_text_with_params(
+        arena, rust_type_text_canonical(arena, target), module_qn, names, tree);
+    if (t && !cbm_type_is_unknown(t)) {
+        rt->alias_type = t;
+        rt->type_param_names = names;
+    }
 }
 
 typedef struct {
@@ -2687,10 +2772,78 @@ static bool rust_eval_path_call_by_target(RustLSPContext *ctx, TSNode func_node,
     return true;
 }
 
+enum { RUST_ALIAS_EXPAND_MAX_DEPTH = 8 };
+
+/* `t` with every registered type alias replaced by the type it stands for,
+ * the alias's written type arguments substituted for its parameters
+ * (`type R<T> = Result<T, E>`: `R<Foo>` -> `Result<Foo, E>`). A parameter
+ * the use leaves unwritten stays a type parameter. */
+static const CBMType *rust_expand_type_aliases(RustLSPContext *ctx, const CBMType *t, int depth) {
+    if (!t || depth > RUST_ALIAS_EXPAND_MAX_DEPTH) {
+        return t;
+    }
+    switch (t->kind) {
+    case CBM_TYPE_REFERENCE: {
+        const CBMType *elem = rust_expand_type_aliases(ctx, t->data.reference.elem, depth);
+        return elem == t->data.reference.elem ? t : cbm_type_reference(ctx->arena, elem);
+    }
+    case CBM_TYPE_NAMED:
+    case CBM_TYPE_TEMPLATE: {
+        bool named = t->kind == CBM_TYPE_NAMED;
+        const char *qn = named ? t->data.named.qualified_name : t->data.template_type.template_name;
+        const CBMRegisteredType *rt = qn ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+        int argc = named ? 0 : t->data.template_type.arg_count;
+        if (rt && rt->alias_type) {
+            const CBMType *target = rt->alias_type;
+            if (rt->type_param_names && argc > 0) {
+                int params = 0;
+                while (rt->type_param_names[params]) {
+                    params++;
+                }
+                int n = argc < params ? argc : params;
+                const char **names = cbm_arena_alloc(ctx->arena, sizeof(char *) * (size_t)(n + 1));
+                const CBMType **args =
+                    cbm_arena_alloc(ctx->arena, sizeof(*args) * (size_t)(n + 1));
+                for (int i = 0; i < n; i++) {
+                    names[i] = rt->type_param_names[i];
+                    args[i] = t->data.template_type.template_args[i];
+                }
+                names[n] = NULL;
+                args[n] = NULL;
+                target = rust_substitute_type(ctx->arena, target, names, args);
+            }
+            return rust_expand_type_aliases(ctx, target, depth + 1);
+        }
+        if (named || argc <= 0) {
+            return t;
+        }
+        const CBMType **args = cbm_arena_alloc(ctx->arena, sizeof(*args) * (size_t)argc);
+        bool changed = false;
+        for (int i = 0; i < argc; i++) {
+            const CBMType *arg = t->data.template_type.template_args[i];
+            args[i] = rust_expand_type_aliases(ctx, arg, depth + 1);
+            changed = changed || args[i] != arg;
+        }
+        return changed ? cbm_type_template(ctx->arena, qn, args, argc) : t;
+    }
+    default:
+        return t;
+    }
+}
+
+static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
+                                             const CBMRegisteredFunc **callee);
+
 /* Type of a call expression. `*callee`, when the call names a registered
- * function or method, is that function: `.await` reads its async flag. */
+ * function or method, is that function: `.await` reads its async flag. A
+ * declared type alias in the result reads as the type it stands for. */
 static const CBMType *rust_eval_call_type(RustLSPContext *ctx, TSNode node,
                                           const CBMRegisteredFunc **callee) {
+    return rust_expand_type_aliases(ctx, rust_eval_call_type_of(ctx, node, callee), 0);
+}
+
+static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
+                                             const CBMRegisteredFunc **callee) {
     *callee = NULL;
     TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
     TSNode args_node = ts_node_child_by_field_name(node, "arguments", 9);
@@ -8317,6 +8470,12 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         rt.qualified_name = d->qualified_name;
         rt.short_name = d->name;
         rt.is_interface = (strcmp(d->label, "Interface") == 0 || strcmp(d->label, "Trait") == 0);
+        int alias_param_count = 0;
+        while (d->type_alias_params && d->type_alias_params[alias_param_count]) {
+            alias_param_count++;
+        }
+        rust_register_type_alias(arena, &rt, d->type_alias, d->type_alias_params,
+                                 alias_param_count, module_qn, NULL);
         cbm_registry_add_type(reg, rt);
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
     }
@@ -8861,6 +9020,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         rt.short_name = cbm_arena_strdup(arena, d->short_name);
         rt.is_interface =
             d->is_interface || strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Interface") == 0;
+        rust_register_type_alias(arena, &rt, d->return_types, d->signature_param_types,
+                                 d->signature_param_count,
+                                 d->def_module_qn ? d->def_module_qn : module_qn, tree);
         cbm_registry_add_type(reg, rt);
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
     }

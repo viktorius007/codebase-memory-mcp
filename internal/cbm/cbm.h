@@ -237,6 +237,11 @@ typedef struct {
      * modifier. It is visible only inside the module that declares the impl
      * and that module's descendants. */
     bool is_rust_private;
+    /* Rust only: a `type Name<P..> = Target;` item's target as written and its
+     * type parameter names in declaration order (NULL-ended, NULL when none),
+     * so a resolver reads a use of the alias as the target. NULL otherwise. */
+    const char *type_alias;
+    const char **type_alias_params;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
