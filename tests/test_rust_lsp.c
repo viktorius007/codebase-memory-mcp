@@ -3355,6 +3355,191 @@ TEST(rustlsp_multiline_tuple_return_elements_name_their_types) {
     PASS();
 }
 
+/* Pattern fixture: `Leaf` and `Other` both have `hit`, so a binding typed
+ * from the wrong position links the wrong `hit`. Payload fields are spelled
+ * as the cross pass folds them: `<Variant>.<pos|name>` on the enum, `<pos>`
+ * on a tuple alias. */
+static int rustlsp_pattern_fixture(CBMRustLSPDef *defs) {
+    int n = 0;
+    static const char *const types[] = {"Leaf", "Other"};
+    for (int i = 0; i < 2; i++) {
+        defs[n++] = (CBMRustLSPDef){
+            .qualified_name = i == 0 ? "p.demo.Leaf" : "p.demo.Other",
+            .short_name = types[i],
+            .label = "Struct",
+            .def_module_qn = "p.demo"};
+        defs[n++] = (CBMRustLSPDef){
+            .qualified_name = i == 0 ? "p.demo.Leaf.hit" : "p.demo.Other.hit",
+            .short_name = "hit",
+            .label = "Method",
+            .receiver_type = i == 0 ? "p.demo.Leaf" : "p.demo.Other",
+            .def_module_qn = "p.demo"};
+    }
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Cfg",
+                                .short_name = "Cfg",
+                                .label = "Struct",
+                                .def_module_qn = "p.demo",
+                                .field_defs = "a:Leaf|b:Other"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Pair",
+                                .short_name = "Pair",
+                                .label = "Type",
+                                .def_module_qn = "p.demo",
+                                .field_defs = "0:Leaf|1:Other"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Ev",
+                                .short_name = "Ev",
+                                .label = "Enum",
+                                .def_module_qn = "p.demo",
+                                .field_defs = "Start.0:Leaf|Stop.0:Other|Both.0:Leaf|Both.1:Other|"
+                                              "Named.leaf:Leaf|Named.other:Other"};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Holder",
+                                .short_name = "Holder",
+                                .label = "Enum",
+                                .def_module_qn = "p.demo"};
+    static const struct {
+        const char *qn;
+        const char *name;
+        const char *ret;
+    } fns[] = {{"p.demo.make", "make", "(Leaf, Other)"},
+               {"p.demo.pair", "pair", "Pair"},
+               {"p.demo.opt", "opt", "Option<Other>"},
+               {"p.demo.res", "res", "Result<Leaf, Other>"},
+               {"p.demo.list", "list", "Vec<Other>"}};
+    for (size_t i = 0; i < sizeof(fns) / sizeof(fns[0]); i++) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = fns[i].qn,
+                                    .short_name = fns[i].name,
+                                    .label = "Function",
+                                    .def_module_qn = "p.demo",
+                                    .return_types = fns[i].ret};
+    }
+    return n;
+}
+
+/* Resolves `src` against the pattern fixture; true when `run` links
+ * `want_hit` (`Leaf` or `Other`) `hit` and not the other one. */
+static bool rustlsp_pattern_links_only(const char *src, const char *want_hit) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[16];
+    int n = rustlsp_pattern_fixture(defs);
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           &out);
+    bool want_leaf = strcmp(want_hit, "Leaf") == 0;
+    bool leaf = find_confident(&out, "run", "p.demo.Leaf.hit") >= 0;
+    bool other = find_confident(&out, "run", "p.demo.Other.hit") >= 0;
+    cbm_arena_destroy(&a);
+    return want_leaf ? (leaf && !other) : (other && !leaf);
+}
+
+TEST(rustlsp_pattern_tuple_binds_its_position) {
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run() { let (_a, b) = demo::make(); b.hit(); }\n", "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_tuple_alias_binds_its_position) {
+    /* `type Pair = (Leaf, Other);` destructures like the tuple it names. */
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run() { let (_a, b) = demo::pair(); b.hit(); }\n", "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_tuple_rest_counts_from_end) {
+    /* After `..` the sub-patterns take the last positions. */
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run() { let (.., b) = demo::make(); b.hit(); }\n", "Other"));
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(e: demo::Ev) { if let demo::Ev::Both(.., o) = e { o.hit(); } }\n", "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_struct_binds_field) {
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(c: demo::Cfg) { let demo::Cfg { b, .. } = c; b.hit(); }\n", "Other"));
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(c: demo::Cfg) { let demo::Cfg { a: renamed, .. } = c; renamed.hit(); }\n",
+        "Leaf"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_struct_through_reference) {
+    /* Match ergonomics: a struct pattern against `&Cfg` binds `&Other`. */
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(c: &demo::Cfg) { let demo::Cfg { b, .. } = c; b.hit(); }\n", "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_some_binds_option_arg) {
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run() { if let Some(x) = demo::opt() { x.hit(); } }\n", "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_err_binds_error_arg) {
+    /* `Err(e)` of `Result<Leaf, Other>` is the error type, not `Leaf`. */
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run() { if let Err(e) = demo::res() { e.hit(); } }\n", "Other"));
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run() { if let Ok(v) = demo::res() { v.hit(); } }\n", "Leaf"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_for_over_vec_binds_element) {
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run() { for x in demo::list() { x.hit(); } }\n", "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_reference_pattern_peels_reference) {
+    /* `&(_, b)` matches through the reference; `b` is the second element. */
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(r: &(demo::Leaf, demo::Other)) { let &(_, ref b) = r; b.hit(); }\n", "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_enum_variant_payload) {
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(e: demo::Ev) { match e { demo::Ev::Stop(o) => o.hit(), _ => {} } }\n", "Other"));
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(e: &demo::Ev) { let demo::Ev::Start(l) = e else { return; }; l.hit(); }\n",
+        "Leaf"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_enum_struct_variant_field) {
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(e: demo::Ev) { if let demo::Ev::Named { other, .. } = e { other.hit(); } }\n",
+        "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_slice_binds_element) {
+    ASSERT_TRUE(rustlsp_pattern_links_only(
+        "fn run(v: &[demo::Other]) { if let [first, ..] = v { first.hit(); } }\n", "Other"));
+    PASS();
+}
+
+TEST(rustlsp_pattern_unknown_position_binds_nothing) {
+    /* `Holder`'s variant payloads are not known: the binding gets no type,
+     * not the template argument. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[16];
+    int n = rustlsp_pattern_fixture(defs);
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    const char *src =
+        "fn run(h: demo::Holder<demo::Other>) { if let demo::Holder::Full(x) = h { x.hit(); } }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           &out);
+    ASSERT_LT(find_confident(&out, "run", "p.demo.Other.hit"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(rustlsp_deref_wrapper_method_wins_over_target) {
     /* `Arc` has its own `downgrade` and implements `PartialEq::eq`; both
      * shadow the same-named methods of `State` behind it. */
@@ -9201,6 +9386,19 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_strict_arc_deref_to_inner);
     RUN_TEST(rustlsp_deref_method_through_arc_field_from_other_module);
     RUN_TEST(rustlsp_multiline_tuple_return_elements_name_their_types);
+    RUN_TEST(rustlsp_pattern_tuple_binds_its_position);
+    RUN_TEST(rustlsp_pattern_tuple_alias_binds_its_position);
+    RUN_TEST(rustlsp_pattern_tuple_rest_counts_from_end);
+    RUN_TEST(rustlsp_pattern_struct_binds_field);
+    RUN_TEST(rustlsp_pattern_struct_through_reference);
+    RUN_TEST(rustlsp_pattern_some_binds_option_arg);
+    RUN_TEST(rustlsp_pattern_err_binds_error_arg);
+    RUN_TEST(rustlsp_pattern_for_over_vec_binds_element);
+    RUN_TEST(rustlsp_pattern_reference_pattern_peels_reference);
+    RUN_TEST(rustlsp_pattern_enum_variant_payload);
+    RUN_TEST(rustlsp_pattern_enum_struct_variant_field);
+    RUN_TEST(rustlsp_pattern_slice_binds_element);
+    RUN_TEST(rustlsp_pattern_unknown_position_binds_nothing);
     RUN_TEST(rustlsp_deref_field_through_box);
     RUN_TEST(rustlsp_deref_wrapper_method_wins_over_target);
     RUN_TEST(rustlsp_dyn_trait_field_links_trait_declaration);

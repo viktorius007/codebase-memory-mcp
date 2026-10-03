@@ -5850,9 +5850,180 @@ static bool rust_builtin_macro_arg_form(const char *mname, RustMacroArgForm *for
  * 9. Statement / pattern binding
  * ════════════════════════════════════════════════════════════════════ */
 
-/* Recursively bind every identifier inside a pattern node to the given
- * fallback type. Handles tuple_pattern, struct_pattern, tuple_struct_pattern,
- * ref_pattern, mut_pattern, captured_pattern, identifier. */
+/* The positional sub-patterns of a tuple, tuple-struct or slice pattern, in
+ * source order: every child except the delimiters, attributes and a
+ * tuple-struct pattern's path. `_` is an anonymous token and still holds a
+ * position. Returns the count written to `out` (at most `cap`). */
+static int rust_pattern_elements(TSNode pattern, TSNode *out, int cap) {
+    int n = 0;
+    uint32_t nc = ts_node_child_count(pattern);
+    for (uint32_t i = 0; i < nc && n < cap; i++) {
+        TSNode c = ts_node_child(pattern, i);
+        const char *ck = ts_node_type(c);
+        const char *field = ts_node_field_name_for_child(pattern, i);
+        if ((field && strcmp(field, "type") == 0) || strcmp(ck, "attribute_item") == 0) {
+            continue;
+        }
+        if (!ts_node_is_named(c) && strcmp(ck, "_") != 0) {
+            continue;
+        }
+        out[n++] = c;
+    }
+    return n;
+}
+
+/* The position a sub-pattern takes in a value of `total` positions when the
+ * pattern lists `count` elements with a `..` at `rest` (-1: none). Elements
+ * after the `..` count from the end. -1 when the position is not known. */
+static int rust_pattern_position(int index, int count, int rest, int total) {
+    if (rest < 0 || index < rest) {
+        return index;
+    }
+    if (total < 0) {
+        return -1;
+    }
+    return total - (count - index);
+}
+
+/* The registered QN of the type a pattern destructures, after peeling the
+ * references the match ergonomics bind through. NULL when not a named type. */
+static const char *rust_pattern_owner_qn(RustLSPContext *ctx, const CBMType *base) {
+    const char *qn = NULL;
+    if (base && base->kind == CBM_TYPE_NAMED) {
+        qn = base->data.named.qualified_name;
+    } else if (base && base->kind == CBM_TYPE_TEMPLATE) {
+        qn = base->data.template_type.template_name;
+    }
+    if (!qn) {
+        return NULL;
+    }
+    const char *registered = rust_registered_type_qn(ctx, qn);
+    return registered ? registered : qn;
+}
+
+/* The last path segment of a pattern's type (`E::V`, `V`, `Self::V`,
+ * `E::<T>::V`), or NULL. */
+static const char *rust_pattern_path_leaf(RustLSPContext *ctx, TSNode pattern) {
+    TSNode tn = ts_node_child_by_field_name(pattern, "type", 4);
+    if (ts_node_is_null(tn)) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(tn), "generic_type") == 0) {
+        TSNode inner = ts_node_child_by_field_name(tn, "type", 4);
+        if (!ts_node_is_null(inner)) {
+            tn = inner;
+        }
+    }
+    if (strcmp(ts_node_type(tn), "scoped_identifier") == 0 ||
+        strcmp(ts_node_type(tn), "scoped_type_identifier") == 0) {
+        TSNode name = ts_node_child_by_field_name(tn, "name", 4);
+        if (!ts_node_is_null(name)) {
+            tn = name;
+        }
+    }
+    return rust_node_text(ctx, tn);
+}
+
+/* `Option` or `Result` when `qn` names the std one, else NULL. */
+static const char *rust_std_sum_type(const char *qn) {
+    if (!qn) {
+        return NULL;
+    }
+    if (strcmp(qn, "core.option.Option") == 0 || strcmp(qn, "std.option.Option") == 0 ||
+        strcmp(qn, "Option") == 0) {
+        return "Option";
+    }
+    if (strcmp(qn, "core.result.Result") == 0 || strcmp(qn, "std.result.Result") == 0 ||
+        strcmp(qn, "Result") == 0) {
+        return "Result";
+    }
+    return NULL;
+}
+
+/* The type of payload position `pos` of variant (or tuple struct) `leaf`
+ * of the matched value `base`: `Some`/`Ok`/`Err` of std's Option and Result
+ * from the template arguments; a corpus enum variant from its registered
+ * payload field `<Variant>.<pos>`; a tuple struct, or a tuple alias matched
+ * by a tuple pattern (`leaf` NULL), from its field `<pos>`. Unknown when the
+ * position's type is not known. */
+static const CBMType *rust_tuple_variant_field(RustLSPContext *ctx, const CBMType *base,
+                                               const char *leaf, int pos) {
+    if (!base || pos < 0) {
+        return cbm_type_unknown();
+    }
+    if (base->kind == CBM_TYPE_TEMPLATE && leaf) {
+        const char *sum = rust_std_sum_type(base->data.template_type.template_name);
+        int argc = base->data.template_type.arg_count;
+        if (sum && pos == 0) {
+            int arg = -1;
+            if (strcmp(sum, "Option") == 0 && strcmp(leaf, "Some") == 0) {
+                arg = 0;
+            } else if (strcmp(sum, "Result") == 0 && strcmp(leaf, "Ok") == 0) {
+                arg = 0;
+            } else if (strcmp(sum, "Result") == 0 && strcmp(leaf, "Err") == 0) {
+                arg = 1;
+            }
+            return arg >= 0 && arg < argc ? base->data.template_type.template_args[arg]
+                                          : cbm_type_unknown();
+        }
+        if (sum) {
+            return cbm_type_unknown();
+        }
+    }
+    const char *owner = rust_pattern_owner_qn(ctx, base);
+    if (!owner) {
+        return cbm_type_unknown();
+    }
+    const char *dot = strrchr(owner, '.');
+    const char *owner_leaf = dot ? dot + 1 : owner;
+    const char *field = !leaf || strcmp(leaf, owner_leaf) == 0 || strcmp(leaf, "Self") == 0
+                            ? cbm_arena_sprintf(ctx->arena, "%d", pos)
+                            : cbm_arena_sprintf(ctx->arena, "%s.%d", leaf, pos);
+    const CBMType *ft = rust_lookup_field(ctx, owner, field, 0);
+    return ft ? ft : cbm_type_unknown();
+}
+
+/* The type of named field `fname` of the struct or struct-like variant
+ * `leaf` of the matched value `base`. NULL when not known. */
+static const CBMType *rust_struct_pattern_field(RustLSPContext *ctx, const char *owner,
+                                                const char *leaf, const char *fname) {
+    if (!owner || !fname) {
+        return NULL;
+    }
+    if (leaf) {
+        const CBMType *vt =
+            rust_lookup_field(ctx, owner, cbm_arena_sprintf(ctx->arena, "%s.%s", leaf, fname), 0);
+        if (vt) {
+            return vt;
+        }
+    }
+    return rust_lookup_field(ctx, owner, fname, 0);
+}
+
+/* A binding made through a reference with the default binding mode is a
+ * reference to the matched part. */
+static const CBMType *rust_pattern_bind_through(RustLSPContext *ctx, const CBMType *part,
+                                                bool by_ref) {
+    if (!by_ref || !part || cbm_type_is_unknown(part)) {
+        return part;
+    }
+    return cbm_type_reference(ctx->arena, part);
+}
+
+/* The number of positions of a tuple variant or tuple struct payload, or -1. */
+static int rust_tuple_variant_arity(RustLSPContext *ctx, const CBMType *base, const char *leaf) {
+    int n = 0;
+    while (n < 64 && !cbm_type_is_unknown(rust_tuple_variant_field(ctx, base, leaf, n))) {
+        n++;
+    }
+    return n > 0 ? n : -1;
+}
+
+/* Recursively bind every identifier inside a pattern node to the type its
+ * position has in the matched value of type `type`, and to unknown where
+ * that position's type is not known. Handles tuple_pattern, slice_pattern,
+ * struct_pattern, tuple_struct_pattern, ref_pattern, mut_pattern,
+ * reference_pattern, captured_pattern, or_pattern, identifier. */
 static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType *type) {
     if (ts_node_is_null(pattern))
         return;
@@ -5882,40 +6053,79 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
     if (strcmp(kind, "ref_pattern") == 0 || strcmp(kind, "mut_pattern") == 0 ||
         strcmp(kind, "reference_pattern") == 0) {
         /* The sub-pattern is the last named child: `mut x` and `&mut x`
-         * carry a `mutable_specifier` before it. */
+         * carry a `mutable_specifier` before it. `&p` matches through one
+         * reference; `ref p` binds a reference to the part. */
+        const CBMType *sub_t = type;
+        if (strcmp(kind, "reference_pattern") == 0) {
+            sub_t = type && type->kind == CBM_TYPE_REFERENCE ? type->data.reference.elem
+                                                             : cbm_type_unknown();
+        } else if (strcmp(kind, "ref_pattern") == 0) {
+            sub_t = rust_pattern_bind_through(ctx, type, true);
+        }
         uint32_t nc = ts_node_named_child_count(pattern);
         if (nc > 0) {
-            rust_bind_pattern(ctx, ts_node_named_child(pattern, nc - 1), type);
+            rust_bind_pattern(ctx, ts_node_named_child(pattern, nc - 1), sub_t);
         }
         return;
     }
-    if (strcmp(kind, "tuple_pattern") == 0) {
+    if (strcmp(kind, "tuple_pattern") == 0 || strcmp(kind, "tuple_struct_pattern") == 0 ||
+        strcmp(kind, "slice_pattern") == 0) {
+        /* `(a, b)` takes tuple positions, `V(a, b)` the variant's payload
+         * positions, `[a, b]` slice elements. A `..` skips positions;
+         * the elements after it count from the end. */
         const CBMType *base = type;
-        while (base && base->kind == CBM_TYPE_REFERENCE)
+        bool by_ref = false;
+        while (base && base->kind == CBM_TYPE_REFERENCE) {
             base = base->data.reference.elem;
-        uint32_t nc = ts_node_named_child_count(pattern);
-        for (uint32_t i = 0; i < nc; i++) {
-            const CBMType *elem_t = cbm_type_unknown();
-            if (base && base->kind == CBM_TYPE_TUPLE && (int)i < base->data.tuple.count) {
-                elem_t = base->data.tuple.elems[i];
+            by_ref = true;
+        }
+        TSNode elems[64];
+        int count = rust_pattern_elements(pattern, elems, 64);
+        int rest = -1;
+        for (int i = 0; i < count; i++) {
+            if (strcmp(ts_node_type(elems[i]), "remaining_field_pattern") == 0) {
+                rest = i;
+                break;
             }
-            rust_bind_pattern(ctx, ts_node_named_child(pattern, i), elem_t);
         }
-        return;
-    }
-    if (strcmp(kind, "tuple_struct_pattern") == 0) {
-        /* Some(x), Ok(x), Err(e) — peel one Option/Result/template. */
-        const CBMType *base = type;
-        while (base && base->kind == CBM_TYPE_REFERENCE)
-            base = base->data.reference.elem;
-        const CBMType *inner = cbm_type_unknown();
-        if (base && base->kind == CBM_TYPE_TEMPLATE && base->data.template_type.arg_count > 0) {
-            inner = base->data.template_type.template_args[0];
+        const char *leaf = strcmp(kind, "tuple_struct_pattern") == 0
+                               ? rust_pattern_path_leaf(ctx, pattern)
+                               : NULL;
+        bool slice = strcmp(kind, "slice_pattern") == 0;
+        int total = -1;
+        if (rest >= 0 && base && base->kind == CBM_TYPE_TUPLE && !leaf) {
+            total = base->data.tuple.count;
+        } else if (rest >= 0 && !slice) {
+            total = rust_tuple_variant_arity(ctx, base, leaf);
         }
-        uint32_t nc = ts_node_named_child_count(pattern);
-        /* First named child is the path; subsequent are sub-patterns. */
-        for (uint32_t i = 1; i < nc; i++) {
-            rust_bind_pattern(ctx, ts_node_named_child(pattern, i), inner);
+        for (int i = 0; i < count; i++) {
+            if (i == rest) {
+                continue;
+            }
+            const CBMType *part = cbm_type_unknown();
+            if (slice) {
+                if (base && base->kind == CBM_TYPE_SLICE) {
+                    part = base->data.slice.elem;
+                }
+                /* `rest @ ..` binds the remaining sub-slice. */
+                if (strcmp(ts_node_type(elems[i]), "captured_pattern") == 0) {
+                    TSNode sub = ts_node_child_by_field_name(elems[i], "pattern", 7);
+                    if (!ts_node_is_null(sub) &&
+                        strcmp(ts_node_type(sub), "remaining_field_pattern") == 0) {
+                        part = base && base->kind == CBM_TYPE_SLICE ? base : cbm_type_unknown();
+                    }
+                }
+            } else {
+                int pos = rust_pattern_position(i, count, rest, total);
+                if (!leaf && base && base->kind == CBM_TYPE_TUPLE) {
+                    if (pos >= 0 && pos < base->data.tuple.count) {
+                        part = base->data.tuple.elems[pos];
+                    }
+                } else {
+                    part = rust_tuple_variant_field(ctx, base, leaf, pos);
+                }
+            }
+            rust_bind_pattern(ctx, elems[i], rust_pattern_bind_through(ctx, part, by_ref));
         }
         return;
     }
@@ -5929,13 +6139,13 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
         TSNode body = ts_node_child_by_field_name(pattern, "body", 4);
         TSNode iter = ts_node_is_null(body) ? pattern : body;
         const CBMType *base = type;
-        while (base && base->kind == CBM_TYPE_REFERENCE)
+        bool by_ref = false;
+        while (base && base->kind == CBM_TYPE_REFERENCE) {
             base = base->data.reference.elem;
-        const char *type_qn = NULL;
-        if (base && base->kind == CBM_TYPE_NAMED)
-            type_qn = base->data.named.qualified_name;
-        else if (base && base->kind == CBM_TYPE_TEMPLATE)
-            type_qn = base->data.template_type.template_name;
+            by_ref = true;
+        }
+        const char *type_qn = rust_pattern_owner_qn(ctx, base);
+        const char *leaf = rust_pattern_path_leaf(ctx, pattern);
 
         uint32_t nc = ts_node_named_child_count(iter);
         for (uint32_t i = 0; i < nc; i++) {
@@ -5947,10 +6157,8 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
                 char *fname = rust_node_text(ctx, name_node);
                 if (!fname)
                     continue;
-                const CBMType *ft =
-                    type_qn ? rust_lookup_field(ctx, type_qn, fname, 0) : cbm_type_unknown();
-                if (!ft)
-                    ft = cbm_type_unknown();
+                const CBMType *ft = rust_struct_pattern_field(ctx, type_qn, leaf, fname);
+                ft = rust_pattern_bind_through(ctx, ft ? ft : cbm_type_unknown(), by_ref);
                 if (!ts_node_is_null(pat_node)) {
                     rust_bind_pattern(ctx, pat_node, ft);
                 } else {
@@ -5960,9 +6168,10 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
                        strcmp(fk, "identifier") == 0) {
                 char *fname = rust_node_text(ctx, fp);
                 if (fname && strcmp(fname, "_") != 0) {
-                    const CBMType *ft =
-                        type_qn ? rust_lookup_field(ctx, type_qn, fname, 0) : cbm_type_unknown();
-                    cbm_scope_bind(ctx->current_scope, fname, ft ? ft : cbm_type_unknown());
+                    const CBMType *ft = rust_struct_pattern_field(ctx, type_qn, leaf, fname);
+                    cbm_scope_bind(
+                        ctx->current_scope, fname,
+                        rust_pattern_bind_through(ctx, ft ? ft : cbm_type_unknown(), by_ref));
                 }
             }
         }

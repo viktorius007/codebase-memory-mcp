@@ -1127,6 +1127,76 @@ TEST(parallel_rust_proven_target_preempts_service_classification) {
     PASS();
 }
 
+/* A pattern in one file destructures a tuple variant, a struct variant, a
+ * tuple struct and a tuple alias declared in another: the payload types
+ * reach the cross pass through the extracted definitions. Each called method
+ * exists only on the type the bound position has. */
+TEST(sequential_rust_pattern_payloads_cross_files) {
+    static const char *sources[] = {
+        "mod model;\n"
+        "use model::{Ev, Pair, Wrap};\n"
+        "fn tuple_variant(e: Ev) { if let Ev::Stop(o) = e { o.other_only(); } }\n"
+        "fn struct_variant(e: &Ev) { if let Ev::Named { leaf, .. } = e { leaf.leaf_only(); } }\n"
+        "fn tuple_struct(w: Wrap) { let Wrap(_, o) = w; o.other_only(); }\n"
+        "fn tuple_alias(p: Pair) { let (l, _) = p; l.leaf_only(); }\n",
+        "pub struct Leaf;\n"
+        "impl Leaf { pub fn leaf_only(&self) {} }\n"
+        "pub struct Other;\n"
+        "impl Other { pub fn other_only(&self) {} }\n"
+        "pub enum Ev { Start(Leaf), Stop(Other), Named { leaf: Leaf, other: Other } }\n"
+        "pub struct Wrap(pub Leaf, pub Other);\n"
+        "pub type Pair = (\n    Leaf,\n    Other,\n);\n",
+    };
+    static const char *rels[] = {"src/lib.rs", "src/model.rs"};
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_rust_pattern_payload_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/src", tmpdir);
+    ASSERT_EQ(cbm_mkdir(path), 0);
+    snprintf(path, sizeof(path), "%s/Cargo.toml", tmpdir);
+    ASSERT_EQ(th_write_file(path, "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\n"), 0);
+    char paths[2][512];
+    cbm_file_info_t files[2] = {{0}};
+    for (int i = 0; i < 2; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        ASSERT_EQ(th_write_file(paths[i], sources[i]), 0);
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_RUST;
+    }
+    cbm_gbuf_t *gbuf = run_sequential_with_lsp_cross_and_mutator("rust_pattern_payload", tmpdir,
+                                                                 files, 2, NULL, NULL, true);
+    ASSERT_NOT_NULL(gbuf);
+    const cbm_gbuf_node_t *leaf_only =
+        find_unique_node_by_name_label_qn_suffix(gbuf, "leaf_only", "Method", "Leaf.leaf_only");
+    const cbm_gbuf_node_t *other_only =
+        find_unique_node_by_name_label_qn_suffix(gbuf, "other_only", "Method", "Other.other_only");
+    ASSERT_NOT_NULL(leaf_only);
+    ASSERT_NOT_NULL(other_only);
+    static const struct {
+        const char *caller;
+        bool leaf;
+    } cases[] = {{"tuple_variant", false},
+                 {"struct_variant", true},
+                 {"tuple_struct", false},
+                 {"tuple_alias", true}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const cbm_gbuf_node_t *caller =
+            find_unique_node_by_name_label_qn_suffix(gbuf, cases[i].caller, "Function",
+                                                     cases[i].caller);
+        ASSERT_NOT_NULL(caller);
+        ASSERT_EQ(count_edges_between_nodes(gbuf, caller, cases[i].leaf ? leaf_only : other_only,
+                                            "CALLS"),
+                  1);
+    }
+    cbm_gbuf_free(gbuf);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(sequential_rust_proven_target_preempts_service_classification) {
     char tmpdir[256];
     cbm_gbuf_t *gbuf = run_rust_service_preemption_fixture(false, tmpdir, sizeof(tmpdir));
@@ -4693,6 +4763,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_rust_local_shadow_loses_to_workspace_manifest_provenance);
     RUN_TEST(parallel_rust_proven_target_preempts_service_classification);
     RUN_TEST(sequential_rust_proven_target_preempts_service_classification);
+    RUN_TEST(sequential_rust_pattern_payloads_cross_files);
     RUN_TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes);
     RUN_TEST(parallel_rust_known_macro_does_not_fallback_to_local_function);
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);

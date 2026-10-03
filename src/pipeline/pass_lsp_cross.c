@@ -996,6 +996,77 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
     }
 }
 
+/* Append "name:type" to a "|"-joined field list held in `arena`. */
+static const char *pxc_field_defs_append(CBMArena *arena, const char *list, const char *name,
+                                         const char *type) {
+    if (!type || !type[0] || strchr(type, '|')) {
+        return list;
+    }
+    return list && list[0] ? cbm_arena_sprintf(arena, "%s|%s:%s", list, name, type)
+                           : cbm_arena_sprintf(arena, "%s:%s", name, type);
+}
+
+/* Rust: a tuple struct's positions and an enum's variant payloads are fields
+ * a pattern destructures. A tuple struct `W(A, B)` or a tuple alias
+ * `type W = (A, B);` (its def carries the elements as param_types) gains
+ * fields `0:A|1:B`; an enum gains, per variant
+ * `V`, `V.0:A` for a tuple payload and `V.f:T` for a named field `f` (the
+ * Field defs scoped by the variant's QN). A field name holding a `.` never
+ * matches a member access, so the enum's own member lookup is unchanged. */
+static void pxc_fold_rust_payload_fields(CBMArena *arena, const CBMFileResult *result,
+                                         CBMLSPDef *defs, int start, int end) {
+    if (!arena || !result || !defs || start >= end) {
+        return;
+    }
+    for (int si = start; si < end; si++) {
+        CBMLSPDef *dst = &defs[si];
+        if (!dst->label || !dst->qualified_name ||
+            (strcmp(dst->label, "Struct") != 0 && strcmp(dst->label, "Type") != 0 &&
+             strcmp(dst->label, "Enum") != 0)) {
+            continue;
+        }
+        bool is_enum = strcmp(dst->label, "Enum") == 0;
+        size_t qn_len = strlen(dst->qualified_name);
+        const char *list = dst->field_defs;
+        for (int di = 0; di < result->defs.count; di++) {
+            const CBMDefinition *d = &result->defs.items[di];
+            if (!d->label || !d->qualified_name) {
+                continue;
+            }
+            if (!is_enum) {
+                if (strcmp(d->label, dst->label) == 0 && d->param_types &&
+                    strcmp(d->qualified_name, dst->qualified_name) == 0) {
+                    for (int p = 0; d->param_types[p]; p++) {
+                        list = pxc_field_defs_append(arena, list, cbm_arena_sprintf(arena, "%d", p),
+                                                     d->param_types[p]);
+                    }
+                }
+                continue;
+            }
+            if (strcmp(d->label, "EnumVariant") != 0 || !d->name ||
+                strncmp(d->qualified_name, dst->qualified_name, qn_len) != 0 ||
+                d->qualified_name[qn_len] != '.' ||
+                strcmp(d->qualified_name + qn_len + 1, d->name) != 0) {
+                continue;
+            }
+            for (int p = 0; d->param_types && d->param_types[p]; p++) {
+                list = pxc_field_defs_append(
+                    arena, list, cbm_arena_sprintf(arena, "%s.%d", d->name, p), d->param_types[p]);
+            }
+            for (int fi = 0; fi < result->defs.count; fi++) {
+                const CBMDefinition *fd = &result->defs.items[fi];
+                if (fd->label && strcmp(fd->label, "Field") == 0 && fd->parent_class && fd->name &&
+                    strcmp(fd->parent_class, d->qualified_name) == 0) {
+                    list = pxc_field_defs_append(
+                        arena, list, cbm_arena_sprintf(arena, "%s.%s", d->name, fd->name),
+                        fd->return_type);
+                }
+            }
+        }
+        dst->field_defs = list;
+    }
+}
+
 /* Carry one Rust type-level impl independently of any method definition.
  * `impl Trait for Type {}` is semantically meaningful even when the block is
  * empty (the trait may provide defaults), so attaching the relation only to
@@ -1109,6 +1180,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             pxc_fold_go_struct_fields(arena, fr, defs, file_start, idx);
         }
         if (files[fi].language == CBM_LANG_RUST) {
+            pxc_fold_rust_payload_fields(arena, fr, defs, file_start, idx);
             for (int ii = 0; ii < fr->impl_traits.count; ii++) {
                 if (pxc_build_rust_impl_relation(arena, &fr->impl_traits.items[ii], project_name,
                                                  files[fi].rel_path, def_modules[fi],

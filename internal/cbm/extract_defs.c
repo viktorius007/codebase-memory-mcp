@@ -204,6 +204,7 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
                                  const CBMLangSpec *spec);
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
+static const char **rust_tuple_payload_types(CBMArena *a, TSNode item, const char *source);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
@@ -4718,6 +4719,10 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
+    if (ctx->language == CBM_LANG_RUST &&
+        (strcmp(kind, "struct_item") == 0 || strcmp(kind, "type_item") == 0)) {
+        def.param_types = rust_tuple_payload_types(a, node, ctx->source);
+    }
 
     cbm_defs_push(&ctx->result->defs, a, def);
 
@@ -5611,6 +5616,40 @@ static bool is_enum_member_kind(const char *kind) {
            strcmp(kind, "enumerator") == 0;
 }
 
+/* The payload types of a Rust tuple struct or tuple variant (`W(A, B)`), or
+ * the elements of a type alias naming a tuple (`type T = (A, B);`), in
+ * position order, as written; NULL when `item` has no positional body. A
+ * tuple payload is its constructor's parameter list. */
+static const char **rust_tuple_payload_types(CBMArena *a, TSNode item, const char *source) {
+    TSNode body = ts_node_child_by_field_name(item, TS_FIELD("body"));
+    bool alias = false;
+    if (strcmp(ts_node_type(item), "type_item") == 0) {
+        /* `type T = (A, B);` names a tuple: same positions. */
+        body = ts_node_child_by_field_name(item, TS_FIELD("type"));
+        alias = true;
+        if (ts_node_is_null(body) || strcmp(ts_node_type(body), "tuple_type") != 0) {
+            return NULL;
+        }
+    } else if (ts_node_is_null(body) ||
+               strcmp(ts_node_type(body), "ordered_field_declaration_list") != 0) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_child_count(body);
+    const char **types = (const char **)cbm_arena_alloc(a, (nc + 1) * sizeof(const char *));
+    int n = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        const char *field = ts_node_field_name_for_child(body, i);
+        if (alias ? !ts_node_is_named(ts_node_child(body, i))
+                  : (!field || strcmp(field, "type") != 0)) {
+            continue;
+        }
+        char *text = cbm_node_text(a, ts_node_child(body, i), source);
+        types[n++] = text ? text : "";
+    }
+    types[n] = NULL;
+    return n > 0 ? types : NULL;
+}
+
 /* Extract enum members as Variable nodes (C#, Java, TypeScript, C++) or Rust
  * EnumVariant nodes. A Rust variant with named fields (`V { a: T }`) also gets
  * its fields, scoped by the variant's QN. */
@@ -5651,6 +5690,9 @@ static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *cl
         mdef.file_path = ctx->rel_path;
         mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
         mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
+        if (rust) {
+            mdef.param_types = rust_tuple_payload_types(a, member, ctx->source);
+        }
         cbm_defs_push(&ctx->result->defs, a, mdef);
         if (rust) {
             extract_class_fields(ctx, member, mdef.qualified_name, cbm_lang_spec(ctx->language));
