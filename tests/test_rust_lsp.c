@@ -3489,6 +3489,29 @@ TEST(rustlsp_field_read_before_same_named_method) {
     PASS();
 }
 
+TEST(rustlsp_generic_struct_member_substitutes_written_args) {
+    /* `Wrap<Item>` binds the struct's own `T` by position: the field
+     * `inner: T` and the return `&T` of `get` are `Item`. `Wrap` written
+     * without arguments leaves `T` unbound, so `.m()` names nothing. */
+    CBMFileResult *r = extract_rust(
+        "struct Item;\n"
+        "impl Item { fn m(&self) {} }\n"
+        "struct Other;\n"
+        "impl Other { fn m(&self) {} }\n"
+        "struct Wrap<T> { inner: T }\n"
+        "impl<T> Wrap<T> { fn get(&self) -> &T { &self.inner } }\n"
+        "fn by_field(w: &Wrap<Item>) { w.inner.m(); }\n"
+        "fn by_method(w: &Wrap<Item>) { w.get().m(); }\n"
+        "fn bare(w: &Wrap) { w.inner.m(); w.get().m(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "by_field", "Item.m"), 0);
+    ASSERT_GTE(require_resolved(r, "by_method", "Item.m"), 0);
+    ASSERT_LT(find_resolved(r, "bare", "Item.m"), 0);
+    ASSERT_LT(find_resolved(r, "bare", "Other.m"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_param_method_overload_disambiguation) {
     /* Two structs with the same method name; type tracking decides. */
     CBMFileResult *r = extract_rust(
@@ -10438,6 +10461,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_nested_impl_blocks);
     RUN_TEST(rustlsp_field_access_chain);
     RUN_TEST(rustlsp_field_read_before_same_named_method);
+    RUN_TEST(rustlsp_generic_struct_member_substitutes_written_args);
     RUN_TEST(rustlsp_param_method_overload_disambiguation);
     RUN_TEST(rustlsp_for_iter_method_resolves);
     RUN_TEST(rustlsp_module_local_function_dispatch);
