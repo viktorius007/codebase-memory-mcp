@@ -384,7 +384,7 @@ static void synth_decorator_qn(const char *func_name, char *out, size_t outsz) {
 /* Resolve one decorator and create DECORATES edge. */
 static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *node,
                               const char *decorator, const char *module_qn, const char **imp_keys,
-                              const char **imp_vals, int imp_count, int *count) {
+                              const char **imp_vals, int imp_count, CBMLanguage lang, int *count) {
     char func_name[CBM_SZ_256];
     extract_decorator_func(decorator, func_name, sizeof(func_name));
     if (func_name[0] == '\0') {
@@ -407,13 +407,9 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     if (res.qualified_name && res.qualified_name[0] != '\0') {
         dec = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     }
-    /* A qualified Rust proc-macro path can collide with the decorated
-     * function's own name: resolving `#[tokio::main]` from module `main`
-     * may fall back from `tokio::main` to same-module `main`.  That is not a
-     * local decorator target (and the self-edge is discarded below), so keep
-     * the full external spelling by materialising the synthetic decorator. */
-    if (dec && dec->id == node->id && decorator[0] == '#' && decorator[1] == '[' &&
-        strstr(func_name, "::")) {
+    /* A Rust attribute binds only a macro of the repository; `#[test]` must
+     * not land on a method `test`, nor `#[tokio::main]` on the local `main`. */
+    if (dec && lang == CBM_LANG_RUST && !cbm_semantic_rust_attr_binds(dec, res.strategy)) {
         dec = NULL;
     }
     if (!dec) {
@@ -450,8 +446,8 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
 
 static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
                                   const char *module_qn, const char **imp_keys,
-                                  const char **imp_vals, int imp_count, int *inherits_count,
-                                  int *decorates_count) {
+                                  const char **imp_vals, int imp_count, CBMLanguage lang,
+                                  int *inherits_count, int *decorates_count) {
     if (!def->qualified_name) {
         return;
     }
@@ -484,7 +480,7 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     if (def->decorators) {
         for (int dc = 0; def->decorators[dc]; dc++) {
             resolve_decorator(ctx, node, def->decorators[dc], module_qn, imp_keys, imp_vals,
-                              imp_count, decorates_count);
+                              imp_count, lang, decorates_count);
         }
     }
 }
@@ -650,7 +646,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         /* ── INHERITS + DECORATES from definitions ──────────────── */
         for (int d = 0; d < result->defs.count; d++) {
             sem_process_def_edges(ctx, &result->defs.items[d], module_qn, imp_keys, imp_vals,
-                                  imp_count, &inherits_count, &decorates_count);
+                                  imp_count, files[i].language, &inherits_count, &decorates_count);
         }
 
         /* Textual Rust impl names are not a semantic identity oracle. */
@@ -685,6 +681,29 @@ const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node) {
     return (base_node && base_node->label && strcmp(base_node->label, "Interface") == 0)
                ? "IMPLEMENTS"
                : "INHERITS";
+}
+
+/* A proc-macro fn carries `#[proc_macro]`, `#[proc_macro_attribute]` or
+ * `#[proc_macro_derive(..)]` as a JSON string element of its "decorators"
+ * property; an escaped quote before the match is docstring text, not one. */
+static bool rust_fn_is_proc_macro(const char *props) {
+    static const char needle[] = "\"#[proc_macro";
+    for (const char *p = props ? strstr(props, needle) : NULL; p; p = strstr(p + 1, needle)) {
+        if (p == props || p[-1] != '\\') {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_semantic_rust_attr_binds(const cbm_gbuf_node_t *target, const char *strategy) {
+    if (!target || !target->label || cbm_suppress_weak_member_match(true, true, strategy)) {
+        return false;
+    }
+    if (strcmp(target->label, "Macro") == 0) {
+        return true;
+    }
+    return strcmp(target->label, "Function") == 0 && rust_fn_is_proc_macro(target->properties_json);
 }
 
 /* Create OVERRIDE edges from one class's methods to same-named methods of one

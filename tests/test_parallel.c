@@ -3227,6 +3227,70 @@ TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
     PASS();
 }
 
+static bool has_edge_between_callable_tails(const cbm_gbuf_t *gbuf, const char *source_tail,
+                                            const char *target_tail, const char *edge_type) {
+    const cbm_gbuf_node_t *target = find_unique_callable_node_by_tail(gbuf, target_tail);
+    return target && has_edge_from_callable_to_qn(gbuf, source_tail, target->qualified_name,
+                                                  edge_type);
+}
+
+/* A Rust attribute names a macro, never a method: `#[test]` with a method
+ * `fn test` in scope stays on the synthetic Decorator node in both pipelines,
+ * while an attribute naming a proc-macro fn of the repository binds that fn. */
+TEST(parallel_rust_attribute_binds_macros_not_same_named_methods) {
+    static const char source[] = "struct Clip;\n"
+                                 "impl Clip {\n    fn test(&self) {}\n}\n"
+                                 "#[proc_macro_attribute]\n"
+                                 "pub fn traced(attr: u8, item: u8) -> u8 { item }\n"
+                                 "#[test]\nfn check() {}\n"
+                                 "#[traced]\nfn work() {}\n";
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_rust_attr_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.rs", tmpdir);
+    FILE *file = cbm_fopen(path, "w");
+    if (!file) {
+        rmdir(tmpdir);
+        FAIL("fopen main.rs failed");
+    }
+    fputs(source, file);
+    fclose(file);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"main.rs";
+    files[0].language = CBM_LANG_RUST;
+    cbm_gbuf_t *runs[2] = {run_sequential("cbm_rust_attr", tmpdir, files, 1),
+                           run_parallel("cbm_rust_attr", tmpdir, files, 1, 1)};
+    bool to_method[2];
+    bool to_synthetic[2];
+    bool to_proc_macro[2];
+    for (int r = 0; r < 2; r++) {
+        to_method[r] = !runs[r] ||
+                       has_edge_between_callable_tails(runs[r], "main.check", "Clip.test",
+                                                       "DECORATES") ||
+                       has_edge_between_callable_tails(runs[r], "main.check", "Clip.test", "USAGE");
+        to_synthetic[r] = runs[r] && has_edge_from_callable_to_qn(runs[r], "main.check",
+                                                                  "<decorator:test>", "DECORATES");
+        to_proc_macro[r] = runs[r] && has_edge_between_callable_tails(runs[r], "main.work",
+                                                                      "main.traced", "DECORATES");
+        printf("  Rust attribute diagnostic run=%d: method=%d synthetic=%d proc_macro=%d\n", r,
+               to_method[r], to_synthetic[r], to_proc_macro[r]);
+        cbm_gbuf_free(runs[r]);
+    }
+    unlink(path);
+    rmdir(tmpdir);
+    for (int r = 0; r < 2; r++) {
+        ASSERT_FALSE(to_method[r]);
+        ASSERT_TRUE(to_synthetic[r]);
+        ASSERT_TRUE(to_proc_macro[r]);
+    }
+    PASS();
+}
+
 static int assert_c_family_preprocessed_collision_graph(CBMLanguage language, const char *extension,
                                                         const char *project, const char *source,
                                                         const char *target_tail) {
@@ -4767,6 +4831,7 @@ SUITE(parallel) {
     RUN_TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes);
     RUN_TEST(parallel_rust_known_macro_does_not_fallback_to_local_function);
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);
+    RUN_TEST(parallel_rust_attribute_binds_macros_not_same_named_methods);
     RUN_TEST(parallel_c_preprocessed_coordinate_collision_preserves_hidden_target);
     RUN_TEST(parallel_cpp_preprocessed_coordinate_collision_preserves_hidden_target);
     RUN_TEST(parallel_cuda_preprocessed_coordinate_collision_preserves_hidden_target);
