@@ -7465,6 +7465,35 @@ TEST(rustlsp_gap_macro_repetition) {
     cbm_free_result(r); PASS();
 }
 
+/* A repetition group binds its fragments once per iteration, nested groups
+ * per inner iteration, and the transcriber pastes them with its separator:
+ * every call written in the list is a call of the invoking function. A
+ * metavar pasted outside its repetition depth cannot be modelled and
+ * expands to nothing. */
+TEST(rustlsp_macro_repetition_binds_each_iteration) {
+    CBMFileResult *r = extract_rust(
+        "fn first() -> u8 { 1 }\n"
+        "fn second() -> u8 { 2 }\n"
+        "fn third() -> u8 { 3 }\n"
+        "fn stray() -> u8 { 4 }\n"
+        "fn sink(_a: u8, _b: u8) -> u8 { 0 }\n"
+        "macro_rules! each { ($f:ident, $($arg:expr),+ $(,)?) => { $f($($arg),+) }; }\n"
+        "macro_rules! nest { ($($k:ident($($a:expr),*)),* $(,)?) => { ($($k($($a),*)),*) }; }\n"
+        "macro_rules! flat { ($($x:expr),*) => { $x }; }\n"
+        "fn via_list() -> u8 { each!(sink, first(), second(),) }\n"
+        "fn via_nested() { let _ = nest!(sink(third(), first()), sink(second(), second())); }\n"
+        "fn via_wrong_depth() { let _ = flat!(stray()); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "via_list", "first"), 0);
+    ASSERT_GTE(require_resolved(r, "via_list", "second"), 0);
+    ASSERT_GTE(require_resolved(r, "via_nested", "third"), 0);
+    ASSERT_GTE(require_resolved(r, "via_nested", "first"), 0);
+    ASSERT_GTE(require_resolved(r, "via_nested", "second"), 0);
+    ASSERT_LT(find_resolved(r, "via_wrong_depth", "stray"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_gap_macro_multi_rule) {
     CBMFileResult *r = extract_rust(
         "macro_rules! pick {\n"
@@ -10192,6 +10221,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_macro_substitute_call);
     RUN_TEST(rustlsp_gap_macro_substitute_method_call);
     RUN_TEST(rustlsp_gap_macro_repetition);
+    RUN_TEST(rustlsp_macro_repetition_binds_each_iteration);
     RUN_TEST(rustlsp_gap_macro_multi_rule);
     RUN_TEST(rustlsp_gap_macro_ident_metavar);
     RUN_TEST(rustlsp_gap_macro_ty_metavar);
