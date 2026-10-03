@@ -2281,6 +2281,46 @@ TEST(rustlsp_crate_expression_macro_arguments_resolve) {
     PASS();
 }
 
+/* `assert_eq!` / `assert_ne!` invoked through the crate that defines them
+ * (`pretty_assertions::`, `std::`) take the same expression arguments as the
+ * unqualified form. */
+TEST(rustlsp_crate_qualified_assert_macro_arguments_resolve) {
+    const char *caller = "fn hidden() {\n"
+                         "    pretty_assertions::assert_eq!(a::one(), 1);\n"
+                         "    pretty_assertions::assert_ne!(a::two(), 2, \"m {}\", a::three());\n"
+                         "    std::assert_eq!(a::four(), 4);\n"
+                         "}\n";
+    const char *const leaves[] = {"one", "two", "three", "four"};
+    const char *const sites[] = {"a::one()", "a::two()", "a::three()", "a::four()"};
+    bool resolved[4];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 4, resolved);
+    ASSERT_TRUE(resolved[0]); /* pretty_assertions::assert_eq! left operand */
+    ASSERT_TRUE(resolved[1]); /* pretty_assertions::assert_ne! left operand */
+    ASSERT_TRUE(resolved[2]); /* format argument */
+    ASSERT_TRUE(resolved[3]); /* std::assert_eq! */
+    PASS();
+}
+
+/* A `select!` arm whose handler is an expression holding a turbofish comma
+ * (`Ok::<_, E>(v)`) ends at the arm's comma, not the turbofish's: the arm after
+ * it still resolves. */
+TEST(rustlsp_select_expression_handler_turbofish_keeps_next_arm) {
+    const char *caller = "async fn hidden() -> Result<u8, E> {\n"
+                         "    tokio::select! {\n"
+                         "        v = a::one(), if a::two() => return Ok::<_, E>(a::three(v)),\n"
+                         "        w = a::four() => { a::five(w); }\n"
+                         "    }\n"
+                         "}\n";
+    const char *const leaves[] = {"three", "four", "five"};
+    const char *const sites[] = {"a::three(v)", "a::four()", "a::five(w)"};
+    bool resolved[3];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 3, resolved);
+    ASSERT_TRUE(resolved[0]); /* expression handler with the turbofish */
+    ASSERT_TRUE(resolved[1]); /* next arm's future */
+    ASSERT_TRUE(resolved[2]); /* next arm's block handler */
+    PASS();
+}
+
 /* `matches!` / `assert_matches!` evaluate the scrutinee and the guard; the
  * pattern and an assert message are not the scrutinee. */
 TEST(rustlsp_matches_macro_scrutinee_and_guard_resolve) {
@@ -10298,6 +10338,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_nested_macro_repeated_text_resolves_at_each_site);
     RUN_TEST(rustlsp_insta_macro_arguments_resolve);
     RUN_TEST(rustlsp_crate_expression_macro_arguments_resolve);
+    RUN_TEST(rustlsp_crate_qualified_assert_macro_arguments_resolve);
+    RUN_TEST(rustlsp_select_expression_handler_turbofish_keeps_next_arm);
     RUN_TEST(rustlsp_operator_carriers_are_occurrence_exact);
     RUN_TEST(rustlsp_macro_operator_has_one_exact_carrier);
     RUN_TEST(rustlsp_known_std_macro_resolutions_have_exact_sites);
