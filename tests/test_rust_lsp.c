@@ -1813,6 +1813,111 @@ TEST(rustlsp_json_macro_values_resolve) {
     PASS();
 }
 
+/* A built-in macro nested in another's arguments is one source occurrence:
+ * the same nested text in a second function is a second site, not a repeat
+ * of the first, and resolves at its own span. */
+TEST(rustlsp_nested_macro_repeated_text_resolves_at_each_site) {
+    const char *caller = "fn first() {\n"
+                         "    let _ = vec![a::wrap(vec![a::one()])];\n"
+                         "}\n"
+                         "fn second() {\n"
+                         "    let _ = vec![a::wrap(vec![a::one()])];\n"
+                         "}\n";
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    const char *const leaves[] = {"wrap", "one"};
+    for (int i = 0; i < 2; i++) {
+        defs[i].qualified_name = cbm_arena_sprintf(&result.arena, "test.a.%s", leaves[i]);
+        defs[i].short_name = leaves[i];
+        defs[i].label = "Function";
+        defs[i].def_module_qn = "test.a";
+        defs[i].return_types = "usize";
+        defs[i].lang = CBM_LANG_RUST;
+    }
+    const char *imp_names[] = {"a"};
+    const char *imp_qns[] = {"test::a"};
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&result.arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
+                                         "test.main", reg, imp_names, imp_qns, 1, NULL,
+                                         /*manifest=*/NULL,
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL);
+    const char *site_text = "a::one()";
+    const char *first_site = strstr(caller, site_text);
+    const char *second_site = first_site ? strstr(first_site + 1, site_text) : NULL;
+    ASSERT_NOT_NULL(second_site);
+    bool resolved[2] = {false, false};
+    const char *occurrences[2] = {first_site, second_site};
+    for (int k = 0; k < 2; k++) {
+        uint32_t start = (uint32_t)(occurrences[k] - caller);
+        uint32_t end = start + (uint32_t)strlen(site_text);
+        for (int i = 0; i < result.calls.count; i++) {
+            const CBMCall *call = &result.calls.items[i];
+            if (!call->callee_name || strcmp(call->callee_name, "one") != 0 ||
+                call->site_start_byte != start || call->site_end_byte != end)
+                continue;
+            const CBMResolvedCall *hit =
+                cbm_pipeline_find_lsp_resolution(&result.resolved_calls, call, false);
+            resolved[k] = hit && hit->callee_qn && strcmp(hit->callee_qn, "test.a.one") == 0;
+        }
+    }
+    cbm_arena_destroy(&result.arena);
+    ASSERT_TRUE(resolved[0]); /* first occurrence */
+    ASSERT_TRUE(resolved[1]); /* identical nested text in another function */
+    PASS();
+}
+
+/* insta snapshot macros: `[name,] value [, @"inline"]`, a statement list in
+ * `allow_duplicates!`, and the body after `with_settings!`'s settings map. */
+TEST(rustlsp_insta_macro_arguments_resolve) {
+    const char *caller =
+        "fn hidden() {\n"
+        "    insta::assert_snapshot!(\"name\", a::one(), @r#\"x\"#);\n"
+        "    assert_snapshot!(a::two(), @\"y\");\n"
+        "    insta::assert_debug_snapshot!(a::three());\n"
+        "    insta::allow_duplicates! { let v = a::four(); insta::assert_snapshot!(v); }\n"
+        "    insta::with_settings!({snapshot_path => \"../s\"}, { a::five(); });\n"
+        "}\n";
+    const char *const leaves[] = {"one", "two", "three", "four", "five"};
+    const char *const sites[] = {"a::one()", "a::two()", "a::three()", "a::four()", "a::five()"};
+    bool resolved[5];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 5, resolved);
+    ASSERT_TRUE(resolved[0]); /* value after a snapshot name, before an inline raw literal */
+    ASSERT_TRUE(resolved[1]); /* value before an inline literal */
+    ASSERT_TRUE(resolved[2]); /* debug snapshot value */
+    ASSERT_TRUE(resolved[3]); /* statement in allow_duplicates! */
+    ASSERT_TRUE(resolved[4]); /* with_settings! body */
+    PASS();
+}
+
+/* anyhow / crossterm / ratatui macros take expression arguments: a condition
+ * and format arguments, a writer and commands, line elements. */
+TEST(rustlsp_crate_expression_macro_arguments_resolve) {
+    const char *caller = "fn hidden() {\n"
+                         "    anyhow::ensure!(a::one() == 1, \"m {}\", a::two());\n"
+                         "    bail!(\"b {}\", a::three());\n"
+                         "    let _ = anyhow::anyhow!(a::four());\n"
+                         "    crossterm::queue!(a::five(), a::six());\n"
+                         "    let _ = ratatui::line![a::seven()];\n"
+                         "}\n";
+    const char *const leaves[] = {"one", "two", "three", "four", "five", "six", "seven"};
+    const char *const sites[] = {"a::one()",  "a::two()", "a::three()", "a::four()",
+                                 "a::five()", "a::six()", "a::seven()"};
+    bool resolved[7];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 7, resolved);
+    ASSERT_TRUE(resolved[0]); /* ensure! condition */
+    ASSERT_TRUE(resolved[1]); /* ensure! format argument */
+    ASSERT_TRUE(resolved[2]); /* bail! format argument */
+    ASSERT_TRUE(resolved[3]); /* anyhow! value */
+    ASSERT_TRUE(resolved[4]); /* queue! writer */
+    ASSERT_TRUE(resolved[5]); /* queue! command */
+    ASSERT_TRUE(resolved[6]); /* line! element */
+    PASS();
+}
+
 /* `matches!` / `assert_matches!` evaluate the scrutinee and the guard; the
  * pattern and an assert message are not the scrutinee. */
 TEST(rustlsp_matches_macro_scrutinee_and_guard_resolve) {
@@ -9027,6 +9132,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_matches_macro_scrutinee_and_guard_resolve);
     RUN_TEST(rustlsp_tokio_macro_branches_resolve);
     RUN_TEST(rustlsp_tracing_macro_fields_resolve);
+    RUN_TEST(rustlsp_nested_macro_repeated_text_resolves_at_each_site);
+    RUN_TEST(rustlsp_insta_macro_arguments_resolve);
+    RUN_TEST(rustlsp_crate_expression_macro_arguments_resolve);
     RUN_TEST(rustlsp_operator_carriers_are_occurrence_exact);
     RUN_TEST(rustlsp_macro_operator_has_one_exact_carrier);
     RUN_TEST(rustlsp_known_std_macro_resolutions_have_exact_sites);
