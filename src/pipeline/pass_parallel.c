@@ -3063,7 +3063,8 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 /* Resolve decorators → DECORATES edges for one definition. */
 static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                    const CBMDefinition *def, const cbm_gbuf_node_t *node,
-                                   const char *mq, const char **ik, const char **iv, int ic) {
+                                   const char *mq, const char **ik, const char **iv, int ic,
+                                   CBMLanguage lang) {
     if (!def->decorators) {
         return;
     }
@@ -3087,12 +3088,9 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
         if (res.qualified_name && res.qualified_name[0] != '\0') {
             dn = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
         }
-        /* Qualified Rust proc-macro paths must not degrade to the decorated
-         * function itself through the registry's same-module suffix fallback
-         * (`#[tokio::main]` on local `main`).  Preserve the full external path
-         * through the synthetic Decorator node instead. */
-        if (dn && dn->id == node->id && def->decorators[dc][0] == '#' &&
-            def->decorators[dc][1] == '[' && strstr(fn, "::")) {
+        /* A Rust attribute binds only a macro of the repository; `#[test]` must
+         * not land on a method `test`, nor `#[tokio::main]` on the local `main`. */
+        if (dn && lang == CBM_LANG_RUST && !cbm_semantic_rust_attr_binds(dn, res.strategy)) {
             dn = NULL;
         }
         int64_t dn_id = 0;
@@ -3145,7 +3143,8 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         resolve_def_inherits(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
-        resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count,
+                               language);
     }
     if (language == CBM_LANG_RUST) {
         ws->semantic_resolved +=

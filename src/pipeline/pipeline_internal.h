@@ -439,6 +439,14 @@ int cbm_pipeline_rust_impl_edges(const cbm_gbuf_t *nodes, cbm_gbuf_t *edges,
  * parallel per-file resolve — the two venues must never diverge. */
 const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node);
 
+/* Whether a resolved Rust attribute (`#[name]`, `#[path::name]`) may bind
+ * TARGET, reached by registry STRATEGY. An attribute names a macro or a
+ * built-in attribute, never a function, method, type or constant: only a
+ * `macro_rules!` Macro or a proc-macro fn reached by a path-aware strategy
+ * qualifies; every other attribute stays on its synthetic Decorator node.
+ * Shared by the sequential and parallel decorator resolvers. */
+bool cbm_semantic_rust_attr_binds(const cbm_gbuf_node_t *target, const char *strategy);
+
 /* Explicit-language override detection on the full graph (serial tail).
  * For every IMPLEMENTS/INHERITS edge whose source is a non-Go class, matches
  * the class's DEFINES_METHOD children by name against the base's and creates
