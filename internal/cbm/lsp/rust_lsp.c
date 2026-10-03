@@ -5746,6 +5746,17 @@ typedef struct {
 
 static void rust_site_windows_push(RustSiteWindows *w, uint32_t synthetic_start,
                                    uint32_t synthetic_end, uint32_t original_start) {
+    /* A window that continues the previous one in both buffers extends it,
+     * so a site pasted from consecutive fragments maps as one range. */
+    if (w->count > 0) {
+        CBMRustSiteWindow *last = &w->items[w->count - 1];
+        if (last->synthetic_end == synthetic_start &&
+            last->original_start + (last->synthetic_end - last->synthetic_start) ==
+                original_start) {
+            last->synthetic_end = synthetic_end;
+            return;
+        }
+    }
     if (w->count == w->cap) {
         int cap = w->cap ? w->cap * 2 : 8;
         CBMRustSiteWindow *grown =
@@ -5800,6 +5811,10 @@ typedef struct {
     char *buf;
     int len;
     int cap;
+    /* The last pasted fragment: where it ends in the invocation text and the
+     * output length right after it. */
+    const char *last_value_end;
+    int last_value_out;
 } MacroOut;
 
 static bool macro_out_append(MacroOut *o, const char *s, int n) {
@@ -5818,6 +5833,40 @@ static bool macro_out_append(MacroOut *o, const char *s, int n) {
     memcpy(o->buf + o->len, s, (size_t)n);
     o->len += n;
     o->buf[o->len] = '\0';
+    return true;
+}
+
+/* Copy the invocation bytes [from, to) into the output, with a site window
+ * for the bytes that reach the original file. */
+static bool macro_paste_span(MacroOut *o, const char *from, const char *to,
+                             const RustMacroSubstSites *sites, uint32_t base) {
+    if (sites && from >= sites->inv && to <= sites->inv + sites->inv_len) {
+        uint32_t src = sites->inv_src_start + (uint32_t)(from - sites->inv);
+        rust_site_windows_carry(sites->ctx, sites->windows, src, src + (uint32_t)(to - from),
+                                base + (uint32_t)o->len);
+    }
+    return macro_out_append(o, from, (int)(to - from));
+}
+
+/* Paste a bound fragment. A fragment pasted right after the previous one
+ * (no transcriber text between them, as in `$($t)*`) keeps the whitespace
+ * that separated the two in the invocation: tokens stay apart, and adjacent
+ * tokens stay one site. */
+static bool macro_paste_value(MacroOut *o, const MacroBinding *b,
+                              const RustMacroSubstSites *sites, uint32_t base) {
+    if (sites && o->last_value_end && o->len == o->last_value_out &&
+        o->last_value_end >= sites->inv && b->value >= o->last_value_end &&
+        b->value <= sites->inv + sites->inv_len) {
+        const char *gap = o->last_value_end;
+        while (gap < b->value && (*gap == ' ' || *gap == '\t' || *gap == '\n' || *gap == '\r'))
+            gap++;
+        if (gap == b->value && !macro_paste_span(o, o->last_value_end, b->value, sites, base))
+            return false;
+    }
+    if (!macro_paste_span(o, b->value, b->value + b->value_len, sites, base))
+        return false;
+    o->last_value_end = b->value + b->value_len;
+    o->last_value_out = o->len;
     return true;
 }
 
@@ -5894,14 +5943,7 @@ static bool macro_subst_seq(MacroOut *o, const char *xs, int xs_len, const Macro
                     return false;
                 const MacroBinding *b = macro_env_lookup(env, name, path);
                 if (b && b->value) {
-                    if (sites && b->value >= sites->inv &&
-                        b->value + b->value_len <= sites->inv + sites->inv_len) {
-                        uint32_t src = sites->inv_src_start + (uint32_t)(b->value - sites->inv);
-                        rust_site_windows_carry(sites->ctx, sites->windows, src,
-                                                src + (uint32_t)b->value_len,
-                                                base + (uint32_t)o->len);
-                    }
-                    if (!macro_out_append(o, b->value, b->value_len))
+                    if (!macro_paste_value(o, b, sites, base))
                         return false;
                     xp = name_end;
                     continue;
