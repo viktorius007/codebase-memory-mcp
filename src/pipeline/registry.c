@@ -1040,17 +1040,17 @@ static cbm_resolution_t resolve_multi_rust(const cbm_registry_t *r, const CBMRus
     const char *bound[CBM_SZ_256];
     int bcount = 0;
     for (int i = 0; i < arr->count && bcount < CBM_SZ_256; i++) {
-        if (rust_name_binds(r, tree, arr->items[i], path, name, module_qn, import_keys,
-                            import_vals, import_count)) {
+        if (rust_name_binds(r, tree, arr->items[i], path, name, module_qn, import_keys, import_vals,
+                            import_count)) {
             bound[bcount++] = arr->items[i];
         }
     }
-    const char *best = bcount == SKIP_ONE ? bound[0]
+    const char *best = bcount == SKIP_ONE  ? bound[0]
                        : bcount > SKIP_ONE ? best_by_import_distance(bound, bcount, module_qn)
                                            : NULL;
     if (!best) {
-        bool member = legacy.qualified_name &&
-                      cbm_registry_label_is_type_member(cbm_registry_label_of(r, legacy.qualified_name));
+        bool member = legacy.qualified_name && cbm_registry_label_is_type_member(
+                                                   cbm_registry_label_of(r, legacy.qualified_name));
         return member ? legacy : empty_result();
     }
     int count = bcount == SKIP_ONE ? arr->count : bcount;
