@@ -66,6 +66,11 @@ typedef struct {
     const char *qn;    /* FUNCTION: function QN; ASSOC, TYPE: type or trait QN */
     const char *assoc; /* ASSOC: the associated item name */
     bool is_trait;     /* ASSOC, TYPE: `qn` is a trait */
+    /* FUNCTION: 1-based line of the declaring `fn`, 0 when two declarations
+     * of `qn` stand in one module. Every item of a file shares the file's
+     * module QN, so a file declaring the name in two modules holds two nodes
+     * for `qn`; the line tells which one the path names. */
+    uint32_t line;
 } CBMRustPathResult;
 
 CBMRustModTree *cbm_rust_modtree_new(void);

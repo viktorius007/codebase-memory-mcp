@@ -8458,6 +8458,24 @@ static bool rust_self_path_target(RustLSPContext *ctx, TSNode callee, const char
     return true;
 }
 
+/* The free function the module tree named by `qn` declared at `line`.
+ * Every item of a file shares the file's module QN, so a name declared in
+ * two modules of one file holds the plain node and `<qn>#L<line>` twins:
+ * the twin at the declaring line is the item, and when no twin carries that
+ * line the declaration kept the plain QN. Without a line (two declarations
+ * in one module) or a namesake twin, the unique node of the name decides. */
+static const CBMRegisteredFunc *rust_module_function_node(RustLSPContext *ctx, const char *qn,
+                                                          uint32_t line) {
+    RustQnMatch m = {0};
+    rust_qn_probe(ctx, qn, false, &m);
+    if (m.func || line == 0) {
+        return m.func;
+    }
+    const CBMRegisteredFunc *f =
+        cbm_registry_lookup_func(ctx->registry, cbm_rust_line_qualified_qn(ctx->arena, qn, line));
+    return f ? f : cbm_registry_lookup_func(ctx->registry, qn);
+}
+
 /* Resolve a call path through the crate's declared module tree and `use`
  * graph into `out`. True when the tree settled the call; false leaves it to
  * the file-layout fallbacks (file outside every crate, undecidable name).
@@ -8483,10 +8501,9 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
     switch (r.kind) {
     case CBM_RUST_PATH_FUNCTION: {
         out->names_function = true;
-        RustQnMatch m = {0};
-        rust_qn_probe(ctx, r.qn, false, &m);
-        if (m.func && !m.func->receiver_type) {
-            rust_call_target_set(out, m.func, m.func->qualified_name, "lsp_module_path",
+        const CBMRegisteredFunc *func = rust_module_function_node(ctx, r.qn, r.line);
+        if (func && !func->receiver_type) {
+            rust_call_target_set(out, func, func->qualified_name, "lsp_module_path",
                                  CBM_RUST_CONF_DIRECT);
             out->impl_key = NULL;
             out->reason = path;
