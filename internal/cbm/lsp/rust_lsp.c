@@ -4664,6 +4664,7 @@ static bool rust_type_derefs_to_first_arg(const char *type_qn) {
                                       "std.sync.RwLockReadGuard",
                                       "std.sync.RwLockWriteGuard",
                                       "core.pin.Pin",
+                                      "std.pin.Pin",
                                       NULL};
     for (const char **p = derefable; *p; p++) {
         if (strcmp(*p, type_qn) == 0)
@@ -9797,6 +9798,14 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
             if (strcmp(pk, "parameter") == 0) {
                 TSNode pat = ts_node_child_by_field_name(p, "pattern", 7);
                 TSNode tn = ts_node_child_by_field_name(p, "type", 4);
+                if (!ts_node_is_null(pat) && strcmp(ts_node_type(pat), "self") == 0) {
+                    /* Typed receiver (`self: &Arc<Self>`, `self: Pin<&mut Self>`):
+                     * `self` takes the declared type, whose `Self` the type parser
+                     * reads as the impl's type; without one, `Self` names nothing. */
+                    if (ctx->self_type_qn && !ts_node_is_null(tn))
+                        cbm_scope_bind(ctx->current_scope, "self", rust_parse_type_node(ctx, tn));
+                    continue;
+                }
                 const CBMType *pt =
                     ts_node_is_null(tn) ? cbm_type_unknown() : rust_parse_type_node(ctx, tn);
                 if (!ts_node_is_null(pat))
