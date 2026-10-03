@@ -9239,6 +9239,45 @@ TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it) {
     PASS();
 }
 
+TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type) {
+    /* `Self` in an impl body is the impl's self type, whatever generic
+     * arguments the header spells: `Self::helper()` inside `impl<'a> W<'a>`
+     * is `W::helper`. A trait body's `Self` is no single type and stays open. */
+    const char *source = "pub struct W<'a> { s: &'a str }\n"
+                         "impl<'a> W<'a> {\n"
+                         "    fn helper() -> u8 { 1 }\n"
+                         "    pub fn run(&self) -> u8 { Self::helper() }\n"
+                         "}\n"
+                         "pub trait T { fn helper() -> u8; fn go() -> u8 { Self::helper() } }\n";
+    RustModTreeFixture fx = {.tree = cbm_rust_modtree_new()};
+    cbm_arena_init(&fx.arena);
+    (void)cbm_rust_modtree_add_file(fx.tree, "src/lib.rs", "p.src.lib");
+    CBMRustModFacts *facts[1] = {cbm_rust_modfacts_scan(source, (int)strlen(source))};
+    (void)cbm_rust_modtree_add_crate(fx.tree, "src/lib.rs", "p", false);
+    cbm_rust_modtree_finish(fx.tree, (const CBMRustModFacts *const *)facts);
+    cbm_rust_modfacts_free(facts[0]);
+    CBMRustLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "p.src.lib.W";
+    defs[0].short_name = "W";
+    defs[0].label = "Struct";
+    defs[0].def_module_qn = "p.src.lib";
+    defs[1].qualified_name = "p.src.lib.W.helper";
+    defs[1].short_name = "helper";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "p.src.lib.W";
+    defs[1].def_module_qn = "p.src.lib";
+    CBMRustImportSource imports = {.modtree = fx.tree};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(&fx.arena, source, (int)strlen(source), "p.src.lib",
+                                         "p.src.lib", defs, 2, NULL, NULL, 0, NULL, NULL, &imports,
+                                         &out, NULL, NULL);
+    ASSERT_GTE(find_confident(&out, "W.run", "p.src.lib.W.helper"), 0);
+    ASSERT_LT(find_confident(&out, "T.go", "helper"), 0);
+    rust_modtree_fixture_free(&fx);
+    PASS();
+}
+
 void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
@@ -9937,4 +9976,5 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_digest_tracks_visibility);
     RUN_TEST(rustlsp_modtree_use_head_names_extern_crate_past_external_glob);
     RUN_TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it);
+    RUN_TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type);
 }

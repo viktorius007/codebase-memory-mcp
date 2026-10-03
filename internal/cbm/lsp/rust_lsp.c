@@ -6655,6 +6655,75 @@ static bool rust_original_offset(const RustLSPContext *ctx, TSNode node, uint32_
     return false;
 }
 
+static const char *rust_impl_self_path(CBMArena *arena, const char *spelling);
+static bool rust_impl_has_type_param(RustLSPContext *ctx, TSNode impl_node, const char *name);
+
+/* The module-level impl block whose body holds `node`, or a null node when
+ * `node` sits in a trait, in a block-local impl or outside any impl. An item
+ * nested in a method body cannot name the outer impl's `Self` (E0401), so
+ * the innermost impl is the one `Self` refers to. */
+static TSNode rust_enclosing_module_impl(TSNode node) {
+    TSNode none = {0};
+    for (TSNode cur = ts_node_parent(node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        const char *kind = ts_node_type(cur);
+        if (strcmp(kind, "trait_item") == 0) {
+            return none;
+        }
+        if (strcmp(kind, "impl_item") != 0) {
+            continue;
+        }
+        TSNode parent = ts_node_parent(cur);
+        const char *pk = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+        if (strcmp(pk, "source_file") == 0) {
+            return cur;
+        }
+        TSNode holder = strcmp(pk, "declaration_list") == 0 ? ts_node_parent(parent) : none;
+        return !ts_node_is_null(holder) && strcmp(ts_node_type(holder), "mod_item") == 0 ? cur
+                                                                                          : none;
+    }
+    return none;
+}
+
+/* `Self::name` inside an impl body: `Self` is the impl's self type, so the
+ * path is that type's associated item. The self type is resolved through the
+ * module tree where the impl spells it, generic arguments dropped; true when
+ * the tree names a project type, with `out` set as for any `Type::name`. */
+static bool rust_self_path_target(RustLSPContext *ctx, TSNode callee, const char *path,
+                                  RustCallTarget *out) {
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    const char *name = path + 6;
+    if (!tree || !ctx->module_qn || !name[0] || strstr(name, "::")) {
+        return false;
+    }
+    TSNode impl = rust_enclosing_module_impl(callee);
+    TSNode type_node =
+        ts_node_is_null(impl) ? impl : ts_node_child_by_field_name(impl, "type", 4);
+    uint32_t offset = 0;
+    if (ts_node_is_null(type_node) || !rust_original_offset(ctx, type_node, &offset)) {
+        return false;
+    }
+    char *spelling = rust_node_text(ctx, type_node);
+    const char *self_path = spelling ? rust_impl_self_path(ctx->arena, spelling) : NULL;
+    if (!self_path || rust_impl_has_type_param(ctx, impl, self_path)) {
+        return false;
+    }
+    CBMRustPathResult r = cbm_rust_modtree_resolve_type(tree, ctx->arena, ctx->module_qn, offset,
+                                                        self_path, NULL, NULL, 0);
+    if (r.kind != CBM_RUST_PATH_TYPE) {
+        return false;
+    }
+    /* Only a found function settles the call: a variant, an ambiguous or an
+     * unregistered item keeps the receiver-based path resolution. */
+    RustCallTarget found = {0};
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", r.qn, name);
+    if (!rust_ufcs_target(ctx, qn, &found) || !found.func) {
+        return false;
+    }
+    *out = found;
+    out->names_function = true;
+    return true;
+}
+
 /* Resolve a call path through the crate's declared module tree and `use`
  * graph into `out`. True when the tree settled the call; false leaves it to
  * the file-layout fallbacks (file outside every crate, undecidable name).
@@ -6662,6 +6731,9 @@ static bool rust_original_offset(const RustLSPContext *ctx, TSNode node, uint32_
  * in-project function (a variant, a type, an external item). */
 static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const char *path,
                                     RustCallTarget *out) {
+    if (strncmp(path, "Self::", 6) == 0) {
+        return rust_self_path_target(ctx, callee, path, out);
+    }
     const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
     uint32_t offset = 0;
     if (!tree || !ctx->module_qn || ctx->glob_count > ctx->file_glob_count ||
