@@ -67,6 +67,10 @@ static char *rust_node_text(RustLSPContext *ctx, TSNode node);
 static const char *convert_path_to_qn(CBMArena *arena, const char *path);
 static bool rust_type_derefs_to_first_arg(const char *type_qn);
 static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t);
+static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head);
+static const char *rust_wrapper_head_qn(RustLSPContext *ctx, const char *head);
+static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMType *base,
+                                                 const char *method);
 static bool rust_bound_is_marker(const char *bound, size_t len);
 static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBMTypeRegistry *reg,
                                                                        const char *receiver_qn,
@@ -2835,6 +2839,541 @@ static const CBMType *rust_expand_type_aliases(RustLSPContext *ctx, const CBMTyp
     }
 }
 
+/* Std types whose methods' returns are declared in RUST_STD_RETURNS. */
+typedef enum {
+    RUST_STD_NONE,
+    RUST_STD_OPTION,
+    RUST_STD_RESULT,
+    RUST_STD_ARC,
+    RUST_STD_RC,
+    RUST_STD_WEAK_SYNC,
+    RUST_STD_WEAK_RC,
+    RUST_STD_MUTEX,
+    RUST_STD_RWLOCK,
+    RUST_STD_REFCELL,
+    RUST_STD_CELL,
+    RUST_STD_PATHBUF,
+    RUST_STD_PATH,
+    RUST_STD_STRING,
+    RUST_STD_VEC,
+} RustStdFamily;
+
+typedef struct {
+    RustStdFamily family;
+    const char *qn;
+} RustStdFamilyQN;
+
+/* Every path a std type is known under (re-exports name the same type).
+ * `std.io.Result<T>` and `anyhow.Result<T>` are `Result<T, E>` with E fixed. */
+static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
+    {RUST_STD_OPTION, "core.option.Option"},  {RUST_STD_OPTION, "std.option.Option"},
+    {RUST_STD_RESULT, "core.result.Result"},  {RUST_STD_RESULT, "std.result.Result"},
+    {RUST_STD_RESULT, "std.io.Result"},       {RUST_STD_RESULT, "anyhow.Result"},
+    {RUST_STD_ARC, "alloc.sync.Arc"},         {RUST_STD_ARC, "std.sync.Arc"},
+    {RUST_STD_RC, "alloc.rc.Rc"},             {RUST_STD_RC, "std.rc.Rc"},
+    {RUST_STD_WEAK_SYNC, "alloc.sync.Weak"},  {RUST_STD_WEAK_SYNC, "std.sync.Weak"},
+    {RUST_STD_WEAK_RC, "alloc.rc.Weak"},      {RUST_STD_WEAK_RC, "std.rc.Weak"},
+    {RUST_STD_MUTEX, "std.sync.Mutex"},       {RUST_STD_RWLOCK, "std.sync.RwLock"},
+    {RUST_STD_REFCELL, "core.cell.RefCell"},  {RUST_STD_REFCELL, "std.cell.RefCell"},
+    {RUST_STD_CELL, "core.cell.Cell"},        {RUST_STD_CELL, "std.cell.Cell"},
+    {RUST_STD_PATHBUF, "std.path.PathBuf"},   {RUST_STD_PATH, "std.path.Path"},
+    {RUST_STD_STRING, "alloc.string.String"}, {RUST_STD_STRING, "std.string.String"},
+    {RUST_STD_VEC, "alloc.vec.Vec"},          {RUST_STD_VEC, "std.vec.Vec"},
+    {RUST_STD_NONE, NULL}};
+
+/* A std method's declared return, written over the receiver: `Self` is the
+ * receiver, `T` / `E` its first / second generic argument, `_` a type the
+ * call does not fix, `~X` X with one reference removed, `&X` a reference,
+ * `[X]` a slice, `()` unit; a lowercase name is a builtin, a dotted name a
+ * std type. `assoc_only` marks an associated function taking the receiver
+ * as its first argument (`Arc::downgrade(&a)`), never a method call. */
+typedef struct {
+    RustStdFamily family;
+    const char *method;
+    const char *ret;
+    bool assoc_only;
+} RustStdReturn;
+
+#define RS_OPT(x) "core.option.Option<" x ">"
+#define RS_RES(x, e) "core.result.Result<" x "," e ">"
+#define RS_PATH "std.path.Path"
+#define RS_PATHBUF "std.path.PathBuf"
+#define RS_OSSTR "std.ffi.OsStr"
+
+static const RustStdReturn RUST_STD_RETURNS[] = {
+    /* Option<T> */
+    {RUST_STD_OPTION, "unwrap", "T", false},
+    {RUST_STD_OPTION, "expect", "T", false},
+    {RUST_STD_OPTION, "unwrap_or", "T", false},
+    {RUST_STD_OPTION, "unwrap_or_else", "T", false},
+    {RUST_STD_OPTION, "unwrap_or_default", "T", false},
+    {RUST_STD_OPTION, "unwrap_unchecked", "T", false},
+    {RUST_STD_OPTION, "as_ref", RS_OPT("&T"), false},
+    {RUST_STD_OPTION, "as_mut", RS_OPT("&T"), false},
+    {RUST_STD_OPTION, "take", "Self", false},
+    {RUST_STD_OPTION, "take_if", "Self", false},
+    {RUST_STD_OPTION, "replace", "Self", false},
+    {RUST_STD_OPTION, "clone", "Self", false},
+    {RUST_STD_OPTION, "or", "Self", false},
+    {RUST_STD_OPTION, "or_else", "Self", false},
+    {RUST_STD_OPTION, "xor", "Self", false},
+    {RUST_STD_OPTION, "filter", "Self", false},
+    {RUST_STD_OPTION, "inspect", "Self", false},
+    {RUST_STD_OPTION, "cloned", RS_OPT("~T"), false},
+    {RUST_STD_OPTION, "copied", RS_OPT("~T"), false},
+    {RUST_STD_OPTION, "ok_or", RS_RES("T", "_"), false},
+    {RUST_STD_OPTION, "ok_or_else", RS_RES("T", "_"), false},
+    {RUST_STD_OPTION, "is_some", "bool", false},
+    {RUST_STD_OPTION, "is_none", "bool", false},
+    {RUST_STD_OPTION, "is_some_and", "bool", false},
+    {RUST_STD_OPTION, "is_none_or", "bool", false},
+    {RUST_STD_OPTION, "insert", "&T", false},
+    {RUST_STD_OPTION, "get_or_insert", "&T", false},
+    {RUST_STD_OPTION, "get_or_insert_with", "&T", false},
+    {RUST_STD_OPTION, "get_or_insert_default", "&T", false},
+    /* Result<T, E> */
+    {RUST_STD_RESULT, "unwrap", "T", false},
+    {RUST_STD_RESULT, "expect", "T", false},
+    {RUST_STD_RESULT, "unwrap_or", "T", false},
+    {RUST_STD_RESULT, "unwrap_or_else", "T", false},
+    {RUST_STD_RESULT, "unwrap_or_default", "T", false},
+    {RUST_STD_RESULT, "unwrap_err", "E", false},
+    {RUST_STD_RESULT, "expect_err", "E", false},
+    {RUST_STD_RESULT, "ok", RS_OPT("T"), false},
+    {RUST_STD_RESULT, "err", RS_OPT("E"), false},
+    {RUST_STD_RESULT, "map_err", RS_RES("T", "_"), false},
+    {RUST_STD_RESULT, "or", RS_RES("T", "_"), false},
+    {RUST_STD_RESULT, "or_else", RS_RES("T", "_"), false},
+    {RUST_STD_RESULT, "map", RS_RES("_", "E"), false},
+    {RUST_STD_RESULT, "and", RS_RES("_", "E"), false},
+    {RUST_STD_RESULT, "and_then", RS_RES("_", "E"), false},
+    {RUST_STD_RESULT, "as_ref", RS_RES("&T", "&E"), false},
+    {RUST_STD_RESULT, "as_mut", RS_RES("&T", "&E"), false},
+    {RUST_STD_RESULT, "cloned", RS_RES("~T", "E"), false},
+    {RUST_STD_RESULT, "copied", RS_RES("~T", "E"), false},
+    {RUST_STD_RESULT, "clone", "Self", false},
+    {RUST_STD_RESULT, "inspect", "Self", false},
+    {RUST_STD_RESULT, "inspect_err", "Self", false},
+    {RUST_STD_RESULT, "is_ok", "bool", false},
+    {RUST_STD_RESULT, "is_err", "bool", false},
+    {RUST_STD_RESULT, "is_ok_and", "bool", false},
+    {RUST_STD_RESULT, "is_err_and", "bool", false},
+    /* Arc<T> */
+    {RUST_STD_ARC, "clone", "Self", false},
+    {RUST_STD_ARC, "as_ref", "&T", false},
+    {RUST_STD_ARC, "downgrade", "alloc.sync.Weak<T>", true},
+    {RUST_STD_ARC, "strong_count", "usize", true},
+    {RUST_STD_ARC, "weak_count", "usize", true},
+    {RUST_STD_ARC, "ptr_eq", "bool", true},
+    {RUST_STD_ARC, "try_unwrap", RS_RES("T", "Self"), true},
+    {RUST_STD_ARC, "into_inner", RS_OPT("T"), true},
+    {RUST_STD_ARC, "unwrap_or_clone", "T", true},
+    {RUST_STD_ARC, "get_mut", RS_OPT("&T"), true},
+    {RUST_STD_ARC, "make_mut", "&T", true},
+    /* Rc<T> */
+    {RUST_STD_RC, "clone", "Self", false},
+    {RUST_STD_RC, "as_ref", "&T", false},
+    {RUST_STD_RC, "downgrade", "alloc.rc.Weak<T>", true},
+    {RUST_STD_RC, "strong_count", "usize", true},
+    {RUST_STD_RC, "weak_count", "usize", true},
+    {RUST_STD_RC, "ptr_eq", "bool", true},
+    {RUST_STD_RC, "try_unwrap", RS_RES("T", "Self"), true},
+    {RUST_STD_RC, "into_inner", RS_OPT("T"), true},
+    {RUST_STD_RC, "unwrap_or_clone", "T", true},
+    {RUST_STD_RC, "get_mut", RS_OPT("&T"), true},
+    {RUST_STD_RC, "make_mut", "&T", true},
+    /* Weak<T> */
+    {RUST_STD_WEAK_SYNC, "clone", "Self", false},
+    {RUST_STD_WEAK_SYNC, "upgrade", RS_OPT("alloc.sync.Arc<T>"), false},
+    {RUST_STD_WEAK_SYNC, "strong_count", "usize", false},
+    {RUST_STD_WEAK_SYNC, "weak_count", "usize", false},
+    {RUST_STD_WEAK_SYNC, "ptr_eq", "bool", false},
+    {RUST_STD_WEAK_RC, "clone", "Self", false},
+    {RUST_STD_WEAK_RC, "upgrade", RS_OPT("alloc.rc.Rc<T>"), false},
+    {RUST_STD_WEAK_RC, "strong_count", "usize", false},
+    {RUST_STD_WEAK_RC, "weak_count", "usize", false},
+    {RUST_STD_WEAK_RC, "ptr_eq", "bool", false},
+    /* Mutex<T>: LockResult / TryLockResult are Result<Guard, _>. */
+    {RUST_STD_MUTEX, "lock", RS_RES("std.sync.MutexGuard<T>", "_"), false},
+    {RUST_STD_MUTEX, "try_lock", RS_RES("std.sync.MutexGuard<T>", "_"), false},
+    {RUST_STD_MUTEX, "into_inner", RS_RES("T", "_"), false},
+    {RUST_STD_MUTEX, "get_mut", RS_RES("&T", "_"), false},
+    {RUST_STD_MUTEX, "is_poisoned", "bool", false},
+    {RUST_STD_MUTEX, "clear_poison", "()", false},
+    /* RwLock<T> */
+    {RUST_STD_RWLOCK, "read", RS_RES("std.sync.RwLockReadGuard<T>", "_"), false},
+    {RUST_STD_RWLOCK, "try_read", RS_RES("std.sync.RwLockReadGuard<T>", "_"), false},
+    {RUST_STD_RWLOCK, "write", RS_RES("std.sync.RwLockWriteGuard<T>", "_"), false},
+    {RUST_STD_RWLOCK, "try_write", RS_RES("std.sync.RwLockWriteGuard<T>", "_"), false},
+    {RUST_STD_RWLOCK, "into_inner", RS_RES("T", "_"), false},
+    {RUST_STD_RWLOCK, "get_mut", RS_RES("&T", "_"), false},
+    {RUST_STD_RWLOCK, "is_poisoned", "bool", false},
+    {RUST_STD_RWLOCK, "clear_poison", "()", false},
+    /* RefCell<T> / Cell<T> */
+    {RUST_STD_REFCELL, "borrow", "core.cell.Ref<T>", false},
+    {RUST_STD_REFCELL, "borrow_mut", "core.cell.RefMut<T>", false},
+    {RUST_STD_REFCELL, "try_borrow", RS_RES("core.cell.Ref<T>", "_"), false},
+    {RUST_STD_REFCELL, "try_borrow_mut", RS_RES("core.cell.RefMut<T>", "_"), false},
+    {RUST_STD_REFCELL, "into_inner", "T", false},
+    {RUST_STD_REFCELL, "get_mut", "&T", false},
+    {RUST_STD_REFCELL, "take", "T", false},
+    {RUST_STD_REFCELL, "replace", "T", false},
+    {RUST_STD_REFCELL, "replace_with", "T", false},
+    {RUST_STD_REFCELL, "clone", "Self", false},
+    {RUST_STD_CELL, "get", "T", false},
+    {RUST_STD_CELL, "take", "T", false},
+    {RUST_STD_CELL, "replace", "T", false},
+    {RUST_STD_CELL, "into_inner", "T", false},
+    {RUST_STD_CELL, "get_mut", "&T", false},
+    {RUST_STD_CELL, "set", "()", false},
+    /* PathBuf (its other methods are Path's, through Deref) */
+    {RUST_STD_PATHBUF, "as_path", "&" RS_PATH, false},
+    {RUST_STD_PATHBUF, "clone", "Self", false},
+    {RUST_STD_PATHBUF, "to_owned", "Self", false},
+    {RUST_STD_PATHBUF, "push", "()", false},
+    {RUST_STD_PATHBUF, "pop", "bool", false},
+    {RUST_STD_PATHBUF, "set_extension", "bool", false},
+    {RUST_STD_PATHBUF, "set_file_name", "()", false},
+    {RUST_STD_PATHBUF, "capacity", "usize", false},
+    {RUST_STD_PATHBUF, "into_os_string", "std.ffi.OsString", false},
+    /* Path */
+    {RUST_STD_PATH, "join", RS_PATHBUF, false},
+    {RUST_STD_PATH, "to_path_buf", RS_PATHBUF, false},
+    {RUST_STD_PATH, "to_owned", RS_PATHBUF, false},
+    {RUST_STD_PATH, "with_extension", RS_PATHBUF, false},
+    {RUST_STD_PATH, "with_file_name", RS_PATHBUF, false},
+    {RUST_STD_PATH, "parent", RS_OPT("&" RS_PATH), false},
+    {RUST_STD_PATH, "file_name", RS_OPT("&" RS_OSSTR), false},
+    {RUST_STD_PATH, "file_stem", RS_OPT("&" RS_OSSTR), false},
+    {RUST_STD_PATH, "extension", RS_OPT("&" RS_OSSTR), false},
+    {RUST_STD_PATH, "as_os_str", "&" RS_OSSTR, false},
+    {RUST_STD_PATH, "to_str", RS_OPT("&str"), false},
+    {RUST_STD_PATH, "strip_prefix", RS_RES("&" RS_PATH, "_"), false},
+    {RUST_STD_PATH, "canonicalize", RS_RES(RS_PATHBUF, "_"), false},
+    {RUST_STD_PATH, "read_link", RS_RES(RS_PATHBUF, "_"), false},
+    {RUST_STD_PATH, "display", "std.path.Display", false},
+    {RUST_STD_PATH, "exists", "bool", false},
+    {RUST_STD_PATH, "is_file", "bool", false},
+    {RUST_STD_PATH, "is_dir", "bool", false},
+    {RUST_STD_PATH, "is_symlink", "bool", false},
+    {RUST_STD_PATH, "is_absolute", "bool", false},
+    {RUST_STD_PATH, "is_relative", "bool", false},
+    {RUST_STD_PATH, "has_root", "bool", false},
+    {RUST_STD_PATH, "starts_with", "bool", false},
+    {RUST_STD_PATH, "ends_with", "bool", false},
+    /* String */
+    {RUST_STD_STRING, "clone", "Self", false},
+    {RUST_STD_STRING, "to_owned", "Self", false},
+    {RUST_STD_STRING, "to_string", "Self", false},
+    {RUST_STD_STRING, "to_lowercase", "Self", false},
+    {RUST_STD_STRING, "to_uppercase", "Self", false},
+    {RUST_STD_STRING, "repeat", "Self", false},
+    {RUST_STD_STRING, "replace", "Self", false},
+    {RUST_STD_STRING, "split_off", "Self", false},
+    {RUST_STD_STRING, "as_str", "&str", false},
+    {RUST_STD_STRING, "as_mut_str", "&str", false},
+    {RUST_STD_STRING, "trim", "&str", false},
+    {RUST_STD_STRING, "trim_start", "&str", false},
+    {RUST_STD_STRING, "trim_end", "&str", false},
+    {RUST_STD_STRING, "as_bytes", "&[u8]", false},
+    {RUST_STD_STRING, "into_bytes", "alloc.vec.Vec<u8>", false},
+    {RUST_STD_STRING, "len", "usize", false},
+    {RUST_STD_STRING, "capacity", "usize", false},
+    {RUST_STD_STRING, "is_empty", "bool", false},
+    {RUST_STD_STRING, "starts_with", "bool", false},
+    {RUST_STD_STRING, "ends_with", "bool", false},
+    {RUST_STD_STRING, "contains", "bool", false},
+    {RUST_STD_STRING, "pop", RS_OPT("char"), false},
+    {RUST_STD_STRING, "remove", "char", false},
+    {RUST_STD_STRING, "push", "()", false},
+    {RUST_STD_STRING, "push_str", "()", false},
+    {RUST_STD_STRING, "insert", "()", false},
+    {RUST_STD_STRING, "insert_str", "()", false},
+    {RUST_STD_STRING, "clear", "()", false},
+    {RUST_STD_STRING, "truncate", "()", false},
+    /* Vec<T> (with the slice methods it reaches through Deref); the
+     * iterators keep the element-typed Iterator the chains below read. */
+    {RUST_STD_VEC, "clone", "Self", false},
+    {RUST_STD_VEC, "to_vec", "Self", false},
+    {RUST_STD_VEC, "split_off", "Self", false},
+    {RUST_STD_VEC, "len", "usize", false},
+    {RUST_STD_VEC, "capacity", "usize", false},
+    {RUST_STD_VEC, "is_empty", "bool", false},
+    {RUST_STD_VEC, "contains", "bool", false},
+    {RUST_STD_VEC, "pop", RS_OPT("T"), false},
+    {RUST_STD_VEC, "remove", "T", false},
+    {RUST_STD_VEC, "swap_remove", "T", false},
+    {RUST_STD_VEC, "first", RS_OPT("&T"), false},
+    {RUST_STD_VEC, "last", RS_OPT("&T"), false},
+    {RUST_STD_VEC, "first_mut", RS_OPT("&T"), false},
+    {RUST_STD_VEC, "last_mut", RS_OPT("&T"), false},
+    {RUST_STD_VEC, "as_slice", "&[T]", false},
+    {RUST_STD_VEC, "as_mut_slice", "&[T]", false},
+    {RUST_STD_VEC, "iter", "core.iter.Iterator<T>", false},
+    {RUST_STD_VEC, "iter_mut", "core.iter.Iterator<T>", false},
+    {RUST_STD_VEC, "into_iter", "core.iter.Iterator<T>", false},
+    {RUST_STD_VEC, "drain", "core.iter.Iterator<T>", false},
+    {RUST_STD_VEC, "push", "()", false},
+    {RUST_STD_VEC, "insert", "()", false},
+    {RUST_STD_VEC, "clear", "()", false},
+    {RUST_STD_VEC, "truncate", "()", false},
+    {RUST_STD_VEC, "extend", "()", false},
+    {RUST_STD_VEC, "extend_from_slice", "()", false},
+    {RUST_STD_VEC, "retain", "()", false},
+    {RUST_STD_VEC, "dedup", "()", false},
+    {RUST_STD_VEC, "reverse", "()", false},
+    {RUST_STD_VEC, "sort", "()", false},
+    {RUST_STD_VEC, "sort_by", "()", false},
+    {RUST_STD_VEC, "sort_by_key", "()", false},
+    {RUST_STD_VEC, "sort_unstable", "()", false},
+    {RUST_STD_NONE, NULL, NULL, false}};
+
+#undef RS_OPT
+#undef RS_RES
+#undef RS_PATH
+#undef RS_PATHBUF
+#undef RS_OSSTR
+
+static RustStdFamily rust_std_family_of_qn(const char *qn) {
+    if (!qn) {
+        return RUST_STD_NONE;
+    }
+    for (const RustStdFamilyQN *e = RUST_STD_FAMILY_QNS; e->qn; e++) {
+        if (strcmp(e->qn, qn) == 0) {
+            return e->family;
+        }
+    }
+    return RUST_STD_NONE;
+}
+
+/* The std type a written or recorded type head names, resolved like any
+ * type name: the head itself, the registry, then for a bare name the
+ * file's `use` and the prelude. A project type sharing the name is not std. */
+static RustStdFamily rust_std_family_of(RustLSPContext *ctx, const char *head) {
+    RustStdFamily fam = rust_std_family_of_qn(head);
+    if (fam != RUST_STD_NONE || !head) {
+        return fam;
+    }
+    const char *qn = convert_path_to_qn(ctx->arena, head);
+    fam = rust_std_family_of_qn(qn);
+    if (fam != RUST_STD_NONE) {
+        return fam;
+    }
+    const char *registered = rust_registered_type_qn(ctx, qn);
+    if (registered) {
+        return rust_std_family_of_qn(registered);
+    }
+    if (strchr(qn, '.')) {
+        return RUST_STD_NONE;
+    }
+    const char *imported = rust_resolve_use(ctx, qn);
+    if (imported) {
+        return rust_std_family_of_qn(convert_path_to_qn(ctx->arena, imported));
+    }
+    return rust_std_family_of_qn(rust_lookup_prelude(qn));
+}
+
+static const RustStdReturn *rust_std_return_entry(RustStdFamily fam, const char *method,
+                                                  bool method_call) {
+    for (const RustStdReturn *e = RUST_STD_RETURNS; e->method; e++) {
+        if (e->family == fam && strcmp(e->method, method) == 0 &&
+            !(method_call && e->assoc_only)) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+enum { RUST_STD_SPEC_MAX_ARGS = 4, RUST_STD_SPEC_NAME_MAX = 64 };
+
+/* One type of a RUST_STD_RETURNS spec at `*sp`, written over `self`. */
+static const CBMType *rust_std_spec_parse(RustLSPContext *ctx, const char **sp,
+                                          const CBMType *self) {
+    const char *s = *sp;
+    const CBMType *const *args =
+        self->kind == CBM_TYPE_TEMPLATE ? self->data.template_type.template_args : NULL;
+    int argc = self->kind == CBM_TYPE_TEMPLATE ? self->data.template_type.arg_count : 0;
+    const CBMType *out = cbm_type_unknown();
+    if (*s == '&' || *s == '~') {
+        char op = *s;
+        *sp = s + 1;
+        const CBMType *inner = rust_std_spec_parse(ctx, sp, self);
+        if (cbm_type_is_unknown(inner)) {
+            return inner;
+        }
+        if (op == '&') {
+            return cbm_type_reference(ctx->arena, inner);
+        }
+        return inner->kind == CBM_TYPE_REFERENCE ? inner->data.reference.elem
+                                                 : cbm_type_unknown();
+    }
+    if (*s == '[') {
+        *sp = s + 1;
+        const CBMType *elem = rust_std_spec_parse(ctx, sp, self);
+        *sp += **sp == ']' ? 1 : 0;
+        return cbm_type_is_unknown(elem) ? elem : cbm_type_slice(ctx->arena, elem);
+    }
+    if (s[0] == '(' && s[1] == ')') {
+        *sp = s + 2;
+        return cbm_type_builtin(ctx->arena, "()");
+    }
+    char name[RUST_STD_SPEC_NAME_MAX];
+    size_t n = 0;
+    while ((isalnum((unsigned char)*s) || *s == '_' || *s == '.') && n + 1 < sizeof(name)) {
+        name[n++] = *s++;
+    }
+    name[n] = '\0';
+    const CBMType *targs[RUST_STD_SPEC_MAX_ARGS];
+    int targc = 0;
+    if (*s == '<') {
+        s++;
+        while (*s && *s != '>') {
+            *sp = s;
+            const CBMType *a = rust_std_spec_parse(ctx, sp, self);
+            s = *sp;
+            if (targc < RUST_STD_SPEC_MAX_ARGS) {
+                targs[targc++] = a;
+            }
+            s += *s == ',' ? 1 : 0;
+        }
+        s += *s == '>' ? 1 : 0;
+    }
+    *sp = s;
+    if (strcmp(name, "Self") == 0) {
+        out = self;
+    } else if (strcmp(name, "T") == 0) {
+        out = argc > 0 && args[0] ? args[0] : cbm_type_unknown();
+    } else if (strcmp(name, "E") == 0) {
+        out = argc > 1 && args[1] ? args[1] : cbm_type_unknown();
+    } else if (strcmp(name, "_") == 0 || n == 0) {
+        out = cbm_type_unknown();
+    } else if (!strchr(name, '.')) {
+        out = cbm_type_builtin(ctx->arena, cbm_arena_strdup(ctx->arena, name));
+    } else {
+        const char *qn = cbm_arena_strdup(ctx->arena, name);
+        out = targc > 0 ? cbm_type_template(ctx->arena, qn, targs, targc)
+                        : cbm_type_named(ctx->arena, qn);
+    }
+    return out;
+}
+
+/* `entry`'s return for the receiver `self`; NULL when the spec reads unknown. */
+static const CBMType *rust_std_return_type(RustLSPContext *ctx, const RustStdReturn *entry,
+                                           const CBMType *self) {
+    const char *sp = entry->ret;
+    const CBMType *t = rust_std_spec_parse(ctx, &sp, self);
+    return cbm_type_is_unknown(t) ? NULL : t;
+}
+
+static const char *rust_std_type_head(const CBMType *t) {
+    if (t && t->kind == CBM_TYPE_TEMPLATE) {
+        return t->data.template_type.template_name;
+    }
+    if (t && t->kind == CBM_TYPE_NAMED) {
+        return t->data.named.qualified_name;
+    }
+    return NULL;
+}
+
+/* Lock and borrow guards implement only Deref, Drop, Debug and Display on
+ * themselves: `guard.clone()` or `guard.as_ref()` reaches the target. */
+static const char *const RUST_GUARD_TRAIT_METHODS[] = {"deref", "deref_mut", "drop",
+                                                       "fmt",   "to_string", NULL};
+
+static bool rust_std_is_guard(RustLSPContext *ctx, const char *head) {
+    static const char *const guards[] = {"core.cell.Ref",          "std.cell.Ref",
+                                         "core.cell.RefMut",       "std.cell.RefMut",
+                                         "std.sync.MutexGuard",    "std.sync.RwLockReadGuard",
+                                         "std.sync.RwLockWriteGuard", NULL};
+    const char *qn = head ? rust_wrapper_head_qn(ctx, head) : NULL;
+    return qn && rust_method_in(guards, qn);
+}
+
+static const CBMType *rust_strip_references(const CBMType *t) {
+    while (t && t->kind == CBM_TYPE_REFERENCE) {
+        t = t->data.reference.elem;
+    }
+    return t;
+}
+
+/* Declared return of `recv.method(..)` when method lookup settles on a std
+ * method in RUST_STD_RETURNS: the receiver, then its Deref targets through
+ * std wrappers, as autoderef probes them (PathBuf reaches Path's methods).
+ * NULL leaves the call to the registry. A wrapper's own trait methods stop
+ * the walk: rustc finds them on the wrapper, not its target, as it does a
+ * `Borrow`/`BorrowMut` the file imports. */
+static const CBMType *rust_std_method_return(RustLSPContext *ctx, const CBMType *recv,
+                                             const char *method) {
+    const CBMType *cur = rust_strip_references(recv);
+    for (int hop = 0; cur && hop < RUST_DEREF_MAX_HOPS; hop++) {
+        RustStdFamily fam = rust_std_family_of(ctx, rust_std_type_head(cur));
+        const char *head = rust_std_type_head(cur);
+        bool wrapper = head && rust_wrapper_head_derefs(ctx, head);
+        if (fam == RUST_STD_NONE && !wrapper) {
+            return NULL;
+        }
+        if (hop > 0 && fam == RUST_STD_REFCELL &&
+            (rust_resolve_use(ctx, "Borrow") || rust_resolve_use(ctx, "BorrowMut"))) {
+            return NULL;
+        }
+        const RustStdReturn *e =
+            fam != RUST_STD_NONE ? rust_std_return_entry(fam, method, true) : NULL;
+        if (!e && fam == RUST_STD_PATHBUF) {
+            e = rust_std_return_entry(RUST_STD_PATH, method, true);
+        }
+        if (e) {
+            return rust_std_return_type(ctx, e, cur);
+        }
+        bool own_trait_method = rust_std_is_guard(ctx, head)
+                                    ? rust_method_in(RUST_GUARD_TRAIT_METHODS, method)
+                                    : rust_is_wrapper_trait_method(method);
+        if (!wrapper || own_trait_method ||
+            rust_wrapper_has_corpus_trait_method(ctx, cur, method)) {
+            return NULL;
+        }
+        cur = rust_strip_references(rust_deref_step(ctx, cur));
+    }
+    return NULL;
+}
+
+/* `Type::method(recv, ..)` for a std type in RUST_STD_RETURNS: the declared
+ * return over the first argument's type, when that argument is the type
+ * the path names (`Arc::clone(&a)`, `Arc::downgrade(&a)`). */
+static const CBMType *rust_std_path_call_return(RustLSPContext *ctx, TSNode func_node,
+                                                TSNode args_node) {
+    if (strcmp(ts_node_type(func_node), "scoped_identifier") != 0 || ts_node_is_null(args_node) ||
+        ts_node_named_child_count(args_node) == 0) {
+        return NULL;
+    }
+    char *path = rust_node_text(ctx, func_node);
+    if (!path) {
+        return NULL;
+    }
+    rust_strip_turbofish(path);
+    char *sep = strstr(path, "::");
+    char *last = NULL;
+    while (sep) {
+        last = sep;
+        sep = strstr(sep + 2, "::");
+    }
+    if (!last) {
+        return NULL;
+    }
+    *last = '\0';
+    RustStdFamily fam = rust_std_family_of(ctx, path);
+    const RustStdReturn *e =
+        fam != RUST_STD_NONE ? rust_std_return_entry(fam, last + 2, false) : NULL;
+    if (!e) {
+        return NULL;
+    }
+    const CBMType *recv =
+        rust_strip_references(rust_eval_expr_type(ctx, ts_node_named_child(args_node, 0)));
+    if (rust_std_family_of(ctx, rust_std_type_head(recv)) != fam) {
+        return NULL;
+    }
+    return rust_std_return_type(ctx, e, recv);
+}
+
 static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                                              const CBMRegisteredFunc **callee);
 
@@ -2856,7 +3395,10 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
     }
     const char *fk = ts_node_type(func_node);
 
-    const CBMType *produced = NULL;
+    const CBMType *produced = rust_std_path_call_return(ctx, func_node, args_node);
+    if (produced) {
+        return produced;
+    }
     if (rust_eval_path_call_by_target(ctx, func_node, &produced, callee)) {
         return produced;
     }
@@ -3005,6 +3547,10 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                 while (base && base->kind == CBM_TYPE_REFERENCE) {
                     base = base->data.reference.elem;
                 }
+                const CBMType *declared = rust_std_method_return(ctx, recv, mname);
+                if (declared) {
+                    return declared;
+                }
                 /* Template Vec<T> method handling */
                 if (base && base->kind == CBM_TYPE_TEMPLATE) {
                     const char *tname = base->data.template_type.template_name;
@@ -3052,48 +3598,6 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                                     cbm_type_slice(ctx->arena,
                                                    base->data.template_type.template_args[0]));
                             }
-                        }
-                    }
-                    if (strstr(tname, "Option")) {
-                        if (strcmp(mname, "unwrap") == 0 || strcmp(mname, "expect") == 0 ||
-                            strcmp(mname, "unwrap_or") == 0 ||
-                            strcmp(mname, "unwrap_or_default") == 0 ||
-                            strcmp(mname, "unwrap_or_else") == 0) {
-                            if (base->data.template_type.arg_count > 0) {
-                                return base->data.template_type.template_args[0];
-                            }
-                        }
-                        if (strcmp(mname, "is_some") == 0 || strcmp(mname, "is_none") == 0) {
-                            return cbm_type_builtin(ctx->arena, "bool");
-                        }
-                        if (strcmp(mname, "as_ref") == 0) {
-                            if (base->data.template_type.arg_count > 0) {
-                                const CBMType *arg0 = cbm_type_reference(
-                                    ctx->arena, base->data.template_type.template_args[0]);
-                                return cbm_type_template(ctx->arena, "core.option.Option",
-                                                         &arg0, 1);
-                            }
-                        }
-                    }
-                    if (strstr(tname, "Result")) {
-                        if (strcmp(mname, "unwrap") == 0 || strcmp(mname, "expect") == 0 ||
-                            strcmp(mname, "unwrap_or") == 0) {
-                            if (base->data.template_type.arg_count > 0) {
-                                return base->data.template_type.template_args[0];
-                            }
-                        }
-                        if (strcmp(mname, "ok") == 0 &&
-                            base->data.template_type.arg_count > 0) {
-                            const CBMType *a0 = base->data.template_type.template_args[0];
-                            return cbm_type_template(ctx->arena, "core.option.Option", &a0, 1);
-                        }
-                        if (strcmp(mname, "err") == 0 &&
-                            base->data.template_type.arg_count > 1) {
-                            const CBMType *a1 = base->data.template_type.template_args[1];
-                            return cbm_type_template(ctx->arena, "core.option.Option", &a1, 1);
-                        }
-                        if (strcmp(mname, "is_ok") == 0 || strcmp(mname, "is_err") == 0) {
-                            return cbm_type_builtin(ctx->arena, "bool");
                         }
                     }
                     if (strstr(tname, "Iterator")) {
@@ -3874,6 +4378,10 @@ static bool rust_type_derefs_to_first_arg(const char *type_qn) {
                                       "std.cell.RefCell",
                                       "core.cell.Cell",
                                       "std.cell.Cell",
+                                      "core.cell.Ref",
+                                      "std.cell.Ref",
+                                      "core.cell.RefMut",
+                                      "std.cell.RefMut",
                                       "std.sync.MutexGuard",
                                       "std.sync.RwLockReadGuard",
                                       "std.sync.RwLockWriteGuard",

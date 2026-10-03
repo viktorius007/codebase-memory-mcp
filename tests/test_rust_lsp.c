@@ -1034,6 +1034,137 @@ TEST(rustlsp_crossfile_return_opaque_types) {
     PASS();
 }
 
+/* Two types with the same method, so only the receiver's type decides
+ * which one a call reaches. */
+#define RUSTLSP_STD_DECOYS                                                \
+    "struct Conn;\nstruct Other;\n"                                       \
+    "impl Conn { fn ping(&self) -> bool { true } }\n"                     \
+    "impl Other { fn ping(&self) -> bool { false } }\n"
+
+static bool rustlsp_std_chain_reaches_conn(const char *source) {
+    CBMFileResult *r = extract_rust(source);
+    if (!r) {
+        return false;
+    }
+    bool ok = find_resolved(r, "run", "Conn.ping") >= 0 && find_resolved(r, "run", "Other.ping") < 0;
+    cbm_free_result(r);
+    return ok;
+}
+
+/* `Arc<T>::clone -> Self`, `Arc::downgrade -> Weak<T>`, `Weak::upgrade ->
+ * Option<Arc<T>>`, `Rc<T>::clone -> Self`, each substituted at the call. */
+TEST(rustlsp_std_returns_shared_pointers) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::Arc;\n" RUSTLSP_STD_DECOYS
+        "fn run(a: Arc<Conn>) -> bool { a.clone().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::Arc;\n" RUSTLSP_STD_DECOYS
+        "fn run(a: &Arc<Conn>) -> bool { Arc::clone(a).ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::Arc;\n" RUSTLSP_STD_DECOYS
+        "fn run(a: Arc<Conn>) -> bool { Arc::downgrade(&a).upgrade().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::rc::Rc;\n" RUSTLSP_STD_DECOYS
+        "fn run(a: Rc<Conn>) -> bool { a.clone().ping() }\n"));
+    PASS();
+}
+
+/* `Mutex<T>::lock -> LockResult<MutexGuard<T>>`; `unwrap`/`?` yields the
+ * guard, which derefs to T. The same for RwLock's read/write guards. */
+TEST(rustlsp_std_returns_locks) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::{Arc, Mutex};\n" RUSTLSP_STD_DECOYS
+        "struct S { c: Arc<Mutex<Conn>> }\n"
+        "fn run(s: &S) -> bool { s.c.lock().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::RwLock;\n" RUSTLSP_STD_DECOYS
+        "fn run(l: &RwLock<Conn>) -> bool { l.read().expect(\"x\").ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::RwLock;\n" RUSTLSP_STD_DECOYS
+        "fn run(l: &RwLock<Conn>) -> Result<bool, String> {\n"
+        "    Ok(l.write().map_err(|_| String::new())?.ping())\n}\n"));
+    PASS();
+}
+
+/* A Mutex the file imports from elsewhere is not std's: its `lock` stays
+ * unknown rather than read as std's guard. */
+TEST(rustlsp_std_returns_foreign_mutex_stays_unknown) {
+    ASSERT_FALSE(rustlsp_std_chain_reaches_conn(
+        "use tokio::sync::Mutex;\n" RUSTLSP_STD_DECOYS
+        "fn run(m: &Mutex<Conn>) -> bool { m.lock().unwrap().ping() }\n"));
+    PASS();
+}
+
+/* `RefCell<T>::borrow_mut -> RefMut<T>` and `borrow -> Ref<T>`, both
+ * derefing to T, reached through an `Rc`. */
+TEST(rustlsp_std_returns_refcell) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::cell::RefCell;\nuse std::rc::Rc;\n" RUSTLSP_STD_DECOYS
+        "fn run(c: Rc<RefCell<Conn>>) -> bool { c.borrow_mut().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::cell::RefCell;\n" RUSTLSP_STD_DECOYS
+        "fn run(c: &RefCell<Option<Conn>>) -> bool { c.borrow().as_ref().unwrap().ping() }\n"));
+    PASS();
+}
+
+/* `Option<T>::ok_or_else -> Result<T, _>`, `Result<T, E>::map_err ->
+ * Result<T, _>`, `expect_err -> E`, `Option<&T>::cloned -> Option<T>`. */
+TEST(rustlsp_std_returns_option_result_adapters) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(o: Option<Conn>) -> Result<bool, u8> {\n"
+                           "    Ok(o.ok_or_else(|| 1)?.ping())\n}\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(r: Result<Conn, u8>) -> Result<bool, u16> {\n"
+                           "    Ok(r.map_err(|e| e as u16)?.ping())\n}\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(r: Result<u8, Conn>) -> bool { r.expect_err(\"x\").ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(o: Option<&Conn>) -> bool { o.cloned().unwrap().ping() }\n"));
+    PASS();
+}
+
+/* `PathBuf::as_path -> &Path`, `Path::join -> PathBuf`, `Path::parent ->
+ * Option<&Path>`: a project trait implemented for Path is reached. */
+TEST(rustlsp_std_returns_paths) {
+    const char *decl = "use std::path::{Path, PathBuf};\n"
+                       "trait Probe { fn ping(&self) -> bool; }\n"
+                       "struct Conn;\n"
+                       "impl Probe for Path { fn ping(&self) -> bool { true } }\n"
+                       "impl Probe for Conn { fn ping(&self) -> bool { false } }\n";
+    char src[1024];
+    snprintf(src, sizeof(src), "%sfn run(p: PathBuf) -> bool { p.as_path().ping() }\n", decl);
+    CBMFileResult *r = extract_rust(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Path.ping"), 0);
+    cbm_free_result(r);
+    snprintf(src, sizeof(src),
+             "%sfn run(p: &Path) -> bool { p.join(\"a\").as_path().parent().unwrap().ping() }\n",
+             decl);
+    r = extract_rust(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Path.ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `Vec<T>::clone -> Self`, `pop -> Option<T>`, `first_mut -> Option<&T>`;
+ * `String::clone -> Self` reaches a project trait implemented for String. */
+TEST(rustlsp_std_returns_vec_and_string) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(v: &Vec<Conn>) -> bool { v.clone().pop().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(v: Vec<Conn>) -> bool { v.first_mut().unwrap().ping() }\n"));
+    CBMFileResult *r = extract_rust("trait Probe { fn ping(&self) -> bool; }\n"
+                                    "struct Conn;\n"
+                                    "impl Probe for String { fn ping(&self) -> bool { true } }\n"
+                                    "impl Probe for Conn { fn ping(&self) -> bool { false } }\n"
+                                    "fn run(s: &String) -> bool { s.clone().ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Extraction carries a `type` item's target and the per-file registry
  * reads a call returning the alias as the aliased type. */
 TEST(rustlsp_same_file_return_project_alias) {
@@ -9730,6 +9861,13 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_return_project_alias);
     RUN_TEST(rustlsp_crossfile_return_generic_alias_with_written_argument);
     RUN_TEST(rustlsp_crossfile_return_io_result_then_try);
+    RUN_TEST(rustlsp_std_returns_shared_pointers);
+    RUN_TEST(rustlsp_std_returns_locks);
+    RUN_TEST(rustlsp_std_returns_foreign_mutex_stays_unknown);
+    RUN_TEST(rustlsp_std_returns_refcell);
+    RUN_TEST(rustlsp_std_returns_option_result_adapters);
+    RUN_TEST(rustlsp_std_returns_paths);
+    RUN_TEST(rustlsp_std_returns_vec_and_string);
     RUN_TEST(rustlsp_crossfile_return_box_with_written_argument);
     RUN_TEST(rustlsp_crossfile_return_opaque_types);
     RUN_TEST(rustlsp_same_file_return_project_alias);
