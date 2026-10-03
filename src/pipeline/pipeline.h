@@ -56,6 +56,12 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
+/* Record the running build's identity (the executable fingerprint) for this
+ * process. It joins every generation's semantic manifest, so a graph written
+ * by another build is never refreshed in place: the first index after an
+ * upgrade rebuilds it. NULL or "" records "unknown". Call once at startup. */
+void cbm_pipeline_set_extractor_build(const char *build_fingerprint);
+
 /* Run the full indexing pipeline. Discovers files, extracts, resolves, and
  * dumps to SQLite. Returns 0 on success and non-zero on failure.
  *

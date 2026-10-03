@@ -33,6 +33,7 @@
 #include "daemon/version_cohort.h"
 #include "mcp/mcp.h"
 #include "mcp/index_supervisor.h"
+#include "pipeline/pipeline.h"
 #include "cli/cli.h"
 #include "cli/progress_sink.h"
 #include "foundation/constants.h"
@@ -1440,6 +1441,7 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
     if (!fingerprint) {
         return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
     }
+    cbm_pipeline_set_extractor_build(fingerprint);
     cbm_sha256_hex(canonical_cache, strlen(canonical_cache), cache_fingerprint);
     *identity = (cbm_daemon_build_identity_t){
         .semantic_version = CBM_VERSION,

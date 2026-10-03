@@ -874,6 +874,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 #define CBM_SEMANTIC_INPUT_GIT_CONTEXT CBM_SEMANTIC_INPUT_PREFIX "git-context-v1"
 #define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
 #define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
+/* Identity of the build that extracted the generation. Every stored node,
+ * edge and LSP surface is a function of the extractor's code as well as of
+ * the file bytes, so a different build cannot reuse them. */
+#define CBM_SEMANTIC_INPUT_EXTRACTOR_BUILD CBM_SEMANTIC_INPUT_PREFIX "extractor-build-v1"
 
 int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_path,
                                          const cbm_file_info_t *files, int file_count,

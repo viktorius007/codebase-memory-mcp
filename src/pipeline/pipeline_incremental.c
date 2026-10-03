@@ -146,6 +146,28 @@ static int semantic_manifest_cmp(const void *a, const void *b) {
     return strcmp(ma->rel_path, mb->rel_path);
 }
 
+/* Digest of the running build, recorded as a virtual manifest input. A
+ * stored generation from another build differs in that input, so it is
+ * neither a no-op nor a closure repair: its unchanged files' nodes, edges
+ * and surfaces were extracted by different code. Set once at startup, before
+ * any pipeline thread runs. */
+static char g_extractor_build_digest[CBM_SHA256_HEX_LEN + 1];
+
+void cbm_pipeline_set_extractor_build(const char *build_fingerprint) {
+    char material[CBM_SZ_256];
+    int n = snprintf(material, sizeof(material), "cbm-extractor-build-v1:%s",
+                     build_fingerprint && build_fingerprint[0] ? build_fingerprint : "unknown");
+    size_t len = n < 0 ? 0 : ((size_t)n < sizeof(material) ? (size_t)n : sizeof(material) - 1);
+    cbm_sha256_hex(material, len, g_extractor_build_digest);
+}
+
+static const char *semantic_manifest_extractor_build_digest(void) {
+    if (!g_extractor_build_digest[0]) {
+        cbm_pipeline_set_extractor_build(NULL);
+    }
+    return g_extractor_build_digest;
+}
+
 static bool semantic_manifest_is_virtual_path(const char *rel_path) {
     return rel_path &&
            strncmp(rel_path, CBM_SEMANTIC_INPUT_PREFIX, strlen(CBM_SEMANTIC_INPUT_PREFIX)) == 0;
@@ -465,6 +487,10 @@ int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_p
     if (rc == 0) {
         rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
                                           project_config_digest, 0, 0);
+    }
+    if (rc == 0) {
+        rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_EXTRACTOR_BUILD,
+                                          semantic_manifest_extractor_build_digest(), 0, 0);
     }
     struct timespec t_hash;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_hash);
@@ -1856,7 +1882,9 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             continue;
         }
         if (synthetic) {
-            decline = "semantic_input_changed";
+            decline = strcmp(fresh[i].rel_path, CBM_SEMANTIC_INPUT_EXTRACTOR_BUILD) == 0
+                          ? "extractor_build_changed"
+                          : "semantic_input_changed";
             goto done;
         }
         if (discovered) {
