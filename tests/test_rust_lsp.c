@@ -9630,6 +9630,76 @@ TEST(rustlsp_modtree_module_reexport_names_definition) {
     PASS();
 }
 
+/* Exact callee of the one call `caller` makes, or NULL. */
+static const char *rust_sole_callee(const CBMResolvedCallArray *arr, const char *caller) {
+    const char *callee = NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->caller_qn && strcmp(rc->caller_qn, caller) == 0 && rc->confidence >= 0.6f) {
+            if (callee) {
+                return NULL;
+            }
+            callee = rc->callee_qn;
+        }
+    }
+    return callee;
+}
+
+/* Crate `q` declares `run` at its root and in inline `mod job`. Both share
+ * the file's QN, so extraction keeps the later (`job::run`) as `<qn>` and
+ * line-qualifies the root's as `<qn>#L1`. A path call names the function of
+ * the module the tree resolves it to: `job::run()` the module's, and the
+ * other crate's `q::run()` the root's. */
+TEST(rustlsp_module_path_call_picks_namesake_of_declaring_module) {
+    static const char *const rels[] = {"p/src/lib.rs", "q/src/lib.rs"};
+    static const char *const qns[] = {"w.p.src.lib", "w.q.src.lib"};
+    static const char *const sources[] = {
+        "pub fn start() { q::run(); }\n",
+        "pub fn run() {}\n"
+        "mod job {\n"
+        "    pub fn run() {}\n"
+        "}\n"
+        "pub fn go() { job::run(); }\n",
+    };
+    CBMRustModTree *tree = rust_modtree_two_crates(rels, qns, sources, 2, 1);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    static const char *const def_qns[] = {"w.q.src.lib.run#L1", "w.q.src.lib.run",
+                                          "w.q.src.lib.go", "w.p.src.lib.start"};
+    static const char *const def_names[] = {"run", "run", "go", "start"};
+    static const char *const def_mods[] = {"w.q.src.lib", "w.q.src.lib", "w.q.src.lib",
+                                           "w.p.src.lib"};
+    CBMLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    for (int i = 0; i < 4; i++) {
+        defs[i].qualified_name = def_qns[i];
+        defs[i].short_name = def_names[i];
+        defs[i].label = "Function";
+        defs[i].def_module_qn = def_mods[i];
+        defs[i].lang = CBM_LANG_RUST;
+    }
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 4);
+    ASSERT_NOT_NULL(registry);
+    CBMRustImportSource imports = {.modtree = tree};
+    CBMResolvedCallArray in_q = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, sources[1], (int)strlen(sources[1]), "w.q.src.lib",
+                                         "w.q.src.lib", registry, NULL, NULL, 0, NULL, NULL,
+                                         &imports, &in_q, NULL, NULL);
+    CBMResolvedCallArray in_p = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, sources[0], (int)strlen(sources[0]), "w.p.src.lib",
+                                         "w.p.src.lib", registry, NULL, NULL, 0, NULL, NULL,
+                                         &imports, &in_p, NULL, NULL);
+    const char *module_call = rust_sole_callee(&in_q, "w.q.src.lib.go");
+    const char *crate_call = rust_sole_callee(&in_p, "w.p.src.lib.start");
+    ASSERT_NOT_NULL(module_call);
+    ASSERT_STR_EQ(module_call, "w.q.src.lib.run");
+    ASSERT_NOT_NULL(crate_call);
+    ASSERT_STR_EQ(crate_call, "w.q.src.lib.run#L1");
+    cbm_arena_destroy(&arena);
+    cbm_rust_modtree_free(tree);
+    PASS();
+}
+
 TEST(rustlsp_modtree_renamed_reexport_names_definition) {
     /* `pub use a::B as C;`: `C` is `B`, and `C::new` is `B`'s item. */
     static const char *const rels[] = {"p/src/lib.rs", "q/src/lib.rs", "q/src/a.rs"};
@@ -10676,6 +10746,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file);
     RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);
     RUN_TEST(rustlsp_modtree_module_reexport_names_definition);
+    RUN_TEST(rustlsp_module_path_call_picks_namesake_of_declaring_module);
     RUN_TEST(rustlsp_modtree_renamed_reexport_names_definition);
     RUN_TEST(rustlsp_modtree_two_hop_reexport_names_definition);
     RUN_TEST(rustlsp_modtree_glob_of_extern_crate_names_its_items);

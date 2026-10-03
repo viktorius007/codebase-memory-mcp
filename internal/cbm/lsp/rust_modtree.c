@@ -37,6 +37,9 @@ typedef struct {
     uint8_t kind;
     uint8_t ns;
     int32_t module;
+    /* RMT_FN: 1-based line of the declaring `fn`, 0 when two declarations
+     * of one QN merged (cfg twins in one module) */
+    uint32_t line;
     const char *qn;
 } RmtDef;
 
@@ -252,13 +255,17 @@ static int rmt_vis_scope(const CBMRustModTree *tree, int module, int levels) {
 }
 
 static void rmt_add_item(CBMRustModTree *tree, int module, const char *name, RmtKind kind,
-                         uint8_t ns, int target_module, int vis) {
+                         uint8_t ns, int target_module, int vis, uint32_t line) {
     const char *qn = NULL;
     if (kind != RMT_MODULE && kind != RMT_OPAQUE) {
         qn = cbm_arena_sprintf(&tree->arena, "%s.%s", tree->files[tree->modules[module].file].qn,
                                name);
     }
-    RmtDef def = {.kind = (uint8_t)kind, .ns = ns, .module = target_module, .qn = qn};
+    RmtDef def = {.kind = (uint8_t)kind,
+                  .ns = ns,
+                  .module = target_module,
+                  .line = kind == RMT_FN ? line : 0,
+                  .qn = qn};
     (void)rmt_add_entry(tree, module, name, def, -1, rmt_vis_scope(tree, module, vis));
 }
 
@@ -444,6 +451,7 @@ typedef struct {
     int8_t vis; /* levels above the declaring module, RMT_VIS_PUB or RMT_VIS_CRATE */
     uint32_t start;
     uint32_t end;
+    uint32_t line; /* RMF_ITEM: 1-based line of the item */
     const char *name;
     const char *text;
 } RmfRecord;
@@ -624,6 +632,7 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
                 rmf_push(scan, (RmfRecord){.op = RMF_ITEM,
                                            .item = (uint8_t)i,
                                            .vis = rmf_visibility(scan->source, item),
+                                           .line = ts_node_start_point(item).row + 1,
                                            .name = cbm_node_text(&scan->facts->arena, name,
                                                                  scan->source)});
             }
@@ -721,14 +730,14 @@ static void rmt_build_mod_decl(const RmtBuild *build, const RmfRecord *decl, int
     const char *children_dir = NULL;
     int file = rmt_out_of_line_file(build, decl, child_dir, inline_scope, &children_dir);
     if (file < 0 || depth >= RMT_MAX_DEPTH) {
-        rmt_add_item(tree, module, decl->name, RMT_OPAQUE, RMT_NS_TYPE, -1, decl->vis);
+        rmt_add_item(tree, module, decl->name, RMT_OPAQUE, RMT_NS_TYPE, -1, decl->vis, 0);
         return;
     }
     int child = rmt_new_module(tree, build->crate, module, file, 0, UINT32_MAX);
     if (child < 0) {
         return;
     }
-    rmt_add_item(tree, module, decl->name, RMT_MODULE, RMT_NS_TYPE, child, decl->vis);
+    rmt_add_item(tree, module, decl->name, RMT_MODULE, RMT_NS_TYPE, child, decl->vis, 0);
     rmt_build_file(build, child, file, children_dir, depth + 1);
 }
 
@@ -763,7 +772,7 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
                 at = rmf_skip_body(facts, at);
                 break;
             }
-            rmt_add_item(tree, module, record->name, RMT_MODULE, RMT_NS_TYPE, child, record->vis);
+            rmt_add_item(tree, module, record->name, RMT_MODULE, RMT_NS_TYPE, child, record->vis, 0);
             at = rmt_build_items(build, facts, at, child, dir, true, depth + 1);
             break;
         }
@@ -779,7 +788,7 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
             break;
         case RMF_ITEM:
             rmt_add_item(tree, module, record->name, RMT_ITEM_KINDS[record->item].kind,
-                         RMT_ITEM_KINDS[record->item].ns, -1, record->vis);
+                         RMT_ITEM_KINDS[record->item].ns, -1, record->vis, record->line);
             break;
         default:
             break;
@@ -910,6 +919,9 @@ static void rmt_defs_add(RmtDefs *defs, const RmtDef *def) {
     for (int i = 0; i < defs->count; i++) {
         if (rmt_same_def(&defs->defs[i], def)) {
             defs->defs[i].ns |= def->ns;
+            if (defs->defs[i].line != def->line) {
+                defs->defs[i].line = 0; /* two declarations: neither line names the item */
+            }
             const char *qn = defs->defs[i].qn;
             if (def->kind == RMT_EXTERNAL && (!qn || !def->qn || strcmp(qn, def->qn) != 0)) {
                 defs->defs[i].qn = NULL; /* two spellings: the path is unknown */
@@ -1385,7 +1397,8 @@ static CBMRustPathResult rmt_classify(const RmtDefs *defs) {
         return unknown;
     }
     if (def->kind == RMT_FN) {
-        return (CBMRustPathResult){.kind = CBM_RUST_PATH_FUNCTION, .qn = def->qn};
+        return (CBMRustPathResult){
+            .kind = CBM_RUST_PATH_FUNCTION, .qn = def->qn, .line = def->line};
     }
     return (CBMRustPathResult){.kind = CBM_RUST_PATH_NOT_FUNCTION};
 }
@@ -1397,7 +1410,7 @@ static bool rmt_same_result(const CBMRustPathResult *a, const CBMRustPathResult 
     bool same_qn = (!a->qn && !b->qn) || (a->qn && b->qn && strcmp(a->qn, b->qn) == 0);
     bool same_assoc =
         (!a->assoc && !b->assoc) || (a->assoc && b->assoc && strcmp(a->assoc, b->assoc) == 0);
-    return same_qn && same_assoc;
+    return same_qn && same_assoc && a->line == b->line;
 }
 
 /* Replace a head bound by an enclosing block's `use` with that use's path. */
