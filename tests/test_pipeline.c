@@ -7545,6 +7545,8 @@ static const RustModTreeCallCase rust_dyn_trait_cases[] = {
      "core.src.out.Box.put[Sink]", false},
     {"return-position impl Trait is not a trait object", "core.src.calls.via_ret",
      "core.src.svc.Service.call", false},
+    {"Box<dyn Trait> with the trait out of scope: the trait object's method",
+     "core.src.calls_bare.via_box_bare", "core.src.out.Out.log", true},
 };
 
 TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
@@ -7555,7 +7557,8 @@ TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
     write_temp_file(tmp, "core/Cargo.toml",
                     "[package]\nname = \"codex-core\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
-    write_temp_file(tmp, "core/src/lib.rs", "mod svc;\nmod out;\nmod holder;\nmod calls;\n");
+    write_temp_file(tmp, "core/src/lib.rs",
+                    "mod svc;\nmod out;\nmod holder;\nmod calls;\nmod calls_bare;\n");
     write_temp_file(tmp, "core/src/svc.rs",
                     "pub trait Named {\n    fn name(&self) -> u8;\n}\n"
                     "pub trait Service: Named + Send + Sync + 'static {\n"
@@ -7576,7 +7579,8 @@ TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
                     "pub struct Holder {\n    pub svc: Arc<dyn Service + Send + Sync>,\n"
                     "    pub out: Box<dyn Out>,\n    pub sink: Box<dyn Sink>,\n}\n");
     write_temp_file(tmp, "core/src/calls.rs",
-                    "use crate::holder::Holder;\nuse crate::svc::{make_svc, Service};\n"
+                    "use crate::holder::Holder;\nuse crate::out::{Out, Sink};\n"
+                    "use crate::svc::{make_svc, Service};\n"
                     "pub fn via_field(h: &Holder) -> u8 { h.svc.call() }\n"
                     "pub fn via_param(s: &(dyn Service + Send)) -> u8 { s.call() }\n"
                     "pub fn via_param_marker_first(s: &(dyn Send + Service)) -> u8 { s.call() }\n"
@@ -7584,6 +7588,10 @@ TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
                     "pub fn via_box(h: &Holder) -> u8 { h.out.log() }\n"
                     "pub fn via_sink(h: &Holder) -> u8 { h.sink.put() }\n"
                     "pub fn via_ret() -> u8 { make_svc().call() }\n");
+    /* `Out` is not in scope: the Box impl is no candidate, `dyn Out` is. */
+    write_temp_file(tmp, "core/src/calls_bare.rs",
+                    "use crate::holder::Holder;\n"
+                    "pub fn via_box_bare(h: &Holder) -> u8 { h.out.log() }\n");
     write_temp_file(tmp, "util/src/lib.rs", "pub fn util_root() -> u8 { 0 }\n");
     for (int i = 0; i < 52; i++) {
         char name[64];
@@ -7725,6 +7733,90 @@ TEST(pipeline_rust_cfg_dependent_name_links_nothing) {
     int mismatches = check_rust_modtree_calls_in_both_modes(
         tmp, rust_cfg_bound_name_cases,
         (int)(sizeof(rust_cfg_bound_name_cases) / sizeof(rust_cfg_bound_name_cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
+/* rustc considers a trait's methods only when the trait is in scope: a caller
+ * that neither imports nor globs the trait does not reach its impl, unless
+ * the prelude names the trait. */
+static const RustModTreeCallCase rust_trait_scope_cases[] = {
+    {"impl of a trait the caller never names", "core.src.user.no_trait", "core.src.ext.S.run[Ext]",
+     false},
+    {"impl of a trait the caller imports", "core.src.user_ext.with_trait", "core.src.ext.S.run[Ext]",
+     true},
+    {"impl of a prelude trait the caller never names", "core.src.user.no_trait",
+     "core.src.s.S.as_ref[AsRef<str>]", true},
+};
+
+TEST(pipeline_rust_trait_impl_out_of_scope_not_linked) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_trait_scope_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    const RustSourceFile files[] = {
+        {"core/src/s.rs", "pub struct S;\npub struct H {\n    pub p: S,\n}\n"
+                          "impl AsRef<str> for S {\n    fn as_ref(&self) -> &str { \"\" }\n}\n"},
+        {"core/src/ext.rs", "use crate::s::S;\npub trait Ext {\n    fn run(&self) -> u8;\n}\n"
+                            "impl Ext for S {\n    fn run(&self) -> u8 { 1 }\n}\n"},
+        {"core/src/user.rs", "use crate::s::{H, S};\n"
+                             "pub fn no_trait(s: &S, h: &H) -> u8 { let _c = h.p.as_ref(); s.run() }\n"},
+        {"core/src/user_ext.rs",
+         "use crate::ext::Ext;\nuse crate::s::S;\npub fn with_trait(s: &S) -> u8 { s.run() }\n"},
+    };
+    write_rust_core_workspace(tmp, "mod s;\nmod ext;\nmod user;\nmod user_ext;\n", files,
+                              (int)(sizeof(files) / sizeof(files[0])));
+
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, rust_trait_scope_cases,
+        (int)(sizeof(rust_trait_scope_cases) / sizeof(rust_trait_scope_cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(0, mismatches);
+    PASS();
+}
+
+/* `impl Renderable for Box<dyn Cell>` is found on the Box before the call
+ * derefs to `dyn Cell`, so `Box<dyn Cell>.height()` is not `Cell::height`.
+ * The impl file's unknown glob leaves `Box` to the prelude. The impl does not
+ * apply to `Box<dyn Renderable>` or `Box<Plain>`: their calls still deref,
+ * and the impl lends `Box` no trait default. */
+static const RustModTreeCallCase rust_wrapper_impl_cases[] = {
+    {"Box<dyn Cell> with a project impl on Box<dyn Cell>", "core.src.user.via_cell",
+     "core.src.cell.Cell.height", false},
+    {"Box<dyn Renderable>: the Box<dyn Cell> impl does not apply", "core.src.user.via_render",
+     "core.src.render.Renderable.height", true},
+    {"Box<dyn Renderable>: not the Box<dyn Cell> impl", "core.src.user.via_render",
+     "core.src.cell.Box.height[Renderable]", false},
+    {"Box<Plain>: derefs to Plain's override", "core.src.user.via_plain",
+     "core.src.user.Plain.depth[Renderable]", true},
+    {"Box<Plain>: not the trait default through Box", "core.src.user.via_plain",
+     "core.src.render.Renderable.depth", false},
+};
+
+TEST(pipeline_rust_wrapper_trait_impl_applies_by_self_type) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_wrapper_impl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    const RustSourceFile files[] = {
+        {"core/src/render.rs", "pub trait Renderable {\n    fn height(&self) -> u8;\n"
+                               "    fn depth(&self) -> u8 { 0 }\n}\n"},
+        {"core/src/cell.rs",
+         "use unknown_dep::prelude::*;\nuse crate::render::Renderable;\n"
+         "pub trait Cell {\n    fn height(&self) -> u8;\n}\n"
+         "impl Renderable for Box<dyn Cell> {\n    fn height(&self) -> u8 { 1 }\n}\n"},
+        {"core/src/user.rs", "use crate::cell::Cell;\nuse crate::render::Renderable;\n"
+                             "pub fn via_cell(c: Box<dyn Cell>) -> u8 { c.height() }\n"
+                             "pub fn via_render(r: Box<dyn Renderable>) -> u8 { r.height() }\n"
+                             "pub struct Plain;\nimpl Renderable for Plain {\n"
+                             "    fn height(&self) -> u8 { 3 }\n    fn depth(&self) -> u8 { 4 }\n}\n"
+                             "pub fn via_plain(p: Box<Plain>) -> u8 { p.depth() }\n"},
+    };
+    write_rust_core_workspace(tmp, "mod render;\nmod cell;\nmod user;\n", files,
+                              (int)(sizeof(files) / sizeof(files[0])));
+
+    int mismatches = check_rust_modtree_calls_in_both_modes(
+        tmp, rust_wrapper_impl_cases,
+        (int)(sizeof(rust_wrapper_impl_cases) / sizeof(rust_wrapper_impl_cases[0])));
     th_rmtree(tmp);
     ASSERT_EQ(0, mismatches);
     PASS();
@@ -17969,6 +18061,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_private_inherent_method_hidden_outside_its_module);
     RUN_TEST(pipeline_rust_line_qualified_twin_sources_its_own_calls);
     RUN_TEST(pipeline_rust_cfg_dependent_name_links_nothing);
+    RUN_TEST(pipeline_rust_trait_impl_out_of_scope_not_linked);
+    RUN_TEST(pipeline_rust_wrapper_trait_impl_applies_by_self_type);
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
     RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
     RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);

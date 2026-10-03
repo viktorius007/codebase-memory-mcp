@@ -45,6 +45,10 @@ typedef struct {
      * method (no visibility modifier). Code outside that file's modules
      * cannot call it. NULL for every other function. */
     const char *rust_private_module;
+    /* Rust only: self type of a trait impl on a std Deref wrapper
+     * (`impl Tr for Box<dyn X>`) as written, its names resolved in the impl's
+     * module; the method is registered on the wrapper's QN. NULL otherwise. */
+    const CBMType *rust_wrapper_impl_self;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.

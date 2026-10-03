@@ -796,10 +796,12 @@ TEST(rustlsp_crossfile_derived_default_types_value) {
 }
 
 /* `Type::build()` where `build` is a default method of a trait `Type`
- * implements (declared in another file) and returns `Self`: the produced value
+ * implements (declared in another file, imported by `use`, without which rustc
+ * finds no `build`) and returns `Self`: the produced value
  * is a `Type`, so its inherent method resolves. */
 TEST(rustlsp_crossfile_trait_provided_constructor_types_value) {
-    const char *caller = "fn run() { let b = demo::Baz::build(); b.qux(); }\n";
+    const char *caller =
+        "use demo::Make;\nfn run() { let b = demo::Baz::build(); b.qux(); }\n";
     CBMArena a;
     cbm_arena_init(&a);
     CBMRustLSPDef defs[5];
@@ -6499,8 +6501,9 @@ TEST(rustlsp_cov_xf_two_methods) {
     ASSERT_GTE(find_confident(&out, "run", "Thing.beta"), 0);
     cbm_arena_destroy(&a); PASS();
 }
+/* The trait is imported: a trait method is callable only with its trait in scope. */
 TEST(rustlsp_cov_xf_trait_impl) {
-    const char *src = "fn run(t: &demo::Foo) { t.beep(); }\n";
+    const char *src = "use demo::Beep;\nfn run(t: &demo::Foo) { t.beep(); }\n";
     CBMArena a; cbm_arena_init(&a);
     CBMRustLSPDef defs[3];
     memset(defs, 0, sizeof(defs));
