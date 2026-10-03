@@ -4360,8 +4360,9 @@ static const CBMType *rust_sig_subst_self(RustLSPContext *ctx, const CBMType *si
 }
 
 /* Member access type: returns the CBMType for `recv.field_or_method`.
- * Methods return their FUNC signature with `Self` replaced by the type that
- * declares them; fields return the field type. A member the receiver lacks
+ * A method call returns the method's FUNC signature with `Self` replaced by
+ * the type that declares them, else the field type; an access that is not a
+ * call returns only a field's type, never a method's. A member the receiver lacks
  * is looked up on its Deref target, hop by hop, as rustc's autoderef does; a
  * method call keeps a wrapper-level prelude trait method on the wrapper.
  * `*out_method`, when given, is the registered method found, else NULL. */
@@ -4441,8 +4442,11 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
     if (!type_qn)
         return cbm_type_unknown();
 
-    /* Check inherent method first. */
-    const CBMRegisteredFunc *method = rust_lookup_method(ctx, type_qn, member);
+    /* A call names a method before a field; an access that is not a call
+     * names only a field, so `self.x.push(..)` reads the field `x` even when
+     * the type also declares `fn x`. */
+    const CBMRegisteredFunc *method =
+        method_call ? rust_lookup_method(ctx, type_qn, member) : NULL;
     if (method && method->signature) {
         if (out_method) {
             *out_method = method;
