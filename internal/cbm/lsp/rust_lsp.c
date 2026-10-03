@@ -9936,6 +9936,92 @@ static const char *rust_impl_std_wrapper_self(const CBMRustModTree *tree, CBMAre
     return qn ? rust_std_wrapper_canonical(qn) : NULL;
 }
 
+/* NULL-terminated receiver list: `lead` (may be NULL), then `qn` alone or
+ * every path of its std family (`alloc.vec.Vec`, `std.vec.Vec`), since a
+ * receiver is typed by whichever path its spelling reaches. */
+static const char **rust_impl_receiver_list(CBMArena *arena, const char *lead, const char *qn) {
+    RustStdFamily fam = rust_std_family_of_qn(qn);
+    int n = 2;
+    for (const RustStdFamilyQN *e = RUST_STD_FAMILY_QNS; e->qn; e++) {
+        n += fam != RUST_STD_NONE && e->family == fam;
+    }
+    const char **out = (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(char *));
+    if (!out) {
+        return NULL;
+    }
+    int used = 0;
+    if (lead) {
+        out[used++] = lead;
+    }
+    if (fam == RUST_STD_NONE) {
+        out[used++] = qn;
+    }
+    for (const RustStdFamilyQN *e = RUST_STD_FAMILY_QNS; fam != RUST_STD_NONE && e->qn; e++) {
+        if (e->family == fam) {
+            out[used++] = e->qn;
+        }
+    }
+    out[used] = NULL;
+    return out;
+}
+
+/* The QN a type path spelled in `module_qn`'s file names for a receiver: the
+ * module tree's answer, else for a bare name nothing in the file claims, the
+ * prelude's (the rule rust_impl_std_wrapper_self applies). */
+static const char *rust_impl_self_path_qn(const CBMRustModTree *tree, CBMArena *arena,
+                                          const char *module_qn, const char *path) {
+    const char *qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, path);
+    if (!qn && !strchr(path, ':') &&
+        cbm_rust_modtree_resolve_type_in_file(tree, arena, module_qn, path).kind ==
+            CBM_RUST_PATH_UNKNOWN) {
+        qn = rust_lookup_prelude(path);
+    }
+    return qn;
+}
+
+/* Receivers a trait impl's methods are found on when its self type is not a
+ * project struct, enum or union (rust_impl_declared_self) nor a std Deref
+ * wrapper: a slice `[T]` is typed `core.slice`, and its methods reach a
+ * `Vec<T>` through Vec's Deref as the std table's slice methods do; a std
+ * type the std table holds is typed by its std family's paths, or its own
+ * QN; a project alias by the type it names. NULL (the extracted receiver
+ * stays) when the resolver cannot place it or it is a dependency's type. */
+static const char **rust_impl_foreign_self(const CBMRustModTree *tree, CBMArena *arena,
+                                           const char *module_qn, const char *spelling,
+                                           RustImplTypeLookup lookup, const void *lookup_ctx) {
+    size_t len = spelling ? strlen(spelling) : 0;
+    if (len > 2 && spelling[0] == '[' && spelling[len - 1] == ']' && !strchr(spelling, ';')) {
+        return rust_impl_receiver_list(arena, "core.slice", "alloc.vec.Vec");
+    }
+    const char *path = spelling ? rust_impl_self_path(arena, spelling) : NULL;
+    if (!path || !tree || !module_qn) {
+        return NULL;
+    }
+    bool project = cbm_rust_modtree_resolve_type_in_file(tree, arena, module_qn, path).kind ==
+                   CBM_RUST_PATH_TYPE;
+    const char *qn = rust_impl_self_path_qn(tree, arena, module_qn, path);
+    const CBMRegisteredType *type = qn ? lookup(lookup_ctx, qn) : NULL;
+    if (project) {
+        /* Only a project alias is left to place: a struct, enum or union is
+         * rust_impl_declared_self's, a trait is no self type. */
+        const CBMType *t = type ? type->alias_type : NULL;
+        qn = !t                             ? NULL
+             : t->kind == CBM_TYPE_NAMED    ? t->data.named.qualified_name
+             : t->kind == CBM_TYPE_TEMPLATE ? t->data.template_type.template_name
+                                            : NULL;
+        type = qn ? lookup(lookup_ctx, qn) : NULL;
+        if (!type || type->alias_type || type->is_interface) {
+            return NULL;
+        }
+    } else if (!qn || (!type && rust_std_family_of_qn(qn) == RUST_STD_NONE)) {
+        /* A dependency's type: its own methods and trait impls are unknown
+         * (ratatui's `Line` takes `.render()` from its `Widget` impl), so a
+         * call on it cannot be proven to reach this impl. */
+        return NULL;
+    }
+    return rust_impl_receiver_list(arena, NULL, qn);
+}
+
 /* The self type of a trait impl on the std wrapper `wrapper_qn`, spelled
  * `spelling` in `module_qn`, with the wrapper named by its canonical QN. */
 static const CBMType *rust_wrapper_impl_self_type(CBMArena *arena, const char *spelling,
@@ -11149,17 +11235,23 @@ static const CBMRegisteredType *rust_declared_type(const void *ctx, const char *
  * self type when the impl sits in another file (rust_impl_declared_self),
  * else the extracted receiver. Runs while `type_idx` holds declared types
  * only, which is what the final registry answers for these QNs at walk time:
- * a receiver left unmoved is auto-registered below, one moved never is. */
+ * a receiver left unmoved is auto-registered below, one moved never is.
+ * A trait-impl method whose self type is outside the project, a slice or a
+ * project alias moves to the receivers rust_impl_foreign_self lists: the
+ * first in `receivers`, the rest (NULL-terminated, or NULL) in `*out_more`. */
 static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegistry *reg,
                                               const CBMIdxMemo *type_idx,
                                               const CBMRustModTree *tree, CBMRustLSPDef *defs,
-                                              int def_count, const char *module_qn) {
-    const char **receivers =
-        (const char **)cbm_arena_alloc(arena, (size_t)(def_count > 0 ? def_count : 1) *
-                                                  sizeof(const char *));
-    if (!receivers) {
+                                              int def_count, const char *module_qn,
+                                              const char *const **out_more) {
+    size_t slots = (size_t)(def_count > 0 ? def_count : 1);
+    const char **receivers = (const char **)cbm_arena_alloc(arena, slots * sizeof(const char *));
+    const char *const *more_none = NULL;
+    const char *const **more = (const char *const **)cbm_arena_alloc(arena, slots * sizeof(more_none));
+    if (!receivers || !more) {
         return NULL;
     }
+    *out_more = more;
     RustDeclaredTypes declared = {.reg = reg, .type_idx = type_idx};
     /* receiver QN -> index of the def that decided it, one memo per def kind:
      * a method moves to a std wrapper's QN, its impl relation does not, so a
@@ -11169,6 +11261,7 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
     for (int i = 0; i < def_count; i++) {
         CBMRustLSPDef *d = &defs[i];
         receivers[i] = d->receiver_type;
+        more[i] = NULL;
         bool owns_methods = d->is_rust_impl_relation || (d->label && strcmp(d->label, "Method") == 0);
         if (!tree || !owns_methods || !d->receiver_type || !d->receiver_spelling) {
             continue;
@@ -11177,6 +11270,7 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
         int32_t decided = cbm_idxmemo_get(seen, d->receiver_type);
         if (decided >= 0) {
             receivers[i] = receivers[decided];
+            more[i] = more[decided];
             continue;
         }
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
@@ -11186,12 +11280,65 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
         if (!self && !d->is_rust_impl_relation) {
             self = rust_impl_std_wrapper_self(tree, arena, def_mod, d->receiver_spelling);
         }
+        const char **foreign = NULL;
+        if (!self && !d->is_rust_impl_relation &&
+            cbm_idxmemo_get(type_idx, d->receiver_type) < 0) {
+            foreign = rust_impl_foreign_self(tree, arena, def_mod, d->receiver_spelling,
+                                             rust_declared_type, &declared);
+        }
+        if (foreign && foreign[0]) {
+            self = foreign[0];
+            more[i] = foreign[1] ? foreign + 1 : NULL;
+        }
         if (self) {
             receivers[i] = self;
         }
         cbm_idxmemo_put_if_absent(seen, arena, d->receiver_type, i);
     }
     return receivers;
+}
+
+/* Add `rf` (the function `d` declares) to the registry, as a method of
+ * `receiver` when that is non-NULL: the receiver type is auto-registered when
+ * absent, a trait-impl method gets the impl key for that receiver, and the
+ * receiver records the trait it implements. An impl on a std wrapper applies
+ * only to the wrapper arguments its self type spells, so it marks no relation
+ * on the wrapper. The relation keeps backwards-compatible direct
+ * CBMRustLSPDef callers working; production extraction additionally emits an
+ * independent relation record. */
+static void rust_register_func_on(CBMArena *arena, CBMTypeRegistry *reg, CBMIdxMemo *type_idx,
+                                  CBMRegisteredFunc rf, const char *receiver,
+                                  const CBMRustLSPDef *d, const char *def_mod,
+                                  const CBMRustModTree *tree) {
+    if (receiver && receiver[0]) {
+        rf.receiver_type = cbm_arena_strdup(arena, receiver);
+        if (cbm_idxmemo_get(type_idx, rf.receiver_type) < 0) {
+            CBMRegisteredType auto_t;
+            memset(&auto_t, 0, sizeof(auto_t));
+            auto_t.qualified_name = rf.receiver_type;
+            const char *dot = strrchr(receiver, '.');
+            auto_t.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : rf.receiver_type;
+            cbm_registry_add_type(reg, auto_t);
+            cbm_idxmemo_put_if_absent(type_idx, arena, auto_t.qualified_name, reg->type_count - 1);
+        }
+    }
+    if (rf.receiver_type && rf.impl_trait_qn && d->receiver_spelling) {
+        rf.impl_key =
+            cbm_rust_impl_key(arena, rf.receiver_type, d->receiver_spelling, d->trait_qn);
+        if (rust_type_derefs_to_first_arg(rf.receiver_type)) {
+            rf.rust_wrapper_impl_self = rust_wrapper_impl_self_type(
+                arena, d->receiver_spelling, rf.receiver_type, def_mod, tree);
+        }
+    }
+
+    cbm_registry_add_func(reg, rf);
+
+    if (rf.receiver_type && rf.impl_trait_qn && !rf.rust_wrapper_impl_self) {
+        int32_t tix = cbm_idxmemo_get(type_idx, rf.receiver_type);
+        if (tix >= 0) {
+            rust_registered_type_add_embedded(arena, &reg->types[tix], rf.impl_trait_qn);
+        }
+    }
 }
 
 /* Record on `trait` each supertrait in `spellings` ("|"-separated bounds as
@@ -11275,8 +11422,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         }
     }
 
+    const char *const **more = NULL;
     const char **receivers =
-        rust_registered_receivers(arena, reg, &type_idx, tree, defs, def_count, module_qn);
+        rust_registered_receivers(arena, reg, &type_idx, tree, defs, def_count, module_qn, &more);
 
     RustTraitNameIndex trait_names;
     rust_trait_name_index_build(&trait_names, arena, reg);
@@ -11424,44 +11572,11 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             rf.signature = cbm_type_func(arena, NULL, param_types, ret_types);
 
             const char *receiver = receivers ? receivers[i] : d->receiver_type;
-            if (strcmp(d->label, "Method") == 0 && receiver && receiver[0]) {
-                rf.receiver_type = cbm_arena_strdup(arena, receiver);
-                if (cbm_idxmemo_get(&type_idx, rf.receiver_type) < 0) {
-                    CBMRegisteredType auto_t;
-                    memset(&auto_t, 0, sizeof(auto_t));
-                    auto_t.qualified_name = rf.receiver_type;
-                    const char *dot = strrchr(receiver, '.');
-                    auto_t.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : rf.receiver_type;
-                    cbm_registry_add_type(reg, auto_t);
-                    cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name,
-                                              reg->type_count - 1);
-                }
-            }
-            if (rf.receiver_type && rf.impl_trait_qn && d->receiver_spelling) {
-                rf.impl_key = cbm_rust_impl_key(arena, rf.receiver_type, d->receiver_spelling,
-                                                d->trait_qn);
-                if (rust_type_derefs_to_first_arg(rf.receiver_type)) {
-                    rf.rust_wrapper_impl_self = rust_wrapper_impl_self_type(
-                        arena, d->receiver_spelling, rf.receiver_type, def_mod, tree);
-                }
-            }
-
-            cbm_registry_add_func(reg, rf);
-
-            /* Method provenance also carries the type-level relation for
-             * backwards-compatible direct CBMRustLSPDef callers. Production
-             * extraction additionally emits an independent relation record.
-             * An impl on a std wrapper applies only to the wrapper arguments
-             * its self type spells, so it marks no relation on the wrapper. */
-            if (rf.receiver_type && rf.impl_trait_qn && !rf.rust_wrapper_impl_self) {
-                CBMRegisteredType *rt = NULL;
-                int32_t tix = cbm_idxmemo_get(&type_idx, rf.receiver_type);
-                if (tix >= 0) {
-                    rt = &reg->types[tix];
-                }
-                if (rt) {
-                    rust_registered_type_add_embedded(arena, rt, rf.impl_trait_qn);
-                }
+            bool is_method = strcmp(d->label, "Method") == 0;
+            rust_register_func_on(arena, reg, &type_idx, rf, is_method ? receiver : NULL, d,
+                                  def_mod, tree);
+            for (const char *const *m = is_method && more ? more[i] : NULL; m && *m; m++) {
+                rust_register_func_on(arena, reg, &type_idx, rf, *m, d, def_mod, tree);
             }
         }
     }
