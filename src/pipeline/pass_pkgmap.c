@@ -18,10 +18,13 @@
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "foundation/win_utf8.h"
 #include "foundation/yaml.h"
+
+#include "lsp/rust_cargo.h"
 
 #include <yyjson/yyjson.h>
 
@@ -57,6 +60,9 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
 }
 
 /* ── Constants ─────────────────────────────────────────────────── */
+
+#define RUST_PATH_SEP "::"
+#define RUST_EXTERN_CRATE_SUFFIX "#extern"
 
 enum {
     PKGMAP_INIT_CAP = 16,
@@ -381,9 +387,47 @@ static char *build_entry_path(const char *rel_path, const char *suffix) {
     return strdup(buf);
 }
 
-/* Rust: Cargo.toml — [package] name */
+/* Register `ident` as the head of a Rust path into a crate: key "<ident>::"
+ * for a crate this repository builds, "<ident>::#extern" for a dependency
+ * fetched from outside it, with `-` spelled `_`, the way a `use` names it. */
+static void push_rust_crate_head(cbm_pkg_entries_t *entries, const char *ident,
+                                 const char *rel_path, bool external) {
+    if (!ident || !ident[0]) {
+        return;
+    }
+    char key[PKGMAP_LINE_BUF];
+    snprintf(key, sizeof(key), "%s" RUST_PATH_SEP "%s", ident,
+             external ? RUST_EXTERN_CRATE_SUFFIX : "");
+    for (char *c = key; *c; c++) {
+        if (*c == '-') {
+            *c = '_';
+        }
+    }
+    pkg_entries_push(entries, strdup(key), build_entry_path(rel_path, "src/lib"));
+}
+
+/* Rust: Cargo.toml — [package] name, plus every name a `use` can give a crate:
+ * the package name and [lib] name of this manifest and the key of each `path`
+ * dependency (which may rename it) name crates of the repository; the key of
+ * any other dependency names an external crate. */
 static void parse_cargo_toml(const char *source, int source_len, const char *rel_path,
                              cbm_pkg_entries_t *entries) {
+    CBMCargoManifest *manifest =
+        (CBMCargoManifest *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*manifest));
+    if (manifest) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_cargo_parse(&arena, source, source_len, manifest);
+        push_rust_crate_head(entries, manifest->package_name, rel_path, false);
+        push_rust_crate_head(entries, manifest->lib_name, rel_path, false);
+        for (int i = 0; i < manifest->dep_count; i++) {
+            push_rust_crate_head(entries, manifest->deps[i].name, rel_path,
+                                 manifest->deps[i].path == NULL);
+        }
+        cbm_arena_destroy(&arena);
+        cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+    }
+
     const char *section = find_line_value(source, source_len, "[package]");
     if (!section) {
         return;
@@ -1291,7 +1335,7 @@ void cbm_pkgmap_free(CBMHashTable *pkgmap) {
 /* Try slash-based prefix matching (Go: github.com/foo/bar/pkg/utils).
  * Returns heap QN or NULL. */
 static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
-    char *buf = strdup(module_path);
+    char *buf = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, module_path);
     if (!buf) {
         return NULL;
     }
@@ -1313,10 +1357,10 @@ static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
                 *c = '.';
             }
         }
-        free(buf);
+        cbm_free(CBM_MEM_CLASS_OTHER, buf);
         return strdup(result);
     }
-    free(buf);
+    cbm_free(CBM_MEM_CLASS_OTHER, buf);
     return NULL;
 }
 
@@ -1570,6 +1614,99 @@ static bool import_symbol_label_allowed(CBMLanguage lang, const char *label) {
     return !(lang == CBM_LANG_RUST && strcmp(label, "Method") == 0);
 }
 
+/* Whether the graph holds a File node for the source file at `rel`. */
+static bool repo_file_exists(const cbm_pipeline_ctx_t *ctx, const char *rel) {
+    char *qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
+    free(qn);
+    return found;
+}
+
+/* Whether module directory `dir` holds the file of child module `name`
+ * (`<dir>/<name>.rs` or `<dir>/<name>/mod.rs`). */
+static bool rust_child_module_exists(const cbm_pipeline_ctx_t *ctx, const char *dir, size_t dir_len,
+                                     const char *name) {
+    const char *sep = dir_len ? "/" : "";
+    char rel[PKGMAP_PATH_BUF];
+    snprintf(rel, sizeof(rel), "%.*s%s%s.rs", (int)dir_len, dir, sep, name);
+    if (repo_file_exists(ctx, rel)) {
+        return true;
+    }
+    snprintf(rel, sizeof(rel), "%.*s%s%s/mod.rs", (int)dir_len, dir, sep, name);
+    return repo_file_exists(ctx, rel);
+}
+
+/* Whether `name` is a child module of the file `source_rel`: its module
+ * directory is the file's directory for a `mod.rs`, `lib.rs`, `main.rs` or any
+ * other crate root, else `<dir>/<stem>`. Both are accepted, since a crate root
+ * outside `src/` (a test or example target) is not known here. */
+static bool rust_names_child_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                    const char *name) {
+    const char *slash = strrchr(source_rel, '/');
+    size_t dir_len = slash ? (size_t)(slash - source_rel) : 0;
+    if (rust_child_module_exists(ctx, source_rel, dir_len, name)) {
+        return true;
+    }
+    const char *dot = strrchr(source_rel, '.');
+    size_t stem_len =
+        dot && (!slash || dot > slash) ? (size_t)(dot - source_rel) : strlen(source_rel);
+    return rust_child_module_exists(ctx, source_rel, stem_len, name);
+}
+
+/* Whether `head` names a crate from outside the repository: a sysroot crate,
+ * or a dependency some Cargo.toml fetches from a registry or git (registered
+ * as "<name>::#extern"). */
+static bool rust_head_is_external_crate(const CBMHashTable *pkgmap, const char *head) {
+    static const char *const sysroot[] = {"std", "core", "alloc", "proc_macro", "test", NULL};
+    for (const char *const *s = sysroot; *s; s++) {
+        if (strcmp(head, *s) == 0) {
+            return true;
+        }
+    }
+    char key[PKGMAP_LINE_BUF + sizeof(RUST_PATH_SEP RUST_EXTERN_CRATE_SUFFIX)];
+    snprintf(key, sizeof(key), "%s" RUST_PATH_SEP RUST_EXTERN_CRATE_SUFFIX, head);
+    return pkgmap && cbm_ht_get(pkgmap, key) != NULL;
+}
+
+/* Whether a Rust `use` path can name an item of this repository. A path whose
+ * first segment (after an optional leading `::`) is an external crate reaches
+ * no node (`use wiremock::matchers::query_param`): it publishes no IMPORTS
+ * edge, and the symbol-name fallback must not bind it to a same-named
+ * repository item. A head is an external crate only when it is not `crate`,
+ * `self`, `super`, a crate the repository builds (registered from Cargo.toml
+ * as "<name>::") or a child module of the importing file, and some evidence
+ * names it external (rust_head_is_external_crate). A head with no such
+ * evidence may be bound by a name this layer cannot see (another `use` of the
+ * file, a `#[path]` module, a 2015-edition crate-root module) and keeps the
+ * fallbacks. */
+static bool rust_use_head_in_repo(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                  const char *module_path) {
+    const char *p = module_path;
+    while (*p == ' ') {
+        p++;
+    }
+    if (strncmp(p, RUST_PATH_SEP, sizeof(RUST_PATH_SEP) - 1) == 0) {
+        p += sizeof(RUST_PATH_SEP) - 1;
+    }
+    char head[PKGMAP_LINE_BUF];
+    size_t n = 0;
+    while (p[n] && p[n] != ':' && p[n] != ' ' && p[n] != '{' && n + 1 < sizeof(head)) {
+        head[n] = p[n];
+        n++;
+    }
+    head[n] = '\0';
+    const CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    if (!head[0] || !rust_head_is_external_crate(pkgmap, head)) {
+        return true; /* `use {a::x, b::y}` has one head per member: not decided here */
+    }
+    char crate_key[PKGMAP_LINE_BUF + sizeof(RUST_PATH_SEP)];
+    snprintf(crate_key, sizeof(crate_key), "%s" RUST_PATH_SEP, head);
+    if (pkgmap && cbm_ht_get(pkgmap, crate_key)) {
+        return true;
+    }
+    return source_rel && rust_names_child_module(ctx, source_rel, head);
+}
+
 static const char *path_leaf(const char *path) {
     const char *leaf = path;
     for (const char *p = path; p && *p; p++) {
@@ -1808,6 +1945,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         resolve_header_include(ctx, source_rel, source_file_qn, imp->module_path);
     if (header_target) {
         return header_target;
+    }
+
+    if (cbm_language_for_filename(path_leaf(source_rel ? source_rel : "")) == CBM_LANG_RUST &&
+        !rust_use_head_in_repo(ctx, source_rel, imp->module_path)) {
+        return NULL;
     }
 
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
