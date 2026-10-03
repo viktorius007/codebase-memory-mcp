@@ -1224,6 +1224,43 @@ TEST(rustlsp_same_file_return_project_alias) {
     PASS();
 }
 
+/* A binding or path head typed by a declared alias dispatches on the
+ * aliased type: a generic struct (direct, through a generic alias and
+ * through an alias of an alias), `Arc<Y>` deref to `Y`, and `Alias::f()`. */
+TEST(rustlsp_alias_receivers_and_paths_dispatch_on_aliased_type) {
+    CBMFileResult *r = extract_rust("use std::sync::Arc;\n"
+                                    "struct Wrap<B> { b: B }\nstruct Back;\nstruct Other;\n"
+                                    "impl<B> Wrap<B> { fn draw(&self) -> bool { true } }\n"
+                                    "impl Other { fn draw(&self) -> bool { false } }\n"
+                                    "struct State;\n"
+                                    "impl State { fn lock(&self) -> bool { true } }\n"
+                                    "impl Other { fn lock(&self) -> bool { false } }\n"
+                                    "struct Cache;\n"
+                                    "impl Cache { fn fresh() -> Cache { Cache } }\n"
+                                    "impl Other { fn fresh() -> Other { Other } }\n"
+                                    "type Term = Wrap<Back>;\n"
+                                    "type Boxed<T> = Wrap<T>;\n"
+                                    "type Term2 = Term;\n"
+                                    "type Shared = Arc<State>;\n"
+                                    "type CacheAlias = Cache;\n"
+                                    "fn by_alias(t: &Term) -> bool { t.draw() }\n"
+                                    "fn by_generic(w: Boxed<Back>) -> bool { w.draw() }\n"
+                                    "fn by_nested(t: Term2) -> bool { t.draw() }\n"
+                                    "fn by_arc(s: Shared) -> bool { s.lock() }\n"
+                                    "fn by_path() { let _c = CacheAlias::fresh(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "by_alias", "Wrap.draw"), 0);
+    ASSERT_GTE(find_resolved(r, "by_generic", "Wrap.draw"), 0);
+    ASSERT_GTE(find_resolved(r, "by_nested", "Wrap.draw"), 0);
+    ASSERT_GTE(find_resolved(r, "by_arc", "State.lock"), 0);
+    ASSERT_GTE(find_resolved(r, "by_path", "Cache.fresh"), 0);
+    ASSERT_EQ(find_resolved(r, "by_alias", "Other.draw"), -1);
+    ASSERT_EQ(find_resolved(r, "by_arc", "Other.lock"), -1);
+    ASSERT_EQ(find_resolved(r, "by_path", "Other.fresh"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* F4 Tier-2: the build-once shared registry path (cbm_rust_build_cross_registry +
  * cbm_run_rust_lsp_cross_with_registry) must resolve IDENTICALLY to the per-file
  * cbm_run_rust_lsp_cross — same fixture as rustlsp_crossfile_method_dispatch. Also
@@ -10239,6 +10276,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_return_box_with_written_argument);
     RUN_TEST(rustlsp_crossfile_return_opaque_types);
     RUN_TEST(rustlsp_same_file_return_project_alias);
+    RUN_TEST(rustlsp_alias_receivers_and_paths_dispatch_on_aliased_type);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_duplicate_free_function_qn_stays_unresolved);
     RUN_TEST(rustlsp_path_module_child_call_does_not_flatten_to_parent);
