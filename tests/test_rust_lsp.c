@@ -2887,6 +2887,44 @@ TEST(rustlsp_doubly_nested_inline_module_body_is_walked) {
     PASS();
 }
 
+/* Two functions of one file share a name: one at the root, one in an inline
+ * module. Extraction keeps the later as `<qn>` and line-qualifies the other.
+ * A bare call names the function its own module declares, so the module's
+ * call links to the module's node and the root's call to the root's node,
+ * each under a strategy CALLS admission publishes. */
+TEST(rustlsp_inline_module_namesake_fn_binds_its_own_module) {
+    CBMFileResult *r = extract_rust("pub fn plain(x: u32) -> u32 { path::plain(x) }\n"
+                                    "fn top() -> u32 { plain(1) }\n"
+                                    "mod path {\n"
+                                    "    pub(super) fn plain(x: u32) -> u32 { x }\n"
+                                    "    fn exists() -> u32 { plain(2) }\n"
+                                    "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.plain#L1"));
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.plain"));
+    int in_module = 0;
+    int in_root = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (!rc->caller_qn || !rc->callee_qn || !rc->strategy ||
+            !cbm_pipeline_rust_strategy_admitted(rc->strategy)) {
+            continue;
+        }
+        if (strcmp(rc->caller_qn, "test.src.main.exists") == 0) {
+            ASSERT_STR_EQ(rc->callee_qn, "test.src.main.plain");
+            in_module++;
+        }
+        if (strcmp(rc->caller_qn, "test.src.main.top") == 0) {
+            ASSERT_STR_EQ(rc->callee_qn, "test.src.main.plain#L1");
+            in_root++;
+        }
+    }
+    ASSERT_EQ(in_module, 1);
+    ASSERT_EQ(in_root, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A trait's default method body is walked under `<Trait>.<name>`; a method
  * called on `self` there is the trait's own declaration. */
 TEST(rustlsp_trait_default_method_body_is_walked) {
@@ -10014,6 +10052,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_nested_function_body_is_walked_as_its_own_node);
     RUN_TEST(rustlsp_inline_module_use_shadows_crate_item);
     RUN_TEST(rustlsp_doubly_nested_inline_module_body_is_walked);
+    RUN_TEST(rustlsp_inline_module_namesake_fn_binds_its_own_module);
     RUN_TEST(rustlsp_trait_default_method_body_is_walked);
     RUN_TEST(rustlsp_cfg_twin_method_bodies_keep_their_own_identity);
     RUN_TEST(rustlsp_nested_macro_rules_call_does_not_inherit_outer_site_map);

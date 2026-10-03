@@ -44,6 +44,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node);
 static void rust_process_nested_item(RustLSPContext *ctx, TSNode item);
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
 static void rust_process_module(RustLSPContext *ctx, TSNode mod_node, int depth);
+static const char *rust_module_fn_target(const RustLSPContext *ctx, const char *name);
 static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path);
 static const char *rust_module_export(RustLSPContext *ctx, const char *module_qn, const char *name);
 static const char *rust_qn_crate_prefix(RustLSPContext *ctx, const char *qn);
@@ -8750,6 +8751,15 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 rust_emit_unresolved_call(ctx, path, "unresolved_glob_import");
                 return;
             }
+            /* The function the walked module itself declares under this
+             * name; its file shares the name, so only the declaring module
+             * tells the nodes apart. */
+            const char *module_fn = rust_module_fn_target(ctx, path);
+            if (module_fn) {
+                rust_emit_resolved_call_reason(ctx, module_fn, NULL, "lsp_module_path",
+                                               CBM_RUST_CONF_DIRECT, path);
+                return;
+            }
         }
 
         if (rust_resolve_call_by_module_tree(ctx, actual_func, path))
@@ -9884,6 +9894,164 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
 /* Bound on inline-module nesting the walk follows. */
 enum { RUST_INLINE_MOD_MAX_DEPTH = 64 };
 
+/* Number of free functions of this file whose graph identity is `name`'s
+ * module-level QN or a line/cfg-qualified twin of it, capped at 2. */
+static int rust_file_fn_namesakes(RustLSPContext *ctx, const char *name) {
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    size_t len = strlen(qn);
+    CBMFreeFuncIter it;
+    cbm_registry_free_funcs_by_short_name_chain(ctx->registry, name, &it);
+    int n = 0;
+    for (int i; n < 2 && (i = cbm_free_func_iter_next(&it)) >= 0;) {
+        const char *cand = it.reg->funcs[i].qualified_name;
+        if (cand && strncmp(cand, qn, len) == 0 && (cand[len] == '\0' || cand[len] == '#')) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* True when `id`, an identifier spelled like a function the module walked
+ * from `body` declares, cannot be a binding that hides that function from a
+ * bare call: the callee of a call, a segment of a qualified path outside a
+ * `use`, the name of a method, the module's own declaration, or a macro
+ * token directly followed by a parenthesised argument list. */
+static bool rust_module_fn_mention_is_inert(TSNode id, TSNode body) {
+    TSNode parent = ts_node_parent(id);
+    const char *pk = ts_node_type(parent);
+    if (strcmp(pk, "function_item") == 0 || strcmp(pk, "function_signature_item") == 0) {
+        TSNode owner = ts_node_parent(parent);
+        return !ts_node_is_null(owner) && strcmp(ts_node_type(owner), "block") != 0;
+    }
+    if (strcmp(pk, "generic_function") == 0) {
+        id = parent;
+        parent = ts_node_parent(parent);
+        pk = ts_node_type(parent);
+    }
+    if (strcmp(pk, "call_expression") == 0) {
+        return ts_node_eq(ts_node_child_by_field_name(parent, "function", 8), id);
+    }
+    if (strcmp(pk, "token_tree") == 0) {
+        TSNode next = ts_node_next_sibling(id);
+        return !ts_node_is_null(next) && strcmp(ts_node_type(next), "token_tree") == 0 &&
+               ts_node_child_count(next) > 0 &&
+               strcmp(ts_node_type(ts_node_child(next, 0)), "(") == 0;
+    }
+    if (strcmp(pk, "scoped_identifier") != 0) {
+        return false;
+    }
+    for (TSNode a = parent; !ts_node_is_null(a) && !ts_node_eq(a, body); a = ts_node_parent(a)) {
+        if (strcmp(ts_node_type(a), "use_declaration") == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Clear every name in `names` that some identifier of `body` (nested modules
+ * excluded: they are their own scope) could bind in place of the module's
+ * function: a local, a parameter, a pattern, a block item, a `use`. */
+static void rust_drop_shadowed_module_fns(RustLSPContext *ctx, TSNode body, const char **names,
+                                          int count) {
+    TSTreeCursor cur = ts_tree_cursor_new(body);
+    for (;;) {
+        TSNode n = ts_tree_cursor_current_node(&cur);
+        const char *k = ts_node_type(n);
+        bool descend = !(strcmp(k, "mod_item") == 0 && !ts_node_eq(n, body));
+        if (strcmp(k, "identifier") == 0 || strcmp(k, "shorthand_field_identifier") == 0) {
+            descend = false;
+            char *text = rust_node_text(ctx, n);
+            for (int i = 0; text && i < count; i++) {
+                if (names[i] && strcmp(names[i], text) == 0 &&
+                    !rust_module_fn_mention_is_inert(n, body)) {
+                    names[i] = NULL;
+                }
+            }
+        }
+        if (descend && ts_tree_cursor_goto_first_child(&cur)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cur)) {
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                ts_tree_cursor_delete(&cur);
+                return;
+            }
+        }
+    }
+}
+
+/* Bind the functions module `body` (the file root or an inline module's
+ * declaration list) declares whose name another function of the file
+ * shares. Extraction gives all of them the file's module QN, so the name
+ * alone cannot pick one; Rust resolves a bare name in the module's bodies to
+ * the module's own item unless a local, a block item or a block `use`
+ * shadows it, and items of enclosing modules are not in scope at all. A
+ * name declared twice in the module (cfg twins) or that any identifier of
+ * the module could rebind stays unbound and keeps its prior resolution. */
+static void rust_bind_module_fns(RustLSPContext *ctx, TSNode body) {
+    ctx->module_fn_names = NULL;
+    ctx->module_fn_qns = NULL;
+    ctx->module_fn_count = 0;
+    if (!ctx->registry || !ctx->module_qn) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(body);
+    const char **names = NULL;
+    const char **qns = NULL;
+    int count = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode item = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(item), "function_item") != 0) {
+            continue;
+        }
+        char *name = rust_node_text(ctx, ts_node_child_by_field_name(item, "name", 4));
+        if (!name || !name[0] || rust_file_fn_namesakes(ctx, name) < 2) {
+            continue;
+        }
+        bool twin = false;
+        for (uint32_t j = 0; j < nc && !twin; j++) {
+            TSNode other = ts_node_named_child(body, j);
+            if (j != i && strcmp(ts_node_type(other), "function_item") == 0) {
+                char *other_name =
+                    rust_node_text(ctx, ts_node_child_by_field_name(other, "name", 4));
+                twin = other_name && strcmp(other_name, name) == 0;
+            }
+        }
+        const char *qn = rust_function_node_qn(ctx, item, name, NULL);
+        if (twin || !cbm_registry_lookup_func(ctx->registry, qn)) {
+            continue;
+        }
+        if (!names) {
+            names = (const char **)cbm_arena_alloc(ctx->arena, nc * sizeof(char *));
+            qns = (const char **)cbm_arena_alloc(ctx->arena, nc * sizeof(char *));
+            if (!names || !qns) {
+                return;
+            }
+        }
+        names[count] = name;
+        qns[count] = qn;
+        count++;
+    }
+    if (count == 0) {
+        return;
+    }
+    rust_drop_shadowed_module_fns(ctx, body, names, count);
+    ctx->module_fn_names = names;
+    ctx->module_fn_qns = qns;
+    ctx->module_fn_count = count;
+}
+
+/* The graph node of the function the module being walked declares as
+ * `name`, when rust_bind_module_fns bound it; NULL otherwise. */
+static const char *rust_module_fn_target(const RustLSPContext *ctx, const char *name) {
+    for (int i = 0; i < ctx->module_fn_count; i++) {
+        if (ctx->module_fn_names[i] && strcmp(ctx->module_fn_names[i], name) == 0) {
+            return ctx->module_fn_qns[i];
+        }
+    }
+    return NULL;
+}
+
 /* Walk the items of inline module `mod_node` at nesting `depth`. Its own
  * `use`s and globs bind its whole body and shadow what the enclosing module
  * sees; the crate's module tree already knows them as that module's imports,
@@ -9907,6 +10075,10 @@ static void rust_process_module(RustLSPContext *ctx, TSNode mod_node, int depth)
     ctx->relative_module_qn = saved_relative;
     ctx->file_use_count = ctx->use_count;
     ctx->file_glob_count = ctx->glob_count;
+    const char **saved_fn_names = ctx->module_fn_names;
+    const char **saved_fn_qns = ctx->module_fn_qns;
+    int saved_fn_count = ctx->module_fn_count;
+    rust_bind_module_fns(ctx, body);
 
     uint32_t count = ts_node_named_child_count(body);
     for (uint32_t i = 0; i < count; i++) {
@@ -9927,6 +10099,9 @@ static void rust_process_module(RustLSPContext *ctx, TSNode mod_node, int depth)
     ctx->glob_count = saved_globs;
     ctx->file_use_count = saved_file_uses;
     ctx->file_glob_count = saved_file_globs;
+    ctx->module_fn_names = saved_fn_names;
+    ctx->module_fn_qns = saved_fn_qns;
+    ctx->module_fn_count = saved_fn_count;
 }
 
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
@@ -9989,6 +10164,7 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
     }
 
     /* Pass 2: walk every top-level item. */
+    rust_bind_module_fns(ctx, root);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(root, i);
         if (ts_node_is_null(c))

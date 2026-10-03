@@ -392,7 +392,11 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
  * 1.98.1): exact registry hits for free functions, imports, workspace-member
  * paths, inherent/trait/deref method dispatch, constructors and UFCS paths.
  * `lsp_module_path` is a free function named through the crate's declared
- * module tree and `use` graph (rust_modtree.h).
+ * module tree and `use` graph (rust_modtree.h), or a bare call to the
+ * function the calling module itself declares when the file holds a
+ * namesake: the target is that declaration's own node, proven by the
+ * declaring module and the absence of any shadowing binding in it
+ * (rust_bind_module_fns), never by name similarity.
  * Sole-impl trait UFCS (`Default::default()`) measured 63% and stays closed,
  * as do prelude guesses, macro carriers, bound dispatch and callable aliases.
  * Operator-trait dispatch (`a + b` on a user type) had no site on the corpus

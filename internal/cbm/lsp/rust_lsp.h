@@ -120,6 +120,13 @@ typedef struct {
      * differs from module_qn when #[path] gives a file a non-physical name;
      * NULL means that identity was ambiguous and relative imports stay open. */
     const char *relative_module_qn;
+    /* Functions the module being walked (the file root or an inline module)
+     * declares whose name another function of the file shares, mapped to
+     * their exact graph node: a bare call there names this node. Not
+     * inherited by nested modules; see rust_bind_module_fns. */
+    const char **module_fn_names;
+    const char **module_fn_qns;
+    int module_fn_count;
     /* Lazily derived from module_qn: the crate's `<project>.<dirs>.<src>`
      * prefix and the module directory this file owns. */
     const char *crate_root_prefix;
