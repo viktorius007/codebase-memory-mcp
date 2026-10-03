@@ -3020,8 +3020,11 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
      * pass (or a stale thread-local) can never read freed manifest memory. */
     if (have_rust) {
         cbm_pxc_set_rust_manifest(NULL);
-        cbm_pxc_set_rust_imports(NULL, NULL, NULL);
-        cbm_rust_modtree_free(rust_modtree);
+        /* The tree outlives the pass: the registry reads it while the calls
+         * and usages passes bind bare names (released by the pipeline). */
+        cbm_pxc_set_rust_imports(NULL, rust_modtree, NULL);
+        cbm_rust_modtree_free(ctx->seq_rust_modtree);
+        ctx->seq_rust_modtree = rust_modtree;
         cbm_rust_macro_table_free(rust_macros);
         cbm_arena_destroy(&cargo_arena);
     }

@@ -2811,6 +2811,170 @@ TEST(pipeline_rust_usage_never_binds_method_by_bare_name) {
     PASS();
 }
 
+/* A Rust bare name `b` names m::b only when a `use` binds `b` (explicitly or
+ * by `use m::*`) or b sits in the referencing module: `use crate::m::a` binds
+ * a, not every same-named item of m. A qualified path is read whole, so
+ * `crate::other::b` is other::b, never m::b. A method candidate nothing binds
+ * is still handed to the usages pass, which re-routes `x.cap()` through the
+ * call record to Buf::cap. Rows: {source, target, target file, expected}. */
+typedef struct {
+    const char *source;
+    const char *target;
+    const char *target_file;
+    int expected;
+} usage_expectation_t;
+
+static const usage_expectation_t rust_bare_binding_rows[] = {
+    {"f", "b", "src/m.rs", 0},     {"f", "b", "src/other.rs", 0},   {"h", "b", "src/m.rs", 1},
+    {"h", "b", "src/other.rs", 0}, {"q", "b", "src/other.rs", 1},   {"q", "b", "src/m.rs", 0},
+    {"r", "cap", "src/m.rs", 1},   {"r", "cap", "src/other.rs", 0},
+};
+enum { RUST_BARE_BINDING_ROWS = sizeof(rust_bare_binding_rows) / sizeof(rust_bare_binding_rows[0]) };
+
+static void usage_expectation_counts(const char *tmp, const char *db_name,
+                                     const usage_expectation_t *rows, int row_count, int *out) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", tmp, db_name);
+    for (int i = 0; i < row_count; i++) {
+        out[i] = -1;
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    if (p && cbm_pipeline_run(p) == 0) {
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        if (s) {
+            const char *project = cbm_pipeline_project_name(p);
+            for (int i = 0; i < row_count; i++) {
+                out[i] = named_edge_to_file_count(s, project, "USAGE", rows[i].source,
+                                                  rows[i].target, rows[i].target_file);
+            }
+            cbm_store_close(s);
+        }
+    }
+    cbm_pipeline_free(p);
+}
+
+/* Runs the fixture in `tmp` sequentially and in parallel; every row of both
+ * runs must hold its expected count. Returns the first failing row, or -1. */
+static int usage_expectations_hold_in_both_modes(const char *tmp, const usage_expectation_t *rows,
+                                                 int row_count) {
+    int seq[16];
+    int par[16];
+    if (row_count > 16) {
+        return 0;
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    usage_expectation_counts(tmp, "sequential.db", rows, row_count, seq);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    usage_expectation_counts(tmp, "parallel.db", rows, row_count, par);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+    }
+    free(saved_workers);
+    free(saved_single);
+    for (int i = 0; i < row_count; i++) {
+        if (seq[i] != rows[i].expected || par[i] != rows[i].expected) {
+            printf("  row %d %s -> %s (%s): sequential %d parallel %d expected %d\n", i,
+                   rows[i].source, rows[i].target, rows[i].target_file, seq[i], par[i],
+                   rows[i].expected);
+            return i;
+        }
+    }
+    return -1;
+}
+
+TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_bare_bind_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod m;\nmod other;\nmod user;\nmod globuser;\n");
+    write_temp_file(tmp, "src/m.rs",
+                    "pub fn a() -> i32 { 1 }\n"
+                    "pub fn b() -> i32 { 2 }\n"
+                    "pub struct Buf {}\n"
+                    "impl Buf {\n"
+                    "    pub fn cap(&self) -> usize { 0 }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/other.rs",
+                    "pub fn b() -> i32 { 3 }\n"
+                    "pub struct Other {}\n"
+                    "impl Other {\n"
+                    "    pub fn cap(&self) -> usize { 1 }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/user.rs",
+                    "use crate::m::a;\n"
+                    "use crate::m::Buf;\n"
+                    "pub fn f() -> i32 { let g = b; a() }\n"
+                    "pub fn q() -> i32 { let g = crate::other::b; 0 }\n"
+                    "pub fn r(x: &Buf) { assert_eq!(x.cap(), 0); }\n");
+    write_temp_file(tmp, "src/globuser.rs", "use crate::m::*;\npub fn h() -> i32 { let g = b; a() }\n");
+    int failed = usage_expectations_hold_in_both_modes(tmp, rust_bare_binding_rows,
+                                                       RUST_BARE_BINDING_ROWS);
+    th_rmtree(tmp);
+    ASSERT_EQ(failed, -1);
+    PASS();
+}
+
+/* The Rust rule above is Rust's own: Python and Go files of the same shape
+ * (import a from m, then a bare `b` that m and other both define) keep the
+ * import-reachability pick of m.b. */
+static const usage_expectation_t python_bare_binding_rows[] = {
+    {"f", "b", "m.py", 1}, {"f", "b", "other.py", 0}, {"h", "b", "m.py", 1},
+    {"h", "b", "other.py", 0},
+};
+static const usage_expectation_t go_bare_binding_rows[] = {
+    {"F", "B", "m/m.go", 1},
+    {"F", "B", "other/other.go", 0},
+};
+
+TEST(pipeline_python_and_go_bare_name_keep_import_reachability) {
+    char py[256];
+    snprintf(py, sizeof(py), "/tmp/cbm_py_bare_bind_XXXXXX");
+    if (!cbm_mkdtemp(py)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(py, "m.py", "def a():\n    return 1\n\ndef b():\n    return 2\n");
+    write_temp_file(py, "other.py", "def b():\n    return 3\n");
+    write_temp_file(py, "user.py", "from m import a\n\ndef f():\n    g = b\n    return a()\n");
+    write_temp_file(py, "globuser.py", "from m import *\n\ndef h():\n    g = b\n    return a()\n");
+    int py_failed = usage_expectations_hold_in_both_modes(
+        py, python_bare_binding_rows,
+        (int)(sizeof(python_bare_binding_rows) / sizeof(python_bare_binding_rows[0])));
+    th_rmtree(py);
+
+    char go[256];
+    snprintf(go, sizeof(go), "/tmp/cbm_go_bare_bind_XXXXXX");
+    if (!cbm_mkdtemp(go)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(go, "go.mod", "module fx\n\ngo 1.21\n");
+    write_temp_file(go, "m/m.go", "package m\n\nfunc A() int { return 1 }\n\nfunc B() int { return 2 }\n");
+    write_temp_file(go, "other/other.go", "package other\n\nfunc B() int { return 3 }\n");
+    write_temp_file(go, "user/user.go",
+                    "package user\n\nimport \"fx/m\"\n\nfunc F() int {\n\tg := B\n\t_ = g\n\treturn m.A()\n}\n");
+    int go_failed = usage_expectations_hold_in_both_modes(
+        go, go_bare_binding_rows,
+        (int)(sizeof(go_bare_binding_rows) / sizeof(go_bare_binding_rows[0])));
+    th_rmtree(go);
+
+    ASSERT_EQ(py_failed, -1);
+    ASSERT_EQ(go_failed, -1);
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the
@@ -18428,6 +18592,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delete);
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_rust_usage_never_binds_method_by_bare_name);
+    RUN_TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob);
+    RUN_TEST(pipeline_python_and_go_bare_name_keep_import_reachability);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

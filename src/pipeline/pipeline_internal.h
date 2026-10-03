@@ -213,6 +213,11 @@ typedef struct {
      * use-after-free first observable on the real-repo corpus tier. */
     char **seq_cross_def_modules;
     int seq_cross_def_module_count;
+    /* Sequential lsp_cross only: the Rust crate module tree, kept installed on
+     * the thread through the calls and usages passes so the registry binds a
+     * Rust bare name the way the parallel resolve does. Released beside the
+     * arena. */
+    struct CBMRustModTree *seq_rust_modtree;
 
     /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
      * no ObjectScript include files were found). Owned by pipeline.c. */

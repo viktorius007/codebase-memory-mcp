@@ -1446,6 +1446,11 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cbm_arena_destroy(&ctx->seq_cross_arena);
         ctx->seq_cross_arena_live = false;
     }
+    if (ctx->seq_rust_modtree) {
+        cbm_pxc_set_rust_imports(NULL, NULL, NULL);
+        cbm_rust_modtree_free(ctx->seq_rust_modtree);
+        ctx->seq_rust_modtree = NULL;
+    }
     if (ctx->seq_cross_def_modules) {
         for (int i = 0; i < ctx->seq_cross_def_module_count; i++) {
             free(ctx->seq_cross_def_modules[i]);
