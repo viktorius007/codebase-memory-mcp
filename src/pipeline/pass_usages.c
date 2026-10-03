@@ -204,6 +204,37 @@ const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(const cbm_gbuf_t *g
     return owned ? cbm_gbuf_find_by_qn(gbuf, owned) : NULL;
 }
 
+const cbm_gbuf_node_t *cbm_pipeline_rust_field_usage_target(const cbm_gbuf_t *gbuf,
+                                                            const char *project_name,
+                                                            const CBMResolvedCallArray *rows,
+                                                            const CBMUsage *usage, bool *owned) {
+    *owned = false;
+    if (!rows || !usage || !usage->ref_name || usage->site_end_byte <= usage->site_start_byte) {
+        return NULL;
+    }
+    const CBMResolvedCall *best = NULL;
+    for (int i = 0; i < rows->count; i++) {
+        const CBMResolvedCall *rc = &rows->items[i];
+        if (rc->kind != CBM_RESOLVED_FIELD_REFERENCE || !rc->callee_qn ||
+            rc->confidence < CBM_LSP_CONFIDENCE_FLOOR || rc->source_origin != usage->source_origin ||
+            rc->site_start_byte != usage->site_start_byte ||
+            rc->site_end_byte != usage->site_end_byte ||
+            strcmp(cbm_lsp_bare_segment(rc->callee_qn), usage->ref_name) != 0) {
+            continue;
+        }
+        *owned = true;
+        if (best && strcmp(best->callee_qn, rc->callee_qn) != 0) {
+            return NULL;
+        }
+        best = rc;
+    }
+    return best ? cbm_pipeline_lsp_target_node(gbuf, project_name, best->callee_qn, false) : NULL;
+}
+
+bool cbm_pipeline_rust_bare_field_target(CBMLanguage lang, const cbm_gbuf_node_t *target) {
+    return lang == CBM_LANG_RUST && target && target->label && strcmp(target->label, "Field") == 0;
+}
+
 /* Resolve USAGE edges for one file's extracted usages. */
 static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
@@ -253,6 +284,17 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (semantic_reference) {
                 continue;
             }
+            /* A proven field access owns its occurrence (twin: pass_parallel.c). */
+            bool field_owned = false;
+            if (lang == CBM_LANG_RUST) {
+                tgt = cbm_pipeline_rust_field_usage_target(
+                    ctx->gbuf, ctx->project_name, &result->resolved_calls, usage, &field_owned);
+            }
+            if (field_owned && !tgt) {
+                continue;
+            }
+        }
+        if (!tgt) {
             /* SQL usages are FROM/JOIN lineage refs and may bind Table/View
              * targets (cbm_registry_resolve_lineage); every other language
              * resolves through the default variant, whose central relation
@@ -287,7 +329,10 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
             }
-            /* A bare name never proves a Rust type member. */
+            /* A bare name never proves a Rust field or type member. */
+            if (cbm_pipeline_rust_bare_field_target(lang, tgt)) {
+                continue;
+            }
             if (tgt && lang == CBM_LANG_RUST && cbm_registry_label_is_type_member(tgt->label)) {
                 tgt = cbm_pipeline_rust_member_usage_target(
                     ctx->gbuf, ctx->project_name, ctx->registry, &result->resolved_calls, usage);

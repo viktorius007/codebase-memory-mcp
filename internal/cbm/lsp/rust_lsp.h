@@ -160,6 +160,11 @@ typedef struct {
      * into the arm. */
     const CBMType *pending_match_type;
 
+    /* QN of the registered type that declared the field the latest
+     * successful rust_lookup_field found (after alias hops). A caller that
+     * clears it before a typing call reads which type owns the field. */
+    const char *field_owner_qn;
+
     /* User-defined `macro_rules!` definitions collected during the
      * pre-walk phase. Each rule stores its pattern + transcriber text;
      * `macro_invocation` resolution attempts to match the invocation

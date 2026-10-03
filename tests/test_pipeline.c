@@ -2928,6 +2928,41 @@ TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob) {
     PASS();
 }
 
+/* A Rust field USAGE comes only from the resolver's field record: `a.x` with
+ * `a: &A` imported from another module links to A.x (not the same-named B.x),
+ * as does a struct-literal field of a proven A. A bare local `x` and `w.x`
+ * on an unproven receiver link to no field. */
+static const usage_expectation_t rust_field_record_rows[] = {
+    {"read", "x", "src/a.rs", 1}, {"read", "x", "src/b.rs", 0},  {"make", "x", "src/a.rs", 1},
+    {"bare", "x", "src/a.rs", 0}, {"bare", "x", "src/b.rs", 0},  {"guess", "x", "src/a.rs", 0},
+    {"guess", "x", "src/b.rs", 0},
+};
+
+TEST(pipeline_rust_field_usage_from_resolver_record) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_field_rec_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod a;\nmod b;\nmod user;\n");
+    write_temp_file(tmp, "src/a.rs", "pub struct A {\n    pub x: i32,\n}\n");
+    write_temp_file(tmp, "src/b.rs", "pub struct B {\n    pub x: i32,\n}\n");
+    write_temp_file(tmp, "src/user.rs",
+                    "use crate::a::A;\n"
+                    "pub fn read(a: &A) -> i32 { a.x }\n"
+                    "pub fn make() -> A { A { x: 1 } }\n"
+                    "pub fn bare(v: Vec<i32>) -> usize { let x = v.len(); x }\n"
+                    "pub fn guess(w: Unknown) -> i32 { w.x }\n");
+    int failed = usage_expectations_hold_in_both_modes(
+        tmp, rust_field_record_rows,
+        (int)(sizeof(rust_field_record_rows) / sizeof(rust_field_record_rows[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(failed, -1);
+    PASS();
+}
+
 /* The Rust rule above is Rust's own: Python and Go files of the same shape
  * (import a from m, then a bare `b` that m and other both define) keep the
  * import-reachability pick of m.b. */
@@ -18658,6 +18693,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_rust_usage_never_binds_method_by_bare_name);
     RUN_TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob);
+    RUN_TEST(pipeline_rust_field_usage_from_resolver_record);
     RUN_TEST(pipeline_python_and_go_bare_name_keep_import_reachability);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);

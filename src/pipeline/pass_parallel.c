@@ -2905,6 +2905,17 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (semantic_reference) {
                 continue;
             }
+            /* A proven field access owns its occurrence (twin: pass_usages.c). */
+            bool field_owned = false;
+            if (lang == CBM_LANG_RUST) {
+                tgt = cbm_pipeline_rust_field_usage_target(
+                    rc->main_gbuf, rc->project_name, &result->resolved_calls, usage, &field_owned);
+            }
+            if (field_owned && !tgt) {
+                continue;
+            }
+        }
+        if (!tgt) {
             /* SQL usages are FROM/JOIN lineage refs and may bind Table/View
              * targets (cbm_registry_resolve_lineage); every other language
              * resolves through the default variant, whose central relation
@@ -2940,7 +2951,11 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
             }
-            /* A bare name never proves a Rust type member (twin: pass_usages.c). */
+            /* A bare name never proves a Rust field or type member (twin:
+             * pass_usages.c). */
+            if (cbm_pipeline_rust_bare_field_target(lang, tgt)) {
+                continue;
+            }
             if (tgt && lang == CBM_LANG_RUST && cbm_registry_label_is_type_member(tgt->label)) {
                 tgt = cbm_pipeline_rust_member_usage_target(
                     rc->main_gbuf, rc->project_name, rc->registry, &result->resolved_calls, usage);

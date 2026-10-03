@@ -1839,7 +1839,9 @@ static void pxc_rust_dump_rows(FILE *dump, const char *rel, const CBMFileResult 
         const CBMResolvedCall *r = &result->resolved_calls.items[i];
         pxc_rust_dump_row(dump, rel, "R", r->site_start_byte, r->site_end_byte, r->caller_qn,
                           r->callee_qn, r->strategy, r->reason, r->confidence,
-                          r->kind == CBM_RESOLVED_INVOCATION ? "invocation" : "reference",
+                          r->kind == CBM_RESOLVED_INVOCATION        ? "invocation"
+                          : r->kind == CBM_RESOLVED_FIELD_REFERENCE ? "field"
+                                                                    : "reference",
                           r->callee_impl_key, NULL, 0, 0);
     }
 }
