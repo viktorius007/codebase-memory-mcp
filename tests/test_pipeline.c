@@ -1239,9 +1239,12 @@ static int named_edge_count(cbm_store_t *s, const char *project, const char *edg
  * file. Semantic-control fixtures intentionally keep the exported short name
  * identical in two modules so a project-wide unique-name fallback cannot make
  * an alias-mapping assertion pass accidentally. */
-static int named_edge_to_file_count(cbm_store_t *s, const char *project, const char *edge_type,
-                                    const char *source_name, const char *target_name,
-                                    const char *target_file_path) {
+/* As named_edge_to_file_count, restricted to targets labelled `target_label`
+ * when it is non-NULL. */
+static int named_edge_to_labelled_count(cbm_store_t *s, const char *project,
+                                        const char *edge_type, const char *source_name,
+                                        const char *target_name, const char *target_file_path,
+                                        const char *target_label) {
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
     if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
@@ -1256,7 +1259,8 @@ static int named_edge_to_file_count(cbm_store_t *s, const char *project, const c
         int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
         if (source_ok && target_ok && source.name && target.name && target.file_path &&
             strcmp(source.name, source_name) == 0 && strcmp(target.name, target_name) == 0 &&
-            strcmp(target.file_path, target_file_path) == 0) {
+            strcmp(target.file_path, target_file_path) == 0 &&
+            (!target_label || (target.label && strcmp(target.label, target_label) == 0))) {
             matches++;
         }
         cbm_node_free_fields(&source);
@@ -1266,6 +1270,13 @@ static int named_edge_to_file_count(cbm_store_t *s, const char *project, const c
         cbm_store_free_edges(edges, edge_count);
     }
     return matches;
+}
+
+static int named_edge_to_file_count(cbm_store_t *s, const char *project, const char *edge_type,
+                                    const char *source_name, const char *target_name,
+                                    const char *target_file_path) {
+    return named_edge_to_labelled_count(s, project, edge_type, source_name, target_name,
+                                        target_file_path, NULL);
 }
 
 /* Count exact-name nodes without depending on project-prefixed qualified names.
@@ -2822,12 +2833,13 @@ typedef struct {
     const char *target;
     const char *target_file;
     int expected;
+    const char *target_label; /* NULL: any label */
 } usage_expectation_t;
 
 static const usage_expectation_t rust_bare_binding_rows[] = {
-    {"f", "b", "src/m.rs", 0},     {"f", "b", "src/other.rs", 0},   {"h", "b", "src/m.rs", 1},
-    {"h", "b", "src/other.rs", 0}, {"q", "b", "src/other.rs", 1},   {"q", "b", "src/m.rs", 0},
-    {"r", "cap", "src/m.rs", 1},   {"r", "cap", "src/other.rs", 0},
+    {"f", "b", "src/m.rs", 0, NULL},     {"f", "b", "src/other.rs", 0, NULL},   {"h", "b", "src/m.rs", 1, NULL},
+    {"h", "b", "src/other.rs", 0, NULL}, {"q", "b", "src/other.rs", 1, NULL},   {"q", "b", "src/m.rs", 0, NULL},
+    {"r", "cap", "src/m.rs", 1, NULL},   {"r", "cap", "src/other.rs", 0, NULL},
 };
 enum { RUST_BARE_BINDING_ROWS = sizeof(rust_bare_binding_rows) / sizeof(rust_bare_binding_rows[0]) };
 
@@ -2844,8 +2856,9 @@ static void usage_expectation_counts(const char *tmp, const char *db_name,
         if (s) {
             const char *project = cbm_pipeline_project_name(p);
             for (int i = 0; i < row_count; i++) {
-                out[i] = named_edge_to_file_count(s, project, "USAGE", rows[i].source,
-                                                  rows[i].target, rows[i].target_file);
+                out[i] = named_edge_to_labelled_count(s, project, "USAGE", rows[i].source,
+                                                      rows[i].target, rows[i].target_file,
+                                                      rows[i].target_label);
             }
             cbm_store_close(s);
         }
@@ -2931,11 +2944,13 @@ TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob) {
 /* A Rust field USAGE comes only from the resolver's field record: `a.x` with
  * `a: &A` imported from another module links to A.x (not the same-named B.x),
  * as does a struct-literal field of a proven A. A bare local `x` and `w.x`
- * on an unproven receiver link to no field. */
+ * on an unproven receiver link to no field. The literal field `n` of G reaches
+ * the Field even though G's same-named getter holds the unsuffixed QN. */
 static const usage_expectation_t rust_field_record_rows[] = {
-    {"read", "x", "src/a.rs", 1}, {"read", "x", "src/b.rs", 0},  {"make", "x", "src/a.rs", 1},
-    {"bare", "x", "src/a.rs", 0}, {"bare", "x", "src/b.rs", 0},  {"guess", "x", "src/a.rs", 0},
-    {"guess", "x", "src/b.rs", 0},
+    {"read", "x", "src/a.rs", 1, NULL}, {"read", "x", "src/b.rs", 0, NULL},  {"make", "x", "src/a.rs", 1, NULL},
+    {"bare", "x", "src/a.rs", 0, NULL}, {"bare", "x", "src/b.rs", 0, NULL},  {"guess", "x", "src/a.rs", 0, NULL},
+    {"guess", "x", "src/b.rs", 0, NULL}, {"mkg", "n", "src/a.rs", 1, "Field"},
+    {"mkg", "n", "src/a.rs", 0, "Method"},
 };
 
 TEST(pipeline_rust_field_usage_from_resolver_record) {
@@ -2947,14 +2962,18 @@ TEST(pipeline_rust_field_usage_from_resolver_record) {
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs", "mod a;\nmod b;\nmod user;\n");
-    write_temp_file(tmp, "src/a.rs", "pub struct A {\n    pub x: i32,\n}\n");
+    write_temp_file(tmp, "src/a.rs",
+                    "pub struct A {\n    pub x: i32,\n}\n"
+                    "pub struct G {\n    pub n: i32,\n}\n"
+                    "impl G {\n    pub fn n(&self) -> i32 { 0 }\n}\n");
     write_temp_file(tmp, "src/b.rs", "pub struct B {\n    pub x: i32,\n}\n");
     write_temp_file(tmp, "src/user.rs",
                     "use crate::a::A;\n"
                     "pub fn read(a: &A) -> i32 { a.x }\n"
                     "pub fn make() -> A { A { x: 1 } }\n"
                     "pub fn bare(v: Vec<i32>) -> usize { let x = v.len(); x }\n"
-                    "pub fn guess(w: Unknown) -> i32 { w.x }\n");
+                    "pub fn guess(w: Unknown) -> i32 { w.x }\n"
+                    "pub fn mkg() -> crate::a::G { crate::a::G { n: 1 } }\n");
     int failed = usage_expectations_hold_in_both_modes(
         tmp, rust_field_record_rows,
         (int)(sizeof(rust_field_record_rows) / sizeof(rust_field_record_rows[0])));
@@ -2967,12 +2986,12 @@ TEST(pipeline_rust_field_usage_from_resolver_record) {
  * (import a from m, then a bare `b` that m and other both define) keep the
  * import-reachability pick of m.b. */
 static const usage_expectation_t python_bare_binding_rows[] = {
-    {"f", "b", "m.py", 1}, {"f", "b", "other.py", 0}, {"h", "b", "m.py", 1},
-    {"h", "b", "other.py", 0},
+    {"f", "b", "m.py", 1, NULL}, {"f", "b", "other.py", 0, NULL}, {"h", "b", "m.py", 1, NULL},
+    {"h", "b", "other.py", 0, NULL},
 };
 static const usage_expectation_t go_bare_binding_rows[] = {
-    {"F", "B", "m/m.go", 1},
-    {"F", "B", "other/other.go", 0},
+    {"F", "B", "m/m.go", 1, NULL},
+    {"F", "B", "other/other.go", 0, NULL},
 };
 
 TEST(pipeline_python_and_go_bare_name_keep_import_reachability) {

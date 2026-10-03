@@ -204,6 +204,40 @@ const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(const cbm_gbuf_t *g
     return owned ? cbm_gbuf_find_by_qn(gbuf, owned) : NULL;
 }
 
+/* The Field node named by `field_qn`. A field sharing its QN with a same-named
+ * method of its type carries the extractor's `#L<line>` suffix; exactly one
+ * such Field is required. */
+static const cbm_gbuf_node_t *rust_field_node(const cbm_gbuf_t *gbuf, const char *project_name,
+                                              const char *field_qn) {
+    const cbm_gbuf_node_t *node = cbm_pipeline_lsp_target_node(gbuf, project_name, field_qn, false);
+    if (node && node->label && strcmp(node->label, "Field") == 0) {
+        return node;
+    }
+    if (!node || !node->qualified_name) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t **named = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, cbm_lsp_bare_segment(field_qn), &named, &count) != 0) {
+        return NULL;
+    }
+    size_t qn_len = strlen(node->qualified_name);
+    const cbm_gbuf_node_t *field = NULL;
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *n = named[i];
+        if (!n->label || strcmp(n->label, "Field") != 0 || !n->qualified_name ||
+            strncmp(n->qualified_name, node->qualified_name, qn_len) != 0 ||
+            strncmp(n->qualified_name + qn_len, "#L", 2) != 0) {
+            continue;
+        }
+        if (field) {
+            return NULL;
+        }
+        field = n;
+    }
+    return field;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_rust_field_usage_target(const cbm_gbuf_t *gbuf,
                                                             const char *project_name,
                                                             const CBMResolvedCallArray *rows,
@@ -228,7 +262,7 @@ const cbm_gbuf_node_t *cbm_pipeline_rust_field_usage_target(const cbm_gbuf_t *gb
         }
         best = rc;
     }
-    return best ? cbm_pipeline_lsp_target_node(gbuf, project_name, best->callee_qn, false) : NULL;
+    return best ? rust_field_node(gbuf, project_name, best->callee_qn) : NULL;
 }
 
 bool cbm_pipeline_rust_bare_field_target(CBMLanguage lang, const cbm_gbuf_node_t *target) {
