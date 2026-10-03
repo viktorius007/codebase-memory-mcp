@@ -214,6 +214,28 @@ TEST(rustlsp_struct_method_self) {
     PASS();
 }
 
+TEST(rustlsp_generic_impl_self_method_and_field_calls) {
+    /* `self` in `impl<'a, T: Clone> W<'a, T>` is a `W`: the generic and
+     * lifetime arguments are not part of the type's QN, so `self.flush()` and
+     * `self.inner.push()` find the methods registered on `W` and `Inner`. */
+    CBMFileResult *r = extract_rust(
+        "struct Inner;\n"
+        "impl Inner { fn push(&mut self) {} }\n"
+        "struct W<'a, T> { inner: Inner, s: &'a str, t: T }\n"
+        "impl<'a, T: Clone> W<'a, T> {\n"
+        "    fn flush(&self) {}\n"
+        "    fn run(&mut self) {\n"
+        "        self.flush();\n"
+        "        self.inner.push();\n"
+        "    }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "W.run", "W.flush"), 0);
+    ASSERT_GTE(require_resolved(r, "W.run", "Inner.push"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_struct_constructor_self_new) {
     CBMFileResult *r = extract_rust(
         "struct Logger;\n"
@@ -9970,6 +9992,7 @@ void suite_rust_lsp(void) {
     /* Inherent impl */
     RUN_TEST(rustlsp_struct_method_dispatch);
     RUN_TEST(rustlsp_struct_method_self);
+    RUN_TEST(rustlsp_generic_impl_self_method_and_field_calls);
     RUN_TEST(rustlsp_struct_constructor_self_new);
     RUN_TEST(rustlsp_method_chain_via_return_type);
 

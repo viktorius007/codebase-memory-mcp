@@ -9760,14 +9760,18 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
         !ts_node_is_null(trait_node) && rust_impl_has_type_param(ctx, impl_node, type_text);
     const char *effective_recv = NULL;
 
+    /* `self` is typed by the impl's type name without its generic and
+     * lifetime arguments (`W<'a>` binds `self` to `W`): the registry holds a
+     * type and its methods under that bare QN, the one the owner below names. */
     if (is_blanket) {
         char *tt = rust_node_text(ctx, trait_node);
         if (tt)
-            effective_recv = rust_resolve_path_expr(ctx, tt);
+            effective_recv = rust_resolve_path_expr(ctx, cbm_rust_impl_owner_name(ctx->arena, tt));
     } else {
         effective_recv = rust_impl_declared_self_in_file(ctx, type_text);
         if (!effective_recv) {
-            effective_recv = rust_resolve_path_expr(ctx, type_text);
+            effective_recv =
+                rust_resolve_path_expr(ctx, cbm_rust_impl_owner_name(ctx->arena, type_text));
         }
     }
     if (!effective_recv)
