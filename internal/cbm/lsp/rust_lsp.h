@@ -65,6 +65,7 @@ typedef struct {
     const char *source;
     int source_len;
     const char *root_source; /* immutable original file buffer */
+    int root_source_len;
 
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
@@ -109,6 +110,7 @@ typedef struct {
      * miss stays a miss; set only by impl-header resolution. */
     bool follow_glob_exports;
     CBMIdxMemo export_memo; /* "<module>\x1f<name>" -> 0 (miss) or 1-based export_values slot */
+    CBMIdxMemo spelled_names; /* identifier -> 1 when this file's source spells it, else 0 */
     const char **export_values;
     int export_value_count;
 

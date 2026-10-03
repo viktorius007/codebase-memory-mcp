@@ -71,6 +71,7 @@ static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head);
 static const char *rust_wrapper_head_qn(RustLSPContext *ctx, const char *head);
 static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMType *base,
                                                  const char *method);
+static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn);
 static bool rust_bound_is_marker(const char *bound, size_t len);
 static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBMTypeRegistry *reg,
                                                                        const char *receiver_qn,
@@ -112,6 +113,7 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->source = source;
     ctx->source_len = source_len;
     ctx->root_source = source;
+    ctx->root_source_len = source_len;
     ctx->registry = registry;
     ctx->module_qn = module_qn;
     ctx->relative_module_qn = module_qn;
@@ -4432,24 +4434,137 @@ static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head) {
     return rust_wrapper_head_qn(ctx, head) != NULL;
 }
 
-/* A trait impl in the corpus on the std wrapper `base` that provides
- * `method` (`impl<T: X + ?Sized> X for Box<T>`). rustc finds it on the
- * wrapper before it derefs to the target; whether that impl applies to
- * this wrapper's argument is not decided here, so the caller links
- * neither it nor the target. */
-static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMType *base,
-                                                 const char *method) {
-    if (!base || base->kind != CBM_TYPE_TEMPLATE || !base->data.template_type.template_name) {
+/* How a corpus trait impl's self type on a std wrapper relates to a receiver
+ * typed as that wrapper (see rust_wrapper_corpus_trait_method). */
+typedef enum {
+    RUST_IMPL_SELF_UNDECIDED, /* a type parameter, alias or unknown type takes part */
+    RUST_IMPL_SELF_SAME,      /* both spell one concrete type */
+    RUST_IMPL_SELF_DIFFERS,   /* concrete types that cannot unify */
+} RustImplSelfMatch;
+
+/* A leaf of a type that names one concrete type: a builtin, or a registered
+ * type that is no alias and no std wrapper left without its arguments. */
+static bool rust_type_leaf_concrete(RustLSPContext *ctx, const CBMType *t) {
+    if (t->kind == CBM_TYPE_BUILTIN) {
+        return t->data.builtin.name != NULL;
+    }
+    if (t->kind != CBM_TYPE_NAMED || !t->data.named.qualified_name ||
+        rust_type_derefs_to_first_arg(t->data.named.qualified_name)) {
         return false;
+    }
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry,
+                                                           t->data.named.qualified_name);
+    return rt && !rt->alias_of;
+}
+
+/* Whether the impl self type `impl_self` (as written, in the impl's module) is
+ * the receiver type `recv` (as typed at the call). Names compare by QN, so a
+ * trait object compares by its trait; anything the comparison cannot ground
+ * (an impl type parameter is an unregistered name) is undecided. */
+static RustImplSelfMatch rust_impl_self_match(RustLSPContext *ctx, const CBMType *impl_self,
+                                              const CBMType *recv) {
+    if (!impl_self || !recv) {
+        return RUST_IMPL_SELF_UNDECIDED;
+    }
+    if (impl_self->kind == CBM_TYPE_TEMPLATE && recv->kind == CBM_TYPE_TEMPLATE) {
+        const char *a = impl_self->data.template_type.template_name;
+        const char *b = recv->data.template_type.template_name;
+        const char *ca = a ? rust_std_wrapper_canonical(a) : NULL;
+        const char *cb = b ? rust_std_wrapper_canonical(b) : NULL;
+        if (!ca || !cb) {
+            return RUST_IMPL_SELF_UNDECIDED;
+        }
+        if (strcmp(ca, cb) != 0) {
+            return RUST_IMPL_SELF_DIFFERS;
+        }
+        if (impl_self->data.template_type.arg_count != recv->data.template_type.arg_count) {
+            return RUST_IMPL_SELF_UNDECIDED;
+        }
+        RustImplSelfMatch all = RUST_IMPL_SELF_SAME;
+        for (int i = 0; i < recv->data.template_type.arg_count; i++) {
+            RustImplSelfMatch m =
+                rust_impl_self_match(ctx, impl_self->data.template_type.template_args[i],
+                                     recv->data.template_type.template_args[i]);
+            if (m == RUST_IMPL_SELF_DIFFERS) {
+                return m;
+            }
+            if (m == RUST_IMPL_SELF_UNDECIDED) {
+                all = m;
+            }
+        }
+        return all;
+    }
+    if (impl_self->kind == CBM_TYPE_REFERENCE && recv->kind == CBM_TYPE_REFERENCE) {
+        return rust_impl_self_match(ctx, impl_self->data.reference.elem, recv->data.reference.elem);
+    }
+    if (!rust_type_leaf_concrete(ctx, impl_self) || !rust_type_leaf_concrete(ctx, recv)) {
+        return RUST_IMPL_SELF_UNDECIDED;
+    }
+    if (impl_self->kind != recv->kind) {
+        return RUST_IMPL_SELF_DIFFERS;
+    }
+    const char *a = impl_self->kind == CBM_TYPE_NAMED ? impl_self->data.named.qualified_name
+                                                      : impl_self->data.builtin.name;
+    const char *b = recv->kind == CBM_TYPE_NAMED ? recv->data.named.qualified_name
+                                                 : recv->data.builtin.name;
+    return strcmp(a, b) == 0 ? RUST_IMPL_SELF_SAME : RUST_IMPL_SELF_DIFFERS;
+}
+
+/* The method a corpus trait impl on the std wrapper `base` (`impl Tr for
+ * Arc<X>`) provides as `method`. rustc finds such a method on the wrapper
+ * before it derefs to the target, when the impl applies to this wrapper and
+ * its trait is in scope. Returns the one impl proven to apply; sets *blocked
+ * when an impl may apply but that is not proven (impl type parameters, a
+ * trait object whose marker bounds the type text drops, several impls), so
+ * the caller links neither it nor the deref target. An impl whose self type
+ * differs from `base`, or whose trait is out of scope, leaves the call to the
+ * deref walk. */
+static const CBMRegisteredFunc *rust_wrapper_corpus_trait_method(RustLSPContext *ctx,
+                                                                 const CBMType *base,
+                                                                 const char *method,
+                                                                 bool *blocked) {
+    *blocked = false;
+    if (!base || base->kind != CBM_TYPE_TEMPLATE || !base->data.template_type.template_name) {
+        return NULL;
     }
     const char *wrapper = rust_wrapper_head_qn(ctx, base->data.template_type.template_name);
     if (!wrapper) {
-        return false;
+        return NULL;
     }
-    bool ambiguous = false;
-    return rust_registry_lookup_trait_impl_method(ctx->registry, wrapper, NULL, method,
-                                                  &ambiguous) != NULL ||
-           ambiguous;
+    const CBMRegisteredFunc *applies = NULL;
+    for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
+        CBMMethodIter it;
+        cbm_registry_methods(reg, wrapper, method, &it);
+        for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+            const CBMRegisteredFunc *candidate = &reg->funcs[index];
+            if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 ||
+                !candidate->impl_trait_qn ||
+                rust_trait_out_of_scope(ctx, candidate->impl_trait_qn)) {
+                continue;
+            }
+            RustImplSelfMatch m = rust_impl_self_match(ctx, candidate->rust_wrapper_impl_self, base);
+            if (m == RUST_IMPL_SELF_DIFFERS) {
+                continue;
+            }
+            bool exact = m == RUST_IMPL_SELF_SAME && candidate->impl_key &&
+                         !strstr(candidate->impl_key, "dyn ");
+            if (!exact || (applies && applies != candidate)) {
+                *blocked = true;
+                return NULL;
+            }
+            applies = candidate;
+        }
+    }
+    return applies;
+}
+
+/* Whether rustc may find `method` on the std wrapper `base` itself through a
+ * corpus trait impl, before any deref: one applies, or one may apply and that
+ * is not settled (see rust_wrapper_corpus_trait_method). */
+static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMType *base,
+                                                 const char *method) {
+    bool blocked = false;
+    return rust_wrapper_corpus_trait_method(ctx, base, method, &blocked) != NULL || blocked;
 }
 
 /* Returns the inner type after one Deref step. For NAMED types we check
@@ -4598,14 +4713,72 @@ const CBMRegisteredFunc *cbm_rust_registry_lookup_impl_method(
                : NULL;
 }
 
+/* Whether `name` is spelled as an identifier anywhere in this file's own
+ * buffer (not a macro expansion being walked). Memoized per file: the answer
+ * depends on that buffer alone. */
+static bool rust_source_spells_identifier(RustLSPContext *ctx, const char *name) {
+    int32_t memo = cbm_idxmemo_get(&ctx->spelled_names, name);
+    if (memo >= 0) {
+        return memo != 0;
+    }
+    size_t n = strlen(name);
+    const char *src = ctx->root_source;
+    const char *end = src + ctx->root_source_len;
+    bool found = false;
+    for (const char *p = src; n > 0 && !found && p + n <= end; p++) {
+        p = memmem(p, (size_t)(end - p), name, n);
+        if (!p) {
+            break;
+        }
+        bool starts = p == src || !(isalnum((unsigned char)p[-1]) || p[-1] == '_');
+        bool ends = p + n == end || !(isalnum((unsigned char)p[n]) || p[n] == '_');
+        found = starts && ends;
+    }
+    cbm_idxmemo_put_if_absent(&ctx->spelled_names, ctx->arena, cbm_arena_strdup(ctx->arena, name),
+                              found ? 1 : 0);
+    return found;
+}
+
+/* A trait whose methods a call on a concrete type in this file provably cannot
+ * reach: rustc considers a trait's methods only when the trait is in scope.
+ * Proven when the trait is declared in another file, is no prelude name, its
+ * name is spelled
+ * nowhere in this file (so no `use`, `as` rename or `as _` import names it),
+ * and every glob import in scope is of this file's own module (whose items
+ * and imports are this file's). Without the proof the trait stays a
+ * candidate. */
+static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn) {
+    if (!ctx || !trait_qn || !ctx->module_qn || !ctx->root_source || ctx->root_source_len <= 0) {
+        return false;
+    }
+    size_t module_len = strlen(ctx->module_qn);
+    if (strncmp(trait_qn, ctx->module_qn, module_len) == 0 && trait_qn[module_len] == '.') {
+        return false;
+    }
+    for (int i = 0; i < ctx->glob_count; i++) {
+        if (!ctx->glob_module_qns[i] || strcmp(ctx->glob_module_qns[i], ctx->module_qn) != 0) {
+            return false;
+        }
+    }
+    const char *dot = strrchr(trait_qn, '.');
+    const char *name = dot ? dot + 1 : trait_qn;
+    /* A prelude name (`Clone`, `AsRef`) is in scope unspelled. */
+    if (rust_lookup_prelude(name)) {
+        return false;
+    }
+    return !rust_source_spells_identifier(ctx, name);
+}
+
 /* Find the trait-impl method for one concrete receiver. With trait_qn==NULL,
  * exactly one implemented trait may contribute this method; two distinct
- * traits are ambiguous and deliberately resolve to NULL. */
-static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBMTypeRegistry *reg,
-                                                                       const char *receiver_qn,
-                                                                       const char *trait_qn,
-                                                                       const char *method_name,
-                                                                       bool *out_ambiguous) {
+ * traits are ambiguous and deliberately resolve to NULL. An impl on a std
+ * wrapper with a recorded self type is no candidate here. With `scope`, an
+ * impl of a trait out of scope there is no candidate (*out_filtered set). */
+static const CBMRegisteredFunc *
+rust_registry_lookup_trait_impl_method_scoped(RustLSPContext *scope, const CBMTypeRegistry *reg,
+                                              const char *receiver_qn, const char *trait_qn,
+                                              const char *method_name, bool *out_ambiguous,
+                                              bool *out_filtered) {
     if (out_ambiguous) {
         *out_ambiguous = false;
     }
@@ -4618,10 +4791,19 @@ static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBM
     cbm_registry_methods(reg, receiver_qn, method_name, &it);
     for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
         const CBMRegisteredFunc *candidate = &reg->funcs[index];
-        if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || !candidate->impl_trait_qn) {
+        /* An impl on a std wrapper applies by the wrapper's arguments, which a
+         * lookup by QN does not see: rust_wrapper_corpus_trait_method decides it. */
+        if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || !candidate->impl_trait_qn ||
+            candidate->rust_wrapper_impl_self) {
             continue;
         }
         if (trait_qn && strcmp(candidate->impl_trait_qn, trait_qn) != 0) {
+            continue;
+        }
+        if (scope && rust_trait_out_of_scope(scope, candidate->impl_trait_qn)) {
+            if (out_filtered) {
+                *out_filtered = true;
+            }
             continue;
         }
         const char *candidate_impl = candidate->impl_key ? candidate->impl_key
@@ -4640,9 +4822,19 @@ static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBM
     if (best_index >= 0) {
         return &reg->funcs[best_index];
     }
-    return reg->fallback ? rust_registry_lookup_trait_impl_method(
-                               reg->fallback, receiver_qn, trait_qn, method_name, out_ambiguous)
+    return reg->fallback ? rust_registry_lookup_trait_impl_method_scoped(
+                               scope, reg->fallback, receiver_qn, trait_qn, method_name,
+                               out_ambiguous, out_filtered)
                          : NULL;
+}
+
+static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBMTypeRegistry *reg,
+                                                                       const char *receiver_qn,
+                                                                       const char *trait_qn,
+                                                                       const char *method_name,
+                                                                       bool *out_ambiguous) {
+    return rust_registry_lookup_trait_impl_method_scoped(NULL, reg, receiver_qn, trait_qn,
+                                                         method_name, out_ambiguous, NULL);
 }
 
 static const CBMRegisteredFunc *rust_lookup_method_depth(RustLSPContext *ctx, const char *type_qn,
@@ -4855,8 +5047,9 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
     }
 
     bool trait_ambiguous = false;
-    const CBMRegisteredFunc *impl_method = rust_registry_lookup_trait_impl_method(
-        reg, receiver_type_qn, NULL, method_name, &trait_ambiguous);
+    bool scope_filtered = false; /* a candidate was dropped for this file's scope */
+    const CBMRegisteredFunc *impl_method = rust_registry_lookup_trait_impl_method_scoped(
+        ctx, reg, receiver_type_qn, NULL, method_name, &trait_ambiguous, &scope_filtered);
     if (trait_ambiguous) {
         if (out_impl_count) {
             *out_impl_count = 2;
@@ -4893,6 +5086,10 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
             if (!candidate) {
                 continue;
             }
+            if (rust_trait_out_of_scope(ctx, trait_qn)) {
+                scope_filtered = true;
+                continue;
+            }
             if (default_trait && strcmp(default_trait, trait_qn) != 0) {
                 if (out_impl_count) {
                     *out_impl_count = 2;
@@ -4912,7 +5109,8 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         }
         return default_method;
     }
-    if (nm_active) {
+    /* A miss that depends on this scope's imports is not a registry fact. */
+    if (nm_active && !scope_filtered) {
         cbm_negmemo_insert(&ctx->neg_memo, ctx->arena, nm_key);
     }
     return NULL;
@@ -8020,7 +8218,15 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             type_qn = "core.slice";
         }
 
-        if (rust_wrapper_has_corpus_trait_method(ctx, base, mname)) {
+        bool wrapper_blocked = false;
+        const CBMRegisteredFunc *wrapper_method =
+            rust_wrapper_corpus_trait_method(ctx, base, mname, &wrapper_blocked);
+        if (wrapper_method) {
+            rust_emit_resolved_call(ctx, wrapper_method->qualified_name, wrapper_method->impl_key,
+                                    "lsp_trait_dispatch", CBM_RUST_CONF_TRAIT_SOLE);
+            return;
+        }
+        if (wrapper_blocked) {
             return;
         }
         if (type_qn) {
@@ -8065,7 +8271,15 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 }
                 if (!next)
                     break;
-                if (rust_wrapper_has_corpus_trait_method(ctx, next, mname))
+                const CBMRegisteredFunc *hop_wrapper_method =
+                    rust_wrapper_corpus_trait_method(ctx, next, mname, &wrapper_blocked);
+                if (hop_wrapper_method) {
+                    rust_emit_resolved_call(ctx, hop_wrapper_method->qualified_name,
+                                            hop_wrapper_method->impl_key, "lsp_deref_dispatch",
+                                            CBM_RUST_CONF_PROMOTED);
+                    return;
+                }
+                if (wrapper_blocked)
                     return;
                 const char *next_qn = NULL;
                 if (next->kind == CBM_TYPE_NAMED)
@@ -9063,12 +9277,33 @@ static const char *rust_impl_declared_self(const CBMRustModTree *tree, CBMArena 
 /* The std Deref wrapper (`alloc.boxed.Box`, `alloc.sync.Arc`, ...) an impl
  * self type spelled `Box<T>` / `Arc<dyn X>` names, or NULL. A method of such
  * an impl is a method of the wrapper: rustc finds it on the wrapper before it
- * derefs to the target. */
+ * derefs to the target. A bare name the module tree cannot settle (no `use`
+ * or item binds it; only a glob of unknown contents might) is read as the
+ * prelude reads it, the rule a call site applies to the same spelling
+ * (rust_wrapper_head_qn). */
 static const char *rust_impl_std_wrapper_self(const CBMRustModTree *tree, CBMArena *arena,
                                               const char *module_qn, const char *spelling) {
     const char *path = spelling ? rust_impl_self_path(arena, spelling) : NULL;
     const char *qn = path ? rust_text_type_qn_by_module_tree(tree, arena, module_qn, path) : NULL;
+    if (!qn && path && tree && module_qn && !strchr(path, ':') &&
+        cbm_rust_modtree_resolve_type_in_file(tree, arena, module_qn, path).kind ==
+            CBM_RUST_PATH_UNKNOWN) {
+        qn = rust_lookup_prelude(path);
+    }
     return qn ? rust_std_wrapper_canonical(qn) : NULL;
+}
+
+/* The self type of a trait impl on the std wrapper `wrapper_qn`, spelled
+ * `spelling` in `module_qn`, with the wrapper named by its canonical QN. */
+static const CBMType *rust_wrapper_impl_self_type(CBMArena *arena, const char *spelling,
+                                                  const char *wrapper_qn, const char *module_qn,
+                                                  const CBMRustModTree *tree) {
+    const CBMType *t = rust_parse_def_type_text(arena, spelling, module_qn, tree);
+    if (!t || t->kind != CBM_TYPE_TEMPLATE) {
+        return NULL;
+    }
+    return cbm_type_template(arena, wrapper_qn, t->data.template_type.template_args,
+                             t->data.template_type.arg_count);
 }
 
 static const CBMRegisteredType *rust_impl_registry_type(const void *reg, const char *qn) {
@@ -10110,7 +10345,11 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
         return NULL;
     }
     RustDeclaredTypes declared = {.reg = reg, .type_idx = type_idx};
-    CBMIdxMemo seen = {0}; /* receiver QN -> index of the def that decided it */
+    /* receiver QN -> index of the def that decided it, one memo per def kind:
+     * a method moves to a std wrapper's QN, its impl relation does not, so a
+     * relation's decision never stands for a method's. */
+    CBMIdxMemo seen_methods = {0};
+    CBMIdxMemo seen_relations = {0};
     for (int i = 0; i < def_count; i++) {
         CBMRustLSPDef *d = &defs[i];
         receivers[i] = d->receiver_type;
@@ -10118,7 +10357,8 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
         if (!tree || !owns_methods || !d->receiver_type || !d->receiver_spelling) {
             continue;
         }
-        int32_t decided = cbm_idxmemo_get(&seen, d->receiver_type);
+        CBMIdxMemo *seen = d->is_rust_impl_relation ? &seen_relations : &seen_methods;
+        int32_t decided = cbm_idxmemo_get(seen, d->receiver_type);
         if (decided >= 0) {
             receivers[i] = receivers[decided];
             continue;
@@ -10133,7 +10373,7 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
         if (self) {
             receivers[i] = self;
         }
-        cbm_idxmemo_put_if_absent(&seen, arena, d->receiver_type, i);
+        cbm_idxmemo_put_if_absent(seen, arena, d->receiver_type, i);
     }
     return receivers;
 }
@@ -10381,14 +10621,20 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             if (rf.receiver_type && rf.impl_trait_qn && d->receiver_spelling) {
                 rf.impl_key = cbm_rust_impl_key(arena, rf.receiver_type, d->receiver_spelling,
                                                 d->trait_qn);
+                if (rust_type_derefs_to_first_arg(rf.receiver_type)) {
+                    rf.rust_wrapper_impl_self = rust_wrapper_impl_self_type(
+                        arena, d->receiver_spelling, rf.receiver_type, def_mod, tree);
+                }
             }
 
             cbm_registry_add_func(reg, rf);
 
             /* Method provenance also carries the type-level relation for
              * backwards-compatible direct CBMRustLSPDef callers. Production
-             * extraction additionally emits an independent relation record. */
-            if (rf.receiver_type && rf.impl_trait_qn) {
+             * extraction additionally emits an independent relation record.
+             * An impl on a std wrapper applies only to the wrapper arguments
+             * its self type spells, so it marks no relation on the wrapper. */
+            if (rf.receiver_type && rf.impl_trait_qn && !rf.rust_wrapper_impl_self) {
                 CBMRegisteredType *rt = NULL;
                 int32_t tix = cbm_idxmemo_get(&type_idx, rf.receiver_type);
                 if (tix >= 0) {
