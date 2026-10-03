@@ -3464,6 +3464,31 @@ TEST(rustlsp_field_access_chain) {
     PASS();
 }
 
+TEST(rustlsp_field_read_before_same_named_method) {
+    /* `self.x` without a call is the field `x: Vec<Item>`, though `fn x`
+     * exists too; only the call `self.x()` names the method. */
+    CBMFileResult *r = extract_rust(
+        "struct Item;\n"
+        "impl Item { fn m(&self) {} }\n"
+        "struct Other;\n"
+        "impl Other { fn m(&self) {} }\n"
+        "struct S { x: Vec<Item> }\n"
+        "impl S {\n"
+        "    fn x(&self) -> Other { Other }\n"
+        "    fn push_field(&mut self) { self.x.push(Item); }\n"
+        "    fn index_field(&self) { self.x[0].m(); }\n"
+        "    fn call_method(&self) { self.x().m(); }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "S.push_field", "Vec.push"), 0);
+    ASSERT_GTE(require_resolved(r, "S.index_field", "Item.m"), 0);
+    ASSERT_LT(find_resolved(r, "S.index_field", "Other.m"), 0);
+    ASSERT_GTE(require_resolved(r, "S.call_method", "Other.m"), 0);
+    ASSERT_LT(find_resolved(r, "S.call_method", "Item.m"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_param_method_overload_disambiguation) {
     /* Two structs with the same method name; type tracking decides. */
     CBMFileResult *r = extract_rust(
@@ -10412,6 +10437,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_return_type_self);
     RUN_TEST(rustlsp_nested_impl_blocks);
     RUN_TEST(rustlsp_field_access_chain);
+    RUN_TEST(rustlsp_field_read_before_same_named_method);
     RUN_TEST(rustlsp_param_method_overload_disambiguation);
     RUN_TEST(rustlsp_for_iter_method_resolves);
     RUN_TEST(rustlsp_module_local_function_dispatch);
