@@ -16,6 +16,7 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include "pipeline/pipeline_internal.h"
 #include <foundation/log.h>
 #include <foundation/mem.h>
 #include <foundation/platform.h>
@@ -904,6 +905,56 @@ TEST(incr_accuracy_vs_full) {
            incr_edges, full_nodes, full_edges);
 
     delete_file_at("fastapi/incr_accuracy.py");
+    PASS();
+}
+
+/* A generation written by another build holds nodes, edges and LSP surfaces
+ * extracted by different code, so a refresh by the new build cannot patch
+ * it: the first refresh after an upgrade rebuilds, and the next edit by the
+ * same build is a closure repair again. */
+static cbm_incremental_route_t upgrade_refresh_route(const char *repo, const char *db) {
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_INCREMENTAL_ROUTE_NONE;
+    }
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc == 0 ? cbm_pipeline_incremental_test_last_route() : CBM_INCREMENTAL_ROUTE_NONE;
+}
+
+TEST(incr_refresh_after_build_change_rebuilds) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_upgrade_refresh_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db[512];
+    snprintf(db, sizeof(db), "%s/upgrade.db", tmp);
+    ASSERT_EQ(th_write_file(th_path_join(tmp, "a.py"), "def upgrade_a():\n    return 1\n"), 0);
+    ASSERT_EQ(th_write_file(th_path_join(tmp, "b.py"),
+                            "from a import upgrade_a\n\ndef upgrade_b():\n    return upgrade_a()\n"),
+              0);
+
+    cbm_pipeline_set_extractor_build("build-A");
+    cbm_pipeline_t *base = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(base);
+    ASSERT_EQ(cbm_pipeline_run(base), 0);
+    cbm_pipeline_free(base);
+
+    ASSERT_EQ(th_write_file(th_path_join(tmp, "b.py"),
+                            "from a import upgrade_a\n\ndef upgrade_b():\n    return upgrade_a() + 1\n"),
+              0);
+    cbm_pipeline_set_extractor_build("build-B");
+    cbm_incremental_route_t first = upgrade_refresh_route(tmp, db);
+
+    ASSERT_EQ(th_write_file(th_path_join(tmp, "b.py"),
+                            "from a import upgrade_a\n\ndef upgrade_b():\n    return upgrade_a() + 2\n"),
+              0);
+    cbm_incremental_route_t second = upgrade_refresh_route(tmp, db);
+    cbm_pipeline_set_extractor_build(NULL);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(first, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(second, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     PASS();
 }
 
@@ -3099,6 +3150,9 @@ TEST(tool_delete_and_verify) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(incremental) {
+    /* Self-contained (own temp repo): runs even when the fixture clone fails. */
+    RUN_TEST(incr_refresh_after_build_change_rebuilds);
+
     if (incremental_setup() != 0) {
         printf("  SETUP FAILED — skipping incremental tests (network?)\n");
         return;
