@@ -7200,9 +7200,55 @@ static int rust_arg_lex_unit(const char *s, int len, int i) {
     return i + 1;
 }
 
+/* True when the '<' at `i` opens generic arguments in expression context: a
+ * turbofish `::<` or a qualified path `<T as Tr>::` in operand position (the
+ * previous token is not an operand, so the '<' cannot be a comparison). */
+static bool rust_arg_angle_opens(const char *s, int from, int i) {
+    if (i - 2 >= from && s[i - 1] == ':' && s[i - 2] == ':')
+        return true;
+    int p = i - 1;
+    while (p >= from && isspace((unsigned char)s[p]))
+        p--;
+    return p < from || strchr("([{,;=&*!|+-", s[p]) != NULL;
+}
+
+/* Index just past the `>` closing the generic arguments opened by the '<' at
+ * `open`, or -1 when the angles do not close as a type would (a `;`, `&&`,
+ * `||` or unbalanced bracket comes first). `->` inside is not a closer. */
+static int rust_arg_angle_end(const char *s, int open, int to) {
+    int angle = 0;
+    int depth = 0;
+    int i = open;
+    while (i < to) {
+        char c = s[i];
+        int next = rust_arg_lex_unit(s, to, i);
+        if (next != i + 1) {
+            i = next;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            if (--depth < 0)
+                return -1;
+        } else if (depth == 0 && c == '<') {
+            angle++;
+        } else if (depth == 0 && c == '>' && s[i - 1] != '-') {
+            if (--angle == 0)
+                return i + 1;
+        } else if (depth == 0 && (c == ';' || ((c == '&' || c == '|') && i + 1 < to &&
+                                               s[i + 1] == c))) {
+            return -1;
+        }
+        i++;
+    }
+    return -1;
+}
+
 /* First depth-0 index in [from, to) holding `want` (',', ';', ':' or '='),
  * or `to`. A ':' must not be part of `::`; a '=' must be a lone `=` (not
- * `==`, `=>`, `<=`, `!=`, `+=`, …). */
+ * `==`, `=>`, `<=`, `!=`, `+=`, …). Generic arguments `::<A, B>` and
+ * `<T as Tr>` nest like brackets. */
 static int rust_arg_find_top(const char *s, int from, int to, char want) {
     int depth = 0;
     int i = from;
@@ -7212,6 +7258,13 @@ static int rust_arg_find_top(const char *s, int from, int to, char want) {
         if (next != i + 1) {
             i = next;
             continue;
+        }
+        if (c == '<' && rust_arg_angle_opens(s, from, i)) {
+            int close = rust_arg_angle_end(s, i, to);
+            if (close > 0) {
+                i = close;
+                continue;
+            }
         }
         if (c == '(' || c == '[' || c == '{') {
             depth++;
@@ -7647,8 +7700,8 @@ static bool rust_builtin_macro_arg_form(const char *mname, RustMacroArgForm *for
         {"writeln", "", RUST_MACRO_ARGS_EXPR_LIST},
         {"panic", "", RUST_MACRO_ARGS_EXPR_LIST},
         {"assert", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"assert_eq", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"assert_ne", "", RUST_MACRO_ARGS_EXPR_LIST},
+        {"assert_eq", "std core pretty_assertions", RUST_MACRO_ARGS_EXPR_LIST},
+        {"assert_ne", "std core pretty_assertions", RUST_MACRO_ARGS_EXPR_LIST},
         {"debug_assert", "", RUST_MACRO_ARGS_EXPR_LIST},
         {"debug_assert_eq", "", RUST_MACRO_ARGS_EXPR_LIST},
         {"debug_assert_ne", "", RUST_MACRO_ARGS_EXPR_LIST},
