@@ -1034,8 +1034,10 @@ static const char *pxc_field_defs_append(CBMArena *arena, const char *list, cons
  * `type W = (A, B);` (its def carries the elements as param_types) gains
  * fields `0:A|1:B`; an enum gains, per variant
  * `V`, `V.0:A` for a tuple payload and `V.f:T` for a named field `f` (the
- * Field defs scoped by the variant's QN). A field name holding a `.` never
- * matches a member access, so the enum's own member lookup is unchanged. */
+ * Field defs scoped by the variant's QN), and `V.:E` for the variant itself,
+ * payload or not, so a value path `E::V` is provably a variant. A field name
+ * holding a `.` never matches a member access, so the enum's own member
+ * lookup is unchanged. */
 static void pxc_fold_rust_payload_fields(CBMArena *arena, const CBMFileResult *result,
                                          CBMLSPDef *defs, int start, int end) {
     if (!arena || !result || !defs || start >= end) {
@@ -1072,6 +1074,8 @@ static void pxc_fold_rust_payload_fields(CBMArena *arena, const CBMFileResult *r
                 strcmp(d->qualified_name + qn_len + 1, d->name) != 0) {
                 continue;
             }
+            list = pxc_field_defs_append(arena, list, cbm_arena_sprintf(arena, "%s.", d->name),
+                                         dst->short_name);
             for (int p = 0; d->param_types && d->param_types[p]; p++) {
                 list = pxc_field_defs_append(
                     arena, list, cbm_arena_sprintf(arena, "%s.%d", d->name, p), d->param_types[p]);
