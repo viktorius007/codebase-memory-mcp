@@ -380,6 +380,7 @@ typedef struct {
     bool is_abstract;             /* required trait declaration (no default)  */
     bool is_async;                /* `async fn`: return is the awaited output */
     bool is_rust_private;         /* inherent method without a visibility modifier */
+    bool has_rust_self;           /* first parameter is a `self` receiver */
 } CBMRustLSPDef;
 
 const char *cbm_rust_impl_key(CBMArena *arena, const char *receiver_qn,

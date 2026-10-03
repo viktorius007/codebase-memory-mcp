@@ -930,6 +930,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->is_abstract = src->is_abstract;
         dst->is_async = src->is_async;
         dst->is_rust_private = src->is_rust_private;
+        dst->has_rust_self = src->has_rust_self;
         /* A type alias carries its target as the type it stands for and its
          * type parameters as that type's positional parameters. */
         if (src->type_alias) {
@@ -2005,6 +2006,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].is_abstract = defs[i].is_abstract;
         out[i].is_async = defs[i].is_async;
         out[i].is_rust_private = defs[i].is_rust_private;
+        out[i].has_rust_self = defs[i].has_rust_self;
     }
     return out;
 }

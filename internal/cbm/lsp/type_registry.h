@@ -23,6 +23,9 @@ typedef enum {
      * Ordinary call resolution keeps its historical language-specific choice,
      * but a function value cannot name one materialized definition exactly. */
     CBM_FUNC_FLAG_AMBIGUOUS_BINDING = 1 << 10,
+    /* Rust only: the method's first parameter is a `self` receiver, so the
+     * first argument of a `Trait::method(x, ..)` path call is the receiver. */
+    CBM_FUNC_FLAG_RUST_SELF = 1 << 11,
 } CBMFuncFlags;
 
 // Registered function/method with full type signature.

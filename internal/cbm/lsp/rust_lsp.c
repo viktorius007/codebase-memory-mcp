@@ -8237,7 +8237,11 @@ static const CBMRegisteredFunc *rust_trait_method_for_type(RustLSPContext *ctx,
 /* `Trait::method(recv, ..)` dispatches on the first argument's type: a
  * concrete type selects its impl of `trait_qn`; `dyn Trait`, `impl Trait`
  * or a type parameter bounded by the trait selects the trait's own
- * declaration. An argument of unknown type selects nothing. */
+ * declaration. An argument of unknown type selects nothing. The first
+ * argument is the receiver only when the selected method takes `self` (an
+ * impl method's receiver matches the trait's, so this holds for a trait
+ * declared outside the registry too): for an associated function
+ * (`fn make(cfg: C) -> Self`) it is an ordinary argument and selects nothing. */
 static const CBMRegisteredFunc *rust_trait_ufcs_by_receiver(RustLSPContext *ctx,
                                                             const char *trait_qn,
                                                             const char *method_name,
@@ -8261,22 +8265,18 @@ static const CBMRegisteredFunc *rust_trait_ufcs_by_receiver(RustLSPContext *ctx,
     }
     const char *dot = strrchr(type_qn, '.');
     const char *bound = rust_lookup_type_param_bound(ctx, dot ? dot + 1 : type_qn);
-    if (bound) {
-        return strcmp(bound, trait_qn) == 0
-                   ? rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, true)
-                   : NULL;
+    const char *registered = bound ? NULL : rust_registered_type_qn(ctx, type_qn);
+    const CBMRegisteredType *t =
+        registered ? cbm_registry_lookup_type(ctx->registry, registered) : NULL;
+    const CBMRegisteredFunc *found = NULL;
+    if (bound || (t && t->is_interface)) {
+        found = strcmp(bound ? bound : registered, trait_qn) == 0
+                    ? rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, true)
+                    : NULL;
+    } else if (registered) {
+        found = rust_trait_method_for_type(ctx, registered, trait_qn, method_name);
     }
-    const char *registered = rust_registered_type_qn(ctx, type_qn);
-    if (!registered) {
-        return NULL;
-    }
-    const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, registered);
-    if (t && t->is_interface) {
-        return strcmp(registered, trait_qn) == 0
-                   ? rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, true)
-                   : NULL;
-    }
-    return rust_trait_method_for_type(ctx, registered, trait_qn, method_name);
+    return found && (found->flags & CBM_FUNC_FLAG_RUST_SELF) ? found : NULL;
 }
 
 /* UFCS form `T::method` / `Trait::method` for a path already resolved to
@@ -10496,6 +10496,9 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             if (d->is_async) {
                 rf.flags |= CBM_FUNC_FLAG_ASYNC;
             }
+            if (d->has_rust_self) {
+                rf.flags |= CBM_FUNC_FLAG_RUST_SELF;
+            }
             if (d->impl_trait) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
                 rf.impl_trait_qn =
@@ -11138,6 +11141,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             if (d->is_async) {
                 rf.flags |= CBM_FUNC_FLAG_ASYNC;
             }
+            if (d->has_rust_self) {
+                rf.flags |= CBM_FUNC_FLAG_RUST_SELF;
+            }
             if (d->trait_qn && d->trait_qn[0]) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
                 rf.impl_trait_qn =
@@ -11677,6 +11683,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].is_abstract = defs[i].is_abstract;
             rdefs[i].is_async = defs[i].is_async;
             rdefs[i].is_rust_private = defs[i].is_rust_private;
+            rdefs[i].has_rust_self = defs[i].has_rust_self;
         }
     }
     rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL, modtree);
