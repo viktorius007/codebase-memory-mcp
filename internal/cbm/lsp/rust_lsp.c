@@ -74,6 +74,9 @@ static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMT
                                                  const char *method);
 static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn);
 static bool rust_bound_is_marker(const char *bound, size_t len);
+static const char *rust_dyn_markers_text(CBMArena *arena, const char *text);
+static const CBMType *rust_type_with_dyn_markers(CBMArena *arena, const CBMType *t,
+                                                 const char *markers);
 static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBMTypeRegistry *reg,
                                                                        const char *receiver_qn,
                                                                        const char *trait_qn,
@@ -1676,6 +1679,34 @@ static const char *resolve_path_to_type_qn(RustLSPContext *ctx, const char *path
     return qn; /* may not be registered yet but caller can still wrap as NAMED */
 }
 
+/* The principal trait node of a `bounded_type` (`dyn A + Send + Sync` nests
+ * as bounded_type(bounded_type(dyn A, Send), Sync)): the first bound, in
+ * source order, that is no lifetime, `?Sized` or auto trait; a null node when
+ * every bound is one. */
+static TSNode rust_bounded_principal_node(RustLSPContext *ctx, TSNode node) {
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode b = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(b), "bounded_type") == 0) {
+            TSNode inner = rust_bounded_principal_node(ctx, b);
+            if (!ts_node_is_null(inner)) {
+                return inner;
+            }
+            continue;
+        }
+        char *btext = rust_node_text(ctx, b);
+        if (!btext) {
+            continue;
+        }
+        const char *bt = strncmp(btext, "dyn ", 4) == 0 ? btext + 4 : btext;
+        if (!rust_bound_is_marker(bt, strlen(bt))) {
+            return b;
+        }
+    }
+    TSNode none = {0};
+    return none;
+}
+
 const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
@@ -1838,7 +1869,11 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         if (ts_node_is_null(inner) && ts_node_named_child_count(node) > 0) {
             inner = ts_node_named_child(node, 0);
         }
-        return rust_parse_type_node(ctx, inner);
+        char *text = rust_node_text(ctx, node);
+        return rust_type_with_dyn_markers(
+            ctx->arena, rust_parse_type_node(ctx, inner),
+            text && strncmp(text, "dyn ", 4) == 0 ? rust_dyn_markers_text(ctx->arena, text + 4)
+                                                  : NULL);
     }
 
     /* abstract_type: impl Trait — best-effort same as dyn Trait */
@@ -1853,6 +1888,15 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
     /* bounded_type: `A + Send + 'a` — the principal trait, the first bound
      * that is not a lifetime, `?Sized` or an auto trait. */
     if (strcmp(kind, "bounded_type") == 0) {
+        char *text = rust_node_text(ctx, node);
+        if (text && strncmp(text, "dyn ", 4) == 0) {
+            TSNode principal = rust_bounded_principal_node(ctx, node);
+            if (ts_node_is_null(principal)) {
+                return cbm_type_unknown();
+            }
+            return rust_type_with_dyn_markers(ctx->arena, rust_parse_type_node(ctx, principal),
+                                              rust_dyn_markers_text(ctx->arena, text + 4));
+        }
         uint32_t nc = ts_node_named_child_count(node);
         for (uint32_t i = 0; i < nc; i++) {
             TSNode b = ts_node_named_child(node, i);
@@ -2011,6 +2055,80 @@ static const char *rust_principal_bound_text(CBMArena *arena, const char *text) 
     return principal ? cbm_arena_strndup(arena, principal, principal_len) : "";
 }
 
+enum { RUST_DYN_MARKERS_MAX = 8 };
+
+static int rust_cmp_cstr(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* The auto-trait bounds of the bound list `text` (`A + Send + Sync + 'a`, the
+ * part after `dyn`), each by its last path segment, sorted and joined by '+'
+ * ("" for none): `dyn A + Send` and `dyn A` are two types, so their impls
+ * differ. Lifetimes are dropped: a program that compiles uses an impl only at
+ * a lifetime it satisfies. */
+static const char *rust_dyn_markers_text(CBMArena *arena, const char *text) {
+    const char *names[RUST_DYN_MARKERS_MAX];
+    int count = 0;
+    int depth = 0;
+    const char *start = text;
+    for (const char *q = text;; q++) {
+        if (*q == '-' && q[1] == '>') {
+            q++;
+            continue;
+        }
+        if (*q == '<' || *q == '(' || *q == '[') {
+            depth++;
+        } else if (*q == '>' || *q == ')' || *q == ']') {
+            depth--;
+        }
+        if (!(*q == '\0' || (*q == '+' && depth == 0))) {
+            continue;
+        }
+        const char *b = start;
+        const char *e = q;
+        while (b < e && isspace((unsigned char)*b)) {
+            b++;
+        }
+        while (e > b && isspace((unsigned char)e[-1])) {
+            e--;
+        }
+        if (e > b && *b != '\'' && *b != '?' && rust_bound_is_marker(b, (size_t)(e - b)) &&
+            count < RUST_DYN_MARKERS_MAX) {
+            const char *seg = e;
+            while (seg > b && seg[-1] != ':' && seg[-1] != ' ') {
+                seg--;
+            }
+            names[count++] = cbm_arena_strndup(arena, seg, (size_t)(e - seg));
+        }
+        if (*q == '\0') {
+            break;
+        }
+        start = q + 1;
+    }
+    qsort(names, (size_t)count, sizeof(names[0]), rust_cmp_cstr);
+    const char *out = "";
+    for (int i = 0; i < count; i++) {
+        out = i == 0 ? names[i] : cbm_arena_sprintf(arena, "%s+%s", out, names[i]);
+    }
+    return out;
+}
+
+/* `t`, the principal trait of a trait object, carrying its auto-trait bounds
+ * `markers`; a type that is no named trait keeps no bounds. */
+static const CBMType *rust_type_with_dyn_markers(CBMArena *arena, const CBMType *t,
+                                                 const char *markers) {
+    if (!t || t->kind != CBM_TYPE_NAMED || !markers) {
+        return t;
+    }
+    CBMType *copy = (CBMType *)cbm_arena_alloc(arena, sizeof(CBMType));
+    if (!copy) {
+        return t;
+    }
+    *copy = *t;
+    copy->data.named.rust_dyn_markers = markers;
+    return copy;
+}
+
 /* The type an associated-type binding argument names: `X` in
  * `Output = X` (as in `Future<Output = X>`); `arg` itself otherwise. */
 static const char *rust_assoc_binding_value(const char *arg) {
@@ -2119,15 +2237,17 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
             parse_type_text_with_params(arena, text + 5, module_qn, type_params, tree);
         return rust_type_is_std_trait(bound_t) ? bound_t : cbm_type_unknown();
     }
+    if (strncmp(text, "dyn ", 4) == 0) {
+        const CBMType *principal =
+            parse_type_text_with_params(arena, text + 4, module_qn, type_params, tree);
+        return rust_type_with_dyn_markers(arena, principal, rust_dyn_markers_text(arena, text + 4));
+    }
     const char *bound = rust_principal_bound_text(arena, text);
     if (!*bound) {
         return cbm_type_unknown();
     }
     if (bound != text) {
         return parse_type_text_with_params(arena, bound, module_qn, type_params, tree);
-    }
-    if (strncmp(text, "dyn ", 4) == 0) {
-        return parse_type_text_with_params(arena, text + 4, module_qn, type_params, tree);
     }
 
     /* Reference: &T or &'a T or &mut T or &'a mut T */
@@ -4522,7 +4642,23 @@ static RustImplSelfMatch rust_impl_self_match(RustLSPContext *ctx, const CBMType
                                                       : impl_self->data.builtin.name;
     const char *b = recv->kind == CBM_TYPE_NAMED ? recv->data.named.qualified_name
                                                  : recv->data.builtin.name;
-    return strcmp(a, b) == 0 ? RUST_IMPL_SELF_SAME : RUST_IMPL_SELF_DIFFERS;
+    if (strcmp(a, b) != 0) {
+        return RUST_IMPL_SELF_DIFFERS;
+    }
+    if (impl_self->kind != CBM_TYPE_NAMED) {
+        return RUST_IMPL_SELF_SAME;
+    }
+    /* A trait object compares by its auto-trait bounds too: `dyn A + Send`
+     * is not `dyn A`. A side whose bounds were not read is undecided. */
+    const char *ma = impl_self->data.named.rust_dyn_markers;
+    const char *mb = recv->data.named.rust_dyn_markers;
+    if (!ma && !mb) {
+        return RUST_IMPL_SELF_SAME;
+    }
+    if (!ma || !mb) {
+        return RUST_IMPL_SELF_UNDECIDED;
+    }
+    return strcmp(ma, mb) == 0 ? RUST_IMPL_SELF_SAME : RUST_IMPL_SELF_DIFFERS;
 }
 
 /* The method a corpus trait impl on the std wrapper `base` (`impl Tr for
@@ -4530,7 +4666,7 @@ static RustImplSelfMatch rust_impl_self_match(RustLSPContext *ctx, const CBMType
  * before it derefs to the target, when the impl applies to this wrapper and
  * its trait is in scope. Returns the one impl proven to apply; sets *blocked
  * when an impl may apply but that is not proven (impl type parameters, a
- * trait object whose marker bounds the type text drops, several impls), so
+ * trait object whose auto-trait bounds were not read, several impls), so
  * the caller links neither it nor the deref target. An impl whose self type
  * differs from `base`, or whose trait is out of scope, leaves the call to the
  * deref walk. */
@@ -4561,9 +4697,7 @@ static const CBMRegisteredFunc *rust_wrapper_corpus_trait_method(RustLSPContext 
             if (m == RUST_IMPL_SELF_DIFFERS) {
                 continue;
             }
-            bool exact = m == RUST_IMPL_SELF_SAME && candidate->impl_key &&
-                         !strstr(candidate->impl_key, "dyn ");
-            if (!exact || (applies && applies != candidate)) {
+            if (m != RUST_IMPL_SELF_SAME || (applies && applies != candidate)) {
                 *blocked = true;
                 return NULL;
             }
