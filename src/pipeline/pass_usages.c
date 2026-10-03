@@ -162,14 +162,15 @@ static const CBMResolvedCall *rust_member_invocation_record(const CBMResolvedCal
         if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
             !rc->strategy || rc->confidence < CBM_LSP_CONFIDENCE_FLOOR ||
             !cbm_pipeline_rust_strategy_admitted(rc->strategy) ||
-            rc->source_origin != usage->source_origin || rc->site_start_byte > usage->site_start_byte ||
+            rc->source_origin != usage->source_origin ||
+            rc->site_start_byte > usage->site_start_byte ||
             rc->site_end_byte < usage->site_end_byte ||
             strcmp(rc->caller_qn, usage->enclosing_func_qn) != 0 ||
             !cbm_pipeline_lsp_method_leaf_eq(cbm_lsp_bare_segment(rc->callee_qn), ref_leaf)) {
             continue;
         }
-        if (best && rc->site_end_byte - rc->site_start_byte >
-                        best->site_end_byte - best->site_start_byte) {
+        if (best &&
+            rc->site_end_byte - rc->site_start_byte > best->site_end_byte - best->site_start_byte) {
             continue;
         }
         if (best && rc->site_start_byte == best->site_start_byte &&
@@ -186,19 +187,20 @@ static const CBMResolvedCall *rust_member_invocation_record(const CBMResolvedCal
     return ambiguous ? NULL : best;
 }
 
-const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(
-    const cbm_gbuf_t *gbuf, const char *project_name, const cbm_registry_t *registry,
-    const CBMResolvedCallArray *rows, const CBMUsage *usage) {
+const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(const cbm_gbuf_t *gbuf,
+                                                             const char *project_name,
+                                                             const cbm_registry_t *registry,
+                                                             const CBMResolvedCallArray *rows,
+                                                             const CBMUsage *usage) {
     if (!usage || !usage->ref_name) {
         return NULL;
     }
-    const CBMResolvedCall *record =
-        rust_member_invocation_record(rows, usage, gbuf, project_name);
+    const CBMResolvedCall *record = rust_member_invocation_record(rows, usage, gbuf, project_name);
     if (record) {
         return cbm_pipeline_lsp_target_node(gbuf, project_name, record->callee_qn, false);
     }
-    const char *owned = cbm_registry_rust_owner_member(registry, usage->ref_name,
-                                                       usage->enclosing_func_qn);
+    const char *owned =
+        cbm_registry_rust_owner_member(registry, usage->ref_name, usage->enclosing_func_qn);
     return owned ? cbm_gbuf_find_by_qn(gbuf, owned) : NULL;
 }
 

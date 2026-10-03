@@ -2942,9 +2942,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             }
             /* A bare name never proves a Rust type member (twin: pass_usages.c). */
             if (tgt && lang == CBM_LANG_RUST && cbm_registry_label_is_type_member(tgt->label)) {
-                tgt = cbm_pipeline_rust_member_usage_target(rc->main_gbuf, rc->project_name,
-                                                            rc->registry, &result->resolved_calls,
-                                                            usage);
+                tgt = cbm_pipeline_rust_member_usage_target(
+                    rc->main_gbuf, rc->project_name, rc->registry, &result->resolved_calls, usage);
             }
         }
         if (!tgt || src->id == tgt->id) {

@@ -744,8 +744,8 @@ static size_t member_qn_len(const char *qn) {
 
 /* True when `qn` (suffix removed) is exactly `<parent>.<member>` and `parent`
  * either equals `owner_qn` (exact) or ends in the segment `owner` (written). */
-static bool member_of_owner(const char *qn, const char *member, const char *owner,
-                            size_t owner_len, bool exact_owner) {
+static bool member_of_owner(const char *qn, const char *member, const char *owner, size_t owner_len,
+                            bool exact_owner) {
     size_t len = member_qn_len(qn);
     size_t mlen = strlen(member);
     if (len < mlen + 2 || strncmp(qn + len - mlen, member, mlen) != 0 ||

@@ -1034,9 +1034,11 @@ void cbm_pp_lsp_linear_fallback_rows_reset(void);
  * `Self::m`) that names exactly one registered owner. Returns that target, or
  * NULL when only the bare name matched. Shared by the sequential
  * (pass_usages.c) and parallel (pass_parallel.c) USAGE emitters. */
-const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(
-    const cbm_gbuf_t *gbuf, const char *project_name, const cbm_registry_t *registry,
-    const CBMResolvedCallArray *rows, const CBMUsage *usage);
+const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(const cbm_gbuf_t *gbuf,
+                                                             const char *project_name,
+                                                             const cbm_registry_t *registry,
+                                                             const CBMResolvedCallArray *rows,
+                                                             const CBMUsage *usage);
 
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
 /* Test-only view of the Studio Export range join, so the ",+<N>" truncation
