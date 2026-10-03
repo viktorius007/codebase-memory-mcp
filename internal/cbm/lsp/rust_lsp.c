@@ -2785,6 +2785,21 @@ static bool rust_eval_path_call_by_target(RustLSPContext *ctx, TSNode func_node,
 
 enum { RUST_ALIAS_EXPAND_MAX_DEPTH = 8 };
 
+/* The registered alias a type name denotes: the exact QN, else the type a
+ * `<defining module>.<Name>` spelling recovers to. NULL for a name that is
+ * no declared alias. */
+static const CBMRegisteredType *rust_lookup_type_alias(RustLSPContext *ctx, const char *qn) {
+    if (!qn) {
+        return NULL;
+    }
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
+    if (!rt) {
+        const char *registered = rust_registered_type_qn(ctx, qn);
+        rt = registered ? cbm_registry_lookup_type(ctx->registry, registered) : NULL;
+    }
+    return rt && rt->alias_type ? rt : NULL;
+}
+
 /* `t` with every registered type alias replaced by the type it stands for,
  * the alias's written type arguments substituted for its parameters
  * (`type R<T> = Result<T, E>`: `R<Foo>` -> `Result<Foo, E>`). A parameter
@@ -2802,9 +2817,9 @@ static const CBMType *rust_expand_type_aliases(RustLSPContext *ctx, const CBMTyp
     case CBM_TYPE_TEMPLATE: {
         bool named = t->kind == CBM_TYPE_NAMED;
         const char *qn = named ? t->data.named.qualified_name : t->data.template_type.template_name;
-        const CBMRegisteredType *rt = qn ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+        const CBMRegisteredType *rt = rust_lookup_type_alias(ctx, qn);
         int argc = named ? 0 : t->data.template_type.arg_count;
-        if (rt && rt->alias_type) {
+        if (rt) {
             const CBMType *target = rt->alias_type;
             if (rt->type_param_names && argc > 0) {
                 int params = 0;
@@ -2840,6 +2855,27 @@ static const CBMType *rust_expand_type_aliases(RustLSPContext *ctx, const CBMTyp
     default:
         return t;
     }
+}
+
+/* Registered QN of the type a path head written as a declared alias stands
+ * for (`type A = B<C>`: `A` -> `B`); NULL when `head` is no alias or its
+ * expansion is no named type. */
+static const char *rust_alias_head_qn(RustLSPContext *ctx, const char *head) {
+    if (!rust_lookup_type_alias(ctx, head)) {
+        return NULL;
+    }
+    const CBMType *t = rust_expand_type_aliases(ctx, cbm_type_named(ctx->arena, head), 0);
+    const char *qn = NULL;
+    if (t && t->kind == CBM_TYPE_NAMED) {
+        qn = t->data.named.qualified_name;
+    } else if (t && t->kind == CBM_TYPE_TEMPLATE) {
+        qn = t->data.template_type.template_name;
+    }
+    if (!qn || rust_lookup_type_alias(ctx, qn)) {
+        return NULL;
+    }
+    const char *registered = rust_registered_type_qn(ctx, qn);
+    return registered ? registered : qn;
 }
 
 /* Std types whose methods' returns are declared in RUST_STD_RETURNS. */
@@ -4255,7 +4291,9 @@ static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType
     if (out_method) {
         *out_method = NULL;
     }
-    return rust_eval_member_access_at(ctx, recv, member, method_call, 0, out_method);
+    /* A receiver typed by a declared alias has the aliased type's members. */
+    return rust_eval_member_access_at(ctx, rust_expand_type_aliases(ctx, recv, 0), member,
+                                      method_call, 0, out_method);
 }
 
 static const CBMType *rust_eval_member_access_deref(RustLSPContext *ctx, const CBMType *base,
@@ -8291,6 +8329,12 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
     }
     char *head = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
     const char *short_name = dot + 1;
+    /* `Alias::f` names the aliased type's `f` unless the alias itself
+     * carries one. */
+    const char *aliased = rust_alias_head_qn(ctx, head);
+    if (aliased && !cbm_registry_lookup_method_aliased(ctx->registry, head, short_name)) {
+        head = cbm_arena_strdup(ctx->arena, aliased);
+    }
     /* If `head` is a trait, `Trait::method` UFCS resolves to the sole
      * concrete impl (lsp_trait_ufcs), NEVER the trait's own abstract
      * method that the inherent lookup below would find. Resolve the trait
@@ -8587,7 +8631,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
          * embedded it as part of the field token. */
         rust_strip_turbofish(mname);
 
-        const CBMType *recv = rust_eval_expr_type(ctx, value);
+        /* A receiver typed by a declared alias dispatches on the aliased type. */
+        const CBMType *recv = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, value), 0);
         const CBMType *base = recv;
         while (base && (base->kind == CBM_TYPE_REFERENCE || base->kind == CBM_TYPE_POINTER)) {
             base = (base->kind == CBM_TYPE_REFERENCE) ? base->data.reference.elem
