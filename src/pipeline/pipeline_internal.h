@@ -1028,6 +1028,18 @@ void cbm_pp_bp_nap_cycles_reset(void);
 uint64_t cbm_pp_lsp_linear_fallback_rows(void);
 void cbm_pp_lsp_linear_fallback_rows_reset(void);
 
+/* Rust USAGE to a Method or AssociatedConst is published only from evidence
+ * that names the member's owner: the CALLS resolver's admitted record for the
+ * call this reference is the callee of, else an owner path (`T::m`,
+ * `Self::m`) that names exactly one registered owner. Returns that target, or
+ * NULL when only the bare name matched. Shared by the sequential
+ * (pass_usages.c) and parallel (pass_parallel.c) USAGE emitters. */
+const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(const cbm_gbuf_t *gbuf,
+                                                             const char *project_name,
+                                                             const cbm_registry_t *registry,
+                                                             const CBMResolvedCallArray *rows,
+                                                             const CBMUsage *usage);
+
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
 /* Test-only view of the Studio Export range join, so the ",+<N>" truncation
  * marker rules can be checked without building a 256-region export file. */

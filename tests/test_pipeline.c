@@ -2741,6 +2741,76 @@ TEST(pipeline_incremental_repoints_call_reference_without_stale_edge) {
     PASS();
 }
 
+/* A Rust method is reachable only through a receiver or an owner path, so a
+ * bare name never proves one. `p.capacity` below reads a field of a type the
+ * project does not define; the only same-named node is Buffer::capacity, and
+ * the name matcher used to publish USAGE total -> capacity. The token
+ * `capacity` inside `assert_eq!(b.capacity(), 0)` is a usage too, and the
+ * CALLS resolver's record for that call must still yield USAGE use_it ->
+ * capacity. Both USAGE emitters (sequential and parallel) are pinned. */
+static void rust_member_usage_counts(const char *tmp, const char *db_name, int *bare,
+                                     int *recorded) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", tmp, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    *bare = -1;
+    *recorded = -1;
+    if (p && cbm_pipeline_run(p) == 0) {
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        if (s) {
+            const char *project = cbm_pipeline_project_name(p);
+            *bare = named_edge_count(s, project, "USAGE", "total", "capacity");
+            *recorded = named_edge_count(s, project, "USAGE", "use_it", "capacity");
+            cbm_store_close(s);
+        }
+    }
+    cbm_pipeline_free(p);
+}
+
+TEST(pipeline_rust_usage_never_binds_method_by_bare_name) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_member_usage_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "lib.rs",
+                    "pub struct Buffer {}\n"
+                    "impl Buffer {\n"
+                    "    pub fn capacity(&self) -> usize { 0 }\n"
+                    "}\n"
+                    "pub fn total(p: &external::Plan) -> usize { p.capacity }\n"
+                    "pub fn use_it(b: &Buffer) { assert_eq!(b.capacity(), 0); }\n");
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    int seq_bare, seq_recorded, par_bare, par_recorded;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    rust_member_usage_counts(tmp, "sequential.db", &seq_bare, &seq_recorded);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    rust_member_usage_counts(tmp, "parallel.db", &par_bare, &par_recorded);
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+    }
+    free(saved_workers);
+    free(saved_single);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(seq_bare, 0);
+    ASSERT_EQ(seq_recorded, 1);
+    ASSERT_EQ(par_bare, 0);
+    ASSERT_EQ(par_recorded, 1);
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the
@@ -18357,6 +18427,7 @@ SUITE(pipeline) {
 SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delete);
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
+    RUN_TEST(pipeline_rust_usage_never_binds_method_by_bare_name);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);
