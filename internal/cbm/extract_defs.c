@@ -3065,6 +3065,40 @@ static bool rust_fn_is_async(TSNode fn) {
     return false;
 }
 
+/* Rust: the function's first parameter is a `self` receiver (`self`, `&self`,
+ * `&mut self`, `mut self` or a typed `self: Box<Self>`). An associated function
+ * without one takes its first call argument as an ordinary parameter. */
+static bool rust_fn_has_self_receiver(TSNode fn, const char *source) {
+    TSNode params = ts_node_child_by_field_name(fn, TS_FIELD("parameters"));
+    if (ts_node_is_null(params)) {
+        return false;
+    }
+    uint32_t n = ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode p = ts_node_named_child(params, i);
+        const char *kind = ts_node_type(p);
+        if (strcmp(kind, "attribute_item") == 0 || strcmp(kind, "line_comment") == 0 ||
+            strcmp(kind, "block_comment") == 0) {
+            continue;
+        }
+        if (strcmp(kind, "self_parameter") == 0) {
+            return true;
+        }
+        if (strcmp(kind, "parameter") != 0) {
+            return false;
+        }
+        TSNode pat = ts_node_child_by_field_name(p, TS_FIELD("pattern"));
+        if (ts_node_is_null(pat)) {
+            return false;
+        }
+        uint32_t s = ts_node_start_byte(pat);
+        uint32_t e = ts_node_end_byte(pat);
+        return strcmp(ts_node_type(pat), "self") == 0 ||
+               (e - s == 4 && strncmp(source + s, "self", 4) == 0);
+    }
+    return false;
+}
+
 static const char **extract_param_names(CBMArena *a, TSNode params, const char *source,
                                         CBMLanguage lang) {
     (void)lang;
@@ -5092,6 +5126,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     }
     if (ctx->language == CBM_LANG_RUST) {
         def.is_async = rust_fn_is_async(child);
+        def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source);
     }
 
     TSNode params = find_function_params(child, ctx->language);
@@ -5356,6 +5391,7 @@ static void extract_rust_impl_member(CBMExtractCtx *ctx, TSNode child, const Rus
     def.parent_class = owner->type_qn;
     def.impl_trait = impl_trait;
     def.is_async = rust_fn_is_async(child);
+    def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source);
     /* A trait-impl method takes the trait's visibility, never its own. */
     def.is_rust_private = !impl_trait && rust_fn_is_private(child);
     def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;

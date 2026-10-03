@@ -9905,12 +9905,13 @@ TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve) {
          .def_module_qn = "w.q.src.lib", .method_names_str = "fetch", .is_interface = true},
         {.qualified_name = "w.q.src.lib.Backend.fetch", .short_name = "fetch",
          .label = "Method", .receiver_type = "w.q.src.lib.Backend",
-         .def_module_qn = "w.q.src.lib", .is_abstract = true},
+         .def_module_qn = "w.q.src.lib", .is_abstract = true, .has_rust_self = true},
         {.qualified_name = "w.q.src.lib.Http", .short_name = "Http", .label = "Struct",
          .def_module_qn = "w.q.src.lib"},
         {.qualified_name = "w.q.src.lib.Http.fetch", .short_name = "fetch", .label = "Method",
          .receiver_type = "w.q.src.lib.Http", .receiver_spelling = "Http",
-         .def_module_qn = "w.q.src.lib", .trait_qn = "Backend"},
+         .def_module_qn = "w.q.src.lib", .trait_qn = "Backend",
+         .has_rust_self = true},
         {.qualified_name = "w.q.src.lib.Http", .short_name = "Http", .label = "RustImpl",
          .receiver_type = "w.q.src.lib.Http", .receiver_spelling = "Http",
          .def_module_qn = "w.q.src.lib", .trait_qn = "Backend", .is_rust_impl_relation = true},
@@ -9918,7 +9919,8 @@ TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve) {
          .def_module_qn = "w.q.src.lib"},
         {.qualified_name = "w.q.src.lib.Mock.fetch", .short_name = "fetch", .label = "Method",
          .receiver_type = "w.q.src.lib.Mock", .receiver_spelling = "Mock",
-         .def_module_qn = "w.q.src.lib", .trait_qn = "Backend"},
+         .def_module_qn = "w.q.src.lib", .trait_qn = "Backend",
+         .has_rust_self = true},
         {.qualified_name = "w.q.src.lib.Mock", .short_name = "Mock", .label = "RustImpl",
          .receiver_type = "w.q.src.lib.Mock", .receiver_spelling = "Mock",
          .def_module_qn = "w.q.src.lib", .trait_qn = "Backend", .is_rust_impl_relation = true},
@@ -9940,6 +9942,25 @@ TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve) {
     ASSERT_GTE(find_confident(&out, "lib.cache", "w.q.src.lib.Cache.default"), 0);
     cbm_rust_modtree_free(tree);
     cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_trait_path_first_argument_is_receiver_only_with_self) {
+    /* `Build::make(c)` with `fn make(cfg: Config) -> Self` takes `c` as an
+     * ordinary argument: Config's impl is not the callee and two impls leave
+     * the call open. `Build::tag(w)` with `fn tag(&self)` dispatches on `w`. */
+    CBMFileResult *r = extract_rust(
+        "trait Build { fn make(cfg: Config) -> Self; fn tag(&self) -> u8; }\n"
+        "struct Config;\nstruct Widget;\n"
+        "impl Build for Config { fn make(cfg: Config) -> Self { cfg } fn tag(&self) -> u8 { 0 } }\n"
+        "impl Build for Widget { fn make(_c: Config) -> Self { Widget } fn tag(&self) -> u8 { 1 } }\n"
+        "fn assoc_site(c: Config) -> Widget { Build::make(c) }\n"
+        "fn method_site(w: &Widget) -> u8 { Build::tag(w) }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "assoc_site", "make"), 0);
+    ASSERT_GTE(require_resolved(r, "method_site", "Widget.tag"), 0);
+    ASSERT_EQ(count_resolved(r, "method_site", "Config.tag"), 0);
+    cbm_free_result(r);
     PASS();
 }
 
@@ -10665,4 +10686,5 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it);
     RUN_TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type);
     RUN_TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve);
+    RUN_TEST(rustlsp_trait_path_first_argument_is_receiver_only_with_self);
 }

@@ -27,7 +27,7 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 7 };
+enum { SURFACE_CODEC_VERSION = 8 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -104,6 +104,7 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         yyjson_mut_obj_add_bool(doc, o, "as", d->is_async);
         yyjson_mut_obj_add_bool(doc, o, "pv", d->is_rust_private);
+        yyjson_mut_obj_add_bool(doc, o, "hs", d->has_rust_self);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
         yyjson_mut_arr_add_val(lsp, o);
     }
@@ -304,6 +305,7 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->is_abstract = yyjson_get_bool(yyjson_obj_get(o, "ab"));
         d->is_async = yyjson_get_bool(yyjson_obj_get(o, "as"));
         d->is_rust_private = yyjson_get_bool(yyjson_obj_get(o, "pv"));
+        d->has_rust_self = yyjson_get_bool(yyjson_obj_get(o, "hs"));
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
         if (!d->qualified_name || !d->short_name || !d->label) {
