@@ -9837,6 +9837,71 @@ TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type) {
     PASS();
 }
 
+TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve) {
+    /* `q::Backend::fetch(x)` is the trait method as dispatched on its first
+     * argument: the impl for a declared `&Http`, the trait's own declaration
+     * for `&dyn Backend`, nothing for an untyped argument (two impls exist).
+     * `q::Cache::default()` is the derived associated function, exactly as
+     * the same paths written after a `use`. */
+    static const char *const rels[] = {"p/src/lib.rs", "q/src/lib.rs"};
+    static const char *const qns[] = {"w.p.src.lib", "w.q.src.lib"};
+    static const char *const sources[] = {
+        "pub fn typed(h: &q::Http) -> u8 { q::Backend::fetch(h) }\n"
+        "pub fn dynamic(b: &dyn q::Backend) -> u8 { q::Backend::fetch(b) }\n"
+        "pub fn untyped() -> u8 { q::Backend::fetch(make()) }\n"
+        "pub fn cache() { let _c = q::Cache::default(); }\n",
+        "pub trait Backend { fn fetch(&self) -> u8; }\n"
+        "pub struct Http;\nimpl Backend for Http { fn fetch(&self) -> u8 { 1 } }\n"
+        "pub struct Mock;\nimpl Backend for Mock { fn fetch(&self) -> u8 { 2 } }\n"
+        "#[derive(Default)]\npub struct Cache;\n",
+    };
+    CBMRustModTree *tree = rust_modtree_two_crates(rels, qns, sources, 2, 1);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *derive_default[] = {"#[derive(Default)]", NULL};
+    CBMRustLSPDef defs[] = {
+        {.qualified_name = "w.q.src.lib.Backend", .short_name = "Backend", .label = "Trait",
+         .def_module_qn = "w.q.src.lib", .method_names_str = "fetch", .is_interface = true},
+        {.qualified_name = "w.q.src.lib.Backend.fetch", .short_name = "fetch",
+         .label = "Method", .receiver_type = "w.q.src.lib.Backend",
+         .def_module_qn = "w.q.src.lib", .is_abstract = true},
+        {.qualified_name = "w.q.src.lib.Http", .short_name = "Http", .label = "Struct",
+         .def_module_qn = "w.q.src.lib"},
+        {.qualified_name = "w.q.src.lib.Http.fetch", .short_name = "fetch", .label = "Method",
+         .receiver_type = "w.q.src.lib.Http", .receiver_spelling = "Http",
+         .def_module_qn = "w.q.src.lib", .trait_qn = "Backend"},
+        {.qualified_name = "w.q.src.lib.Http", .short_name = "Http", .label = "RustImpl",
+         .receiver_type = "w.q.src.lib.Http", .receiver_spelling = "Http",
+         .def_module_qn = "w.q.src.lib", .trait_qn = "Backend", .is_rust_impl_relation = true},
+        {.qualified_name = "w.q.src.lib.Mock", .short_name = "Mock", .label = "Struct",
+         .def_module_qn = "w.q.src.lib"},
+        {.qualified_name = "w.q.src.lib.Mock.fetch", .short_name = "fetch", .label = "Method",
+         .receiver_type = "w.q.src.lib.Mock", .receiver_spelling = "Mock",
+         .def_module_qn = "w.q.src.lib", .trait_qn = "Backend"},
+        {.qualified_name = "w.q.src.lib.Mock", .short_name = "Mock", .label = "RustImpl",
+         .receiver_type = "w.q.src.lib.Mock", .receiver_spelling = "Mock",
+         .def_module_qn = "w.q.src.lib", .trait_qn = "Backend", .is_rust_impl_relation = true},
+        {.qualified_name = "w.q.src.lib.Cache", .short_name = "Cache", .label = "Struct",
+         .def_module_qn = "w.q.src.lib", .decorators = derive_default},
+    };
+    int def_count = (int)(sizeof(defs) / sizeof(defs[0]));
+    CBMRustImportSource imports = {.modtree = tree};
+    const char *app = sources[0];
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(&arena, app, (int)strlen(app), "w.p.src.lib",
+                                         "w.p.src.lib", defs, def_count, NULL, NULL, 0, NULL,
+                                         NULL, &imports, &out, NULL, NULL);
+    ASSERT_GTE(find_confident(&out, "lib.typed", "w.q.src.lib.Http.fetch"), 0);
+    ASSERT_LT(find_confident(&out, "lib.typed", "Mock.fetch"), 0);
+    ASSERT_GTE(find_confident(&out, "lib.dynamic", "w.q.src.lib.Backend.fetch"), 0);
+    ASSERT_LT(find_confident(&out, "lib.untyped", "fetch"), 0);
+    ASSERT_EQ(count_confident_strategy(&out, "lsp_trait_dispatch"), 2);
+    ASSERT_GTE(find_confident(&out, "lib.cache", "w.q.src.lib.Cache.default"), 0);
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
@@ -10557,4 +10622,5 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_use_head_names_extern_crate_past_external_glob);
     RUN_TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it);
     RUN_TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type);
+    RUN_TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve);
 }

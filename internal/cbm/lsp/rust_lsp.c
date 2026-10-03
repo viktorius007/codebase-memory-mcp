@@ -7961,10 +7961,117 @@ static void rust_call_target_set(RustCallTarget *t, const CBMRegisteredFunc *fun
     t->confidence = confidence;
 }
 
+/* The first argument of the call whose callee is `callee`, or a null node. */
+static TSNode rust_call_first_argument(TSNode callee) {
+    TSNode none = {0};
+    TSNode call = ts_node_is_null(callee) ? none : ts_node_parent(callee);
+    if (!ts_node_is_null(call) && strcmp(ts_node_type(call), "generic_function") == 0) {
+        call = ts_node_parent(call);
+    }
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+        return none;
+    }
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+    uint32_t n = ts_node_is_null(args) ? 0 : ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        const char *kind = ts_node_type(arg);
+        if (strcmp(kind, "line_comment") != 0 && strcmp(kind, "block_comment") != 0) {
+            return arg;
+        }
+    }
+    return none;
+}
+
+/* The one method `trait_qn` contributes to `type_qn` under `method_name`:
+ * the impl's own definition, else the trait's provided default when the type
+ * implements the trait without overriding it. NULL when the type does not
+ * implement the trait, or implements it more than once (generic arguments). */
+static const CBMRegisteredFunc *rust_trait_method_for_type(RustLSPContext *ctx,
+                                                           const char *type_qn,
+                                                           const char *trait_qn,
+                                                           const char *method_name) {
+    const CBMTypeRegistry *reg = ctx->registry;
+    const CBMRegisteredFunc *found = NULL;
+    const char *found_impl = NULL;
+    CBMMethodIter it;
+    cbm_registry_methods(reg, type_qn, method_name, &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *f = &reg->funcs[index];
+        if ((f->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || !f->impl_trait_qn ||
+            strcmp(f->impl_trait_qn, trait_qn) != 0) {
+            continue;
+        }
+        const char *impl = f->impl_key ? f->impl_key : f->impl_trait_qn;
+        if (found_impl && strcmp(found_impl, impl) != 0) {
+            return NULL;
+        }
+        found_impl = impl;
+        found = found ? found : f;
+    }
+    if (found) {
+        return found;
+    }
+    const CBMRegisteredType *t = cbm_registry_lookup_type(reg, type_qn);
+    for (int i = 0; t && t->embedded_types && t->embedded_types[i]; i++) {
+        if (strcmp(t->embedded_types[i], trait_qn) == 0) {
+            return rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, false);
+        }
+    }
+    return NULL;
+}
+
+/* `Trait::method(recv, ..)` dispatches on the first argument's type: a
+ * concrete type selects its impl of `trait_qn`; `dyn Trait`, `impl Trait`
+ * or a type parameter bounded by the trait selects the trait's own
+ * declaration. An argument of unknown type selects nothing. */
+static const CBMRegisteredFunc *rust_trait_ufcs_by_receiver(RustLSPContext *ctx,
+                                                            const char *trait_qn,
+                                                            const char *method_name,
+                                                            TSNode receiver) {
+    if (ts_node_is_null(receiver)) {
+        return NULL;
+    }
+    const CBMType *base = rust_eval_expr_type(ctx, receiver);
+    while (base && (base->kind == CBM_TYPE_REFERENCE || base->kind == CBM_TYPE_POINTER)) {
+        base = base->kind == CBM_TYPE_REFERENCE ? base->data.reference.elem
+                                                : base->data.pointer.elem;
+    }
+    const char *type_qn = NULL;
+    if (base && base->kind == CBM_TYPE_NAMED) {
+        type_qn = base->data.named.qualified_name;
+    } else if (base && base->kind == CBM_TYPE_TEMPLATE) {
+        type_qn = base->data.template_type.template_name;
+    }
+    if (!type_qn) {
+        return NULL;
+    }
+    const char *dot = strrchr(type_qn, '.');
+    const char *bound = rust_lookup_type_param_bound(ctx, dot ? dot + 1 : type_qn);
+    if (bound) {
+        return strcmp(bound, trait_qn) == 0
+                   ? rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, true)
+                   : NULL;
+    }
+    const char *registered = rust_registered_type_qn(ctx, type_qn);
+    if (!registered) {
+        return NULL;
+    }
+    const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, registered);
+    if (t && t->is_interface) {
+        return strcmp(registered, trait_qn) == 0
+                   ? rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, true)
+                   : NULL;
+    }
+    return rust_trait_method_for_type(ctx, registered, trait_qn, method_name);
+}
+
 /* UFCS form `T::method` / `Trait::method` for a path already resolved to
- * `<type or trait QN>.<method>`. True when the call was settled (a target
- * found or deliberately left open); false when no type or trait answers. */
-static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, RustCallTarget *out) {
+ * `<type or trait QN>.<method>`; `first_arg` is the call's first argument
+ * (null when unknown). True when the call was settled (a target found or
+ * deliberately left open); false when no type or trait answers. */
+static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_arg,
+                             RustCallTarget *out) {
     const char *dot = strrchr(qn, '.');
     if (!dot) {
         return false;
@@ -7997,6 +8104,16 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, RustCallTarget
             trait_qn = fh;
     }
     if (trait_qn) {
+        /* A typed first argument is the receiver `recv.method()` would
+         * dispatch on, so the target carries the same proof and strategy. */
+        const CBMRegisteredFunc *typed =
+            rust_trait_ufcs_by_receiver(ctx, trait_qn, short_name, first_arg);
+        if (typed) {
+            rust_call_target_set(out, typed, typed->qualified_name, "lsp_trait_dispatch",
+                                 CBM_RUST_CONF_UFCS);
+            out->receiver_qn = typed->receiver_type;
+            return true;
+        }
         int tn = 0;
         const CBMRegisteredFunc *ti_m = rust_find_sole_trait_impl(ctx, trait_qn, short_name, &tn);
         if (tn == 1) {
@@ -8048,9 +8165,9 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, RustCallTarget
     return false;
 }
 
-static bool rust_resolve_ufcs_path(RustLSPContext *ctx, const char *qn) {
+static bool rust_resolve_ufcs_path(RustLSPContext *ctx, TSNode callee, const char *qn) {
     RustCallTarget t = {0};
-    if (!rust_ufcs_target(ctx, qn, &t)) {
+    if (!rust_ufcs_target(ctx, qn, rust_call_first_argument(callee), &t)) {
         return false;
     }
     rust_emit_call_target(ctx, &t);
@@ -8134,7 +8251,7 @@ static bool rust_self_path_target(RustLSPContext *ctx, TSNode callee, const char
      * unregistered item keeps the receiver-based path resolution. */
     RustCallTarget found = {0};
     const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", r.qn, name);
-    if (!rust_ufcs_target(ctx, qn, &found) || !found.func) {
+    if (!rust_ufcs_target(ctx, qn, rust_call_first_argument(callee), &found) || !found.func) {
         return false;
     }
     *out = found;
@@ -8183,7 +8300,7 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
     case CBM_RUST_PATH_ASSOC: {
         out->names_function = true;
         const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", r.qn, r.assoc);
-        if (!rust_ufcs_target(ctx, qn, out)) {
+        if (!rust_ufcs_target(ctx, qn, rust_call_first_argument(callee), out)) {
             out->open_qn = qn;
             out->open_reason = "associated_item_not_registered";
         }
@@ -8446,7 +8563,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             }
         }
 
-        if (rust_resolve_ufcs_path(ctx, qn))
+        if (rust_resolve_ufcs_path(ctx, actual_func, qn))
             return;
 
         const char *workspace_path = path;
