@@ -9855,6 +9855,7 @@ TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve) {
     ASSERT_LT(find_confident(&out, "lib.typed", "Mock.fetch"), 0);
     ASSERT_GTE(find_confident(&out, "lib.dynamic", "w.q.src.lib.Backend.fetch"), 0);
     ASSERT_LT(find_confident(&out, "lib.untyped", "fetch"), 0);
+    ASSERT_EQ(count_confident_strategy(&out, "lsp_trait_dispatch"), 2);
     ASSERT_GTE(find_confident(&out, "lib.cache", "w.q.src.lib.Cache.default"), 0);
     cbm_rust_modtree_free(tree);
     cbm_arena_destroy(&arena);

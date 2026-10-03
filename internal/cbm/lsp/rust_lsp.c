@@ -7856,10 +7856,12 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
             trait_qn = fh;
     }
     if (trait_qn) {
+        /* A typed first argument is the receiver `recv.method()` would
+         * dispatch on, so the target carries the same proof and strategy. */
         const CBMRegisteredFunc *typed =
             rust_trait_ufcs_by_receiver(ctx, trait_qn, short_name, first_arg);
         if (typed) {
-            rust_call_target_set(out, typed, typed->qualified_name, "lsp_trait_ufcs",
+            rust_call_target_set(out, typed, typed->qualified_name, "lsp_trait_dispatch",
                                  CBM_RUST_CONF_UFCS);
             out->receiver_qn = typed->receiver_type;
             return true;
