@@ -9557,6 +9557,54 @@ TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file) {
     PASS();
 }
 
+TEST(rustlsp_value_path_receivers_type_as_their_item) {
+    /* `Tier::Fast` (unit variant), `Tier::Tokens(3)` (tuple-variant
+     * constructor) and `Marker` (unit struct, reached by a glob) are values
+     * of their enum / struct, so the method called on each resolves. An
+     * associated const of the enum is not a variant and stays untyped. */
+    static const char *const rels[] = {"src/lib.rs", "src/model.rs", "src/app.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.model", "p.src.app"};
+    static const char *const sources[] = {
+        "mod model;\nmod app;\n",
+        "pub enum Tier { Fast, Tokens(u32) }\n"
+        "impl Tier { pub const MAX: u8 = 9; pub fn code(&self) -> u8 { 0 } }\n"
+        "pub struct Marker;\nimpl Marker { pub fn run(&self) {} }\n",
+        "use crate::model::*;\n"
+        "fn unit() -> u8 { Tier::Fast.code() }\n"
+        "fn tuple() -> u8 { Tier::Tokens(3).code() }\n"
+        "fn marker() { Marker.run() }\n"
+        "fn assoc() -> u8 { Tier::MAX.code() }\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 3);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustLSPDef defs[] = {
+        {.qualified_name = "p.src.model.Tier", .short_name = "Tier", .label = "Enum",
+         .def_module_qn = "p.src.model", .field_defs = "Fast.:Tier|Tokens.:Tier|Tokens.0:u32"},
+        {.qualified_name = "p.src.model.Tier.code", .short_name = "code", .label = "Method",
+         .receiver_type = "p.src.model.Tier", .receiver_spelling = "Tier",
+         .def_module_qn = "p.src.model", .return_types = "u8"},
+        {.qualified_name = "p.src.model.Marker", .short_name = "Marker", .label = "Struct",
+         .def_module_qn = "p.src.model"},
+        {.qualified_name = "p.src.model.Marker.run", .short_name = "run", .label = "Method",
+         .receiver_type = "p.src.model.Marker", .receiver_spelling = "Marker",
+         .def_module_qn = "p.src.model"},
+    };
+    CBMRustImportSource imports = {.modtree = tree};
+    const char *app = sources[2];
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(&arena, app, (int)strlen(app), "p.src.app", "p.src.app",
+                                         defs, (int)(sizeof(defs) / sizeof(defs[0])), NULL, NULL,
+                                         0, NULL, NULL, &imports, &out, NULL, NULL);
+    ASSERT_GTE(find_confident(&out, "app.unit", "p.src.model.Tier.code"), 0);
+    ASSERT_GTE(find_confident(&out, "app.tuple", "p.src.model.Tier.code"), 0);
+    ASSERT_GTE(find_confident(&out, "app.marker", "p.src.model.Marker.run"), 0);
+    ASSERT_LT(find_confident(&out, "app.assoc", "Tier.code"), 0);
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved) {
     /* Two globs bring two different `Y`s: the name is ambiguous. */
     static const char *const rels[] = {"src/lib.rs", "src/m1.rs", "src/m2.rs", "src/user.rs"};
@@ -10675,6 +10723,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer);
     RUN_TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file);
     RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);
+    RUN_TEST(rustlsp_value_path_receivers_type_as_their_item);
     RUN_TEST(rustlsp_modtree_module_reexport_names_definition);
     RUN_TEST(rustlsp_modtree_renamed_reexport_names_definition);
     RUN_TEST(rustlsp_modtree_two_hop_reexport_names_definition);

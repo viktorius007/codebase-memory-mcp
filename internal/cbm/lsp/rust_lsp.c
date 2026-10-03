@@ -3393,6 +3393,7 @@ static const CBMType *rust_std_path_call_return(RustLSPContext *ctx, TSNode func
 
 static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                                              const CBMRegisteredFunc **callee);
+static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node);
 
 /* Type of a call expression. `*callee`, when the call names a registered
  * function or method, is that function: `.await` reads its async flag. A
@@ -3415,6 +3416,13 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
     const CBMType *produced = rust_std_path_call_return(ctx, func_node, args_node);
     if (produced) {
         return produced;
+    }
+    /* A tuple-variant constructor `E::V(..)` builds an `E`. */
+    if (strcmp(fk, "scoped_identifier") == 0) {
+        produced = rust_eval_value_path_type(ctx, func_node);
+        if (produced) {
+            return produced;
+        }
     }
     if (rust_eval_path_call_by_target(ctx, func_node, &produced, callee)) {
         return produced;
@@ -3752,6 +3760,100 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
     return cbm_type_unknown();
 }
 
+/* True when registered enum `rt` declares variant `name`: the registry
+ * carries every variant as a field `<Variant>.` (plus `<Variant>.<pos>` /
+ * `<Variant>.<field>` for its payload), a spelling no struct field takes. */
+static bool rust_type_has_variant(const CBMRegisteredType *rt, const char *name) {
+    if (!rt || !rt->field_names || !name) {
+        return false;
+    }
+    size_t len = strlen(name);
+    for (int i = 0; rt->field_names[i]; i++) {
+        if (strncmp(rt->field_names[i], name, len) == 0 && rt->field_names[i][len] == '.') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The project type or enum the value path `node` (text `path`, turbofish
+ * stripped) settles on through the module tree, in the value namespace:
+ * `*out_assoc` the associated item `E::V` names, NULL for a bare item. NULL
+ * when the tree leaves the path open. */
+static const char *rust_value_path_owner(RustLSPContext *ctx, TSNode node, const char *path,
+                                         const char **out_assoc) {
+    *out_assoc = NULL;
+    if (strncmp(path, "Self::", 6) == 0) {
+        if (!ctx->self_type_qn || strstr(path + 6, "::")) {
+            return NULL;
+        }
+        *out_assoc = path + 6;
+        return ctx->self_type_qn;
+    }
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    uint32_t offset = 0;
+    if (!tree || !ctx->module_qn || ctx->glob_count > ctx->file_glob_count ||
+        !rust_original_offset(ctx, node, &offset)) {
+        return NULL;
+    }
+    int block_uses = ctx->use_count > ctx->file_use_count ? ctx->use_count - ctx->file_use_count : 0;
+    CBMRustPathResult r =
+        cbm_rust_modtree_resolve(tree, ctx->arena, ctx->module_qn, offset, path,
+                                 block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
+                                 block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL,
+                                 block_uses);
+    if (r.kind == CBM_RUST_PATH_ASSOC && !r.is_trait) {
+        *out_assoc = r.assoc;
+        return r.qn;
+    }
+    if (r.kind == CBM_RUST_PATH_NOT_FUNCTION) {
+        /* Something in the value namespace: a unit struct when the type
+         * namespace settles the same name on a project struct. */
+        return rust_type_qn_by_module_tree(ctx, node, path);
+    }
+    return NULL;
+}
+
+/* Type of a value path naming an enum variant (`E::V`, `Self::V`, the
+ * callee of a tuple-variant constructor `E::V(..)`) or a unit struct
+ * (`Marker`): the enum, with the type arguments the path writes on it, or
+ * the struct. NULL when the module tree and the registry do not prove it. */
+static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node) {
+    const char *kind = ts_node_type(node);
+    bool bare = strcmp(kind, "identifier") == 0;
+    if (!bare && strcmp(kind, "scoped_identifier") != 0) {
+        return NULL;
+    }
+    char *path = rust_node_text(ctx, node);
+    if (!path || (bare && cbm_scope_contains(ctx->current_scope, path))) {
+        return NULL;
+    }
+    rust_strip_turbofish(path);
+    const char *assoc = NULL;
+    const char *owner = rust_value_path_owner(ctx, node, path, &assoc);
+    const CBMRegisteredType *rt = owner ? cbm_registry_lookup_type(ctx->registry, owner) : NULL;
+    if (!rt || rt->is_interface || rt->alias_of || rt->alias_type) {
+        return NULL;
+    }
+    if (!assoc) {
+        /* A struct named as a value is a unit struct only when it has no
+         * fields: a tuple struct's name is its constructor function. */
+        return rt->field_names && rt->field_names[0] ? NULL : cbm_type_named(ctx->arena, owner);
+    }
+    if (!rust_type_has_variant(rt, assoc)) {
+        return NULL;
+    }
+    TSNode head = ts_node_child_by_field_name(node, "path", 4);
+    if (!ts_node_is_null(head) && strcmp(ts_node_type(head), "generic_type") == 0) {
+        const CBMType *written = rust_parse_type_node(ctx, head);
+        if (written && written->kind == CBM_TYPE_TEMPLATE) {
+            return cbm_type_template(ctx->arena, owner, written->data.template_type.template_args,
+                                     written->data.template_type.arg_count);
+        }
+    }
+    return cbm_type_named(ctx->arena, owner);
+}
+
 const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
@@ -3792,7 +3894,8 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         if (cbm_registry_lookup_type(ctx->registry, type_qn)) {
             return cbm_type_named(ctx->arena, type_qn);
         }
-        return cbm_type_unknown();
+        const CBMType *value = rust_eval_value_path_type(ctx, node);
+        return value ? value : cbm_type_unknown();
     }
 
     /* self_parameter token: bound in scope as `self`. */
@@ -3807,18 +3910,18 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
             return cbm_type_unknown();
         }
         const char *qn = rust_resolve_path_expr(ctx, path);
-        if (!qn) {
-            return cbm_type_unknown();
+        if (qn) {
+            const CBMRegisteredFunc *f = rust_lookup_func_variants(ctx, qn);
+            if (f && f->signature) {
+                return f->signature;
+            }
+            const CBMRegisteredType *t = rust_lookup_type_variants(ctx, qn);
+            if (t) {
+                return cbm_type_named(ctx->arena, t->qualified_name);
+            }
         }
-        const CBMRegisteredFunc *f = rust_lookup_func_variants(ctx, qn);
-        if (f && f->signature) {
-            return f->signature;
-        }
-        const CBMRegisteredType *t = rust_lookup_type_variants(ctx, qn);
-        if (t) {
-            return cbm_type_named(ctx->arena, t->qualified_name);
-        }
-        return cbm_type_unknown();
+        const CBMType *value = rust_eval_value_path_type(ctx, node);
+        return value ? value : cbm_type_unknown();
     }
 
     /* generic_function: foo::<T> */
