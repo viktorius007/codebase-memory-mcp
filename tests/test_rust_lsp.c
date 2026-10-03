@@ -1097,6 +1097,25 @@ TEST(rustlsp_std_returns_foreign_mutex_stays_unknown) {
     PASS();
 }
 
+/* A `Result` head the registry does not know (a dependency's alias) is
+ * core's `Result<T, _>`: `.expect()` yields its first argument. So does
+ * std's `LockResult<G>`. A project type named `Result` keeps its own methods. */
+TEST(rustlsp_std_returns_unknown_result_head) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "impl Conn { fn new() -> notify::Result<Self> { Ok(Conn) } }\n"
+                           "fn run() -> bool { Conn::new().expect(\"x\").ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::LockResult;\n" RUSTLSP_STD_DECOYS
+        "fn run(r: LockResult<Conn>) -> bool { r.expect(\"x\").ping() }\n"));
+    ASSERT_FALSE(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "mod errs {\n    pub struct Result<T>(pub T);\n"
+                           "    impl<T> Result<T> {\n"
+                           "        pub fn expect(&self, m: &str) -> super::Other { super::Other }\n"
+                           "    }\n}\n"
+                           "fn run(r: errs::Result<Conn>) -> bool { r.expect(\"x\").ping() }\n"));
+    PASS();
+}
+
 /* `RefCell<T>::borrow_mut -> RefMut<T>` and `borrow -> Ref<T>`, both
  * derefing to T, reached through an `Rc`. */
 TEST(rustlsp_std_returns_refcell) {
@@ -9972,6 +9991,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_std_returns_shared_pointers);
     RUN_TEST(rustlsp_std_returns_locks);
     RUN_TEST(rustlsp_std_returns_foreign_mutex_stays_unknown);
+    RUN_TEST(rustlsp_std_returns_unknown_result_head);
     RUN_TEST(rustlsp_std_returns_refcell);
     RUN_TEST(rustlsp_std_returns_option_result_adapters);
     RUN_TEST(rustlsp_std_returns_paths);
