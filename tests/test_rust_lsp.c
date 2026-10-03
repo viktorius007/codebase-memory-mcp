@@ -2995,6 +2995,67 @@ TEST(rustlsp_nested_function_body_is_walked_as_its_own_node) {
     PASS();
 }
 
+/* QN extraction gave the definition named `name` that starts on `line`. */
+static const char *rustlsp_def_qn_at(const CBMFileResult *r, const char *name, int line) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, name) == 0 && (int)d->start_line == line) {
+            return d->qualified_name;
+        }
+    }
+    return NULL;
+}
+
+/* Admitted resolutions from exactly `caller_qn` to exactly `callee_qn`. */
+static int rustlsp_admitted_calls(const CBMFileResult *r, const char *caller_qn,
+                                  const char *callee_qn) {
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && rc->callee_qn && rc->strategy &&
+            strcmp(rc->caller_qn, caller_qn) == 0 && strcmp(rc->callee_qn, callee_qn) == 0 &&
+            cbm_pipeline_rust_strategy_admitted(rc->strategy)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* A function item declared in a block, or in an `extern` block inside it,
+ * names the bare call anywhere in that block, before its declaration too and
+ * from a sibling item's body, ahead of the module function of the same name;
+ * outside the block the module function keeps the name. */
+TEST(rustlsp_block_fn_item_shadows_module_fn) {
+    CBMFileResult *r = extract_rust("fn helper() {}\n"
+                                    "fn outer() {\n"
+                                    "    helper();\n"
+                                    "    fn helper() {}\n"
+                                    "    fn sibling() { helper(); }\n"
+                                    "    unsafe { sandbox_enabled() };\n"
+                                    "    extern \"C\" { fn sandbox_enabled() -> bool; }\n"
+                                    "}\n"
+                                    "fn other() { helper(); }\n");
+    ASSERT_NOT_NULL(r);
+    const char *module_helper = rustlsp_def_qn_at(r, "helper", 1);
+    const char *local_helper = rustlsp_def_qn_at(r, "helper", 4);
+    const char *sibling = rustlsp_def_qn_at(r, "sibling", 5);
+    const char *foreign = rustlsp_def_qn_at(r, "sandbox_enabled", 7);
+    ASSERT_NOT_NULL(module_helper);
+    ASSERT_NOT_NULL(local_helper);
+    ASSERT_NOT_NULL(sibling);
+    ASSERT_NOT_NULL(foreign);
+    ASSERT_STR_NEQ(module_helper, local_helper);
+    ASSERT_EQ(rustlsp_admitted_calls(r, "test.src.main.outer", local_helper), 1);
+    ASSERT_EQ(rustlsp_admitted_calls(r, "test.src.main.outer", module_helper), 0);
+    ASSERT_EQ(rustlsp_admitted_calls(r, sibling, local_helper), 1);
+    ASSERT_EQ(rustlsp_admitted_calls(r, sibling, module_helper), 0);
+    ASSERT_EQ(rustlsp_admitted_calls(r, "test.src.main.outer", foreign), 1);
+    ASSERT_EQ(rustlsp_admitted_calls(r, "test.src.main.other", module_helper), 1);
+    ASSERT_EQ(rustlsp_admitted_calls(r, "test.src.main.other", local_helper), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* An inline module's own `use` binds its body: a path through that name is
  * the imported item, never the crate item of the same name. */
 TEST(rustlsp_inline_module_use_shadows_crate_item) {
@@ -10384,6 +10445,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_later_macro_does_not_shadow_earlier_std_macro);
     RUN_TEST(rustlsp_nested_macro_scope_does_not_leak);
     RUN_TEST(rustlsp_nested_function_body_is_walked_as_its_own_node);
+    RUN_TEST(rustlsp_block_fn_item_shadows_module_fn);
     RUN_TEST(rustlsp_inline_module_use_shadows_crate_item);
     RUN_TEST(rustlsp_doubly_nested_inline_module_body_is_walked);
     RUN_TEST(rustlsp_inline_module_namesake_fn_binds_its_own_module);

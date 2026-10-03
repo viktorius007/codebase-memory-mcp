@@ -127,6 +127,15 @@ typedef struct {
     const char **module_fn_names;
     const char **module_fn_qns;
     int module_fn_count;
+    /* Value-namespace items declared in the blocks enclosing the walk point,
+     * outermost first: the name and, for a function with its own graph node,
+     * that node's QN (NULL otherwise). Entries from block_item_base on are
+     * visible inside a nested item's body; a nested module starts a new base. */
+    const char **block_item_names;
+    const char **block_item_qns;
+    int block_item_count;
+    int block_item_cap;
+    int block_item_base;
     /* Lazily derived from module_qn: the crate's `<project>.<dirs>.<src>`
      * prefix and the module directory this file owns. */
     const char *crate_root_prefix;

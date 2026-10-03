@@ -48,6 +48,10 @@ static const char *rust_module_fn_target(const RustLSPContext *ctx, const char *
 static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path);
 static const char *rust_module_export(RustLSPContext *ctx, const char *module_qn, const char *name);
 static const char *rust_qn_crate_prefix(RustLSPContext *ctx, const char *qn);
+static const char *rust_function_node_qn(RustLSPContext *ctx, TSNode func_node, const char *name,
+                                         const char *parent_qn);
+static bool rust_is_block_fn_item(const RustLSPContext *ctx, const char *name,
+                                  const char *target);
 typedef struct RustQnMatch RustQnMatch;
 static void rust_qn_variants(RustLSPContext *ctx, const char *qn, bool want_type, RustQnMatch *m);
 static void rust_emit_resolved_call(RustLSPContext *ctx, const char *callee_qn,
@@ -9105,7 +9109,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
             const char *alias_target = cbm_scope_lookup_callable(ctx->current_scope, path);
             if (alias_target) {
-                rust_emit_resolved_call_reason(ctx, alias_target, NULL, "lsp_callable_alias",
+                /* A function item of an enclosing block is named directly;
+                 * a value bound to a function is only an alias of it. */
+                const char *strategy = rust_is_block_fn_item(ctx, path, alias_target)
+                                           ? "lsp_direct"
+                                           : "lsp_callable_alias";
+                rust_emit_resolved_call_reason(ctx, alias_target, NULL, strategy,
                                                CBM_RUST_CONF_DIRECT, path);
                 return;
             }
@@ -9306,6 +9315,92 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
     ctx->emit_site_end_byte = saved_end;
     ctx->emit_callee_start_byte = saved_callee_start;
     ctx->emit_callee_end_byte = saved_callee_end;
+}
+
+/* Bind a value-namespace item of the block being entered in that block's
+ * scope and record it for the bodies of nested items. A function with its own
+ * graph node binds as that node (`qn`), so a bare call anywhere in the block,
+ * before or after the declaration, names it ahead of any module item or import
+ * of the same name; a later `let` of the name rebinds it. */
+static void rust_declare_block_item(RustLSPContext *ctx, const char *name, const char *qn) {
+    if (!name || !name[0]) {
+        return;
+    }
+    cbm_scope_bind_callable(ctx->current_scope, name, cbm_type_unknown(), qn);
+    if (ctx->block_item_count == ctx->block_item_cap) {
+        int cap = ctx->block_item_cap ? ctx->block_item_cap * 2 : 16;
+        const char **names =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(char *));
+        const char **qns = (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(char *));
+        if (!names || !qns) {
+            return;
+        }
+        if (ctx->block_item_count > 0) {
+            memcpy(names, ctx->block_item_names, (size_t)ctx->block_item_count * sizeof(char *));
+            memcpy(qns, ctx->block_item_qns, (size_t)ctx->block_item_count * sizeof(char *));
+        }
+        ctx->block_item_names = names;
+        ctx->block_item_qns = qns;
+        ctx->block_item_cap = cap;
+    }
+    ctx->block_item_names[ctx->block_item_count] = name;
+    ctx->block_item_qns[ctx->block_item_count] = qn;
+    ctx->block_item_count++;
+}
+
+/* Declare the value-namespace items `block` holds directly, including the
+ * functions of an `extern` block. Items spelled inside a macro expansion have
+ * no graph node, so they shadow without naming a target. */
+static void rust_declare_block_items(RustLSPContext *ctx, TSNode block) {
+    bool have_nodes = ctx->source == ctx->root_source && ctx->macro_expand_depth == 0 &&
+                      !ctx->site_map_active;
+    for (uint32_t i = 0; i < ts_node_named_child_count(block); i++) {
+        TSNode item = ts_node_named_child(block, i);
+        const char *item_kind = ts_node_type(item);
+        if (strcmp(item_kind, "foreign_mod_item") == 0) {
+            TSNode body = ts_node_child_by_field_name(item, "body", 4);
+            for (uint32_t j = 0; !ts_node_is_null(body) && j < ts_node_named_child_count(body);
+                 j++) {
+                TSNode foreign = ts_node_named_child(body, j);
+                TSNode name = ts_node_child_by_field_name(foreign, "name", 4);
+                if (ts_node_is_null(name)) {
+                    continue;
+                }
+                char *text = rust_node_text(ctx, name);
+                bool is_fn = strcmp(ts_node_type(foreign), "function_signature_item") == 0;
+                rust_declare_block_item(ctx, text,
+                                        is_fn && have_nodes && text
+                                            ? rust_function_node_qn(ctx, foreign, text, NULL)
+                                            : NULL);
+            }
+            continue;
+        }
+        bool is_fn = strcmp(item_kind, "function_item") == 0;
+        if (is_fn || strcmp(item_kind, "const_item") == 0 ||
+            strcmp(item_kind, "static_item") == 0 || strcmp(item_kind, "struct_item") == 0) {
+            TSNode name = ts_node_child_by_field_name(item, "name", 4);
+            if (ts_node_is_null(name)) {
+                continue;
+            }
+            char *text = rust_node_text(ctx, name);
+            rust_declare_block_item(ctx, text,
+                                    is_fn && have_nodes && text
+                                        ? rust_function_node_qn(ctx, item, text, NULL)
+                                        : NULL);
+        }
+    }
+}
+
+/* True when `target`, the callable the scope binds `name` to, is the function
+ * item an enclosing block declares under that name, not a value aliasing it. */
+static bool rust_is_block_fn_item(const RustLSPContext *ctx, const char *name,
+                                  const char *target) {
+    for (int i = ctx->block_item_count - 1; i >= ctx->block_item_base; i--) {
+        if (strcmp(ctx->block_item_names[i], name) == 0) {
+            return ctx->block_item_qns[i] && strcmp(ctx->block_item_qns[i], target) == 0;
+        }
+    }
+    return false;
 }
 
 /* Walk every node in a function body, recording calls and refining scope
@@ -9536,36 +9631,15 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     CBMScope *saved = ctx->current_scope;
     int saved_use_count = ctx->use_count;
     int saved_glob_count = ctx->glob_count;
+    int saved_block_item_count = ctx->block_item_count;
     if (push_scope) {
         ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
     }
     if (strcmp(kind, "block") == 0) {
         rust_collect_uses(ctx, node);
         /* Item bindings cover the whole block, including calls before the
-         * declaration. Nested function identity is not module identity. */
-        for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-            TSNode item = ts_node_named_child(node, i);
-            const char *item_kind = ts_node_type(item);
-            if (strcmp(item_kind, "foreign_mod_item") == 0) {
-                TSNode body = ts_node_child_by_field_name(item, "body", 4);
-                for (uint32_t j = 0; j < ts_node_named_child_count(body); j++) {
-                    TSNode name =
-                        ts_node_child_by_field_name(ts_node_named_child(body, j), "name", 4);
-                    if (!ts_node_is_null(name)) {
-                        cbm_scope_bind(ctx->current_scope, rust_node_text(ctx, name),
-                                       cbm_type_unknown());
-                    }
-                }
-            }
-            if (strcmp(item_kind, "function_item") == 0 || strcmp(item_kind, "const_item") == 0 ||
-                strcmp(item_kind, "static_item") == 0 || strcmp(item_kind, "struct_item") == 0) {
-                TSNode name = ts_node_child_by_field_name(item, "name", 4);
-                if (!ts_node_is_null(name)) {
-                    cbm_scope_bind(ctx->current_scope, rust_node_text(ctx, name),
-                                   cbm_type_unknown());
-                }
-            }
-        }
+         * declaration. */
+        rust_declare_block_items(ctx, node);
     }
     if (uncertain_callable_flow) {
         ctx->callable_control_flow_depth++;
@@ -9712,6 +9786,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     }
     ctx->use_count = saved_use_count;
     ctx->glob_count = saved_glob_count;
+    ctx->block_item_count = saved_block_item_count;
     if (uncertain_callable_flow) {
         ctx->callable_control_flow_depth--;
     }
@@ -10334,7 +10409,20 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     ctx->pending_match_type = NULL;
     ctx->callable_control_flow_depth = 0;
 
+    /* The items of the enclosing blocks stay visible in a nested item's
+     * body; a nested module opens a new namespace that sees none of them. */
     const char *kind = ts_node_type(item);
+    int saved_block_item_base = ctx->block_item_base;
+    if (strcmp(kind, "mod_item") == 0) {
+        ctx->block_item_base = ctx->block_item_count;
+    } else {
+        ctx->current_scope = cbm_scope_push(ctx->arena, file_scope);
+        for (int i = ctx->block_item_base; i < ctx->block_item_count; i++) {
+            cbm_scope_bind_callable(ctx->current_scope, ctx->block_item_names[i],
+                                    cbm_type_unknown(), ctx->block_item_qns[i]);
+        }
+    }
+
     if (strcmp(kind, "function_item") == 0) {
         rust_process_function(ctx, item, NULL);
     } else if (strcmp(kind, "impl_item") == 0) {
@@ -10345,6 +10433,7 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
         rust_process_module(ctx, item, 0);
     }
 
+    ctx->block_item_base = saved_block_item_base;
     ctx->current_scope = saved_scope;
     ctx->self_type_qn = saved_self;
     ctx->self_trait_qn = saved_trait;
