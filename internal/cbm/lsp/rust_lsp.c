@@ -5758,33 +5758,50 @@ static bool rust_has_visible_macro_definition(RustLSPContext *ctx, const char *m
  *   $name:expr / $name:ty / $name:ident / $name:tt / $name:path /
  *   $name:pat / $name:literal / $name:block / $name:stmt
  *
- * And one form of repetition: `$(...)<sep><kind>` where kind is `*`,
- * `+`, or `?`. Repetitions inside repetitions are NOT supported.
+ * Repetition `$( ... ) sep? kind` (kind `*`, `+` or `?`) binds each
+ * fragment once per iteration, nested up to RUST_MACRO_MAX_DEPTH groups
+ * deep; the transcriber's `$( ... )` group pastes them per iteration with
+ * its separator. A matcher or transcriber the engine cannot model expands
+ * to nothing rather than to a guess.
  *
  * Substitution writes the bound values back into the transcriber and
  * re-parses the result so any calls inside are visible to the
  * resolver. */
 
-#define RUST_MACRO_MAX_BINDINGS 32
-#define RUST_MACRO_MAX_REPS 32
+#define RUST_MACRO_MAX_BINDINGS 256
+#define RUST_MACRO_MAX_REPS 128
+#define RUST_MACRO_MAX_DEPTH 4
+#define RUST_MACRO_NAME_MAX 32
 
+/* Pattern match results below zero: no match, or a shape the engine does
+ * not model (no further rule may be tried: it could have been the match). */
+enum { MACRO_NO_MATCH = -1, MACRO_UNMODELLED = -2 };
+
+/* One metavar value. A metavar declared inside `depth` repetition groups
+ * has one binding per iteration, keyed by the iteration index of each
+ * enclosing group. */
 typedef struct {
-    char name[32];     /* metavar name (without `$`) */
-    const char *value; /* substring of the invocation args */
+    char name[RUST_MACRO_NAME_MAX]; /* metavar name (without `$`) */
+    const char *value;              /* substring of the invocation args */
     int value_len;
+    int depth;
+    int idx[RUST_MACRO_MAX_DEPTH];
 } MacroBinding;
+
+/* Iteration count of one matched repetition group, recorded for every
+ * metavar declared inside it: the group sits `depth` groups deep at the
+ * enclosing iteration `idx`. */
+typedef struct {
+    char name[RUST_MACRO_NAME_MAX];
+    int depth;
+    int idx[RUST_MACRO_MAX_DEPTH];
+    int count;
+} MacroRepCount;
 
 typedef struct {
     MacroBinding kv[RUST_MACRO_MAX_BINDINGS];
     int count;
-    /* Repetition bindings: each metavar that appears inside `$(...)*`
-     * collects an array of values (one per iteration). */
-    struct {
-        char name[32];
-        const char **values; /* arena-allocated array of strings */
-        int *lengths;
-        int count;
-    } reps[RUST_MACRO_MAX_REPS];
+    MacroRepCount reps[RUST_MACRO_MAX_REPS];
     int rep_count;
 } MacroEnv;
 
@@ -5946,6 +5963,9 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
                 return p;
             return macro_consume_fragment(s, len, from, "literal");
         }
+        /* A closing delimiter ends the enclosing token tree; it is no tt. */
+        if (c == ')' || c == ']' || c == '}')
+            return from;
         return from + 1;
     }
     /* expr / ty / path / pat / stmt / block — balance brackets, stop
@@ -5955,8 +5975,9 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
             return macro_consume_balanced(s, len, from);
         return from;
     }
-    /* For expr/ty/path/pat/stmt: greedy balanced span. */
-    int depth = 0;
+    /* For expr/ty/path/pat/stmt: greedy balanced span up to a token none
+     * of them holds outside brackets (`,` `;` `=>`). */
+    bool item = strcmp(frag, "item") == 0;
     int p = from;
     while (p < len) {
         char c = s[p];
@@ -5978,136 +5999,251 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
         }
         if (c == ')' || c == ']' || c == '}')
             break;
-        if (depth == 0 && c == ',')
+        if (c == ',')
             break;
-        if (strcmp(frag, "stmt") == 0 && c == ';')
+        if (!item && (c == ';' || (c == '=' && p + 1 < len && s[p + 1] == '>')))
             break;
         p++;
     }
     return p;
 }
 
-/* Bind a metavar in the env. Returns false if the table is full or the
- * name doesn't fit. */
-static bool macro_env_bind(MacroEnv *env, const char *name, int name_len, const char *val,
-                           int val_len) {
-    if (env->count >= RUST_MACRO_MAX_BINDINGS)
+/* Iteration path of the repetition being matched or transcribed: `depth`
+ * enclosing groups, `idx[i]` the iteration of the i-th. */
+typedef struct {
+    int depth;
+    int idx[RUST_MACRO_MAX_DEPTH];
+} MacroRepPath;
+
+static bool macro_name_copy(char *dst, const char *name, int name_len) {
+    if (name_len <= 0 || name_len >= RUST_MACRO_NAME_MAX)
         return false;
-    if (name_len <= 0 || name_len >= 32)
-        return false;
-    MacroBinding *b = &env->kv[env->count++];
-    memcpy(b->name, name, name_len);
-    b->name[name_len] = '\0';
-    b->value = val;
-    b->value_len = val_len;
+    memcpy(dst, name, (size_t)name_len);
+    dst[name_len] = '\0';
     return true;
 }
 
-static const MacroBinding *macro_env_lookup(const MacroEnv *env, const char *name) {
+/* True when `prefix` (depth entries) is the leading part of `idx`. */
+static bool macro_idx_prefix(const int *idx, const MacroRepPath *path, int depth) {
+    for (int i = 0; i < depth; i++) {
+        if (idx[i] != path->idx[i])
+            return false;
+    }
+    return true;
+}
+
+/* Bind a metavar at the current iteration path. Returns false if the
+ * table is full or the name doesn't fit. */
+static bool macro_env_bind(MacroEnv *env, const char *name, int name_len, const char *val,
+                           int val_len, const MacroRepPath *path) {
+    if (env->count >= RUST_MACRO_MAX_BINDINGS)
+        return false;
+    MacroBinding *b = &env->kv[env->count];
+    if (!macro_name_copy(b->name, name, name_len))
+        return false;
+    b->value = val;
+    b->value_len = val_len;
+    b->depth = path->depth;
+    memcpy(b->idx, path->idx, sizeof(b->idx));
+    env->count++;
+    return true;
+}
+
+/* The binding of `name` visible at `path`: declared at most path->depth
+ * groups deep, from the enclosing iterations of `path`. */
+static const MacroBinding *macro_env_lookup(const MacroEnv *env, const char *name,
+                                            const MacroRepPath *path) {
     for (int i = 0; i < env->count; i++) {
-        if (strcmp(env->kv[i].name, name) == 0)
-            return &env->kv[i];
+        const MacroBinding *b = &env->kv[i];
+        if (b->depth <= path->depth && strcmp(b->name, name) == 0 &&
+            macro_idx_prefix(b->idx, path, b->depth))
+            return b;
     }
     return NULL;
 }
 
-/* Match a pattern against an input. Pattern fragments like `$x:expr`
- * bind into `env`. Returns true if the pattern matches the whole input
- * (or up to the end of pattern, with trailing whitespace in input). */
-static bool macro_pattern_match(const char *pat, int pat_len, const char *in, int in_len,
-                                MacroEnv *env) {
-    int pp = 0; /* pattern pos */
-    int ip = 0; /* input pos */
+/* True when `name` was declared inside a repetition group at least
+ * `depth` groups deep (it still repeats at that depth). */
+static bool macro_env_repeats_at(const MacroEnv *env, const char *name, int depth) {
+    for (int i = 0; i < env->rep_count; i++) {
+        if (env->reps[i].depth >= depth && strcmp(env->reps[i].name, name) == 0)
+            return true;
+    }
+    return false;
+}
 
+/* Parse the operator after a repetition group's `)` at `from`: an optional
+ * separator token and the kind `*`, `+` or `?`. Returns the position after
+ * the kind, or -1 for an operator the engine does not model. */
+static int macro_parse_rep_op(const char *s, int len, int from, int *sep_start, int *sep_len,
+                              char *kind) {
+    int p = macro_skip_ws(s, len, from);
+    *sep_start = p;
+    *sep_len = 0;
+    if (p < len && (s[p] == '*' || s[p] == '+' || s[p] == '?')) {
+        *kind = s[p];
+        return p + 1;
+    }
+    if (p + 1 < len && s[p] == '=' && s[p + 1] == '>') {
+        *sep_len = 2;
+    } else if (p < len && (s[p] == ',' || s[p] == ';' || s[p] == '|' || s[p] == '=' ||
+                           s[p] == '.' || s[p] == '&' || s[p] == ':')) {
+        *sep_len = 1;
+    } else {
+        return -1;
+    }
+    int q = macro_skip_ws(s, len, p + *sep_len);
+    if (q < len && (s[q] == '*' || s[q] == '+')) {
+        *kind = s[q];
+        return q + 1;
+    }
+    return -1;
+}
+
+/* Record the iteration count of a matched group for every metavar declared
+ * in its pattern `body` (nested groups included). */
+static bool macro_env_record_reps(MacroEnv *env, const char *body, int body_len,
+                                  const MacroRepPath *path, int count) {
+    for (int p = 0; p < body_len; p++) {
+        if (body[p] != '$')
+            continue;
+        int ns = macro_skip_ws(body, body_len, p + 1);
+        int ne = macro_consume_ident(body, body_len, ns);
+        if (ne == ns || ne >= body_len || body[ne] != ':')
+            continue;
+        if (env->rep_count >= RUST_MACRO_MAX_REPS)
+            return false;
+        MacroRepCount *rc = &env->reps[env->rep_count];
+        if (!macro_name_copy(rc->name, body + ns, ne - ns))
+            return false;
+        rc->depth = path->depth;
+        memcpy(rc->idx, path->idx, sizeof(rc->idx));
+        rc->count = count;
+        env->rep_count++;
+        p = ne;
+    }
+    return true;
+}
+
+static int macro_match_seq(const char *pat, int pat_len, const char *in, int in_len, int ip,
+                           MacroEnv *env, const MacroRepPath *path);
+
+/* Match the repetition group whose `(` is at pat[open] against the input at
+ * `ip`: as many iterations as match, joined by the separator. Returns the
+ * input position after the last iteration (or a MACRO_ result below 0) and
+ * sets *pat_after past the operator. */
+static int macro_match_rep(const char *pat, int pat_len, int open, const char *in, int in_len,
+                           int ip, MacroEnv *env, const MacroRepPath *path, int *pat_after) {
+    int close_after = macro_consume_balanced(pat, pat_len, open);
+    if (close_after <= open || pat[close_after - 1] != ')')
+        return MACRO_UNMODELLED;
+    int sep_start = 0;
+    int sep_len = 0;
+    char kind = 0;
+    int after = macro_parse_rep_op(pat, pat_len, close_after, &sep_start, &sep_len, &kind);
+    if (after < 0 || path->depth >= RUST_MACRO_MAX_DEPTH)
+        return MACRO_UNMODELLED;
+    const char *body = pat + open + 1;
+    int body_len = close_after - 1 - (open + 1);
+    MacroRepPath inner = *path;
+    inner.depth = path->depth + 1;
+    int n = 0;
+    int cur = ip;
+    for (;;) {
+        int start = cur;
+        if (n > 0 && sep_len > 0) {
+            int s = macro_skip_ws(in, in_len, cur);
+            if (s + sep_len > in_len || memcmp(in + s, pat + sep_start, (size_t)sep_len) != 0)
+                break;
+            start = s + sep_len;
+        }
+        inner.idx[path->depth] = n;
+        int saved_count = env->count;
+        int saved_reps = env->rep_count;
+        int end = macro_match_seq(body, body_len, in, in_len, start, env, &inner);
+        if (end == MACRO_UNMODELLED)
+            return MACRO_UNMODELLED;
+        if (end < 0 || macro_skip_ws(in, in_len, end) == macro_skip_ws(in, in_len, start)) {
+            env->count = saved_count;
+            env->rep_count = saved_reps;
+            break;
+        }
+        cur = end;
+        n++;
+        if (kind == '?')
+            break;
+    }
+    if (kind == '+' && n == 0)
+        return MACRO_NO_MATCH;
+    if (!macro_env_record_reps(env, body, body_len, path, n))
+        return MACRO_UNMODELLED;
+    *pat_after = after;
+    return cur;
+}
+
+/* Match a pattern sequence against the input from `ip`. Fragments like
+ * `$x:expr` bind into `env` at the iteration `path`. Returns the input
+ * position after the matched prefix, or a MACRO_ result below 0. */
+static int macro_match_seq(const char *pat, int pat_len, const char *in, int in_len, int ip,
+                           MacroEnv *env, const MacroRepPath *path) {
+    int pp = 0;
     while (pp < pat_len) {
         pp = macro_skip_ws(pat, pat_len, pp);
         ip = macro_skip_ws(in, in_len, ip);
         if (pp >= pat_len)
             break;
-
-        char pc = pat[pp];
-
-        /* Metavar: $name:frag or $name */
-        if (pc == '$') {
+        if (pat[pp] != '$') {
+            /* Literal: must match input verbatim. */
+            if (ip >= in_len || pat[pp] != in[ip])
+                return MACRO_NO_MATCH;
             pp++;
-            /* Repetition group `$( ... )<sep><kind>` — for now we
-             * treat any rep group as a wildcard accepting the rest of
-             * the input (best-effort). We bind no names inside reps. */
-            pp = macro_skip_ws(pat, pat_len, pp);
-            if (pp < pat_len && pat[pp] == '(') {
-                int after = macro_consume_balanced(pat, pat_len, pp);
-                pp = after;
-                /* Skip optional separator + kind (one char each). */
-                if (pp < pat_len && pat[pp] != ' ' && pat[pp] != '$' && pat[pp] != '\n') {
-                    pp++;
-                }
-                if (pp < pat_len && (pat[pp] == '*' || pat[pp] == '+' || pat[pp] == '?')) {
-                    pp++;
-                }
-                /* Consume the rest of the input greedy until we hit
-                 * the next literal pattern char. */
-                int next_lit = pp;
-                while (next_lit < pat_len && (pat[next_lit] == ' ' || pat[next_lit] == '\t' ||
-                                              pat[next_lit] == '\n' || pat[next_lit] == '\r')) {
-                    next_lit++;
-                }
-                if (next_lit >= pat_len) {
-                    ip = in_len;
-                } else {
-                    char target = pat[next_lit];
-                    while (ip < in_len && in[ip] != target)
-                        ip++;
-                }
-                continue;
-            }
-            /* Metavar name. */
-            int name_start = pp;
-            pp = macro_consume_ident(pat, pat_len, pp);
-            int name_end = pp;
-            if (name_end == name_start)
-                return false;
-            const char *frag = "tt";
-            if (pp < pat_len && pat[pp] == ':') {
-                pp++;
-                int frag_start = pp;
-                pp = macro_consume_ident(pat, pat_len, pp);
-                /* Copy frag into a small buffer. */
-                static char frag_buf[16];
-                int fl = pp - frag_start;
-                if (fl > 0 && fl < (int)sizeof(frag_buf)) {
-                    memcpy(frag_buf, pat + frag_start, fl);
-                    frag_buf[fl] = '\0';
-                    frag = frag_buf;
-                }
-            }
-            /* Consume the fragment from input. */
-            int val_start = ip;
-            int val_end = macro_consume_fragment(in, in_len, ip, frag);
-            if (val_end <= val_start) {
-                /* For "expr"/"ty" the matcher may need to accept empty
-                 * input (e.g. trailing `$($x:expr),*` form). */
-                return false;
-            }
-            ip = val_end;
-            if (!macro_env_bind(env, pat + name_start, name_end - name_start, in + val_start,
-                                val_end - val_start)) {
-                return false;
-            }
+            ip++;
             continue;
         }
-
-        /* Literal: must match input verbatim. */
-        if (ip >= in_len)
-            return false;
-        char ic = in[ip];
-        if (pc != ic)
-            return false;
-        pp++;
-        ip++;
+        pp = macro_skip_ws(pat, pat_len, pp + 1);
+        if (pp < pat_len && pat[pp] == '(') {
+            int pat_after = pp;
+            ip = macro_match_rep(pat, pat_len, pp, in, in_len, ip, env, path, &pat_after);
+            if (ip < 0)
+                return ip;
+            pp = pat_after;
+            continue;
+        }
+        int name_start = pp;
+        pp = macro_consume_ident(pat, pat_len, pp);
+        int name_end = pp;
+        if (name_end == name_start)
+            return MACRO_UNMODELLED;
+        char frag[16] = "tt";
+        if (pp < pat_len && pat[pp] == ':') {
+            int frag_start = ++pp;
+            pp = macro_consume_ident(pat, pat_len, pp);
+            int fl = pp - frag_start;
+            if (fl <= 0 || fl >= (int)sizeof(frag))
+                return MACRO_UNMODELLED;
+            memcpy(frag, pat + frag_start, (size_t)fl);
+            frag[fl] = '\0';
+        }
+        int val_start = macro_skip_ws(in, in_len, ip);
+        int val_end = macro_consume_fragment(in, in_len, ip, frag);
+        if (val_end <= val_start)
+            return MACRO_NO_MATCH;
+        if (!macro_env_bind(env, pat + name_start, name_end - name_start, in + val_start,
+                            val_end - val_start, path))
+            return MACRO_UNMODELLED;
+        ip = val_end;
     }
-    /* Allow trailing whitespace in input. */
-    ip = macro_skip_ws(in, in_len, ip);
-    return ip == in_len;
+    return ip;
+}
+
+/* Match a rule's whole pattern against the whole input. */
+static int macro_pattern_match(const char *pat, int pat_len, const char *in, int in_len,
+                               MacroEnv *env) {
+    MacroRepPath top = {0};
+    int end = macro_match_seq(pat, pat_len, in, in_len, 0, env, &top);
+    if (end < 0)
+        return end;
+    return macro_skip_ws(in, in_len, end) == in_len ? end : MACRO_NO_MATCH;
 }
 
 /* Site windows of a synthetic buffer under construction (arena-grown). */
@@ -6120,6 +6256,17 @@ typedef struct {
 
 static void rust_site_windows_push(RustSiteWindows *w, uint32_t synthetic_start,
                                    uint32_t synthetic_end, uint32_t original_start) {
+    /* A window that continues the previous one in both buffers extends it,
+     * so a site pasted from consecutive fragments maps as one range. */
+    if (w->count > 0) {
+        CBMRustSiteWindow *last = &w->items[w->count - 1];
+        if (last->synthetic_end == synthetic_start &&
+            last->original_start + (last->synthetic_end - last->synthetic_start) ==
+                original_start) {
+            last->synthetic_end = synthetic_end;
+            return;
+        }
+    }
     if (w->count == w->cap) {
         int cap = w->cap ? w->cap * 2 : 8;
         CBMRustSiteWindow *grown =
@@ -6168,80 +6315,171 @@ typedef struct {
     RustSiteWindows *windows;
 } RustMacroSubstSites;
 
-/* Substitute env bindings into the transcriber text. Allocates a
- * fresh string in the arena. `sites` (optional) receives a window for each
- * substituted fragment, offset by `base`. */
-static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const MacroEnv *env,
+/* Transcriber output under construction (arena-grown). */
+typedef struct {
+    CBMArena *arena;
+    char *buf;
+    int len;
+    int cap;
+    /* The last pasted fragment: where it ends in the invocation text and the
+     * output length right after it. */
+    const char *last_value_end;
+    int last_value_out;
+} MacroOut;
+
+static bool macro_out_append(MacroOut *o, const char *s, int n) {
+    if (o->len + n + 1 > o->cap) {
+        int cap = o->cap ? o->cap : 256;
+        while (o->len + n + 1 > cap)
+            cap *= 2;
+        char *grown = (char *)cbm_arena_alloc(o->arena, (size_t)cap);
+        if (!grown)
+            return false;
+        if (o->len > 0)
+            memcpy(grown, o->buf, (size_t)o->len);
+        o->buf = grown;
+        o->cap = cap;
+    }
+    memcpy(o->buf + o->len, s, (size_t)n);
+    o->len += n;
+    o->buf[o->len] = '\0';
+    return true;
+}
+
+/* Copy the invocation bytes [from, to) into the output, with a site window
+ * for the bytes that reach the original file. */
+static bool macro_paste_span(MacroOut *o, const char *from, const char *to,
+                             const RustMacroSubstSites *sites, uint32_t base) {
+    if (sites && from >= sites->inv && to <= sites->inv + sites->inv_len) {
+        uint32_t src = sites->inv_src_start + (uint32_t)(from - sites->inv);
+        rust_site_windows_carry(sites->ctx, sites->windows, src, src + (uint32_t)(to - from),
+                                base + (uint32_t)o->len);
+    }
+    return macro_out_append(o, from, (int)(to - from));
+}
+
+/* Paste a bound fragment. A fragment pasted right after the previous one
+ * (no transcriber text between them, as in `$($t)*`) keeps the whitespace
+ * that separated the two in the invocation: tokens stay apart, and adjacent
+ * tokens stay one site. */
+static bool macro_paste_value(MacroOut *o, const MacroBinding *b,
                               const RustMacroSubstSites *sites, uint32_t base) {
-    /* Estimate output size: each metavar expansion could be up to
-     * ~256 bytes; bound the total at xs_len * 4 + 4KB. */
-    int cap = xs_len * 4 + 4096;
-    char *out = (char *)cbm_arena_alloc(arena, cap + 1);
-    if (!out)
-        return NULL;
-    int op = 0;
+    if (sites && o->last_value_end && o->len == o->last_value_out &&
+        o->last_value_end >= sites->inv && b->value >= o->last_value_end &&
+        b->value <= sites->inv + sites->inv_len) {
+        const char *gap = o->last_value_end;
+        while (gap < b->value && (*gap == ' ' || *gap == '\t' || *gap == '\n' || *gap == '\r'))
+            gap++;
+        if (gap == b->value && !macro_paste_span(o, o->last_value_end, b->value, sites, base))
+            return false;
+    }
+    if (!macro_paste_span(o, b->value, b->value + b->value_len, sites, base))
+        return false;
+    o->last_value_end = b->value + b->value_len;
+    o->last_value_out = o->len;
+    return true;
+}
+
+/* Iteration count of a transcriber repetition group `body` at `path`: the
+ * count its matcher group recorded for the metavars in `body` that still
+ * repeat at this depth. -1 when none does or they disagree. */
+static int macro_rep_count(const MacroEnv *env, const char *body, int body_len,
+                           const MacroRepPath *path) {
+    int count = -1;
+    for (int p = 0; p < body_len; p++) {
+        if (body[p] != '$')
+            continue;
+        int ne = macro_consume_ident(body, body_len, p + 1);
+        char name[RUST_MACRO_NAME_MAX];
+        if (!macro_name_copy(name, body + p + 1, ne - (p + 1)))
+            continue;
+        for (int i = 0; i < env->rep_count; i++) {
+            const MacroRepCount *rc = &env->reps[i];
+            if (rc->depth != path->depth || strcmp(rc->name, name) != 0 ||
+                !macro_idx_prefix(rc->idx, path, path->depth))
+                continue;
+            if (count >= 0 && count != rc->count)
+                return -1;
+            count = rc->count;
+        }
+        p = ne - 1;
+    }
+    return count;
+}
+
+/* Substitute env bindings into the transcriber text at iteration `path`.
+ * `sites` (optional) receives a window for each substituted fragment,
+ * offset by `base`. Returns false for a transcriber the engine cannot
+ * model (a metavar pasted at the wrong repetition depth, a group with no
+ * repeating metavar). */
+static bool macro_subst_seq(MacroOut *o, const char *xs, int xs_len, const MacroEnv *env,
+                            const RustMacroSubstSites *sites, uint32_t base,
+                            const MacroRepPath *path) {
     int xp = 0;
     while (xp < xs_len) {
         char c = xs[xp];
-        if (c == '$' && xp + 1 < xs_len) {
-            /* Skip rep groups: `$(...)<sep><kind>` — naive expansion:
-             * emit the body once, no separator handling. */
-            if (xs[xp + 1] == '(') {
-                int body_start = xp + 2;
-                int after = macro_consume_balanced(xs, xs_len, xp + 1);
-                int body_end = after - 1;
-                /* Emit the body recursively substituted. */
-                int windows_before = sites ? sites->windows->count : 0;
-                char *inner = macro_substitute(arena, xs + body_start, body_end - body_start, env,
-                                               sites, base + (uint32_t)op);
-                int il = inner ? (int)strlen(inner) : 0;
-                if (inner && op + il < cap) {
-                    memcpy(out + op, inner, il);
-                    op += il;
-                } else if (sites) {
-                    sites->windows->count = windows_before;
-                }
-                xp = after;
-                /* Skip optional separator + kind. */
-                if (xp < xs_len && xs[xp] != ' ' && xs[xp] != '\n')
-                    xp++;
-                if (xp < xs_len && (xs[xp] == '*' || xs[xp] == '+' || xs[xp] == '?')) {
-                    xp++;
-                }
-                continue;
+        if (c == '$' && xp + 1 < xs_len && xs[xp + 1] == '(') {
+            int close_after = macro_consume_balanced(xs, xs_len, xp + 1);
+            if (close_after <= xp + 1 || xs[close_after - 1] != ')')
+                return false;
+            int sep_start = 0;
+            int sep_len = 0;
+            char kind = 0;
+            int after = macro_parse_rep_op(xs, xs_len, close_after, &sep_start, &sep_len, &kind);
+            if (after < 0 || path->depth >= RUST_MACRO_MAX_DEPTH)
+                return false;
+            const char *body = xs + xp + 2;
+            int body_len = close_after - 1 - (xp + 2);
+            int n = macro_rep_count(env, body, body_len, path);
+            if (n < 0)
+                return false;
+            MacroRepPath inner = *path;
+            inner.depth = path->depth + 1;
+            for (int i = 0; i < n; i++) {
+                if (i > 0 && sep_len > 0 && !macro_out_append(o, xs + sep_start, sep_len))
+                    return false;
+                inner.idx[path->depth] = i;
+                if (!macro_subst_seq(o, body, body_len, env, sites, base, &inner))
+                    return false;
             }
-            /* $name reference. */
-            int name_start = xp + 1;
-            int name_end = macro_consume_ident(xs, xs_len, name_start);
-            if (name_end > name_start) {
-                char name_buf[32];
-                int nl = name_end - name_start;
-                if (nl < 32) {
-                    memcpy(name_buf, xs + name_start, nl);
-                    name_buf[nl] = '\0';
-                    const MacroBinding *b = macro_env_lookup(env, name_buf);
-                    if (b && b->value && op + b->value_len < cap) {
-                        if (sites && b->value >= sites->inv &&
-                            b->value + b->value_len <= sites->inv + sites->inv_len) {
-                            uint32_t src = sites->inv_src_start + (uint32_t)(b->value - sites->inv);
-                            rust_site_windows_carry(sites->ctx, sites->windows, src,
-                                                    src + (uint32_t)b->value_len,
-                                                    base + (uint32_t)op);
-                        }
-                        memcpy(out + op, b->value, b->value_len);
-                        op += b->value_len;
-                        xp = name_end;
-                        continue;
-                    }
+            xp = after;
+            continue;
+        }
+        if (c == '$') {
+            int name_end = macro_consume_ident(xs, xs_len, xp + 1);
+            char name[RUST_MACRO_NAME_MAX];
+            if (macro_name_copy(name, xs + xp + 1, name_end - (xp + 1))) {
+                if (macro_env_repeats_at(env, name, path->depth))
+                    return false;
+                const MacroBinding *b = macro_env_lookup(env, name, path);
+                if (b && b->value) {
+                    if (!macro_paste_value(o, b, sites, base))
+                        return false;
+                    xp = name_end;
+                    continue;
                 }
             }
         }
-        if (op < cap)
-            out[op++] = c;
+        if (!macro_out_append(o, &c, 1))
+            return false;
         xp++;
     }
-    out[op] = '\0';
-    return out;
+    return true;
+}
+
+/* Substitute env bindings into the transcriber text. Allocates a fresh
+ * string in the arena; NULL when the transcriber cannot be modelled. */
+static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const MacroEnv *env,
+                              const RustMacroSubstSites *sites, uint32_t base) {
+    MacroOut o = {.arena = arena};
+    MacroRepPath top = {0};
+    int windows_before = sites ? sites->windows->count : 0;
+    if (!macro_out_append(&o, "", 0) || !macro_subst_seq(&o, xs, xs_len, env, sites, base, &top)) {
+        if (sites)
+            sites->windows->count = windows_before;
+        return NULL;
+    }
+    return o.buf;
 }
 
 /* Re-parse a user macro's transcriber body as a synthetic Rust
@@ -6260,8 +6498,6 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     /* Try each rule from the lexically selected definition until one matches;
      * first matching rule wins. */
     RustMacroRule *hit = NULL;
-    MacroEnv env;
-    memset(&env, 0, sizeof(env));
 
     /* Extract the invocation argument text. */
     const char *inv_args = NULL;
@@ -6288,23 +6524,34 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         }
     }
 
+    if (!inv_args)
+        return;
+    MacroEnv *env = (MacroEnv *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*env));
+    if (!env)
+        return;
     for (int i = 0; i < ctx->macro_rules_count; i++) {
         RustMacroRule *r = ctx->macro_rules_arr[i];
         if (strcmp(r->macro_name, mname) != 0 || r->external_id != visible->external_id ||
             r->definition_start_byte != visible->definition_start_byte ||
             r->scope_start_byte != visible->scope_start_byte ||
-            r->scope_end_byte != visible->scope_end_byte) {
+            r->scope_end_byte != visible->scope_end_byte || !r->pattern_text) {
             continue;
         }
-        memset(&env, 0, sizeof(env));
-        if (r->pattern_text && inv_args &&
-            macro_pattern_match(r->pattern_text, r->pattern_len, inv_args, inv_args_len, &env)) {
+        env->count = 0;
+        env->rep_count = 0;
+        int matched = macro_pattern_match(r->pattern_text, r->pattern_len, inv_args, inv_args_len,
+                                          env);
+        if (matched == MACRO_UNMODELLED)
+            break;
+        if (matched >= 0) {
             hit = r;
             break;
         }
     }
-    if (!hit || !hit->transcriber_text || hit->transcriber_len <= 0)
+    if (!hit || !hit->transcriber_text || hit->transcriber_len <= 0) {
+        cbm_free(CBM_MEM_CLASS_OTHER, env);
         return;
+    }
 
     /* Substitute the bound metavars into the transcriber body. A fragment
      * copied from the invocation keeps its original bytes, so calls inside it
@@ -6317,7 +6564,8 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
                                  .inv_src_start = inv_src_start,
                                  .windows = &windows};
     char *substituted = macro_substitute(ctx->arena, hit->transcriber_text, hit->transcriber_len,
-                                         &env, &sites, (uint32_t)strlen(expand_prefix));
+                                         env, &sites, (uint32_t)strlen(expand_prefix));
+    cbm_free(CBM_MEM_CLASS_OTHER, env);
     if (!substituted)
         return;
 
