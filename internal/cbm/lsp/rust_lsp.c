@@ -5920,6 +5920,34 @@ static const CBMRegisteredFunc *rust_registry_lookup_unique_method(
     return only;
 }
 
+/* `Type::f` where `Type` carries several `f`: rustc probes inherent
+ * associated items before trait items, so the inherent `f` declared on
+ * exactly this type is the callee. Nothing is selected when the type has no
+ * inherent `f`, when it has several distinct ones (impl blocks that differ by
+ * type arguments or cfg), or when the caller cannot name the inherent one
+ * (rustc then goes on to the trait items). */
+static const CBMRegisteredFunc *rust_registry_lookup_sole_inherent_method(
+    const RustLSPContext *ctx, const char *receiver_qn, const char *method_name) {
+    const CBMRegisteredFunc *only = NULL;
+    CBMMethodIter it;
+    cbm_registry_methods_chain(ctx->registry, receiver_qn, method_name, &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &it.reg->funcs[index];
+        if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0) {
+            continue;
+        }
+        if (rust_method_hidden_from_caller(ctx, candidate)) {
+            return NULL;
+        }
+        /* One item reached through both registries of the chain counts once. */
+        if (only && strcmp(only->qualified_name, candidate->qualified_name) != 0) {
+            return NULL;
+        }
+        only = only ? only : candidate;
+    }
+    return only;
+}
+
 const char *cbm_rust_impl_key(CBMArena *arena, const char *receiver_qn,
                               const char *receiver_spelling, const char *trait_spelling) {
     if (!arena || !receiver_qn || !receiver_spelling || !trait_spelling) {
@@ -9882,6 +9910,10 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
     if (m) {
         const CBMRegisteredFunc *unique =
             rust_registry_lookup_unique_method(ctx->registry, m->receiver_type, m->short_name);
+        if (!unique) {
+            unique =
+                rust_registry_lookup_sole_inherent_method(ctx, m->receiver_type, m->short_name);
+        }
         if (!unique) {
             unique = rust_trait_impl_by_argument(ctx, m->receiver_type, m->short_name, first_arg);
         }
