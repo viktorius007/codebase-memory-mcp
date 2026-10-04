@@ -1254,7 +1254,9 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
          "mod nested { use super::other as target; }\nfn caller() { target(); }\n",
          1, "rust_call_gate.nested_use.target"},
         {"rust_nested_function", "nested_fn.rs", CBM_LANG_RUST,
-         "fn target() {}\nfn caller() { fn target() {} target(); }\n", 0, NULL},
+         "fn target() {}\nfn caller() { fn target() {} target(); }\n",
+         /* The module fn takes the `#L1` twin; the block item keeps the plain QN. */
+         1, "rust_call_gate.nested_fn.target"},
         {"rust_const_shadow", "const_shadow.rs", CBM_LANG_RUST,
          "fn target() {}\nfn other() {}\n"
          "fn caller() { target(); const target: fn() = other; }\n", 0, NULL},
@@ -1267,7 +1269,8 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
          "fn target(_: i32) {}\nfn caller() { struct target(i32); target(1); }\n", 0, NULL},
         {"rust_foreign_shadow", "foreign_shadow.rs", CBM_LANG_RUST,
          "fn target() {}\nfn caller() { extern \"C\" { fn target(); } unsafe { target(); } }\n",
-         0, NULL},
+         /* The extern-block fn keeps the plain QN, as the nested fn above. */
+         1, "rust_call_gate.foreign_shadow.target"},
         {"rust_method_caller", "method_caller.rs", CBM_LANG_RUST,
          "fn target() {}\nstruct Worker;\nimpl Worker { fn caller() { target(); } }\n",
          1, "rust_call_gate.method_caller.target"},

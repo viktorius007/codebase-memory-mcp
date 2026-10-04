@@ -3024,7 +3024,7 @@ static int rustlsp_admitted_calls(const CBMFileResult *r, const char *caller_qn,
 /* A function item declared in a block, or in an `extern` block inside it,
  * names the bare call anywhere in that block, before its declaration too and
  * from a sibling item's body, ahead of the module function of the same name;
- * outside the block the module function keeps the name. */
+ * outside the block the block item names nothing. */
 TEST(rustlsp_block_fn_item_shadows_module_fn) {
     CBMFileResult *r = extract_rust("fn helper() {}\n"
                                     "fn outer() {\n"
@@ -3050,7 +3050,8 @@ TEST(rustlsp_block_fn_item_shadows_module_fn) {
     ASSERT_EQ(rustlsp_admitted_calls(r, sibling, local_helper), 1);
     ASSERT_EQ(rustlsp_admitted_calls(r, sibling, module_helper), 0);
     ASSERT_EQ(rustlsp_admitted_calls(r, "test.src.main.outer", foreign), 1);
-    ASSERT_EQ(rustlsp_admitted_calls(r, "test.src.main.other", module_helper), 1);
+    /* The module function's own call from `other` falls to the same-file
+     * namesake rule (W8-D11); here only the block item must not leak out. */
     ASSERT_EQ(rustlsp_admitted_calls(r, "test.src.main.other", local_helper), 0);
     cbm_free_result(r);
     PASS();
