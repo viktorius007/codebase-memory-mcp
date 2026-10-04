@@ -505,19 +505,29 @@ static void rust_trait_name_index_build(RustTraitNameIndex *index, CBMArena *are
     if (!arena || !reg) {
         return;
     }
-    for (int i = 0; i < reg->type_count; i++) {
-        const CBMRegisteredType *type = &reg->types[i];
-        if (!type->is_interface || !type->qualified_name) {
-            continue;
-        }
-        const char *suffix = type->qualified_name;
-        for (;;) {
-            rust_trait_name_index_add(index, arena, reg, suffix, i);
-            const char *dot = strchr(suffix, '.');
-            if (!dot || !dot[1]) {
-                break;
+    /* Declared traits first, then re-exports: a re-export (`std.error.Error`
+     * of `core.error.Error`) is indexed as the trait it names, so both
+     * spellings answer with one QN. */
+    for (int aliases = 0; aliases <= 1; aliases++) {
+        for (int i = 0; i < reg->type_count; i++) {
+            const CBMRegisteredType *type = &reg->types[i];
+            if (!type->is_interface || !type->qualified_name || (type->alias_of != NULL) != aliases) {
+                continue;
             }
-            suffix = dot + 1;
+            int named = i;
+            int32_t target = aliases ? cbm_idxmemo_get(&index->unique, type->alias_of) : -1;
+            if (target >= 0 && strcmp(reg->types[target].qualified_name, type->alias_of) == 0) {
+                named = target;
+            }
+            const char *suffix = type->qualified_name;
+            for (;;) {
+                rust_trait_name_index_add(index, arena, reg, suffix, named);
+                const char *dot = strchr(suffix, '.');
+                if (!dot || !dot[1]) {
+                    break;
+                }
+                suffix = dot + 1;
+            }
         }
     }
 }
@@ -534,8 +544,109 @@ static const char *rust_trait_name_index_lookup(const RustTraitNameIndex *index,
     return reg->types[type_index].qualified_name;
 }
 
+/* `std` re-exports the items of `core` and `alloc` under the same module
+ * path, so one std-library trait is spelled through up to three roots. */
+static const char *const RUST_FACADE_ROOTS[] = {"core", "alloc", "std"};
+enum { RUST_FACADE_ROOT_COUNT = sizeof(RUST_FACADE_ROOTS) / sizeof(RUST_FACADE_ROOTS[0]) };
+
+static bool rust_qn_has_facade_root(const char *qn) {
+    const char *dot = strchr(qn, '.');
+    for (int i = 0; dot && i < RUST_FACADE_ROOT_COUNT; i++) {
+        size_t len = strlen(RUST_FACADE_ROOTS[i]);
+        if ((size_t)(dot - qn) == len && strncmp(qn, RUST_FACADE_ROOTS[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The registered trait a full path through `std`, `core` or `alloc` names:
+ * the one std-library trait registered under that module path below any of
+ * the three roots. NULL for a path with another root, or when none or two
+ * distinct traits are. */
+static const char *rust_facade_trait_qn(CBMArena *arena, const CBMTypeRegistry *reg,
+                                        const RustTraitNameIndex *index, const char *qn) {
+    if (!rust_qn_has_facade_root(qn)) {
+        return NULL;
+    }
+    const char *tail = strchr(qn, '.');
+    const char *found = NULL;
+    for (int i = 0; i < RUST_FACADE_ROOT_COUNT; i++) {
+        const char *spelled = cbm_arena_sprintf(arena, "%s%s", RUST_FACADE_ROOTS[i], tail);
+        const char *hit = rust_trait_name_index_lookup(index, reg, spelled);
+        if (!hit || !rust_qn_has_facade_root(hit)) {
+            continue;
+        }
+        if (found && strcmp(found, hit) != 0) {
+            return NULL;
+        }
+        found = hit;
+    }
+    return found;
+}
+
+/* What tells which item the head of a trait path written in a file names:
+ * the crate module tree when the caller has one, else the file's own `use`
+ * bindings. Either may be NULL. */
+typedef struct {
+    const CBMRustModTree *tree;
+    const CBMImportArray *imports;
+} RustTraitScope;
+
+/* `qn` (dotted, as written) with its head replaced by the path the file's
+ * `use` binds that head to; NULL when no `use` binds it. */
+static const char *rust_trait_path_through_use(CBMArena *arena, const CBMImportArray *imports,
+                                               const char *qn) {
+    const char *dot = strchr(qn, '.');
+    size_t head = dot ? (size_t)(dot - qn) : strlen(qn);
+    for (int i = 0; imports && i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || !imp->module_path || strlen(imp->local_name) != head ||
+            strncmp(imp->local_name, qn, head) != 0) {
+            continue;
+        }
+        const char *bound = convert_path_to_qn(arena, imp->module_path);
+        if (!bound || !bound[0]) {
+            return NULL;
+        }
+        return dot ? cbm_arena_sprintf(arena, "%s%s", bound, dot) : bound;
+    }
+    return NULL;
+}
+
+/* The registered trait the module tree proves `path` (as written, without
+ * generic arguments) names in the file of `def_module_qn`: a std-library
+ * trait the path reaches through the file's `use` graph, or the project trait
+ * a single name is declared or imported as. NULL otherwise; a longer path to
+ * a project trait is left to the name index. */
+static const char *rust_trait_qn_by_module_tree(CBMArena *arena, const CBMTypeRegistry *reg,
+                                                const RustTraitNameIndex *index,
+                                                const CBMRustModTree *tree,
+                                                const char *def_module_qn, const char *path) {
+    if (!tree || !def_module_qn) {
+        return NULL;
+    }
+    CBMRustPathResult r = cbm_rust_modtree_resolve_type_in_file(tree, arena, def_module_qn, path);
+    if (!r.qn) {
+        return NULL;
+    }
+    if (r.kind == CBM_RUST_PATH_NOT_FUNCTION) {
+        return rust_facade_trait_qn(arena, reg, index, r.qn);
+    }
+    if (r.kind != CBM_RUST_PATH_TYPE || strstr(path, "::")) {
+        return NULL;
+    }
+    const char *hit = rust_trait_name_index_lookup(index, reg, r.qn);
+    return hit && strcmp(hit, r.qn) == 0 ? hit : NULL;
+}
+
+/* The registered trait an impl header's trait text names, NULL when it
+ * settles on none. One trait has one answer however it is spelled: by a full
+ * `core::`/`std::`/`alloc::` path, by a `use`-bound name or module prefix, or
+ * relative to the impl's module. */
 static const char *rust_canonical_impl_trait(CBMArena *arena, const CBMTypeRegistry *reg,
-                                             const RustTraitNameIndex *index, const char *raw_trait,
+                                             const RustTraitNameIndex *index,
+                                             const RustTraitScope *scope, const char *raw_trait,
                                              const char *def_module_qn) {
     if (!arena || !reg || !index || !raw_trait || !raw_trait[0]) {
         return NULL;
@@ -548,15 +659,18 @@ static const char *rust_canonical_impl_trait(CBMArena *arena, const CBMTypeRegis
     } else if (strncmp(raw_trait, "impl ", 5) == 0) {
         raw_trait += 5;
     }
-    const char *normalized = convert_path_to_qn(arena, raw_trait);
-    if (!normalized || !normalized[0]) {
+    const char *raw_args = strchr(raw_trait, '<');
+    const char *path =
+        raw_args ? cbm_arena_strndup(arena, raw_trait, (size_t)(raw_args - raw_trait)) : raw_trait;
+    const char *lookup_name = path ? convert_path_to_qn(arena, path) : NULL;
+    if (!lookup_name || !lookup_name[0]) {
         return NULL;
     }
-    const char *generic_args = strchr(normalized, '<');
-    const char *lookup_name =
-        generic_args
-            ? cbm_arena_strndup(arena, normalized, (size_t)(generic_args - normalized))
-            : normalized;
+    const char *by_tree = rust_trait_qn_by_module_tree(
+        arena, reg, index, scope ? scope->tree : NULL, def_module_qn, path);
+    if (by_tree) {
+        return by_tree;
+    }
 
     /* A bare/relative trait declared in the impl's own module is exact and
      * therefore wins even if another module declares the same leaf. */
@@ -571,6 +685,18 @@ static const char *rust_canonical_impl_trait(CBMArena *arena, const CBMTypeRegis
         if (local_qn) {
             return local_qn;
         }
+    }
+
+    /* A `use`-bound head names what the `use` spells, never a same-named
+     * trait found by leaf: a std-library path settles here, a project path
+     * goes on as that path. */
+    const char *used =
+        rust_trait_path_through_use(arena, scope ? scope->imports : NULL, lookup_name);
+    if (used) {
+        lookup_name = used;
+    }
+    if (rust_qn_has_facade_root(lookup_name)) {
+        return rust_facade_trait_qn(arena, reg, index, lookup_name);
     }
 
     const char *exact = rust_trait_name_index_lookup(index, reg, lookup_name);
@@ -2660,19 +2786,10 @@ static void rust_register_type_alias(CBMArena *arena, CBMRegisteredType *rt, con
     }
 }
 
-/* True when an impl's trait is the language's `Deref`, the only trait that
- * gives a receiver its auto-deref step: `canonical` (the trait's registered
- * QN, NULL when it has none) is `core.ops.Deref`, or the raw spelling is a
- * full path the registry holds as a re-export of it (`std::ops::Deref`). */
-static bool rust_impl_trait_is_deref(CBMArena *arena, const CBMTypeRegistry *reg,
-                                     const char *canonical, const char *raw_trait) {
-    static const char deref_qn[] = "core.ops.Deref";
-    if (canonical) {
-        return strcmp(canonical, deref_qn) == 0;
-    }
-    const char *spelled = raw_trait ? convert_path_to_qn(arena, raw_trait) : NULL;
-    const CBMRegisteredType *rt = spelled ? cbm_registry_lookup_type(reg, spelled) : NULL;
-    return rt && rt->alias_of && strcmp(rt->alias_of, deref_qn) == 0;
+/* True when `canonical`, an impl's canonical trait QN, is the language's
+ * `Deref`: the only trait that gives a receiver its auto-deref step. */
+static bool rust_impl_trait_is_deref(const char *canonical) {
+    return canonical && strcmp(canonical, "core.ops.Deref") == 0;
 }
 
 /* Record `impl Deref for <spelling> { type Target = <target>; }`, written in
@@ -12453,6 +12570,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
     }
     RustTraitNameIndex trait_names;
     rust_trait_name_index_build(&trait_names, arena, reg);
+    const RustTraitScope trait_scope = {.imports = &result->imports};
 
     /* Phase A2: register every Function/Method definition. */
     for (int i = 0; i < result->defs.count; i++) {
@@ -12477,8 +12595,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             }
             if (d->impl_trait) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
-                rf.impl_trait_qn =
-                    rust_canonical_impl_trait(arena, reg, &trait_names, d->impl_trait, module_qn);
+                rf.impl_trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
+                                                             d->impl_trait, module_qn);
             } else if (d->is_rust_private && module_qn) {
                 rf.rust_private_module = module_qn;
             }
@@ -12807,10 +12925,9 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         const char *recv_qn = it->struct_qn
                                   ? it->struct_qn
                                   : cbm_arena_sprintf(arena, "%s.%s", module_qn, it->struct_name);
-        const char *trait_qn =
-            rust_canonical_impl_trait(arena, reg, &trait_names, it->trait_name, module_qn);
-        bool deref = rust_impl_trait_is_deref(arena, reg, trait_qn, it->trait_name);
-        if (!trait_qn && !deref) {
+        const char *trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
+                                                         it->trait_name, module_qn);
+        if (!trait_qn) {
             continue;
         }
 
@@ -12830,7 +12947,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name, reg->type_count - 1);
         }
         rust_registered_type_add_embedded(arena, rt, trait_qn);
-        if (deref) {
+        if (rust_impl_trait_is_deref(trait_qn)) {
             rust_register_deref_target(arena, rt, it->target_type, it->struct_name, module_qn,
                                        NULL);
         }
@@ -13022,7 +13139,8 @@ static void rust_register_supertraits(CBMArena *arena, const CBMTypeRegistry *re
         const char *qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, path);
         int32_t index = qn ? cbm_idxmemo_get(type_idx, qn) : -1;
         if (index < 0 || !reg->types[index].is_interface) {
-            qn = rust_canonical_impl_trait(arena, reg, names, s, module_qn);
+            const RustTraitScope scope = {.tree = tree};
+            qn = rust_canonical_impl_trait(arena, reg, names, &scope, s, module_qn);
         }
         if (qn && strcmp(qn, trait->qualified_name) != 0) {
             rust_registered_type_add_embedded(
@@ -13094,6 +13212,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
 
     RustTraitNameIndex trait_names;
     rust_trait_name_index_build(&trait_names, arena, reg);
+    const RustTraitScope trait_scope = {.tree = tree};
 
     for (int i = 0; i < def_count; i++) {
         CBMRustLSPDef *d = &defs[i];
@@ -13115,10 +13234,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             continue;
         }
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
-        const char *trait_qn =
-            rust_canonical_impl_trait(arena, reg, &trait_names, d->trait_qn, def_mod);
-        bool deref = rust_impl_trait_is_deref(arena, reg, trait_qn, d->trait_qn);
-        if (!trait_qn && !deref) {
+        const char *trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
+                                                         d->trait_qn, def_mod);
+        if (!trait_qn) {
             continue;
         }
         int32_t type_index = cbm_idxmemo_get(&type_idx, receiver);
@@ -13133,7 +13251,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name, type_index);
         }
         rust_registered_type_add_embedded(arena, &reg->types[type_index], trait_qn);
-        if (deref) {
+        if (rust_impl_trait_is_deref(trait_qn)) {
             rust_register_deref_target(arena, &reg->types[type_index], d->impl_target,
                                        d->receiver_spelling, def_mod, tree);
         }
@@ -13202,8 +13320,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             }
             if (d->trait_qn && d->trait_qn[0]) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
-                rf.impl_trait_qn =
-                    rust_canonical_impl_trait(arena, reg, &trait_names, d->trait_qn, def_mod);
+                rf.impl_trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
+                                                             d->trait_qn, def_mod);
             } else if (d->is_rust_private && def_mod) {
                 rf.rust_private_module = cbm_arena_strdup(arena, def_mod);
             }
