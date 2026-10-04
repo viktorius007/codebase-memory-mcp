@@ -5499,6 +5499,286 @@ static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node
     return cbm_type_named(ctx->arena, owner);
 }
 
+static void rust_declare_block_items(RustLSPContext *ctx, TSNode block);
+
+static bool rust_type_is_never(const CBMType *t) {
+    return t && t->kind == CBM_TYPE_BUILTIN && t->data.builtin.name &&
+           strcmp(t->data.builtin.name, "!") == 0;
+}
+
+/* The one type two branches of the same value both have, or NULL when they
+ * are proven to differ. A part one branch leaves open (`None`, `Vec::new()`,
+ * an untyped tuple element) takes the other branch's spelling of it. */
+#define RUST_UNIFY_DEPTH_MAX 8
+#define RUST_UNIFY_PARTS_MAX 16
+static const CBMType *rust_unify_branch_types(RustLSPContext *ctx, const CBMType *a,
+                                              const CBMType *b, int depth) {
+    if (!a || cbm_type_is_unknown(a)) {
+        return b;
+    }
+    if (!b || cbm_type_is_unknown(b)) {
+        return a;
+    }
+    if (cbm_type_equal(a, b)) {
+        return a;
+    }
+    if (depth >= RUST_UNIFY_DEPTH_MAX) {
+        return NULL;
+    }
+    if (a->kind == CBM_TYPE_NAMED && b->kind == CBM_TYPE_TEMPLATE) {
+        const CBMType *swap = a;
+        a = b;
+        b = swap;
+    }
+    if (a->kind == CBM_TYPE_TEMPLATE && b->kind == CBM_TYPE_NAMED) {
+        bool same = a->data.template_type.template_name && b->data.named.qualified_name &&
+                    !b->data.named.rust_dyn_markers &&
+                    strcmp(a->data.template_type.template_name, b->data.named.qualified_name) == 0;
+        return same ? a : NULL;
+    }
+    if (a->kind != b->kind) {
+        return NULL;
+    }
+    const CBMType *parts[RUST_UNIFY_PARTS_MAX];
+    if (a->kind == CBM_TYPE_REFERENCE) {
+        const CBMType *elem =
+            rust_unify_branch_types(ctx, a->data.reference.elem, b->data.reference.elem, depth + 1);
+        return elem ? cbm_type_reference(ctx->arena, elem) : NULL;
+    }
+    if (a->kind == CBM_TYPE_TUPLE) {
+        int count = a->data.tuple.count;
+        if (count != b->data.tuple.count || count > RUST_UNIFY_PARTS_MAX) {
+            return NULL;
+        }
+        for (int i = 0; i < count; i++) {
+            parts[i] = rust_unify_branch_types(ctx, a->data.tuple.elems[i], b->data.tuple.elems[i],
+                                               depth + 1);
+            if (!parts[i]) {
+                return NULL;
+            }
+        }
+        return cbm_type_tuple(ctx->arena, parts, count);
+    }
+    if (a->kind == CBM_TYPE_TEMPLATE) {
+        int count = a->data.template_type.arg_count;
+        int other = b->data.template_type.arg_count;
+        if (!a->data.template_type.template_name || !b->data.template_type.template_name ||
+            strcmp(a->data.template_type.template_name, b->data.template_type.template_name) !=
+                0) {
+            return NULL;
+        }
+        if (count == 0 || other == 0) {
+            return count == 0 ? b : a;
+        }
+        if (count != other || count > RUST_UNIFY_PARTS_MAX) {
+            return NULL;
+        }
+        for (int i = 0; i < count; i++) {
+            parts[i] = rust_unify_branch_types(ctx, a->data.template_type.template_args[i],
+                                               b->data.template_type.template_args[i], depth + 1);
+            if (!parts[i]) {
+                return NULL;
+            }
+        }
+        return cbm_type_template(ctx->arena, a->data.template_type.template_name, parts, count);
+    }
+    return NULL;
+}
+
+/* The type the branches of an `if` or `match` agree on. A branch that
+ * diverges has no value and an untyped one proves nothing, so neither
+ * contributes; two branches proven to differ leave the value untyped. A
+ * branch read as `()` beside one with a value is one that diverges where
+ * this resolver does not see it (`unreachable!()`, a call that never
+ * returns), since the two cannot differ in a program that compiles. */
+typedef struct {
+    const CBMType *type;
+    bool conflict;
+    bool untyped;
+    bool diverges;
+    bool unit;
+} RustBranchJoin;
+
+static void rust_branch_join_add(RustLSPContext *ctx, RustBranchJoin *join, const CBMType *t) {
+    if (rust_type_is_never(t)) {
+        join->diverges = true;
+        return;
+    }
+    if (!t || cbm_type_is_unknown(t)) {
+        join->untyped = true;
+        return;
+    }
+    if (t->kind == CBM_TYPE_BUILTIN && t->data.builtin.name &&
+        strcmp(t->data.builtin.name, "()") == 0) {
+        join->unit = true;
+        return;
+    }
+    if (!join->type) {
+        join->type = t;
+        return;
+    }
+    const CBMType *unified = rust_unify_branch_types(ctx, join->type, t, 0);
+    if (unified) {
+        join->type = unified;
+        return;
+    }
+    join->conflict = true;
+}
+
+static const CBMType *rust_branch_join_type(RustLSPContext *ctx, const RustBranchJoin *join) {
+    if (join->conflict) {
+        return cbm_type_unknown();
+    }
+    if (join->type) {
+        return join->type;
+    }
+    if (join->untyped) {
+        return cbm_type_unknown();
+    }
+    if (join->unit) {
+        return cbm_type_builtin(ctx->arena, "()");
+    }
+    return join->diverges ? cbm_type_builtin(ctx->arena, "!") : cbm_type_unknown();
+}
+
+/* Type of a block's last statement when the block has no trailing
+ * expression. `return x;` ends the block without a value; whether a macro
+ * statement does is not known here. */
+static const CBMType *rust_eval_last_statement(RustLSPContext *ctx, TSNode statement) {
+    const CBMType *unit = cbm_type_builtin(ctx->arena, "()");
+    if (ts_node_named_child_count(statement) == 0) {
+        return unit;
+    }
+    TSNode inner = ts_node_named_child(statement, 0);
+    uint32_t count = ts_node_child_count(statement);
+    if (strcmp(ts_node_type(ts_node_child(statement, count - 1)), ";") != 0) {
+        return rust_eval_expr_type(ctx, inner);
+    }
+    const char *kind = ts_node_type(inner);
+    if (strcmp(kind, "return_expression") == 0 || strcmp(kind, "break_expression") == 0 ||
+        strcmp(kind, "continue_expression") == 0) {
+        return cbm_type_builtin(ctx->arena, "!");
+    }
+    return strcmp(kind, "macro_invocation") == 0 ? cbm_type_unknown() : unit;
+}
+
+/* Value type of a block: its trailing expression, typed after the block's
+ * own `let`s in a scope that ends with the block. */
+static const CBMType *rust_eval_block_value(RustLSPContext *ctx, TSNode block) {
+    CBMScope *saved = ctx->current_scope;
+    int saved_block_item_count = ctx->block_item_count;
+    ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    rust_declare_block_items(ctx, block);
+
+    TSNode last = {0};
+    bool found = false;
+    for (uint32_t i = 0; i < ts_node_named_child_count(block); i++) {
+        TSNode c = ts_node_named_child(block, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "line_comment") == 0 || strcmp(ck, "block_comment") == 0 ||
+            strcmp(ck, "empty_statement") == 0 || strcmp(ck, "label") == 0) {
+            continue;
+        }
+        if (strcmp(ck, "let_declaration") == 0) {
+            rust_process_statement(ctx, c);
+        }
+        last = c;
+        found = true;
+    }
+    const CBMType *result = cbm_type_builtin(ctx->arena, "()");
+    if (found && strcmp(ts_node_type(last), "expression_statement") == 0) {
+        result = rust_eval_last_statement(ctx, last);
+    } else if (found && strcmp(ts_node_type(last), "let_declaration") != 0) {
+        result = rust_eval_expr_type(ctx, last);
+    }
+    ctx->current_scope = saved;
+    ctx->block_item_count = saved_block_item_count;
+    return result;
+}
+
+/* Bind the patterns of an `if` condition from their scrutinees, each typed
+ * before its own pattern binds. */
+static void rust_bind_condition(RustLSPContext *ctx, TSNode cond) {
+    const char *kind = ts_node_type(cond);
+    if (strcmp(kind, "let_chain") == 0) {
+        for (uint32_t i = 0; i < ts_node_named_child_count(cond); i++) {
+            rust_bind_condition(ctx, ts_node_named_child(cond, i));
+        }
+        return;
+    }
+    if (strcmp(kind, "let_condition") != 0) {
+        return;
+    }
+    TSNode pat = ts_node_child_by_field_name(cond, "pattern", 7);
+    TSNode val = ts_node_child_by_field_name(cond, "value", 5);
+    if (!ts_node_is_null(pat) && !ts_node_is_null(val)) {
+        rust_bind_pattern(ctx, pat, rust_eval_expr_type(ctx, val));
+    }
+}
+
+/* Value type of an `if`: the consequence sees the condition's bindings, the
+ * `else` branch does not. Without an `else` the value is `()`. */
+static const CBMType *rust_eval_if_value(RustLSPContext *ctx, TSNode node) {
+    TSNode cons = ts_node_child_by_field_name(node, "consequence", 11);
+    TSNode cond = ts_node_child_by_field_name(node, "condition", 9);
+    TSNode alt = ts_node_child_by_field_name(node, "alternative", 11);
+    if (ts_node_is_null(cons)) {
+        return cbm_type_unknown();
+    }
+    if (ts_node_is_null(alt)) {
+        return cbm_type_builtin(ctx->arena, "()");
+    }
+    RustBranchJoin join = {0};
+    CBMScope *saved = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    if (!ts_node_is_null(cond)) {
+        rust_bind_condition(ctx, cond);
+    }
+    rust_branch_join_add(ctx, &join, rust_eval_expr_type(ctx, cons));
+    ctx->current_scope = saved;
+
+    const CBMType *other = cbm_type_unknown();
+    if (strcmp(ts_node_type(alt), "else_clause") != 0) {
+        other = rust_eval_expr_type(ctx, alt);
+    } else if (ts_node_named_child_count(alt) > 0) {
+        other = rust_eval_expr_type(ctx,
+                                    ts_node_named_child(alt, ts_node_named_child_count(alt) - 1));
+    }
+    rust_branch_join_add(ctx, &join, other);
+    return rust_branch_join_type(ctx, &join);
+}
+
+/* Value type of a `match`: each arm's value typed under that arm's pattern
+ * bindings, which end with the arm. */
+static const CBMType *rust_eval_match_value(RustLSPContext *ctx, TSNode node) {
+    TSNode value = ts_node_child_by_field_name(node, "value", 5);
+    TSNode body = ts_node_child_by_field_name(node, "body", 4);
+    if (ts_node_is_null(body)) {
+        return cbm_type_unknown();
+    }
+    const CBMType *scrutinee =
+        ts_node_is_null(value) ? cbm_type_unknown() : rust_eval_expr_type(ctx, value);
+    RustBranchJoin join = {0};
+    CBMScope *saved = ctx->current_scope;
+    uint32_t nc = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode arm = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(arm), "match_arm") != 0) {
+            continue;
+        }
+        TSNode pattern = ts_node_child_by_field_name(arm, "pattern", 7);
+        TSNode v = ts_node_child_by_field_name(arm, "value", 5);
+        ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        if (!ts_node_is_null(pattern)) {
+            rust_bind_pattern(ctx, pattern, scrutinee);
+        }
+        rust_branch_join_add(ctx, &join,
+                             ts_node_is_null(v) ? cbm_type_unknown() : rust_eval_expr_type(ctx, v));
+        ctx->current_scope = saved;
+    }
+    return rust_branch_join_type(ctx, &join);
+}
+
 const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
@@ -5842,50 +6122,16 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         return cbm_type_unknown();
     }
 
-    /* if_expression / match_expression / block / loop_expression — value of
-     * the trailing expression in the consequence. */
+    /* if / match / block used as a value: the type its branches agree on,
+     * each typed inside the scope it is written in. */
     if (strcmp(kind, "if_expression") == 0) {
-        TSNode cons = ts_node_child_by_field_name(node, "consequence", 11);
-        if (!ts_node_is_null(cons)) {
-            return rust_eval_expr_type(ctx, cons);
-        }
+        return rust_eval_if_value(ctx, node);
     }
     if (strcmp(kind, "match_expression") == 0) {
-        /* Take the type of the first arm's value if available. */
-        TSNode body = ts_node_child_by_field_name(node, "body", 4);
-        if (!ts_node_is_null(body)) {
-            uint32_t nc = ts_node_named_child_count(body);
-            for (uint32_t i = 0; i < nc; i++) {
-                TSNode arm = ts_node_named_child(body, i);
-                if (strcmp(ts_node_type(arm), "match_arm") == 0) {
-                    TSNode v = ts_node_child_by_field_name(arm, "value", 5);
-                    if (!ts_node_is_null(v)) {
-                        return rust_eval_expr_type(ctx, v);
-                    }
-                }
-            }
-        }
+        return rust_eval_match_value(ctx, node);
     }
     if (strcmp(kind, "block") == 0) {
-        /* Find the last expression child (the trailing expression of the block). */
-        uint32_t nc = ts_node_named_child_count(node);
-        TSNode last = {0};
-        bool found = false;
-        for (uint32_t i = nc; i > 0; i--) {
-            TSNode c = ts_node_named_child(node, i - 1);
-            const char *ck = ts_node_type(c);
-            if (strcmp(ck, "expression_statement") != 0 && strcmp(ck, "let_declaration") != 0 &&
-                strcmp(ck, "empty_statement") != 0 && strcmp(ck, "line_comment") != 0 &&
-                strcmp(ck, "block_comment") != 0) {
-                last = c;
-                found = true;
-                break;
-            }
-        }
-        if (found) {
-            return rust_eval_expr_type(ctx, last);
-        }
-        return cbm_type_builtin(ctx->arena, "()");
+        return rust_eval_block_value(ctx, node);
     }
     if (strcmp(kind, "loop_expression") == 0) {
         return cbm_type_builtin(ctx->arena, "()");
