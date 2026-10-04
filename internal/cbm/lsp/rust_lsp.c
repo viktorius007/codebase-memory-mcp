@@ -9211,6 +9211,319 @@ static bool rust_resolve_call_by_module_tree(RustLSPContext *ctx, TSNode callee,
     return true;
 }
 
+/* ── Expected type of an expression, read from the enclosing syntax ──
+ * Only positions that declare the type are read: a struct literal's
+ * `..base` and field initialisers, an argument against the callee's
+ * registered parameter, a `let` annotation, and a function's declared
+ * return in `return` or tail position. Every other position has no
+ * expected type (NULL). */
+
+static bool rust_is_comment_node(TSNode n) {
+    const char *k = ts_node_type(n);
+    return strcmp(k, "line_comment") == 0 || strcmp(k, "block_comment") == 0 ||
+           strcmp(k, "attribute_item") == 0;
+}
+
+/* True when `name` is a generic parameter declared by an item enclosing
+ * `node` (function, impl, trait, struct, enum). */
+static bool rust_name_is_enclosing_type_param(RustLSPContext *ctx, TSNode node,
+                                              const char *name) {
+    for (TSNode cur = node; !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        TSNode params = ts_node_child_by_field_name(cur, "type_parameters", 15);
+        if (ts_node_is_null(params)) {
+            continue;
+        }
+        uint32_t n = ts_node_named_child_count(params);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode p = ts_node_named_child(params, i);
+            TSNode id = strcmp(ts_node_type(p), "type_identifier") == 0
+                            ? p
+                            : ts_node_child_by_field_name(p, "name", 4);
+            if (ts_node_is_null(id) && ts_node_named_child_count(p) > 0) {
+                id = ts_node_named_child(p, 0);
+            }
+            char *text = ts_node_is_null(id) ? NULL : rust_node_text(ctx, id);
+            if (text && strcmp(text, name) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool rust_name_in_list(const char **names, const char *name) {
+    for (int i = 0; names && names[i]; i++) {
+        if (strcmp(names[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Declared struct type of a struct literal, or NULL. */
+static const char *rust_struct_literal_type_qn(RustLSPContext *ctx, TSNode lit) {
+    if (ts_node_is_null(lit) || strcmp(ts_node_type(lit), "struct_expression") != 0) {
+        return NULL;
+    }
+    const CBMType *t = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, lit), 0);
+    const char *qn = NULL;
+    if (t && t->kind == CBM_TYPE_NAMED) {
+        qn = t->data.named.qualified_name;
+    } else if (t && t->kind == CBM_TYPE_TEMPLATE) {
+        qn = t->data.template_type.template_name;
+    }
+    return qn ? rust_registered_type_qn(ctx, qn) : NULL;
+}
+
+/* The registered function a path call names, found as the call step finds
+ * it: the module tree when it settles the path, else the registry's free
+ * function or the `Type::f` associated item. NULL when none is proven. */
+static const CBMRegisteredFunc *rust_path_callee(RustLSPContext *ctx, TSNode call) {
+    TSNode fn = ts_node_child_by_field_name(call, "function", 8);
+    if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "generic_function") == 0) {
+        fn = ts_node_child_by_field_name(fn, "function", 8);
+    }
+    if (ts_node_is_null(fn)) {
+        return NULL;
+    }
+    bool bare = strcmp(ts_node_type(fn), "identifier") == 0;
+    if (!bare && strcmp(ts_node_type(fn), "scoped_identifier") != 0) {
+        return NULL;
+    }
+    char *path = rust_node_text(ctx, fn);
+    if (!path) {
+        return NULL;
+    }
+    rust_strip_turbofish(path);
+    if (bare && (cbm_scope_lookup_callable(ctx->current_scope, path) ||
+                 cbm_scope_contains(ctx->current_scope, path))) {
+        return NULL;
+    }
+    RustCallTarget target = {0};
+    if (rust_module_tree_target(ctx, fn, path, &target)) {
+        return target.func;
+    }
+    const char *qn = rust_resolve_path_expr(ctx, path);
+    if (!qn) {
+        return NULL;
+    }
+    const CBMRegisteredFunc *direct = rust_lookup_func_variants(ctx, qn);
+    if (!direct && ctx->module_qn && !strchr(qn, '.')) {
+        direct = cbm_registry_lookup_func(
+            ctx->registry, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn));
+    }
+    if (direct && !direct->receiver_type) {
+        return direct;
+    }
+    RustCallTarget ufcs = {0};
+    return rust_ufcs_target(ctx, qn, rust_call_first_argument(fn), &ufcs) ? ufcs.func : NULL;
+}
+
+/* Declared type of the parameter receiving argument `arg` of `call`. */
+static const CBMType *rust_expected_argument_type(RustLSPContext *ctx, TSNode call, TSNode arg,
+                                                  TSNode args, const char ***type_params) {
+    int index = 0;
+    bool found = false;
+    uint32_t n = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(args, i);
+        if (ts_node_eq(c, arg)) {
+            found = true;
+            break;
+        }
+        if (!rust_is_comment_node(c)) {
+            index++;
+        }
+    }
+    if (!found) {
+        return NULL;
+    }
+    const CBMRegisteredFunc *callee = NULL;
+    (void)rust_eval_call_type_of(ctx, call, &callee);
+    if (!callee) {
+        callee = rust_path_callee(ctx, call);
+    }
+    if (!callee || !callee->signature || callee->signature->kind != CBM_TYPE_FUNC ||
+        !callee->signature->data.func.param_types) {
+        return NULL;
+    }
+    /* A path call to a `self` method (`T::m(x, ..)`) passes the receiver
+     * first; the receiver is not a declared parameter. */
+    TSNode fn = ts_node_child_by_field_name(call, "function", 8);
+    if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "generic_function") == 0) {
+        fn = ts_node_child_by_field_name(fn, "function", 8);
+    }
+    bool method_form = !ts_node_is_null(fn) && strcmp(ts_node_type(fn), "field_expression") == 0;
+    if (!method_form && (callee->flags & CBM_FUNC_FLAG_RUST_SELF)) {
+        if (index == 0) {
+            return NULL;
+        }
+        index--;
+    }
+    const CBMType **params = callee->signature->data.func.param_types;
+    for (int i = 0; i < index; i++) {
+        if (!params[i]) {
+            return NULL;
+        }
+    }
+    *type_params = callee->type_param_names;
+    return params[index];
+}
+
+/* Declared return type of the function whose result `expr` is: `return
+ * expr` or the tail of the function body. A closure or async block in
+ * between owns the result, so it has none. */
+static const CBMType *rust_expected_return_type(RustLSPContext *ctx, TSNode expr) {
+    TSNode parent = ts_node_parent(expr);
+    const char *pk = ts_node_type(parent);
+    TSNode fn = {0};
+    if (strcmp(pk, "return_expression") == 0) {
+        for (TSNode cur = ts_node_parent(parent); !ts_node_is_null(cur);
+             cur = ts_node_parent(cur)) {
+            const char *k = ts_node_type(cur);
+            if (strcmp(k, "closure_expression") == 0 || strcmp(k, "async_block") == 0) {
+                return NULL;
+            }
+            if (strcmp(k, "function_item") == 0) {
+                fn = cur;
+                break;
+            }
+        }
+    } else if (strcmp(pk, "block") == 0) {
+        uint32_t n = ts_node_named_child_count(parent);
+        TSNode last = {0};
+        for (uint32_t i = n; i > 0; i--) {
+            TSNode c = ts_node_named_child(parent, i - 1);
+            if (!rust_is_comment_node(c)) {
+                last = c;
+                break;
+            }
+        }
+        TSNode holder = ts_node_parent(parent);
+        if (!ts_node_is_null(last) && ts_node_eq(last, expr) && !ts_node_is_null(holder) &&
+            strcmp(ts_node_type(holder), "function_item") == 0) {
+            fn = holder;
+        }
+    }
+    if (ts_node_is_null(fn)) {
+        return NULL;
+    }
+    TSNode ret = ts_node_child_by_field_name(fn, "return_type", 11);
+    return ts_node_is_null(ret) ? NULL : rust_parse_type_node(ctx, ret);
+}
+
+/* Registered QN of the declared type `expr` is expected to have, or NULL. */
+static const char *rust_expected_type_qn(RustLSPContext *ctx, TSNode expr) {
+    TSNode parent = ts_node_parent(expr);
+    if (ts_node_is_null(parent)) {
+        return NULL;
+    }
+    const char *pk = ts_node_type(parent);
+    const CBMType *t = NULL;
+    const char **type_params = NULL;
+    if (strcmp(pk, "base_field_initializer") == 0) {
+        return rust_struct_literal_type_qn(ctx, ts_node_parent(ts_node_parent(parent)));
+    }
+    if (strcmp(pk, "field_initializer") == 0) {
+        TSNode value = ts_node_child_by_field_name(parent, "value", 5);
+        TSNode field = ts_node_child_by_field_name(parent, "field", 5);
+        if (ts_node_is_null(value) || !ts_node_eq(value, expr) || ts_node_is_null(field)) {
+            return NULL;
+        }
+        const char *owner = rust_struct_literal_type_qn(ctx, ts_node_parent(ts_node_parent(parent)));
+        char *name = owner ? rust_node_text(ctx, field) : NULL;
+        if (!name) {
+            return NULL;
+        }
+        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, owner);
+        type_params = rt ? rt->type_param_names : NULL;
+        t = rust_lookup_field(ctx, owner, name, 0);
+    } else if (strcmp(pk, "arguments") == 0) {
+        TSNode call = ts_node_parent(parent);
+        if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+            return NULL;
+        }
+        t = rust_expected_argument_type(ctx, call, expr, parent, &type_params);
+    } else if (strcmp(pk, "let_declaration") == 0) {
+        TSNode value = ts_node_child_by_field_name(parent, "value", 5);
+        TSNode type = ts_node_child_by_field_name(parent, "type", 4);
+        if (ts_node_is_null(value) || !ts_node_eq(value, expr) || ts_node_is_null(type)) {
+            return NULL;
+        }
+        t = rust_parse_type_node(ctx, type);
+    } else {
+        t = rust_expected_return_type(ctx, expr);
+    }
+    t = t ? rust_expand_type_aliases(ctx, t, 0) : NULL;
+    const char *qn = NULL;
+    if (t && t->kind == CBM_TYPE_NAMED) {
+        qn = t->data.named.qualified_name;
+    } else if (t && t->kind == CBM_TYPE_TEMPLATE) {
+        qn = t->data.template_type.template_name;
+    }
+    if (!qn) {
+        return NULL;
+    }
+    const char *dot = strrchr(qn, '.');
+    const char *leaf = dot ? dot + 1 : qn;
+    if (rust_name_in_list(type_params, leaf) || rust_name_is_enclosing_type_param(ctx, expr, leaf)) {
+        return NULL;
+    }
+    return rust_registered_type_qn(ctx, qn);
+}
+
+/* The `default` of the repository's `impl Default for <type_qn>`. NULL when
+ * there is none (derived or external) or impls on distinct instantiations
+ * leave the choice open. */
+static const CBMRegisteredFunc *rust_default_impl_of(RustLSPContext *ctx, const char *type_qn) {
+    const CBMRegisteredFunc *found = NULL;
+    const char *found_impl = NULL;
+    CBMMethodIter it;
+    cbm_registry_methods(ctx->registry, type_qn, "default", &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *f = &ctx->registry->funcs[index];
+        /* A derived impl has no body in the repository and no impl key. */
+        if ((f->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || !f->impl_trait_qn ||
+            !f->impl_key) {
+            continue;
+        }
+        if (strcmp(f->impl_trait_qn, "core.default.Default") != 0 &&
+            strcmp(f->impl_trait_qn, "std.default.Default") != 0) {
+            continue;
+        }
+        const char *impl = f->impl_key ? f->impl_key : f->qualified_name;
+        if (found_impl && strcmp(found_impl, impl) != 0) {
+            return NULL;
+        }
+        found_impl = impl;
+        found = found ? found : f;
+    }
+    return found;
+}
+
+/* `Default::default()` (std's trait, spelled bare or through `std`/`core`)
+ * links to the expected type's `impl Default`. True when it emitted. */
+static bool rust_resolve_default_by_expected_type(RustLSPContext *ctx, TSNode call,
+                                                  const char *path) {
+    if (strcmp(path, "Default::default") == 0) {
+        const char *imported = rust_resolve_use(ctx, "Default");
+        if (imported && strstr(imported, "default") == NULL) {
+            return false;
+        }
+    } else if (strcmp(path, "std::default::Default::default") != 0 &&
+               strcmp(path, "core::default::Default::default") != 0) {
+        return false;
+    }
+    const char *type_qn = rust_expected_type_qn(ctx, call);
+    const CBMRegisteredFunc *f = type_qn ? rust_default_impl_of(ctx, type_qn) : NULL;
+    if (!f) {
+        return false;
+    }
+    rust_emit_resolved_call(ctx, f->qualified_name, f->impl_key, "lsp_trait_dispatch",
+                            CBM_RUST_CONF_UFCS);
+    return true;
+}
+
 static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node) {
     TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
     TSNode args_node = ts_node_child_by_field_name(node, "arguments", 9);
@@ -9421,6 +9734,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         /* Strip ALL turbofish (`Vec::<i32>::new` → `Vec::new`). */
         rust_strip_turbofish(path);
 
+        if (rust_resolve_default_by_expected_type(ctx, node, path)) {
+            return;
+        }
         if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
             const char *alias_target = cbm_scope_lookup_callable(ctx->current_scope, path);
             if (alias_target) {

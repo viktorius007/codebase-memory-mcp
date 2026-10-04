@@ -7084,7 +7084,7 @@ TEST(pipeline_rust_dump_records_only_published_calls_in_both_modes) {
                                  "pub fn recursive() { recursive(); }\n"
                                  "pub struct S;\n"
                                  "impl Default for S { fn default() -> Self { S } }\n"
-                                 "pub fn closed() -> S { Default::default() }\n"
+                                 "pub fn closed() { let _s = Default::default(); }\n"
                                  "pub fn caller() -> u8 { sink(\"(\", target()); sink(\"(\", target()) }\n";
     const char *nested_target = strstr(source, "target())");
     ASSERT_NOT_NULL(nested_target);
@@ -7390,7 +7390,7 @@ typedef struct {
     bool glob_import;        /* `use crate::a::*` binds a unique glob source */
     bool cfg_caller;         /* a #[cfg] twin keeps its published caller identity */
     bool super_path;         /* super::m_root() from m/inner.rs reaches m/mod.rs */
-    bool trait_ufcs_guess;   /* Default::default() must stay closed */
+    bool trait_ufcs_guess;   /* Default::default() with no declared type stays closed */
 } RustModuleCallObservation;
 
 static RustModuleCallObservation observe_rust_module_calls(const char *root, const char *db_name) {
@@ -7464,7 +7464,7 @@ TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes) {
                     "    }\n"
                     "}\n"
                     "impl Default for S { fn default() -> Self { S { runtime: Runtime } } }\n"
-                    "pub fn dflt() -> S { Default::default() }\n"
+                    "pub fn dflt() { let _s = Default::default(); }\n"
                     "pub struct D;\n"
                     "impl Host for D {\n"
                     "    fn notify(&self) {\n"

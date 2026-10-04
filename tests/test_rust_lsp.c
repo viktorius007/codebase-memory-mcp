@@ -10362,6 +10362,41 @@ TEST(rustlsp_trait_path_first_argument_is_receiver_only_with_self) {
     PASS();
 }
 
+TEST(rustlsp_default_default_follows_declared_expected_type) {
+    /* `Default::default()` names the `Default` impl of the type the
+     * expression must have: a struct literal's base, a field's declared
+     * type, the callee's parameter, a `let` annotation or the declared
+     * return. Two in-file impls keep a sole-impl guess from passing. A
+     * derived `Default` has no impl body and an untyped `let` has no
+     * expected type: neither publishes. */
+    CBMFileResult *r = extract_rust(
+        "struct X { a: u8, b: u8 }\n"
+        "impl Default for X { fn default() -> Self { X { a: 0, b: 0 } } }\n"
+        "struct Y;\n"
+        "impl Default for Y { fn default() -> Self { Y } }\n"
+        "#[derive(Default)]\nstruct D { n: u8 }\n"
+        "struct H { x: X, y: Y }\n"
+        "fn take(x: X) { let _ = x; }\n"
+        "fn site_base() -> X { X { a: 1, ..Default::default() } }\n"
+        "fn site_field() -> H { H { x: Default::default(), y: Y } }\n"
+        "fn site_arg() { take(Default::default()); }\n"
+        "fn site_let() { let x: X = Default::default(); take(x); }\n"
+        "fn site_ret() -> Y { Default::default() }\n"
+        "fn site_derived() -> D { D { ..Default::default() } }\n"
+        "fn site_untyped() { let v = Default::default(); take(v); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "site_base", "X.default"), 0);
+    ASSERT_GTE(require_resolved(r, "site_field", "X.default"), 0);
+    ASSERT_GTE(require_resolved(r, "site_arg", "X.default"), 0);
+    ASSERT_GTE(require_resolved(r, "site_let", "X.default"), 0);
+    ASSERT_GTE(require_resolved(r, "site_ret", "Y.default"), 0);
+    ASSERT_EQ(count_resolved(r, "site_base", "Y.default"), 0);
+    ASSERT_EQ(count_resolved(r, "site_derived", "default"), 0);
+    ASSERT_EQ(count_resolved(r, "site_untyped", "default"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
@@ -11097,4 +11132,5 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type);
     RUN_TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve);
     RUN_TEST(rustlsp_trait_path_first_argument_is_receiver_only_with_self);
+    RUN_TEST(rustlsp_default_default_follows_declared_expected_type);
 }
