@@ -1724,6 +1724,97 @@ TEST(rustlsp_tokio_signatures_need_the_tokio_item) {
     PASS();
 }
 
+/* Whether `run` in `source` calls `probe` on a receiver typed `type_qn`:
+ * the method is declared nowhere, so its record names the receiver type. */
+static bool rustlsp_run_probes(const char *source, const char *type_qn) {
+    CBMFileResult *r = extract_rust(source);
+    if (!r) {
+        return false;
+    }
+    char callee[128];
+    snprintf(callee, sizeof(callee), "%s.probe", type_qn);
+    bool ok = false;
+    for (int i = 0; i < r->resolved_calls.count && !ok; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        ok = rc->caller_qn && strstr(rc->caller_qn, "run") && rc->callee_qn &&
+             strcmp(rc->callee_qn, callee) == 0;
+    }
+    cbm_free_result(r);
+    return ok;
+}
+
+/* tempfile's producers yield `io::Result<TempDir>` with or without
+ * arguments, under the import or the full path; `TempDir::path` is a
+ * `&Path`, which std's `join` carries on to a `PathBuf`. */
+TEST(rustlsp_tempfile_tempdir_path_is_std_path) {
+    ASSERT(rustlsp_run_probes(
+        "use tempfile::TempDir;\n"
+        "fn run() { let d = TempDir::new().expect(\"d\"); d.path().probe(); }\n",
+        "std.path.Path"));
+    ASSERT(rustlsp_run_probes("use tempfile::tempdir;\n"
+                              "fn run() -> std::io::Result<()> {\n"
+                              "    let d = tempdir()?;\n"
+                              "    d.path().join(\"a\").probe();\n    Ok(())\n}\n",
+                              "std.path.PathBuf"));
+    ASSERT(rustlsp_run_probes("fn run(base: &std::path::Path) {\n"
+                              "    let d = tempfile::tempdir_in(base).unwrap();\n"
+                              "    let e = tempfile::TempDir::new_in(d.path()).unwrap();\n"
+                              "    e.path().to_path_buf().probe();\n}\n",
+                              "std.path.PathBuf"));
+    ASSERT(rustlsp_run_probes("struct Home { dir: tempfile::TempDir }\n"
+                              "fn run(h: Home) { h.dir.keep().probe(); }\n",
+                              "std.path.PathBuf"));
+    PASS();
+}
+
+/* `Builder` setters return the builder; its `tempdir` / `tempfile` and
+ * `NamedTempFile::new` produce the named types, and a `TempPath` derefs to
+ * `Path`. */
+TEST(rustlsp_tempfile_builder_and_named_file) {
+    ASSERT(rustlsp_run_probes(
+        "fn run() {\n"
+        "    let d = tempfile::Builder::new().prefix(\"p\").tempdir().unwrap();\n"
+        "    d.path().probe();\n}\n",
+        "std.path.Path"));
+    ASSERT(rustlsp_run_probes("use tempfile::Builder;\n"
+                              "fn run() {\n"
+                              "    let f = Builder::new().suffix(\".x\").tempfile().unwrap();\n"
+                              "    f.path().probe();\n}\n",
+                              "std.path.Path"));
+    ASSERT(rustlsp_run_probes("use tempfile::NamedTempFile;\n"
+                              "fn run() {\n"
+                              "    let f = NamedTempFile::new().unwrap();\n"
+                              "    f.into_temp_path().join(\"a\").probe();\n}\n",
+                              "std.path.PathBuf"));
+    PASS();
+}
+
+/* Only tempfile's items read the tempfile signatures: a project `TempDir`
+ * and a project `tempdir` keep their declared returns, and a `TempDir` or
+ * `tempdir` imported from another crate stays unknown. */
+TEST(rustlsp_tempfile_signatures_need_the_tempfile_item) {
+    CBMFileResult *r = extract_rust(RUSTLSP_STD_DECOYS
+                                    "struct TempDir;\n"
+                                    "impl TempDir {\n"
+                                    "    fn new() -> TempDir { TempDir }\n"
+                                    "    fn path(&self) -> Other { Other }\n}\n"
+                                    "fn tempdir() -> Other { Other }\n"
+                                    "fn run() -> bool { TempDir::new().path().ping() }\n"
+                                    "fn second() -> bool { tempdir().ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Other.ping"), 0);
+    ASSERT_GTE(require_resolved(r, "second", "Other.ping"), 0);
+    cbm_free_result(r);
+    ASSERT_FALSE(rustlsp_run_probes(
+        "use scratch::TempDir;\n"
+        "fn run() { TempDir::new().unwrap().path().probe(); }\n",
+        "std.path.Path"));
+    ASSERT_FALSE(rustlsp_run_probes("use scratch::tempdir;\n"
+                                    "fn run() { tempdir().unwrap().path().probe(); }\n",
+                                    "std.path.Path"));
+    PASS();
+}
+
 /* A `Result` head the registry does not know (a dependency's alias) is
  * core's `Result<T, _>`: `.expect()` yields its first argument. So does
  * std's `LockResult<G>`. A project type named `Result` keeps its own methods. */
@@ -12236,6 +12327,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_tokio_locks_await_to_guard);
     RUN_TEST(rustlsp_tokio_timeout_yields_result_of_output);
     RUN_TEST(rustlsp_tokio_signatures_need_the_tokio_item);
+    RUN_TEST(rustlsp_tempfile_tempdir_path_is_std_path);
+    RUN_TEST(rustlsp_tempfile_builder_and_named_file);
+    RUN_TEST(rustlsp_tempfile_signatures_need_the_tempfile_item);
     RUN_TEST(rustlsp_std_returns_unknown_result_head);
     RUN_TEST(rustlsp_std_namesake_declared_in_file_is_project_type);
     RUN_TEST(rustlsp_std_namesake_in_inline_module_is_project_type);

@@ -3582,12 +3582,21 @@ typedef enum {
     RUST_STD_ONCELOCK,
     RUST_TOKIO_MUTEX,
     RUST_TOKIO_RWLOCK,
+    RUST_TEMPFILE_DIR,
+    RUST_TEMPFILE_NAMED,
+    RUST_TEMPFILE_PATH,
+    RUST_TEMPFILE_BUILDER,
 } RustStdFamily;
 
 typedef struct {
     RustStdFamily family;
     const char *qn;
 } RustStdFamilyQN;
+
+#define RS_TEMPDIR "tempfile.TempDir"
+#define RS_TEMPNAMED "tempfile.NamedTempFile"
+#define RS_TEMPPATH "tempfile.TempPath"
+#define RS_TEMPBUILDER "tempfile.Builder"
 
 /* Every path a std type is known under (re-exports name the same type).
  * `std.io.Result<T>` and `anyhow.Result<T>` are `Result<T, E>` with E fixed. */
@@ -3609,7 +3618,9 @@ static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
     {RUST_STD_ANY, "core.any.Any"},           {RUST_STD_ANY, "std.any.Any"},
     {RUST_STD_ERROR, "core.error.Error"},     {RUST_STD_ERROR, "std.error.Error"},
     {RUST_STD_ONCELOCK, "std.sync.OnceLock"}, {RUST_TOKIO_MUTEX, "tokio.sync.Mutex"},
-    {RUST_TOKIO_RWLOCK, "tokio.sync.RwLock"}, {RUST_STD_NONE, NULL}};
+    {RUST_TOKIO_RWLOCK, "tokio.sync.RwLock"}, {RUST_TEMPFILE_DIR, RS_TEMPDIR},
+    {RUST_TEMPFILE_NAMED, RS_TEMPNAMED},      {RUST_TEMPFILE_PATH, RS_TEMPPATH},
+    {RUST_TEMPFILE_BUILDER, RS_TEMPBUILDER},  {RUST_STD_NONE, NULL}};
 
 /* A std method's declared return, written over the receiver: `Self` is the
  * receiver, `T` / `E` its first / second generic argument, `_` a type the
@@ -3634,6 +3645,8 @@ typedef struct {
 #define RS_PATH "std.path.Path"
 #define RS_PATHBUF "std.path.PathBuf"
 #define RS_OSSTR "std.ffi.OsStr"
+#define RS_FILE "std.fs.File"
+#define RS_IO_RES(x) RS_RES(x, "std.io.Error")
 #define RS_ITER(x) "core.iter.Iterator<" x ">"
 /* What an `async fn` or a function returning `impl Future<Output = X>`
  * returns before `.await`. */
@@ -3916,6 +3929,37 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_ONCELOCK, "set", RS_RES("()", "T"), false},
     {RUST_STD_ONCELOCK, "into_inner", RS_OPT("T"), false},
     {RUST_STD_ONCELOCK, "take", RS_OPT("T"), false},
+    /* tempfile: TempDir, NamedTempFile, TempPath (derefs to Path), Builder */
+    {RUST_TEMPFILE_DIR, "path", "&" RS_PATH, false},
+    {RUST_TEMPFILE_DIR, "keep", RS_PATHBUF, false},
+    {RUST_TEMPFILE_DIR, "into_path", RS_PATHBUF, false},
+    {RUST_TEMPFILE_DIR, "close", RS_IO_RES("()"), false},
+    {RUST_TEMPFILE_DIR, "disable_cleanup", "()", false},
+    {RUST_TEMPFILE_NAMED, "path", "&" RS_PATH, false},
+    {RUST_TEMPFILE_NAMED, "close", RS_IO_RES("()"), false},
+    {RUST_TEMPFILE_NAMED, "reopen", RS_IO_RES(RS_FILE), false},
+    {RUST_TEMPFILE_NAMED, "persist", RS_RES(RS_FILE, "tempfile.PersistError"), false},
+    {RUST_TEMPFILE_NAMED, "persist_noclobber", RS_RES(RS_FILE, "tempfile.PersistError"), false},
+    {RUST_TEMPFILE_NAMED, "as_file", "&" RS_FILE, false},
+    {RUST_TEMPFILE_NAMED, "as_file_mut", "&" RS_FILE, false},
+    {RUST_TEMPFILE_NAMED, "into_file", RS_FILE, false},
+    {RUST_TEMPFILE_NAMED, "into_temp_path", RS_TEMPPATH, false},
+    {RUST_TEMPFILE_NAMED, "disable_cleanup", "()", false},
+    {RUST_TEMPFILE_PATH, "close", RS_IO_RES("()"), false},
+    {RUST_TEMPFILE_PATH, "persist", RS_RES("()", "tempfile.PathPersistError"), false},
+    {RUST_TEMPFILE_PATH, "persist_noclobber", RS_RES("()", "tempfile.PathPersistError"), false},
+    {RUST_TEMPFILE_PATH, "keep", RS_RES(RS_PATHBUF, "tempfile.PathPersistError"), false},
+    {RUST_TEMPFILE_PATH, "disable_cleanup", "()", false},
+    {RUST_TEMPFILE_BUILDER, "prefix", "&Self", false},
+    {RUST_TEMPFILE_BUILDER, "suffix", "&Self", false},
+    {RUST_TEMPFILE_BUILDER, "rand_bytes", "&Self", false},
+    {RUST_TEMPFILE_BUILDER, "append", "&Self", false},
+    {RUST_TEMPFILE_BUILDER, "permissions", "&Self", false},
+    {RUST_TEMPFILE_BUILDER, "disable_cleanup", "&Self", false},
+    {RUST_TEMPFILE_BUILDER, "tempdir", RS_IO_RES(RS_TEMPDIR), false},
+    {RUST_TEMPFILE_BUILDER, "tempdir_in", RS_IO_RES(RS_TEMPDIR), false},
+    {RUST_TEMPFILE_BUILDER, "tempfile", RS_IO_RES(RS_TEMPNAMED), false},
+    {RUST_TEMPFILE_BUILDER, "tempfile_in", RS_IO_RES(RS_TEMPNAMED), false},
     {RUST_STD_NONE, NULL, NULL, false}};
 
 /* A std function or associated function whose declared return is written
@@ -3945,6 +3989,24 @@ static const RustStdProducer RUST_STD_PRODUCERS[] = {
 static const RustStdProducer RUST_DEP_PRODUCERS[] = {
     {"tokio.time.timeout", RS_FUT(RS_RES("O", "tokio.time.error.Elapsed"))},
     {"tokio.time.timeout_at", RS_FUT(RS_RES("O", "tokio.time.error.Elapsed"))},
+    {"tempfile.tempdir", RS_IO_RES(RS_TEMPDIR)},
+    {"tempfile.tempdir_in", RS_IO_RES(RS_TEMPDIR)},
+    {"tempfile.tempfile", RS_IO_RES(RS_FILE)},
+    {"tempfile.tempfile_in", RS_IO_RES(RS_FILE)},
+    {RS_TEMPDIR ".new", RS_IO_RES(RS_TEMPDIR)},
+    {RS_TEMPDIR ".new_in", RS_IO_RES(RS_TEMPDIR)},
+    {RS_TEMPDIR ".with_prefix", RS_IO_RES(RS_TEMPDIR)},
+    {RS_TEMPDIR ".with_prefix_in", RS_IO_RES(RS_TEMPDIR)},
+    {RS_TEMPDIR ".with_suffix", RS_IO_RES(RS_TEMPDIR)},
+    {RS_TEMPDIR ".with_suffix_in", RS_IO_RES(RS_TEMPDIR)},
+    {RS_TEMPNAMED ".new", RS_IO_RES(RS_TEMPNAMED)},
+    {RS_TEMPNAMED ".new_in", RS_IO_RES(RS_TEMPNAMED)},
+    {RS_TEMPNAMED ".with_prefix", RS_IO_RES(RS_TEMPNAMED)},
+    {RS_TEMPNAMED ".with_prefix_in", RS_IO_RES(RS_TEMPNAMED)},
+    {RS_TEMPNAMED ".with_suffix", RS_IO_RES(RS_TEMPNAMED)},
+    {RS_TEMPNAMED ".with_suffix_in", RS_IO_RES(RS_TEMPNAMED)},
+    {RS_TEMPBUILDER ".new", RS_TEMPBUILDER},
+    {RS_TEMPBUILDER ".default", RS_TEMPBUILDER},
     {NULL, NULL}};
 
 #undef RS_OPT
@@ -3952,6 +4014,8 @@ static const RustStdProducer RUST_DEP_PRODUCERS[] = {
 #undef RS_PATH
 #undef RS_PATHBUF
 #undef RS_OSSTR
+#undef RS_FILE
+#undef RS_IO_RES
 #undef RS_ITER
 #undef RS_FUT
 
@@ -4158,6 +4222,7 @@ static const CBMType *rust_std_deref_target(RustLSPContext *ctx, const CBMType *
     case RUST_STD_STRING:
         return cbm_type_builtin(ctx->arena, "str");
     case RUST_STD_PATHBUF:
+    case RUST_TEMPFILE_PATH:
         return cbm_type_named(ctx->arena, "std.path.Path");
     case RUST_STD_VEC:
         return t->kind == CBM_TYPE_TEMPLATE && t->data.template_type.arg_count > 0
@@ -4346,7 +4411,7 @@ static const CBMType *rust_std_method_return(RustLSPContext *ctx, const CBMType 
         }
         const RustStdReturn *e =
             fam != RUST_STD_NONE ? rust_std_return_entry(fam, method, true) : NULL;
-        if (!e && fam == RUST_STD_PATHBUF) {
+        if (!e && (fam == RUST_STD_PATHBUF || fam == RUST_TEMPFILE_PATH)) {
             e = rust_std_return_entry(RUST_STD_PATH, method, true);
         }
         if (e) {
@@ -4659,8 +4724,10 @@ static const CBMType *rust_std_iter_adapter_return(RustLSPContext *ctx, const CB
     return item ? cbm_type_template(ctx->arena, "core.iter.Iterator", &item, 1) : NULL;
 }
 
-/* A std function in RUST_STD_PRODUCERS the path `func_node` names: its
- * declared return over the call's arguments. */
+/* A std function in RUST_STD_PRODUCERS or a dependency function in
+ * RUST_DEP_PRODUCERS the path `func_node` names: its declared return over
+ * the call's arguments. A std producer is written over an argument; a
+ * dependency producer may take none (`tempfile::tempdir()`). */
 static const CBMType *rust_std_producer_return(RustLSPContext *ctx, TSNode func_node,
                                                TSNode args_node) {
     const char *fk = ts_node_type(func_node);
@@ -4674,7 +4741,8 @@ static const CBMType *rust_std_producer_return(RustLSPContext *ctx, TSNode func_
     const char *leaf = path ? strrchr(path, ':') : NULL;
     leaf = leaf ? leaf + 1 : path;
     RustStdCall call = {args_node, {0}};
-    for (const RustStdProducer *p = RUST_STD_PRODUCERS; leaf && p->path; p++) {
+    bool has_args = ts_node_named_child_count(args_node) > 0;
+    for (const RustStdProducer *p = RUST_STD_PRODUCERS; has_args && leaf && p->path; p++) {
         const char *dot = strrchr(p->path, '.');
         if (strcmp(dot ? dot + 1 : p->path, leaf) == 0 && rust_std_path_names(ctx, path, p->path)) {
             return rust_std_return_type(ctx, p->ret, cbm_type_unknown(), &call);
@@ -4698,11 +4766,12 @@ static const CBMType *rust_std_producer_return(RustLSPContext *ctx, TSNode func_
  * in RUST_STD_PRODUCERS: its declared return over its arguments. */
 static const CBMType *rust_std_path_call_return(RustLSPContext *ctx, TSNode func_node,
                                                 TSNode args_node) {
-    if (ts_node_is_null(args_node) || ts_node_named_child_count(args_node) == 0) {
+    if (ts_node_is_null(args_node)) {
         return NULL;
     }
     const CBMType *produced = rust_std_producer_return(ctx, func_node, args_node);
-    if (produced || strcmp(ts_node_type(func_node), "scoped_identifier") != 0) {
+    if (produced || ts_node_named_child_count(args_node) == 0 ||
+        strcmp(ts_node_type(func_node), "scoped_identifier") != 0) {
         return produced;
     }
     char *path = rust_node_text(ctx, func_node);
