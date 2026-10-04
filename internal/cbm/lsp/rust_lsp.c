@@ -3571,6 +3571,12 @@ typedef enum {
     RUST_STD_ONCELOCK,
     RUST_TOKIO_MUTEX,
     RUST_TOKIO_RWLOCK,
+    /* Future types: what `.await` reads (rust_future_output). */
+    RUST_STD_PIN,
+    RUST_STD_BOX,
+    RUST_STD_FUTURE,
+    RUST_TOKIO_JOIN_HANDLE,
+    RUST_DEP_BOX_FUTURE,
 } RustStdFamily;
 
 typedef struct {
@@ -3598,7 +3604,18 @@ static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
     {RUST_STD_ANY, "core.any.Any"},           {RUST_STD_ANY, "std.any.Any"},
     {RUST_STD_ERROR, "core.error.Error"},     {RUST_STD_ERROR, "std.error.Error"},
     {RUST_STD_ONCELOCK, "std.sync.OnceLock"}, {RUST_TOKIO_MUTEX, "tokio.sync.Mutex"},
-    {RUST_TOKIO_RWLOCK, "tokio.sync.RwLock"}, {RUST_STD_NONE, NULL}};
+    {RUST_TOKIO_RWLOCK, "tokio.sync.RwLock"},
+    {RUST_STD_PIN, "core.pin.Pin"},           {RUST_STD_PIN, "std.pin.Pin"},
+    {RUST_STD_BOX, "alloc.boxed.Box"},        {RUST_STD_BOX, "std.boxed.Box"},
+    {RUST_STD_FUTURE, "core.future.Future"},  {RUST_STD_FUTURE, "std.future.Future"},
+    {RUST_TOKIO_JOIN_HANDLE, "tokio.task.JoinHandle"},
+    {RUST_DEP_BOX_FUTURE, "futures.future.BoxFuture"},
+    {RUST_DEP_BOX_FUTURE, "futures.future.LocalBoxFuture"},
+    {RUST_DEP_BOX_FUTURE, "futures_util.future.BoxFuture"},
+    {RUST_DEP_BOX_FUTURE, "futures_util.future.LocalBoxFuture"},
+    {RUST_DEP_BOX_FUTURE, "futures_core.future.BoxFuture"},
+    {RUST_DEP_BOX_FUTURE, "futures_core.future.LocalBoxFuture"},
+    {RUST_STD_NONE, NULL}};
 
 /* A std method's declared return, written over the receiver: `Self` is the
  * receiver, `T` / `E` its first / second generic argument, `_` a type the
@@ -3607,7 +3624,8 @@ static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
  * std type. Over the call: `A` is the first argument's type, `F` what the
  * first argument returns when it is a closure (its first parameter typed
  * `T`), `G` the first turbofish argument, `O` what awaiting the second
- * argument yields (`timeout(d, fut)`); `*X` is X's Deref target and `?X`
+ * argument yields (`timeout(d, fut)`), `P` the first argument as the future
+ * it is (`Box::pin(f())`); `*X` is X's Deref target and `?X`
  * X's first generic argument. `assoc_only` marks an associated function
  * taking the receiver as its first argument (`Arc::downgrade(&a)`), never a
  * method call. */
@@ -3917,7 +3935,7 @@ typedef struct {
 } RustStdProducer;
 
 static const RustStdProducer RUST_STD_PRODUCERS[] = {
-    {"boxed.Box.pin", "core.pin.Pin<alloc.boxed.Box<A>>"},
+    {"boxed.Box.pin", "core.pin.Pin<alloc.boxed.Box<P>>"},
     {"sync.Arc.new_cyclic", "alloc.sync.Arc<F>"},
     {"rc.Rc.new_cyclic", "alloc.rc.Rc<F>"},
     {"panic.catch_unwind", RS_RES("F", "_")},
@@ -4045,6 +4063,7 @@ static TSNode rust_std_call_first_arg(const RustStdCall *call) {
 }
 
 static const CBMType *rust_await_output(RustLSPContext *ctx, TSNode awaited);
+static const CBMType *rust_future_expr_type(RustLSPContext *ctx, TSNode expr);
 
 /* `path` resolved in the file names the std item `std_path` (written
  * without its crate segment): `std::`, `core::` and `alloc::` re-export it. */
@@ -4237,6 +4256,9 @@ static const CBMType *rust_std_spec_parse(RustLSPContext *ctx, const char **sp, 
     } else if (strcmp(name, "O") == 0) {
         TSNode fut = rust_std_call_arg(call, 1);
         out = ts_node_is_null(fut) ? cbm_type_unknown() : rust_await_output(ctx, fut);
+    } else if (strcmp(name, "P") == 0) {
+        TSNode fut = rust_std_call_first_arg(call);
+        out = ts_node_is_null(fut) ? cbm_type_unknown() : rust_future_expr_type(ctx, fut);
     } else if (strcmp(name, "G") == 0) {
         TSNode g = {0};
         if (call && !ts_node_is_null(call->type_args) &&
@@ -4730,8 +4752,63 @@ static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node
 static const CBMType *rust_eval_call_type(RustLSPContext *ctx, TSNode node,
                                           const CBMRegisteredFunc **callee);
 
+enum { RUST_FUTURE_PEEL_MAX = 8 };
+
+/* The declared `Output` of the future type `t`, read through references,
+ * declared aliases, `Pin<..>` and `Box<..>`: `Future<Output = X>` (written
+ * `dyn` or `impl`) and `BoxFuture<'_, X>` output X, tokio's `JoinHandle<X>`
+ * outputs `Result<X, JoinError>`. `*peeled` counts the wrappers removed.
+ * NULL when `t` declares no output. */
+static const CBMType *rust_future_output(RustLSPContext *ctx, const CBMType *t, int *peeled) {
+    *peeled = 0;
+    for (int hop = 0; hop < RUST_FUTURE_PEEL_MAX; hop++) {
+        t = rust_strip_references(rust_expand_type_aliases(ctx, rust_strip_references(t), 0));
+        if (!t || t->kind != CBM_TYPE_TEMPLATE || t->data.template_type.arg_count <= 0) {
+            return NULL;
+        }
+        int argc = t->data.template_type.arg_count;
+        const CBMType *const *args = t->data.template_type.template_args;
+        switch (rust_std_family_of(ctx, t->data.template_type.template_name)) {
+        case RUST_STD_PIN:
+        case RUST_STD_BOX:
+            t = args[0];
+            (*peeled)++;
+            continue;
+        case RUST_STD_FUTURE:
+            return args[0];
+        case RUST_DEP_BOX_FUTURE:
+            return args[argc - 1];
+        case RUST_TOKIO_JOIN_HANDLE: {
+            const CBMType *res[2] = {args[0], cbm_type_named(ctx->arena, "tokio.task.JoinError")};
+            return cbm_type_template(ctx->arena, "core.result.Result", res, 2);
+        }
+        default:
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+/* The type of `expr` as a future. A call to an `async fn` is typed with the
+ * function's declared output (what awaiting it yields); as a value handed on
+ * un-awaited it is a `Future` of that output. */
+static const CBMType *rust_future_expr_type(RustLSPContext *ctx, TSNode expr) {
+    if (strcmp(ts_node_type(expr), "call_expression") != 0) {
+        return rust_eval_expr_type(ctx, expr);
+    }
+    const CBMRegisteredFunc *callee = NULL;
+    const CBMType *t = rust_eval_call_type(ctx, expr, &callee);
+    if (!callee || (callee->flags & CBM_FUNC_FLAG_ASYNC) == 0 || !t) {
+        return t;
+    }
+    return cbm_type_template(ctx->arena, "core.future.Future", &t, 1);
+}
+
 /* What awaiting the expression `awaited` yields (see the `.await` case of
- * rust_eval_expr_type). */
+ * rust_eval_expr_type). A future type behind `Pin`/`Box` that declares no
+ * output stays untyped. Any other future type the resolver has no
+ * declaration for is approximated by its first generic argument, except
+ * Option<T>, which no future type spells. */
 static const CBMType *rust_await_output(RustLSPContext *ctx, TSNode awaited) {
     const CBMRegisteredFunc *callee = NULL;
     const CBMType *inner = strcmp(ts_node_type(awaited), "call_expression") == 0
@@ -4739,6 +4816,14 @@ static const CBMType *rust_await_output(RustLSPContext *ctx, TSNode awaited) {
                                : rust_eval_expr_type(ctx, awaited);
     if (callee && (callee->flags & CBM_FUNC_FLAG_ASYNC) != 0) {
         return inner;
+    }
+    int peeled = 0;
+    const CBMType *output = rust_future_output(ctx, inner, &peeled);
+    if (output) {
+        return output;
+    }
+    if (peeled > 0) {
+        return cbm_type_unknown();
     }
     if (inner && inner->kind == CBM_TYPE_TEMPLATE) {
         const char *name = inner->data.template_type.template_name;

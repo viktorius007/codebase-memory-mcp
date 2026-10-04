@@ -1588,6 +1588,95 @@ TEST(rustlsp_tokio_signatures_need_the_tokio_item) {
     PASS();
 }
 
+/* `.await` on a boxed future yields its declared `Output`, through `Pin`,
+ * `Box`, `dyn Future<Output = T>` and project aliases of those (an
+ * async-trait method's desugared return). */
+TEST(rustlsp_await_boxed_future_yields_declared_output) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::future::Future;\nuse std::pin::Pin;\n" RUSTLSP_STD_DECOYS
+        "trait Maker { fn make<'a>(&'a self) -> Pin<Box<dyn Future<Output = Conn> + Send + 'a>>; }\n"
+        "async fn run(m: &dyn Maker) -> bool { m.make().await.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::future::Future;\nuse std::pin::Pin;\n" RUSTLSP_STD_DECOYS
+        "type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;\n"
+        "type ConnFut<'a> = Fut<'a, Conn>;\n"
+        "trait Maker { fn make<'a>(&'a self) -> ConnFut<'a>; }\n"
+        "async fn run(m: &dyn Maker) -> bool { m.make().await.expect(\"made\").ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use futures::future::BoxFuture;\n" RUSTLSP_STD_DECOYS
+        "fn make() -> BoxFuture<'static, Conn> { todo!() }\n"
+        "async fn run() -> bool { let c = make().await; c.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::future::Future;\n" RUSTLSP_STD_DECOYS
+        "trait Maker { fn make(&self) -> Box<dyn Future<Output = Conn> + Send + Unpin>; }\n"
+        "async fn run(m: &dyn Maker) -> bool { let f = m.make(); f.await.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::future::Future;\n" RUSTLSP_STD_DECOYS
+        "trait Maker { fn make(&self) -> Box<dyn Future<Output = Conn> + Send + Unpin>; }\n"
+        "async fn run(m: &dyn Maker) -> bool { let mut f = m.make(); let c = (&mut f).await; c.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::future::Future;\n" RUSTLSP_STD_DECOYS
+        "trait Maker { fn make(&self) -> Box<dyn Future<Output = Conn> + Send + Unpin>; }\n"
+        "async fn run(m: &dyn Maker) -> bool { let mut f = m.make(); (&mut f).await.ping() }\n"));
+    PASS();
+}
+
+/* `Box::pin(f())` of an async fn is a boxed future of f's output, awaited
+ * directly, destructured, or bound first. */
+TEST(rustlsp_await_box_pin_of_async_call_yields_output) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "async fn make() -> Conn { Conn }\n"
+        "async fn run() -> bool { Box::pin(make()).await.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "async fn make() -> (Conn, Other) { (Conn, Other) }\n"
+        "async fn run() -> bool { let (c, _o) = Box::pin(make()).await; c.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "async fn make() -> Result<Conn, Other> { Ok(Conn) }\n"
+        "async fn run() -> bool { let f = Box::pin(make()); f.await.unwrap().ping() }\n"));
+    PASS();
+}
+
+/* A boxed value whose output no declaration states stays untyped: the
+ * un-awaited future is not its output, and a boxed project type does not
+ * await to itself. */
+TEST(rustlsp_await_boxed_future_without_declared_output_is_untyped) {
+    CBMFileResult *r = extract_rust(RUSTLSP_STD_DECOYS
+                                    "async fn make() -> Conn { Conn }\n"
+                                    "fn run() -> bool { Box::pin(make()).ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT(find_resolved(r, "run", "Conn.ping") < 0);
+    cbm_free_result(r);
+    r = extract_rust(RUSTLSP_STD_DECOYS
+                     "fn make() -> std::pin::Pin<Box<Conn>> { todo!() }\n"
+                     "async fn run() -> bool { make().await.ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT(find_resolved(r, "run", "Conn.ping") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* tokio's `JoinHandle<T>` awaits to `Result<T, JoinError>`, so a timeout
+ * over it is a Result of that Result. */
+TEST(rustlsp_await_join_handle_yields_result) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use tokio::task::JoinHandle;\n" RUSTLSP_STD_DECOYS
+        "async fn run(h: JoinHandle<Conn>) -> bool { h.await.unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::time::Duration;\nuse tokio::task::JoinHandle;\nuse tokio::time::timeout;\n"
+        RUSTLSP_STD_DECOYS
+        "async fn run(d: Duration, h: JoinHandle<Conn>) -> bool {\n"
+        "    timeout(d, h).await.unwrap().unwrap().ping()\n}\n"));
+    CBMFileResult *r = extract_rust(
+        "use std::time::Duration;\nuse tokio::task::JoinHandle;\nuse tokio::time::timeout;\n"
+        RUSTLSP_STD_DECOYS
+        "async fn run(d: Duration, h: JoinHandle<Conn>) -> bool {\n"
+        "    timeout(d, h).await.unwrap().ping()\n}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT(find_resolved(r, "run", "Conn.ping") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A `Result` head the registry does not know (a dependency's alias) is
  * core's `Result<T, _>`: `.expect()` yields its first argument. So does
  * std's `LockResult<G>`. A project type named `Result` keeps its own methods. */
@@ -11933,6 +12022,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_std_returns_foreign_mutex_stays_unknown);
     RUN_TEST(rustlsp_tokio_locks_await_to_guard);
     RUN_TEST(rustlsp_tokio_timeout_yields_result_of_output);
+    RUN_TEST(rustlsp_await_boxed_future_yields_declared_output);
+    RUN_TEST(rustlsp_await_box_pin_of_async_call_yields_output);
+    RUN_TEST(rustlsp_await_boxed_future_without_declared_output_is_untyped);
+    RUN_TEST(rustlsp_await_join_handle_yields_result);
     RUN_TEST(rustlsp_tokio_signatures_need_the_tokio_item);
     RUN_TEST(rustlsp_std_returns_unknown_result_head);
     RUN_TEST(rustlsp_std_namesake_declared_in_file_is_project_type);
