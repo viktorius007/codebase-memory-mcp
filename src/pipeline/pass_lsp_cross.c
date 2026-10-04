@@ -1929,7 +1929,14 @@ static void pxc_rust_imports_collect_entry(const char *key, void *value, void *u
 }
 
 void cbm_pipeline_rust_imports_free(cbm_pipeline_ctx_t *ctx) {
-    if (!ctx || !ctx->rust_imports) {
+    if (!ctx) {
+        return;
+    }
+    cbm_rust_modtree_free(ctx->rust_use_modtree);
+    cbm_rust_macro_table_free(ctx->rust_use_macros);
+    ctx->rust_use_modtree = NULL;
+    ctx->rust_use_macros = NULL;
+    if (!ctx->rust_imports) {
         return;
     }
     /* The table borrows keys, so collect every key and value first and free
@@ -2865,6 +2872,47 @@ CBMRustModTree *cbm_pxc_build_rust_modtree(const cbm_pipeline_ctx_t *ctx,
     return tree;
 }
 
+void cbm_pipeline_rust_modtree_prepare(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                       int file_count) {
+    if (!ctx || !files || ctx->rust_use_modtree) {
+        return;
+    }
+    bool have_rust = false;
+    for (int i = 0; i < file_count && !have_rust; i++) {
+        have_rust = files[i].language == CBM_LANG_RUST;
+    }
+    if (!have_rust) {
+        return;
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMCargoManifest manifest;
+    bool have_manifest = cbm_pxc_build_rust_manifest(ctx, &arena, &manifest, files, file_count);
+    cbm_rust_macro_table_free(ctx->rust_use_macros);
+    ctx->rust_use_macros = NULL;
+    ctx->rust_use_modtree = cbm_pxc_build_rust_modtree(ctx, have_manifest ? &manifest : NULL, files,
+                                                       file_count, &ctx->rust_use_macros);
+    cbm_arena_destroy(&arena);
+}
+
+CBMRustModTree *cbm_pipeline_rust_modtree_take(cbm_pipeline_ctx_t *ctx,
+                                               const CBMCargoManifest *root,
+                                               const cbm_file_info_t *files, int file_count,
+                                               CBMRustMacroTable **out_macros) {
+    if (!ctx || !ctx->rust_use_modtree) {
+        return cbm_pxc_build_rust_modtree(ctx, root, files, file_count, out_macros);
+    }
+    CBMRustModTree *tree = ctx->rust_use_modtree;
+    ctx->rust_use_modtree = NULL;
+    if (out_macros) {
+        *out_macros = ctx->rust_use_macros;
+    } else {
+        cbm_rust_macro_table_free(ctx->rust_use_macros);
+    }
+    ctx->rust_use_macros = NULL;
+    return tree;
+}
+
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                 int file_count, CBMFileResult **cache) {
     if (!ctx || !files || file_count <= 0 || !cache)
@@ -2916,8 +2964,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     CBMRustModTree *rust_modtree = NULL;
     CBMRustMacroTable *rust_macros = NULL;
     if (have_rust) {
-        rust_modtree = cbm_pxc_build_rust_modtree(ctx, have_manifest ? &cargo_manifest : NULL,
-                                                  files, file_count, &rust_macros);
+        rust_modtree = cbm_pipeline_rust_modtree_take(ctx, have_manifest ? &cargo_manifest : NULL,
+                                                      files, file_count, &rust_macros);
         cbm_pxc_set_rust_imports(ctx->rust_imports, rust_modtree, rust_macros);
     }
     /* Same seam as the parallel driver: serialize per-file surfaces while the

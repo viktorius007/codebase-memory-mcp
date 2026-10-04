@@ -160,6 +160,12 @@ typedef struct {
      * resolve, so re-exports and parent-module globs resolve from source
      * paths rather than from name-matched IMPORTS edges. */
     CBMHashTable *rust_imports;
+    /* The Rust crate module tree and macro table of this run, built before
+     * IMPORTS edges are created (cbm_pipeline_rust_modtree_prepare) so a `use`
+     * links to the item its path names, then handed to the cross-file resolve
+     * (cbm_pipeline_rust_modtree_take). NULL outside that window. */
+    struct CBMRustModTree *rust_use_modtree;
+    struct CBMRustMacroTable *rust_use_macros;
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
     cbm_pipeline_t *pipeline; /* back-pointer for recording per-file skips
@@ -325,6 +331,21 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
+
+/* Build the run's Rust module tree when `files` holds a Rust file and none
+ * is prepared yet; called before IMPORTS edges are created. */
+void cbm_pipeline_rust_modtree_prepare(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                       int file_count);
+
+/* Create the IMPORTS edges of one import of the file `source` (File node,
+ * path `rel`, QN `file_qn`); returns how many. A Rust `use` of a named item
+ * links to each item the module tree resolves its path to, and to nothing
+ * when the tree proves the path names no project item. Every other import,
+ * and a `use` the tree cannot decide, links to the node
+ * cbm_pipeline_resolve_import_node picks. */
+int cbm_pipeline_link_import(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *source,
+                             const char *rel, const char *file_qn, const CBMImport *imp,
+                             CBMHashTable *namespace_map);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by

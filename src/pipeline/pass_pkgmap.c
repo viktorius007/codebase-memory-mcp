@@ -25,6 +25,7 @@
 #include "foundation/yaml.h"
 
 #include "lsp/rust_cargo.h"
+#include "lsp/rust_modtree.h"
 
 #include <yyjson/yyjson.h>
 
@@ -2314,6 +2315,62 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
         }
     }
     return map;
+}
+
+enum { RUST_USE_TARGETS_MAX = 2 }; /* one item per namespace */
+
+/* The item nodes the module tree resolves a Rust `use` to. Returns their
+ * count, or -1 when the tree does not decide this import: no tree, a glob,
+ * an undecidable path, or a resolved item the graph holds no node for. */
+static int rust_use_targets(const cbm_pipeline_ctx_t *ctx, const char *rel, const CBMImport *imp,
+                            const cbm_gbuf_node_t **out) {
+    if (!ctx->rust_use_modtree || !rel || !imp->local_name || strcmp(imp->local_name, "*") == 0 ||
+        strcmp(imp->local_name, "_") == 0 ||
+        cbm_language_for_filename(path_leaf(rel)) != CBM_LANG_RUST) {
+        return -1;
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *qns[RUST_USE_TARGETS_MAX];
+    int found = cbm_rust_modtree_use_items(ctx->rust_use_modtree, &arena, rel, imp->local_name,
+                                           imp->module_path, qns, RUST_USE_TARGETS_MAX);
+    int count = found;
+    for (int i = 0; i < found; i++) {
+        const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, qns[i]);
+        if (!node || !node->label || strcmp(node->label, "Method") == 0) {
+            count = -1;
+            break;
+        }
+        out[i] = node;
+    }
+    cbm_arena_destroy(&arena);
+    return count;
+}
+
+int cbm_pipeline_link_import(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *source,
+                             const char *rel, const char *file_qn, const CBMImport *imp,
+                             CBMHashTable *namespace_map) {
+    if (!ctx || !source || !imp || !imp->module_path) {
+        return 0;
+    }
+    const cbm_gbuf_node_t *targets[RUST_USE_TARGETS_MAX];
+    int count = rust_use_targets(ctx, rel, imp, targets);
+    if (count < 0) {
+        targets[0] = cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
+        count = targets[0] ? 1 : 0;
+    }
+    char esc_ln[CBM_SZ_128];
+    cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
+    char props[CBM_SZ_256];
+    snprintf(props, sizeof(props), "{\"local_name\":\"%s\"}", esc_ln);
+    int linked = 0;
+    for (int i = 0; i < count; i++) {
+        if (targets[i]->id != source->id) {
+            cbm_gbuf_insert_edge(ctx->gbuf, source->id, targets[i]->id, "IMPORTS", props);
+            linked++;
+        }
+    }
+    return linked;
 }
 
 static void ns_map_free_entry(const char *key, void *value, void *ud) {

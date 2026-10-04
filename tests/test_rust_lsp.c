@@ -9795,6 +9795,59 @@ TEST(rustlsp_modtree_super_glob_sees_parent_private_import) {
     PASS();
 }
 
+TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module) {
+    /* A `use` names the item its path resolves to: through a by-name
+     * `pub use`, through a `#[path]` module, and from the inline module that
+     * declares it. A re-exported std item is proven outside the project (0);
+     * an unknown name and a module are left undecided (-1). */
+    static const char *const rels[] = {"src/lib.rs", "src/cli.rs", "src/device_buffers.rs",
+                                       "src/aaa.rs", "src/user.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.cli", "p.src.device_buffers",
+                                      "p.src.aaa", "p.src.user"};
+    static const char *const sources[] = {
+        "mod cli;\n#[path = \"device_buffers.rs\"]\nmod buffers;\nmod aaa;\nmod user;\n"
+        "pub use cli::Cli;\npub use std::fmt::Debug;\n",
+        "pub struct Cli;\npub fn run() {}\n",
+        "pub struct Frame;\n",
+        "pub struct Cli;\npub struct Frame;\npub trait Debug {}\n",
+        "use crate::Cli;\nuse crate::buffers::Frame;\nuse crate::Debug;\nuse crate::Missing;\n"
+        "use crate::cli;\nmod inner {\n    use super::super::cli::run;\n}\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 5);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *out[2] = {NULL, NULL};
+    ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "Cli", "crate::Cli", out, 2),
+              1);
+    ASSERT_STR_EQ(out[0], "p.src.cli.Cli");
+    ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "Frame",
+                                         "crate::buffers::Frame", out, 2),
+              1);
+    ASSERT_STR_EQ(out[0], "p.src.device_buffers.Frame");
+    ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "run",
+                                         "super::super::cli::run", out, 2),
+              1);
+    ASSERT_STR_EQ(out[0], "p.src.cli.run");
+    ASSERT_EQ(
+        cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "Debug", "crate::Debug", out, 2), 0);
+    ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "Missing", "crate::Missing",
+                                         out, 2),
+              -1);
+    ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "cli", "crate::cli", out, 2),
+              -1);
+    /* A block-level `use` is not declared by any module: its path is
+     * resolved from the file's modules, which must agree. */
+    ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/cli.rs", "Frame",
+                                         "crate::buffers::Frame", out, 2),
+              1);
+    ASSERT_STR_EQ(out[0], "p.src.device_buffers.Frame");
+    ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "Frame", "self::Frame", out, 2),
+              -1);
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer) {
     /* `b` re-exports `a::X`, `c` re-exports all of `b`; `user` globs `c`. */
     static const char *const rels[] = {"src/lib.rs", "src/a.rs", "src/b.rs", "src/c.rs",
@@ -11210,6 +11263,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
+    RUN_TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module);
     RUN_TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer);
     RUN_TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file);
     RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);
