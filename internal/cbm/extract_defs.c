@@ -2609,23 +2609,19 @@ static const char *rust_generic_param_name(CBMArena *a, TSNode param, const char
     return ts_node_is_null(name) ? NULL : cbm_node_text(a, name, source);
 }
 
-/* Rust `type Name<P..> = Target;`: the target as written and the type
- * parameter names, in order, into `def`. */
-static void extract_rust_type_alias(CBMArena *a, TSNode item, const char *source,
-                                    CBMDefinition *def) {
-    TSNode target = ts_node_child_by_field_name(item, TS_FIELD("type"));
-    if (ts_node_is_null(target)) {
-        return;
-    }
-    def->type_alias = cbm_node_text(a, target, source);
+/* The type parameter names a Rust item declares, in order, lifetimes left
+ * out (NULL-ended, NULL when none); `*out_count` gets their number. */
+static const char **rust_item_type_param_names(CBMArena *a, TSNode item, const char *source,
+                                               int *out_count) {
+    *out_count = 0;
     TSNode params = ts_node_child_by_field_name(item, TS_FIELD("type_parameters"));
     uint32_t nc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
     if (nc == 0) {
-        return;
+        return NULL;
     }
     const char **names = (const char **)cbm_arena_alloc(a, (nc + 1) * sizeof(const char *));
     if (!names) {
-        return;
+        return NULL;
     }
     int count = 0;
     for (uint32_t i = 0; i < nc; i++) {
@@ -2635,7 +2631,21 @@ static void extract_rust_type_alias(CBMArena *a, TSNode item, const char *source
         }
     }
     names[count] = NULL;
-    def->type_alias_params = count > 0 ? names : NULL;
+    *out_count = count;
+    return count > 0 ? names : NULL;
+}
+
+/* Rust `type Name<P..> = Target;`: the target as written and the type
+ * parameter names, in order, into `def`. */
+static void extract_rust_type_alias(CBMArena *a, TSNode item, const char *source,
+                                    CBMDefinition *def) {
+    TSNode target = ts_node_child_by_field_name(item, TS_FIELD("type"));
+    if (ts_node_is_null(target)) {
+        return;
+    }
+    def->type_alias = cbm_node_text(a, target, source);
+    int count = 0;
+    def->type_alias_params = rust_item_type_param_names(a, item, source, &count);
 }
 
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
@@ -4803,6 +4813,15 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     }
     if (ctx->language == CBM_LANG_RUST && strcmp(kind, "type_item") == 0) {
         extract_rust_type_alias(a, node, ctx->source, &def);
+    }
+    /* A generic struct, enum or union carries its type parameter names as
+     * its positional parameters, as an alias's do across files, so a use
+     * written `Name<A, B>` binds each to its argument. */
+    if (ctx->language == CBM_LANG_RUST &&
+        (strcmp(kind, "struct_item") == 0 || strcmp(kind, "enum_item") == 0 ||
+         strcmp(kind, "union_item") == 0)) {
+        def.signature_param_types =
+            rust_item_type_param_names(a, node, ctx->source, &def.signature_param_count);
     }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);

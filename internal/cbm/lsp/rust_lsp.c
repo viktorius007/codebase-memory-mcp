@@ -2534,6 +2534,98 @@ static const CBMType *rust_parse_def_type_text(CBMArena *arena, const char *text
                                        NULL, tree);
 }
 
+/* The NULL-ended copy of `count` type parameter names; NULL when none. */
+static const char **rust_type_param_names_copy(CBMArena *arena, const char *const *params,
+                                               int count) {
+    if (!params || count <= 0) {
+        return NULL;
+    }
+    const char **names = cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(char *));
+    if (!names) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        names[i] = params[i] ? cbm_arena_strdup(arena, params[i]) : "";
+    }
+    names[count] = NULL;
+    return names;
+}
+
+/* True when `text[0..len)` is one identifier (`B`, `T0`). */
+static bool rust_spelling_is_bare_name(const char *text, size_t len) {
+    if (len == 0 || isdigit((unsigned char)text[0])) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (!isalnum(c) && c != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The names an impl's self type spells at its argument positions, lifetimes
+ * left out as a parsed type leaves them out (`Terminal<B>` -> [B],
+ * `Req<'_, H>` -> [H]). An argument that is not a bare name gets "", which
+ * names no parameter. NULL when the spelling has no type arguments or its
+ * owner is not `receiver_qn`'s leaf (an alias or wrapper spelling, whose
+ * positions are not the receiver's). */
+static const char **rust_impl_self_param_names(CBMArena *arena, const char *spelling,
+                                               const char *receiver_qn) {
+    const char *open = spelling ? strchr(spelling, '<') : NULL;
+    if (!open || !receiver_qn) {
+        return NULL;
+    }
+    const char *owner = cbm_rust_impl_owner_name(arena, spelling);
+    const char *owner_leaf = owner ? strrchr(owner, ':') : NULL;
+    owner_leaf = owner_leaf ? owner_leaf + 1 : owner;
+    const char *recv_leaf = strrchr(receiver_qn, '.');
+    recv_leaf = recv_leaf ? recv_leaf + 1 : receiver_qn;
+    if (!owner_leaf || strcmp(owner_leaf, recv_leaf) != 0) {
+        return NULL;
+    }
+    const char *names[16];
+    int count = 0;
+    int depth = 0;
+    const char *start = open + 1;
+    for (const char *p = start; *p && count < 15; p++) {
+        if (*p == '>' && p[-1] == '-') {
+            continue; /* the arrow of `Fn() -> T` */
+        }
+        if (*p == '<' || *p == '(' || *p == '[') {
+            depth++;
+            continue;
+        }
+        bool close = *p == '>' && depth == 0;
+        if (!close && (*p == '>' || *p == ')' || *p == ']')) {
+            depth--;
+            continue;
+        }
+        if (!close && !(*p == ',' && depth == 0)) {
+            continue;
+        }
+        const char *a = start;
+        const char *b = p;
+        while (a < b && isspace((unsigned char)*a)) {
+            a++;
+        }
+        while (b > a && isspace((unsigned char)b[-1])) {
+            b--;
+        }
+        if (a < b && *a != '\'') {
+            size_t len = (size_t)(b - a);
+            names[count++] =
+                rust_spelling_is_bare_name(a, len) ? cbm_arena_strndup(arena, a, len) : "";
+        }
+        start = p + 1;
+        if (close) {
+            break;
+        }
+    }
+    return rust_type_param_names_copy(arena, names, count);
+}
+
 /* Make `rt` the alias `type Name<params..> = target;` spelled in the file of
  * `module_qn`: the target's type with each parameter as a TYPE_PARAM, read
  * through the module tree when one is given. */
@@ -4498,6 +4590,104 @@ static const CBMType *rust_sig_subst_self(RustLSPContext *ctx, const CBMType *si
                          rets);
 }
 
+/* `params[i]` when `t` names that type parameter, else -1. A parameter
+ * reads as a TYPE_PARAM, or as the NAMED path its bare name took in the
+ * declaring module (`<module>.T`) when no registered type has that path. */
+static int rust_receiver_param_index(RustLSPContext *ctx, const CBMType *t,
+                                     const char *const *params, int argc) {
+    const char *name = NULL;
+    if (t->kind == CBM_TYPE_TYPE_PARAM) {
+        name = t->data.type_param.name;
+    } else if (t->kind == CBM_TYPE_NAMED && t->data.named.qualified_name &&
+               !cbm_registry_lookup_type(ctx->registry, t->data.named.qualified_name)) {
+        const char *dot = strrchr(t->data.named.qualified_name, '.');
+        name = dot ? dot + 1 : NULL;
+    }
+    for (int i = 0; name && i < argc && params[i]; i++) {
+        if (params[i][0] && strcmp(params[i], name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+enum { RUST_RECEIVER_SUBST_MAX_DEPTH = 16 };
+
+/* `t` read through a receiver written with type arguments: each of the
+ * declaring item's positional `params` is replaced by the argument at its
+ * position, and `Self` by `self_t` when given. A parameter past the written
+ * arguments stays as it is. */
+static const CBMType *rust_subst_receiver_args(RustLSPContext *ctx, const CBMType *t,
+                                               const char *const *params,
+                                               const CBMType *const *args, int argc,
+                                               const CBMType *self_t, int depth) {
+    if (!t || depth > RUST_RECEIVER_SUBST_MAX_DEPTH) {
+        return t;
+    }
+    int at = rust_receiver_param_index(ctx, t, params, argc);
+    if (at >= 0) {
+        return args[at];
+    }
+    switch (t->kind) {
+    case CBM_TYPE_NAMED:
+        return self_t && strcmp(t->data.named.qualified_name, "Self") == 0 ? self_t : t;
+    case CBM_TYPE_REFERENCE:
+        return cbm_type_reference(ctx->arena,
+                                  rust_subst_receiver_args(ctx, t->data.reference.elem, params,
+                                                           args, argc, self_t, depth + 1));
+    case CBM_TYPE_POINTER:
+        return cbm_type_pointer(ctx->arena,
+                                rust_subst_receiver_args(ctx, t->data.pointer.elem, params, args,
+                                                         argc, self_t, depth + 1));
+    case CBM_TYPE_SLICE:
+        return cbm_type_slice(ctx->arena,
+                              rust_subst_receiver_args(ctx, t->data.slice.elem, params, args, argc,
+                                                       self_t, depth + 1));
+    case CBM_TYPE_TEMPLATE: {
+        int n = t->data.template_type.arg_count;
+        if (n <= 0) {
+            return t;
+        }
+        const CBMType **sub = cbm_arena_alloc(ctx->arena, sizeof(*sub) * (size_t)n);
+        for (int i = 0; i < n; i++) {
+            sub[i] = rust_subst_receiver_args(ctx, t->data.template_type.template_args[i], params,
+                                              args, argc, self_t, depth + 1);
+        }
+        return cbm_type_template(ctx->arena, t->data.template_type.template_name, sub, n);
+    }
+    case CBM_TYPE_TUPLE: {
+        int n = t->data.tuple.count;
+        if (n <= 0) {
+            return t;
+        }
+        const CBMType **sub = cbm_arena_alloc(ctx->arena, sizeof(*sub) * (size_t)n);
+        for (int i = 0; i < n; i++) {
+            sub[i] = rust_subst_receiver_args(ctx, t->data.tuple.elems[i], params, args, argc,
+                                              self_t, depth + 1);
+        }
+        return cbm_type_tuple(ctx->arena, sub, n);
+    }
+    case CBM_TYPE_FUNC: {
+        const CBMType *const *rets = t->data.func.return_types;
+        int n = 0;
+        while (rets && rets[n]) {
+            n++;
+        }
+        if (n == 0) {
+            return t;
+        }
+        const CBMType **sub = cbm_arena_alloc(ctx->arena, sizeof(*sub) * (size_t)(n + 1));
+        for (int i = 0; i < n; i++) {
+            sub[i] = rust_subst_receiver_args(ctx, rets[i], params, args, argc, self_t, depth + 1);
+        }
+        sub[n] = NULL;
+        return cbm_type_func(ctx->arena, t->data.func.param_names, t->data.func.param_types, sub);
+    }
+    default:
+        return t;
+    }
+}
+
 /* Member access type: returns the CBMType for `recv.field_or_method`.
  * A method call returns the method's FUNC signature with `Self` replaced by
  * the type that declares them, else the field type; an access that is not a
@@ -4551,7 +4741,6 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
     const char *type_qn = NULL;
     const CBMType **template_args = NULL;
     int template_count = 0;
-    const char **template_params = NULL;
 
     if (base->kind == CBM_TYPE_NAMED) {
         type_qn = base->data.named.qualified_name;
@@ -4593,18 +4782,27 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
             *out_method = method;
         }
         const CBMType *sig = method->signature;
-        if (template_args && method->type_param_names) {
-            template_params = method->type_param_names;
-            sig = rust_substitute_type(ctx->arena, sig, template_params, template_args);
+        /* `Wrap<Item>` binds the impl's own parameters (`impl<T> Wrap<T>`)
+         * by position, and `Self` is the receiver with its arguments. */
+        if (template_args && method->type_param_names && method->receiver_type &&
+            strcmp(method->receiver_type, type_qn) == 0) {
+            const CBMType *self_t =
+                cbm_type_template(ctx->arena, type_qn, template_args, template_count);
+            sig = rust_subst_receiver_args(ctx, sig, method->type_param_names, template_args,
+                                           template_count, self_t, 0);
         }
         return rust_sig_subst_self(ctx, sig, type_qn);
     }
 
-    /* Field on the type's RegisteredType. */
+    /* Field on the type's RegisteredType: `inner: T` read through
+     * `Wrap<Item>` is the argument at `T`'s position in `struct Wrap<T>`. */
     const CBMType *ft = rust_lookup_field(ctx, type_qn, member, 0);
     if (ft) {
-        if (template_args && template_params) {
-            return rust_substitute_type(ctx->arena, ft, template_params, template_args);
+        const CBMRegisteredType *rt =
+            template_args ? cbm_registry_lookup_type(ctx->registry, type_qn) : NULL;
+        if (rt && !rt->alias_of && rt->type_param_names) {
+            return rust_subst_receiver_args(ctx, ft, rt->type_param_names, template_args,
+                                            template_count, NULL, 0);
         }
         return ft;
     }
@@ -10906,6 +11104,10 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         }
         rust_register_type_alias(arena, &rt, d->type_alias, d->type_alias_params,
                                  alias_param_count, module_qn, NULL);
+        if (!rt.alias_type) {
+            rt.type_param_names = rust_type_param_names_copy(
+                arena, d->signature_param_types, d->signature_param_count);
+        }
         cbm_registry_add_type(reg, rt);
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
     }
@@ -10987,6 +11189,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
 
             if (strcmp(d->label, "Method") == 0 && d->parent_class) {
                 rf.receiver_type = d->parent_class;
+                rf.type_param_names =
+                    rust_impl_self_param_names(arena, d->receiver, d->parent_class);
                 if (cbm_idxmemo_get(&type_idx, rf.receiver_type) < 0) {
                     CBMRegisteredType auto_t;
                     memset(&auto_t, 0, sizeof(auto_t));
@@ -11423,6 +11627,8 @@ static void rust_register_func_on(CBMArena *arena, CBMTypeRegistry *reg, CBMIdxM
                                   const CBMRustModTree *tree) {
     if (receiver && receiver[0]) {
         rf.receiver_type = cbm_arena_strdup(arena, receiver);
+        rf.type_param_names =
+            rust_impl_self_param_names(arena, d->receiver_spelling, rf.receiver_type);
         if (cbm_idxmemo_get(type_idx, rf.receiver_type) < 0) {
             CBMRegisteredType auto_t;
             memset(&auto_t, 0, sizeof(auto_t));
@@ -11522,6 +11728,10 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         rust_register_type_alias(arena, &rt, d->return_types, d->signature_param_types,
                                  d->signature_param_count,
                                  d->def_module_qn ? d->def_module_qn : module_qn, tree);
+        if (!rt.alias_type) {
+            rt.type_param_names = rust_type_param_names_copy(
+                arena, d->signature_param_types, d->signature_param_count);
+        }
         cbm_registry_add_type(reg, rt);
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
     }
