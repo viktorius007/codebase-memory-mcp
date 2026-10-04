@@ -155,14 +155,6 @@ typedef struct {
     const char *self_trait_qn;
     const char *self_trait_spelling; /* raw `impl <Trait> for` text, NULL outside trait impls */
 
-    /* Closure parameter inference: when the call resolver descends into a
-     * call's argument list and the callee is a method like
-     * `.map(|x| ...)` / `.filter(|x| ...)`, it stashes the inferred type
-     * of the closure's first param here. The closure_expression handler
-     * consumes it (and clears it) when binding params, so a chain like
-     * `vec.iter().map(|x| x.method())` resolves `x.method()` correctly. */
-    const CBMType *pending_closure_param_type;
-
     /* Scrutinee type inherited by the match arms currently being walked.
      * Even when an enum payload's exact field type is unavailable, binding
      * its pattern as unknown prevents an outer same-named local from leaking

@@ -1262,6 +1262,147 @@ TEST(rustlsp_std_returns_option_result_adapters) {
     PASS();
 }
 
+/* An unannotated closure parameter takes the type the std method declares
+ * for it, read off the receiver: `Option<T>::map(FnOnce(T))`,
+ * `Result<T, E>::map_err(FnOnce(E))`, `Iterator<Item = T>::find(FnMut(&T))`,
+ * `Vec<T>::retain(FnMut(&T))`. */
+TEST(rustlsp_closure_param_from_std_signature) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(o: Option<Conn>) -> bool { o.is_some_and(|c| c.ping()) }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "fn run(r: Result<Other, Conn>) -> bool { r.map_err(|e| e.ping()).is_ok() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "fn run(r: Result<Conn, Other>) -> bool { r.map_or_else(|_| false, |c| c.ping()) }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "fn run(v: Vec<Conn>) -> bool { v.iter().find(|c| c.ping()).is_some() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(v: &[Conn]) -> bool { v.iter().any(|c| c.ping()) }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(mut v: Vec<Conn>) -> bool { v.retain(|c| c.ping()); true }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::Arc;\n" RUSTLSP_STD_DECOYS
+        "fn run(v: Arc<Vec<Conn>>) -> bool { v.iter().all(|c| c.ping()) }\n"));
+    PASS();
+}
+
+/* Each parameter of a several-parameter closure is read from its own
+ * place in the declared signature: `sort_by(FnMut(&T, &T))`,
+ * `fold(B, FnMut(B, T))` with B the type of the first argument,
+ * `HashMap<K, V>::retain(FnMut(&K, &mut V))`; a tuple Item is destructured
+ * by the parameter pattern. */
+TEST(rustlsp_closure_param_positions_and_patterns) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "fn run(mut v: Vec<Conn>) -> bool { v.sort_by(|a, b| a.ping().cmp(&b.ping())); true }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "fn run(v: Vec<Other>, seed: Conn) -> bool {\n"
+        "    v.iter().fold(seed, |acc, _o| { acc.ping(); acc }); true\n}\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(v: Vec<Conn>, seed: Other) -> bool {\n"
+                           "    v.iter().fold(seed, |acc, c| { c.ping(); acc }); true\n}\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::collections::HashMap;\n" RUSTLSP_STD_DECOYS
+        "fn run(mut m: HashMap<Other, Conn>) -> bool { m.retain(|_k, v| v.ping()); true }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "fn run(v: Vec<Conn>) -> bool { v.iter().enumerate().any(|(_i, c)| c.ping()) }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(v: Vec<Conn>, w: Vec<Other>) -> bool {\n"
+                           "    w.iter().zip(v.iter()).any(|(_o, c)| c.ping())\n}\n"));
+    PASS();
+}
+
+/* An adapter's Item is what its closure proves: `map` yields the closure's
+ * return, `filter_map` the argument of the Option it returns, `flat_map`
+ * the Item of what it returns; `flatten` yields the Item's Item. The next
+ * closure in the chain is bound from it, and a closure inside the receiver
+ * does not take the outer closure's parameter type. */
+TEST(rustlsp_closure_param_through_adapter_chain) {
+    static const char *const prelude =
+        RUSTLSP_STD_DECOYS "struct Src;\nimpl Src {\n"
+                           "    fn conn(&self) -> Conn { Conn }\n"
+                           "    fn maybe(&self) -> Option<Conn> { None }\n"
+                           "    fn many(&self) -> Vec<Conn> { Vec::new() }\n}\n";
+    static const char *const bodies[] = {
+        "v.iter().map(|s| s.conn()).any(|c| c.ping())",
+        "v.iter().filter_map(|s| s.maybe()).any(|c| c.ping())",
+        "v.iter().flat_map(|s| s.many()).any(|c| c.ping())",
+        "v.iter().map(|s| s.maybe()).flatten().any(|c| c.ping())",
+        "v.iter().find_map(|s| s.maybe()).is_some_and(|c| c.ping())",
+        "v.iter().filter(|s| s.maybe().is_some()).map(|s| s.conn()).any(|c| c.ping())",
+    };
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+        char source[1024];
+        snprintf(source, sizeof(source), "%sfn run(v: Vec<Src>) -> bool { %s }\n", prelude,
+                 bodies[i]);
+        if (!rustlsp_std_chain_reaches_conn(source)) {
+            FAIL(bodies[i]);
+        }
+    }
+    PASS();
+}
+
+/* A parameter nothing proves stays unbound: a project type's own
+ * closure-taking method (its signature is not the std one, whatever the
+ * type is called), a receiver of unknown type, an Item that is a type
+ * parameter, and a method the receiver's std type does not declare. */
+TEST(rustlsp_closure_param_unproven_stays_unbound) {
+    static const char *const sources[] = {
+        RUSTLSP_STD_DECOYS "struct MyVec<T>(T);\n"
+                           "impl<T> MyVec<T> { fn map<F: Fn(Other) -> bool>(&self, f: F) -> bool "
+                           "{ f(Other) } }\n"
+                           "fn run(v: MyVec<Conn>) -> bool { v.map(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn run() -> bool { missing().iter().any(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn run<T>(v: Vec<T>) -> bool { v.iter().any(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn run(o: Option<Conn>) -> bool { o.map_err(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn run(r: Result<Conn, u8>) -> bool { r.map_err(|c| c.ping()).is_ok() }\n",
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        CBMFileResult *r = extract_rust(sources[i]);
+        ASSERT_NOT_NULL(r);
+        bool linked =
+            find_resolved(r, "run", "Conn.ping") >= 0 || find_resolved(r, "run", "Other.ping") >= 0;
+        cbm_free_result(r);
+        if (linked) {
+            FAIL(sources[i]);
+        }
+    }
+    PASS();
+}
+
+/* A parameter is bound only from the call its closure is passed to: in
+ * `o.as_ref().and_then(|w| ..).map(|c| ..)` the receiver chain's `w` is the
+ * `&Wrap` that `and_then` declares, not the `Conn` the outer `map` yields. */
+TEST(rustlsp_closure_param_not_bound_from_outer_call) {
+    CBMFileResult *r = extract_rust(
+        RUSTLSP_STD_DECOYS "struct Wrap { inner: Option<Conn> }\n"
+                           "impl Wrap { fn ping(&self) -> bool { true } }\n"
+                           "fn run(o: Option<Wrap>) -> bool {\n"
+                           "    o.as_ref().and_then(|w| { w.ping(); w.inner.as_ref() })\n"
+                           "        .map(|c| c.clone()).is_some()\n}\n");
+    ASSERT_NOT_NULL(r);
+    int wrap = find_resolved(r, "run", "Wrap.ping");
+    int conn = find_resolved(r, "run", "Conn.ping");
+    cbm_free_result(r);
+    ASSERT_GTE(wrap, 0);
+    ASSERT_EQ(conn, -1);
+    PASS();
+}
+
+/* A slice has the slice methods the Vec entries declare (`first`, `iter`,
+ * `last`): `[T]::first -> Option<&T>`. */
+TEST(rustlsp_std_returns_slice_methods) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(v: &[Conn]) -> bool { v.first().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS "fn run(v: &[Conn]) -> bool { v.iter().next().unwrap().ping() }\n"));
+    PASS();
+}
+
 /* `PathBuf::as_path -> &Path`, `Path::join -> PathBuf`, `Path::parent ->
  * Option<&Path>`: a project trait implemented for Path is reached. */
 TEST(rustlsp_std_returns_paths) {
@@ -10815,6 +10956,12 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_std_returns_unknown_result_head);
     RUN_TEST(rustlsp_std_returns_refcell);
     RUN_TEST(rustlsp_std_returns_option_result_adapters);
+    RUN_TEST(rustlsp_closure_param_from_std_signature);
+    RUN_TEST(rustlsp_closure_param_positions_and_patterns);
+    RUN_TEST(rustlsp_closure_param_through_adapter_chain);
+    RUN_TEST(rustlsp_closure_param_unproven_stays_unbound);
+    RUN_TEST(rustlsp_closure_param_not_bound_from_outer_call);
+    RUN_TEST(rustlsp_std_returns_slice_methods);
     RUN_TEST(rustlsp_std_returns_paths);
     RUN_TEST(rustlsp_std_returns_read_the_call);
     RUN_TEST(rustlsp_std_returns_vec_and_string);

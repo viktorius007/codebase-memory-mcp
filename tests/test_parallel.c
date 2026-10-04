@@ -1277,6 +1277,10 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
         {"rust_import_guess", "import_guess.rs", CBM_LANG_RUST,
          "use std::env::split_paths as imported;\nfn split_paths(_: &str) {}\n"
          "fn caller() { imported(\"x\"); }\n", 0, NULL},
+        {"rust_closure_param", "closure_param.rs", CBM_LANG_RUST,
+         "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
+         "fn caller(workers: &[Worker]) { workers.iter().for_each(|w| w.work()); }\n",
+         1, "rust_call_gate.closure_param.Worker.work"},
         {"c_exact", "exact.c", CBM_LANG_C,
          "void target(void) {}\nvoid caller(void) { target(); }\n",
          1, "rust_call_gate.exact.target"},

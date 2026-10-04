@@ -3901,6 +3901,17 @@ static const CBMType *rust_std_method_return(RustLSPContext *ctx, const CBMType 
                                              const char *method, const RustStdCall *call) {
     const CBMType *cur = rust_strip_references(recv);
     for (int hop = 0; cur && hop < RUST_DEREF_MAX_HOPS; hop++) {
+        if (cur->kind == CBM_TYPE_SLICE) {
+            /* `[T]` has the slice methods the Vec entries declare. */
+            const CBMType *elem = cur->data.slice.elem;
+            const RustStdReturn *se = elem && strcmp(method, "clone") != 0
+                                          ? rust_std_return_entry(RUST_STD_VEC, method, true)
+                                          : NULL;
+            return se ? rust_std_return_type(
+                            ctx, se->ret, cbm_type_template(ctx->arena, "alloc.vec.Vec", &elem, 1),
+                            call)
+                      : NULL;
+        }
         RustStdFamily fam = rust_std_family_of(ctx, rust_std_type_head(cur));
         const char *head = rust_std_type_head(cur);
         bool wrapper = head && rust_wrapper_head_derefs(ctx, head);
@@ -3929,6 +3940,303 @@ static const CBMType *rust_std_method_return(RustLSPContext *ctx, const CBMType 
         cur = rust_strip_references(rust_deref_step(ctx, cur));
     }
     return NULL;
+}
+
+/* The std receiver a closure-taking method is declared on. */
+typedef enum {
+    RUST_CLOSURE_RECV_NONE,
+    RUST_CLOSURE_RECV_OPTION, /* Option<T> */
+    RUST_CLOSURE_RECV_RESULT, /* Result<T, E> */
+    RUST_CLOSURE_RECV_ITER,   /* Iterator<Item = T> */
+    RUST_CLOSURE_RECV_SEQ,    /* Vec<T>, [T] */
+    RUST_CLOSURE_RECV_SET,    /* VecDeque<T>, HashSet<T>, BTreeSet<T> */
+    RUST_CLOSURE_RECV_MAP,    /* HashMap<T, E>, BTreeMap<T, E> */
+} RustClosureRecv;
+
+/* The parameters a std method declares for the closure it takes as argument
+ * `arg`: one RUST_STD_RETURNS spec per parameter, comma-separated, written
+ * over the receiver (`T` / `E` its first / second generic argument, `A` the
+ * call's first argument, `_` a parameter the receiver does not fix). */
+typedef struct {
+    RustClosureRecv recv;
+    const char *method;
+    int arg;
+    const char *params;
+} RustStdClosureParams;
+
+static const RustStdClosureParams RUST_STD_CLOSURE_PARAMS[] = {
+    {RUST_CLOSURE_RECV_OPTION, "map", 0, "T"},
+    {RUST_CLOSURE_RECV_OPTION, "and_then", 0, "T"},
+    {RUST_CLOSURE_RECV_OPTION, "is_some_and", 0, "T"},
+    {RUST_CLOSURE_RECV_OPTION, "is_none_or", 0, "T"},
+    {RUST_CLOSURE_RECV_OPTION, "filter", 0, "&T"},
+    {RUST_CLOSURE_RECV_OPTION, "inspect", 0, "&T"},
+    {RUST_CLOSURE_RECV_OPTION, "take_if", 0, "&T"},
+    {RUST_CLOSURE_RECV_OPTION, "map_or", 1, "T"},
+    {RUST_CLOSURE_RECV_OPTION, "map_or_else", 1, "T"},
+    {RUST_CLOSURE_RECV_RESULT, "map", 0, "T"},
+    {RUST_CLOSURE_RECV_RESULT, "and_then", 0, "T"},
+    {RUST_CLOSURE_RECV_RESULT, "is_ok_and", 0, "T"},
+    {RUST_CLOSURE_RECV_RESULT, "inspect", 0, "&T"},
+    {RUST_CLOSURE_RECV_RESULT, "map_or", 1, "T"},
+    {RUST_CLOSURE_RECV_RESULT, "map_or_else", 1, "T"},
+    {RUST_CLOSURE_RECV_RESULT, "map_or_else", 0, "E"},
+    {RUST_CLOSURE_RECV_RESULT, "map_err", 0, "E"},
+    {RUST_CLOSURE_RECV_RESULT, "or_else", 0, "E"},
+    {RUST_CLOSURE_RECV_RESULT, "unwrap_or_else", 0, "E"},
+    {RUST_CLOSURE_RECV_RESULT, "is_err_and", 0, "E"},
+    {RUST_CLOSURE_RECV_RESULT, "inspect_err", 0, "&E"},
+    {RUST_CLOSURE_RECV_ITER, "map", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "for_each", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "try_for_each", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "filter_map", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "flat_map", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "find_map", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "map_while", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "any", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "all", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "position", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "rposition", 0, "T"},
+    {RUST_CLOSURE_RECV_ITER, "filter", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "find", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "rfind", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "take_while", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "skip_while", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "inspect", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "partition", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "max_by_key", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "min_by_key", 0, "&T"},
+    {RUST_CLOSURE_RECV_ITER, "max_by", 0, "&T,&T"},
+    {RUST_CLOSURE_RECV_ITER, "min_by", 0, "&T,&T"},
+    {RUST_CLOSURE_RECV_ITER, "reduce", 0, "T,T"},
+    {RUST_CLOSURE_RECV_ITER, "fold", 1, "A,T"},
+    {RUST_CLOSURE_RECV_SEQ, "retain", 0, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "retain_mut", 0, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "dedup_by_key", 0, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "dedup_by", 0, "&T,&T"},
+    {RUST_CLOSURE_RECV_SEQ, "sort_by", 0, "&T,&T"},
+    {RUST_CLOSURE_RECV_SEQ, "sort_unstable_by", 0, "&T,&T"},
+    {RUST_CLOSURE_RECV_SEQ, "sort_by_key", 0, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "sort_unstable_by_key", 0, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "sort_by_cached_key", 0, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "binary_search_by", 0, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "binary_search_by_key", 1, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "partition_point", 0, "&T"},
+    {RUST_CLOSURE_RECV_SEQ, "chunk_by", 0, "&T,&T"},
+    {RUST_CLOSURE_RECV_SEQ, "split", 0, "&T"},
+    {RUST_CLOSURE_RECV_SET, "retain", 0, "&T"},
+    {RUST_CLOSURE_RECV_MAP, "retain", 0, "&T,&E"},
+    {RUST_CLOSURE_RECV_NONE, NULL, 0, NULL}};
+
+enum { RUST_CLOSURE_PARAM_MAX = 2 };
+
+static bool rust_std_closure_method_known(const char *method, int arg) {
+    for (const RustStdClosureParams *e = RUST_STD_CLOSURE_PARAMS; e->method; e++) {
+        if (e->arg == arg && strcmp(e->method, method) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The receiver class of `*self` (references stripped). A slice is rewritten
+ * to the `Vec` of its element so the specs read `T` off it. */
+static RustClosureRecv rust_closure_recv_of(RustLSPContext *ctx, const CBMType **self) {
+    static const char *const iters[] = {"core.iter.Iterator", "std.iter.Iterator", NULL};
+    static const char *const sets[] = {"std.collections.VecDeque",
+                                       "alloc.collections.VecDeque",
+                                       "std.collections.HashSet",
+                                       "std.collections.BTreeSet",
+                                       "alloc.collections.BTreeSet",
+                                       NULL};
+    static const char *const maps[] = {"std.collections.HashMap", "std.collections.BTreeMap",
+                                       "alloc.collections.BTreeMap", NULL};
+    const CBMType *t = *self;
+    if (t->kind == CBM_TYPE_SLICE) {
+        const CBMType *elem = t->data.slice.elem;
+        if (!elem) {
+            return RUST_CLOSURE_RECV_NONE;
+        }
+        *self = cbm_type_template(ctx->arena, "alloc.vec.Vec", &elem, 1);
+        return RUST_CLOSURE_RECV_SEQ;
+    }
+    const char *head = rust_std_type_head(t);
+    if (!head) {
+        return RUST_CLOSURE_RECV_NONE;
+    }
+    switch (rust_std_family_of(ctx, head)) {
+    case RUST_STD_OPTION:
+        return RUST_CLOSURE_RECV_OPTION;
+    case RUST_STD_RESULT:
+        return RUST_CLOSURE_RECV_RESULT;
+    case RUST_STD_VEC:
+        return RUST_CLOSURE_RECV_SEQ;
+    case RUST_STD_NONE:
+        break;
+    default:
+        return RUST_CLOSURE_RECV_NONE;
+    }
+    const char *qn = convert_path_to_qn(ctx->arena, head);
+    const char *registered = rust_registered_type_qn(ctx, qn);
+    if (registered) {
+        qn = registered;
+    } else if (!strchr(qn, '.')) {
+        const char *imported = rust_resolve_use(ctx, qn);
+        qn = imported ? convert_path_to_qn(ctx->arena, imported) : rust_lookup_prelude(qn);
+    }
+    if (!qn) {
+        return RUST_CLOSURE_RECV_NONE;
+    }
+    if (rust_method_in(iters, qn)) {
+        return RUST_CLOSURE_RECV_ITER;
+    }
+    if (rust_method_in(sets, qn)) {
+        return RUST_CLOSURE_RECV_SET;
+    }
+    return rust_method_in(maps, qn) ? RUST_CLOSURE_RECV_MAP : RUST_CLOSURE_RECV_NONE;
+}
+
+/* The method call `closure` is an argument of: its `receiver.method`
+ * field_expression in `*callee`, its argument list in `*args`, and the
+ * closure's position among the arguments as the result; -1 when the closure
+ * is no method-call argument. */
+static int rust_closure_method_call(TSNode closure, TSNode *callee, TSNode *args) {
+    *args = ts_node_parent(closure);
+    if (ts_node_is_null(*args) || strcmp(ts_node_type(*args), "arguments") != 0) {
+        return -1;
+    }
+    TSNode call = ts_node_parent(*args);
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+        return -1;
+    }
+    *callee = ts_node_child_by_field_name(call, "function", 8);
+    if (!ts_node_is_null(*callee) && strcmp(ts_node_type(*callee), "generic_function") == 0) {
+        *callee = ts_node_child_by_field_name(*callee, "function", 8);
+    }
+    if (ts_node_is_null(*callee) || strcmp(ts_node_type(*callee), "field_expression") != 0) {
+        return -1;
+    }
+    int index = 0;
+    uint32_t n = ts_node_named_child_count(*args);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(*args, i);
+        if (ts_node_eq(c, closure)) {
+            return index;
+        }
+        const char *k = ts_node_type(c);
+        index += strcmp(k, "line_comment") != 0 && strcmp(k, "block_comment") != 0;
+    }
+    return -1;
+}
+
+/* The parameter types the std method `closure` is passed to declares for
+ * it, written into `out[RUST_CLOSURE_PARAM_MAX]` (unknown where nothing is
+ * proven): the method is found on the receiver's proven type as autoderef
+ * finds it — the type itself, then the targets of std wrappers — and its
+ * declared closure signature is read with the receiver's type arguments
+ * substituted. A receiver that is no std type with a table entry, or whose
+ * type argument is unknown, leaves the parameter unknown. */
+static void rust_std_closure_param_types(RustLSPContext *ctx, TSNode closure,
+                                         const CBMType **out) {
+    for (int i = 0; i < RUST_CLOSURE_PARAM_MAX; i++) {
+        out[i] = cbm_type_unknown();
+    }
+    TSNode callee;
+    TSNode args;
+    int arg = rust_closure_method_call(closure, &callee, &args);
+    TSNode value = {0};
+    TSNode field = {0};
+    if (arg >= 0) {
+        value = ts_node_child_by_field_name(callee, "value", 5);
+        field = ts_node_child_by_field_name(callee, "field", 5);
+    }
+    char *method = ts_node_is_null(field) ? NULL : rust_node_text(ctx, field);
+    if (ts_node_is_null(value) || !method || !rust_std_closure_method_known(method, arg)) {
+        return;
+    }
+    const CBMType *cur = rust_strip_references(rust_eval_expr_type(ctx, value));
+    for (int hop = 0; cur && !cbm_type_is_unknown(cur) && hop < RUST_DEREF_MAX_HOPS; hop++) {
+        const CBMType *self = cur;
+        RustClosureRecv recv = rust_closure_recv_of(ctx, &self);
+        if (recv != RUST_CLOSURE_RECV_NONE) {
+            for (const RustStdClosureParams *e = RUST_STD_CLOSURE_PARAMS; e->method; e++) {
+                if (e->recv != recv || e->arg != arg || strcmp(e->method, method) != 0) {
+                    continue;
+                }
+                RustStdCall call = {args, {0}};
+                const char *sp = e->params;
+                for (int i = 0; i < RUST_CLOSURE_PARAM_MAX && *sp; i++) {
+                    const CBMType *t = rust_std_spec_parse(ctx, &sp, self, &call);
+                    out[i] = t ? t : cbm_type_unknown();
+                    sp += *sp == ',' ? 1 : 0;
+                }
+                return;
+            }
+            return;
+        }
+        const char *head = rust_std_type_head(cur);
+        if (!head || !rust_wrapper_head_derefs(ctx, head) ||
+            rust_is_wrapper_trait_method(method) ||
+            rust_wrapper_has_corpus_trait_method(ctx, cur, method)) {
+            return;
+        }
+        cur = rust_strip_references(rust_deref_step(ctx, cur));
+    }
+}
+
+/* The Item `t` yields as an `IntoIterator`: the element of a slice, `Vec`,
+ * set or `Option`, the Item of an `Iterator`. NULL for any other type (a map
+ * yields pairs) and for an unknown element. */
+static const CBMType *rust_std_into_iter_item(RustLSPContext *ctx, const CBMType *t) {
+    const CBMType *self = rust_strip_references(t);
+    if (!self || cbm_type_is_unknown(self)) {
+        return NULL;
+    }
+    RustClosureRecv recv = rust_closure_recv_of(ctx, &self);
+    if (recv == RUST_CLOSURE_RECV_NONE || recv == RUST_CLOSURE_RECV_MAP ||
+        recv == RUST_CLOSURE_RECV_RESULT || self->kind != CBM_TYPE_TEMPLATE ||
+        self->data.template_type.arg_count < 1) {
+        return NULL;
+    }
+    const CBMType *item = self->data.template_type.template_args[0];
+    return item && !cbm_type_is_unknown(item) ? item : NULL;
+}
+
+/* The declared return of an `Iterator<Item = T>` adapter that its argument
+ * fixes: `map` yields what the closure returns, `filter_map` and `find_map`
+ * the `Option` it returns (its argument as the next Item, or itself),
+ * `flat_map` the Item of what it returns, `flatten` the Item of T, `zip`
+ * pairs T with the argument's Item. NULL for any other head or method, and
+ * where the argument does not prove the type. */
+static const CBMType *rust_std_iter_adapter_return(RustLSPContext *ctx, const CBMType *iter,
+                                                   const char *method, const RustStdCall *call) {
+    if (strcmp(iter->data.template_type.template_name, "core.iter.Iterator") != 0 ||
+        iter->data.template_type.arg_count < 1) {
+        return NULL;
+    }
+    const CBMType *own = iter->data.template_type.template_args[0];
+    if (strcmp(method, "map") == 0) {
+        return rust_std_return_type(ctx, "core.iter.Iterator<F>", iter, call);
+    }
+    if (strcmp(method, "filter_map") == 0) {
+        return rust_std_return_type(ctx, "core.iter.Iterator<?F>", iter, call);
+    }
+    if (strcmp(method, "find_map") == 0) {
+        return rust_std_return_type(ctx, "F", iter, call);
+    }
+    const CBMType *item = NULL;
+    TSNode first = rust_std_call_first_arg(call);
+    if (strcmp(method, "flatten") == 0) {
+        item = rust_std_into_iter_item(ctx, own);
+    } else if (strcmp(method, "flat_map") == 0) {
+        item = rust_std_into_iter_item(ctx, rust_std_callable_return(ctx, first, own));
+    } else if (strcmp(method, "zip") == 0 && !ts_node_is_null(first) && own &&
+               !cbm_type_is_unknown(own)) {
+        const CBMType *pair[2] = {own,
+                                  rust_std_into_iter_item(ctx, rust_eval_expr_type(ctx, first))};
+        item = pair[1] ? cbm_type_tuple(ctx->arena, pair, 2) : NULL;
+    }
+    return item ? cbm_type_template(ctx->arena, "core.iter.Iterator", &item, 1) : NULL;
 }
 
 /* A std function in RUST_STD_PRODUCERS the path `func_node` names: its
@@ -4268,6 +4576,11 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                     }
                     if (strstr(tname, "Iterator")) {
                         /* map/filter/take/skip/rev/chain → Iterator (with the relevant elem) */
+                        const CBMType *adapted =
+                            rust_std_iter_adapter_return(ctx, base, mname, &call);
+                        if (adapted) {
+                            return adapted;
+                        }
                         if (strcmp(mname, "collect") == 0) {
                             /* Often Vec<Item>; without turbofish info we model as Vec<elem>. */
                             if (base->data.template_type.arg_count > 0) {
@@ -4282,7 +4595,10 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                         if (strcmp(mname, "next") == 0 || strcmp(mname, "last") == 0 ||
                             strcmp(mname, "nth") == 0 || strcmp(mname, "find") == 0 ||
                             strcmp(mname, "max") == 0 || strcmp(mname, "min") == 0 ||
-                            strcmp(mname, "max_by") == 0 || strcmp(mname, "min_by") == 0) {
+                            strcmp(mname, "max_by") == 0 || strcmp(mname, "min_by") == 0 ||
+                            strcmp(mname, "max_by_key") == 0 ||
+                            strcmp(mname, "min_by_key") == 0 || strcmp(mname, "rfind") == 0 ||
+                            strcmp(mname, "next_back") == 0) {
                             if (base->data.template_type.arg_count > 0) {
                                 const CBMType *a0 = base->data.template_type.template_args[0];
                                 return cbm_type_template(ctx->arena, "core.option.Option", &a0,
@@ -4294,6 +4610,7 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                             strcmp(mname, "cloned") == 0 || strcmp(mname, "copied") == 0 ||
                             strcmp(mname, "step_by") == 0 || strcmp(mname, "fuse") == 0 ||
                             strcmp(mname, "peekable") == 0 || strcmp(mname, "by_ref") == 0 ||
+                            strcmp(mname, "chain") == 0 ||
                             strcmp(mname, "take_while") == 0 ||
                             strcmp(mname, "skip_while") == 0 || strcmp(mname, "inspect") == 0) {
                             return base; /* preserves Iterator<Item> */
@@ -4349,13 +4666,14 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                                                          1);
                             }
                         }
-                        if (strcmp(mname, "keys") == 0 &&
+                        if ((strcmp(mname, "keys") == 0 || strcmp(mname, "into_keys") == 0) &&
                             base->data.template_type.arg_count > 0) {
                             return cbm_type_template(ctx->arena, "core.iter.Iterator",
                                                      &base->data.template_type.template_args[0],
                                                      1);
                         }
-                        if (strcmp(mname, "values") == 0 &&
+                        if ((strcmp(mname, "values") == 0 || strcmp(mname, "values_mut") == 0 ||
+                             strcmp(mname, "into_values") == 0) &&
                             base->data.template_type.arg_count > 1) {
                             return cbm_type_template(ctx->arena, "core.iter.Iterator",
                                                      &base->data.template_type.template_args[1],
@@ -10503,54 +10821,6 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     /* Resolve a call expression. */
     if (strcmp(kind, "call_expression") == 0) {
         rust_resolve_call_expression(ctx, node);
-        /* Closure-parameter inference: when the call is a known
-         * iterator-style method that takes a closure of `Item`, stash
-         * the receiver's element type so the closure_expression child
-         * binds its first param to it. We compute this here (after
-         * the call edge is emitted) so the recursion picks it up. */
-        TSNode fn = ts_node_child_by_field_name(node, "function", 8);
-        if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "field_expression") == 0) {
-            TSNode val = ts_node_child_by_field_name(fn, "value", 5);
-            TSNode fld = ts_node_child_by_field_name(fn, "field", 5);
-            if (!ts_node_is_null(val) && !ts_node_is_null(fld)) {
-                char *mname = rust_node_text(ctx, fld);
-                static const char *item_methods[] = {
-                    "map",    "filter",     "for_each",   "find",        "position", "any",
-                    "all",    "take_while", "skip_while", "filter_map",  "inspect",  "max_by",
-                    "min_by", "max_by_key", "min_by_key", "sort_by_key", NULL};
-                bool is_item_method = false;
-                if (mname) {
-                    for (const char **mm = item_methods; *mm; mm++) {
-                        if (strcmp(mname, *mm) == 0) {
-                            is_item_method = true;
-                            break;
-                        }
-                    }
-                }
-                if (is_item_method) {
-                    const CBMType *recv = rust_eval_expr_type(ctx, val);
-                    const CBMType *base = recv;
-                    while (base &&
-                           (base->kind == CBM_TYPE_REFERENCE || base->kind == CBM_TYPE_POINTER)) {
-                        base = (base->kind == CBM_TYPE_REFERENCE) ? base->data.reference.elem
-                                                                  : base->data.pointer.elem;
-                    }
-                    if (base && base->kind == CBM_TYPE_TEMPLATE &&
-                        base->data.template_type.arg_count > 0) {
-                        const char *tn = base->data.template_type.template_name;
-                        if (tn && (strstr(tn, "Iterator") || strstr(tn, "Vec") ||
-                                   strstr(tn, "VecDeque") || strstr(tn, "Option") ||
-                                   strstr(tn, "Result") || strstr(tn, "HashSet") ||
-                                   strstr(tn, "BTreeSet") || strstr(tn, "Slice"))) {
-                            ctx->pending_closure_param_type =
-                                base->data.template_type.template_args[0];
-                        }
-                    } else if (base && base->kind == CBM_TYPE_SLICE) {
-                        ctx->pending_closure_param_type = base->data.slice.elem;
-                    }
-                }
-            }
-        }
         /* Continue recursion so calls inside arguments are also seen. */
     }
 
@@ -10788,41 +11058,26 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         }
     }
 
-    /* closure_expression: bind closure parameters.
-     *
-     * Priority order for each param:
-     *   1. Explicit type annotation (`|n: &i32|`) — use it directly.
-     *   2. `ctx->pending_closure_param_type` for the FIRST param when the
-     *      surrounding call resolver inferred one (`.map(|x| ...)` on
-     *      Iterator<T>).
-     *   3. Otherwise unknown.
-     *
-     * After binding, clear the pending type so it doesn't leak into a
-     * sibling closure. */
+    /* closure_expression: bind closure parameters. A written type
+     * (`|n: &i32|`) binds the parameter to it; otherwise the std method the
+     * closure is passed to declares it (rust_std_closure_param_types);
+     * otherwise it is unknown. */
     if (strcmp(kind, "closure_expression") == 0) {
-        const CBMType *hint = ctx->pending_closure_param_type;
-        ctx->pending_closure_param_type = NULL;
+        const CBMType *declared[RUST_CLOSURE_PARAM_MAX];
+        rust_std_closure_param_types(ctx, node, declared);
         TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
-        if (!ts_node_is_null(params)) {
-            uint32_t pc = ts_node_named_child_count(params);
-            for (uint32_t i = 0; i < pc; i++) {
-                TSNode p = ts_node_named_child(params, i);
-                /* For `parameter`-shaped nodes, peel off the type
-                 * annotation if present; otherwise treat the whole node
-                 * as the pattern. */
-                TSNode pat = p;
-                const CBMType *bound = (i == 0 && hint) ? hint : cbm_type_unknown();
-                if (strcmp(ts_node_type(p), "parameter") == 0) {
-                    TSNode tn = ts_node_child_by_field_name(p, "type", 4);
-                    TSNode pn = ts_node_child_by_field_name(p, "pattern", 7);
-                    if (!ts_node_is_null(pn))
-                        pat = pn;
-                    if (!ts_node_is_null(tn)) {
-                        bound = rust_parse_type_node(ctx, tn);
-                    }
-                }
-                rust_bind_pattern(ctx, pat, bound);
+        uint32_t pc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+        for (uint32_t i = 0; i < pc; i++) {
+            TSNode p = ts_node_named_child(params, i);
+            TSNode pat = p;
+            const CBMType *bound = i < RUST_CLOSURE_PARAM_MAX ? declared[i] : cbm_type_unknown();
+            if (strcmp(ts_node_type(p), "parameter") == 0) {
+                TSNode tn = ts_node_child_by_field_name(p, "type", 4);
+                TSNode pn = ts_node_child_by_field_name(p, "pattern", 7);
+                pat = ts_node_is_null(pn) ? p : pn;
+                bound = ts_node_is_null(tn) ? bound : rust_parse_type_node(ctx, tn);
             }
+            rust_bind_pattern(ctx, pat, bound);
         }
     }
 
@@ -11449,7 +11704,6 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     const char *saved_trait_spelling = ctx->self_trait_spelling;
     const char *saved_impl_key = ctx->enclosing_impl_key;
     const char *saved_func_qn = ctx->enclosing_func_qn;
-    const CBMType *saved_closure_param = ctx->pending_closure_param_type;
     const CBMType *saved_match = ctx->pending_match_type;
     int saved_flow_depth = ctx->callable_control_flow_depth;
 
@@ -11462,7 +11716,6 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     ctx->self_trait_qn = NULL;
     ctx->self_trait_spelling = NULL;
     ctx->enclosing_impl_key = NULL;
-    ctx->pending_closure_param_type = NULL;
     ctx->pending_match_type = NULL;
     ctx->callable_control_flow_depth = 0;
 
@@ -11497,7 +11750,6 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     ctx->self_trait_spelling = saved_trait_spelling;
     ctx->enclosing_impl_key = saved_impl_key;
     ctx->enclosing_func_qn = saved_func_qn;
-    ctx->pending_closure_param_type = saved_closure_param;
     ctx->pending_match_type = saved_match;
     ctx->callable_control_flow_depth = saved_flow_depth;
 }
