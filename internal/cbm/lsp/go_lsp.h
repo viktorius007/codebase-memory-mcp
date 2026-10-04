@@ -104,6 +104,9 @@ typedef struct {
      * a decorator rebinds the function name, so the undecorated definition is
      * not automatically an exact callable-value target. */
     const char **decorators;
+    /* Rust-only: type parameter names the function declares on itself
+     * (`fn f<T>`), NULL-ended, NULL when none. */
+    const char **type_params;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

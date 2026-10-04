@@ -58,6 +58,10 @@ typedef struct {
      * `fn(A)`), its param_types the declared argument types; NULL for any
      * other parameter. NULL when no parameter takes a callable. */
     const CBMType *const *rust_callable_params;
+    /* Rust only: type parameter names the function declares on itself
+     * (`fn f<T, U>`), NULL-ended, NULL when none. `type_param_names` holds
+     * the enclosing impl's parameters by self-type position instead. */
+    const char **rust_fn_type_params;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.
