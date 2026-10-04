@@ -621,6 +621,116 @@ TEST(rustlsp_match_payload_shadows_outer_binding) {
     PASS();
 }
 
+/* ── Binding scope: an initializer runs before its pattern binds ── */
+
+#define RUSTLSP_REBIND_PRELUDE                           \
+    "struct Old; struct New;\n"                          \
+    "impl Old {\n"                                       \
+    "    fn step(&self) -> Option<New> { None }\n"       \
+    "    fn plain(&self) -> New { New }\n"               \
+    "    fn items(&self) -> Vec<New> { Vec::new() }\n"   \
+    "    fn ok(&self) -> bool { true }\n"                \
+    "}\n"                                                \
+    "impl New {\n"                                       \
+    "    fn step(&self) -> Option<New> { None }\n"       \
+    "    fn plain(&self) -> New { New }\n"               \
+    "    fn items(&self) -> Vec<New> { Vec::new() }\n"   \
+    "    fn ok(&self) -> bool { true }\n"                \
+    "    fn after(&self) {}\n"                           \
+    "}\n"                                                \
+    "fn pass(n: New) -> New { n }\n"
+
+/* Resolves `body` as `fn run(x: Old)` after the rebind prelude; true when
+ * `run` links every callee of the space-separated `want` and none of
+ * `wrong`. */
+static bool rustlsp_rebind_links(const char *body, const char *want, const char *wrong) {
+    char src[2048];
+    snprintf(src, sizeof(src), "%sfn run(x: Old) {\n%s\n}\n", RUSTLSP_REBIND_PRELUDE, body);
+    CBMFileResult *r = extract_rust(src);
+    if (!r) {
+        return false;
+    }
+    bool ok = true;
+    const char *lists[2] = {want, wrong};
+    for (int l = 0; l < 2; l++) {
+        char names[256];
+        snprintf(names, sizeof(names), "%s", lists[l]);
+        for (char *name = strtok(names, " "); name; name = strtok(NULL, " ")) {
+            bool linked = find_confident(&r->resolved_calls, "main.run", name) >= 0;
+            if (linked != (l == 0)) {
+                printf("  rebind: `%s` %s\n", name, linked ? "linked (wrong)" : "not linked");
+                ok = false;
+            }
+        }
+    }
+    cbm_free_result(r);
+    return ok;
+}
+
+TEST(rustlsp_let_initializer_reads_previous_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links("    let x = x.plain();\n    x.after();",
+                                     "Old.plain New.after", "New.plain"));
+    ASSERT_TRUE(rustlsp_rebind_links("    let x = pass(x.plain());\n    x.after();",
+                                     "Old.plain New.after main.pass", "New.plain"));
+    PASS();
+}
+
+TEST(rustlsp_let_else_block_reads_previous_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links("    let Some(x) = x.step() else { x.plain(); return; };\n"
+                                     "    x.after();",
+                                     "Old.step Old.plain New.after", "New.step New.plain"));
+    PASS();
+}
+
+TEST(rustlsp_if_let_scrutinee_reads_previous_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links("    if let Some(x) = x.step() { x.after(); }",
+                                     "Old.step New.after", "New.step"));
+    PASS();
+}
+
+TEST(rustlsp_if_let_else_branch_reads_previous_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    if let Some(x) = x.step() { x.after(); } else { x.plain(); }",
+        "Old.step New.after Old.plain", "New.step New.plain"));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    if let Some(x) = x.step() { x.after(); } else if x.ok() { x.plain(); }",
+        "Old.step New.after Old.ok Old.plain", "New.step New.ok New.plain"));
+    PASS();
+}
+
+TEST(rustlsp_while_let_scrutinee_reads_previous_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links("    while let Some(x) = x.step() { x.after(); }",
+                                     "Old.step New.after", "New.step"));
+    PASS();
+}
+
+TEST(rustlsp_let_chain_binds_in_condition_order) {
+    /* The first scrutinee reads the parameter; the conditions after it and
+     * the body read the binding the first condition introduced. */
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    if let Some(x) = x.step() && x.ok() && let Some(y) = x.plain().step() { y.after(); }",
+        "Old.step New.ok New.plain New.step New.after", "Old.ok Old.plain"));
+    ASSERT_TRUE(rustlsp_rebind_links("    if x.ok() && let Some(x) = x.step() { x.after(); }",
+                                     "Old.ok Old.step New.after", "New.ok New.step"));
+    PASS();
+}
+
+TEST(rustlsp_for_iterable_reads_previous_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links("    for x in x.items() { x.after(); }",
+                                     "Old.items New.after", "New.items"));
+    PASS();
+}
+
+TEST(rustlsp_match_scrutinee_reads_previous_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    match x.step() { Some(x) => { x.after(); } None => { x.plain(); } }",
+        "Old.step New.after Old.plain", "New.step New.plain"));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    match x.step() { Some(x) if x.ok() => { x.after(); } _ => {} }",
+        "Old.step New.ok New.after", "New.step Old.ok"));
+    PASS();
+}
+
 /* ── Category 7: Macros ───────────────────────────────────────── */
 
 TEST(rustlsp_println_macro) {
@@ -11649,6 +11759,14 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_for_loop_vec);
     RUN_TEST(rustlsp_match_arm_binding);
     RUN_TEST(rustlsp_match_payload_shadows_outer_binding);
+    RUN_TEST(rustlsp_let_initializer_reads_previous_binding);
+    RUN_TEST(rustlsp_let_else_block_reads_previous_binding);
+    RUN_TEST(rustlsp_if_let_scrutinee_reads_previous_binding);
+    RUN_TEST(rustlsp_if_let_else_branch_reads_previous_binding);
+    RUN_TEST(rustlsp_while_let_scrutinee_reads_previous_binding);
+    RUN_TEST(rustlsp_let_chain_binds_in_condition_order);
+    RUN_TEST(rustlsp_for_iterable_reads_previous_binding);
+    RUN_TEST(rustlsp_match_scrutinee_reads_previous_binding);
 
     /* Macros */
     RUN_TEST(rustlsp_println_macro);
