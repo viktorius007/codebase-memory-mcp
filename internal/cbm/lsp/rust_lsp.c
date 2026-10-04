@@ -3096,7 +3096,9 @@ static const char *rust_alias_head_qn(RustLSPContext *ctx, const char *head) {
     return registered ? registered : qn;
 }
 
-/* Std types whose methods' returns are declared in RUST_STD_RETURNS. */
+/* Std types whose methods' returns are declared in RUST_STD_RETURNS, and
+ * the tokio locks declared beside them: a dependency's public signatures are
+ * declared like std's, never read from its source. */
 typedef enum {
     RUST_STD_NONE,
     RUST_STD_OPTION,
@@ -3116,6 +3118,8 @@ typedef enum {
     RUST_STD_ANY,
     RUST_STD_ERROR,
     RUST_STD_ONCELOCK,
+    RUST_TOKIO_MUTEX,
+    RUST_TOKIO_RWLOCK,
 } RustStdFamily;
 
 typedef struct {
@@ -3142,7 +3146,8 @@ static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
     {RUST_STD_VEC, "alloc.vec.Vec"},          {RUST_STD_VEC, "std.vec.Vec"},
     {RUST_STD_ANY, "core.any.Any"},           {RUST_STD_ANY, "std.any.Any"},
     {RUST_STD_ERROR, "core.error.Error"},     {RUST_STD_ERROR, "std.error.Error"},
-    {RUST_STD_ONCELOCK, "std.sync.OnceLock"}, {RUST_STD_NONE, NULL}};
+    {RUST_STD_ONCELOCK, "std.sync.OnceLock"}, {RUST_TOKIO_MUTEX, "tokio.sync.Mutex"},
+    {RUST_TOKIO_RWLOCK, "tokio.sync.RwLock"}, {RUST_STD_NONE, NULL}};
 
 /* A std method's declared return, written over the receiver: `Self` is the
  * receiver, `T` / `E` its first / second generic argument, `_` a type the
@@ -3150,7 +3155,8 @@ static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
  * `[X]` a slice, `()` unit; a lowercase name is a builtin, a dotted name a
  * std type. Over the call: `A` is the first argument's type, `F` what the
  * first argument returns when it is a closure (its first parameter typed
- * `T`), `G` the first turbofish argument; `*X` is X's Deref target and `?X`
+ * `T`), `G` the first turbofish argument, `O` what awaiting the second
+ * argument yields (`timeout(d, fut)`); `*X` is X's Deref target and `?X`
  * X's first generic argument. `assoc_only` marks an associated function
  * taking the receiver as its first argument (`Arc::downgrade(&a)`), never a
  * method call. */
@@ -3167,6 +3173,9 @@ typedef struct {
 #define RS_PATHBUF "std.path.PathBuf"
 #define RS_OSSTR "std.ffi.OsStr"
 #define RS_ITER(x) "core.iter.Iterator<" x ">"
+/* What an `async fn` or a function returning `impl Future<Output = X>`
+ * returns before `.await`. */
+#define RS_FUT(x) "core.future.Future<" x ">"
 
 static const RustStdReturn RUST_STD_RETURNS[] = {
     /* Option<T> */
@@ -3290,6 +3299,25 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_RWLOCK, "get_mut", RS_RES("&T", "_"), false},
     {RUST_STD_RWLOCK, "is_poisoned", "bool", false},
     {RUST_STD_RWLOCK, "clear_poison", "()", false},
+    /* tokio::sync::Mutex<T>: `lock` is async and does not poison. */
+    {RUST_TOKIO_MUTEX, "lock", RS_FUT("tokio.sync.MutexGuard<T>"), false},
+    {RUST_TOKIO_MUTEX, "lock_owned", RS_FUT("tokio.sync.OwnedMutexGuard<T>"), false},
+    {RUST_TOKIO_MUTEX, "blocking_lock", "tokio.sync.MutexGuard<T>", false},
+    {RUST_TOKIO_MUTEX, "try_lock", RS_RES("tokio.sync.MutexGuard<T>", "_"), false},
+    {RUST_TOKIO_MUTEX, "try_lock_owned", RS_RES("tokio.sync.OwnedMutexGuard<T>", "_"), false},
+    {RUST_TOKIO_MUTEX, "into_inner", "T", false},
+    {RUST_TOKIO_MUTEX, "get_mut", "&T", false},
+    /* tokio::sync::RwLock<T> */
+    {RUST_TOKIO_RWLOCK, "read", RS_FUT("tokio.sync.RwLockReadGuard<T>"), false},
+    {RUST_TOKIO_RWLOCK, "write", RS_FUT("tokio.sync.RwLockWriteGuard<T>"), false},
+    {RUST_TOKIO_RWLOCK, "read_owned", RS_FUT("tokio.sync.OwnedRwLockReadGuard<T>"), false},
+    {RUST_TOKIO_RWLOCK, "write_owned", RS_FUT("tokio.sync.OwnedRwLockWriteGuard<T>"), false},
+    {RUST_TOKIO_RWLOCK, "blocking_read", "tokio.sync.RwLockReadGuard<T>", false},
+    {RUST_TOKIO_RWLOCK, "blocking_write", "tokio.sync.RwLockWriteGuard<T>", false},
+    {RUST_TOKIO_RWLOCK, "try_read", RS_RES("tokio.sync.RwLockReadGuard<T>", "_"), false},
+    {RUST_TOKIO_RWLOCK, "try_write", RS_RES("tokio.sync.RwLockWriteGuard<T>", "_"), false},
+    {RUST_TOKIO_RWLOCK, "into_inner", "T", false},
+    {RUST_TOKIO_RWLOCK, "get_mut", "&T", false},
     /* RefCell<T> / Cell<T> */
     {RUST_STD_REFCELL, "borrow", "core.cell.Ref<T>", false},
     {RUST_STD_REFCELL, "borrow_mut", "core.cell.RefMut<T>", false},
@@ -3451,12 +3479,19 @@ static const RustStdProducer RUST_STD_PRODUCERS[] = {
     {"mem.ManuallyDrop.into_inner", "?A"},
     {NULL, NULL}};
 
+/* Functions of a dependency crate, each under its full path. */
+static const RustStdProducer RUST_DEP_PRODUCERS[] = {
+    {"tokio.time.timeout", RS_FUT(RS_RES("O", "tokio.time.error.Elapsed"))},
+    {"tokio.time.timeout_at", RS_FUT(RS_RES("O", "tokio.time.error.Elapsed"))},
+    {NULL, NULL}};
+
 #undef RS_OPT
 #undef RS_RES
 #undef RS_PATH
 #undef RS_PATHBUF
 #undef RS_OSSTR
 #undef RS_ITER
+#undef RS_FUT
 
 static RustStdFamily rust_std_family_of_qn(const char *qn) {
     if (!qn) {
@@ -3534,8 +3569,8 @@ typedef struct {
 static const char *rust_std_type_head(const CBMType *t);
 static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType *type);
 
-/* The first argument of `call`, skipping comments; a null node if none. */
-static TSNode rust_std_call_first_arg(const RustStdCall *call) {
+/* Argument `index` of `call`, skipping comments; a null node if none. */
+static TSNode rust_std_call_arg(const RustStdCall *call, uint32_t index) {
     TSNode none = {0};
     if (!call || ts_node_is_null(call->args)) {
         return none;
@@ -3544,12 +3579,21 @@ static TSNode rust_std_call_first_arg(const RustStdCall *call) {
     for (uint32_t i = 0; i < n; i++) {
         TSNode c = ts_node_named_child(call->args, i);
         const char *k = ts_node_type(c);
-        if (strcmp(k, "line_comment") != 0 && strcmp(k, "block_comment") != 0) {
+        if (strcmp(k, "line_comment") == 0 || strcmp(k, "block_comment") == 0) {
+            continue;
+        }
+        if (index-- == 0) {
             return c;
         }
     }
     return none;
 }
+
+static TSNode rust_std_call_first_arg(const RustStdCall *call) {
+    return rust_std_call_arg(call, 0);
+}
+
+static const CBMType *rust_await_output(RustLSPContext *ctx, TSNode awaited);
 
 /* `path` resolved in the file names the std item `std_path` (written
  * without its crate segment): `std::`, `core::` and `alloc::` re-export it. */
@@ -3739,6 +3783,9 @@ static const CBMType *rust_std_spec_parse(RustLSPContext *ctx, const char **sp, 
     } else if (strcmp(name, "F") == 0) {
         out =
             rust_std_callable_return(ctx, rust_std_call_first_arg(call), argc > 0 ? args[0] : NULL);
+    } else if (strcmp(name, "O") == 0) {
+        TSNode fut = rust_std_call_arg(call, 1);
+        out = ts_node_is_null(fut) ? cbm_type_unknown() : rust_await_output(ctx, fut);
     } else if (strcmp(name, "G") == 0) {
         TSNode g = {0};
         if (call && !ts_node_is_null(call->type_args) &&
@@ -3786,7 +3833,12 @@ static bool rust_std_is_guard(RustLSPContext *ctx, const char *head) {
     static const char *const guards[] = {"core.cell.Ref",          "std.cell.Ref",
                                          "core.cell.RefMut",       "std.cell.RefMut",
                                          "std.sync.MutexGuard",    "std.sync.RwLockReadGuard",
-                                         "std.sync.RwLockWriteGuard", NULL};
+                                         "std.sync.RwLockWriteGuard",
+                                         "tokio.sync.MutexGuard",  "tokio.sync.OwnedMutexGuard",
+                                         "tokio.sync.RwLockReadGuard",
+                                         "tokio.sync.RwLockWriteGuard",
+                                         "tokio.sync.OwnedRwLockReadGuard",
+                                         "tokio.sync.OwnedRwLockWriteGuard", NULL};
     const char *qn = head ? rust_wrapper_head_qn(ctx, head) : NULL;
     return qn && rust_method_in(guards, qn);
 }
@@ -3853,10 +3905,19 @@ static const CBMType *rust_std_producer_return(RustLSPContext *ctx, TSNode func_
     }
     const char *leaf = path ? strrchr(path, ':') : NULL;
     leaf = leaf ? leaf + 1 : path;
+    RustStdCall call = {args_node, {0}};
     for (const RustStdProducer *p = RUST_STD_PRODUCERS; leaf && p->path; p++) {
         const char *dot = strrchr(p->path, '.');
         if (strcmp(dot ? dot + 1 : p->path, leaf) == 0 && rust_std_path_names(ctx, path, p->path)) {
-            RustStdCall call = {args_node, {0}};
+            return rust_std_return_type(ctx, p->ret, cbm_type_unknown(), &call);
+        }
+    }
+    for (const RustStdProducer *p = RUST_DEP_PRODUCERS; leaf && p->path; p++) {
+        if (strcmp(strrchr(p->path, '.') + 1, leaf) != 0) {
+            continue;
+        }
+        const char *qn = rust_resolve_path_expr(ctx, path);
+        if (qn && strcmp(qn, p->path) == 0) {
             return rust_std_return_type(ctx, p->ret, cbm_type_unknown(), &call);
         }
     }
@@ -3908,6 +3969,31 @@ static const CBMType *rust_std_path_call_return(RustLSPContext *ctx, TSNode func
 static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                                              const CBMRegisteredFunc **callee);
 static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node);
+
+static const CBMType *rust_eval_call_type(RustLSPContext *ctx, TSNode node,
+                                          const CBMRegisteredFunc **callee);
+
+/* What awaiting the expression `awaited` yields (see the `.await` case of
+ * rust_eval_expr_type). */
+static const CBMType *rust_await_output(RustLSPContext *ctx, TSNode awaited) {
+    const CBMRegisteredFunc *callee = NULL;
+    const CBMType *inner = strcmp(ts_node_type(awaited), "call_expression") == 0
+                               ? rust_eval_call_type(ctx, awaited, &callee)
+                               : rust_eval_expr_type(ctx, awaited);
+    if (callee && (callee->flags & CBM_FUNC_FLAG_ASYNC) != 0) {
+        return inner;
+    }
+    if (inner && inner->kind == CBM_TYPE_TEMPLATE) {
+        const char *name = inner->data.template_type.template_name;
+        if (name && strstr(name, "Option")) {
+            return inner;
+        }
+        if (inner->data.template_type.arg_count > 0) {
+            return inner->data.template_type.template_args[0];
+        }
+    }
+    return inner;
+}
 
 /* Type of a call expression. `*callee`, when the call names a registered
  * function or method, is that function: `.await` reads its async flag. A
@@ -4654,22 +4740,7 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
      * value is a future type: its output is approximated by the first
      * generic argument, except Option<T>, which no future type spells. */
     if (strcmp(kind, "await_expression") == 0 && ts_node_named_child_count(node) > 0) {
-        TSNode awaited = ts_node_named_child(node, 0);
-        const CBMRegisteredFunc *callee = NULL;
-        const CBMType *inner = strcmp(ts_node_type(awaited), "call_expression") == 0
-                                   ? rust_eval_call_type(ctx, awaited, &callee)
-                                   : rust_eval_expr_type(ctx, awaited);
-        if (callee && (callee->flags & CBM_FUNC_FLAG_ASYNC) != 0) {
-            return inner;
-        }
-        if (inner && inner->kind == CBM_TYPE_TEMPLATE) {
-            const char *name = inner->data.template_type.template_name;
-            if (name && strstr(name, "Option"))
-                return inner;
-            if (inner->data.template_type.arg_count > 0)
-                return inner->data.template_type.template_args[0];
-        }
-        return inner;
+        return rust_await_output(ctx, ts_node_named_child(node, 0));
     }
 
     /* type_cast_expression: x as T */
@@ -5152,6 +5223,12 @@ static bool rust_type_derefs_to_first_arg(const char *type_qn) {
                                       "std.sync.MutexGuard",
                                       "std.sync.RwLockReadGuard",
                                       "std.sync.RwLockWriteGuard",
+                                      "tokio.sync.MutexGuard",
+                                      "tokio.sync.OwnedMutexGuard",
+                                      "tokio.sync.RwLockReadGuard",
+                                      "tokio.sync.RwLockWriteGuard",
+                                      "tokio.sync.OwnedRwLockReadGuard",
+                                      "tokio.sync.OwnedRwLockWriteGuard",
                                       "core.pin.Pin",
                                       "std.pin.Pin",
                                       NULL};
