@@ -1111,7 +1111,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
         cap_rw += (size_t)r->rw.cap * sizeof(CBMReadWrite);
         rec_typerefs += (size_t)r->type_refs.count * sizeof(CBMTypeRef);
         cap_typerefs += (size_t)r->type_refs.cap * sizeof(CBMTypeRef);
-        rec_imports += (size_t)r->imports.count * sizeof(CBMImport);
+        rec_imports += (size_t)(r->imports.count + r->scoped_imports.count) * sizeof(CBMImport);
         rec_resolved += (size_t)r->resolved_calls.count * sizeof(CBMResolvedCall);
         rec_other += (size_t)r->throws.count * sizeof(CBMThrow) +
                      (size_t)r->env_accesses.count * sizeof(CBMEnvAccess) +
@@ -1120,7 +1120,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                      (size_t)r->impl_traits.count * sizeof(CBMImplTrait) +
                      (size_t)r->infra_bindings.count * sizeof(CBMInfraBinding) +
                      (size_t)r->channels.count * sizeof(CBMChannel);
-        cap_other += (size_t)r->imports.cap * sizeof(CBMImport) +
+        cap_other += (size_t)(r->imports.cap + r->scoped_imports.cap) * sizeof(CBMImport) +
                      (size_t)r->resolved_calls.cap * sizeof(CBMResolvedCall) +
                      (size_t)r->throws.cap * sizeof(CBMThrow) +
                      (size_t)r->env_accesses.cap * sizeof(CBMEnvAccess) +

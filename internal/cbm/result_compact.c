@@ -297,6 +297,11 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->imports.items[i].local_name);
         cr_str(c, &r->imports.items[i].module_path);
     }
+    cr_array(c, (void **)&r->scoped_imports.items, r->scoped_imports.count, sizeof(CBMImport));
+    for (int i = 0; i < r->scoped_imports.count && r->scoped_imports.items; i++) {
+        cr_str(c, &r->scoped_imports.items[i].local_name);
+        cr_str(c, &r->scoped_imports.items[i].module_path);
+    }
     cr_array(c, (void **)&r->usages.items, r->usages.count, sizeof(CBMUsage));
     for (int i = 0; i < r->usages.count && r->usages.items; i++) {
         cr_str(c, &r->usages.items[i].ref_name);
@@ -448,6 +453,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.defs.cap = tmp.defs.count;
     tmp.calls.cap = tmp.calls.count;
     tmp.imports.cap = tmp.imports.count;
+    tmp.scoped_imports.cap = tmp.scoped_imports.count;
     tmp.usages.cap = tmp.usages.count;
     tmp.throws.cap = tmp.throws.count;
     tmp.rw.cap = tmp.rw.count;

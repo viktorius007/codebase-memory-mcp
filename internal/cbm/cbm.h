@@ -303,6 +303,7 @@ typedef struct {
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
+    uint32_t scope_byte;     // scoped_imports only: start byte of the `use` declaration
 } CBMImport;
 
 typedef enum {
@@ -572,6 +573,8 @@ typedef struct CBMFileResult {
     CBMDefArray defs;
     CBMCallArray calls;
     CBMImportArray imports;
+    CBMImportArray scoped_imports; // Rust `use` inside an inline module or a block: they
+                                   // bind in that scope only, so they stay out of `imports`
     CBMUsageArray usages;
     CBMThrowArray throws;
     CBMRWArray rw;

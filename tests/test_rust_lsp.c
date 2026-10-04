@@ -10313,6 +10313,44 @@ TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module) {
     PASS();
 }
 
+TEST(rustlsp_modtree_use_items_at_answers_in_the_module_at_the_offset) {
+    /* The same spelling `super::Item` names a different item in the root
+     * module of user.rs and in its inline module: the offset selects the
+     * module, for a `use` the module declares and for one written in a block
+     * (which no module declares). */
+    static const char *const rels[] = {"src/lib.rs", "src/user.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.user"};
+    static const char *const sources[] = {
+        "mod user;\npub struct Item;\n",
+        "pub struct Item;\nmod inner {\n    use super::Item;\n    fn f() {}\n}\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 2);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *user = sources[1];
+    uint32_t at_use = (uint32_t)(strstr(user, "use super::Item") - user);
+    uint32_t at_fn = (uint32_t)(strstr(user, "fn f") - user);
+    const char *out[2] = {NULL, NULL};
+    ASSERT_EQ(cbm_rust_modtree_use_items_at(tree, &arena, "src/user.rs", at_use, "Item",
+                                            "super::Item", out, 2),
+              1);
+    ASSERT_STR_EQ(out[0], "p.src.user.Item");
+    ASSERT_EQ(cbm_rust_modtree_use_items_at(tree, &arena, "src/user.rs", at_fn, "Item",
+                                            "self::super::Item", out, 2),
+              1);
+    ASSERT_STR_EQ(out[0], "p.src.user.Item");
+    ASSERT_EQ(
+        cbm_rust_modtree_use_items_at(tree, &arena, "src/user.rs", 0, "Item", "super::Item", out, 2),
+        1);
+    ASSERT_STR_EQ(out[0], "p.src.lib.Item");
+    ASSERT_EQ(cbm_rust_modtree_use_items_at(tree, &arena, "src/user.rs", at_fn, "Missing",
+                                            "super::Missing", out, 2),
+              -1);
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer) {
     /* `b` re-exports `a::X`, `c` re-exports all of `b`; `user` globs `c`. */
     static const char *const rels[] = {"src/lib.rs", "src/a.rs", "src/b.rs", "src/c.rs",
@@ -11746,6 +11784,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
     RUN_TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module);
+    RUN_TEST(rustlsp_modtree_use_items_at_answers_in_the_module_at_the_offset);
     RUN_TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer);
     RUN_TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file);
     RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);

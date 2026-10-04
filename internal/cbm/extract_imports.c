@@ -668,19 +668,129 @@ void cbm_extract_rust_use_tree(CBMArena *arena, TSNode argument, const char *sou
     }
 }
 
+/* True when a block declares `name`: an item of that name, a `use` that
+ * binds it, or a glob `use` that may. */
+static bool rust_block_declares(CBMArena *arena, TSNode block, TSNode skip, const char *source,
+                                const char *name) {
+    uint32_t count = ts_node_named_child_count(block);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(block, i);
+        if (ts_node_eq(child, skip)) {
+            continue;
+        }
+        if (strcmp(ts_node_type(child), "use_declaration") != 0) {
+            TSNode item_name = ts_node_child_by_field_name(child, TS_FIELD("name"));
+            if (!ts_node_is_null(item_name) &&
+                strcmp(cbm_node_text(arena, item_name, source), name) == 0) {
+                return true;
+            }
+            continue;
+        }
+        CBMImportArray uses = {0};
+        cbm_extract_rust_use_tree(arena, ts_node_child_by_field_name(child, TS_FIELD("argument")),
+                                  source, &uses);
+        for (int u = 0; u < uses.count; u++) {
+            const char *local = uses.items[u].local_name;
+            if (local && (strcmp(local, "*") == 0 || strcmp(local, name) == 0)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* True when the path of a `use` written in a block starts at a name one of
+ * its enclosing blocks declares, so module scope does not decide it. */
+static bool rust_use_head_is_block_local(CBMArena *arena, TSNode use, const char *source,
+                                         const char *path) {
+    const char *sep = strstr(path, "::");
+    char *head =
+        sep ? cbm_arena_strndup(arena, path, (size_t)(sep - path)) : cbm_arena_strdup(arena, path);
+    if (!head || head[0] == '\0') {
+        return false; /* `::name` starts at the crate namespace */
+    }
+    for (TSNode up = ts_node_parent(use); !ts_node_is_null(up); up = ts_node_parent(up)) {
+        if (strcmp(ts_node_type(up), "block") == 0 &&
+            rust_block_declares(arena, up, use, source, head)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef enum {
+    RUST_USE_TOP,      /* an item of the file's root module */
+    RUST_USE_MODULE,   /* an item of an inline module */
+    RUST_USE_BLOCK,    /* written in a block of a module the file declares */
+    RUST_USE_UNSCOPED, /* inside a module that is itself declared in a block */
+} RustUseScope;
+
+static RustUseScope rust_use_scope(TSNode use) {
+    bool in_module = false;
+    bool in_block = false;
+    for (TSNode up = ts_node_parent(use); !ts_node_is_null(up); up = ts_node_parent(up)) {
+        const char *kind = ts_node_type(up);
+        if (strcmp(kind, "source_file") == 0 || strcmp(kind, "declaration_list") == 0) {
+            continue;
+        }
+        if (strcmp(kind, "mod_item") == 0) {
+            in_module = true;
+        } else if (in_module) {
+            return RUST_USE_UNSCOPED;
+        } else {
+            in_block = true;
+        }
+    }
+    if (in_block) {
+        return RUST_USE_BLOCK;
+    }
+    return in_module ? RUST_USE_MODULE : RUST_USE_TOP;
+}
+
+/* A top-level `use` goes to `imports`. One inside an inline module or a
+ * block binds in that scope only: it goes to `scoped_imports` with the byte
+ * offset that locates its module. */
+static void rust_push_use(CBMExtractCtx *ctx, TSNode use) {
+    RustUseScope scope = rust_use_scope(use);
+    if (scope == RUST_USE_UNSCOPED) {
+        return;
+    }
+    TSNode argument = ts_node_child_by_field_name(use, TS_FIELD("argument"));
+    if (scope == RUST_USE_TOP) {
+        cbm_extract_rust_use_tree(ctx->arena, argument, ctx->source, &ctx->result->imports);
+        return;
+    }
+    CBMImportArray uses = {0};
+    cbm_extract_rust_use_tree(ctx->arena, argument, ctx->source, &uses);
+    for (int i = 0; i < uses.count; i++) {
+        CBMImport imp = uses.items[i];
+        if (!imp.module_path ||
+            (scope == RUST_USE_BLOCK &&
+             rust_use_head_is_block_local(ctx->arena, use, ctx->source, imp.module_path))) {
+            continue;
+        }
+        imp.scope_byte = ts_node_start_byte(use);
+        cbm_imports_push(&ctx->result->scoped_imports, ctx->arena, imp);
+    }
+}
+
 static void parse_rust_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
-    if (ts_tree_cursor_goto_first_child(&cursor)) {
-        do {
-            TSNode node = ts_tree_cursor_current_node(&cursor);
-            if (strcmp(ts_node_type(node), "use_declaration") == 0) {
-                cbm_extract_rust_use_tree(ctx->arena,
-                                          ts_node_child_by_field_name(node, TS_FIELD("argument")),
-                                          ctx->source, &ctx->result->imports);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool use = strcmp(ts_node_type(node), "use_declaration") == 0;
+        if (use) {
+            rust_push_use(ctx, node);
+        } else if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                return;
             }
-        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
     }
-    ts_tree_cursor_delete(&cursor);
 }
 
 // --- C/C++ imports ---

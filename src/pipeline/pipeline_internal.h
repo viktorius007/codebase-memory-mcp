@@ -347,6 +347,13 @@ int cbm_pipeline_link_import(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *sou
                              const char *rel, const char *file_qn, const CBMImport *imp,
                              CBMHashTable *namespace_map);
 
+/* Create the IMPORTS edges of the file's Rust `use` declarations written
+ * inside an inline module or a block (`result->scoped_imports`); returns how
+ * many. Each links to the items the module tree resolves its path to in the
+ * module it is written in, and to nothing when the tree does not decide. */
+int cbm_pipeline_link_scoped_imports(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *source,
+                                     const char *rel, const CBMFileResult *result);
+
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by
  * the namespace string (e.g. "App.Utils", "com.example").  Returns NULL when no
