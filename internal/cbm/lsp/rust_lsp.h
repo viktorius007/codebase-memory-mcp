@@ -127,6 +127,15 @@ typedef struct {
     const char **module_fn_names;
     const char **module_fn_qns;
     int module_fn_count;
+    /* Type-namespace items (struct, enum, union, type alias, trait) the
+     * module being walked declares: a bare name among them is that item,
+     * whatever an enclosing module imports or the prelude calls by that
+     * name. Not inherited by nested modules. */
+    const char **module_type_names;
+    int module_type_count;
+    /* The registry holds this file's items only (the per-file pass), so what
+     * a glob import of another module brings into scope is unseen. */
+    bool registry_is_file_local;
     /* Value-namespace items declared in the blocks enclosing the walk point,
      * outermost first: the name and, for a function with its own graph node,
      * that node's QN (NULL otherwise). Entries from block_item_base on are

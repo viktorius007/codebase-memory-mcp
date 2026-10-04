@@ -1361,6 +1361,183 @@ TEST(rustlsp_std_returns_unknown_result_head) {
     PASS();
 }
 
+/* Project types named like std's, each method returning Other where std's
+ * would hand back the wrapped Conn. */
+#define RUSTLSP_STD_NAMESAKES                                                         \
+    "pub struct Mutex<T> { pub v: T }\n"                                              \
+    "impl<T> Mutex<T> {\n"                                                            \
+    "    pub fn new(v: T) -> Self { Mutex { v } }\n"                                  \
+    "    pub fn lock(&self) -> Other { Other }\n}\n"                                  \
+    "pub struct RwLock<T> { pub v: T }\n"                                             \
+    "impl<T> RwLock<T> { pub fn read(&self) -> Other { Other } }\n"                   \
+    "pub struct Arc<T> { pub v: T }\n"                                                \
+    "impl<T> Arc<T> {\n"                                                              \
+    "    pub fn clone(a: &Self) -> Other { Other }\n"                                 \
+    "    pub fn get(&self) -> Other { Other }\n}\n"                                   \
+    "pub struct Option<T> { pub v: T }\n"                                             \
+    "impl<T> Option<T> { pub fn unwrap(self) -> Other { Other } }\n"                  \
+    "pub struct Result<T> { pub v: T }\n"                                             \
+    "impl<T> Result<T> { pub fn unwrap(self) -> Other { Other } }\n"
+
+/* Callers of the namesakes, one per table reader: a method on a typed
+ * receiver, an associated function, and a method on what it returns. */
+#define RUSTLSP_STD_NAMESAKE_CALLERS                                                  \
+    "pub fn c_mutex(m: &Mutex<Conn>) -> bool { m.lock().ping() }\n"                   \
+    "pub fn c_new(c: Conn) -> bool { Mutex::new(c).lock().ping() }\n"                 \
+    "pub fn c_rwlock(m: &RwLock<Conn>) -> bool { m.read().ping() }\n"                 \
+    "pub fn c_arc(a: Arc<Conn>) -> bool { a.get().ping() }\n"                         \
+    "pub fn c_clone(a: &Arc<Conn>) -> bool { Arc::clone(a).ping() }\n"                \
+    "pub fn c_option(o: Option<Conn>) -> bool { o.unwrap().ping() }\n"                \
+    "pub fn c_result(o: Result<Conn>) -> bool { o.unwrap().ping() }\n"                \
+    "pub struct Holder { pub m: Mutex<Conn>, pub o: Option<Conn> }\n"                 \
+    "pub fn c_field(h: &Holder) -> bool { h.m.lock().ping() }\n"                      \
+    "pub fn c_fopt(h: Holder) -> bool { h.o.unwrap().ping() }\n"                      \
+    "pub fn make(c: Conn) -> Option<Conn> { Option { v: c } }\n"                      \
+    "pub fn c_ret(c: Conn) -> bool { make(c).unwrap().ping() }\n"
+
+/* Each caller links the project method under `owner` and the `ping` of what
+ * it returns, never Conn's. `with_fields` includes the callers that go
+ * through a struct field. */
+static bool rustlsp_namesake_calls_reach_project(const CBMResolvedCallArray *calls,
+                                                 const char *owner, bool with_fields) {
+    static const char *const expected[][2] = {
+        {"c_mutex", "Mutex.lock"},     {"c_new", "Mutex.new"},       {"c_new", "Mutex.lock"},
+        {"c_rwlock", "RwLock.read"},   {"c_arc", "Arc.get"},         {"c_clone", "Arc.clone"},
+        {"c_option", "Option.unwrap"}, {"c_result", "Result.unwrap"}, {"c_ret", "Option.unwrap"},
+        {"c_field", "Mutex.lock"},     {"c_fopt", "Option.unwrap"}};
+    size_t count = sizeof(expected) / sizeof(expected[0]) - (with_fields ? 0 : 2);
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        bool linked = false;
+        bool pinged = false;
+        for (int c = 0; c < calls->count; c++) {
+            const CBMResolvedCall *rc = &calls->items[c];
+            if (!rc->caller_qn || !rc->callee_qn || !strstr(rc->caller_qn, expected[i][0])) {
+                continue;
+            }
+            if (strncmp(rc->callee_qn, owner, strlen(owner)) == 0 &&
+                strcmp(rc->callee_qn + strlen(owner), expected[i][1]) == 0) {
+                linked = true;
+            }
+            if (strstr(rc->callee_qn, "Other.ping")) {
+                pinged = true;
+            }
+            if (strstr(rc->callee_qn, "Conn.ping")) {
+                ok = false;
+            }
+        }
+        if (!linked || !pinged) {
+            printf("  namesake %s -> %s%s: linked=%d pinged=%d\n", expected[i][0], owner,
+                   expected[i][1], linked, pinged);
+            for (int c = 0; c < calls->count; c++) {
+                const CBMResolvedCall *rc = &calls->items[c];
+                if (rc->caller_qn && strstr(rc->caller_qn, expected[i][0])) {
+                    printf("    %s -> %s\n", rc->caller_qn, rc->callee_qn ? rc->callee_qn : "?");
+                }
+            }
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+/* A project type declared in the file under a std name is the project's:
+ * its methods link, and std's declared signatures do not apply. */
+TEST(rustlsp_std_namesake_declared_in_file_is_project_type) {
+    CBMFileResult *r = extract_rust(RUSTLSP_STD_DECOYS RUSTLSP_STD_NAMESAKES
+                                        RUSTLSP_STD_NAMESAKE_CALLERS);
+    ASSERT_NOT_NULL(r);
+    ASSERT(rustlsp_namesake_calls_reach_project(&r->resolved_calls, "test.src.main.", true));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same inside an inline module of a file that imports std's types of
+ * those names at the top: the module's own items are the project's, and
+ * outside it the names stay std's. (The per-file pass records no fields for
+ * a struct of an inline module, so the field callers are left out.) */
+TEST(rustlsp_std_namesake_in_inline_module_is_project_type) {
+    CBMFileResult *r = extract_rust(
+        "use std::sync::{Arc, Mutex, RwLock};\n" RUSTLSP_STD_DECOYS
+        "pub fn outer(m: &Mutex<Conn>) -> bool { m.lock().unwrap().ping() }\n"
+        "pub fn outer_arc(a: Arc<RwLock<Conn>>) -> bool { a.read().unwrap().ping() }\n"
+        "pub mod inner {\n    use super::{Conn, Other};\n" RUSTLSP_STD_NAMESAKES
+            RUSTLSP_STD_NAMESAKE_CALLERS "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT(rustlsp_namesake_calls_reach_project(&r->resolved_calls, "test.src.main.", false));
+    ASSERT_GTE(require_resolved(r, "main.outer", "Conn.ping"), 0);
+    ASSERT_GTE(require_resolved(r, "outer_arc", "Conn.ping"), 0);
+    ASSERT(find_resolved(r, "main.outer", "Other.ping") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* True when a call from `run` names a std callee or Conn's `ping`. */
+static bool rustlsp_run_reads_std(const char *source) {
+    CBMFileResult *r = extract_rust(source);
+    if (!r) {
+        return true;
+    }
+    bool std_read = false;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && rc->callee_qn && strstr(rc->caller_qn, "run") &&
+            (strncmp(rc->callee_qn, "std.", 4) == 0 || strncmp(rc->callee_qn, "core.", 5) == 0 ||
+             strncmp(rc->callee_qn, "alloc.", 6) == 0 || strstr(rc->callee_qn, "Conn.ping"))) {
+            printf("  read as std: %s -> %s\n", rc->caller_qn, rc->callee_qn);
+            std_read = true;
+        }
+    }
+    cbm_free_result(r);
+    return std_read;
+}
+
+/* A field or return type spelled with a name the file imports from a project
+ * module is that module's type, as a parameter of that type is. */
+TEST(rustlsp_std_namesake_imported_in_signature_is_not_std) {
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use crate::locks::Mutex;\n" RUSTLSP_STD_DECOYS
+        "fn run(m: &Mutex<Conn>) -> bool { m.lock().unwrap().ping() }\n"));
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use crate::locks::Mutex;\n" RUSTLSP_STD_DECOYS "struct H { m: Mutex<Conn> }\n"
+        "fn run(h: &H) -> bool { h.m.lock().unwrap().ping() }\n"));
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use crate::locks::{Mutex, Option};\n" RUSTLSP_STD_DECOYS
+        "fn make() -> Option<Mutex<Conn>> { todo!() }\n"
+        "fn run() -> bool { make().unwrap().lock().unwrap().ping() }\n"));
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use crate::locks::{Mutex, Option};\n" RUSTLSP_STD_DECOYS
+        "struct H;\nimpl H { fn make(&self) -> Option<Mutex<Conn>> { todo!() } }\n"
+        "fn run(h: &H) -> bool { h.make().unwrap().lock().unwrap().ping() }\n"));
+    PASS();
+}
+
+/* `Mutex`, `RwLock` and `Arc` are not in std's prelude: bare and unimported,
+ * a glob import supplies them, and the per-file pass cannot see what a glob
+ * of a project module supplies, so no std callee is published and std's
+ * signatures are not read. A glob of a std module leaves them std's. */
+TEST(rustlsp_std_namesake_behind_unseen_glob_is_not_std) {
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use crate::locks::*;\n" RUSTLSP_STD_DECOYS
+        "fn run(m: &Mutex<Conn>) -> bool { m.lock().unwrap().ping() }\n"));
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use crate::locks::*;\n" RUSTLSP_STD_DECOYS
+        "fn run(c: Conn) -> bool { Mutex::new(c).lock().unwrap().ping() }\n"));
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use super::*;\n" RUSTLSP_STD_DECOYS
+        "fn run(m: &RwLock<Conn>) -> bool { m.read().unwrap().ping() }\n"));
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use crate::locks::*;\n" RUSTLSP_STD_DECOYS
+        "fn run(a: &Arc<Conn>) -> bool { Arc::clone(a).ping() }\n"));
+    ASSERT_FALSE(rustlsp_run_reads_std(
+        "use crate::locks::*;\n" RUSTLSP_STD_DECOYS "struct H { m: Arc<Mutex<Conn>> }\n"
+        "fn run(h: &H) -> bool { h.m.lock().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::*;\n" RUSTLSP_STD_DECOYS
+        "fn run(m: &Mutex<Conn>) -> bool { m.lock().unwrap().ping() }\n"));
+    PASS();
+}
+
 /* `RefCell<T>::borrow_mut -> RefMut<T>` and `borrow -> Ref<T>`, both
  * derefing to T, reached through an `Rc`. */
 TEST(rustlsp_std_returns_refcell) {
@@ -11336,6 +11513,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_tokio_timeout_yields_result_of_output);
     RUN_TEST(rustlsp_tokio_signatures_need_the_tokio_item);
     RUN_TEST(rustlsp_std_returns_unknown_result_head);
+    RUN_TEST(rustlsp_std_namesake_declared_in_file_is_project_type);
+    RUN_TEST(rustlsp_std_namesake_in_inline_module_is_project_type);
+    RUN_TEST(rustlsp_std_namesake_imported_in_signature_is_not_std);
+    RUN_TEST(rustlsp_std_namesake_behind_unseen_glob_is_not_std);
     RUN_TEST(rustlsp_std_returns_refcell);
     RUN_TEST(rustlsp_std_returns_option_result_adapters);
     RUN_TEST(rustlsp_closure_param_from_std_signature);
