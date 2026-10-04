@@ -4477,6 +4477,129 @@ TEST(rustlsp_user_trait_named_deref_gives_no_deref_step) {
     PASS();
 }
 
+/* RUSTLSP_USER_DEREF_SRC with the `use` lines in `uses` and the impl's trait
+ * written as `trait_path`: 1 when `m.ping()` reaches `Inner::ping` through
+ * the Deref step, 0 when it does not, -1 when extraction fails. */
+static int rustlsp_deref_spelling_reaches_target(const char *uses, const char *trait_path) {
+    char src[1024];
+    snprintf(src, sizeof(src),
+             "%sstruct Inner;\nimpl Inner { fn ping(&self) {} }\n"
+             "struct Managed { v: Inner }\n"
+             "impl %s for Managed {\n"
+             "    type Target = Inner;\n"
+             "    fn deref(&self) -> &Inner { &self.v }\n"
+             "}\n"
+             "fn run(m: Managed) { m.ping(); }\n",
+             uses, trait_path);
+    CBMFileResult *r = extract_rust(src);
+    if (!r) {
+        return -1;
+    }
+    int reached = find_resolved(r, "run", "Inner.ping") >= 0;
+    cbm_free_result(r);
+    return reached;
+}
+
+TEST(rustlsp_impl_trait_by_core_path_is_the_std_trait) {
+    ASSERT_EQ(rustlsp_deref_spelling_reaches_target("", "core::ops::Deref"), 1);
+    PASS();
+}
+
+TEST(rustlsp_impl_trait_by_std_path_is_the_std_trait) {
+    ASSERT_EQ(rustlsp_deref_spelling_reaches_target("", "std::ops::Deref"), 1);
+    PASS();
+}
+
+TEST(rustlsp_impl_trait_by_imported_name_is_the_std_trait) {
+    ASSERT_EQ(rustlsp_deref_spelling_reaches_target("use std::ops::Deref;\n", "Deref"), 1);
+    ASSERT_EQ(rustlsp_deref_spelling_reaches_target("use core::ops::Deref;\n", "Deref"), 1);
+    PASS();
+}
+
+TEST(rustlsp_impl_trait_by_renamed_import_is_the_std_trait) {
+    /* `Reach` names no trait by itself: only the `use` says it is Deref. */
+    ASSERT_EQ(rustlsp_deref_spelling_reaches_target("use std::ops::Deref as Reach;\n", "Reach"),
+              1);
+    PASS();
+}
+
+TEST(rustlsp_impl_trait_by_module_prefix_is_the_std_trait) {
+    ASSERT_EQ(rustlsp_deref_spelling_reaches_target("use std::ops;\n", "ops::Deref"), 1);
+    PASS();
+}
+
+TEST(rustlsp_impl_trait_imported_from_project_is_not_the_std_trait) {
+    /* `Deref` is bound by the `use` to a trait of the project declared in
+     * another file: it is not the language's Deref, whatever its name. */
+    ASSERT_EQ(rustlsp_deref_spelling_reaches_target("use crate::other::Deref;\n", "Deref"), 0);
+    PASS();
+}
+
+/* `impl <trait_path> for A { fn fmt }` in one file: 1 when the qualified call
+ * `core::fmt::Display::fmt(&a, f)` is dispatched to that impl's method, which
+ * it is only when the impl records the trait `core::fmt::Display`. */
+static int rustlsp_display_spelling_dispatches(const char *uses, const char *trait_path) {
+    char src[1024];
+    snprintf(src, sizeof(src),
+             "%sstruct A;\n"
+             "impl %s for A {\n"
+             "    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) }\n"
+             "}\n"
+             "fn run(a: A, f: &mut core::fmt::Formatter<'_>) {\n"
+             "    let _ = core::fmt::Display::fmt(&a, f);\n"
+             "}\n",
+             uses, trait_path);
+    CBMFileResult *r = extract_rust(src);
+    if (!r) {
+        return -1;
+    }
+    int hit = find_resolved(r, "run", "A.fmt") >= 0;
+    cbm_free_result(r);
+    return hit;
+}
+
+TEST(rustlsp_impl_trait_by_alloc_path_is_the_std_trait) {
+    ASSERT_EQ(rustlsp_display_spelling_dispatches("", "alloc::fmt::Display"), 1);
+    PASS();
+}
+
+TEST(rustlsp_impl_trait_by_std_path_dispatches_qualified_call) {
+    ASSERT_EQ(rustlsp_display_spelling_dispatches("", "std::fmt::Display"), 1);
+    ASSERT_EQ(rustlsp_display_spelling_dispatches("use std::fmt;\n", "fmt::Display"), 1);
+    PASS();
+}
+
+TEST(rustlsp_impl_trait_unlisted_reexport_is_the_std_trait) {
+    /* `core.hash.Hasher` is registered under one root only, with no `std`
+     * re-export row: the std spelling still records it, so a call qualified
+     * by the trait reaches the impl. */
+    CBMFileResult *r = extract_rust("struct H;\n"
+                                    "impl std::hash::Hasher for H {\n"
+                                    "    fn finish(&self) -> u64 { 0 }\n"
+                                    "    fn write(&mut self, bytes: &[u8]) {}\n"
+                                    "}\n"
+                                    "fn run(h: H) { let _ = core::hash::Hasher::finish(&h); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "H.finish"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_impl_trait_registered_reexport_is_the_std_trait) {
+    /* `std.error.Error` is itself registered, as a re-export of
+     * `core.error.Error`: an impl spelled through it records the core trait,
+     * so a call qualified by the core path reaches the impl. */
+    CBMFileResult *r = extract_rust("struct E;\n"
+                                    "impl std::error::Error for E {\n"
+                                    "    fn description(&self) -> &str { \"e\" }\n"
+                                    "}\n"
+                                    "fn run(e: E) { let _ = core::error::Error::description(&e); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "E.description"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_user_deref_own_method_wins_over_target) {
     /* The receiver's own method is probed before the deref step. */
     CBMFileResult *r = extract_rust(
@@ -4521,7 +4644,8 @@ TEST(rustlsp_user_deref_generic_target_takes_written_argument) {
 
 /* Cross-file fixture: `p.demo.Managed` derefs to `p.demo.State` by the impl
  * relation records in `impls` (each names a `type Target` text). */
-static void rustlsp_run_user_deref_fixture(CBMArena *a, const char *const *targets, int impls,
+static void rustlsp_run_user_deref_fixture(CBMArena *a, const char *trait_path,
+                                           const char *const *targets, int impls,
                                            CBMResolvedCallArray *out) {
     CBMRustLSPDef defs[12];
     int n = rustlsp_deref_fixture(defs);
@@ -4536,7 +4660,7 @@ static void rustlsp_run_user_deref_fixture(CBMArena *a, const char *const *targe
                                     .receiver_type = "p.demo.Managed",
                                     .receiver_spelling = "Managed",
                                     .def_module_qn = "p.demo",
-                                    .trait_qn = "std::ops::Deref",
+                                    .trait_qn = trait_path,
                                     .impl_target = targets[i],
                                     .is_rust_impl_relation = true};
     }
@@ -4555,9 +4679,100 @@ TEST(rustlsp_user_deref_impl_from_other_module) {
     cbm_arena_init(&a);
     CBMResolvedCallArray out;
     const char *targets[] = {"State"};
-    rustlsp_run_user_deref_fixture(&a, targets, 1, &out);
+    rustlsp_run_user_deref_fixture(&a, "std::ops::Deref", targets, 1, &out);
     ASSERT_GTE(find_confident(&out, "run", "p.demo.State.ping"), 0);
     cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_cross_impl_trait_spellings_name_one_trait) {
+    /* The impl relation comes from another file as raw trait text: every
+     * spelling of the std trait gives the same Deref step. */
+    static const char *const spellings[] = {"core::ops::Deref", "std::ops::Deref", "Deref",
+                                            "ops::Deref"};
+    const char *targets[] = {"State"};
+    for (size_t i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
+        CBMArena a;
+        cbm_arena_init(&a);
+        CBMResolvedCallArray out;
+        rustlsp_run_user_deref_fixture(&a, spellings[i], targets, 1, &out);
+        ASSERT_GTE(find_confident(&out, "run", "p.demo.State.ping"), 0);
+        cbm_arena_destroy(&a);
+    }
+    PASS();
+}
+
+/* Crate `p`: `src/other.rs` declares its own trait `Deref`; `src/demo.rs`
+ * imports a `Deref` by `demo_use` and implements it for `Managed` with
+ * `type Target = State`. Returns whether `m.ping()` written in `src/lib.rs`
+ * reaches `State::ping`, i.e. whether that impl gave a Deref step. */
+static bool rustlsp_modtree_deref_reaches_target(const char *demo_use) {
+    static const char *const rels[] = {"src/lib.rs", "src/demo.rs", "src/other.rs"};
+    static const char *const qns[] = {"p.src.lib", "p.src.demo", "p.src.other"};
+    char demo_src[512];
+    snprintf(demo_src, sizeof(demo_src),
+             "%spub struct State;\npub struct Managed;\n"
+             "impl Deref for Managed { type Target = State; }\n",
+             demo_use);
+    const char *sources[] = {"pub mod demo;\npub mod other;\n", demo_src,
+                             "pub trait Deref { type Target; }\n"};
+    CBMRustModTree *tree = cbm_rust_modtree_new();
+    CBMRustModFacts *facts[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        (void)cbm_rust_modtree_add_file(tree, rels[i], qns[i]);
+        facts[i] = cbm_rust_modfacts_scan(sources[i], (int)strlen(sources[i]));
+    }
+    (void)cbm_rust_modtree_add_crate(tree, "src/lib.rs", "p", false);
+    cbm_rust_modtree_finish(tree, (const CBMRustModFacts *const *)facts);
+    for (int i = 0; i < 3; i++) {
+        cbm_rust_modfacts_free(facts[i]);
+    }
+
+    CBMLSPDef defs[5];
+    memset(defs, 0, sizeof(defs));
+    defs[0] = (CBMLSPDef){.qualified_name = "p.src.demo.State", .short_name = "State",
+                          .label = "Struct", .def_module_qn = "p.src.demo",
+                          .lang = CBM_LANG_RUST};
+    defs[1] = (CBMLSPDef){.qualified_name = "p.src.demo.State.ping", .short_name = "ping",
+                          .label = "Method", .receiver_type = "p.src.demo.State",
+                          .receiver_spelling = "State", .def_module_qn = "p.src.demo",
+                          .lang = CBM_LANG_RUST};
+    defs[2] = (CBMLSPDef){.qualified_name = "p.src.demo.Managed", .short_name = "Managed",
+                          .label = "Struct", .def_module_qn = "p.src.demo",
+                          .lang = CBM_LANG_RUST};
+    defs[3] = (CBMLSPDef){.qualified_name = "p.src.other.Deref", .short_name = "Deref",
+                          .label = "Trait", .def_module_qn = "p.src.other", .is_interface = true,
+                          .lang = CBM_LANG_RUST};
+    defs[4] = (CBMLSPDef){.qualified_name = "p.src.demo.Managed", .short_name = "Managed",
+                          .label = "RustImpl", .receiver_type = "p.src.demo.Managed",
+                          .receiver_spelling = "Managed", .def_module_qn = "p.src.demo",
+                          .trait_qn = "Deref", .impl_target = "State",
+                          .is_rust_impl_relation = true, .lang = CBM_LANG_RUST};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry_with_modtree(&arena, defs, 5, tree);
+    const char *source = "fn run(m: demo::Managed) { m.ping(); }\n";
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::src::demo"};
+    CBMResolvedCallArray out = {0};
+    if (registry) {
+        cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source), "p.src.lib",
+                                             "p.src.lib", registry, imp_n, imp_q, 1, NULL, NULL,
+                                             NULL, &out, NULL, NULL);
+    }
+    bool reached = find_confident(&out, "run", "p.src.demo.State.ping") >= 0;
+    cbm_arena_destroy(&arena);
+    cbm_rust_modtree_free(tree);
+    return reached;
+}
+
+TEST(rustlsp_cross_std_trait_import_wins_over_same_named_project_trait) {
+    ASSERT_TRUE(rustlsp_modtree_deref_reaches_target("use std::ops::Deref;\n"));
+    PASS();
+}
+
+TEST(rustlsp_cross_project_trait_import_stays_the_project_trait) {
+    ASSERT_FALSE(rustlsp_modtree_deref_reaches_target("use crate::other::Deref;\n"));
     PASS();
 }
 
@@ -4567,7 +4782,7 @@ TEST(rustlsp_user_deref_impls_disagreeing_give_no_target) {
     cbm_arena_init(&a);
     CBMResolvedCallArray out;
     const char *targets[] = {"State", "Leaf"};
-    rustlsp_run_user_deref_fixture(&a, targets, 2, &out);
+    rustlsp_run_user_deref_fixture(&a, "std::ops::Deref", targets, 2, &out);
     ASSERT_EQ(find_confident(&out, "run", "p.demo.State.ping"), -1);
     cbm_arena_destroy(&a);
     PASS();
@@ -11253,6 +11468,19 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_user_deref_own_method_wins_over_target);
     RUN_TEST(rustlsp_user_deref_generic_target_takes_written_argument);
     RUN_TEST(rustlsp_user_deref_impl_from_other_module);
+    RUN_TEST(rustlsp_impl_trait_by_core_path_is_the_std_trait);
+    RUN_TEST(rustlsp_impl_trait_by_std_path_is_the_std_trait);
+    RUN_TEST(rustlsp_impl_trait_by_imported_name_is_the_std_trait);
+    RUN_TEST(rustlsp_impl_trait_by_renamed_import_is_the_std_trait);
+    RUN_TEST(rustlsp_impl_trait_by_module_prefix_is_the_std_trait);
+    RUN_TEST(rustlsp_impl_trait_imported_from_project_is_not_the_std_trait);
+    RUN_TEST(rustlsp_impl_trait_by_alloc_path_is_the_std_trait);
+    RUN_TEST(rustlsp_impl_trait_by_std_path_dispatches_qualified_call);
+    RUN_TEST(rustlsp_impl_trait_unlisted_reexport_is_the_std_trait);
+    RUN_TEST(rustlsp_impl_trait_registered_reexport_is_the_std_trait);
+    RUN_TEST(rustlsp_cross_impl_trait_spellings_name_one_trait);
+    RUN_TEST(rustlsp_cross_std_trait_import_wins_over_same_named_project_trait);
+    RUN_TEST(rustlsp_cross_project_trait_import_stays_the_project_trait);
     RUN_TEST(rustlsp_user_deref_impls_disagreeing_give_no_target);
     RUN_TEST(rustlsp_deref_wrapper_method_wins_over_target);
     RUN_TEST(rustlsp_dyn_trait_field_links_trait_declaration);
