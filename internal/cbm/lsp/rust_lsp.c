@@ -6672,20 +6672,12 @@ static bool rust_source_spells_identifier(RustLSPContext *ctx, const char *name)
     return found;
 }
 
-/* A trait whose methods a call on a concrete type in this file provably cannot
- * reach: rustc considers a trait's methods only when the trait is in scope.
- * Proven when the trait is declared in another file, is no prelude name, its
- * name is spelled
- * nowhere in this file (so no `use`, `as` rename or `as _` import names it),
- * and every glob import in scope is of this file's own module (whose items
- * and imports are this file's). Without the proof the trait stays a
- * candidate. */
-static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn) {
-    if (!ctx || !trait_qn || !ctx->module_qn || !ctx->root_source || ctx->root_source_len <= 0) {
-        return false;
-    }
-    size_t module_len = strlen(ctx->module_qn);
-    if (strncmp(trait_qn, ctx->module_qn, module_len) == 0 && trait_qn[module_len] == '.') {
+/* A trait name this file provably does not have in scope: it is no prelude
+ * name, is spelled nowhere in this file (so no `use`, `as` rename or `as _`
+ * import names it), and every glob import in scope is of this file's own
+ * module (whose items and imports are this file's). */
+static bool rust_trait_name_out_of_scope(RustLSPContext *ctx, const char *name) {
+    if (!ctx || !name || !ctx->module_qn || !ctx->root_source || ctx->root_source_len <= 0) {
         return false;
     }
     for (int i = 0; i < ctx->glob_count; i++) {
@@ -6693,13 +6685,104 @@ static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn) {
             return false;
         }
     }
-    const char *dot = strrchr(trait_qn, '.');
-    const char *name = dot ? dot + 1 : trait_qn;
     /* A prelude name (`Clone`, `AsRef`) is in scope unspelled. */
     if (rust_lookup_prelude(name)) {
         return false;
     }
     return !rust_source_spells_identifier(ctx, name);
+}
+
+/* A trait whose methods a call on a concrete type in this file provably cannot
+ * reach: rustc considers a trait's methods only when the trait is in scope.
+ * Proven when the trait is declared in another file and its name is out of
+ * scope here. Without the proof the trait stays a candidate. */
+static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn) {
+    if (!ctx || !trait_qn || !ctx->module_qn) {
+        return false;
+    }
+    size_t module_len = strlen(ctx->module_qn);
+    if (strncmp(trait_qn, ctx->module_qn, module_len) == 0 && trait_qn[module_len] == '.') {
+        return false;
+    }
+    const char *dot = strrchr(trait_qn, '.');
+    return rust_trait_name_out_of_scope(ctx, dot ? dot + 1 : trait_qn);
+}
+
+/* The trait path an impl key (cbm_rust_impl_key) ends with, as the impl
+ * header spells it; NULL for a key of another shape. */
+static const char *rust_impl_key_trait_spelling(const char *key) {
+    enum { IMPL_KEY_PARTS = 3, DECIMAL = 10 };
+    const char *part = NULL;
+    for (int i = 0; key && i < IMPL_KEY_PARTS; i++) {
+        char *colon = NULL;
+        unsigned long len = strtoul(key, &colon, DECIMAL);
+        if (colon == key || *colon != ':' || strlen(colon + 1) < len) {
+            return NULL;
+        }
+        part = colon + 1;
+        key = part + len;
+    }
+    return part;
+}
+
+/* Last path segment of a trait path as written (`a::b::Tr<X>` -> `Tr`). */
+static const char *rust_trait_spelling_leaf(CBMArena *arena, const char *spelling) {
+    size_t end = strcspn(spelling, "<");
+    while (end > 0 && isspace((unsigned char)spelling[end - 1])) {
+        end--;
+    }
+    size_t start = end;
+    while (start > 0 && (isalnum((unsigned char)spelling[start - 1]) || spelling[start - 1] == '_')) {
+        start--;
+    }
+    return end > start ? cbm_arena_strndup(arena, spelling + start, end - start) : NULL;
+}
+
+/* The method `method_name` that `receiver_qn` gets from an impl of a trait the
+ * registry does not hold (a dependency's or a generated trait: the impl's
+ * methods carry the trait flag and no trait QN). The impl is project source,
+ * so the receiver type and the method name select it without the trait's
+ * declaration. Exactly one such impl may define the name: two set
+ * *out_ambiguous. An impl whose trait name is out of scope in `scope` is no
+ * candidate (*out_filtered set). */
+static const CBMRegisteredFunc *
+rust_registry_lookup_unregistered_trait_impl_method(RustLSPContext *scope,
+                                                    const CBMTypeRegistry *reg,
+                                                    const char *receiver_qn,
+                                                    const char *method_name, bool *out_ambiguous,
+                                                    bool *out_filtered) {
+    int best_index = -1;
+    const char *matched_impl = NULL;
+    CBMMethodIter it;
+    cbm_registry_methods(reg, receiver_qn, method_name, &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &reg->funcs[index];
+        if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || candidate->impl_trait_qn) {
+            continue;
+        }
+        const char *spelling = rust_impl_key_trait_spelling(candidate->impl_key);
+        const char *leaf = spelling ? rust_trait_spelling_leaf(scope->arena, spelling) : NULL;
+        /* An impl without a readable identity cannot be told from another. */
+        if (!leaf || (matched_impl && strcmp(matched_impl, candidate->impl_key) != 0)) {
+            *out_ambiguous = true;
+            return NULL;
+        }
+        if (rust_trait_name_out_of_scope(scope, leaf)) {
+            *out_filtered = true;
+            continue;
+        }
+        matched_impl = candidate->impl_key;
+        if (best_index < 0 || index < best_index) {
+            best_index = index;
+        }
+    }
+    if (best_index >= 0) {
+        return &reg->funcs[best_index];
+    }
+    return reg->fallback ? rust_registry_lookup_unregistered_trait_impl_method(
+                               scope, reg->fallback, receiver_qn, method_name, out_ambiguous,
+                               out_filtered)
+                         : NULL;
 }
 
 /* Find the trait-impl method for one concrete receiver. With trait_qn==NULL,
@@ -6909,8 +6992,19 @@ static const CBMRegisteredFunc *rust_lookup_method_in_trait_own(RustLSPContext *
     return NULL;
 }
 
+/* Whether `qn` lies under the project's root segment, where only project
+ * source files put a QN. */
+static bool rust_qn_in_project(const RustLSPContext *ctx, const char *qn) {
+    if (!ctx->module_qn || !qn) {
+        return false;
+    }
+    size_t project_len = strcspn(ctx->module_qn, ".");
+    return strncmp(qn, ctx->module_qn, project_len) == 0 && qn[project_len] == '.';
+}
+
 /* Resolve an ordinary method call with Rust precedence: inherent first,
- * concrete trait override second, then an unambiguous trait default. */
+ * concrete trait override second (of a registered trait or, on a project
+ * type, of an unregistered one), then an unambiguous trait default. */
 static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
                                                           const char *receiver_type_qn,
                                                           const char *method_name,
@@ -6979,7 +7073,18 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
     bool scope_filtered = false; /* a candidate was dropped for this file's scope */
     const CBMRegisteredFunc *impl_method = rust_registry_lookup_trait_impl_method_scoped(
         ctx, reg, receiver_type_qn, NULL, method_name, &trait_ambiguous, &scope_filtered);
-    if (trait_ambiguous) {
+    /* An impl of a trait the registry does not hold is as much a candidate,
+     * on a type declared in the project when the registry holds the whole
+     * project: its inherent methods are then all known, so none of that name
+     * leaves the trait impls. A file-local registry misses the inherent impls
+     * other files write. */
+    const CBMRegisteredFunc *unregistered_method = NULL;
+    if (!trait_ambiguous && !ctx->registry_is_file_local && receiver_type &&
+        !receiver_type->rust_undeclared && rust_qn_in_project(ctx, receiver_type_qn)) {
+        unregistered_method = rust_registry_lookup_unregistered_trait_impl_method(
+            ctx, reg, receiver_type_qn, method_name, &trait_ambiguous, &scope_filtered);
+    }
+    if (trait_ambiguous || (impl_method && unregistered_method)) {
         if (out_impl_count) {
             *out_impl_count = 2;
         }
@@ -7028,6 +7133,15 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
             default_trait = trait_qn;
             default_method = candidate;
         }
+    }
+    if (default_method && unregistered_method) {
+        if (out_impl_count) {
+            *out_impl_count = 2;
+        }
+        return NULL;
+    }
+    if (!default_method) {
+        default_method = unregistered_method;
     }
     if (default_method) {
         if (out_impl_count) {
@@ -13483,6 +13597,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 if (cbm_idxmemo_get(&type_idx, rf.receiver_type) < 0) {
                     CBMRegisteredType auto_t;
                     memset(&auto_t, 0, sizeof(auto_t));
+                    auto_t.rust_undeclared = true;
                     auto_t.qualified_name = rf.receiver_type;
                     const char *dot = strrchr(rf.receiver_type, '.');
                     auto_t.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : rf.receiver_type;
@@ -13491,7 +13606,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                                               reg->type_count - 1);
                 }
             }
-            if (rf.receiver_type && rf.impl_trait_qn && d->receiver) {
+            if (rf.receiver_type && d->impl_trait && d->receiver) {
                 rf.impl_key =
                     cbm_rust_impl_key(arena, rf.receiver_type, d->receiver, d->impl_trait);
             }
@@ -13755,6 +13870,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         if (!rt) {
             CBMRegisteredType auto_t;
             memset(&auto_t, 0, sizeof(auto_t));
+            auto_t.rust_undeclared = true;
             auto_t.qualified_name = recv_qn;
             const char *dot = strrchr(recv_qn, '.');
             auto_t.short_name = dot ? dot + 1 : recv_qn;
@@ -13911,6 +14027,7 @@ static void rust_register_func_on(CBMArena *arena, CBMTypeRegistry *reg, CBMIdxM
         if (cbm_idxmemo_get(type_idx, rf.receiver_type) < 0) {
             CBMRegisteredType auto_t;
             memset(&auto_t, 0, sizeof(auto_t));
+            auto_t.rust_undeclared = true;
             auto_t.qualified_name = rf.receiver_type;
             const char *dot = strrchr(receiver, '.');
             auto_t.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : rf.receiver_type;
@@ -13918,10 +14035,12 @@ static void rust_register_func_on(CBMArena *arena, CBMTypeRegistry *reg, CBMIdxM
             cbm_idxmemo_put_if_absent(type_idx, arena, auto_t.qualified_name, reg->type_count - 1);
         }
     }
-    if (rf.receiver_type && rf.impl_trait_qn && d->receiver_spelling) {
+    if (rf.receiver_type && d->receiver_spelling) {
+        /* Keyed whether or not the trait is registered: the key is what tells
+         * two impls of unregistered traits on one type apart. */
         rf.impl_key =
             cbm_rust_impl_key(arena, rf.receiver_type, d->receiver_spelling, d->trait_qn);
-        if (rust_type_derefs_to_first_arg(rf.receiver_type)) {
+        if (rf.impl_trait_qn && rust_type_derefs_to_first_arg(rf.receiver_type)) {
             rf.rust_wrapper_impl_self = rust_wrapper_impl_self_type(
                 arena, d->receiver_spelling, rf.receiver_type, def_mod, tree);
         }
@@ -14060,6 +14179,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         if (type_index < 0) {
             CBMRegisteredType auto_t;
             memset(&auto_t, 0, sizeof(auto_t));
+            auto_t.rust_undeclared = true;
             auto_t.qualified_name = cbm_arena_strdup(arena, receiver);
             const char *dot = strrchr(receiver, '.');
             auto_t.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : auto_t.qualified_name;
