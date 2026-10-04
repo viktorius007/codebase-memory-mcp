@@ -1004,6 +1004,135 @@ TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type) {
     PASS();
 }
 
+/* `Type::f(..)` on a type with an inherent `f` and a trait-impl `f`: rustc
+ * probes inherent items first, so the inherent fn is the callee. The link is
+ * told apart from the trait impl's by its empty impl key. */
+#define RUSTLSP_INHERENT_AND_TRAIT                                                                 \
+    "trait Sink { fn flush(&self) -> u8; }\n"                                                      \
+    "struct Store;\n"                                                                              \
+    "impl Store { fn flush(&self) -> u8 { 1 } }\n"                                                 \
+    "impl Sink for Store { fn flush(&self) -> u8 { Store::flush(self) } }\n"
+
+/* The `Store.flush` link published by a caller; NULL when none. */
+static const CBMResolvedCall *rustlsp_flush_link(const CBMResolvedCallArray *calls,
+                                                 const char *caller) {
+    int i = find_confident(calls, caller, "Store.flush");
+    return i >= 0 ? &calls->items[i] : NULL;
+}
+
+TEST(rustlsp_type_path_call_prefers_inherent_over_trait_impl) {
+    CBMFileResult *r = extract_rust(RUSTLSP_INHERENT_AND_TRAIT
+                                    "fn run(s: &Store) -> u8 { Store::flush(s) }\n");
+    ASSERT_NOT_NULL(r);
+    const CBMResolvedCall *link = rustlsp_flush_link(&r->resolved_calls, "main.run");
+    ASSERT_NOT_NULL(link);
+    ASSERT_NULL(link->callee_impl_key);
+    /* The delegating trait-impl method calls the inherent fn, not itself. */
+    link = rustlsp_flush_link(&r->resolved_calls, "Store.flush");
+    ASSERT_NOT_NULL(link);
+    ASSERT_NULL(link->callee_impl_key);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A link to the trait impl's method, or none: never the inherent fn. */
+static bool rustlsp_flush_link_is_not_inherent(const CBMResolvedCallArray *calls,
+                                               const char *caller) {
+    const CBMResolvedCall *link = rustlsp_flush_link(calls, caller);
+    return !link || rustlsp_key_names(link->callee_impl_key, "Sink");
+}
+
+/* A path through the trait names the trait's item, so the inherent fn is
+ * never its callee. `<Type as Trait>::f` publishes no link today, with or
+ * without an inherent `f`; `Trait::f` links the impl. */
+TEST(rustlsp_trait_qualified_path_call_keeps_trait_impl) {
+    CBMFileResult *r = extract_rust(RUSTLSP_INHERENT_AND_TRAIT
+                                    "fn run(s: &Store) -> u8 { <Store as Sink>::flush(s) }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(rustlsp_flush_link_is_not_inherent(&r->resolved_calls, "main.run"));
+    cbm_free_result(r);
+
+    r = extract_rust(RUSTLSP_INHERENT_AND_TRAIT "fn run(s: &Store) -> u8 { Sink::flush(s) }\n");
+    ASSERT_NOT_NULL(r);
+    const CBMResolvedCall *link = rustlsp_flush_link(&r->resolved_calls, "main.run");
+    ASSERT_NOT_NULL(link);
+    ASSERT_TRUE(rustlsp_key_names(link->callee_impl_key, "Sink"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* No inherent `f`: two trait impls stay ambiguous, one stays linked. */
+TEST(rustlsp_type_path_call_with_only_trait_candidates_is_unchanged) {
+    CBMFileResult *r = extract_rust("trait Sink { fn flush(&self) -> u8; }\n"
+                                    "trait Drain { fn flush(&self) -> u8; }\n"
+                                    "struct Store;\n"
+                                    "impl Sink for Store { fn flush(&self) -> u8 { 1 } }\n"
+                                    "impl Drain for Store { fn flush(&self) -> u8 { 2 } }\n"
+                                    "fn run(s: &Store) -> u8 { Store::flush(s) }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(rustlsp_flush_link(&r->resolved_calls, "main.run"));
+    cbm_free_result(r);
+
+    r = extract_rust("trait Sink { fn flush(&self) -> u8; }\n"
+                     "struct Store;\n"
+                     "impl Sink for Store { fn flush(&self) -> u8 { 1 } }\n"
+                     "fn run(s: &Store) -> u8 { Store::flush(s) }\n");
+    ASSERT_NOT_NULL(r);
+    const CBMResolvedCall *link = rustlsp_flush_link(&r->resolved_calls, "main.run");
+    ASSERT_NOT_NULL(link);
+    ASSERT_TRUE(rustlsp_key_names(link->callee_impl_key, "Sink"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same choice when the type and its impls live in another file. */
+TEST(rustlsp_crossfile_type_path_call_prefers_inherent_over_trait_impl) {
+    CBMFileResult *lib = extract_rust(RUSTLSP_INHERENT_AND_TRAIT);
+    ASSERT_NOT_NULL(lib);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef *defs = cbm_arena_alloc(&arena, (size_t)lib->defs.count * sizeof(*defs));
+    ASSERT_NOT_NULL(defs);
+    memset(defs, 0, (size_t)lib->defs.count * sizeof(*defs));
+    for (int i = 0; i < lib->defs.count; i++) {
+        const CBMDefinition *src = &lib->defs.items[i];
+        defs[i].qualified_name = src->qualified_name;
+        defs[i].short_name = src->name;
+        defs[i].label = src->label;
+        defs[i].receiver_type = src->parent_class;
+        defs[i].receiver_spelling = src->receiver;
+        defs[i].trait_qn = src->impl_trait;
+        defs[i].signature_param_types = src->signature_param_types;
+        defs[i].signature_param_count = src->signature_param_count;
+        defs[i].def_module_qn = "test.src.main";
+        defs[i].lang = CBM_LANG_RUST;
+    }
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, lib->defs.count);
+    ASSERT_NOT_NULL(registry);
+    const char *imp_names[] = {"Store", "Sink"};
+    const char *imp_qns[] = {"test::src::main::Store", "test::src::main::Sink"};
+
+    const char *plain = "fn run(s: &Store) -> u8 { Store::flush(s) }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, plain, (int)strlen(plain), "test.src.caller",
+                                         "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
+                                         NULL, NULL, &out, NULL, NULL);
+    const CBMResolvedCall *link = rustlsp_flush_link(&out, "caller.run");
+    ASSERT_NOT_NULL(link);
+    ASSERT_NULL(link->callee_impl_key);
+
+    const char *qualified = "fn run(s: &Store) -> u8 { <Store as Sink>::flush(s) }\n";
+    CBMResolvedCallArray out_q = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, qualified, (int)strlen(qualified),
+                                         "test.src.caller", "test.src.caller", registry, imp_names,
+                                         imp_qns, 2, NULL, NULL, NULL, &out_q, NULL, NULL);
+    ASSERT_TRUE(rustlsp_flush_link_is_not_inherent(&out_q, "caller.run"));
+
+    cbm_arena_destroy(&arena);
+    cbm_free_result(lib);
+    PASS();
+}
+
 /* ── Category 10: Cross-file resolution ──────────────────────── */
 
 TEST(rustlsp_crossfile_method_dispatch) {
@@ -11784,6 +11913,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_from_call_selects_impl_by_argument_type);
     RUN_TEST(rustlsp_from_call_with_unproven_argument_is_unresolved);
     RUN_TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type);
+    RUN_TEST(rustlsp_type_path_call_prefers_inherent_over_trait_impl);
+    RUN_TEST(rustlsp_trait_qualified_path_call_keeps_trait_impl);
+    RUN_TEST(rustlsp_type_path_call_with_only_trait_candidates_is_unchanged);
+    RUN_TEST(rustlsp_crossfile_type_path_call_prefers_inherent_over_trait_impl);
 
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
