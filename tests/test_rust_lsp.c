@@ -698,6 +698,86 @@ TEST(rustlsp_if_let_else_branch_reads_previous_binding) {
     PASS();
 }
 
+/* ── A match / if / block used as a value is typed inside its own scope ── */
+
+TEST(rustlsp_match_value_typed_under_arm_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(v) => v, None => return };\n    y.after();",
+        "Old.step New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(v) => v, None => unreachable!(\"no\") };\n"
+        "    y.after();",
+        "Old.step New.after", ""));
+    /* The trailing match of a block, with a diverging block arm. */
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = { match x.step() { Some(v) => v, None => { return; } } };\n    y.after();",
+        "Old.step New.after", ""));
+    PASS();
+}
+
+TEST(rustlsp_match_arm_binding_ends_with_the_arm) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(x) => x, None => return };\n"
+        "    x.items();\n    y.after();",
+        "Old.step Old.items New.after", "New.items"));
+    PASS();
+}
+
+TEST(rustlsp_if_let_value_typed_under_condition_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = if let Some(v) = x.step() { v } else { return; };\n    y.after();",
+        "Old.step New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = if let Some(x) = x.step() { x } else { x.plain() };\n"
+        "    x.items();\n    y.after();",
+        "Old.step Old.plain Old.items New.after", "New.plain New.items"));
+    PASS();
+}
+
+TEST(rustlsp_block_value_typed_after_block_lets) {
+    ASSERT_TRUE(rustlsp_rebind_links("    let y = { let v = x.plain(); v };\n    y.after();",
+                                     "Old.plain New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = { let Some(v) = x.step() else { return; }; v };\n    y.after();",
+        "Old.step New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = { let x = x.plain(); x };\n    x.items();\n    y.after();",
+        "Old.plain Old.items New.after", "New.plain New.items"));
+    PASS();
+}
+
+TEST(rustlsp_branch_left_open_takes_the_other_branch_type) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(v) => Some(v), None => None };\n"
+        "    if let Some(z) = y { z.after(); }",
+        "Old.step New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let (a, b) = if x.ok() { (None, x.plain()) } else { (x.step(), x.plain()) };\n"
+        "    if let Some(z) = a { z.after(); }\n    b.items();",
+        "Old.ok Old.plain Old.step New.after New.items", ""));
+    /* Elements proven to differ leave the whole tuple untyped. */
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let n = x.plain();\n"
+        "    let (a, b) = if x.ok() { (n, n) } else { (x, n) };\n    b.items();",
+        "Old.plain Old.ok", "New.items Old.items"));
+    PASS();
+}
+
+TEST(rustlsp_branches_of_different_types_leave_value_untyped) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let n = x.plain();\n"
+        "    let y = if x.ok() { n } else { x };\n    y.items();",
+        "Old.plain Old.ok", "Old.items New.items"));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(v) => v, None => x };\n    y.items();",
+        "Old.step", "Old.items New.items"));
+    /* An `if` without `else` is `()`, not its consequence. */
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let n = x.plain();\n    let y = if x.ok() { n };\n    y.items();",
+        "Old.plain Old.ok", "New.items"));
+    PASS();
+}
+
 TEST(rustlsp_while_let_scrutinee_reads_previous_binding) {
     ASSERT_TRUE(rustlsp_rebind_links("    while let Some(x) = x.step() { x.after(); }",
                                      "Old.step New.after", "New.step"));
@@ -11892,6 +11972,12 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_let_else_block_reads_previous_binding);
     RUN_TEST(rustlsp_if_let_scrutinee_reads_previous_binding);
     RUN_TEST(rustlsp_if_let_else_branch_reads_previous_binding);
+    RUN_TEST(rustlsp_match_value_typed_under_arm_binding);
+    RUN_TEST(rustlsp_match_arm_binding_ends_with_the_arm);
+    RUN_TEST(rustlsp_if_let_value_typed_under_condition_binding);
+    RUN_TEST(rustlsp_block_value_typed_after_block_lets);
+    RUN_TEST(rustlsp_branch_left_open_takes_the_other_branch_type);
+    RUN_TEST(rustlsp_branches_of_different_types_leave_value_untyped);
     RUN_TEST(rustlsp_while_let_scrutinee_reads_previous_binding);
     RUN_TEST(rustlsp_let_chain_binds_in_condition_order);
     RUN_TEST(rustlsp_for_iterable_reads_previous_binding);
