@@ -13,9 +13,49 @@ for l in open(D+'g_nodes.tsv',errors='replace'):
 scip_files=set()
 file_crates=collections.defaultdict(set)  # corpus file -> crate names of the oracle symbols defined in it
 ref_lines=set()  # (file, line) carrying an oracle reference to a corpus definition
+file_mod={}  # corpus file -> oracle descriptor prefix of its file module ('' for a crate root)
+fn_defs=collections.defaultdict(lambda: collections.defaultdict(set))  # file -> fn descriptor -> {definition line}
 for l in open(D+'refs.tsv',errors='replace'):
-    p=l.split('\t',3)
+    p=l.rstrip('\n').split('\t')
     if p[0] in('R','D'): ref_lines.add((p[1],int(p[2])))
+    if p[0]=='D' and p[3]=='fn': fn_defs[p[1]][p[5]].add(p[2])
+    elif p[0]=='D' and p[3]=='module' and p[2]=='1': file_mod[p[1]]='' if p[5]=='crate/' else p[5]
+manifests={}
+def manifest_dir(f):
+    """Directory of the nearest Cargo.toml above corpus file f: the package that compiles it."""
+    d=os.path.dirname(f)
+    if d not in manifests:
+        manifests[d]=d if os.path.exists(CORPUS+d+'/Cargo.toml') else manifest_dir(d) if d else ''
+    return manifests[d]
+def second_module_paths():
+    """[(descriptor prefix, declaring file, source file)] for every `#[path = ".."] mod name;`
+    that compiles a source file under a module path other than the one the oracle defines
+    its symbols under.
+
+    The oracle records each source file's definitions once (refs.tsv D rows, one module
+    path per file). A file that is compiled a second time through `#[path]` has a second
+    set of symbols, <declaring file's module path><name>/..., with no definition record;
+    truth.tsv gives their definition file as `ext`. Only a declaration outside an inline
+    module is taken: its path is relative to the declaring file's directory."""
+    decl=re.compile(r'^#\[path\s*=\s*"([^"]+)"\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;',re.M)
+    out=[]
+    for f in sorted(file_mod):
+        text='\n'.join(source(f))
+        if '#[path' not in text: continue
+        for m in decl.finditer(text):
+            target=os.path.normpath(os.path.join(os.path.dirname(f),m.group(1)))
+            prefix=file_mod[f]+m.group(2)+'/'
+            if target in file_mod and file_mod[target]!=prefix: out.append((prefix,f,target))
+    return out
+src={}
+def source(f):
+    if f not in src:
+        try: src[f]=open(CORPUS+f,errors='replace').read().split('\n')
+        except OSError: src[f]=[]
+    return src[f]
+aliases=second_module_paths()
+alias_prefixes=tuple({a[0] for a in aliases})
+pending=[]  # oracle call records whose symbol lies under a second module path
 bycaller=collections.defaultdict(lambda: collections.defaultdict(set))  # (caller file, line, name) -> callee name -> {(df,dl,kind)}
 at_line=collections.defaultdict(list)  # (file, line) -> [(kind, callee name or '-')]: every oracle record on that line
 for l in open(D+'truth.tsv',errors='replace'):
@@ -27,12 +67,26 @@ for l in open(D+'truth.tsv',errors='replace'):
     at_line[(f,int(line))].append((kind,cname))
     if kind.endswith('unresolved') or cf=='-': continue
     bycaller[(cf,int(cl),cn)][cname].add((df,dl,kind))
-src={}
-def source(f):
-    if f not in src:
-        try: src[f]=open(CORPUS+f,errors='replace').read().split('\n')
-        except OSError: src[f]=[]
-    return src[f]
+    if df=='ext' and alias_prefixes and sym.startswith('rust-analyzer cargo '):
+        _,_,crate,_,desc=sym.split(' ',4)
+        if desc.startswith(alias_prefixes): pending.append((cf,int(cl),cn,cname,kind,crate.replace('-','_'),desc))
+dir_crates=collections.defaultdict(set)  # package directory -> crate names of the oracle symbols defined in it
+for f,crates in file_crates.items(): dir_crates[manifest_dir(f)]|=crates
+def source_definition(crate,desc):
+    """(file, line) of the one source definition behind an oracle symbol that lies under a
+    second module path, or None. The symbol must belong to the package of the declaring
+    file, and the rest of its descriptor, re-rooted at the module path the oracle defines
+    the source file under, must name exactly one fn definition in that file."""
+    found=set()
+    for prefix,decl_file,target in aliases:
+        if not desc.startswith(prefix) or crate not in dir_crates[manifest_dir(decl_file)]: continue
+        found|={(target,ln) for ln in fn_defs[target].get(file_mod[target]+desc[len(prefix):],())}
+    return next(iter(found)) if len(found)==1 else None
+rerouted=[]
+for cf,cl,cn,cname,kind,crate,desc in pending:
+    d=source_definition(crate,desc)
+    if d is None: continue
+    bycaller[(cf,cl,cn)][cname].add((d[0],d[1],kind)); rerouted.append((cf,cl,cn,desc,d))
 def macro_lines(lines,lo,hi):
     """Lines in [lo,hi] that lie inside the token tree of a `name!(...)`/`name![...]`/`name!{...}` invocation."""
     inside=set(); depth=0; text='\n'.join(lines[lo-1:hi]); ln=lo; i=0; opener=re.compile(r'\b[A-Za-z_]\w*!\s*[(\[{]')
@@ -139,6 +193,12 @@ for l in open(D+'g_calls.tsv'):
 tot=sum(C.values())
 for k,v in C.most_common(): print(f'{v:>7} {100*v/tot:5.1f}%  {k}')
 print('wrong/not-in-truth by strategy:',dict(strat))
+print(f'oracle call records judged by source definition (file compiled under a second module path): {len(rerouted)} of {len(pending)}; second module paths: {len(aliases)}')
+for cf,cl,cn,desc,d in rerouted: print(f'  {cf}:{cl} {cn} -> {desc} = {d[0]}:{d[1]}')
+with open(D+'wrong_pairs.tsv','w') as o:  # every pair behind the WRONG TARGET and NOT IN TRUTH counts
+    for k in sorted(S):
+        if k.startswith(('WRONG','NOT IN')):
+            for st,a,b in S[k]: o.write(f'{k.split(":")[0]}\t{st}\t{a[2]}:{a[3]} {a[1]}\t{b[2]}:{b[3]} {b[1]}\n')
 random.seed(5)
 for k in C:
     if k.startswith(('WRONG','NOT IN')):
