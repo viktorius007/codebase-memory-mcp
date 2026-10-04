@@ -1150,6 +1150,71 @@ TEST(rustlsp_std_returns_foreign_mutex_stays_unknown) {
     PASS();
 }
 
+/* tokio's `Mutex<T>::lock` is async and yields a guard that derefs to T, as
+ * do `RwLock<T>::read` / `write`; `lock_owned` goes through the `Arc`. The
+ * same chain inside a macro's arguments links too. */
+TEST(rustlsp_tokio_locks_await_to_guard) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use tokio::sync::Mutex;\n" RUSTLSP_STD_DECOYS
+        "async fn run(m: &Mutex<Conn>) -> bool { m.lock().await.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::Arc;\nuse tokio::sync::Mutex;\n" RUSTLSP_STD_DECOYS
+        "struct S { c: Arc<Mutex<Conn>> }\n"
+        "async fn run(s: &S) -> bool { let g = s.c.lock().await; g.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::Arc;\nuse tokio::sync::Mutex;\n" RUSTLSP_STD_DECOYS
+        "async fn run(c: Arc<Mutex<Conn>>) -> bool { c.lock_owned().await.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "async fn run(l: &tokio::sync::RwLock<Conn>) -> bool { l.read().await.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use tokio::sync::RwLock;\n" RUSTLSP_STD_DECOYS
+        "async fn run(l: &RwLock<Conn>) -> bool { l.write().await.ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use tokio::sync::Mutex;\n" RUSTLSP_STD_DECOYS
+        "async fn run(m: &Mutex<Conn>) { assert!(m.lock().await.ping()); }\n"));
+    PASS();
+}
+
+/* `tokio::time::timeout(d, fut).await` is `Result<F::Output, Elapsed>`,
+ * under the import or the full path. */
+TEST(rustlsp_tokio_timeout_yields_result_of_output) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::time::Duration;\nuse tokio::time::timeout;\n" RUSTLSP_STD_DECOYS
+        "async fn make() -> Conn { Conn }\n"
+        "async fn run(d: Duration) -> bool { timeout(d, make()).await.unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::time::Duration;\n" RUSTLSP_STD_DECOYS
+        "async fn make() -> Conn { Conn }\n"
+        "async fn run(d: Duration) -> Result<bool, tokio::time::error::Elapsed> {\n"
+        "    let c = tokio::time::timeout(d, make()).await?;\n"
+        "    Ok(c.ping())\n}\n"));
+    PASS();
+}
+
+/* Only tokio's items read the tokio signatures: a project lock type with its
+ * own async `lock`, and a project `timeout`, keep their declared returns. */
+TEST(rustlsp_tokio_signatures_need_the_tokio_item) {
+    CBMFileResult *r =
+        extract_rust(RUSTLSP_STD_DECOYS
+                     "struct Gate<T> { v: T }\n"
+                     "impl<T> Gate<T> { async fn lock(&self) -> Other { Other } }\n"
+                     "async fn run(m: &Gate<Conn>) -> bool { m.lock().await.ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Other.ping"), 0);
+    ASSERT(find_resolved(r, "run", "Conn.ping") < 0);
+    cbm_free_result(r);
+    r = extract_rust(RUSTLSP_STD_DECOYS
+                     "async fn make() -> Conn { Conn }\n"
+                     "async fn timeout<F>(_d: u64, _f: F) -> Other { Other }\n"
+                     "async fn run() -> bool { timeout(1, make()).await.ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Other.ping"), 0);
+    ASSERT(find_resolved(r, "run", "Conn.ping") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A `Result` head the registry does not know (a dependency's alias) is
  * core's `Result<T, _>`: `.expect()` yields its first argument. So does
  * std's `LockResult<G>`. A project type named `Result` keeps its own methods. */
@@ -10744,6 +10809,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_std_returns_shared_pointers);
     RUN_TEST(rustlsp_std_returns_locks);
     RUN_TEST(rustlsp_std_returns_foreign_mutex_stays_unknown);
+    RUN_TEST(rustlsp_tokio_locks_await_to_guard);
+    RUN_TEST(rustlsp_tokio_timeout_yields_result_of_output);
+    RUN_TEST(rustlsp_tokio_signatures_need_the_tokio_item);
     RUN_TEST(rustlsp_std_returns_unknown_result_head);
     RUN_TEST(rustlsp_std_returns_refcell);
     RUN_TEST(rustlsp_std_returns_option_result_adapters);
