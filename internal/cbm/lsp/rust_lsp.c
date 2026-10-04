@@ -9665,6 +9665,147 @@ static const CBMRegisteredFunc *rust_trait_ufcs_by_receiver(RustLSPContext *ctx,
     return found && (found->flags & CBM_FUNC_FLAG_RUST_SELF) ? found : NULL;
 }
 
+/* One spelling per type name for comparing two types: the registered QN
+ * when the registry answers, else `qn` itself (a std or external path).
+ * A signature in this file's own registry records a bare name as
+ * `<this module>.<Name>` without resolving it: when no registered type
+ * answers to that and the file neither imports the name nor has a glob
+ * import that could supply it, the name is the prelude's. */
+static const char *rust_type_name_identity(RustLSPContext *ctx, const char *qn) {
+    const char *registered = rust_registered_type_qn(ctx, qn);
+    if (registered) {
+        return registered;
+    }
+    size_t module_len = ctx->module_qn ? strlen(ctx->module_qn) : 0;
+    if (module_len == 0 || strncmp(qn, ctx->module_qn, module_len) != 0 ||
+        qn[module_len] != '.' || strchr(qn + module_len + 1, '.') || ctx->glob_count > 0) {
+        return qn;
+    }
+    const char *leaf = qn + module_len + 1;
+    const char *prelude = rust_resolve_use(ctx, leaf) ? NULL : rust_lookup_prelude(leaf);
+    if (!prelude) {
+        return qn;
+    }
+    registered = rust_registered_type_qn(ctx, prelude);
+    return registered ? registered : prelude;
+}
+
+/* Whether `param` (a parameter type as an impl wrote it) and `arg` (a type
+ * the evaluator gave an expression) are proven to be one type. Names compare
+ * by rust_type_name_identity, std wrapper heads by their one canonical QN. A type parameter, an unknown
+ * part or any other shape proves nothing. `&T` and `&mut T` are not told
+ * apart: a caller that needs them apart sees two matches. */
+static bool rust_param_type_is(RustLSPContext *ctx, const CBMType *param, const CBMType *arg,
+                               int depth) {
+    if (!param || !arg || depth > 16 || param->kind != arg->kind) {
+        return false;
+    }
+    switch (param->kind) {
+    case CBM_TYPE_BUILTIN:
+        return param->data.builtin.name && arg->data.builtin.name &&
+               strcmp(param->data.builtin.name, arg->data.builtin.name) == 0;
+    case CBM_TYPE_NAMED: {
+        const char *a = param->data.named.qualified_name;
+        const char *b = arg->data.named.qualified_name;
+        if (!a || !b || param->data.named.rust_dyn_markers || arg->data.named.rust_dyn_markers) {
+            return false;
+        }
+        return strcmp(rust_type_name_identity(ctx, a), rust_type_name_identity(ctx, b)) == 0;
+    }
+    case CBM_TYPE_REFERENCE:
+        return rust_param_type_is(ctx, param->data.reference.elem, arg->data.reference.elem,
+                                  depth + 1);
+    case CBM_TYPE_SLICE:
+        return rust_param_type_is(ctx, param->data.slice.elem, arg->data.slice.elem, depth + 1);
+    case CBM_TYPE_TEMPLATE: {
+        const char *a = param->data.template_type.template_name;
+        const char *b = arg->data.template_type.template_name;
+        if (!a || !b ||
+            param->data.template_type.arg_count != arg->data.template_type.arg_count) {
+            return false;
+        }
+        const char *wa = rust_std_wrapper_canonical(a);
+        const char *wb = rust_std_wrapper_canonical(b);
+        if (strcmp(wa ? wa : rust_type_name_identity(ctx, a),
+                   wb ? wb : rust_type_name_identity(ctx, b)) != 0) {
+            return false;
+        }
+        for (int i = 0; i < arg->data.template_type.arg_count; i++) {
+            if (!rust_param_type_is(ctx, param->data.template_type.template_args[i],
+                                    arg->data.template_type.template_args[i], depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+/* `Type::f(arg)` where `Type` implements one generic trait several times
+ * (`From<A>`, `From<B>`) and `f` is an associated function of it: rustc
+ * selects the impl by the argument's type, and impls of one trait cannot
+ * overlap, so the one impl whose first parameter type is the argument's
+ * proven type is the callee. Nothing is selected when the argument's type is
+ * unknown, when it is an unsuffixed numeric literal (its type comes from the
+ * impl, not the other way round), when no or several impls match, or when an
+ * owned and a borrowed impl of the same type both exist and the argument is
+ * not a `&expr` (a binding's reference level is not proven). */
+static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
+                                                            const char *receiver_qn,
+                                                            const char *method_name,
+                                                            TSNode first_arg) {
+    if (ts_node_is_null(first_arg)) {
+        return NULL;
+    }
+    const char *arg_kind = ts_node_type(first_arg);
+    if (strcmp(arg_kind, "integer_literal") == 0 || strcmp(arg_kind, "float_literal") == 0 ||
+        strcmp(arg_kind, "unary_expression") == 0) {
+        return NULL;
+    }
+    const CBMType *arg = rust_eval_expr_type(ctx, first_arg);
+    if (!arg || cbm_type_is_unknown(arg)) {
+        return NULL;
+    }
+    const CBMType *arg_base = rust_strip_references(arg);
+    const char *trait_qn = NULL;
+    const CBMRegisteredFunc *exact = NULL;
+    const char *base_key = NULL;
+    int same_base = 0;
+    CBMMethodIter it;
+    cbm_registry_methods_chain(ctx->registry, receiver_qn, method_name, &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *f = &it.reg->funcs[index];
+        const CBMType *sig = f->signature;
+        if ((f->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 ||
+            (f->flags & CBM_FUNC_FLAG_RUST_SELF) != 0 || !f->impl_trait_qn || !f->impl_key ||
+            (trait_qn && strcmp(trait_qn, f->impl_trait_qn) != 0)) {
+            return NULL;
+        }
+        trait_qn = f->impl_trait_qn;
+        const CBMType *param = sig && sig->kind == CBM_TYPE_FUNC && sig->data.func.param_types
+                                   ? sig->data.func.param_types[0]
+                                   : NULL;
+        /* One impl reached through both registries of the chain counts once. */
+        if (rust_param_type_is(ctx, rust_strip_references(param), arg_base, 0) &&
+            (!base_key || strcmp(base_key, f->impl_key) != 0)) {
+            base_key = base_key ? base_key : f->impl_key;
+            same_base++;
+        }
+        if (rust_param_type_is(ctx, param, arg, 0)) {
+            if (exact && strcmp(exact->impl_key, f->impl_key) != 0) {
+                return NULL;
+            }
+            exact = f;
+        }
+    }
+    if (same_base > 1 && strcmp(arg_kind, "reference_expression") != 0) {
+        return NULL;
+    }
+    return exact;
+}
+
 /* UFCS form `T::method` / `Trait::method` for a path already resolved to
  * `<type or trait QN>.<method>`; `first_arg` is the call's first argument
  * (null when unknown). True when the call was settled (a target found or
@@ -9741,6 +9882,9 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
     if (m) {
         const CBMRegisteredFunc *unique =
             rust_registry_lookup_unique_method(ctx->registry, m->receiver_type, m->short_name);
+        if (!unique) {
+            unique = rust_trait_impl_by_argument(ctx, m->receiver_type, m->short_name, first_arg);
+        }
         if (unique) {
             rust_call_target_set(out, unique, unique->qualified_name,
                                  strcmp(short_name, "new") == 0 ? "lsp_constructor" : "lsp_ufcs",
