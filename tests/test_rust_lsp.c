@@ -750,20 +750,147 @@ TEST(rustlsp_ufcs_macro_generated_constructor) {
     PASS();
 }
 
-TEST(rustlsp_type_qualified_call_with_ambiguous_from_impls_is_unresolved) {
-    CBMFileResult *r = extract_rust(
-        "trait From<T> { fn from(value: T) -> Self; }\n"
-        "struct HyperlinkLine;\n"
-        "impl From<&'static str> for HyperlinkLine {\n"
-        "    fn from(_value: &'static str) -> Self { Self }\n"
-        "}\n"
-        "impl From<String> for HyperlinkLine {\n"
-        "    fn from(_value: String) -> Self { Self }\n"
-        "}\n"
-        "fn run() { let _ = HyperlinkLine::from(\"text\"); }\n");
+/* `Type::from(arg)` on a type with several `From<_>` impls: the impl whose
+ * parameter type is the argument's proven type is the callee, named by its
+ * impl key. */
+#define RUSTLSP_FROM_IMPLS                                                                         \
+    "trait From<T> { fn from(value: T) -> Self; }\n"                                               \
+    "struct Label; struct Other;\n"                                                                \
+    "impl From<&'static str> for Label { fn from(_value: &'static str) -> Self { Self } }\n"       \
+    "impl From<String> for Label { fn from(_value: String) -> Self { Self } }\n"                   \
+    "impl From<&String> for Label { fn from(_value: &String) -> Self { Self } }\n"                 \
+    "impl From<Other> for Label { fn from(_value: Other) -> Self { Self } }\n"                     \
+    "fn text() -> &'static str { \"t\" }\n"
+
+/* The impl key of the `Label::from` link `run` publishes; NULL when none. */
+static const char *rustlsp_from_impl_key(const CBMResolvedCallArray *calls) {
+    int i = find_confident(calls, "run", "Label.from");
+    return i >= 0 ? calls->items[i].callee_impl_key : NULL;
+}
+
+static bool rustlsp_key_names(const char *key, const char *trait_spelling) {
+    return key && strstr(key, trait_spelling) != NULL;
+}
+
+TEST(rustlsp_from_call_selects_impl_by_argument_type) {
+    CBMFileResult *r = extract_rust(RUSTLSP_FROM_IMPLS
+                                    "fn run() { let _ = Label::from(\"text\"); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_EQ(-1, find_confident(&r->resolved_calls, "run", "HyperlinkLine.from"));
+    ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&r->resolved_calls), "From<&'static str>"));
     cbm_free_result(r);
+
+    r = extract_rust(RUSTLSP_FROM_IMPLS "fn run() { let _ = Label::from(text()); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&r->resolved_calls), "From<&'static str>"));
+    cbm_free_result(r);
+
+    r = extract_rust(RUSTLSP_FROM_IMPLS "fn run(o: Other) { let _ = Label::from(o); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&r->resolved_calls), "From<Other>"));
+    cbm_free_result(r);
+
+    /* `&expr` is a reference by syntax, so the borrowed impl is proven. */
+    r = extract_rust(RUSTLSP_FROM_IMPLS "fn run(s: String) { let _ = Label::from(&s); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&r->resolved_calls), "From<&String>"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_from_call_with_unproven_argument_is_unresolved) {
+    /* Unknown argument type. */
+    CBMFileResult *r = extract_rust(RUSTLSP_FROM_IMPLS
+                                    "fn run() { let _ = Label::from(missing()); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(rustlsp_from_impl_key(&r->resolved_calls));
+    cbm_free_result(r);
+
+    /* `From<String>` and `From<&String>` both exist: a binding's reference
+     * level does not settle which one applies. */
+    r = extract_rust(RUSTLSP_FROM_IMPLS "fn run(s: String) { let _ = Label::from(s); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(rustlsp_from_impl_key(&r->resolved_calls));
+    cbm_free_result(r);
+
+    /* A type no impl names. */
+    r = extract_rust(RUSTLSP_FROM_IMPLS "fn run(n: u64) { let _ = Label::from(n); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(rustlsp_from_impl_key(&r->resolved_calls));
+    cbm_free_result(r);
+
+    /* An unsuffixed literal takes its type from the impl. */
+    r = extract_rust("trait From<T> { fn from(value: T) -> Self; }\n"
+                     "struct Label;\n"
+                     "impl From<i32> for Label { fn from(_value: i32) -> Self { Self } }\n"
+                     "impl From<u8> for Label { fn from(_value: u8) -> Self { Self } }\n"
+                     "fn run() { let _ = Label::from(7); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(rustlsp_from_impl_key(&r->resolved_calls));
+    cbm_free_result(r);
+
+    /* A generic impl's parameter proves nothing about a concrete argument. */
+    r = extract_rust("trait From<T> { fn from(value: T) -> Self; }\n"
+                     "struct Label; struct Other;\n"
+                     "impl<T> From<Vec<T>> for Label { fn from(_value: Vec<T>) -> Self { Self } }\n"
+                     "impl From<Other> for Label { fn from(_value: Other) -> Self { Self } }\n"
+                     "fn run(v: Vec<u8>) { let _ = Label::from(v); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(rustlsp_from_impl_key(&r->resolved_calls));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same selection when the impls live in another file and reach the
+ * caller through the shared cross-file registry. */
+TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type) {
+    CBMFileResult *lib = extract_rust(RUSTLSP_FROM_IMPLS);
+    ASSERT_NOT_NULL(lib);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef *defs = cbm_arena_alloc(&arena, (size_t)lib->defs.count * sizeof(*defs));
+    ASSERT_NOT_NULL(defs);
+    memset(defs, 0, (size_t)lib->defs.count * sizeof(*defs));
+    for (int i = 0; i < lib->defs.count; i++) {
+        const CBMDefinition *src = &lib->defs.items[i];
+        defs[i].qualified_name = src->qualified_name;
+        defs[i].short_name = src->name;
+        defs[i].label = src->label;
+        defs[i].receiver_type = src->parent_class;
+        defs[i].receiver_spelling = src->receiver;
+        defs[i].trait_qn = src->impl_trait;
+        defs[i].signature_param_types = src->signature_param_types;
+        defs[i].signature_param_count = src->signature_param_count;
+        defs[i].def_module_qn = "test.src.main";
+        defs[i].lang = CBM_LANG_RUST;
+    }
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, lib->defs.count);
+    ASSERT_NOT_NULL(registry);
+    const char *imp_names[] = {"Label", "Other"};
+    const char *imp_qns[] = {"test::src::main::Label", "test::src::main::Other"};
+
+    const char *typed = "fn run() { let _ = Label::from(\"text\"); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, typed, (int)strlen(typed), "test.src.caller",
+                                         "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
+                                         NULL, NULL, &out, NULL, NULL);
+    ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&out), "From<&'static str>"));
+
+    const char *owned = "fn run(o: Other) { let _ = Label::from(o); }\n";
+    CBMResolvedCallArray out_owned = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, owned, (int)strlen(owned), "test.src.caller",
+                                         "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
+                                         NULL, NULL, &out_owned, NULL, NULL);
+    ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&out_owned), "From<Other>"));
+
+    const char *unknown = "fn run() { let _ = Label::from(missing()); }\n";
+    CBMResolvedCallArray out_unknown = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, unknown, (int)strlen(unknown), "test.src.caller",
+                                         "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
+                                         NULL, NULL, &out_unknown, NULL, NULL);
+    ASSERT_NULL(rustlsp_from_impl_key(&out_unknown));
+
+    cbm_arena_destroy(&arena);
+    cbm_free_result(lib);
     PASS();
 }
 
@@ -10729,7 +10856,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_self_uppercase);
     RUN_TEST(rustlsp_ufcs_trait_method);
     RUN_TEST(rustlsp_ufcs_macro_generated_constructor);
-    RUN_TEST(rustlsp_type_qualified_call_with_ambiguous_from_impls_is_unresolved);
+    RUN_TEST(rustlsp_from_call_selects_impl_by_argument_type);
+    RUN_TEST(rustlsp_from_call_with_unproven_argument_is_unresolved);
+    RUN_TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type);
 
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
