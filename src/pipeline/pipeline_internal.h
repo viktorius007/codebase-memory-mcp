@@ -1057,6 +1057,17 @@ const cbm_gbuf_node_t *cbm_pipeline_rust_member_usage_target(const cbm_gbuf_t *g
                                                              const CBMResolvedCallArray *rows,
                                                              const CBMUsage *usage);
 
+/* Rust USAGE to a Field is published only from the resolver's field record
+ * (CBM_RESOLVED_FIELD_REFERENCE) for this exact occurrence. `*owned` is set
+ * when a record covers the occurrence; the result is its target node, or NULL
+ * when the records disagree or the field has no node. A Field reached by the
+ * bare name alone is never published. Shared by both USAGE emitters. */
+const cbm_gbuf_node_t *cbm_pipeline_rust_field_usage_target(const cbm_gbuf_t *gbuf,
+                                                            const char *project_name,
+                                                            const CBMResolvedCallArray *rows,
+                                                            const CBMUsage *usage, bool *owned);
+bool cbm_pipeline_rust_bare_field_target(CBMLanguage lang, const cbm_gbuf_node_t *target);
+
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
 /* Test-only view of the Studio Export range join, so the ",+<N>" truncation
  * marker rules can be checked without building a 256-region export file. */

@@ -60,6 +60,8 @@ static void rust_emit_unresolved_call(RustLSPContext *ctx, const char *expr_text
                                       const char *reason);
 static const CBMType *rust_lookup_field(RustLSPContext *ctx, const char *type_qn,
                                         const char *field_name, int depth);
+static void rust_emit_field_reference(RustLSPContext *ctx, TSNode site, const char *owner_qn,
+                                      const char *field_name);
 static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
                                                             const char *trait_qn,
                                                             const char *method_name,
@@ -4826,6 +4828,7 @@ static const CBMType *rust_lookup_field(RustLSPContext *ctx, const char *type_qn
         for (int i = 0; rt->field_names[i]; i++) {
             if (strcmp(rt->field_names[i], field_name) == 0 && rt->field_types &&
                 rt->field_types[i]) {
+                ctx->field_owner_qn = rt->qualified_name;
                 return rt->field_types[i];
             }
         }
@@ -8149,18 +8152,25 @@ static const CBMType *rust_tuple_variant_field(RustLSPContext *ctx, const CBMTyp
 /* The type of named field `fname` of the struct or struct-like variant
  * `leaf` of the matched value `base`. NULL when not known. */
 static const CBMType *rust_struct_pattern_field(RustLSPContext *ctx, const char *owner,
-                                                const char *leaf, const char *fname) {
+                                                const char *leaf, const char *fname, TSNode site) {
     if (!owner || !fname) {
         return NULL;
     }
     if (leaf) {
-        const CBMType *vt =
-            rust_lookup_field(ctx, owner, cbm_arena_sprintf(ctx->arena, "%s.%s", leaf, fname), 0);
+        const char *variant_field = cbm_arena_sprintf(ctx->arena, "%s.%s", leaf, fname);
+        ctx->field_owner_qn = NULL;
+        const CBMType *vt = rust_lookup_field(ctx, owner, variant_field, 0);
         if (vt) {
+            rust_emit_field_reference(ctx, site, ctx->field_owner_qn, variant_field);
             return vt;
         }
     }
-    return rust_lookup_field(ctx, owner, fname, 0);
+    ctx->field_owner_qn = NULL;
+    const CBMType *ft = rust_lookup_field(ctx, owner, fname, 0);
+    if (ft) {
+        rust_emit_field_reference(ctx, site, ctx->field_owner_qn, fname);
+    }
+    return ft;
 }
 
 /* A binding made through a reference with the default binding mode is a
@@ -8320,7 +8330,7 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
                 char *fname = rust_node_text(ctx, name_node);
                 if (!fname)
                     continue;
-                const CBMType *ft = rust_struct_pattern_field(ctx, type_qn, leaf, fname);
+                const CBMType *ft = rust_struct_pattern_field(ctx, type_qn, leaf, fname, name_node);
                 ft = rust_pattern_bind_through(ctx, ft ? ft : cbm_type_unknown(), by_ref);
                 if (!ts_node_is_null(pat_node)) {
                     rust_bind_pattern(ctx, pat_node, ft);
@@ -8331,7 +8341,7 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
                        strcmp(fk, "identifier") == 0) {
                 char *fname = rust_node_text(ctx, fp);
                 if (fname && strcmp(fname, "_") != 0) {
-                    const CBMType *ft = rust_struct_pattern_field(ctx, type_qn, leaf, fname);
+                    const CBMType *ft = rust_struct_pattern_field(ctx, type_qn, leaf, fname, fp);
                     cbm_scope_bind(
                         ctx->current_scope, fname,
                         rust_pattern_bind_through(ctx, ft ? ft : cbm_type_unknown(), by_ref));
@@ -8662,6 +8672,113 @@ static void rust_resolve_callable_argument_references(RustLSPContext *ctx, TSNod
             .site_end_byte = end,
         };
         cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, reference);
+    }
+}
+
+/* Publish one proven field occurrence: `site` is the field name's node and
+ * `owner_qn` the registered type declaring `field_name`. Nothing is published
+ * when the occurrence has no original-source coordinates. */
+static void rust_emit_field_reference(RustLSPContext *ctx, TSNode site, const char *owner_qn,
+                                      const char *field_name) {
+    if (!ctx || !ctx->resolved_calls || !ctx->enclosing_func_qn || !owner_qn || !field_name ||
+        ts_node_is_null(site)) {
+        return;
+    }
+    uint32_t start = 0;
+    uint32_t end = 0;
+    if (!rust_map_source_range(ctx, ts_node_start_byte(site), ts_node_end_byte(site), &start,
+                               &end)) {
+        return;
+    }
+    CBMResolvedCall reference = {
+        .caller_qn = ctx->enclosing_func_qn,
+        .callee_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", owner_qn, field_name),
+        .caller_impl_key = ctx->enclosing_impl_key,
+        .strategy = "lsp_field_access",
+        .confidence = CBM_RUST_CONF_DIRECT,
+        .kind = CBM_RESOLVED_FIELD_REFERENCE,
+        .site_start_byte = start,
+        .site_end_byte = end,
+    };
+    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, reference);
+}
+
+/* True when `node` is the callee of a method call (`recv.m()`,
+ * `recv.m::<T>()`): that occurrence is a method, not a field. */
+static bool rust_field_expression_is_method_callee(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "generic_function") == 0) {
+        node = parent;
+        parent = ts_node_parent(node);
+    }
+    if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "call_expression") != 0) {
+        return false;
+    }
+    TSNode callee = ts_node_child_by_field_name(parent, "function", 8);
+    return !ts_node_is_null(callee) && ts_node_eq(callee, node);
+}
+
+/* `recv.field` outside a method-call callee: the member is typed exactly as
+ * the resolver types the expression (aliases, deref hops); a field result
+ * names its declaring type through field_owner_qn. */
+static void rust_resolve_field_access(RustLSPContext *ctx, TSNode node) {
+    if (rust_field_expression_is_method_callee(node)) {
+        return;
+    }
+    TSNode value = ts_node_child_by_field_name(node, "value", 5);
+    TSNode field = ts_node_child_by_field_name(node, "field", 5);
+    if (ts_node_is_null(value) || ts_node_is_null(field) ||
+        strcmp(ts_node_type(field), "field_identifier") != 0) {
+        return;
+    }
+    char *fname = rust_node_text(ctx, field);
+    if (!fname || !fname[0]) {
+        return;
+    }
+    const CBMType *recv = rust_eval_expr_type(ctx, value);
+    const CBMRegisteredFunc *method = NULL;
+    ctx->field_owner_qn = NULL;
+    const CBMType *member = rust_eval_member_access(ctx, recv, fname, false, &method);
+    if (!method && member && !cbm_type_is_unknown(member)) {
+        rust_emit_field_reference(ctx, field, ctx->field_owner_qn, fname);
+    }
+}
+
+/* `S { field: v, shorthand }`: each named field of the literal's proven
+ * struct type. */
+static void rust_resolve_struct_literal_fields(RustLSPContext *ctx, TSNode node) {
+    TSNode body = ts_node_child_by_field_name(node, "body", 4);
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    const CBMType *type = rust_eval_expr_type(ctx, node);
+    if (!type || type->kind != CBM_TYPE_NAMED || !type->data.named.qualified_name) {
+        return;
+    }
+    const char *type_qn = type->data.named.qualified_name;
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(body, i);
+        const char *item_kind = ts_node_type(item);
+        TSNode name = {0};
+        if (strcmp(item_kind, "field_initializer") == 0) {
+            name = ts_node_child_by_field_name(item, "field", 5);
+        } else if (strcmp(item_kind, "shorthand_field_initializer") == 0 &&
+                   ts_node_named_child_count(item) > 0) {
+            name = ts_node_named_child(item, 0);
+        }
+        if (ts_node_is_null(name) || (strcmp(ts_node_type(name), "field_identifier") != 0 &&
+                                      strcmp(ts_node_type(name), "identifier") != 0)) {
+            continue;
+        }
+        char *fname = rust_node_text(ctx, name);
+        if (!fname || !fname[0]) {
+            continue;
+        }
+        ctx->field_owner_qn = NULL;
+        if (rust_lookup_field(ctx, type_qn, fname, 0)) {
+            rust_emit_field_reference(ctx, name, ctx->field_owner_qn, fname);
+        }
     }
 }
 
@@ -9549,6 +9666,12 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
 
     /* Bind variables introduced by this statement. */
     rust_process_statement(ctx, node);
+
+    if (strcmp(kind, "field_expression") == 0) {
+        rust_resolve_field_access(ctx, node);
+    } else if (strcmp(kind, "struct_expression") == 0) {
+        rust_resolve_struct_literal_fields(ctx, node);
+    }
 
     /* Resolve a call expression. */
     if (strcmp(kind, "call_expression") == 0) {

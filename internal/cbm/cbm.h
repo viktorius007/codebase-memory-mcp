@@ -429,6 +429,9 @@ typedef struct {
 typedef enum {
     CBM_RESOLVED_INVOCATION = 0,
     CBM_RESOLVED_CALL_REFERENCE,
+    /* A proven field access: callee_qn is the field's QN, the site is the
+     * field name's exact occurrence. Feeds USAGE, never CALLS. */
+    CBM_RESOLVED_FIELD_REFERENCE,
 } CBMResolvedKind;
 
 // LSP-resolved invocation/reference: high-confidence type-aware resolution.
