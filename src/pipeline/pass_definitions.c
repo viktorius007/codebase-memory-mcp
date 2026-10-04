@@ -452,8 +452,7 @@ int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
     return count;
 }
 
-/* Create IMPORTS edges for one file's imports.  Mirrors the resolution
- * logic in pass_parallel.c register_and_link_def — keep the two in sync. */
+/* Create IMPORTS edges for one file's imports. */
 static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                         const char *rel, CBMHashTable *namespace_map, bool rust) {
     int count = 0;
@@ -471,16 +470,7 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         if (rust) {
             cbm_pipeline_rust_imports_add(ctx, rel, imp);
         }
-        const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        if (target && target->id != source_node->id) {
-            char esc_ln[CBM_SZ_128];
-            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
-            cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-            count++;
-        }
+        count += cbm_pipeline_link_import(ctx, source_node, rel, file_qn, imp, namespace_map);
     }
     free(file_qn);
     return count;
@@ -735,6 +725,7 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count) {
     cbm_log_info("pass.start", "pass", "definitions", "files", itoa_log(file_count));
+    cbm_pipeline_rust_modtree_prepare(ctx, files, file_count);
 
     /* Ensure extraction library is initialized */
     cbm_init();

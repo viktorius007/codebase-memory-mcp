@@ -1371,16 +1371,7 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
         if (rust) {
             cbm_pipeline_rust_imports_add(ctx, rel, imp);
         }
-        const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        if (target && target->id != source_node->id) {
-            char esc_ln[CBM_SZ_128];
-            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
-            cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-            count++;
-        }
+        count += cbm_pipeline_link_import(ctx, source_node, rel, file_qn, imp, namespace_map);
     }
     free(file_qn);
     return count;
@@ -1450,6 +1441,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     CBMHashTable *namespace_map =
         cbm_pipeline_namespace_map_build(ctx->project_name, result_cache, rels, file_count);
     free(rels);
+    cbm_pipeline_rust_modtree_prepare(ctx, files, file_count);
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
@@ -3607,9 +3599,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     };
     CBMRustMacroTable *rust_macros = NULL;
     CBMRustModTree *rust_modtree =
-        have_rust
-            ? cbm_pxc_build_rust_modtree(ctx, rust_manifest_ptr, files, file_count, &rust_macros)
-            : NULL;
+        have_rust ? cbm_pipeline_rust_modtree_take(ctx, rust_manifest_ptr, files, file_count,
+                                                   &rust_macros)
+                  : NULL;
     rc.rust_modtree = rust_modtree;
     rc.rust_macros = rust_macros;
     atomic_init(&rc.next_file_idx, 0);

@@ -820,6 +820,50 @@ TEST(ei_rust_use_external_head_never_binds) {
     PASS();
 }
 
+/* Rust: a `use` links to the item its path resolves to in the module tree,
+ * not to a node that merely has the name. `use crate::Cli` crosses the
+ * by-name re-export in lib.rs to cli.rs; `use crate::buffers::Frame` crosses
+ * the `#[path]` module to device_buffers.rs; `use crate::Debug` reaches a std
+ * item and links nothing. aaa.rs declares all three names and sorts first, so
+ * the name fallback binds every one of them to aaa.rs (RED without the tree). */
+TEST(ei_rust_use_links_through_module_tree) {
+    static const EILangFile f[] = {
+        {"Cargo.toml", "[package]\nname = \"app\"\nedition = \"2021\"\n"},
+        {"src/lib.rs", "mod aaa;\nmod cli;\n#[path = \"device_buffers.rs\"]\nmod buffers;\n"
+                       "mod user;\npub use cli::Cli;\npub use std::fmt::Debug;\n"},
+        {"src/aaa.rs", "pub struct Cli;\npub struct Frame;\npub trait Debug {}\n"},
+        {"src/cli.rs", "pub struct Cli;\n"},
+        {"src/device_buffers.rs", "pub struct Frame;\n"},
+        {"src/user.rs", "use crate::Cli;\nuse crate::buffers::Frame;\nuse crate::Debug;\n\n"
+                        "fn make(_c: Cli, _f: Frame) {}\n"}};
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 6);
+    ASSERT_NOT_NULL(store);
+    int64_t user_id = ei_node_id_for_file_label(store, lp.project, "src/user.rs", "File");
+    ASSERT_GT(user_id, 0);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, user_id, "IMPORTS", &edges, &edge_count),
+              CBM_STORE_OK);
+    bool saw_cli = false;
+    bool saw_frame = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t target = {0};
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, &target), CBM_STORE_OK);
+        const char *file = target.file_path ? target.file_path : "";
+        const char *name = target.name ? target.name : "";
+        saw_cli |= strcmp(file, "src/cli.rs") == 0 && strcmp(name, "Cli") == 0;
+        saw_frame |= strcmp(file, "src/device_buffers.rs") == 0 && strcmp(name, "Frame") == 0;
+        cbm_node_free_fields(&target);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ASSERT_EQ(edge_count, 2);
+    ASSERT_TRUE(saw_cli);
+    ASSERT_TRUE(saw_frame);
+    ei_cleanup(&lp, store);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * RED REPRODUCTION — Kotlin
  *
@@ -1216,6 +1260,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_rust_trait_use);
     RUN_TEST(ei_rust_use_never_binds_method);
     RUN_TEST(ei_rust_use_external_head_never_binds);
+    RUN_TEST(ei_rust_use_links_through_module_tree);
 
     /* ── RED REPRODUCTIONS — Kotlin (expected to FAIL until pipeline fixed) ── */
     RUN_TEST(ei_kotlin_basic_class_import);

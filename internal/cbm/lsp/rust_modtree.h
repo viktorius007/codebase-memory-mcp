@@ -149,4 +149,18 @@ CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMA
 CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tree, CBMArena *arena,
                                                         const char *module_qn, const char *path);
 
+/* The project items a named `use` written in the registered file `rel_path`
+ * binds: `local_name` is the name it introduces and `path` the
+ * path it spells, both as cbm_extract_rust_use_tree reports them. A `use`
+ * declared at module level answers from the module that declares it; one
+ * declared in a block is resolved from every module of the file. Writes up
+ * to `max` item QNs (a name can bind one item per namespace) and returns
+ * their count; 0 when the path is proven to name nothing the project
+ * declares (an item of an external crate or of the language). Returns -1
+ * when the tree cannot decide: an unresolved path, a module, an enum
+ * variant, or modules of the file that disagree. */
+int cbm_rust_modtree_use_items(const CBMRustModTree *tree, CBMArena *arena, const char *rel_path,
+                               const char *local_name, const char *path, const char **out_qns,
+                               int max);
+
 #endif /* CBM_LSP_RUST_MODTREE_H */
