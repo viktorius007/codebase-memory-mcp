@@ -391,6 +391,7 @@ typedef struct {
     const char *receiver_spelling;      /* exact impl receiver spelling; registry-only */
     const char *impl_target;            /* impl relation: raw `type Target = ..;` text */
     const char **decorators;            /* borrowed attribute texts (`#[derive(..)]`), NULL-ended */
+    const char **fn_type_params;        /* the fn's own type parameter names, NULL-ended */
     bool is_interface;           /* true for traits                          */
     bool is_rust_impl_relation;   /* independent type-level impl record       */
     bool is_abstract;             /* required trait declaration (no default)  */

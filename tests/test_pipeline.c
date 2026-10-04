@@ -2843,8 +2843,8 @@ static const usage_expectation_t rust_bare_binding_rows[] = {
 };
 enum { RUST_BARE_BINDING_ROWS = sizeof(rust_bare_binding_rows) / sizeof(rust_bare_binding_rows[0]) };
 
-static void usage_expectation_counts(const char *tmp, const char *db_name,
-                                     const usage_expectation_t *rows, int row_count, int *out) {
+static void edge_expectation_counts(const char *tmp, const char *db_name, const char *edge_type,
+                                    const usage_expectation_t *rows, int row_count, int *out) {
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/%s", tmp, db_name);
     for (int i = 0; i < row_count; i++) {
@@ -2856,7 +2856,7 @@ static void usage_expectation_counts(const char *tmp, const char *db_name,
         if (s) {
             const char *project = cbm_pipeline_project_name(p);
             for (int i = 0; i < row_count; i++) {
-                out[i] = named_edge_to_labelled_count(s, project, "USAGE", rows[i].source,
+                out[i] = named_edge_to_labelled_count(s, project, edge_type, rows[i].source,
                                                       rows[i].target, rows[i].target_file,
                                                       rows[i].target_label);
             }
@@ -2867,9 +2867,10 @@ static void usage_expectation_counts(const char *tmp, const char *db_name,
 }
 
 /* Runs the fixture in `tmp` sequentially and in parallel; every row of both
- * runs must hold its expected count. Returns the first failing row, or -1. */
-static int usage_expectations_hold_in_both_modes(const char *tmp, const usage_expectation_t *rows,
-                                                 int row_count) {
+ * runs must hold its expected count of `edge_type` links. Returns the first
+ * failing row, or -1. */
+static int edge_expectations_hold_in_both_modes(const char *tmp, const char *edge_type,
+                                                const usage_expectation_t *rows, int row_count) {
     int seq[16];
     int par[16];
     if (row_count > 16) {
@@ -2880,10 +2881,10 @@ static int usage_expectations_hold_in_both_modes(const char *tmp, const usage_ex
     char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
     char *saved_single = old_single ? strdup(old_single) : NULL;
     cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
-    usage_expectation_counts(tmp, "sequential.db", rows, row_count, seq);
+    edge_expectation_counts(tmp, "sequential.db", edge_type, rows, row_count, seq);
     cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
     cbm_setenv("CBM_WORKERS", "4", 1);
-    usage_expectation_counts(tmp, "parallel.db", rows, row_count, par);
+    edge_expectation_counts(tmp, "parallel.db", edge_type, rows, row_count, par);
     if (saved_workers) {
         cbm_setenv("CBM_WORKERS", saved_workers, 1);
     } else {
@@ -2903,6 +2904,57 @@ static int usage_expectations_hold_in_both_modes(const char *tmp, const usage_ex
         }
     }
     return -1;
+}
+
+static int usage_expectations_hold_in_both_modes(const char *tmp, const usage_expectation_t *rows,
+                                                 int row_count) {
+    return edge_expectations_hold_in_both_modes(tmp, "USAGE", rows, row_count);
+}
+
+/* `s.get::<Conn>()` on `fn get<T>(&self) -> Option<Arc<T>>` declared in
+ * another file is an `Option<Arc<Conn>>`: the method's own type parameters
+ * reach the resolver in both pipeline modes, so the chained `ping` is Conn's,
+ * not the namesake of a type the turbofish does not write. */
+TEST(pipeline_rust_turbofish_method_binds_written_type_argument) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_turbofish_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod store;\nmod other;\nmod user;\n");
+    write_temp_file(tmp, "src/store.rs",
+                    "use std::sync::Arc;\n"
+                    "pub struct Conn;\n"
+                    "impl Conn {\n"
+                    "    pub fn ping(&self) -> bool { true }\n"
+                    "}\n"
+                    "pub struct Store;\n"
+                    "impl Store {\n"
+                    "    pub fn get<T>(&self) -> Option<Arc<T>> { None }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/other.rs",
+                    "pub struct Other;\n"
+                    "impl Other {\n"
+                    "    pub fn ping(&self) -> bool { false }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/user.rs",
+                    "use crate::other::Other;\n"
+                    "use crate::store::{Conn, Store};\n"
+                    "pub fn run(s: &Store) -> bool { s.get::<Conn>().unwrap().ping() }\n"
+                    "pub fn hole(s: &Store) -> bool { s.get::<_>().unwrap().ping() }\n"
+                    "pub fn keep(_o: &Other) {}\n");
+    static const usage_expectation_t rows[] = {
+        {"run", "get", "src/store.rs", 1, NULL},   {"run", "ping", "src/store.rs", 1, NULL},
+        {"run", "ping", "src/other.rs", 0, NULL},  {"hole", "get", "src/store.rs", 1, NULL},
+        {"hole", "ping", "src/store.rs", 0, NULL}, {"hole", "ping", "src/other.rs", 0, NULL},
+    };
+    int failed = edge_expectations_hold_in_both_modes(tmp, "CALLS", rows,
+                                                      (int)(sizeof(rows) / sizeof(rows[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(failed, -1);
+    PASS();
 }
 
 TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob) {
@@ -17545,7 +17597,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":9") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":10") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -18751,6 +18803,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_rust_usage_never_binds_method_by_bare_name);
     RUN_TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob);
+    RUN_TEST(pipeline_rust_turbofish_method_binds_written_type_argument);
     RUN_TEST(pipeline_rust_field_usage_from_resolver_record);
     RUN_TEST(pipeline_python_and_go_bare_name_keep_import_reachability);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);

@@ -242,7 +242,9 @@ typedef struct {
     bool has_rust_self;
     /* Rust only: a `type Name<P..> = Target;` item's target as written and its
      * type parameter names in declaration order (NULL-ended, NULL when none),
-     * so a resolver reads a use of the alias as the target. NULL otherwise. */
+     * so a resolver reads a use of the alias as the target. NULL otherwise.
+     * On a Rust function or method, `type_alias_params` holds the type
+     * parameters the fn itself declares (`fn get<T>`), `type_alias` NULL. */
     const char *type_alias;
     const char **type_alias_params;
 } CBMDefinition;

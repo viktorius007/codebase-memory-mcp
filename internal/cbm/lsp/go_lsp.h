@@ -99,6 +99,7 @@ typedef struct {
     bool is_async;              // Rust `async fn`: recorded return is the awaited output
     bool is_rust_private;       // Rust inherent method without a visibility modifier
     bool has_rust_self;         // Rust method whose first parameter is a `self` receiver
+    const char **fn_type_params; // Rust fn's own type parameter names, NULL-ended, or NULL
     /* Python-only raw decorator syntax, borrowed from CBMDefinition.  The
      * resolver must retain it across fused/cross-file registry construction:
      * a decorator rebinds the function name, so the undecorated definition is

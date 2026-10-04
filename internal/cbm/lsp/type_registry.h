@@ -35,6 +35,9 @@ typedef struct {
     const char *short_name;        // e.g., "MethodName"
     const CBMType *signature;      // FUNC type with param/return types
     const char **type_param_names; // NULL-terminated, e.g., ["T", "R", NULL] for generics
+    // Rust only: the type parameters the fn itself declares (`fn get<T>`), NULL-terminated;
+    // type_param_names holds those of a method's impl.
+    const char **fn_type_param_names;
     int min_params;                // Minimum required params (excluding defaulted). -1 = unknown.
     int flags;                     // CBM_FUNC_FLAG_* bitfield
     const char **decorator_qns;    // NULL-terminated decorator QNs (Python only); used for
