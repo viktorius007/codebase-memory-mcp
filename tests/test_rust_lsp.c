@@ -4108,6 +4108,138 @@ TEST(rustlsp_deref_field_through_box) {
     PASS();
 }
 
+/* One file: `Managed` derefs to `Inner` by its own `impl Deref`. */
+#define RUSTLSP_USER_DEREF_SRC(trait_decl, trait_path)                 \
+    trait_decl "struct Inner { leaf: Leaf }\n"                         \
+               "struct Leaf;\n"                                        \
+               "impl Leaf { fn go(&self) {} }\n"                       \
+               "impl Inner { fn ping(&self) {} }\n"                    \
+               "struct Managed { v: Inner }\n"                         \
+               "impl " trait_path " for Managed {\n"                   \
+               "    type Target = Inner;\n"                            \
+               "    fn deref(&self) -> &Inner { &self.v }\n"           \
+               "}\n"                                                   \
+               "fn run(m: Managed) { m.ping(); m.leaf.go(); }\n"
+
+TEST(rustlsp_user_deref_reaches_target_method_and_field) {
+    /* `m.ping()` is `Inner::ping` and `m.leaf` is `Inner`'s field: both are
+     * found only through `impl Deref for Managed { type Target = Inner; }`. */
+    CBMFileResult *r = extract_rust(RUSTLSP_USER_DEREF_SRC("", "std::ops::Deref"));
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Inner.ping"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "Leaf.go"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_user_trait_named_deref_gives_no_deref_step) {
+    /* A project trait that happens to be called `Deref` is not the
+     * language's: its `Target` is no auto-deref step. */
+    CBMFileResult *r = extract_rust(RUSTLSP_USER_DEREF_SRC(
+        "trait Deref { type Target; fn deref(&self) -> &Self::Target; }\n", "Deref"));
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "run", "Inner.ping"), -1);
+    ASSERT_EQ(find_resolved(r, "run", "Leaf.go"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_user_deref_own_method_wins_over_target) {
+    /* The receiver's own method is probed before the deref step. */
+    CBMFileResult *r = extract_rust(
+        "struct Inner;\nimpl Inner { fn ping(&self) {} }\n"
+        "struct Managed { v: Inner }\nimpl Managed { fn ping(&self) {} }\n"
+        "impl std::ops::Deref for Managed {\n"
+        "    type Target = Inner;\n"
+        "    fn deref(&self) -> &Inner { &self.v }\n"
+        "}\n"
+        "fn run(m: Managed) { m.ping(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Managed.ping"), 0);
+    ASSERT_EQ(find_resolved(r, "run", "Inner.ping"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_user_deref_generic_target_takes_written_argument) {
+    /* `impl<T> Deref for Held<T> { type Target = T; }`: `Held<Inner>` derefs
+     * to `Inner`, and `Outer<Inner>` -> `Held<Inner>` -> `Inner` in two steps. */
+    CBMFileResult *r = extract_rust(
+        "use std::ops::Deref;\n"
+        "struct Inner;\nimpl Inner { fn ping(&self) {} }\n"
+        "struct Held<T> { v: T }\n"
+        "impl<T> Deref for Held<T> {\n"
+        "    type Target = T;\n"
+        "    fn deref(&self) -> &T { &self.v }\n"
+        "}\n"
+        "struct Outer<U> { h: Held<U> }\n"
+        "impl<U> Deref for Outer<U> {\n"
+        "    type Target = Held<U>;\n"
+        "    fn deref(&self) -> &Held<U> { &self.h }\n"
+        "}\n"
+        "fn one(h: Held<Inner>) { h.ping(); }\n"
+        "fn two(o: &Outer<Inner>) { o.ping(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "one", "Inner.ping"), 0);
+    ASSERT_GTE(require_resolved(r, "two", "Inner.ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Cross-file fixture: `p.demo.Managed` derefs to `p.demo.State` by the impl
+ * relation records in `impls` (each names a `type Target` text). */
+static void rustlsp_run_user_deref_fixture(CBMArena *a, const char *const *targets, int impls,
+                                           CBMResolvedCallArray *out) {
+    CBMRustLSPDef defs[12];
+    int n = rustlsp_deref_fixture(defs);
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Managed",
+                                .short_name = "Managed",
+                                .label = "Type",
+                                .def_module_qn = "p.demo"};
+    for (int i = 0; i < impls; i++) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Managed",
+                                    .short_name = "Managed",
+                                    .label = "RustImpl",
+                                    .receiver_type = "p.demo.Managed",
+                                    .receiver_spelling = "Managed",
+                                    .def_module_qn = "p.demo",
+                                    .trait_qn = "std::ops::Deref",
+                                    .impl_target = targets[i],
+                                    .is_rust_impl_relation = true};
+    }
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    const char *src = "fn run(m: demo::Managed) { m.ping(); }\n";
+    memset(out, 0, sizeof(*out));
+    cbm_run_rust_lsp_cross(a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           out);
+}
+
+TEST(rustlsp_user_deref_impl_from_other_module) {
+    /* The impl and its target live in `p.demo`; the caller only names
+     * `Managed`. The target text is read in the impl's module. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    const char *targets[] = {"State"};
+    rustlsp_run_user_deref_fixture(&a, targets, 1, &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.demo.State.ping"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_user_deref_impls_disagreeing_give_no_target) {
+    /* Two Deref impls (cfg twins) naming different targets prove neither. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    const char *targets[] = {"State", "Leaf"};
+    rustlsp_run_user_deref_fixture(&a, targets, 2, &out);
+    ASSERT_EQ(find_confident(&out, "run", "p.demo.State.ping"), -1);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(rustlsp_multiline_tuple_return_elements_name_their_types) {
     /* A signature written over several lines reaches the caller with its
      * line breaks; each tuple element still names its type. */
@@ -10734,6 +10866,12 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_pattern_slice_binds_element);
     RUN_TEST(rustlsp_pattern_unknown_position_binds_nothing);
     RUN_TEST(rustlsp_deref_field_through_box);
+    RUN_TEST(rustlsp_user_deref_reaches_target_method_and_field);
+    RUN_TEST(rustlsp_user_trait_named_deref_gives_no_deref_step);
+    RUN_TEST(rustlsp_user_deref_own_method_wins_over_target);
+    RUN_TEST(rustlsp_user_deref_generic_target_takes_written_argument);
+    RUN_TEST(rustlsp_user_deref_impl_from_other_module);
+    RUN_TEST(rustlsp_user_deref_impls_disagreeing_give_no_target);
     RUN_TEST(rustlsp_deref_wrapper_method_wins_over_target);
     RUN_TEST(rustlsp_dyn_trait_field_links_trait_declaration);
     RUN_TEST(rustlsp_dyn_trait_supertrait_method);

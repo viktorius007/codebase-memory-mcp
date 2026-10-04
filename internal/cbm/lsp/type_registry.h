@@ -66,6 +66,11 @@ typedef struct {
     const char *alias_of;          // QN of aliased type (type Foo = Bar), NULL if not alias
     const CBMType *alias_type;     // Rust: full aliased type; TYPE_PARAMs name type_param_names
     const char **type_param_names; // NULL-terminated, e.g., ["T", "K", NULL] for template classes
+    // Rust: `type Target` of the type's `impl Deref`; UNKNOWN when its impls do not agree on
+    // one readable target, NULL when it has none. TYPE_PARAMs name deref_param_names, the
+    // names the impl's self type spells at the type's argument positions.
+    const CBMType *deref_target;
+    const char **deref_param_names;
     bool is_interface;
     bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)
 
