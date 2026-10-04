@@ -1281,6 +1281,11 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
          "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
          "fn caller(workers: &[Worker]) { workers.iter().for_each(|w| w.work()); }\n",
          1, "rust_call_gate.closure_param.Worker.work"},
+        {"rust_closure_bound", "closure_bound.rs", CBM_LANG_RUST,
+         "struct Worker;\nimpl Worker { fn work(&self) {} }\n"
+         "fn each<F: Fn(&Worker)>(f: F) {}\n"
+         "fn caller() { each(|w| w.work()); }\n",
+         2, "rust_call_gate.closure_bound.Worker.work"},
         {"c_exact", "exact.c", CBM_LANG_C,
          "void target(void) {}\nvoid caller(void) { target(); }\n",
          1, "rust_call_gate.exact.target"},

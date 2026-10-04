@@ -1109,8 +1109,8 @@ TEST(rustlsp_crossfile_method_result_self_return) {
  * free fn `demo::make` whose declared return is `ret`. */
 enum { RUSTLSP_RET_DEFS = 9 };
 
-static int rustlsp_declared_return_target(const char *ret, const char *caller,
-                                          const char *callee) {
+static int rustlsp_declared_fn_target(const char *ret, const char **params, int param_count,
+                                      const char *caller, const char *callee) {
     CBMArena a;
     cbm_arena_init(&a);
     CBMRustLSPDef defs[RUSTLSP_RET_DEFS];
@@ -1151,7 +1151,9 @@ static int rustlsp_declared_return_target(const char *ret, const char *caller,
                               .short_name = "make",
                               .label = "Function",
                               .def_module_qn = "test.demo",
-                              .return_types = ret};
+                              .return_types = ret,
+                              .signature_param_types = params,
+                              .signature_param_count = param_count};
     const char *imp_names[] = {"demo"};
     const char *imp_qns[] = {"test::demo"};
     CBMResolvedCallArray out;
@@ -1161,6 +1163,11 @@ static int rustlsp_declared_return_target(const char *ret, const char *caller,
     int idx = find_confident(&out, "run", callee);
     cbm_arena_destroy(&a);
     return idx;
+}
+
+static int rustlsp_declared_return_target(const char *ret, const char *caller,
+                                          const char *callee) {
+    return rustlsp_declared_fn_target(ret, NULL, 0, caller, callee);
 }
 
 /* A project alias in a declared return reads as the type it stands for. */
@@ -1656,10 +1663,6 @@ TEST(rustlsp_closure_param_through_adapter_chain) {
  * parameter, and a method the receiver's std type does not declare. */
 TEST(rustlsp_closure_param_unproven_stays_unbound) {
     static const char *const sources[] = {
-        RUSTLSP_STD_DECOYS "struct MyVec<T>(T);\n"
-                           "impl<T> MyVec<T> { fn map<F: Fn(Other) -> bool>(&self, f: F) -> bool "
-                           "{ f(Other) } }\n"
-                           "fn run(v: MyVec<Conn>) -> bool { v.map(|c| c.ping()) }\n",
         RUSTLSP_STD_DECOYS "fn run() -> bool { missing().iter().any(|c| c.ping()) }\n",
         RUSTLSP_STD_DECOYS "fn run<T>(v: Vec<T>) -> bool { v.iter().any(|c| c.ping()) }\n",
         RUSTLSP_STD_DECOYS "fn run(o: Option<Conn>) -> bool { o.map_err(|c| c.ping()) }\n",
@@ -1694,6 +1697,174 @@ TEST(rustlsp_closure_param_not_bound_from_outer_call) {
     cbm_free_result(r);
     ASSERT_GTE(wrap, 0);
     ASSERT_EQ(conn, -1);
+    PASS();
+}
+
+/* A closure passed to a project fn is called with what the fn's parameter
+ * declares: an inline `impl Fn`, a type parameter bounded in the angle
+ * brackets or the `where` clause, a `&dyn Fn` taking `&closure`, at any
+ * argument position and for any closure parameter. */
+TEST(rustlsp_closure_param_from_callee_bound) {
+    static const char *const sources[] = {
+        RUSTLSP_STD_DECOYS "fn with(f: impl FnOnce(&mut Conn) -> bool) -> bool { true }\n"
+                           "fn run() -> bool { with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn with<F: FnOnce(&Conn) -> bool + Send>(f: F) -> bool { true }\n"
+                           "fn run() -> bool { with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn with<F, R>(n: u8, f: F) -> R\nwhere\n    R: Default,\n"
+                           "    F: for<'a> FnOnce(Other, &'a Conn) -> R,\n{ R::default() }\n"
+                           "fn run() -> bool { with(1, |_, c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn with(f: &dyn Fn(&Conn) -> bool) -> bool { true }\n"
+                           "fn run() -> bool { with(&|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn with(f: &mut (dyn FnMut(Conn) -> bool + Send)) -> bool { true }\n"
+                           "fn run() -> bool { with(&mut |c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn with(f: fn(&Conn) -> bool) -> bool { true }\n"
+                           "fn run() -> bool { with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "struct Hub;\n"
+                           "impl Hub { fn each(f: impl Fn(&Conn) -> bool) -> bool { true }\n"
+                           "    fn all(&self, n: u8, f: impl Fn(&Conn) -> bool) -> bool { true } }\n"
+                           "fn run(h: Hub) -> bool { Hub::each(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "struct Hub;\n"
+                           "impl Hub { fn all(&self, n: u8, f: impl Fn(&Conn) -> bool) -> bool "
+                           "{ true } }\n"
+                           "fn run(h: Hub) -> bool { h.all(1, |c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "struct Hub;\n"
+                           "impl Hub { fn all(&self, n: u8, f: impl Fn(&Conn) -> bool) -> bool "
+                           "{ true } }\n"
+                           "fn run(h: Hub) -> bool { Hub::all(&h, 1, |c| c.ping()) }\n",
+        /* A project method named like a std one reads its own declaration. */
+        "struct Conn;\nstruct Other;\n"
+        "impl Conn { fn ping(&self) -> bool { true } }\n"
+        "struct MyVec<T>(T);\n"
+        "impl<T> MyVec<T> { fn map<F: Fn(Conn) -> bool>(&self, f: F) -> bool { true } }\n"
+        "impl Other { fn ping(&self) -> bool { false } }\n"
+        "fn run(v: MyVec<Other>) -> bool { v.map(|c| c.ping()) }\n",
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        if (!rustlsp_std_chain_reaches_conn(sources[i])) {
+            FAIL(sources[i]);
+        }
+    }
+    PASS();
+}
+
+/* The callee's impl parameters read as the receiver's type arguments and
+ * `Self` as the receiver's type. */
+TEST(rustlsp_closure_param_callee_bound_reads_receiver) {
+    static const char *const sources[] = {
+        RUSTLSP_STD_DECOYS "struct Hold<K, T>(K, T);\n"
+                           "impl<K, T> Hold<K, T> { fn with(&self, f: impl FnOnce(&T) -> bool) "
+                           "-> bool { true } }\n"
+                           "fn run(h: &Hold<Other, Conn>) -> bool { h.with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "struct Hold<K, T>(K, T);\n"
+                           "impl<K, T> Hold<K, T> { fn with<F>(&self, f: F) -> bool\n"
+                           "    where F: FnOnce(&K, &mut T) -> bool { true } }\n"
+                           "fn run(h: std::sync::Arc<Hold<Other, Conn>>) -> bool "
+                           "{ h.with(|_, c| c.ping()) }\n",
+        "struct Conn;\nstruct Other;\n"
+        "impl Other { fn ping(&self) -> bool { false } }\n"
+        "impl Conn { fn ping(&self) -> bool { true }\n"
+        "    fn with(&self, f: impl FnOnce(&Self) -> bool) -> bool { f(self) }\n"
+        "    fn go(&self) -> bool { self.with(|c| c.ping()) } }\n"
+        "fn run(x: Conn) -> bool { x.with(|c| c.ping()) }\n",
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        if (!rustlsp_std_chain_reaches_conn(sources[i])) {
+            FAIL(sources[i]);
+        }
+    }
+    PASS();
+}
+
+/* A declared argument type the call site does not prove binds nothing: a
+ * type parameter of the fn or of the trait (also one named like a type), an
+ * impl parameter whose argument the receiver does not give, `Self` of a
+ * trait's own method, a closure that is not the argument itself. */
+TEST(rustlsp_closure_param_callee_bound_unproven_stays_unbound) {
+    static const char *const sources[] = {
+        RUSTLSP_STD_DECOYS "fn with<Conn>(f: impl Fn(&Conn) -> bool) -> bool { true }\n"
+                           "fn run() -> bool { with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn with<Conn, F>(f: F) -> bool where F: Fn(&Conn) -> bool { true }\n"
+                           "fn run() -> bool { with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn with<T: Iterator, F: Fn(T::Item) -> bool>(f: F) -> bool { true }\n"
+                           "struct Item;\nimpl Item { fn ping(&self) -> bool { true } }\n"
+                           "fn run() -> bool { with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "trait Tr<Conn> { fn with(&self, f: impl Fn(&Conn) -> bool) -> bool "
+                           "{ true } }\n"
+                           "fn run(x: &dyn Tr<Other>) -> bool { x.with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "struct Hub;\ntrait Tr<T> { fn with(&self, f: impl Fn(&T) -> bool) "
+                           "-> bool; }\n"
+                           "impl<Conn> Tr<Conn> for Hub { fn with(&self, f: impl Fn(&Conn) -> bool)"
+                           " -> bool { true } }\n"
+                           "fn run(x: Hub) -> bool { x.with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "struct Hold<T>(T);\n"
+                           "impl<T> Hold<T> { fn with(&self, f: impl Fn(&T) -> bool) -> bool "
+                           "{ true } }\n"
+                           "fn run<U>(h: Hold<U>) -> bool { h.with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "struct Hold<Conn>(Conn);\n"
+                           "impl<Conn> Hold<Conn> { fn each(f: impl Fn(&Conn) -> bool) -> bool "
+                           "{ true } }\n"
+                           "fn run() -> bool { Hold::<Other>::each(|c| c.ping()) }\n",
+        "struct Conn;\nstruct Other;\n"
+        "trait Tr { fn ping(&self) -> bool { true }\n"
+        "    fn with(&self, f: impl Fn(&Self) -> bool) -> bool { true } }\n"
+        "impl Tr for Conn {}\nimpl Tr for Other {}\n"
+        "impl Conn { fn ping(&self) -> bool { true } }\n"
+        "impl Other { fn ping(&self) -> bool { true } }\n"
+        "fn run(x: &dyn Tr) -> bool { x.with(|c| c.ping()) }\n",
+        RUSTLSP_STD_DECOYS "fn with(f: Option<Box<dyn Fn(&Conn) -> bool>>) -> bool { true }\n"
+                           "fn run() -> bool { with(Some(Box::new(|c| c.ping()))) }\n",
+        RUSTLSP_STD_DECOYS "fn with(n: (fn(&Conn) -> bool, u8), f: impl Fn(u8) -> bool) -> bool "
+                           "{ true }\n"
+                           "fn run() -> bool { with((|c| c.ping(), 1), |n| n == 1) }\n",
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        CBMFileResult *r = extract_rust(sources[i]);
+        ASSERT_NOT_NULL(r);
+        bool linked =
+            find_resolved(r, "run", "Conn.ping") >= 0 || find_resolved(r, "run", "Other.ping") >= 0;
+        cbm_free_result(r);
+        if (linked) {
+            FAIL(sources[i]);
+        }
+    }
+    PASS();
+}
+
+/* The signature text of a callable parameter declares its call signature on
+ * its own: a bounded type parameter reads as the bound, and a type parameter
+ * no receiver gives reads `_`. Other parameters keep their spelling. */
+TEST(rustlsp_callable_param_signature_text) {
+    CBMFileResult *r = extract_rust(
+        "struct Hold<T>(T);\n"
+        "impl<T, U> Hold<T> {\n"
+        "    fn with<F, R>(&self, n: R, g: &T, f: F, h: impl Fn(&U, &'static R) -> T) -> R\n"
+        "    where\n        F: for<'a> FnOnce(&'a mut T, R) -> R + Send,\n    { todo!() }\n}\n");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *with = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "with") == 0) {
+            with = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(with);
+    ASSERT_EQ(with->signature_param_count, 4);
+    ASSERT_STR_EQ(with->signature_param_types[0], "R");
+    ASSERT_STR_EQ(with->signature_param_types[1], "&T");
+    ASSERT_STR_EQ(with->signature_param_types[2], "impl for<'a> FnOnce(&'a mut T, _) -> _ + Send");
+    ASSERT_STR_EQ(with->signature_param_types[3], "impl Fn(&_, &'static _) -> T");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A callee declared in another file gives the same binding through the
+ * shared registry, its argument types resolved in the declaring module. */
+TEST(rustlsp_crossfile_closure_param_from_callee_bound) {
+    const char *caller = "fn run() -> bool { demo::make(1, |c| c.ping()) }\n";
+    const char *bound[] = {"u8", "impl FnOnce(&mut Conn) -> bool + Send"};
+    const char *masked[] = {"u8", "impl FnOnce(&mut _) -> bool"};
+    ASSERT_GTE(rustlsp_declared_fn_target("bool", bound, 2, caller, "Conn.ping"), 0);
+    ASSERT_EQ(rustlsp_declared_fn_target("bool", bound, 2, caller, "Other.ping"), -1);
+    ASSERT_EQ(rustlsp_declared_fn_target("bool", masked, 2, caller, "ping"), -1);
     PASS();
 }
 
@@ -11524,6 +11695,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_closure_param_through_adapter_chain);
     RUN_TEST(rustlsp_closure_param_unproven_stays_unbound);
     RUN_TEST(rustlsp_closure_param_not_bound_from_outer_call);
+    RUN_TEST(rustlsp_closure_param_from_callee_bound);
+    RUN_TEST(rustlsp_closure_param_callee_bound_reads_receiver);
+    RUN_TEST(rustlsp_closure_param_callee_bound_unproven_stays_unbound);
+    RUN_TEST(rustlsp_callable_param_signature_text);
+    RUN_TEST(rustlsp_crossfile_closure_param_from_callee_bound);
     RUN_TEST(rustlsp_std_returns_slice_methods);
     RUN_TEST(rustlsp_std_returns_paths);
     RUN_TEST(rustlsp_std_returns_read_the_call);
