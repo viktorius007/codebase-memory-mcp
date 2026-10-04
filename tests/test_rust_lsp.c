@@ -1309,6 +1309,25 @@ TEST(rustlsp_closure_param_unproven_stays_unbound) {
     PASS();
 }
 
+/* A parameter is bound only from the call its closure is passed to: in
+ * `o.as_ref().and_then(|w| ..).map(|c| ..)` the receiver chain's `w` is the
+ * `&Wrap` that `and_then` declares, not the `Conn` the outer `map` yields. */
+TEST(rustlsp_closure_param_not_bound_from_outer_call) {
+    CBMFileResult *r = extract_rust(
+        RUSTLSP_STD_DECOYS "struct Wrap { inner: Option<Conn> }\n"
+                           "impl Wrap { fn ping(&self) -> bool { true } }\n"
+                           "fn run(o: Option<Wrap>) -> bool {\n"
+                           "    o.as_ref().and_then(|w| { w.ping(); w.inner.as_ref() })\n"
+                           "        .map(|c| c.clone()).is_some()\n}\n");
+    ASSERT_NOT_NULL(r);
+    int wrap = find_resolved(r, "run", "Wrap.ping");
+    int conn = find_resolved(r, "run", "Conn.ping");
+    cbm_free_result(r);
+    ASSERT_GTE(wrap, 0);
+    ASSERT_EQ(conn, -1);
+    PASS();
+}
+
 /* A slice has the slice methods the Vec entries declare (`first`, `iter`,
  * `last`): `[T]::first -> Option<&T>`. */
 TEST(rustlsp_std_returns_slice_methods) {
@@ -10741,6 +10760,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_closure_param_positions_and_patterns);
     RUN_TEST(rustlsp_closure_param_through_adapter_chain);
     RUN_TEST(rustlsp_closure_param_unproven_stays_unbound);
+    RUN_TEST(rustlsp_closure_param_not_bound_from_outer_call);
     RUN_TEST(rustlsp_std_returns_slice_methods);
     RUN_TEST(rustlsp_std_returns_paths);
     RUN_TEST(rustlsp_std_returns_read_the_call);
