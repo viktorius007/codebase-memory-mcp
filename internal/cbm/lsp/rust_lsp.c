@@ -2926,7 +2926,7 @@ static const CBMType *rust_callable_param_sig(CBMArena *arena, const char *text,
         }
         if (p > start) {
             char *piece = cbm_arena_strndup(arena, start, (size_t)(p - start));
-            params[n++] = parse_type_text_with_params(arena, piece, module_qn, NULL, tree);
+            params[n++] = parse_type_text_with_params(arena, piece, module_qn, NULL, tree, NULL);
         }
         start = p + 1;
     }
