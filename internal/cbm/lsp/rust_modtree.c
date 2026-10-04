@@ -1598,6 +1598,56 @@ static bool rmt_use_agree(RmtDefs *agreed, bool *any, const RmtDefs *defs) {
     return true;
 }
 
+/* Write the project items of an agreed `use` answer; -1 when it names a
+ * module or an item without a QN. */
+static int rmt_use_emit(const RmtDefs *agreed, const char **out_qns, int max) {
+    int found = 0;
+    for (int i = 0; i < agreed->count; i++) {
+        const RmtDef *def = &agreed->defs[i];
+        if (def->kind == RMT_EXTERNAL) {
+            continue;
+        }
+        if (def->kind == RMT_MODULE || def->kind == RMT_OPAQUE || !def->qn) {
+            return -1;
+        }
+        if (found < max) {
+            out_qns[found++] = def->qn;
+        }
+    }
+    return found;
+}
+
+int cbm_rust_modtree_use_items_at(const CBMRustModTree *tree, CBMArena *arena, const char *rel_path,
+                                  uint32_t offset, const char *local_name, const char *path,
+                                  const char **out_qns, int max) {
+    if (!tree || !arena || !rel_path || !local_name || !path || !out_qns) {
+        return -1;
+    }
+    int file = rmt_file_id(tree, rel_path);
+    const char *segs[RMT_MAX_SEGS];
+    int count = file >= 0 ? rmt_split_path(arena, path, segs, RMT_MAX_SEGS) : -1;
+    if (count <= 0) {
+        return -1;
+    }
+    RmtDefs agreed = {0};
+    bool any = false;
+    CBMRustModTree *readonly = (CBMRustModTree *)tree; /* imports are DONE: only read */
+    for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
+        if (!rmt_contains(&tree->modules[m], offset) || !rmt_innermost(tree, file, m, offset)) {
+            continue;
+        }
+        const RmtDefs *declared = rmt_declared_use(tree, m, local_name, segs, count);
+        RmtDefs defs = {0};
+        if (!declared) {
+            rmt_resolve_path(readonly, arena, m, segs, count, RMT_NS_ALL, true, &defs, false);
+        }
+        if (!rmt_use_agree(&agreed, &any, declared ? declared : &defs)) {
+            return -1;
+        }
+    }
+    return any ? rmt_use_emit(&agreed, out_qns, max) : -1;
+}
+
 int cbm_rust_modtree_use_items(const CBMRustModTree *tree, CBMArena *arena, const char *rel_path,
                                const char *local_name, const char *path, const char **out_qns,
                                int max) {
@@ -1627,18 +1677,5 @@ int cbm_rust_modtree_use_items(const CBMRustModTree *tree, CBMArena *arena, cons
             return -1;
         }
     }
-    int found = 0;
-    for (int i = 0; any && i < agreed.count; i++) {
-        const RmtDef *def = &agreed.defs[i];
-        if (def->kind == RMT_EXTERNAL) {
-            continue;
-        }
-        if (def->kind == RMT_MODULE || def->kind == RMT_OPAQUE || !def->qn) {
-            return -1;
-        }
-        if (found < max) {
-            out_qns[found++] = def->qn;
-        }
-    }
-    return any ? found : -1;
+    return any ? rmt_use_emit(&agreed, out_qns, max) : -1;
 }

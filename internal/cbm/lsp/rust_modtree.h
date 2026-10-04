@@ -163,4 +163,11 @@ int cbm_rust_modtree_use_items(const CBMRustModTree *tree, CBMArena *arena, cons
                                const char *local_name, const char *path, const char **out_qns,
                                int max);
 
+/* Same answer for a `use` written at byte `offset` of the file, inside an
+ * inline module or a block: the innermost module at that offset decides,
+ * from the `use` it declares, else by resolving the path in its scope. */
+int cbm_rust_modtree_use_items_at(const CBMRustModTree *tree, CBMArena *arena, const char *rel_path,
+                                  uint32_t offset, const char *local_name, const char *path,
+                                  const char **out_qns, int max);
+
 #endif /* CBM_LSP_RUST_MODTREE_H */

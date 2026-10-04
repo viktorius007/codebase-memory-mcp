@@ -864,6 +864,65 @@ TEST(ei_rust_use_links_through_module_tree) {
     PASS();
 }
 
+TEST(ei_rust_scoped_use_links_in_its_own_module) {
+    /* A `use` inside an inline module or a block links like a top-level one,
+     * resolved in the module it is written in: `super::Item` in `mod tests`
+     * is this file's Item, not the namesake in aaa.rs. An unresolved one
+     * (`crate::missing::Guess`) links to nothing, and so does one whose head
+     * the block itself declares (`local::Local`, not the module's `local`). */
+    static const EILangFile f[] = {
+        {"Cargo.toml", "[package]\nname = \"app\"\nedition = \"2021\"\n"},
+        {"src/lib.rs", "mod aaa;\nmod user;\n"},
+        {"src/aaa.rs", "pub struct Item;\npub struct Deep;\npub struct Guess;\n"},
+        {"src/user.rs", "pub struct Item;\n"
+                        "pub mod wide {\n    pub struct Wide;\n}\n"
+                        "mod local {\n    pub struct Local;\n}\n"
+                        "mod tests {\n"
+                        "    use super::Item;\n"
+                        "    fn inner() {\n        use super::wide::Wide;\n    }\n"
+                        "}\n"
+                        "fn block() {\n"
+                        "    use crate::aaa::Deep;\n"
+                        "    use crate::missing::Guess;\n"
+                        "    mod local {\n        pub struct Local;\n    }\n"
+                        "    use local::Local;\n"
+                        "}\n"}};
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 4);
+    ASSERT_NOT_NULL(store);
+    int64_t user_id = ei_node_id_for_file_label(store, lp.project, "src/user.rs", "File");
+    ASSERT_GT(user_id, 0);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, user_id, "IMPORTS", &edges, &edge_count),
+              CBM_STORE_OK);
+    bool saw_item = false;
+    bool saw_wide = false;
+    bool saw_deep = false;
+    int other = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t target = {0};
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, &target), CBM_STORE_OK);
+        const char *file = target.file_path ? target.file_path : "";
+        const char *name = target.name ? target.name : "";
+        bool item = strcmp(file, "src/user.rs") == 0 && strcmp(name, "Item") == 0;
+        bool wide = strcmp(file, "src/user.rs") == 0 && strcmp(name, "Wide") == 0;
+        bool deep = strcmp(file, "src/aaa.rs") == 0 && strcmp(name, "Deep") == 0;
+        saw_item |= item;
+        saw_wide |= wide;
+        saw_deep |= deep;
+        other += !item && !wide && !deep;
+        cbm_node_free_fields(&target);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ASSERT_TRUE(saw_item);
+    ASSERT_TRUE(saw_wide);
+    ASSERT_TRUE(saw_deep);
+    ASSERT_EQ(other, 0);
+    ei_cleanup(&lp, store);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * RED REPRODUCTION — Kotlin
  *
@@ -1261,6 +1320,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_rust_use_never_binds_method);
     RUN_TEST(ei_rust_use_external_head_never_binds);
     RUN_TEST(ei_rust_use_links_through_module_tree);
+    RUN_TEST(ei_rust_scoped_use_links_in_its_own_module);
 
     /* ── RED REPRODUCTIONS — Kotlin (expected to FAIL until pipeline fixed) ── */
     RUN_TEST(ei_kotlin_basic_class_import);

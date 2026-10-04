@@ -1373,6 +1373,7 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
         }
         count += cbm_pipeline_link_import(ctx, source_node, rel, file_qn, imp, namespace_map);
     }
+    count += cbm_pipeline_link_scoped_imports(ctx, source_node, rel, result);
     free(file_qn);
     return count;
 }

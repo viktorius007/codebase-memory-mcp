@@ -2323,17 +2323,21 @@ enum { RUST_USE_TARGETS_MAX = 2 }; /* one item per namespace */
  * count, or -1 when the tree does not decide this import: no tree, a glob,
  * an undecidable path, or a resolved item the graph holds no node for. */
 static int rust_use_targets(const cbm_pipeline_ctx_t *ctx, const char *rel, const CBMImport *imp,
-                            const cbm_gbuf_node_t **out) {
-    if (!ctx->rust_use_modtree || !rel || !imp->local_name || strcmp(imp->local_name, "*") == 0 ||
-        strcmp(imp->local_name, "_") == 0 ||
+                            bool scoped, const cbm_gbuf_node_t **out) {
+    if (!ctx->rust_use_modtree || !rel || !imp->local_name || !imp->module_path ||
+        strcmp(imp->local_name, "*") == 0 || strcmp(imp->local_name, "_") == 0 ||
         cbm_language_for_filename(path_leaf(rel)) != CBM_LANG_RUST) {
         return -1;
     }
     CBMArena arena;
     cbm_arena_init(&arena);
     const char *qns[RUST_USE_TARGETS_MAX];
-    int found = cbm_rust_modtree_use_items(ctx->rust_use_modtree, &arena, rel, imp->local_name,
-                                           imp->module_path, qns, RUST_USE_TARGETS_MAX);
+    int found =
+        scoped ? cbm_rust_modtree_use_items_at(ctx->rust_use_modtree, &arena, rel, imp->scope_byte,
+                                               imp->local_name, imp->module_path, qns,
+                                               RUST_USE_TARGETS_MAX)
+               : cbm_rust_modtree_use_items(ctx->rust_use_modtree, &arena, rel, imp->local_name,
+                                            imp->module_path, qns, RUST_USE_TARGETS_MAX);
     int count = found;
     for (int i = 0; i < found; i++) {
         const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, qns[i]);
@@ -2347,18 +2351,10 @@ static int rust_use_targets(const cbm_pipeline_ctx_t *ctx, const char *rel, cons
     return count;
 }
 
-int cbm_pipeline_link_import(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *source,
-                             const char *rel, const char *file_qn, const CBMImport *imp,
-                             CBMHashTable *namespace_map) {
-    if (!ctx || !source || !imp || !imp->module_path) {
-        return 0;
-    }
-    const cbm_gbuf_node_t *targets[RUST_USE_TARGETS_MAX];
-    int count = rust_use_targets(ctx, rel, imp, targets);
-    if (count < 0) {
-        targets[0] = cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        count = targets[0] ? 1 : 0;
-    }
+/* Write one IMPORTS edge per target that is not the importing file itself. */
+static int link_import_targets(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *source,
+                               const CBMImport *imp, const cbm_gbuf_node_t *const *targets,
+                               int count) {
     char esc_ln[CBM_SZ_128];
     cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
     char props[CBM_SZ_256];
@@ -2369,6 +2365,36 @@ int cbm_pipeline_link_import(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *sou
             cbm_gbuf_insert_edge(ctx->gbuf, source->id, targets[i]->id, "IMPORTS", props);
             linked++;
         }
+    }
+    return linked;
+}
+
+int cbm_pipeline_link_import(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *source,
+                             const char *rel, const char *file_qn, const CBMImport *imp,
+                             CBMHashTable *namespace_map) {
+    if (!ctx || !source || !imp || !imp->module_path) {
+        return 0;
+    }
+    const cbm_gbuf_node_t *targets[RUST_USE_TARGETS_MAX] = {NULL};
+    int count = rust_use_targets(ctx, rel, imp, false, targets);
+    if (count < 0) {
+        targets[0] = cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
+        count = targets[0] ? 1 : 0;
+    }
+    return link_import_targets(ctx, source, imp, targets, count);
+}
+
+int cbm_pipeline_link_scoped_imports(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *source,
+                                     const char *rel, const CBMFileResult *result) {
+    if (!ctx || !source || !result) {
+        return 0;
+    }
+    int linked = 0;
+    for (int i = 0; i < result->scoped_imports.count; i++) {
+        const CBMImport *imp = &result->scoped_imports.items[i];
+        const cbm_gbuf_node_t *targets[RUST_USE_TARGETS_MAX] = {NULL};
+        int count = rust_use_targets(ctx, rel, imp, true, targets);
+        linked += link_import_targets(ctx, source, imp, targets, count);
     }
     return linked;
 }
