@@ -52,6 +52,12 @@ typedef struct {
      * (`impl Tr for Box<dyn X>`) as written, its names resolved in the impl's
      * module; the method is registered on the wrapper's QN. NULL otherwise. */
     const CBMType *rust_wrapper_impl_self;
+    /* Rust only: per declared parameter (parallel to the signature's
+     * param_types), the FUNC type of the call signature the parameter
+     * declares for a callable argument (`impl Fn(&T)`, `&dyn FnMut(A, B)`,
+     * `fn(A)`), its param_types the declared argument types; NULL for any
+     * other parameter. NULL when no parameter takes a callable. */
+    const CBMType *const *rust_callable_params;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.

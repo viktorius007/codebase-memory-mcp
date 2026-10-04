@@ -2540,6 +2540,157 @@ static const CBMType *rust_parse_def_type_text(CBMArena *arena, const char *text
                                        NULL, tree);
 }
 
+/* The end of the bracketed group opening at `open` (its closing bracket), or
+ * NULL when it does not close. `->` is no bracket. */
+static const char *rust_type_text_group_end(const char *open) {
+    int depth = 0;
+    for (const char *p = open; *p; p++) {
+        if (*p == '-' && p[1] == '>') {
+            p++;
+        } else if (*p == '<' || *p == '(' || *p == '[') {
+            depth++;
+        } else if ((*p == '>' || *p == ')' || *p == ']') && --depth == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* The argument list (at its `(`) of the call signature the canonical
+ * parameter type `text` declares: `impl Fn(..)`, `dyn FnMut(..)`, also behind
+ * `&` / `&mut` and parentheses, among other bounds and under `for<'a>`, or a
+ * `fn(..)` pointer. NULL for any other type. */
+static const char *rust_callable_type_args(const char *text) {
+    const char *p = text;
+    for (;;) {
+        if (*p == '&' || *p == ' ' ||
+            (*p == '(' && (strncmp(p + 1, "dyn ", 4) == 0 || strncmp(p + 1, "impl ", 5) == 0))) {
+            p++;
+        } else if (*p == '\'') {
+            p++;
+            while (isalnum((unsigned char)*p) || *p == '_') {
+                p++;
+            }
+        } else if (strncmp(p, "mut ", 4) == 0 || strncmp(p, "mut(", 4) == 0) {
+            p += 3;
+        } else {
+            break;
+        }
+    }
+    if (strncmp(p, "fn(", 3) == 0) {
+        return p + 2;
+    }
+    if (strncmp(p, "impl ", 5) != 0 && strncmp(p, "dyn ", 4) != 0) {
+        return NULL;
+    }
+    p = strchr(p, ' ') + 1;
+    /* One bound per top-level `+`. */
+    while (*p) {
+        if (strncmp(p, "for<", 4) == 0) {
+            const char *end = rust_type_text_group_end(p + 3);
+            if (!end) {
+                return NULL;
+            }
+            p = end + 1;
+            while (*p == ' ') {
+                p++;
+            }
+        }
+        static const char *const callables[] = {"FnOnce(", "FnMut(", "Fn(", NULL};
+        for (const char *const *c = callables; *c; c++) {
+            size_t len = strlen(*c);
+            if (strncmp(p, *c, len) == 0) {
+                return p + len - 1;
+            }
+        }
+        int depth = 0;
+        for (; *p && !(*p == '+' && depth == 0); p++) {
+            if (*p == '-' && p[1] == '>') {
+                p++;
+            } else if (*p == '<' || *p == '(' || *p == '[') {
+                depth++;
+            } else if (*p == '>' || *p == ')' || *p == ']') {
+                if (depth == 0) {
+                    return NULL;
+                }
+                depth--;
+            }
+        }
+        p += *p == '+';
+    }
+    return NULL;
+}
+
+enum { RUST_CLOSURE_PARAM_MAX = 4 };
+
+/* The call signature a parameter spelled `text` in `module_qn` declares for
+ * a callable argument, as a FUNC type over its first RUST_CLOSURE_PARAM_MAX
+ * argument types; NULL when the parameter takes no callable or the callable
+ * takes no argument. */
+static const CBMType *rust_callable_param_sig(CBMArena *arena, const char *text,
+                                              const char *module_qn, const CBMRustModTree *tree) {
+    const char *canonical = text ? rust_type_text_canonical(arena, text) : NULL;
+    const char *open = canonical ? rust_callable_type_args(canonical) : NULL;
+    const char *close = open ? rust_type_text_group_end(open) : NULL;
+    if (!close || close == open + 1) {
+        return NULL;
+    }
+    const CBMType **params = cbm_arena_alloc(arena, sizeof(*params) * (RUST_CLOSURE_PARAM_MAX + 1));
+    if (!params) {
+        return NULL;
+    }
+    int n = 0;
+    int depth = 0;
+    const char *start = open + 1;
+    for (const char *p = start; p <= close && n < RUST_CLOSURE_PARAM_MAX; p++) {
+        if (*p == '-' && p[1] == '>') {
+            p++;
+            continue;
+        }
+        if (p < close && (*p == '<' || *p == '(' || *p == '[')) {
+            depth++;
+        } else if (p < close && (*p == '>' || *p == ')' || *p == ']')) {
+            depth--;
+        }
+        if (p < close && !(*p == ',' && depth == 0)) {
+            continue;
+        }
+        if (p > start) {
+            char *piece = cbm_arena_strndup(arena, start, (size_t)(p - start));
+            params[n++] = parse_type_text_with_params(arena, piece, module_qn, NULL, tree);
+        }
+        start = p + 1;
+    }
+    if (n == 0) {
+        return NULL;
+    }
+    params[n] = NULL;
+    return cbm_type_func(arena, NULL, params, NULL);
+}
+
+/* rust_callable_param_sig of each of `count` parameter texts; NULL when none
+ * of them takes a callable. */
+static const CBMType *const *rust_callable_param_sigs(CBMArena *arena, const char *const *texts,
+                                                      int count, const char *module_qn,
+                                                      const CBMRustModTree *tree) {
+    const CBMType **sigs = NULL;
+    for (int i = 0; texts && i < count; i++) {
+        const CBMType *sig =
+            texts[i] ? rust_callable_param_sig(arena, texts[i], module_qn, tree) : NULL;
+        if (sig && !sigs) {
+            sigs = cbm_arena_alloc(arena, sizeof(*sigs) * (size_t)count);
+            if (!sigs) {
+                return NULL;
+            }
+            memset(sigs, 0, sizeof(*sigs) * (size_t)count);
+        }
+        if (sig) {
+            sigs[i] = sig;
+        }
+    }
+    return sigs;
+}
+
 /* The NULL-ended copy of `count` type parameter names; NULL when none. */
 static const char **rust_type_param_names_copy(CBMArena *arena, const char *const *params,
                                                int count) {
@@ -4027,8 +4178,6 @@ static const RustStdClosureParams RUST_STD_CLOSURE_PARAMS[] = {
     {RUST_CLOSURE_RECV_SET, "retain", 0, "&T"},
     {RUST_CLOSURE_RECV_MAP, "retain", 0, "&T,&E"},
     {RUST_CLOSURE_RECV_NONE, NULL, 0, NULL}};
-
-enum { RUST_CLOSURE_PARAM_MAX = 2 };
 
 static bool rust_std_closure_method_known(const char *method, int arg) {
     for (const RustStdClosureParams *e = RUST_STD_CLOSURE_PARAMS; e->method; e++) {
@@ -10201,9 +10350,12 @@ static const CBMRegisteredFunc *rust_path_callee(RustLSPContext *ctx, TSNode cal
     return rust_ufcs_target(ctx, qn, rust_call_first_argument(fn), &ufcs) ? ufcs.func : NULL;
 }
 
-/* Declared type of the parameter receiving argument `arg` of `call`. */
-static const CBMType *rust_expected_argument_type(RustLSPContext *ctx, TSNode call, TSNode arg,
-                                                  TSNode args, const char ***type_params) {
+/* The registered function `call` calls and, in `*out_index`, the position
+ * among its declared parameters that receives argument `arg` of the call's
+ * argument list `args`. NULL when the callee is not proven or has no such
+ * parameter. */
+static const CBMRegisteredFunc *rust_argument_callee(RustLSPContext *ctx, TSNode call, TSNode arg,
+                                                     TSNode args, int *out_index) {
     int index = 0;
     bool found = false;
     uint32_t n = ts_node_named_child_count(args);
@@ -10243,13 +10395,171 @@ static const CBMType *rust_expected_argument_type(RustLSPContext *ctx, TSNode ca
         index--;
     }
     const CBMType **params = callee->signature->data.func.param_types;
-    for (int i = 0; i < index; i++) {
+    for (int i = 0; i <= index; i++) {
         if (!params[i]) {
             return NULL;
         }
     }
+    *out_index = index;
+    return callee;
+}
+
+/* Declared type of the parameter receiving argument `arg` of `call`. */
+static const CBMType *rust_expected_argument_type(RustLSPContext *ctx, TSNode call, TSNode arg,
+                                                  TSNode args, const char ***type_params) {
+    int index = 0;
+    const CBMRegisteredFunc *callee = rust_argument_callee(ctx, call, arg, args, &index);
+    if (!callee) {
+        return NULL;
+    }
     *type_params = callee->type_param_names;
-    return params[index];
+    return callee->signature->data.func.param_types[index];
+}
+
+/* True when `t` names a type the call site does not prove: unknown, `Self`
+ * or a path under it, a masked type parameter (`_`), or a parameter in
+ * `params` (the callee's impl parameters) left unsubstituted. */
+static bool rust_type_unproven(const CBMType *t, const char *const *params, int depth) {
+    if (!t || cbm_type_is_unknown(t) || depth > RUST_RECEIVER_SUBST_MAX_DEPTH) {
+        return true;
+    }
+    const char *qn = NULL;
+    switch (t->kind) {
+    case CBM_TYPE_TYPE_PARAM:
+        return true;
+    case CBM_TYPE_REFERENCE:
+        return rust_type_unproven(t->data.reference.elem, params, depth + 1);
+    case CBM_TYPE_POINTER:
+        return rust_type_unproven(t->data.pointer.elem, params, depth + 1);
+    case CBM_TYPE_SLICE:
+        return rust_type_unproven(t->data.slice.elem, params, depth + 1);
+    case CBM_TYPE_TUPLE:
+        for (int i = 0; i < t->data.tuple.count; i++) {
+            if (rust_type_unproven(t->data.tuple.elems[i], params, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    case CBM_TYPE_TEMPLATE:
+        for (int i = 0; i < t->data.template_type.arg_count; i++) {
+            if (rust_type_unproven(t->data.template_type.template_args[i], params,
+                                   depth + 1)) {
+                return true;
+            }
+        }
+        qn = t->data.template_type.template_name;
+        break;
+    case CBM_TYPE_NAMED:
+        qn = t->data.named.qualified_name;
+        break;
+    default:
+        return false;
+    }
+    if (!qn || strcmp(qn, "Self") == 0 || strncmp(qn, "Self.", 5) == 0) {
+        return true;
+    }
+    for (const char *seg = qn; seg; seg = strchr(seg, '.') ? strchr(seg, '.') + 1 : NULL) {
+        if (seg[0] == '_' && (seg[1] == '\0' || seg[1] == '.')) {
+            return true;
+        }
+    }
+    /* Inside the impl a parameter's name is the parameter, also where a
+     * type of that name is declared. */
+    const char *dot = strrchr(qn, '.');
+    const char *leaf = dot ? dot + 1 : qn;
+    for (int i = 0; params && params[i]; i++) {
+        if (strcmp(params[i], leaf) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The type `Self` names in `callee`'s signature at the call whose function
+ * is `fn`, with the type arguments the call site proves: for a method call,
+ * the receiver's type at the autoderef step whose type declares the method;
+ * for a path call, the declaring type without arguments. NULL when the
+ * callee is a free function or a trait's own method, or the receiver does
+ * not reach the declaring type. */
+static const CBMType *rust_callee_self_type(RustLSPContext *ctx, TSNode fn,
+                                            const CBMRegisteredFunc *callee) {
+    const CBMRegisteredType *owner =
+        callee->receiver_type ? cbm_registry_lookup_type(ctx->registry, callee->receiver_type)
+                              : NULL;
+    if (!owner || owner->is_interface) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(fn), "field_expression") != 0) {
+        return cbm_type_named(ctx->arena, callee->receiver_type);
+    }
+    TSNode value = ts_node_child_by_field_name(fn, "value", 5);
+    const CBMType *cur =
+        ts_node_is_null(value) ? NULL : rust_strip_references(rust_eval_expr_type(ctx, value));
+    for (int hop = 0; cur && !cbm_type_is_unknown(cur) && hop < RUST_DEREF_MAX_HOPS; hop++) {
+        const char *qn = cur->kind == CBM_TYPE_NAMED      ? cur->data.named.qualified_name
+                         : cur->kind == CBM_TYPE_TEMPLATE ? cur->data.template_type.template_name
+                                                          : NULL;
+        const char *registered = qn ? rust_registered_type_qn(ctx, qn) : NULL;
+        if (registered && strcmp(registered, callee->receiver_type) == 0) {
+            return cur;
+        }
+        cur = rust_strip_references(rust_deref_step(ctx, cur));
+    }
+    return NULL;
+}
+
+/* The parameter types the project function `closure` is passed to declares
+ * for it, written into `out[RUST_CLOSURE_PARAM_MAX]` where the std table left
+ * them unknown. The callee is the one of the call the closure is an argument
+ * of (also as `&closure`); its parameter at the closure's position declares a
+ * call signature (rust_callable_param_sig), read with the callee's impl
+ * parameters replaced by the receiver's type arguments and `Self` by the
+ * receiver's type. A declared type that still names an unproven type
+ * (rust_type_unproven) leaves the closure parameter unknown. */
+static void rust_callee_closure_param_types(RustLSPContext *ctx, TSNode closure,
+                                            const CBMType **out) {
+    TSNode arg = closure;
+    TSNode args = ts_node_parent(arg);
+    if (!ts_node_is_null(args) && strcmp(ts_node_type(args), "reference_expression") == 0) {
+        arg = args;
+        args = ts_node_parent(arg);
+    }
+    if (ts_node_is_null(args) || strcmp(ts_node_type(args), "arguments") != 0) {
+        return;
+    }
+    TSNode call = ts_node_parent(args);
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+        return;
+    }
+    int index = 0;
+    const CBMRegisteredFunc *callee = rust_argument_callee(ctx, call, arg, args, &index);
+    const CBMType *sig =
+        callee && callee->rust_callable_params ? callee->rust_callable_params[index] : NULL;
+    if (!sig) {
+        return;
+    }
+    TSNode fn = ts_node_child_by_field_name(call, "function", 8);
+    if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "generic_function") == 0) {
+        fn = ts_node_child_by_field_name(fn, "function", 8);
+    }
+    const CBMType *self_t = ts_node_is_null(fn) ? NULL : rust_callee_self_type(ctx, fn, callee);
+    const CBMType *const *self_args = NULL;
+    int self_argc = 0;
+    if (self_t && self_t->kind == CBM_TYPE_TEMPLATE && callee->type_param_names) {
+        self_args = self_t->data.template_type.template_args;
+        self_argc = self_t->data.template_type.arg_count;
+    }
+    const CBMType *const *declared = sig->data.func.param_types;
+    for (int i = 0; i < RUST_CLOSURE_PARAM_MAX && declared[i]; i++) {
+        if (!cbm_type_is_unknown(out[i])) {
+            continue;
+        }
+        const CBMType *t = rust_subst_receiver_args(ctx, declared[i], callee->type_param_names,
+                                                    self_args, self_argc, self_t, 0);
+        if (!rust_type_unproven(t, callee->type_param_names, 0)) {
+            out[i] = t;
+        }
+    }
 }
 
 /* Declared return type of the function whose result `expr` is: `return
@@ -11204,17 +11514,29 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
 
     /* closure_expression: bind closure parameters. A written type
      * (`|n: &i32|`) binds the parameter to it; otherwise the std method the
-     * closure is passed to declares it (rust_std_closure_param_types);
+     * closure is passed to declares it (rust_std_closure_param_types), or the
+     * project function it is passed to (rust_callee_closure_param_types);
      * otherwise it is unknown. */
     if (strcmp(kind, "closure_expression") == 0) {
         const CBMType *declared[RUST_CLOSURE_PARAM_MAX];
         rust_std_closure_param_types(ctx, node, declared);
+        rust_callee_closure_param_types(ctx, node, declared);
         TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
-        uint32_t pc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+        uint32_t pc = ts_node_is_null(params) ? 0 : ts_node_child_count(params);
+        /* A `_` parameter is an unnamed node that still takes a position. */
+        int position = 0;
         for (uint32_t i = 0; i < pc; i++) {
-            TSNode p = ts_node_named_child(params, i);
+            TSNode p = ts_node_child(params, i);
+            const char *pk = ts_node_type(p);
+            if (strcmp(pk, "|") == 0 || strcmp(pk, ",") == 0 || rust_is_comment_node(p)) {
+                continue;
+            }
+            int at = position++;
+            if (!ts_node_is_named(p)) {
+                continue;
+            }
             TSNode pat = p;
-            const CBMType *bound = i < RUST_CLOSURE_PARAM_MAX ? declared[i] : cbm_type_unknown();
+            const CBMType *bound = at < RUST_CLOSURE_PARAM_MAX ? declared[at] : cbm_type_unknown();
             if (strcmp(ts_node_type(p), "parameter") == 0) {
                 TSNode tn = ts_node_child_by_field_name(p, "type", 4);
                 TSNode pn = ts_node_child_by_field_name(p, "pattern", 7);
@@ -12511,6 +12833,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     arena, d->signature_param_types, d->signature_param_count,
                     rust_signature_param_type_adapter, &parser_ctx);
                 param_names = NULL;
+                rf.rust_callable_params = rust_callable_param_sigs(
+                    arena, d->signature_param_types, d->signature_param_count, module_qn, NULL);
             } else if (d->param_types) {
                 int count = 0;
                 while (d->param_types[count])
@@ -13241,6 +13565,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                 arena, d->signature_param_types, d->signature_param_count,
                 rust_signature_param_type_adapter, &parser_ctx);
             rf.signature = cbm_type_func(arena, NULL, param_types, ret_types);
+            rf.rust_callable_params = rust_callable_param_sigs(
+                arena, d->signature_param_types, d->signature_param_count, def_mod, tree);
 
             const char *receiver = receivers ? receivers[i] : d->receiver_type;
             bool is_method = strcmp(d->label, "Method") == 0;

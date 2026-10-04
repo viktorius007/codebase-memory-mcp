@@ -3540,6 +3540,177 @@ static char *resolve_signature_param_type_text(CBMArena *a, TSNode param, const 
     return resolve_param_type_text(a, param, source, lang);
 }
 
+/* Rust: the type parameter names `item` (fn, impl or trait) declares,
+ * appended to `names[*n..max)`. */
+static void rust_append_type_param_names(CBMArena *a, TSNode item, const char *source,
+                                         const char **names, int *n, int max) {
+    int count = 0;
+    const char **declared = rust_item_type_param_names(a, item, source, &count);
+    for (int i = 0; i < count && *n < max; i++) {
+        names[(*n)++] = declared[i];
+    }
+}
+
+/* Rust: true when `bounds` (a `trait_bounds` node) holds a call signature
+ * (`Fn(A) -> R`, also under `for<'a>`). */
+static bool rust_bounds_declare_call(TSNode bounds) {
+    uint32_t nc = ts_node_named_child_count(bounds);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode b = ts_node_named_child(bounds, i);
+        const char *k = ts_node_type(b);
+        if (strcmp(k, "higher_ranked_trait_bound") == 0) {
+            b = ts_node_child_by_field_name(b, TS_FIELD("type"));
+            k = ts_node_is_null(b) ? "" : ts_node_type(b);
+        }
+        if (strcmp(k, "function_type") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Rust: the call-signature bounds `fn_item` declares for its type parameter
+ * `name`, in the angle brackets or the `where` clause; a null node when it
+ * declares none. */
+static TSNode rust_type_param_call_bounds(CBMArena *a, TSNode fn_item, const char *source,
+                                          const char *name) {
+    TSNode tps = ts_node_child_by_field_name(fn_item, TS_FIELD("type_parameters"));
+    TSNode where = cbm_find_child_by_kind(fn_item, "where_clause");
+    TSNode lists[2] = {tps, where};
+    const char *const name_fields[2] = {"name", "left"};
+    for (int l = 0; l < 2; l++) {
+        uint32_t nc = ts_node_is_null(lists[l]) ? 0 : ts_node_named_child_count(lists[l]);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode entry = ts_node_named_child(lists[l], i);
+            TSNode left = ts_node_child_by_field_name(entry, name_fields[l],
+                                                      (uint32_t)strlen(name_fields[l]));
+            TSNode bounds = ts_node_child_by_field_name(entry, TS_FIELD("bounds"));
+            if (ts_node_is_null(left) || ts_node_is_null(bounds) ||
+                !rust_bounds_declare_call(bounds)) {
+                continue;
+            }
+            char *left_text = cbm_node_text(a, left, source);
+            if (left_text && strcmp(left_text, name) == 0) {
+                return bounds;
+            }
+        }
+    }
+    TSNode none = {0};
+    return none;
+}
+
+static bool rust_subtree_has_kind(TSNode node, const char *kind, int depth) {
+    if (depth > 32) {
+        return false;
+    }
+    if (strcmp(ts_node_type(node), kind) == 0) {
+        return true;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        if (rust_subtree_has_kind(ts_node_named_child(node, i), kind, depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rust_ident_byte(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* `text` with every whole-word occurrence of a name in `names[0..n)` replaced
+ * by `_` (a lifetime `'T` is no occurrence). */
+static char *rust_mask_names(CBMArena *a, const char *text, const char *const *names, int n) {
+    size_t len = strlen(text);
+    char *out = (char *)cbm_arena_alloc(a, len + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < len;) {
+        if (!rust_ident_byte(text[i]) || (i > 0 && rust_ident_byte(text[i - 1]))) {
+            out[used++] = text[i++];
+            continue;
+        }
+        size_t end = i;
+        while (end < len && rust_ident_byte(text[end])) {
+            end++;
+        }
+        bool masked = false;
+        for (int k = 0; k < n && !masked && (i == 0 || text[i - 1] != '\''); k++) {
+            masked = strlen(names[k]) == end - i && strncmp(names[k], text + i, end - i) == 0;
+        }
+        if (masked) {
+            out[used++] = '_';
+        } else {
+            memcpy(out + used, text + i, end - i);
+            used += end - i;
+        }
+        i = end;
+    }
+    out[used] = '\0';
+    return out;
+}
+
+enum { RUST_MASKED_NAMES_MAX = 32 };
+
+/* Rust: the signature text of a parameter that takes a callable, written so
+ * that the text alone declares what the callable is called with. A parameter
+ * typed by a type parameter of the fn (`f: F`, `F: FnOnce(&mut T) -> R` in
+ * the angle brackets or the `where` clause) reads `impl FnOnce(&mut T) -> R`.
+ * In every callable parameter, a type parameter no caller can read off the
+ * receiver (one of the fn, of the enclosing trait, or of the enclosing impl
+ * that its self type does not spell) reads `_`, so it is never taken for a
+ * type of the same name. Any other parameter keeps `text`. */
+static const char *rust_callable_param_type_text(CBMArena *a, TSNode param, const char *source,
+                                                 const char *text) {
+    TSNode type = ts_node_child_by_field_name(param, TS_FIELD("type"));
+    TSNode list = ts_node_parent(param);
+    TSNode fn_item = ts_node_is_null(list) ? list : ts_node_parent(list);
+    if (ts_node_is_null(type) || ts_node_is_null(fn_item) ||
+        (strcmp(ts_node_type(fn_item), "function_item") != 0 &&
+         strcmp(ts_node_type(fn_item), "function_signature_item") != 0)) {
+        return text;
+    }
+    if (strcmp(ts_node_type(type), "type_identifier") == 0) {
+        TSNode bounds = rust_type_param_call_bounds(a, fn_item, source, text);
+        char *bounds_text = ts_node_is_null(bounds) ? NULL : cbm_node_text(a, bounds, source);
+        if (!bounds_text) {
+            return text;
+        }
+        while (*bounds_text == ':' || isspace((unsigned char)*bounds_text)) {
+            bounds_text++;
+        }
+        text = cbm_arena_sprintf(a, "impl %s", bounds_text);
+    } else if (!rust_subtree_has_kind(type, "function_type", 0)) {
+        return text;
+    }
+    const char *names[RUST_MASKED_NAMES_MAX];
+    int n = 0;
+    rust_append_type_param_names(a, fn_item, source, names, &n, RUST_MASKED_NAMES_MAX);
+    TSNode body = ts_node_parent(fn_item);
+    TSNode owner = ts_node_is_null(body) ? body : ts_node_parent(body);
+    if (!ts_node_is_null(owner) && strcmp(ts_node_type(owner), "trait_item") == 0) {
+        rust_append_type_param_names(a, owner, source, names, &n, RUST_MASKED_NAMES_MAX);
+    } else if (!ts_node_is_null(owner) && strcmp(ts_node_type(owner), "impl_item") == 0) {
+        int first = n;
+        rust_append_type_param_names(a, owner, source, names, &n, RUST_MASKED_NAMES_MAX);
+        TSNode self_type = ts_node_child_by_field_name(owner, TS_FIELD("type"));
+        char *self_text = ts_node_is_null(self_type) ? NULL : cbm_node_text(a, self_type, source);
+        int kept = first;
+        for (int i = first; i < n; i++) {
+            char *masked = self_text ? rust_mask_names(a, self_text, &names[i], 1) : NULL;
+            if (!masked || strcmp(masked, self_text) == 0) {
+                names[kept++] = names[i];
+            }
+        }
+        n = kept;
+    }
+    char *masked = n > 0 ? rust_mask_names(a, text, names, n) : NULL;
+    return masked ? masked : text;
+}
+
 static const char **extract_signature_param_types(CBMArena *a, TSNode params, const char *source,
                                                   CBMLanguage lang, bool method, int *out_count) {
     *out_count = 0;
@@ -3561,6 +3732,9 @@ static const char **extract_signature_param_types(CBMArena *a, TSNode params, co
 
         char *type_text = resolve_signature_param_type_text(a, param, source, lang);
         const char *entry = type_text && type_text[0] ? type_text : signature_unknown_type;
+        if (lang == CBM_LANG_RUST && entry != signature_unknown_type) {
+            entry = rust_callable_param_type_text(a, param, source, entry);
+        }
         int multiplicity = signature_param_multiplicity(param, lang);
         for (int n = 0; n < multiplicity && *out_count < MAX_PARAMS_MINUS_1; n++) {
             types[(*out_count)++] = entry;
