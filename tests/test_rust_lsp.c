@@ -1221,6 +1221,37 @@ TEST(rustlsp_std_returns_paths) {
     PASS();
 }
 
+/* Returns written over the call: `Arc::new_cyclic(f) -> Arc<T>` with T what
+ * `f` returns (its block `let`s bound), `Option<T>::as_deref ->
+ * Option<&T::Target>`, `PathBuf::ancestors -> Iterator<&Path>` (reaching a
+ * project trait implemented for Path), `downcast_ref::<T>() -> Option<&T>`
+ * on `dyn Any`, `Box::pin(x) -> Pin<Box<X>>`. */
+TEST(rustlsp_std_returns_read_the_call) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::sync::Arc;\n" RUSTLSP_STD_DECOYS "fn make() -> Conn { Conn }\n"
+        "fn run() -> bool { Arc::new_cyclic(|_w| { let c = make(); c }).ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "fn run(o: Option<Box<Conn>>) -> bool { o.as_deref().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::any::Any;\n" RUSTLSP_STD_DECOYS
+        "fn run(a: &dyn Any) -> bool { a.downcast_ref::<Conn>().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(RUSTLSP_STD_DECOYS
+                                          "fn make() -> Conn { Conn }\n"
+                                          "fn run() -> bool { Box::pin(make()).ping() }\n"));
+    CBMFileResult *r =
+        extract_rust("use std::path::{Path, PathBuf};\n"
+                     "trait Probe { fn ping(&self) -> bool; }\n"
+                     "struct Conn;\n"
+                     "impl Probe for Path { fn ping(&self) -> bool { true } }\n"
+                     "impl Probe for Conn { fn ping(&self) -> bool { false } }\n"
+                     "fn run(p: PathBuf) -> bool { p.ancestors().next().unwrap().ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Path.ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* `Vec<T>::clone -> Self`, `pop -> Option<T>`, `first_mut -> Option<&T>`;
  * `String::clone -> Self` reaches a project trait implemented for String. */
 TEST(rustlsp_std_returns_vec_and_string) {
@@ -10470,6 +10501,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_std_returns_refcell);
     RUN_TEST(rustlsp_std_returns_option_result_adapters);
     RUN_TEST(rustlsp_std_returns_paths);
+    RUN_TEST(rustlsp_std_returns_read_the_call);
     RUN_TEST(rustlsp_std_returns_vec_and_string);
     RUN_TEST(rustlsp_crossfile_return_box_with_written_argument);
     RUN_TEST(rustlsp_crossfile_return_opaque_types);
