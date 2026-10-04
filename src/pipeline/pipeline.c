@@ -1158,7 +1158,8 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             str_def_fp += def->fingerprint ? (size_t)def->fingerprint_k * sizeof(uint32_t) : 0;
             str_def_misc += census_len(def->route_path) + census_len(def->route_method) +
                             census_len(def->impl_trait) + census_len(def->supertraits) +
-                            census_len(def->type_alias) + census_list(def->type_alias_params);
+                            census_len(def->type_alias) + census_list(def->type_alias_params) +
+                            census_list(def->rust_type_params);
         }
         for (int c = 0; c < r->calls.count; c++) {
             const CBMCall *call = &r->calls.items[c];

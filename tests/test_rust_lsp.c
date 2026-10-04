@@ -1430,6 +1430,62 @@ TEST(rustlsp_crossfile_return_generic_alias_with_written_argument) {
     PASS();
 }
 
+/* Across files a function's own type parameter is fixed by its argument:
+ * `demo::pass(c)` declared `fn pass<T>(v: T) -> T` returns `c`'s type. A `T`
+ * the function does not declare as its parameter is an ordinary type name
+ * and binds nothing. */
+static int rustlsp_generic_fn_argument_target(bool declares_param, const char *callee) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[RUSTLSP_RET_DEFS];
+    memset(defs, 0, sizeof(defs));
+    const char *tqn[] = {"test.demo.Conn", "test.demo.Other"};
+    const char *tname[] = {"Conn", "Other"};
+    int n = 0;
+    for (int i = 0; i < 2; i++) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = tqn[i],
+                                    .short_name = tname[i],
+                                    .label = "Struct",
+                                    .def_module_qn = "test.demo"};
+        defs[n++] = (CBMRustLSPDef){.qualified_name = i == 0 ? "test.demo.Conn.ping"
+                                                             : "test.demo.Other.ping",
+                                    .short_name = "ping",
+                                    .label = "Method",
+                                    .receiver_type = tqn[i],
+                                    .def_module_qn = "test.demo",
+                                    .return_types = "bool",
+                                    .has_rust_self = true};
+    }
+    static const char *const pass_params[] = {"T"};
+    static const char *const pass_type_params[] = {"T", NULL};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "test.demo.pass",
+                                .short_name = "pass",
+                                .label = "Function",
+                                .def_module_qn = "test.demo",
+                                .return_types = "T",
+                                .signature_param_types = (const char **)pass_params,
+                                .signature_param_count = 1,
+                                .type_params =
+                                    declares_param ? (const char **)pass_type_params : NULL};
+    const char *caller = "fn run(c: demo::Conn) -> bool { demo::pass(c).ping() }\n";
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, n, imp_names,
+                           imp_qns, 1, NULL, &out);
+    int idx = find_confident(&out, "run", callee);
+    cbm_arena_destroy(&a);
+    return idx;
+}
+
+TEST(rustlsp_crossfile_generic_fn_argument_fixes_return) {
+    ASSERT_GTE(rustlsp_generic_fn_argument_target(true, "Conn.ping"), 0);
+    ASSERT_EQ(rustlsp_generic_fn_argument_target(true, "Other.ping"), -1);
+    ASSERT_EQ(rustlsp_generic_fn_argument_target(false, "Conn.ping"), -1);
+    PASS();
+}
+
 /* `io::Result<T>` with `?` or `.expect(..)` yields T. */
 TEST(rustlsp_crossfile_return_io_result_then_try) {
     const char *by_try = "fn run() -> std::io::Result<bool> { Ok(demo::make()?.ping()) }\n";
@@ -4521,6 +4577,55 @@ TEST(rustlsp_generic_struct_member_substitutes_written_args) {
     ASSERT_GTE(require_resolved(r, "by_method", "Item.m"), 0);
     ASSERT_LT(find_resolved(r, "bare", "Item.m"), 0);
     ASSERT_LT(find_resolved(r, "bare", "Other.m"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_call_arguments_fix_type_params) {
+    /* A call's arguments fix the type parameters its declaration spells:
+     * the impl's `T` in `Wrap::new(item)` (so `Self` is `Wrap<Item>`), a
+     * function's own `T` in `ident(item)` and in a method `put<T>`, and the
+     * `T` inside `impl Future<Output = Result<T, String>>` given a call to
+     * an `async fn`. Two arguments that fix one parameter differently, or
+     * no argument that fixes it, leave the result untyped. */
+    CBMFileResult *r = extract_rust(
+        "struct Item;\n"
+        "impl Item { fn make() -> Item { Item } fn hit(&self) {} }\n"
+        "struct Other;\n"
+        "impl Other { fn make() -> Other { Other } fn hit(&self) {} }\n"
+        "struct Wrap<T> { inner: T }\n"
+        "impl<T> Wrap<T> {\n"
+        "    fn new(inner: T) -> Self { Wrap { inner } }\n"
+        "    fn get(&self) -> &T { &self.inner }\n"
+        "}\n"
+        "struct Reg;\n"
+        "impl Reg { fn put<T>(&self, v: T) -> T { v } }\n"
+        "fn ident<T>(v: T) -> T { v }\n"
+        "fn pick<T>(a: T, b: T) -> T { a }\n"
+        "fn none<T>() -> T { loop {} }\n"
+        "async fn load() -> Result<Item, String> { Ok(Item) }\n"
+        "async fn settle<T>(f: impl std::future::Future<Output = Result<T, String>>) -> T {\n"
+        "    f.await.unwrap()\n"
+        "}\n"
+        "fn by_impl() { let w = Wrap::new(Item::make()); w.get().hit(); }\n"
+        "fn by_field() { let w = Wrap::new(Other::make()); w.inner.hit(); }\n"
+        "fn by_fn() { ident(Item::make()).hit(); }\n"
+        "fn by_method(r: &Reg) { r.put(Other::make()).hit(); }\n"
+        "async fn by_future() { settle(load()).await.hit(); }\n"
+        "fn conflict() { pick(Item::make(), Other::make()).hit(); }\n"
+        "fn unproven() { none().hit(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "by_impl", "Item.hit"), 0);
+    ASSERT_LT(find_resolved(r, "by_impl", "Other.hit"), 0);
+    ASSERT_GTE(require_resolved(r, "by_field", "Other.hit"), 0);
+    ASSERT_GTE(require_resolved(r, "by_fn", "Item.hit"), 0);
+    ASSERT_GTE(require_resolved(r, "by_method", "Other.hit"), 0);
+    ASSERT_LT(find_resolved(r, "by_method", "Item.hit"), 0);
+    ASSERT_GTE(require_resolved(r, "by_future", "Item.hit"), 0);
+    ASSERT_LT(find_resolved(r, "conflict", "Item.hit"), 0);
+    ASSERT_LT(find_resolved(r, "conflict", "Other.hit"), 0);
+    ASSERT_LT(find_resolved(r, "unproven", "Item.hit"), 0);
+    ASSERT_LT(find_resolved(r, "unproven", "Other.hit"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -11927,6 +12032,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_method_result_self_return);
     RUN_TEST(rustlsp_crossfile_return_project_alias);
     RUN_TEST(rustlsp_crossfile_return_generic_alias_with_written_argument);
+    RUN_TEST(rustlsp_crossfile_generic_fn_argument_fixes_return);
     RUN_TEST(rustlsp_crossfile_return_io_result_then_try);
     RUN_TEST(rustlsp_std_returns_shared_pointers);
     RUN_TEST(rustlsp_std_returns_locks);
@@ -12025,6 +12131,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_field_access_chain);
     RUN_TEST(rustlsp_field_read_before_same_named_method);
     RUN_TEST(rustlsp_generic_struct_member_substitutes_written_args);
+    RUN_TEST(rustlsp_call_arguments_fix_type_params);
     RUN_TEST(rustlsp_param_method_overload_disambiguation);
     RUN_TEST(rustlsp_for_iter_method_resolves);
     RUN_TEST(rustlsp_module_local_function_dispatch);

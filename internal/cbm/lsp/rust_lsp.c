@@ -2991,6 +2991,15 @@ static bool rust_spelling_is_bare_name(const char *text, size_t len) {
     return true;
 }
 
+/* The NULL-ended copy of a function's own type parameter names. */
+static const char **rust_fn_type_params_copy(CBMArena *arena, const char *const *params) {
+    int count = 0;
+    while (params && params[count]) {
+        count++;
+    }
+    return rust_type_param_names_copy(arena, params, count);
+}
+
 /* The names an impl's self type spells at its argument positions, lifetimes
  * left out as a parsed type leaves them out (`Terminal<B>` -> [B],
  * `Req<'_, H>` -> [H]). An argument that is not a bare name gets "", which
@@ -3411,11 +3420,12 @@ static const CBMType *rust_subst_self(RustLSPContext *ctx, const CBMType *t, con
 /* Type a path call `f(..)` / `Type::f(..)` from the same target the call
  * step publishes for it. True when the module tree settles the path as a
  * function: `*out` is then the target's declared return type, unknown when
- * the target is not registered, and `*out_fn` the registered target or NULL.
- * False leaves the call to other evidence. */
+ * the target is not registered, `*out_fn` the registered target or NULL, and
+ * `*out_self_qn` the type `Self` names in that return type (NULL for a free
+ * function). False leaves the call to other evidence. */
 static bool rust_eval_path_call_by_target(RustLSPContext *ctx, TSNode func_node,
-                                          const CBMType **out,
-                                          const CBMRegisteredFunc **out_fn) {
+                                          const CBMType **out, const CBMRegisteredFunc **out_fn,
+                                          const char **out_self_qn) {
     TSNode callee = func_node;
     if (strcmp(ts_node_type(callee), "generic_function") == 0) {
         callee = ts_node_child_by_field_name(callee, "function", 8);
@@ -3448,6 +3458,7 @@ static bool rust_eval_path_call_by_target(RustLSPContext *ctx, TSNode func_node,
         f->signature->data.func.return_types && f->signature->data.func.return_types[0]) {
         const char *self_qn = target.receiver_qn ? target.receiver_qn : f->receiver_type;
         *out = rust_subst_self(ctx, f->signature->data.func.return_types[0], self_qn);
+        *out_self_qn = self_qn;
     }
     return true;
 }
@@ -4760,6 +4771,243 @@ static const CBMType *rust_eval_call_type(RustLSPContext *ctx, TSNode node,
     return rust_expand_type_aliases(ctx, rust_eval_call_type_of(ctx, node, callee), 0);
 }
 
+/* ── Type parameters a call's arguments fix ─────────────────────────
+ * `fn wrap<T>(v: T) -> Holder<T>` called as `wrap(Item::new())` returns
+ * `Holder<Item>`: the argument's type stands where the declaration spells the
+ * parameter. The parameters are the callee's own (`fn f<T>`) and, for a path
+ * call, those of its impl (`impl<B> Terminal<B>`), which also give `Self` its
+ * arguments. */
+
+enum { RUST_CALL_INFER_MAX_PARAMS = 16, RUST_CALL_INFER_MAX_DEPTH = 16 };
+
+typedef struct {
+    const char *names[RUST_CALL_INFER_MAX_PARAMS]; /* "" names no parameter */
+    const CBMType *bound[RUST_CALL_INFER_MAX_PARAMS];
+    bool conflict[RUST_CALL_INFER_MAX_PARAMS];
+    int count;
+} RustCallInference;
+
+static int rust_receiver_param_index(RustLSPContext *ctx, const CBMType *t,
+                                     const char *const *params, int argc);
+static const CBMType *rust_subst_receiver_args(RustLSPContext *ctx, const CBMType *t,
+                                               const char *const *params,
+                                               const CBMType *const *args, int argc,
+                                               const CBMType *self_t, int depth);
+
+/* True when `t` spells one of `inf`'s parameters, or `Self` when `self` is set. */
+static bool rust_type_spells_param(RustLSPContext *ctx, const RustCallInference *inf,
+                                   const CBMType *t, bool self, int depth) {
+    if (!t || depth > RUST_CALL_INFER_MAX_DEPTH) {
+        return false;
+    }
+    if (rust_receiver_param_index(ctx, t, inf->names, inf->count) >= 0) {
+        return true;
+    }
+    switch (t->kind) {
+    case CBM_TYPE_NAMED:
+        return self && strcmp(t->data.named.qualified_name, "Self") == 0;
+    case CBM_TYPE_REFERENCE:
+        return rust_type_spells_param(ctx, inf, t->data.reference.elem, self, depth + 1);
+    case CBM_TYPE_POINTER:
+        return rust_type_spells_param(ctx, inf, t->data.pointer.elem, self, depth + 1);
+    case CBM_TYPE_SLICE:
+        return rust_type_spells_param(ctx, inf, t->data.slice.elem, self, depth + 1);
+    case CBM_TYPE_TEMPLATE:
+        for (int i = 0; i < t->data.template_type.arg_count; i++) {
+            if (rust_type_spells_param(ctx, inf, t->data.template_type.template_args[i], self,
+                                       depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    case CBM_TYPE_TUPLE:
+        for (int i = 0; i < t->data.tuple.count; i++) {
+            if (rust_type_spells_param(ctx, inf, t->data.tuple.elems[i], self, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+/* Bind each parameter the declared type `param` spells to what stands at its
+ * place in the argument type `arg`. A parameter two arguments bind to
+ * different types is marked conflicting and binds nothing. */
+static void rust_infer_unify(RustLSPContext *ctx, RustCallInference *inf, const CBMType *param,
+                             const CBMType *arg, int depth) {
+    if (!param || !arg || cbm_type_is_unknown(arg) || depth > RUST_CALL_INFER_MAX_DEPTH) {
+        return;
+    }
+    int at = rust_receiver_param_index(ctx, param, inf->names, inf->count);
+    if (at >= 0) {
+        if (!inf->bound[at]) {
+            inf->bound[at] = arg;
+        } else if (!cbm_type_equal(inf->bound[at], arg)) {
+            inf->conflict[at] = true;
+        }
+        return;
+    }
+    switch (param->kind) {
+    case CBM_TYPE_REFERENCE:
+        /* `&T` takes `&x`, and a binding that already holds a reference. */
+        rust_infer_unify(ctx, inf, param->data.reference.elem,
+                         arg->kind == CBM_TYPE_REFERENCE ? arg->data.reference.elem : arg,
+                         depth + 1);
+        return;
+    case CBM_TYPE_POINTER:
+        if (arg->kind == CBM_TYPE_POINTER) {
+            rust_infer_unify(ctx, inf, param->data.pointer.elem, arg->data.pointer.elem,
+                             depth + 1);
+        }
+        return;
+    case CBM_TYPE_SLICE:
+        if (arg->kind == CBM_TYPE_SLICE) {
+            rust_infer_unify(ctx, inf, param->data.slice.elem, arg->data.slice.elem, depth + 1);
+        }
+        return;
+    case CBM_TYPE_TUPLE:
+        if (arg->kind == CBM_TYPE_TUPLE && arg->data.tuple.count == param->data.tuple.count) {
+            for (int i = 0; i < param->data.tuple.count; i++) {
+                rust_infer_unify(ctx, inf, param->data.tuple.elems[i], arg->data.tuple.elems[i],
+                                 depth + 1);
+            }
+        }
+        return;
+    case CBM_TYPE_TEMPLATE:
+        if (arg->kind == CBM_TYPE_TEMPLATE && param->data.template_type.template_name &&
+            arg->data.template_type.template_name &&
+            strcmp(param->data.template_type.template_name,
+                   arg->data.template_type.template_name) == 0) {
+            int n = param->data.template_type.arg_count;
+            if (arg->data.template_type.arg_count < n) {
+                n = arg->data.template_type.arg_count;
+            }
+            for (int i = 0; i < n; i++) {
+                rust_infer_unify(ctx, inf, param->data.template_type.template_args[i],
+                                 arg->data.template_type.template_args[i], depth + 1);
+            }
+        }
+        return;
+    default:
+        return;
+    }
+}
+
+/* True for the `Future` trait under either path the standard library
+ * exports it at. */
+static bool rust_type_is_future_trait(const CBMType *t) {
+    const char *name = t->data.template_type.template_name;
+    return name &&
+           (strcmp(name, "core.future.Future") == 0 || strcmp(name, "std.future.Future") == 0);
+}
+
+/* Unify one declared parameter type with the argument written for it. A call
+ * to an `async fn` is typed with its output, which is what a parameter
+ * declared `impl Future<Output = X>` names as `X`. */
+static void rust_infer_from_argument(RustLSPContext *ctx, RustCallInference *inf,
+                                     const CBMType *param, TSNode arg_node) {
+    const CBMRegisteredFunc *arg_callee = NULL;
+    const CBMType *arg = strcmp(ts_node_type(arg_node), "call_expression") == 0
+                             ? rust_eval_call_type(ctx, arg_node, &arg_callee)
+                             : rust_eval_expr_type(ctx, arg_node);
+    param = rust_expand_type_aliases(ctx, param, 0);
+    if (arg_callee && (arg_callee->flags & CBM_FUNC_FLAG_ASYNC) != 0) {
+        if (param && param->kind == CBM_TYPE_TEMPLATE &&
+            param->data.template_type.arg_count > 0 &&
+            rust_type_is_future_trait(param)) {
+            rust_infer_unify(ctx, inf, param->data.template_type.template_args[0], arg, 0);
+        }
+        return;
+    }
+    rust_infer_unify(ctx, inf, param, arg, 0);
+}
+
+/* The return type `ret` of a call to `f` with the type parameters its
+ * arguments fix substituted, or NULL when they fix none that `ret` spells.
+ * `self_qn` is the type `Self` names in `ret` (NULL: `Self` is already
+ * substituted); `impl_params` adds the parameters of `f`'s impl to the
+ * function's own. The first `skip` arguments are not declared parameters. */
+static const CBMType *rust_infer_call_return(RustLSPContext *ctx, const CBMRegisteredFunc *f,
+                                             const CBMType *ret, const char *self_qn,
+                                             bool impl_params, TSNode args_node, int skip) {
+    if (!f || !ret || ts_node_is_null(args_node) || !f->signature ||
+        f->signature->kind != CBM_TYPE_FUNC || !f->signature->data.func.param_types) {
+        return NULL;
+    }
+    RustCallInference inf = {0};
+    int impl_count = 0;
+    if (impl_params && self_qn && f->type_param_names) {
+        while (f->type_param_names[impl_count] && inf.count < RUST_CALL_INFER_MAX_PARAMS) {
+            inf.names[inf.count++] = f->type_param_names[impl_count++];
+        }
+    }
+    for (int i = 0; f->rust_fn_type_params && f->rust_fn_type_params[i] &&
+                    inf.count < RUST_CALL_INFER_MAX_PARAMS;
+         i++) {
+        inf.names[inf.count++] = f->rust_fn_type_params[i];
+    }
+    if (inf.count == 0 || !rust_type_spells_param(ctx, &inf, ret, impl_count > 0, 0)) {
+        return NULL;
+    }
+    const CBMType *const *params = f->signature->data.func.param_types;
+    uint32_t argc = ts_node_named_child_count(args_node);
+    int at = 0;
+    for (uint32_t i = 0; i < argc; i++) {
+        TSNode arg_node = ts_node_named_child(args_node, i);
+        if (ts_node_is_extra(arg_node)) {
+            continue;
+        }
+        if (skip > 0) {
+            skip--;
+            continue;
+        }
+        if (!params[at]) {
+            break;
+        }
+        rust_infer_from_argument(ctx, &inf, params[at++], arg_node);
+    }
+    bool any = false;
+    bool any_impl = false;
+    for (int i = 0; i < inf.count; i++) {
+        if (inf.bound[i] && !inf.conflict[i]) {
+            any = true;
+            any_impl = any_impl || i < impl_count;
+        } else {
+            inf.names[i] = "";
+            inf.bound[i] = NULL;
+        }
+    }
+    if (!any) {
+        return NULL;
+    }
+    /* `Self` is the impl's type with the arguments fixed for its parameters. */
+    const CBMType *self_t = NULL;
+    if (any_impl) {
+        const CBMType *self_args[RUST_CALL_INFER_MAX_PARAMS];
+        for (int i = 0; i < impl_count; i++) {
+            self_args[i] = inf.bound[i] ? inf.bound[i] : cbm_type_unknown();
+        }
+        self_t = cbm_type_template(ctx->arena, self_qn, self_args, impl_count);
+    }
+    const CBMType *out =
+        rust_subst_receiver_args(ctx, ret, inf.names, inf.bound, inf.count, self_t, 0);
+    return self_qn ? rust_subst_self(ctx, out, self_qn) : out;
+}
+
+/* What the path call `f(..)` / `Type::f(..)` to `f` returns: its declared
+ * return type with `Self` read as `self_qn` and the type parameters the
+ * arguments fix substituted. `f` has a declared return type. */
+static const CBMType *rust_path_call_return(RustLSPContext *ctx, const CBMRegisteredFunc *f,
+                                            const char *self_qn, TSNode args_node) {
+    const CBMType *ret = f->signature->data.func.return_types[0];
+    /* `Type::method(recv, ..)` passes the receiver as its first argument. */
+    int skip = (f->flags & CBM_FUNC_FLAG_RUST_SELF) != 0 ? 1 : 0;
+    const CBMType *inferred = rust_infer_call_return(ctx, f, ret, self_qn, true, args_node, skip);
+    return inferred ? inferred : rust_subst_self(ctx, ret, self_qn);
+}
+
 static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                                              const CBMRegisteredFunc **callee) {
     *callee = NULL;
@@ -4781,7 +5029,13 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
             return produced;
         }
     }
-    if (rust_eval_path_call_by_target(ctx, func_node, &produced, callee)) {
+    const char *self_qn = NULL;
+    if (rust_eval_path_call_by_target(ctx, func_node, &produced, callee, &self_qn)) {
+        const CBMRegisteredFunc *f = *callee;
+        if (f && f->signature && f->signature->kind == CBM_TYPE_FUNC &&
+            f->signature->data.func.return_types && f->signature->data.func.return_types[0]) {
+            return rust_path_call_return(ctx, f, self_qn, args_node);
+        }
         return produced;
     }
 
@@ -4854,7 +5108,7 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                             return cbm_type_named(ctx->arena, f->receiver_type);
                         }
                         /* Self -> receiver_type substitution. */
-                        return rust_subst_self(ctx, ret, f->receiver_type);
+                        return rust_path_call_return(ctx, f, f->receiver_type, args_node);
                     }
                 }
                 /* UFCS path lookup: split off short name and try
@@ -4887,7 +5141,7 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                         /* Substitute Self / unknown returns with the
                          * receiver type so chained calls keep typing. */
                         if (!cbm_type_is_unknown(ret)) {
-                            return rust_subst_self(ctx, ret, head);
+                            return rust_path_call_return(ctx, m, head, args_node);
                         }
                         if (cbm_type_is_unknown(ret) &&
                             (strcmp(short_name, "new") == 0 ||
@@ -5109,7 +5363,11 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                             return cbm_type_named(ctx->arena, rb->data.named.qualified_name);
                         }
                     }
-                    return ret;
+                    const CBMType *inferred =
+                        *callee ? rust_infer_call_return(ctx, *callee, ret, NULL, false,
+                                                         args_node, 0)
+                                : NULL;
+                    return inferred ? inferred : ret;
                 }
                 return t;
             }
@@ -13160,6 +13418,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             if (d->has_rust_self) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_SELF;
             }
+            rf.rust_fn_type_params = d->rust_type_params;
             if (d->impl_trait) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
                 rf.impl_trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
@@ -13876,6 +14135,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             if (d->has_rust_self) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_SELF;
             }
+            rf.rust_fn_type_params = rust_fn_type_params_copy(arena, d->type_params);
             if (d->trait_qn && d->trait_qn[0]) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
                 rf.impl_trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
@@ -14386,6 +14646,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].is_async = defs[i].is_async;
             rdefs[i].is_rust_private = defs[i].is_rust_private;
             rdefs[i].has_rust_self = defs[i].has_rust_self;
+            rdefs[i].type_params = defs[i].type_params;
         }
     }
     rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL, modtree);
