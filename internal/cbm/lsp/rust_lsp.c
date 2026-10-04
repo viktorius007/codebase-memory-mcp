@@ -10919,6 +10919,38 @@ static bool rust_is_block_fn_item(const RustLSPContext *ctx, const char *name,
 /* Walk every node in a function body, recording calls and refining scope
  * for control-flow constructs that bind variables. */
 #define CBM_RUST_EVAL_STEP_CAP 200000 /* per-file budget */
+/* Walk an `if`/`while` condition in evaluation order. A `let` condition's
+ * scrutinee is walked and typed before its pattern binds, so a name the
+ * pattern shadows still reads the previous binding there; the conditions
+ * after it in a let-chain see the new one. */
+static void rust_walk_condition(RustLSPContext *ctx, TSNode cond) {
+    const char *kind = ts_node_type(cond);
+    if (strcmp(kind, "let_chain") == 0) {
+        for (uint32_t i = 0; i < ts_node_named_child_count(cond); i++) {
+            rust_walk_condition(ctx, ts_node_named_child(cond, i));
+        }
+        return;
+    }
+    if (strcmp(kind, "let_condition") != 0) {
+        rust_resolve_calls_in_node(ctx, cond);
+        return;
+    }
+    TSNode pat = ts_node_child_by_field_name(cond, "pattern", 7);
+    TSNode val = ts_node_child_by_field_name(cond, "value", 5);
+    if (!ts_node_is_null(val)) {
+        rust_resolve_calls_in_node(ctx, val);
+        if (!ts_node_is_null(pat)) {
+            rust_bind_pattern(ctx, pat, rust_eval_expr_type(ctx, val));
+        }
+    }
+    for (uint32_t i = 0; i < ts_node_child_count(cond); i++) {
+        TSNode c = ts_node_child(cond, i);
+        if (ts_node_is_null(val) || !ts_node_eq(c, val)) {
+            rust_resolve_calls_in_node(ctx, c);
+        }
+    }
+}
+
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
@@ -10941,15 +10973,21 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
             ts_node_is_null(value) ? cbm_type_unknown() : rust_eval_expr_type(ctx, value);
     }
 
-    /* A `let` initializer runs before its pattern is in scope: resolve the
-     * value first so `let f = f(x);` still reaches the function `f`. */
-    TSNode let_value = {0};
-    bool let_value_walked = false;
+    /* Children walked here, before the statement's pattern binds, and
+     * skipped by the recursion below. A `let` initializer and the block of
+     * a `let … else` run before the pattern is in scope: resolve them first
+     * so `let f = f(x);` still reaches the function `f`. */
+    TSNode walked[2];
+    int walked_count = 0;
     if (strcmp(kind, "let_declaration") == 0) {
-        let_value = ts_node_child_by_field_name(node, "value", 5);
-        if (!ts_node_is_null(let_value)) {
-            rust_resolve_calls_in_node(ctx, let_value);
-            let_value_walked = true;
+        static const char *const before_binding[] = {"value", "alternative"};
+        for (int i = 0; i < 2; i++) {
+            TSNode early = ts_node_child_by_field_name(node, before_binding[i],
+                                                       (uint32_t)strlen(before_binding[i]));
+            if (!ts_node_is_null(early)) {
+                rust_resolve_calls_in_node(ctx, early);
+                walked[walked_count++] = early;
+            }
         }
     }
 
@@ -11099,6 +11137,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         strcmp(kind, "for_expression") == 0 || strcmp(kind, "loop_expression") == 0 ||
         strcmp(kind, "match_arm") == 0 || strcmp(kind, "closure_expression") == 0;
 
+    bool is_if = strcmp(kind, "if_expression") == 0;
     CBMScope *saved = ctx->current_scope;
     int saved_use_count = ctx->use_count;
     int saved_glob_count = ctx->glob_count;
@@ -11130,34 +11169,10 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         }
     }
     if (strcmp(kind, "if_expression") == 0 || strcmp(kind, "while_expression") == 0) {
-        /* Look for a let_condition (or let_chain) anywhere in the
-         * condition slot. */
         TSNode cond = ts_node_child_by_field_name(node, "condition", 9);
         if (!ts_node_is_null(cond)) {
-            uint32_t nc2 = ts_node_named_child_count(cond);
-            /* Walk one level down for let_condition / let_chain. */
-            const char *ck = ts_node_type(cond);
-            TSNode targets[8];
-            int tcount = 0;
-            if (strcmp(ck, "let_condition") == 0) {
-                targets[tcount++] = cond;
-            } else if (strcmp(ck, "let_chain") == 0) {
-                for (uint32_t i = 0; i < nc2 && tcount < 8; i++) {
-                    TSNode c2 = ts_node_named_child(cond, i);
-                    if (strcmp(ts_node_type(c2), "let_condition") == 0) {
-                        targets[tcount++] = c2;
-                    }
-                }
-            }
-            for (int t = 0; t < tcount; t++) {
-                TSNode lc = targets[t];
-                TSNode pat = ts_node_child_by_field_name(lc, "pattern", 7);
-                TSNode val = ts_node_child_by_field_name(lc, "value", 5);
-                if (!ts_node_is_null(pat) && !ts_node_is_null(val)) {
-                    const CBMType *vt = rust_eval_expr_type(ctx, val);
-                    rust_bind_pattern(ctx, pat, vt);
-                }
-            }
+            rust_walk_condition(ctx, cond);
+            walked[walked_count++] = cond;
         }
     }
 
@@ -11166,6 +11181,8 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         TSNode pat = ts_node_child_by_field_name(node, "pattern", 7);
         TSNode val = ts_node_child_by_field_name(node, "value", 5);
         if (!ts_node_is_null(pat) && !ts_node_is_null(val)) {
+            rust_resolve_calls_in_node(ctx, val);
+            walked[walked_count++] = val;
             const CBMType *vt = rust_eval_expr_type(ctx, val);
             const CBMType *base = vt;
             while (base && base->kind == CBM_TYPE_REFERENCE)
@@ -11229,11 +11246,19 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(node, i);
-        if (let_value_walked && ts_node_eq(c, let_value)) {
+        if (ts_node_is_null(c) || (walked_count > 0 && ts_node_eq(c, walked[0])) ||
+            (walked_count > 1 && ts_node_eq(c, walked[1]))) {
             continue;
         }
-        if (!ts_node_is_null(c)) {
-            rust_resolve_calls_in_node(ctx, c);
+        /* An `if`'s `else` branch sees none of the condition's bindings. */
+        bool outside_bindings = is_if && strcmp(ts_node_type(c), "else_clause") == 0;
+        CBMScope *inner = ctx->current_scope;
+        if (outside_bindings) {
+            ctx->current_scope = saved;
+        }
+        rust_resolve_calls_in_node(ctx, c);
+        if (outside_bindings) {
+            ctx->current_scope = inner;
         }
     }
 
