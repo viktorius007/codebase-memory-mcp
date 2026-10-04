@@ -7987,6 +7987,116 @@ TEST(rustlsp_cov_xf_trait_impl) {
     ASSERT_GTE(find_confident(&out, "run", "Foo.beep"), 0);
     cbm_arena_destroy(&a); PASS();
 }
+/* The per-file pass sees one file: an inherent method another file gives the
+ * type would win over the impl's, so the impl of an unregistered trait is not
+ * selected there. */
+TEST(rustlsp_unregistered_trait_impl_method_not_selected_file_local) {
+    CBMFileResult *r = extract_rust("use dep::Store;\n"
+                                    "struct Jar;\n"
+                                    "impl Store for Jar { fn cookies(&self) {} }\n"
+                                    "fn run(j: &Jar) { j.cookies(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "cookies"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Cross-file fixture: `p.demo.Jar` with `cookies` defined by one impl per
+ * trait spelling in `traits` (NULL-terminated, at most two). `declared` says
+ * whether the type's declaration is among the defs, `shelf_registered`
+ * whether the project declares the trait `p.demo.Shelf`; `dep::` traits are
+ * never registered. Returns whether `src` (module `p.caller`) links `run` to
+ * `Jar.cookies`. */
+static bool rustlsp_unregistered_trait_xf_links(const char *src, const char *const *traits,
+                                                bool declared, bool shelf_registered) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    int n = 0;
+    if (declared) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Jar", .short_name = "Jar",
+                                    .label = "Type", .def_module_qn = "p.demo"};
+    }
+    if (shelf_registered) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Shelf", .short_name = "Shelf",
+                                    .label = "Trait", .def_module_qn = "p.demo"};
+    }
+    for (int i = 0; traits[i]; i++) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Jar.cookies",
+                                    .short_name = "cookies", .label = "Method",
+                                    .receiver_type = "p.demo.Jar", .receiver_spelling = "Jar",
+                                    .trait_qn = traits[i], .def_module_qn = "p.demo"};
+    }
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           &out);
+    bool linked = find_confident(&out, "run", "Jar.cookies") >= 0;
+    cbm_arena_destroy(&a);
+    return linked;
+}
+
+/* A method call on a project type links to the method an `impl Tr for Type`
+ * block defines when `Tr` is not registered (a dependency's trait): the impl
+ * is project source, so the receiver type and the name select it. The
+ * caller's file names the trait. */
+TEST(rustlsp_crossfile_unregistered_trait_impl_method_sole_candidate) {
+    const char *const traits[] = {"dep::Store", NULL};
+    ASSERT_TRUE(rustlsp_unregistered_trait_xf_links(
+        "use dep::Store;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, true, false));
+    PASS();
+}
+
+/* The caller's file never spells the trait's name and has no glob import: the
+ * trait is out of scope there, so its impl's method is no candidate. */
+TEST(rustlsp_crossfile_unregistered_trait_out_of_scope_unresolved) {
+    const char *const traits[] = {"dep::Store", NULL};
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links("fn run(j: &demo::Jar) { j.cookies(); }\n",
+                                                     traits, true, false));
+    PASS();
+}
+
+/* Two impls of unregistered traits define the name and both trait names are
+ * spelled: rustc picks by the trait in scope, which is not proven. */
+TEST(rustlsp_crossfile_unregistered_trait_two_impls_unresolved) {
+    const char *const traits[] = {"dep::Store", "dep::Shelf", NULL};
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links(
+        "use dep::{Store, Shelf};\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, true,
+        false));
+    PASS();
+}
+
+/* An impl of a registered trait and one of an unregistered trait both define
+ * the name and both traits are in scope: nothing is linked. */
+TEST(rustlsp_crossfile_unregistered_trait_beside_registered_unresolved) {
+    const char *const traits[] = {"dep::Store", "Shelf", NULL};
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links(
+        "use dep::Store;\nuse demo::Shelf;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits,
+        true, true));
+    PASS();
+}
+
+/* Of two impls, the one whose trait is out of scope is no candidate: the
+ * other is the only one rustc could pick. */
+TEST(rustlsp_crossfile_unregistered_trait_scope_selects_impl) {
+    const char *const traits[] = {"dep::Store", "dep::Shelf", NULL};
+    ASSERT_TRUE(rustlsp_unregistered_trait_xf_links(
+        "use dep::Store;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, true, false));
+    PASS();
+}
+
+/* The receiver type has no declaration in the project (only an impl names
+ * it): its inherent methods are unknown, so the impl's method is not proven. */
+TEST(rustlsp_crossfile_unregistered_trait_undeclared_type_unresolved) {
+    const char *const traits[] = {"dep::Store", NULL};
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links(
+        "use dep::Store;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, false, false));
+    PASS();
+}
+
 TEST(rustlsp_cov_xf_free_function_chain) {
     const char *src = "fn run() {\n    let s = util::make();\n    let _ = s.len();\n}\n";
     CBMArena a; cbm_arena_init(&a);
@@ -12224,6 +12334,13 @@ void suite_rust_lsp(void) {
     /* Cov §N: Cross-file */
     RUN_TEST(rustlsp_cov_xf_two_methods);
     RUN_TEST(rustlsp_cov_xf_trait_impl);
+    RUN_TEST(rustlsp_unregistered_trait_impl_method_not_selected_file_local);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_beside_registered_unresolved);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_impl_method_sole_candidate);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_out_of_scope_unresolved);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_two_impls_unresolved);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_scope_selects_impl);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_undeclared_type_unresolved);
     RUN_TEST(rustlsp_cov_xf_free_function_chain);
     RUN_TEST(rustlsp_cov_xf_batch);
     RUN_TEST(rustlsp_cov_xf_empty_defs);

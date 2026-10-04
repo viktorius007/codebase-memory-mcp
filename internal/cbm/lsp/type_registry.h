@@ -78,6 +78,9 @@ typedef struct {
     const CBMType *deref_target;
     const char **deref_param_names;
     bool is_interface;
+    /* Rust: registered only as the self type of an impl; no declaration of the
+     * type was read, so its inherent methods are not known. */
+    bool rust_undeclared;
     bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)
 
     // --- TS-specific fields (NULL/empty for non-TS types — backward compatible) ---
