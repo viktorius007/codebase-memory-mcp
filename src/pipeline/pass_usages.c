@@ -250,7 +250,8 @@ const cbm_gbuf_node_t *cbm_pipeline_rust_field_usage_target(const cbm_gbuf_t *gb
     for (int i = 0; i < rows->count; i++) {
         const CBMResolvedCall *rc = &rows->items[i];
         if (rc->kind != CBM_RESOLVED_FIELD_REFERENCE || !rc->callee_qn ||
-            rc->confidence < CBM_LSP_CONFIDENCE_FLOOR || rc->source_origin != usage->source_origin ||
+            rc->confidence < CBM_LSP_CONFIDENCE_FLOOR ||
+            rc->source_origin != usage->source_origin ||
             rc->site_start_byte != usage->site_start_byte ||
             rc->site_end_byte != usage->site_end_byte ||
             strcmp(cbm_lsp_bare_segment(rc->callee_qn), usage->ref_name) != 0) {
