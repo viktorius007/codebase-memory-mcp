@@ -333,6 +333,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->impl_traits.items[i].trait_name);
         cr_str(c, &r->impl_traits.items[i].struct_name);
         cr_str(c, &r->impl_traits.items[i].struct_qn);
+        cr_str(c, &r->impl_traits.items[i].target_type);
     }
     cr_array(c, (void **)&r->rust_impl_links.items, r->rust_impl_links.count,
              sizeof(CBMRustImplLink));

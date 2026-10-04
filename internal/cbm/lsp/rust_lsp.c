@@ -2656,6 +2656,46 @@ static void rust_register_type_alias(CBMArena *arena, CBMRegisteredType *rt, con
     }
 }
 
+/* True when an impl's trait is the language's `Deref`, the only trait that
+ * gives a receiver its auto-deref step: `canonical` (the trait's registered
+ * QN, NULL when it has none) is `core.ops.Deref`, or the raw spelling is a
+ * full path the registry holds as a re-export of it (`std::ops::Deref`). */
+static bool rust_impl_trait_is_deref(CBMArena *arena, const CBMTypeRegistry *reg,
+                                     const char *canonical, const char *raw_trait) {
+    static const char deref_qn[] = "core.ops.Deref";
+    if (canonical) {
+        return strcmp(canonical, deref_qn) == 0;
+    }
+    const char *spelled = raw_trait ? convert_path_to_qn(arena, raw_trait) : NULL;
+    const CBMRegisteredType *rt = spelled ? cbm_registry_lookup_type(reg, spelled) : NULL;
+    return rt && rt->alias_of && strcmp(rt->alias_of, deref_qn) == 0;
+}
+
+/* Record `impl Deref for <spelling> { type Target = <target>; }`, written in
+ * the file of `module_qn`, on the registered self type `rt`. A type whose
+ * Deref impls name different targets, or one target that cannot be read,
+ * keeps no target. */
+static void rust_register_deref_target(CBMArena *arena, CBMRegisteredType *rt, const char *target,
+                                       const char *spelling, const char *module_qn,
+                                       const CBMRustModTree *tree) {
+    if (!rt || !target || !target[0]) {
+        return;
+    }
+    const char **names = rust_impl_self_param_names(arena, spelling, rt->qualified_name);
+    const CBMType *t = parse_type_text_with_params(
+        arena, rust_type_text_canonical(arena, target), module_qn, names, tree);
+    if (!t) {
+        t = cbm_type_unknown();
+    }
+    if (!rt->deref_target) {
+        rt->deref_target = t;
+        rt->deref_param_names = names;
+    } else if (!cbm_type_equal(rt->deref_target, t)) {
+        rt->deref_target = cbm_type_unknown();
+        rt->deref_param_names = NULL;
+    }
+}
+
 typedef struct {
     const char *module_qn;
     const CBMRustModTree *tree;
@@ -5063,10 +5103,45 @@ static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMT
     return rust_wrapper_corpus_trait_method(ctx, base, method, &blocked) != NULL || blocked;
 }
 
-/* Returns the inner type after one Deref step. For NAMED types we check
- * for a registered `embedded_types` entry whose tail is "Target=<U>" or,
- * for stdlib smart pointers, peel the first template arg. Returns NULL
- * if no Deref relationship is known. */
+/* The `Target` of the project's `impl Deref` for the type named `qn`, the
+ * receiver's written type arguments substituted for the names the impl's self
+ * type spells. NULL when the type has no single readable Deref target. */
+static const CBMType *rust_user_deref_target(RustLSPContext *ctx, const char *qn,
+                                             const CBMType **args, int argc) {
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
+    if (!rt) {
+        const char *registered = rust_registered_type_qn(ctx, qn);
+        rt = registered ? cbm_registry_lookup_type(ctx->registry, registered) : NULL;
+    }
+    if (!rt || !rt->deref_target || cbm_type_is_unknown(rt->deref_target)) {
+        return NULL;
+    }
+    const CBMType *target = rt->deref_target;
+    if (!rt->deref_param_names || argc <= 0) {
+        return target;
+    }
+    int params = 0;
+    while (rt->deref_param_names[params]) {
+        params++;
+    }
+    int n = argc < params ? argc : params;
+    const char **names = cbm_arena_alloc(ctx->arena, sizeof(char *) * (size_t)(n + 1));
+    const CBMType **subst = cbm_arena_alloc(ctx->arena, sizeof(*subst) * (size_t)(n + 1));
+    if (!names || !subst) {
+        return NULL;
+    }
+    for (int i = 0; i < n; i++) {
+        names[i] = rt->deref_param_names[i];
+        subst[i] = args[i];
+    }
+    names[n] = NULL;
+    subst[n] = NULL;
+    return rust_substitute_type(ctx->arena, target, names, subst);
+}
+
+/* Returns the inner type after one Deref step: the first template arg of
+ * a stdlib smart pointer, or the `Target` of a project type's `impl Deref`.
+ * Returns NULL if no Deref relationship is known. */
 static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t) {
     if (!t)
         return NULL;
@@ -5079,6 +5154,9 @@ static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t) {
             }
             return NULL;
         }
+        return rust_user_deref_target(ctx, t->data.template_type.template_name,
+                                      t->data.template_type.template_args,
+                                      t->data.template_type.arg_count);
     }
     /* NAMED smart-pointer (rare — only when the user wrote `Rc` without
      * type arg) — no inner to peel. */
@@ -5086,22 +5164,7 @@ static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t) {
         if (rust_type_derefs_to_first_arg(t->data.named.qualified_name)) {
             return NULL;
         }
-        /* Project type with a registered Deref impl. We approximate this
-         * by checking `embedded_types` for an entry of the form
-         * `<TraitQN>:DerefTarget:<U>` — set up by `impl Deref for X`
-         * post-processing. (Currently not produced by extract_defs; the
-         * call still works for stdlib types.) */
-        const CBMRegisteredType *rt =
-            cbm_registry_lookup_type(ctx->registry, t->data.named.qualified_name);
-        if (rt && rt->embedded_types) {
-            for (int i = 0; rt->embedded_types[i]; i++) {
-                const char *e = rt->embedded_types[i];
-                static const char prefix[] = "DerefTarget:";
-                if (strncmp(e, prefix, sizeof(prefix) - 1) == 0) {
-                    return cbm_type_named(ctx->arena, e + sizeof(prefix) - 1);
-                }
-            }
-        }
+        return rust_user_deref_target(ctx, t->data.named.qualified_name, NULL, 0);
     }
     return NULL;
 }
@@ -5366,10 +5429,6 @@ static const CBMRegisteredFunc *rust_lookup_method_depth(RustLSPContext *ctx, co
         }
         if (rt->embedded_types) {
             for (int i = 0; rt->embedded_types[i]; i++) {
-                /* Skip the synthetic DerefTarget marker — handled by the
-                 * caller in the receiver-walk loop. */
-                if (strncmp(rt->embedded_types[i], "DerefTarget:", 12) == 0)
-                    continue;
                 /* Skip bound markers used for type-param trait bound
                  * recording — those live under "Bound:<TraitQN>". */
                 if (strncmp(rt->embedded_types[i], "Bound:", 6) == 0) {
@@ -5570,7 +5629,7 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
     if (receiver_type && receiver_type->embedded_types) {
         for (int i = 0; receiver_type->embedded_types[i]; i++) {
             const char *trait_qn = receiver_type->embedded_types[i];
-            if (strncmp(trait_qn, "DerefTarget:", 12) == 0 || strncmp(trait_qn, "Bound:", 6) == 0) {
+            if (strncmp(trait_qn, "Bound:", 6) == 0) {
                 continue;
             }
             const CBMRegisteredType *trait_type = cbm_registry_lookup_type(reg, trait_qn);
@@ -11908,7 +11967,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                                   : cbm_arena_sprintf(arena, "%s.%s", module_qn, it->struct_name);
         const char *trait_qn =
             rust_canonical_impl_trait(arena, reg, &trait_names, it->trait_name, module_qn);
-        if (!trait_qn) {
+        bool deref = rust_impl_trait_is_deref(arena, reg, trait_qn, it->trait_name);
+        if (!trait_qn && !deref) {
             continue;
         }
 
@@ -11928,6 +11988,10 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name, reg->type_count - 1);
         }
         rust_registered_type_add_embedded(arena, rt, trait_qn);
+        if (deref) {
+            rust_register_deref_target(arena, rt, it->target_type, it->struct_name, module_qn,
+                                       NULL);
+        }
     }
 }
 
@@ -12211,7 +12275,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
         const char *trait_qn =
             rust_canonical_impl_trait(arena, reg, &trait_names, d->trait_qn, def_mod);
-        if (!trait_qn) {
+        bool deref = rust_impl_trait_is_deref(arena, reg, trait_qn, d->trait_qn);
+        if (!trait_qn && !deref) {
             continue;
         }
         int32_t type_index = cbm_idxmemo_get(&type_idx, receiver);
@@ -12226,6 +12291,10 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name, type_index);
         }
         rust_registered_type_add_embedded(arena, &reg->types[type_index], trait_qn);
+        if (deref) {
+            rust_register_deref_target(arena, &reg->types[type_index], d->impl_target,
+                                       d->receiver_spelling, def_mod, tree);
+        }
     }
 
     for (int i = 0; i < def_count; i++) {
@@ -12789,6 +12858,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].signature_param_count = defs[i].signature_param_count;
             rdefs[i].trait_qn = defs[i].trait_qn;
             rdefs[i].receiver_spelling = defs[i].receiver_spelling;
+            rdefs[i].impl_target = defs[i].impl_target;
             rdefs[i].decorators = defs[i].decorators;
             rdefs[i].is_interface = defs[i].is_interface;
             rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;

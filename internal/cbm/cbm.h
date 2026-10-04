@@ -408,6 +408,9 @@ typedef struct {
      * does not need a later leaf-name guess, and the relation exists even for
      * an empty `impl Trait for Type {}` block. */
     const char *struct_qn;
+    /* Raw text of the impl's `type Target = ..;` item, NULL when it has none.
+     * For `impl Deref` this is the type a receiver auto-derefs to. */
+    const char *target_type;
 } CBMImplTrait;
 
 /* Rust: one `impl` block whose header names resolved to registered

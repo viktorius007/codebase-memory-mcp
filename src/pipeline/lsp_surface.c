@@ -27,7 +27,7 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 8 };
+enum { SURFACE_CODEC_VERSION = 9 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -100,6 +100,7 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         add_str_or_null(doc, o, "ns", d->namespace_name);
         add_str_or_null(doc, o, "tq", d->trait_qn);
         add_str_or_null(doc, o, "rs", d->receiver_spelling);
+        add_str_or_null(doc, o, "it", d->impl_target);
         yyjson_mut_obj_add_bool(doc, o, "ir", d->is_rust_impl_relation);
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         yyjson_mut_obj_add_bool(doc, o, "as", d->is_async);
@@ -301,6 +302,7 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->namespace_name = arena_str_or_null(arena, yyjson_obj_get(o, "ns"));
         d->trait_qn = arena_str_or_null(arena, yyjson_obj_get(o, "tq"));
         d->receiver_spelling = arena_str_or_null(arena, yyjson_obj_get(o, "rs"));
+        d->impl_target = arena_str_or_null(arena, yyjson_obj_get(o, "it"));
         d->is_rust_impl_relation = yyjson_get_bool(yyjson_obj_get(o, "ir"));
         d->is_abstract = yyjson_get_bool(yyjson_obj_get(o, "ab"));
         d->is_async = yyjson_get_bool(yyjson_obj_get(o, "as"));

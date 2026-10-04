@@ -6238,6 +6238,32 @@ static void extract_rust_impl_macro(CBMExtractCtx *ctx, TSNode invocation,
     }
 }
 
+/* The type text of the `type Target = ..;` item written in an impl body, NULL
+ * when the body has none. */
+static const char *rust_impl_target_type(CBMExtractCtx *ctx, TSNode impl_node) {
+    TSNode body = ts_node_child_by_field_name(impl_node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return NULL;
+    }
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(item), "type_item") != 0) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(item, TS_FIELD("name"));
+        TSNode type = ts_node_child_by_field_name(item, TS_FIELD("type"));
+        if (ts_node_is_null(name) || ts_node_is_null(type)) {
+            continue;
+        }
+        const char *text = cbm_node_text(ctx->arena, name, ctx->source);
+        if (text && strcmp(text, "Target") == 0) {
+            return cbm_node_text(ctx->arena, type, ctx->source);
+        }
+    }
+    return NULL;
+}
+
 static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -6263,6 +6289,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             it.trait_name = trait_name;
             it.struct_name = receiver_name;
             it.struct_qn = type_qn;
+            it.target_type = rust_impl_target_type(ctx, node);
             cbm_impltrait_push(&ctx->result->impl_traits, a, it);
             impl_trait = trait_name;
         }
