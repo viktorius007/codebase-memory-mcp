@@ -58,6 +58,10 @@ typedef struct {
      * `fn(A)`), its param_types the declared argument types; NULL for any
      * other parameter. NULL when no parameter takes a callable. */
     const CBMType *const *rust_callable_params;
+    /* Rust only: type parameter names the function declares on itself
+     * (`fn f<T, U>`), NULL-ended, NULL when none. `type_param_names` holds
+     * the enclosing impl's parameters by self-type position instead. */
+    const char **rust_fn_type_params;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.
@@ -78,6 +82,9 @@ typedef struct {
     const CBMType *deref_target;
     const char **deref_param_names;
     bool is_interface;
+    /* Rust: registered only as the self type of an impl; no declaration of the
+     * type was read, so its inherent methods are not known. */
+    bool rust_undeclared;
     bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)
 
     // --- TS-specific fields (NULL/empty for non-TS types — backward compatible) ---

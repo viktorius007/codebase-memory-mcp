@@ -27,7 +27,7 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 9 };
+enum { SURFACE_CODEC_VERSION = 10 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -107,6 +107,7 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         yyjson_mut_obj_add_bool(doc, o, "pv", d->is_rust_private);
         yyjson_mut_obj_add_bool(doc, o, "hs", d->has_rust_self);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
+        add_str_array_or_null(doc, o, "tp", d->type_params, -1);
         yyjson_mut_arr_add_val(lsp, o);
     }
     yyjson_mut_obj_add_val(doc, root, "lsp", lsp);
@@ -310,6 +311,8 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->has_rust_self = yyjson_get_bool(yyjson_obj_get(o, "hs"));
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
+        int type_param_count = 0;
+        d->type_params = arena_str_array(arena, yyjson_obj_get(o, "tp"), true, &type_param_count);
         if (!d->qualified_name || !d->short_name || !d->label) {
             /* A def the writer could not have produced: qn/sn/label are
              * unconditionally present in build_lsp_def output. Corrupt row. */

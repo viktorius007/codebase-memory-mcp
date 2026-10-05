@@ -698,6 +698,86 @@ TEST(rustlsp_if_let_else_branch_reads_previous_binding) {
     PASS();
 }
 
+/* ── A match / if / block used as a value is typed inside its own scope ── */
+
+TEST(rustlsp_match_value_typed_under_arm_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(v) => v, None => return };\n    y.after();",
+        "Old.step New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(v) => v, None => unreachable!(\"no\") };\n"
+        "    y.after();",
+        "Old.step New.after", ""));
+    /* The trailing match of a block, with a diverging block arm. */
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = { match x.step() { Some(v) => v, None => { return; } } };\n    y.after();",
+        "Old.step New.after", ""));
+    PASS();
+}
+
+TEST(rustlsp_match_arm_binding_ends_with_the_arm) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(x) => x, None => return };\n"
+        "    x.items();\n    y.after();",
+        "Old.step Old.items New.after", "New.items"));
+    PASS();
+}
+
+TEST(rustlsp_if_let_value_typed_under_condition_binding) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = if let Some(v) = x.step() { v } else { return; };\n    y.after();",
+        "Old.step New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = if let Some(x) = x.step() { x } else { x.plain() };\n"
+        "    x.items();\n    y.after();",
+        "Old.step Old.plain Old.items New.after", "New.plain New.items"));
+    PASS();
+}
+
+TEST(rustlsp_block_value_typed_after_block_lets) {
+    ASSERT_TRUE(rustlsp_rebind_links("    let y = { let v = x.plain(); v };\n    y.after();",
+                                     "Old.plain New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = { let Some(v) = x.step() else { return; }; v };\n    y.after();",
+        "Old.step New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = { let x = x.plain(); x };\n    x.items();\n    y.after();",
+        "Old.plain Old.items New.after", "New.plain New.items"));
+    PASS();
+}
+
+TEST(rustlsp_branch_left_open_takes_the_other_branch_type) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(v) => Some(v), None => None };\n"
+        "    if let Some(z) = y { z.after(); }",
+        "Old.step New.after", ""));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let (a, b) = if x.ok() { (None, x.plain()) } else { (x.step(), x.plain()) };\n"
+        "    if let Some(z) = a { z.after(); }\n    b.items();",
+        "Old.ok Old.plain Old.step New.after New.items", ""));
+    /* Elements proven to differ leave the whole tuple untyped. */
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let n = x.plain();\n"
+        "    let (a, b) = if x.ok() { (n, n) } else { (x, n) };\n    b.items();",
+        "Old.plain Old.ok", "New.items Old.items"));
+    PASS();
+}
+
+TEST(rustlsp_branches_of_different_types_leave_value_untyped) {
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let n = x.plain();\n"
+        "    let y = if x.ok() { n } else { x };\n    y.items();",
+        "Old.plain Old.ok", "Old.items New.items"));
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let y = match x.step() { Some(v) => v, None => x };\n    y.items();",
+        "Old.step", "Old.items New.items"));
+    /* An `if` without `else` is `()`, not its consequence. */
+    ASSERT_TRUE(rustlsp_rebind_links(
+        "    let n = x.plain();\n    let y = if x.ok() { n };\n    y.items();",
+        "Old.plain Old.ok", "New.items"));
+    PASS();
+}
+
 TEST(rustlsp_while_let_scrutinee_reads_previous_binding) {
     ASSERT_TRUE(rustlsp_rebind_links("    while let Some(x) = x.step() { x.after(); }",
                                      "Old.step New.after", "New.step"));
@@ -1430,6 +1510,62 @@ TEST(rustlsp_crossfile_return_generic_alias_with_written_argument) {
     PASS();
 }
 
+/* Across files a function's own type parameter is fixed by its argument:
+ * `demo::pass(c)` declared `fn pass<T>(v: T) -> T` returns `c`'s type. A `T`
+ * the function does not declare as its parameter is an ordinary type name
+ * and binds nothing. */
+static int rustlsp_generic_fn_argument_target(bool declares_param, const char *callee) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[RUSTLSP_RET_DEFS];
+    memset(defs, 0, sizeof(defs));
+    const char *tqn[] = {"test.demo.Conn", "test.demo.Other"};
+    const char *tname[] = {"Conn", "Other"};
+    int n = 0;
+    for (int i = 0; i < 2; i++) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = tqn[i],
+                                    .short_name = tname[i],
+                                    .label = "Struct",
+                                    .def_module_qn = "test.demo"};
+        defs[n++] = (CBMRustLSPDef){.qualified_name = i == 0 ? "test.demo.Conn.ping"
+                                                             : "test.demo.Other.ping",
+                                    .short_name = "ping",
+                                    .label = "Method",
+                                    .receiver_type = tqn[i],
+                                    .def_module_qn = "test.demo",
+                                    .return_types = "bool",
+                                    .has_rust_self = true};
+    }
+    static const char *const pass_params[] = {"T"};
+    static const char *const pass_type_params[] = {"T", NULL};
+    defs[n++] = (CBMRustLSPDef){.qualified_name = "test.demo.pass",
+                                .short_name = "pass",
+                                .label = "Function",
+                                .def_module_qn = "test.demo",
+                                .return_types = "T",
+                                .signature_param_types = (const char **)pass_params,
+                                .signature_param_count = 1,
+                                .type_params =
+                                    declares_param ? (const char **)pass_type_params : NULL};
+    const char *caller = "fn run(c: demo::Conn) -> bool { demo::pass(c).ping() }\n";
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, n, imp_names,
+                           imp_qns, 1, NULL, &out);
+    int idx = find_confident(&out, "run", callee);
+    cbm_arena_destroy(&a);
+    return idx;
+}
+
+TEST(rustlsp_crossfile_generic_fn_argument_fixes_return) {
+    ASSERT_GTE(rustlsp_generic_fn_argument_target(true, "Conn.ping"), 0);
+    ASSERT_EQ(rustlsp_generic_fn_argument_target(true, "Other.ping"), -1);
+    ASSERT_EQ(rustlsp_generic_fn_argument_target(false, "Conn.ping"), -1);
+    PASS();
+}
+
 /* `io::Result<T>` with `?` or `.expect(..)` yields T. */
 TEST(rustlsp_crossfile_return_io_result_then_try) {
     const char *by_try = "fn run() -> std::io::Result<bool> { Ok(demo::make()?.ping()) }\n";
@@ -1674,6 +1810,106 @@ TEST(rustlsp_await_join_handle_yields_result) {
     ASSERT_NOT_NULL(r);
     ASSERT(find_resolved(r, "run", "Conn.ping") < 0);
     cbm_free_result(r);
+    PASS();
+}
+
+/* Whether `run` in `source` calls `probe` on a receiver typed `type_qn`:
+ * the method is declared nowhere, so its record names the receiver type. */
+static bool rustlsp_run_probes(const char *source, const char *type_qn) {
+    CBMFileResult *r = extract_rust(source);
+    if (!r) {
+        return false;
+    }
+    char callee[128];
+    snprintf(callee, sizeof(callee), "%s.probe", type_qn);
+    bool ok = false;
+    for (int i = 0; i < r->resolved_calls.count && !ok; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        ok = rc->caller_qn && strstr(rc->caller_qn, "run") && rc->callee_qn &&
+             strcmp(rc->callee_qn, callee) == 0;
+    }
+    cbm_free_result(r);
+    return ok;
+}
+
+/* tempfile's producers yield `io::Result<TempDir>` with or without
+ * arguments, under the import or the full path; `TempDir::path` is a
+ * `&Path`, which std's `join` carries on to a `PathBuf`. */
+TEST(rustlsp_tempfile_tempdir_path_is_std_path) {
+    ASSERT(rustlsp_run_probes(
+        "use std::future::Future;\nuse std::pin::Pin;\n"
+        "trait Maker { fn make(&self) -> Pin<Box<dyn Future<Output = tempfile::TempDir>>>; }\n"
+        "async fn run(m: &dyn Maker) { m.make().await.path().join(\"a\").probe(); }\n",
+        "std.path.PathBuf"));
+    ASSERT(rustlsp_run_probes(
+        "async fn make() -> std::io::Result<tempfile::TempDir> { tempfile::tempdir() }\n"
+        "async fn run() { Box::pin(make()).await.unwrap().path().probe(); }\n",
+        "std.path.Path"));
+    ASSERT(rustlsp_run_probes(
+        "use tempfile::TempDir;\n"
+        "fn run() { let d = TempDir::new().expect(\"d\"); d.path().probe(); }\n",
+        "std.path.Path"));
+    ASSERT(rustlsp_run_probes("use tempfile::tempdir;\n"
+                              "fn run() -> std::io::Result<()> {\n"
+                              "    let d = tempdir()?;\n"
+                              "    d.path().join(\"a\").probe();\n    Ok(())\n}\n",
+                              "std.path.PathBuf"));
+    ASSERT(rustlsp_run_probes("fn run(base: &std::path::Path) {\n"
+                              "    let d = tempfile::tempdir_in(base).unwrap();\n"
+                              "    let e = tempfile::TempDir::new_in(d.path()).unwrap();\n"
+                              "    e.path().to_path_buf().probe();\n}\n",
+                              "std.path.PathBuf"));
+    ASSERT(rustlsp_run_probes("struct Home { dir: tempfile::TempDir }\n"
+                              "fn run(h: Home) { h.dir.keep().probe(); }\n",
+                              "std.path.PathBuf"));
+    PASS();
+}
+
+/* `Builder` setters return the builder; its `tempdir` / `tempfile` and
+ * `NamedTempFile::new` produce the named types, and a `TempPath` derefs to
+ * `Path`. */
+TEST(rustlsp_tempfile_builder_and_named_file) {
+    ASSERT(rustlsp_run_probes(
+        "fn run() {\n"
+        "    let d = tempfile::Builder::new().prefix(\"p\").tempdir().unwrap();\n"
+        "    d.path().probe();\n}\n",
+        "std.path.Path"));
+    ASSERT(rustlsp_run_probes("use tempfile::Builder;\n"
+                              "fn run() {\n"
+                              "    let f = Builder::new().suffix(\".x\").tempfile().unwrap();\n"
+                              "    f.path().probe();\n}\n",
+                              "std.path.Path"));
+    ASSERT(rustlsp_run_probes("use tempfile::NamedTempFile;\n"
+                              "fn run() {\n"
+                              "    let f = NamedTempFile::new().unwrap();\n"
+                              "    f.into_temp_path().join(\"a\").probe();\n}\n",
+                              "std.path.PathBuf"));
+    PASS();
+}
+
+/* Only tempfile's items read the tempfile signatures: a project `TempDir`
+ * and a project `tempdir` keep their declared returns, and a `TempDir` or
+ * `tempdir` imported from another crate stays unknown. */
+TEST(rustlsp_tempfile_signatures_need_the_tempfile_item) {
+    CBMFileResult *r = extract_rust(RUSTLSP_STD_DECOYS
+                                    "struct TempDir;\n"
+                                    "impl TempDir {\n"
+                                    "    fn new() -> TempDir { TempDir }\n"
+                                    "    fn path(&self) -> Other { Other }\n}\n"
+                                    "fn tempdir() -> Other { Other }\n"
+                                    "fn run() -> bool { TempDir::new().path().ping() }\n"
+                                    "fn second() -> bool { tempdir().ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Other.ping"), 0);
+    ASSERT_GTE(require_resolved(r, "second", "Other.ping"), 0);
+    cbm_free_result(r);
+    ASSERT_FALSE(rustlsp_run_probes(
+        "use scratch::TempDir;\n"
+        "fn run() { TempDir::new().unwrap().path().probe(); }\n",
+        "std.path.Path"));
+    ASSERT_FALSE(rustlsp_run_probes("use scratch::tempdir;\n"
+                                    "fn run() { tempdir().unwrap().path().probe(); }\n",
+                                    "std.path.Path"));
     PASS();
 }
 
@@ -4610,6 +4846,55 @@ TEST(rustlsp_generic_struct_member_substitutes_written_args) {
     ASSERT_GTE(require_resolved(r, "by_method", "Item.m"), 0);
     ASSERT_LT(find_resolved(r, "bare", "Item.m"), 0);
     ASSERT_LT(find_resolved(r, "bare", "Other.m"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_call_arguments_fix_type_params) {
+    /* A call's arguments fix the type parameters its declaration spells:
+     * the impl's `T` in `Wrap::new(item)` (so `Self` is `Wrap<Item>`), a
+     * function's own `T` in `ident(item)` and in a method `put<T>`, and the
+     * `T` inside `impl Future<Output = Result<T, String>>` given a call to
+     * an `async fn`. Two arguments that fix one parameter differently, or
+     * no argument that fixes it, leave the result untyped. */
+    CBMFileResult *r = extract_rust(
+        "struct Item;\n"
+        "impl Item { fn make() -> Item { Item } fn hit(&self) {} }\n"
+        "struct Other;\n"
+        "impl Other { fn make() -> Other { Other } fn hit(&self) {} }\n"
+        "struct Wrap<T> { inner: T }\n"
+        "impl<T> Wrap<T> {\n"
+        "    fn new(inner: T) -> Self { Wrap { inner } }\n"
+        "    fn get(&self) -> &T { &self.inner }\n"
+        "}\n"
+        "struct Reg;\n"
+        "impl Reg { fn put<T>(&self, v: T) -> T { v } }\n"
+        "fn ident<T>(v: T) -> T { v }\n"
+        "fn pick<T>(a: T, b: T) -> T { a }\n"
+        "fn none<T>() -> T { loop {} }\n"
+        "async fn load() -> Result<Item, String> { Ok(Item) }\n"
+        "async fn settle<T>(f: impl std::future::Future<Output = Result<T, String>>) -> T {\n"
+        "    f.await.unwrap()\n"
+        "}\n"
+        "fn by_impl() { let w = Wrap::new(Item::make()); w.get().hit(); }\n"
+        "fn by_field() { let w = Wrap::new(Other::make()); w.inner.hit(); }\n"
+        "fn by_fn() { ident(Item::make()).hit(); }\n"
+        "fn by_method(r: &Reg) { r.put(Other::make()).hit(); }\n"
+        "async fn by_future() { settle(load()).await.hit(); }\n"
+        "fn conflict() { pick(Item::make(), Other::make()).hit(); }\n"
+        "fn unproven() { none().hit(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "by_impl", "Item.hit"), 0);
+    ASSERT_LT(find_resolved(r, "by_impl", "Other.hit"), 0);
+    ASSERT_GTE(require_resolved(r, "by_field", "Other.hit"), 0);
+    ASSERT_GTE(require_resolved(r, "by_fn", "Item.hit"), 0);
+    ASSERT_GTE(require_resolved(r, "by_method", "Other.hit"), 0);
+    ASSERT_LT(find_resolved(r, "by_method", "Item.hit"), 0);
+    ASSERT_GTE(require_resolved(r, "by_future", "Item.hit"), 0);
+    ASSERT_LT(find_resolved(r, "conflict", "Item.hit"), 0);
+    ASSERT_LT(find_resolved(r, "conflict", "Other.hit"), 0);
+    ASSERT_LT(find_resolved(r, "unproven", "Item.hit"), 0);
+    ASSERT_LT(find_resolved(r, "unproven", "Other.hit"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -8205,6 +8490,116 @@ TEST(rustlsp_cov_xf_trait_impl) {
     ASSERT_GTE(find_confident(&out, "run", "Foo.beep"), 0);
     cbm_arena_destroy(&a); PASS();
 }
+/* The per-file pass sees one file: an inherent method another file gives the
+ * type would win over the impl's, so the impl of an unregistered trait is not
+ * selected there. */
+TEST(rustlsp_unregistered_trait_impl_method_not_selected_file_local) {
+    CBMFileResult *r = extract_rust("use dep::Store;\n"
+                                    "struct Jar;\n"
+                                    "impl Store for Jar { fn cookies(&self) {} }\n"
+                                    "fn run(j: &Jar) { j.cookies(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "cookies"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Cross-file fixture: `p.demo.Jar` with `cookies` defined by one impl per
+ * trait spelling in `traits` (NULL-terminated, at most two). `declared` says
+ * whether the type's declaration is among the defs, `shelf_registered`
+ * whether the project declares the trait `p.demo.Shelf`; `dep::` traits are
+ * never registered. Returns whether `src` (module `p.caller`) links `run` to
+ * `Jar.cookies`. */
+static bool rustlsp_unregistered_trait_xf_links(const char *src, const char *const *traits,
+                                                bool declared, bool shelf_registered) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    int n = 0;
+    if (declared) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Jar", .short_name = "Jar",
+                                    .label = "Type", .def_module_qn = "p.demo"};
+    }
+    if (shelf_registered) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Shelf", .short_name = "Shelf",
+                                    .label = "Trait", .def_module_qn = "p.demo"};
+    }
+    for (int i = 0; traits[i]; i++) {
+        defs[n++] = (CBMRustLSPDef){.qualified_name = "p.demo.Jar.cookies",
+                                    .short_name = "cookies", .label = "Method",
+                                    .receiver_type = "p.demo.Jar", .receiver_spelling = "Jar",
+                                    .trait_qn = traits[i], .def_module_qn = "p.demo"};
+    }
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"p::demo"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, n, imp_n, imp_q, 1, NULL,
+                           &out);
+    bool linked = find_confident(&out, "run", "Jar.cookies") >= 0;
+    cbm_arena_destroy(&a);
+    return linked;
+}
+
+/* A method call on a project type links to the method an `impl Tr for Type`
+ * block defines when `Tr` is not registered (a dependency's trait): the impl
+ * is project source, so the receiver type and the name select it. The
+ * caller's file names the trait. */
+TEST(rustlsp_crossfile_unregistered_trait_impl_method_sole_candidate) {
+    const char *const traits[] = {"dep::Store", NULL};
+    ASSERT_TRUE(rustlsp_unregistered_trait_xf_links(
+        "use dep::Store;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, true, false));
+    PASS();
+}
+
+/* The caller's file never spells the trait's name and has no glob import: the
+ * trait is out of scope there, so its impl's method is no candidate. */
+TEST(rustlsp_crossfile_unregistered_trait_out_of_scope_unresolved) {
+    const char *const traits[] = {"dep::Store", NULL};
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links("fn run(j: &demo::Jar) { j.cookies(); }\n",
+                                                     traits, true, false));
+    PASS();
+}
+
+/* Two impls of unregistered traits define the name and both trait names are
+ * spelled: rustc picks by the trait in scope, which is not proven. */
+TEST(rustlsp_crossfile_unregistered_trait_two_impls_unresolved) {
+    const char *const traits[] = {"dep::Store", "dep::Shelf", NULL};
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links(
+        "use dep::{Store, Shelf};\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, true,
+        false));
+    PASS();
+}
+
+/* An impl of a registered trait and one of an unregistered trait both define
+ * the name and both traits are in scope: nothing is linked. */
+TEST(rustlsp_crossfile_unregistered_trait_beside_registered_unresolved) {
+    const char *const traits[] = {"dep::Store", "Shelf", NULL};
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links(
+        "use dep::Store;\nuse demo::Shelf;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits,
+        true, true));
+    PASS();
+}
+
+/* Of two impls, the one whose trait is out of scope is no candidate: the
+ * other is the only one rustc could pick. */
+TEST(rustlsp_crossfile_unregistered_trait_scope_selects_impl) {
+    const char *const traits[] = {"dep::Store", "dep::Shelf", NULL};
+    ASSERT_TRUE(rustlsp_unregistered_trait_xf_links(
+        "use dep::Store;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, true, false));
+    PASS();
+}
+
+/* The receiver type has no declaration in the project (only an impl names
+ * it): its inherent methods are unknown, so the impl's method is not proven. */
+TEST(rustlsp_crossfile_unregistered_trait_undeclared_type_unresolved) {
+    const char *const traits[] = {"dep::Store", NULL};
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links(
+        "use dep::Store;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, false, false));
+    PASS();
+}
+
 TEST(rustlsp_cov_xf_free_function_chain) {
     const char *src = "fn run() {\n    let s = util::make();\n    let _ = s.len();\n}\n";
     CBMArena a; cbm_arena_init(&a);
@@ -11981,6 +12376,12 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_let_else_block_reads_previous_binding);
     RUN_TEST(rustlsp_if_let_scrutinee_reads_previous_binding);
     RUN_TEST(rustlsp_if_let_else_branch_reads_previous_binding);
+    RUN_TEST(rustlsp_match_value_typed_under_arm_binding);
+    RUN_TEST(rustlsp_match_arm_binding_ends_with_the_arm);
+    RUN_TEST(rustlsp_if_let_value_typed_under_condition_binding);
+    RUN_TEST(rustlsp_block_value_typed_after_block_lets);
+    RUN_TEST(rustlsp_branch_left_open_takes_the_other_branch_type);
+    RUN_TEST(rustlsp_branches_of_different_types_leave_value_untyped);
     RUN_TEST(rustlsp_while_let_scrutinee_reads_previous_binding);
     RUN_TEST(rustlsp_let_chain_binds_in_condition_order);
     RUN_TEST(rustlsp_for_iterable_reads_previous_binding);
@@ -12016,6 +12417,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_crossfile_method_result_self_return);
     RUN_TEST(rustlsp_crossfile_return_project_alias);
     RUN_TEST(rustlsp_crossfile_return_generic_alias_with_written_argument);
+    RUN_TEST(rustlsp_crossfile_generic_fn_argument_fixes_return);
     RUN_TEST(rustlsp_crossfile_return_io_result_then_try);
     RUN_TEST(rustlsp_std_returns_shared_pointers);
     RUN_TEST(rustlsp_std_returns_locks);
@@ -12027,6 +12429,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_await_boxed_future_without_declared_output_is_untyped);
     RUN_TEST(rustlsp_await_join_handle_yields_result);
     RUN_TEST(rustlsp_tokio_signatures_need_the_tokio_item);
+    RUN_TEST(rustlsp_tempfile_tempdir_path_is_std_path);
+    RUN_TEST(rustlsp_tempfile_builder_and_named_file);
+    RUN_TEST(rustlsp_tempfile_signatures_need_the_tempfile_item);
     RUN_TEST(rustlsp_std_returns_unknown_result_head);
     RUN_TEST(rustlsp_std_namesake_declared_in_file_is_project_type);
     RUN_TEST(rustlsp_std_namesake_in_inline_module_is_project_type);
@@ -12118,6 +12523,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_field_access_chain);
     RUN_TEST(rustlsp_field_read_before_same_named_method);
     RUN_TEST(rustlsp_generic_struct_member_substitutes_written_args);
+    RUN_TEST(rustlsp_call_arguments_fix_type_params);
     RUN_TEST(rustlsp_param_method_overload_disambiguation);
     RUN_TEST(rustlsp_for_iter_method_resolves);
     RUN_TEST(rustlsp_module_local_function_dispatch);
@@ -12450,6 +12856,13 @@ void suite_rust_lsp(void) {
     /* Cov §N: Cross-file */
     RUN_TEST(rustlsp_cov_xf_two_methods);
     RUN_TEST(rustlsp_cov_xf_trait_impl);
+    RUN_TEST(rustlsp_unregistered_trait_impl_method_not_selected_file_local);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_beside_registered_unresolved);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_impl_method_sole_candidate);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_out_of_scope_unresolved);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_two_impls_unresolved);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_scope_selects_impl);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_undeclared_type_unresolved);
     RUN_TEST(rustlsp_cov_xf_free_function_chain);
     RUN_TEST(rustlsp_cov_xf_batch);
     RUN_TEST(rustlsp_cov_xf_empty_defs);
