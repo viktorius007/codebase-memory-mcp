@@ -36,7 +36,7 @@ else
     ln -sf "$BENCH/truth.tsv" "$BENCH/refs.tsv" "$OUT/"
     SECONDS=0
     CBM_CACHE_DIR="$OUT/cache" CBM_RUNTIME_DIR="$OUT/rt" \
-        "$BIN" cli index_repository --repo-path "$CORPUS" --mode full --name score \
+        "$ROOT/scripts/index-local.sh" "$BIN" "$CORPUS" score full \
         > "$OUT/index.out" 2> "$OUT/index.err" || { echo "index failed: $OUT/index.err" >&2; exit 1; }
     INDEX_S=$SECONDS
     DB="file:$OUT/cache/score.db?mode=ro"
