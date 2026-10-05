@@ -962,6 +962,30 @@ static bool rustlsp_key_names(const char *key, const char *trait_spelling) {
     return key && strstr(key, trait_spelling) != NULL;
 }
 
+TEST(rustlsp_sole_visible_from_impl_rejects_other_argument) {
+    CBMFileResult *r =
+        extract_rust("trait From<T> { fn from(value: T) -> Self; }\n"
+                     "struct Label; struct Other; struct Hidden;\n"
+                     "impl From<Other> for Label { fn from(value: Other) -> Self { Self } }\n"
+                     "fn run(value: Hidden) { Label::from(value); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(rustlsp_from_impl_key(&r->resolved_calls));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_sole_visible_from_impl_accepts_matching_argument) {
+    CBMFileResult *r =
+        extract_rust("trait From<T> { fn from(value: T) -> Self; }\n"
+                     "struct Label; struct Other;\n"
+                     "impl From<Other> for Label { fn from(value: Other) -> Self { Self } }\n"
+                     "fn run(value: Other) { Label::from(value); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&r->resolved_calls), "From<Other>"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_from_call_selects_impl_by_argument_type) {
     CBMFileResult *r = extract_rust(RUSTLSP_FROM_IMPLS
                                     "fn run() { let _ = Label::from(\"text\"); }\n");
@@ -8542,13 +8566,11 @@ static bool rustlsp_unregistered_trait_xf_links(const char *src, const char *con
     return linked;
 }
 
-/* A method call on a project type links to the method an `impl Tr for Type`
- * block defines when `Tr` is not registered (a dependency's trait): the impl
- * is project source, so the receiver type and the name select it. The
- * caller's file names the trait. */
-TEST(rustlsp_crossfile_unregistered_trait_impl_method_sole_candidate) {
+/* A sole visible unregistered trait impl is insufficient: macros may add
+ * competing impls even when the caller imports the visible trait. */
+TEST(rustlsp_crossfile_unregistered_trait_impl_method_sole_candidate_unproven) {
     const char *const traits[] = {"dep::Store", NULL};
-    ASSERT_TRUE(rustlsp_unregistered_trait_xf_links(
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links(
         "use dep::Store;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, true, false));
     PASS();
 }
@@ -8582,11 +8604,11 @@ TEST(rustlsp_crossfile_unregistered_trait_beside_registered_unresolved) {
     PASS();
 }
 
-/* Of two impls, the one whose trait is out of scope is no candidate: the
- * other is the only one rustc could pick. */
-TEST(rustlsp_crossfile_unregistered_trait_scope_selects_impl) {
+/* Filtering an out-of-scope trait still cannot establish that the remaining
+ * visible impl is the only applicable impl after macro expansion. */
+TEST(rustlsp_crossfile_unregistered_trait_scope_filter_still_unproven) {
     const char *const traits[] = {"dep::Store", "dep::Shelf", NULL};
-    ASSERT_TRUE(rustlsp_unregistered_trait_xf_links(
+    ASSERT_FALSE(rustlsp_unregistered_trait_xf_links(
         "use dep::Store;\nfn run(j: &demo::Jar) { j.cookies(); }\n", traits, true, false));
     PASS();
 }
@@ -12400,6 +12422,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_self_uppercase);
     RUN_TEST(rustlsp_ufcs_trait_method);
     RUN_TEST(rustlsp_ufcs_macro_generated_constructor);
+    RUN_TEST(rustlsp_sole_visible_from_impl_rejects_other_argument);
+    RUN_TEST(rustlsp_sole_visible_from_impl_accepts_matching_argument);
     RUN_TEST(rustlsp_from_call_selects_impl_by_argument_type);
     RUN_TEST(rustlsp_from_call_with_unproven_argument_is_unresolved);
     RUN_TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type);
@@ -12858,10 +12882,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_xf_trait_impl);
     RUN_TEST(rustlsp_unregistered_trait_impl_method_not_selected_file_local);
     RUN_TEST(rustlsp_crossfile_unregistered_trait_beside_registered_unresolved);
-    RUN_TEST(rustlsp_crossfile_unregistered_trait_impl_method_sole_candidate);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_impl_method_sole_candidate_unproven);
     RUN_TEST(rustlsp_crossfile_unregistered_trait_out_of_scope_unresolved);
     RUN_TEST(rustlsp_crossfile_unregistered_trait_two_impls_unresolved);
-    RUN_TEST(rustlsp_crossfile_unregistered_trait_scope_selects_impl);
+    RUN_TEST(rustlsp_crossfile_unregistered_trait_scope_filter_still_unproven);
     RUN_TEST(rustlsp_crossfile_unregistered_trait_undeclared_type_unresolved);
     RUN_TEST(rustlsp_cov_xf_free_function_chain);
     RUN_TEST(rustlsp_cov_xf_batch);
