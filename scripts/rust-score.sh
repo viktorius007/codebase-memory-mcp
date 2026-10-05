@@ -24,6 +24,13 @@ if [[ "${1:-}" == --rescore ]]; then
     for t in g_nodes g_calls g_IMPORTS g_DEFINES_METHOD g_USAGE edge_types; do
         [[ -s "$OUT/$t.tsv" ]] || { echo "no $t.tsv in $OUT: run a full score first" >&2; exit 2; }
     done
+    # Older score directories did not export reference edges. Recover them from
+    # their frozen database; a missing table must never mean zero references.
+    if [[ ! -f "$OUT/g_CALL_REFERENCE.tsv" ]]; then
+        [[ -s "$OUT/cache/score.db" ]] || { echo "no g_CALL_REFERENCE.tsv or cache/score.db in $OUT" >&2; exit 2; }
+        sqlite3 -separator $'\t' "file:$OUT/cache/score.db?mode=ro" \
+            "select source_id,target_id from edges where type='CALL_REFERENCE'" > "$OUT/g_CALL_REFERENCE.tsv"
+    fi
     ln -sf "$BENCH/truth.tsv" "$BENCH/refs.tsv" "$OUT/"
 else
     BIN="$1"; OUT="${2:-$(mktemp -d /tmp/cbm-score.XXXXXX)}"
@@ -43,7 +50,7 @@ else
     q() { sqlite3 -separator $'\t' "$DB" "$1"; }
     q "select id,label,name,file_path,start_line,end_line from nodes where file_path like '%.rs'" > "$OUT/g_nodes.tsv"
     q "select source_id,target_id,coalesce(json_extract(properties,'\$.strategy'),'') from edges where type='CALLS'" > "$OUT/g_calls.tsv"
-    for t in IMPORTS DEFINES_METHOD IMPLEMENTS USAGE; do
+    for t in IMPORTS DEFINES_METHOD IMPLEMENTS USAGE CALL_REFERENCE; do
         q "select source_id,target_id from edges where type='$t'" > "$OUT/g_$t.tsv"
     done
     q "select type,count(*) from edges group by 1 order by 1" > "$OUT/edge_types.tsv"
@@ -62,18 +69,34 @@ for l in open(out + '/join.txt'):
     if m: c[(m.group(2), m.group(3))] = int(m.group(1))
 tp = tt = 0
 print(f'out: {out}   index: {secs}s')
+print('Call sites credited by a caller-callee CALLS pair (positions are not stored):')
 for k in ('path', 'method', 'macro_arg'):
     p, t = c[(k, 'PUBLISHED')], c[(k, 'PUBLISHED')] + c[(k, 'missing')]
     tp += p; tt += t
     print(f'calls {k:<10}{p:>7} / {t:<7} {100*p/t:5.1f}%')
 print(f'calls ALL       {tp:>7} / {tt:<7} {100*tp/tt:5.1f}%')
+for l in open(out + '/join.txt'):
+    if l.startswith('credited call sites sharing '): print(l.rstrip())
 wrong = sum(int(m.group(1)) for l in open(out + '/precision.txt')
             if (m := re.match(r'\s*(\d+)\s+[\d.]+%\s+(WRONG TARGET|NOT IN TRUTH)', l)))
 print(f'calls wrong-or-unconfirmed pairs: {wrong}')
 blind = sum(int(m.group(1)) for l in open(out + '/precision.txt')
-            if (m := re.match(r'\s*(\d+)\s+[\d.]+%\s+unverifiable: (oracle left|no oracle record)', l)))
-print(f'calls unverifiable pairs (oracle has no record at the call site): {blind}')
-keep = re.compile(r'^\s+(macro|module|term:|type|fn:)|owner link correct|^impl links published|^IMPORTS|published Rust File|^\s+(Enum|Field|Function|Interface|Method|Struct|Type|Variable)\s+\d')
+            if (m := re.match(r'\s*(\d+)\s+[\d.]+%\s+unverifiable:', l)))
+print(f'calls unverifiable pairs (all reasons, including uncompiled callers and missing oracle data): {blind}')
+keep = re.compile(r'^\s+(macro|module|term:|type|fn:)|owner link correct|^IMPORTS|published Rust File|^module-level USAGE')
+usage, refs = {}, {}
 for l in open(out + '/families.txt'):
-    if keep.search(l): print(l.rstrip()[:150])
+    if keep.search(l): print(l.rstrip())
+    m = re.fullmatch(r'\s+(\w+)\s+(\d+)\s+(\d+)\s+(\d+)\s*', l)
+    if m: usage[m[1]] = tuple(map(int, m.groups()[1:]))
+    m = re.fullmatch(r'    (\w+)\s+(\d+) / (\d+)\s+([\d.]+)%\s*', l)
+    if m: refs[m[1]] = (int(m[2]), int(m[3]), m[4])
+print('USAGE pairs from Rust sources: confirmed / unconfirmed / unverifiable; function reference pairs hit / mapped')
+print('  target kind         confirmed unconfirmed unverifiable    hit / mapped    %')
+for k in sorted(usage.keys() | refs.keys()):
+    good, bad, unver = usage.get(k, (0, 0, 0))
+    hit, total, pct = refs.get(k, (0, 0, '0.0'))
+    print(f'  {k:<19}{good:>9}{bad:>12}{unver:>13}{hit:>9} / {total:<8}{pct:>5}')
+for l in open(out + '/families.txt'):
+    if l.startswith('impl links published'): print(l.rstrip())
 EOF

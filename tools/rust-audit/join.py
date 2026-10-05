@@ -18,6 +18,7 @@ for l in open(D+'g_calls.tsv'):
     s,t,st=l.rstrip('\n').split('\t'); edges.add((int(s),int(t))); strat[(int(s),int(t))]=st
 C=collections.Counter(); shapes=collections.Counter(); shapes_hit=collections.Counter()
 truth_pairs=set(); truth_pairs_macro=set(); caller_unmapped=0; callee_unmapped=0
+credited_pairs=collections.Counter()
 form=collections.Counter(); form_hit=collections.Counter()
 def callee_form(sym):
     d=sym.split(' ',4)[-1]
@@ -38,11 +39,13 @@ for l in open(D+'truth.tsv',errors='replace'):
     if a is None: caller_unmapped+=1
     if b is None: callee_unmapped+=1
     hit = a is not None and b is not None and (a,b) in edges
+    if hit: credited_pairs[(a,b)]+=1
     if a is not None and b is not None: (truth_pairs_macro if inmacro else truth_pairs).add((a,b))
     C[f'{scope}: in corpus, fn caller, PUBLISHED' if hit else f'{scope}: in corpus, fn caller, missing']+=1
     fm=callee_form(sym); form[(scope,fm)]+=1; form_hit[(scope,fm)]+=hit
     if kind=='method': shapes[shape+(' +?/await' if wr!='-' else '')]+=1; shapes_hit[shape+(' +?/await' if wr!='-' else '')]+=hit
 for k in sorted(C): print(f'{C[k]:>9}  {k}')
+print(f'credited call sites sharing a caller-callee pair with another credited site: {sum(v for v in credited_pairs.values() if v>1)} / {sum(credited_pairs.values())}')
 print(f'caller fn not found in graph: {caller_unmapped}; callee fn not found in graph: {callee_unmapped}')
 print('\nrecall by target form (sites with in-corpus target and fn caller):')
 for k in sorted(form): print(f'  {k[0]:<10}{k[1]:<20}{form_hit[k]:>8} / {form[k]:<8} {100*form_hit[k]/form[k]:.1f}%')
