@@ -2,6 +2,8 @@
 code-graph-mcp
 /codebase-memory-mcp
 bin/
+!tools/rust-audit/tsdiff/src/bin/
+!tools/rust-audit/tsdiff/src/bin/*.rs
 *.exe
 *.dll
 *.so
