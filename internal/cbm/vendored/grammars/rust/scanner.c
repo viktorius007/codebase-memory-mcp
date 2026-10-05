@@ -134,7 +134,7 @@ static inline bool process_float_literal(TSLexer *lexer) {
     if (lexer->lookahead == '.') {
         has_fraction = true;
         advance(lexer);
-        if (iswalpha(lexer->lookahead)) {
+        if (iswalpha(lexer->lookahead) || lexer->lookahead == '_') {
             // The dot is followed by a letter: 1.max(2) => not a float but an integer
             return false;
         }
@@ -213,14 +213,17 @@ typedef struct {
     unsigned nestingDepth;
 } BlockCommentProcessing;
 
-static inline void process_left_forward_slash(BlockCommentProcessing *processing, char current) {
+static inline void process_left_forward_slash(BlockCommentProcessing *processing, int32_t current) {
     if (current == '*') {
         processing->nestingDepth += 1;
+    } else if (current == '/') {
+        processing->state = LeftForwardSlash;
+        return;
     }
     processing->state = Continuing;
 };
 
-static inline void process_left_asterisk(BlockCommentProcessing *processing, char current, TSLexer *lexer) {
+static inline void process_left_asterisk(BlockCommentProcessing *processing, int32_t current, TSLexer *lexer) {
     if (current == '*') {
         lexer->mark_end(lexer);
         processing->state = LeftAsterisk;
@@ -234,7 +237,7 @@ static inline void process_left_asterisk(BlockCommentProcessing *processing, cha
     processing->state = Continuing;
 }
 
-static inline void process_continuing(BlockCommentProcessing *processing, char current) {
+static inline void process_continuing(BlockCommentProcessing *processing, int32_t current) {
     switch (current) {
         case '/':
             processing->state = LeftForwardSlash;
@@ -246,7 +249,7 @@ static inline void process_continuing(BlockCommentProcessing *processing, char c
 }
 
 static inline bool process_block_comment(TSLexer *lexer, const bool *valid_symbols) {
-    char first = (char)lexer->lookahead;
+    int32_t first = lexer->lookahead;
     // The first character is stored so we can safely advance inside
     // these if blocks. However, because we only store one, we can only
     // safely advance 1 time. Since there's a chance that an advance could
@@ -306,7 +309,7 @@ static inline bool process_block_comment(TSLexer *lexer, const bool *valid_symbo
             // as we force an advance in the above code when we are checking if we
             // need to handle a block comment inner or outer doc comment signifier
             // node
-            first = (char)lexer->lookahead;
+            first = lexer->lookahead;
             switch (processing.state) {
                 case LeftForwardSlash:
                     process_left_forward_slash(&processing, first);
