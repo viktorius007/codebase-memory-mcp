@@ -7048,6 +7048,8 @@ typedef struct {
     int dump_calls;
     bool exact_rows;
     bool nested_target_range;
+    bool recursive_row;
+    bool recursive_graph;
 } RustPublishedCallDumpObservation;
 
 static int split_dump_fields(char *line, char **fields, int capacity) {
@@ -7076,6 +7078,8 @@ static void observe_rust_published_call_rows(const char *dump_path, const char *
     char caller_qn[512];
     char sink_qn[512];
     char target_qn[512];
+    char recursive_qn[512];
+    snprintf(recursive_qn, sizeof(recursive_qn), "%s.lib.recursive", project);
     snprintf(caller_qn, sizeof(caller_qn), "%s.lib.caller", project);
     snprintf(sink_qn, sizeof(sink_qn), "%s.lib.sink", project);
     snprintf(target_qn, sizeof(target_qn), "%s.lib.target", project);
@@ -7090,9 +7094,13 @@ static void observe_rust_published_call_rows(const char *dump_path, const char *
         observation->dump_calls++;
         bool known_target =
             count >= 14 && (strcmp(fields[6], sink_qn) == 0 || strcmp(fields[6], target_qn) == 0);
+        bool recursive = count >= 14 && strcmp(fields[4], recursive_qn) == 0 &&
+                         strcmp(fields[6], recursive_qn) == 0;
+        observation->recursive_row = observation->recursive_row || recursive;
         observation->exact_rows =
-            observation->exact_rows && known_target && strcmp(fields[1], "lib.rs") == 0 &&
-            strcmp(fields[4], caller_qn) == 0 && strcmp(fields[7], "lsp_direct") == 0;
+            observation->exact_rows && (recursive || (known_target &&
+            strcmp(fields[4], caller_qn) == 0)) && strcmp(fields[1], "lib.rs") == 0 &&
+            strcmp(fields[7], "lsp_direct") == 0;
         if (known_target && strcmp(fields[6], target_qn) == 0) {
             observation->nested_target_range = strtoul(fields[12], NULL, 10) == target_start &&
                                                strtoul(fields[13], NULL, 10) == target_end;
@@ -7118,6 +7126,7 @@ static RustPublishedCallDumpObservation observe_rust_published_call_dump(const c
     if (store && pipeline) {
         const char *project = cbm_pipeline_project_name(pipeline);
         observation.graph_calls = cbm_store_count_edges_by_type(store, project, "CALLS");
+        observation.recursive_graph = cross_file_call_exists(store, project, "recursive", "recursive");
         observe_rust_published_call_rows(dump_path, project, target_start, target_end,
                                          &observation);
     }
@@ -7209,7 +7218,9 @@ TEST(pipeline_rust_dump_records_only_published_calls_in_both_modes) {
     const RustPublishedCallDumpObservation *modes[] = {&sequential, &parallel};
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
         ASSERT_EQ(modes[i]->run_rc, 0);
-        ASSERT_EQ(modes[i]->graph_calls, 2);
+        ASSERT_EQ(modes[i]->graph_calls, 3);
+        ASSERT_TRUE(modes[i]->recursive_row);
+        ASSERT_TRUE(modes[i]->recursive_graph);
         ASSERT_EQ(modes[i]->dump_calls, modes[i]->graph_calls);
         ASSERT_TRUE(modes[i]->exact_rows);
         ASSERT_TRUE(modes[i]->nested_target_range);
@@ -7717,6 +7728,124 @@ static int check_rust_modtree_calls_in_both_modes(const char *root,
         }
     }
     return mismatches;
+}
+
+TEST(pipeline_rust_type_headed_call_prefers_crossfile_inherent_method) {
+    char tmp[256] = "/tmp/cbm_rs_shadow_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"shadow-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "[lib]\npath = \"lib.rs\"\n");
+    write_temp_file(tmp, "lib.rs",
+                    "mod inner; pub struct S; pub trait Tr { fn m(&self); }\n"
+                    "impl Tr for S { fn m(&self) { S::m(self); } }\n");
+    write_temp_file(tmp, "inner.rs", "use super::S; impl S { pub fn m(&self) {} }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad_%02d.rs", i);
+        write_temp_file(tmp, name, "pub fn pad() {}\n");
+    }
+    const RustModTreeCallCase cases[] = {
+        {"cross-file inherent method", "lib.S.m[Tr]", "inner.S.m", true},
+        {"shadowed trait method is not recursion", "lib.S.m[Tr]", "lib.S.m[Tr]", false},
+    };
+    int mismatches = check_rust_modtree_calls_in_both_modes(tmp, cases, 2);
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_reference_and_type_headed_recursion_in_both_modes) {
+    char tmp[256] = "/tmp/cbm_rs_proof_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib.rs",
+                    "pub struct Inner;\n"
+                    "impl Inner { pub fn ping(&self) {} }\n"
+                    "pub struct Managed { v: Inner }\n"
+                    "impl std::ops::Deref for Managed {\n"
+                    " type Target = Inner;\n"
+                    " fn deref(&self) -> &Inner { &self.v }\n"
+                    "}\n"
+                    "impl Managed { pub fn ping(&self) { (**self).ping(); } }\n"
+                    "pub trait Tr { fn reference(&self); }\n"
+                    "impl<T: Tr + ?Sized> Tr for &T { fn reference(&self) { self.reference(); } }\n"
+                    "pub trait AliasTr { fn alias(&self); }\n"
+                    "impl<T: AliasTr + ?Sized> AliasTr for &T { fn alias(&self) { let same = self; same.alias(); } }\n"
+                    "pub trait Generic { fn recurse(&self); }\n"
+                    "impl<T> Generic for T { fn recurse(&self) { T::recurse(self); } }\n"
+                    "pub struct S;\n"
+                    "impl S { pub fn concrete(&self) { S::concrete(self); } }\n"
+                    "pub trait Typed { fn typed(self: &Self); }\n"
+                    "impl<T: Typed + ?Sized> Typed for &T { fn typed(self: &Self) { self.typed(); } }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad_%02d.rs", i);
+        write_temp_file(tmp, name, "pub fn pad() {}\n");
+    }
+    const RustModTreeCallCase cases[] = {
+        {"reference recursion", "lib.&T.reference[Tr]", "lib.&T.reference[Tr]", true},
+        {"alias recursion", "lib.&T.alias[AliasTr]", "lib.&T.alias[AliasTr]", true},
+        {"typed Self recursion", "lib.&T.typed[Typed]", "lib.&T.typed[Typed]", true},
+        {"generic type headed recursion", "lib.T.recurse[Generic]", "lib.T.recurse[Generic]", true},
+        {"concrete type headed recursion", "lib.S.concrete", "lib.S.concrete", true},
+        {"custom Deref inner target", "lib.Managed.ping", "lib.Inner.ping", true},
+        {"custom Deref false recursion", "lib.Managed.ping", "lib.Managed.ping", false},
+    };
+    int mismatches = check_rust_modtree_calls_in_both_modes(tmp, cases, 7);
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_self_recursion_is_published_in_both_modes) {
+    char tmp[256] = "/tmp/cbm_rs_recursion_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib.rs",
+                    "pub fn recur(n: u8) { if n > 0 { recur(n - 1); } }\n"
+                    "pub struct S; impl S {\n"
+                    "    pub fn step(&self, n: u8) { if n > 0 { self.step(n - 1); } }\n"
+                    "    pub fn build(n: u8) { if n > 0 { Self::build(n - 1); } }\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad_%02d.rs", i);
+        write_temp_file(tmp, name, "pub fn pad() {}\n");
+    }
+    const RustModTreeCallCase cases[] = {
+        {"free recursion", "lib.recur", "lib.recur", true},
+        {"method recursion", "lib.S.step", "lib.S.step", true},
+        {"associated recursion", "lib.S.build", "lib.S.build", true},
+    };
+    int mismatches = check_rust_modtree_calls_in_both_modes(tmp, cases, 3);
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_reference_forwarding_is_not_published_as_recursion) {
+    char tmp[256] = "/tmp/cbm_rs_forward_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "lib.rs",
+                    "pub trait Tr { fn m(&self) -> u8; }\n"
+                    "impl<T: Tr + ?Sized> Tr for &T {\n"
+                    "    fn m(&self) -> u8 { (*self).m() }\n"
+                    "}\n"
+                    "pub struct S; impl S { pub fn m(&self) -> u8 { 1 } }\n"
+                    "impl Tr for &S { fn m(&self) -> u8 { (*self).m() } }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad_%02d.rs", i);
+        write_temp_file(tmp, name, "pub fn pad() {}\n");
+    }
+    const RustModTreeCallCase cases[] = {
+        {"generic forwarding is not recursion", "lib.&T.m[Tr]", "lib.&T.m[Tr]", false},
+        {"concrete forwarding is not recursion", "lib.&S.m[Tr]", "lib.&S.m[Tr]", false},
+        {"concrete forwarding reaches inner method", "lib.&S.m[Tr]", "lib.S.m", true},
+    };
+    int mismatches = check_rust_modtree_calls_in_both_modes(tmp, cases, 3);
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
 }
 
 /* A Cargo workspace whose module identities differ from the file layout:
@@ -18514,6 +18643,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_cfg_twins_stay_distinct_and_unattributed_calls_publish_nothing);
     RUN_TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller);
     RUN_TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes);
+    RUN_TEST(pipeline_rust_type_headed_call_prefers_crossfile_inherent_method);
+    RUN_TEST(pipeline_rust_reference_and_type_headed_recursion_in_both_modes);
+    RUN_TEST(pipeline_rust_self_recursion_is_published_in_both_modes);
+    RUN_TEST(pipeline_rust_reference_forwarding_is_not_published_as_recursion);
     RUN_TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes);
     RUN_TEST(pipeline_rust_method_on_path_call_result_uses_published_producer);
     RUN_TEST(pipeline_rust_type_names_resolve_through_declared_module_tree);

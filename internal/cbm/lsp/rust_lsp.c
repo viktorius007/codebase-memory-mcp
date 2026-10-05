@@ -1992,7 +1992,8 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
             return cbm_type_builtin(ctx->arena, name);
         }
         if (strcmp(name, "Self") == 0 && ctx->self_type_qn) {
-            return cbm_type_named(ctx->arena, ctx->self_type_qn);
+            return ctx->self_value_type ? ctx->self_value_type
+                                        : cbm_type_named(ctx->arena, ctx->self_type_qn);
         }
         const char *qn = rust_type_qn_by_module_tree(ctx, node, name);
         return cbm_type_named(ctx->arena, qn ? qn : rust_resolve_path_expr(ctx, name));
@@ -6223,6 +6224,21 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
             }
             if (inner && inner->kind == CBM_TYPE_POINTER) {
                 return inner->data.pointer.elem;
+            }
+            /* An erased wrapper has no proven target. Keeping its type here
+             * would turn a forwarding call into false self-recursion. */
+            const CBMType *target = rust_deref_step(ctx, inner);
+            if (target) {
+                return target;
+            }
+            const char *inner_qn = inner && inner->kind == CBM_TYPE_NAMED
+                                       ? inner->data.named.qualified_name
+                                       : inner && inner->kind == CBM_TYPE_TEMPLATE
+                                             ? inner->data.template_type.template_name
+                                             : NULL;
+            if (inner_qn && ctx->self_type_qn &&
+                strcmp(inner_qn, ctx->self_type_qn) == 0) {
+                return cbm_type_unknown();
             }
             return inner;
         }
@@ -11193,6 +11209,10 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
          * `<module>.Logger.new`. */
         const char *full_head = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
         m = cbm_registry_lookup_method_aliased(ctx->registry, full_head, short_name);
+        if (m) {
+            head = cbm_arena_strdup(ctx->arena, full_head);
+            head_t = cbm_registry_lookup_type(ctx->registry, head);
+        }
     }
     if (m) {
         const CBMRegisteredFunc *unique =
@@ -11205,6 +11225,25 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
             unique = rust_trait_impl_by_argument(ctx, m->receiver_type, m->short_name, first_arg);
         }
         if (unique) {
+            /* A local registry cannot rule out an inherent method in another file. */
+            if (ctx->enclosing_func_qn &&
+                strcmp(unique->qualified_name, ctx->enclosing_func_qn) == 0 &&
+                (unique->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0 &&
+                head_t && !head_t->rust_undeclared && !ctx->registry->read_only) {
+                out->open_qn = qn;
+                out->open_reason = "incomplete_method_registry";
+                return true;
+            }
+            if (ctx->enclosing_func_qn &&
+                strcmp(unique->qualified_name, ctx->enclosing_func_qn) == 0 &&
+                (!ctx->self_type_qn || strcmp(head, ctx->self_type_qn) != 0 ||
+                 !head_t || head_t->rust_undeclared) &&
+                (((unique->flags & CBM_FUNC_FLAG_RUST_SELF) == 0) ||
+                 ts_node_is_null(first_arg) ||
+                 !cbm_type_equal(rust_eval_expr_type(ctx, first_arg),
+                                 cbm_scope_lookup(ctx->current_scope, "self")))) {
+                return true;
+            }
             rust_call_target_set(out, unique, unique->qualified_name,
                                  strcmp(short_name, "new") == 0 ? "lsp_constructor" : "lsp_ufcs",
                                  CBM_RUST_CONF_UFCS);
@@ -11221,6 +11260,25 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
         tm = rust_resolve_trait_method(ctx, receiver, short_name, &impls, NULL);
     }
     if (tm && impls == 1) {
+        /* A local registry cannot rule out an inherent method in another file. */
+        if (ctx->enclosing_func_qn &&
+            strcmp(tm->qualified_name, ctx->enclosing_func_qn) == 0 &&
+            (tm->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0 &&
+            head_t && !head_t->rust_undeclared && !ctx->registry->read_only) {
+            out->open_qn = qn;
+            out->open_reason = "incomplete_method_registry";
+            return true;
+        }
+        if (ctx->enclosing_func_qn &&
+            strcmp(tm->qualified_name, ctx->enclosing_func_qn) == 0 &&
+            (!ctx->self_type_qn || strcmp(head, ctx->self_type_qn) != 0 ||
+             !head_t || head_t->rust_undeclared) &&
+            (((tm->flags & CBM_FUNC_FLAG_RUST_SELF) == 0) ||
+             ts_node_is_null(first_arg) ||
+             !cbm_type_equal(rust_eval_expr_type(ctx, first_arg),
+                             cbm_scope_lookup(ctx->current_scope, "self")))) {
+            return true;
+        }
         /* `Type::method()` names the receiver explicitly, so its sole
          * trait implementation is exact; only a trait-headed path
          * (`Trait::method()`) depends on inference and stays a guess. */
@@ -11918,6 +11976,22 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
 
         /* A receiver typed by a declared alias dispatches on the aliased type. */
         const CBMType *recv = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, value), 0);
+        /* The method's borrowed Self receiver precedes autoderef candidates.
+         * Compare types so an alias of self retains the same proof. */
+        if (ctx->self_value_type && ctx->self_value_type->kind == CBM_TYPE_REFERENCE &&
+            recv && recv->kind == CBM_TYPE_REFERENCE &&
+            cbm_type_equal(recv->data.reference.elem, ctx->self_value_type)) {
+            const CBMRegisteredFunc *exact =
+                rust_resolve_trait_method(ctx, ctx->self_type_qn, mname, NULL, NULL);
+            if (exact && (exact->flags & CBM_FUNC_FLAG_RUST_SELF) != 0 &&
+                ctx->enclosing_func_qn &&
+                strcmp(exact->qualified_name, ctx->enclosing_func_qn) == 0 &&
+                cbm_type_equal(recv, cbm_scope_lookup(ctx->current_scope, "self"))) {
+                rust_emit_resolved_call(ctx, exact->qualified_name, exact->impl_key,
+                                        "lsp_trait_dispatch", CBM_RUST_CONF_TRAIT_SOLE);
+                return;
+            }
+        }
         const CBMType *base = recv;
         while (base && (base->kind == CBM_TYPE_REFERENCE || base->kind == CBM_TYPE_POINTER)) {
             base = (base->kind == CBM_TYPE_REFERENCE) ? base->data.reference.elem
@@ -11957,6 +12031,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             return;
         }
         if (type_qn) {
+            const char *receiver_qn = type_qn;
             const char *registered = rust_registered_type_qn(ctx, type_qn);
             if (registered) {
                 type_qn = registered;
@@ -11966,6 +12041,14 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             const CBMRegisteredFunc *m =
                 rust_resolve_trait_method(ctx, type_qn, mname, &impl_count, &trait_dispatch);
             if (m) {
+                /* Leaf-name recovery does not prove that a foreign receiver
+                 * is the enclosing type, even when the method names match. */
+                if (ctx->enclosing_func_qn &&
+                    strcmp(m->qualified_name, ctx->enclosing_func_qn) == 0 &&
+                    strcmp(receiver_qn, type_qn) != 0 &&
+                    !rust_lookup_type_variants(ctx, receiver_qn)) {
+                    return;
+                }
                 const char *strategy = "lsp_method_dispatch";
                 float conf = CBM_RUST_CONF_METHOD;
                 const CBMRegisteredType *method_owner =
@@ -12835,7 +12918,9 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
                 if (ctx->self_type_qn) {
                     /* Determine if &self / &mut self / self by reference. */
                     char *text = rust_node_text(ctx, p);
-                    const CBMType *self_t = cbm_type_named(ctx->arena, ctx->self_type_qn);
+                    const CBMType *self_t = ctx->self_value_type
+                                                ? ctx->self_value_type
+                                                : cbm_type_named(ctx->arena, ctx->self_type_qn);
                     if (text && strchr(text, '&')) {
                         self_t = cbm_type_reference(ctx->arena, self_t);
                     }
@@ -13273,10 +13358,14 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
         return;
 
     const char *saved_self = ctx->self_type_qn;
+    const CBMType *saved_self_value = ctx->self_value_type;
     const char *saved_trait = ctx->self_trait_qn;
     const char *saved_trait_spelling = ctx->self_trait_spelling;
     const char *saved_impl_key = ctx->enclosing_impl_key;
     ctx->self_type_qn = effective_recv;
+    ctx->self_value_type = strcmp(ts_node_type(type_node), "reference_type") == 0
+                               ? rust_parse_type_node(ctx, type_node)
+                               : NULL;
     ctx->self_trait_qn = NULL;
     ctx->self_trait_spelling = NULL;
     ctx->enclosing_impl_key = NULL;
@@ -13313,6 +13402,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     }
 
     ctx->self_type_qn = saved_self;
+    ctx->self_value_type = saved_self_value;
     ctx->self_trait_qn = saved_trait;
     ctx->self_trait_spelling = saved_trait_spelling;
     ctx->enclosing_impl_key = saved_impl_key;
@@ -13331,10 +13421,12 @@ static void rust_process_trait(RustLSPContext *ctx, TSNode trait_node) {
         ctx->registry ? cbm_registry_lookup_type(ctx->registry, owner_qn) : NULL;
 
     const char *saved_self = ctx->self_type_qn;
+    const CBMType *saved_self_value = ctx->self_value_type;
     const char *saved_trait = ctx->self_trait_qn;
     const char *saved_trait_spelling = ctx->self_trait_spelling;
     const char *saved_impl_key = ctx->enclosing_impl_key;
     ctx->self_type_qn = trait_type && trait_type->is_interface ? trait_type->qualified_name : NULL;
+    ctx->self_value_type = NULL;
     ctx->self_trait_qn = NULL;
     ctx->self_trait_spelling = NULL;
     ctx->enclosing_impl_key = NULL;
@@ -13345,6 +13437,7 @@ static void rust_process_trait(RustLSPContext *ctx, TSNode trait_node) {
         }
     }
     ctx->self_type_qn = saved_self;
+    ctx->self_value_type = saved_self_value;
     ctx->self_trait_qn = saved_trait;
     ctx->self_trait_spelling = saved_trait_spelling;
     ctx->enclosing_impl_key = saved_impl_key;
@@ -13361,6 +13454,7 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     }
     CBMScope *saved_scope = ctx->current_scope;
     const char *saved_self = ctx->self_type_qn;
+    const CBMType *saved_self_value = ctx->self_value_type;
     const char *saved_trait = ctx->self_trait_qn;
     const char *saved_trait_spelling = ctx->self_trait_spelling;
     const char *saved_impl_key = ctx->enclosing_impl_key;
@@ -13374,6 +13468,7 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     }
     ctx->current_scope = file_scope;
     ctx->self_type_qn = NULL;
+    ctx->self_value_type = NULL;
     ctx->self_trait_qn = NULL;
     ctx->self_trait_spelling = NULL;
     ctx->enclosing_impl_key = NULL;
@@ -13407,6 +13502,7 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     ctx->block_item_base = saved_block_item_base;
     ctx->current_scope = saved_scope;
     ctx->self_type_qn = saved_self;
+    ctx->self_value_type = saved_self_value;
     ctx->self_trait_qn = saved_trait;
     ctx->self_trait_spelling = saved_trait_spelling;
     ctx->enclosing_impl_key = saved_impl_key;

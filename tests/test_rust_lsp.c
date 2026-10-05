@@ -7476,6 +7476,163 @@ TEST(rustlsp_cov_method_recursive_call) {
     PASS();
 }
 
+TEST(rustlsp_exact_layout_receiver_recovery_keeps_recursion) {
+    const char *source = "use crate::S; impl S { fn recurse(&self) { self.same.recurse(); } }\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.pkg.lib.S", .short_name = "S", .label = "Struct",
+         .def_module_qn = "test.pkg.lib", .field_defs = "same:&test.pkg.S", .lang = CBM_LANG_RUST},
+        {.qualified_name = "test.pkg.lib.S.recurse", .short_name = "recurse", .label = "Method",
+         .def_module_qn = "test.pkg.lib", .receiver_type = "test.pkg.lib.S", .has_rust_self = true,
+         .lang = CBM_LANG_RUST},
+    };
+    CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(registry);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.pkg.lib",
+                                         "test.pkg.lib", registry, NULL, NULL, 0, NULL, NULL, NULL,
+                                         &out, NULL, NULL);
+    int found = find_confident(&out, "S.recurse", "S.recurse");
+    ASSERT_GTE(found, 0);
+    ASSERT_STR_EQ(out.items[found].caller_qn, "test.pkg.lib.S.recurse");
+    ASSERT_STR_EQ(out.items[found].callee_qn, "test.pkg.lib.S.recurse");
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape) {
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn reference(&self); }\n"
+        "impl<T: Tr + ?Sized> Tr for &T { fn reference(&self) { self.reference(); } }\n"
+        "trait AliasTr { fn alias(&self); }\n"
+        "impl<T: AliasTr + ?Sized> AliasTr for &T { fn alias(&self) { let same = self; same.alias(); } }\n"
+        "trait Typed { fn typed(self: &Self); }\n"
+        "impl<T: Typed + ?Sized> Typed for &T { fn typed(self: &Self) { self.typed(); } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "&T.reference[Tr]", "&T.reference[Tr]"), 1);
+    ASSERT_EQ(count_resolved(r, "&T.alias[AliasTr]", "&T.alias[AliasTr]"), 1);
+    ASSERT_EQ(count_resolved(r, "&T.typed[Typed]", "&T.typed[Typed]"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_type_headed_recursion_proves_self_argument) {
+    CBMFileResult *r = extract_rust(
+        "trait Generic { fn recurse(&self); }\n"
+        "impl<T> Generic for T { fn recurse(&self) { T::recurse(self); } }\n"
+        "struct S; impl S { fn concrete(&self) { S::concrete(self); } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "T.recurse[Generic]", "T.recurse[Generic]"), 1);
+    ASSERT_EQ(count_resolved(r, "S.concrete", "S.concrete"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_foreign_receiver_leaf_is_not_recursion) {
+    CBMFileResult *r = extract_rust(
+        "struct Outer { platform: remote::Outer }\n"
+        "impl Outer { fn acquire(&self) { self.platform.acquire(); } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "Outer.acquire", "Outer.acquire"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_generic_bound_static_call_is_not_recursion) {
+    CBMFileResult *r = extract_rust(
+        "trait Base { fn matches() -> bool; }\n"
+        "trait Erased { fn matches(&self) -> bool; }\n"
+        "impl<T: Base> Erased for T {\n"
+        "    fn matches(&self) -> bool { T::matches() }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "T.matches", "T.matches"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_explicit_dereference_reaches_inner_method) {
+    CBMFileResult *r = extract_rust(
+        "struct Inner; impl Inner { fn ping(&self) {} }\n"
+        "struct Managed { v: Inner }\n"
+        "impl std::ops::Deref for Managed {\n"
+        "    type Target = Inner;\n"
+        "    fn deref(&self) -> &Inner { &self.v }\n"
+        "}\n"
+        "impl Managed { fn ping(&self) { (**self).ping(); } }\n");
+    ASSERT_NOT_NULL(r);
+    int index = require_resolved(r, "Managed.ping", "Inner.ping");
+    ASSERT_GTE(index, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[index].callee_qn, "test.src.main.Inner.ping");
+    ASSERT_EQ(count_resolved(r, "Managed.ping", "Managed.ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_typed_self_in_reference_impl_is_not_false_recursion) {
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn m(self: &Self) -> u8; }\n"
+        "impl<T: Tr + ?Sized> Tr for &T {\n"
+        "    fn m(self: &Self) -> u8 { (*self).m() }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        ASSERT_FALSE(call->caller_qn && call->callee_qn &&
+                     strcmp(call->caller_qn, call->callee_qn) == 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_erased_wrapper_dereference_is_not_recursion) {
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn m(&self) -> u8; }\n"
+        "impl<T: Tr + ?Sized> Tr for Box<T> {\n"
+        "    fn m(&self) -> u8 { (**self).m() }\n"
+        "}\n"
+        "impl<T: Tr + ?Sized> Tr for std::sync::Arc<T> {\n"
+        "    fn m(&self) -> u8 { (**self).m() }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        ASSERT_FALSE(call->caller_qn && call->callee_qn &&
+                     strcmp(call->caller_qn, call->callee_qn) == 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_reference_impl_forwarding_is_not_recursion) {
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn m(&self) -> u8; }\n"
+        "impl<T: Tr + ?Sized> Tr for &T {\n"
+        "    fn m(&self) -> u8 { (*self).m() }\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        ASSERT_FALSE(call->caller_qn && call->callee_qn &&
+                     strcmp(call->caller_qn, call->callee_qn) == 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_reference_impl_dereference_reaches_inner_type) {
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn m(&self) -> u8; }\n"
+        "struct S; impl S { fn m(&self) -> u8 { 1 } }\n"
+        "impl Tr for &S { fn m(&self) -> u8 { (*self).m() } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "&S.m[Tr]", "S.m"), 0);
+    ASSERT_EQ(count_resolved(r, "&S.m[Tr]", "&S.m[Tr]"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Cov §E: Pattern binding (25 tests) ─────────────────────── */
 
 TEST(rustlsp_cov_pat_simple_id) {
@@ -12819,6 +12976,16 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_method_after_index);
     RUN_TEST(rustlsp_cov_method_after_get_unwrap);
     RUN_TEST(rustlsp_cov_method_recursive_call);
+    RUN_TEST(rustlsp_exact_layout_receiver_recovery_keeps_recursion);
+    RUN_TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape);
+    RUN_TEST(rustlsp_type_headed_recursion_proves_self_argument);
+    RUN_TEST(rustlsp_foreign_receiver_leaf_is_not_recursion);
+    RUN_TEST(rustlsp_generic_bound_static_call_is_not_recursion);
+    RUN_TEST(rustlsp_explicit_dereference_reaches_inner_method);
+    RUN_TEST(rustlsp_typed_self_in_reference_impl_is_not_false_recursion);
+    RUN_TEST(rustlsp_erased_wrapper_dereference_is_not_recursion);
+    RUN_TEST(rustlsp_reference_impl_forwarding_is_not_recursion);
+    RUN_TEST(rustlsp_reference_impl_dereference_reaches_inner_type);
 
     /* Cov §E: Pattern binding */
     RUN_TEST(rustlsp_cov_pat_simple_id);

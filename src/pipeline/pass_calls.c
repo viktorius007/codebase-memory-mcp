@@ -583,7 +583,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         const cbm_gbuf_node_t *target_node = cbm_pipeline_lsp_target_node_policy(
             ctx->gbuf, lang == CBM_LANG_RUST ? NULL : ctx->project_name, lsp->callee_qn,
             allow_fallback, allow_fallback);
-        if (target_node && source_node->id != target_node->id) {
+        if (target_node && (lang == CBM_LANG_RUST || source_node->id != target_node->id)) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical
              * project-qualified form even when fallback prefixed the project. */
