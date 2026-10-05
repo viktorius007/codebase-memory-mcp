@@ -77,6 +77,34 @@ TEST(skip_vendor) {
     ASSERT_TRUE(cbm_should_skip_dir("vendor", CBM_MODE_FULL));
     PASS();
 }
+TEST(discover_rust_source_vendored_preserves_dependency_exclusions) {
+    char *base = th_mktempdir("cbm_disc_rustvendored");
+    ASSERT_NOT_NULL(base);
+    th_write_file(TH_PATH(base, "crate/Cargo.toml"), "[package]\nname=\"fixture\"\n");
+    th_write_file(TH_PATH(base, "crate/src/vendored/mod.rs"), "mod path;\n");
+    th_write_file(TH_PATH(base, "crate/src/vendored/path.rs"), "fn owned() {}\n");
+    th_write_file(TH_PATH(base, "vendored/dependency/src/lib.rs"), "fn external() {}\n");
+    th_write_file(TH_PATH(base, "vendor/dependency/src/lib.rs"), "fn external() {}\n");
+    th_write_file(TH_PATH(base, "internal/cbm/vendored/parser.c"), "void external(void) {}\n");
+    th_write_file(TH_PATH(base, "other/src/vendored/parser.c"), "void external(void) {}\n");
+    th_write_file(TH_PATH(base, "dependency/Cargo.toml"), "[package]\nname=\"dependency\"\n");
+    th_write_file(TH_PATH(base, "dependency/.cargo-checksum.json"), "{}\n");
+    th_write_file(TH_PATH(base, "dependency/src/vendored/mod.rs"), "fn external() {}\n");
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "crate/src/vendored/path.rs"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "vendored/dependency/src/lib.rs"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "vendor/dependency/src/lib.rs"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "internal/cbm/vendored/parser.c"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "other/src/vendored/parser.c"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "dependency/src/vendored/mod.rs"));
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(skip_vendored) {
     ASSERT_TRUE(cbm_should_skip_dir("vendored", CBM_MODE_FULL));
     PASS();
@@ -1845,6 +1873,7 @@ SUITE(discover) {
     RUN_TEST(skip_dist);
     RUN_TEST(skip_target);
     RUN_TEST(skip_vendor);
+    RUN_TEST(discover_rust_source_vendored_preserves_dependency_exclusions);
     RUN_TEST(skip_vendored);
     RUN_TEST(skip_terraform);
     RUN_TEST(skip_coverage);

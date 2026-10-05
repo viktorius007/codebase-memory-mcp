@@ -880,6 +880,25 @@ TEST(groovy_class) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* --- Rust --- */
+TEST(rust_literal_function_name_is_extracted) {
+    CBMFileResult *r =
+        extract("fn function() {}\nfn caller() { function(); }\n", CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Function", "function"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_trait_default_body_items_are_extracted) {
+    CBMFileResult *r = extract("trait T { fn outer() { fn helper() {} helper(); } }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Method", "outer"));
+    ASSERT(has_def(r, "Function", "helper"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_function) {
     CBMFileResult *r =
         extract("fn main() { println!(\"Hello\"); }\npub fn add(a: i32, b: i32) -> i32 { a + b }\n",
@@ -8042,6 +8061,8 @@ SUITE(extraction) {
     RUN_TEST(groovy_class);
 
     /* Systems */
+    RUN_TEST(rust_literal_function_name_is_extracted);
+    RUN_TEST(rust_trait_default_body_items_are_extracted);
     RUN_TEST(rust_function);
     RUN_TEST(rust_calls_to_fns_named_like_builtin_macros);
     RUN_TEST(rust_cfg_suffix_only_on_same_named_siblings);

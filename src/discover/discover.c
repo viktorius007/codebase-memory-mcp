@@ -655,8 +655,32 @@ static bool dir_is_cache_tree(const char *abs_path) {
     return abs_path[n] == '\0' || abs_path[n] == '/' || abs_path[n] == '\\';
 }
 
+/* A Cargo source module is project code, even when named vendored. Cargo-vendor
+ * packages carry a checksum marker; those and non-source dependency trees retain
+ * the directory exclusion. Ignore rules still apply to admitted modules. */
+static bool is_rust_source_module(const char *abs_path) {
+    if (!ends_with(abs_path, "/src/vendored")) {
+        return false;
+    }
+    char path[CBM_SZ_4K];
+    int n = snprintf(path, sizeof(path), "%s/../../Cargo.toml", abs_path);
+    if (n < 0 || (size_t)n >= sizeof(path) || !cbm_file_exists(path)) {
+        return false;
+    }
+    n = snprintf(path, sizeof(path), "%s/../../.cargo-checksum.json", abs_path);
+    if (n < 0 || (size_t)n >= sizeof(path) || cbm_file_exists(path)) {
+        return false;
+    }
+    n = snprintf(path, sizeof(path), "%s.rs", abs_path);
+    if (n > 0 && (size_t)n < sizeof(path) && cbm_file_exists(path)) {
+        return true;
+    }
+    n = snprintf(path, sizeof(path), "%s/mod.rs", abs_path);
+    return n > 0 && (size_t)n < sizeof(path) && cbm_file_exists(path);
+}
+
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
-                                  const cbm_discover_opts_t *opts,
+                                  const char *abs_path, const cbm_discover_opts_t *opts,
                                   const gitignore_link_t *ignore_chain,
                                   const cbm_gitignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore) {
@@ -665,8 +689,9 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
          * match for this dir un-skips a built-in skip-list dir — except the
          * non-negatable safety core. Fall through so .gitignore/global/local
          * rules still apply to the un-skipped dir. */
-        bool unskipped = cbmignore && !is_safety_core_dir(entry_name) &&
-                         cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        bool unskipped = (strcmp(entry_name, "vendored") == 0 && is_rust_source_module(abs_path)) ||
+                         (cbmignore && !is_safety_core_dir(entry_name) &&
+                          cbm_gitignore_match_result(cbmignore, rel_path, true) < 0);
         if (!unskipped) {
             return true;
         }
@@ -954,8 +979,8 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
 
     if (S_ISDIR(st.st_mode)) {
         if (!dir_is_cache_tree(abs_path) &&
-            !should_skip_directory(entry->name, rel_path, opts, frame->ignore_chain, global_gi,
-                                   cbmignore)) {
+            !should_skip_directory(entry->name, rel_path, abs_path, opts, frame->ignore_chain,
+                                   global_gi, cbmignore)) {
             walk_push_subdir(ws, abs_path, rel_path, frame, out);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */

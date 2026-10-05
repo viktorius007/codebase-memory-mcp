@@ -3973,7 +3973,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     }
 
     char *name = cbm_func_name_node_text(a, name_node, ctx->source, ctx->language);
-    if (!name || !name[0] || strcmp(name, "function") == 0) {
+    if (!name || !name[0] || (ctx->language != CBM_LANG_RUST && strcmp(name, "function") == 0)) {
         return;
     }
 
@@ -9443,6 +9443,16 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
             push_class_body_children(node, spec, &s, new_enclosing, ctx);
+            if (ctx->language == CBM_LANG_RUST && strcmp(kind, "trait_item") == 0) {
+                TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+                uint32_t count = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
+                for (uint32_t i = 0; i < count; i++) {
+                    TSNode member = ts_node_named_child(body, i);
+                    if (strcmp(ts_node_type(member), "function_item") == 0) {
+                        rust_push_body_items(ctx, &s, member, frame.enclosing_class_qn);
+                    }
+                }
+            }
             continue;
         }
 
