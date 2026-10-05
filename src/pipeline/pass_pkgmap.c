@@ -1598,9 +1598,10 @@ static bool import_targetable_label(const char *label) {
  * segment to an arbitrary same-named project symbol (`import "os/exec"` → a
  * test harness's exec() method, two imports → a Makefile target). Languages
  * whose import genuinely can name a member (Python `from m import f`, Java
- * `import com.example.Foo`, Rust `use crate::ops::helper`) keep it. */
+ * `import com.example.Foo`) keep it. Rust paths are resolved through the
+ * module tree; an unresolved path must not bind to a same-named item. */
 bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
-    return lang != CBM_LANG_GO;
+    return lang != CBM_LANG_GO && lang != CBM_LANG_RUST;
 }
 
 /* Whether Strategy 3 may bind an import from a file of `lang` to a node with

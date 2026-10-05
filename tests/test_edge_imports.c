@@ -820,6 +820,17 @@ TEST(ei_rust_use_external_head_never_binds) {
     PASS();
 }
 
+TEST(ei_rust_unresolved_reexport_never_binds_namesake) {
+    static const EILangFile f[] = {
+        {"Cargo.toml", "[package]\nname = \"app\"\nedition = \"2021\"\n"},
+        {"src/lib.rs", "pub use external_macros::JsonSchema;\nmod item;\n"},
+        {"src/item.rs", "use crate::JsonSchema;\npub struct Item;\n"},
+        {"src/decoy.rs", "pub struct JsonSchema;\n"},
+    };
+    ASSERT_TRUE(ei_edge_count_is(f, 4, "IMPORTS", 0));
+    PASS();
+}
+
 /* Rust: a `use` links to the item its path resolves to in the module tree,
  * not to a node that merely has the name. `use crate::Cli` crosses the
  * by-name re-export in lib.rs to cli.rs; `use crate::buffers::Frame` crosses
@@ -1319,6 +1330,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_rust_trait_use);
     RUN_TEST(ei_rust_use_never_binds_method);
     RUN_TEST(ei_rust_use_external_head_never_binds);
+    RUN_TEST(ei_rust_unresolved_reexport_never_binds_namesake);
     RUN_TEST(ei_rust_use_links_through_module_tree);
     RUN_TEST(ei_rust_scoped_use_links_in_its_own_module);
 
