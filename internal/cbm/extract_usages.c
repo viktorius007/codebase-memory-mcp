@@ -63,13 +63,22 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
         return false;
     }
 
-    /* A Rust scoped_identifier owns the complete path occurrence. Its nested
-     * path/identifier children are grammar structure, not additional value
-     * references; keeping them would let a short-name fallback bind a decoy. */
+    /* Keep the full Rust path and its qualifier in the type namespace.
+     * A terminal path child is not a separate bare-name value reference. */
     if (lang == CBM_LANG_RUST &&
-        (strcmp(kind, "identifier") == 0 || strcmp(kind, "scoped_identifier") == 0)) {
+        (strcmp(kind, "identifier") == 0 || strcmp(kind, "type_identifier") == 0 ||
+         strcmp(kind, "scoped_identifier") == 0 || strcmp(kind, "scoped_type_identifier") == 0)) {
         TSNode parent = ts_node_parent(node);
-        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "scoped_identifier") == 0) {
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "for_expression") == 0 &&
+            ts_node_eq(node, ts_node_child_by_field_name(parent, "pattern", 7)))
+            return false;
+        if (!ts_node_is_null(parent) &&
+            strcmp(ts_node_type(parent), "scoped_type_identifier") == 0 &&
+            !ts_node_eq(node, ts_node_child_by_field_name(parent, "path", 4))) {
+            return false;
+        }
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "scoped_identifier") == 0 &&
+            !ts_node_eq(node, ts_node_child_by_field_name(parent, "path", 4))) {
             return false;
         }
     }
@@ -114,7 +123,8 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_PYTHON:
         return strcmp(kind, "attribute") == 0;
     case CBM_LANG_RUST:
-        return strcmp(kind, "field_identifier") == 0 || strcmp(kind, "scoped_identifier") == 0;
+        return strcmp(kind, "field_identifier") == 0 || strcmp(kind, "scoped_identifier") == 0 ||
+               strcmp(kind, "scoped_type_identifier") == 0;
     case CBM_LANG_C:
     case CBM_LANG_CPP:
     case CBM_LANG_CUDA:
@@ -1629,6 +1639,24 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
 
 static char *reference_name(CBMExtractCtx *ctx, TSNode node) {
     char *name = cbm_node_text(ctx->arena, node, ctx->source);
+    if (ctx->language == CBM_LANG_RUST &&
+        strcmp(ts_node_type(ts_node_parent(node)), "token_tree") == 0) {
+        TSNode first = node;
+        TSNode separator = ts_node_prev_sibling(first);
+        while (!ts_node_is_null(separator) && strcmp(ts_node_type(separator), "::") == 0) {
+            TSNode segment = ts_node_prev_sibling(separator);
+            if (ts_node_is_null(segment) || ts_node_named_child_count(segment) != 0)
+                break;
+            const char *kind = ts_node_type(segment);
+            if (strcmp(kind, "identifier") != 0 && strcmp(kind, "crate") != 0 &&
+                strcmp(kind, "self") != 0 && strcmp(kind, "super") != 0)
+                break;
+            first = segment;
+            separator = ts_node_prev_sibling(first);
+        }
+        name = cbm_arena_strndup(ctx->arena, ctx->source + ts_node_start_byte(first),
+                                 ts_node_end_byte(node) - ts_node_start_byte(first));
+    }
     if (!name || ctx->language != CBM_LANG_MAKEFILE ||
         strcmp(ts_node_type(node), "variable_reference") != 0) {
         return name;
@@ -1666,6 +1694,9 @@ static const char *lexical_binding_key(CBMExtractCtx *ctx, WalkState *state, con
     if (ctx->language == CBM_LANG_TCL && name[0] == '$') {
         name++;
     }
+    if (ctx->language == CBM_LANG_RUST && strstr(name, "::")) {
+        name = cbm_arena_strndup(ctx->arena, name, strcspn(name, ":"));
+    }
     if (!lexical_identifier_case_insensitive(ctx->language)) {
         return name;
     }
@@ -1684,6 +1715,88 @@ static const char *lexical_binding_key(CBMExtractCtx *ctx, WalkState *state, con
     return folded;
 }
 
+/* A block use is hoisted to its enclosing block, just like a module use.
+ * Keep the source spelling, and separately record the path that binding names.
+ * Generic parameters shadow project types throughout their item. */
+static const char *rust_usage_scope_path(CBMExtractCtx *ctx, TSNode node, const char *path) {
+    size_t head_len = strcspn(path, ":");
+    for (TSNode scope = node; !ts_node_is_null(scope); scope = ts_node_parent(scope)) {
+        TSNode params = ts_node_child_by_field_name(scope, "type_parameters", 15);
+        for (uint32_t i = 0; !ts_node_is_null(params) && i < ts_node_named_child_count(params);
+             i++) {
+            TSNode param = ts_node_named_child(params, i);
+            TSNode id = strcmp(ts_node_type(param), "type_identifier") == 0
+                            ? param
+                            : ts_node_child_by_field_name(param, "name", 4);
+            const char *text =
+                ts_node_is_null(id) ? NULL : cbm_node_text(ctx->arena, id, ctx->source);
+            if (text && strlen(text) == head_len && strncmp(text, path, head_len) == 0)
+                return "";
+        }
+        if (strcmp(ts_node_type(scope), "block") != 0)
+            continue;
+        CBMImportArray uses = {0};
+        for (uint32_t i = 0; i < ts_node_named_child_count(scope); i++) {
+            TSNode item = ts_node_named_child(scope, i);
+            const char *kind = ts_node_type(item);
+            if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "enum_item") == 0 ||
+                strcmp(kind, "union_item") == 0 || strcmp(kind, "type_item") == 0 ||
+                strcmp(kind, "trait_item") == 0) {
+                TSNode id = ts_node_child_by_field_name(item, "name", 4);
+                const char *name =
+                    ts_node_is_null(id) ? NULL : cbm_node_text(ctx->arena, id, ctx->source);
+                if (name && strlen(name) == head_len && strncmp(name, path, head_len) == 0)
+                    return "";
+            }
+            if (strcmp(ts_node_type(item), "use_declaration") == 0)
+                cbm_extract_rust_use_tree(ctx->arena,
+                                          ts_node_child_by_field_name(item, "argument", 8),
+                                          ctx->source, &uses);
+        }
+        const char *binding = NULL;
+        for (int i = 0; i < uses.count; i++) {
+            const CBMImport *use = &uses.items[i];
+            if (use->local_name && strlen(use->local_name) == head_len &&
+                strncmp(use->local_name, path, head_len) == 0) {
+                if (binding && strcmp(binding, use->module_path) != 0)
+                    return "";
+                binding = use->module_path;
+            }
+        }
+        if (binding)
+            return cbm_arena_sprintf(ctx->arena, "%s%s", binding, path + head_len);
+    }
+    return NULL;
+}
+
+/* Macro token trees keep turbofish arguments as tokens rather than typed
+ * AST nodes. A still-open `::<...>` proves the type namespace; an ordinary
+ * comparison `<` does not. Nested angle pairs preserve the outer context. */
+static bool rust_token_turbofish_type(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "token_tree") != 0)
+        return false;
+    int closed = 0;
+    for (TSNode previous = ts_node_prev_sibling(node); !ts_node_is_null(previous);
+         previous = ts_node_prev_sibling(previous)) {
+        const char *kind = ts_node_type(previous);
+        if (strcmp(kind, ">") == 0)
+            closed++;
+        else if (strcmp(kind, ">>") == 0)
+            closed += 2;
+        else if (strcmp(kind, "<") == 0) {
+            if (closed > 0)
+                closed--;
+            else {
+                TSNode prefix = ts_node_prev_sibling(previous);
+                if (!ts_node_is_null(prefix) && strcmp(ts_node_type(prefix), "::") == 0)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void stamp_usage_site(CBMExtractCtx *ctx, CBMUsage *usage, TSNode node, const char *name,
                              WalkState *state) {
     TSNode candidate_site = call_reference_candidate_site(ctx, node, name, state);
@@ -1691,6 +1804,50 @@ static void stamp_usage_site(CBMExtractCtx *ctx, CBMUsage *usage, TSNode node, c
     usage->site_start_byte = ts_node_start_byte(site);
     usage->site_end_byte = ts_node_end_byte(site);
     usage->may_be_call_reference = !ts_node_is_null(candidate_site);
+    if (ctx->language == CBM_LANG_RUST) {
+        usage->scope_path = rust_usage_scope_path(ctx, node, name);
+        TSNode parent = ts_node_parent(node);
+        bool qualifier = !ts_node_is_null(parent) &&
+                         (strcmp(ts_node_type(parent), "scoped_identifier") == 0 ||
+                          strcmp(ts_node_type(parent), "scoped_type_identifier") == 0) &&
+                         ts_node_eq(node, ts_node_child_by_field_name(parent, "path", 4));
+        TSNode next = ts_node_next_sibling(node);
+        qualifier |= !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "token_tree") == 0 &&
+                     !ts_node_is_null(next) && strcmp(ts_node_type(next), "::") == 0;
+        if (qualifier || rust_token_turbofish_type(node) ||
+            strcmp(ts_node_type(node), "type_identifier") == 0 ||
+            strcmp(ts_node_type(node), "scoped_type_identifier") == 0) {
+            usage->kind = CBM_USAGE_TYPE;
+        }
+        /* Preserve the carrier for an occurrence-exact field-owner record;
+         * a macro field label cannot denote a bare module value. */
+        TSNode owner = ts_node_is_null(parent) ? (TSNode){0} : ts_node_prev_sibling(parent);
+        const char *owner_kind = ts_node_is_null(owner) ? "" : ts_node_type(owner);
+        bool written_owner = strcmp(owner_kind, "identifier") == 0 ||
+                             strcmp(owner_kind, "type_identifier") == 0 ||
+                             strcmp(owner_kind, "scoped_identifier") == 0 ||
+                             strcmp(owner_kind, "scoped_type_identifier") == 0;
+        TSNode opening = ts_node_is_null(parent) ? (TSNode){0} : ts_node_child(parent, 0);
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "token_tree") == 0 &&
+            written_owner && !ts_node_is_null(opening) && strcmp(ts_node_type(opening), "{") == 0 &&
+            !ts_node_is_null(next) && strcmp(ts_node_type(next), ":") == 0)
+            usage->is_member_access = true;
+        if (usage->kind == CBM_USAGE_VALUE) {
+            size_t head_len = strcspn(name, ":");
+            for (TSNode scope = ts_node_parent(node); !ts_node_is_null(scope);
+                 scope = ts_node_parent(scope)) {
+                if (strcmp(ts_node_type(scope), "for_expression") != 0 ||
+                    !field_contains_node(scope, "body", node))
+                    continue;
+                TSNode pattern = ts_node_child_by_field_name(scope, "pattern", 7);
+                if (ts_node_is_null(pattern) || strcmp(ts_node_type(pattern), "identifier") != 0)
+                    continue;
+                const char *binding = cbm_node_text(ctx->arena, pattern, ctx->source);
+                if (binding && strlen(binding) == head_len && strncmp(binding, name, head_len) == 0)
+                    usage->scope_path = "";
+            }
+        }
+    }
 }
 
 static const CBMLexicalScope *usage_lexical_scope(const WalkState *state, uint32_t id) {
@@ -2277,6 +2434,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
      * signature/body languages extend the scope after parameters are seen. */
     binding->active_end = 0;
     binding->name = name;
+    binding->import_binding = import_binding;
 }
 
 static int compare_lexical_bindings(const void *left_ptr, const void *right_ptr) {
@@ -2321,13 +2479,14 @@ static int lexical_binding_lower_bound(const WalkState *state, uint32_t scope_id
     return low;
 }
 
-static bool lexical_binding_active_at(const WalkState *state, uint32_t scope_id, const char *name,
-                                      uint32_t position) {
+static const CBMLexicalBinding *lexical_binding_active_at(const WalkState *state, uint32_t scope_id,
+                                                          const char *name, uint32_t position) {
     const CBMLexicalScope *scope = usage_lexical_scope(state, scope_id);
     if (!scope) {
-        return false;
+        return NULL;
     }
     int index = lexical_binding_lower_bound(state, scope_id, name);
+    const CBMLexicalBinding *best = NULL;
     while (index < state->lexical_binding_count) {
         const CBMLexicalBinding *binding = &state->lexical_bindings[index++];
         if (binding->scope_id != scope_id || strcmp(binding->name, name) != 0) {
@@ -2335,15 +2494,16 @@ static bool lexical_binding_active_at(const WalkState *state, uint32_t scope_id,
         }
         uint32_t active_end = binding->active_end ? binding->active_end : scope->end_byte;
         if (binding->active_start <= position && position < active_end) {
-            return true;
+            best = binding;
         }
     }
-    return false;
+    return best;
 }
 
 static const CBMLexicalScope *lexical_binding_scope_for_usage(const WalkState *state,
                                                               const CBMUsage *usage,
-                                                              const char *name) {
+                                                              const char *name,
+                                                              bool *import_binding) {
     uint32_t scope_id = usage->lexical_scope_id;
     int remaining = state ? state->lexical_scope_count : 0;
     while (scope_id != 0 && remaining-- > 0) {
@@ -2351,7 +2511,10 @@ static const CBMLexicalScope *lexical_binding_scope_for_usage(const WalkState *s
         if (!scope) {
             return NULL;
         }
-        if (lexical_binding_active_at(state, scope_id, name, usage->site_start_byte)) {
+        const CBMLexicalBinding *binding =
+            lexical_binding_active_at(state, scope_id, name, usage->site_start_byte);
+        if (binding) {
+            *import_binding = binding->import_binding;
             return scope;
         }
         scope_id = scope->lookup_parent_id;
@@ -2376,12 +2539,22 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
         if (!name) {
             continue;
         }
-        const CBMLexicalScope *binding_scope = lexical_binding_scope_for_usage(state, usage, name);
+        bool import_binding = false;
+        const CBMLexicalScope *binding_scope =
+            lexical_binding_scope_for_usage(state, usage, name, &import_binding);
+        if (ctx->language == CBM_LANG_RUST && usage->scope_path && !usage->scope_path[0]) {
+            usage->semantic_reference_blocked = true;
+            usage->semantic_reference_local_shadow = true;
+            continue;
+        }
         if (!binding_scope) {
             continue;
         }
         usage->semantic_reference_blocked = true;
-        usage->semantic_reference_local_shadow = binding_scope->kind != CBM_LEXICAL_SCOPE_MODULE;
+        usage->semantic_reference_local_shadow =
+            binding_scope->kind != CBM_LEXICAL_SCOPE_MODULE &&
+            !(ctx->language == CBM_LANG_RUST && import_binding && usage->scope_path &&
+              usage->scope_path[0]);
     }
 
     /* Allocation failure must never widen textual fallback. Exact semantic
@@ -2623,7 +2796,30 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
                 cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
             }
         }
-        return;
+        bool local_function = false;
+        if (ctx->language == CBM_LANG_RUST && reference_node &&
+            strcmp(ts_node_type(node), "identifier") == 0) {
+            const char *callee = cbm_node_text(ctx->arena, node, ctx->source);
+            for (TSNode scope = ts_node_parent(node); !ts_node_is_null(scope);
+                 scope = ts_node_parent(scope)) {
+                const char *scope_kind = ts_node_type(scope);
+                if (strcmp(scope_kind, "block") != 0 && strcmp(scope_kind, "source_file") != 0 &&
+                    strcmp(scope_kind, "declaration_list") != 0)
+                    continue;
+                for (uint32_t i = 0; i < ts_node_named_child_count(scope); i++) {
+                    TSNode item = ts_node_named_child(scope, i);
+                    if (strcmp(ts_node_type(item), "function_item") != 0)
+                        continue;
+                    TSNode id = ts_node_child_by_field_name(item, "name", 4);
+                    const char *name =
+                        ts_node_is_null(id) ? NULL : cbm_node_text(ctx->arena, id, ctx->source);
+                    local_function |= name && callee && strcmp(name, callee) == 0;
+                }
+            }
+        }
+        if (!local_function || state->invocation_kind == CBM_INVOCATION_CALLABLE_REFERENCE) {
+            return;
+        }
     }
     if (is_forward_sibling_callee(ctx->language, node)) {
         return;

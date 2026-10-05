@@ -333,10 +333,11 @@ bool cbm_registry_label_is_type_member(const char *label);
 
 /* Rust owner path `...::Owner::member`: the single registered Method or
  * AssociatedConst whose parent segment is the written `Owner` (for `Self`,
- * exactly the type owning `enclosing_qn`). NULL when the path is not an owner
+ * exactly the type owning `enclosing_qn`). With `proved_owner`, require that
+ * canonical owner instead of matching the written segment. NULL when the path is not an owner
  * path, no member matches, or two same-named types both define it. */
 const char *cbm_registry_rust_owner_member(const cbm_registry_t *r, const char *ref_name,
-                                           const char *enclosing_qn);
+                                           const char *enclosing_qn, const char *proved_owner);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

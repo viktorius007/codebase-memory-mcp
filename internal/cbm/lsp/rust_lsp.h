@@ -116,6 +116,8 @@ typedef struct {
 
     /* Module-qualified name for this file (e.g. "<project>.<crate>.foo"). */
     const char *module_qn;
+    /* Graph prefix of the inline module whose body is being walked. */
+    const char *item_module_qn;
     /* Rust module identity used only for `self::` / `super::` imports. It
      * differs from module_qn when #[path] gives a file a non-physical name;
      * NULL means that identity was ambiguous and relative imports stay open. */

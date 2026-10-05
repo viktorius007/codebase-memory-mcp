@@ -2079,6 +2079,96 @@ TEST(rust_nested_items_are_definitions) {
 /* Rust: `macro_rules!` defines a Macro; an impl's associated const and type are
  * AssociatedConst / AssociatedType owned by the impl's type, keyed by the trait
  * for a trait impl. */
+TEST(rust_inline_module_items_keep_their_written_scope) {
+    CBMFileResult *r = extract("const LIMIT: u8 = 0;\n"
+                               "struct Item { value: u8 }\n"
+                               "mod a { const LIMIT: u8 = 1; struct Item { value: u8 }\n"
+                               "  impl Item { fn get(&self) -> u8 { self.value } }\n"
+                               "  macro_rules! emit { () => {}; }\n"
+                               "  mod b { type Alias = u8; enum Mode { Ready } fn run() {} }\n"
+                               "}\n"
+                               "mod c { const LIMIT: u8 = 2; struct Item { value: u8 } }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    static const char *const expected[] = {
+        "t.lib.LIMIT",          "t.lib.Item",    "t.lib.Item.value",   "t.lib.a",
+        "t.lib.a.LIMIT",        "t.lib.a.Item",  "t.lib.a.Item.value", "t.lib.a.Item.get",
+        "t.lib.a.emit",         "t.lib.a.b",     "t.lib.a.b.Alias",    "t.lib.a.b.Mode",
+        "t.lib.a.b.Mode.Ready", "t.lib.a.b.run", "t.lib.c.LIMIT",      "t.lib.c.Item",
+        "t.lib.c.Item.value",
+    };
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        ASSERT(has_def_qn(r, expected[i]));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_cfg_inline_modules_keep_their_declaration_identity) {
+    CBMFileResult *r = extract("#[cfg(unix)] mod imp { struct Cache { value: u8 } }\n"
+                               "#[cfg(windows)] mod imp { struct Cache { value: u8 } }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def_qn(r, "t.lib.imp#cfg(unix)]"));
+    ASSERT(has_def_qn(r, "t.lib.imp#cfg(unix)].Cache"));
+    ASSERT(has_def_qn(r, "t.lib.imp#cfg(unix)].Cache.value"));
+    ASSERT(has_def_qn(r, "t.lib.imp#cfg(windows)]"));
+    ASSERT(has_def_qn(r, "t.lib.imp#cfg(windows)].Cache"));
+    ASSERT(has_def_qn(r, "t.lib.imp#cfg(windows)].Cache.value"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_value_paths_keep_their_complete_type_qualifier) {
+    CBMFileResult *r = extract("enum Mode { Ready }\nfn run() { let _ = Mode::Ready; }\n"
+                               "mod child { pub struct Item; }\n"
+                               "fn build() { child::Item::new(); }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    int bare = 0, qualified = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *u = &r->usages.items[i];
+        if (!u->enclosing_func_qn ||
+            (strcmp(u->enclosing_func_qn, "t.lib.run") != 0 &&
+             strcmp(u->enclosing_func_qn, "t.lib.build") != 0)) {
+            continue;
+        }
+        if (strcmp(u->ref_name, "Mode") == 0 || strcmp(u->ref_name, "child::Item") == 0) {
+            ASSERT_EQ(u->kind, CBM_USAGE_TYPE);
+            bare += strcmp(u->ref_name, "Mode") == 0;
+            qualified += strcmp(u->ref_name, "child::Item") == 0;
+        }
+        ASSERT_FALSE(strcmp(u->ref_name, "Ready") == 0);
+        ASSERT_FALSE(strcmp(u->ref_name, "Item") == 0);
+    }
+    ASSERT_EQ(bare, 1);
+    ASSERT_EQ(qualified, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_scoped_type_usage_keeps_its_namespace_and_whole_path) {
+    CBMFileResult *r = extract("struct Item; mod child { pub struct Item; }\n"
+                               "fn consume(_: child::Item, _: Item) {}\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    int qualified = 0, bare = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *u = &r->usages.items[i];
+        if (strcmp(u->ref_name, "child::Item") == 0) {
+            ASSERT(u->kind != CBM_USAGE_VALUE);
+            qualified++;
+        } else if (strcmp(u->ref_name, "Item") == 0) {
+            ASSERT(u->kind != CBM_USAGE_VALUE);
+            bare++;
+        }
+    }
+    ASSERT_EQ(qualified, 1);
+    ASSERT_EQ(bare, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_macro_and_associated_items) {
     CBMFileResult *r = extract("macro_rules! my_mac { () => {}; }\n"
                                "struct S;\n"
@@ -2190,6 +2280,21 @@ TEST(rust_shared_qn_definitions_all_survive) {
 /* Rust: an item-position macro call whose argument parses as Rust items yields
  * those items at their own lines; an argument in a macro-specific language
  * yields nothing. */
+TEST(rust_item_macro_arguments_inherit_the_inline_module) {
+    CBMFileResult *r = extract("macro_rules! item { ($item:item) => { $item }; }\n"
+                               "mod a { item! { struct Item { value: u8 } } }\n"
+                               "mod b { item! { struct Item { value: u8 } } }\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def_qn(r, "t.lib.a.Item"));
+    ASSERT(has_def_qn(r, "t.lib.a.Item.value"));
+    ASSERT(has_def_qn(r, "t.lib.b.Item"));
+    ASSERT(has_def_qn(r, "t.lib.b.Item.value"));
+    ASSERT_FALSE(has_def_qn(r, "t.lib.Item"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_item_macro_argument_items) {
     CBMFileResult *r = extract("wrap!(\n"
                                "    pub enum Mode {\n"
@@ -8027,9 +8132,14 @@ SUITE(extraction) {
     RUN_TEST(rust_enum);
     RUN_TEST(rust_enum_variants_and_variant_fields);
     RUN_TEST(rust_nested_items_are_definitions);
+    RUN_TEST(rust_inline_module_items_keep_their_written_scope);
+    RUN_TEST(rust_cfg_inline_modules_keep_their_declaration_identity);
+    RUN_TEST(rust_value_paths_keep_their_complete_type_qualifier);
+    RUN_TEST(rust_scoped_type_usage_keeps_its_namespace_and_whole_path);
     RUN_TEST(rust_macro_and_associated_items);
     RUN_TEST(rust_impl_macro_rules_members);
     RUN_TEST(rust_shared_qn_definitions_all_survive);
+    RUN_TEST(rust_item_macro_arguments_inherit_the_inline_module);
     RUN_TEST(rust_item_macro_argument_items);
     RUN_TEST(zig_struct);
     RUN_TEST(cpp_function);

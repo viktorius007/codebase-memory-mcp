@@ -313,13 +313,14 @@ typedef struct {
 typedef enum {
     CBM_USAGE_VALUE = 0,
     CBM_USAGE_CALL_REFERENCE,
+    CBM_USAGE_TYPE, /* Rust type namespace; ordinary USAGE publication. */
 } CBMUsageKind;
 
 typedef struct {
     const char *ref_name;          // referenced identifier
+    const char *scope_path;        // Rust block-use expansion; empty means a local binding
     const char *enclosing_func_qn; // QN of enclosing function (or module QN)
-    /* Fixed-width fields grouped so the record packs to 40 bytes (was 48; the
-     * Go corpus holds 4.68M of these). Field meanings unchanged. */
+    /* Group fixed-width fields to avoid padding between flags and byte spans. */
     uint32_t lexical_scope_id;       // extraction-local scope instance; never graph identity
     uint32_t site_start_byte;        // exact reference-token span; end > start when present
     uint32_t site_end_byte;          // exclusive byte offset in the source file
@@ -342,10 +343,12 @@ typedef struct {
 typedef struct {
     const char *var_name;          // variable name
     const char *enclosing_func_qn; // QN of enclosing function
-    bool is_write;                 // true = write, false = read
-    bool is_member_access;         // var_name is the field half of a selector/member LHS
-                                   // (`t.err = x` → "err"); the receiver is stripped here,
-                                   // so this is the only record of selector shape (#1962)
+    uint32_t site_start_byte;      // original assignment member token
+    uint32_t site_end_byte;
+    bool is_write;         // true = write, false = read
+    bool is_member_access; // var_name is the field half of a selector/member LHS
+                           // (`t.err = x` → "err"); the receiver is stripped here,
+                           // so this is the only record of selector shape (#1962)
 } CBMReadWrite;
 
 typedef struct {

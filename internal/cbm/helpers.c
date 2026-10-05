@@ -337,8 +337,8 @@ bool cbm_label_is_registry_symbol(const char *label) {
      * lookup. */
     return strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
            cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
-           strcmp(label, "Constant") == 0 || strcmp(label, "Field") == 0 ||
-           cbm_label_is_relation(label);
+           strcmp(label, "Constant") == 0 || strcmp(label, "AssociatedConst") == 0 ||
+           strcmp(label, "Field") == 0 || cbm_label_is_relation(label);
 }
 
 bool cbm_lisp_node_in_quote(CBMArena *a, TSNode node, const char *source) {

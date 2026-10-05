@@ -364,6 +364,31 @@ static bool cargo_is_dependency_section(const char *section) {
     return strcmp(section, "workspace.dependencies") == 0;
 }
 
+/* The last component of a dependency table is the declared crate alias,
+ * rather than an entry key. Its parent uses the same section rules as an
+ * inline dependency, including target and workspace sections. */
+static const char *cargo_dependency_table_name(CBMArena *arena, const char *section) {
+    const char *dot = strrchr(section, '.');
+    if (!dot || !dot[1]) return NULL;
+    const char *parent = cbm_arena_strndup(arena, section, (size_t)(dot - section));
+    if (!cargo_is_dependency_section(parent)) return NULL;
+    const char *name = NULL;
+    int length = (int)strlen(dot + 1);
+    return parse_key(arena, dot + 1, length, 0, &name) == length ? name : NULL;
+}
+
+static int parse_dependency_table_field(CBMArena *arena, const char *source, int length,
+                                         int from, CBMCargoDep *dep) {
+    const char *key = NULL;
+    from = parse_key(arena, source, length, from, &key);
+    from = skip_ws_and_comment(source, length, from);
+    if (from < length && source[from] == '=') from++;
+    from = skip_ws_and_comment(source, length, from);
+    return key && strcmp(key, "path") == 0
+        ? parse_string(arena, source, length, from, &dep->path)
+        : skip_value(source, length, from);
+}
+
 void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     CBMCargoManifest* out) {
     if (!arena || !src || !out) return;
@@ -376,6 +401,7 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     /* Default: pre-header content treated as [package]. */
     const char* section = "package";
     CBMCargoTarget *target = NULL;
+    CBMCargoDep *dependency_table = NULL;
 
     while (from < src_len) {
         from = skip_ws_and_comment(src, src_len, from);
@@ -385,6 +411,12 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
             from = parse_section(arena, src, src_len, from, &hdr);
             section = hdr ? hdr : "";
             target = NULL;
+            dependency_table = NULL;
+            const char *dependency_name = cargo_dependency_table_name(arena, section);
+            if (dependency_name && out->dep_count < CBM_CARGO_MAX_DEPS) {
+                dependency_table = &out->deps[out->dep_count++];
+                dependency_table->name = dependency_name;
+            }
             if (strcmp(section, "lib") == 0)
                 target = append_target(arena, out, CBM_CARGO_TARGET_LIB);
             else if (strcmp(section, "bin") == 0)
@@ -409,6 +441,8 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
             from = parse_workspace_kv(arena, src, src_len, from, out);
         } else if (strcmp(section, "workspace.package") == 0) {
             from = parse_workspace_package_kv(arena, src, src_len, from, out);
+        } else if (dependency_table) {
+            from = parse_dependency_table_field(arena, src, src_len, from, dependency_table);
         } else if (cargo_is_dependency_section(section)) {
             from = parse_dep_entry(arena, src, src_len, from, out);
         } else {

@@ -1754,7 +1754,8 @@ TEST(rustlsp_tokio_signatures_need_the_tokio_item) {
 TEST(rustlsp_await_boxed_future_yields_declared_output) {
     ASSERT(rustlsp_std_chain_reaches_conn(
         "use std::future::Future;\nuse std::pin::Pin;\n" RUSTLSP_STD_DECOYS
-        "trait Maker { fn make<'a>(&'a self) -> Pin<Box<dyn Future<Output = Conn> + Send + 'a>>; }\n"
+        "trait Maker { fn make<'a>(&'a self) -> Pin<Box<dyn Future<Output = Conn> + Send + 'a>>; "
+        "}\n"
         "async fn run(m: &dyn Maker) -> bool { m.make().await.ping() }\n"));
     ASSERT(rustlsp_std_chain_reaches_conn(
         "use std::future::Future;\nuse std::pin::Pin;\n" RUSTLSP_STD_DECOYS
@@ -1773,7 +1774,8 @@ TEST(rustlsp_await_boxed_future_yields_declared_output) {
     ASSERT(rustlsp_std_chain_reaches_conn(
         "use std::future::Future;\n" RUSTLSP_STD_DECOYS
         "trait Maker { fn make(&self) -> Box<dyn Future<Output = Conn> + Send + Unpin>; }\n"
-        "async fn run(m: &dyn Maker) -> bool { let mut f = m.make(); let c = (&mut f).await; c.ping() }\n"));
+        "async fn run(m: &dyn Maker) -> bool { let mut f = m.make(); let c = (&mut f).await; "
+        "c.ping() }\n"));
     ASSERT(rustlsp_std_chain_reaches_conn(
         "use std::future::Future;\n" RUSTLSP_STD_DECOYS
         "trait Maker { fn make(&self) -> Box<dyn Future<Output = Conn> + Send + Unpin>; }\n"
@@ -1822,12 +1824,14 @@ TEST(rustlsp_await_join_handle_yields_result) {
         "use tokio::task::JoinHandle;\n" RUSTLSP_STD_DECOYS
         "async fn run(h: JoinHandle<Conn>) -> bool { h.await.unwrap().ping() }\n"));
     ASSERT(rustlsp_std_chain_reaches_conn(
-        "use std::time::Duration;\nuse tokio::task::JoinHandle;\nuse tokio::time::timeout;\n"
+        "use std::time::Duration;\nuse tokio::task::JoinHandle;\nuse "
+        "tokio::time::timeout;\n"
         RUSTLSP_STD_DECOYS
         "async fn run(d: Duration, h: JoinHandle<Conn>) -> bool {\n"
         "    timeout(d, h).await.unwrap().unwrap().ping()\n}\n"));
     CBMFileResult *r = extract_rust(
-        "use std::time::Duration;\nuse tokio::task::JoinHandle;\nuse tokio::time::timeout;\n"
+        "use std::time::Duration;\nuse tokio::task::JoinHandle;\nuse "
+                                    "tokio::time::timeout;\n"
         RUSTLSP_STD_DECOYS
         "async fn run(d: Duration, h: JoinHandle<Conn>) -> bool {\n"
         "    timeout(d, h).await.unwrap().ping()\n}\n");
@@ -2056,10 +2060,11 @@ TEST(rustlsp_std_namesake_in_inline_module_is_project_type) {
         "use std::sync::{Arc, Mutex, RwLock};\n" RUSTLSP_STD_DECOYS
         "pub fn outer(m: &Mutex<Conn>) -> bool { m.lock().unwrap().ping() }\n"
         "pub fn outer_arc(a: Arc<RwLock<Conn>>) -> bool { a.read().unwrap().ping() }\n"
-        "pub mod inner {\n    use super::{Conn, Other};\n" RUSTLSP_STD_NAMESAKES
+        "pub mod inner {\n    use super::{Conn, "
+                     "Other};\n" RUSTLSP_STD_NAMESAKES
             RUSTLSP_STD_NAMESAKE_CALLERS "}\n");
     ASSERT_NOT_NULL(r);
-    ASSERT(rustlsp_namesake_calls_reach_project(&r->resolved_calls, "test.src.main.", false));
+    ASSERT(rustlsp_namesake_calls_reach_project(&r->resolved_calls, "test.src.main.inner.", false));
     ASSERT_GTE(require_resolved(r, "main.outer", "Conn.ping"), 0);
     ASSERT_GTE(require_resolved(r, "outer_arc", "Conn.ping"), 0);
     ASSERT(find_resolved(r, "main.outer", "Other.ping") < 0);
@@ -3600,7 +3605,8 @@ static void rustlsp_macro_arg_sites_resolve(const char *caller, const char *cons
 TEST(rustlsp_json_macro_values_resolve) {
     const char *caller =
         "fn hidden() {\n"
-        "    let _ = serde_json::json!({\"a\": a::one(), \"b::c\": [a::two(), {\"d\": a::three()}]});\n"
+        "    let _ = serde_json::json!({\"a\": a::one(), \"b::c\": [a::two(), "
+                         "{\"d\": a::three()}]});\n"
         "    let _ = json!(a::four());\n"
         "}\n";
     const char *const leaves[] = {"one", "two", "three", "four"};
@@ -4480,7 +4486,7 @@ TEST(rustlsp_inline_module_use_shadows_crate_item) {
                                  "Listener::bind", &syn),
               1);
     ASSERT_TRUE(syn);
-    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.open", "test.src.main.Listener.bind",
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.platform.open", "test.src.main.Listener.bind",
                                  "Listener::bind", &syn),
               0);
     ASSERT_TRUE(syn);
@@ -4498,15 +4504,15 @@ TEST(rustlsp_doubly_nested_inline_module_body_is_walked) {
                                     "}\n");
     ASSERT_NOT_NULL(r);
     bool syn = false;
-    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.f"));
-    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.f", "test.src.main.g", "g", &syn), 1);
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.a.b.f"));
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.a.b.f", "test.src.main.a.b.g", "g", &syn), 1);
     ASSERT_TRUE(syn);
     cbm_free_result(r);
     PASS();
 }
 
 /* Two functions of one file share a name: one at the root, one in an inline
- * module. Extraction keeps the later as `<qn>` and line-qualifies the other.
+ * module. Each declaration has its own module-qualified identity.
  * A bare call names the function its own module declares, so the module's
  * call links to the module's node and the root's call to the root's node,
  * each under a strategy CALLS admission publishes. */
@@ -4518,8 +4524,8 @@ TEST(rustlsp_inline_module_namesake_fn_binds_its_own_module) {
                                     "    fn exists() -> u32 { plain(2) }\n"
                                     "}\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.plain#L1"));
     ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.plain"));
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.path.plain"));
     int in_module = 0;
     int in_root = 0;
     for (int i = 0; i < r->resolved_calls.count; i++) {
@@ -4528,12 +4534,12 @@ TEST(rustlsp_inline_module_namesake_fn_binds_its_own_module) {
             !cbm_pipeline_rust_strategy_admitted(rc->strategy)) {
             continue;
         }
-        if (strcmp(rc->caller_qn, "test.src.main.exists") == 0) {
-            ASSERT_STR_EQ(rc->callee_qn, "test.src.main.plain");
+        if (strcmp(rc->caller_qn, "test.src.main.path.exists") == 0) {
+            ASSERT_STR_EQ(rc->callee_qn, "test.src.main.path.plain");
             in_module++;
         }
         if (strcmp(rc->caller_qn, "test.src.main.top") == 0) {
-            ASSERT_STR_EQ(rc->callee_qn, "test.src.main.plain#L1");
+            ASSERT_STR_EQ(rc->callee_qn, "test.src.main.plain");
             in_root++;
         }
     }
@@ -8564,7 +8570,8 @@ TEST(rustlsp_cov_iter_rev) {
 TEST(rustlsp_cov_hm_insert) {
     CBMFileResult *r = extract_rust(
         "use std::collections::HashMap;\n"
-        "fn run() { let mut m: HashMap<String, i32> = HashMap::new(); m.insert(String::new(), 1); }\n");
+        "fn run() { let mut m: HashMap<String, i32> = HashMap::new(); "
+                                    "m.insert(String::new(), 1); }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "HashMap.insert"), 0);
     cbm_free_result(r); PASS();
@@ -8596,7 +8603,8 @@ TEST(rustlsp_cov_hm_remove) {
 TEST(rustlsp_cov_hm_len_is_empty) {
     CBMFileResult *r = extract_rust(
         "use std::collections::HashMap;\n"
-        "fn run(m: HashMap<String, i32>) {\n    let _l = m.len();\n    let _e = m.is_empty();\n}\n");
+        "fn run(m: HashMap<String, i32>) {\n    let _l = m.len();\n    "
+                                    "let _e = m.is_empty();\n}\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "HashMap.len"), 0);
     ASSERT_GTE(require_resolved(r, "run", "HashMap.is_empty"), 0);
@@ -8605,7 +8613,8 @@ TEST(rustlsp_cov_hm_len_is_empty) {
 TEST(rustlsp_cov_hm_keys_values) {
     CBMFileResult *r = extract_rust(
         "use std::collections::HashMap;\n"
-        "fn run(m: HashMap<String, i32>) {\n    for _k in m.keys() {}\n    for _v in m.values() {}\n}\n");
+        "fn run(m: HashMap<String, i32>) {\n    for _k in m.keys() "
+                                    "{}\n    for _v in m.values() {}\n}\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "HashMap.keys"), 0);
     ASSERT_GTE(require_resolved(r, "run", "HashMap.values"), 0);
@@ -8661,7 +8670,8 @@ TEST(rustlsp_cov_clo_iter_map) {
 }
 TEST(rustlsp_cov_clo_iter_filter) {
     CBMFileResult *r = extract_rust(
-        "fn run(v: Vec<i32>) -> Vec<i32> { v.iter().filter(|x| x.is_positive()).cloned().collect() }\n");
+        "fn run(v: Vec<i32>) -> Vec<i32> { v.iter().filter(|x| "
+                                    "x.is_positive()).cloned().collect() }\n");
     ASSERT_NOT_NULL(r);
     int got = find_resolved(r, "run", "is_positive") >= 0 ? 1 : 0;
     ASSERT_GTE(got, 0);  /* lenient — depends on i32 method registration */
@@ -9113,7 +9123,8 @@ TEST(rustlsp_cov_robust_only_macros) {
 }
 TEST(rustlsp_cov_robust_deeply_nested) {
     CBMFileResult *r = extract_rust(
-        "fn run() {\n    if true {\n        if true {\n            if true {\n                let _s = String::new();\n            }\n        }\n    }\n}\n");
+        "fn run() {\n    if true {\n        if true {\n            if true {\n        "
+                     "        let _s = String::new();\n            }\n        }\n    }\n}\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "String.new"), 0);
     cbm_free_result(r); PASS();
@@ -9249,7 +9260,8 @@ TEST(rustlsp_cov_trait_simple_method) {
 }
 TEST(rustlsp_cov_trait_default_method) {
     CBMFileResult *r = extract_rust(
-        "trait Counter { fn count(&self) -> usize { 0 } fn double(&self) -> usize { self.count() * 2 } }\n"
+        "trait Counter { fn count(&self) -> usize { 0 } fn "
+                                    "double(&self) -> usize { self.count() * 2 } }\n"
         "struct C; impl Counter for C {}\n"
         "fn run(c: &C) -> usize { c.double() }\n");
     ASSERT_NOT_NULL(r);
@@ -9522,7 +9534,8 @@ TEST(rustlsp_cov_edge_call_with_question_mark_chain) {
 }
 TEST(rustlsp_cov_edge_tuple_field_access) {
     CBMFileResult *r = extract_rust(
-        "fn run() {\n    let t = (String::new(), 42i32);\n    let _ = t.0.len();\n    let _ = t.1.abs();\n}\n");
+        "fn run() {\n    let t = (String::new(), 42i32);\n    let _ = "
+                                    "t.0.len();\n    let _ = t.1.abs();\n}\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "String.len"), 0);
     ASSERT_GTE(require_resolved(r, "run", "i32.abs"), 0);
@@ -9918,7 +9931,8 @@ TEST(rustlsp_gap_gat_basic) {
         "    type Item<'a> where Self: 'a;\n"
         "    fn next<'a>(&'a self) -> Self::Item<'a>;\n"
         "}\n"
-        "struct S;\nimpl Stream for S { type Item<'a> = &'a i32; fn next<'a>(&'a self) -> &'a i32 { &0 } }\n");
+        "struct S;\nimpl Stream for S { type Item<'a> = &'a i32; fn "
+                                    "next<'a>(&'a self) -> &'a i32 { &0 } }\n");
     ASSERT_NOT_NULL(r);
     cbm_free_result(r); PASS();
 }
@@ -9952,7 +9966,8 @@ TEST(rustlsp_gap_const_generic_struct) {
 
 TEST(rustlsp_gap_gat_with_method) {
     CBMFileResult *r = extract_rust(
-        "trait Iter { type Item<'a> where Self: 'a; fn next<'a>(&'a mut self) -> Option<Self::Item<'a>>; }\n");
+        "trait Iter { type Item<'a> where Self: 'a; fn next<'a>(&'a "
+                                    "mut self) -> Option<Self::Item<'a>>; }\n");
     ASSERT_NOT_NULL(r);
     cbm_free_result(r); PASS();
 }
@@ -10196,7 +10211,8 @@ TEST(rustlsp_gap_macro_using_imported_fn) {
 
 TEST(rustlsp_gap_macro_emit_struct) {
     CBMFileResult *r = extract_rust(
-        "macro_rules! make_struct { ($name:ident) => { struct $name; impl $name { fn x(&self) {} } } }\n"
+        "macro_rules! make_struct { ($name:ident) => { struct $name; "
+                                    "impl $name { fn x(&self) {} } } }\n"
         "make_struct!(Foo);\n"
         "fn run(f: &Foo) { f.x(); }\n");
     ASSERT_NOT_NULL(r);
@@ -10840,7 +10856,8 @@ TEST(rustlsp_followup_a6_blanket_impl_method) {
 TEST(rustlsp_followup_a6_assoc_type_one_hop) {
     CBMFileResult *r = extract_rust(
         "trait Container { type Item; fn first(&self) -> Self::Item; }\n"
-        "struct V; impl Container for V { type Item = String; fn first(&self) -> String { String::new() } }\n"
+        "struct V; impl Container for V { type Item = String; fn first(&self) -> "
+                     "String { String::new() } }\n"
         "fn run(v: &V) -> usize { v.first().len() }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "V.first"), 0);
@@ -10893,7 +10910,8 @@ TEST(rustlsp_partial_gat_lifetime_stripped) {
      * and resolves through the impl's assoc-type binding. */
     CBMFileResult *r = extract_rust(
         "trait Stream { type Item<'a> where Self: 'a; fn next<'a>(&'a self) -> Self::Item<'a>; }\n"
-        "struct S; impl Stream for S { type Item<'a> = &'a i32; fn next<'a>(&'a self) -> &'a i32 { &0 } }\n"
+        "struct S; impl Stream for S { type Item<'a> = &'a i32; fn next<'a>(&'a self) -> &'a i32 { "
+        "&0 } }\n"
         "fn run(s: &S) { s.next(); }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "S.next"), 0);
@@ -11415,9 +11433,7 @@ TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved) {
     PASS();
 }
 
-/* An inline module function shares its QN with a file-level function; the
- * one the graph does not keep is `<qn>#L<line>`. The module body's calls
- * belong to its own node, never to the file-level twin. */
+/* Inline-module and file-level functions own their respective body links. */
 TEST(rustlsp_inline_module_body_attaches_to_its_own_node) {
     CBMFileResult *r = extract_rust(
         "fn helper() {}\n"
@@ -11425,12 +11441,12 @@ TEST(rustlsp_inline_module_body_attaches_to_its_own_node) {
         "mod imp { use super::*; fn work() { helper(); } }\n");
     ASSERT_NOT_NULL(r);
     bool syn = false;
-    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.work#L2"));
     ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.work"));
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.imp.work"));
     ASSERT_EQ(
-        rustlsp_body_calls(r, "test.src.main.work", "test.src.main.helper", "helper", &syn), 1);
+        rustlsp_body_calls(r, "test.src.main.imp.work", "test.src.main.helper", "helper", &syn), 1);
     ASSERT_TRUE(syn);
-    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.work#L2", "test.src.main.helper", "helper",
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.work", "test.src.main.helper", "helper",
                                  &syn),
               0);
     ASSERT_FALSE(syn);
@@ -11716,8 +11732,8 @@ typedef struct {
 
 /* lib.rs declares `a` and `b` out of line and `inner` inline, imports
  * a::f as h and glob-imports both `a` and `b`. `b_readable` false stands
- * for a file that could not be read: its facts are NULL. Facts are freed before any query, so a resolve that
- * still pointed into them would fault under ASan. */
+ * for a file that could not be read: its facts are NULL. Facts are freed before any query, so a
+ * resolve that still pointed into them would fault under ASan. */
 static RustModTreeFixture rust_modtree_from_facts(bool b_readable) {
     static const char *const rels[] = {"src/lib.rs", "src/a.rs", "src/b.rs"};
     static const char *const qns[] = {"p.src.lib", "p.src.a", "p.src.b"};
@@ -11763,7 +11779,7 @@ TEST(rustlsp_modtree_built_from_scanned_facts) {
     ASSERT_STR_EQ(imported.qn, "p.src.a.f");
     CBMRustPathResult inline_item = rust_modtree_lookup(&fx, "inner::g");
     ASSERT_EQ(inline_item.kind, CBM_RUST_PATH_FUNCTION);
-    ASSERT_STR_EQ(inline_item.qn, "p.src.lib.g");
+    ASSERT_STR_EQ(inline_item.qn, "p.src.lib.inner.g");
     CBMRustPathResult glob = rust_modtree_lookup(&fx, "f");
     ASSERT_EQ(glob.kind, CBM_RUST_PATH_FUNCTION);
     ASSERT_STR_EQ(glob.qn, "p.src.a.f");
@@ -11880,6 +11896,96 @@ TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module) {
     ASSERT_STR_EQ(out[0], "p.src.device_buffers.Frame");
     ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "Frame", "self::Frame", out, 2),
               -1);
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_associated_function_keeps_its_owner_when_a_free_function_shares_its_name) {
+    CBMFileResult *r = extract_rust("struct Item; impl Item { fn local() {} }\n"
+                                    "fn local() {} fn run() { Item::local(); }\n"
+                                    "mod child { struct Item; impl Item { fn local() {} }\n"
+                                    "fn local() {} fn run() { Item::local(); } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "test.src.main.run", "test.src.main.Item.local"), 0);
+    ASSERT_GTE(require_resolved(r, "test.src.main.child.run", "test.src.main.child.Item.local"), 0);
+    ASSERT_EQ(find_resolved(r, "test.src.main.run", "test.src.main.local"), -1);
+    ASSERT_EQ(find_resolved(r, "test.src.main.child.run", "test.src.main.child.local"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_super_type_at_file_root_stays_within_the_parsed_tree) {
+    CBMFileResult *r = extract_rust("fn run(x: Option<super::Item>) {}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->defs.count, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_modtree_inline_namesakes_have_distinct_targets) {
+    static const char *const rels[] = {"src/lib.rs"};
+    static const char *const qns[] = {"p.src.lib"};
+    static const char *const sources[] = {
+        "pub const LIMIT: u8 = 0; pub struct Item;\n"
+        "pub mod a { pub const LIMIT: u8 = 1; pub struct Item;\n"
+        "  pub mod b { pub fn run() {} } }\n"
+        "pub mod c { pub const LIMIT: u8 = 2; pub struct Item; }\n"
+        "use a::LIMIT as AL; use c::LIMIT as CL;\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 1);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *out[2] = {NULL, NULL};
+    ASSERT_EQ(
+        cbm_rust_modtree_use_items_at(tree, &arena, "src/lib.rs", 0, "AL", "a::LIMIT", out, 2), 1);
+    ASSERT_STR_EQ(out[0], "p.src.lib.a.LIMIT");
+    ASSERT_EQ(
+        cbm_rust_modtree_use_items_at(tree, &arena, "src/lib.rs", 0, "CL", "c::LIMIT", out, 2), 1);
+    ASSERT_STR_EQ(out[0], "p.src.lib.c.LIMIT");
+    CBMRustPathResult value =
+        cbm_rust_modtree_resolve(tree, &arena, "p.src.lib", 0, "a::LIMIT", NULL, NULL, 0);
+    ASSERT_EQ(value.kind, CBM_RUST_PATH_NOT_FUNCTION);
+    ASSERT_STR_EQ(value.qn, "p.src.lib.a.LIMIT");
+    CBMRustPathResult type =
+        cbm_rust_modtree_resolve_type(tree, &arena, "p.src.lib", 0, "a::Item", NULL, NULL, 0);
+    ASSERT_EQ(type.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(type.qn, "p.src.lib.a.Item");
+    CBMRustPathResult fn =
+        cbm_rust_modtree_resolve(tree, &arena, "p.src.lib", 0, "a::b::run", NULL, NULL, 0);
+    ASSERT_EQ(fn.kind, CBM_RUST_PATH_FUNCTION);
+    ASSERT_STR_EQ(fn.qn, "p.src.lib.a.b.run");
+    CBMRustPathResult root_type =
+        cbm_rust_modtree_resolve_type_in_file(tree, &arena, "p.src.lib", "Item");
+    CBMRustPathResult inline_type =
+        cbm_rust_modtree_resolve_type_in_file(tree, &arena, "p.src.lib.a", "Item");
+    ASSERT_STR_EQ(root_type.qn, "p.src.lib.Item");
+    ASSERT_STR_EQ(inline_type.qn, "p.src.lib.a.Item");
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_modtree_cfg_inline_items_resolve_at_their_own_declaration) {
+    static const char *const rels[] = {"src/lib.rs"};
+    static const char *const qns[] = {"p.src.lib"};
+    static const char *const sources[] = {
+        "#[cfg(unix)] mod imp { struct Item; fn first(_: Item) {} }\n"
+        "#[cfg(windows)] mod imp { struct Item; fn second(_: Item) {} }\n",
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 1);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    uint32_t first = (uint32_t)(strstr(sources[0], "fn first") - sources[0]);
+    uint32_t second = (uint32_t)(strstr(sources[0], "fn second") - sources[0]);
+    CBMRustPathResult one =
+        cbm_rust_modtree_resolve_type(tree, &arena, "p.src.lib", first, "Item", NULL, NULL, 0);
+    CBMRustPathResult two =
+        cbm_rust_modtree_resolve_type(tree, &arena, "p.src.lib", second, "Item", NULL, NULL, 0);
+    ASSERT_EQ(one.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(one.qn, "p.src.lib.imp#cfg(unix)].Item");
+    ASSERT_EQ(two.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(two.qn, "p.src.lib.imp#cfg(windows)].Item");
     cbm_rust_modtree_free(tree);
     cbm_arena_destroy(&arena);
     PASS();
@@ -12059,7 +12165,7 @@ TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved) {
     cbm_arena_init(&arena);
     CBMRustPathResult r =
         cbm_rust_modtree_resolve_type(tree, &arena, "p.src.user", 0, "Y", NULL, NULL, 0);
-    ASSERT_EQ(r.kind, CBM_RUST_PATH_UNKNOWN);
+    ASSERT_EQ(r.kind, CBM_RUST_PATH_AMBIGUOUS);
     cbm_rust_modtree_free(tree);
     cbm_arena_destroy(&arena);
     PASS();
@@ -12132,9 +12238,8 @@ static const char *rust_sole_callee(const CBMResolvedCallArray *arr, const char 
     return callee;
 }
 
-/* Crate `q` declares `run` at its root and in inline `mod job`. Both share
- * the file's QN, so extraction keeps the later (`job::run`) as `<qn>` and
- * line-qualifies the root's as `<qn>#L1`. A path call names the function of
+/* Crate `q` declares `run` at its root and in inline `mod job`.
+ * A path call names the function of
  * the module the tree resolves it to: `job::run()` the module's, and the
  * other crate's `q::run()` the root's. */
 TEST(rustlsp_module_path_call_picks_namesake_of_declaring_module) {
@@ -12151,7 +12256,7 @@ TEST(rustlsp_module_path_call_picks_namesake_of_declaring_module) {
     CBMRustModTree *tree = rust_modtree_two_crates(rels, qns, sources, 2, 1);
     CBMArena arena;
     cbm_arena_init(&arena);
-    static const char *const def_qns[] = {"w.q.src.lib.run#L1", "w.q.src.lib.run",
+    static const char *const def_qns[] = {"w.q.src.lib.run", "w.q.src.lib.job.run",
                                           "w.q.src.lib.go", "w.p.src.lib.start"};
     static const char *const def_names[] = {"run", "run", "go", "start"};
     static const char *const def_mods[] = {"w.q.src.lib", "w.q.src.lib", "w.q.src.lib",
@@ -12179,9 +12284,9 @@ TEST(rustlsp_module_path_call_picks_namesake_of_declaring_module) {
     const char *module_call = rust_sole_callee(&in_q, "w.q.src.lib.go");
     const char *crate_call = rust_sole_callee(&in_p, "w.p.src.lib.start");
     ASSERT_NOT_NULL(module_call);
-    ASSERT_STR_EQ(module_call, "w.q.src.lib.run");
+    ASSERT_STR_EQ(module_call, "w.q.src.lib.job.run");
     ASSERT_NOT_NULL(crate_call);
-    ASSERT_STR_EQ(crate_call, "w.q.src.lib.run#L1");
+    ASSERT_STR_EQ(crate_call, "w.q.src.lib.run");
     cbm_arena_destroy(&arena);
     cbm_rust_modtree_free(tree);
     PASS();
@@ -12303,6 +12408,14 @@ static uint64_t rust_modtree_digest_of(const char *source) {
     return digest;
 }
 
+TEST(rustlsp_modtree_digest_tracks_conditional_namespace_facts) {
+    uint64_t base = rust_modtree_digest_of("use dep::Same; struct Same;\n");
+    ASSERT_NEQ(base, rust_modtree_digest_of("#[cfg(unix)] use dep::Same; struct Same;\n"));
+    ASSERT_NEQ(base, rust_modtree_digest_of("use dep::Same; #[cfg(unix)] struct Same;\n"));
+    ASSERT_EQ(base, rust_modtree_digest_of("use dep::Same; // note\nstruct Same;\n"));
+    PASS();
+}
+
 TEST(rustlsp_modtree_digest_tracks_visibility) {
     /* Visibility decides what a glob import brings in elsewhere, so an edit
      * to it must change the digest; a comment edit must not. */
@@ -12373,7 +12486,8 @@ TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it) {
         "use ext::prelude::*;\nuse support::responses;\n",
         "make_items!();\nuse support::responses;\n",
         "use ext::prelude::*;\n",
-        "use ext::prelude::*;\nmod support { pub mod responses { pub fn sse() {} } }\nuse support::responses;\n",
+        ("use ext::prelude::*;\nmod support { pub mod responses { pub fn sse() {} } }\nuse "
+         "support::responses;\n"),
         "use ext::prelude::*;\nuse undecided::m as support;\nuse support::responses;\n",
     };
     RustModTreeFixture fx = {.tree = cbm_rust_modtree_new()};
@@ -12407,10 +12521,46 @@ TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it) {
     CBMRustPathResult shadowed =
         cbm_rust_modtree_resolve(fx.tree, &fx.arena, "s.app.src.shadowed", 0, path, NULL, NULL, 0);
     ASSERT_EQ(shadowed.kind, CBM_RUST_PATH_FUNCTION);
-    ASSERT_STR_EQ(shadowed.qn, "s.app.src.shadowed.sse");
+    ASSERT_STR_EQ(shadowed.qn, "s.app.src.shadowed.support.responses.sse");
     CBMRustPathResult aliased =
         cbm_rust_modtree_resolve(fx.tree, &fx.arena, "s.app.src.aliased", 0, path, NULL, NULL, 0);
     ASSERT_EQ(aliased.kind, CBM_RUST_PATH_UNKNOWN);
+    rust_modtree_fixture_free(&fx);
+    PASS();
+}
+
+TEST(rustlsp_modtree_glob_preserves_proved_absence_of_an_extern_head) {
+    static const char *const rels[] = {"support/src/lib.rs", "app/src/lib.rs", "app/src/child.rs",
+                                       "app/src/maybe.rs"};
+    static const char *const qns[] = {"s.support.src.lib", "s.app.src.lib", "s.app.src.child",
+                                      "s.app.src.maybe"};
+    static const char *const sources[] = {
+        "pub struct Item;\n",
+        "use outside::*; use support::Item as Imported; mod child; mod maybe;\n",
+        "use super::*;\n",
+        "use outside::*; #[cfg(unix)] use support::Item as Imported;\n",
+    };
+    RustModTreeFixture fx = {.tree = cbm_rust_modtree_new()};
+    cbm_arena_init(&fx.arena);
+    CBMRustModFacts *facts[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        cbm_rust_modtree_add_file(fx.tree, rels[i], qns[i]);
+        facts[i] = cbm_rust_modfacts_scan(sources[i], (int)strlen(sources[i]));
+    }
+    int support = cbm_rust_modtree_add_crate(fx.tree, rels[0], "support", false);
+    int app = cbm_rust_modtree_add_crate(fx.tree, rels[1], "app", false);
+    cbm_rust_modtree_add_extern(fx.tree, app, "support", support);
+    cbm_rust_modtree_add_extern(fx.tree, app, "outside", -1);
+    cbm_rust_modtree_finish(fx.tree, (const CBMRustModFacts *const *)facts);
+    for (int i = 0; i < 4; i++)
+        cbm_rust_modfacts_free(facts[i]);
+    CBMRustPathResult child = cbm_rust_modtree_resolve_type(fx.tree, &fx.arena, qns[2], 0,
+                                                            "support::Item", NULL, NULL, 0);
+    ASSERT_EQ(child.kind, CBM_RUST_PATH_TYPE);
+    ASSERT_STR_EQ(child.qn, "s.support.src.lib.Item");
+    CBMRustPathResult maybe = cbm_rust_modtree_resolve_type(fx.tree, &fx.arena, qns[3], 0,
+                                                            "support::Item", NULL, NULL, 0);
+    ASSERT_EQ(maybe.kind, CBM_RUST_PATH_UNKNOWN);
     rust_modtree_fixture_free(&fx);
     PASS();
 }
@@ -12572,7 +12722,8 @@ TEST(rustlsp_trait_path_first_argument_is_receiver_only_with_self) {
         "trait Build { fn make(cfg: Config) -> Self; fn tag(&self) -> u8; }\n"
         "struct Config;\nstruct Widget;\n"
         "impl Build for Config { fn make(cfg: Config) -> Self { cfg } fn tag(&self) -> u8 { 0 } }\n"
-        "impl Build for Widget { fn make(_c: Config) -> Self { Widget } fn tag(&self) -> u8 { 1 } }\n"
+        "impl Build for Widget { fn make(_c: Config) -> Self { Widget } fn tag(&self) -> u8 { 1 } "
+        "}\n"
         "fn assoc_site(c: Config) -> Widget { Build::make(c) }\n"
         "fn method_site(w: &Widget) -> u8 { Build::tag(w) }\n");
     ASSERT_NOT_NULL(r);
@@ -13428,6 +13579,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
     RUN_TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module);
+    RUN_TEST(rustlsp_associated_function_keeps_its_owner_when_a_free_function_shares_its_name);
+    RUN_TEST(rustlsp_super_type_at_file_root_stays_within_the_parsed_tree);
+    RUN_TEST(rustlsp_modtree_inline_namesakes_have_distinct_targets);
+    RUN_TEST(rustlsp_modtree_cfg_inline_items_resolve_at_their_own_declaration);
     RUN_TEST(rustlsp_modtree_use_items_at_answers_in_the_module_at_the_offset);
     RUN_TEST(rustlsp_modtree_pub_use_chain_reaches_glob_importer);
     RUN_TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file);
@@ -13439,9 +13594,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_two_hop_reexport_names_definition);
     RUN_TEST(rustlsp_modtree_glob_of_extern_crate_names_its_items);
     RUN_TEST(rustlsp_modtree_external_glob_leaves_only_unsupplied_names_open);
+    RUN_TEST(rustlsp_modtree_digest_tracks_conditional_namespace_facts);
     RUN_TEST(rustlsp_modtree_digest_tracks_visibility);
     RUN_TEST(rustlsp_modtree_use_head_names_extern_crate_past_external_glob);
     RUN_TEST(rustlsp_modtree_expr_head_names_extern_crate_where_a_use_proves_it);
+    RUN_TEST(rustlsp_modtree_glob_preserves_proved_absence_of_an_extern_head);
     RUN_TEST(rustlsp_modtree_std_use_resolves_past_module_macro_item);
     RUN_TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type);
     RUN_TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve);

@@ -2872,6 +2872,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         const cbm_gbuf_node_t *tgt = NULL;
+        const char *publishing_rule = "registry";
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
         if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
@@ -2887,6 +2888,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                 tgt = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
                                                    semantic_reference->callee_qn, allow_tail);
                 precise_call_reference = cbm_pipeline_node_is_callable_target(tgt);
+                if (tgt)
+                    publishing_rule = "semantic_reference";
             }
         }
         if (!tgt) {
@@ -2901,9 +2904,37 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                 tgt = cbm_pipeline_rust_field_usage_target(
                     rc->main_gbuf, rc->project_name, &result->resolved_calls, usage, &field_owned);
             }
+            if (tgt)
+                publishing_rule = "field_owner";
             if (field_owned && !tgt) {
                 continue;
             }
+        }
+        if (!tgt && lang == CBM_LANG_RUST && usage->is_member_access) {
+            tgt = cbm_pipeline_rust_member_usage_target(
+                rc->main_gbuf, rc->project_name, rc->registry, &result->resolved_calls, usage);
+            if (tgt)
+                publishing_rule = "invocation";
+        }
+        if (!tgt && lang == CBM_LANG_RUST) {
+            tgt = cbm_pipeline_rust_invocation_usage_target(rc->main_gbuf, rc->project_name, result,
+                                                            usage);
+            if (tgt)
+                publishing_rule = "invocation";
+        }
+        if (!tgt && lang == CBM_LANG_RUST) {
+            tgt =
+                cbm_pipeline_rust_item_usage_target(rc->main_gbuf, rc->registry, module_qn, usage);
+        }
+        if (tgt && strcmp(publishing_rule, "registry") == 0 && lang == CBM_LANG_RUST)
+            publishing_rule = "module_path";
+        /* An unresolved Rust type path must not be shortened to a same-named
+         * declaration from another module or an unrelated imported alias. */
+        if (!tgt && lang == CBM_LANG_RUST && usage->kind == CBM_USAGE_TYPE) {
+            continue;
+        }
+        if (!tgt && lang == CBM_LANG_RUST) {
+            continue;
         }
         if (!tgt) {
             /* SQL usages are FROM/JOIN lineage refs and may bind Table/View
@@ -2951,7 +2982,9 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                     rc->main_gbuf, rc->project_name, rc->registry, &result->resolved_calls, usage);
             }
         }
-        if (!tgt || src->id == tgt->id) {
+        if (!tgt || src->id == tgt->id ||
+            (cbm_language_for_filename(src->file_path) == CBM_LANG_PROTOBUF &&
+             cbm_suppress_cross_language_ref(CBM_LANG_PROTOBUF, tgt->file_path))) {
             continue;
         }
         /* 512, matching the sequential twin in pass_usages.c. esc_ref holds up
@@ -2963,7 +2996,11 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         char uprops[CBM_SZ_512];
         char esc_ref[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
         cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
-        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
+        if (lang == CBM_LANG_RUST)
+            snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\",\"rule\":\"%s\"}", esc_ref,
+                     publishing_rule);
+        else
+            snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
         const char *edge_type = precise_call_reference ? "CALL_REFERENCE" : "USAGE";
         cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, edge_type, uprops);
         ws->usages_resolved++;
@@ -3018,10 +3055,13 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         }
         cbm_resolution_t res = cbm_registry_resolve(rc->registry, rw->var_name, module_qn, imp_keys,
                                                     imp_vals, imp_count);
-        if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        if (lang != CBM_LANG_RUST && (!res.qualified_name || res.qualified_name[0] == '\0')) {
             continue;
         }
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt =
+            lang == CBM_LANG_RUST ? cbm_pipeline_rust_write_target(rc->main_gbuf, rc->project_name,
+                                                                   module_qn, result, rw)
+                                  : cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
             continue;
         }

@@ -126,6 +126,7 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->root_source_len = source_len;
     ctx->registry = registry;
     ctx->module_qn = module_qn;
+    ctx->item_module_qn = module_qn;
     ctx->relative_module_qn = module_qn;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
@@ -548,29 +549,71 @@ typedef struct {
     const char *source;
 } RustModuleScope;
 
-/* True when module scope `ms` declares a type item called `name`. */
-static bool rust_scope_declares_type(const RustModuleScope *ms, const char *name) {
+/* Resolve only declarations written in this module scope and its explicit
+ * inline children. The AST supplies the physical identity, including cfg scopes. */
+static const char *rust_scope_type_qn(CBMArena *arena, const RustModuleScope *ms,
+                                       const char *path, const char *module_qn, bool *ambiguous) {
     if (!ms || !ms->source || ts_node_is_null(ms->scope)) {
-        return false;
+        return NULL;
     }
-    size_t name_len = strlen(name);
-    uint32_t nc = ts_node_named_child_count(ms->scope);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode item = ts_node_named_child(ms->scope, i);
-        if (!rust_is_type_item(ts_node_type(item))) {
+    TSNode scope = ms->scope;
+    const char *part = path;
+    while (part && *part) {
+        const char *sep = strstr(part, "::");
+        size_t len = sep ? (size_t)(sep - part) : strlen(part);
+        if (sep && len == 4 && strncmp(part, "self", len) == 0) {
+            part = sep + 2;
             continue;
         }
-        TSNode item_name = ts_node_child_by_field_name(item, "name", 4);
-        if (ts_node_is_null(item_name)) {
+        if (sep && len == 5 && strncmp(part, "super", len) == 0) {
+            TSNode parent = ts_node_parent(scope);
+            if (ts_node_is_null(parent)) {
+                return NULL;
+            }
+            scope = ts_node_parent(parent);
+            if (ts_node_is_null(scope)) {
+                return NULL;
+            }
+            part = sep + 2;
             continue;
         }
-        uint32_t start = ts_node_start_byte(item_name);
-        if (ts_node_end_byte(item_name) - start == name_len &&
-            strncmp(ms->source + start, name, name_len) == 0) {
-            return true;
+        TSNode found = {0};
+        uint32_t nc = ts_node_named_child_count(scope);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode item = ts_node_named_child(scope, i);
+            const char *kind = ts_node_type(item);
+            if (sep ? strcmp(kind, "mod_item") != 0 : !rust_is_type_item(kind)) {
+                continue;
+            }
+            TSNode id = ts_node_child_by_field_name(item, "name", 4);
+            if (ts_node_is_null(id)) {
+                continue;
+            }
+            uint32_t start = ts_node_start_byte(id);
+            if (ts_node_end_byte(id) - start != len ||
+                strncmp(ms->source + start, part, len) != 0) {
+                continue;
+            }
+            if (!ts_node_is_null(found)) {
+                if (ambiguous) *ambiguous = true;
+                return NULL;
+            }
+            found = item;
         }
+        if (ts_node_is_null(found)) {
+            return NULL;
+        }
+        if (!sep) {
+            const char *name = cbm_arena_strndup(arena, part, len);
+            return cbm_rust_item_qn(arena, found, ms->source, module_qn, name);
+        }
+        scope = ts_node_child_by_field_name(found, "body", 4);
+        if (ts_node_is_null(scope)) {
+            return NULL;
+        }
+        part = sep + 2;
     }
-    return false;
+    return NULL;
 }
 
 /* The module scope holding source row `row`: the innermost inline module's
@@ -1321,8 +1364,8 @@ static int rust_target_capacity(const RustLSPContext *ctx) {
 
 /* Probe every file layout a module path can denote: the exact QN, a
  * `mod.rs` directory module, the `lib.rs`/`main.rs` crate root, a child
- * module declared from a crate-root file, and an inline `mod` flattened by
- * extraction. Exactly one distinct registered item may answer. */
+ * module declared from a crate-root file. Inline items keep their own QN.
+ * Exactly one distinct registered item may answer. */
 static void rust_qn_variants(RustLSPContext *ctx, const char *qn, bool want_type, RustQnMatch *m) {
     memset(m, 0, sizeof(*m));
     if (!ctx || !ctx->registry || !qn || !qn[0]) {
@@ -1369,16 +1412,6 @@ static void rust_qn_variants(RustLSPContext *ctx, const char *qn, bool want_type
                           cbm_arena_sprintf(ctx->arena, "%.*s%s.%s", (int)(mod_seg - parent),
                                             parent, mod_seg + 4, leaf),
                           want_type, m);
-        }
-        /* Inline `mod name { ... }` items are extracted under the file itself. */
-        const char *parent_dot = strrchr(parent, '.');
-        bool physical_identity = ctx->relative_module_qn && ctx->module_qn &&
-                                 strcmp(ctx->relative_module_qn, ctx->module_qn) == 0;
-        if (physical_identity && parent_dot && (size_t)(parent_dot - parent) > prefix_len) {
-            rust_qn_probe(
-                ctx,
-                cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)(parent_dot - parent), parent, leaf),
-                want_type, m);
         }
     }
     /* Nothing declared under that module: follow the module file's own
@@ -1743,7 +1776,7 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
         }
         /* Bare identifier — this module's own item, else a unique glob source. */
         if (ctx->module_qn) {
-            const char *own = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, path);
+            const char *own = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->item_module_qn, path);
             if (ctx->glob_count > 0 && ctx->registry &&
                 !cbm_registry_lookup_type(ctx->registry, own) &&
                 !cbm_registry_lookup_func(ctx->registry, own)) {
@@ -1767,6 +1800,11 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
         const char *full_dotted = convert_path_to_qn(ctx->arena, full);
         const char *tail_dotted = convert_path_to_qn(ctx->arena, tail);
         return cbm_arena_sprintf(ctx->arena, "%s.%s", full_dotted, tail_dotted);
+    }
+
+    if (rust_module_declares_type(ctx, head)) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s.%s", ctx->item_module_qn, head,
+                                 convert_path_to_qn(ctx->arena, tail));
     }
 
     /* Prelude head: `String::from` → `alloc.string.String.from`. */
@@ -1838,7 +1876,7 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
 
     /* `Type::item` where the type arrives through exactly one glob import. */
     if (ctx->glob_count > 0 && ctx->module_qn && ctx->registry) {
-        const char *own = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, head);
+        const char *own = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->item_module_qn, head);
         if (!cbm_registry_lookup_type(ctx->registry, own)) {
             const CBMRegisteredType *glob_type = rust_resolve_glob_type(ctx, head);
             if (glob_type) {
@@ -1892,8 +1930,18 @@ static bool rust_original_offset(const RustLSPContext *ctx, TSNode node, uint32_
  * declared module tree and `use` graph exactly as a call path is: the
  * declaring definition's QN, or NULL when the tree does not settle it on a
  * project type (generic parameter, item outside the project, undecidable). */
-static const char *rust_type_qn_by_module_tree(RustLSPContext *ctx, TSNode node, const char *path) {
+static const char *rust_type_qn_by_module_tree(RustLSPContext *ctx, TSNode node, const char *path,
+                                               bool *ambiguous) {
     const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    if (!tree) {
+        TSNode scope = node;
+        while (!ts_node_is_null(scope) && strcmp(ts_node_type(scope), "declaration_list") != 0 &&
+               strcmp(ts_node_type(scope), "source_file") != 0) {
+            scope = ts_node_parent(scope);
+        }
+        RustModuleScope own = {.scope = scope, .source = ctx->source};
+        return rust_scope_type_qn(ctx->arena, &own, path, ctx->module_qn, ambiguous);
+    }
     uint32_t offset = 0;
     if (!tree || !ctx->module_qn || !path || ctx->glob_count > ctx->file_glob_count ||
         !rust_original_offset(ctx, node, &offset)) {
@@ -1905,6 +1953,7 @@ static const char *rust_type_qn_by_module_tree(RustLSPContext *ctx, TSNode node,
                                       block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
                                       block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL,
                                       block_uses);
+    if (ambiguous) *ambiguous = r.kind == CBM_RUST_PATH_AMBIGUOUS;
     return r.kind == CBM_RUST_PATH_TYPE ? r.qn : NULL;
 }
 
@@ -1995,7 +2044,9 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
             return ctx->self_value_type ? ctx->self_value_type
                                         : cbm_type_named(ctx->arena, ctx->self_type_qn);
         }
-        const char *qn = rust_type_qn_by_module_tree(ctx, node, name);
+        bool ambiguous = false;
+        const char *qn = rust_type_qn_by_module_tree(ctx, node, name, &ambiguous);
+        if (ambiguous) return cbm_type_unknown();
         return cbm_type_named(ctx->arena, qn ? qn : rust_resolve_path_expr(ctx, name));
     }
 
@@ -2005,7 +2056,9 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         if (!path) {
             return cbm_type_unknown();
         }
-        const char *qn = rust_type_qn_by_module_tree(ctx, node, path);
+        bool ambiguous = false;
+        const char *qn = rust_type_qn_by_module_tree(ctx, node, path, &ambiguous);
+        if (ambiguous) return cbm_type_unknown();
         return cbm_type_named(ctx->arena, qn ? qn : resolve_path_to_type_qn(ctx, path));
     }
 
@@ -2092,7 +2145,9 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         if (!head) {
             return cbm_type_unknown();
         }
-        const char *head_qn = rust_type_qn_by_module_tree(ctx, tn, head);
+        bool ambiguous = false;
+        const char *head_qn = rust_type_qn_by_module_tree(ctx, tn, head, &ambiguous);
+        if (ambiguous) return cbm_type_unknown();
         if (!head_qn) {
             head_qn = resolve_path_to_type_qn(ctx, head);
         }
@@ -2200,11 +2255,12 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
  * graph spells it (a bare prelude name takes its canonical path). NULL when
  * there is no tree or it does not settle the name. */
 static const char *rust_text_type_qn_by_module_tree(const CBMRustModTree *tree, CBMArena *arena,
-                                                    const char *module_qn, const char *path) {
+                                                    const char *module_qn, const char *path, bool *ambiguous) {
     if (!tree || !module_qn) {
         return NULL;
     }
     CBMRustPathResult r = cbm_rust_modtree_resolve_type_in_file(tree, arena, module_qn, path);
+    if (ambiguous) *ambiguous = r.kind == CBM_RUST_PATH_AMBIGUOUS;
     if (r.kind == CBM_RUST_PATH_TYPE) {
         return r.qn;
     }
@@ -2662,9 +2718,12 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
                     start = q + 1;
                 }
             }
-            const char *head_qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, head);
-            if (!head_qn && !strstr(head, "::") && rust_scope_declares_type(own, head)) {
-                head_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, head);
+            bool ambiguous = false;
+            const char *head_qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, head, &ambiguous);
+            if (ambiguous) return cbm_type_unknown();
+            if (!head_qn) {
+                head_qn = rust_scope_type_qn(arena, own, head, module_qn, &ambiguous);
+                if (ambiguous) return cbm_type_unknown();
             }
             if (!head_qn) {
                 head_qn = rust_unsettled_generic_head_qn(arena, head);
@@ -2696,7 +2755,13 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
     /* Has `::` → absolute path; treat dotted paths as already-qualified
      * QNs (cross-file callers pass module-qualified text directly). */
     if (!strchr(text, '.')) {
-        const char *declared = rust_text_type_qn_by_module_tree(tree, arena, module_qn, text);
+        bool ambiguous = false;
+        const char *declared = rust_text_type_qn_by_module_tree(tree, arena, module_qn, text, &ambiguous);
+        if (ambiguous) return cbm_type_unknown();
+        if (!declared) {
+            declared = rust_scope_type_qn(arena, own, text, module_qn, &ambiguous);
+            if (ambiguous) return cbm_type_unknown();
+        }
         if (declared) {
             return cbm_type_named(arena, declared);
         }
@@ -3069,6 +3134,11 @@ static void rust_register_type_alias(CBMArena *arena, CBMRegisteredType *rt, con
                                      const char *const *params, int param_count,
                                      const char *module_qn, const CBMRustModTree *tree) {
     if (!target || !target[0]) {
+        return;
+    }
+    if (tree && cbm_rust_modtree_resolve_type_in_file(tree, arena, module_qn, rt->short_name).kind ==
+                    CBM_RUST_PATH_AMBIGUOUS) {
+        rt->alias_type = cbm_type_unknown();
         return;
     }
     const char **names = NULL;
@@ -5715,7 +5785,7 @@ static const char *rust_value_path_owner(RustLSPContext *ctx, TSNode node, const
     if (r.kind == CBM_RUST_PATH_NOT_FUNCTION) {
         /* Something in the value namespace: a unit struct when the type
          * namespace settles the same name on a project struct. */
-        return rust_type_qn_by_module_tree(ctx, node, path);
+        return rust_type_qn_by_module_tree(ctx, node, path, NULL);
     }
     return NULL;
 }
@@ -6076,7 +6146,7 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
             }
         }
         /* Same-module type? */
-        const char *type_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+        const char *type_qn = cbm_rust_item_qn(ctx->arena, node, ctx->source, ctx->module_qn, name);
         if (cbm_registry_lookup_type(ctx->registry, type_qn)) {
             return cbm_type_named(ctx->arena, type_qn);
         }
@@ -6392,7 +6462,10 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         if (!ts_node_is_null(name_node)) {
             char *path = rust_node_text(ctx, name_node);
             if (path) {
-                return cbm_type_named(ctx->arena, resolve_path_to_type_qn(ctx, path));
+                bool ambiguous = false;
+                const char *qn = rust_type_qn_by_module_tree(ctx, name_node, path, &ambiguous);
+                if (ambiguous) return cbm_type_unknown();
+                return cbm_type_named(ctx->arena, qn ? qn : resolve_path_to_type_qn(ctx, path));
             }
         }
         return cbm_type_unknown();
@@ -12867,6 +12940,7 @@ static const char *rust_function_node_qn(RustLSPContext *ctx, TSNode func_node, 
             ? cbm_arena_sprintf(ctx->arena, "%s.%s[%s]", prefix, name, ctx->self_trait_spelling)
             : cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name);
     if (!parent_qn) {
+        qn = cbm_rust_item_qn(ctx->arena, func_node, ctx->source, ctx->module_qn, name);
         qn = cbm_rust_cfg_scope_qn(ctx->arena, func_node, ctx->source, qn);
     }
     if (ctx->registry) {
@@ -13171,7 +13245,7 @@ static const char *rust_impl_declared_self(const CBMRustModTree *tree, CBMArena 
 static const char *rust_impl_std_wrapper_self(const CBMRustModTree *tree, CBMArena *arena,
                                               const char *module_qn, const char *spelling) {
     const char *path = spelling ? rust_impl_self_path(arena, spelling) : NULL;
-    const char *qn = path ? rust_text_type_qn_by_module_tree(tree, arena, module_qn, path) : NULL;
+    const char *qn = path ? rust_text_type_qn_by_module_tree(tree, arena, module_qn, path, NULL) : NULL;
     if (!qn && path && tree && module_qn && !strchr(path, ':') &&
         cbm_rust_modtree_resolve_type_in_file(tree, arena, module_qn, path).kind ==
             CBM_RUST_PATH_UNKNOWN) {
@@ -13214,7 +13288,7 @@ static const char **rust_impl_receiver_list(CBMArena *arena, const char *lead, c
  * prelude's (the rule rust_impl_std_wrapper_self applies). */
 static const char *rust_impl_self_path_qn(const CBMRustModTree *tree, CBMArena *arena,
                                           const char *module_qn, const char *path) {
-    const char *qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, path);
+    const char *qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, path, NULL);
     if (!qn && !strchr(path, ':') &&
         cbm_rust_modtree_resolve_type_in_file(tree, arena, module_qn, path).kind ==
             CBM_RUST_PATH_UNKNOWN) {
@@ -13389,7 +13463,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
      * type's base name (extract_rust_impl), not by the resolved receiver:
      * `impl<T> Shape for G<T>` in ops.rs owns `ops.G.area[Shape]` even when
      * `G` is declared in another module. */
-    const char *owner_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn,
+    const char *owner_qn = cbm_rust_item_qn(ctx->arena, impl_node, ctx->source, ctx->module_qn,
                                              cbm_rust_impl_owner_name(ctx->arena, type_text));
     TSNode body = ts_node_child_by_field_name(impl_node, "body", 4);
     if (!ts_node_is_null(body)) {
@@ -13420,7 +13494,7 @@ static void rust_process_trait(RustLSPContext *ctx, TSNode trait_node) {
     TSNode body = ts_node_child_by_field_name(trait_node, "body", 4);
     if (!name || !name[0] || ts_node_is_null(body))
         return;
-    const char *owner_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    const char *owner_qn = cbm_rust_item_qn(ctx->arena, trait_node, ctx->source, ctx->module_qn, name);
     const CBMRegisteredType *trait_type =
         ctx->registry ? cbm_registry_lookup_type(ctx->registry, owner_qn) : NULL;
 
@@ -13605,9 +13679,8 @@ static void rust_drop_shadowed_module_fns(RustLSPContext *ctx, TSNode body, cons
 }
 
 /* Bind the functions module `body` (the file root or an inline module's
- * declaration list) declares whose name another function of the file
- * shares. Extraction gives all of them the file's module QN, so the name
- * alone cannot pick one; Rust resolves a bare name in the module's bodies to
+ * declaration list) declares whose name another function of the file shares.
+ * Rust resolves a bare name in the module's bodies to
  * the module's own item unless a local, a block item or a block `use`
  * shadows it, and items of enclosing modules are not in scope at all. A
  * name declared twice in the module (cfg twins) or that any identifier of
@@ -13706,7 +13779,7 @@ static const char *rust_module_fn_target(const RustLSPContext *ctx, const char *
  * sees; the crate's module tree already knows them as that module's imports,
  * so they extend the module-level use set, not a block's. `self::` /
  * `super::` in those `use`s are relative to the inline module. Its items are
- * extracted under the file's module QN, so bodies keep that identity. */
+ * extracted under their inline-module QN, so bodies keep that identity. */
 static void rust_process_module(RustLSPContext *ctx, TSNode mod_node, int depth) {
     TSNode body = ts_node_child_by_field_name(mod_node, "body", 4);
     char *name = rust_node_text(ctx, ts_node_child_by_field_name(mod_node, "name", 4));
@@ -13717,11 +13790,14 @@ static void rust_process_module(RustLSPContext *ctx, TSNode mod_node, int depth)
     int saved_globs = ctx->glob_count;
     int saved_file_uses = ctx->file_use_count;
     int saved_file_globs = ctx->file_glob_count;
+    const char *saved_item_module = ctx->item_module_qn;
+    const char *item_module = cbm_rust_item_qn(
+        ctx->arena, body, ctx->source, ctx->module_qn, "");
+    ctx->item_module_qn = cbm_arena_strndup(ctx->arena, item_module, strlen(item_module) - 1);
     const char *saved_relative = ctx->relative_module_qn;
     ctx->relative_module_qn =
         saved_relative ? cbm_arena_sprintf(ctx->arena, "%s.%s", saved_relative, name) : NULL;
     rust_collect_uses(ctx, body);
-    ctx->relative_module_qn = saved_relative;
     ctx->file_use_count = ctx->use_count;
     ctx->file_glob_count = ctx->glob_count;
     const char **saved_fn_names = ctx->module_fn_names;
@@ -13747,6 +13823,8 @@ static void rust_process_module(RustLSPContext *ctx, TSNode mod_node, int depth)
         }
     }
 
+    ctx->relative_module_qn = saved_relative;
+    ctx->item_module_qn = saved_item_module;
     ctx->use_count = saved_uses;
     ctx->glob_count = saved_globs;
     ctx->file_use_count = saved_file_uses;
@@ -14589,7 +14667,10 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
             more[i] = more[decided];
             continue;
         }
-        const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        const char *def_mod = cbm_rust_modtree_item_module(tree, arena, d->qualified_name);
+        if (!def_mod) {
+            def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        }
         const char *self = rust_impl_declared_self(tree, arena, def_mod, d->receiver_type,
                                                    d->receiver_spelling, rust_declared_type,
                                                    &declared);
@@ -14678,7 +14759,7 @@ static void rust_register_supertraits(CBMArena *arena, const CBMTypeRegistry *re
         }
         const char *lt = strchr(s, '<');
         const char *path = lt ? cbm_arena_strndup(arena, s, (size_t)(lt - s)) : s;
-        const char *qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, path);
+        const char *qn = rust_text_type_qn_by_module_tree(tree, arena, module_qn, path, NULL);
         int32_t index = qn ? cbm_idxmemo_get(type_idx, qn) : -1;
         if (index < 0 || !reg->types[index].is_interface) {
             const RustTraitScope scope = {.tree = tree};
@@ -14724,6 +14805,10 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         if (!cbm_label_is_type_like(d->label)) {
             continue;
         }
+        const char *def_mod = cbm_rust_modtree_item_module(tree, arena, d->qualified_name);
+        if (!def_mod) {
+            def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        }
         CBMRegisteredType rt;
         memset(&rt, 0, sizeof(rt));
         rt.qualified_name = cbm_arena_strdup(arena, d->qualified_name);
@@ -14732,7 +14817,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             d->is_interface || strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Interface") == 0;
         rust_register_type_alias(arena, &rt, d->return_types, d->signature_param_types,
                                  d->signature_param_count,
-                                 d->def_module_qn ? d->def_module_qn : module_qn, tree);
+                                 def_mod, tree);
         if (!rt.alias_type) {
             rt.type_param_names = rust_type_param_names_copy(
                 arena, d->signature_param_types, d->signature_param_count);
@@ -14762,9 +14847,12 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                                  ? cbm_idxmemo_get(&type_idx, d->qualified_name)
                                  : -1;
         if (type_index >= 0 && reg->types[type_index].is_interface) {
+            const char *def_mod = cbm_rust_modtree_item_module(tree, arena, d->qualified_name);
+            if (!def_mod) {
+                def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+            }
             rust_register_supertraits(arena, reg, &type_idx, &trait_names, tree,
-                                      &reg->types[type_index], d->embedded_types,
-                                      d->def_module_qn ? d->def_module_qn : module_qn);
+                                      &reg->types[type_index], d->embedded_types, def_mod);
         }
     }
 
@@ -14775,7 +14863,10 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         if (!d->is_rust_impl_relation || !receiver || !d->trait_qn) {
             continue;
         }
-        const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        const char *def_mod = cbm_rust_modtree_item_module(tree, arena, d->qualified_name);
+        if (!def_mod) {
+            def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        }
         const char *trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
                                                          d->trait_qn, def_mod);
         if (!trait_qn) {
@@ -14804,7 +14895,10 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         CBMRustLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label || d->is_rust_impl_relation)
             continue;
-        const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        const char *def_mod = cbm_rust_modtree_item_module(tree, arena, d->qualified_name);
+        if (!def_mod) {
+            def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        }
 
         /* Struct fields (`name:type|name:type`) let `self.field.method()` and
          * `value.field.method()` type their receiver across files. Field types
@@ -15092,8 +15186,8 @@ static TSNode rust_impl_local_item(RustLSPContext *ctx, TSNode impl_node, const 
     return none;
 }
 
-/* Registered identity of in-file type item `item`. Extraction gives every
- * item of a file the file's module QN; a same-QN item other than the one the
+/* Registered identity of in-file type item `item`, including its inline
+ * modules. A same-QN item other than the one the
  * graph keeps carries a `#L<line>` suffix. *def_line pins the graph node. */
 static const char *rust_impl_local_qn(RustLSPContext *ctx, TSNode item, bool want_trait,
                                       uint32_t *def_line) {
@@ -15102,7 +15196,7 @@ static const char *rust_impl_local_qn(RustLSPContext *ctx, TSNode item, bool wan
         return NULL;
     }
     uint32_t line = ts_node_start_point(item).row + 1;
-    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    const char *qn = cbm_rust_item_qn(ctx->arena, item, ctx->source, ctx->module_qn, name);
     const CBMRegisteredType *type =
         cbm_registry_lookup_type(ctx->registry, cbm_arena_sprintf(ctx->arena, "%s#L%u", qn, line));
     if (!type) {

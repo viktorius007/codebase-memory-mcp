@@ -115,6 +115,7 @@ typedef struct {
     uint32_t active_start;
     uint32_t active_end;
     const char *name;
+    bool import_binding;
 } CBMLexicalBinding;
 
 typedef enum {

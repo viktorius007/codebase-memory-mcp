@@ -1241,10 +1241,9 @@ static int named_edge_count(cbm_store_t *s, const char *project, const char *edg
  * an alias-mapping assertion pass accidentally. */
 /* As named_edge_to_file_count, restricted to targets labelled `target_label`
  * when it is non-NULL. */
-static int named_edge_to_labelled_count(cbm_store_t *s, const char *project,
-                                        const char *edge_type, const char *source_name,
-                                        const char *target_name, const char *target_file_path,
-                                        const char *target_label) {
+static int named_edge_to_labelled_count(cbm_store_t *s, const char *project, const char *edge_type,
+                                        const char *source_name, const char *target_name,
+                                        const char *target_file_path, const char *target_label) {
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
     if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
@@ -2837,11 +2836,14 @@ typedef struct {
 } usage_expectation_t;
 
 static const usage_expectation_t rust_bare_binding_rows[] = {
-    {"f", "b", "src/m.rs", 0, NULL},     {"f", "b", "src/other.rs", 0, NULL},   {"h", "b", "src/m.rs", 1, NULL},
-    {"h", "b", "src/other.rs", 0, NULL}, {"q", "b", "src/other.rs", 1, NULL},   {"q", "b", "src/m.rs", 0, NULL},
+    {"f", "b", "src/m.rs", 0, NULL},     {"f", "b", "src/other.rs", 0, NULL},
+    {"h", "b", "src/m.rs", 1, NULL},     {"h", "b", "src/other.rs", 0, NULL},
+    {"q", "b", "src/other.rs", 1, NULL}, {"q", "b", "src/m.rs", 0, NULL},
     {"r", "cap", "src/m.rs", 1, NULL},   {"r", "cap", "src/other.rs", 0, NULL},
 };
-enum { RUST_BARE_BINDING_ROWS = sizeof(rust_bare_binding_rows) / sizeof(rust_bare_binding_rows[0]) };
+enum {
+    RUST_BARE_BINDING_ROWS = sizeof(rust_bare_binding_rows) / sizeof(rust_bare_binding_rows[0])
+};
 
 static void edge_expectation_counts(const char *tmp, const char *db_name, const char *edge_type,
                                     const usage_expectation_t *rows, int row_count, int *out) {
@@ -3003,9 +3005,10 @@ TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob) {
                     "pub fn f() -> i32 { let g = b; a() }\n"
                     "pub fn q() -> i32 { let g = crate::other::b; 0 }\n"
                     "pub fn r(x: &Buf) { assert_eq!(x.cap(), 0); }\n");
-    write_temp_file(tmp, "src/globuser.rs", "use crate::m::*;\npub fn h() -> i32 { let g = b; a() }\n");
-    int failed = usage_expectations_hold_in_both_modes(tmp, rust_bare_binding_rows,
-                                                       RUST_BARE_BINDING_ROWS);
+    write_temp_file(tmp, "src/globuser.rs",
+                    "use crate::m::*;\npub fn h() -> i32 { let g = b; a() }\n");
+    int failed =
+        usage_expectations_hold_in_both_modes(tmp, rust_bare_binding_rows, RUST_BARE_BINDING_ROWS);
     th_rmtree(tmp);
     ASSERT_EQ(failed, -1);
     PASS();
@@ -3017,9 +3020,10 @@ TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob) {
  * on an unproven receiver link to no field. The literal field `n` of G reaches
  * the Field even though G's same-named getter holds the unsuffixed QN. */
 static const usage_expectation_t rust_field_record_rows[] = {
-    {"read", "x", "src/a.rs", 1, NULL}, {"read", "x", "src/b.rs", 0, NULL},  {"make", "x", "src/a.rs", 1, NULL},
-    {"bare", "x", "src/a.rs", 0, NULL}, {"bare", "x", "src/b.rs", 0, NULL},  {"guess", "x", "src/a.rs", 0, NULL},
-    {"guess", "x", "src/b.rs", 0, NULL}, {"mkg", "n", "src/a.rs", 1, "Field"},
+    {"read", "x", "src/a.rs", 1, NULL},    {"read", "x", "src/b.rs", 0, NULL},
+    {"make", "x", "src/a.rs", 1, NULL},    {"bare", "x", "src/a.rs", 0, NULL},
+    {"bare", "x", "src/b.rs", 0, NULL},    {"guess", "x", "src/a.rs", 0, NULL},
+    {"guess", "x", "src/b.rs", 0, NULL},   {"mkg", "n", "src/a.rs", 1, "Field"},
     {"mkg", "n", "src/a.rs", 0, "Method"},
 };
 
@@ -3056,7 +3060,9 @@ TEST(pipeline_rust_field_usage_from_resolver_record) {
  * (import a from m, then a bare `b` that m and other both define) keep the
  * import-reachability pick of m.b. */
 static const usage_expectation_t python_bare_binding_rows[] = {
-    {"f", "b", "m.py", 1, NULL}, {"f", "b", "other.py", 0, NULL}, {"h", "b", "m.py", 1, NULL},
+    {"f", "b", "m.py", 1, NULL},
+    {"f", "b", "other.py", 0, NULL},
+    {"h", "b", "m.py", 1, NULL},
     {"h", "b", "other.py", 0, NULL},
 };
 static const usage_expectation_t go_bare_binding_rows[] = {
@@ -3085,10 +3091,12 @@ TEST(pipeline_python_and_go_bare_name_keep_import_reachability) {
         FAIL("tmpdir");
     }
     write_temp_file(go, "go.mod", "module fx\n\ngo 1.21\n");
-    write_temp_file(go, "m/m.go", "package m\n\nfunc A() int { return 1 }\n\nfunc B() int { return 2 }\n");
+    write_temp_file(go, "m/m.go",
+                    "package m\n\nfunc A() int { return 1 }\n\nfunc B() int { return 2 }\n");
     write_temp_file(go, "other/other.go", "package other\n\nfunc B() int { return 3 }\n");
     write_temp_file(go, "user/user.go",
-                    "package user\n\nimport \"fx/m\"\n\nfunc F() int {\n\tg := B\n\t_ = g\n\treturn m.A()\n}\n");
+                    "package user\n\nimport \"fx/m\"\n\nfunc F() int {\n\tg := B\n\t_ = "
+                    "g\n\treturn m.A()\n}\n");
     int go_failed = usage_expectations_hold_in_both_modes(
         go, go_bare_binding_rows,
         (int)(sizeof(go_bare_binding_rows) / sizeof(go_bare_binding_rows[0])));
@@ -3680,8 +3688,8 @@ static cbm_incremental_route_t closure_edge_budget_route(bool edit_dense) {
             int pos = 0;
             for (int k = 0; k < CHAIN; k++) {
                 pos += snprintf(body + pos, sizeof(body) - (size_t)pos,
-                                "export function dense%02d_%02d(): number {\n  return %d;\n}\n",
-                                f, k, round);
+                                "export function dense%02d_%02d(): number {\n  return %d;\n}\n", f,
+                                k, round);
                 if (k + 1 < CHAIN) {
                     pos += snprintf(body + pos, sizeof(body) - (size_t)pos,
                                     "export function denseCall%02d_%02d(): number {\n"
@@ -3696,8 +3704,8 @@ static cbm_incremental_route_t closure_edge_budget_route(bool edit_dense) {
             if (round == 1 && (edit_dense || f >= DENSE)) {
                 break;
             }
-            snprintf(body, sizeof(body), "export function sparse%02d(): number {\n  return %d;\n}\n",
-                     f, round);
+            snprintf(body, sizeof(body),
+                     "export function sparse%02d(): number {\n  return %d;\n}\n", f, round);
             snprintf(name, sizeof(name), "sparse_%02d.ts", f);
             write_temp_file(tmp, name, body);
         }
@@ -7158,13 +7166,14 @@ static RustPublishedCallDumpObservation observe_rust_calls_without_dump(const ch
 }
 
 TEST(pipeline_rust_dump_records_only_published_calls_in_both_modes) {
-    static const char source[] = "pub fn target() -> u8 { 1 }\n"
-                                 "pub fn sink(_marker: &str, value: u8) -> u8 { value }\n"
-                                 "pub fn recursive() { recursive(); }\n"
-                                 "pub struct S;\n"
-                                 "impl Default for S { fn default() -> Self { S } }\n"
-                                 "pub fn closed() { let _s = Default::default(); }\n"
-                                 "pub fn caller() -> u8 { sink(\"(\", target()); sink(\"(\", target()) }\n";
+    static const char source[] =
+        "pub fn target() -> u8 { 1 }\n"
+        "pub fn sink(_marker: &str, value: u8) -> u8 { value }\n"
+        "pub fn recursive() { recursive(); }\n"
+        "pub struct S;\n"
+        "impl Default for S { fn default() -> Self { S } }\n"
+        "pub fn closed() { let _s = Default::default(); }\n"
+        "pub fn caller() -> u8 { sink(\"(\", target()); sink(\"(\", target()) }\n";
     const char *nested_target = strstr(source, "target())");
     ASSERT_NOT_NULL(nested_target);
     uint32_t target_start = (uint32_t)(nested_target - source);
@@ -7260,12 +7269,10 @@ static int rust_instantiated_method_nodes_are_exact(cbm_store_t *store, const ch
 TEST(pipeline_rust_impl_edges_pin_in_file_items_to_their_line) {
     cbm_gbuf_t *gb = cbm_gbuf_new("rust-pin", "/tmp/rust-pin");
     ASSERT_NOT_NULL(gb);
-    int64_t type_id =
-        cbm_gbuf_upsert_node(gb, "Struct", "Local", "rust-pin.src.lib.Local", "src/lib.rs", 2, 2,
-                             "{}");
-    int64_t trait_id =
-        cbm_gbuf_upsert_node(gb, "Interface", "Paint", "rust-pin.src.lib.Paint", "src/lib.rs", 1,
-                             1, "{}");
+    int64_t type_id = cbm_gbuf_upsert_node(gb, "Struct", "Local", "rust-pin.src.lib.Local",
+                                           "src/lib.rs", 2, 2, "{}");
+    int64_t trait_id = cbm_gbuf_upsert_node(gb, "Interface", "Paint", "rust-pin.src.lib.Paint",
+                                            "src/lib.rs", 1, 1, "{}");
     CBMFileResult result;
     memset(&result, 0, sizeof(result));
     cbm_arena_init(&result.arena);
@@ -7295,11 +7302,12 @@ TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_mode
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_nodes_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "lib.rs",
-                    "trait From<T> { fn from(value: T) -> Self; }\n"
-                    "struct Feet; struct Inches; struct Meters;\n"
-                    "impl From<Feet> for Meters { fn from(_value: Feet) -> Self { Meters } }\n"
-                    "impl From<Inches> for Meters { fn from(_value: Inches) -> Self { Meters } }\n");
+    write_temp_file(
+        tmp, "lib.rs",
+        "trait From<T> { fn from(value: T) -> Self; }\n"
+        "struct Feet; struct Inches; struct Meters;\n"
+        "impl From<Feet> for Meters { fn from(_value: Feet) -> Self { Meters } }\n"
+        "impl From<Inches> for Meters { fn from(_value: Inches) -> Self { Meters } }\n");
     for (int i = 0; i < 52; i++) {
         char name[64];
         char body[128];
@@ -7446,13 +7454,11 @@ static RustTraitCallObservation observe_rust_trait_calls(const char *root, const
         snprintf(admitted_qn, sizeof(admitted_qn), "%s.lib.Scale.value[Measure<Feet>]", project);
         observation.admitted = exact_call_qns_exist(store, project, source_qn, admitted_qn);
         snprintf(source_qn, sizeof(source_qn), "%s.lib.ambiguous", project);
-        snprintf(ambiguous_a_qn, sizeof(ambiguous_a_qn),
-                 "%s.lib.Meters.read[Read<Feet>]", project);
-        snprintf(ambiguous_b_qn, sizeof(ambiguous_b_qn),
-                 "%s.lib.Meters.read[Read<Inches>]", project);
-        observation.ambiguous =
-            exact_call_qns_exist(store, project, source_qn, ambiguous_a_qn) ||
-            exact_call_qns_exist(store, project, source_qn, ambiguous_b_qn);
+        snprintf(ambiguous_a_qn, sizeof(ambiguous_a_qn), "%s.lib.Meters.read[Read<Feet>]", project);
+        snprintf(ambiguous_b_qn, sizeof(ambiguous_b_qn), "%s.lib.Meters.read[Read<Inches>]",
+                 project);
+        observation.ambiguous = exact_call_qns_exist(store, project, source_qn, ambiguous_a_qn) ||
+                                exact_call_qns_exist(store, project, source_qn, ambiguous_b_qn);
     }
     if (store) {
         cbm_store_close(store);
@@ -7623,7 +7629,8 @@ typedef struct {
 
 static const RustModTreeCallCase rust_modtree_call_cases[] = {
     {"re-export from a private module", "core.src.lib.root_fn", "util.src.inner.helper", true},
-    {"member crate inline module path", "core.src.lib.root_fn", "util.src.lib.normalize", true},
+    {"member crate inline module path", "core.src.lib.root_fn", "util.src.lib.paths.normalize",
+     true},
     {"child module path", "core.src.exec_policy.load", "core.src.exec_policy.model_policy.permit",
      true},
     {"#[path] file imports its parent's item", "core.src.exec_policy.model_policy_tests.t",
@@ -7634,8 +7641,10 @@ static const RustModTreeCallCase rust_modtree_call_cases[] = {
      "core.src.lib.root_fn", true},
     {"child module of a file module", "core.src.tools.tool_root", "core.src.tools.spec.build",
      true},
-    {"super:: from an inline module", "core.src.tools.deep", "core.src.tools.spec.build", true},
-    {"inline module sibling", "core.src.tools.caller", "core.src.tools.deep", true},
+    {"super:: from an inline module", "core.src.tools.inline_mod.deep", "core.src.tools.spec.build",
+     true},
+    {"inline module sibling", "core.src.tools.inline_mod.caller", "core.src.tools.inline_mod.deep",
+     true},
     {"use of a crate:: item", "core.src.tools.spec.build", "core.src.exec_policy.load", true},
     {"path-dependency import", "core.tests.suite.cases.case", "core.tests.common.responses.sse",
      true},
@@ -7643,8 +7652,7 @@ static const RustModTreeCallCase rust_modtree_call_cases[] = {
      "core.tests.common.lib.wait_for_event", true},
     {"path-dependency module path", "core.tests.suite.cases.case",
      "core.tests.common.responses.mount", true},
-    {"own library from a test target", "core.tests.suite.cases.case", "core.src.lib.root_fn",
-     true},
+    {"own library from a test target", "core.tests.suite.cases.case", "core.src.lib.root_fn", true},
     {"external import shadows a project name", "core.tests.suite.cases.ext",
      "core.src.exec_policy.load", false},
 };
@@ -7867,7 +7875,8 @@ TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes) {
                     "[dependencies]\ncodex-util = { workspace = true }\n"
                     "[dev-dependencies]\ncore_test_support = { workspace = true }\n"
                     "ext_dep = \"1\"\n");
-    write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "util/Cargo.toml",
+                    "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
     /* write_temp_file creates one directory level: parents come first. */
     write_temp_file(tmp, "core/tests/all.rs", "mod suite;\n");
     write_temp_file(tmp, "core/tests/common/Cargo.toml",
@@ -7958,7 +7967,8 @@ TEST(pipeline_rust_type_names_resolve_through_declared_module_tree) {
                     "[package]\nname = \"codex-core\"\nedition = \"2021\"\n"
                     "[dependencies]\ncore_test_support = { path = \"../support\" }\n"
                     "ext_dep = \"1\"\n");
-    write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "util/Cargo.toml",
+                    "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
     /* A path dependency outside the workspace, named by its crate name. */
     write_temp_file(tmp, "support/Cargo.toml",
                     "[package]\nname = \"core_test_support\"\nedition = \"2021\"\n"
@@ -7972,18 +7982,19 @@ TEST(pipeline_rust_type_names_resolve_through_declared_module_tree) {
                     "pub struct Widget;\nimpl Widget {\n    pub fn spin(&self) -> u8 { 2 }\n}\n");
     write_temp_file(tmp, "core/src/other.rs",
                     "pub struct Widget;\nimpl Widget {\n    pub fn spin(&self) -> u8 { 3 }\n}\n");
-    write_temp_file(tmp, "core/src/by_use.rs",
-                    "use crate::model::Widget;\nuse std::sync::Arc;\n"
-                    "impl Widget {\n    pub fn extra(&self) -> u8 { 5 }\n}\n"
-                    "pub fn widget_made() -> Widget { Widget }\n"
-                    "pub fn use_widget_ret() -> u8 { let w = widget_made(); w.spin() }\n"
-                    "pub fn harness() -> core_test_support::harness::Harness {\n"
-                    "    core_test_support::harness::Harness\n}\n"
-                    "pub fn crate_ret() -> u8 { let h = harness(); h.run() }\n"
-                    "pub fn crate_param(h: &core_test_support::harness::Harness) -> u8 { h.run() }\n"
-                    "pub fn make() -> Arc<Widget> { Arc::new(Widget) }\n"
-                    "pub fn returned() -> u8 { let w = make(); w.spin() }\n"
-                    "#[cfg(test)]\n#[path = \"by_use_tests.rs\"]\nmod tests;\n");
+    write_temp_file(
+        tmp, "core/src/by_use.rs",
+        "use crate::model::Widget;\nuse std::sync::Arc;\n"
+        "impl Widget {\n    pub fn extra(&self) -> u8 { 5 }\n}\n"
+        "pub fn widget_made() -> Widget { Widget }\n"
+        "pub fn use_widget_ret() -> u8 { let w = widget_made(); w.spin() }\n"
+        "pub fn harness() -> core_test_support::harness::Harness {\n"
+        "    core_test_support::harness::Harness\n}\n"
+        "pub fn crate_ret() -> u8 { let h = harness(); h.run() }\n"
+        "pub fn crate_param(h: &core_test_support::harness::Harness) -> u8 { h.run() }\n"
+        "pub fn make() -> Arc<Widget> { Arc::new(Widget) }\n"
+        "pub fn returned() -> u8 { let w = make(); w.spin() }\n"
+        "#[cfg(test)]\n#[path = \"by_use_tests.rs\"]\nmod tests;\n");
     write_temp_file(tmp, "core/src/by_use_tests.rs",
                     "use super::*;\n"
                     "impl Widget {\n    fn test_only(&self) -> u8 { 9 }\n}\n"
@@ -8043,7 +8054,8 @@ TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
     write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"core\", \"util\"]\n");
     write_temp_file(tmp, "core/Cargo.toml",
                     "[package]\nname = \"codex-core\"\nedition = \"2021\"\n");
-    write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "util/Cargo.toml",
+                    "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "core/src/lib.rs",
                     "mod svc;\nmod out;\nmod holder;\nmod calls;\nmod calls_bare;\n");
     write_temp_file(tmp, "core/src/svc.rs",
@@ -8108,7 +8120,8 @@ static void write_rust_core_workspace(const char *tmp, const char *lib_rs,
     write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"core\", \"util\"]\n");
     write_temp_file(tmp, "core/Cargo.toml",
                     "[package]\nname = \"codex-core\"\nedition = \"2021\"\n");
-    write_temp_file(tmp, "util/Cargo.toml", "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "util/Cargo.toml",
+                    "[package]\nname = \"codex-util\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "core/src/lib.rs", lib_rs);
     for (int i = 0; i < file_count; i++) {
         write_temp_file(tmp, files[i].path, files[i].content);
@@ -8158,17 +8171,16 @@ TEST(pipeline_rust_private_inherent_method_hidden_outside_its_module) {
     PASS();
 }
 
-/* Two functions of one file share a QN (inline modules are not part of it):
- * the one published as `<qn>#L<line>` sources the calls of its own body. */
+/* Namesakes in distinct inline modules source only their own bodies' calls. */
 static const RustModTreeCallCase rust_line_qualified_caller_cases[] = {
-    {"inline-module twin calls from its own node", "core.src.jobs.run#L4", "core.src.jobs.f", true},
-    {"inline-module twin keeps its namesake's calls", "core.src.jobs.run#L4", "core.src.jobs.g",
+    {"inline-module twin calls from its own node", "core.src.jobs.x.run", "core.src.jobs.f", true},
+    {"inline-module twin keeps its namesake's calls", "core.src.jobs.x.run", "core.src.jobs.g",
      false},
-    {"plain-QN twin calls from its own node", "core.src.jobs.run", "core.src.jobs.g", true},
-    {"plain-QN twin does not take its namesake's calls", "core.src.jobs.run", "core.src.jobs.f",
+    {"plain-QN twin calls from its own node", "core.src.jobs.y.run", "core.src.jobs.g", true},
+    {"plain-QN twin does not take its namesake's calls", "core.src.jobs.y.run", "core.src.jobs.f",
      false},
-    {"root fn beside an inline-module namesake", "core.src.solo.run#L1", "core.src.solo.f", true},
-    {"root fn's call not on the inline-module namesake", "core.src.solo.run", "core.src.solo.f",
+    {"root fn beside an inline-module namesake", "core.src.solo.run", "core.src.solo.f", true},
+    {"root fn's call not on the inline-module namesake", "core.src.solo.job.run", "core.src.solo.f",
      false},
 };
 
@@ -8187,10 +8199,10 @@ TEST(pipeline_rust_line_qualified_twin_sources_its_own_calls) {
     write_rust_core_workspace(tmp, "mod jobs;\nmod solo;\n", files,
                               (int)(sizeof(files) / sizeof(files[0])));
 
-    int mismatches = check_rust_modtree_calls_in_both_modes(
-        tmp, rust_line_qualified_caller_cases,
-        (int)(sizeof(rust_line_qualified_caller_cases) /
-              sizeof(rust_line_qualified_caller_cases[0])));
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, rust_line_qualified_caller_cases,
+                                               (int)(sizeof(rust_line_qualified_caller_cases) /
+                                                     sizeof(rust_line_qualified_caller_cases[0])));
     th_rmtree(tmp);
     ASSERT_EQ(0, mismatches);
     PASS();
@@ -8231,8 +8243,8 @@ TEST(pipeline_rust_cfg_dependent_name_links_nothing) {
 static const RustModTreeCallCase rust_trait_scope_cases[] = {
     {"impl of a trait the caller never names", "core.src.user.no_trait", "core.src.ext.S.run[Ext]",
      false},
-    {"impl of a trait the caller imports", "core.src.user_ext.with_trait", "core.src.ext.S.run[Ext]",
-     true},
+    {"impl of a trait the caller imports", "core.src.user_ext.with_trait",
+     "core.src.ext.S.run[Ext]", true},
     {"impl of a prelude trait the caller never names", "core.src.user.no_trait",
      "core.src.s.S.as_ref[AsRef<str>]", true},
 };
@@ -8246,8 +8258,9 @@ TEST(pipeline_rust_trait_impl_out_of_scope_not_linked) {
                           "impl AsRef<str> for S {\n    fn as_ref(&self) -> &str { \"\" }\n}\n"},
         {"core/src/ext.rs", "use crate::s::S;\npub trait Ext {\n    fn run(&self) -> u8;\n}\n"
                             "impl Ext for S {\n    fn run(&self) -> u8 { 1 }\n}\n"},
-        {"core/src/user.rs", "use crate::s::{H, S};\n"
-                             "pub fn no_trait(s: &S, h: &H) -> u8 { let _c = h.p.as_ref(); s.run() }\n"},
+        {"core/src/user.rs",
+         "use crate::s::{H, S};\n"
+         "pub fn no_trait(s: &S, h: &H) -> u8 { let _c = h.p.as_ref(); s.run() }\n"},
         {"core/src/user_ext.rs",
          "use crate::ext::Ext;\nuse crate::s::S;\npub fn with_trait(s: &S) -> u8 { s.run() }\n"},
     };
@@ -8291,12 +8304,13 @@ TEST(pipeline_rust_wrapper_trait_impl_applies_by_self_type) {
          "use unknown_dep::prelude::*;\nuse crate::render::Renderable;\n"
          "pub trait Cell {\n    fn height(&self) -> u8;\n}\n"
          "impl Renderable for Box<dyn Cell> {\n    fn height(&self) -> u8 { 1 }\n}\n"},
-        {"core/src/user.rs", "use crate::cell::Cell;\nuse crate::render::Renderable;\n"
-                             "pub fn via_cell(c: Box<dyn Cell>) -> u8 { c.height() }\n"
-                             "pub fn via_render(r: Box<dyn Renderable>) -> u8 { r.height() }\n"
-                             "pub struct Plain;\nimpl Renderable for Plain {\n"
-                             "    fn height(&self) -> u8 { 3 }\n    fn depth(&self) -> u8 { 4 }\n}\n"
-                             "pub fn via_plain(p: Box<Plain>) -> u8 { p.depth() }\n"},
+        {"core/src/user.rs",
+         "use crate::cell::Cell;\nuse crate::render::Renderable;\n"
+         "pub fn via_cell(c: Box<dyn Cell>) -> u8 { c.height() }\n"
+         "pub fn via_render(r: Box<dyn Renderable>) -> u8 { r.height() }\n"
+         "pub struct Plain;\nimpl Renderable for Plain {\n"
+         "    fn height(&self) -> u8 { 3 }\n    fn depth(&self) -> u8 { 4 }\n}\n"
+         "pub fn via_plain(p: Box<Plain>) -> u8 { p.depth() }\n"},
     };
     write_rust_core_workspace(tmp, "mod render;\nmod cell;\nmod user;\n", files,
                               (int)(sizeof(files) / sizeof(files[0])));
@@ -8332,8 +8346,9 @@ TEST(pipeline_rust_method_on_path_call_result_uses_published_producer) {
                     "fn assoc() -> u8 { let w = Worker::new(); w.run() }\n"
                     "fn fallible() -> Result<u8, ()> { let w = Worker::open()?; Ok(w.run()) }\n"
                     "fn imported() -> u8 { let w = make_worker(); w.run() }\n");
-    write_temp_file(tmp, "core/tests/common/Cargo.toml",
-                    "[package]\nname = \"support\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n");
+    write_temp_file(
+        tmp, "core/tests/common/Cargo.toml",
+        "[package]\nname = \"support\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n");
     write_temp_file(tmp, "core/tests/common/lib.rs",
                     "pub mod factory;\n"
                     "pub struct Worker;\n"
@@ -8417,9 +8432,10 @@ TEST(pipeline_rust_await_async_fn_output_survives_closure_repair) {
                     "    pub fn ping(&self) -> bool { true }\n"
                     "}\n"
                     "impl Other { pub fn ping(&self) -> bool { false } }\n");
-    write_temp_file(tmp, "src/caller.rs",
-                    "use crate::conn::Conn;\n"
-                    "pub async fn run(c: &Conn) -> bool { c.reopen().await.expect(\"x\").ping() }\n");
+    write_temp_file(
+        tmp, "src/caller.rs",
+        "use crate::conn::Conn;\n"
+        "pub async fn run(c: &Conn) -> bool { c.reopen().await.expect(\"x\").ping() }\n");
     char db[512];
     snprintf(db, sizeof(db), "%s/await.db", tmp);
 
@@ -8645,13 +8661,12 @@ TEST(pipeline_rust_path_module_glob_rejects_cfg_collision) {
     int wrong_edges = -1;
     if (store && pipeline) {
         sqlite3_stmt *stmt = NULL;
-        const char *sql =
-            "SELECT count(*), "
-            "sum(EXISTS(SELECT 1 FROM edges e JOIN nodes s ON s.id=e.source_id "
-            "WHERE e.target_id=t.id AND e.type='CALLS' "
-            "AND s.file_path='src/compression_tests.rs' AND s.name='check')) "
-            "FROM nodes t WHERE t.project=?1 AND t.file_path='src/compression.rs' "
-            "AND t.name='compressed_rollout_path' AND t.start_line=13";
+        const char *sql = "SELECT count(*), "
+                          "sum(EXISTS(SELECT 1 FROM edges e JOIN nodes s ON s.id=e.source_id "
+                          "WHERE e.target_id=t.id AND e.type='CALLS' "
+                          "AND s.file_path='src/compression_tests.rs' AND s.name='check')) "
+                          "FROM nodes t WHERE t.project=?1 AND t.file_path='src/compression.rs' "
+                          "AND t.name='compressed_rollout_path' AND t.start_line=13";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, cbm_pipeline_project_name(pipeline), -1, SQLITE_TRANSIENT);
             if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -8716,6 +8731,675 @@ TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity) {
 
     ASSERT_EQ(run_rc, 0);
     ASSERT_FALSE(wrong_edge);
+    PASS();
+}
+
+static bool rust_inline_variable_edges(const char *source_suffix, const char *target_suffix,
+                                       cbm_store_t *store, const char *project) {
+    char source_qn[512], target_qn[512];
+    snprintf(source_qn, sizeof(source_qn), "%s.%s", project, source_suffix);
+    snprintf(target_qn, sizeof(target_qn), "%s.%s", project, target_suffix);
+    cbm_node_t source = {0}, target = {0};
+    bool found = false;
+    if (cbm_store_find_node_by_qn(store, project, source_qn, &source) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(store, project, target_qn, &target) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int count = 0;
+        cbm_store_find_edges_by_source_type(store, source.id, "USAGE", &edges, &count);
+        for (int i = 0; i < count; i++) {
+            found = found || edges[i].target_id == target.id;
+        }
+        cbm_store_free_edges(edges, count);
+    }
+    cbm_node_free_fields(&source);
+    cbm_node_free_fields(&target);
+    return found;
+}
+
+static int check_rust_inline_variable_publication(bool sequential) {
+    char tmp[] = "/tmp/cbm_inline_variables_XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "const LIMIT: u8 = 0; fn root() -> u8 { LIMIT }\n"
+                    "mod a { pub const LIMIT: u8 = 1; pub fn read() -> u8 { LIMIT } }\n"
+                    "mod b { pub const LIMIT: u8 = 2; pub fn read() -> u8 { LIMIT } }\n"
+                    "struct Item; mod child { pub struct Item; }\n"
+                    "fn consume(_: child::Item, _: Item) {}\n"
+                    "mod local { struct Item; fn consume(_: Item) {} }\n"
+                    "type Result = u8; fn external(_: std::result::Result<u8, u8>) {}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad_%02d.rs", i);
+        write_temp_file(tmp, name, "// padding for the parallel threshold\n");
+    }
+    char *saved =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    if (sequential) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    bool root = false, first = false, second = false, wrong = false;
+    bool types = false;
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        root = rust_inline_variable_edges("src.lib.root", "src.lib.LIMIT", store, project);
+        first = rust_inline_variable_edges("src.lib.a.read", "src.lib.a.LIMIT", store, project);
+        second = rust_inline_variable_edges("src.lib.b.read", "src.lib.b.LIMIT", store, project);
+        types =
+            rust_inline_variable_edges("src.lib.consume", "src.lib.child.Item", store, project) &&
+            rust_inline_variable_edges("src.lib.consume", "src.lib.Item", store, project) &&
+            rust_inline_variable_edges("src.lib.local.consume", "src.lib.local.Item", store,
+                                       project) &&
+            !rust_inline_variable_edges("src.lib.local.consume", "src.lib.Item", store, project);
+        wrong = rust_inline_variable_edges("src.lib.a.read", "src.lib.LIMIT", store, project) ||
+                rust_inline_variable_edges("src.lib.b.read", "src.lib.LIMIT", store, project) ||
+                rust_inline_variable_edges("src.lib.a.read", "src.lib.b.LIMIT", store, project) ||
+                rust_inline_variable_edges("src.lib.external", "src.lib.Result", store, project);
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    if (saved) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(root);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(types);
+    ASSERT_FALSE(wrong);
+    return 0;
+}
+
+static int check_rust_inline_read_write_publication(bool sequential) {
+    char tmp[] = "/tmp/cbm_inline_rw_XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "use dependency::External; struct Decoy { count: u8 }\n"
+                    "mod child { fn count() {} }\n"
+                    "fn run(mut local: External) { local.count = 1; }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad_%02d.rs", i);
+        write_temp_file(tmp, name, "// parallel threshold\n");
+    }
+    char *saved =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    if (sequential)
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    bool wrong = true;
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        wrong = cross_file_edge_exists(store, project, "run", "count", "WRITES");
+    }
+    if (store)
+        cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    if (saved) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved, 1);
+        free(saved);
+    } else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    th_rmtree(tmp);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_FALSE(wrong);
+    return 0;
+}
+
+TEST(pipeline_rust_inline_read_write_sequential_requires_an_owner) {
+    ASSERT_EQ(check_rust_inline_read_write_publication(true), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_inline_read_write_parallel_requires_an_owner) {
+    ASSERT_EQ(check_rust_inline_read_write_publication(false), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_inline_namesake_fields_have_distinct_owners) {
+    char tmp[] = "/tmp/cbm_inline_fields_XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "struct Item { value: u8 } fn root(x: Item) -> u8 { x.value }\n"
+                    "mod a { struct Item { value: u8 } fn read(x: Item) -> u8 { x.value } }\n"
+                    "mod b { struct Item { value: u8 } fn read(x: Item) -> u8 { x.value } }\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    bool own = false, wrong = true;
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        own =
+            rust_inline_variable_edges("src.lib.root", "src.lib.Item.value", store, project) &&
+            rust_inline_variable_edges("src.lib.a.read", "src.lib.a.Item.value", store, project) &&
+            rust_inline_variable_edges("src.lib.b.read", "src.lib.b.Item.value", store, project);
+        wrong =
+            rust_inline_variable_edges("src.lib.a.read", "src.lib.Item.value", store, project) ||
+            rust_inline_variable_edges("src.lib.a.read", "src.lib.b.Item.value", store, project) ||
+            rust_inline_variable_edges("src.lib.root", "src.lib.b.Item.value", store, project);
+    }
+    if (store)
+        cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(own);
+    ASSERT_FALSE(wrong);
+    PASS();
+}
+
+TEST(pipeline_rust_struct_literal_fields_follow_nested_module_globs) {
+    char tmp[] = "/tmp/cbm_literal_glob_XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod model;\n");
+    write_temp_file(tmp, "src/model.rs", "pub struct Item { pub value: u8 } mod checks;\n");
+    write_temp_file(tmp, "src/model/checks.rs", "use super::*; mod leaf;\n");
+    write_temp_file(tmp, "src/model/checks/leaf.rs",
+                    "use super::*; fn make() -> Item { Item { value: 1 } }\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    bool field = store && pipeline &&
+                 rust_inline_variable_edges("src.model.checks.leaf.make", "src.model.Item.value",
+                                            store, cbm_pipeline_project_name(pipeline));
+    if (store)
+        cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(field);
+    PASS();
+}
+
+static int check_rust_occurrence_proof(bool sequential, int scenario) {
+    char tmp[] = "/tmp/cbm_occurrence_XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n");
+    static const char *const sources[] = {
+        "enum E { V { n: u8 }, U } fn payload() { let _ = E::V { n: 1 }; }\n",
+        "struct Same; mod external { pub struct Same; } fn imported() { use external::Same; let _: "
+        "Option<Same> = None; }\n",
+        "struct Same; fn generic<Same>(_: Same) {}\n",
+        "struct Owner { value: u8 } fn write(x: &mut Owner) { x.value = 3; }\n",
+        "struct A; impl A { fn ping(&self) {} } struct B; impl B { fn ping(&self) {} } "
+        "#[cfg(unix)] type Stream = A; #[cfg(windows)] type Stream = B; fn invoke(x: Stream) { "
+        "x.ping(); }\n",
+        "trait Loader {}\n",
+        "mod child { fn target() {} fn reference() { let f = target; f(); } }\n",
+        "fn enclosing() { fn helper() {} helper(); }\n",
+        "struct Owner; impl Owner { fn touch(&self) {} } fn touch() {} fn caller(x: Owner) { "
+        "x.touch(); }\n",
+        "fn join_paths() {} fn to_vec() {} fn caller(x: Vec<u8>) { let _ = "
+        "std::env::join_paths; let _ = Vec::to_vec; }\n",
+        "mod child { pub const LIMIT: u8 = 1; } const LIMIT: u8 = 2; mod inner { enum Tag { A } fn "
+        "macro_read() { let _ = vec![Tag::A, Tag::A]; let _ = vec![crate::child::LIMIT]; } }\n",
+        "use dependency::Same; struct Same; fn derived(_: Same) {}\n",
+
+        "struct Same; fn local_type() { struct Same; let _: Option<Same> = None; }\n",
+        "mod a { pub fn choice() {} } mod b { pub fn choice() {} } #[cfg(unix)] use a::choice; "
+        "#[cfg(windows)] use b::choice; mod caller;\n",
+        "mod model { use dependency::Same; pub struct Same; } pub use model::Same; fn reexport(_: "
+        "Same) {}\n",
+        "struct Same; impl Same { fn read(&self) {} } mod child { pub struct Same; impl Same { pub "
+        "fn read(&self) {} } } fn reference() { let _ = child::Same::read; } fn generic<Same>() { "
+        "let _ = Same::read; }\n",
+        "struct Owner; #[cfg(unix)] impl Owner { fn read(&self) {} } #[cfg(windows)] impl Owner { "
+        "fn read(&self) {} } fn reference() { let _ = Owner::read; }\n",
+        "use outside::*; use support::Item as Imported; mod child;\n",
+        "struct Same; impl Same { const LIMIT: u8 = 1; } mod child { pub struct Same; impl Same { pub const LIMIT: u8 = 2; } } fn reference() { let _ = child::Same::LIMIT; } fn generic<Same>() { let _ = Same::LIMIT; }\n",
+        "struct Owner; trait First { fn read(); } impl First for Owner { fn read() {} } mod child { use crate::Owner; trait Second { fn read(); } impl Second for Owner { fn read() {} } } fn reference() { let _ = Owner::read; }\n",
+
+        "fn consume(_: dep::Item) {}\n",
+        "enum E { V } fn decode<T>() {} fn consume() { assert!({ decode::<E>(); true }); } fn generic<E>() { assert!({ decode::<E>(); true }); } fn comparison() { let E = 3; assert!({ decode::<Vec<u8>>(); 2 < E }); }\n",
+
+        "fn originator() {} fn loop_local() { for originator in [1u8] { let _ = originator; } } fn function_value() { let _ = originator; }\n",
+        "fn cell_id() {} struct Record { cell_id: u8 } fn field_label() { assert!(matches!(Record { cell_id: 1 }, Record { cell_id: 1 })); } fn function_value() { let _ = cell_id; }\n",
+
+        "const KEY: &str = \"key\"; fn json_key() { let _ = serde_json::json!({ KEY: 1 }); }\n",
+
+    };
+    write_temp_file(tmp, "src/lib.rs", sources[scenario]);
+    if (scenario == 11 || scenario == 14)
+        write_temp_file(tmp, "Cargo.toml",
+                        "[package]\nname = \"fixture\"\nversion = "
+                        "\"0.1.0\"\n[dependencies]\ndependency = \"0.1\"\n");
+    if (scenario == 17) {
+        write_temp_file(
+            tmp, "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = "
+            "\"2021\"\n[dependencies]\nsupport = { path = \"support\" }\noutside = \"0.1\"\n");
+        write_temp_file(tmp, "support/Cargo.toml",
+                        "[package]\nname = \"support\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        write_temp_file(tmp, "support/src/lib.rs", "pub struct Item;\n");
+        write_temp_file(tmp, "src/child.rs", "use super::*; fn consume(_: support::Item) {}\n");
+    }
+    if (scenario == 20) {
+        write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies.dep]\npath = \"dep\"\npackage = \"actual\"\n");
+        write_temp_file(tmp, "dep/Cargo.toml", "[package]\nname = \"actual\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        write_temp_file(tmp, "dep/src/lib.rs", "pub struct Item;\n");
+    }
+    if (scenario == 13)
+        write_temp_file(tmp, "src/caller.rs", "use crate::choice; fn run() {}\n");
+    if (scenario == 5)
+        write_temp_file(tmp, "src/schema.proto",
+                        "syntax = \"proto3\"; service Loader { rpc Load(Request) returns "
+                        "(Response); } message Request {} message Response {}\n");
+    for (int i = 0; i < 60; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad_%02d.rs", i);
+        write_temp_file(tmp, name, "// parallel threshold\n");
+    }
+    char *saved =
+        getenv("CBM_INDEX_SINGLE_THREAD") ? strdup(getenv("CBM_INDEX_SINGLE_THREAD")) : NULL;
+    if (sequential)
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int status = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db);
+    bool correct = false;
+    if (store && pipeline) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        switch (scenario) {
+        case 0:
+            correct = cross_file_edge_exists(store, project, "payload", "E", "USAGE");
+            break;
+        case 1:
+            correct =
+                rust_inline_variable_edges("src.lib.imported", "src.lib.external.Same", store,
+                                           project) &&
+                !rust_inline_variable_edges("src.lib.imported", "src.lib.Same", store, project);
+            break;
+        case 2:
+            correct = !cross_file_edge_exists(store, project, "generic", "Same", "USAGE");
+            break;
+        case 3:
+            correct = cross_file_edge_exists(store, project, "write", "value", "WRITES");
+            break;
+        case 4:
+            correct = !cross_file_edge_exists(store, project, "invoke", "ping", "CALLS");
+            break;
+        case 5:
+            correct =
+                rust_inline_variable_edges("src.schema", "src.schema.Loader", store, project) &&
+                !rust_inline_variable_edges("src.schema", "src.lib.Loader", store, project);
+            break;
+        case 6:
+            correct = rust_inline_variable_edges("src.lib.child.reference", "src.lib.child.target",
+                                                 store, project);
+            break;
+        case 7:
+            correct = cross_file_edge_exists(store, project, "enclosing", "helper", "USAGE");
+            break;
+        case 8:
+            correct =
+                rust_inline_variable_edges("src.lib.caller", "src.lib.Owner.touch", store,
+                                           project) &&
+                !rust_inline_variable_edges("src.lib.caller", "src.lib.touch", store, project);
+            break;
+        case 9:
+            correct = !cross_file_edge_exists(store, project, "caller", "join_paths", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "caller", "to_vec", "USAGE");
+            break;
+        case 10:
+            correct = rust_inline_variable_edges("src.lib.inner.macro_read", "src.lib.inner.Tag",
+                                                 store, project) &&
+                      rust_inline_variable_edges("src.lib.inner.macro_read", "src.lib.child.LIMIT",
+                                                 store, project) &&
+                      !rust_inline_variable_edges("src.lib.inner.macro_read", "src.lib.LIMIT",
+                                                  store, project);
+            break;
+        case 11:
+            correct = rust_inline_variable_edges("src.lib.derived", "src.lib.Same", store, project);
+            break;
+        case 12:
+            correct =
+                !rust_inline_variable_edges("src.lib.local_type", "src.lib.Same", store, project);
+            break;
+        case 13:
+            correct = !cross_file_edge_exists(store, project, "caller.rs", "choice", "IMPORTS");
+            break;
+        case 14:
+            correct = rust_inline_variable_edges("src.lib.reexport", "src.lib.model.Same", store,
+                                                 project);
+            break;
+        case 15:
+            correct = rust_inline_variable_edges("src.lib.reference", "src.lib.child.Same.read",
+                                                 store, project) &&
+                      !rust_inline_variable_edges("src.lib.reference", "src.lib.Same.read", store,
+                                                  project) &&
+                      !cross_file_edge_exists(store, project, "generic", "read", "USAGE");
+            break;
+        case 16:
+            correct = !cross_file_edge_exists(store, project, "reference", "read", "USAGE");
+            break;
+        case 17:
+            correct = rust_inline_variable_edges("src.child.consume", "support.src.lib.Item", store,
+                                                 project);
+            break;
+        case 18:
+            correct = rust_inline_variable_edges("src.lib.reference", "src.lib.child.Same.LIMIT", store, project) &&
+                      !rust_inline_variable_edges("src.lib.reference", "src.lib.Same.LIMIT", store, project) &&
+                      !cross_file_edge_exists(store, project, "generic", "LIMIT", "USAGE");
+            break;
+        case 19:
+            correct = !cross_file_edge_exists(store, project, "reference", "read", "USAGE");
+            break;
+        case 20:
+            correct = rust_inline_variable_edges("src.lib.consume", "dep.src.lib.Item", store, project);
+            break;
+        case 21:
+            correct = rust_inline_variable_edges("src.lib.consume", "src.lib.E", store, project) &&
+                      !cross_file_edge_exists(store, project, "generic", "E", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "comparison", "E", "USAGE");
+            break;
+
+        case 22:
+            correct = !cross_file_edge_exists(store, project, "loop_local", "originator", "USAGE") &&
+                      cross_file_edge_exists(store, project, "function_value", "originator", "USAGE");
+            break;
+        case 23:
+            correct = !rust_inline_variable_edges("src.lib.field_label", "src.lib.cell_id", store, project);
+            /* The same spelling is still a function value outside the label. */
+            correct = correct && cross_file_edge_exists(store, project, "function_value", "cell_id", "USAGE");
+            break;
+
+        case 24:
+            correct = rust_inline_variable_edges("src.lib.json_key", "src.lib.KEY", store, project);
+            break;
+
+        }
+    }
+    if (store)
+        cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    if (saved) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved, 1);
+        free(saved);
+    } else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    th_rmtree(tmp);
+    ASSERT_EQ(status, 0);
+    ASSERT_TRUE(correct);
+    return 0;
+}
+
+TEST(pipeline_rust_enum_variant_qualifier_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 0), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_enum_variant_qualifier_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 0), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_block_use_type_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 1), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_block_use_type_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 1), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_generic_type_shadow_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 2), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_generic_type_shadow_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 2), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_typed_field_write_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 3), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_typed_field_write_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 3), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_cfg_alias_owner_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 4), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_cfg_alias_owner_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 4), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_proto_namespace_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 5), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_proto_namespace_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 5), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_function_value_scope_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 6), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_function_value_scope_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 6), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_block_function_usage_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 7), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_block_function_usage_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 7), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_external_value_path_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 9), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_external_value_path_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 9), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_argument_paths_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 10), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_argument_paths_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 10), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_type_beside_derive_import_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 11), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_type_beside_derive_import_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 11), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_block_type_shadow_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 12), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_block_type_shadow_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 12), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_ambiguous_cfg_import_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 13), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_ambiguous_cfg_import_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 13), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_derive_type_reexport_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 14), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_derive_type_reexport_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 14), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_scoped_method_value_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 15), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_scoped_method_value_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 15), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_cfg_method_value_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 16), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_cfg_method_value_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 16), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_glob_extern_absence_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 17), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_glob_extern_absence_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 17), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_scoped_associated_const_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 18), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_scoped_associated_const_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 18), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_trait_member_needs_impl_proof_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 19), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_trait_member_needs_impl_proof_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 19), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_dependency_table_type_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 20), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_dependency_table_type_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 20), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_turbofish_type_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 21), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_turbofish_type_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 21), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_loop_value_shadow_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 22), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_loop_value_shadow_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 22), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_field_label_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 23), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_field_label_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 23), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_json_key_value_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 24), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_json_key_value_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 24), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_inline_module_variables_sequential) {
+    ASSERT_EQ(check_rust_inline_variable_publication(true), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_inline_module_variables_parallel) {
+    ASSERT_EQ(check_rust_inline_variable_publication(false), 0);
     PASS();
 }
 
@@ -8828,8 +9512,7 @@ typedef struct {
 
 static RustExactCallObservation observe_rust_exact_calls(const char *root, const char *db_name,
                                                          const RustExactCallPair *pairs,
-                                                         int pair_count,
-                                                         const char *target_leaf) {
+                                                         int pair_count, const char *target_leaf) {
     RustExactCallObservation observation = {.run_rc = -1};
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/%s", root, db_name);
@@ -8931,7 +9614,8 @@ TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both
         {"src.ops.G.inherent", "src.shapes.render"},
         {"src.ops.Widget.draw", "src.shapes.render"},
     };
-    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "render");
+    RustBothModesObservation observed =
+        observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "render");
     th_rmtree(tmp);
 
     ASSERT_EQ(observed.sequential.run_rc, 0);
@@ -8973,8 +9657,7 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
                     "impl KeysExt for [Key] { fn is_pressed(&self) -> bool { true } }\n"
                     "pub trait Draw { fn render(&self) -> u8; }\n"
                     "impl Draw for Line { fn render(&self) -> u8 { 2 } }\n");
-    write_temp_file(tmp, "src/model.rs",
-                    "pub mod view;\npub struct Ctx;\npub type Shown = Ctx;\n");
+    write_temp_file(tmp, "src/model.rs", "pub mod view;\npub struct Ctx;\npub type Shown = Ctx;\n");
     write_temp_file(tmp, "src/model/view.rs",
                     "pub trait Entries { fn entries(&self) -> u8; }\n"
                     "impl Entries for super::Shown { fn entries(&self) -> u8 { 3 } }\n");
@@ -8993,8 +9676,8 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
     write_rust_pad_files(tmp, 52);
     static const RustModTreeCallCase cases[] = {
         {"std self type, &Path receiver", "src.calls.on_path", "src.ext.Path.abs[PathExt]", true},
-        {"std self type, as_path() receiver", "src.calls.on_as_path",
-         "src.ext.Path.abs[PathExt]", true},
+        {"std self type, as_path() receiver", "src.calls.on_as_path", "src.ext.Path.abs[PathExt]",
+         true},
         {"slice self type, &[T] receiver", "src.calls.on_slice",
          "src.ext.[Key].is_pressed[KeysExt]", true},
         {"slice self type, Vec<T> receiver", "src.calls.on_vec",
@@ -9004,8 +9687,8 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
         {"dependency self type is not placed", "src.calls.on_line", "src.ext.Line.render[Draw]",
          false},
     };
-    int mismatches = check_rust_modtree_calls_in_both_modes(
-        tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
     th_rmtree(tmp);
     ASSERT_EQ(0, mismatches);
     PASS();
@@ -9042,8 +9725,8 @@ TEST(pipeline_rust_std_impl_beside_module_macro_item_in_both_modes) {
         {"&PathBuf receiver, impl beside thread_local!", "src.calls.on_buf",
          "src.ext.PathBuf.n[BufExt]", true},
     };
-    int mismatches = check_rust_modtree_calls_in_both_modes(
-        tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
     th_rmtree(tmp);
     ASSERT_EQ(0, mismatches);
     PASS();
@@ -9129,7 +9812,8 @@ TEST(pipeline_rust_cfg_gated_callers_own_their_calls_in_both_modes) {
         {"src.lib.double", "src.lib.target"},
         {"src.user.use_lone", "src.lib.double"},
     };
-    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "target");
+    RustBothModesObservation observed =
+        observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "target");
     th_rmtree(tmp);
 
     const RustExactCallObservation *modes[2] = {&observed.sequential, &observed.parallel};
@@ -9171,7 +9855,8 @@ TEST(pipeline_rust_cfg_twins_stay_distinct_and_unattributed_calls_publish_nothin
         {"src.user.use_twin", "src.lib.os_name#cfg(unix)]"},
         {"src.user.use_twin", "src.lib.os_name#cfg(not(unix))]"},
     };
-    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "target");
+    RustBothModesObservation observed =
+        observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "target");
     th_rmtree(tmp);
 
     const RustExactCallObservation *modes[2] = {&observed.sequential, &observed.parallel};
@@ -9209,7 +9894,8 @@ TEST(pipeline_rust_reexport_call_survives_incremental_reindex_of_caller) {
     bool full_edge = false;
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (store && full) {
-        full_edge = cross_file_call_exists(store, cbm_pipeline_project_name(full), "use_it", "helper");
+        full_edge =
+            cross_file_call_exists(store, cbm_pipeline_project_name(full), "use_it", "helper");
         cbm_store_close(store);
     }
     cbm_pipeline_free(full);
@@ -9258,12 +9944,10 @@ TEST(pipeline_rust_reexport_retarget_incremental_calls_match_fresh_full) {
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"reexport\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
-    write_temp_file(tmp, "src/lib.rs",
-                    "pub mod inner;\npub mod user;\npub use inner::helper;\n");
+    write_temp_file(tmp, "src/lib.rs", "pub mod inner;\npub mod user;\npub use inner::helper;\n");
     write_temp_file(tmp, "src/inner.rs",
                     "pub fn helper() -> u32 { 1 }\npub fn other() -> u32 { 2 }\n");
-    write_temp_file(tmp, "src/user.rs",
-                    "pub fn use_it() -> u32 {\n    crate::helper()\n}\n");
+    write_temp_file(tmp, "src/user.rs", "pub fn use_it() -> u32 {\n    crate::helper()\n}\n");
 
     char incremental_db[512];
     char fresh_db[512];
@@ -9897,8 +10581,8 @@ TEST(pipeline_rust_closure_repair_resolves_through_project_module_tree) {
     cbm_pipeline_free(baseline);
     cbm_store_t *store = cbm_store_open_path(live_db);
     ASSERT_NOT_NULL(store);
-    int inline_call = named_edge_to_file_count(store, project, "CALLS", "run", "helper",
-                                               "crates/app/src/lib.rs");
+    int inline_call =
+        named_edge_to_file_count(store, project, "CALLS", "run", "helper", "crates/app/src/lib.rs");
     int path_dep_call = named_edge_to_file_count(store, project, "CALLS", "run", "wait_ready",
                                                  "support/src/lib.rs");
     int module_call = named_edge_to_file_count(store, project, "CALLS", "run", "extra_fn",
@@ -10000,8 +10684,8 @@ TEST(pipeline_rust_closure_repair_folder_sibling_modules_keep_unique_ids) {
                      i, children[c], c, i, children[c], i, children[c]);
             write_temp_file(tmp, rel, source);
         }
-        lib_len += snprintf(lib_rs + lib_len, sizeof(lib_rs) - (size_t)lib_len, "pub mod m%02d;\n",
-                            i);
+        lib_len +=
+            snprintf(lib_rs + lib_len, sizeof(lib_rs) - (size_t)lib_len, "pub mod m%02d;\n", i);
     }
     write_temp_file(tmp, "crates/app/src/lib.rs", lib_rs);
 
@@ -10109,8 +10793,8 @@ static RustImplLinkRefreshObservation observe_rust_impl_link_refresh(bool force_
     }
     cbm_store_t *store = cbm_store_open_path(live_db);
     if (store) {
-        observed.implements_shape = named_edge_to_file_count(
-            store, project, "IMPLEMENTS", "Square", "Shape", "crates/app/src/shape.rs");
+        observed.implements_shape = named_edge_to_file_count(store, project, "IMPLEMENTS", "Square",
+                                                             "Shape", "crates/app/src/shape.rs");
         observed.defines_double = named_edge_to_file_count(
             store, project, "DEFINES_METHOD", "Square", "double", "crates/app/src/square_impls.rs");
         cbm_store_close(store);
@@ -10147,7 +10831,7 @@ static int assert_refresh_equivalent(RustIncrementalEquivalence observed,
 static int assert_rust_impl_link_refresh(RustImplLinkRefreshObservation observed,
                                          cbm_incremental_route_t expected_route) {
     ASSERT_EQ(observed.baseline_rc, 0);
-    ASSERT_EQ(observed.implements_shape, 1);  /* control: cross-file trait impl */
+    ASSERT_EQ(observed.implements_shape, 1); /* control: cross-file trait impl */
     ASSERT_EQ(observed.defines_double, 1);   /* control: cross-file inherent method */
     ASSERT_EQ(assert_refresh_equivalent(observed.owner_edit, expected_route), 0);
     ASSERT_EQ(assert_refresh_equivalent(observed.trait_edit, expected_route), 0);
@@ -18630,7 +19314,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
-    RUN_TEST(pipeline_rust_macro_hidden_call_publishes_with_exact_admitted_resolution_in_both_modes);
+    RUN_TEST(
+        pipeline_rust_macro_hidden_call_publishes_with_exact_admitted_resolution_in_both_modes);
     RUN_TEST(pipeline_rust_dump_records_only_published_calls_in_both_modes);
     RUN_TEST(pipeline_rust_impl_edges_pin_in_file_items_to_their_line);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
@@ -18661,6 +19346,60 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_path_module_super_resolves_from_declared_parent);
     RUN_TEST(pipeline_rust_path_module_glob_rejects_cfg_collision);
     RUN_TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity);
+    RUN_TEST(pipeline_rust_inline_read_write_sequential_requires_an_owner);
+    RUN_TEST(pipeline_rust_inline_read_write_parallel_requires_an_owner);
+    RUN_TEST(pipeline_rust_inline_namesake_fields_have_distinct_owners);
+    RUN_TEST(pipeline_rust_struct_literal_fields_follow_nested_module_globs);
+    RUN_TEST(pipeline_rust_enum_variant_qualifier_sequential);
+    RUN_TEST(pipeline_rust_enum_variant_qualifier_parallel);
+    RUN_TEST(pipeline_rust_block_use_type_sequential);
+    RUN_TEST(pipeline_rust_block_use_type_parallel);
+    RUN_TEST(pipeline_rust_generic_type_shadow_sequential);
+    RUN_TEST(pipeline_rust_generic_type_shadow_parallel);
+    RUN_TEST(pipeline_rust_typed_field_write_sequential);
+    RUN_TEST(pipeline_rust_typed_field_write_parallel);
+    RUN_TEST(pipeline_rust_cfg_alias_owner_sequential);
+    RUN_TEST(pipeline_rust_cfg_alias_owner_parallel);
+    RUN_TEST(pipeline_rust_proto_namespace_sequential);
+    RUN_TEST(pipeline_rust_proto_namespace_parallel);
+    RUN_TEST(pipeline_rust_function_value_scope_sequential);
+    RUN_TEST(pipeline_rust_function_value_scope_parallel);
+    RUN_TEST(pipeline_rust_block_function_usage_sequential);
+    RUN_TEST(pipeline_rust_block_function_usage_parallel);
+    RUN_TEST(pipeline_rust_external_value_path_sequential);
+    RUN_TEST(pipeline_rust_external_value_path_parallel);
+    RUN_TEST(pipeline_rust_macro_argument_paths_sequential);
+    RUN_TEST(pipeline_rust_macro_argument_paths_parallel);
+    RUN_TEST(pipeline_rust_type_beside_derive_import_sequential);
+    RUN_TEST(pipeline_rust_type_beside_derive_import_parallel);
+    RUN_TEST(pipeline_rust_block_type_shadow_sequential);
+    RUN_TEST(pipeline_rust_block_type_shadow_parallel);
+    RUN_TEST(pipeline_rust_ambiguous_cfg_import_sequential);
+    RUN_TEST(pipeline_rust_ambiguous_cfg_import_parallel);
+    RUN_TEST(pipeline_rust_derive_type_reexport_sequential);
+    RUN_TEST(pipeline_rust_derive_type_reexport_parallel);
+    RUN_TEST(pipeline_rust_scoped_method_value_sequential);
+    RUN_TEST(pipeline_rust_scoped_method_value_parallel);
+    RUN_TEST(pipeline_rust_cfg_method_value_sequential);
+    RUN_TEST(pipeline_rust_cfg_method_value_parallel);
+    RUN_TEST(pipeline_rust_glob_extern_absence_sequential);
+    RUN_TEST(pipeline_rust_glob_extern_absence_parallel);
+    RUN_TEST(pipeline_rust_scoped_associated_const_sequential);
+    RUN_TEST(pipeline_rust_scoped_associated_const_parallel);
+    RUN_TEST(pipeline_rust_trait_member_needs_impl_proof_sequential);
+    RUN_TEST(pipeline_rust_trait_member_needs_impl_proof_parallel);
+    RUN_TEST(pipeline_rust_dependency_table_type_sequential);
+    RUN_TEST(pipeline_rust_dependency_table_type_parallel);
+    RUN_TEST(pipeline_rust_macro_turbofish_type_sequential);
+    RUN_TEST(pipeline_rust_macro_turbofish_type_parallel);
+    RUN_TEST(pipeline_rust_loop_value_shadow_sequential);
+    RUN_TEST(pipeline_rust_loop_value_shadow_parallel);
+    RUN_TEST(pipeline_rust_macro_field_label_sequential);
+    RUN_TEST(pipeline_rust_macro_field_label_parallel);
+    RUN_TEST(pipeline_rust_json_key_value_sequential);
+    RUN_TEST(pipeline_rust_json_key_value_parallel);
+    RUN_TEST(pipeline_rust_inline_module_variables_sequential);
+    RUN_TEST(pipeline_rust_inline_module_variables_parallel);
     RUN_TEST(pipeline_rust_path_module_chain_does_not_use_physical_parent);
     RUN_TEST(pipeline_rust_cargo_manifest_converges_across_routes);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API

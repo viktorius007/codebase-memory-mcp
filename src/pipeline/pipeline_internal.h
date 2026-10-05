@@ -1094,6 +1094,18 @@ const cbm_gbuf_node_t *cbm_pipeline_rust_field_usage_target(const cbm_gbuf_t *gb
                                                             const char *project_name,
                                                             const CBMResolvedCallArray *rows,
                                                             const CBMUsage *usage, bool *owned);
+const cbm_gbuf_node_t *cbm_pipeline_rust_invocation_usage_target(const cbm_gbuf_t *gbuf,
+                                                                 const char *project,
+                                                                 const CBMFileResult *result,
+                                                                 const CBMUsage *usage);
+const cbm_gbuf_node_t *cbm_pipeline_rust_item_usage_target(const cbm_gbuf_t *gbuf,
+                                                           const cbm_registry_t *registry,
+                                                           const char *module_qn,
+                                                           const CBMUsage *usage);
+const cbm_gbuf_node_t *cbm_pipeline_rust_write_target(const cbm_gbuf_t *gbuf, const char *project,
+                                                      const char *module,
+                                                      const CBMFileResult *result,
+                                                      const CBMReadWrite *rw);
 bool cbm_pipeline_rust_bare_field_target(CBMLanguage lang, const cbm_gbuf_node_t *target);
 
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
