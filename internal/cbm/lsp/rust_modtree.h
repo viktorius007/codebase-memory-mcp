@@ -48,17 +48,18 @@ CBMRustModFacts *cbm_rust_modfacts_scan(const char *source, int len);
 void cbm_rust_modfacts_free(CBMRustModFacts *facts);
 
 typedef enum {
-    CBM_RUST_PATH_UNKNOWN = 0,  /* the tree cannot decide; caller may try other evidence */
-    CBM_RUST_PATH_FUNCTION,     /* `qn` is a free function */
-    CBM_RUST_PATH_ASSOC,        /* `qn` is a type or trait; `assoc` is its associated item */
-    CBM_RUST_PATH_NOT_FUNCTION, /* proven to name no in-project function (variable, type,
-                                 * constant, variant, external crate item); for a type
-                                 * query: proven to name a type outside the project */
-    CBM_RUST_PATH_TYPE,         /* type query: `qn` is a type or trait declared in the project */
-    CBM_RUST_PATH_AMBIGUOUS,    /* value query: two or more distinct items carry the name in
-                                 * this module (only cfg-gated alternatives can, e.g. a local
-                                 * `#[cfg(unix)] fn f` beside `#[cfg(windows)] use w::f`);
-                                 * which one a build sees depends on its configuration */
+    CBM_RUST_PATH_UNKNOWN = 0,     /* the tree cannot decide; caller may try other evidence */
+    CBM_RUST_PATH_FUNCTION,        /* `qn` is a free function */
+    CBM_RUST_PATH_ASSOC,           /* `qn` is a type or trait; `assoc` is its associated item */
+    CBM_RUST_PATH_NOT_FUNCTION,    /* proven to name no in-project function (variable, type,
+                                    * constant, variant, external crate item); for a type
+                                    * query: proven to name a type outside the project */
+    CBM_RUST_PATH_EDITION_UNKNOWN, /* crate edition is unreadable: do not use fallback paths */
+    CBM_RUST_PATH_TYPE,            /* type query: `qn` is a type or trait declared in the project */
+    CBM_RUST_PATH_AMBIGUOUS,       /* value query: two or more distinct items carry the name in
+                                    * this module (only cfg-gated alternatives can, e.g. a local
+                                    * `#[cfg(unix)] fn f` beside `#[cfg(windows)] use w::f`);
+                                    * which one a build sees depends on its configuration */
 } CBMRustPathKind;
 
 typedef struct {
@@ -79,11 +80,18 @@ void cbm_rust_modtree_free(CBMRustModTree *tree);
  * file id used by the loader. */
 int cbm_rust_modtree_add_file(CBMRustModTree *tree, const char *rel_path, const char *module_qn);
 
+typedef enum {
+    CBM_RUST_EDITION_MODERN = 0,
+    CBM_RUST_EDITION_2015 = 1,
+    CBM_RUST_EDITION_UNKNOWN = 2,
+} CBMRustEdition;
+
 /* Register a crate root. `extern_name` is the name other crates use for it
  * (NULL for targets nobody can depend on: binaries, tests, examples). The
- * returned crate id receives extern-prelude entries below. */
+ * returned crate id receives extern-prelude entries below. UNKNOWN keeps
+ * the module ownership but refuses path links into or out of the crate. */
 int cbm_rust_modtree_add_crate(CBMRustModTree *tree, const char *root_rel_path,
-                               const char *extern_name, bool edition_2015);
+                               const char *extern_name, CBMRustEdition edition);
 
 /* Make `name` visible in `crate_id`'s extern prelude. `target_crate` is the
  * library crate it names, or -1 for a crate outside the project. */

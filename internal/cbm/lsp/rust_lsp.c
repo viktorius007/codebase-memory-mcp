@@ -11528,6 +11528,10 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
     }
     case CBM_RUST_PATH_NOT_FUNCTION:
         return true;
+    case CBM_RUST_PATH_EDITION_UNKNOWN:
+        out->open_qn = path;
+        out->open_reason = "unknown_edition";
+        return true;
     case CBM_RUST_PATH_AMBIGUOUS:
         /* The name's target depends on the build configuration: no link. */
         out->open_qn = path;

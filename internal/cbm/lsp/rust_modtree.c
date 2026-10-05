@@ -93,7 +93,7 @@ typedef struct {
 typedef struct {
     const char *root_rel;
     const char *extern_name;
-    bool edition_2015;
+    CBMRustEdition edition;
     int root_module;
 } RmtCrate;
 
@@ -186,7 +186,7 @@ int cbm_rust_modtree_add_file(CBMRustModTree *tree, const char *rel_path, const 
 }
 
 int cbm_rust_modtree_add_crate(CBMRustModTree *tree, const char *root_rel_path,
-                               const char *extern_name, bool edition_2015) {
+                               const char *extern_name, CBMRustEdition edition) {
     if (!tree || !root_rel_path) {
         return -1;
     }
@@ -195,7 +195,7 @@ int cbm_rust_modtree_add_crate(CBMRustModTree *tree, const char *root_rel_path,
     tree->crates[id] = (RmtCrate){
         .root_rel = cbm_arena_strdup(&tree->arena, root_rel_path),
         .extern_name = extern_name ? cbm_arena_strdup(&tree->arena, extern_name) : NULL,
-        .edition_2015 = edition_2015,
+        .edition = edition,
         .root_module = -1,
     };
     return id;
@@ -1115,6 +1115,10 @@ static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name,
  * module's globs, as it does for the module itself. */
 static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8_t ns, RmtDefs *out,
                        RmtVisit *visit, bool building, const RmtSeers *seers) {
+    if (tree->crates[tree->modules[module].crate].edition == CBM_RUST_EDITION_UNKNOWN) {
+        out->open = true;
+        return;
+    }
     char key[RMT_KEY_MAX];
     int written = snprintf(key, sizeof(key), "%d\x1f%s", module, name);
     if (written < 0 || written >= (int)sizeof(key)) {
@@ -1172,7 +1176,7 @@ static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8
     rmt_lookup_globs(tree, module, name, ns, out, visit, building, seers);
     RmtDef external = {0};
     if (out->count == 0 && (ns & RMT_NS_TYPE) &&
-        !tree->crates[tree->modules[module].crate].edition_2015 &&
+        (tree->crates[tree->modules[module].crate].edition == CBM_RUST_EDITION_MODERN) &&
         rmt_use_proves_extern(tree, module, name) &&
         rmt_extern_prelude(tree, tree->modules[module].crate, name, &external)) {
         /* The same-module use rules out this name in its unknown globs and
@@ -1262,8 +1266,9 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
                              bool is_use, RmtDefs *out, bool building) {
     int crate = tree->modules[module].crate;
     RmtVisit visit = {.count = 0};
-    int scope =
-        is_use && tree->crates[crate].edition_2015 ? tree->crates[crate].root_module : module;
+    int scope = is_use && (tree->crates[crate].edition == CBM_RUST_EDITION_2015)
+                    ? tree->crates[crate].root_module
+                    : module;
     rmt_lookup(tree, scope, head, ns, out, &visit, building, NULL);
     RmtDef def = {.kind = RMT_EXTERNAL, .ns = RMT_NS_ALL, .module = -1};
     /* A 2018+ `use` path whose head names both an extern crate and a glob
@@ -1274,8 +1279,8 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
      * this way, so a `use` of either names the same item in every module.
      * A dependency crate is not: its items publish nothing, and impl
      * receivers keep its type names file-local. */
-    if (out->open && out->count == 0 && !tree->crates[crate].edition_2015 && (ns & RMT_NS_TYPE) &&
-        (is_use || rmt_use_proves_extern(tree, module, head)) &&
+    if (out->open && out->count == 0 && !(tree->crates[crate].edition == CBM_RUST_EDITION_2015) &&
+        (ns & RMT_NS_TYPE) && (is_use || rmt_use_proves_extern(tree, module, head)) &&
         rmt_extern_prelude(tree, crate, head, &def) &&
         (def.kind == RMT_MODULE || rmt_in_list(RMT_LANGUAGE_CRATES, head))) {
         *out = (RmtDefs){0};
@@ -1344,6 +1349,10 @@ static const char *rmt_external_path(CBMArena *arena, const char *prefix, const 
 static void rmt_resolve_path(CBMRustModTree *tree, CBMArena *arena, int module,
                              const char *const *segs, int count, uint8_t final_ns, bool is_use,
                              RmtDefs *out, bool building) {
+    if (tree->crates[tree->modules[module].crate].edition == CBM_RUST_EDITION_UNKNOWN) {
+        out->open = true;
+        return;
+    }
     RmtDefs cur = {0};
     int i = rmt_start(tree, module, segs, count, final_ns, is_use, &cur, building);
     if (i < 0) {
@@ -1592,6 +1601,8 @@ static CBMRustPathResult rmt_resolve_query(const CBMRustModTree *tree, CBMArena 
             (!rmt_contains(&tree->modules[m], offset) || !rmt_innermost(tree, file, m, offset))) {
             continue;
         }
+        if (tree->crates[tree->modules[m].crate].edition == CBM_RUST_EDITION_UNKNOWN)
+            return (CBMRustPathResult){.kind = CBM_RUST_PATH_EDITION_UNKNOWN};
         RmtDefs defs = {0};
         rmt_resolve_path(readonly, arena, m, segs, count, ns, false, &defs, false);
         CBMRustPathResult result =

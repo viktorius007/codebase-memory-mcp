@@ -1,4 +1,5 @@
-/* rust_cargo.c — Hand-rolled TOML subset parser for Cargo.toml.
+/* rust_cargo.c — Cargo manifest reader. TOML package fields accept string,
+ * dotted-key, inline-table and subtable spellings, including TOML 1.1.
  *
  * Recognises only the shapes we need (per RUST_LSP_FOLLOWUP §A3):
  *   - `[section]`, `[a.b.c]`, `[workspace]`, `[dependencies]`
@@ -14,6 +15,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 
 /* ── Tiny tokenizer ──────────────────────────────────────────── */
 
@@ -35,20 +37,117 @@ static bool is_ident_char(char c) {
            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
 }
 
+/* Cargo uses TOML strings and tables, including quoted/dotted keys and
+ * multiline strings: https://doc.rust-lang.org/cargo/reference/manifest.html */
+static const char *cargo_toml_string(CBMArena *arena, const char *s, size_t len) {
+    if (len < 2 || (s[0] != '\'' && s[0] != '"'))
+        return NULL;
+    char quote = s[0];
+    size_t delimiter = len >= 6 && s[1] == quote && s[2] == quote ? 3 : 1;
+    size_t end = len - delimiter, pos = delimiter, used = 0;
+    char *out = cbm_arena_alloc(arena, len + 1);
+    if (!out)
+        return NULL;
+    if (delimiter == 3) {
+        if (pos < end && s[pos] == '\r')
+            pos++;
+        if (pos < end && s[pos] == '\n')
+            pos++;
+    }
+    while (pos < end) {
+        unsigned char c = (unsigned char)s[pos++];
+        if (c == '\r' && pos < end && s[pos] == '\n')
+            continue;
+        if (c != '\\' || quote == '\'') {
+            out[used++] = (char)c;
+            continue;
+        }
+        if (pos >= end)
+            return NULL;
+        c = (unsigned char)s[pos++];
+        if (delimiter == 3 && isspace(c)) {
+            while (pos < end && isspace((unsigned char)s[pos]))
+                pos++;
+            continue;
+        }
+        const char *escapes = "btnfre\"\\";
+        const char *values = "\b\t\n\f\r\x1b\"\\";
+        const char *escape = strchr(escapes, c);
+        if (escape) {
+            out[used++] = values[escape - escapes];
+            continue;
+        }
+        int digits = c == 'x' ? 2 : c == 'u' ? 4 : c == 'U' ? 8 : 0;
+        if (!digits || pos + (size_t)digits > end)
+            return NULL;
+        uint32_t cp = 0;
+        for (int i = 0; i < digits; i++) {
+            unsigned char h = (unsigned char)s[pos++];
+            int d = h >= '0' && h <= '9'   ? h - '0'
+                    : h >= 'a' && h <= 'f' ? h - 'a' + 10
+                    : h >= 'A' && h <= 'F' ? h - 'A' + 10
+                                           : -1;
+            if (d < 0)
+                return NULL;
+            cp = (cp << 4) | (uint32_t)d;
+        }
+        if (cp == 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+            return NULL;
+        if (cp < 0x80)
+            out[used++] = (char)cp;
+        else {
+            if (cp >= 0x10000)
+                out[used++] = (char)(0xf0 | (cp >> 18));
+            else if (cp >= 0x800)
+                out[used++] = (char)(0xe0 | (cp >> 12));
+            else
+                out[used++] = (char)(0xc0 | (cp >> 6));
+            if (cp >= 0x10000)
+                out[used++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+            if (cp >= 0x800)
+                out[used++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+            out[used++] = (char)(0x80 | (cp & 0x3f));
+        }
+    }
+    out[used] = '\0';
+    return out;
+}
+
+static int cargo_string_end(const char *s, int len, int from) {
+    char quote = s[from];
+    bool multiline = from + 2 < len && s[from + 1] == quote && s[from + 2] == quote;
+    int delimiter = multiline ? 3 : 1;
+    from += delimiter;
+    while (from < len) {
+        if (!multiline && (s[from] == '\n' || s[from] == '\r')) return -1;
+        if (quote == '"' && s[from] == '\\') {
+            from += from + 1 < len ? 2 : 1;
+            continue;
+        }
+        if (s[from] == quote) {
+            int end = from;
+            while (end < len && s[end] == quote) end++;
+            if (end - from >= delimiter) return multiline ? end : from + 1;
+            from = end;
+        } else from++;
+    }
+    return -1;
+}
+
+static int parse_string(CBMArena *arena, const char *s, int len, int from,
+                          const char **out) {
+    if (from >= len || (s[from] != '"' && s[from] != '\'')) return from;
+    int end = cargo_string_end(s, len, from);
+    *out = end >= 0 ? cargo_toml_string(arena, s + from, (size_t)(end - from)) : NULL;
+    return end >= 0 ? end : len;
+}
+
 /* Parse a bare key (ident-like). Stores arena-allocated copy in *out. */
 static int parse_key(CBMArena* a, const char* s, int len, int from,
     const char** out) {
     int start = from;
-    if (from < len && s[from] == '"') {
-        from++;
-        start = from;
-        while (from < len && s[from] != '"') {
-            if (s[from] == '\\' && from + 1 < len) from += 2;
-            else from++;
-        }
-        *out = cbm_arena_strndup(a, s + start, (size_t)(from - start));
-        if (from < len && s[from] == '"') from++;
-        return from;
+    if (from < len && (s[from] == '"' || s[from] == '\'')) {
+        return parse_string(a, s, len, from, out);
     }
     while (from < len && is_ident_char(s[from])) from++;
     if (from > start) {
@@ -57,33 +156,13 @@ static int parse_key(CBMArena* a, const char* s, int len, int from,
     return from;
 }
 
-/* Parse a string literal (single or double quoted). */
-static int parse_string(CBMArena* a, const char* s, int len, int from,
-    const char** out) {
-    if (from >= len) return from;
-    char q = s[from];
-    if (q != '"' && q != '\'') return from;
-    from++;
-    int start = from;
-    while (from < len && s[from] != q) {
-        if (s[from] == '\\' && from + 1 < len) from += 2;
-        else from++;
-    }
-    *out = cbm_arena_strndup(a, s + start, (size_t)(from - start));
-    if (from < len) from++;
-    return from;
-}
-
 static int parse_bool(const char *s, int len, int from, bool *out) {
-    if (from + 4 <= len && strncmp(s + from, "true", 4) == 0) {
-        *out = true;
-        return from + 4;
-    }
-    if (from + 5 <= len && strncmp(s + from, "false", 5) == 0) {
-        *out = false;
-        return from + 5;
-    }
-    return from;
+    int size = from + 4 <= len && strncmp(s + from, "true", 4) == 0 ? 4 :
+               from + 5 <= len && strncmp(s + from, "false", 5) == 0 ? 5 : 0;
+    if (!size || (from + size < len && !strchr(" \t\r\n#,}]", s[from + size])))
+        return from;
+    *out = size == 4;
+    return from + size;
 }
 
 /* Skip a value (used for keys we don't care about). Handles strings,
@@ -93,13 +172,8 @@ static int skip_value(const char* s, int len, int from) {
     if (from >= len) return from;
     char c = s[from];
     if (c == '"' || c == '\'') {
-        from++;
-        while (from < len && s[from] != c) {
-            if (s[from] == '\\' && from + 1 < len) from += 2;
-            else from++;
-        }
-        if (from < len) from++;
-        return from;
+        int end = cargo_string_end(s, len, from);
+        return end >= 0 ? end : len;
     }
     if (c == '[' || c == '{') {
         char open = c, close = (c == '[' ? ']' : '}');
@@ -108,12 +182,12 @@ static int skip_value(const char* s, int len, int from) {
         while (from < len && depth > 0) {
             char d = s[from];
             if (d == '"' || d == '\'') {
-                from++;
-                while (from < len && s[from] != d) {
-                    if (s[from] == '\\' && from + 1 < len) from += 2;
-                    else from++;
-                }
-                if (from < len) from++;
+                int end = cargo_string_end(s, len, from);
+                from = end >= 0 ? end : len;
+                continue;
+            }
+            if (d == '#') {
+                while (from < len && s[from] != '\n') from++;
                 continue;
             }
             if (d == open) depth++;
@@ -127,24 +201,6 @@ static int skip_value(const char* s, int len, int from) {
     while (from < len && s[from] != '\n' && s[from] != '#' && s[from] != ',' &&
            s[from] != '}' && s[from] != ']')
         from++;
-    return from;
-}
-
-/* Parse `[section.path]` header — returns the section name as a flat
- * dotted string, e.g. "dependencies" or "workspace.dependencies". */
-static int parse_section(CBMArena* a, const char* s, int len, int from,
-    const char** out) {
-    if (from >= len || s[from] != '[') return from;
-    /* Skip leading `[` or `[[`. */
-    bool array_of_tables = false;
-    from++;
-    if (from < len && s[from] == '[') { array_of_tables = true; from++; }
-    int start = from;
-    while (from < len && s[from] != ']') from++;
-    *out = cbm_arena_strndup(a, s + start, (size_t)(from - start));
-    /* Consume closing `]` (or `]]`). */
-    if (from < len) from++;
-    if (array_of_tables && from < len && s[from] == ']') from++;
     return from;
 }
 
@@ -221,89 +277,63 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
     return from;
 }
 
-/* ── Section dispatcher ──────────────────────────────────────── */
-
-static int parse_package_kv(CBMArena* a, const char* s, int len, int from,
-    CBMCargoManifest* out) {
-    from = skip_ws_and_comment(s, len, from);
-    if (from >= len || s[from] == '[') return from;
-    const char* key = NULL;
-    from = parse_key(a, s, len, from, &key);
-    from = skip_ws_and_comment(s, len, from);
-    if (from < len && s[from] == '=') {
+/* Quoted "edition.workspace" is one key, unlike edition.workspace. */
+static int cargo_key_path(CBMArena *arena, const char *s, int len, int from,
+                            const char **out) {
+    const char *path = "";
+    while (from < len) {
+        while (from < len && (s[from] == ' ' || s[from] == '\t')) from++;
+        const char *part = NULL;
+        int start = from;
+        if (from < len && (s[from] == '"' || s[from] == '\''))
+            from = parse_string(arena, s, len, from, &part);
+        else {
+            while (from < len && is_ident_char(s[from]) && s[from] != '.') from++;
+            if (from > start) part = cbm_arena_strndup(arena, s + start, (size_t)(from - start));
+        }
+        if (!part || !*part || strchr(part, '\x1f')) return start;
+        path = cbm_arena_sprintf(arena, "%s%s%s", path, *path ? "\x1f" : "", part);
+        while (from < len && (s[from] == ' ' || s[from] == '\t')) from++;
+        if (from >= len || s[from] != '.') break;
         from++;
-        from = skip_ws_and_comment(s, len, from);
     }
-    if (key && strcmp(key, "name") == 0) {
-        from = parse_string(a, s, len, from, &out->package_name);
-    } else if (key && strcmp(key, "version") == 0) {
-        from = parse_string(a, s, len, from, &out->package_version);
-    } else if (key && strcmp(key, "edition") == 0) {
-        from = parse_string(a, s, len, from, &out->edition);
-    } else if (key && strcmp(key, "edition.workspace") == 0) {
-        from = parse_bool(s, len, from, &out->edition_inherited);
-    } else {
-        static const char *const auto_keys[] = {
-            "autolib", "autobins", "autotests", "autoexamples", "autobenches",
-        };
-        int auto_index = -1;
+    *out = path;
+    return from;
+}
+
+static int cargo_package_value(CBMArena *arena, const char *s, int len, int from,
+                                const char *key, CBMCargoManifest *out) {
+    const char *string = NULL;
+    int end = parse_string(arena, s, len, from, &string);
+    bool flag = false;
+    int boolean_end = parse_bool(s, len, from, &flag);
+    bool boolean = boolean_end > from;
+    if (strncmp(key, "package\x1f" "edition\x1f", 16) == 0)
+        out->edition_unreadable = true;
+    if (strcmp(key, "package\x1f" "name") == 0) out->package_name = string;
+    else if (strcmp(key, "package\x1f" "version") == 0) out->package_version = string;
+    else if (strcmp(key, "package\x1f" "edition") == 0) {
+        out->edition = string;
+        out->edition_unreadable = !string;
+    } else if (strcmp(key, "package\x1f" "edition\x1f" "workspace") == 0) {
+        out->edition_inherited = boolean && flag;
+        out->edition_unreadable = !out->edition_inherited;
+    } else if (strcmp(key, "package\x1f" "version\x1f" "workspace") == 0)
+        out->version_inherited = boolean && flag;
+    else if (strcmp(key, "workspace\x1f" "package\x1f" "edition") == 0)
+        out->workspace_edition = string;
+    else if (strcmp(key, "workspace\x1f" "package\x1f" "version") == 0)
+        out->workspace_version = string;
+    else {
+        static const char *const keys[] = {"autolib", "autobins", "autotests", "autoexamples", "autobenches"};
         for (int i = 0; i < 5; i++) {
-            if (key && strcmp(key, auto_keys[i]) == 0) {
-                auto_index = i;
-                break;
+            if (boolean && strncmp(key, "package\x1f", 8) == 0 && strcmp(key + 8, keys[i]) == 0) {
+                out->auto_targets[i] = flag;
+                out->auto_target_overrides |= 1u << i;
             }
         }
-        int parsed = auto_index >= 0 ? parse_bool(s, len, from, &out->auto_targets[auto_index])
-                                     : from;
-        if (parsed != from) {
-            out->auto_target_overrides |= 1u << auto_index;
-            from = parsed;
-        } else {
-            from = skip_value(s, len, from);
-        }
     }
-    return from;
-}
-
-static int parse_target_kv(CBMArena *a, const char *s, int len, int from,
-                           CBMCargoManifest *out, CBMCargoTarget *target) {
-    from = skip_ws_and_comment(s, len, from);
-    if (from >= len || s[from] == '[')
-        return from;
-    const char *key = NULL;
-    from = parse_key(a, s, len, from, &key);
-    from = skip_ws_and_comment(s, len, from);
-    if (from < len && s[from] == '=') {
-        from++;
-        from = skip_ws_and_comment(s, len, from);
-    }
-    if (key && strcmp(key, "name") == 0) {
-        from = parse_string(a, s, len, from, &target->name);
-        if (target->kind == CBM_CARGO_TARGET_LIB)
-            out->lib_name = target->name;
-    } else if (key && strcmp(key, "path") == 0) {
-        from = parse_string(a, s, len, from, &target->path);
-    } else {
-        from = skip_value(s, len, from);
-    }
-    return from;
-}
-
-static int parse_workspace_package_kv(CBMArena *a, const char *s, int len, int from,
-                                      CBMCargoManifest *out) {
-    from = skip_ws_and_comment(s, len, from);
-    if (from >= len || s[from] == '[')
-        return from;
-    const char *key = NULL;
-    from = parse_key(a, s, len, from, &key);
-    from = skip_ws_and_comment(s, len, from);
-    if (from < len && s[from] == '=') {
-        from++;
-        from = skip_ws_and_comment(s, len, from);
-    }
-    if (key && strcmp(key, "edition") == 0)
-        return parse_string(a, s, len, from, &out->workspace_edition);
-    return skip_value(s, len, from);
+    return end > from ? end : skip_value(s, len, from);
 }
 
 static int parse_workspace_kv(CBMArena *a, const char *s, int len, int from,
@@ -347,13 +377,69 @@ static int parse_workspace_kv(CBMArena *a, const char *s, int len, int from,
     return from;
 }
 
+/* Package paths are a bounded Cargo schema, not a general TOML object model. */
+static int cargo_package_entry(CBMArena *arena, const char *s, int len, int from,
+                                const char *prefix, CBMCargoManifest *out, int depth) {
+    const char *key = NULL;
+    int start = from;
+    from = cargo_key_path(arena, s, len, from, &key);
+    if (!key || from >= len || s[from] != '=') {
+        out->edition_unreadable = true;
+        return skip_value(s, len, start);
+    }
+    const char *path = cbm_arena_sprintf(arena, "%s%s%s", prefix, *prefix ? "\x1f" : "", key);
+    if (strcmp(path, "workspace") == 0) out->is_workspace_root = true;
+    if (strcmp(path, "workspace\x1f" "members") == 0)
+        return parse_workspace_kv(arena, s, len, start, out);
+    from = skip_ws_and_comment(s, len, from + 1);
+    if (from >= len || s[from] != '{') return cargo_package_value(arena, s, len, from, path, out);
+    if (strcmp(path, "package\x1f" "edition") == 0) out->edition_unreadable = true;
+    if (depth >= 4) return skip_value(s, len, from);
+    from++;
+    while (from < len) {
+        from = skip_ws_and_comment(s, len, from);
+        if (from >= len) break;
+        if (s[from] == '}') return from + 1;
+        if (s[from] == ',') { from++; continue; }
+        int next = cargo_package_entry(arena, s, len, from, path, out, depth + 1);
+        if (next <= from) break;
+        from = next;
+    }
+    out->edition_unreadable = true;
+    return len;
+}
+
+static int parse_target_kv(CBMArena *a, const char *s, int len, int from,
+                           CBMCargoManifest *out, CBMCargoTarget *target) {
+    from = skip_ws_and_comment(s, len, from);
+    if (from >= len || s[from] == '[')
+        return from;
+    const char *key = NULL;
+    from = parse_key(a, s, len, from, &key);
+    from = skip_ws_and_comment(s, len, from);
+    if (from < len && s[from] == '=') {
+        from++;
+        from = skip_ws_and_comment(s, len, from);
+    }
+    if (key && strcmp(key, "name") == 0) {
+        from = parse_string(a, s, len, from, &target->name);
+        if (target->kind == CBM_CARGO_TARGET_LIB)
+            out->lib_name = target->name;
+    } else if (key && strcmp(key, "path") == 0) {
+        from = parse_string(a, s, len, from, &target->path);
+    } else {
+        from = skip_value(s, len, from);
+    }
+    return from;
+}
+
 /* `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, their
  * `[target.<cfg>.…]` forms, and `[workspace.dependencies]`. */
 static bool cargo_is_dependency_section(const char *section) {
     static const char *const kinds[] = {"dependencies", "dev-dependencies", "build-dependencies"};
     const char *tail = section;
-    if (strncmp(section, "target.", 7) == 0) {
-        tail = strrchr(section, '.');
+    if (strncmp(section, "target\x1f", 7) == 0) {
+        tail = strrchr(section, '\x1f');
         tail = tail ? tail + 1 : section;
     }
     for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
@@ -361,20 +447,17 @@ static bool cargo_is_dependency_section(const char *section) {
             return true;
         }
     }
-    return strcmp(section, "workspace.dependencies") == 0;
+    return strcmp(section, "workspace\x1f" "dependencies") == 0;
 }
 
 /* The last component of a dependency table is the declared crate alias,
  * rather than an entry key. Its parent uses the same section rules as an
  * inline dependency, including target and workspace sections. */
 static const char *cargo_dependency_table_name(CBMArena *arena, const char *section) {
-    const char *dot = strrchr(section, '.');
-    if (!dot || !dot[1]) return NULL;
-    const char *parent = cbm_arena_strndup(arena, section, (size_t)(dot - section));
-    if (!cargo_is_dependency_section(parent)) return NULL;
-    const char *name = NULL;
-    int length = (int)strlen(dot + 1);
-    return parse_key(arena, dot + 1, length, 0, &name) == length ? name : NULL;
+    const char *separator = strrchr(section, '\x1f');
+    if (!separator || !separator[1]) return NULL;
+    const char *parent = cbm_arena_strndup(arena, section, (size_t)(separator - section));
+    return cargo_is_dependency_section(parent) ? separator + 1 : NULL;
 }
 
 static int parse_dependency_table_field(CBMArena *arena, const char *source, int length,
@@ -389,27 +472,32 @@ static int parse_dependency_table_field(CBMArena *arena, const char *source, int
         : skip_value(source, length, from);
 }
 
-void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
-    CBMCargoManifest* out) {
+void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoManifest *out) {
     if (!arena || !src || !out) return;
     memset(out, 0, sizeof(*out));
-    for (int i = 0; i < 5; i++)
-        out->auto_targets[i] = true;
+    for (int i = 0; i < 5; i++) out->auto_targets[i] = true;
     if (src_len <= 0) src_len = (int)strlen(src);
-
     int from = 0;
-    /* Default: pre-header content treated as [package]. */
-    const char* section = "package";
+    const char *section = "";
+    const char *package_prefix = "";
     CBMCargoTarget *target = NULL;
     CBMCargoDep *dependency_table = NULL;
-
     while (from < src_len) {
         from = skip_ws_and_comment(src, src_len, from);
         if (from >= src_len) break;
         if (src[from] == '[') {
-            const char* hdr = NULL;
-            from = parse_section(arena, src, src_len, from, &hdr);
-            section = hdr ? hdr : "";
+            bool array = from + 1 < src_len && src[from + 1] == '[';
+            from += array ? 2 : 1;
+            const char *path = NULL;
+            from = cargo_key_path(arena, src, src_len, from, &path);
+            if (!path || from >= src_len || src[from] != ']') {
+                out->edition_unreadable = true;
+                break;
+            }
+            from++;
+            if (array && from < src_len && src[from] == ']') from++;
+            package_prefix = path;
+            section = path;
             target = NULL;
             dependency_table = NULL;
             const char *dependency_name = cargo_dependency_table_name(arena, section);
@@ -417,48 +505,60 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
                 dependency_table = &out->deps[out->dep_count++];
                 dependency_table->name = dependency_name;
             }
-            if (strcmp(section, "lib") == 0)
-                target = append_target(arena, out, CBM_CARGO_TARGET_LIB);
-            else if (strcmp(section, "bin") == 0)
-                target = append_target(arena, out, CBM_CARGO_TARGET_BIN);
-            else if (strcmp(section, "test") == 0)
-                target = append_target(arena, out, CBM_CARGO_TARGET_TEST);
-            else if (strcmp(section, "example") == 0)
-                target = append_target(arena, out, CBM_CARGO_TARGET_EXAMPLE);
-            else if (strcmp(section, "bench") == 0)
-                target = append_target(arena, out, CBM_CARGO_TARGET_BENCH);
+            static const char *const kinds[] = {"lib", "bin", "test", "example", "bench"};
+            for (int t = 0; t < 5; t++)
+                if (strcmp(section, kinds[t]) == 0) target = append_target(arena, out, (CBMCargoTargetKind)t);
+            if (strcmp(section, "workspace") == 0) out->is_workspace_root = true;
+            if (strcmp(path, "package\x1f" "edition") == 0 ||
+                strncmp(path, "package\x1f" "edition\x1f", 16) == 0)
+                out->edition_unreadable = true;
             continue;
         }
-        if (!section) {
-            from = skip_value(src, src_len, from);
-            continue;
-        }
-        if (strcmp(section, "package") == 0) {
-            from = parse_package_kv(arena, src, src_len, from, out);
-        } else if (target) {
-            from = parse_target_kv(arena, src, src_len, from, out, target);
-        } else if (strcmp(section, "workspace") == 0) {
-            from = parse_workspace_kv(arena, src, src_len, from, out);
-        } else if (strcmp(section, "workspace.package") == 0) {
-            from = parse_workspace_package_kv(arena, src, src_len, from, out);
+        int start = from;
+        if (!*section || strcmp(section, "package") == 0 || strncmp(package_prefix, "package\x1f", 8) == 0 ||
+            strcmp(section, "workspace\x1f" "package") == 0) {
+            from = cargo_package_entry(arena, src, src_len, from, package_prefix, out, 0);
+        } else if (target) from = parse_target_kv(arena, src, src_len, from, out, target);
+        else if (strcmp(section, "workspace") == 0) {
+            /* workspace.package may itself be dotted or an inline table. */
+            const char *key = NULL;
+            cargo_key_path(arena, src, src_len, from, &key);
+            if (key && (strcmp(key, "package") == 0 || strncmp(key, "package\x1f", 8) == 0))
+                from = cargo_package_entry(arena, src, src_len, from, package_prefix, out, 0);
+            else from = parse_workspace_kv(arena, src, src_len, from, out);
         } else if (dependency_table) {
             from = parse_dependency_table_field(arena, src, src_len, from, dependency_table);
-        } else if (cargo_is_dependency_section(section)) {
-            from = parse_dep_entry(arena, src, src_len, from, out);
-        } else {
-            /* Section we don't care about — skip the line. */
-            while (from < src_len && src[from] != '\n' && src[from] != '[') {
-                from++;
-            }
+        } else if (cargo_is_dependency_section(section)) from = parse_dep_entry(arena, src, src_len, from, out);
+        else {
+            const char *key = NULL;
+            from = cargo_key_path(arena, src, src_len, from, &key);
+            if (from < src_len && src[from] == '=') from = skip_value(src, src_len, from + 1);
+        }
+        if (from <= start) {
+            out->edition_unreadable = true;
+            from = start + 1;
         }
     }
+}
+
+const char *cbm_cargo_effective_edition(const CBMCargoManifest *manifest,
+                                        const char *inherited_edition) {
+    if (!manifest || manifest->edition_unreadable)
+        return NULL;
+    const char *edition = manifest->edition_inherited ? inherited_edition : manifest->edition;
+    if (!edition && !manifest->edition_inherited)
+        return "2015";
+    if (edition && (strcmp(edition, "2015") == 0 || strcmp(edition, "2018") == 0 ||
+                    strcmp(edition, "2021") == 0 || strcmp(edition, "2024") == 0))
+        return edition;
+    return NULL;
 }
 
 static bool target_auto_enabled(const CBMCargoManifest *manifest, CBMCargoTargetKind kind,
                                 const char *inherited_edition) {
     if (manifest->auto_target_overrides & (1u << kind))
         return manifest->auto_targets[kind];
-    const char *edition = manifest->edition_inherited ? inherited_edition : manifest->edition;
+    const char *edition = cbm_cargo_effective_edition(manifest, inherited_edition);
     bool modern = edition && strcmp(edition, "2018") >= 0;
     return modern || manifest->target_count == 0;
 }
