@@ -7260,19 +7260,12 @@ static const char *rust_trait_spelling_leaf(CBMArena *arena, const char *spellin
     return end > start ? cbm_arena_strndup(arena, spelling + start, end - start) : NULL;
 }
 
-/* The method `method_name` that `receiver_qn` gets from an impl of a trait the
- * registry does not hold (a dependency's or a generated trait: the impl's
- * methods carry the trait flag and no trait QN). The impl is project source,
- * so the receiver type and the method name select it without the trait's
- * declaration. Exactly one such impl may define the name: two set
- * *out_ambiguous. An impl whose trait name is out of scope in `scope` is no
- * candidate (*out_filtered set). */
-static const CBMRegisteredFunc *
-rust_registry_lookup_unregistered_trait_impl_method(RustLSPContext *scope,
-                                                    const CBMTypeRegistry *reg,
-                                                    const char *receiver_qn,
-                                                    const char *method_name, bool *out_ambiguous,
-                                                    bool *out_filtered) {
+/* Unregistered trait impls can compete with registered methods, but their
+ * visible count cannot prove selection: macros can generate more impls.
+ * In-scope candidates therefore veto dispatch rather than supply a target. */
+static const CBMRegisteredFunc *rust_registry_lookup_unregistered_trait_impl_method(
+    RustLSPContext *scope, const CBMTypeRegistry *reg, const char *receiver_qn,
+    const char *method_name, bool *out_ambiguous, bool *out_filtered) {
     int best_index = -1;
     const char *matched_impl = NULL;
     CBMMethodIter it;
@@ -7299,12 +7292,13 @@ rust_registry_lookup_unregistered_trait_impl_method(RustLSPContext *scope,
         }
     }
     if (best_index >= 0) {
-        return &reg->funcs[best_index];
+        *out_ambiguous = true;
+        return NULL;
     }
-    return reg->fallback ? rust_registry_lookup_unregistered_trait_impl_method(
-                               scope, reg->fallback, receiver_qn, method_name, out_ambiguous,
-                               out_filtered)
-                         : NULL;
+    return reg->fallback
+               ? rust_registry_lookup_unregistered_trait_impl_method(
+                     scope, reg->fallback, receiver_qn, method_name, out_ambiguous, out_filtered)
+               : NULL;
 }
 
 /* Find the trait-impl method for one concrete receiver. With trait_qn==NULL,
@@ -11193,7 +11187,7 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
         }
         int tn = 0;
         const CBMRegisteredFunc *ti_m = rust_find_sole_trait_impl(ctx, trait_qn, short_name, &tn);
-        if (tn == 1) {
+        if (tn == 1 && strcmp(short_name, "from") != 0 && strcmp(short_name, "into") != 0) {
             rust_call_target_set(
                 out, ti_m,
                 ti_m ? ti_m->qualified_name
@@ -11203,7 +11197,8 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
         }
         return true;
     }
-    const CBMRegisteredFunc *m = cbm_registry_lookup_method_aliased(ctx->registry, head, short_name);
+    const CBMRegisteredFunc *m =
+        cbm_registry_lookup_method_aliased(ctx->registry, head, short_name);
     if (!m && ctx->module_qn) {
         /* Fall back to module-qualified head: `Logger.new` →
          * `<module>.Logger.new`. */
@@ -11222,6 +11217,12 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
                 rust_registry_lookup_sole_inherent_method(ctx, m->receiver_type, m->short_name);
         }
         if (!unique) {
+            unique = rust_trait_impl_by_argument(ctx, m->receiver_type, m->short_name, first_arg);
+        }
+        /* Visible impls are incomplete when macros generate conversions.
+         * Conversions require argument proof even if the visible impl is unique. */
+        if (unique && (unique->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0 &&
+            (strcmp(short_name, "from") == 0 || strcmp(short_name, "into") == 0)) {
             unique = rust_trait_impl_by_argument(ctx, m->receiver_type, m->short_name, first_arg);
         }
         if (unique) {
@@ -11260,6 +11261,9 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
         tm = rust_resolve_trait_method(ctx, receiver, short_name, &impls, NULL);
     }
     if (tm && impls == 1) {
+        if (strcmp(short_name, "from") == 0 || strcmp(short_name, "into") == 0) {
+            return true;
+        }
         /* A local registry cannot rule out an inherent method in another file. */
         if (ctx->enclosing_func_qn &&
             strcmp(tm->qualified_name, ctx->enclosing_func_qn) == 0 &&
