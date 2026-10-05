@@ -2635,12 +2635,6 @@ static const char **rust_item_type_param_names(CBMArena *a, TSNode item, const c
     return count > 0 ? names : NULL;
 }
 
-/* The type parameters a Rust fn itself declares (`fn get<T, U>`), in order. */
-static const char **rust_fn_type_param_names(CBMArena *a, TSNode fn, const char *source) {
-    int count = 0;
-    return rust_item_type_param_names(a, fn, source, &count);
-}
-
 /* Rust `type Name<P..> = Target;`: the target as written and the type
  * parameter names, in order, into `def`. */
 static void extract_rust_type_alias(CBMArena *a, TSNode item, const char *source,
@@ -4049,7 +4043,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     }
     if (ctx->language == CBM_LANG_RUST) {
         def.is_async = rust_fn_is_async(node);
-        def.type_alias_params = rust_fn_type_param_names(a, node, ctx->source);
+        int type_param_count = 0;
+        def.rust_type_params = rust_item_type_param_names(a, node, ctx->source, &type_param_count);
     }
 
     // Parameters — use func_node (inner function for templates)
@@ -5327,7 +5322,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (ctx->language == CBM_LANG_RUST) {
         def.is_async = rust_fn_is_async(child);
         def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source);
-        def.type_alias_params = rust_fn_type_param_names(a, child, ctx->source);
+        int type_param_count = 0;
+        def.rust_type_params = rust_item_type_param_names(a, child, ctx->source, &type_param_count);
     }
 
     TSNode params = find_function_params(child, ctx->language);
@@ -5593,7 +5589,8 @@ static void extract_rust_impl_member(CBMExtractCtx *ctx, TSNode child, const Rus
     def.impl_trait = impl_trait;
     def.is_async = rust_fn_is_async(child);
     def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source);
-    def.type_alias_params = rust_fn_type_param_names(a, child, ctx->source);
+    int type_param_count = 0;
+    def.rust_type_params = rust_item_type_param_names(a, child, ctx->source, &type_param_count);
     /* A trait-impl method takes the trait's visibility, never its own. */
     def.is_rust_private = !impl_trait && rust_fn_is_private(child);
     def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;

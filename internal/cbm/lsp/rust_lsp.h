@@ -391,13 +391,13 @@ typedef struct {
     const char *receiver_spelling;      /* exact impl receiver spelling; registry-only */
     const char *impl_target;            /* impl relation: raw `type Target = ..;` text */
     const char **decorators;            /* borrowed attribute texts (`#[derive(..)]`), NULL-ended */
-    const char **fn_type_params;        /* the fn's own type parameter names, NULL-ended */
     bool is_interface;           /* true for traits                          */
     bool is_rust_impl_relation;   /* independent type-level impl record       */
     bool is_abstract;             /* required trait declaration (no default)  */
     bool is_async;                /* `async fn`: return is the awaited output */
     bool is_rust_private;         /* inherent method without a visibility modifier */
     bool has_rust_self;           /* first parameter is a `self` receiver */
+    const char **type_params;     /* the fn's own type parameter names, NULL-ended */
 } CBMRustLSPDef;
 
 const char *cbm_rust_impl_key(CBMArena *arena, const char *receiver_qn,

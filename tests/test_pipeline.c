@@ -2914,7 +2914,9 @@ static int usage_expectations_hold_in_both_modes(const char *tmp, const usage_ex
 /* `s.get::<Conn>()` on `fn get<T>(&self) -> Option<Arc<T>>` declared in
  * another file is an `Option<Arc<Conn>>`: the method's own type parameters
  * reach the resolver in both pipeline modes, so the chained `ping` is Conn's,
- * not the namesake of a type the turbofish does not write. */
+ * not the namesake of a type the turbofish does not write. `pass` uses the
+ * same carrier to infer its return from the argument, including the result
+ * of the turbofish call in `combined`. */
 TEST(pipeline_rust_turbofish_method_binds_written_type_argument) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_turbofish_XXXXXX");
@@ -2930,6 +2932,7 @@ TEST(pipeline_rust_turbofish_method_binds_written_type_argument) {
                     "impl Conn {\n"
                     "    pub fn ping(&self) -> bool { true }\n"
                     "}\n"
+                    "pub fn pass<T>(value: T) -> T { value }\n"
                     "pub struct Store;\n"
                     "impl Store {\n"
                     "    pub fn get<T>(&self) -> Option<Arc<T>> { None }\n"
@@ -2941,14 +2944,29 @@ TEST(pipeline_rust_turbofish_method_binds_written_type_argument) {
                     "}\n");
     write_temp_file(tmp, "src/user.rs",
                     "use crate::other::Other;\n"
-                    "use crate::store::{Conn, Store};\n"
+                    "use crate::store::{pass, Conn, Store};\n"
                     "pub fn run(s: &Store) -> bool { s.get::<Conn>().unwrap().ping() }\n"
                     "pub fn hole(s: &Store) -> bool { s.get::<_>().unwrap().ping() }\n"
+                    "pub fn inferred(c: Conn) -> bool { pass(c).ping() }\n"
+                    "pub fn combined(s: &Store) -> bool { pass(s.get::<Conn>().unwrap()).ping() }\n"
                     "pub fn keep(_o: &Other) {}\n");
+    /* Discovery must exceed the pipeline's small-repository sequential cutoff. */
+    for (int i = 0; i < 50; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "src/filler_%02d.rs", i);
+        write_temp_file(tmp, path, "pub struct Filler;\n");
+    }
     static const usage_expectation_t rows[] = {
         {"run", "get", "src/store.rs", 1, NULL},   {"run", "ping", "src/store.rs", 1, NULL},
         {"run", "ping", "src/other.rs", 0, NULL},  {"hole", "get", "src/store.rs", 1, NULL},
         {"hole", "ping", "src/store.rs", 0, NULL}, {"hole", "ping", "src/other.rs", 0, NULL},
+        {"inferred", "pass", "src/store.rs", 1, NULL},
+        {"inferred", "ping", "src/store.rs", 1, NULL},
+        {"inferred", "ping", "src/other.rs", 0, NULL},
+        {"combined", "get", "src/store.rs", 1, NULL},
+        {"combined", "pass", "src/store.rs", 1, NULL},
+        {"combined", "ping", "src/store.rs", 1, NULL},
+        {"combined", "ping", "src/other.rs", 0, NULL},
     };
     int failed = edge_expectations_hold_in_both_modes(tmp, "CALLS", rows,
                                                       (int)(sizeof(rows) / sizeof(rows[0])));
@@ -17597,7 +17615,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":10") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":11") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
