@@ -8,7 +8,7 @@
  * Fork of tree-sitter/tree-sitter-rust v0.24.2 (77a3747266f4), maintained in this
  * repository; changes (c) 2026 DeusData, MIT. The generated src/parser.c, src/scanner.c
  * and src/tree_sitter/*.h are copied to internal/cbm/vendored/grammars/rust/.
- * Regenerate with `npx tree-sitter-cli@0.25.10 generate`.
+ * Regenerate with `tree-sitter generate` using tree-sitter CLI 0.27.0.
  *
  * Changes from upstream, each found by comparing parse trees with rust-analyzer's
  * parser on real code: `safe` and `try` usable as identifiers; cargo-script
@@ -128,6 +128,7 @@ module.exports = grammar({
     [$.visibility_modifier, $.scoped_identifier, $.scoped_type_identifier],
     [$.foreign_mod_item, $.function_modifiers],
     [$.range_expression],
+    [$.break_expression],
     [$.generic_type_with_turbofish, $.generic_pattern],
   ],
 
@@ -188,7 +189,7 @@ module.exports = grammar({
       );
 
       return seq(
-        token(seq('macro_rules', /\s*/, '!')),
+        'macro_rules', '!',
         field('name', choice(
           $.identifier,
           $._reserved_identifier,
@@ -724,7 +725,7 @@ module.exports = grammar({
 
     extern_modifier: $ => seq(
       'extern',
-      optional($.string_literal),
+      optional(choice($.string_literal, $.raw_string_literal)),
     ),
 
     visibility_modifier: $ => choice(
@@ -843,6 +844,7 @@ module.exports = grammar({
 
     generic_type: $ => prec(1, seq(
       field('type', choice(
+        alias(choice(...primitiveTypes), $.primitive_type),
         $._type_identifier,
         $._reserved_identifier,
         $.scoped_type_identifier,
@@ -862,7 +864,7 @@ module.exports = grammar({
     bounded_type: $ => prec.left(-1, seq(
       choice($.lifetime, $._type, $.use_bounds),
       '+',
-      choice($.lifetime, $._type, $.use_bounds),
+      choice($.lifetime, $._type, $.use_bounds, $.higher_ranked_trait_bound),
     )),
 
     use_bounds: $ => seq(
@@ -881,18 +883,20 @@ module.exports = grammar({
 
     type_arguments: $ => seq(
       token(prec(1, '<')),
-      sepBy1(',', seq(
-        choice(
-          $._type,
-          $.type_binding,
-          $.lifetime,
-          $._literal,
-          $.negative_literal,
-          $.block,
-        ),
-        optional($.trait_bounds),
+      optional(seq(
+        sepBy1(',', seq(
+          choice(
+            $._type,
+            $.type_binding,
+            $.lifetime,
+            $._literal,
+            $.negative_literal,
+            $.block,
+          ),
+          optional($.trait_bounds),
+        )),
+        optional(','),
       )),
-      optional(','),
       '>',
     ),
 
@@ -1360,12 +1364,9 @@ module.exports = grammar({
 
     label: $ => seq('\'', $.identifier),
 
-    break_expression: $ => choice(
-      prec.left(seq('break', optional($.label), $._expression)),
-      prec(-1, seq('break', optional($.label))),
-    ),
+    break_expression: $ => prec(PREC.closure, seq('break', optional($.label), optional($._expression))),
 
-    continue_expression: $ => prec.left(seq('continue', optional($.label))),
+    continue_expression: $ => prec.right(seq('continue', optional($.label))),
 
     index_expression: $ => prec(PREC.call, seq($._expression, '[', $._expression, ']')),
 
@@ -1584,7 +1585,7 @@ module.exports = grammar({
         /0b[01_]+/,
         /0o[0-7_]+/,
       ),
-      optional(choice(...numericTypes)),
+      optional(choice(...numericTypes, /[a-zA-Z_]\w*/)),
     )),
 
     string_literal: $ => seq(
@@ -1702,6 +1703,7 @@ module.exports = grammar({
       'gen',
       'raw',
       'safe',
+      'macro_rules',
       // `try` is an identifier in edition 2015 and names the `try!` macro.
       'try',
     ), $.identifier),
@@ -1713,7 +1715,7 @@ module.exports = grammar({
     super: _ => 'super',
     crate: _ => 'crate',
 
-    metavariable: _ => /\$[a-zA-Z_]\w*/,
+    metavariable: _ => /\$\s*[_\p{XID_Start}][_\p{XID_Continue}]*/,
   },
 });
 

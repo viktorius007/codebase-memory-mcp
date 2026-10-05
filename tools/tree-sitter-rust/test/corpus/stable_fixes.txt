@@ -1,0 +1,273 @@
+==================
+macro rules comment
+==================
+
+macro_rules /* separated */ ! m { () => {}; }
+
+---
+
+(source_file
+  (macro_definition
+    (block_comment)
+    (identifier)
+    (macro_rule
+      (token_tree_pattern)
+      (token_tree))))
+
+==================
+macro metavariable spacing unicode
+==================
+
+macro_rules! m { ($ x:ident, $λ:ident) => { $ x $λ }; }
+
+---
+
+(source_file
+  (macro_definition
+    (identifier)
+    (macro_rule
+      (token_tree_pattern
+        (token_binding_pattern
+          (metavariable)
+          (fragment_specifier))
+        (token_binding_pattern
+          (metavariable)
+          (fragment_specifier)))
+      (token_tree
+        (metavariable)
+        (metavariable)))))
+
+==================
+block comment unicode
+==================
+
+/* Īį text */ fn f() {}
+
+---
+
+(source_file
+  (block_comment)
+  (function_item
+    (identifier)
+    (parameters)
+    (block)))
+
+==================
+block comment repeated slashes
+==================
+
+/* //* nested */ still outer */ fn f() {}
+
+---
+
+(source_file
+  (block_comment)
+  (function_item
+    (identifier)
+    (parameters)
+    (block)))
+
+==================
+integer underscore method
+==================
+
+fn f() { 1._method(); }
+
+---
+
+(source_file
+  (function_item
+    (identifier)
+    (parameters)
+    (block
+      (expression_statement
+        (call_expression
+          (field_expression
+            (integer_literal)
+            (field_identifier))
+          (arguments))))))
+
+==================
+macro integer suffix
+==================
+
+m!(1widget 0xffwidget 0b10widget 0o7widget);
+
+---
+
+(source_file
+  (expression_statement
+    (macro_invocation
+      (identifier)
+      (token_tree
+        (integer_literal)
+        (integer_literal)
+        (integer_literal)
+        (integer_literal)))))
+
+==================
+empty type arguments
+==================
+
+struct Vehicle; type Bike = Vehicle<>; mod epsilon { pub struct Foo; } pub struct H(epsilon::Foo::<>); type K = u8<>;
+
+---
+
+(source_file
+  (struct_item
+    (type_identifier))
+  (type_item
+    (type_identifier)
+    (generic_type
+      (type_identifier)
+      (type_arguments)))
+  (mod_item
+    (identifier)
+    (declaration_list
+      (struct_item
+        (visibility_modifier)
+        (type_identifier))))
+  (struct_item
+    (visibility_modifier)
+    (type_identifier)
+    (ordered_field_declaration_list
+      (generic_type
+        (scoped_identifier
+          (identifier)
+          (identifier))
+        (type_arguments))))
+  (type_item
+    (type_identifier)
+    (generic_type
+      (primitive_type)
+      (type_arguments))))
+
+==================
+raw string abi
+==================
+
+extern r#"C"# fn foo() {} type T = extern r#"C"# fn();
+
+---
+
+(source_file
+  (function_item
+    (function_modifiers
+      (extern_modifier
+        (raw_string_literal
+          (string_content))))
+    (identifier)
+    (parameters)
+    (block))
+  (type_item
+    (type_identifier)
+    (function_type
+      (function_modifiers
+        (extern_modifier
+          (raw_string_literal
+            (string_content))))
+      (parameters))))
+
+==================
+higher ranked bound after plus
+==================
+
+trait Trait<'b> {} struct S<'a> { pub baz: &'a (dyn Unpin + for<'b> Trait<'b>), }
+
+---
+
+(source_file
+  (trait_item
+    (type_identifier)
+    (type_parameters
+      (lifetime_parameter
+        (lifetime
+          (identifier))))
+    (declaration_list))
+  (struct_item
+    (type_identifier)
+    (type_parameters
+      (lifetime_parameter
+        (lifetime
+          (identifier))))
+    (field_declaration_list
+      (field_declaration
+        (visibility_modifier)
+        (field_identifier)
+        (reference_type
+          (lifetime
+            (identifier))
+          (tuple_type
+            (bounded_type
+              (dynamic_type
+                (type_identifier))
+              (higher_ranked_trait_bound
+                (type_parameters
+                  (lifetime_parameter
+                    (lifetime
+                      (identifier))))
+                (generic_type
+                  (type_identifier)
+                  (type_arguments
+                    (lifetime
+                      (identifier))))))))))))
+
+==================
+labelled while control flow
+==================
+
+fn f() { 'a: while break 'a {} 'b: while continue 'b {} }
+
+---
+
+(source_file
+  (function_item
+    (identifier)
+    (parameters)
+    (block
+      (expression_statement
+        (while_expression
+          (label
+            (identifier))
+          (break_expression
+            (label
+              (identifier)))
+          (block)))
+      (expression_statement
+        (while_expression
+          (label
+            (identifier))
+          (continue_expression
+            (label
+              (identifier)))
+          (block))))))
+==================
+empty type arguments reject a lone comma
+==================
+
+struct S; type T=S<,>;
+
+---
+
+(source_file
+  (struct_item (type_identifier))
+  (type_item
+    (type_identifier)
+    (generic_type
+      (type_identifier)
+      (type_arguments (ERROR)))))
+==================
+macro rules remains callable as an identifier
+==================
+
+fn f() { macro_rules(); }
+
+---
+
+(source_file
+  (function_item
+    (identifier)
+    (parameters)
+    (block
+      (expression_statement
+        (call_expression (identifier) (arguments))))))
