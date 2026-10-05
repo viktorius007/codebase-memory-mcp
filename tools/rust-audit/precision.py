@@ -167,8 +167,6 @@ def no_oracle_data(a,b):
             why=UNIMPORTED; continue
         return None
     return why
-idx=collections.defaultdict(list)
-for (cf,cl,cn) in bycaller: idx[cf].append((cl,cn))
 C=collections.Counter(); S=collections.defaultdict(list); strat=collections.Counter()
 for l in open(D+'g_calls.tsv'):
     s,t,st=l.rstrip('\n').split('\t'); s=int(s); t=int(t)
@@ -177,8 +175,10 @@ for l in open(D+'g_calls.tsv'):
     if a[0] not in('Function','Method') or b[0] not in('Function','Method'): continue
     if a[2] not in scip_files: k='unverifiable: caller file not compiled on the oracle platform'
     else:
-        key=next(((a[2],cl,cn) for cl,cn in idx[a[2]] if cn==a[1] and a[3]<=cl<=a[4]),None)
-        if key is None: k='unverifiable: caller has no oracle data (inactive cfg or no calls)'
+        # Truth owns calls by the source caller's declaration, including macro-expanded
+        # callers absent from SCIP declarations. A nested same-name caller owns a different key.
+        key=(a[2],a[3],a[1])
+        if key not in bycaller: k='unverifiable: caller has no oracle data (inactive cfg or no calls)'
         else:
             tg=bycaller[key].get(b[1])
             if not tg: k=no_oracle_data(a,b) or 'NOT IN TRUTH: caller never references a function of that name'
