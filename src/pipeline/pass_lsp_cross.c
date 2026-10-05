@@ -2706,18 +2706,16 @@ static char *pxc_rust_crate_name(CBMArena *arena, const char *name) {
     return out;
 }
 
-static bool pxc_rust_edition_2015(const CBMCargoManifest *manifest, const char *inherited) {
-    const char *edition = manifest->edition_inherited ? inherited : manifest->edition;
-    return !edition || strcmp(edition, "2015") == 0;
-}
-
 static void pxc_rust_add_package_crates(PXCRustCrates *crates, PXCRustPackage *package,
                                         const CBMCargoManifest *owners, const char *inherited,
                                         CBMRustModTree *tree) {
     CBMCargoManifest *m = package->manifest;
     pxc_cargo_discover_targets(crates->arena, owners, m, package->dir, crates->files,
                                crates->file_count, inherited);
-    bool e2015 = pxc_rust_edition_2015(m, inherited);
+    const char *edition = cbm_cargo_effective_edition(m, inherited);
+    CBMRustEdition tree_edition = !edition                       ? CBM_RUST_EDITION_UNKNOWN
+                                  : strcmp(edition, "2015") == 0 ? CBM_RUST_EDITION_2015
+                                                                 : CBM_RUST_EDITION_MODERN;
     for (int t = 0; t < m->target_count; t++) {
         const CBMCargoTarget *target = &m->targets[t];
         if (!target->path) {
@@ -2728,7 +2726,7 @@ static void pxc_rust_add_package_crates(PXCRustCrates *crates, PXCRustPackage *p
             lib ? pxc_rust_crate_name(crates->arena, m->lib_name ? m->lib_name : m->package_name)
                 : NULL;
         int id = cbm_rust_modtree_add_crate(
-            tree, pxc_rel_join(crates->arena, package->dir, target->path), name, e2015);
+            tree, pxc_rel_join(crates->arena, package->dir, target->path), name, tree_edition);
         if (id < 0) {
             continue;
         }

@@ -10,11 +10,9 @@
  * module QN, and to mark calls into known external deps as "external,
  * not local" rather than fully unresolved.
  *
- * The parser is a tiny hand-written TOML subset: handles `[section]`
- * headers, `key = "value"`, `key = { path = "...", … }` (the relevant
- * subset for our needs), arrays `members = ["a", "b"]`. It IGNORES
- * everything it doesn't understand — that's safe because Cargo.toml
- * is much richer than what we use. */
+ * The reader decodes TOML strings and the Cargo package-key schema.
+ * Other manifest sections use a smaller subset.
+ * Unreadable editions are distinguished from Cargo's default. */
 
 #ifndef CBM_LSP_RUST_CARGO_H
 #define CBM_LSP_RUST_CARGO_H
@@ -40,8 +38,8 @@ typedef struct {
 } CBMCargoTarget;
 
 typedef struct {
-    const char* name;       /* declared dependency name */
-    const char* path;       /* path = "../foo" if local, else NULL */
+    const char *name; /* declared dependency name */
+    const char *path; /* path = "../foo" if local, else NULL */
 } CBMCargoDep;
 
 typedef struct {
@@ -54,13 +52,16 @@ typedef struct {
 } CBMCargoMember;
 
 typedef struct CBMCargoManifest {
-    const char *package_name;    /* [package].name, NULL if missing */
-    const char *package_version; /* [package].version, NULL if missing */
-    const char *lib_name;        /* [lib].name, NULL if missing */
-    const char *edition;         /* [package].edition, NULL if Cargo's default */
+    const char *package_name;      /* [package].name, NULL if missing */
+    const char *package_version;   /* [package].version, NULL if missing */
+    const char *lib_name;          /* [lib].name, NULL if missing */
+    const char *edition;           /* [package].edition, NULL if Cargo's default */
     const char *workspace_edition; /* [workspace.package].edition */
-    bool edition_inherited;      /* edition.workspace = true */
-    bool is_workspace_root;      /* [workspace] section seen */
+    const char *workspace_version; /* [workspace.package].version */
+    bool version_inherited;        /* version.workspace = true */
+    bool edition_unreadable;       /* invalid or unsupported declaration: never default */
+    bool edition_inherited;        /* edition.workspace = true */
+    bool is_workspace_root;        /* [workspace] section seen */
     bool auto_targets[5];
     unsigned auto_target_overrides;
 
@@ -77,20 +78,24 @@ typedef struct CBMCargoManifest {
 
 /* Parse a Cargo.toml-formatted string. The output strings are
  * arena-allocated (so the caller doesn't need to keep `src` alive). */
-void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
-    CBMCargoManifest* out);
+void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoManifest *out);
+
+/* Cargo's edition when established: omission is 2015; unreadable declarations,
+ * unsupported editions and missing inherited values return NULL. */
+const char *cbm_cargo_effective_edition(const CBMCargoManifest *manifest,
+                                        const char *inherited_edition);
 
 /* Record a target Cargo discovered from the package's filesystem layout.
  * Explicit target tables without a path are completed by matching kind/name;
  * otherwise a target is added only when Cargo auto-discovery is enabled. */
 void cbm_cargo_record_discovered_target(CBMArena *arena, CBMCargoManifest *manifest,
-                                        CBMCargoTargetKind kind, const char *name,
-                                        const char *path, const char *inherited_edition);
+                                        CBMCargoTargetKind kind, const char *name, const char *path,
+                                        const char *inherited_edition);
 
 /* Convenience: does a given path-prefix look like one of the listed
  * dependency names? Used by the resolver to recognise external crate
  * paths. */
-bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head);
+bool cbm_cargo_is_known_dep(const CBMCargoManifest *m, const char *head);
 
 /* Find a workspace member by the head of a Rust path: its directory name,
  * its [package].name or its [lib].name, comparing `-` and `_` as equal.

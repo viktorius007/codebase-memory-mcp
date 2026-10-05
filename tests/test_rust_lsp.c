@@ -10912,6 +10912,119 @@ TEST(rustlsp_partial_hrtb_stripped) {
 }
 
 /* Cargo.toml parsing. */
+TEST(rustlsp_cargo_package_string_forms_are_decoded) {
+    const char *const values[][3] = {
+        {"\"test_pkg\"", "\"1.2.3\"", "\"2024\""},
+        {"'test_pkg'", "'1.2.3'", "'2024'"},
+        {"\"\"\"test_pkg\"\"\"", "\"\"\"1.2.3\"\"\"", "\"\"\"2024\"\"\""},
+        {"'''test_pkg'''", "'''1.2.3'''", "'''2024'''"},
+        {"\"test_\\x70kg\"", "\"1.2.\\x33\"", "\"20\\x324\""},
+        {"\"test_\\u0070kg\"", "\"1.2.\\U00000033\"", "\"20\\u00324\""},
+        {"\"\"\"\ntest_\\\n  pkg\"\"\"", "\"\"\"\r\n1.2.3\"\"\"", "\"\"\"\n20\\\n  24\"\"\""},
+    };
+    const char *const layouts[] = {
+        "[package]\nname=%s\nversion=%s\nedition=%s\n",
+        "package.name=%s\npackage.version=%s\npackage.edition=%s\n",
+        "package = {name=%s, version=%s, edition=%s}\n",
+        "[ \"package\" ]\nname=%s\nversion=%s\n\"ed\\u0069tion\"=%s\n",
+    };
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        for (size_t j = 0; j < sizeof(layouts) / sizeof(layouts[0]); j++) {
+            CBMArena arena; cbm_arena_init(&arena);
+            char *src = cbm_arena_sprintf(&arena, layouts[j], values[i][0], values[i][1], values[i][2]);
+            CBMCargoManifest m; cbm_cargo_parse(&arena, src, 0, &m);
+            ASSERT_STR_EQ("test_pkg", m.package_name);
+            ASSERT_STR_EQ("1.2.3", m.package_version);
+            ASSERT_STR_EQ("2024", m.edition);
+            cbm_arena_destroy(&arena);
+        }
+    }
+    PASS();
+}
+
+TEST(rustlsp_cargo_inheritance_forms_are_equivalent) {
+    const char *const declarations[] = {
+        "[package]\nedition.workspace=true\nversion.workspace=true\n",
+        "[package]\nedition={workspace=true}\nversion={workspace=true}\n",
+        "[package]\nedition={\nworkspace=true, # TOML 1.1\n}\nversion={\nworkspace=true,\n}\n",
+        "[package.edition]\nworkspace=true\n[package.version]\nworkspace=true\n",
+        "[ 'package' . 'edition' ]\n'workspace'=true\n[ 'package' . 'version' ]\n'workspace'=true\n",
+        "package.edition.workspace=true\npackage.version.workspace=true\n",
+        "package={edition={workspace=true}, version={workspace=true}}\n",
+        "[package]\n\"edition\" . 'workspace' = true\n'version' . \"workspace\" = true\n",
+    };
+    for (size_t i = 0; i < sizeof(declarations) / sizeof(declarations[0]); i++) {
+        CBMArena arena; cbm_arena_init(&arena);
+        char *src = cbm_arena_sprintf(&arena, "%s\n[workspace.package]\nedition='2024'\nversion='1.2.3'\n", declarations[i]);
+        CBMCargoManifest m; cbm_cargo_parse(&arena, src, 0, &m);
+        ASSERT_TRUE(m.edition_inherited);
+        ASSERT_TRUE(m.version_inherited);
+        ASSERT_STR_EQ("2024", m.workspace_edition);
+        ASSERT_STR_EQ("1.2.3", m.workspace_version);
+        ASSERT_STR_EQ("2024", cbm_cargo_effective_edition(&m, m.workspace_edition));
+        cbm_arena_destroy(&arena);
+    }
+    PASS();
+}
+
+TEST(rustlsp_cargo_auto_target_keys_read_both_boolean_values) {
+    const char *const keys[] = {"autolib", "autobins", "autotests", "autoexamples", "autobenches"};
+    for (int i = 0; i < 5; i++) {
+        for (int flag = 0; flag < 2; flag++) {
+            CBMArena arena; cbm_arena_init(&arena);
+            char *src = cbm_arena_sprintf(&arena, "[ 'package' ]\n'%s'=%s\n", keys[i], flag ? "true" : "false");
+            CBMCargoManifest m; cbm_cargo_parse(&arena, src, 0, &m);
+            ASSERT_EQ(1u << i, m.auto_target_overrides);
+            ASSERT_EQ(flag != 0, m.auto_targets[i]);
+            cbm_arena_destroy(&arena);
+        }
+    }
+    PASS();
+}
+
+TEST(rustlsp_cargo_workspace_edition_string_forms_and_layouts) {
+    const char *const layouts[] = {
+        "[workspace.package]\nedition='%s'\n",
+        "[workspace]\npackage.edition='%s'\n",
+        "workspace.package.edition='%s'\n",
+        "workspace={package={edition='%s'}}\n",
+        "[ 'workspace' . 'package' ]\n'edition'='%s'\n",
+        "[workspace]\npackage={edition='%s'}\n",
+    };
+    const char *const editions[] = {"2015", "2018", "2021", "2024"};
+    for (size_t i = 0; i < sizeof(layouts) / sizeof(layouts[0]); i++) {
+        for (size_t j = 0; j < sizeof(editions) / sizeof(editions[0]); j++) {
+            CBMArena arena; cbm_arena_init(&arena);
+            char *src = cbm_arena_sprintf(&arena, "%s[package]\nname='p'\nedition.workspace=true\n", cbm_arena_sprintf(&arena, layouts[i], editions[j]));
+            CBMCargoManifest m; cbm_cargo_parse(&arena, src, 0, &m);
+            ASSERT_STR_EQ(editions[j], m.workspace_edition);
+            ASSERT_STR_EQ(editions[j], cbm_cargo_effective_edition(&m, m.workspace_edition));
+            cbm_arena_destroy(&arena);
+        }
+    }
+    PASS();
+}
+
+TEST(rustlsp_cargo_omission_defaults_but_unreadable_edition_does_not) {
+    const char *const unknown[] = {
+        "edition=2024", "edition='2099'", "edition={workspace=false}",
+        "edition={}", "[package.edition]", "edition.workspace=true", "edition='2024", "edition=true",
+    };
+    CBMArena arena; cbm_arena_init(&arena);
+    CBMCargoManifest m; cbm_cargo_parse(&arena, "[package]\nname='p'\n", 0, &m);
+    ASSERT_STR_EQ("2015", cbm_cargo_effective_edition(&m, NULL));
+    for (size_t i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+        char *src = cbm_arena_sprintf(&arena, "[package]\nname='p'\n%s\n", unknown[i]);
+        cbm_cargo_parse(&arena, src, 0, &m);
+        ASSERT_NULL(cbm_cargo_effective_edition(&m, NULL));
+    }
+    cbm_cargo_parse(&arena, "[package]\n\"edition.workspace\"=true\n", 0, &m);
+    ASSERT_FALSE(m.edition_inherited);
+    ASSERT_STR_EQ("2015", cbm_cargo_effective_edition(&m, NULL));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(rustlsp_partial_cargo_parses_simple) {
     CBMArena a; cbm_arena_init(&a);
     const char *toml =
@@ -11750,6 +11863,40 @@ static CBMRustPathResult rust_modtree_lookup(RustModTreeFixture *fx, const char 
 static void rust_modtree_fixture_free(RustModTreeFixture *fx) {
     cbm_rust_modtree_free(fx->tree);
     cbm_arena_destroy(&fx->arena);
+}
+
+TEST(rustlsp_cargo_edition_selects_import_scope_and_unknown_refuses_links) {
+    const char *const rels[] = {"src/lib.rs", "src/nested.rs", "src/nested/inner.rs", "src/inner.rs"};
+    const char *const qns[] = {"p.src.lib", "p.src.nested", "p.src.nested.inner", "p.src.inner"};
+    const char *const sources[] = {
+        "mod nested; mod inner;\n", "mod inner; use inner::act; pub fn run() { act(); }\n",
+        "pub fn act() {}\n", "pub fn act() {}\n",
+    };
+    const CBMRustEdition editions[] = {CBM_RUST_EDITION_2015, CBM_RUST_EDITION_MODERN, CBM_RUST_EDITION_UNKNOWN};
+    const char *const expected[] = {"p.src.inner.act", "p.src.nested.inner.act", NULL};
+    for (int e = 0; e < 3; e++) {
+        CBMRustModTree *tree = cbm_rust_modtree_new();
+        CBMRustModFacts *facts[4];
+        CBMArena arena; cbm_arena_init(&arena);
+        for (int i = 0; i < 4; i++) {
+            cbm_rust_modtree_add_file(tree, rels[i], qns[i]);
+            facts[i] = cbm_rust_modfacts_scan(sources[i], (int)strlen(sources[i]));
+        }
+        cbm_rust_modtree_add_crate(tree, rels[0], "p", editions[e]);
+        cbm_rust_modtree_finish(tree, (const CBMRustModFacts *const *)facts);
+        CBMRustPathResult result = cbm_rust_modtree_resolve(tree, &arena, qns[1], 50, "act", NULL, NULL, 0);
+        if (expected[e]) {
+            ASSERT_EQ(CBM_RUST_PATH_FUNCTION, result.kind);
+            ASSERT_STR_EQ(expected[e], result.qn);
+        } else {
+            ASSERT_EQ(CBM_RUST_PATH_EDITION_UNKNOWN, result.kind);
+            const char *items[2];
+            ASSERT_EQ(-1, cbm_rust_modtree_use_items(tree, &arena, rels[1], "act", "inner::act", items, 2));
+        }
+        for (int i = 0; i < 4; i++) cbm_rust_modfacts_free(facts[i]);
+        cbm_rust_modtree_free(tree); cbm_arena_destroy(&arena);
+    }
+    PASS();
 }
 
 TEST(rustlsp_modtree_built_from_scanned_facts) {
@@ -13405,6 +13552,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_partial_registry_hash_lookup_correctness);
     RUN_TEST(rustlsp_partial_gat_lifetime_stripped);
     RUN_TEST(rustlsp_partial_hrtb_stripped);
+    RUN_TEST(rustlsp_cargo_package_string_forms_are_decoded);
+    RUN_TEST(rustlsp_cargo_inheritance_forms_are_equivalent);
+    RUN_TEST(rustlsp_cargo_auto_target_keys_read_both_boolean_values);
+    RUN_TEST(rustlsp_cargo_workspace_edition_string_forms_and_layouts);
+    RUN_TEST(rustlsp_cargo_omission_defaults_but_unreadable_edition_does_not);
     RUN_TEST(rustlsp_partial_cargo_parses_simple);
     RUN_TEST(rustlsp_partial_cargo_parses_workspace);
     RUN_TEST(rustlsp_partial_cargo_handles_comments_and_quirks);
@@ -13424,6 +13576,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_followup_b_pathological_no_hang);
 
     /* Crate module tree from scanned facts */
+    RUN_TEST(rustlsp_cargo_edition_selects_import_scope_and_unknown_refuses_links);
     RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
