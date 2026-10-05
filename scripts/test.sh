@@ -366,6 +366,9 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
 echo "=== Step 5f: worker request-scope regression ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_session_scope.sh"
 
+echo "=== Daemon-free indexing regression ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_index_local.sh"
+
 # Step 5g: CLI cache validation under a filesystem sandbox.
 echo "=== Step 5g: CLI cache validation under a filesystem sandbox ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_cli_sandbox.sh"
