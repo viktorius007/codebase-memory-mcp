@@ -11,13 +11,15 @@
 # Bench root (CBM_RUST_BENCH, default ~/.cache/cbm-rust-bench) holds:
 #   codex/codex-rs  corpus at bc98fc69f8 (read-only: never edit or commit there)
 #   truth.tsv refs.tsv  from tools/rust-audit/tsdiff (truth, refs binaries)
+# Another corpus: point CBM_RUST_BENCH at a root holding its truth.tsv and
+# refs.tsv and CBM_RUST_CORPUS at the directory the truth paths are relative to.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BENCH="${CBM_RUST_BENCH:-$HOME/.cache/cbm-rust-bench}"
-CORPUS="$BENCH/codex/codex-rs"
+CORPUS="${CBM_RUST_CORPUS:-$BENCH/codex/codex-rs}"
 [[ -f "$CORPUS/Cargo.toml" && -s "$BENCH/truth.tsv" && -s "$BENCH/refs.tsv" ]] ||
     { echo "bench incomplete: $BENCH" >&2; exit 2; }
-[[ "$(find "$CORPUS" -name '*.rs' -type f | wc -l | tr -d ' ')" == 4698 ]] ||
+[[ -n "${CBM_RUST_CORPUS:-}" || "$(find "$CORPUS" -name '*.rs' -type f | wc -l | tr -d ' ')" == 4698 ]] ||
     { echo "corpus is not the 4,698-file tree: $CORPUS" >&2; exit 2; }
 if [[ "${1:-}" == --rescore ]]; then
     OUT="${2:?usage: $0 --rescore <out-dir>}"; INDEX_S=-
