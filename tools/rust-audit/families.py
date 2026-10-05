@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Independent check of definitions, method ownership, imports, usages, impl relations in the published graph."""
-import collections, re, random
+import bisect, collections, re, random
 import os
 D=os.environ.get('AUDIT_DIR','/tmp/ts-audit')+'/'
 nodes={}; by_file=collections.defaultdict(list); filenode={}
@@ -11,7 +11,7 @@ for l in open(D+'g_nodes.tsv',errors='replace'):
 def find(f,line,name,labels=None):
     best=None
     for s,e,n,i,lab in by_file.get(f,()):
-        if s<=line<=e and n==name and (labels is None or lab in labels) and (best is None or e-s<best[0]): best=(e-s,i)
+        if s<=line<=e and n.removeprefix('r#')==name.removeprefix('r#') and (labels is None or lab in labels) and (best is None or e-s<best[0]): best=(e-s,i)
     return best[1] if best else None
 defs=[]; refs=[]; impls=[]; scip_files=set()
 for l in open(D+'refs.tsv',errors='replace'):
@@ -97,29 +97,44 @@ random.seed(1)
 for f,n in random.sample(badrows,10): print('    not confirmed:',f,'->',n)
 # 4. usages
 fnrefs=collections.defaultdict(set)
+module_refs=collections.defaultdict(set)
 for f,line,ctx,el,en,df,dl,kind,name in refs:
-    if el=='-': continue
-    a=find(f,int(el),en,{'Function','Method'}); b=find(df,int(dl),name)
+    b=find(df,int(dl),name)
+    if el=='-':
+        if ctx!='use' and b is not None: module_refs[(f,b)].add(int(line))
+        continue
+    a=find(f,int(el),en,{'Function','Method'})
     if a is not None and b is not None: fnrefs[a].add(b)
+module_refs={k:sorted(v) for k,v in module_refs.items()}
 U=collections.Counter(); tr_pairs=sum(len(v) for v in fnrefs.values()); found=0; gus=collections.defaultdict(set)
+module_confirmed=0
 for l in open(D+'g_USAGE.tsv'):
     s,t=map(int,l.split('\t'))
     if s not in nodes or t not in nodes or not nodes[s][2].endswith('.rs'): continue
     gus[s].add(t)
     lab=nodes[t][0]
+    source_label,_,f,lo,hi=nodes[s]
+    lines=module_refs.get((f,t),()) if source_label in ('Module','File') else ()
+    pos=bisect.bisect_left(lines,lo)
+    module_hit=pos<len(lines) and (source_label=='File' or lines[pos]<=hi)
     if nodes[s][2] not in scip_files: U[(lab,'unverifiable')]+=1
-    elif t in fnrefs.get(s,()): U[(lab,'confirmed')]+=1
+    elif t in fnrefs.get(s,()) or module_hit:
+        U[(lab,'confirmed')]+=1
+        module_confirmed+=module_hit
     else: U[(lab,'not confirmed')]+=1
-print('\nUSAGE links from Rust functions, by target kind: confirmed / not confirmed / unverifiable')
+print('\nUSAGE pairs from Rust sources, by target kind: confirmed / not confirmed / unverifiable')
 for lab in sorted({k[0] for k in U}): print(f'  {lab:<10}{U[(lab,"confirmed")]:>8}{U[(lab,"not confirmed")]:>8}{U[(lab,"unverifiable")]:>8}')
+print(f'module-level USAGE pairs confirmed by non-use references in the source Module/File span: {module_confirmed}')
 calls=collections.defaultdict(set)
 for l in open(D+'g_calls.tsv'):
     s,t,_=l.split('\t',2); calls[int(s)].add(int(t))
+for l in open(D+'g_CALL_REFERENCE.tsv'):
+    s,t=map(int,l.split('\t')); calls[s].add(t)
 bykind=collections.Counter(); bykind_hit=collections.Counter()
 for a,ts in fnrefs.items():
     for b in ts:
         k=nodes[b][0]; bykind[k]+=1; bykind_hit[k]+= (b in gus.get(a,())) or (b in calls.get(a,()))
-print('  truth: function references in-corpus item -> any USAGE/CALLS link published')
+print('  truth: function reference pairs with mapped targets -> any USAGE/CALLS/CALL_REFERENCE pair published')
 for k,v in bykind.most_common(): print(f'    {k:<10}{bykind_hit[k]:>8} / {v:<8} {100*bykind_hit[k]/v:.1f}%')
 # 5. impl relations: `impl Trait for Type` -> IMPLEMENTS edge Type -> Trait.
 # Truth: the impl header's in-corpus references (refs.tsv R rows on the header
