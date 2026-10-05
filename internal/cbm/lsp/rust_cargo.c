@@ -450,6 +450,28 @@ static bool cargo_is_dependency_section(const char *section) {
     return strcmp(section, "workspace\x1f" "dependencies") == 0;
 }
 
+/* The last component of a dependency table is the declared crate alias,
+ * rather than an entry key. Its parent uses the same section rules as an
+ * inline dependency, including target and workspace sections. */
+static const char *cargo_dependency_table_name(CBMArena *arena, const char *section) {
+    const char *separator = strrchr(section, '\x1f');
+    if (!separator || !separator[1]) return NULL;
+    const char *parent = cbm_arena_strndup(arena, section, (size_t)(separator - section));
+    return cargo_is_dependency_section(parent) ? separator + 1 : NULL;
+}
+
+static int parse_dependency_table_field(CBMArena *arena, const char *source, int length,
+                                         int from, CBMCargoDep *dep) {
+    const char *key = NULL;
+    from = parse_key(arena, source, length, from, &key);
+    from = skip_ws_and_comment(source, length, from);
+    if (from < length && source[from] == '=') from++;
+    from = skip_ws_and_comment(source, length, from);
+    return key && strcmp(key, "path") == 0
+        ? parse_string(arena, source, length, from, &dep->path)
+        : skip_value(source, length, from);
+}
+
 void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoManifest *out) {
     if (!arena || !src || !out) return;
     memset(out, 0, sizeof(*out));
@@ -459,6 +481,7 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
     const char *section = "";
     const char *package_prefix = "";
     CBMCargoTarget *target = NULL;
+    CBMCargoDep *dependency_table = NULL;
     while (from < src_len) {
         from = skip_ws_and_comment(src, src_len, from);
         if (from >= src_len) break;
@@ -476,6 +499,12 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
             package_prefix = path;
             section = path;
             target = NULL;
+            dependency_table = NULL;
+            const char *dependency_name = cargo_dependency_table_name(arena, section);
+            if (dependency_name && out->dep_count < CBM_CARGO_MAX_DEPS) {
+                dependency_table = &out->deps[out->dep_count++];
+                dependency_table->name = dependency_name;
+            }
             static const char *const kinds[] = {"lib", "bin", "test", "example", "bench"};
             for (int t = 0; t < 5; t++)
                 if (strcmp(section, kinds[t]) == 0) target = append_target(arena, out, (CBMCargoTargetKind)t);
@@ -497,6 +526,8 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
             if (key && (strcmp(key, "package") == 0 || strncmp(key, "package\x1f", 8) == 0))
                 from = cargo_package_entry(arena, src, src_len, from, package_prefix, out, 0);
             else from = parse_workspace_kv(arena, src, src_len, from, out);
+        } else if (dependency_table) {
+            from = parse_dependency_table_field(arena, src, src_len, from, dependency_table);
         } else if (cargo_is_dependency_section(section)) from = parse_dep_entry(arena, src, src_len, from, out);
         else {
             const char *key = NULL;

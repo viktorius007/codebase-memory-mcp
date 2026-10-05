@@ -3674,6 +3674,17 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
             call.site_start_byte = ts_node_start_byte(node);
             call.site_end_byte = ts_node_end_byte(node);
+            if (ctx->language == CBM_LANG_RUST) {
+                TSNode fn = ts_node_child_by_field_name(node, "function", 8);
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "generic_function") == 0)
+                    fn = ts_node_child_by_field_name(fn, "function", 8);
+                if (!ts_node_is_null(fn)) {
+                    TSNode leaf = ts_node_child_by_field_name(fn, "field", 5);
+                    if (ts_node_is_null(leaf))
+                        leaf = ts_node_child_by_field_name(fn, "name", 4);
+                    callee.leaf = ts_node_is_null(leaf) ? fn : leaf;
+                }
+            }
             if (!ts_node_is_null(callee.leaf)) {
                 call.callee_start_byte = ts_node_start_byte(callee.leaf);
                 call.callee_end_byte = ts_node_end_byte(callee.leaf);

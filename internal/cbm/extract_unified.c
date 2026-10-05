@@ -1237,6 +1237,9 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
     }
 
+    if (ctx->language == CBM_LANG_RUST) {
+        return cbm_rust_item_qn(ctx->arena, node, ctx->source, ctx->module_qn, name);
+    }
     /* Java/Go: directory-based module (see compute_func_qn). */
     return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
                                        ctx->language);

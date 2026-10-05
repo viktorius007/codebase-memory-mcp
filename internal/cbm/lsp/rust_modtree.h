@@ -64,13 +64,11 @@ typedef enum {
 
 typedef struct {
     CBMRustPathKind kind;
-    const char *qn;    /* FUNCTION: function QN; ASSOC, TYPE: type or trait QN */
+    const char *qn;    /* Declaring QN when known; ASSOC: the type or trait QN. */
     const char *assoc; /* ASSOC: the associated item name */
     bool is_trait;     /* ASSOC, TYPE: `qn` is a trait */
     /* FUNCTION: 1-based line of the declaring `fn`, 0 when two declarations
-     * of `qn` stand in one module. Every item of a file shares the file's
-     * module QN, so a file declaring the name in two modules holds two nodes
-     * for `qn`; the line tells which one the path names. */
+     * of `qn` stand in one module (cfg twins). Inline modules have their own QN. */
     uint32_t line;
 } CBMRustPathResult;
 
@@ -152,8 +150,12 @@ CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMA
                                                 const char *path, const char *const *extra_names,
                                                 const char *const *extra_paths, int extra_count);
 
-/* Same as cbm_rust_modtree_resolve_type for a type spelled somewhere in the
- * file without a known offset: every module of the file must agree. */
+/* Physical module containing a declared item QN, or NULL if unregistered. */
+const char *cbm_rust_modtree_item_module(const CBMRustModTree *tree, CBMArena *arena,
+                                         const char *item_qn);
+
+/* Resolve a definition header in the exact physical module QN, including
+ * inline modules. Every crate mount of that module must agree. */
 CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tree, CBMArena *arena,
                                                         const char *module_qn, const char *path);
 

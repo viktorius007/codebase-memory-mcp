@@ -2028,6 +2028,23 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     return result;
 }
 
+const char *cbm_rust_item_qn(CBMArena *a, TSNode node, const char *source, const char *module_qn,
+                             const char *name) {
+    const char *path = name;
+    for (TSNode cur = ts_node_parent(node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        if (strcmp(ts_node_type(cur), "mod_item") != 0) {
+            continue;
+        }
+        TSNode id = ts_node_child_by_field_name(cur, TS_FIELD("name"));
+        const char *segment = cbm_node_text(a, id, source);
+        if (segment && segment[0]) {
+            segment = cbm_rust_cfg_scope_qn(a, cur, source, segment);
+            path = cbm_arena_sprintf(a, "%s.%s", segment, path);
+        }
+    }
+    return cbm_arena_sprintf(a, "%s.%s", module_qn, path);
+}
+
 const char *cbm_rust_impl_owner_name(CBMArena *a, const char *type_text) {
     const char *lt = type_text ? strchr(type_text, '<') : NULL;
     return lt ? cbm_arena_strndup(a, type_text, (size_t)(lt - type_text)) : type_text;
@@ -4031,6 +4048,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
          ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
+    if (ctx->language == CBM_LANG_RUST) {
+        def.qualified_name = cbm_rust_item_qn(a, node, ctx->source, ctx->module_qn, qn_name);
+    }
     def.label = "Function";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -4900,6 +4920,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         class_qn = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
     } else {
         class_qn = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+    }
+    if (ctx->language == CBM_LANG_RUST && !ctx->enclosing_class_qn) {
+        class_qn = cbm_rust_item_qn(a, node, ctx->source, ctx->module_qn, name);
     }
     const char *label = class_label_for_kind(kind);
 
@@ -6456,8 +6479,8 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (!receiver_name || !receiver_name[0]) {
         return;
     }
-    const char *type_qn =
-        cbm_fqn_compute(a, ctx->project, ctx->rel_path, cbm_rust_impl_owner_name(a, receiver_name));
+    const char *type_qn = cbm_rust_item_qn(a, node, ctx->source, ctx->module_qn,
+                                           cbm_rust_impl_owner_name(a, receiver_name));
 
     // Check for "impl Trait for Struct" pattern
     const char *impl_trait = NULL;
@@ -6635,6 +6658,10 @@ static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
     def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
                                                      qn_name ? qn_name : name, ctx->language);
+    if (ctx->language == CBM_LANG_RUST) {
+        def.qualified_name =
+            cbm_rust_item_qn(a, node, ctx->source, ctx->module_qn, qn_name ? qn_name : name);
+    }
     def.label = "Variable";
     def.file_path = ctx->rel_path;
     /* Class-body variables record their declaring class (set by
@@ -8554,6 +8581,9 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
             if (saved_enclosing) {
                 return cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname);
             }
+            if (ctx->language == CBM_LANG_RUST) {
+                return cbm_rust_item_qn(ctx->arena, node, ctx->source, ctx->module_qn, cname);
+            }
             /* Top-level: language-aware module so Java/Go don't double the
              * filename stem (matches extract_class_def above). */
             return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, cname,
@@ -9099,7 +9129,7 @@ static void extract_rust_macro_def(CBMExtractCtx *ctx, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_rust_item_qn(a, node, ctx->source, ctx->module_qn, name);
     def.label = "Macro";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -9127,7 +9157,8 @@ static void extract_rust_inline_module(CBMExtractCtx *ctx, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_rust_cfg_scope_qn(
+        a, node, ctx->source, cbm_rust_item_qn(a, node, ctx->source, ctx->module_qn, name));
     def.label = "Module";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -9208,6 +9239,9 @@ static void extract_rust_macro_items(CBMExtractCtx *ctx, TSNode invocation) {
             CBMExtractCtx sub = *ctx;
             sub.root = root;
             sub.enclosing_class_qn = NULL;
+            const char *scope =
+                cbm_rust_item_qn(ctx->arena, invocation, ctx->source, ctx->module_qn, "");
+            sub.module_qn = cbm_arena_strndup(ctx->arena, scope, strlen(scope) - 1);
             cbm_extract_definitions_without_module(&sub);
         }
         ts_tree_delete(tree);

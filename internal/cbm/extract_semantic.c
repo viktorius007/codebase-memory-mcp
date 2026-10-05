@@ -260,11 +260,16 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
     bool is_member = false;
     char *name = resolve_lhs_write_name(ctx, left, &is_member);
     if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-        CBMReadWrite rw;
+        CBMReadWrite rw = {0};
         rw.var_name = name;
         rw.is_write = true;
         rw.enclosing_func_qn = func_qn;
         rw.is_member_access = is_member;
+        TSNode site = ctx->language == CBM_LANG_RUST && is_member
+                          ? ts_node_child_by_field_name(left, "field", 5)
+                          : left;
+        rw.site_start_byte = ts_node_start_byte(site);
+        rw.site_end_byte = ts_node_end_byte(site);
         cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
     }
 }
@@ -340,11 +345,16 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
             bool is_member = false;
             char *name = resolve_lhs_write_name(ctx, left, &is_member);
             if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-                CBMReadWrite rw;
+                CBMReadWrite rw = {0};
                 rw.var_name = name;
                 rw.is_write = true;
                 rw.enclosing_func_qn = state->enclosing_func_qn;
                 rw.is_member_access = is_member;
+                TSNode site = ctx->language == CBM_LANG_RUST && is_member
+                                  ? ts_node_child_by_field_name(left, "field", 5)
+                                  : left;
+                rw.site_start_byte = ts_node_start_byte(site);
+                rw.site_end_byte = ts_node_end_byte(site);
                 cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
             }
         }

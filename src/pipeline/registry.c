@@ -651,7 +651,6 @@ void cbm_registry_free(cbm_registry_t *r) {
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
-    (void)name;
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -687,6 +686,17 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
     const char *simple = simple_name(qualified_name);
+    /* Rust collision/cfg and trait-impl suffixes describe declaration
+     * provenance, not the member's source spelling. All such declarations
+     * must share a candidate bucket for an owner uniqueness check. */
+    if (name && strncmp(simple, name, strlen(name)) == 0) {
+        const char *suffix = simple + strlen(name);
+        bool line_suffix = strncmp(suffix, "#L", 2) == 0 && suffix[2] &&
+                           strspn(suffix + 2, "0123456789") == strlen(suffix + 2);
+        if (line_suffix || strncmp(suffix, "#cfg(", 5) == 0 ||
+            (suffix[0] == '[' && suffix[strlen(suffix) - 1] == ']'))
+            simple = name;
+    }
     qn_array_t *arr = cbm_ht_get(r->by_name, simple);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
@@ -737,7 +747,9 @@ bool cbm_registry_label_is_type_member(const char *label) {
 
 /* Length of `qn` without a terminal `[Trait<...>]` impl-provenance suffix. */
 static size_t member_qn_len(const char *qn) {
-    size_t len = strlen(qn);
+    const char *dot = strrchr(qn, '.');
+    const char *hash = strchr(dot ? dot + 1 : qn, '#');
+    size_t len = hash ? (size_t)(hash - qn) : strlen(qn);
     if (len == 0 || qn[len - SKIP_ONE] != ']') {
         return len;
     }
@@ -766,7 +778,7 @@ static bool member_of_owner(const char *qn, const char *member, const char *owne
 }
 
 const char *cbm_registry_rust_owner_member(const cbm_registry_t *r, const char *ref_name,
-                                           const char *enclosing_qn) {
+                                           const char *enclosing_qn, const char *proved_owner) {
     if (!r || !ref_name) {
         return NULL;
     }
@@ -795,9 +807,13 @@ const char *cbm_registry_rust_owner_member(const cbm_registry_t *r, const char *
     if (!member[0] || owner_len == 0) {
         return NULL;
     }
-    bool exact_owner = false;
+    bool exact_owner = proved_owner != NULL;
+    if (proved_owner) {
+        owner = proved_owner;
+        owner_len = strlen(proved_owner);
+    }
     char self_owner[CBM_SZ_512];
-    if (owner_len == 4 && strncmp(owner, "Self", 4) == 0) {
+    if (!proved_owner && owner_len == 4 && strncmp(owner, "Self", 4) == 0) {
         /* `Self` is the type that owns the enclosing method. */
         if (!enclosing_qn) {
             return NULL;
@@ -825,6 +841,13 @@ const char *cbm_registry_rust_owner_member(const cbm_registry_t *r, const char *
     const char *match = NULL;
     for (int i = 0; i < arr->count; i++) {
         const char *qn = arr->items[i];
+        /* Trait impls may be declared in another module under that module's
+         * physical owner QN. This index is not a complete canonical-owner
+         * census for traits; a proved type path alone cannot select an impl.
+         * A resolved invocation can still supply its exact semantic target. */
+        if (proved_owner && strchr(qn, '[')) {
+            continue;
+        }
         if (!cbm_registry_label_is_type_member(cbm_registry_label_of(r, qn)) ||
             !member_of_owner(qn, member, owner, owner_len, exact_owner)) {
             continue;
