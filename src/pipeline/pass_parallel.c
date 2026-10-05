@@ -2645,9 +2645,6 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
                                     const char **imp_vals, int imp_count, CBMLanguage lang,
                                     const CBMResolvedCall *lsp) {
     if (lang == CBM_LANG_RUST && lsp_target) {
-        if (source_node->id == lsp_target->id) {
-            return;
-        }
         uint64_t rust_t0 = extract_now_ns();
         res.qualified_name = lsp_target->qualified_name;
         int64_t published_target_id =
