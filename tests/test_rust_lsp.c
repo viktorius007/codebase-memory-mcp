@@ -2497,6 +2497,113 @@ TEST(rustlsp_std_returns_read_the_call) {
     PASS();
 }
 
+/* A generic project method keyed by its own type parameter, beside the two
+ * `ping` decoys: only the written type argument decides which `ping` a call
+ * chained on `get::<X>()` reaches. */
+#define RUSTLSP_TURBOFISH_STORE                                               \
+    "use std::sync::Arc;\n" RUSTLSP_STD_DECOYS "struct Store;\n"              \
+    "impl Store {\n"                                                          \
+    "    fn get<T>(&self) -> Option<Arc<T>> { None }\n"                       \
+    "    fn pair<K, V>(&self) -> Option<(K, V)> { None }\n"                   \
+    "    fn fixed<T>(&self, _t: T) -> Conn { Conn }\n"                        \
+    "}\n"
+
+/* `recv.m::<X>(..)` on a project method types as `recv.m(..)` does, its
+ * written type arguments standing for the method's own type parameters by
+ * position; the turbofish call itself keeps its link. */
+TEST(rustlsp_turbofish_method_binds_written_type_arguments) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_TURBOFISH_STORE "fn run(s: &Store) -> bool { s.get::<Conn>().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_TURBOFISH_STORE
+        "fn run(s: &Store) -> bool { s.pair::<Other, Conn>().unwrap().1.ping() }\n"));
+    /* A return that names no type parameter is the declared one. */
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_TURBOFISH_STORE "fn run(s: &Store) -> bool { s.fixed::<u8>(1).ping() }\n"));
+    /* Inside a macro argument. */
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_TURBOFISH_STORE
+        "fn run(s: &Store) { assert!(s.get::<Conn>().unwrap().ping()); }\n"));
+    CBMFileResult *r = extract_rust(
+        RUSTLSP_TURBOFISH_STORE "fn run(s: &Store) -> bool { s.get::<Other>().unwrap().ping() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Store.get"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "Other.ping"), 0);
+    ASSERT_EQ(find_resolved(r, "run", "Conn.ping"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A written argument holding `_` leaves its position unproven: nothing
+ * chained on it is linked, while the turbofish call itself still is. */
+TEST(rustlsp_turbofish_method_hole_stays_unproven) {
+    const char *holes[] = {
+        "fn run(s: &Store) -> bool { s.get::<_>().unwrap().ping() }\n",
+        "fn run(s: &Store) -> bool { s.pair::<Conn, _>().unwrap().1.ping() }\n",
+    };
+    for (int i = 0; i < 2; i++) {
+        char src[1024];
+        snprintf(src, sizeof(src), "%s%s", RUSTLSP_TURBOFISH_STORE, holes[i]);
+        CBMFileResult *r = extract_rust(src);
+        ASSERT_NOT_NULL(r);
+        ASSERT_GTE(require_resolved(r, "run", i == 0 ? "Store.get" : "Store.pair"), 0);
+        ASSERT_EQ(find_resolved(r, "run", "Conn.ping"), -1);
+        ASSERT_EQ(find_resolved(r, "run", "Other.ping"), -1);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* `collect::<C>()` builds the written `C`: `Vec<_>` holds the iterator's
+ * items, a type written whole is itself, and any other `_` is unproven. */
+TEST(rustlsp_turbofish_collect_builds_written_type) {
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        RUSTLSP_STD_DECOYS
+        "fn run(v: Vec<Conn>) -> bool { v.into_iter().collect::<Vec<_>>().pop().unwrap().ping() }\n"));
+    ASSERT(rustlsp_std_chain_reaches_conn(
+        "use std::collections::HashMap;\n" RUSTLSP_STD_DECOYS
+        "fn run(v: Vec<(u8, Conn)>) -> bool {\n"
+        "    v.into_iter().collect::<HashMap<u8, Conn>>().remove(&1).unwrap().ping()\n}\n"));
+    CBMFileResult *r =
+        extract_rust("use std::collections::HashMap;\n" RUSTLSP_STD_DECOYS
+                     "fn run(v: Vec<Conn>) -> bool {\n"
+                     "    v.into_iter().collect::<HashMap<_, _>>().pop().unwrap().ping()\n}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "run", "Conn.ping"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Across files the method's own type parameters travel with its def. */
+TEST(rustlsp_crossfile_turbofish_method_binds_written_type_arguments) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[7];
+    rustlsp_conn_fixture(defs, false);
+    memset(&defs[6], 0, sizeof(defs[6]));
+    const char *own_params[] = {"T", NULL};
+    defs[6].qualified_name = "test.demo.Conn.get";
+    defs[6].short_name = "get";
+    defs[6].label = "Method";
+    defs[6].receiver_type = "test.demo.Conn";
+    defs[6].def_module_qn = "test.demo";
+    defs[6].return_types = "Option<T>";
+    defs[6].type_params = own_params;
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+    const char *caller =
+        "fn run(c: &demo::Conn) -> bool { c.get::<demo::Other>().unwrap().ping() }\n";
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", defs, 7, imp_names,
+                           imp_qns, 1, NULL, &out);
+    ASSERT_GTE(find_confident(&out, "run", "Conn.get"), 0);
+    ASSERT_GTE(find_confident(&out, "run", "Other.ping"), 0);
+    ASSERT_EQ(find_confident(&out, "run", "Conn.ping"), -1);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 /* `Vec<T>::clone -> Self`, `pop -> Option<T>`, `first_mut -> Option<&T>`;
  * `String::clone -> Self` reaches a project trait implemented for String. */
 TEST(rustlsp_std_returns_vec_and_string) {
@@ -12452,6 +12559,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_std_returns_slice_methods);
     RUN_TEST(rustlsp_std_returns_paths);
     RUN_TEST(rustlsp_std_returns_read_the_call);
+    RUN_TEST(rustlsp_turbofish_method_binds_written_type_arguments);
+    RUN_TEST(rustlsp_turbofish_method_hole_stays_unproven);
+    RUN_TEST(rustlsp_turbofish_collect_builds_written_type);
+    RUN_TEST(rustlsp_crossfile_turbofish_method_binds_written_type_arguments);
     RUN_TEST(rustlsp_std_returns_vec_and_string);
     RUN_TEST(rustlsp_crossfile_return_box_with_written_argument);
     RUN_TEST(rustlsp_crossfile_return_opaque_types);

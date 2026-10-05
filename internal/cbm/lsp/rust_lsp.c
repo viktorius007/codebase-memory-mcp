@@ -4917,6 +4917,115 @@ static const CBMType *rust_await_output(RustLSPContext *ctx, TSNode awaited) {
     return inner;
 }
 
+static bool rust_is_comment_node(TSNode n);
+static const CBMType *rust_subst_receiver_args(RustLSPContext *ctx, const CBMType *t,
+                                               const char *const *params,
+                                               const CBMType *const *args, int argc,
+                                               const CBMType *self_t, int depth);
+
+/* The turbofish call `recv.m::<G..>(..)` as its method `recv.m` in
+ * `*method` and its written type arguments in `*type_args`; false for any
+ * other callee. */
+static bool rust_turbofish_method(TSNode callee, TSNode *method, TSNode *type_args) {
+    if (ts_node_is_null(callee) || strcmp(ts_node_type(callee), "generic_function") != 0) {
+        return false;
+    }
+    *method = ts_node_child_by_field_name(callee, "function", 8);
+    *type_args = ts_node_child_by_field_name(callee, "type_arguments", 14);
+    return !ts_node_is_null(*method) && strcmp(ts_node_type(*method), "field_expression") == 0;
+}
+
+/* True when the written type `node` leaves any position to inference (`_`). */
+static bool rust_written_type_has_hole(RustLSPContext *ctx, TSNode node) {
+    if (ts_node_named_child_count(node) == 0) {
+        char *text = rust_node_text(ctx, node);
+        return !text || strcmp(text, "_") == 0;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        if (rust_written_type_has_hole(ctx, ts_node_named_child(node, i))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The declared return `ret` of `callee` at a call written with the
+ * turbofish `type_args`: each type parameter the fn itself declares reads as
+ * the argument written at its position. An argument holding `_`, or one the
+ * turbofish does not write, is unproven and reads unknown. */
+static const CBMType *rust_subst_written_type_args(RustLSPContext *ctx, const CBMType *ret,
+                                                   const CBMRegisteredFunc *callee,
+                                                   TSNode type_args) {
+    enum { MAX_WRITTEN = 16 };
+    const char *const *names = callee ? callee->rust_fn_type_params : NULL;
+    if (!ret || !names || !names[0]) {
+        return ret;
+    }
+    const CBMType *written[MAX_WRITTEN];
+    int count = 0;
+    uint32_t n = ts_node_is_null(type_args) ? 0 : ts_node_named_child_count(type_args);
+    uint32_t at = 0;
+    while (names[count] && count < MAX_WRITTEN) {
+        TSNode arg = {0};
+        while (at < n && ts_node_is_null(arg)) {
+            TSNode c = ts_node_named_child(type_args, at++);
+            if (strcmp(ts_node_type(c), "lifetime") != 0 && !rust_is_comment_node(c)) {
+                arg = c;
+            }
+        }
+        written[count++] = ts_node_is_null(arg) || rust_written_type_has_hole(ctx, arg)
+                               ? cbm_type_unknown()
+                               : rust_parse_type_node(ctx, arg);
+    }
+    return rust_subst_receiver_args(ctx, ret, names, written, count, NULL, 0);
+}
+
+/* What `iter.collect::<C>()` builds from an iterator of `item` (NULL when
+ * unknown): `C` as written when it leaves nothing to inference; a std
+ * sequence written `Vec<_>` holds the items; any other `_` is unproven.
+ * NULL when the turbofish writes no type. */
+static const CBMType *rust_collect_written_type(RustLSPContext *ctx, TSNode type_args,
+                                                const CBMType *item) {
+    TSNode written = {0};
+    uint32_t n = ts_node_is_null(type_args) ? 0 : ts_node_named_child_count(type_args);
+    for (uint32_t i = 0; i < n && ts_node_is_null(written); i++) {
+        TSNode c = ts_node_named_child(type_args, i);
+        if (strcmp(ts_node_type(c), "lifetime") != 0 && !rust_is_comment_node(c)) {
+            written = c;
+        }
+    }
+    if (ts_node_is_null(written)) {
+        return NULL;
+    }
+    if (!rust_written_type_has_hole(ctx, written)) {
+        return rust_parse_type_node(ctx, written);
+    }
+    TSNode args = ts_node_child_by_field_name(written, "type_arguments", 14);
+    const CBMType *parsed = rust_parse_type_node(ctx, written);
+    if (strcmp(ts_node_type(written), "generic_type") != 0 || ts_node_is_null(args) ||
+        ts_node_named_child_count(args) != 1 ||
+        ts_node_named_child_count(ts_node_named_child(args, 0)) != 0 || !parsed ||
+        parsed->kind != CBM_TYPE_TEMPLATE) {
+        return cbm_type_unknown();
+    }
+    const char *qn = parsed->data.template_type.template_name;
+    static const char *const sequences[] = {"alloc.vec.Vec",
+                                            "std.vec.Vec",
+                                            "alloc.collections.VecDeque",
+                                            "std.collections.VecDeque",
+                                            "std.collections.HashSet",
+                                            "alloc.collections.BTreeSet",
+                                            "std.collections.BTreeSet",
+                                            NULL};
+    for (int i = 0; qn && item && sequences[i]; i++) {
+        if (strcmp(qn, sequences[i]) == 0) {
+            return cbm_type_template(ctx->arena, qn, &item, 1);
+        }
+    }
+    return cbm_type_unknown();
+}
+
 /* Type of a call expression. `*callee`, when the call names a registered
  * function or method, is that function: `.await` reads its async flag. A
  * declared type alias in the result reads as the type it stands for. */
@@ -5325,10 +5434,15 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
         }
     }
 
-    /* Method call expressed as field_expression callee. */
-    if (strcmp(fk, "field_expression") == 0) {
-        TSNode value = ts_node_child_by_field_name(func_node, "value", 5);
-        TSNode field = ts_node_child_by_field_name(func_node, "field", 5);
+    /* Method call: a field_expression callee, bare or under a turbofish
+     * (`recv.m::<G>(..)`), which types as the same call with the written
+     * type arguments standing for the method's own type parameters. */
+    TSNode method_node = func_node;
+    TSNode type_args = {0};
+    bool turbofish = rust_turbofish_method(func_node, &method_node, &type_args);
+    if (turbofish || strcmp(fk, "field_expression") == 0) {
+        TSNode value = ts_node_child_by_field_name(method_node, "value", 5);
+        TSNode field = ts_node_child_by_field_name(method_node, "field", 5);
         if (!ts_node_is_null(value) && !ts_node_is_null(field)) {
             const CBMType *recv = rust_eval_expr_type(ctx, value);
             char *mname = rust_node_text(ctx, field);
@@ -5337,7 +5451,7 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                 while (base && base->kind == CBM_TYPE_REFERENCE) {
                     base = base->data.reference.elem;
                 }
-                RustStdCall call = {args_node, {0}};
+                RustStdCall call = {args_node, type_args};
                 const CBMType *declared = rust_std_method_return(ctx, recv, mname, &call);
                 if (declared) {
                     return declared;
@@ -5399,6 +5513,14 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                             return adapted;
                         }
                         if (strcmp(mname, "collect") == 0) {
+                            const CBMType *built = rust_collect_written_type(
+                                ctx, type_args,
+                                base->data.template_type.arg_count > 0
+                                    ? base->data.template_type.template_args[0]
+                                    : NULL);
+                            if (built) {
+                                return built;
+                            }
                             /* Often Vec<Item>; without turbofish info we model as Vec<elem>. */
                             if (base->data.template_type.arg_count > 0) {
                                 return cbm_type_template(ctx->arena, "alloc.vec.Vec",
@@ -5507,6 +5629,9 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                 if (t && t->kind == CBM_TYPE_FUNC && t->data.func.return_types &&
                     t->data.func.return_types[0]) {
                     const CBMType *ret = t->data.func.return_types[0];
+                    if (turbofish) {
+                        ret = rust_subst_written_type_args(ctx, ret, *callee, type_args);
+                    }
                     /* Self -> receiver. */
                     if (ret->kind == CBM_TYPE_NAMED &&
                         strcmp(ret->data.named.qualified_name, "Self") == 0) {
@@ -5524,25 +5649,6 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                     return inferred ? inferred : ret;
                 }
                 return t;
-            }
-        }
-    }
-
-    /* `recv.method::<G>(..)` naming a std method: its declared return. */
-    if (strcmp(fk, "generic_function") == 0) {
-        TSNode method = ts_node_child_by_field_name(func_node, "function", 8);
-        if (!ts_node_is_null(method) && strcmp(ts_node_type(method), "field_expression") == 0) {
-            TSNode value = ts_node_child_by_field_name(method, "value", 5);
-            TSNode field = ts_node_child_by_field_name(method, "field", 5);
-            char *mname = ts_node_is_null(field) ? NULL : rust_node_text(ctx, field);
-            RustStdCall call = {args_node,
-                                ts_node_child_by_field_name(func_node, "type_arguments", 14)};
-            const CBMType *declared =
-                mname && !ts_node_is_null(value)
-                    ? rust_std_method_return(ctx, rust_eval_expr_type(ctx, value), mname, &call)
-                    : NULL;
-            if (declared) {
-                return declared;
             }
         }
     }
