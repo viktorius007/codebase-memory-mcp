@@ -3745,6 +3745,73 @@ TEST(rustlsp_crate_qualified_assert_macro_arguments_resolve) {
     PASS();
 }
 
+TEST(rustlsp_standard_format_argument_macros_resolve) {
+    const char *caller = "fn hidden() {\n"
+                         "    let _ = format_args!(\"{}\", a::one());\n"
+                         "    let _ = core::format_args!(\"{value}\", value = a::two());\n"
+                         "    let _ = std::format_args_nl!(\"{}\", a::three());\n"
+                         "    todo!(\"{}\", a::four());\n"
+                         "    core::unimplemented!(\"{}\", a::five());\n"
+                         "    std::println!(\"{}\", a::six());\n"
+                         "}\n";
+    const char *const leaves[] = {"one", "two", "three", "four", "five", "six"};
+    const char *const sites[] = {"a::one()", "a::two()", "a::three()",
+                                "a::four()", "a::five()", "a::six()"};
+    bool resolved[6];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 6, resolved);
+    for (int i = 0; i < 6; i++)
+        ASSERT_TRUE(resolved[i]);
+    PASS();
+}
+
+TEST(rustlsp_format_arguments_keep_receiver_binding) {
+    CBMFileResult *result = extract_rust(
+        "struct A; struct B;\n"
+        "impl A { fn value(&self) -> u8 { 1 } }\n"
+        "impl B { fn value(&self) -> u8 { 2 } }\n"
+        "fn run(a: A) { let _ = format_args!(\"{}\", a.value()); }\n");
+    ASSERT_NOT_NULL(result);
+    ASSERT_GTE(find_resolved(result, "run", "A.value"), 0);
+    ASSERT_EQ(find_resolved(result, "run", "B.value"), -1);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(rustlsp_unknown_format_argument_macro_withholds) {
+    const char *caller = "fn hidden() { external::format_args!(a::one()); }\n";
+    const char *const leaves[] = {"one"};
+    const char *const sites[] = {"a::one()"};
+    bool resolved[1];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 1, resolved);
+    ASSERT_FALSE(resolved[0]);
+    PASS();
+}
+
+TEST(rustlsp_imported_unknown_format_argument_macro_withholds) {
+    const char *caller = "use external::format_args;\n"
+                         "fn hidden() { format_args!(a::one()); }\n";
+    const char *const leaves[] = {"one"};
+    const char *const sites[] = {"a::one()"};
+    bool resolved[1];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 1, resolved);
+    ASSERT_FALSE(resolved[0]);
+    PASS();
+}
+
+TEST(rustlsp_visible_format_argument_macro_discards_tokens) {
+    CBMFileResult *result = extract_rust(
+        "fn kept() {} fn discarded() {}\n"
+        "fn run() {\n"
+        "    macro_rules! format_args { ($($arg:tt)*) => { kept() } }\n"
+        "    format_args!(discarded());\n"
+        "}\n");
+    ASSERT_NOT_NULL(result);
+    ASSERT_GTE(find_resolved(result, "run", "kept"), 0);
+    ASSERT_EQ(find_resolved(result, "run", "discarded"), -1);
+    cbm_free_result(result);
+    PASS();
+}
+
 /* A `select!` arm whose handler is an expression holding a turbofish comma
  * (`Ok::<_, E>(v)`) ends at the arm's comma, not the turbofish's: the arm after
  * it still resolves. */
@@ -13092,6 +13159,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_insta_macro_arguments_resolve);
     RUN_TEST(rustlsp_crate_expression_macro_arguments_resolve);
     RUN_TEST(rustlsp_crate_qualified_assert_macro_arguments_resolve);
+    RUN_TEST(rustlsp_standard_format_argument_macros_resolve);
+    RUN_TEST(rustlsp_format_arguments_keep_receiver_binding);
+    RUN_TEST(rustlsp_unknown_format_argument_macro_withholds);
+    RUN_TEST(rustlsp_visible_format_argument_macro_discards_tokens);
+    RUN_TEST(rustlsp_imported_unknown_format_argument_macro_withholds);
     RUN_TEST(rustlsp_select_expression_handler_turbofish_keeps_next_arm);
     RUN_TEST(rustlsp_operator_carriers_are_occurrence_exact);
     RUN_TEST(rustlsp_macro_operator_has_one_exact_carrier);

@@ -8112,6 +8112,10 @@ static void rust_collect_macro_rules(RustLSPContext *ctx, TSNode root) {
             TSNode body = ts_node_child_by_field_name(c, "body", 4);
             if (!ts_node_is_null(body))
                 rust_collect_macro_rules(ctx, body);
+        } else if (strcmp(k, "token_tree") != 0) {
+            /* A block-local definition shadows the prelude in that block;
+             * its transcriber, not its argument spelling, proves the calls. */
+            rust_collect_macro_rules(ctx, c);
         }
     }
 }
@@ -10059,7 +10063,8 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation,
  * `serde_json::json`, `tokio::select`, …), or false when its arguments are not
  * plain expressions in a known grammar. The path qualifier must be absent or
  * name the crate that defines the macro. */
-static bool rust_builtin_macro_arg_form(const char *mname, RustMacroArgForm *form) {
+static bool rust_builtin_macro_arg_form(RustLSPContext *ctx, const char *mname,
+                                         RustMacroArgForm *form) {
     if (strncmp(mname, "::", 2) == 0)
         mname += 2;
     const char *leaf = mname;
@@ -10070,23 +10075,32 @@ static bool rust_builtin_macro_arg_form(const char *mname, RustMacroArgForm *for
         const char *leaf;
         const char *quals; /* space-separated crate paths; "" alone = unqualified only */
         RustMacroArgForm form;
+        bool check_import;
     } table[] = {
-        {"println", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"eprintln", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"print", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"eprint", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"format", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"write", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"writeln", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"panic", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"assert", "", RUST_MACRO_ARGS_EXPR_LIST},
+        /* std::fmt defines positional expressions and `name = expression`:
+         * https://doc.rust-lang.org/std/fmt/#named-parameters
+         * format_args_nl has the same grammar with a newline appended;
+         * todo/unimplemented forward their messages to panic. */
+        {"format_args", "std core", RUST_MACRO_ARGS_EXPR_LIST, true},
+        {"format_args_nl", "std core", RUST_MACRO_ARGS_EXPR_LIST, true},
+        {"todo", "std core", RUST_MACRO_ARGS_EXPR_LIST, true},
+        {"unimplemented", "std core", RUST_MACRO_ARGS_EXPR_LIST, true},
+        {"println", "std", RUST_MACRO_ARGS_EXPR_LIST},
+        {"eprintln", "std", RUST_MACRO_ARGS_EXPR_LIST},
+        {"print", "std", RUST_MACRO_ARGS_EXPR_LIST},
+        {"eprint", "std", RUST_MACRO_ARGS_EXPR_LIST},
+        {"format", "std alloc", RUST_MACRO_ARGS_EXPR_LIST},
+        {"write", "std core", RUST_MACRO_ARGS_EXPR_LIST},
+        {"writeln", "std core", RUST_MACRO_ARGS_EXPR_LIST},
+        {"panic", "std core", RUST_MACRO_ARGS_EXPR_LIST},
+        {"assert", "std core", RUST_MACRO_ARGS_EXPR_LIST},
         {"assert_eq", "std core pretty_assertions", RUST_MACRO_ARGS_EXPR_LIST},
         {"assert_ne", "std core pretty_assertions", RUST_MACRO_ARGS_EXPR_LIST},
-        {"debug_assert", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"debug_assert_eq", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"debug_assert_ne", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"dbg", "", RUST_MACRO_ARGS_EXPR_LIST},
-        {"vec", "", RUST_MACRO_ARGS_ARRAY_BODY},
+        {"debug_assert", "std core", RUST_MACRO_ARGS_EXPR_LIST},
+        {"debug_assert_eq", "std core", RUST_MACRO_ARGS_EXPR_LIST},
+        {"debug_assert_ne", "std core", RUST_MACRO_ARGS_EXPR_LIST},
+        {"dbg", "std", RUST_MACRO_ARGS_EXPR_LIST},
+        {"vec", "std alloc", RUST_MACRO_ARGS_ARRAY_BODY},
         {"json", "serde_json", RUST_MACRO_ARGS_JSON},
         {"matches", "std core", RUST_MACRO_ARGS_MATCHES},
         {"assert_matches", "assert_matches std::assert_matches core::assert_matches",
@@ -10130,6 +10144,13 @@ static bool rust_builtin_macro_arg_form(const char *mname, RustMacroArgForm *for
         if (strcmp(leaf, table[i].leaf) != 0)
             continue;
         if (qual_len == 0) {
+            /* Newly admitted prelude grammars must not reinterpret an imported
+             * external macro's tokens. Existing third-party grammar policies
+             * are deliberately independent of this standard-family admission. */
+            const char *imported = table[i].check_import ? rust_resolve_use(ctx, mname) : NULL;
+            if (imported)
+                return strstr(imported, "::") &&
+                       rust_builtin_macro_arg_form(ctx, imported, form);
             *form = table[i].form;
             return true;
         }
@@ -12722,7 +12743,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                      * re-parse the args to recover calls like `format!("{}",
                      * d.label())`. */
                     RustMacroArgForm arg_form;
-                    if (rust_builtin_macro_arg_form(mname, &arg_form))
+                    if (rust_builtin_macro_arg_form(ctx, mname, &arg_form))
                         rust_resolve_macro_arg_exprs(ctx, node, arg_form);
                     if (strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
                         strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
