@@ -83,10 +83,15 @@ typedef struct {
     // names the impl's self type spells at the type's argument positions.
     const CBMType *deref_target;
     const char **deref_param_names;
+    /* Rust: declaration types of associated constants, keyed by short name.
+     * Duplicate declarations bind UNKNOWN; constants never enter callable indexes. */
+    struct CBMScope *rust_assoc_consts;
     bool is_interface;
     /* Rust: registered only as the self type of an impl; no declaration of the
      * type was read, so its inherent methods are not known. */
     bool rust_undeclared;
+    bool rust_nominal_identity_ambiguous; /* distinct declarations collapsed into one QN */
+    bool rust_attribute_methods_unknown;  /* qualified attributes may generate field accessors */
     bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)
 
     // --- TS-specific fields (NULL/empty for non-TS types — backward compatible) ---

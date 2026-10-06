@@ -584,7 +584,7 @@ static const char *pxc_map_label(CBMArena *arena, const char *label) {
          * was blind across files, leaving property references to the
          * name-only fallback). Every registrar filters by explicit label, so
          * the other languages ignore Variable defs untouched. */
-        strcmp(label, "Variable") == 0) {
+        strcmp(label, "Variable") == 0 || strcmp(label, "AssociatedConst") == 0) {
         static const char *const canon[] = {"Class", "Struct",   "Interface", "Enum",   "Type",
                                             "Trait", "Protocol", "Function",  "Method", "Variable"};
         for (size_t i = 0; i < sizeof(canon) / sizeof(canon[0]); i++) {
@@ -1089,7 +1089,9 @@ static void pxc_fold_rust_payload_fields(CBMArena *arena, const CBMFileResult *r
             if (strcmp(d->label, "EnumVariant") != 0 || !d->name ||
                 strncmp(d->qualified_name, dst->qualified_name, qn_len) != 0 ||
                 d->qualified_name[qn_len] != '.' ||
-                strcmp(d->qualified_name + qn_len + 1, d->name) != 0) {
+                (strncmp(d->qualified_name + qn_len + 1, d->name, strlen(d->name)) != 0 ||
+                 (d->qualified_name[qn_len + 1 + strlen(d->name)] != '\0' &&
+                  d->qualified_name[qn_len + 1 + strlen(d->name)] != '#'))) {
                 continue;
             }
             list = pxc_field_defs_append(arena, list, cbm_arena_sprintf(arena, "%s.", d->name),

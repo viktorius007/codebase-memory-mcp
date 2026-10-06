@@ -316,6 +316,87 @@ TEST(rustlsp_trait_dispatch_single_impl) {
     PASS();
 }
 
+TEST(rustlsp_trait_alias_identity_ignores_canonical_leaf_import) {
+    CBMFileResult *r = extract_rust(
+        "mod first { pub trait Db { fn system(&self); } }\n"
+        "mod second { pub trait Db {} }\n"
+        "use first::Db as SourceDb; use second::Db;\n"
+        "struct Item; impl SourceDb for Item { fn system(&self) {} }\n"
+        "fn run(item: Item) { item.system(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.system"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_unbounded_impl_accepts_concrete_argument) {
+    CBMFileResult *r = extract_rust(
+        "trait Paint { fn paint(&self); }\n"
+        "struct Holder<T>(T);\n"
+        "impl<T> Paint for Holder<T> { fn paint(&self) {} }\n"
+        "fn run(item: Holder<u8>) { item.paint(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Holder.paint"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_collapsed_block_local_types_withhold_impl) {
+    CBMFileResult *r =
+        extract_rust("fn first() { #[derive(Default)] struct Token; Token::default(); }\n"
+                     "fn second() { struct Token; impl Default for Token { fn default() -> Self { "
+                     "Token } } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.first", "Token.default"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_attribute_field_accessor_withholds_impl) {
+    CBMFileResult *r = extract_rust("trait Read { fn value(self) -> u8; }\n"
+                                    "#[factory::record] struct Item { value: u8 }\n"
+                                    "impl Read for Item { fn value(self) -> u8 { self.value } }\n"
+                                    "fn run(item: Item) { item.value(); Item::value(item); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "Item.value"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_field_without_attribute_accepts_impl) {
+    CBMFileResult *r = extract_rust("trait Read { fn value(&self) -> u8; }\n"
+                                    "struct Item { value: u8 }\n"
+                                    "impl Read for Item { fn value(&self) -> u8 { self.value } }\n"
+                                    "fn run(item: Item) { item.value(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.value"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_reexport_keeps_canonical_identity) {
+    CBMFileResult *r = extract_rust(
+        "use std::hash::{Hash, Hasher};\n"
+        "struct Item; impl Hash for Item { fn hash<H: Hasher>(&self, _: &mut H) {} }\n"
+        "fn run<H: Hasher>(item: Item, hasher: &mut H) { item.hash(hasher); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.hash"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_imported_subtrait_keeps_same_named_supertrait_method) {
+    CBMFileResult *r = extract_rust("mod base { pub trait Db { fn system(&self); } }\n"
+                                    "mod child { pub trait Db: super::base::Db {} }\n"
+                                    "struct Item; impl base::Db for Item { fn system(&self) {} }\n"
+                                    "impl child::Db for Item {}\n"
+                                    "use child::Db; fn run(item: Item) { item.system(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.system"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_trait_owned_self_does_not_select_borrowed_receiver) {
     CBMFileResult *r = extract_rust(
         "trait Consume { fn consume(self); }\n"
@@ -3828,6 +3909,73 @@ TEST(rustlsp_crate_qualified_assert_macro_arguments_resolve) {
     ASSERT_TRUE(resolved[1]); /* pretty_assertions::assert_ne! left operand */
     ASSERT_TRUE(resolved[2]); /* format argument */
     ASSERT_TRUE(resolved[3]); /* std::assert_eq! */
+    PASS();
+}
+
+TEST(rustlsp_standard_format_argument_macros_resolve) {
+    const char *caller = "fn hidden() {\n"
+                         "    let _ = format_args!(\"{}\", a::one());\n"
+                         "    let _ = core::format_args!(\"{value}\", value = a::two());\n"
+                         "    let _ = std::format_args_nl!(\"{}\", a::three());\n"
+                         "    todo!(\"{}\", a::four());\n"
+                         "    core::unimplemented!(\"{}\", a::five());\n"
+                         "    std::println!(\"{}\", a::six());\n"
+                         "}\n";
+    const char *const leaves[] = {"one", "two", "three", "four", "five", "six"};
+    const char *const sites[] = {"a::one()", "a::two()", "a::three()",
+                                "a::four()", "a::five()", "a::six()"};
+    bool resolved[6];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 6, resolved);
+    for (int i = 0; i < 6; i++)
+        ASSERT_TRUE(resolved[i]);
+    PASS();
+}
+
+TEST(rustlsp_format_arguments_keep_receiver_binding) {
+    CBMFileResult *result = extract_rust(
+        "struct A; struct B;\n"
+        "impl A { fn value(&self) -> u8 { 1 } }\n"
+        "impl B { fn value(&self) -> u8 { 2 } }\n"
+        "fn run(a: A) { let _ = format_args!(\"{}\", a.value()); }\n");
+    ASSERT_NOT_NULL(result);
+    ASSERT_GTE(find_resolved(result, "run", "A.value"), 0);
+    ASSERT_EQ(find_resolved(result, "run", "B.value"), -1);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(rustlsp_unknown_format_argument_macro_withholds) {
+    const char *caller = "fn hidden() { external::format_args!(a::one()); }\n";
+    const char *const leaves[] = {"one"};
+    const char *const sites[] = {"a::one()"};
+    bool resolved[1];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 1, resolved);
+    ASSERT_FALSE(resolved[0]);
+    PASS();
+}
+
+TEST(rustlsp_imported_unknown_format_argument_macro_withholds) {
+    const char *caller = "use external::format_args;\n"
+                         "fn hidden() { format_args!(a::one()); }\n";
+    const char *const leaves[] = {"one"};
+    const char *const sites[] = {"a::one()"};
+    bool resolved[1];
+    rustlsp_macro_arg_sites_resolve(caller, leaves, sites, 1, resolved);
+    ASSERT_FALSE(resolved[0]);
+    PASS();
+}
+
+TEST(rustlsp_visible_format_argument_macro_discards_tokens) {
+    CBMFileResult *result = extract_rust(
+        "fn kept() {} fn discarded() {}\n"
+        "fn run() {\n"
+        "    macro_rules! format_args { ($($arg:tt)*) => { kept() } }\n"
+        "    format_args!(discarded());\n"
+        "}\n");
+    ASSERT_NOT_NULL(result);
+    ASSERT_GTE(find_resolved(result, "run", "kept"), 0);
+    ASSERT_EQ(find_resolved(result, "run", "discarded"), -1);
+    cbm_free_result(result);
     PASS();
 }
 
@@ -7629,6 +7777,23 @@ TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape) {
     ASSERT_EQ(count_resolved(r, "&T.reference[Tr]", "&T.reference[Tr]"), 1);
     ASSERT_EQ(count_resolved(r, "&T.alias[AliasTr]", "&T.alias[AliasTr]"), 1);
     ASSERT_EQ(count_resolved(r, "&T.typed[Typed]", "&T.typed[Typed]"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_reference_blanket_impl_prevents_concrete_trait_guess) {
+    CBMFileResult *r = extract_rust(
+        "trait Read { fn read(&self) -> u8; }\n"
+        "struct Widget;\n"
+        "impl Read for Widget { fn read(&self) -> u8 { 1 } }\n"
+        "impl<T: Read> Read for &T { fn read(&self) -> u8 { T::read(self) } }\n"
+        "fn owned(w: Widget) -> u8 { w.read() }\n"
+        "fn single(w: &Widget) -> u8 { w.read() }\n"
+        "fn double(w: &&Widget) -> u8 { w.read() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "main.owned", "Widget.read"), 0);
+    ASSERT_EQ(find_resolved(r, "main.single", "Widget.read"), -1);
+    ASSERT_EQ(find_resolved(r, "main.double", "Widget.read"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -12075,6 +12240,50 @@ static CBMRustModTree *rust_modtree_from_sources(const char *const *rels, const 
     return tree;
 }
 
+TEST(rustlsp_modtree_qualified_impl_trait_keeps_proven_identity) {
+    const char *spellings[] = {"Action", "contract::Action", "crate::contract::Action",
+                               "super::contract::Action", "api::Action"};
+    const char *rels[] = {"src/lib.rs", "src/contract.rs", "src/other.rs", "src/user.rs"};
+    const char *qns[] = {"p.src.lib", "p.src.contract", "p.src.other", "p.src.user"};
+    for (size_t i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
+        char user[512];
+        snprintf(user, sizeof(user),
+                 "use crate::contract::{self, Action}; use crate::contract as api;\n"
+                 "pub struct Widget; impl %s for Widget { fn act(&self) {} }\n", spellings[i]);
+        const char *sources[] = {"mod contract; mod other; mod user;\n",
+                                  "pub trait Action { fn act(&self); }\n",
+                                  "pub mod contract { pub trait Action { fn act(&self); } }\n", user};
+        CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 4);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMRustPathResult path = cbm_rust_modtree_resolve_type_in_file(
+            tree, &arena, "p.src.user", spellings[i]);
+        ASSERT_EQ(path.kind, CBM_RUST_PATH_TYPE);
+        ASSERT_STR_EQ(path.qn, "p.src.contract.Action");
+        CBMLSPDef defs[] = {
+            {.qualified_name = "p.src.contract.Action", .short_name = "Action", .label = "Trait",
+             .def_module_qn = "p.src.contract", .is_interface = true, .lang = CBM_LANG_RUST},
+            {.qualified_name = "p.src.other.contract.Action", .short_name = "Action", .label = "Trait",
+             .def_module_qn = "p.src.other.contract", .is_interface = true, .lang = CBM_LANG_RUST},
+            {.qualified_name = "p.src.user.Widget", .short_name = "Widget", .label = "Struct",
+             .def_module_qn = "p.src.user", .lang = CBM_LANG_RUST},
+            {.qualified_name = "p.src.user.Widget", .short_name = "Widget", .label = "RustImpl",
+             .receiver_type = "p.src.user.Widget", .receiver_spelling = "Widget",
+             .def_module_qn = "p.src.user", .trait_qn = spellings[i],
+             .is_rust_impl_relation = true, .lang = CBM_LANG_RUST},
+        };
+        CBMTypeRegistry *registry = cbm_rust_build_cross_registry_with_modtree(&arena, defs, 4, tree);
+        const CBMRegisteredType *widget = cbm_registry_lookup_type(registry, "p.src.user.Widget");
+        ASSERT_NOT_NULL(widget);
+        ASSERT_NOT_NULL(widget->embedded_types);
+        ASSERT_STR_EQ(widget->embedded_types[0], "p.src.contract.Action");
+        ASSERT_NULL(widget->embedded_types[1]);
+        cbm_arena_destroy(&arena);
+        cbm_rust_modtree_free(tree);
+    }
+    PASS();
+}
+
 TEST(rustlsp_modtree_super_glob_sees_parent_private_import) {
     /* `svc` only imports `Session`, privately. Its child's `use super::*`
      * may see that import; a sibling's `use crate::svc::*` may not. */
@@ -12362,7 +12571,7 @@ TEST(rustlsp_value_path_receivers_type_as_their_item) {
     /* `Tier::Fast` (unit variant), `Tier::Tokens(3)` (tuple-variant
      * constructor) and `Marker` (unit struct, reached by a glob) are values
      * of their enum / struct, so the method called on each resolves. An
-     * associated const of the enum is not a variant and stays untyped. */
+     * associated const of the enum has its own declared type. */
     static const char *const rels[] = {"src/lib.rs", "src/model.rs", "src/app.rs"};
     static const char *const qns[] = {"p.src.lib", "p.src.model", "p.src.app"};
     static const char *const sources[] = {
@@ -12403,6 +12612,126 @@ TEST(rustlsp_value_path_receivers_type_as_their_item) {
     ASSERT_LT(find_confident(&out, "app.assoc", "Tier.code"), 0);
     cbm_rust_modtree_free(tree);
     cbm_arena_destroy(&arena);
+    PASS();
+}
+
+static int rustlsp_associated_const_targets(const char *type, const char *body,
+                                           bool duplicate, bool variant) {
+    const char *rels[] = {"src/lib.rs", "src/model.rs", "src/app.rs"};
+    const char *qns[] = {"p.src.lib", "p.src.model", "p.src.app"};
+    const char *sources[] = {
+        "mod model; mod app;",
+        variant
+            ? "pub enum Owner { VALUE } pub struct Value;\n"
+              "pub trait Has { const VALUE: Value; }\n"
+              "impl Owner { pub const VALUE: Value = Value; pub fn act(&self) {} }\n"
+              "impl Value { pub fn act(&self) {} }"
+            : "pub struct Owner; pub struct Value; pub trait Has { const VALUE: Value; }\n"
+              "impl Owner { pub const VALUE: Value = Value; pub fn act(&self) {} }\n"
+              "impl Value { pub fn act(&self) {} }",
+        body,
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 3);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustLSPDef defs[] = {
+        {.qualified_name = "p.src.model.Owner", .short_name = "Owner",
+         .label = variant ? "Enum" : "Struct", .def_module_qn = "p.src.model",
+         .field_defs = variant ? "VALUE.:Owner" : NULL},
+        {.qualified_name = "p.src.model.Value", .short_name = "Value", .label = "Struct",
+         .def_module_qn = "p.src.model"},
+        {.qualified_name = "p.src.model.Has", .short_name = "Has", .label = "Trait",
+         .def_module_qn = "p.src.model", .is_interface = true},
+        {.qualified_name = "p.src.model.Owner.act", .short_name = "act", .label = "Method",
+         .receiver_type = "p.src.model.Owner", .def_module_qn = "p.src.model",
+         .receiver_spelling = "Owner"},
+        {.qualified_name = "p.src.model.Value.act", .short_name = "act", .label = "Method",
+         .receiver_type = "p.src.model.Value", .def_module_qn = "p.src.model",
+         .receiver_spelling = "Value"},
+        {.qualified_name = "p.src.model.Owner.VALUE", .short_name = "VALUE",
+         .label = "AssociatedConst", .receiver_type = "p.src.model.Owner",
+         .receiver_spelling = "Owner", .def_module_qn = "p.src.model", .return_types = type},
+        {.qualified_name = "p.src.model.Has.VALUE", .short_name = "VALUE",
+         .label = "AssociatedConst", .receiver_type = "p.src.model.Has",
+         .def_module_qn = "p.src.model", .return_types = type},
+        {.qualified_name = "p.src.model.Owner.VALUE", .short_name = "VALUE",
+         .label = "AssociatedConst", .receiver_type = "p.src.model.Owner",
+         .receiver_spelling = "Owner", .def_module_qn = "p.src.model", .return_types = type},
+    };
+    CBMRustImportSource imports = {.modtree = tree};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(&arena, body, (int)strlen(body), "p.src.app", "p.src.app",
+                                         defs, duplicate ? 8 : 7, NULL, NULL, 0, NULL, NULL,
+                                         &imports, &out, NULL, NULL);
+    bool linked = find_confident(&out, "run", "p.src.model.Value.act") >= 0;
+    bool wrong = find_confident(&out, "run", "p.src.model.Owner.act") >= 0;
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    return (linked ? 1 : 0) | (wrong ? 2 : 0);
+}
+
+TEST(rustlsp_associated_const_uses_declared_value_type) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", false, false), 1);
+    PASS();
+}
+
+TEST(rustlsp_associated_const_types_derived_binding) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; fn run() { let value = Owner::VALUE; value.act(); }", false, false), 1);
+    PASS();
+}
+
+TEST(rustlsp_self_associated_const_uses_declared_value_type) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; impl Owner { fn run() { Self::VALUE.act(); } }", false, false), 1);
+    PASS();
+}
+
+TEST(rustlsp_qualified_associated_const_uses_trait_declaration_type) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Has; fn run<T: Has>() { <T as Has>::VALUE.act(); }", false, false), 1);
+    PASS();
+}
+
+TEST(rustlsp_associated_const_projection_stays_untyped) {
+    ASSERT_EQ(rustlsp_associated_const_targets("<Owner as Has>::Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", false, false), 0);
+    ASSERT_EQ(rustlsp_associated_const_targets("Owner::Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", false, false), 0);
+    PASS();
+}
+
+TEST(rustlsp_associated_const_duplicate_declaration_stays_untyped) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", true, false), 0);
+    PASS();
+}
+
+TEST(rustlsp_associated_const_parameter_shadows_module_type) {
+    const char *source =
+        "struct T; impl T { fn act(&self) {} }\n"
+        "trait Act { fn act(&self); }\n"
+        "struct Owner<T>(T);\n"
+        "impl<T: Act> Owner<T> { const VALUE: T = panic!();\n"
+        "    fn run() { Self::VALUE.act(); } }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_LT(find_resolved(result, "run", "T.act"), 0);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(rustlsp_enum_variant_precedes_same_named_associated_const) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", false, true), 2);
+    CBMFileResult *result = extract_rust(
+        "enum E { Same } struct Value; impl Value { fn act(&self) {} }\n"
+        "impl E { const Same: Value = Value; fn act(&self) {} }\n"
+        "fn run() { E::Same.act(); }");
+    ASSERT_NOT_NULL(result);
+    ASSERT_LT(find_resolved(result, "run", "Value.act"), 0);
+    cbm_free_result(result);
     PASS();
 }
 
@@ -13040,6 +13369,13 @@ void suite_rust_lsp(void) {
 
     /* Trait dispatch */
     RUN_TEST(rustlsp_trait_dispatch_single_impl);
+    RUN_TEST(rustlsp_trait_alias_identity_ignores_canonical_leaf_import);
+    RUN_TEST(rustlsp_trait_unbounded_impl_accepts_concrete_argument);
+    RUN_TEST(rustlsp_trait_collapsed_block_local_types_withhold_impl);
+    RUN_TEST(rustlsp_trait_attribute_field_accessor_withholds_impl);
+    RUN_TEST(rustlsp_trait_field_without_attribute_accepts_impl);
+    RUN_TEST(rustlsp_trait_reexport_keeps_canonical_identity);
+    RUN_TEST(rustlsp_imported_subtrait_keeps_same_named_supertrait_method);
     RUN_TEST(rustlsp_trait_owned_self_does_not_select_borrowed_receiver);
     RUN_TEST(rustlsp_trait_specialized_impl_does_not_select_other_argument);
     RUN_TEST(rustlsp_trait_specialized_impl_accepts_matching_argument);
@@ -13187,6 +13523,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_insta_macro_arguments_resolve);
     RUN_TEST(rustlsp_crate_expression_macro_arguments_resolve);
     RUN_TEST(rustlsp_crate_qualified_assert_macro_arguments_resolve);
+    RUN_TEST(rustlsp_standard_format_argument_macros_resolve);
+    RUN_TEST(rustlsp_format_arguments_keep_receiver_binding);
+    RUN_TEST(rustlsp_unknown_format_argument_macro_withholds);
+    RUN_TEST(rustlsp_visible_format_argument_macro_discards_tokens);
+    RUN_TEST(rustlsp_imported_unknown_format_argument_macro_withholds);
     RUN_TEST(rustlsp_select_expression_handler_turbofish_keeps_next_arm);
     RUN_TEST(rustlsp_operator_carriers_are_occurrence_exact);
     RUN_TEST(rustlsp_macro_operator_has_one_exact_carrier);
@@ -13418,6 +13759,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_method_recursive_call);
     RUN_TEST(rustlsp_exact_layout_receiver_recovery_keeps_recursion);
     RUN_TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape);
+    RUN_TEST(rustlsp_reference_blanket_impl_prevents_concrete_trait_guess);
     RUN_TEST(rustlsp_type_headed_recursion_proves_self_argument);
     RUN_TEST(rustlsp_foreign_receiver_leaf_is_not_recursion);
     RUN_TEST(rustlsp_generic_bound_static_call_is_not_recursion);
@@ -13849,6 +14191,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cargo_edition_selects_import_scope_and_unknown_refuses_links);
     RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
+    RUN_TEST(rustlsp_modtree_qualified_impl_trait_keeps_proven_identity);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
     RUN_TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module);
     RUN_TEST(rustlsp_associated_function_keeps_its_owner_when_a_free_function_shares_its_name);
@@ -13860,6 +14203,14 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file);
     RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);
     RUN_TEST(rustlsp_value_path_receivers_type_as_their_item);
+    RUN_TEST(rustlsp_associated_const_uses_declared_value_type);
+    RUN_TEST(rustlsp_associated_const_types_derived_binding);
+    RUN_TEST(rustlsp_associated_const_projection_stays_untyped);
+    RUN_TEST(rustlsp_associated_const_duplicate_declaration_stays_untyped);
+    RUN_TEST(rustlsp_associated_const_parameter_shadows_module_type);
+    RUN_TEST(rustlsp_enum_variant_precedes_same_named_associated_const);
+    RUN_TEST(rustlsp_self_associated_const_uses_declared_value_type);
+    RUN_TEST(rustlsp_qualified_associated_const_uses_trait_declaration_type);
     RUN_TEST(rustlsp_modtree_module_reexport_names_definition);
     RUN_TEST(rustlsp_module_path_call_picks_namesake_of_declaring_module);
     RUN_TEST(rustlsp_modtree_renamed_reexport_names_definition);
