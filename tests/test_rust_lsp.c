@@ -1178,6 +1178,78 @@ TEST(rustlsp_from_call_selects_impl_by_argument_type) {
     PASS();
 }
 
+#define RUSTLSP_NUMERIC_FROM_IMPLS \
+    "trait From<T> { fn from(value: T) -> Self; }\n" \
+    "struct Label;\n" \
+    "impl From<u32> for Label { fn from(value: u32) -> Self { Self } }\n" \
+    "impl From<i32> for Label { fn from(value: i32) -> Self { Self } }\n" \
+    "impl From<bool> for Label { fn from(value: bool) -> Self { Self } }\n" \
+    "impl From<f32> for Label { fn from(value: f32) -> Self { Self } }\n" \
+    "impl From<f64> for Label { fn from(value: f64) -> Self { Self } }\n"
+
+TEST(rustlsp_from_unary_argument_uses_written_operand_type) {
+    const char *bodies[] = {
+        "fn run(x: &u32) { Label::from(*x); }",
+        "fn run(n: i32) { Label::from(-n); }",
+        "fn run(b: bool) { Label::from(!b); }",
+        "fn run(n: u32) { Label::from(!n); }",
+        "fn run(mut n: u32) { n = 7; Label::from(!n); }",
+    };
+    const char *keys[] = {"From<u32>", "From<i32>", "From<bool>", "From<u32>", "From<u32>"};
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+        char source[2048];
+        snprintf(source, sizeof(source), "%s%s", RUSTLSP_NUMERIC_FROM_IMPLS, bodies[i]);
+        CBMFileResult *r = extract_rust(source);
+        ASSERT_NOT_NULL(r);
+        ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&r->resolved_calls), keys[i]));
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+TEST(rustlsp_from_numeric_argument_requires_written_type) {
+    const char *bodies[] = {
+        "fn run() { Label::from(7u32); }",
+        "fn run() { Label::from(0xff_u32); }",
+        "fn run() { Label::from(1.5f32); }",
+        "fn run() { Label::from(-7i32); }",
+        "fn run() { let n: u32 = 7; Label::from(n); }",
+        "fn run() { let n = 7u32; Label::from(n); }",
+        "fn run() { Label::from(7); }",
+        "fn run() { Label::from(-7); }",
+        "fn run() { Label::from(!7); }",
+        "fn run() { Label::from(1.5); }",
+        "fn run() { let n = 7; Label::from(n); }",
+        "fn run() { let n = -7; Label::from(n); }",
+    };
+    const char *keys[] = {"From<u32>", "From<u32>", "From<f32>", "From<i32>",
+                          "From<u32>", "From<u32>", NULL, NULL, NULL, NULL, NULL, NULL};
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+        char source[2048];
+        snprintf(source, sizeof(source), "%s%s", RUSTLSP_NUMERIC_FROM_IMPLS, bodies[i]);
+        CBMFileResult *r = extract_rust(source);
+        ASSERT_NOT_NULL(r);
+        const char *key = rustlsp_from_impl_key(&r->resolved_calls);
+        if (keys[i]) {
+            ASSERT_TRUE(rustlsp_key_names(key, keys[i]));
+        } else {
+            ASSERT_NULL(key);
+        }
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+TEST(rustlsp_from_overloaded_unary_argument_stays_unproven) {
+    CBMFileResult *r = extract_rust(RUSTLSP_NUMERIC_FROM_IMPLS
+        "struct Operand; impl std::ops::Not for Operand { type Output = u32; "
+        "fn not(self) -> u32 { 0 } } fn run(n: Operand) { Label::from(!n); }");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(rustlsp_from_impl_key(&r->resolved_calls));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_from_call_with_unproven_argument_is_unresolved) {
     /* Unknown argument type. */
     CBMFileResult *r = extract_rust(RUSTLSP_FROM_IMPLS
@@ -13643,6 +13715,9 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_sole_visible_from_impl_rejects_other_argument);
     RUN_TEST(rustlsp_sole_visible_from_impl_accepts_matching_argument);
     RUN_TEST(rustlsp_from_call_selects_impl_by_argument_type);
+    RUN_TEST(rustlsp_from_unary_argument_uses_written_operand_type);
+    RUN_TEST(rustlsp_from_numeric_argument_requires_written_type);
+    RUN_TEST(rustlsp_from_overloaded_unary_argument_stays_unproven);
     RUN_TEST(rustlsp_from_call_with_unproven_argument_is_unresolved);
     RUN_TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type);
     RUN_TEST(rustlsp_type_path_call_prefers_inherent_over_trait_impl);

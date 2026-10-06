@@ -3510,39 +3510,26 @@ static const CBMType *rust_apply_subst(CBMArena *arena, const CBMType *t, const 
 /* Evaluate the type of a literal child like `integer_literal`, `float_literal`,
  * `string_literal`, `char_literal`, `boolean_literal`. */
 static const CBMType *rust_eval_literal_type(RustLSPContext *ctx, const char *kind, TSNode node) {
-    if (strcmp(kind, "integer_literal") == 0) {
+    if (strcmp(kind, "integer_literal") == 0 || strcmp(kind, "float_literal") == 0) {
         char *text = rust_node_text(ctx, node);
-        /* Look at suffix. */
-        if (text) {
-            /* Strip leading `-` if any. */
-            const char *p = text;
-            if (*p == '-')
-                p++;
-            /* Find suffix start (first non-digit/non-_/non-x/non-X/non-hex). */
-            while (*p && (isdigit((unsigned char)*p) || *p == '_' || *p == '.' || *p == 'x' ||
-                          *p == 'X' || *p == 'b' || *p == 'B' || *p == 'o' || *p == 'O' ||
-                          (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) {
-                p++;
-            }
-            if (*p) {
-                return cbm_type_builtin(ctx->arena, p);
+        const char *integer_suffixes[] = {"i8", "i16", "i32", "i64", "i128", "isize",
+                                          "u8", "u16", "u32", "u64", "u128", "usize"};
+        const char *float_suffixes[] = {"f32", "f64"};
+        bool integer = strcmp(kind, "integer_literal") == 0;
+        const char **suffixes = integer ? integer_suffixes : float_suffixes;
+        size_t count = integer ? sizeof(integer_suffixes) / sizeof(integer_suffixes[0])
+                               : sizeof(float_suffixes) / sizeof(float_suffixes[0]);
+        size_t length = text ? strlen(text) : 0;
+        for (size_t i = 0; i < count; i++) {
+            size_t suffix_length = strlen(suffixes[i]);
+            if (length > suffix_length &&
+                strcmp(text + length - suffix_length, suffixes[i]) == 0) {
+                return cbm_type_builtin(ctx->arena, suffixes[i]);
             }
         }
-        return cbm_type_builtin(ctx->arena, "i32");
-    }
-    if (strcmp(kind, "float_literal") == 0) {
-        char *text = rust_node_text(ctx, node);
-        if (text) {
-            const char *p = text;
-            while (*p && (isdigit((unsigned char)*p) || *p == '.' || *p == 'e' || *p == 'E' ||
-                          *p == '+' || *p == '-' || *p == '_')) {
-                p++;
-            }
-            if (*p) {
-                return cbm_type_builtin(ctx->arena, p);
-            }
-        }
-        return cbm_type_builtin(ctx->arena, "f64");
+        /* A default numeric type is not source evidence, including when the
+         * literal flows through an inferred binding into impl selection. */
+        return cbm_type_unknown();
     }
     if (strcmp(kind, "string_literal") == 0 || strcmp(kind, "raw_string_literal") == 0) {
         /* &'static str — represented as &str */
@@ -6428,7 +6415,8 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
             ts_node_is_null(cbm_find_child_by_kind(node, "mutable_specifier")));
     }
 
-    /* unary_expression — *x dereferences, !x is bool, -x same as operand */
+    /* Built-in unary operators preserve the operand type; user operators
+     * need an Output proof the expression evaluator does not yet carry. */
     if (strcmp(kind, "unary_expression") == 0) {
         TSNode operand = ts_node_named_child_count(node) > 0
                              ? ts_node_named_child(node, ts_node_named_child_count(node) - 1)
@@ -6468,10 +6456,19 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
             }
             return inner;
         }
-        if (op && strcmp(op, "!") == 0) {
-            return cbm_type_builtin(ctx->arena, "bool");
+        const CBMType *base = rust_strip_references(inner);
+        const char *name = base && base->kind == CBM_TYPE_BUILTIN ? base->data.builtin.name : NULL;
+        bool integer = name && (name[0] == 'i' || name[0] == 'u') &&
+                       (isdigit((unsigned char)name[1]) || strcmp(name + 1, "size") == 0);
+        bool floating = name && (strcmp(name, "f32") == 0 || strcmp(name, "f64") == 0);
+        if (op && strcmp(op, "!") == 0 &&
+            (integer || (name && strcmp(name, "bool") == 0))) {
+            return base;
         }
-        return inner;
+        if (op && strcmp(op, "-") == 0 && (integer || floating)) {
+            return base;
+        }
+        return cbm_type_unknown();
     }
 
     /* binary_expression — comparisons → bool, logical → bool, arith → left */
@@ -11535,10 +11532,6 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
         return NULL;
     }
     const char *arg_kind = ts_node_type(first_arg);
-    if (strcmp(arg_kind, "integer_literal") == 0 || strcmp(arg_kind, "float_literal") == 0 ||
-        strcmp(arg_kind, "unary_expression") == 0) {
-        return NULL;
-    }
     const CBMType *arg = rust_eval_expr_type(ctx, first_arg);
     if (!arg || cbm_type_is_unknown(arg)) {
         return NULL;
