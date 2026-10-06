@@ -4086,8 +4086,8 @@ static const RustStdReturn RUST_STD_RETURNS[] = {
     {RUST_STD_VEC, "last_mut", RS_OPT("&T"), false},
     {RUST_STD_VEC, "as_slice", "&[T]", false},
     {RUST_STD_VEC, "as_mut_slice", "&[T]", false},
-    {RUST_STD_VEC, "iter", "core.iter.Iterator<T>", false},
-    {RUST_STD_VEC, "iter_mut", "core.iter.Iterator<T>", false},
+    {RUST_STD_VEC, "iter", RS_ITER("&T"), false},
+    {RUST_STD_VEC, "iter_mut", RS_ITER("&T"), false},
     {RUST_STD_VEC, "into_iter", "core.iter.Iterator<T>", false},
     {RUST_STD_VEC, "drain", "core.iter.Iterator<T>", false},
     {RUST_STD_VEC, "windows", RS_ITER("&[T]"), false},
@@ -7810,9 +7810,9 @@ static bool rust_qn_in_project(const RustLSPContext *ctx, const char *qn) {
     return strncmp(qn, ctx->module_qn, project_len) == 0 && qn[project_len] == '.';
 }
 
-/* Reference depth can be lost during collection inference. A reference impl
- * of the selected trait may precede the concrete target; its bounds and self
- * shape are not proved by this lookup, so neither target is published. */
+/* A reference impl can precede a concrete method after autoderef. Its
+ * bounds are not proved here. A concrete `&self` method at exactly one
+ * reference layer precedes a reference impl's `&self` method. */
 static bool rust_reference_impl_may_precede(RustLSPContext *ctx, const CBMType *receiver,
                                             const CBMRegisteredFunc *method) {
     if (!receiver || receiver->kind != CBM_TYPE_REFERENCE || !method->impl_trait_qn) {
@@ -7832,8 +7832,27 @@ static bool rust_reference_impl_may_precede(RustLSPContext *ctx, const CBMType *
                     strcmp(candidate->impl_trait_qn, method->impl_trait_qn) != 0) {
                     continue;
                 }
-                const char *self = rust_impl_key_part(candidate->impl_key, 1, NULL);
-                if (self && *self == '&') {
+                size_t self_len = 0;
+                const char *self = rust_impl_key_part(candidate->impl_key, 1, &self_len);
+                if (!self || *self != '&') {
+                    continue;
+                }
+                size_t qualifier = 1;
+                while (qualifier < self_len && isspace((unsigned char)self[qualifier])) {
+                    qualifier++;
+                }
+                /* Inferred reference types erase mutability. These impl
+                 * shapes can precede a shared concrete method. */
+                if (qualifier == self_len || self[qualifier] == '\'' ||
+                    (self_len - qualifier >= 3 && strncmp(self + qualifier, "mut", 3) == 0)) {
+                    return true;
+                }
+                const char *selected_self = rust_impl_key_part(method->impl_key, 1, NULL);
+                bool exact_borrow = receiver->data.reference.elem &&
+                                    receiver->data.reference.elem->kind != CBM_TYPE_REFERENCE &&
+                                    (method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) != 0 &&
+                                    selected_self && *selected_self != '&';
+                if (!exact_borrow || (candidate->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0) {
                     return true;
                 }
             }
@@ -13268,6 +13287,16 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                     elem = cbm_type_tuple(ctx->arena, pair, 2);
                 }
             }
+            /* IntoIterator for a borrowed slice or Vec yields borrowed
+             * elements, including another layer when its element is &T. */
+            if (vt && vt->kind == CBM_TYPE_REFERENCE && base &&
+                (base->kind == CBM_TYPE_SLICE ||
+                 (base->kind == CBM_TYPE_TEMPLATE &&
+                  rust_std_family_of(ctx, base->data.template_type.template_name) ==
+                      RUST_STD_VEC)) &&
+                !cbm_type_is_unknown(elem)) {
+                elem = cbm_type_reference(ctx->arena, elem);
+            }
             rust_bind_pattern(ctx, pat, elem);
         }
     }
@@ -14704,6 +14733,9 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             if (d->has_rust_value_self) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_VALUE_SELF;
             }
+            if (d->has_rust_shared_self) {
+                rf.flags |= CBM_FUNC_FLAG_RUST_SHARED_SELF;
+            }
             rf.rust_unbounded_impl_params = d->rust_unbounded_impl_params;
             rf.rust_fn_type_params = d->rust_type_params;
             if (d->impl_trait) {
@@ -15477,6 +15509,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             if (d->has_rust_value_self) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_VALUE_SELF;
             }
+            if (d->has_rust_shared_self) {
+                rf.flags |= CBM_FUNC_FLAG_RUST_SHARED_SELF;
+            }
             rf.rust_unbounded_impl_params = d->rust_unbounded_impl_params;
             rf.rust_fn_type_params = rust_fn_type_params_copy(arena, d->type_params);
             if (d->trait_qn && d->trait_qn[0]) {
@@ -15990,6 +16025,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].is_rust_private = defs[i].is_rust_private;
             rdefs[i].has_rust_self = defs[i].has_rust_self;
             rdefs[i].has_rust_value_self = defs[i].has_rust_value_self;
+            rdefs[i].has_rust_shared_self = defs[i].has_rust_shared_self;
             rdefs[i].rust_unbounded_impl_params = defs[i].rust_unbounded_impl_params;
             rdefs[i].type_params = defs[i].type_params;
         }

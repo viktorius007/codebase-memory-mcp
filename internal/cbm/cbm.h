@@ -241,6 +241,7 @@ typedef struct {
      * receiver. False for an associated function such as `fn new() -> Self`. */
     bool has_rust_self;
     bool has_rust_value_self;                /* unborrowed `self` or `mut self` */
+    bool has_rust_shared_self;               /* explicit shared `&self` receiver */
     const char **rust_unbounded_impl_params; /* declared impl parameters with no bounds */
     /* Rust only: a `type Name<P..> = Target;` item's target as written and its
      * type parameter names in declaration order (NULL-ended, NULL when none),

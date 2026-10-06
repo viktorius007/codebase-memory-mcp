@@ -3095,8 +3095,10 @@ static bool rust_fn_is_async(TSNode fn) {
 /* Rust: the function's first parameter is a `self` receiver (`self`, `&self`,
  * `&mut self`, `mut self` or a typed `self: Box<Self>`). An associated function
  * without one takes its first call argument as an ordinary parameter. */
-static bool rust_fn_has_self_receiver(TSNode fn, const char *source, bool *value_self) {
+static bool rust_fn_has_self_receiver(TSNode fn, const char *source, bool *value_self,
+                                      bool *shared_self) {
     *value_self = false;
+    *shared_self = false;
     TSNode params = ts_node_child_by_field_name(fn, TS_FIELD("parameters"));
     if (ts_node_is_null(params)) {
         return false;
@@ -3111,11 +3113,17 @@ static bool rust_fn_has_self_receiver(TSNode fn, const char *source, bool *value
         }
         if (strcmp(kind, "self_parameter") == 0) {
             *value_self = true;
+            bool mutable = false;
             for (uint32_t j = 0; j < ts_node_child_count(p); j++) {
-                if (strcmp(ts_node_type(ts_node_child(p, j)), "&") == 0) {
+                const char *token = ts_node_type(ts_node_child(p, j));
+                if (strcmp(token, "&") == 0) {
                     *value_self = false;
                 }
+                if (strcmp(token, "mutable_specifier") == 0 || strcmp(token, "mut") == 0) {
+                    mutable = true;
+                }
             }
+            *shared_self = !*value_self && !mutable;
             return true;
         }
         if (strcmp(kind, "parameter") != 0) {
@@ -5351,7 +5359,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     }
     if (ctx->language == CBM_LANG_RUST) {
         def.is_async = rust_fn_is_async(child);
-        def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source, &def.has_rust_value_self);
+        def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source, &def.has_rust_value_self,
+                                                      &def.has_rust_shared_self);
         int type_param_count = 0;
         def.rust_type_params = rust_item_type_param_names(a, child, ctx->source, &type_param_count);
     }
@@ -5631,7 +5640,8 @@ static void extract_rust_impl_member(CBMExtractCtx *ctx, TSNode child, const Rus
     def.impl_trait = impl_trait;
     def.rust_unbounded_impl_params = owner->unbounded_params;
     def.is_async = rust_fn_is_async(child);
-    def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source, &def.has_rust_value_self);
+    def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source, &def.has_rust_value_self,
+                                                  &def.has_rust_shared_self);
     int type_param_count = 0;
     def.rust_type_params = rust_item_type_param_names(a, child, ctx->source, &type_param_count);
     /* A trait-impl method takes the trait's visibility, never its own. */

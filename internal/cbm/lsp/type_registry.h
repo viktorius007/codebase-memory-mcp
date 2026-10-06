@@ -26,7 +26,8 @@ typedef enum {
     /* Rust only: the method's first parameter is a `self` receiver, so the
      * first argument of a `Trait::method(x, ..)` path call is the receiver. */
     CBM_FUNC_FLAG_RUST_SELF = 1 << 11,
-    CBM_FUNC_FLAG_RUST_VALUE_SELF = 1 << 12, // Rust: receiver is `self` or `mut self`
+    CBM_FUNC_FLAG_RUST_VALUE_SELF = 1 << 12,  // Rust: receiver is `self` or `mut self`
+    CBM_FUNC_FLAG_RUST_SHARED_SELF = 1 << 13, // Rust: explicit shared `&self`
 } CBMFuncFlags;
 
 // Registered function/method with full type signature.

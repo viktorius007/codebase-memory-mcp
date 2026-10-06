@@ -401,6 +401,7 @@ typedef struct {
     bool is_rust_private;         /* inherent method without a visibility modifier */
     bool has_rust_self;           /* first parameter is a `self` receiver */
     bool has_rust_value_self;     /* unborrowed `self` or `mut self` */
+    bool has_rust_shared_self;    /* explicit shared `&self` receiver */
     const char **rust_unbounded_impl_params; /* declared impl parameters with no bounds */
     const char **type_params;     /* the fn's own type parameter names, NULL-ended */
 } CBMRustLSPDef;

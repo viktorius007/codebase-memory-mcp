@@ -7781,7 +7781,7 @@ TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape) {
     PASS();
 }
 
-TEST(rustlsp_reference_blanket_impl_prevents_concrete_trait_guess) {
+TEST(rustlsp_single_borrow_precedes_reference_blanket_impl) {
     CBMFileResult *r = extract_rust(
         "trait Read { fn read(&self) -> u8; }\n"
         "struct Widget;\n"
@@ -7792,8 +7792,118 @@ TEST(rustlsp_reference_blanket_impl_prevents_concrete_trait_guess) {
         "fn double(w: &&Widget) -> u8 { w.read() }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "main.owned", "Widget.read"), 0);
-    ASSERT_EQ(find_resolved(r, "main.single", "Widget.read"), -1);
+    ASSERT_GTE(require_resolved(r, "main.single", "Widget.read"), 0);
     ASSERT_EQ(find_resolved(r, "main.double", "Widget.read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_borrowed_collection_preserves_element_reference) {
+    CBMFileResult *r =
+        extract_rust("trait Read { fn read(&self) -> u8; }\n"
+                     "struct Widget;\n"
+                     "impl Read for Widget { fn read(&self) -> u8 { 1 } }\n"
+                     "impl<T: Read> Read for &T { fn read(&self) -> u8 { T::read(self) } }\n"
+                     "fn single(ws: &std::vec::Vec<Widget>) { for w in ws { w.read(); } }\n"
+                     "fn double(ws: &std::vec::Vec<&Widget>) { for w in ws { w.read(); } }\n"
+                     "fn slice(ws: &[Widget]) { for w in ws { w.read(); } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "main.single", "Widget.read"), 0);
+    ASSERT_GTE(require_resolved(r, "main.slice", "Widget.read"), 0);
+    ASSERT_EQ(find_resolved(r, "main.double", "Widget.read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_borrowed_collection_cannot_move_noncopy_element) {
+    CBMFileResult *r =
+        extract_rust("trait Consume { fn consume(self); }\n"
+                     "struct Widget; impl Consume for Widget { fn consume(self) {} }\n"
+                     "fn run(ws: &std::vec::Vec<Widget>) { for w in ws { w.consume(); } }\n"
+                     "fn slice(ws: &[Widget]) { for w in ws { w.consume(); } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "Widget.consume"), -1);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.slice", "Widget.consume"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_value_reference_blanket_still_withholds_concrete_guess) {
+    CBMFileResult *r =
+        extract_rust("trait Read { fn read(self) -> u8; }\n"
+                     "#[derive(Clone, Copy)] struct Widget;\n"
+                     "impl Read for Widget { fn read(self) -> u8 { 1 } }\n"
+                     "impl<T: Read + Copy> Read for &T { fn read(self) -> u8 { T::read(*self) } }\n"
+                     "fn single(w: &Widget) -> u8 { w.read() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "main.single", "Widget.read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_typed_value_reference_blanket_withholds_concrete_guess) {
+    CBMFileResult *r = extract_rust(
+        "trait Read { fn read(self: Self) -> u8; }\n"
+        "#[derive(Clone, Copy)] struct Widget;\n"
+        "impl Read for Widget { fn read(self: Self) -> u8 { 1 } }\n"
+        "impl<T: Read + Copy> Read for &T { fn read(self: Self) -> u8 { T::read(*self) } }\n"
+        "fn single(w: &Widget) -> u8 { w.read() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "main.single", "Widget.read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_mutable_reference_receiver_stays_unproved) {
+    CBMFileResult *r = extract_rust(
+        "trait Read { fn read(&mut self) -> u8; }\n"
+        "struct Widget;\n"
+        "impl Read for Widget { fn read(&mut self) -> u8 { 1 } }\n"
+        "impl<T: Read> Read for &mut T { fn read(&mut self) -> u8 { T::read(self) } }\n"
+        "fn single(w: &Widget) { w.read(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "main.single", "Widget.read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_shared_receiver_with_arguments_precedes_reference_impl) {
+    CBMFileResult *r = extract_rust(
+        "trait Read { fn read(&self, n: u8) -> u8; }\n"
+        "struct Widget;\n"
+        "impl Read for Widget { fn read(&self, n: u8) -> u8 { n } }\n"
+        "impl<T: Read> Read for &T { fn read(&self, n: u8) -> u8 { T::read(self, n) } }\n"
+        "fn single(w: &Widget) -> u8 { w.read(1) }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "main.single", "Widget.read"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_iterator_preserves_borrowed_element_layers) {
+    CBMFileResult *r = extract_rust(
+        "trait Read { fn read(&self) -> u8; }\n"
+        "struct Widget; impl Read for Widget { fn read(&self) -> u8 { 1 } }\n"
+        "impl<T: Read> Read for &T { fn read(&self) -> u8 { 2 } }\n"
+        "fn single(ws: &std::vec::Vec<Widget>) { for w in ws.iter() { w.read(); } }\n"
+        "fn double(ws: &std::vec::Vec<&Widget>) { for w in ws.iter() { w.read(); } }\n"
+        "fn mapped(ws: &std::vec::Vec<&Widget>) { ws.iter().map(|w| w.read()); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "main.single", "Widget.read"), 0);
+    ASSERT_EQ(find_resolved(r, "main.double", "Widget.read"), -1);
+    ASSERT_EQ(find_resolved(r, "main.mapped", "Widget.read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_mutable_impl_self_stays_unproved) {
+    CBMFileResult *r = extract_rust(
+        "trait Read { fn read(&self) -> u8; }\n"
+        "struct Widget; impl Read for Widget { fn read(&self) -> u8 { 1 } }\n"
+        "impl<T: Read> Read for &mut T { fn read(&self) -> u8 { 2 } }\n"
+        "fn single(w: &mut Widget) -> u8 { w.read() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "main.single", "Widget.read"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -13759,7 +13869,15 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_method_recursive_call);
     RUN_TEST(rustlsp_exact_layout_receiver_recovery_keeps_recursion);
     RUN_TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape);
-    RUN_TEST(rustlsp_reference_blanket_impl_prevents_concrete_trait_guess);
+    RUN_TEST(rustlsp_single_borrow_precedes_reference_blanket_impl);
+    RUN_TEST(rustlsp_borrowed_collection_preserves_element_reference);
+    RUN_TEST(rustlsp_borrowed_collection_cannot_move_noncopy_element);
+    RUN_TEST(rustlsp_value_reference_blanket_still_withholds_concrete_guess);
+    RUN_TEST(rustlsp_typed_value_reference_blanket_withholds_concrete_guess);
+    RUN_TEST(rustlsp_mutable_reference_receiver_stays_unproved);
+    RUN_TEST(rustlsp_shared_receiver_with_arguments_precedes_reference_impl);
+    RUN_TEST(rustlsp_iterator_preserves_borrowed_element_layers);
+    RUN_TEST(rustlsp_mutable_impl_self_stays_unproved);
     RUN_TEST(rustlsp_type_headed_recursion_proves_self_argument);
     RUN_TEST(rustlsp_foreign_receiver_leaf_is_not_recursion);
     RUN_TEST(rustlsp_generic_bound_static_call_is_not_recursion);
