@@ -78,7 +78,12 @@ static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head);
 static const char *rust_wrapper_head_qn(RustLSPContext *ctx, const char *head);
 static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMType *base,
                                                  const char *method);
-static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn);
+static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
+    const char *trait_qn, const char *method_name, bool allow_abstract);
+static const char *rust_impl_key_part(const char *key, int index, size_t *part_len);
+static const char *rust_trait_spelling_leaf(CBMArena *arena, const char *spelling);
+static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
+                                   const char *method_name, const char *impl_key);
 static bool rust_bound_is_marker(const char *bound, size_t len);
 static const char *rust_dyn_markers_text(CBMArena *arena, const char *text);
 static const CBMType *rust_type_with_dyn_markers(CBMArena *arena, const CBMType *t,
@@ -5712,15 +5717,20 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                                                          1);
                             }
                         }
+                        if (strcmp(mname, "by_ref") == 0) {
+                            return cbm_type_reference(ctx->arena, recv);
+                        }
                         if (strcmp(mname, "filter") == 0 || strcmp(mname, "take") == 0 ||
                             strcmp(mname, "skip") == 0 || strcmp(mname, "rev") == 0 ||
                             strcmp(mname, "cloned") == 0 || strcmp(mname, "copied") == 0 ||
                             strcmp(mname, "step_by") == 0 || strcmp(mname, "fuse") == 0 ||
-                            strcmp(mname, "peekable") == 0 || strcmp(mname, "by_ref") == 0 ||
+                            strcmp(mname, "peekable") == 0 ||
                             strcmp(mname, "chain") == 0 ||
                             strcmp(mname, "take_while") == 0 ||
                             strcmp(mname, "skip_while") == 0 || strcmp(mname, "inspect") == 0) {
-                            return base; /* preserves Iterator<Item> */
+                            return cbm_type_template(ctx->arena, "core.iter.Iterator",
+                                                     base->data.template_type.template_args,
+                                                     base->data.template_type.arg_count);
                         }
                         if ((strcmp(mname, "sum") == 0 || strcmp(mname, "product") == 0 ||
                              strcmp(mname, "fold") == 0 || strcmp(mname, "reduce") == 0) &&
@@ -6701,10 +6711,13 @@ static int rust_receiver_param_index(RustLSPContext *ctx, const CBMType *t,
     const char *name = NULL;
     if (t->kind == CBM_TYPE_TYPE_PARAM) {
         name = t->data.type_param.name;
-    } else if (t->kind == CBM_TYPE_NAMED && t->data.named.qualified_name &&
-               !cbm_registry_lookup_type(ctx->registry, t->data.named.qualified_name)) {
-        const char *dot = strrchr(t->data.named.qualified_name, '.');
-        name = dot ? dot + 1 : NULL;
+    } else if (t->kind == CBM_TYPE_NAMED && t->data.named.qualified_name) {
+        const CBMRegisteredType *registered =
+            cbm_registry_lookup_type(ctx->registry, t->data.named.qualified_name);
+        if (!registered || registered->rust_undeclared) {
+            const char *dot = strrchr(t->data.named.qualified_name, '.');
+            name = dot ? dot + 1 : t->data.named.qualified_name;
+        }
     }
     for (int i = 0; name && i < argc && params[i]; i++) {
         if (params[i][0] && strcmp(params[i], name) == 0) {
@@ -6798,6 +6811,9 @@ static const CBMType *rust_subst_receiver_args(RustLSPContext *ctx, const CBMTyp
  * is looked up on its Deref target, hop by hop, as rustc's autoderef does; a
  * method call keeps a wrapper-level prelude trait method on the wrapper.
  * `*out_method`, when given, is the registered method found, else NULL. */
+static const char *rust_trait_receiver_refusal(RustLSPContext *ctx, const CBMRegisteredFunc *method,
+                                      const CBMType *recv);
+
 static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMType *recv,
                                                  const char *member, bool method_call, int hop,
                                                  const CBMRegisteredFunc **out_method);
@@ -6881,6 +6897,9 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
     const CBMRegisteredFunc *method =
         method_call ? rust_lookup_method(ctx, type_qn, member) : NULL;
     if (method && method->signature) {
+        if (rust_trait_receiver_refusal(ctx, method, recv)) {
+            return cbm_type_unknown();
+        }
         if (out_method) {
             *out_method = method;
         }
@@ -7043,7 +7062,8 @@ static bool rust_type_leaf_concrete(RustLSPContext *ctx, const CBMType *t) {
     }
     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry,
                                                            t->data.named.qualified_name);
-    return rt && !rt->alias_of;
+    return rt && !rt->alias_of && !rt->rust_undeclared &&
+           (!rt->type_param_names || !rt->type_param_names[0]);
 }
 
 /* Whether the impl self type `impl_self` (as written, in the impl's module) is
@@ -7055,13 +7075,35 @@ static RustImplSelfMatch rust_impl_self_match(RustLSPContext *ctx, const CBMType
     if (!impl_self || !recv) {
         return RUST_IMPL_SELF_UNDECIDED;
     }
+    /* Lifetimes do not distinguish impls. Their erased argument list may be
+     * represented as either a named type or a zero-argument template. */
+    if (impl_self->kind == CBM_TYPE_TEMPLATE && impl_self->data.template_type.arg_count == 0) {
+        const CBMRegisteredType *rt = cbm_registry_lookup_type(
+            ctx->registry, impl_self->data.template_type.template_name);
+        if (rt && (!rt->type_param_names || !rt->type_param_names[0])) {
+            impl_self = cbm_type_named(ctx->arena, impl_self->data.template_type.template_name);
+        }
+    }
+    if (recv->kind == CBM_TYPE_TEMPLATE && recv->data.template_type.arg_count == 0) {
+        const CBMRegisteredType *rt = cbm_registry_lookup_type(
+            ctx->registry, recv->data.template_type.template_name);
+        if (rt && (!rt->type_param_names || !rt->type_param_names[0])) {
+            recv = cbm_type_named(ctx->arena, recv->data.template_type.template_name);
+        }
+    }
     if (impl_self->kind == CBM_TYPE_TEMPLATE && recv->kind == CBM_TYPE_TEMPLATE) {
         const char *a = impl_self->data.template_type.template_name;
         const char *b = recv->data.template_type.template_name;
         const char *ca = a ? rust_std_wrapper_canonical(a) : NULL;
         const char *cb = b ? rust_std_wrapper_canonical(b) : NULL;
         if (!ca || !cb) {
-            return RUST_IMPL_SELF_UNDECIDED;
+            const CBMRegisteredType *ta = a ? cbm_registry_lookup_type(ctx->registry, a) : NULL;
+            const CBMRegisteredType *tb = b ? cbm_registry_lookup_type(ctx->registry, b) : NULL;
+            if (!ta || !tb || ta->rust_undeclared || tb->rust_undeclared || ta->alias_of || tb->alias_of) {
+                return RUST_IMPL_SELF_UNDECIDED;
+            }
+            ca = a;
+            cb = b;
         }
         if (strcmp(ca, cb) != 0) {
             return RUST_IMPL_SELF_DIFFERS;
@@ -7085,6 +7127,9 @@ static RustImplSelfMatch rust_impl_self_match(RustLSPContext *ctx, const CBMType
     }
     if (impl_self->kind == CBM_TYPE_REFERENCE && recv->kind == CBM_TYPE_REFERENCE) {
         return rust_impl_self_match(ctx, impl_self->data.reference.elem, recv->data.reference.elem);
+    }
+    if (impl_self->kind == CBM_TYPE_SLICE && recv->kind == CBM_TYPE_SLICE) {
+        return rust_impl_self_match(ctx, impl_self->data.slice.elem, recv->data.slice.elem);
     }
     if (!rust_type_leaf_concrete(ctx, impl_self) || !rust_type_leaf_concrete(ctx, recv)) {
         return RUST_IMPL_SELF_UNDECIDED;
@@ -7144,7 +7189,7 @@ static const CBMRegisteredFunc *rust_wrapper_corpus_trait_method(RustLSPContext 
             const CBMRegisteredFunc *candidate = &reg->funcs[index];
             if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 ||
                 !candidate->impl_trait_qn ||
-                rust_trait_out_of_scope(ctx, candidate->impl_trait_qn)) {
+                rust_trait_out_of_scope(ctx, candidate->impl_trait_qn, method, candidate->impl_key)) {
                 continue;
             }
             RustImplSelfMatch m = rust_impl_self_match(ctx, candidate->rust_wrapper_impl_self, base);
@@ -7417,33 +7462,81 @@ static bool rust_trait_name_out_of_scope(RustLSPContext *ctx, const char *name) 
  * reach: rustc considers a trait's methods only when the trait is in scope.
  * Proven when the trait is declared in another file and its name is out of
  * scope here. Without the proof the trait stays a candidate. */
-static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn) {
+static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
+                                   const char *method_name, const char *impl_key) {
     if (!ctx || !trait_qn || !ctx->module_qn) {
+        return false;
+    }
+    const char *dot = strrchr(trait_qn, '.');
+    const char *leaf = dot ? dot + 1 : trait_qn;
+    size_t spelling_len = 0;
+    const char *written = rust_impl_key_part(impl_key, 2, &spelling_len);
+    if (written) {
+        const char *name = rust_trait_spelling_leaf(ctx->arena,
+            cbm_arena_strndup(ctx->arena, written, spelling_len));
+        if (name) {
+            leaf = name;
+        }
+    }
+    const char *imported = rust_resolve_use(ctx, leaf);
+    const char *canonical_leaf = dot ? dot + 1 : trait_qn;
+    if (!imported && strcmp(leaf, canonical_leaf) != 0) {
+        imported = rust_resolve_use(ctx, canonical_leaf);
+    }
+    const char *identity = NULL;
+    if (imported) {
+        const char *qn = convert_path_to_qn(ctx->arena, imported);
+        const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
+        if (!type) {
+            type = cbm_registry_lookup_type(ctx->registry,
+                cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn));
+        }
+        if (type) {
+            const CBMRegisteredType *target = type->alias_of
+                ? cbm_registry_lookup_type(ctx->registry, type->alias_of) : NULL;
+            identity = target && target->is_interface
+                ? target->qualified_name : type->qualified_name;
+        } else if (ctx->imports && ctx->imports->modtree) {
+            identity = rust_registered_type_qn(ctx, qn);
+        }
+    }
+    if (identity && strcmp(identity, trait_qn) != 0) {
+        const CBMRegisteredFunc *inherited =
+            rust_lookup_method_in_trait(ctx, identity, method_name, true);
+        if (!inherited || !inherited->receiver_type ||
+            strcmp(inherited->receiver_type, trait_qn) != 0) {
+            return true;
+        }
+    }
+    if (identity) {
         return false;
     }
     size_t module_len = strlen(ctx->module_qn);
     if (strncmp(trait_qn, ctx->module_qn, module_len) == 0 && trait_qn[module_len] == '.') {
         return false;
     }
-    const char *dot = strrchr(trait_qn, '.');
-    return rust_trait_name_out_of_scope(ctx, dot ? dot + 1 : trait_qn);
+    return rust_trait_name_out_of_scope(ctx, canonical_leaf);
 }
 
-/* Start of a length-prefixed impl-key part: receiver QN, receiver spelling,
- * then trait spelling. Only the final part is NUL-terminated. */
-static const char *rust_impl_key_spelling(const char *key, int part_index) {
-    enum { DECIMAL = 10 };
+/* One length-prefixed part of cbm_rust_impl_key, or NULL for an unreadable key. */
+static const char *rust_impl_key_part(const char *key, int index, size_t *part_len) {
+    enum { IMPL_KEY_PARTS = 3, DECIMAL = 10 };
     const char *part = NULL;
-    for (int i = 0; key && i <= part_index; i++) {
+    for (int i = 0; key && i < IMPL_KEY_PARTS; i++) {
         char *colon = NULL;
         unsigned long len = strtoul(key, &colon, DECIMAL);
         if (colon == key || *colon != ':' || strlen(colon + 1) < len) {
             return NULL;
         }
         part = colon + 1;
+        if (i == index) {
+            if (part_len)
+                *part_len = len;
+            return part;
+        }
         key = part + len;
     }
-    return part;
+    return NULL;
 }
 
 /* Last path segment of a trait path as written (`a::b::Tr<X>` -> `Tr`). */
@@ -7474,7 +7567,7 @@ static const CBMRegisteredFunc *rust_registry_lookup_unregistered_trait_impl_met
         if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || candidate->impl_trait_qn) {
             continue;
         }
-        const char *spelling = rust_impl_key_spelling(candidate->impl_key, 2);
+        const char *spelling = rust_impl_key_part(candidate->impl_key, 2, NULL);
         const char *leaf = spelling ? rust_trait_spelling_leaf(scope->arena, spelling) : NULL;
         /* An impl without a readable identity cannot be told from another. */
         if (!leaf || (matched_impl && strcmp(matched_impl, candidate->impl_key) != 0)) {
@@ -7531,7 +7624,7 @@ rust_registry_lookup_trait_impl_method_scoped(RustLSPContext *scope, const CBMTy
         if (trait_qn && strcmp(candidate->impl_trait_qn, trait_qn) != 0) {
             continue;
         }
-        if (scope && rust_trait_out_of_scope(scope, candidate->impl_trait_qn)) {
+        if (scope && rust_trait_out_of_scope(scope, candidate->impl_trait_qn, method_name, candidate->impl_key)) {
             if (out_filtered) {
                 *out_filtered = true;
             }
@@ -7739,7 +7832,7 @@ static bool rust_reference_impl_may_precede(RustLSPContext *ctx, const CBMType *
                     strcmp(candidate->impl_trait_qn, method->impl_trait_qn) != 0) {
                     continue;
                 }
-                const char *self = rust_impl_key_spelling(candidate->impl_key, 1);
+                const char *self = rust_impl_key_part(candidate->impl_key, 1, NULL);
                 if (self && *self == '&') {
                     return true;
                 }
@@ -7867,7 +7960,7 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
             if (!candidate) {
                 continue;
             }
-            if (rust_trait_out_of_scope(ctx, trait_qn)) {
+            if (rust_trait_out_of_scope(ctx, trait_qn, method_name, candidate->impl_key)) {
                 scope_filtered = true;
                 continue;
             }
@@ -11497,6 +11590,14 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
                                  cbm_scope_lookup(ctx->current_scope, "self")))) {
                 return true;
             }
+            const char *refusal = rust_trait_receiver_refusal(ctx, unique,
+                cbm_type_named(ctx->arena, unique->receiver_type));
+            if (refusal && (strcmp(refusal, "trait_inherent_accessor_unknown") == 0 ||
+                            strcmp(refusal, "trait_nominal_identity_ambiguous") == 0)) {
+                out->open_qn = unique->qualified_name;
+                out->open_reason = refusal;
+                return true;
+            }
             rust_call_target_set(out, unique, unique->qualified_name,
                                  strcmp(short_name, "new") == 0 ? "lsp_constructor" : "lsp_ufcs",
                                  CBM_RUST_CONF_UFCS);
@@ -11533,6 +11634,14 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode first_a
              ts_node_is_null(first_arg) ||
              !cbm_type_equal(rust_eval_expr_type(ctx, first_arg),
                              cbm_scope_lookup(ctx->current_scope, "self")))) {
+            return true;
+        }
+        const char *refusal = rust_trait_receiver_refusal(ctx, tm,
+                                                         cbm_type_named(ctx->arena, receiver));
+        if (refusal && (strcmp(refusal, "trait_inherent_accessor_unknown") == 0 ||
+                        strcmp(refusal, "trait_nominal_identity_ambiguous") == 0)) {
+            out->open_qn = tm->qualified_name;
+            out->open_reason = refusal;
             return true;
         }
         /* `Type::method()` names the receiver explicitly, so its sole
@@ -12204,6 +12313,129 @@ static bool rust_resolve_default_by_expected_type(RustLSPContext *ctx, TSNode ca
     return true;
 }
 
+/* Registry buckets erase references and type arguments. A sole candidate in
+ * such a bucket proves dispatch only when its written self type also matches. */
+static const char *rust_trait_receiver_refusal(RustLSPContext *ctx, const CBMRegisteredFunc *method,
+                                      const CBMType *recv) {
+    if ((method->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || !method->impl_key) {
+        return NULL;
+    }
+    const CBMRegisteredType *owner = method->receiver_type
+        ? cbm_registry_lookup_type(ctx->registry, method->receiver_type) : NULL;
+    if (owner && owner->rust_nominal_identity_ambiguous) {
+        return "trait_nominal_identity_ambiguous";
+    }
+    for (int i = 0; owner && owner->rust_attribute_methods_unknown &&
+                    (method->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0 &&
+                    owner->field_names && owner->field_names[i]; i++) {
+        if (strcmp(owner->field_names[i], method->short_name) == 0) {
+            return "trait_inherent_accessor_unknown";
+        }
+    }
+    if (method->impl_trait_qn && rust_trait_out_of_scope(ctx, method->impl_trait_qn, method->short_name, method->impl_key)) {
+        return "trait_scope_identity";
+    }
+    if (ctx->enclosing_impl_key && strcmp(ctx->enclosing_impl_key, method->impl_key) == 0 &&
+        cbm_type_equal(recv, cbm_scope_lookup(ctx->current_scope, "self"))) {
+        return NULL;
+    }
+    size_t len = 0;
+    const char *part = rust_impl_key_part(method->impl_key, 1, &len);
+    if (!part) {
+        return "trait_impl_key_unreadable";
+    }
+    const char *spelling = cbm_arena_strndup(ctx->arena, part, len);
+    if (strchr(spelling, ';')) {
+        return "trait_array_length_unknown";
+    }
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    const char *module = tree ? cbm_rust_modtree_item_module(tree, ctx->arena, method->qualified_name) : NULL;
+    if (!module && method->receiver_type) {
+        const char *dot = strrchr(method->receiver_type, '.');
+        module = dot ? cbm_arena_strndup(ctx->arena, method->receiver_type,
+                                       (size_t)(dot - method->receiver_type)) : ctx->module_qn;
+    }
+    const CBMType *self = rust_expand_type_aliases(
+        ctx, rust_parse_def_type_text(ctx->arena, spelling, module, tree), 0);
+    if (self && self->kind == CBM_TYPE_TEMPLATE && method->receiver_type && module &&
+        !strchr(self->data.template_type.template_name, '.') &&
+        strcmp(cbm_arena_sprintf(ctx->arena, "%s.%s", module,
+                                self->data.template_type.template_name), method->receiver_type) == 0) {
+        self = cbm_type_template(ctx->arena, method->receiver_type,
+                                 self->data.template_type.template_args,
+                                 self->data.template_type.arg_count);
+    }
+    if (!self || !recv) {
+        return "trait_receiver_unknown";
+    }
+    const CBMType *actual = recv;
+    if (self->kind != CBM_TYPE_REFERENCE) {
+        if ((method->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0 &&
+            recv->kind == CBM_TYPE_REFERENCE) {
+            bool copy = self->kind == CBM_TYPE_BUILTIN &&
+                        strcmp(self->data.builtin.name, "str") != 0;
+            const CBMRegisteredType *rt = self->kind == CBM_TYPE_NAMED
+                ? cbm_registry_lookup_type(ctx->registry, self->data.named.qualified_name) : NULL;
+            for (int i = 0; rt && rt->embedded_types && rt->embedded_types[i]; i++) {
+                if (strcmp(rt->embedded_types[i], "core.marker.Copy") == 0) {
+                    copy = true;
+                }
+            }
+            if (!copy) {
+                return "trait_owned_receiver_borrowed";
+            }
+        }
+        while (actual && actual->kind == CBM_TYPE_REFERENCE) {
+            actual = actual->data.reference.elem;
+        }
+    }
+    if (self->kind == CBM_TYPE_SLICE && actual && actual->kind == CBM_TYPE_TEMPLATE &&
+        rust_std_family_of_qn(actual->data.template_type.template_name) == RUST_STD_VEC &&
+        actual->data.template_type.arg_count == 1) {
+        actual = cbm_type_slice(ctx->arena, actual->data.template_type.template_args[0]);
+    }
+    const CBMType *base = actual;
+    while (base && base->kind == CBM_TYPE_REFERENCE) {
+        base = base->data.reference.elem;
+    }
+    if (base && base->kind == CBM_TYPE_TEMPLATE && method->type_param_names &&
+        method->rust_unbounded_impl_params) {
+        int count = base->data.template_type.arg_count;
+        const char **params = cbm_arena_alloc(ctx->arena, (size_t)(count + 1) * sizeof(*params));
+        int positions = 0;
+        while (method->type_param_names[positions])
+            positions++;
+        for (int i = 0; i < count; i++) {
+            params[i] = "";
+            for (int j = 0; i < positions && method->type_param_names[i] && method->rust_unbounded_impl_params[j]; j++) {
+                if (strcmp(method->type_param_names[i], method->rust_unbounded_impl_params[j]) == 0) {
+                    params[i] = method->type_param_names[i];
+                }
+            }
+        }
+        params[count] = NULL;
+        self = rust_subst_receiver_args(ctx, self, params,
+                                        base->data.template_type.template_args,
+                                        base->data.template_type.arg_count, NULL, 0);
+    }
+    if (method->rust_unbounded_impl_params && cbm_type_equal(self, actual)) {
+        return NULL;
+    }
+    if (rust_type_unproven(self, NULL, 0) || rust_type_unproven(actual, NULL, 0)) {
+        return "trait_receiver_partial";
+    }
+    if (cbm_type_equal(self, actual) ||
+        rust_impl_self_match(ctx, self, actual) == RUST_IMPL_SELF_SAME) {
+        return NULL;
+    }
+    const char *self_head = self->kind == CBM_TYPE_NAMED ? self->data.named.qualified_name
+        : self->kind == CBM_TYPE_TEMPLATE ? self->data.template_type.template_name : "-";
+    const char *actual_head = actual->kind == CBM_TYPE_NAMED ? actual->data.named.qualified_name
+        : actual->kind == CBM_TYPE_TEMPLATE ? actual->data.template_type.template_name : "-";
+    return cbm_arena_sprintf(ctx->arena, "trait_receiver_shape:%d:%s:%d:%s",
+                             self->kind, self_head, actual->kind, actual_head);
+}
+
 static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node) {
     TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
     TSNode args_node = ts_node_child_by_field_name(node, "arguments", 9);
@@ -12319,6 +12551,11 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                                      : NULL;
                 if ((m->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0 ||
                     (method_owner && method_owner->is_interface) || trait_dispatch) {
+                    const char *refusal = rust_trait_receiver_refusal(ctx, m, recv);
+                    if (refusal) {
+                        rust_emit_unresolved_call(ctx, m->qualified_name, refusal);
+                        return;
+                    }
                     strategy = "lsp_trait_dispatch";
                     conf = (impl_count == 1) ? CBM_RUST_CONF_TRAIT_SOLE : CBM_RUST_CONF_TRAIT_AMB;
                 }
@@ -14339,6 +14576,11 @@ static void rust_root_type_ctx_init(RustLSPContext *ctx, CBMArena *arena, const 
     rust_bind_module_types(ctx, root);
 }
 
+static void rust_register_supertraits(CBMArena *arena, const CBMTypeRegistry *reg,
+    const CBMIdxMemo *type_idx, const RustTraitNameIndex *names,
+    const CBMRustModTree *tree, CBMRegisteredType *trait,
+    const char *spellings, const char *module_qn);
+
 void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFileResult *result,
                                    const char *module_qn, TSNode root, const char *source) {
 
@@ -14363,6 +14605,22 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         memset(&rt, 0, sizeof(rt));
         rt.qualified_name = d->qualified_name;
         rt.short_name = d->name;
+        const char *suffix = strchr(rt.qualified_name, '#');
+        const char *declaration_key = cbm_arena_sprintf(arena, "RustDecl:%.*s",
+            (int)(suffix ? suffix - rt.qualified_name : strlen(rt.qualified_name)),
+            rt.qualified_name);
+        int32_t previous = cbm_idxmemo_get(&type_idx, declaration_key);
+        if (previous >= 0) {
+            reg->types[previous].rust_nominal_identity_ambiguous = true;
+            rt.rust_nominal_identity_ambiguous = true;
+        }
+        for (int j = 0; d->decorators && d->decorators[j]; j++) {
+            const char *path = strstr(d->decorators[j], "::");
+            const char *args = strchr(d->decorators[j], '(');
+            if (path && (!args || path < args)) {
+                rt.rust_attribute_methods_unknown = true;
+            }
+        }
         rt.is_interface = (strcmp(d->label, "Interface") == 0 || strcmp(d->label, "Trait") == 0);
         int alias_param_count = 0;
         while (d->type_alias_params && d->type_alias_params[alias_param_count]) {
@@ -14375,11 +14633,25 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 arena, d->signature_param_types, d->signature_param_count);
         }
         cbm_registry_add_type(reg, rt);
+        cbm_idxmemo_put_if_absent(&type_idx, arena, declaration_key, reg->type_count - 1);
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
     }
     RustTraitNameIndex trait_names;
     rust_trait_name_index_build(&trait_names, arena, reg);
     const RustTraitScope trait_scope = {.imports = &result->imports};
+
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        int32_t index = d->qualified_name ? cbm_idxmemo_get(&type_idx, d->qualified_name) : -1;
+        if (index < 0 || !reg->types[index].is_interface || !d->supertraits) {
+            continue;
+        }
+        const char *dot = strrchr(d->qualified_name, '.');
+        const char *owner_module = dot ? cbm_arena_strndup(arena, d->qualified_name,
+            (size_t)(dot - d->qualified_name)) : module_qn;
+        rust_register_supertraits(arena, reg, &type_idx, &trait_names, NULL,
+                                  &reg->types[index], d->supertraits, owner_module);
+    }
 
     for (int i = 0; i < result->defs.count; i++) {
         CBMDefinition *d = &result->defs.items[i];
@@ -14429,6 +14701,10 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             if (d->has_rust_self) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_SELF;
             }
+            if (d->has_rust_value_self) {
+                rf.flags |= CBM_FUNC_FLAG_RUST_VALUE_SELF;
+            }
+            rf.rust_unbounded_impl_params = d->rust_unbounded_impl_params;
             rf.rust_fn_type_params = d->rust_type_params;
             if (d->impl_trait) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
@@ -15028,6 +15304,22 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         memset(&rt, 0, sizeof(rt));
         rt.qualified_name = cbm_arena_strdup(arena, d->qualified_name);
         rt.short_name = cbm_arena_strdup(arena, d->short_name);
+        const char *suffix = strchr(rt.qualified_name, '#');
+        const char *declaration_key = cbm_arena_sprintf(arena, "RustDecl:%.*s",
+            (int)(suffix ? suffix - rt.qualified_name : strlen(rt.qualified_name)),
+            rt.qualified_name);
+        int32_t previous = cbm_idxmemo_get(&type_idx, declaration_key);
+        if (previous >= 0) {
+            reg->types[previous].rust_nominal_identity_ambiguous = true;
+            rt.rust_nominal_identity_ambiguous = true;
+        }
+        for (int j = 0; d->decorators && d->decorators[j]; j++) {
+            const char *path = strstr(d->decorators[j], "::");
+            const char *args = strchr(d->decorators[j], '(');
+            if (path && (!args || path < args)) {
+                rt.rust_attribute_methods_unknown = true;
+            }
+        }
         rt.is_interface =
             d->is_interface || strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Interface") == 0;
         rust_register_type_alias(arena, &rt, d->return_types, d->signature_param_types,
@@ -15038,6 +15330,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                 arena, d->signature_param_types, d->signature_param_count);
         }
         cbm_registry_add_type(reg, rt);
+        cbm_idxmemo_put_if_absent(&type_idx, arena, declaration_key, reg->type_count - 1);
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
     }
     for (int i = 0; i < def_count; i++) {
@@ -15181,6 +15474,10 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             if (d->has_rust_self) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_SELF;
             }
+            if (d->has_rust_value_self) {
+                rf.flags |= CBM_FUNC_FLAG_RUST_VALUE_SELF;
+            }
+            rf.rust_unbounded_impl_params = d->rust_unbounded_impl_params;
             rf.rust_fn_type_params = rust_fn_type_params_copy(arena, d->type_params);
             if (d->trait_qn && d->trait_qn[0]) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
@@ -15692,6 +15989,8 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].is_async = defs[i].is_async;
             rdefs[i].is_rust_private = defs[i].is_rust_private;
             rdefs[i].has_rust_self = defs[i].has_rust_self;
+            rdefs[i].has_rust_value_self = defs[i].has_rust_value_self;
+            rdefs[i].rust_unbounded_impl_params = defs[i].rust_unbounded_impl_params;
             rdefs[i].type_params = defs[i].type_params;
         }
     }

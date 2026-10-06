@@ -316,6 +316,173 @@ TEST(rustlsp_trait_dispatch_single_impl) {
     PASS();
 }
 
+TEST(rustlsp_trait_alias_identity_ignores_canonical_leaf_import) {
+    CBMFileResult *r = extract_rust(
+        "mod first { pub trait Db { fn system(&self); } }\n"
+        "mod second { pub trait Db {} }\n"
+        "use first::Db as SourceDb; use second::Db;\n"
+        "struct Item; impl SourceDb for Item { fn system(&self) {} }\n"
+        "fn run(item: Item) { item.system(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.system"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_unbounded_impl_accepts_concrete_argument) {
+    CBMFileResult *r = extract_rust(
+        "trait Paint { fn paint(&self); }\n"
+        "struct Holder<T>(T);\n"
+        "impl<T> Paint for Holder<T> { fn paint(&self) {} }\n"
+        "fn run(item: Holder<u8>) { item.paint(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Holder.paint"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_collapsed_block_local_types_withhold_impl) {
+    CBMFileResult *r =
+        extract_rust("fn first() { #[derive(Default)] struct Token; Token::default(); }\n"
+                     "fn second() { struct Token; impl Default for Token { fn default() -> Self { "
+                     "Token } } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.first", "Token.default"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_attribute_field_accessor_withholds_impl) {
+    CBMFileResult *r = extract_rust("trait Read { fn value(self) -> u8; }\n"
+                                    "#[factory::record] struct Item { value: u8 }\n"
+                                    "impl Read for Item { fn value(self) -> u8 { self.value } }\n"
+                                    "fn run(item: Item) { item.value(); Item::value(item); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "Item.value"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_field_without_attribute_accepts_impl) {
+    CBMFileResult *r = extract_rust("trait Read { fn value(&self) -> u8; }\n"
+                                    "struct Item { value: u8 }\n"
+                                    "impl Read for Item { fn value(&self) -> u8 { self.value } }\n"
+                                    "fn run(item: Item) { item.value(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.value"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_reexport_keeps_canonical_identity) {
+    CBMFileResult *r = extract_rust(
+        "use std::hash::{Hash, Hasher};\n"
+        "struct Item; impl Hash for Item { fn hash<H: Hasher>(&self, _: &mut H) {} }\n"
+        "fn run<H: Hasher>(item: Item, hasher: &mut H) { item.hash(hasher); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.hash"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_imported_subtrait_keeps_same_named_supertrait_method) {
+    CBMFileResult *r = extract_rust("mod base { pub trait Db { fn system(&self); } }\n"
+                                    "mod child { pub trait Db: super::base::Db {} }\n"
+                                    "struct Item; impl base::Db for Item { fn system(&self) {} }\n"
+                                    "impl child::Db for Item {}\n"
+                                    "use child::Db; fn run(item: Item) { item.system(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.system"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_owned_self_does_not_select_borrowed_receiver) {
+    CBMFileResult *r = extract_rust(
+        "trait Consume { fn consume(self); }\n"
+        "struct Item; impl Consume for Item { fn consume(self) {} }\n"
+        "fn run(item: &Item) { item.consume(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "Item.consume"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_specialized_impl_does_not_select_other_argument) {
+    CBMFileResult *r = extract_rust(
+        "trait Paint { fn paint(&self); }\n"
+        "struct Holder<T>(T);\n"
+        "impl Paint for Holder<u8> { fn paint(&self) {} }\n"
+        "fn run(item: Holder<u16>) { item.paint(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "Holder.paint"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_specialized_impl_accepts_matching_argument) {
+    CBMFileResult *r = extract_rust(
+        "trait Paint { fn paint(&self); }\n"
+        "struct Holder<T>(T);\n"
+        "impl Paint for Holder<u8> { fn paint(&self) {} }\n"
+        "fn run(item: Holder<u8>) { item.paint(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Holder.paint"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_partial_argument_withholds_specialized_impl) {
+    CBMFileResult *r = extract_rust(
+        "trait Paint { fn paint(&self); }\n"
+        "struct Holder<T>(T);\n"
+        "impl Paint for Holder<u8> { fn paint(&self) {} }\n"
+        "fn run<T>(item: Holder<T>) { item.paint(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "Holder.paint"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_same_name_import_does_not_select_other_trait) {
+    CBMFileResult *r = extract_rust(
+        "struct Item;\n"
+        "mod first { pub trait Paint { fn paint(&self); } }\n"
+        "mod second { pub trait Paint { fn paint(&self); } }\n"
+        "impl first::Paint for Item { fn paint(&self) {} }\n"
+        "use second::Paint;\n"
+        "fn run(item: Item) { item.paint(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "Item.paint"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_iterator_adapter_does_not_select_original_impl) {
+    CBMFileResult *r = extract_rust(
+        "struct CursorIterator<T>(T);\n"
+        "impl Iterator for CursorIterator<u8> { type Item = u8;\n"
+        "fn next(&mut self) -> Option<u8> { None } }\n"
+        "fn run(iter: CursorIterator<u8>) { iter.take(1).next(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "CursorIterator.next"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_value_self_on_borrowed_copy_type_remains_proven) {
+    CBMFileResult *r = extract_rust(
+        "trait Consume { fn consume(self); }\n"
+        "#[derive(Clone, Copy)]\n"
+        "struct Item;\n"
+        "impl Consume for Item { fn consume(self) {} }\n"
+        "fn run(item: &Item) { item.consume(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "Item.consume"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_prelude_trait_clone) {
     CBMFileResult *r = extract_rust(
         "struct Foo { name: String }\n"
@@ -13202,6 +13369,22 @@ void suite_rust_lsp(void) {
 
     /* Trait dispatch */
     RUN_TEST(rustlsp_trait_dispatch_single_impl);
+    RUN_TEST(rustlsp_trait_alias_identity_ignores_canonical_leaf_import);
+    RUN_TEST(rustlsp_trait_unbounded_impl_accepts_concrete_argument);
+    RUN_TEST(rustlsp_trait_collapsed_block_local_types_withhold_impl);
+    RUN_TEST(rustlsp_trait_attribute_field_accessor_withholds_impl);
+    RUN_TEST(rustlsp_trait_field_without_attribute_accepts_impl);
+    RUN_TEST(rustlsp_trait_reexport_keeps_canonical_identity);
+    RUN_TEST(rustlsp_imported_subtrait_keeps_same_named_supertrait_method);
+    RUN_TEST(rustlsp_trait_owned_self_does_not_select_borrowed_receiver);
+    RUN_TEST(rustlsp_trait_specialized_impl_does_not_select_other_argument);
+    RUN_TEST(rustlsp_trait_specialized_impl_accepts_matching_argument);
+    RUN_TEST(rustlsp_trait_partial_argument_withholds_specialized_impl);
+    RUN_TEST(rustlsp_trait_same_name_import_does_not_select_other_trait);
+    RUN_TEST(rustlsp_iterator_adapter_does_not_select_original_impl);
+    RUN_TEST(rustlsp_trait_value_self_on_borrowed_copy_type_remains_proven);
+
+
     RUN_TEST(rustlsp_prelude_trait_clone);
 
     /* Path resolution */

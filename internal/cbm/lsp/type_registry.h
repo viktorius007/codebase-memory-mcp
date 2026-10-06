@@ -26,6 +26,7 @@ typedef enum {
     /* Rust only: the method's first parameter is a `self` receiver, so the
      * first argument of a `Trait::method(x, ..)` path call is the receiver. */
     CBM_FUNC_FLAG_RUST_SELF = 1 << 11,
+    CBM_FUNC_FLAG_RUST_VALUE_SELF = 1 << 12, // Rust: receiver is `self` or `mut self`
 } CBMFuncFlags;
 
 // Registered function/method with full type signature.
@@ -52,6 +53,7 @@ typedef struct {
      * (`impl Tr for Box<dyn X>`) as written, its names resolved in the impl's
      * module; the method is registered on the wrapper's QN. NULL otherwise. */
     const CBMType *rust_wrapper_impl_self;
+    const char **rust_unbounded_impl_params; /* source-proved unconstrained impl parameters */
     /* Rust only: per declared parameter (parallel to the signature's
      * param_types), the FUNC type of the call signature the parameter
      * declares for a callable argument (`impl Fn(&T)`, `&dyn FnMut(A, B)`,
@@ -88,6 +90,8 @@ typedef struct {
     /* Rust: registered only as the self type of an impl; no declaration of the
      * type was read, so its inherent methods are not known. */
     bool rust_undeclared;
+    bool rust_nominal_identity_ambiguous; /* distinct declarations collapsed into one QN */
+    bool rust_attribute_methods_unknown;  /* qualified attributes may generate field accessors */
     bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)
 
     // --- TS-specific fields (NULL/empty for non-TS types — backward compatible) ---
