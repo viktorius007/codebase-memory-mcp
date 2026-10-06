@@ -5724,6 +5724,111 @@ TEST(rustlsp_strict_char_classify) {
     PASS();
 }
 
+TEST(rustlsp_foreign_channel_receiver_does_not_select_project_recv) {
+    CBMFileResult *r = extract_rust(
+        "struct Receiver; impl Receiver { fn recv(&mut self) {} }\n"
+        "fn run(r: &mut tokio::sync::mpsc::Receiver<u8>) { r.recv(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "test.src.main.Receiver.recv"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_foreign_signal_receiver_does_not_select_project_recv) {
+    CBMFileResult *r = extract_rust(
+        "use tokio::signal::unix::Signal;\n"
+        "#[cfg(windows)] struct Signal;\n"
+        "#[cfg(windows)] impl Signal { fn recv(&mut self) {} }\n"
+        "fn run(r: &mut Signal) { r.recv(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "test.src.main.Signal.recv"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_deref_foreign_target_does_not_select_project_method) {
+    CBMFileResult *r = extract_rust(
+        "struct Inner; impl Inner { fn ping(&self) {} }\n"
+        "fn run(b: Box<remote::Inner>, d: Box<dyn remote::Inner>) { b.ping(); d.ping(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "test.src.main.Inner.ping"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_project_reexport_does_not_select_same_named_local_type) {
+    const char *source =
+        "mod imported { pub use remote::Inner; }\n"
+        "fn run(b: Box<p::src::imported::Inner>) { b.ping(); }\n"
+        "mod traits { pub use remote::Tr; }\n"
+        "fn dyn_run(b: Box<dyn p::src::traits::Tr>) { b.ping(); }\n";
+    CBMRustLSPDef defs[] = {
+        {.qualified_name = "p.src.lib.Tr", .short_name = "Tr", .label = "Trait",
+         .is_interface = true},
+        {.qualified_name = "p.src.lib.Tr.ping", .short_name = "ping", .label = "Method",
+         .receiver_type = "p.src.lib.Tr", .has_rust_self = true, .is_abstract = true},
+        {.qualified_name = "p.src.lib.Inner", .short_name = "Inner", .label = "Type"},
+        {.qualified_name = "p.src.lib.Inner.ping", .short_name = "ping", .label = "Method",
+         .receiver_type = "p.src.lib.Inner", .has_rust_self = true},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&arena, source, (int)strlen(source), "p.src.lib", defs, 4,
+                           NULL, NULL, 0, NULL, &out);
+    ASSERT_EQ(find_confident(&out, "run", "p.src.lib.Inner.ping"), -1);
+    ASSERT_EQ(find_confident(&out, "dyn_run", "p.src.lib.Tr.ping"), -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_box_dyn_selects_declaration_over_concrete_inherent) {
+    const char *source = "fn run(b: Box<dyn Tr>) { b.ping(); }\n";
+    CBMRustLSPDef defs[] = {
+        {.qualified_name = "p.main.Tr", .short_name = "Tr", .label = "Trait",
+         .is_interface = true},
+        {.qualified_name = "p.main.Tr.ping", .short_name = "ping", .label = "Method",
+         .receiver_type = "p.main.Tr", .has_rust_self = true, .is_abstract = true},
+        {.qualified_name = "p.main.Inner", .short_name = "Inner", .label = "Type"},
+        {.qualified_name = "p.main.Inner.ping", .short_name = "ping", .label = "Method",
+         .receiver_type = "p.main.Inner", .has_rust_self = true},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross(&arena, source, (int)strlen(source), "p.main", defs, 4,
+                           NULL, NULL, 0, NULL, &out);
+    ASSERT_GTE(find_confident(&out, "run", "p.main.Tr.ping"), 0);
+    ASSERT_EQ(find_confident(&out, "run", "p.main.Inner.ping"), -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_local_deref_waits_for_project_registry) {
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn ping(&self); }\n"
+        "fn run(b: Box<dyn Tr>) { b.ping(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "Tr.ping"), -1);
+    int index = require_resolved(r, "run", "Tr.ping");
+    ASSERT_GTE(index, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[index].reason, "deref_requires_project_registry");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_arc_generic_forwarding_impl_withholds_deref_guess) {
+    CBMFileResult *r = extract_rust(
+        "use std::sync::Arc;\n"
+        "trait Tr { fn ping(&self); }\n"
+        "impl<T: Tr + ?Sized> Tr for Arc<T> { fn ping(&self) {} }\n"
+        "fn run(b: Arc<dyn Tr>) { b.ping(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "Tr.ping"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_strict_box_deref_to_inner) {
     /* Box<MyStruct>::method dispatches to MyStruct::method via Deref. */
     CBMFileResult *r = extract_rust(
@@ -14061,6 +14166,13 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_strict_integer_methods);
     RUN_TEST(rustlsp_strict_float_methods);
     RUN_TEST(rustlsp_strict_char_classify);
+    RUN_TEST(rustlsp_foreign_channel_receiver_does_not_select_project_recv);
+    RUN_TEST(rustlsp_foreign_signal_receiver_does_not_select_project_recv);
+    RUN_TEST(rustlsp_deref_foreign_target_does_not_select_project_method);
+    RUN_TEST(rustlsp_project_reexport_does_not_select_same_named_local_type);
+    RUN_TEST(rustlsp_box_dyn_selects_declaration_over_concrete_inherent);
+    RUN_TEST(rustlsp_local_deref_waits_for_project_registry);
+    RUN_TEST(rustlsp_arc_generic_forwarding_impl_withholds_deref_guess);
     RUN_TEST(rustlsp_strict_box_deref_to_inner);
     RUN_TEST(rustlsp_strict_rc_deref_to_inner);
     RUN_TEST(rustlsp_strict_arc_deref_to_inner);

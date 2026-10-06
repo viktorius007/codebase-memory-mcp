@@ -12891,7 +12891,25 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         }
         if (type_qn) {
             const char *receiver_qn = type_qn;
+            const char *identity_refusal = NULL;
+            const char *dot = strrchr(type_qn, '.');
+            const char *leaf = dot ? dot + 1 : type_qn;
+            const char *imported = rust_resolve_use(ctx, leaf);
+            /* A recorded local name can coexist with a cfg-gated foreign
+             * import. Without selecting cfg, the local receiver is unproved. */
+            if (imported && ctx->module_qn &&
+                strcmp(type_qn, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, leaf)) == 0 &&
+                !rust_lookup_type_variants(ctx, convert_path_to_qn(ctx->arena, imported))) {
+                identity_refusal = "receiver_import_identity_not_proven";
+            }
             const char *registered = rust_registered_type_qn(ctx, type_qn);
+            /* A qualified path cannot acquire a project receiver merely by
+             * sharing its leaf name. Layout variants preserve path identity;
+             * a known crate alone does not prove a re-export's target. */
+            if (registered && strchr(type_qn, '.') && strcmp(registered, type_qn) != 0 &&
+                !rust_lookup_type_variants(ctx, type_qn)) {
+                identity_refusal = "receiver_identity_not_proven";
+            }
             if (registered) {
                 type_qn = registered;
             }
@@ -12936,8 +12954,17 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                     strategy = "lsp_trait_dispatch";
                     conf = (impl_count == 1) ? CBM_RUST_CONF_TRAIT_SOLE : CBM_RUST_CONF_TRAIT_AMB;
                 }
+                if (identity_refusal && strcmp(strategy, "lsp_method_dispatch") == 0) {
+                    rust_emit_unresolved_call(ctx, mname, identity_refusal);
+                    return;
+                }
                 rust_emit_resolved_call(ctx, m->qualified_name, m->impl_key, strategy, conf);
                 (void)args_node;
+                return;
+            }
+
+            if (identity_refusal) {
+                rust_emit_unresolved_call(ctx, mname, identity_refusal);
                 return;
             }
 
@@ -12983,11 +13010,25 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 if (!next_qn)
                     break;
                 const char *next_registered = rust_registered_type_qn(ctx, next_qn);
+                if (next_registered && strchr(next_qn, '.') && strcmp(next_registered, next_qn) != 0 &&
+                    !rust_lookup_type_variants(ctx, next_qn)) {
+                    rust_emit_unresolved_call(ctx, mname, "deref_receiver_identity_not_proven");
+                    return;
+                }
                 if (next_registered)
                     next_qn = next_registered;
                 int hop_impls = 0;
                 const CBMRegisteredFunc *hm =
                     rust_resolve_trait_method(ctx, next_qn, mname, &hop_impls, NULL, false);
+                /* A local trait declaration does not rule out a project
+                 * forwarding impl on the wrapper before this Deref step. */
+                const CBMRegisteredType *target =
+                    hm ? cbm_registry_lookup_type(ctx->registry, next_qn) : NULL;
+                if (ctx->registry_is_file_local && target && target->is_interface) {
+                    rust_emit_unresolved_call(ctx, hm->qualified_name,
+                                              "deref_requires_project_registry");
+                    return;
+                }
                 if (hm) {
                     rust_emit_resolved_call(ctx, hm->qualified_name, hm->impl_key,
                                             "lsp_deref_dispatch",
