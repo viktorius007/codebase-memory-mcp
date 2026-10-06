@@ -88,7 +88,7 @@ struct CBMType {
             int count;
         } tuple;                                            // TUPLE
         struct { const char* name; } type_param;            // TYPE_PARAM
-        struct { const CBMType* elem; } reference;            // REFERENCE / RVALUE_REF
+        struct { const CBMType* elem; bool rust_shared; } reference;            // REFERENCE / RVALUE_REF
         struct {
             const char* template_name;      // "std::vector", "std::map"
             const CBMType** template_args;  // NULL-terminated

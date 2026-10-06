@@ -7930,6 +7930,98 @@ TEST(rustlsp_foreign_receiver_leaf_is_not_recursion) {
     PASS();
 }
 
+TEST(rustlsp_reference_shared_trait_precedes_value_inherent) {
+    CBMFileResult *r = extract_rust(
+        "#[derive(Clone, Copy)] struct Span;\n"
+        "impl Span { fn start(self) -> u8 { 1 } }\n"
+        "trait Located { fn start(&self) -> u8 { 2 } }\n"
+        "impl Located for Span {}\n"
+        "fn borrowed(s: &Span) -> u8 { s.start() }\n"
+        "fn owned(s: Span) -> u8 { s.start() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "borrowed", "Located.start"), 0);
+    ASSERT_EQ(count_resolved(r, "borrowed", "Span.start"), 0);
+    ASSERT_GTE(require_resolved(r, "owned", "Span.start"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_generic_static_call_selects_trait_declaration) {
+    CBMFileResult *r = extract_rust(
+        "trait Check { fn check() -> bool; }\n"
+        "impl<T> Check for T { fn check() -> bool { true } }\n"
+        "fn run<T: Check>() -> bool { T::check() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Check.check"), 0);
+    ASSERT_EQ(count_resolved(r, "run", "T.check"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_generic_receiver_selects_trait_declaration) {
+    CBMFileResult *r = extract_rust(
+        "trait Setup { fn setup(&self); }\n"
+        "impl<F> Setup for F { fn setup(&self) {} }\n"
+        "fn run<F: Setup>(f: F) { f.setup(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Setup.setup"), 0);
+    ASSERT_EQ(count_resolved(r, "run", "F.setup"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_ambiguous_generic_bounds_withhold_target) {
+    CBMFileResult *r = extract_rust(
+        "trait First { fn choose(&self); }\n"
+        "trait Second { fn choose(&self); }\n"
+        "impl<T> First for T { fn choose(&self) {} }\n"
+        "fn run<T: First + Second>(t: T) { t.choose(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "run", "choose"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_shared_inherent_precedes_shared_trait_on_reference) {
+    CBMFileResult *r = extract_rust(
+        "struct Span; impl Span { fn start(&self) -> u8 { 1 } }\n"
+        "trait Located { fn start(&self) -> u8 { 2 } }\n"
+        "impl Located for Span {}\n"
+        "fn run(s: &Span) -> u8 { s.start() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Span.start"), 0);
+    ASSERT_EQ(count_resolved(r, "run", "Located.start"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_where_bound_receiver_selects_trait_declaration) {
+    CBMFileResult *r = extract_rust(
+        "trait Setup { fn setup(self); }\n"
+        "impl<F> Setup for F { fn setup(self) {} }\n"
+        "fn run<F>(f: F) where F: Setup { f.setup(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Setup.setup"), 0);
+    ASSERT_EQ(count_resolved(r, "run", "F.setup"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_mutable_borrow_withholds_competing_shared_trait) {
+    CBMFileResult *r = extract_rust(
+        "#[derive(Clone, Copy)] struct Span;\n"
+        "impl Span { fn start(self) -> u8 { 1 } }\n"
+        "trait Located { fn start(&self) -> u8 { 2 } }\n"
+        "impl Located for Span {}\n"
+        "fn direct(s: &mut Span) -> u8 { s.start() }\n"
+        "fn element(s: &mut Vec<Span>) { s.last_mut().map(|v| v.start()); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "direct", "Located.start"), 0);
+    ASSERT_EQ(count_resolved(r, "element", "Located.start"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_generic_bound_static_call_is_not_recursion) {
     CBMFileResult *r = extract_rust(
         "trait Base { fn matches() -> bool; }\n"
@@ -10089,13 +10181,14 @@ TEST(rustlsp_gap_bound_clone_method_through_t) {
     cbm_free_result(r); PASS();
 }
 
-TEST(rustlsp_gap_bound_display_to_string) {
+TEST(rustlsp_display_bound_withholds_unproved_blanket_method) {
     CBMFileResult *r = extract_rust(
         "use std::fmt::Display;\n"
         "fn shout<T: Display>(t: T) -> String { t.to_string() }\n");
     ASSERT_NOT_NULL(r);
-    int got = find_resolved(r, "shout", "to_string") >= 0 ? 1 : 0;
-    ASSERT_GTE(got, 1);
+    /* Display declares no to_string method; the external blanket impl
+     * is not proved by the bound environment. */
+    ASSERT_EQ(count_resolved(r, "shout", "to_string"), 0);
     cbm_free_result(r); PASS();
 }
 
@@ -11566,13 +11659,12 @@ TEST(rustlsp_partial_chalk_lite_clone_bound) {
     cbm_free_result(r); PASS();
 }
 
-TEST(rustlsp_partial_chalk_lite_display_bound) {
+TEST(rustlsp_imported_display_bound_withholds_unproved_blanket_method) {
     CBMFileResult *r = extract_rust(
         "use std::fmt::Display;\n"
         "fn show<T: Display>(t: T) -> String { t.to_string() }\n");
     ASSERT_NOT_NULL(r);
-    int got = find_resolved(r, "show", "to_string") >= 0 ? 1 : 0;
-    ASSERT_GTE(got, 1);
+    ASSERT_EQ(count_resolved(r, "show", "to_string"), 0);
     cbm_free_result(r); PASS();
 }
 
@@ -13880,6 +13972,13 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_mutable_impl_self_stays_unproved);
     RUN_TEST(rustlsp_type_headed_recursion_proves_self_argument);
     RUN_TEST(rustlsp_foreign_receiver_leaf_is_not_recursion);
+    RUN_TEST(rustlsp_reference_shared_trait_precedes_value_inherent);
+    RUN_TEST(rustlsp_generic_static_call_selects_trait_declaration);
+    RUN_TEST(rustlsp_generic_receiver_selects_trait_declaration);
+    RUN_TEST(rustlsp_ambiguous_generic_bounds_withhold_target);
+    RUN_TEST(rustlsp_shared_inherent_precedes_shared_trait_on_reference);
+    RUN_TEST(rustlsp_where_bound_receiver_selects_trait_declaration);
+    RUN_TEST(rustlsp_mutable_borrow_withholds_competing_shared_trait);
     RUN_TEST(rustlsp_generic_bound_static_call_is_not_recursion);
     RUN_TEST(rustlsp_explicit_dereference_reaches_inner_method);
     RUN_TEST(rustlsp_typed_self_in_reference_impl_is_not_false_recursion);
@@ -14137,7 +14236,7 @@ void suite_rust_lsp(void) {
 
     /* Cov §U: Trait bounds + multi-impl dispatch */
     RUN_TEST(rustlsp_gap_bound_clone_method_through_t);
-    RUN_TEST(rustlsp_gap_bound_display_to_string);
+    RUN_TEST(rustlsp_display_bound_withholds_unproved_blanket_method);
     RUN_TEST(rustlsp_gap_bound_iterator_methods);
     RUN_TEST(rustlsp_gap_bound_multiple_traits);
     RUN_TEST(rustlsp_gap_bound_where_clause_dispatch);
@@ -14293,7 +14392,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cargo_dependency_tables_preserve_inherited_edition);
     RUN_TEST(rustlsp_cargo_reads_target_cfg_dependency_sections);
     RUN_TEST(rustlsp_partial_chalk_lite_clone_bound);
-    RUN_TEST(rustlsp_partial_chalk_lite_display_bound);
+    RUN_TEST(rustlsp_imported_display_bound_withholds_unproved_blanket_method);
     RUN_TEST(rustlsp_partial_chalk_lite_multi_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_where_clause);
     RUN_TEST(rustlsp_partial_hm_multi_var);
