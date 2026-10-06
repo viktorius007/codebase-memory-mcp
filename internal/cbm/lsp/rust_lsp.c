@@ -2774,6 +2774,104 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
     return cbm_type_named(arena, cbm_arena_sprintf(arena, "%s.%s", module_qn, text));
 }
 
+/* A constant's written nominal type must settle in its declaration module.
+ * Unlike general return typing, an unsettled path cannot fall back to a spelling:
+ * it may be a projection, a parameter, or a name an unexpanded macro shadows. */
+static const CBMType *rust_assoc_const_type(CBMArena *arena, const CBMTypeRegistry *reg,
+                                            const char *text, const CBMRegisteredType *owner,
+                                            const char *module, const CBMRustModTree *tree,
+                                            const RustModuleScope *own,
+                                            const char *const *type_params, int depth) {
+    if (!text || depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
+        return cbm_type_unknown();
+    }
+    text = rust_type_text_fold_space(arena, text);
+    if (*text == '&') {
+        const char *inner = text + 1;
+        while (*inner == ' ')
+            inner++;
+        if (*inner == '\'') {
+            while (*inner && *inner != ' ')
+                inner++;
+            while (*inner == ' ')
+                inner++;
+        }
+        if (strncmp(inner, "mut ", 4) == 0)
+            inner += 4;
+        const CBMType *elem = rust_assoc_const_type(arena, reg, inner, owner, module, tree, own,
+                                                    type_params, depth + 1);
+        return cbm_type_is_unknown(elem) ? elem : cbm_type_reference(arena, elem);
+    }
+    const char *lt = strchr(text, '<');
+    const char *head = lt ? cbm_arena_strndup(arena, text, (size_t)(lt - text)) : text;
+    head = rust_type_text_fold_space(arena, head);
+    for (int i = 0; type_params && type_params[i]; i++) {
+        if (strcmp(head, type_params[i]) == 0 || strcmp(head, "Self") == 0) {
+            return cbm_type_unknown();
+        }
+    }
+    if (is_rust_primitive(head)) {
+        return lt ? cbm_type_unknown() : cbm_type_builtin(arena, head);
+    }
+    bool ambiguous = false;
+    const char *qn = strcmp(head, "Self") == 0 && !owner->is_interface
+                         ? owner->qualified_name
+                         : rust_text_type_qn_by_module_tree(tree, arena, module, head, &ambiguous);
+    if (!tree && !qn) {
+        qn = rust_scope_type_qn(arena, own, head, module, &ambiguous);
+    }
+    const CBMRegisteredType *named = qn ? cbm_registry_lookup_type(reg, qn) : NULL;
+    if (ambiguous || !named || named->rust_undeclared || named->is_interface || named->alias_of ||
+        named->alias_type) {
+        return cbm_type_unknown();
+    }
+    if (!lt) {
+        return cbm_type_named(arena, qn);
+    }
+    size_t length = strlen(lt);
+    if (length < 2 || lt[length - 1] != '>') {
+        return cbm_type_unknown();
+    }
+    char *args = cbm_arena_strndup(arena, lt + 1, length - 2);
+    const CBMType *types[16];
+    int count = 0, nesting = 0;
+    char *start = args;
+    for (char *p = args;; p++) {
+        if (*p == '<' || *p == '(' || *p == '[')
+            nesting++;
+        if (*p == '>' || *p == ')' || *p == ']')
+            nesting--;
+        if ((*p != ',' || nesting != 0) && *p != '\0')
+            continue;
+        char save = *p;
+        *p = '\0';
+        const char *arg = rust_type_text_fold_space(arena, start);
+        if (*arg && *arg != '\'') {
+            if (count == 16)
+                return cbm_type_unknown();
+            types[count] = rust_assoc_const_type(arena, reg, arg, owner, module, tree, own,
+                                                 type_params, depth + 1);
+            if (cbm_type_is_unknown(types[count]))
+                return cbm_type_unknown();
+            count++;
+        }
+        if (!save)
+            break;
+        start = p + 1;
+    }
+    return cbm_type_template(arena, qn, types, count);
+}
+
+static void rust_register_assoc_const(CBMArena *arena, CBMRegisteredType *owner, const char *name,
+                                      const CBMType *type) {
+    if (!owner->rust_assoc_consts) {
+        owner->rust_assoc_consts = cbm_scope_push(arena, NULL);
+    }
+    CBMScope *constants = owner->rust_assoc_consts;
+    cbm_scope_bind(constants, name,
+                   cbm_scope_contains(constants, name) ? cbm_type_unknown() : type);
+}
+
 /* A byte that can sit inside an identifier, keyword or lifetime. */
 static bool rust_type_text_word_byte(unsigned char c) {
     return isalnum(c) || c == '_' || c == '\'' || c >= 0x80;
@@ -5758,6 +5856,22 @@ static bool rust_type_has_variant(const CBMRegisteredType *rt, const char *name)
 static const char *rust_value_path_owner(RustLSPContext *ctx, TSNode node, const char *path,
                                          const char **out_assoc) {
     *out_assoc = NULL;
+    TSNode head = ts_node_child_by_field_name(node, "path", 4);
+    if (!ts_node_is_null(head) && strcmp(ts_node_type(head), "bracketed_type") == 0) {
+        TSNode qualified = ts_node_named_child(head, 0);
+        if (strcmp(ts_node_type(qualified), "qualified_type") != 0)
+            return NULL;
+        TSNode trait = ts_node_child_by_field_name(qualified, "alias", 5);
+        char *trait_path = rust_node_text(ctx, trait);
+        const char *trait_qn =
+            trait_path ? rust_type_qn_by_module_tree(ctx, trait, trait_path, NULL) : NULL;
+        const CBMRegisteredType *rt =
+            trait_qn ? cbm_registry_lookup_type(ctx->registry, trait_qn) : NULL;
+        if (!rt || !rt->is_interface)
+            return NULL;
+        *out_assoc = rust_node_text(ctx, ts_node_child_by_field_name(node, "name", 4));
+        return trait_qn;
+    }
     if (strncmp(path, "Self::", 6) == 0) {
         if (!ctx->self_type_qn || strstr(path + 6, "::")) {
             return NULL;
@@ -5789,10 +5903,10 @@ static const char *rust_value_path_owner(RustLSPContext *ctx, TSNode node, const
     return NULL;
 }
 
-/* Type of a value path naming an enum variant (`E::V`, `Self::V`, the
- * callee of a tuple-variant constructor `E::V(..)`) or a unit struct
- * (`Marker`): the enum, with the type arguments the path writes on it, or
- * the struct. NULL when the module tree and the registry do not prove it. */
+/* A value path carries its constant's declared type, its variant's enum
+ * (`E::V`, `Self::V`, or `E::V(..)`) with written type arguments, or its
+ * unit struct's type (`Marker`). NULL when the module tree and registry
+ * do not prove the item; UNKNOWN when its declaration leaves the type open. */
 static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node) {
     const char *kind = ts_node_type(node);
     bool bare = strcmp(kind, "identifier") == 0;
@@ -5807,15 +5921,28 @@ static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node
     const char *assoc = NULL;
     const char *owner = rust_value_path_owner(ctx, node, path, &assoc);
     const CBMRegisteredType *rt = owner ? cbm_registry_lookup_type(ctx->registry, owner) : NULL;
-    if (!rt || rt->is_interface || rt->alias_of || rt->alias_type) {
+    if (!rt || rt->alias_of || rt->alias_type) {
         return NULL;
     }
+    bool variant = assoc && rust_type_has_variant(rt, assoc);
+    if (assoc && !variant && cbm_scope_contains(rt->rust_assoc_consts, assoc)) {
+        return cbm_scope_lookup(rt->rust_assoc_consts, assoc);
+    }
+    if (assoc && !variant && strncmp(path, "Self::", 6) == 0 && ctx->self_trait_qn) {
+        const CBMRegisteredType *trait =
+            cbm_registry_lookup_type(ctx->registry, ctx->self_trait_qn);
+        if (trait && cbm_scope_contains(trait->rust_assoc_consts, assoc)) {
+            return cbm_scope_lookup(trait->rust_assoc_consts, assoc);
+        }
+    }
+    if (rt->is_interface)
+        return NULL;
     if (!assoc) {
         /* A struct named as a value is a unit struct only when it has no
          * fields: a tuple struct's name is its constructor function. */
         return rt->field_names && rt->field_names[0] ? NULL : cbm_type_named(ctx->arena, owner);
     }
-    if (!rust_type_has_variant(rt, assoc)) {
+    if (!variant) {
         return NULL;
     }
     TSNode head = ts_node_child_by_field_name(node, "path", 4);
@@ -14254,6 +14381,33 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
     rust_trait_name_index_build(&trait_names, arena, reg);
     const RustTraitScope trait_scope = {.imports = &result->imports};
 
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *d = &result->defs.items[i];
+        if (!d->label || strcmp(d->label, "AssociatedConst") != 0 || d->impl_trait ||
+            !d->parent_class || !d->name)
+            continue;
+        int32_t index = cbm_idxmemo_get(&type_idx, d->parent_class);
+        if (index < 0)
+            continue;
+        CBMRegisteredType *owner = &reg->types[index];
+        RustModuleScope own = {
+            rust_module_scope_at_row(root, d->start_line > 0 ? d->start_line - 1 : 0), source};
+        const CBMType *type = rust_assoc_const_type(arena, reg, d->return_type, owner, module_qn,
+                                                    NULL, &own, d->rust_type_params, 0);
+        for (int vi = 0; vi < result->defs.count; vi++) {
+            const CBMDefinition *v = &result->defs.items[vi];
+            size_t length = strlen(owner->qualified_name);
+            if (v->label && strcmp(v->label, "EnumVariant") == 0 && v->name &&
+                strcmp(v->name, d->name) == 0 && v->qualified_name &&
+                strncmp(v->qualified_name, owner->qualified_name, length) == 0 &&
+                v->qualified_name[length] == '.') {
+                type = cbm_type_unknown();
+                break;
+            }
+        }
+        rust_register_assoc_const(arena, owner, d->name, type);
+    }
+
     /* Phase A2: register every Function/Method definition. */
     for (int i = 0; i < result->defs.count; i++) {
         CBMDefinition *d = &result->defs.items[i];
@@ -14684,7 +14838,7 @@ static const CBMRegisteredType *rust_declared_type(const void *ctx, const char *
     return index >= 0 ? &declared->reg->types[index] : NULL;
 }
 
-/* Receiver each Method / impl-relation def is registered on: its declared
+/* Receiver each Method, associated constant, or impl-relation def is registered on: its declared
  * self type when the impl sits in another file (rust_impl_declared_self),
  * else the extracted receiver. Runs while `type_idx` holds declared types
  * only, which is what the final registry answers for these QNs at walk time:
@@ -14715,7 +14869,9 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
         CBMRustLSPDef *d = &defs[i];
         receivers[i] = d->receiver_type;
         more[i] = NULL;
-        bool owns_methods = d->is_rust_impl_relation || (d->label && strcmp(d->label, "Method") == 0);
+        bool owns_methods =
+            d->is_rust_impl_relation || (d->label && (strcmp(d->label, "Method") == 0 ||
+                                                      strcmp(d->label, "AssociatedConst") == 0));
         if (!tree || !owns_methods || !d->receiver_type || !d->receiver_spelling) {
             continue;
         }
@@ -14957,6 +15113,17 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         const char *def_mod = cbm_rust_modtree_item_module(tree, arena, d->qualified_name);
         if (!def_mod) {
             def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        }
+
+        if (strcmp(d->label, "AssociatedConst") == 0 && !d->trait_qn) {
+            const char *receiver = receivers ? receivers[i] : d->receiver_type;
+            int32_t index = receiver ? cbm_idxmemo_get(&type_idx, receiver) : -1;
+            if (index >= 0) {
+                CBMRegisteredType *owner = &reg->types[index];
+                const CBMType *type = rust_assoc_const_type(arena, reg, d->return_types, owner,
+                                                            def_mod, tree, NULL, d->type_params, 0);
+                rust_register_assoc_const(arena, owner, d->short_name, type);
+            }
         }
 
         /* Struct fields (`name:type|name:type`) let `self.field.method()` and

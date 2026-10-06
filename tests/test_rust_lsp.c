@@ -12404,7 +12404,7 @@ TEST(rustlsp_value_path_receivers_type_as_their_item) {
     /* `Tier::Fast` (unit variant), `Tier::Tokens(3)` (tuple-variant
      * constructor) and `Marker` (unit struct, reached by a glob) are values
      * of their enum / struct, so the method called on each resolves. An
-     * associated const of the enum is not a variant and stays untyped. */
+     * associated const of the enum has its own declared type. */
     static const char *const rels[] = {"src/lib.rs", "src/model.rs", "src/app.rs"};
     static const char *const qns[] = {"p.src.lib", "p.src.model", "p.src.app"};
     static const char *const sources[] = {
@@ -12445,6 +12445,126 @@ TEST(rustlsp_value_path_receivers_type_as_their_item) {
     ASSERT_LT(find_confident(&out, "app.assoc", "Tier.code"), 0);
     cbm_rust_modtree_free(tree);
     cbm_arena_destroy(&arena);
+    PASS();
+}
+
+static int rustlsp_associated_const_targets(const char *type, const char *body,
+                                           bool duplicate, bool variant) {
+    const char *rels[] = {"src/lib.rs", "src/model.rs", "src/app.rs"};
+    const char *qns[] = {"p.src.lib", "p.src.model", "p.src.app"};
+    const char *sources[] = {
+        "mod model; mod app;",
+        variant
+            ? "pub enum Owner { VALUE } pub struct Value;\n"
+              "pub trait Has { const VALUE: Value; }\n"
+              "impl Owner { pub const VALUE: Value = Value; pub fn act(&self) {} }\n"
+              "impl Value { pub fn act(&self) {} }"
+            : "pub struct Owner; pub struct Value; pub trait Has { const VALUE: Value; }\n"
+              "impl Owner { pub const VALUE: Value = Value; pub fn act(&self) {} }\n"
+              "impl Value { pub fn act(&self) {} }",
+        body,
+    };
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 3);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMRustLSPDef defs[] = {
+        {.qualified_name = "p.src.model.Owner", .short_name = "Owner",
+         .label = variant ? "Enum" : "Struct", .def_module_qn = "p.src.model",
+         .field_defs = variant ? "VALUE.:Owner" : NULL},
+        {.qualified_name = "p.src.model.Value", .short_name = "Value", .label = "Struct",
+         .def_module_qn = "p.src.model"},
+        {.qualified_name = "p.src.model.Has", .short_name = "Has", .label = "Trait",
+         .def_module_qn = "p.src.model", .is_interface = true},
+        {.qualified_name = "p.src.model.Owner.act", .short_name = "act", .label = "Method",
+         .receiver_type = "p.src.model.Owner", .def_module_qn = "p.src.model",
+         .receiver_spelling = "Owner"},
+        {.qualified_name = "p.src.model.Value.act", .short_name = "act", .label = "Method",
+         .receiver_type = "p.src.model.Value", .def_module_qn = "p.src.model",
+         .receiver_spelling = "Value"},
+        {.qualified_name = "p.src.model.Owner.VALUE", .short_name = "VALUE",
+         .label = "AssociatedConst", .receiver_type = "p.src.model.Owner",
+         .receiver_spelling = "Owner", .def_module_qn = "p.src.model", .return_types = type},
+        {.qualified_name = "p.src.model.Has.VALUE", .short_name = "VALUE",
+         .label = "AssociatedConst", .receiver_type = "p.src.model.Has",
+         .def_module_qn = "p.src.model", .return_types = type},
+        {.qualified_name = "p.src.model.Owner.VALUE", .short_name = "VALUE",
+         .label = "AssociatedConst", .receiver_type = "p.src.model.Owner",
+         .receiver_spelling = "Owner", .def_module_qn = "p.src.model", .return_types = type},
+    };
+    CBMRustImportSource imports = {.modtree = tree};
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_manifest(&arena, body, (int)strlen(body), "p.src.app", "p.src.app",
+                                         defs, duplicate ? 8 : 7, NULL, NULL, 0, NULL, NULL,
+                                         &imports, &out, NULL, NULL);
+    bool linked = find_confident(&out, "run", "p.src.model.Value.act") >= 0;
+    bool wrong = find_confident(&out, "run", "p.src.model.Owner.act") >= 0;
+    cbm_rust_modtree_free(tree);
+    cbm_arena_destroy(&arena);
+    return (linked ? 1 : 0) | (wrong ? 2 : 0);
+}
+
+TEST(rustlsp_associated_const_uses_declared_value_type) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", false, false), 1);
+    PASS();
+}
+
+TEST(rustlsp_associated_const_types_derived_binding) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; fn run() { let value = Owner::VALUE; value.act(); }", false, false), 1);
+    PASS();
+}
+
+TEST(rustlsp_self_associated_const_uses_declared_value_type) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; impl Owner { fn run() { Self::VALUE.act(); } }", false, false), 1);
+    PASS();
+}
+
+TEST(rustlsp_qualified_associated_const_uses_trait_declaration_type) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Has; fn run<T: Has>() { <T as Has>::VALUE.act(); }", false, false), 1);
+    PASS();
+}
+
+TEST(rustlsp_associated_const_projection_stays_untyped) {
+    ASSERT_EQ(rustlsp_associated_const_targets("<Owner as Has>::Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", false, false), 0);
+    ASSERT_EQ(rustlsp_associated_const_targets("Owner::Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", false, false), 0);
+    PASS();
+}
+
+TEST(rustlsp_associated_const_duplicate_declaration_stays_untyped) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", true, false), 0);
+    PASS();
+}
+
+TEST(rustlsp_associated_const_parameter_shadows_module_type) {
+    const char *source =
+        "struct T; impl T { fn act(&self) {} }\n"
+        "trait Act { fn act(&self); }\n"
+        "struct Owner<T>(T);\n"
+        "impl<T: Act> Owner<T> { const VALUE: T = panic!();\n"
+        "    fn run() { Self::VALUE.act(); } }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_LT(find_resolved(result, "run", "T.act"), 0);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(rustlsp_enum_variant_precedes_same_named_associated_const) {
+    ASSERT_EQ(rustlsp_associated_const_targets("Value",
+        "use crate::model::Owner; fn run() { Owner::VALUE.act(); }", false, true), 2);
+    CBMFileResult *result = extract_rust(
+        "enum E { Same } struct Value; impl Value { fn act(&self) {} }\n"
+        "impl E { const Same: Value = Value; fn act(&self) {} }\n"
+        "fn run() { E::Same.act(); }");
+    ASSERT_NOT_NULL(result);
+    ASSERT_LT(find_resolved(result, "run", "Value.act"), 0);
+    cbm_free_result(result);
     PASS();
 }
 
@@ -13900,6 +14020,14 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file);
     RUN_TEST(rustlsp_modtree_name_from_two_globs_stays_unresolved);
     RUN_TEST(rustlsp_value_path_receivers_type_as_their_item);
+    RUN_TEST(rustlsp_associated_const_uses_declared_value_type);
+    RUN_TEST(rustlsp_associated_const_types_derived_binding);
+    RUN_TEST(rustlsp_associated_const_projection_stays_untyped);
+    RUN_TEST(rustlsp_associated_const_duplicate_declaration_stays_untyped);
+    RUN_TEST(rustlsp_associated_const_parameter_shadows_module_type);
+    RUN_TEST(rustlsp_enum_variant_precedes_same_named_associated_const);
+    RUN_TEST(rustlsp_self_associated_const_uses_declared_value_type);
+    RUN_TEST(rustlsp_qualified_associated_const_uses_trait_declaration_type);
     RUN_TEST(rustlsp_modtree_module_reexport_names_definition);
     RUN_TEST(rustlsp_module_path_call_picks_namesake_of_declaring_module);
     RUN_TEST(rustlsp_modtree_renamed_reexport_names_definition);

@@ -5537,14 +5537,15 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
 
 // --- Rust impl block extraction ---
 
-/* An impl's associated `const NAME: T = ..;` (AssociatedConst) or `type Name =
+/* An impl or trait's associated `const NAME: T = ..;` (AssociatedConst) or `type Name =
  * ..;` (AssociatedType), owned by the impl's type and, for a trait impl, keyed by
  * the trait the way its methods are. Like a variant, an associated item is
  * reachable only through its type (`T::NAME`, `Self::Item`), so its label is one
  * the bare-name symbol registry does not admit: as a Type, every `Error` or
  * `Value` in the corpus would resolve to some impl's `type Error`. */
 static void extract_rust_assoc_item(CBMExtractCtx *ctx, TSNode item, const char *type_qn,
-                                    const char *impl_trait) {
+                                    const char *impl_trait, const char *receiver,
+                                    const char **type_params) {
     CBMArena *a = ctx->arena;
     TSNode name_node = ts_node_child_by_field_name(item, TS_FIELD("name"));
     if (ts_node_is_null(name_node)) {
@@ -5561,6 +5562,14 @@ static void extract_rust_assoc_item(CBMExtractCtx *ctx, TSNode item, const char 
     def.qualified_name = impl_trait ? cbm_arena_sprintf(a, "%s.%s[%s]", type_qn, name, impl_trait)
                                     : cbm_arena_sprintf(a, "%s.%s", type_qn, name);
     def.label = is_type ? "AssociatedType" : "AssociatedConst";
+    if (!is_type) {
+        TSNode type = ts_node_child_by_field_name(item, TS_FIELD("type"));
+        def.return_type = ts_node_is_null(type) ? NULL : cbm_node_text(a, type, ctx->source);
+        def.parent_class = type_qn;
+        def.impl_trait = impl_trait;
+        def.receiver = receiver;
+        def.rust_type_params = type_params;
+    }
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(item).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(item).row + TS_LINE_OFFSET;
@@ -5574,6 +5583,7 @@ typedef struct {
     const char *type_qn;
     const char *receiver_name;
     const char *impl_trait;
+    const char **type_params;
 } RustImplOwner;
 
 /* One member of an impl body: a method, an associated const or an associated
@@ -5584,7 +5594,8 @@ static void extract_rust_impl_member(CBMExtractCtx *ctx, TSNode child, const Rus
     CBMArena *a = ctx->arena;
     if (strcmp(ts_node_type(child), "const_item") == 0 ||
         strcmp(ts_node_type(child), "type_item") == 0) {
-        extract_rust_assoc_item(ctx, child, owner->type_qn, owner->impl_trait);
+        extract_rust_assoc_item(ctx, child, owner->type_qn, owner->impl_trait, owner->receiver_name,
+                                owner->type_params);
         return;
     }
     if (!cbm_kind_in_set(child, spec->function_node_types)) {
@@ -6504,8 +6515,12 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         return;
     }
 
-    RustImplOwner owner = {
-        .type_qn = type_qn, .receiver_name = receiver_name, .impl_trait = impl_trait};
+    int type_param_count = 0;
+    RustImplOwner owner = {.type_qn = type_qn,
+                           .receiver_name = receiver_name,
+                           .impl_trait = impl_trait,
+                           .type_params =
+                               rust_item_type_param_names(a, node, ctx->source, &type_param_count)};
     uint32_t count = ts_node_child_count(body);
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(body, i);
@@ -9446,9 +9461,15 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             if (ctx->language == CBM_LANG_RUST && strcmp(kind, "trait_item") == 0) {
                 TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
                 uint32_t count = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
+                int type_param_count = 0;
+                const char **type_params =
+                    rust_item_type_param_names(ctx->arena, node, ctx->source, &type_param_count);
                 for (uint32_t i = 0; i < count; i++) {
                     TSNode member = ts_node_named_child(body, i);
-                    if (strcmp(ts_node_type(member), "function_item") == 0) {
+                    if (strcmp(ts_node_type(member), "const_item") == 0) {
+                        extract_rust_assoc_item(ctx, member, new_enclosing, NULL, NULL,
+                                                type_params);
+                    } else if (strcmp(ts_node_type(member), "function_item") == 0) {
                         rust_push_body_items(ctx, &s, member, frame.enclosing_class_qn);
                     }
                 }

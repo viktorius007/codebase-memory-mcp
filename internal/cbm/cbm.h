@@ -247,7 +247,8 @@ typedef struct {
     const char **type_alias_params;
     /* Rust only: the type parameter names a function or method declares on
      * itself (`fn f<T, U>`), in order, lifetimes left out (NULL-ended, NULL
-     * when none). The parameters of an enclosing impl are not among them. */
+     * when none). For an associated constant these are the enclosing impl or
+     * trait's parameters, which shadow module type names in its declaration. */
     const char **rust_type_params;
 } CBMDefinition;
 
