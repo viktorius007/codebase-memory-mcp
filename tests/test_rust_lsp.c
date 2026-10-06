@@ -7952,6 +7952,67 @@ TEST(rustlsp_shared_receiver_with_arguments_precedes_reference_impl) {
     PASS();
 }
 
+TEST(rustlsp_written_iterator_item_types_bindings) {
+    CBMFileResult *r = extract_rust(
+        "struct Widget; impl Widget { fn act(&self) {} }\n"
+        "type Element = Widget; type Alias = Items; type Wrapped = Option<Result<Element, ()>>;\n"
+        "struct WrappedItems; impl Iterator for WrappedItems { type Item = Wrapped; fn next(&mut self) -> Option<Wrapped> { None } }\n"
+        "struct Items; impl Iterator for Items { type Item = Element; fn next(&mut self) -> Option<Element> { None } }\n"
+        "struct Bag; impl IntoIterator for Bag { type Item = Element; type IntoIter = Items; fn into_iter(self) -> Items { Items } }\n"
+        "impl IntoIterator for &Bag { type Item = Element; type IntoIter = Items; fn into_iter(self) -> Items { Items } }\n"
+        "fn owned(b: Bag) { for x in b { x.act(); } }\n"
+        "fn borrowed(b: &Bag) { for x in b { x.act(); } }\n"
+        "fn direct(i: Items) { for x in i { x.act(); } }\n"
+        "fn callback(i: Items) { i.for_each(|x| x.act()); }\n"
+        "fn mapped(i: Items) { i.map(|x| x.act()); }\n"
+        "fn filtered(i: Items) { i.filter(|x| { x.act(); true }); }\n"
+        "fn any(i: Items) { i.any(|x| { x.act(); true }); }\n"
+        "fn aliased(i: Alias) { i.for_each(|x| x.act()); }\n"
+        "fn nested(i: WrappedItems) { i.for_each(|o| { o.map(|r| { r.map(|x| x.act()); }); }); }\n"
+        "fn standard(i: std::slice::Iter<Widget>) { i.for_each(|x| x.act()); }\n"
+        "fn chained(i: Items) { for x in i.filter(|_| true) { x.act(); } }\n"
+        "struct SelfItems; impl SelfItems { fn act(&self) {} }\n"
+        "impl Iterator for SelfItems { type Item = Self; fn next(&mut self) -> Option<Self> { None } }\n"
+        "fn self_item(i: SelfItems) { i.for_each(|x| x.act()); }\n");
+    ASSERT_NOT_NULL(r);
+    const char *callers[] = {"owned", "borrowed", "direct", "callback", "mapped", "filtered", "any", "aliased", "nested", "standard", "chained"};
+    int resolved = 0;
+    for (int i = 0; i < 11; i++) {
+        resolved += require_resolved(r, callers[i], "Widget.act") >= 0;
+    }
+    ASSERT_EQ(resolved, 11);
+    ASSERT_GTE(require_resolved(r, "main.self_item", "SelfItems.act"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_unproved_iterator_item_stays_unknown) {
+    CBMFileResult *r = extract_rust(
+        "struct Widget; impl Widget { fn act(&self) {} }\n"
+        "struct Generic<T>(T); impl<T> Iterator for Generic<T> { type Item = Widget; fn next(&mut self) -> Option<Widget> { None } }\n"
+        "struct Items; impl Iterator for Items { type Item = Widget; fn next(&mut self) -> Option<Widget> { None } }\n"
+        "impl Iterator for Items { type Item = Widget; fn next(&mut self) -> Option<Widget> { None } }\n"
+        "fn generic(i: Generic<Widget>) { for x in i { x.act(); } }\n"
+        "struct Shadow; impl Iterator for Shadow { type Item = Widget; fn next(&mut self) -> Option<Widget> { None } }\n"
+        "impl Shadow { fn map<F: Fn(u8)>(self, f: F) { f(0); } }\n"
+        "fn shadow(i: Shadow) { i.map(|x| x.act()); }\n"
+        "struct Other; impl Other { fn act(&self) {} }\n"
+        "struct Split; impl Iterator for Split { type Item = Widget; fn next(&mut self) -> Option<Widget> { None } }\n"
+        "impl<'a> Iterator for &'a Split { type Item = Other; fn next(&mut self) -> Option<Other> { None } }\n"
+        "fn split(i: &Split) { i.for_each(|x| x.act()); }\n"
+        "fn mutable_split(i: &mut Split) { for x in i { x.act(); } }\n"
+        "fn ambiguous(i: Items) { i.for_each(|x| x.act()); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "main.generic", "Widget.act"), -1);
+    ASSERT_EQ(find_resolved(r, "main.ambiguous", "Widget.act"), -1);
+    ASSERT_EQ(find_resolved(r, "main.shadow", "Widget.act"), -1);
+    ASSERT_EQ(find_resolved(r, "main.split", "Widget.act"), -1);
+    ASSERT_GTE(require_resolved(r, "main.split", "Other.act"), 0);
+    ASSERT_EQ(find_resolved(r, "main.mutable_split", "Other.act"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_iterator_preserves_borrowed_element_layers) {
     CBMFileResult *r = extract_rust(
         "trait Read { fn read(&self) -> u8; }\n"
@@ -8009,11 +8070,17 @@ TEST(rustlsp_reference_shared_trait_precedes_value_inherent) {
         "trait Located { fn start(&self) -> u8 { 2 } }\n"
         "impl Located for Span {}\n"
         "fn borrowed(s: &Span) -> u8 { s.start() }\n"
-        "fn owned(s: Span) -> u8 { s.start() }\n");
+        "fn owned(s: Span) -> u8 { s.start() }\n"
+        "fn iterator(mut i: std::slice::Iter<Span>) { i.next().map(|s| s.start()); }\n"
+        "fn callback(i: std::slice::Iter<Span>) { i.for_each(|s| { s.start(); }); }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "borrowed", "Located.start"), 0);
     ASSERT_EQ(count_resolved(r, "borrowed", "Span.start"), 0);
     ASSERT_GTE(require_resolved(r, "owned", "Span.start"), 0);
+    ASSERT_GTE(require_resolved(r, "iterator", "Located.start"), 0);
+    ASSERT_EQ(count_resolved(r, "iterator", "Span.start"), 0);
+    ASSERT_GTE(require_resolved(r, "callback", "Located.start"), 0);
+    ASSERT_EQ(count_resolved(r, "callback", "Span.start"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -14043,6 +14110,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_typed_value_reference_blanket_withholds_concrete_guess);
     RUN_TEST(rustlsp_mutable_reference_receiver_stays_unproved);
     RUN_TEST(rustlsp_shared_receiver_with_arguments_precedes_reference_impl);
+    RUN_TEST(rustlsp_written_iterator_item_types_bindings);
+    RUN_TEST(rustlsp_unproved_iterator_item_stays_unknown);
     RUN_TEST(rustlsp_iterator_preserves_borrowed_element_layers);
     RUN_TEST(rustlsp_mutable_impl_self_stays_unproved);
     RUN_TEST(rustlsp_type_headed_recursion_proves_self_argument);

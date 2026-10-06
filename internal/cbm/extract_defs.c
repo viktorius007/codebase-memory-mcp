@@ -6471,9 +6471,9 @@ static void extract_rust_impl_macro(CBMExtractCtx *ctx, TSNode invocation,
     }
 }
 
-/* The type text of the `type Target = ..;` item written in an impl body, NULL
+/* The type text of the requested associated type written in an impl body, NULL
  * when the body has none. */
-static const char *rust_impl_target_type(CBMExtractCtx *ctx, TSNode impl_node) {
+static const char *rust_impl_target_type(CBMExtractCtx *ctx, TSNode impl_node, const char *wanted) {
     TSNode body = ts_node_child_by_field_name(impl_node, TS_FIELD("body"));
     if (ts_node_is_null(body)) {
         return NULL;
@@ -6490,7 +6490,7 @@ static const char *rust_impl_target_type(CBMExtractCtx *ctx, TSNode impl_node) {
             continue;
         }
         const char *text = cbm_node_text(ctx->arena, name, ctx->source);
-        if (text && strcmp(text, "Target") == 0) {
+        if (text && strcmp(text, wanted) == 0) {
             return cbm_node_text(ctx->arena, type, ctx->source);
         }
     }
@@ -6522,7 +6522,14 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             it.trait_name = trait_name;
             it.struct_name = receiver_name;
             it.struct_qn = type_qn;
-            it.target_type = rust_impl_target_type(ctx, node);
+            it.target_type = rust_impl_target_type(ctx, node, "Target");
+            int item_param_count = 0;
+            rust_item_type_param_names(a, node, ctx->source, &item_param_count);
+            TSNode item_where = cbm_find_child_by_kind(node, "where_clause");
+            it.item_type = item_param_count || !ts_node_is_null(item_where) ||
+                                   rust_subtree_has_kind(type_node, "mutable_specifier", 0)
+                               ? ""
+                               : rust_impl_target_type(ctx, node, "Item");
             cbm_impltrait_push(&ctx->result->impl_traits, a, it);
             impl_trait = trait_name;
         }

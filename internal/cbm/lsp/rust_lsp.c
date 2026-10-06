@@ -3713,6 +3713,45 @@ static const CBMType *rust_expand_type_aliases(RustLSPContext *ctx, const CBMTyp
     }
 }
 
+/* Keep every impl, including unreadable ones, so an overlapping candidate
+ * cannot turn a missing proof into a published Item. */
+static void rust_register_iterator_item(CBMArena *arena, CBMTypeRegistry *reg,
+                                        const CBMIdxMemo *type_idx,
+                                        const char *trait, const char *item,
+                                        const char *spelling, const char *module,
+                                        const CBMRustModTree *tree) {
+    if (strcmp(trait, "core.iter.Iterator") != 0 &&
+        strcmp(trait, "core.iter.IntoIterator") != 0) {
+        return;
+    }
+    RustLSPContext types = {.arena = arena, .registry = reg, .module_qn = module};
+    const CBMType *declared = rust_expand_type_aliases(
+        &types, rust_parse_def_type_text(arena, spelling, module, tree), 0);
+    const CBMType *base = declared;
+    while (base && base->kind == CBM_TYPE_REFERENCE) {
+        base = base->data.reference.elem;
+    }
+    const char *head = base && base->kind == CBM_TYPE_NAMED
+                           ? base->data.named.qualified_name
+                           : base && base->kind == CBM_TYPE_TEMPLATE
+                                 ? base->data.template_type.template_name : NULL;
+    int32_t index = head ? cbm_idxmemo_get(type_idx, head) : -1;
+    if (index < 0) {
+        return;
+    }
+    CBMRegisteredType *rt = &reg->types[index];
+    CBMRustIteratorImpl *impl = cbm_arena_alloc(arena, sizeof(*impl));
+    impl->trait_qn = trait;
+    impl->self_type = item && *item ? declared : cbm_type_unknown();
+    const char *self_param[] = {"Self", NULL};
+    impl->item_type = item && *item
+                          ? parse_type_text_with_params(arena, rust_type_text_canonical(arena, item),
+                                                        module, self_param, tree, NULL)
+                          : cbm_type_unknown();
+    impl->next = rt->rust_iterator_impls;
+    rt->rust_iterator_impls = impl;
+}
+
 /* Registered QN of the type a path head written as a declared alias stands
  * for (`type A = B<C>`: `A` -> `B`); NULL when `head` is no alias or its
  * expansion is no named type. */
@@ -4549,6 +4588,62 @@ static const char *rust_std_type_head(const CBMType *t) {
     return NULL;
 }
 
+/* Exactly one written impl must match the full self shape. Generic impls
+ * whose applicability was not proved poison the lookup rather than guessing. */
+static const CBMType *rust_written_iter_item(RustLSPContext *ctx, const CBMType *self,
+                                             const char *trait) {
+    self = rust_expand_type_aliases(ctx, self, 0);
+    const CBMType *base = self;
+    while (base && base->kind == CBM_TYPE_REFERENCE) {
+        base = base->data.reference.elem;
+    }
+    const char *head = rust_std_type_head(base);
+    const char *qn = head ? rust_registered_type_qn(ctx, head) : NULL;
+    const CBMRegisteredType *rt = qn ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+    if (!rt || rt->rust_nominal_identity_ambiguous) {
+        return NULL;
+    }
+    const CBMType *item = NULL;
+    for (const CBMRustIteratorImpl *it = rt->rust_iterator_impls; it; it = it->next) {
+        if (strcmp(it->trait_qn, trait) != 0) {
+            continue;
+        }
+        if (cbm_type_is_unknown(it->self_type)) {
+            return cbm_type_unknown();
+        }
+        const CBMType *declared = rust_expand_type_aliases(ctx, it->self_type, 0);
+        const CBMType *left = declared;
+        const CBMType *right = self;
+        while (left && right && left->kind == CBM_TYPE_REFERENCE &&
+               right->kind == CBM_TYPE_REFERENCE) {
+            if (!left->data.reference.rust_shared || !right->data.reference.rust_shared) {
+                return cbm_type_unknown();
+            }
+            left = left->data.reference.elem;
+            right = right->data.reference.elem;
+        }
+        /* Lifetime-only arguments disappear from the type representation. */
+        bool left_nominal = left && (left->kind == CBM_TYPE_NAMED ||
+            (left->kind == CBM_TYPE_TEMPLATE && left->data.template_type.arg_count == 0));
+        bool right_nominal = right && (right->kind == CBM_TYPE_NAMED ||
+            (right->kind == CBM_TYPE_TEMPLATE && right->data.template_type.arg_count == 0));
+        bool same = left_nominal && right_nominal
+                        ? strcmp(rust_std_type_head(left), rust_std_type_head(right)) == 0
+                        : cbm_type_equal(left, right);
+        if (!same) {
+            continue;
+        }
+        if (item) {
+            return cbm_type_unknown();
+        }
+        const char *params[] = {"Self", NULL};
+        const CBMType *args[] = {self};
+        item = rust_expand_type_aliases(
+            ctx, rust_substitute_type(ctx->arena, it->item_type, params, args), 0);
+    }
+    return item;
+}
+
 /* Lock and borrow guards implement only Deref, Drop, Debug and Display on
  * themselves: `guard.clone()` or `guard.as_ref()` reaches the target. */
 static const char *const RUST_GUARD_TRAIT_METHODS[] = {"deref", "deref_mut", "drop",
@@ -4734,7 +4829,9 @@ static RustClosureRecv rust_closure_recv_of(RustLSPContext *ctx, const CBMType *
                                        NULL};
     static const char *const maps[] = {"std.collections.HashMap", "std.collections.BTreeMap",
                                        "alloc.collections.BTreeMap", NULL};
-    const CBMType *t = *self;
+    const CBMType *written_self = rust_expand_type_aliases(ctx, *self, 0);
+    const CBMType *t = rust_strip_references(written_self);
+    *self = t;
     if (t->kind == CBM_TYPE_SLICE) {
         const CBMType *elem = t->data.slice.elem;
         if (!elem) {
@@ -4773,10 +4870,66 @@ static RustClosureRecv rust_closure_recv_of(RustLSPContext *ctx, const CBMType *
     if (rust_method_in(iters, qn)) {
         return RUST_CLOSURE_RECV_ITER;
     }
+    static const char *const borrowed_iters[] = {
+        "core.slice.Iter", "std.slice.Iter", "core.slice.IterMut", "std.slice.IterMut", NULL};
+    static const char *const owned_iters[] = {
+        "alloc.vec.IntoIter", "std.vec.IntoIter", "core.option.IntoIter", "std.option.IntoIter",
+        "core.result.IntoIter", "std.result.IntoIter",
+        "core.ops.Range", "std.ops.Range", "core.ops.RangeInclusive", "std.ops.RangeInclusive",
+        "core.ops.RangeFrom", "std.ops.RangeFrom", NULL};
+    bool borrowed = rust_method_in(borrowed_iters, qn);
+    if ((borrowed || rust_method_in(owned_iters, qn)) && t->kind == CBM_TYPE_TEMPLATE &&
+        t->data.template_type.arg_count == 1) {
+        const CBMType *item = t->data.template_type.template_args[0];
+        if (borrowed) {
+            item = rust_reference_type(ctx->arena, item, !strstr(qn, "IterMut"));
+        }
+        *self = cbm_type_template(ctx->arena, "core.iter.Iterator", &item, 1);
+        return RUST_CLOSURE_RECV_ITER;
+    }
     if (rust_method_in(sets, qn)) {
         return RUST_CLOSURE_RECV_SET;
     }
-    return rust_method_in(maps, qn) ? RUST_CLOSURE_RECV_MAP : RUST_CLOSURE_RECV_NONE;
+    if (rust_method_in(maps, qn)) {
+        return RUST_CLOSURE_RECV_MAP;
+    }
+    const CBMType *item = rust_written_iter_item(ctx, written_self, "core.iter.Iterator");
+    if (item && !cbm_type_is_unknown(item)) {
+        *self = cbm_type_template(ctx->arena, "core.iter.Iterator", &item, 1);
+        return RUST_CLOSURE_RECV_ITER;
+    }
+    return RUST_CLOSURE_RECV_NONE;
+}
+
+/* A written Item fixes an adaptor only if no source method can shadow the
+ * Iterator method with another callback signature. */
+static const CBMType *rust_iterator_method_receiver(RustLSPContext *ctx, const CBMType *recv,
+                                                    const char *method) {
+    recv = rust_expand_type_aliases(ctx, recv, 0);
+    const CBMType *self = recv;
+    if (!self || rust_closure_recv_of(ctx, &self) != RUST_CLOSURE_RECV_ITER) {
+        return NULL;
+    }
+    const char *head = rust_std_type_head(rust_strip_references(recv));
+    if (head && (strcmp(head, "core.iter.Iterator") == 0 ||
+                 strcmp(head, "std.iter.Iterator") == 0)) {
+        return self;
+    }
+    const char *qn = head ? rust_registered_type_qn(ctx, head) : NULL;
+    const CBMRegisteredType *rt = qn ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+    if (rt && (rt->rust_attribute_methods_unknown || rt->rust_nominal_identity_ambiguous)) {
+        return NULL;
+    }
+    CBMMethodIter methods;
+    cbm_registry_methods(ctx->registry, qn, method, &methods);
+    for (int index; (index = cbm_method_iter_next(&methods)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &methods.reg->funcs[index];
+        if (!candidate->impl_trait_qn ||
+            strcmp(candidate->impl_trait_qn, "core.iter.Iterator") != 0) {
+            return NULL;
+        }
+    }
+    return self;
 }
 
 /* The method call `closure` is an argument of: its `receiver.method`
@@ -4817,8 +4970,8 @@ static int rust_closure_method_call(TSNode closure, TSNode *callee, TSNode *args
  * proven): the method is found on the receiver's proven type as autoderef
  * finds it — the type itself, then the targets of std wrappers — and its
  * declared closure signature is read with the receiver's type arguments
- * substituted. A receiver that is no std type with a table entry, or whose
- * type argument is unknown, leaves the parameter unknown. */
+ * substituted. A custom Iterator reads its unique written Item; an
+ * unproved signature or Item leaves the parameter unknown. */
 static void rust_std_closure_param_types(RustLSPContext *ctx, TSNode closure,
                                          const CBMType **out) {
     for (int i = 0; i < RUST_CLOSURE_PARAM_MAX; i++) {
@@ -4837,11 +4990,17 @@ static void rust_std_closure_param_types(RustLSPContext *ctx, TSNode closure,
     if (ts_node_is_null(value) || !method || !rust_std_closure_method_known(method, arg)) {
         return;
     }
-    const CBMType *cur = rust_strip_references(rust_eval_expr_type(ctx, value));
+    const CBMType *cur = rust_eval_expr_type(ctx, value);
     for (int hop = 0; cur && !cbm_type_is_unknown(cur) && hop < RUST_DEREF_MAX_HOPS; hop++) {
         const CBMType *self = cur;
         RustClosureRecv recv = rust_closure_recv_of(ctx, &self);
         if (recv != RUST_CLOSURE_RECV_NONE) {
+            if (recv == RUST_CLOSURE_RECV_ITER) {
+                self = rust_iterator_method_receiver(ctx, cur, method);
+                if (!self) {
+                    return;
+                }
+            }
             for (const RustStdClosureParams *e = RUST_STD_CLOSURE_PARAMS; e->method; e++) {
                 if (e->recv != recv || e->arg != arg || strcmp(e->method, method) != 0) {
                     continue;
@@ -4857,31 +5016,50 @@ static void rust_std_closure_param_types(RustLSPContext *ctx, TSNode closure,
             }
             return;
         }
-        const char *head = rust_std_type_head(cur);
+        const CBMType *base = rust_strip_references(cur);
+        const char *head = rust_std_type_head(base);
         if (!head || !rust_wrapper_head_derefs(ctx, head) ||
             rust_is_wrapper_trait_method(method) ||
-            rust_wrapper_has_corpus_trait_method(ctx, cur, method)) {
+            rust_wrapper_has_corpus_trait_method(ctx, base, method)) {
             return;
         }
-        cur = rust_strip_references(rust_deref_step(ctx, cur));
+        cur = rust_strip_references(rust_deref_step(ctx, base));
     }
 }
 
-/* The Item `t` yields as an `IntoIterator`: the element of a slice, `Vec`,
- * set or `Option`, the Item of an `Iterator`. NULL for any other type (a map
- * yields pairs) and for an unknown element. */
+/* The unique written Item, or the element fixed by a standard collection's
+ * IntoIterator declaration. Borrowed maps yield pairs of borrowed elements. */
 static const CBMType *rust_std_into_iter_item(RustLSPContext *ctx, const CBMType *t) {
-    const CBMType *self = rust_strip_references(t);
+    t = rust_expand_type_aliases(ctx, t, 0);
+    const CBMType *self = t;
     if (!self || cbm_type_is_unknown(self)) {
         return NULL;
     }
-    RustClosureRecv recv = rust_closure_recv_of(ctx, &self);
-    if (recv == RUST_CLOSURE_RECV_NONE || recv == RUST_CLOSURE_RECV_MAP ||
-        recv == RUST_CLOSURE_RECV_RESULT || self->kind != CBM_TYPE_TEMPLATE ||
-        self->data.template_type.arg_count < 1) {
-        return NULL;
+    const CBMType *written = rust_written_iter_item(ctx, t, "core.iter.IntoIterator");
+    if (!written) {
+        written = rust_written_iter_item(ctx, t, "core.iter.Iterator");
     }
-    const CBMType *item = self->data.template_type.template_args[0];
+    if (written) {
+        return written;
+    }
+    RustClosureRecv recv = rust_closure_recv_of(ctx, &self);
+    const CBMType *item = NULL;
+    if (self->kind == CBM_TYPE_TEMPLATE && self->data.template_type.arg_count > 0) {
+        if (recv != RUST_CLOSURE_RECV_NONE) {
+            item = self->data.template_type.template_args[0];
+        }
+        if (recv == RUST_CLOSURE_RECV_MAP && self->data.template_type.arg_count > 1) {
+            const CBMType *pair[2] = {item, self->data.template_type.template_args[1]};
+            if (t->kind == CBM_TYPE_REFERENCE) {
+                pair[0] = rust_reference_type(ctx->arena, pair[0], t->data.reference.rust_shared);
+                pair[1] = rust_reference_type(ctx->arena, pair[1], t->data.reference.rust_shared);
+            }
+            return cbm_type_tuple(ctx->arena, pair, 2);
+        }
+    }
+    if (item && t->kind == CBM_TYPE_REFERENCE && recv != RUST_CLOSURE_RECV_ITER) {
+        item = rust_reference_type(ctx->arena, item, t->data.reference.rust_shared);
+    }
     return item && !cbm_type_is_unknown(item) ? item : NULL;
 }
 
@@ -5631,6 +5809,10 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                 const CBMType *declared = rust_std_method_return(ctx, recv, mname, &call);
                 if (declared) {
                     return declared;
+                }
+                const CBMType *iterator = rust_iterator_method_receiver(ctx, recv, mname);
+                if (iterator) {
+                    base = iterator;
                 }
                 /* Template Vec<T> method handling */
                 if (base && base->kind == CBM_TYPE_TEMPLATE) {
@@ -13362,37 +13544,10 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         if (!ts_node_is_null(pat) && !ts_node_is_null(val)) {
             rust_resolve_calls_in_node(ctx, val);
             walked[walked_count++] = val;
-            const CBMType *vt = rust_eval_expr_type(ctx, val);
-            const CBMType *base = vt;
-            while (base && base->kind == CBM_TYPE_REFERENCE)
-                base = base->data.reference.elem;
-            const CBMType *elem = cbm_type_unknown();
-            if (base && base->kind == CBM_TYPE_SLICE) {
-                elem = base->data.slice.elem;
-            } else if (base && base->kind == CBM_TYPE_TEMPLATE) {
-                const char *nm = base->data.template_type.template_name;
-                if ((strstr(nm, "Vec") || strstr(nm, "VecDeque") || strstr(nm, "Iterator") ||
-                     strstr(nm, "Range")) &&
-                    base->data.template_type.arg_count > 0) {
-                    elem = base->data.template_type.template_args[0];
-                }
-                if ((strstr(nm, "HashMap") || strstr(nm, "BTreeMap")) &&
-                    base->data.template_type.arg_count > 1) {
-                    /* Iter over (K, V) tuples. */
-                    const CBMType *pair[2] = {base->data.template_type.template_args[0],
-                                              base->data.template_type.template_args[1]};
-                    elem = cbm_type_tuple(ctx->arena, pair, 2);
-                }
-            }
-            /* IntoIterator for a borrowed slice or Vec yields borrowed
-             * elements, including another layer when its element is &T. */
-            if (vt && vt->kind == CBM_TYPE_REFERENCE && base &&
-                (base->kind == CBM_TYPE_SLICE ||
-                 (base->kind == CBM_TYPE_TEMPLATE &&
-                  rust_std_family_of(ctx, base->data.template_type.template_name) ==
-                      RUST_STD_VEC)) &&
-                !cbm_type_is_unknown(elem)) {
-                elem = rust_reference_type(ctx->arena, elem, vt->data.reference.rust_shared);
+            const CBMType *elem = rust_std_into_iter_item(ctx, rust_eval_expr_type(ctx, val));
+            if (!elem) {
+                elem = cbm_type_unknown();
+
             }
             rust_bind_pattern(ctx, pat, elem);
         }
@@ -15183,6 +15338,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name, reg->type_count - 1);
         }
         rust_registered_type_add_embedded(arena, rt, trait_qn);
+        rust_register_iterator_item(arena, reg, &type_idx, trait_qn, it->item_type, it->struct_name,
+                                    module_qn, NULL);
         if (rust_impl_trait_is_deref(trait_qn)) {
             rust_register_deref_target(arena, rt, it->target_type, it->struct_name, module_qn,
                                        NULL);
@@ -15524,6 +15681,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name, type_index);
         }
         rust_registered_type_add_embedded(arena, &reg->types[type_index], trait_qn);
+        rust_register_iterator_item(arena, reg, &type_idx, trait_qn, d->impl_item,
+                                    d->receiver_spelling, def_mod, tree);
         if (rust_impl_trait_is_deref(trait_qn)) {
             rust_register_deref_target(arena, &reg->types[type_index], d->impl_target,
                                        d->receiver_spelling, def_mod, tree);
@@ -16116,6 +16275,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].trait_qn = defs[i].trait_qn;
             rdefs[i].receiver_spelling = defs[i].receiver_spelling;
             rdefs[i].impl_target = defs[i].impl_target;
+            rdefs[i].impl_item = defs[i].impl_item;
             rdefs[i].decorators = defs[i].decorators;
             rdefs[i].is_interface = defs[i].is_interface;
             rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;

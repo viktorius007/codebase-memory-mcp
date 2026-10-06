@@ -67,6 +67,15 @@ typedef struct {
     const char **rust_fn_type_params;
 } CBMRegisteredFunc;
 
+/* Rust impl records retain the self shape: owned and borrowed impls can
+ * declare different Items. Unknown self shapes may overlap any candidate. */
+typedef struct CBMRustIteratorImpl {
+    const char *trait_qn;
+    const CBMType *self_type;
+    const CBMType *item_type;
+    struct CBMRustIteratorImpl *next;
+} CBMRustIteratorImpl;
+
 // Registered type with fields and method names.
 typedef struct {
     const char *qualified_name;    // e.g., "proj.pkg.TypeName"
@@ -84,6 +93,7 @@ typedef struct {
     // names the impl's self type spells at the type's argument positions.
     const CBMType *deref_target;
     const char **deref_param_names;
+    CBMRustIteratorImpl *rust_iterator_impls;
     /* Rust: declaration types of associated constants, keyed by short name.
      * Duplicate declarations bind UNKNOWN; constants never enter callable indexes. */
     struct CBMScope *rust_assoc_consts;

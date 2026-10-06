@@ -7755,8 +7755,10 @@ static bool rust_generic_receivers_are_exact(const CBMFileResult *result) {
         if (!impl->struct_qn || strcmp(impl->struct_qn, "t.lib.Box") != 0) {
             continue;
         }
-        u32_impls += impl->struct_name && strcmp(impl->struct_name, "Box<u32>") == 0;
-        string_impls += impl->struct_name && strcmp(impl->struct_name, "Box<String>") == 0;
+        u32_impls += impl->struct_name && strcmp(impl->struct_name, "Box<u32>") == 0 &&
+                     impl->item_type && strcmp(impl->item_type, "u32") == 0;
+        string_impls += impl->struct_name && strcmp(impl->struct_name, "Box<String>") == 0 &&
+                        impl->item_type && strcmp(impl->item_type, "String") == 0;
         collapsed_impls += impl->struct_name && strcmp(impl->struct_name, "Box") == 0;
     }
     for (int i = 0; i < result->defs.count; i++) {
@@ -7772,10 +7774,10 @@ static bool rust_generic_receivers_are_exact(const CBMFileResult *result) {
 }
 
 TEST(extract_rust_generic_impl_receivers_survive_spill) {
-    const char *source = "trait Render {}\n"
+    const char *source = "trait Render { type Item; }\n"
                          "struct Box<T>(T);\n"
-                         "impl Render for Box<u32> { fn render(&self) {} }\n"
-                         "impl Render for Box<String> { fn render(&self) {} }\n";
+                         "impl Render for Box<u32> { type Item = u32; fn render(&self) {} }\n"
+                         "impl Render for Box<String> { type Item = String; fn render(&self) {} }\n";
     CBMFileResult *result = extract(source, CBM_LANG_RUST, "t", "lib.rs");
     ASSERT_NOT_NULL(result);
     ASSERT_TRUE(rust_generic_receivers_are_exact(result));

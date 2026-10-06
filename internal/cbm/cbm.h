@@ -423,6 +423,7 @@ typedef struct {
     /* Raw text of the impl's `type Target = ..;` item, NULL when it has none.
      * For `impl Deref` this is the type a receiver auto-derefs to. */
     const char *target_type;
+    const char *item_type; /* written Item; empty when impl applicability is unproved */
 } CBMImplTrait;
 
 /* Rust: one `impl` block whose header names resolved to registered

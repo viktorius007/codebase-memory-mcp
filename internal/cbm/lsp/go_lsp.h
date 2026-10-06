@@ -94,6 +94,7 @@ typedef struct {
     const char *trait_qn;
     const char *receiver_spelling; // Rust-only exact impl receiver; registry identity input
     const char *impl_target;       // Rust impl relation: raw `type Target = ..;` text, or NULL
+    const char *impl_item; /* written Item; empty when impl applicability is unproved */
     bool is_rust_impl_relation; // independent type-level impl record (empty impls survive)
     bool is_abstract;           // Rust required trait method; false for defaults
     bool is_async;              // Rust `async fn`: recorded return is the awaited output
