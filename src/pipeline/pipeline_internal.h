@@ -21,6 +21,47 @@
 #include <stdatomic.h>
 #include <string.h>
 
+/* Unresolved occurrences are metadata, never graph nodes/edges. Identity is file/kind/span,
+ * independent of the guessed target; incremental file replacement removes them.
+ * reason is a resolver stop code, never a display message. Pipeline stop codes:
+ * source_item_absent, source_file_mismatch, cross_language_candidate_rejected,
+ * usage_target_identity_not_proven,
+ * macro_token_not_resolved, target_not_materialized, type_path_not_proven,
+ * member_target_not_proven, value_path_not_proven, self_usage_suppressed, binding_syntax_filtered,
+ * write_syntax_filtered, keyword_syntax_filtered, field_label_syntax_filtered,
+ * import_syntax_filtered, macro_invocation_not_proven (the extractor owns these stops), and
+ * plain-call closure codes declared in lsp_resolve.h. Closed semantic call codes emitted by
+ * rust_lsp.c: receiver_import_identity_not_proven, receiver_identity_not_proven,
+ * deref_receiver_identity_not_proven, deref_requires_project_registry,
+ * incomplete_method_registry, module_function_not_registered,
+ * associated_item_not_registered, unknown_edition, cfg_dependent_name,
+ * bound_declaration_not_proven, method_not_found, unknown_receiver_type,
+ * unresolved_glob_import, workspace_library_path_not_registered,
+ * function_not_in_registry, trait_nominal_identity_ambiguous,
+ * trait_inherent_accessor_unknown, trait_scope_identity, trait_impl_key_unreadable,
+ * trait_array_length_unknown, trait_receiver_unknown, trait_owned_receiver_borrowed,
+ * trait_receiver_partial, trait_receiver_scope_unproved,
+ * trait_receiver_shape (shape details are not reason codes). */
+void cbm_pipeline_record_unresolved(cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                    const char *caller, const char *name, const char *kind,
+                                    const char *reason, int line, uint32_t start, uint32_t end);
+void cbm_pipeline_record_unresolved_call(cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                         const CBMCall *call, const CBMHashTable *reasons,
+                                         const char *stop);
+/* Existing published fallback links are preserved; record a missing field proof or
+ * indistinguishable declaration identity alongside them. */
+void cbm_pipeline_record_unproven_usage_target(cbm_gbuf_t *destination, const cbm_gbuf_t *symbols,
+                                               const char *project, const char *rel,
+                                               const CBMUsage *usage, const CBMFileResult *result,
+                                               const cbm_gbuf_node_t *target,
+                                               bool precise_reference);
+CBMHashTable *cbm_pipeline_unresolved_reasons(const CBMResolvedCallArray *rows);
+void cbm_pipeline_unresolved_reasons_free(CBMHashTable *reasons);
+void cbm_pipeline_record_unresolved_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_t *symbols,
+                                          const char *project, const char *rel,
+                                          const CBMUsage *usage, const CBMFileResult *result,
+                                          const char *stop);
+
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
 /* Maximum byte budget for tree-sitter extraction per file */

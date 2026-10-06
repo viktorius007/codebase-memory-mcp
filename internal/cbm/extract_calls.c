@@ -3686,6 +3686,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 }
             }
             if (!ts_node_is_null(callee.leaf)) {
+                call.unresolved_line = (int)ts_node_start_point(callee.leaf).row + 1;
                 call.callee_start_byte = ts_node_start_byte(callee.leaf);
                 call.callee_end_byte = ts_node_end_byte(callee.leaf);
             }

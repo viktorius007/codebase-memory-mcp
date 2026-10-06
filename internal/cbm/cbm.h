@@ -289,6 +289,7 @@ typedef struct {
     int loop_depth;                // enclosing loop nesting at the call site
     int branch_depth;              // enclosing branch nesting at the call site
     int start_line;                // 1-based source line of the call (for def range-match)
+    int unresolved_line;           // written callee line; never used for edge emission
     uint32_t site_start_byte;      // exact AST occurrence span; end > start when present
     uint32_t site_end_byte;        // exclusive byte offset in the source file
     uint32_t callee_start_byte;    // exact terminal callee-identifier span when present
@@ -322,11 +323,25 @@ typedef enum {
     CBM_USAGE_TYPE, /* Rust type namespace; ordinary USAGE publication. */
 } CBMUsageKind;
 
+/* Extraction stops retained for recording only; never enter link resolution. */
+typedef enum {
+    CBM_USAGE_NOT_FILTERED = 0,
+    CBM_USAGE_BINDING_FILTERED,
+    CBM_USAGE_WRITE_FILTERED,
+    CBM_USAGE_IMPORT_FILTERED,
+    CBM_USAGE_MACRO_FILTERED,
+    CBM_USAGE_FIELD_LABEL_FILTERED,
+    CBM_USAGE_KEYWORD_FILTERED,
+    CBM_USAGE_KEYWORD_CALL_FILTERED,
+    CBM_USAGE_MACRO_TOKEN_FILTERED,
+} CBMUsageFilter;
+
 typedef struct {
     const char *ref_name;          // referenced identifier
     const char *scope_path;        // Rust block-use expansion; empty means a local binding
     const char *enclosing_func_qn; // QN of enclosing function (or module QN)
     /* Group fixed-width fields to avoid padding between flags and byte spans. */
+    int start_line;                  // source line retained even when source bytes spill
     uint32_t lexical_scope_id;       // extraction-local scope instance; never graph identity
     uint32_t site_start_byte;        // exact reference-token span; end > start when present
     uint32_t site_end_byte;          // exclusive byte offset in the source file
@@ -339,6 +354,7 @@ typedef struct {
                                           // (Go x.f — field_identifier). The extractor strips
                                           // the receiver, so this is the only surviving record
                                           // of selector shape (#1962). Default false.
+    CBMUsageFilter unresolved_filter;
 } CBMUsage;
 
 typedef struct {

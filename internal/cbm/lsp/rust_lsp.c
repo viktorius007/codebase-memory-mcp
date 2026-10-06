@@ -11246,6 +11246,14 @@ static void rust_inject_syn_call(RustLSPContext *ctx, const char *callee_qn) {
         call.callee_end_byte = ctx->emit_callee_end_byte;
         call.requires_lsp_resolution = true;
     }
+    /* Source coordinates are metadata only: populating start_line would alter
+     * published edge properties for existing synthetic calls. */
+    if (ctx->root_source && call.site_end_byte > call.site_start_byte) {
+        call.unresolved_line = 1;
+        for (uint32_t i = 0; i < (call.callee_end_byte > call.callee_start_byte
+                                      ? call.callee_start_byte : call.site_start_byte); i++)
+            call.unresolved_line += ctx->root_source[i] == '\n';
+    }
     cbm_calls_push(ctx->syn_calls, ctx->arena, call);
 }
 

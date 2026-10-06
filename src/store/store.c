@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
+#include "foundation/mem_core.h"
 #include "foundation/sha256.h"
 
 #include <math.h>
@@ -244,8 +245,7 @@ static int init_schema(cbm_store_t *s) {
         "  mtime_ns INTEGER NOT NULL DEFAULT 0,"
         "  size INTEGER NOT NULL DEFAULT 0,"
         "  PRIMARY KEY (project, rel_path)"
-        ");"
-        "CREATE TABLE IF NOT EXISTS nodes ("
+        ");" CBM_UNRESOLVED_SCHEMA_SQL "CREATE TABLE IF NOT EXISTS nodes ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
         "  label TEXT NOT NULL,"
@@ -2546,6 +2546,8 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name) {
     }
 
     static const char *cleanup_sql[] = {
+        ("DELETE FROM unresolved_occurrences WHERE project_id=(SELECT id FROM unresolved_strings "
+         "WHERE value=?1);"),
         "DELETE FROM index_coverage WHERE project = ?1;",
         "DELETE FROM index_coverage_meta WHERE project = ?1;",
         "DELETE FROM projects WHERE name = ?1 || '::missed';",
@@ -3117,6 +3119,111 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     return count;
 }
 
+static int64_t unresolved_string_id(sqlite3_stmt *stmt, CBMHashTable *ids, const char *value) {
+    int64_t id = (int64_t)(uintptr_t)cbm_ht_get(ids, value);
+    if (id)
+        return id;
+    sqlite3_bind_text(stmt, 1, value, -1, CBM_SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        id = sqlite3_column_int64(stmt, 0);
+    sqlite3_reset(stmt);
+    if (id)
+        cbm_ht_set(ids, cbm_mem_strdup(CBM_MEM_CLASS_STORE, value), (void *)(uintptr_t)id);
+    return id;
+}
+
+static void unresolved_id_free(const char *key, void *value, void *context) {
+    (void)value;
+    (void)context;
+    cbm_free(CBM_MEM_CLASS_STORE, (void *)key);
+}
+
+int cbm_store_write_unresolved_sites(sqlite3 *db, const char *project,
+                                     const cbm_unresolved_site_t *sites, int count) {
+    if (sqlite3_exec(db, CBM_UNRESOLVED_SCHEMA_SQL, NULL, NULL, NULL) != SQLITE_OK)
+        return CBM_STORE_ERR;
+    sqlite3_stmt *stmt = NULL, *strings = NULL;
+    const char *sql =
+        "INSERT OR REPLACE INTO unresolved_occurrences VALUES(?1,?2,?3,?4,?5,?6,?7,?8)";
+    const char *intern = "INSERT INTO unresolved_strings(value) VALUES(?1) RETURNING id";
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(db, intern, -1, &strings, NULL);
+    CBMHashTable *ids = cbm_ht_create(CBM_SZ_256);
+    sqlite3_stmt *existing = NULL;
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(db, "SELECT id,value FROM unresolved_strings", -1, &existing, NULL);
+    if (rc == SQLITE_OK) {
+        int read_rc;
+        while ((read_rc = sqlite3_step(existing)) == SQLITE_ROW) {
+            const char *value = (const char *)sqlite3_column_text(existing, 1);
+            cbm_ht_set(ids, cbm_mem_strdup(CBM_MEM_CLASS_STORE, value),
+                       (void *)(uintptr_t)sqlite3_column_int64(existing, 0));
+        }
+        if (read_rc != SQLITE_DONE)
+            rc = read_rc;
+    }
+    sqlite3_finalize(existing);
+    int64_t project_id = rc == SQLITE_OK ? unresolved_string_id(strings, ids, project) : 0;
+    if (!project_id)
+        rc = SQLITE_ERROR;
+    /* Keep stop-code and file IDs compact before interning the much larger
+     * caller/name vocabulary. SQLite stores these IDs on every occurrence. */
+    for (int i = 0; rc == SQLITE_OK && i < count; i++) {
+        if (!unresolved_string_id(strings, ids, sites[i].reason))
+            rc = SQLITE_ERROR;
+    }
+    for (int i = 0; rc == SQLITE_OK && i < count; i++) {
+        if (!unresolved_string_id(strings, ids, sites[i].file_path))
+            rc = SQLITE_ERROR;
+    }
+    for (int i = 0; rc == SQLITE_OK && i < count; i++) {
+        const cbm_unresolved_site_t *site = &sites[i];
+        const char *values[] = {site->file_path, site->caller, site->name, site->reason};
+        int columns[] = {2, 6, 7, 8};
+        for (int j = 0; j < 4; j++) {
+            int64_t id = unresolved_string_id(strings, ids, values[j]);
+            if (!id) {
+                rc = SQLITE_ERROR;
+                break;
+            }
+            sqlite3_bind_int64(stmt, columns[j], id);
+        }
+        if (rc != SQLITE_OK)
+            break;
+        sqlite3_bind_int64(stmt, 1, project_id);
+        int kind = strcmp(site->kind, "call") == 0     ? 0
+                   : strcmp(site->kind, "type") == 0   ? 1
+                   : strcmp(site->kind, "member") == 0 ? 2
+                                                       : 3;
+        sqlite3_bind_int64(stmt, 3, site->site_start_byte);
+        sqlite3_bind_int64(stmt, 4,
+                           ((int64_t)(site->site_end_byte - site->site_start_byte) << 2) | kind);
+        sqlite3_bind_int(stmt, 5, site->line);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+        sqlite3_reset(stmt);
+    }
+    cbm_ht_foreach(ids, unresolved_id_free, NULL);
+    cbm_ht_free(ids);
+    sqlite3_finalize(stmt);
+    sqlite3_finalize(strings);
+    return rc == SQLITE_OK ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+static int delete_unresolved_sites(cbm_store_t *s, const char *project, const char *file_path) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "DELETE FROM unresolved_occurrences WHERE project_id=(SELECT id FROM "
+                      "unresolved_strings WHERE value=?1) AND (?2 IS NULL OR "
+                      "file_id=(SELECT id FROM unresolved_strings WHERE value=?2))";
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return CBM_STORE_ERR;
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, file_path, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_nodes_by_project,
                                         "DELETE FROM nodes WHERE project = ?1;");
@@ -3129,7 +3236,7 @@ int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
         store_set_error_sqlite(s, "delete_nodes_by_project");
         return CBM_STORE_ERR;
     }
-    return CBM_STORE_OK;
+    return delete_unresolved_sites(s, project, NULL);
 }
 
 int cbm_store_delete_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path) {
@@ -3145,7 +3252,7 @@ int cbm_store_delete_nodes_by_file(cbm_store_t *s, const char *project, const ch
         store_set_error_sqlite(s, "delete_nodes_by_file");
         return CBM_STORE_ERR;
     }
-    return CBM_STORE_OK;
+    return delete_unresolved_sites(s, project, file_path);
 }
 
 int cbm_store_delete_nodes_by_label(cbm_store_t *s, const char *project, const char *label) {

@@ -545,6 +545,11 @@ static const tool_def_t TOOLS[] = {
      "Evidence/args yield before nearest graph rows.\"},"
      "\"cursor\":{\"type\":\"string\",\"description\":\"Pass next/next_cursor with traversal "
      "args unchanged; budget may increase.\"},"
+     "\"unresolved_only\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"List unresolved Rust occurrences instead of traversing links.\"},"
+     "\"unresolved_caller\":{\"type\":\"string\",\"description\":\"Exact enclosing item QN.\"},"
+     "\"unresolved_file\":{\"type\":\"string\",\"description\":\"Exact project-relative file.\"},"
+     "\"unresolved_offset\":{\"type\":\"integer\",\"minimum\":0,\"default\":0},"
      "\"mode\":{"
      "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\"],\"default\":"
      "\"calls\",\"description\":\"calls, argument-aware data_flow, or service edges.\"},"
@@ -5576,6 +5581,93 @@ static rust_semantic_coverage_t rust_semantic_coverage_get(cbm_store_t *store,
     return result;
 }
 
+static yyjson_mut_val *rust_unresolved_json(yyjson_mut_doc *doc, cbm_store_t *store,
+                                            const char *project, const char *path,
+                                            const char *caller) {
+    yyjson_mut_val *result = yyjson_mut_obj(doc);
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT f.value,CASE (o.site_extent & 3) WHEN 0 THEN 'call' WHEN 1 THEN 'type' WHEN 2 THEN "
+        "'member' "
+        "ELSE 'reference' "
+        "END,count(*) "
+        "FROM unresolved_occurrences o JOIN unresolved_strings f ON f.id=o.file_id "
+        "WHERE o.project_id=(SELECT id FROM unresolved_strings WHERE value=?1) AND (?2 IS NULL OR "
+        "f.value=?2) "
+        "AND (?3 IS NULL OR o.caller_id=(SELECT id FROM unresolved_strings WHERE value=?3)) "
+        "GROUP BY o.file_id,(o.site_extent & 3) ORDER BY f.value,2";
+    int rc = sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL);
+    int64_t calls = 0, usages = 0;
+    int groups = 0;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, caller, -1, SQLITE_TRANSIENT);
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            const char *kind = (const char *)sqlite3_column_text(stmt, 1);
+            int64_t total = sqlite3_column_int64(stmt, 2);
+            if (strcmp(kind, "call") == 0)
+                calls += total;
+            else
+                usages += total;
+            if (groups++ < 20) {
+                yyjson_mut_val *file = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, file, "path",
+                                          (const char *)sqlite3_column_text(stmt, 0));
+                yyjson_mut_obj_add_strcpy(doc, file, "kind", kind);
+                yyjson_mut_obj_add_int(doc, file, "total", total);
+                yyjson_mut_arr_add_val(files, file);
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    yyjson_mut_obj_add_str(doc, result, "lookup", rc == SQLITE_DONE ? "complete" : "error");
+    if (rc == SQLITE_DONE) {
+        yyjson_mut_obj_add_int(doc, result, "calls", calls);
+        yyjson_mut_obj_add_int(doc, result, "references", usages);
+    } else {
+        yyjson_mut_obj_add_null(doc, result, "calls");
+        yyjson_mut_obj_add_null(doc, result, "references");
+    }
+    yyjson_mut_obj_add_val(doc, result, "files", files);
+    yyjson_mut_obj_add_int(doc, result, "file_kind_groups_total", groups);
+    yyjson_mut_obj_add_bool(doc, result, "files_truncated", groups > 20);
+    yyjson_mut_obj_add_str(doc, result, "scope",
+                           caller ? "enclosing_item"
+                           : path ? "file"
+                                  : "project");
+    if (caller)
+        yyjson_mut_obj_add_strcpy(doc, result, "caller", caller);
+    cbm_coverage_meta_t meta = {0};
+    cbm_project_t project_row = {0};
+    bool have_project = cbm_store_get_project(store, project, &project_row) == CBM_STORE_OK;
+    bool recorded = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK &&
+                    meta.coverage_version == CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION &&
+                    have_project && meta.generation && project_row.indexed_at &&
+                    strcmp(meta.generation, project_row.indexed_at) == 0;
+    cbm_store_coverage_meta_clear(&meta);
+    if (have_project) {
+        safe_str_free(&project_row.name);
+        safe_str_free(&project_row.indexed_at);
+        safe_str_free(&project_row.root_path);
+    }
+    yyjson_mut_obj_add_str(doc, result, "recording", recorded ? "available" : "unavailable");
+    yyjson_mut_obj_add_str(doc, result, "listing_tool", "trace_path");
+    yyjson_mut_obj_add_str(
+        doc, result, "listing_arguments",
+        "Set unresolved_only=true; use unresolved_caller or unresolved_file for exact scope, "
+        "and unresolved_offset/limit for paging. Listings include tests.");
+    yyjson_mut_obj_add_str(
+        doc, result, "note",
+        "Inbound unknown targets cannot be attributed to a callee: project counts are "
+        "conservative. "
+        "Outbound single-item counts cover that enclosing item, including tests. Counts include "
+        "filtered source candidates and opaque macro tokens; those do not prove expanded semantic "
+        "occurrences.");
+    return result;
+}
+
 static const char *rust_semantic_status_name(rust_semantic_status_t status) {
     if (status == RUST_SEMANTIC_COMPLETE) {
         return "semantic_complete";
@@ -6294,6 +6386,8 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
         rust_semantic_coverage_from_meta(generation_matches, &meta);
     rust_semantic_add_object(doc, root, semantic_coverage);
     bool ignored_total_authoritative = generation_matches && meta.ignored_files_total >= ni_file_n;
+    yyjson_mut_obj_add_val(doc, root, "unresolved_sites",
+                           rust_unresolved_json(doc, store, project, NULL, NULL));
     int ni_file_total = ni_file_n;
     if (ignored_total_authoritative) {
         ni_file_total = meta.ignored_files_total;
@@ -6754,6 +6848,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             }
             yyjson_mut_obj_add_strcpy(doc, item, "path", rel);
             rust_semantic_add_path_fields(doc, item, rel, semantic_coverage);
+            yyjson_mut_obj_add_val(doc, item, "unresolved_sites",
+                                   rust_unresolved_json(doc, store, project, rel, NULL));
             cbm_coverage_row_t *rows = NULL;
             int row_count = 0;
             int cov_rc = cbm_store_coverage_get_path(store, project, rel, &rows, &row_count);
@@ -9169,10 +9265,77 @@ static int clamp_mcp_depth(int depth, const char *tool) {
     return depth;
 }
 
+static char *handle_unresolved_sites(cbm_store_t *store, const char *project, const char *args) {
+    char *path = cbm_mcp_get_string_arg(args, "unresolved_file");
+    char *caller = cbm_mcp_get_string_arg(args, "unresolved_caller");
+    int limit = cbm_mcp_get_int_arg(args, "limit", 100);
+    int offset = cbm_mcp_get_int_arg(args, "unresolved_offset", 0);
+    if (limit < 1 || limit > MCP_BFS_LIMIT_MAX || offset < 0) {
+        safe_free(path);
+        safe_free(caller);
+        return cbm_mcp_text_result("unresolved listing requires limit 1..5000 and offset >= 0",
+                                   true);
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = rust_unresolved_json(doc, store, project, path, caller);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *rows = yyjson_mut_arr(doc);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT file_path,line,caller,name,kind,reason,site_start_byte,site_end_byte "
+                      "FROM unresolved_sites WHERE project=?1 AND (?2 IS NULL OR file_path=?2) "
+                      "AND (?3 IS NULL OR caller=?3) ORDER BY file_path,kind,site_start_byte,"
+                      "site_end_byte LIMIT ?4 OFFSET ?5";
+    int rc = sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL);
+    int count = 0;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, caller, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 4, limit);
+        sqlite3_bind_int(stmt, 5, offset);
+        const char *keys[] = {"file_path", "line",   "caller",          "name",
+                              "kind",      "reason", "site_start_byte", "site_end_byte"};
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            yyjson_mut_val *row = yyjson_mut_obj(doc);
+            for (int i = 0; i < 8; i++) {
+                if (i == 1 || i >= 6)
+                    yyjson_mut_obj_add_int(doc, row, keys[i], sqlite3_column_int64(stmt, i));
+                else
+                    yyjson_mut_obj_add_strcpy(doc, row, keys[i],
+                                              (const char *)sqlite3_column_text(stmt, i));
+            }
+            yyjson_mut_arr_add_val(rows, row);
+            count++;
+        }
+    }
+    sqlite3_finalize(stmt);
+    yyjson_mut_obj_add_val(doc, root, "sites", rows);
+    yyjson_mut_obj_add_int(doc, root, "returned", count);
+    int64_t total = yyjson_mut_get_sint(yyjson_mut_obj_get(root, "calls")) +
+                    yyjson_mut_get_sint(yyjson_mut_obj_get(root, "references"));
+    yyjson_mut_obj_add_bool(doc, root, "has_more", (int64_t)offset + count < total);
+    yyjson_mut_obj_add_int(doc, root, "next_offset", offset + count);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *result = cbm_mcp_text_result(json ? json : "unresolved listing serialization failed",
+                                       rc != SQLITE_DONE);
+    safe_free(json);
+    yyjson_mut_doc_free(doc);
+    safe_free(path);
+    safe_free(caller);
+    return result;
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
+    if (cbm_mcp_get_bool_arg(args, "unresolved_only")) {
+        char *result = store ? handle_unresolved_sites(store, project, args)
+                             : cbm_mcp_text_result("project not found or not indexed", true);
+        safe_free(func_name);
+        safe_free(project);
+        return result;
+    }
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     char *mode = cbm_mcp_get_string_arg(args, "mode");
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
@@ -9652,6 +9815,15 @@ render_trace_output:;
             }
         }
         rust_semantic_add_note_tree(&sb, trace_semantic_affected);
+        yyjson_mut_doc *gap_doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *gaps =
+            rust_unresolved_json(gap_doc, store, project, NULL,
+                                 do_inbound || node_count != 1 ? NULL : nodes[0].qualified_name);
+        yyjson_mut_doc_set_root(gap_doc, gaps);
+        char *gap_json = yyjson_mut_write(gap_doc, 0, NULL);
+        cbm_tree_scalar_str(&sb, "unresolved_sites", gap_json ? gap_json : "lookup error");
+        safe_free(gap_json);
+        yyjson_mut_doc_free(gap_doc);
         json = cbm_sb_finish(&sb);
     } else {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -9659,6 +9831,10 @@ render_trace_output:;
         yyjson_mut_doc_set_root(doc, root);
 
         yyjson_mut_obj_add_str(doc, root, "function", func_name);
+        yyjson_mut_obj_add_val(
+            doc, root, "unresolved_sites",
+            rust_unresolved_json(doc, store, project, NULL,
+                                 do_inbound || node_count != 1 ? NULL : nodes[0].qualified_name));
         yyjson_mut_obj_add_str(doc, root, "direction", direction);
         if (mode) {
             yyjson_mut_obj_add_str(doc, root, "mode", mode);

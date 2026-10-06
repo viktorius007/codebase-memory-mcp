@@ -385,14 +385,25 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         cbm_pipeline_lsp_reference_index_build(&result->resolved_calls, &reference_index);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
+        if (lang == CBM_LANG_RUST && usage->unresolved_filter) {
+            cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name, rel,
+                                                 usage, result, NULL);
+            continue;
+        }
         if (!usage->ref_name) {
             continue;
         }
         const cbm_gbuf_node_t *src = find_enclosing_node(ctx, usage->enclosing_func_qn, rel);
         if (!src) {
+            if (lang == CBM_LANG_RUST)
+                cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name, rel,
+                                                     usage, result, "source_item_absent");
             continue;
         }
 
+        if (lang == CBM_LANG_RUST && strcmp(src->file_path, rel) != 0)
+            cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name, rel,
+                                                 usage, result, "source_file_mismatch");
         const cbm_gbuf_node_t *tgt = NULL;
         const char *publishing_rule = "registry";
         bool precise_call_reference = false;
@@ -425,6 +436,10 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
              * Kotlin local function). Falling back by raw name here would bind
              * an unrelated same-named declaration. */
             if (semantic_reference) {
+                if (lang == CBM_LANG_RUST)
+                    cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name,
+                                                         rel, usage, result,
+                                                         "target_not_materialized");
                 continue;
             }
             /* A proven field access owns its occurrence (twin: pass_parallel.c). */
@@ -436,6 +451,10 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (tgt)
                 publishing_rule = "field_owner";
             if (field_owned && !tgt) {
+                if (lang == CBM_LANG_RUST)
+                    cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name,
+                                                         rel, usage, result,
+                                                         "target_not_materialized");
                 continue;
             }
         }
@@ -459,9 +478,14 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         /* An unresolved Rust type path must not be shortened to a same-named
          * declaration from another module or an unrelated imported alias. */
         if (!tgt && lang == CBM_LANG_RUST && usage->kind == CBM_USAGE_TYPE) {
+            cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name, rel,
+                                                 usage, result, "type_path_not_proven");
             continue;
         }
         if (!tgt && lang == CBM_LANG_RUST) {
+            cbm_pipeline_record_unresolved_usage(
+                ctx->gbuf, ctx->gbuf, ctx->project_name, rel, usage, result,
+                usage->is_member_access ? "member_target_not_proven" : "value_path_not_proven");
             continue;
         }
         if (!tgt) {
@@ -489,6 +513,10 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (tgt &&
                 (cbm_suppress_cross_language_ref(lang, tgt->file_path) ||
                  cbm_suppress_cross_language_code_match(lang, ctx->repo_path, tgt->file_path))) {
+                if (lang == CBM_LANG_RUST)
+                    cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name,
+                                                         rel, usage, result,
+                                                         "cross_language_candidate_rejected");
                 continue;
             }
             /* #1942/#1962: a bare Go reference can never denote a struct
@@ -518,6 +546,12 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                        ? lang
                                                        : cbm_language_for_filename(src->file_path),
                                                    ctx->repo_path, tgt->file_path)) {
+            if (lang == CBM_LANG_RUST)
+                cbm_pipeline_record_unresolved_usage(
+                    ctx->gbuf, ctx->gbuf, ctx->project_name, rel, usage, result,
+                    !tgt                 ? "target_not_materialized"
+                    : src->id == tgt->id ? "self_usage_suppressed"
+                                         : "cross_language_candidate_rejected");
             continue;
         }
 
@@ -525,6 +559,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
          * escape it or the edge properties JSON is malformed. */
         char esc_ref[CBM_SZ_256];
         cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
+        if (lang == CBM_LANG_RUST)
+            cbm_pipeline_record_unproven_usage_target(ctx->gbuf, ctx->gbuf, ctx->project_name, rel,
+                                                      usage, result, tgt, precise_call_reference);
         char uprops[CBM_SZ_512];
         if (lang == CBM_LANG_RUST)
             snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\",\"rule\":\"%s\"}", esc_ref,

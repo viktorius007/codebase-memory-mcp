@@ -211,7 +211,7 @@ static inline bool cbm_pipeline_reference_candidate_fallback_allowed(
  * argument shape in a language whose resolver can prove callable identity;
  * without an exact LSP record it remains USAGE. */
 static inline bool cbm_pipeline_usage_semantic_reference_candidate(const CBMUsage *usage) {
-    if (!usage) {
+    if (!usage || usage->unresolved_filter) {
         return false;
     }
     return usage->kind == CBM_USAGE_CALL_REFERENCE ||

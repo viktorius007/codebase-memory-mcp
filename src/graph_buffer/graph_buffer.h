@@ -9,6 +9,7 @@
 #ifndef CBM_GRAPH_BUFFER_H
 #define CBM_GRAPH_BUFFER_H
 
+#include "store/store.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
@@ -78,6 +79,9 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src);
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json);
+
+/* Copies an unresolved source occurrence into metadata, outside the graph. */
+void cbm_gbuf_record_unresolved(cbm_gbuf_t *gb, const cbm_unresolved_site_t *site);
 
 /* Find a node by qualified name. Returns NULL if not found. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn);

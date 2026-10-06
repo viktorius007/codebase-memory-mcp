@@ -1797,10 +1797,21 @@ static bool rust_token_turbofish_type(TSNode node) {
     return false;
 }
 
+static int rust_reference_line(TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "scoped_identifier") == 0 || strcmp(kind, "scoped_type_identifier") == 0) {
+        TSNode name = ts_node_child_by_field_name(node, "name", 4);
+        if (!ts_node_is_null(name))
+            node = name;
+    }
+    return (int)ts_node_start_point(node).row + 1;
+}
+
 static void stamp_usage_site(CBMExtractCtx *ctx, CBMUsage *usage, TSNode node, const char *name,
                              WalkState *state) {
     TSNode candidate_site = call_reference_candidate_site(ctx, node, name, state);
     TSNode site = ts_node_is_null(candidate_site) ? node : candidate_site;
+    usage->start_line = (int)ts_node_start_point(site).row + 1;
     usage->site_start_byte = ts_node_start_byte(site);
     usage->site_end_byte = ts_node_end_byte(site);
     usage->may_be_call_reference = !ts_node_is_null(candidate_site);
@@ -2532,7 +2543,7 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
     }
     for (int i = state->usage_start_index; i < ctx->result->usages.count; i++) {
         CBMUsage *usage = &ctx->result->usages.items[i];
-        if (!usage->ref_name || !usage->ref_name[0]) {
+        if (usage->unresolved_filter || !usage->ref_name || !usage->ref_name[0]) {
             continue;
         }
         const char *name = lexical_binding_key(ctx, state, usage->ref_name);
@@ -2748,6 +2759,61 @@ void cbm_extract_usages(CBMExtractCtx *ctx) {
 // --- Unified handler: called once per node by the cursor walk ---
 // Uses WalkState flags instead of parent-chain walks for O(1) context checks.
 
+/* Keep filtered Rust occurrences without changing the set submitted to the
+ * resolver. Plain names are candidates here: the recorder checks that a graph
+ * type/field/callable with that spelling exists, without guessing its identity. */
+static void retain_filtered_rust_usage(CBMExtractCtx *ctx, TSNode node, WalkState *state,
+                                       CBMUsageFilter filter) {
+    if (ctx->language != CBM_LANG_RUST ||
+        (!ts_node_is_named(node) && filter != CBM_USAGE_MACRO_TOKEN_FILTERED))
+        return;
+    const char *kind = ts_node_type(node);
+    if (filter != CBM_USAGE_MACRO_TOKEN_FILTERED && strcmp(kind, "identifier") != 0 &&
+        strcmp(kind, "type_identifier") != 0 && strcmp(kind, "scoped_identifier") != 0 &&
+        strcmp(kind, "scoped_type_identifier") != 0 && strcmp(kind, "field_identifier") != 0 &&
+        strcmp(kind, "shorthand_field_identifier") != 0 &&
+        strcmp(kind, "shorthand_field_initializer") != 0)
+        return;
+    TSNode parent = ts_node_parent(node);
+    const char *pk = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+    if ((strcmp(pk, "field_declaration") == 0 || strcmp(pk, "enum_variant") == 0 ||
+         strcmp(pk, "type_parameter") == 0 || strcmp(pk, "function_item") == 0 ||
+         strcmp(pk, "struct_item") == 0 || strcmp(pk, "enum_item") == 0 ||
+         strcmp(pk, "trait_item") == 0 || strcmp(pk, "type_item") == 0) &&
+        ts_node_eq(node, ts_node_child_by_field_name(parent, "name", 4)))
+        return;
+    if (strcmp(kind, "shorthand_field_initializer") == 0) {
+        for (uint32_t i = ts_node_named_child_count(node); i > 0; i--) {
+            TSNode child = ts_node_named_child(node, i - 1);
+            if (strcmp(ts_node_type(child), "identifier") == 0) {
+                node = child;
+                break;
+            }
+        }
+    }
+    CBMUsage usage = {0};
+    usage.ref_name = reference_name(ctx, node);
+    if (!usage.ref_name || !usage.ref_name[0])
+        return;
+    if (filter == CBM_USAGE_IMPORT_FILTERED &&
+        (!state->enclosing_func_qn || strcmp(state->enclosing_func_qn, ctx->module_qn) == 0))
+        return;
+    usage.enclosing_func_qn = state->enclosing_func_qn;
+    usage.unresolved_filter = filter;
+    usage.start_line = rust_reference_line(node);
+    usage.site_start_byte = ts_node_start_byte(node);
+    usage.site_end_byte = ts_node_end_byte(node);
+    usage.kind = strstr(kind, "type_identifier") ? CBM_USAGE_TYPE : CBM_USAGE_VALUE;
+    if (filter == CBM_USAGE_KEYWORD_CALL_FILTERED) {
+        usage.site_start_byte = ts_node_start_byte(parent);
+        usage.site_end_byte = ts_node_end_byte(parent);
+    }
+    usage.is_member_access = strcmp(kind, "field_identifier") == 0 ||
+                             strcmp(kind, "shorthand_field_identifier") == 0 ||
+                             strcmp(kind, "shorthand_field_initializer") == 0;
+    cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+}
+
 void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (emit_direct_perl_coderef_usage(ctx, node, state->enclosing_func_qn,
                                        active_lexical_scope_id(state))) {
@@ -2755,6 +2821,26 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     }
     if (inside_direct_perl_coderef(ctx, node)) {
         return;
+    }
+    if (ctx->language == CBM_LANG_RUST &&
+        strcmp(ts_node_type(node), "shorthand_field_identifier") == 0)
+        retain_filtered_rust_usage(ctx, node, state, CBM_USAGE_BINDING_FILTERED);
+    if (ctx->language == CBM_LANG_RUST &&
+        strcmp(ts_node_type(node), "shorthand_field_initializer") == 0)
+        retain_filtered_rust_usage(ctx, node, state, CBM_USAGE_FIELD_LABEL_FILTERED);
+    if (ctx->language == CBM_LANG_RUST && !ts_node_is_named(node)) {
+        TSNode parent = ts_node_parent(node);
+        const char *kind = ts_node_type(node);
+        bool operator_token =
+            strcmp(kind, "[") == 0 || strcmp(kind, "*") == 0 || strcmp(kind, "+") == 0 ||
+            strcmp(kind, "-") == 0 || strcmp(kind, "/") == 0 || strcmp(kind, "%") == 0 ||
+            strcmp(kind, "!") == 0 || strcmp(kind, "&") == 0 || strcmp(kind, "|") == 0 ||
+            strcmp(kind, "^") == 0 || strcmp(kind, "<<") == 0 || strcmp(kind, ">>") == 0 ||
+            strcmp(kind, "==") == 0 || strcmp(kind, "!=") == 0 || strcmp(kind, "<") == 0 ||
+            strcmp(kind, ">") == 0 || strcmp(kind, "<=") == 0 || strcmp(kind, ">=") == 0;
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "token_tree") == 0 &&
+            (operator_token || isalpha((unsigned char)kind[0])))
+            retain_filtered_rust_usage(ctx, node, state, CBM_USAGE_MACRO_TOKEN_FILTERED);
     }
     bool reference_node = is_reference_node(node, ctx->language);
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
@@ -2830,6 +2916,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     // Imports do not emit ordinary usages, but their binding occurrence must
     // be recorded before the subtree is skipped.
     if (state->inside_import) {
+        retain_filtered_rust_usage(ctx, node, state, CBM_USAGE_IMPORT_FILTERED);
         if (is_import_binding_occurrence(ctx, node, spec)) {
             char *binding_name = reference_name(ctx, node);
             if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {
@@ -2843,6 +2930,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
                                              lexical_ancestor_kind(node, "nonlocal_statement"));
     if (python_scope_directive || is_binding_occurrence(ctx, node, spec, state)) {
+        retain_filtered_rust_usage(ctx, node, state, CBM_USAGE_BINDING_FILTERED);
         char *binding_name = reference_name(ctx, node);
         if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {
             record_lexical_binding(ctx, state, node, spec, binding_name, false);
@@ -2853,6 +2941,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         return;
     }
     if (is_write_occurrence(ctx, node, spec, state)) {
+        retain_filtered_rust_usage(ctx, node, state, CBM_USAGE_WRITE_FILTERED);
         if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
             ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
             char *binding_name = reference_name(ctx, node);
@@ -2864,6 +2953,14 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     }
 
     char *name = reference_name(ctx, node);
+    if (ctx->language == CBM_LANG_RUST && name && name[0] && cbm_is_keyword(name, ctx->language)) {
+        TSNode parent = ts_node_parent(node);
+        bool call = !ts_node_is_null(parent) &&
+                    strcmp(ts_node_type(parent), "call_expression") == 0 &&
+                    ts_node_eq(node, ts_node_child_by_field_name(parent, "function", 8));
+        retain_filtered_rust_usage(
+            ctx, node, state, call ? CBM_USAGE_KEYWORD_CALL_FILTERED : CBM_USAGE_KEYWORD_FILTERED);
+    }
     if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
         CBMUsage usage = {0};
         usage.ref_name = name;
@@ -2875,5 +2972,15 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         usage.is_member_access = strcmp(ts_node_type(node), "field_identifier") == 0;
         stamp_usage_site(ctx, &usage, node, name, state);
         cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+        TSNode parent = ts_node_parent(node);
+        if (ctx->language == CBM_LANG_RUST && !ts_node_is_null(parent) &&
+            strcmp(ts_node_type(parent), "token_tree") == 0) {
+            /* A token-tree function name is a reference, but whether an opaque
+             * macro invokes it is unproved. Keep the ordinary USAGE resolver
+             * carrier and a separate invocation-stop candidate. */
+            usage.unresolved_filter = CBM_USAGE_MACRO_FILTERED;
+            usage.may_be_call_reference = false;
+            cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+        }
     }
 }

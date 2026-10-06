@@ -2745,8 +2745,12 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
             if (n >= 0 && (size_t)n < sizeof(source_path))
                 source_lang = cbm_detect_file_language(source_node->file_path, source_path);
         }
-        drop_plain_call |= cbm_suppress_cross_language_code_match(source_lang, rc->repo_path,
-                                                                  target_node->file_path);
+        bool cross_language = cbm_suppress_cross_language_code_match(source_lang, rc->repo_path,
+                                                                     target_node->file_path);
+        drop_plain_call |= cross_language;
+        if (lang == CBM_LANG_RUST && cross_language)
+            cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call,
+                                                NULL, "cross_language_candidate_rejected");
     }
     if (!target_node || source_node->id == target_node->id) {
         /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
@@ -2815,6 +2819,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
     }
 
+    CBMHashTable *reasons =
+        lang == CBM_LANG_RUST ? cbm_pipeline_unresolved_reasons(&result->resolved_calls) : NULL;
     if (lang == CBM_LANG_RUST) {
         cbm_pxc_rust_dump_file(rel, result);
     }
@@ -2829,6 +2835,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         atomic_fetch_add_explicit(&rc->time_ns_rc_source, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         if (!source_node) {
+            if (lang == CBM_LANG_RUST)
+                cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call,
+                                                    reasons, "source_item_absent");
             continue;
         }
 
@@ -2844,6 +2853,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   lsp_exact_idx_complete, lsp_legacy_idx_complete, allow_tail);
         const char *closure = cbm_pipeline_plain_call_closure(lang, call, lsp, module_qn);
         if (closure) {
+            cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call,
+                                                reasons, closure);
             continue;
         }
         const cbm_gbuf_node_t *lsp_target = resolve_file_call_target(
@@ -2853,11 +2864,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * resolved it to a concrete graph node. Never let registry, field-name,
          * route, or service heuristics manufacture a target for it. */
         if ((call->requires_lsp_resolution || lang == CBM_LANG_RUST) && !lsp_target) {
+            if (lang == CBM_LANG_RUST)
+                cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call,
+                                                    reasons, "target_not_materialized");
             continue;
         }
         emit_resolved_file_call(rc, ws, call, res, source_node, lsp_target, rel, module_qn,
                                 imp_keys, imp_vals, imp_count, lang, lsp);
     }
+    cbm_pipeline_unresolved_reasons_free(reasons);
     if (lsp_exact_idx) {
         cbm_ht_foreach(lsp_exact_idx, lsp_idx_free_key, NULL);
         cbm_ht_free(lsp_exact_idx);
@@ -2878,14 +2893,27 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         cbm_pipeline_lsp_reference_index_build(&result->resolved_calls, &reference_index);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
+        if (lang == CBM_LANG_RUST && usage->unresolved_filter) {
+            cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
+                                                 rc->project_name, rel, usage, result, NULL);
+            continue;
+        }
         if (!usage->ref_name) {
             continue;
         }
         const cbm_gbuf_node_t *src =
             find_source_node(rc->main_gbuf, rc->project_name, rel, usage->enclosing_func_qn);
         if (!src) {
+            if (lang == CBM_LANG_RUST)
+                cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
+                                                     rc->project_name, rel, usage, result,
+                                                     "source_item_absent");
             continue;
         }
+        if (lang == CBM_LANG_RUST && strcmp(src->file_path, rel) != 0)
+            cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
+                                                 rc->project_name, rel, usage, result,
+                                                 "source_file_mismatch");
         const cbm_gbuf_node_t *tgt = NULL;
         const char *publishing_rule = "registry";
         bool precise_call_reference = false;
@@ -2911,6 +2939,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             /* Exact semantic ownership beats textual name fallback even when
              * the semantic target is not materialized in this graph. */
             if (semantic_reference) {
+                if (lang == CBM_LANG_RUST)
+                    cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
+                                                         rc->project_name, rel, usage, result,
+                                                         "target_not_materialized");
                 continue;
             }
             /* A proven field access owns its occurrence (twin: pass_usages.c). */
@@ -2922,6 +2954,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt)
                 publishing_rule = "field_owner";
             if (field_owned && !tgt) {
+                if (lang == CBM_LANG_RUST)
+                    cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
+                                                         rc->project_name, rel, usage, result,
+                                                         "target_not_materialized");
                 continue;
             }
         }
@@ -2946,9 +2982,15 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         /* An unresolved Rust type path must not be shortened to a same-named
          * declaration from another module or an unrelated imported alias. */
         if (!tgt && lang == CBM_LANG_RUST && usage->kind == CBM_USAGE_TYPE) {
+            cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
+                                                 rc->project_name, rel, usage, result,
+                                                 "type_path_not_proven");
             continue;
         }
         if (!tgt && lang == CBM_LANG_RUST) {
+            cbm_pipeline_record_unresolved_usage(
+                ws->local_edge_buf, rc->main_gbuf, rc->project_name, rel, usage, result,
+                usage->is_member_access ? "member_target_not_proven" : "value_path_not_proven");
             continue;
         }
         if (!tgt) {
@@ -2977,6 +3019,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt &&
                 (cbm_suppress_cross_language_ref(lang, tgt->file_path) ||
                  cbm_suppress_cross_language_code_match(lang, rc->repo_path, tgt->file_path))) {
+                if (lang == CBM_LANG_RUST)
+                    cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
+                                                         rc->project_name, rel, usage, result,
+                                                         "cross_language_candidate_rejected");
                 continue;
             }
             /* #1942/#1962: a bare Go reference can never denote a struct
@@ -3007,6 +3053,12 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                                        ? lang
                                                        : cbm_language_for_filename(src->file_path),
                                                    rc->repo_path, tgt->file_path)) {
+            if (lang == CBM_LANG_RUST)
+                cbm_pipeline_record_unresolved_usage(
+                    ws->local_edge_buf, rc->main_gbuf, rc->project_name, rel, usage, result,
+                    !tgt                 ? "target_not_materialized"
+                    : src->id == tgt->id ? "self_usage_suppressed"
+                                         : "cross_language_candidate_rejected");
             continue;
         }
         /* 512, matching the sequential twin in pass_usages.c. esc_ref holds up
@@ -3015,6 +3067,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
          * closing quote-brace and persisting MALFORMED JSON. The two paths must
          * also agree: the same repo indexed in parallel and sequentially has to
          * produce byte-identical edge properties. */
+        if (lang == CBM_LANG_RUST)
+            cbm_pipeline_record_unproven_usage_target(ws->local_edge_buf, rc->main_gbuf,
+                                                      rc->project_name, rel, usage, result, tgt,
+                                                      precise_call_reference);
         char uprops[CBM_SZ_512];
         char esc_ref[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
         cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);

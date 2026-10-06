@@ -88,6 +88,7 @@ struct cbm_gbuf {
      * This ensures pointers stored in hash tables remain valid when the
      * pointer array reallocs (only the pointer array moves, not the nodes). */
     CBM_DYN_ARRAY(cbm_gbuf_node_t *) nodes;
+    CBM_DYN_ARRAY(cbm_unresolved_site_t) unresolved_sites;
 
     /* Primary index: QN → cbm_gbuf_node_t* */
     CBMHashTable *node_by_qn;
@@ -671,10 +672,22 @@ cbm_gbuf_t *cbm_gbuf_new_worker(const char *project, const char *root_path,
     return gb;
 }
 
+void cbm_gbuf_record_unresolved(cbm_gbuf_t *gb, const cbm_unresolved_site_t *site) {
+    cbm_unresolved_site_t copy = *site;
+    copy.file_path = gb_intern(gb, site->file_path);
+    copy.caller = gb_intern(gb, site->caller);
+    copy.name = gb_intern(gb, site->name);
+    copy.kind = gb_intern(gb, site->kind);
+    copy.reason = gb_intern(gb, site->reason);
+    cbm_da_push(&gb->unresolved_sites, copy);
+}
+
 void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
     }
+
+    cbm_da_free(&gb->unresolved_sites);
 
     /* Free each individually-allocated node */
     for (int i = 0; i < gb->nodes.count; i++) {
@@ -1113,6 +1126,14 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         return CBM_NOT_FOUND;
     }
 
+    int kept = 0;
+    for (int i = 0; i < gb->unresolved_sites.count; i++) {
+        cbm_unresolved_site_t *site = &gb->unresolved_sites.items[i];
+        if (strcmp(site->file_path, file_path) != 0)
+            gb->unresolved_sites.items[kept++] = *site;
+    }
+    gb->unresolved_sites.count = kept;
+
     /* Collect IDs of nodes in this file */
     CBMHashTable *deleted_set = cbm_ht_create(CBM_SZ_64);
     int deleted_count = 0;
@@ -1168,6 +1189,31 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         cbm_log_info("gbuf.delete_by_file", "file", file_path, "scanned", s_buf, "deleted", d_buf);
     }
     return deleted_count;
+}
+
+static int load_unresolved_sites(cbm_gbuf_t *gb, sqlite3 *db, const char *project) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT file_path,caller,name,kind,reason,line,site_start_byte,site_end_byte "
+                      "FROM unresolved_sites WHERE project=?1";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return CBM_NOT_FOUND;
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        cbm_unresolved_site_t site = {
+            .file_path = (const char *)sqlite3_column_text(stmt, 0),
+            .caller = (const char *)sqlite3_column_text(stmt, 1),
+            .name = (const char *)sqlite3_column_text(stmt, 2),
+            .kind = (const char *)sqlite3_column_text(stmt, 3),
+            .reason = (const char *)sqlite3_column_text(stmt, 4),
+            .line = sqlite3_column_int(stmt, 5),
+            .site_start_byte = (uint32_t)sqlite3_column_int64(stmt, 6),
+            .site_end_byte = (uint32_t)sqlite3_column_int64(stmt, 7),
+        };
+        cbm_gbuf_record_unresolved(gb, &site);
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : CBM_NOT_FOUND;
 }
 
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
@@ -1261,9 +1307,10 @@ int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *proje
     }
     sqlite3_finalize(stmt);
 
+    int unresolved_rc = load_unresolved_sites(gb, db, project);
     cbm_free(CBM_MEM_CLASS_GBUF_INDEX, old_to_new);
     cbm_store_close(store);
-    return 0;
+    return unresolved_rc;
 }
 
 void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, void *userdata) {
@@ -1666,6 +1713,8 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
     if (!dst || !src) {
         return CBM_NOT_FOUND;
     }
+    for (int i = 0; i < src->unresolved_sites.count; i++)
+        cbm_gbuf_record_unresolved(dst, &src->unresolved_sites.items[i]);
     if (src->nodes.count == 0 && src->edges.count == 0) {
         return 0;
     }
@@ -1948,6 +1997,23 @@ static void release_and_remap_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_fin
     CBM_PROF_END_N("dump", "5_vector_remap_sort", t_vec_remap, gb->dump_vector_count);
 }
 
+static int dump_unresolved_sites(cbm_gbuf_t *gb, const char *path) {
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open(path, &db);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+    if (rc == SQLITE_OK)
+        rc = cbm_store_write_unresolved_sites(db, gb->project, gb->unresolved_sites.items,
+                                              gb->unresolved_sites.count);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    if (rc != SQLITE_OK)
+        cbm_log_error("gbuf.unresolved_write_failed", "error",
+                      db ? sqlite3_errmsg(db) : "open failed");
+    sqlite3_close(db);
+    return rc == SQLITE_OK ? 0 : CBM_NOT_FOUND;
+}
+
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
@@ -2045,6 +2111,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         rc = frc;
     }
 
+    if (rc == 0)
+        rc = dump_unresolved_sites(gb, path);
     log_dump_summary(node_idx, edge_idx);
     free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
     cbm_free(CBM_MEM_CLASS_DUMP, src_nodes);
@@ -2117,6 +2185,13 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         cbm_store_insert_edge(store, &se);
     }
 
+    if (cbm_store_write_unresolved_sites(cbm_store_get_db(store), gb->project,
+                                         gb->unresolved_sites.items,
+                                         gb->unresolved_sites.count) != CBM_STORE_OK) {
+        cbm_store_rollback(store);
+        cbm_free(CBM_MEM_CLASS_DUMP, temp_to_real);
+        return CBM_NOT_FOUND;
+    }
     cbm_store_commit(store);
     cbm_store_create_indexes(store);
     cbm_store_end_bulk(store);
@@ -2178,6 +2253,13 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         cbm_store_insert_edge(store, &se);
     }
 
+    if (cbm_store_write_unresolved_sites(cbm_store_get_db(store), gb->project,
+                                         gb->unresolved_sites.items,
+                                         gb->unresolved_sites.count) != CBM_STORE_OK) {
+        cbm_store_rollback(store);
+        cbm_free(CBM_MEM_CLASS_DUMP, temp_to_real);
+        return CBM_NOT_FOUND;
+    }
     cbm_store_commit(store);
 
     cbm_free(CBM_MEM_CLASS_DUMP, temp_to_real);

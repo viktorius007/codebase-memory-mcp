@@ -13,6 +13,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
+#include "mcp/mcp.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
 #include "foundation/sha256.h"
@@ -3026,6 +3027,170 @@ static const usage_expectation_t rust_field_record_rows[] = {
     {"guess", "x", "src/b.rs", 0, NULL},   {"mkg", "n", "src/a.rs", 1, "Field"},
     {"mkg", "n", "src/a.rs", 0, "Method"},
 };
+
+TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable) {
+    char tmp[256] = "/tmp/cbm_unresolved_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub fn target() {}\n"
+                    "pub fn known() { target(); }\n"
+                    "pub fn unknown(x: Missing) { x.absent(); x.absent(); let _ = x.field; }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/fixture.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char *project = strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+    const char *indexed_fixture = getenv("CBM_UNRESOLVED_FIXTURE_DB");
+    const char *fixture_project = getenv("CBM_UNRESOLVED_FIXTURE_PROJECT");
+    if (indexed_fixture && fixture_project) {
+        snprintf(db, sizeof(db), "%s", indexed_fixture);
+        free(project);
+        project = strdup(fixture_project);
+    }
+    char snapshot_path[1024];
+    snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s.db", tmp, project);
+    cbm_store_t *source = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(source);
+    sqlite3 *destination = NULL;
+    ASSERT_EQ(sqlite3_open(snapshot_path, &destination), SQLITE_OK);
+    sqlite3_backup *snapshot =
+        sqlite3_backup_init(destination, "main", cbm_store_get_db(source), "main");
+    ASSERT_NOT_NULL(snapshot);
+    ASSERT_EQ(sqlite3_backup_step(snapshot, -1), SQLITE_DONE);
+    ASSERT_EQ(sqlite3_backup_finish(snapshot), SQLITE_OK);
+    sqlite3_close(destination);
+    cbm_store_close(source);
+    char saved_cache[4096] = {0};
+    const char *previous_cache = getenv("CBM_CACHE_DIR");
+    if (previous_cache)
+        snprintf(saved_cache, sizeof(saved_cache), "%s", previous_cache);
+    cbm_setenv("CBM_CACHE_DIR", tmp, 1);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(server);
+    ASSERT_NOT_NULL(cbm_mcp_server_store(server));
+    cbm_mcp_server_set_project(server, project);
+    char args[1024];
+    snprintf(
+        args, sizeof(args),
+        "{\"project\":\"%s\",\"function_name\":\"unknown\",\"unresolved_only\":true,\"limit\":1}",
+        project);
+    char *listing = cbm_mcp_handle_tool(server, "trace_path", args);
+    ASSERT_NOT_NULL(listing);
+    yyjson_doc *envelope = yyjson_read(listing, strlen(listing), 0);
+    ASSERT_NOT_NULL(envelope);
+    const char *payload = yyjson_get_str(yyjson_obj_get(
+        yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(envelope), "content"), 0), "text"));
+    ASSERT_NOT_NULL(payload);
+    yyjson_doc *data = yyjson_read(payload, strlen(payload), 0);
+    ASSERT_NOT_NULL(data);
+    yyjson_val *root = yyjson_doc_get_root(data);
+    ASSERT_EQ(yyjson_get_sint(yyjson_obj_get(root, "calls")), 2);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+    yyjson_val *sites = yyjson_obj_get(root, "sites");
+    ASSERT_EQ(yyjson_arr_size(sites), 1);
+    yyjson_val *site = yyjson_arr_get(sites, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(site, "reason")), "method_not_found");
+    ASSERT_EQ(yyjson_get_sint(yyjson_obj_get(site, "line")), 3);
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(site, "name")), "absent"));
+    ASSERT_GT(yyjson_get_uint(yyjson_obj_get(site, "site_end_byte")),
+              yyjson_get_uint(yyjson_obj_get(site, "site_start_byte")));
+    yyjson_doc_free(data);
+    yyjson_doc_free(envelope);
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"function_name\":\"unknown\",\"direction\":\"outbound\","
+             "\"depth\":1,\"format\":\"json\"}",
+             project);
+    char *trace = cbm_mcp_handle_tool(server, "trace_path", args);
+    ASSERT_NOT_NULL(trace);
+    ASSERT_NOT_NULL(strstr(trace, "unresolved_sites"));
+    ASSERT_NOT_NULL(strstr(trace, "enclosing_item"));
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"paths\":[\"src/lib.rs\"],\"format\":\"json\"}", project);
+    char *coverage = cbm_mcp_handle_tool(server, "check_index_coverage", args);
+    ASSERT_NOT_NULL(coverage);
+    ASSERT_NOT_NULL(strstr(coverage, "unresolved_sites"));
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", project);
+    char *status = cbm_mcp_handle_tool(server, "index_status", args);
+    ASSERT_NOT_NULL(status);
+    ASSERT_NOT_NULL(strstr(status, "unresolved_sites"));
+    printf("unresolved fixture listing: %s\ntrace: %s\ncoverage: %s\nstatus: %s\n", listing, trace,
+           coverage, status);
+    free(listing);
+    free(trace);
+    free(coverage);
+    free(status);
+    cbm_mcp_server_free(server);
+    if (saved_cache[0])
+        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    else
+        cbm_unsetenv("CBM_CACHE_DIR");
+    free(project);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded) {
+    char tmp[256] = "/tmp/cbm_unresolved_filtered_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub enum Mode { Ready, Go }\n"
+                    "pub struct Payload { pub field: i32 }\n"
+                    "pub fn target() {}\n"
+                    "pub fn unknown(x: Missing) {\n"
+                    "    x\n"
+                    "        .absent();\n"
+                    "    let _ = Mode::Ready;\n"
+                    "    let Payload { field, .. } = make();\n"
+                    "    x.field = 1;\n"
+                    "    let _ = Payload { field };\n"
+                    "    opaque!(target, Mode::Go, x.field);\n"
+                    "}\n"
+                    "pub const INIT: Payload = Payload { field: 42 };\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/fixture.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(store);
+    const struct {
+        int line;
+        const char *name;
+        const char *reason;
+    } expected[] = {
+        {6, "absent", "method_not_found"},
+        {7, "Mode::Ready", "value_path_not_proven"},
+        {8, "field", "binding_syntax_filtered"},
+        {9, "field", "write_syntax_filtered"},
+        {10, "field", "field_label_syntax_filtered"},
+        {11, "target", "macro_invocation_not_proven"},
+    };
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+                                 "SELECT caller FROM unresolved_sites WHERE file_path='src/lib.rs' "
+                                 "AND line=?1 AND name=?2 AND reason=?3",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        sqlite3_bind_int(stmt, 1, expected[i].line);
+        sqlite3_bind_text(stmt, 2, expected[i].name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, expected[i].reason, -1, SQLITE_STATIC);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_NOT_NULL(strstr((const char *)sqlite3_column_text(stmt, 0), ".unknown"));
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    th_rmtree(tmp);
+    PASS();
+}
 
 TEST(pipeline_rust_field_usage_from_resolver_record) {
     char tmp[256];
@@ -19826,6 +19991,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_rust_usage_never_binds_method_by_bare_name);
     RUN_TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob);
     RUN_TEST(pipeline_rust_turbofish_method_binds_written_type_argument);
+    RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
+    RUN_TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded);
     RUN_TEST(pipeline_rust_field_usage_from_resolver_record);
     RUN_TEST(pipeline_python_and_go_bare_name_keep_import_reachability);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
@@ -19865,4 +20032,9 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);
 #endif
+}
+
+SUITE(pipeline_unresolved) {
+    RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
+    RUN_TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded);
 }

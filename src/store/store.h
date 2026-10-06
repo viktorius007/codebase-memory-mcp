@@ -664,8 +664,48 @@ typedef struct {
      CBM_RUST_SEMANTIC_GAP_IMPL_RELATIONSHIPS_UNAVAILABLE)
 
 enum {
-    CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION = 16,
+    CBM_RUST_SEMANTIC_GAPS_COVERAGE_VERSION = 17,
 };
+
+/* site_extent stores (byte length << 2) | kind; small reference tokens stay compact.
+ * The public view exposes the original kind and byte coordinates. */
+#define CBM_UNRESOLVED_SCHEMA_SQL                                                                  \
+    "CREATE TABLE IF NOT EXISTS unresolved_strings(id INTEGER PRIMARY KEY,value TEXT NOT "         \
+    "NULL);"                                                                                       \
+    "CREATE TABLE IF NOT EXISTS unresolved_occurrences("                                           \
+    "project_id INTEGER NOT NULL REFERENCES unresolved_strings(id),"                               \
+    "file_id INTEGER NOT NULL,"                                                                    \
+    "site_start_byte INTEGER NOT NULL,site_extent INTEGER NOT NULL,line INTEGER NOT NULL,"         \
+    "caller_id INTEGER NOT NULL,name_id INTEGER NOT NULL,reason_id INTEGER NOT NULL,"              \
+    "PRIMARY KEY(project_id,file_id,site_start_byte,site_extent)) WITHOUT ROWID;"                  \
+    "CREATE VIEW IF NOT EXISTS unresolved_sites AS SELECT p.value AS project,f.value AS "          \
+    "file_path,"                                                                                   \
+    "CASE (o.site_extent & 3) WHEN 0 THEN 'call' WHEN 1 THEN 'type' WHEN 2 THEN 'member' ELSE "    \
+    "'reference' END "                                                                             \
+    "AS kind,"                                                                                     \
+    "o.site_start_byte,o.site_start_byte+(o.site_extent >> 2) AS site_end_byte,o.line,c.value AS " \
+    "caller,n.value AS name,r.value AS "                                                           \
+    "reason "                                                                                      \
+    "FROM unresolved_occurrences o JOIN unresolved_strings p ON p.id=o.project_id JOIN "           \
+    "unresolved_strings f ON f.id=o.file_id "                                                      \
+    "JOIN unresolved_strings c ON c.id=o.caller_id JOIN unresolved_strings n ON n.id=o.name_id "   \
+    "JOIN unresolved_strings r ON r.id=o.reason_id;"
+
+typedef struct {
+    const char *file_path;
+    const char *caller;
+    const char *name;
+    const char *kind;
+    const char *reason;
+    int line;
+    uint32_t site_start_byte;
+    uint32_t site_end_byte;
+} cbm_unresolved_site_t;
+
+/* Write occurrence metadata within the caller's transaction. No graph facts
+ * or IDs are allocated. File/project deletion has the same lifetime as nodes. */
+int cbm_store_write_unresolved_sites(struct sqlite3 *db, const char *project,
+                                     const cbm_unresolved_site_t *sites, int count);
 
 /* Metadata describing how completely one index run recorded the best-effort
  * coverage signal. `recording_status` is "complete", "truncated", or

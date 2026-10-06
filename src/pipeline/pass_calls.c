@@ -10,6 +10,8 @@
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
+#include "foundation/platform.h"
 
 enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 /* Confidence for a service-pattern HTTP/ASYNC edge emitted when registry
@@ -559,12 +561,190 @@ static bool emit_service_pattern_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     return true;
 }
 
+void cbm_pipeline_record_unresolved(cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                    const char *caller, const char *name, const char *kind,
+                                    const char *reason, int line, uint32_t start, uint32_t end) {
+    char *fallback =
+        (!caller || !caller[0]) ? cbm_pipeline_fqn_compute(project, rel, "__file__") : NULL;
+    cbm_unresolved_site_t site = {.file_path = rel,
+                                  .caller = fallback ? fallback : caller,
+                                  .name = name ? name : "",
+                                  .kind = kind,
+                                  .reason = reason,
+                                  .line = line,
+                                  .site_start_byte = start,
+                                  .site_end_byte = end};
+    cbm_gbuf_record_unresolved(gbuf, &site);
+    safe_free(fallback);
+}
+
+static char *unresolved_occurrence_key(const char *caller, uint32_t start, uint32_t end,
+                                       CBMSourceOrigin origin) {
+    const char *name = caller ? caller : "";
+    size_t size = strlen(name) + CBM_SZ_64;
+    char *key = cbm_alloc(CBM_MEM_CLASS_GBUF_INDEX, size);
+    if (key)
+        snprintf(key, size, "%u:%u:%u:%s", start, end, (unsigned)origin, name);
+    return key;
+}
+
+CBMHashTable *cbm_pipeline_unresolved_reasons(const CBMResolvedCallArray *rows) {
+    CBMHashTable *reasons = cbm_ht_create((uint32_t)rows->count + 1);
+    for (int i = 0; reasons && i < rows->count; i++) {
+        const CBMResolvedCall *row = &rows->items[i];
+        if (row->kind != CBM_RESOLVED_INVOCATION || row->site_end_byte <= row->site_start_byte)
+            continue;
+        char *key = unresolved_occurrence_key(row->caller_qn, row->site_start_byte,
+                                              row->site_end_byte, row->source_origin);
+        if (!key)
+            continue;
+        const char *existing = cbm_ht_get_key(reasons, key);
+        if (existing) {
+            cbm_ht_set(reasons, existing, (void *)row);
+            cbm_free(CBM_MEM_CLASS_GBUF_INDEX, key);
+        } else {
+            cbm_ht_set(reasons, key, (void *)row);
+        }
+    }
+    return reasons;
+}
+
+static void unresolved_reason_key_free(const char *key, void *value, void *context) {
+    (void)value;
+    (void)context;
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, (void *)key);
+}
+
+void cbm_pipeline_unresolved_reasons_free(CBMHashTable *reasons) {
+    if (reasons) {
+        cbm_ht_foreach(reasons, unresolved_reason_key_free, NULL);
+        cbm_ht_free(reasons);
+    }
+}
+
+void cbm_pipeline_record_unresolved_call(cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                         const CBMCall *call, const CBMHashTable *reasons,
+                                         const char *stop) {
+    char *key = unresolved_occurrence_key(call->enclosing_func_qn, call->site_start_byte,
+                                          call->site_end_byte, call->source_origin);
+    const CBMResolvedCall *row = key && reasons ? cbm_ht_get(reasons, key) : NULL;
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, key);
+    /* The index retains the last exact occurrence, including successful rows.
+     * An earlier failure must never describe a later semantic pass's result. */
+    if (row && row->reason && row->strategy && strcmp(row->strategy, "lsp_unresolved") == 0 &&
+        cbm_pipeline_invocation_leaf_matches(row, call, 2))
+        stop = strncmp(row->reason, "trait_receiver_shape:", 21) == 0 ? "trait_receiver_shape"
+                                                                      : row->reason;
+    cbm_pipeline_record_unresolved(
+        gbuf, project, rel, call->enclosing_func_qn, cbm_lsp_bare_segment(call->callee_name),
+        "call", stop, call->unresolved_line > 0 ? call->unresolved_line : call->start_line,
+        call->site_start_byte, call->site_end_byte);
+}
+
+void cbm_pipeline_record_unresolved_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_t *symbols,
+                                          const char *project, const char *rel,
+                                          const CBMUsage *usage, const CBMFileResult *result,
+                                          const char *stop) {
+    static const char *const filters[] = {NULL,
+                                          "binding_syntax_filtered",
+                                          "write_syntax_filtered",
+                                          "import_syntax_filtered",
+                                          "macro_invocation_not_proven",
+                                          "field_label_syntax_filtered",
+                                          "keyword_syntax_filtered",
+                                          "keyword_syntax_filtered",
+                                          "macro_token_not_resolved"};
+    if (usage->unresolved_filter)
+        stop = filters[usage->unresolved_filter];
+    bool macro = usage->unresolved_filter == CBM_USAGE_MACRO_FILTERED;
+    bool keyword = usage->unresolved_filter == CBM_USAGE_KEYWORD_FILTERED;
+    bool keyword_call = usage->unresolved_filter == CBM_USAGE_KEYWORD_CALL_FILTERED;
+    bool relevant = usage->unresolved_filter == CBM_USAGE_MACRO_TOKEN_FILTERED || keyword_call ||
+                    (!macro && !keyword &&
+                     (usage->kind == CBM_USAGE_TYPE || usage->is_member_access ||
+                      strstr(usage->ref_name, "::") != NULL));
+    /* Self is a type occurrence even though its target's written declaration
+     * has another name. Other filtered keyword names need a graph candidate. */
+    relevant |= macro && result->module_qn && usage->enclosing_func_qn &&
+                strcmp(usage->enclosing_func_qn, result->module_qn) == 0;
+    relevant |= usage->may_be_call_reference && !usage->semantic_reference_local_shadow;
+    relevant |= keyword && usage->kind == CBM_USAGE_TYPE && strcmp(usage->ref_name, "Self") == 0;
+    if (!relevant) {
+        const cbm_gbuf_node_t **named = NULL;
+        int count = 0;
+        cbm_gbuf_find_by_name(symbols, cbm_lsp_bare_segment(usage->ref_name), &named, &count);
+        for (int i = 0; i < count && !relevant; i++) {
+            const char *label = named[i]->label;
+            relevant = (label &&
+                        (strcmp(label, "Struct") == 0 || strcmp(label, "Enum") == 0 ||
+                         strcmp(label, "EnumVariant") == 0 || strcmp(label, "Interface") == 0 ||
+                         strcmp(label, "Type") == 0 || strcmp(label, "AssociatedType") == 0 ||
+                         ((macro || keyword) &&
+                          (strcmp(label, "Field") == 0 || strcmp(label, "Function") == 0 ||
+                           strcmp(label, "Method") == 0 || strcmp(label, "Macro") == 0)) ||
+                         (usage->may_be_call_reference && !usage->semantic_reference_local_shadow &&
+                          (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0))));
+        }
+    }
+    if (!relevant)
+        return;
+    int line = usage->start_line;
+    if (!usage->unresolved_filter) {
+        for (const char *p = usage->ref_name; *p; p++)
+            line += *p == '\n';
+    }
+    const char *caller = usage->enclosing_func_qn;
+    const cbm_gbuf_node_t *enclosing = caller ? cbm_gbuf_find_by_qn(symbols, caller) : NULL;
+    if (enclosing && strcmp(enclosing->file_path, rel) != 0)
+        caller = NULL;
+    cbm_pipeline_record_unresolved(gbuf, project, rel, caller, usage->ref_name,
+                                   keyword_call                    ? "call"
+                                   : usage->kind == CBM_USAGE_TYPE ? "type"
+                                   : usage->is_member_access       ? "member"
+                                                                   : "reference",
+                                   stop, line, usage->site_start_byte, usage->site_end_byte);
+}
+
+void cbm_pipeline_record_unproven_usage_target(cbm_gbuf_t *destination, const cbm_gbuf_t *symbols,
+                                               const char *project, const char *rel,
+                                               const CBMUsage *usage, const CBMFileResult *result,
+                                               const cbm_gbuf_node_t *target,
+                                               bool precise_reference) {
+    if (!target || precise_reference)
+        return;
+    const char *reason = NULL;
+    if (usage->is_member_access && strcmp(target->label, "Field") != 0) {
+        reason = "member_target_not_proven";
+    } else {
+        const cbm_gbuf_node_t **named = NULL;
+        int count = 0;
+        cbm_gbuf_find_by_name(symbols, target->name, &named, &count);
+        for (int i = 0; i < count && !reason; i++) {
+            const cbm_gbuf_node_t *other = named[i];
+            if (other->id == target->id || strcmp(other->file_path, target->file_path) != 0 ||
+                (strcmp(other->label, target->label) != 0 &&
+                 !(cbm_label_is_type_like(other->label) && cbm_label_is_type_like(target->label))))
+                continue;
+            size_t length = strcspn(target->qualified_name, "#");
+            if (strncmp(other->qualified_name, target->qualified_name, length) == 0 &&
+                (other->qualified_name[length] == '#' || other->qualified_name[length] == '\0'))
+                reason = "usage_target_identity_not_proven";
+        }
+    }
+    if (reason)
+        cbm_pipeline_record_unresolved_usage(destination, symbols, project, rel, usage, result,
+                                             reason);
+}
+
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
-                               const CBMResolvedCallArray *lsp_calls, const char *rel,
-                               const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count, CBMLanguage lang) {
+                               const CBMResolvedCallArray *lsp_calls, const CBMHashTable *reasons,
+                               const char *rel, const char *module_qn, const char **imp_keys,
+                               const char **imp_vals, int imp_count, CBMLanguage lang) {
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
+        if (lang == CBM_LANG_RUST)
+            cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+                                                "source_item_absent");
         return 0;
     }
 
@@ -575,6 +755,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
     const char *closure = cbm_pipeline_plain_call_closure(lang, call, lsp, module_qn);
     if (closure) {
+        cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+                                            closure);
         return 0;
     }
     if (lsp) {
@@ -615,6 +797,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * unresolved primitive expression such as `int + int` to an unrelated
      * project `operator+`, fabricating a CALLS edge. */
     if (call->requires_lsp_resolution || lang == CBM_LANG_RUST) {
+        if (lang == CBM_LANG_RUST)
+            cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+                                                "target_not_materialized");
         return 0;
     }
 
@@ -878,6 +1063,9 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             cbm_pxc_rust_dump_file(rel, result);
         }
 
+        CBMHashTable *reasons = files[i].language == CBM_LANG_RUST
+                                    ? cbm_pipeline_unresolved_reasons(&result->resolved_calls)
+                                    : NULL;
         /* Resolve each call */
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
@@ -885,14 +1073,15 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 continue;
             }
             total_calls++;
-            if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language)) {
+            if (resolve_single_call(ctx, call, &result->resolved_calls, reasons, rel, module_qn,
+                                    imp_keys, imp_vals, imp_count, files[i].language)) {
                 resolved++;
             } else {
                 unresolved++;
             }
         }
 
+        cbm_pipeline_unresolved_reasons_free(reasons);
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
