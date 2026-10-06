@@ -26,6 +26,7 @@ typedef enum {
     /* Rust only: the method's first parameter is a `self` receiver, so the
      * first argument of a `Trait::method(x, ..)` path call is the receiver. */
     CBM_FUNC_FLAG_RUST_SELF = 1 << 11,
+    CBM_FUNC_FLAG_RUST_VALUE_SELF = 1 << 12, // Rust: receiver is `self` or `mut self`
 } CBMFuncFlags;
 
 // Registered function/method with full type signature.
@@ -52,6 +53,7 @@ typedef struct {
      * (`impl Tr for Box<dyn X>`) as written, its names resolved in the impl's
      * module; the method is registered on the wrapper's QN. NULL otherwise. */
     const CBMType *rust_wrapper_impl_self;
+    const char **rust_unbounded_impl_params; /* source-proved unconstrained impl parameters */
     /* Rust only: per declared parameter (parallel to the signature's
      * param_types), the FUNC type of the call signature the parameter
      * declares for a callable argument (`impl Fn(&T)`, `&dyn FnMut(A, B)`,

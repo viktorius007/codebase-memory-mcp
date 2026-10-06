@@ -3095,7 +3095,8 @@ static bool rust_fn_is_async(TSNode fn) {
 /* Rust: the function's first parameter is a `self` receiver (`self`, `&self`,
  * `&mut self`, `mut self` or a typed `self: Box<Self>`). An associated function
  * without one takes its first call argument as an ordinary parameter. */
-static bool rust_fn_has_self_receiver(TSNode fn, const char *source) {
+static bool rust_fn_has_self_receiver(TSNode fn, const char *source, bool *value_self) {
+    *value_self = false;
     TSNode params = ts_node_child_by_field_name(fn, TS_FIELD("parameters"));
     if (ts_node_is_null(params)) {
         return false;
@@ -3109,6 +3110,12 @@ static bool rust_fn_has_self_receiver(TSNode fn, const char *source) {
             continue;
         }
         if (strcmp(kind, "self_parameter") == 0) {
+            *value_self = true;
+            for (uint32_t j = 0; j < ts_node_child_count(p); j++) {
+                if (strcmp(ts_node_type(ts_node_child(p, j)), "&") == 0) {
+                    *value_self = false;
+                }
+            }
             return true;
         }
         if (strcmp(kind, "parameter") != 0) {
@@ -5344,7 +5351,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     }
     if (ctx->language == CBM_LANG_RUST) {
         def.is_async = rust_fn_is_async(child);
-        def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source);
+        def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source, &def.has_rust_value_self);
         int type_param_count = 0;
         def.rust_type_params = rust_item_type_param_names(a, child, ctx->source, &type_param_count);
     }
@@ -5574,6 +5581,7 @@ typedef struct {
     const char *type_qn;
     const char *receiver_name;
     const char *impl_trait;
+    const char **unbounded_params;
 } RustImplOwner;
 
 /* One member of an impl body: a method, an associated const or an associated
@@ -5610,8 +5618,9 @@ static void extract_rust_impl_member(CBMExtractCtx *ctx, TSNode child, const Rus
     def.receiver = owner->receiver_name;
     def.parent_class = owner->type_qn;
     def.impl_trait = impl_trait;
+    def.rust_unbounded_impl_params = owner->unbounded_params;
     def.is_async = rust_fn_is_async(child);
-    def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source);
+    def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source, &def.has_rust_value_self);
     int type_param_count = 0;
     def.rust_type_params = rust_item_type_param_names(a, child, ctx->source, &type_param_count);
     /* A trait-impl method takes the trait's visibility, never its own. */
@@ -6506,6 +6515,13 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
     RustImplOwner owner = {
         .type_qn = type_qn, .receiver_name = receiver_name, .impl_trait = impl_trait};
+    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("type_parameters"));
+    TSNode where = cbm_find_child_by_kind(node, "where_clause");
+    if (ts_node_is_null(where) &&
+        (ts_node_is_null(params) || !rust_subtree_has_kind(params, "trait_bounds", 0))) {
+        int param_count = 0;
+        owner.unbounded_params = rust_item_type_param_names(a, node, ctx->source, &param_count);
+    }
     uint32_t count = ts_node_child_count(body);
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(body, i);

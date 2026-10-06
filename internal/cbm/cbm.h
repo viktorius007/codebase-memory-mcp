@@ -240,6 +240,8 @@ typedef struct {
     /* Rust only: a method or trait method whose first parameter is a `self`
      * receiver. False for an associated function such as `fn new() -> Self`. */
     bool has_rust_self;
+    bool has_rust_value_self;                /* unborrowed `self` or `mut self` */
+    const char **rust_unbounded_impl_params; /* declared impl parameters with no bounds */
     /* Rust only: a `type Name<P..> = Target;` item's target as written and its
      * type parameter names in declaration order (NULL-ended, NULL when none),
      * so a resolver reads a use of the alias as the target. NULL otherwise. */
