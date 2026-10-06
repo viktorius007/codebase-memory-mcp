@@ -4,8 +4,8 @@ import collections, random, re
 import os
 D=os.environ.get('AUDIT_DIR','/tmp/ts-audit')+'/'
 CORPUS=os.environ.get('AUDIT_CORPUS',os.path.expanduser('~/.cache/cbm-rust-bench/codex/codex-rs'))+'/'
-UNRESOLVED='unverifiable: oracle left every call site unresolved (dev-dependency cycle, inactive cfg)'
-UNEXPANDED='unverifiable: no oracle record in the macro holding the call (unexpanded, or arguments unresolved)'
+UNRESOLVED='unverifiable: oracle left a source call site unresolved (dev-dependency cycle, inactive cfg)'
+UNMACRO='unverifiable: oracle has no target for the named call in macro arguments'
 UNIMPORTED='unverifiable: oracle left every import of the callee crate unresolved in the caller file (dev-dependency cycle)'
 nodes={}
 for l in open(D+'g_nodes.tsv',errors='replace'):
@@ -122,51 +122,47 @@ def crate_unresolved(f,df):
     spans=[r for root,r in use_decls[f] if root==crate]
     return bool(spans) and not any((f,ln) in ref_lines for r in spans for ln in r)
 def no_oracle_data(a,b):
-    """Why the oracle cannot judge the published call a -> b, or None when it can.
+    """Return an oracle gap when some source call of this name has no target.
 
-    Every textual call of b's name inside a's span is located in the corpus source. The
-    pair is unverifiable only when the oracle recorded no resolution for any of them: no
-    record on the site line names b, and every other resolved call record on that line
-    names a different call written on the same line (so none can be b's call resolved
-    under another name). UNRESOLVED: each site line carries an unresolved record of the
-    site's form (path or method). UNEXPANDED: some site carries no record at all, which
-    is legitimate only inside a macro token tree that produced no record on any of its
-    lines, and only when the name is not bound locally (a closure call has no record).
-    UNIMPORTED: some site has neither, but the crate defining b is absent from the
-    caller file's compilation (crate_unresolved), so the oracle cannot resolve any call
-    into it and no record on that line can be b's call."""
+    A resolved namesake elsewhere does not judge an unresolved site. Macro arguments
+    have SCIP references rather than syntactic unresolved rows, so a missing named
+    reference is a gap even when neighboring arguments have resolved references.
+    This changes verifiability only; it never credits a missing target as correct.
+    """
     lines=source(a[2]); n=b[1]
     if not lines: return None
-    call=re.compile(r'(\.\s*)?(?<![\w$])'+re.escape(n)+r'\s*(::\s*<[^()]*>\s*)?\(')
+    names={n}
+    for alias in re.finditer(r'\b'+re.escape(n)+r'\s+as\s+(\w+)\b', '\n'.join(lines)):
+        names.add(alias.group(1))
+    spelling='(?:'+'|'.join(map(re.escape,sorted(names)))+')'
+    call=re.compile(r'(\.\s*)?(?<![\w$])'+spelling+r'\s*(::\s*<[^()]*>\s*)?\(')
     local=re.compile(r'(\blet\s+(mut\s+)?|[|,(]\s*(mut\s+)?)'+re.escape(n)+r'\b\s*[:=|,)]')
-    sites=[]
+    sites=[]; bound=False
     for ln in range(a[3],min(a[4],len(lines))+1):
         t=re.sub(r'(^|\s)//.*','',lines[ln-1])
         if re.search(r'\bfn\s+'+re.escape(n)+r'\b',t): continue
-        if local.search(t): return None
         for m in call.finditer(t):
+            qualified=t[:m.start()].rstrip().endswith('::')
+            if bound and not m.group(1) and not qualified: return None
             sites.append((ln,'method' if m.group(1) else 'path'))
+        if local.search(t): bound=True
     if not sites: return None
-    macro=None; why=UNRESOLVED
+    macro=None; why=UNRESOLVED; unknown=False
     for ln,form in sites:
         recs=at_line.get((a[2],ln),[])
         t=lines[ln-1]
-        if any(nm==n for _,nm in recs): return None
+        if any(nm in names for _,nm in recs): continue
         for kind,nm in recs:
-            if kind in('path','method','ref_in_macro') and not re.search(r'(?<![\w$])'+re.escape(nm)+r'\b',t): return None
-        if any(kind==form+'_unresolved' for kind,_ in recs): continue
-        if not recs:
-            if macro is None: macro=macro_lines(lines,a[3],a[4])
-            lo=hi=ln
-            while lo-1 in macro: lo-=1
-            while hi+1 in macro: hi+=1
-            if ln in macro and not any((a[2],x) in at_line for x in range(lo,hi+1)):
-                if why==UNRESOLVED: why=UNEXPANDED
-                continue
+            if kind in('path','method') and not re.search(r'(?<![\w$])'+re.escape(nm)+r'\b',t): return None
+        if any(kind==form+'_unresolved' for kind,_ in recs):
+            unknown=True; continue
+        if macro is None: macro=macro_lines(lines,a[3],a[4])
+        if ln in macro:
+            unknown=True; why=UNMACRO; continue
         if crate_unresolved(a[2],b[2]):
-            why=UNIMPORTED; continue
+            unknown=True; why=UNIMPORTED; continue
         return None
-    return why
+    return why if unknown else None
 C=collections.Counter(); S=collections.defaultdict(list); strat=collections.Counter()
 for l in open(D+'g_calls.tsv'):
     s,t,st=l.rstrip('\n').split('\t'); s=int(s); t=int(t)
@@ -187,7 +183,7 @@ for l in open(D+'g_calls.tsv'):
                 if exact:
                     kinds={x[2] for x in exact}
                     k='correct: explicit call' if kinds&{'path','method'} else 'correct: call inside macro arguments' if 'ref_in_macro' in kinds else 'correct target, but reference is not a call (fn value / implicit)'
-                else: k='WRONG TARGET: caller calls a different function of that name'
+                else: k=no_oracle_data(a,b) or 'WRONG TARGET: caller calls a different function of that name'
     C[k]+=1; S[k].append((st,a,b)); 
     if k.startswith(('WRONG','NOT IN')): strat[st]+=1
 tot=sum(C.values())

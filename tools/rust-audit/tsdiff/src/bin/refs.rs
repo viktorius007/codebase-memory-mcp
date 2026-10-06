@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 #[path = "../scip_defs.rs"]
 mod scip_defs;
-use scip_defs::Definitions;
+use scip_defs::{Definitions, to_off};
 use std::io::Write;
 use syntax::ast::{self, AstNode, HasName};
 use syntax::{Edition, SourceFile, SyntaxKind::*, SyntaxNode, TextRange, TextSize};
@@ -32,16 +32,6 @@ fn intern(m: &mut HashMap<String, u32>, v: &mut Vec<String>, s: &str) -> u32 {
 }
 
 fn line_starts(t: &str) -> Vec<usize> { let mut v = vec![0]; for (i, b) in t.bytes().enumerate() { if b == b'\n' { v.push(i + 1); } } v }
-fn to_off(t: &str, ls: &[usize], line: i32, ch: i32, enc: u64) -> Option<usize> {
-    let s = *ls.get(line as usize)?;
-    if enc == 1 || enc == 0 && false { return Some(s + ch as usize); }
-    let rest = &t[s..]; let mut units = 0i32;
-    for (i, c) in rest.char_indices() {
-        if units >= ch { return Some(s + i); }
-        units += if enc == 2 || enc == 0 { c.len_utf16() as i32 } else { 1 };
-    }
-    Some(s + rest.len())
-}
 fn fn_like(sym: &str) -> bool { sym.ends_with(").") }
 
 
@@ -90,6 +80,25 @@ fn main() {
     }
     let mut def = Definitions::default();
     for (di, d) in docs.iter().enumerate() { for o in &d.occs { if o.roles & 1 == 1 { def.insert(o.sym, di, &o.range, &o.body); } } }
+    let mut recovered = Vec::new();
+    let recorded: std::collections::HashSet<u32> = docs.iter().flat_map(|d| &d.occs)
+        .filter(|o| o.roles & 1 == 1).map(|o| o.sym).collect();
+    // SCIP's enclosing_range is the target body, not the caller's lexical scope.
+    for (di, d) in docs.iter().enumerate() {
+        let Ok(text) = std::fs::read_to_string(format!("{}/{}", a[2], d.path)) else { continue };
+        let ls = line_starts(&text);
+        let parsed = SourceFile::parse(&text, Edition::Edition2024);
+        if !parsed.errors().is_empty() { continue; }
+        let root = parsed.syntax_node();
+        for o in &d.occs {
+            if recorded.contains(&o.sym) { continue; }
+            let Some(range) = scip_defs::source_function(&root, &text, &ls, d.enc,
+                                                        &syms[o.sym as usize], &o.body) else { continue };
+            if def.insert(o.sym, di, &range, &o.body) {
+                recovered.push((di, o.sym, range[0] + 1));
+            }
+        }
+    }
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a[3]).unwrap());
     let mut ambiguous = 0usize;
     for (document, d) in docs.iter().enumerate() {
@@ -109,6 +118,10 @@ fn main() {
             writeln!(out, "I\t{}\t{}\t{}\t{}", d.path, line_of(u32::from(n.text_range().start()) as usize),
                 i.self_ty().map(|t| clean(t.syntax().text().to_string())).unwrap_or("-".into()), i.trait_().map(|t| clean(t.syntax().text().to_string())).unwrap_or("-".into())).unwrap();
         }
+        for &(_, symbol, line) in recovered.iter().filter(|&&(di, _, _)| di == document) {
+            let sym = &syms[symbol as usize];
+            writeln!(out, "D\t{}\t{}\tfn\t{}\t{}", d.path, line, name_of(sym), sym.splitn(5, ' ').nth(4).unwrap_or("")).unwrap();
+        }
         for o in &d.occs {
             let sym = &syms[o.sym as usize];
             let Some(s) = to_off(&text, &ls, o.range[0], o.range[1], d.enc) else { continue };
@@ -124,6 +137,7 @@ fn main() {
             let tok = root.token_at_offset(TextSize::from(s as u32)).right_biased();
             let (mut in_use, mut encl) = (false, None);
             if let Some(t) = &tok { for anc in t.parent_ancestors() { match anc.kind() { USE => in_use = true, FN if encl.is_none() => encl = ast::Fn::cast(anc).and_then(|f| f.name()), _ => {} } } }
+            if encl.as_ref().is_some_and(|name| u32::from(name.syntax().text_range().start()) as usize == s) { continue; }
             let (el, en) = match encl { Some(nm) => (line_of(u32::from(nm.syntax().text_range().start()) as usize).to_string(), nm.text().to_string()), None => ("-".into(), "-".into()) };
             writeln!(out, "R\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", d.path, o.range[0] + 1, if in_use { "use" } else { "ref" }, el, en, docs[di].path, dl + 1, kind_of(sym), name_of(sym)).unwrap();
         }

@@ -62,6 +62,35 @@ class CollidingDefinitions(unittest.TestCase):
         self.assertEqual([(r[6], r[7]) for r in results['refs'] if r[0] == 'R'],
                          [(path, str(line))])
 
+    def test_attribute_target_without_definition_occurrence_is_local(self):
+        source = '#[instrument]\nfn target() {}\nfn caller() { target(); }\n'
+        docs = [document('attribute.rs', [occurrence([2, 14, 20], [0, 2, 12])])]
+        result = self.extract(docs, {'attribute.rs': source})
+        self.assert_target(result, 'attribute.rs', 2)
+        self.assertIn(['D', 'attribute.rs', '2', 'fn', 'target', 'target().'], result['refs'])
+
+    def test_macro_function_name_is_a_declaration_not_a_reference(self):
+        source = '#[instrument]\nfn target() {}\nfn caller() { target(); }\n'
+        docs = [document('attribute.rs', [occurrence([1, 3, 9], [0, 2, 12]),
+                                         occurrence([2, 14, 20], [0, 2, 12])])]
+        result = self.extract(docs, {'attribute.rs': source})
+        self.assert_target(result, 'attribute.rs', 2)
+        self.assertEqual(len(result['truth']), 1)
+
+    def test_recorded_macro_definition_is_not_duplicated_at_the_source_name(self):
+        source = '#[instrument]\nfn target() {}\nfn caller() { target(); }\n'
+        body = [0, 2, 12]
+        docs = [document('attribute.rs', [occurrence(body, body, True),
+                                         occurrence([2, 14, 20], body)])]
+        self.assert_target(self.extract(docs, {'attribute.rs': source}), 'attribute.rs', 1)
+
+    def test_attribute_body_cannot_identify_a_differently_named_function(self):
+        source = '#[instrument]\nfn different() {}\nfn caller() { target(); }\n'
+        docs = [document('attribute.rs', [occurrence([2, 14, 20], [0, 2, 12])])]
+        result = self.extract(docs, {'attribute.rs': source})
+        self.assertEqual(result['truth'][0][7:9], ['ext', '-'])
+        self.assertFalse(any(r[0] == 'R' for r in result['refs']))
+
     def test_sibling_targets_and_library_tests_keep_document_identity(self):
         source = 'fn target() {}\nfn caller() { target(); }\n'
         definition = occurrence([0, 3, 9], [0, 0, 14], True)

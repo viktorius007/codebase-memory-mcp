@@ -145,5 +145,47 @@ class ScoreSummary(unittest.TestCase):
         self.assertIn('no g_CALL_REFERENCE.tsv or cache/score.db', result.stdout)
 
 
+class MacroOracleGap(unittest.TestCase):
+    def test_unresolved_import_alias_is_an_oracle_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'f.rs').write_text(
+                'use dependency::target as renamed;\nfn caller() { let target = renamed(); other(); }\n'
+                'fn target() {}\n')
+            (root / 'g_nodes.tsv').write_text(
+                '1\tFunction\tcaller\tf.rs\t2\t2\n2\tFunction\ttarget\tf.rs\t3\t3\n')
+            (root / 'g_calls.tsv').write_text('1\t2\tfixture\n')
+            (root / 'refs.tsv').write_text('D\tf.rs\t3\tfn\ttarget\ttarget().\n')
+            (root / 'truth.tsv').write_text(
+                'f.rs\t2\tpath_unresolved\t-\t-\t-\t-\t-\t-\t-\t-\n'
+                'f.rs\t2\tpath\tf.rs\t2\tcaller\trust-analyzer cargo fixture 0 other().\text\t-\t-\t-\n')
+            result = subprocess.run(['python3', str(ROOT / 'tools/rust-audit/precision.py')],
+                                    env=dict(os.environ, AUDIT_DIR=tmp, AUDIT_CORPUS=tmp),
+                                    check=True, capture_output=True, text=True)
+            self.assertIn('unverifiable: oracle left a source call site unresolved', result.stdout)
+            self.assertEqual((root / 'wrong_pairs.tsv').read_text(), '')
+
+    def test_missing_macro_target_is_unverifiable_despite_a_resolved_namesake(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'f.rs').write_text(
+                'fn caller() { let target = 0;\n assert_eq!(local.target(), other());\n external.target();\n}\n'
+                'fn target() {}\nfn other() {}\n')
+            (root / 'g_nodes.tsv').write_text(
+                '1\tFunction\tcaller\tf.rs\t1\t4\n'
+                '2\tFunction\ttarget\tf.rs\t5\t5\n')
+            (root / 'g_calls.tsv').write_text('1\t2\tfixture\n')
+            (root / 'refs.tsv').write_text('D\tf.rs\t5\tfn\ttarget\ttarget().\n')
+            (root / 'truth.tsv').write_text(
+                'f.rs\t2\tref_in_macro\tf.rs\t1\tcaller\trust-analyzer cargo fixture 0 implicit().\text\t-\t-\t-\n'
+                'f.rs\t3\tmethod\tf.rs\t1\tcaller\trust-analyzer cargo dependency 0 target().\text\t-\t-\t-\n')
+            result = subprocess.run(['python3', str(ROOT / 'tools/rust-audit/precision.py')],
+                                    env=dict(os.environ, AUDIT_DIR=tmp, AUDIT_CORPUS=tmp),
+                                    check=True, capture_output=True, text=True)
+            self.assertIn('unverifiable: oracle has no target for the named call in macro arguments',
+                          result.stdout)
+            self.assertEqual((root / 'wrong_pairs.tsv').read_text(), '')
+
+
 if __name__ == '__main__':
     unittest.main()
