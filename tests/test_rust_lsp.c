@@ -7614,6 +7614,23 @@ TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape) {
     PASS();
 }
 
+TEST(rustlsp_reference_blanket_impl_prevents_concrete_trait_guess) {
+    CBMFileResult *r = extract_rust(
+        "trait Read { fn read(&self) -> u8; }\n"
+        "struct Widget;\n"
+        "impl Read for Widget { fn read(&self) -> u8 { 1 } }\n"
+        "impl<T: Read> Read for &T { fn read(&self) -> u8 { T::read(self) } }\n"
+        "fn owned(w: Widget) -> u8 { w.read() }\n"
+        "fn single(w: &Widget) -> u8 { w.read() }\n"
+        "fn double(w: &&Widget) -> u8 { w.read() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "main.owned", "Widget.read"), 0);
+    ASSERT_EQ(find_resolved(r, "main.single", "Widget.read"), -1);
+    ASSERT_EQ(find_resolved(r, "main.double", "Widget.read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_type_headed_recursion_proves_self_argument) {
     CBMFileResult *r = extract_rust(
         "trait Generic { fn recurse(&self); }\n"
@@ -12056,6 +12073,50 @@ static CBMRustModTree *rust_modtree_from_sources(const char *const *rels, const 
     return tree;
 }
 
+TEST(rustlsp_modtree_qualified_impl_trait_keeps_proven_identity) {
+    const char *spellings[] = {"Action", "contract::Action", "crate::contract::Action",
+                               "super::contract::Action", "api::Action"};
+    const char *rels[] = {"src/lib.rs", "src/contract.rs", "src/other.rs", "src/user.rs"};
+    const char *qns[] = {"p.src.lib", "p.src.contract", "p.src.other", "p.src.user"};
+    for (size_t i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
+        char user[512];
+        snprintf(user, sizeof(user),
+                 "use crate::contract::{self, Action}; use crate::contract as api;\n"
+                 "pub struct Widget; impl %s for Widget { fn act(&self) {} }\n", spellings[i]);
+        const char *sources[] = {"mod contract; mod other; mod user;\n",
+                                  "pub trait Action { fn act(&self); }\n",
+                                  "pub mod contract { pub trait Action { fn act(&self); } }\n", user};
+        CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 4);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMRustPathResult path = cbm_rust_modtree_resolve_type_in_file(
+            tree, &arena, "p.src.user", spellings[i]);
+        ASSERT_EQ(path.kind, CBM_RUST_PATH_TYPE);
+        ASSERT_STR_EQ(path.qn, "p.src.contract.Action");
+        CBMLSPDef defs[] = {
+            {.qualified_name = "p.src.contract.Action", .short_name = "Action", .label = "Trait",
+             .def_module_qn = "p.src.contract", .is_interface = true, .lang = CBM_LANG_RUST},
+            {.qualified_name = "p.src.other.contract.Action", .short_name = "Action", .label = "Trait",
+             .def_module_qn = "p.src.other.contract", .is_interface = true, .lang = CBM_LANG_RUST},
+            {.qualified_name = "p.src.user.Widget", .short_name = "Widget", .label = "Struct",
+             .def_module_qn = "p.src.user", .lang = CBM_LANG_RUST},
+            {.qualified_name = "p.src.user.Widget", .short_name = "Widget", .label = "RustImpl",
+             .receiver_type = "p.src.user.Widget", .receiver_spelling = "Widget",
+             .def_module_qn = "p.src.user", .trait_qn = spellings[i],
+             .is_rust_impl_relation = true, .lang = CBM_LANG_RUST},
+        };
+        CBMTypeRegistry *registry = cbm_rust_build_cross_registry_with_modtree(&arena, defs, 4, tree);
+        const CBMRegisteredType *widget = cbm_registry_lookup_type(registry, "p.src.user.Widget");
+        ASSERT_NOT_NULL(widget);
+        ASSERT_NOT_NULL(widget->embedded_types);
+        ASSERT_STR_EQ(widget->embedded_types[0], "p.src.contract.Action");
+        ASSERT_NULL(widget->embedded_types[1]);
+        cbm_arena_destroy(&arena);
+        cbm_rust_modtree_free(tree);
+    }
+    PASS();
+}
+
 TEST(rustlsp_modtree_super_glob_sees_parent_private_import) {
     /* `svc` only imports `Session`, privately. Its child's `use super::*`
      * may see that import; a sibling's `use crate::svc::*` may not. */
@@ -13395,6 +13456,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_method_recursive_call);
     RUN_TEST(rustlsp_exact_layout_receiver_recovery_keeps_recursion);
     RUN_TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape);
+    RUN_TEST(rustlsp_reference_blanket_impl_prevents_concrete_trait_guess);
     RUN_TEST(rustlsp_type_headed_recursion_proves_self_argument);
     RUN_TEST(rustlsp_foreign_receiver_leaf_is_not_recursion);
     RUN_TEST(rustlsp_generic_bound_static_call_is_not_recursion);
@@ -13826,6 +13888,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cargo_edition_selects_import_scope_and_unknown_refuses_links);
     RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
+    RUN_TEST(rustlsp_modtree_qualified_impl_trait_keeps_proven_identity);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
     RUN_TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module);
     RUN_TEST(rustlsp_associated_function_keeps_its_owner_when_a_free_function_shares_its_name);

@@ -785,9 +785,8 @@ static const char *rust_trait_path_through_use(CBMArena *arena, const CBMImportA
 
 /* The registered trait the module tree proves `path` (as written, without
  * generic arguments) names in the file of `def_module_qn`: a std-library
- * trait the path reaches through the file's `use` graph, or the project trait
- * a single name is declared or imported as. NULL otherwise; a longer path to
- * a project trait is left to the name index. */
+ * trait the path reaches through the file's `use` graph, or a project trait
+ * reached by a declaration, import or qualified path. NULL otherwise. */
 static const char *rust_trait_qn_by_module_tree(CBMArena *arena, const CBMTypeRegistry *reg,
                                                 const RustTraitNameIndex *index,
                                                 const CBMRustModTree *tree,
@@ -802,7 +801,7 @@ static const char *rust_trait_qn_by_module_tree(CBMArena *arena, const CBMTypeRe
     if (r.kind == CBM_RUST_PATH_NOT_FUNCTION) {
         return rust_facade_trait_qn(arena, reg, index, r.qn);
     }
-    if (r.kind != CBM_RUST_PATH_TYPE || strstr(path, "::")) {
+    if (r.kind != CBM_RUST_PATH_TYPE) {
         return NULL;
     }
     const char *hit = rust_trait_name_index_lookup(index, reg, r.qn);
@@ -7303,12 +7302,12 @@ static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn) {
     return rust_trait_name_out_of_scope(ctx, dot ? dot + 1 : trait_qn);
 }
 
-/* The trait path an impl key (cbm_rust_impl_key) ends with, as the impl
- * header spells it; NULL for a key of another shape. */
-static const char *rust_impl_key_trait_spelling(const char *key) {
-    enum { IMPL_KEY_PARTS = 3, DECIMAL = 10 };
+/* Start of a length-prefixed impl-key part: receiver QN, receiver spelling,
+ * then trait spelling. Only the final part is NUL-terminated. */
+static const char *rust_impl_key_spelling(const char *key, int part_index) {
+    enum { DECIMAL = 10 };
     const char *part = NULL;
-    for (int i = 0; key && i < IMPL_KEY_PARTS; i++) {
+    for (int i = 0; key && i <= part_index; i++) {
         char *colon = NULL;
         unsigned long len = strtoul(key, &colon, DECIMAL);
         if (colon == key || *colon != ':' || strlen(colon + 1) < len) {
@@ -7348,7 +7347,7 @@ static const CBMRegisteredFunc *rust_registry_lookup_unregistered_trait_impl_met
         if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 || candidate->impl_trait_qn) {
             continue;
         }
-        const char *spelling = rust_impl_key_trait_spelling(candidate->impl_key);
+        const char *spelling = rust_impl_key_spelling(candidate->impl_key, 2);
         const char *leaf = spelling ? rust_trait_spelling_leaf(scope->arena, spelling) : NULL;
         /* An impl without a readable identity cannot be told from another. */
         if (!leaf || (matched_impl && strcmp(matched_impl, candidate->impl_key) != 0)) {
@@ -7589,6 +7588,38 @@ static bool rust_qn_in_project(const RustLSPContext *ctx, const char *qn) {
     }
     size_t project_len = strcspn(ctx->module_qn, ".");
     return strncmp(qn, ctx->module_qn, project_len) == 0 && qn[project_len] == '.';
+}
+
+/* Reference depth can be lost during collection inference. A reference impl
+ * of the selected trait may precede the concrete target; its bounds and self
+ * shape are not proved by this lookup, so neither target is published. */
+static bool rust_reference_impl_may_precede(RustLSPContext *ctx, const CBMType *receiver,
+                                            const CBMRegisteredFunc *method) {
+    if (!receiver || receiver->kind != CBM_TYPE_REFERENCE || !method->impl_trait_qn) {
+        return false;
+    }
+    const char *dot = strrchr(method->impl_trait_qn, '.');
+    const char *leaf = dot ? dot + 1 : method->impl_trait_qn;
+    for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
+        CBMTypeEmbedIter types;
+        cbm_registry_types_by_embedded_bare(reg, leaf, &types);
+        for (int ti; (ti = cbm_type_embed_iter_next(&types)) >= 0;) {
+            CBMMethodIter methods;
+            cbm_registry_methods(reg, reg->types[ti].qualified_name, method->short_name, &methods);
+            for (int mi; (mi = cbm_method_iter_next(&methods)) >= 0;) {
+                const CBMRegisteredFunc *candidate = &reg->funcs[mi];
+                if (!candidate->impl_trait_qn ||
+                    strcmp(candidate->impl_trait_qn, method->impl_trait_qn) != 0) {
+                    continue;
+                }
+                const char *self = rust_impl_key_spelling(candidate->impl_key, 1);
+                if (self && *self == '&') {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 /* Resolve an ordinary method call with Rust precedence: inherent first,
@@ -12143,6 +12174,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             const CBMRegisteredFunc *m =
                 rust_resolve_trait_method(ctx, type_qn, mname, &impl_count, &trait_dispatch);
             if (m) {
+                if (rust_reference_impl_may_precede(ctx, recv, m)) {
+                    return;
+                }
                 /* Leaf-name recovery does not prove that a foreign receiver
                  * is the enclosing type, even when the method names match. */
                 if (ctx->enclosing_func_qn &&
