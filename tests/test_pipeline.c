@@ -13447,6 +13447,96 @@ TEST(project_name_uniqueness) {
     PASS();
 }
 
+static int cross_language_name_edges(const char *edge_type) {
+    const char *files[] = {"lib.rs", "main.py", "local.py", "CMakeLists.txt"};
+    const char *contents[] = {
+        "pub fn alien_call() {}\npub fn alien_decorator() {}\npub fn ast() {}\n",
+        ("import ast\nimport lib.rs\nfrom local import local_helper, "
+         "local_decorator\n@alien_decorator\n@local_decorator\n"
+         "def run():\n    alien_call()\n    return local_helper()\n"),
+        "def local_helper():\n    return 1\n\ndef local_decorator(fn):\n    return fn\n",
+        "include(\"lib.rs\")\n"};
+    if (setup_lang_repo(files, contents, 4) != 0)
+        return -1;
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    if (!p || cbm_pipeline_run(p) != 0)
+        return -1;
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (!s)
+        return -1;
+    const char *proj = cbm_pipeline_project_name(p);
+    const char *witness = strcmp(edge_type, "IMPORTS") == 0 ? "ast"
+                          : strcmp(edge_type, "CALLS") == 0 ? "alien_call"
+                                                            : "alien_decorator";
+    cbm_node_t *targets = NULL;
+    int target_count = 0;
+    int target_ok = cbm_store_find_nodes_by_name(s, proj, witness, &targets, &target_count);
+    int rust_targets = 0;
+    for (int i = 0; i < target_count; i++)
+        if (targets[i].file_path && strcmp(targets[i].file_path, "lib.rs") == 0)
+            rust_targets++;
+    bool target_present = target_ok == CBM_STORE_OK && rust_targets == 1;
+    cbm_store_free_nodes(targets, target_count);
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    int foreign = 0;
+    bool valid = target_present;
+    int local = 0;
+    bool file_reference = false;
+    if (cbm_store_find_edges_by_type(s, proj, edge_type, &edges, &count) != CBM_STORE_OK)
+        valid = false;
+    for (int i = 0; i < count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &source) != CBM_STORE_OK ||
+            cbm_store_find_node_by_id(s, edges[i].target_id, &target) != CBM_STORE_OK) {
+            valid = false;
+        } else if (source.file_path && strcmp(source.file_path, "main.py") == 0 &&
+                   target.file_path) {
+            if (strcmp(target.file_path, "lib.rs") == 0)
+                foreign++;
+            if (strcmp(target.file_path, "local.py") == 0)
+                local++;
+        } else if (source.file_path && target.file_path &&
+                   strcmp(source.file_path, "CMakeLists.txt") == 0 &&
+                   strcmp(target.file_path, "lib.rs") == 0) {
+            file_reference = true;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (local == 0 || (strcmp(edge_type, "IMPORTS") == 0 && !file_reference))
+        valid = false;
+    cbm_store_free_edges(edges, count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    return valid ? foreign : -1;
+}
+
+TEST(pipeline_imports_withhold_foreign_name_match) {
+    ASSERT_EQ(cross_language_name_edges("IMPORTS"), 0);
+    PASS();
+}
+
+TEST(pipeline_calls_withhold_foreign_name_match) {
+    ASSERT_EQ(cross_language_name_edges("CALLS"), 0);
+    PASS();
+}
+
+TEST(pipeline_usage_withholds_foreign_decorator_name_match) {
+    ASSERT_EQ(cross_language_name_edges("USAGE"), 0);
+    PASS();
+}
+
+TEST(pipeline_decorators_withhold_foreign_name_match) {
+    ASSERT_EQ(cross_language_name_edges("DECORATES"), 0);
+    PASS();
+}
+
+
 /* ── Git diff helpers (pass_gitdiff.c) ─────────────────────────── */
 
 TEST(gitdiff_parse_range_with_count) {
@@ -19479,6 +19569,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_cross_package_import);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
+    RUN_TEST(pipeline_imports_withhold_foreign_name_match);
+    RUN_TEST(pipeline_calls_withhold_foreign_name_match);
+    RUN_TEST(pipeline_usage_withholds_foreign_decorator_name_match);
+    RUN_TEST(pipeline_decorators_withhold_foreign_name_match);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
     RUN_TEST(pipeline_kotlin_project);

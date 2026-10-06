@@ -115,7 +115,7 @@ static bool is_checked_exception(const char *name) {
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
                             const char ***out_vals, int *out_count, CBMLanguage lang) {
-    return cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel_path, lang, result, out_keys,
+    return cbm_pxc_build_import_map(ctx, ctx->project_name, rel_path, lang, result, out_keys,
                                     out_vals, out_count);
 }
 
@@ -486,7 +486,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             /* #1928: the registry fallback is a bare-name guess — never let it
              * bind a reference across a language boundary (the LSP-backed
              * semantic branch above is not affected). */
-            if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+            if (tgt &&
+                (cbm_suppress_cross_language_ref(lang, tgt->file_path) ||
+                 cbm_suppress_cross_language_code_match(lang, ctx->repo_path, tgt->file_path))) {
                 continue;
             }
             /* #1942/#1962: a bare Go reference can never denote a struct
@@ -510,7 +512,12 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
         if (!tgt || src->id == tgt->id ||
             (cbm_language_for_filename(src->file_path) == CBM_LANG_PROTOBUF &&
-             cbm_suppress_cross_language_ref(CBM_LANG_PROTOBUF, tgt->file_path))) {
+             cbm_suppress_cross_language_ref(CBM_LANG_PROTOBUF, tgt->file_path)) ||
+            cbm_suppress_cross_language_code_match(src->file_path &&
+                                                           strcmp(src->file_path, rel) == 0
+                                                       ? lang
+                                                       : cbm_language_for_filename(src->file_path),
+                                                   ctx->repo_path, tgt->file_path)) {
             continue;
         }
 
@@ -556,7 +563,9 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         if (res.qualified_name && res.qualified_name[0]) {
             tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
         }
-        if (!tgt || src->id == tgt->id) {
+        if (!tgt || src->id == tgt->id ||
+            cbm_suppress_cross_language_code_match(cbm_language_for_filename(src->file_path),
+                                                   ctx->repo_path, tgt->file_path)) {
             continue;
         }
 
@@ -597,7 +606,13 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         }
         /* #1928: every resolution here is a bare-name registry guess — never
          * let it bind a read/write across a language boundary. */
-        if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+        if (cbm_suppress_cross_language_ref(lang, tgt->file_path) ||
+            cbm_suppress_cross_language_code_match(src->file_path &&
+                                                           strcmp(src->file_path, rel) == 0
+                                                       ? lang
+                                                       : cbm_language_for_filename(src->file_path),
+                                                   ctx->repo_path, tgt->file_path) ||
+            cbm_suppress_cross_language_code_match(lang, ctx->repo_path, tgt->file_path)) {
             continue;
         }
         /* #1942/#1962: a bare Go reference can never denote a struct field;

@@ -26,6 +26,10 @@
  * Returns CBM_LANG_COUNT if unknown. */
 CBMLanguage cbm_language_for_filename(const char *filename);
 
+/* Detect the file's effective indexing language, including content-based
+ * disambiguation, Studio Export XML and shebang-only scripts. */
+CBMLanguage cbm_detect_file_language(const char *filename, const char *absolute_path);
+
 /* Detect language from a file extension (including the dot, e.g. ".go").
  * Returns CBM_LANG_COUNT if unknown. */
 CBMLanguage cbm_language_for_extension(const char *ext);

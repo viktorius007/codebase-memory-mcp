@@ -256,7 +256,8 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
     if (!cls->file_path || !cls->qualified_name) {
         return 0;
     }
-    if (!fp_ends_with(cls->file_path, ".go")) {
+    if (!fp_ends_with(cls->file_path, ".go") ||
+        cbm_suppress_cross_language_code_match(CBM_LANG_GO, ctx->repo_path, iface->file_path)) {
         return 0;
     }
     /* Resolve the struct's methods two ways and use whichever finds them:
@@ -409,7 +410,8 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     }
     /* A Rust attribute binds only a macro of the repository; `#[test]` must
      * not land on a method `test`, nor `#[tokio::main]` on the local `main`. */
-    if (dec && lang == CBM_LANG_RUST && !cbm_semantic_rust_attr_binds(dec, res.strategy)) {
+    if (dec && (cbm_suppress_cross_language_code_match(lang, ctx->repo_path, dec->file_path) ||
+                (lang == CBM_LANG_RUST && !cbm_semantic_rust_attr_binds(dec, res.strategy)))) {
         dec = NULL;
     }
     if (!dec) {
@@ -463,7 +465,9 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
                 continue;
             }
             const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
-            if (base_node && node->id != base_node->id) {
+            if (base_node && node->id != base_node->id &&
+                !cbm_suppress_cross_language_code_match(lang, ctx->repo_path,
+                                                        base_node->file_path)) {
                 /* A base that resolves to an Interface is an IMPLEMENTS relation
                  * (Java `implements`, C# `: IFace`, TS `implements`); a Class/
                  * Type/Enum base is plain INHERITS. Keyed off the target NODE's
@@ -584,7 +588,7 @@ int cbm_pipeline_rust_impl_edges(const cbm_gbuf_t *nodes, cbm_gbuf_t *edges,
 /* Resolve Rust impl traits for one file's extraction results. */
 static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count) {
+                               int imp_count, CBMLanguage lang) {
     int count = 0;
     for (int t = 0; t < result->impl_traits.count; t++) {
         CBMImplTrait *it = &result->impl_traits.items[t];
@@ -603,7 +607,9 @@ static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
         const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, trait_qn);
         const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(ctx->gbuf, struct_qn);
-        if (tn && sn && tn->id != sn->id) {
+        if (tn && sn && tn->id != sn->id &&
+            !cbm_suppress_cross_language_code_match(lang, ctx->repo_path, tn->file_path) &&
+            !cbm_suppress_cross_language_code_match(lang, ctx->repo_path, sn->file_path)) {
             cbm_gbuf_insert_edge(ctx->gbuf, sn->id, tn->id, "IMPLEMENTS", "{}");
             count++;
         }
@@ -651,8 +657,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
 
         /* Textual Rust impl names are not a semantic identity oracle. */
         if (files[i].language != CBM_LANG_RUST) {
-            implements_count +=
-                resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
+            implements_count += resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals,
+                                                    imp_count, files[i].language);
         } else {
             implements_count += cbm_pipeline_rust_impl_edges(ctx->gbuf, ctx->gbuf, result);
         }

@@ -293,7 +293,9 @@ static int create_tests_file_edges(cbm_pipeline_ctx_t *ctx) {
         free(prod_qn);
         free(prod_path);
 
-        if (prod_node && fnode->id != prod_node->id) {
+        if (prod_node && fnode->id != prod_node->id &&
+            !cbm_suppress_cross_language_code_match(cbm_language_for_filename(fnode->file_path),
+                                                    ctx->repo_path, prod_node->file_path)) {
             cbm_gbuf_insert_edge(ctx->gbuf, fnode->id, prod_node->id, "TESTS_FILE", "{}");
             count++;
         }

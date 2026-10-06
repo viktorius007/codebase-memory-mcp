@@ -319,6 +319,11 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
  * unit-tested in test_registry.c. */
 bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path);
 
+/* Code candidates must belong to the caller's resolution language family.
+ * Explicit file references and configuration integrations are separate relations. */
+bool cbm_suppress_cross_language_code_match(CBMLanguage caller_lang, const char *repo_path,
+                                            const char *target_file_path);
+
 /* #1942: a bare (dot-less) Go reference can never denote a struct field —
  * field access is always a selector expression, and selector references
  * resolve on the LSP path. Drops a READS/WRITES/USAGE bind whose target is a

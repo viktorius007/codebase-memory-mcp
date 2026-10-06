@@ -311,6 +311,7 @@ typedef struct {
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
+    bool is_file_reference;  // syntax denotes a file reference, not a namespace
     uint32_t scope_byte;     // scoped_imports only: start byte of the `use` declaration
 } CBMImport;
 

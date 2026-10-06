@@ -752,7 +752,7 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
 }
 
 /* Detect language for a file, handling .m disambiguation and JSON filtering. */
-static CBMLanguage detect_file_language(const char *entry_name, const char *abs_path) {
+CBMLanguage cbm_detect_file_language(const char *entry_name, const char *abs_path) {
     CBMLanguage lang = cbm_language_for_filename(entry_name);
     if (lang == CBM_LANG_COUNT) {
         /* Filename/extension detection failed: fall back to a conservative
@@ -872,7 +872,7 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
         file_list_add_ignored(out, rel_path, skip_reason);
         return;
     }
-    CBMLanguage lang = detect_file_language(name, abs_path);
+    CBMLanguage lang = cbm_detect_file_language(name, abs_path);
     if (lang == CBM_LANG_COUNT) {
         return;
     }

@@ -343,14 +343,17 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    if (file_node && node_id > 0) {
+    if (file_node && node_id > 0 &&
+        !cbm_suppress_cross_language_code_match(lang, ctx->repo_path,
+                                                def->file_path ? def->file_path : rel)) {
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "DEFINES", "{}");
     }
     free(file_qn);
     if (def->parent_class && def->label && strcmp(def->label, "Method") == 0 &&
         !cbm_pipeline_is_rust_impl_method(def, lang)) {
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
-        if (parent && node_id > 0) {
+        if (parent && node_id > 0 &&
+            !cbm_suppress_cross_language_code_match(lang, ctx->repo_path, parent->file_path)) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
         }
     }

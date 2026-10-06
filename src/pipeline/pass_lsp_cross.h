@@ -77,9 +77,9 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
  * metadata cannot diverge between pipelines. Values are owned by the returned
  * map (not borrowed from gbuf); release both arrays with
  * cbm_pxc_free_import_map(). */
-int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
-                             CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
-                             const char ***out_vals, int *out_count);
+int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                             const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
+                             const char ***out_keys, const char ***out_vals, int *out_count);
 
 void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
 

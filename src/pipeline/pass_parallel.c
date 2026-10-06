@@ -64,6 +64,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #define PP_RETAIN_TOTAL_HARD_MAX_BYTES (1024ULL * 1024 * 1024)  /* 1 GiB default ceiling */
 #define PP_RETAIN_PER_FILE_HARD_MAX_BYTES (32ULL * 1024 * 1024) /* 32 MiB per file */
 #include "pipeline/pipeline.h"
+#include "discover/discover.h"
 #include "pipeline/pipeline_internal.h"
 #include "result_spill.h"
 #include "foundation/platform.h"     /* cbm_resolve_cache_dir */
@@ -1338,7 +1339,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
     const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
-    if (file_node && def_node) {
+    if (file_node && def_node &&
+        !cbm_suppress_cross_language_code_match(lang, ctx->repo_path, def_node->file_path)) {
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, def_node->id, "DEFINES", "{}");
         edges++;
     }
@@ -1346,7 +1348,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     if (def->parent_class && strcmp(def->label, "Method") == 0 &&
         !cbm_pipeline_is_rust_impl_method(def, lang)) {
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
-        if (parent && def_node) {
+        if (parent && def_node &&
+            !cbm_suppress_cross_language_code_match(lang, ctx->repo_path, parent->file_path)) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, def_node->id, "DEFINES_METHOD", "{}");
         }
     }
@@ -2729,9 +2732,21 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
                               memory_order_relaxed);
     if (target_node && source_node->id != target_node->id &&
         cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
-        /* #725: same guard as pass_calls.c — do not emit a suffix_match
-         * CALLS edge across a language boundary. */
         return;
+    }
+    if (target_node) {
+        CBMLanguage source_lang = source_node->file_path && strcmp(source_node->file_path, rel) == 0
+                                      ? lang
+                                      : cbm_language_for_filename(source_node->file_path);
+        if (source_lang == CBM_LANG_COUNT && source_node->file_path && rc->repo_path) {
+            char source_path[CBM_SZ_4K];
+            int n = snprintf(source_path, sizeof(source_path), "%s/%s", rc->repo_path,
+                             source_node->file_path);
+            if (n >= 0 && (size_t)n < sizeof(source_path))
+                source_lang = cbm_detect_file_language(source_node->file_path, source_path);
+        }
+        drop_plain_call |= cbm_suppress_cross_language_code_match(source_lang, rc->repo_path,
+                                                                  target_node->file_path);
     }
     if (!target_node || source_node->id == target_node->id) {
         /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
@@ -2959,7 +2974,9 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             /* #1928: the registry fallback is a bare-name guess — never let it
              * bind a reference across a language boundary. Mirrors the
              * sequential twin (pass_usages.c). */
-            if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+            if (tgt &&
+                (cbm_suppress_cross_language_ref(lang, tgt->file_path) ||
+                 cbm_suppress_cross_language_code_match(lang, rc->repo_path, tgt->file_path))) {
                 continue;
             }
             /* #1942/#1962: a bare Go reference can never denote a struct
@@ -2984,7 +3001,12 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         }
         if (!tgt || src->id == tgt->id ||
             (cbm_language_for_filename(src->file_path) == CBM_LANG_PROTOBUF &&
-             cbm_suppress_cross_language_ref(CBM_LANG_PROTOBUF, tgt->file_path))) {
+             cbm_suppress_cross_language_ref(CBM_LANG_PROTOBUF, tgt->file_path)) ||
+            cbm_suppress_cross_language_code_match(src->file_path &&
+                                                           strcmp(src->file_path, rel) == 0
+                                                       ? lang
+                                                       : cbm_language_for_filename(src->file_path),
+                                                   rc->repo_path, tgt->file_path)) {
             continue;
         }
         /* 512, matching the sequential twin in pass_usages.c. esc_ref holds up
@@ -3032,7 +3054,9 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
-        if (!tgt || src->id == tgt->id) {
+        if (!tgt || src->id == tgt->id ||
+            cbm_suppress_cross_language_code_match(cbm_language_for_filename(src->file_path),
+                                                   rc->repo_path, tgt->file_path)) {
             continue;
         }
         cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, edge_type, "{}");
@@ -3068,7 +3092,13 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         /* #1928: every resolution here is a bare-name registry guess — never
          * let it bind a read/write across a language boundary. Mirrors the
          * sequential twin (pass_usages.c). */
-        if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+        if (cbm_suppress_cross_language_ref(lang, tgt->file_path) ||
+            cbm_suppress_cross_language_code_match(src->file_path &&
+                                                           strcmp(src->file_path, rel) == 0
+                                                       ? lang
+                                                       : cbm_language_for_filename(src->file_path),
+                                                   rc->repo_path, tgt->file_path) ||
+            cbm_suppress_cross_language_code_match(lang, rc->repo_path, tgt->file_path)) {
             continue;
         }
         /* #1942/#1962: a bare Go reference can never denote a struct field;
@@ -3084,7 +3114,8 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
 /* Resolve base_classes → INHERITS edges for one definition. */
 static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                  const CBMDefinition *def, const cbm_gbuf_node_t *node,
-                                 const char *mq, const char **ik, const char **iv, int ic) {
+                                 const char *mq, const char **ik, const char **iv, int ic,
+                                 CBMLanguage lang) {
     if (!def->base_classes) {
         return;
     }
@@ -3094,7 +3125,8 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, bqn);
-        if (bn && node->id != bn->id) {
+        if (bn && node->id != bn->id &&
+            !cbm_suppress_cross_language_code_match(lang, rc->repo_path, bn->file_path)) {
             /* Same Interface-label split as the sequential semantic pass —
              * hardcoding INHERITS here demoted every explicit `implements`
              * on large (parallel-path) corpora. */
@@ -3135,7 +3167,8 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
         }
         /* A Rust attribute binds only a macro of the repository; `#[test]` must
          * not land on a method `test`, nor `#[tokio::main]` on the local `main`. */
-        if (dn && lang == CBM_LANG_RUST && !cbm_semantic_rust_attr_binds(dn, res.strategy)) {
+        if (dn && (cbm_suppress_cross_language_code_match(lang, rc->repo_path, dn->file_path) ||
+                   (lang == CBM_LANG_RUST && !cbm_semantic_rust_attr_binds(dn, res.strategy)))) {
             dn = NULL;
         }
         int64_t dn_id = 0;
@@ -3187,7 +3220,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!node) {
             continue;
         }
-        resolve_def_inherits(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_inherits(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count, language);
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count,
                                language);
     }
@@ -3210,7 +3243,9 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         }
         const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(rc->main_gbuf, tqn);
         const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(rc->main_gbuf, sqn);
-        if (tn && sn && tn->id != sn->id) {
+        if (tn && sn && tn->id != sn->id &&
+            !cbm_suppress_cross_language_code_match(language, rc->repo_path, tn->file_path) &&
+            !cbm_suppress_cross_language_code_match(language, rc->repo_path, sn->file_path)) {
             cbm_gbuf_insert_edge(ws->local_edge_buf, sn->id, tn->id, "IMPLEMENTS", "{}");
             ws->semantic_resolved++;
         }
@@ -3408,7 +3443,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         const char **imp_vals = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang, result, &imp_keys,
+        cbm_pxc_build_import_map(rc->pctx, rc->project_name, rel, lang, result, &imp_keys,
                                  &imp_vals, &imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);

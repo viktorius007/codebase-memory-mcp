@@ -1616,6 +1616,19 @@ static bool import_symbol_label_allowed(CBMLanguage lang, const char *label) {
     return !(lang == CBM_LANG_RUST && strcmp(label, "Method") == 0);
 }
 
+/* Path resolution can import another language's file (HTML script src, for
+ * example). The requested filename must match the actual target filename. */
+static bool import_target_language_allowed(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
+                                           const CBMImport *imp, const cbm_gbuf_node_t *target) {
+    if (!cbm_suppress_cross_language_code_match(lang, ctx->repo_path, target->file_path))
+        return true;
+    const char *module_path = imp->module_path;
+    return imp->is_file_reference &&
+           (strcmp(target->label, "File") == 0 || strcmp(target->label, "Module") == 0) &&
+           cbm_language_for_filename(path_basename(module_path)) != CBM_LANG_COUNT &&
+           strcmp(path_basename(module_path), path_basename(target->file_path)) == 0;
+}
+
 /* Whether the graph holds a File node for the source file at `rel`. */
 static bool repo_file_exists(const cbm_pipeline_ctx_t *ctx, const char *rel) {
     char *qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -2356,13 +2369,22 @@ static int rust_use_targets(const cbm_pipeline_ctx_t *ctx, const char *rel, cons
 static int link_import_targets(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *source,
                                const CBMImport *imp, const cbm_gbuf_node_t *const *targets,
                                int count) {
+    CBMLanguage lang = cbm_language_for_filename(source->file_path);
+    if (ctx->repo_path && source->file_path) {
+        char source_path[CBM_SZ_4K];
+        int n =
+            snprintf(source_path, sizeof(source_path), "%s/%s", ctx->repo_path, source->file_path);
+        if (n >= 0 && (size_t)n < sizeof(source_path))
+            lang = cbm_detect_file_language(path_basename(source->file_path), source_path);
+    }
     char esc_ln[CBM_SZ_128];
     cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
     char props[CBM_SZ_256];
     snprintf(props, sizeof(props), "{\"local_name\":\"%s\"}", esc_ln);
     int linked = 0;
     for (int i = 0; i < count; i++) {
-        if (targets[i]->id != source->id) {
+        if (targets[i]->id != source->id &&
+            import_target_language_allowed(ctx, lang, imp, targets[i])) {
             cbm_gbuf_insert_edge(ctx->gbuf, source->id, targets[i]->id, "IMPORTS", props);
             linked++;
         }

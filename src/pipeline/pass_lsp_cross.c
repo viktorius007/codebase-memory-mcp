@@ -1213,8 +1213,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         int imp_count = 0;
         if (ctx && ctx->registry && pxc_lang_resolves_base_qns(files[fi].language)) {
             base_reg = ctx->registry;
-            cbm_pxc_build_import_map(ctx->gbuf, project_name, files[fi].rel_path,
-                                     files[fi].language, fr, &imp_keys, &imp_vals, &imp_count);
+            cbm_pxc_build_import_map(ctx, project_name, files[fi].rel_path, files[fi].language, fr,
+                                     &imp_keys, &imp_vals, &imp_count);
         }
         for (int di = 0; di < fr->defs.count; di++) {
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
@@ -1300,7 +1300,7 @@ static char *pxc_kotlin_import_from_metadata(const CBMFileResult *result, const 
      * package-qualified (target.actual), not path/project-qualified. The
      * resolver still requires a registered function/type before emitting an
      * exact semantic relationship. */
-    return strdup(path);
+    return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path);
 }
 
 /* IMPORTS edges correctly target dependency modules, but Python from-imports
@@ -1316,7 +1316,7 @@ static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
     if (lang == CBM_LANG_KOTLIN)
         return pxc_kotlin_import_from_metadata(result, local_name);
     if (lang != CBM_LANG_PYTHON)
-        return strdup(target->qualified_name);
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, target->qualified_name);
 
     bool ambiguous = false;
     const char *path = pxc_unique_import_path(result, local_name, &ambiguous);
@@ -1327,11 +1327,11 @@ static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
     if (!path || !source_leaf || !target_leaf || strcmp(source_leaf, local_name) != 0 ||
         strcmp(source_leaf, target_leaf) == 0 || !target->label ||
         (strcmp(target->label, "Module") != 0 && strcmp(target->label, "Folder") != 0)) {
-        return strdup(target->qualified_name);
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, target->qualified_name);
     }
 
     size_t need = strlen(target->qualified_name) + 1 + strlen(source_leaf) + 1;
-    char *qualified = (char *)malloc(need);
+    char *qualified = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, need);
     if (!qualified)
         return NULL;
     snprintf(qualified, need, "%s.%s", target->qualified_name, source_leaf);
@@ -1365,7 +1365,7 @@ static char *pxc_python_import_from_metadata(const cbm_gbuf_t *gbuf, const char 
     const cbm_gbuf_node_t *exact =
         cbm_pipeline_lsp_target_node(gbuf, project_name, module_path, false);
     if (exact && exact->qualified_name)
-        return strdup(exact->qualified_name);
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, exact->qualified_name);
 
     const char *last_dot = strrchr(module_path, '.');
     if (last_dot && last_dot > module_path) {
@@ -1382,7 +1382,7 @@ static char *pxc_python_import_from_metadata(const cbm_gbuf_t *gbuf, const char 
             (strcmp(module_node->label, "Module") == 0 ||
              strcmp(module_node->label, "Folder") == 0)) {
             size_t need = strlen(module_node->qualified_name) + 1 + strlen(source_leaf) + 1;
-            char *qualified = (char *)malloc(need);
+            char *qualified = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, need);
             if (!qualified)
                 return NULL;
             snprintf(qualified, need, "%s.%s", module_node->qualified_name, source_leaf);
@@ -1391,21 +1391,22 @@ static char *pxc_python_import_from_metadata(const cbm_gbuf_t *gbuf, const char 
     }
 
     if (!project_name || !project_name[0])
-        return strdup(module_path);
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, module_path);
     size_t need = strlen(project_name) + 1 + strlen(module_path) + 1;
-    char *qualified = (char *)malloc(need);
+    char *qualified = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, need);
     if (!qualified)
         return NULL;
     snprintf(qualified, need, "%s.%s", project_name, module_path);
     return qualified;
 }
 
-/* Build per-file import map (local_name -> semantic import QN) from gbuf
- * IMPORTS edges. Both pipeline drivers call this implementation. Returns 0
- * with *out_count = 0 when the file has no IMPORTS edges. */
-int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
-                             CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
-                             const char ***out_vals, int *out_count) {
+/* Build the private per-file import map from graph and extraction bindings.
+ * Both pipeline drivers call this implementation; publishing producers apply
+ * the language guard even when a rejected import remains in this map. */
+int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                             const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
+                             const char ***out_keys, const char ***out_vals, int *out_count) {
+    const cbm_gbuf_t *gbuf = ctx->gbuf;
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
@@ -1423,15 +1424,17 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
 
     int metadata_count =
         (lang == CBM_LANG_PYTHON || lang == CBM_LANG_KOTLIN) && result ? result->imports.count : 0;
-    if (edge_count == 0 && metadata_count == 0)
+    if (edge_count == 0 && (!result || result->imports.count == 0))
         return 0;
 
-    size_t capacity = (size_t)edge_count + (size_t)metadata_count;
-    const char **keys = (const char **)calloc(capacity, sizeof(const char *));
-    const char **vals = (const char **)calloc(capacity, sizeof(const char *));
+    size_t capacity = (size_t)edge_count + (result ? (size_t)result->imports.count : 0);
+    const char **keys =
+        (const char **)cbm_calloc(CBM_MEM_CLASS_OTHER, capacity * sizeof(const char *));
+    const char **vals =
+        (const char **)cbm_calloc(CBM_MEM_CLASS_OTHER, capacity * sizeof(const char *));
     if (!keys || !vals) {
-        free(keys);
-        free(vals);
+        cbm_free(CBM_MEM_CLASS_OTHER, keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, vals);
         return 0;
     }
     int count = 0;
@@ -1448,19 +1451,46 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
         if (!end || end <= start)
             continue;
         size_t n = (size_t)(end - start);
-        char *local = (char *)malloc(n + 1);
+        char *local = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, n + 1);
         if (!local)
             continue;
         memcpy(local, start, n);
         local[n] = '\0';
         char *value = pxc_import_value_qn(lang, result, local, target);
         if (!value) {
-            free(local);
+            cbm_free(CBM_MEM_CLASS_OTHER, local);
             continue;
         }
         keys[count] = local;
         vals[count] = value;
         count++;
+    }
+
+    /* Keep rejected import bindings private. Erasing a binding would let a
+     * weaker name guess replace the rejected target in later producers. */
+    if (result) {
+        file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+        for (int i = 0; i < result->imports.count; i++) {
+            const CBMImport *imp = &result->imports.items[i];
+            if (!imp->local_name || !imp->local_name[0] || !imp->module_path ||
+                pxc_import_map_has_local(keys, count, imp->local_name))
+                continue;
+            const cbm_gbuf_node_t *target =
+                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, NULL);
+            if (!target ||
+                !cbm_suppress_cross_language_code_match(lang, ctx->repo_path, target->file_path))
+                continue;
+            char *local = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, imp->local_name);
+            char *value = pxc_import_value_qn(lang, result, imp->local_name, target);
+            if (!local || !value) {
+                cbm_free(CBM_MEM_CLASS_OTHER, local);
+                cbm_free(CBM_MEM_CLASS_OTHER, value);
+                continue;
+            }
+            keys[count] = local;
+            vals[count++] = value;
+        }
+        free(file_qn);
     }
 
     /* IMPORTS edges are best-effort graph relationships. The cross-LSP still
@@ -1483,9 +1513,9 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
                 : pxc_python_import_from_metadata(gbuf, project_name, imp->local_name, path);
         if (!value)
             continue;
-        char *local = strdup(imp->local_name);
+        char *local = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, imp->local_name);
         if (!local) {
-            free(value);
+            cbm_free(CBM_MEM_CLASS_OTHER, value);
             continue;
         }
         keys[count] = local;
@@ -1501,13 +1531,13 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
 void cbm_pxc_free_import_map(const char **keys, const char **vals, int count) {
     if (keys) {
         for (int i = 0; i < count; i++)
-            free((void *)keys[i]);
-        free((void *)keys);
+            cbm_free(CBM_MEM_CLASS_OTHER, (void *)keys[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)keys);
     }
     if (vals) {
         for (int i = 0; i < count; i++)
-            free((void *)vals[i]);
-        free((void *)vals);
+            cbm_free(CBM_MEM_CLASS_OTHER, (void *)vals[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)vals);
     }
 }
 
@@ -3064,7 +3094,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, lang, cache[i],
+        cbm_pxc_build_import_map(ctx, ctx->project_name, files[i].rel_path, lang, cache[i],
                                  &imp_keys, &imp_vals, &imp_count);
 
         /* Journal around the resolve: a hang here must be attributed to THIS

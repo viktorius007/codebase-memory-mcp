@@ -555,6 +555,16 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
     return true;
 }
 
+static CBMLanguage resolution_language_family(CBMLanguage lang) {
+    if (js_ts_family(lang))
+        return CBM_LANG_JAVASCRIPT;
+    if (c_cpp_family(lang))
+        return CBM_LANG_C;
+    if (lang == CBM_LANG_OBJECTSCRIPT_EXPORT || lang == CBM_LANG_OBJECTSCRIPT_ROUTINE)
+        return CBM_LANG_OBJECTSCRIPT_UDL;
+    return lang;
+}
+
 bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path) {
     /* #1928: USAGE / WRITES / READS analog of the CALLS guard above. A
      * variable or field reference resolved by the short-name registry must
@@ -574,16 +584,32 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
     if (target_lang == CBM_LANG_COUNT) {
         return false;
     }
-    if (caller_lang == target_lang) {
+    return resolution_language_family(caller_lang) != resolution_language_family(target_lang);
+}
+
+bool cbm_suppress_cross_language_code_match(CBMLanguage caller_lang, const char *repo_path,
+                                            const char *target_file_path) {
+    if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0])
         return false;
-    }
-    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    /* Configuration, schema and documentation relations are not code bindings. */
+    if (target_lang == CBM_LANG_PROTOBUF || target_lang == CBM_LANG_TOML ||
+        target_lang == CBM_LANG_JSON || target_lang == CBM_LANG_MARKDOWN)
         return false;
+    if (repo_path) {
+        char absolute_path[CBM_SZ_4K];
+        int n =
+            snprintf(absolute_path, sizeof(absolute_path), "%s/%s", repo_path, target_file_path);
+        if (n < 0 || (size_t)n >= sizeof(absolute_path))
+            return true;
+        CBMLanguage detected =
+            cbm_detect_file_language(path_basename(target_file_path), absolute_path);
+        if (detected != CBM_LANG_COUNT)
+            target_lang = detected;
     }
-    if (c_cpp_family(caller_lang) && c_cpp_family(target_lang)) {
+    if (target_lang == CBM_LANG_COUNT)
         return false;
-    }
-    return true;
+    return resolution_language_family(caller_lang) != resolution_language_family(target_lang);
 }
 
 bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label) {

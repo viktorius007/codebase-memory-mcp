@@ -811,6 +811,24 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
     PASS();
 }
 
+TEST(cross_language_code_match_preserves_resolver_families) {
+    ASSERT_TRUE(cbm_suppress_cross_language_code_match(CBM_LANG_PYTHON, NULL, "lib.rs"));
+    ASSERT_TRUE(cbm_suppress_cross_language_code_match(CBM_LANG_TYPESCRIPT, NULL, "lib.rs"));
+    ASSERT_TRUE(cbm_suppress_cross_language_code_match(CBM_LANG_BASH, NULL, "lib.rs"));
+    ASSERT_FALSE(cbm_suppress_cross_language_code_match(CBM_LANG_RUST, NULL, "lib.rs"));
+    ASSERT_FALSE(cbm_suppress_cross_language_code_match(CBM_LANG_JAVASCRIPT, NULL, "helper.ts"));
+    ASSERT_FALSE(cbm_suppress_cross_language_code_match(CBM_LANG_C, NULL, "api.h"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_code_match(CBM_LANG_OBJECTSCRIPT_EXPORT, NULL, "worker.mac"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_code_match(CBM_LANG_OBJECTSCRIPT_EXPORT, NULL, "worker.cls"));
+    ASSERT_FALSE(cbm_suppress_cross_language_code_match(CBM_LANG_RUST, NULL, "service.proto"));
+    ASSERT_FALSE(cbm_suppress_cross_language_code_match(CBM_LANG_RUST, NULL, "Cargo.toml"));
+    ASSERT_FALSE(cbm_suppress_cross_language_code_match(CBM_LANG_RUST, NULL, "config.json"));
+    ASSERT_FALSE(cbm_suppress_cross_language_code_match(CBM_LANG_RUST, NULL, "README.md"));
+    PASS();
+}
+
 TEST(cross_language_ref_drops_go_vs_c) {
     /* #1928: the USAGE/WRITES/READS analog of #725. Reference edges carry no
      * import-closure evidence, so EVERY registry strategy is a bare-name
@@ -1065,6 +1083,7 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
+    RUN_TEST(cross_language_code_match_preserves_resolver_families);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);

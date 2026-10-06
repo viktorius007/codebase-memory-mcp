@@ -16,6 +16,7 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
  * resolution is empty (external, unindexed client library) — see #523. */
 #define PC_SVC_PATTERN_CONF 0.5
 #include "pipeline/pipeline.h"
+#include "discover/discover.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
@@ -704,12 +705,23 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
-    /* #725: suffix_match is language-agnostic and will attach a Python
-     * Store.commit() call to a JS function named commit (or a Bash main
-     * to a Python main). Drop that weak cross-language edge. */
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
+    /* A unique name and an import-map guess need the same language evidence
+     * as a suffix match; none establishes a foreign-language binding. */
+    CBMLanguage source_lang = source_node->file_path && strcmp(source_node->file_path, rel) == 0
+                                  ? lang
+                                  : cbm_language_for_filename(source_node->file_path);
+    if (source_lang == CBM_LANG_COUNT && source_node->file_path && ctx->repo_path) {
+        char source_path[CBM_SZ_4K];
+        int n = snprintf(source_path, sizeof(source_path), "%s/%s", ctx->repo_path,
+                         source_node->file_path);
+        if (n >= 0 && (size_t)n < sizeof(source_path))
+            source_lang = cbm_detect_file_language(source_node->file_path, source_path);
+    }
+    drop_plain_call |=
+        cbm_suppress_cross_language_code_match(source_lang, ctx->repo_path, target_node->file_path);
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count, drop_plain_call);
     return SKIP_ONE;
