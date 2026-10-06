@@ -27,7 +27,7 @@
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 13 };
+enum { SURFACE_CODEC_VERSION = 14 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -109,6 +109,7 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         yyjson_mut_obj_add_bool(doc, o, "hs", d->has_rust_self);
         yyjson_mut_obj_add_bool(doc, o, "vs", d->has_rust_value_self);
         yyjson_mut_obj_add_bool(doc, o, "ss", d->has_rust_shared_self);
+        yyjson_mut_obj_add_bool(doc, o, "iu", d->rust_impl_self_needs_proof);
         add_str_array_or_null(doc, o, "up", d->rust_unbounded_impl_params, -1);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
         add_str_array_or_null(doc, o, "tp", d->type_params, -1);
@@ -316,6 +317,8 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->has_rust_self = yyjson_get_bool(yyjson_obj_get(o, "hs"));
         d->has_rust_value_self = yyjson_get_bool(yyjson_obj_get(o, "vs"));
         d->has_rust_shared_self = yyjson_get_bool(yyjson_obj_get(o, "ss"));
+        yyjson_val *impl_proof = yyjson_obj_get(o, "iu");
+        d->rust_impl_self_needs_proof = !yyjson_is_bool(impl_proof) || yyjson_get_bool(impl_proof);
         int impl_param_count = 0;
         d->rust_unbounded_impl_params =
             arena_str_array(arena, yyjson_obj_get(o, "up"), true, &impl_param_count);

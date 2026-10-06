@@ -5601,6 +5601,7 @@ typedef struct {
     const char *impl_trait;
     const char **unbounded_params;
     const char **type_params;
+    bool self_needs_proof;
 } RustImplOwner;
 
 /* One member of an impl body: a method, an associated const or an associated
@@ -5639,6 +5640,7 @@ static void extract_rust_impl_member(CBMExtractCtx *ctx, TSNode child, const Rus
     def.parent_class = owner->type_qn;
     def.impl_trait = impl_trait;
     def.rust_unbounded_impl_params = owner->unbounded_params;
+    def.rust_impl_self_needs_proof = owner->self_needs_proof;
     def.is_async = rust_fn_is_async(child);
     def.has_rust_self = rust_fn_has_self_receiver(child, ctx->source, &def.has_rust_value_self,
                                                   &def.has_rust_shared_self);
@@ -6549,6 +6551,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                                rust_item_type_param_names(a, node, ctx->source, &type_param_count)};
     TSNode params = ts_node_child_by_field_name(node, TS_FIELD("type_parameters"));
     TSNode where = cbm_find_child_by_kind(node, "where_clause");
+    owner.self_needs_proof = type_param_count > 0 || !ts_node_is_null(where);
     if (ts_node_is_null(where) &&
         (ts_node_is_null(params) || !rust_subtree_has_kind(params, "trait_bounds", 0))) {
         owner.unbounded_params = owner.type_params;

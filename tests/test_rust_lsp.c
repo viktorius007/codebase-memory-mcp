@@ -7958,6 +7958,268 @@ TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape) {
     PASS();
 }
 
+TEST(rustlsp_written_reference_impl_selects_borrowed_owner) {
+    CBMFileResult *r = extract_rust("trait Measure { fn measure(self); }\n"
+                                    "impl Measure for &str { fn measure(self) {} }\n"
+                                    "fn run(x: &str) { x.measure(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "&str.measure[Measure]"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_written_primitive_impl_selects_canonical_owner) {
+    CBMFileResult *r = extract_rust("trait Measure { fn measure(&self); }\n"
+                                    "impl Measure for str { fn measure(&self) {} }\n"
+                                    "impl Measure for u32 { fn measure(&self) {} }\n"
+                                    "fn text(x: &str) { x.measure(); }\n"
+                                    "fn number(x: u32) { x.measure(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.text", "str.measure[Measure]"), 0);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.number", "u32.measure[Measure]"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_nested_reference_impl_precedes_inner_inherent) {
+    CBMFileResult *r = extract_rust("trait Measure { fn measure(&self); }\n"
+                                    "struct Item; impl Item { fn measure(&self) {} }\n"
+                                    "impl Measure for &Item { fn measure(&self) {} }\n"
+                                    "fn run(x: &&Item) { x.measure(); }\n"
+                                    "fn inner(x: &Item) { x.measure(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "&Item.measure[Measure]"), 0);
+    ASSERT_EQ(find_resolved(r, "main.run", "main.Item.measure"), -1);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.inner", "main.Item.measure"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_unknown_reference_qualifier_is_not_promoted_by_alias_expansion) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &arena);
+    cbm_registry_add_type(
+        &registry, (CBMRegisteredType){.qualified_name = "test.pkg.Item", .short_name = "Item"});
+    cbm_registry_add_type(
+        &registry, (CBMRegisteredType){.qualified_name = "test.pkg.Alias",
+                                       .short_name = "Alias",
+                                       .alias_type = cbm_type_named(&arena, "test.pkg.Item")});
+    CBMType *mutable =
+        (CBMType *)cbm_type_reference(&arena, cbm_type_named(&arena, "test.pkg.Item"));
+    mutable->data.reference.rust_mutable = true;
+    cbm_registry_add_func(
+        &registry,
+        (CBMRegisteredFunc){
+            .qualified_name = "test.pkg.&mut Item.read[Read]",
+            .short_name = "read",
+            .receiver_type = "core.reference",
+            .impl_trait_qn = "test.pkg.Read",
+            .impl_key = cbm_rust_impl_key(&arena, "test.pkg.&mut Item", "&mut Item", "Read"),
+            .rust_reference_impl_self = mutable,
+            .flags = CBM_FUNC_FLAG_RUST_TRAIT_IMPL | CBM_FUNC_FLAG_RUST_SELF |
+                     CBM_FUNC_FLAG_RUST_VALUE_SELF});
+    const char *source = "fn run() { x.read(); }";
+    extern const TSLanguage *tree_sitter_rust(void);
+    TSParser *parser = ts_parser_new();
+    ts_parser_set_language(parser, tree_sitter_rust());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    CBMResolvedCallArray out = {0};
+    RustLSPContext ctx;
+    rust_lsp_init(&ctx, &arena, source, (int)strlen(source), &registry, "test.pkg", &out);
+    ctx.enclosing_func_qn = "test.pkg.run";
+    cbm_scope_bind(ctx.current_scope, "x",
+                   cbm_type_reference(&arena, cbm_type_named(&arena, "test.pkg.Alias")));
+    rust_lsp_process_file(&ctx, ts_tree_root_node(tree));
+    ASSERT_EQ(find_confident(&out, "test.pkg.run", "read"), -1);
+    CBMType *proved =
+        (CBMType *)cbm_type_reference(&arena, cbm_type_named(&arena, "test.pkg.Alias"));
+    proved->data.reference.rust_mutable = true;
+    rust_lsp_init(&ctx, &arena, source, (int)strlen(source), &registry, "test.pkg", &out);
+    ctx.enclosing_func_qn = "test.pkg.run";
+    cbm_scope_bind(ctx.current_scope, "x", proved);
+    rust_lsp_process_file(&ctx, ts_tree_root_node(tree));
+    ASSERT_GTE(find_confident(&out, "test.pkg.run", "&mut Item.read[Read]"), 0);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_reference_impl_disjoint_referent_does_not_block_unknown_qualifier) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &arena);
+    cbm_registry_add_type(&registry, (CBMRegisteredType){
+        .qualified_name = "test.pkg.Item", .short_name = "Item"});
+    cbm_registry_add_type(&registry, (CBMRegisteredType){
+        .qualified_name = "test.pkg.Read", .short_name = "Read", .is_interface = true});
+    int shared = CBM_FUNC_FLAG_RUST_SELF | CBM_FUNC_FLAG_RUST_SHARED_SELF;
+    cbm_registry_add_func(&registry, (CBMRegisteredFunc){
+        .qualified_name = "test.pkg.Item.read", .short_name = "read",
+        .receiver_type = "test.pkg.Item", .flags = shared});
+    cbm_registry_add_func(&registry, (CBMRegisteredFunc){
+        .qualified_name = "test.pkg.Read.read", .short_name = "read",
+        .receiver_type = "test.pkg.Read", .flags = shared | CBM_FUNC_FLAG_RUST_ABSTRACT});
+    CBMType *string = (CBMType *)cbm_type_reference(&arena, cbm_type_builtin(&arena, "str"));
+    string->data.reference.rust_shared = true;
+    cbm_registry_add_func(&registry, (CBMRegisteredFunc){
+        .qualified_name = "test.pkg.&str.read[Read]", .short_name = "read",
+        .receiver_type = "core.reference", .impl_trait_qn = "test.pkg.Read",
+        .impl_key = cbm_rust_impl_key(&arena, "test.pkg.&str", "&str", "Read"),
+        .rust_reference_impl_self = string, .flags = shared | CBM_FUNC_FLAG_RUST_TRAIT_IMPL});
+    const char *source = "fn run() { x.read(); }";
+    extern const TSLanguage *tree_sitter_rust(void);
+    TSParser *parser = ts_parser_new();
+    ts_parser_set_language(parser, tree_sitter_rust());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    const CBMType *trait = cbm_type_named(&arena, "test.pkg.Read");
+    const CBMType *receivers[] = {
+        cbm_type_reference(&arena, cbm_type_named(&arena, "test.pkg.Item")),
+        cbm_type_reference(&arena, cbm_type_template(&arena, "alloc.boxed.Box", &trait, 1))};
+    const char *targets[] = {"test.pkg.Item.read", "test.pkg.Read.read"};
+    for (int i = 0; i < 2; i++) {
+        CBMResolvedCallArray out = {0};
+        RustLSPContext ctx;
+        rust_lsp_init(&ctx, &arena, source, (int)strlen(source), &registry, "test.pkg", &out);
+        ctx.enclosing_func_qn = "test.pkg.run";
+        cbm_scope_bind(ctx.current_scope, "x", receivers[i]);
+        rust_lsp_process_file(&ctx, ts_tree_root_node(tree));
+        ASSERT_GTE(find_confident(&out, "test.pkg.run", targets[i]), 0);
+        ASSERT_EQ(find_confident(&out, "test.pkg.run", "&str.read[Read]"), -1);
+    }
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(rustlsp_reference_impl_unknown_referent_does_not_prove_different_depth) {
+    CBMFileResult *r = extract_rust(
+        "struct Item; impl Item { fn read(&self) {} }\n"
+        "trait Read { fn read(self); }\n"
+        "impl<T> Read for &T { fn read(self) {} }\n"
+        "fn run(x: &&Item) { x.read(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_shared_self_uses_enclosing_trait_impl_before_reference_wrappers) {
+    CBMFileResult *r = extract_rust(
+        "trait Db {}\n"
+        "trait Resolve { fn input(&self); fn run(&self); }\n"
+        "impl<T: Db> Resolve for T { fn input(&self) {} fn run(&self) { self.input(); } }\n"
+        "impl Resolve for &dyn Db { fn input(&self) {} fn run(&self) {} }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.T.run[Resolve]", "main.T.input[Resolve]"), 0);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.T.run[Resolve]", "&dyn Db.input[Resolve]"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_borrowed_mutable_reference_cannot_be_consumed) {
+    CBMFileResult *r = extract_rust("trait Read { fn read(self); }\n"
+                                    "struct Item; impl Read for &mut Item { fn read(self) {} }\n"
+                                    "fn borrowed(x: &&mut Item) { x.read(); }\n"
+                                    "fn direct(x: &mut Item) { x.read(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.borrowed", "read"), -1);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.direct", "&mut Item.read[Read]"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_shared_inherent_method_through_borrowed_mutable_reference) {
+    CBMFileResult *r = extract_rust("struct Item; impl Item { fn observe(&self) {} }\n"
+                                    "fn run(x: &&mut Item) { x.observe(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "main.Item.observe"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_reference_blanket_without_forwarding_stays_withheld) {
+    CBMFileResult *r =
+        extract_rust("trait Read { fn read(&self) -> u8; }\n"
+                     "struct Item; impl Read for Item { fn read(&self) -> u8 { 1 } }\n"
+                     "impl<T: Read> Read for &T { fn read(&self) -> u8 { 2 } }\n"
+                     "fn run(x: &&Item) -> u8 { x.read() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_reference_impl_same_depth_ambiguity_withholds) {
+    CBMFileResult *r = extract_rust("trait A { fn measure(self); } trait B { fn measure(self); }\n"
+                                    "impl A for &str { fn measure(self) {} }\n"
+                                    "impl B for &str { fn measure(self) {} }\n"
+                                    "fn run(x: &str) { x.measure(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "measure"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_reference_impl_generic_shadowing_withholds_unproved_bound) {
+    CBMFileResult *r = extract_rust("struct U; trait Bound {}\n"
+                                    "trait Read { fn read(&self); }\n"
+                                    "impl<U: Bound> Read for &U { fn read(&self) {} }\n"
+                                    "fn run(x: &&U) { x.read(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_inherent_shared_receiver_precedes_unproved_blanket) {
+    CBMFileResult *r = extract_rust(
+        "struct Item; impl Item { fn read(&self) {} }\n"
+        "trait Read { fn read(self); }\n"
+        "impl<T> Read for &T { fn read(self) {} }\n"
+        "fn run(x: &Item) { x.read(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "main.Item.read"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_mutable_reference_wrapper_precedes_shared_inner) {
+    CBMFileResult *r = extract_rust("trait Read { fn read(&self); }\n"
+                                    "struct Item; impl Item { fn read(&self) {} }\n"
+                                    "impl Read for &mut Item { fn read(&self) {} }\n"
+                                    "fn run(x: &mut Item) { x.read(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "&mut Item.read[Read]"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_unproved_mutable_reference_receiver_blocks_inner) {
+    CBMFileResult *r = extract_rust("trait Change { fn change(&mut self); }\n"
+                                    "struct Item; impl Item { fn change(&self) {} }\n"
+                                    "impl Change for &Item { fn change(&mut self) {} }\n"
+                                    "fn run(x: &mut &Item) { x.change(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "change"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_primitive_unsupported_method_receiver_is_withheld) {
+    CBMFileResult *r = extract_rust("trait Read { fn read(self: Box<Self>); }\n"
+                                    "impl Read for str { fn read(self: Box<Self>) {} }\n"
+                                    "fn run(x: &str) { x.read(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "read"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_single_borrow_precedes_reference_blanket_impl) {
     CBMFileResult *r = extract_rust(
         "trait Read { fn read(&self) -> u8; }\n"
@@ -14332,6 +14594,22 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_method_recursive_call);
     RUN_TEST(rustlsp_exact_layout_receiver_recovery_keeps_recursion);
     RUN_TEST(rustlsp_reference_impl_recursion_preserves_receiver_shape);
+    RUN_TEST(rustlsp_written_reference_impl_selects_borrowed_owner);
+    RUN_TEST(rustlsp_written_primitive_impl_selects_canonical_owner);
+    RUN_TEST(rustlsp_nested_reference_impl_precedes_inner_inherent);
+    RUN_TEST(rustlsp_unknown_reference_qualifier_is_not_promoted_by_alias_expansion);
+    RUN_TEST(rustlsp_reference_impl_generic_shadowing_withholds_unproved_bound);
+    RUN_TEST(rustlsp_inherent_shared_receiver_precedes_unproved_blanket);
+    RUN_TEST(rustlsp_mutable_reference_wrapper_precedes_shared_inner);
+    RUN_TEST(rustlsp_unproved_mutable_reference_receiver_blocks_inner);
+    RUN_TEST(rustlsp_primitive_unsupported_method_receiver_is_withheld);
+    RUN_TEST(rustlsp_shared_inherent_method_through_borrowed_mutable_reference);
+    RUN_TEST(rustlsp_reference_impl_disjoint_referent_does_not_block_unknown_qualifier);
+    RUN_TEST(rustlsp_reference_impl_unknown_referent_does_not_prove_different_depth);
+    RUN_TEST(rustlsp_shared_self_uses_enclosing_trait_impl_before_reference_wrappers);
+    RUN_TEST(rustlsp_borrowed_mutable_reference_cannot_be_consumed);
+    RUN_TEST(rustlsp_reference_blanket_without_forwarding_stays_withheld);
+    RUN_TEST(rustlsp_reference_impl_same_depth_ambiguity_withholds);
     RUN_TEST(rustlsp_single_borrow_precedes_reference_blanket_impl);
     RUN_TEST(rustlsp_borrowed_collection_preserves_element_reference);
     RUN_TEST(rustlsp_borrowed_collection_cannot_move_noncopy_element);
