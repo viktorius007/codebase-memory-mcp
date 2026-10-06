@@ -216,19 +216,12 @@ typedef struct {
      * awareness. Owned by the caller; the RustLSPContext only borrows. */
     const struct CBMCargoManifest *cargo_manifest;
 
-    /* Chalk-lite trait-bound environment for the *currently-active*
-     * function or impl. Populated at function/impl entry from the
-     * `<T: Bound + …>` parameter list and `where` clause. Consulted
-     * by trait method dispatch when the receiver is typed as a type
-     * parameter — we look up the param's bounds and try resolving
-     * the method on each trait. Also stores associated-type bindings
-     * (`T: Iterator<Item = U>` → `U` aliases the Item of `T`).
-     *
-     * Arrays are arena-allocated and reset on every function entry.
-     */
+    /* Written bounds of active impl/function parameters. A NULL trait QN
+     * starts a parameter scope; "?" records a bound whose trait identity is
+     * unproven. Counts are restored when leaving the item. */
     struct {
         const char *param_name; /* "T", "U", "Item" */
-        const char *trait_qn;   /* "core.clone.Clone" */
+        const char *trait_qn;   /* Trait QN, NULL scope marker, or "?". */
     } *type_param_bounds;
     int type_param_bound_count;
 

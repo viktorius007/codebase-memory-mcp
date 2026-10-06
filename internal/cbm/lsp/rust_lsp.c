@@ -104,7 +104,11 @@ static const CBMRegisteredFunc *rust_registry_lookup_trait_impl_method(const CBM
                                                                        const char *method_name,
                                                                        bool *out_ambiguous);
 static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char *name);
-static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text);
+static const CBMRegisteredFunc *rust_bound_method(RustLSPContext *ctx, const char *param,
+                                                  const char *method, bool receiver_method,
+                                                  bool *bounded);
+static void rust_collect_item_bounds(RustLSPContext *ctx, TSNode item);
+static void rust_collect_trait_bounds(RustLSPContext *ctx, const char *param, TSNode node);
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
 static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_name,
                                          const char *trait_qn);
@@ -2057,6 +2061,10 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         if (strcmp(name, "Self") == 0 && ctx->self_type_qn) {
             return ctx->self_value_type ? ctx->self_value_type
                                         : cbm_type_named(ctx->arena, ctx->self_type_qn);
+        }
+        for (int i = ctx->type_param_bound_count - 1; i >= 0; i--) {
+            if (strcmp(ctx->type_param_bounds[i].param_name, name) == 0)
+                return cbm_type_named(ctx->arena, name);
         }
         bool ambiguous = false;
         const char *qn = rust_type_qn_by_module_tree(ctx, node, name, &ambiguous);
@@ -7082,20 +7090,20 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
     } else {
         return cbm_type_unknown();
     }
-    {
+    bool bounded = false;
+    const CBMRegisteredFunc *method =
+        method_call ? rust_bound_method(ctx, type_qn, member, true, &bounded) : NULL;
+    if (bounded && !method)
+        return cbm_type_unknown();
+    if (!bounded) {
         const char *registered = rust_registered_type_qn(ctx, type_qn);
-        if (registered) {
+        if (registered)
             type_qn = registered;
-        }
+        method = method_call ? rust_lookup_method(ctx, type_qn, member) : NULL;
     }
     if (!type_qn)
         return cbm_type_unknown();
 
-    /* A call names a method before a field; an access that is not a call
-     * names only a field, so `self.x.push(..)` reads the field `x` even when
-     * the type also declares `fn x`. */
-    const CBMRegisteredFunc *method =
-        method_call ? rust_lookup_method(ctx, type_qn, member) : NULL;
     if (method && method->signature) {
         if (rust_trait_receiver_refusal(ctx, method, recv)) {
             return cbm_type_unknown();
@@ -8016,29 +8024,6 @@ static const CBMRegisteredFunc *rust_lookup_method_in_trait_own(RustLSPContext *
                                                allow_abstract);
     }
     return NULL;
-}
-
-/* A generic receiver selects a declaration from its bounds, never a
- * registered implementor. Different declarations leave selection unproved. */
-static const CBMRegisteredFunc *rust_lookup_bound_method(RustLSPContext *ctx,
-                                                         const char *name,
-                                                         const char *method_name) {
-    const CBMRegisteredFunc *selected = NULL;
-    for (int i = 0; i < ctx->type_param_bound_count; i++) {
-        if (strcmp(ctx->type_param_bounds[i].param_name, name) != 0) {
-            continue;
-        }
-        const CBMRegisteredFunc *candidate = rust_lookup_method_in_trait(
-            ctx, ctx->type_param_bounds[i].trait_qn, method_name, true);
-        if (!candidate) {
-            continue;
-        }
-        if (selected && strcmp(selected->qualified_name, candidate->qualified_name) != 0) {
-            return NULL;
-        }
-        selected = candidate;
-    }
-    return selected;
 }
 
 /* Whether `qn` lies under the project's root segment, where only project
@@ -11775,14 +11760,29 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
     }
     const char *head_dot = strrchr(head, '.');
     const char *param_name = head_dot ? head_dot + 1 : head;
-    if (path && strcmp(path, cbm_arena_sprintf(ctx->arena, "%s::%s", param_name, short_name)) == 0 &&
-        rust_lookup_type_param_bound(ctx, param_name)) {
-        const CBMRegisteredFunc *bound = rust_lookup_bound_method(ctx, param_name, short_name);
-        if (bound) {
-            rust_call_target_set(out, bound, bound->qualified_name, "lsp_trait_dispatch",
-                                 CBM_RUST_CONF_UFCS);
+    if (path &&
+        strcmp(path, cbm_arena_sprintf(ctx->arena, "%s::%s", param_name, short_name)) == 0) {
+        bool bounded = false;
+        const CBMRegisteredFunc *bound =
+            rust_bound_method(ctx, param_name, short_name, false, &bounded);
+        if (bounded) {
+            if (bound) {
+                rust_call_target_set(out, bound, bound->qualified_name, "lsp_trait_dispatch",
+                                     CBM_RUST_CONF_UFCS);
+                return true;
+            }
+            const char *recursive = ctx->module_qn
+                                        ? cbm_arena_sprintf(ctx->arena, "%s.%s.%s", ctx->module_qn,
+                                                            param_name, short_name)
+                                        : NULL;
+            /* Preserve type-headed recursion when the first argument proves self. */
+            if (!recursive || !ctx->enclosing_func_qn ||
+                strncmp(ctx->enclosing_func_qn, recursive, strlen(recursive)) != 0 ||
+                ctx->enclosing_func_qn[strlen(recursive)] != '[' || ts_node_is_null(first_arg) ||
+                !cbm_type_equal(rust_eval_expr_type(ctx, first_arg),
+                                cbm_scope_lookup(ctx->current_scope, "self")))
+                return true;
         }
-        return true;
     }
     /* `Alias::f` names the aliased type's `f` unless the alias itself
      * carries one. */
@@ -12586,6 +12586,61 @@ static const CBMRegisteredFunc *rust_default_impl_of(RustLSPContext *ctx, const 
     return found;
 }
 
+/* Every reachable declaration must agree. An unknown trait or truncated
+ * supertrait walk cannot prove that another declaration does not compete. */
+static void rust_bound_trait_declarations(RustLSPContext *ctx, const char *trait_qn,
+                                          const char *method, bool receiver_method, int depth,
+                                          const CBMRegisteredFunc **selected, bool *ambiguous) {
+    if (*ambiguous)
+        return;
+    const CBMRegisteredType *trait = cbm_registry_lookup_type(ctx->registry, trait_qn);
+    if (!trait || !trait->is_interface || trait->rust_nominal_identity_ambiguous ||
+        depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
+        *ambiguous = true;
+        return;
+    }
+    for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
+        CBMMethodIter methods;
+        cbm_registry_methods(reg, trait_qn, method, &methods);
+        for (int index; (index = cbm_method_iter_next(&methods)) >= 0;) {
+            const CBMRegisteredFunc *candidate = &reg->funcs[index];
+            if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0 ||
+                (receiver_method && (candidate->flags & CBM_FUNC_FLAG_RUST_SELF) == 0))
+                continue;
+            if (*selected && strcmp((*selected)->qualified_name, candidate->qualified_name) != 0) {
+                *ambiguous = true;
+                return;
+            }
+            *selected = candidate;
+        }
+    }
+    for (int i = 0; trait->embedded_types && trait->embedded_types[i]; i++) {
+        const char *parent = trait->embedded_types[i];
+        if (strncmp(parent, RUST_SUPERTRAIT_PREFIX, RUST_SUPERTRAIT_PREFIX_LEN) == 0)
+            rust_bound_trait_declarations(ctx, parent + RUST_SUPERTRAIT_PREFIX_LEN, method,
+                                          receiver_method, depth + 1, selected, ambiguous);
+    }
+}
+
+/* Shared by publication and return-type inference for a bounded receiver. */
+static const CBMRegisteredFunc *rust_bound_method(RustLSPContext *ctx, const char *param,
+                                                  const char *method, bool receiver_method,
+                                                  bool *bounded) {
+    bool ambiguous = false;
+    const CBMRegisteredFunc *declaration = NULL;
+    for (int i = ctx->type_param_bound_count - 1; param && i >= 0; i--) {
+        if (strcmp(ctx->type_param_bounds[i].param_name, param) != 0)
+            continue;
+        *bounded = true;
+        const char *trait = ctx->type_param_bounds[i].trait_qn;
+        if (!trait)
+            break;
+        rust_bound_trait_declarations(ctx, trait, method, receiver_method, 0, &declaration,
+                                      &ambiguous);
+    }
+    return ambiguous ? NULL : declaration;
+}
+
 /* `Default::default()` (std's trait, spelled bare or through `std`/`core`)
  * links to the expected type's `impl Default`. True when it emitted. */
 static bool rust_resolve_default_by_expected_type(RustLSPContext *ctx, TSNode call,
@@ -12809,17 +12864,18 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             type_qn = "core.slice";
         }
 
-        const char *param_dot = type_qn ? strrchr(type_qn, '.') : NULL;
-        const char *param_name = param_dot ? param_dot + 1 : type_qn;
-        if (param_name && (!param_dot || (ctx->module_qn &&
-            strcmp(type_qn, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, param_name)) == 0)) &&
-            rust_lookup_type_param_bound(ctx, param_name)) {
-            const CBMRegisteredFunc *bound = rust_lookup_bound_method(ctx, param_name, mname);
-            if (bound) {
-                rust_emit_resolved_call(ctx, bound->qualified_name, bound->impl_key,
-                                        "lsp_trait_dispatch", CBM_RUST_CONF_TRAIT_AMB);
+        if (type_qn) {
+            bool bounded = false;
+            const CBMRegisteredFunc *declaration =
+                rust_bound_method(ctx, type_qn, mname, true, &bounded);
+            if (bounded) {
+                if (declaration)
+                    rust_emit_resolved_call(ctx, declaration->qualified_name, NULL,
+                                            "lsp_bound_dispatch", CBM_RUST_CONF_TRAIT_AMB);
+                else
+                    rust_emit_unresolved_call(ctx, mname, "bound_declaration_not_proven");
+                return;
             }
-            return;
         }
 
         bool wrapper_blocked = false;
@@ -13676,18 +13732,7 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
      * and where-clause bounds into ctx so dispatch through generic
      * receivers can route via the bound trait. */
     int saved_bound_count = ctx->type_param_bound_count;
-    TSNode tp_list = ts_node_child_by_field_name(func_node, "type_parameters", 15);
-    if (!ts_node_is_null(tp_list)) {
-        char *tp_text = rust_node_text(ctx, tp_list);
-        if (tp_text)
-            rust_collect_bounds_from_text(ctx, tp_text);
-    }
-    TSNode where_clause = cbm_find_child_by_kind(func_node, "where_clause");
-    if (!ts_node_is_null(where_clause)) {
-        char *wt = rust_node_text(ctx, where_clause);
-        if (wt)
-            rust_collect_bounds_from_text(ctx, wt);
-    }
+    rust_collect_item_bounds(ctx, func_node);
 
     /* Bind self for impl/trait methods. */
     TSNode params = ts_node_child_by_field_name(func_node, "parameters", 10);
@@ -13723,6 +13768,37 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
                 }
                 const CBMType *pt =
                     ts_node_is_null(tn) ? cbm_type_unknown() : rust_parse_type_node(ctx, tn);
+                TSNode bound_node = tn;
+                while (!ts_node_is_null(bound_node)) {
+                    const char *bound_kind = ts_node_type(bound_node);
+                    if (strcmp(bound_kind, "reference_type") == 0) {
+                        bound_node = ts_node_child_by_field_name(bound_node, "type", 4);
+                    } else if (strcmp(bound_kind, "parenthesized_type") == 0 ||
+                               (strcmp(bound_kind, "tuple_type") == 0 &&
+                                ts_node_named_child_count(bound_node) == 1 &&
+                                ts_node_child_count(bound_node) == 3)) {
+                        bound_node = ts_node_named_child(bound_node, 0);
+                    } else {
+                        break;
+                    }
+                }
+                char *type_text =
+                    ts_node_is_null(bound_node) ? NULL : rust_node_text(ctx, bound_node);
+                if (type_text && strncmp(type_text, "impl ", 5) == 0) {
+                    const char *param =
+                        cbm_arena_sprintf(ctx->arena, "<impl@%u>", ts_node_start_byte(bound_node));
+                    rust_record_type_param_bound(ctx, param, NULL);
+                    rust_collect_trait_bounds(ctx, param, bound_node);
+                    pt = cbm_type_named(ctx->arena, param);
+                    TSNode wrapper = bound_node;
+                    while (!ts_node_eq(wrapper, tn)) {
+                        wrapper = ts_node_parent(wrapper);
+                        if (strcmp(ts_node_type(wrapper), "reference_type") == 0)
+                            pt = rust_reference_type(ctx->arena, pt,
+                                                     ts_node_is_null(cbm_find_child_by_kind(
+                                                         wrapper, "mutable_specifier")));
+                    }
+                }
                 if (!ts_node_is_null(pat))
                     rust_bind_pattern(ctx, pat, pt);
             }
@@ -13747,7 +13823,7 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
  * environment. The arrays grow by 8 to keep allocs cheap. */
 static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_name,
                                          const char *trait_qn) {
-    if (!ctx || !param_name || !trait_qn)
+    if (!ctx || !param_name)
         return;
     /* Grow by 8s. */
     if (ctx->type_param_bound_count % 8 == 0) {
@@ -13764,7 +13840,7 @@ static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_
     ctx->type_param_bounds[ctx->type_param_bound_count].param_name =
         cbm_arena_strdup(ctx->arena, param_name);
     ctx->type_param_bounds[ctx->type_param_bound_count].trait_qn =
-        cbm_arena_strdup(ctx->arena, trait_qn);
+        trait_qn ? cbm_arena_strdup(ctx->arena, trait_qn) : NULL;
     ctx->type_param_bound_count++;
 }
 
@@ -13773,125 +13849,94 @@ static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_
 static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char *name) {
     if (!ctx || !name)
         return NULL;
-    for (int i = 0; i < ctx->type_param_bound_count; i++) {
-        if (strcmp(ctx->type_param_bounds[i].param_name, name) == 0) {
-            return ctx->type_param_bounds[i].trait_qn;
-        }
+    const char *bound = NULL;
+    for (int i = ctx->type_param_bound_count - 1; i >= 0; i--) {
+        if (strcmp(ctx->type_param_bounds[i].param_name, name) != 0)
+            continue;
+        if (!ctx->type_param_bounds[i].trait_qn)
+            return bound;
+        bound = ctx->type_param_bounds[i].trait_qn;
     }
-    return NULL;
+    return bound;
 }
 
-/* Parse the impl/function's <T: Bound + Bound, U: Bound> + where clause
- * text into the per-context bound environment. We don't reason about
- * lifetimes; we record only trait bounds and associated-type bindings.
- *
- * Format we accept (simplified TOML-like grammar):
- *   `<T: Clone + Debug, U: Iterator<Item = V>>`
- *   `where T: Clone, U: Iterator<Item = V>`
- *
- * Multiple bounds are split on `+` (top-level), entries on `,`. */
-static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text) {
-    if (!ctx || !text)
+/* Read trait paths from grammar nodes, without treating associated-type
+ * constraints, lifetimes or optional bounds as receiver trait declarations. */
+static void rust_collect_trait_bounds(RustLSPContext *ctx, const char *param, TSNode node) {
+    if (ts_node_is_null(node))
         return;
-    /* Walk text, find segments separated by `,` at top depth. For each
-     * segment, split on `:` to get (param, bound-list); split bounds on `+`
-     * at top depth. Resolve each bound through the path resolver to its QN. */
-    int len = (int)strlen(text);
-    int from = 0;
-    while (from < len) {
-        /* Skip whitespace + leading 'where'/punct. */
-        while (from < len && (text[from] == ' ' || text[from] == '\n' || text[from] == '<' ||
-                              text[from] == ',' || text[from] == '>' || text[from] == 'w')) {
-            if (text[from] == 'w' && from + 5 < len && strncmp(text + from, "where", 5) == 0) {
-                from += 5;
-            } else {
-                from++;
-            }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "trait_bounds") == 0 || strcmp(kind, "bounded_type") == 0 ||
+        strcmp(kind, "abstract_type") == 0 || strcmp(kind, "parenthesized_type") == 0) {
+        for (uint32_t i = 0; i < ts_node_named_child_count(node); i++)
+            rust_collect_trait_bounds(ctx, param, ts_node_named_child(node, i));
+        return;
+    }
+    if (strcmp(kind, "lifetime") == 0 || strcmp(kind, "removed_trait_bound") == 0)
+        return;
+    if (strcmp(kind, "higher_ranked_trait_bound") == 0) {
+        rust_collect_trait_bounds(ctx, param, ts_node_child_by_field_name(node, "type", 4));
+        return;
+    }
+    if (strcmp(kind, "generic_type") == 0)
+        node = ts_node_child_by_field_name(node, "type", 4);
+    else if (strcmp(kind, "function_type") == 0)
+        node = ts_node_child_by_field_name(node, "trait", 5);
+    if (ts_node_is_null(node)) {
+        rust_record_type_param_bound(ctx, param, "?");
+        return;
+    }
+    char *text = rust_node_text(ctx, node);
+    for (int i = 0; text && i < ctx->type_param_bound_count; i++) {
+        if (strcmp(ctx->type_param_bounds[i].param_name, text) == 0) {
+            rust_record_type_param_bound(ctx, param, "?");
+            return;
         }
-        if (from >= len)
-            break;
+    }
+    const CBMType *type = rust_parse_type_node(ctx, node);
+    const char *qn = type && type->kind == CBM_TYPE_NAMED ? type->data.named.qualified_name : NULL;
+    const CBMRegisteredType *trait = qn ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+    rust_record_type_param_bound(ctx, param, trait && trait->is_interface ? qn : "?");
+}
 
-        /* Param name. */
-        int name_start = from;
-        if (text[from] == '\'') {
-            /* Lifetime — skip. */
-            from++;
-            while (from < len && (isalnum((unsigned char)text[from]) || text[from] == '_'))
-                from++;
+/* A NULL bound marks a new parameter scope, including an unbounded parameter
+ * shadowing an impl parameter. where predicates extend only these parameters. */
+static void rust_collect_item_bounds(RustLSPContext *ctx, TSNode item) {
+    TSNode params = ts_node_child_by_field_name(item, "type_parameters", 15);
+    /* All names are in scope in every bound, including later parameters. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t i = 0; !ts_node_is_null(params) && i < ts_node_named_child_count(params);
+             i++) {
+            TSNode param = ts_node_named_child(params, i);
+            if (strcmp(ts_node_type(param), "type_parameter") != 0)
+                continue;
+            char *name = rust_node_text(ctx, ts_node_child_by_field_name(param, "name", 4));
+            if (!name)
+                continue;
+            if (pass == 0)
+                rust_record_type_param_bound(ctx, name, NULL);
+            else
+                rust_collect_trait_bounds(ctx, name,
+                                          ts_node_child_by_field_name(param, "bounds", 6));
+        }
+    }
+    for (uint32_t i = 0; i < ts_node_named_child_count(item); i++) {
+        TSNode clause = ts_node_named_child(item, i);
+        if (strcmp(ts_node_type(clause), "where_clause") != 0)
             continue;
+        for (uint32_t j = 0; j < ts_node_named_child_count(clause); j++) {
+            TSNode predicate = ts_node_named_child(clause, j);
+            TSNode left = ts_node_child_by_field_name(predicate, "left", 4);
+            if (ts_node_is_null(left) || strcmp(ts_node_type(left), "type_identifier") != 0)
+                continue;
+            char *name = rust_node_text(ctx, left);
+            bool parameter = false;
+            for (int k = 0; name && k < ctx->type_param_bound_count; k++)
+                parameter |= strcmp(ctx->type_param_bounds[k].param_name, name) == 0;
+            if (parameter)
+                rust_collect_trait_bounds(ctx, name,
+                                          ts_node_child_by_field_name(predicate, "bounds", 6));
         }
-        while (from < len && (isalnum((unsigned char)text[from]) || text[from] == '_'))
-            from++;
-        int name_end = from;
-        if (name_end == name_start) {
-            from++;
-            continue;
-        }
-        char *pname =
-            cbm_arena_strndup(ctx->arena, text + name_start, (size_t)(name_end - name_start));
-        /* Look for `:`. */
-        while (from < len && (text[from] == ' ' || text[from] == '\t'))
-            from++;
-        if (from >= len || text[from] != ':') {
-            /* No bound; skip to next entry. */
-            while (from < len && text[from] != ',' && text[from] != '>' && text[from] != '\n')
-                from++;
-            continue;
-        }
-        from++; /* consume `:` */
-
-        /* Bound list: split on `+` at depth 0, terminated by `,` / `>` /
-         * end of where clause. */
-        int depth = 0;
-        int bound_start = from;
-        while (from <= len) {
-            char c = text[from];
-            if (depth == 0 && (c == '+' || c == ',' || c == '\n' || c == '>' || c == '\0')) {
-                /* End of one bound. */
-                int b_end = from;
-                /* Trim trailing whitespace. */
-                while (b_end > bound_start && (text[b_end - 1] == ' ' || text[b_end - 1] == '\t')) {
-                    b_end--;
-                }
-                /* Trim leading whitespace. */
-                int b_start = bound_start;
-                while (b_start < b_end && (text[b_start] == ' ' || text[b_start] == '\t')) {
-                    b_start++;
-                }
-                if (b_end > b_start) {
-                    char *btext =
-                        cbm_arena_strndup(ctx->arena, text + b_start, (size_t)(b_end - b_start));
-                    /* Strip any `<…>` associated-type suffix for the
-                     * trait QN lookup — we keep the trait name only. */
-                    char *langle = strchr(btext, '<');
-                    if (langle)
-                        *langle = '\0';
-                    const char *qn = rust_resolve_path_expr(ctx, btext);
-                    if (qn) {
-                        rust_record_type_param_bound(ctx, pname, qn);
-                    }
-                }
-                if (c == '+') {
-                    from++;
-                    bound_start = from;
-                    continue;
-                }
-                /* End of entry. */
-                break;
-            }
-            if (c == '<' || c == '(' || c == '[') {
-                depth++;
-            } else if (c == '>' || c == ')' || c == ']') {
-                if (depth == 0) {
-                    break;
-                }
-                depth--;
-            }
-            from++;
-        }
-        /* Advance past entry terminator. */
-        if (from < len && (text[from] == ',' || text[from] == '\n'))
-            from++;
     }
 }
 
@@ -14165,6 +14210,9 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
         }
     }
 
+    int saved_bound_count = ctx->type_param_bound_count;
+    rust_collect_item_bounds(ctx, impl_node);
+
     /* The Method node is keyed by this file's module and the implementing
      * type's base name (extract_rust_impl), not by the resolved receiver:
      * `impl<T> Shape for G<T>` in ops.rs owns `ops.G.area[Shape]` even when
@@ -14185,6 +14233,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
         }
     }
 
+    ctx->type_param_bound_count = saved_bound_count;
     ctx->self_type_qn = saved_self;
     ctx->self_value_type = saved_self_value;
     ctx->self_trait_qn = saved_trait;
@@ -14236,6 +14285,9 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
     if (ctx->source != ctx->root_source || ctx->macro_expand_depth > 0 || ctx->site_map_active) {
         return;
     }
+    void *saved_bounds = ctx->type_param_bounds;
+    int saved_bound_count = ctx->type_param_bound_count;
+    ctx->type_param_bound_count = 0;
     CBMScope *saved_scope = ctx->current_scope;
     const char *saved_self = ctx->self_type_qn;
     const CBMType *saved_self_value = ctx->self_value_type;
@@ -14283,6 +14335,8 @@ static void rust_process_nested_item(RustLSPContext *ctx, TSNode item) {
         rust_process_module(ctx, item, 0);
     }
 
+    ctx->type_param_bounds = saved_bounds;
+    ctx->type_param_bound_count = saved_bound_count;
     ctx->block_item_base = saved_block_item_base;
     ctx->current_scope = saved_scope;
     ctx->self_type_qn = saved_self;

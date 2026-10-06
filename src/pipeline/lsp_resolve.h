@@ -407,8 +407,10 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
  * namesake: the target is that declaration's own node, proven by the
  * declaring module and the absence of any shadowing binding in it
  * (rust_bind_module_fns), never by name similarity.
+ * Bound dispatch admits only a unique method declaration proved by the
+ * receiver's written traits and supertraits, never a concrete implementation.
  * Sole-impl trait UFCS (`Default::default()`) measured 63% and stays closed,
- * as do prelude guesses, macro carriers, bound dispatch and callable aliases.
+ * as do prelude guesses, macro carriers and callable aliases.
  * Operator-trait dispatch (`a + b` on a user type) had no site on the corpus
  * and stays closed until a corpus lane measures it. */
 static inline bool cbm_pipeline_rust_strategy_admitted(const char *strategy) {
@@ -416,6 +418,7 @@ static inline bool cbm_pipeline_rust_strategy_admitted(const char *strategy) {
            strcmp(strategy, "lsp_glob_import") == 0 || strcmp(strategy, "lsp_cross_crate") == 0 ||
            strcmp(strategy, "lsp_method_dispatch") == 0 ||
            strcmp(strategy, "lsp_trait_dispatch") == 0 ||
+           strcmp(strategy, "lsp_bound_dispatch") == 0 ||
            strcmp(strategy, "lsp_deref_dispatch") == 0 ||
            strcmp(strategy, "lsp_constructor") == 0 || strcmp(strategy, "lsp_ufcs") == 0 ||
            strcmp(strategy, "lsp_module_path") == 0;

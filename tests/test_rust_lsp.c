@@ -8116,7 +8116,7 @@ TEST(rustlsp_ambiguous_generic_bounds_withhold_target) {
         "impl<T> First for T { fn choose(&self) {} }\n"
         "fn run<T: First + Second>(t: T) { t.choose(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_EQ(count_resolved(r, "run", "choose"), 0);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "choose"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -10309,6 +10309,123 @@ TEST(rustlsp_gap_bidir_inferred_from_struct_init) {
 
 /* ── Cov §U: Trait bounds + multi-impl dispatch (15 tests) ──── */
 
+TEST(rustlsp_generic_static_unknown_bound_withholds_declaration) {
+    CBMFileResult *r = extract_rust(
+        "trait Static { fn check(); } "
+        "impl<T> Static for T { fn check() {} } "
+        "fn call<T: Static + external::Missing>() { T::check(); }");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "call", "Static.check"), -1);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        if (call->caller_qn && strstr(call->caller_qn, "call"))
+            ASSERT_FALSE(cbm_pipeline_rust_strategy_admitted(call->strategy));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_written_bounds_select_only_the_trait_declaration) {
+    const char *forms[] = {
+        "fn call<T: Tr>(t: T) { t.m(); }",
+        "fn call<T>(t: T) where T: Tr { t.m(); }",
+        "struct W<T>(T); impl<T: Tr> W<T> { fn call(&self, t: T) { t.m(); } }",
+        "struct W<T>(T); impl<T> W<T> where T: Tr { fn call(&self, t: T) { t.m(); } }",
+        "fn call(t: impl Tr) { t.m(); }",
+        "fn call<T: Sub>(t: T) { t.m(); }",
+        "fn call<T: Marker + Tr>(t: T) { t.m(); }",
+        "fn call(t: impl Marker + Tr) { t.m(); }",
+        "fn call(t: &impl Tr) { t.m(); }",
+        "fn call<T: for<'a> Tr>(t: T) { t.m(); }",
+    };
+    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        char source[1024];
+        snprintf(source, sizeof(source),
+                 "trait Tr { fn m(&self); } trait Sub: Tr {} trait Marker {} "
+                 "struct C; impl Tr for C { fn m(&self) {} } %s",
+                 forms[i]);
+        CBMFileResult *r = extract_rust(source);
+        ASSERT_NOT_NULL(r);
+        int index = require_resolved(r, "call", "Tr.m");
+        ASSERT_GTE(index, 0);
+        ASSERT_STR_EQ(r->resolved_calls.items[index].callee_qn, "test.src.main.Tr.m");
+        ASSERT_TRUE(cbm_pipeline_rust_strategy_admitted(r->resolved_calls.items[index].strategy));
+        ASSERT_EQ(find_resolved(r, "call", "C.m"), -1);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+TEST(rustlsp_bound_declaration_return_type_preserves_chained_calls) {
+    CBMFileResult *r = extract_rust("struct ResultType; impl ResultType { fn n(&self) {} } "
+                                    "trait Tr { fn m(&self) -> ResultType; } "
+                                    "fn call(t: impl Tr) { t.m().n(); }");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "call", "Tr.m"), 0);
+    ASSERT_GTE(require_resolved(r, "call", "ResultType.n"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_generic_bound_does_not_replace_a_qualified_concrete_receiver) {
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn m(&self); } "
+        "mod other { pub struct T; impl T { pub fn m(&self) {} } } "
+        "fn call<T: Tr>(generic: T, concrete: other::T) { generic.m(); concrete.m(); }");
+    ASSERT_NOT_NULL(r);
+    int generic = require_resolved(r, "call", "Tr.m");
+    int concrete = require_resolved(r, "call", "other.T.m");
+    ASSERT_GTE(generic, 0);
+    ASSERT_GTE(concrete, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[generic].callee_qn, "test.src.main.Tr.m");
+    ASSERT_STR_EQ(r->resolved_calls.items[concrete].callee_qn, "test.src.main.other.T.m");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_bounds_without_a_unique_declaration_withhold_the_call) {
+    const char *forms[] = {
+        "fn call<T: Marker>(t: T) { t.m(); }",
+        "fn call<T: Tr + Other>(t: T) { t.m(); }",
+        "fn call<T: Both>(t: T) { t.m(); }",
+        "fn call<T: C>(t: T) { t.m(); }",
+        "struct W<T>(T); impl<T: Tr> W<T> { fn call<T>(&self, t: T) { t.m(); } }",
+        "fn call(t: impl Tr + Other) { t.m(); }",
+        "fn call<T: Static>(t: T) { t.m(); }",
+        "fn call(t: &(impl Tr + Other)) { t.m(); }",
+        "fn outer<T: Tr>(t: T) { fn call(t: T) { t.m(); } }",
+        "fn call<T: U, U>(t: T) { t.m(); }",
+        "trait Conditional { #[cfg(feature = \"first\")] fn m(&self); "
+        "#[cfg(not(feature = \"first\"))] fn m(&self) {} } "
+        "fn call<T: Conditional>(t: T) { t.m(); }",
+    };
+    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        char source[1024];
+        snprintf(source, sizeof(source),
+                 "trait Tr { fn m(&self); } trait Other { fn m(&self); } "
+                 "trait Both: Tr + Other {} trait Marker {} trait Static { fn m(); } trait U { fn "
+                 "m(&self); } "
+                 "struct C; impl C { fn m(&self) {} } %s",
+                 forms[i]);
+        CBMFileResult *r = extract_rust(source);
+        ASSERT_NOT_NULL(r);
+        int seen = 0;
+        for (int j = 0; j < r->resolved_calls.count; j++) {
+            const CBMResolvedCall *call = &r->resolved_calls.items[j];
+            if (call->caller_qn && strstr(call->caller_qn, "call")) {
+                seen++;
+                ASSERT_STR_EQ(call->strategy, "lsp_unresolved");
+                ASSERT_STR_EQ(call->reason,
+                              i == 8 ? "method_not_found" : "bound_declaration_not_proven");
+                ASSERT_FALSE(cbm_pipeline_rust_strategy_admitted(call->strategy));
+            }
+        }
+        ASSERT_EQ(seen, 1);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 TEST(rustlsp_gap_bound_clone_method_through_t) {
     /* `fn run<T: Clone>(t: T) -> T { t.clone() }` should attribute
      * t.clone() to Clone trait. */
@@ -10327,7 +10444,7 @@ TEST(rustlsp_display_bound_withholds_unproved_blanket_method) {
     ASSERT_NOT_NULL(r);
     /* Display declares no to_string method; the external blanket impl
      * is not proved by the bound environment. */
-    ASSERT_EQ(count_resolved(r, "shout", "to_string"), 0);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "shout", "to_string"), -1);
     cbm_free_result(r); PASS();
 }
 
@@ -11803,7 +11920,7 @@ TEST(rustlsp_imported_display_bound_withholds_unproved_blanket_method) {
         "use std::fmt::Display;\n"
         "fn show<T: Display>(t: T) -> String { t.to_string() }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_EQ(count_resolved(r, "show", "to_string"), 0);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "show", "to_string"), -1);
     cbm_free_result(r); PASS();
 }
 
@@ -14379,6 +14496,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_bidir_inferred_from_struct_init);
 
     /* Cov §U: Trait bounds + multi-impl dispatch */
+    RUN_TEST(rustlsp_generic_static_unknown_bound_withholds_declaration);
+    RUN_TEST(rustlsp_written_bounds_select_only_the_trait_declaration);
+    RUN_TEST(rustlsp_bound_declaration_return_type_preserves_chained_calls);
+    RUN_TEST(rustlsp_generic_bound_does_not_replace_a_qualified_concrete_receiver);
+    RUN_TEST(rustlsp_bounds_without_a_unique_declaration_withhold_the_call);
     RUN_TEST(rustlsp_gap_bound_clone_method_through_t);
     RUN_TEST(rustlsp_display_bound_withholds_unproved_blanket_method);
     RUN_TEST(rustlsp_gap_bound_iterator_methods);

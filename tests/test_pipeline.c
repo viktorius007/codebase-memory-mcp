@@ -9580,6 +9580,43 @@ static RustBothModesObservation observe_rust_exact_calls_in_both_modes(
     return result;
 }
 
+TEST(pipeline_rust_written_bound_calls_publish_declarations_in_both_modes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_bound_calls_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"bounds\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "src/decl.rs", "pub trait Exported { fn m(&self); }\n");
+    write_temp_file(tmp, "src/reexport.rs", "pub use crate::decl::Exported;\n");
+    write_temp_file(tmp, "src/use_bound.rs",
+                    "use crate::reexport::Exported; fn reexport(t: impl Exported) { t.m(); }\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "mod decl; mod reexport; mod use_bound;\n"
+                    "trait Tr { fn m(&self); }\n"
+                    "struct C; impl Tr for C { fn m(&self) {} }\n"
+                    "fn inline<T: Tr>(t: T) { t.m(); }\n"
+                    "fn predicate<T>(t: T) where T: Tr { t.m(); }\n"
+                    "struct W<T>(T); impl<T: Tr> W<T> { fn call(&self, t: T) { t.m(); } }\n"
+                    "fn opaque(t: impl Tr) { t.m(); }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustExactCallPair pairs[4] = {
+        {"src.lib.inline", "src.lib.Tr.m"},
+        {"src.lib.predicate", "src.lib.Tr.m"},
+        {"src.lib.W.call", "src.lib.Tr.m"},
+        {"src.use_bound.reexport", "src.decl.Exported.m"},
+    };
+    RustBothModesObservation observed = observe_rust_exact_calls_in_both_modes(tmp, pairs, 4, "m");
+    th_rmtree(tmp);
+    ASSERT_EQ(observed.sequential.run_rc, 0);
+    ASSERT_EQ(observed.parallel.run_rc, 0);
+    for (int i = 0; i < 4; i++) {
+        ASSERT_TRUE(observed.sequential.found[i]);
+        ASSERT_TRUE(observed.parallel.found[i]);
+    }
+    ASSERT_FALSE(observed.sequential.file_node_calls_target);
+    ASSERT_FALSE(observed.parallel.file_node_calls_target);
+    PASS();
+}
+
 /* The Method node of an impl method is keyed by the file's module and the
  * implementing type's base name (`ops.G.area[Shape]`, `ops.Widget.draw`);
  * the resolver's caller identity must be the same string or no call inside
@@ -19320,6 +19357,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_impl_edges_pin_in_file_items_to_their_line);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
+    RUN_TEST(pipeline_rust_written_bound_calls_publish_declarations_in_both_modes);
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes);
