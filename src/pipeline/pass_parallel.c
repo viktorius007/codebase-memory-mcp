@@ -2745,8 +2745,13 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
             if (n >= 0 && (size_t)n < sizeof(source_path))
                 source_lang = cbm_detect_file_language(source_node->file_path, source_path);
         }
-        bool cross_language = cbm_suppress_cross_language_code_match(source_lang, rc->repo_path,
-                                                                     target_node->file_path);
+        /* An exact LSP target is semantic proof, not the bare-name match this
+         * language guard is designed to reject. Java/Kotlin calls legitimately
+         * cross source languages inside one JVM project. */
+        bool exact_lsp_target = lsp_target && target_node->id == lsp_target->id;
+        bool cross_language =
+            !exact_lsp_target && cbm_suppress_cross_language_code_match(source_lang, rc->repo_path,
+                                                                        target_node->file_path);
         drop_plain_call |= cross_language;
         if (lang == CBM_LANG_RUST && cross_language)
             cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call,

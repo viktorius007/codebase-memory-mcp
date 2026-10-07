@@ -791,7 +791,7 @@ TEST(cp_recursive_python) {
     PASS();
 }
 
-/* D2c — The ordinary local call survives; self-loop suppression is unchanged. */
+/* D2c — Rust publishes both the recursive self-call and the ordinary local call. */
 TEST(cp_recursive_rust) {
     static const CP_File f[] = {{"math.rs", "pub fn sum(n: u64) -> u64 {\n"
                                             "    if n == 0 { return 0; }\n    n + sum(n - 1)\n}\n\n"
@@ -800,11 +800,11 @@ TEST(cp_recursive_rust) {
     cbm_store_t *store = cp_index_files(&lp, f, 1);
     int calls = cp_edges(store, lp.project, "CALLS");
     int functions = cp_count_label(store, lp.project, "Function");
-    if (calls != 1 || functions < 2)
+    if (calls != 2 || functions < 2)
         cp_diag(store, lp.project, "recursive/rust");
     cp_cleanup(&lp, store);
     ASSERT_TRUE(functions >= 2);
-    ASSERT_EQ(calls, 1);
+    ASSERT_EQ(calls, 2);
     PASS();
 }
 
@@ -1562,7 +1562,7 @@ SUITE(convergence_probe) {
     RUN_TEST(cp_recursive_go);
     /* D2b Python               — EXPECTED GREEN */
     RUN_TEST(cp_recursive_python);
-    /* D2c Rust                 — EXPECTED FAIL-CLOSED CALLS */
+    /* D2c Rust                 — EXPECTED GREEN, INCLUDING RECURSION */
     RUN_TEST(cp_recursive_rust);
     /* D2d Java                 — EXPECTED GREEN */
     RUN_TEST(cp_recursive_java);

@@ -2513,8 +2513,7 @@ static const CBMLexicalBinding *lexical_binding_active_at(const WalkState *state
 
 static const CBMLexicalScope *lexical_binding_scope_for_usage(const WalkState *state,
                                                               const CBMUsage *usage,
-                                                              const char *name,
-                                                              bool *import_binding) {
+                                                              const char *name) {
     uint32_t scope_id = usage->lexical_scope_id;
     int remaining = state ? state->lexical_scope_count : 0;
     while (scope_id != 0 && remaining-- > 0) {
@@ -2525,7 +2524,6 @@ static const CBMLexicalScope *lexical_binding_scope_for_usage(const WalkState *s
         const CBMLexicalBinding *binding =
             lexical_binding_active_at(state, scope_id, name, usage->site_start_byte);
         if (binding) {
-            *import_binding = binding->import_binding;
             return scope;
         }
         scope_id = scope->lookup_parent_id;
@@ -2550,9 +2548,7 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
         if (!name) {
             continue;
         }
-        bool import_binding = false;
-        const CBMLexicalScope *binding_scope =
-            lexical_binding_scope_for_usage(state, usage, name, &import_binding);
+        const CBMLexicalScope *binding_scope = lexical_binding_scope_for_usage(state, usage, name);
         if (ctx->language == CBM_LANG_RUST && usage->scope_path && !usage->scope_path[0]) {
             usage->semantic_reference_blocked = true;
             usage->semantic_reference_local_shadow = true;
@@ -2562,10 +2558,7 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
             continue;
         }
         usage->semantic_reference_blocked = true;
-        usage->semantic_reference_local_shadow =
-            binding_scope->kind != CBM_LEXICAL_SCOPE_MODULE &&
-            !(ctx->language == CBM_LANG_RUST && import_binding && usage->scope_path &&
-              usage->scope_path[0]);
+        usage->semantic_reference_local_shadow = binding_scope->kind != CBM_LEXICAL_SCOPE_MODULE;
     }
 
     /* Allocation failure must never widen textual fallback. Exact semantic
@@ -2882,30 +2875,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
                 cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
             }
         }
-        bool local_function = false;
-        if (ctx->language == CBM_LANG_RUST && reference_node &&
-            strcmp(ts_node_type(node), "identifier") == 0) {
-            const char *callee = cbm_node_text(ctx->arena, node, ctx->source);
-            for (TSNode scope = ts_node_parent(node); !ts_node_is_null(scope);
-                 scope = ts_node_parent(scope)) {
-                const char *scope_kind = ts_node_type(scope);
-                if (strcmp(scope_kind, "block") != 0 && strcmp(scope_kind, "source_file") != 0 &&
-                    strcmp(scope_kind, "declaration_list") != 0)
-                    continue;
-                for (uint32_t i = 0; i < ts_node_named_child_count(scope); i++) {
-                    TSNode item = ts_node_named_child(scope, i);
-                    if (strcmp(ts_node_type(item), "function_item") != 0)
-                        continue;
-                    TSNode id = ts_node_child_by_field_name(item, "name", 4);
-                    const char *name =
-                        ts_node_is_null(id) ? NULL : cbm_node_text(ctx->arena, id, ctx->source);
-                    local_function |= name && callee && strcmp(name, callee) == 0;
-                }
-            }
-        }
-        if (!local_function || state->invocation_kind == CBM_INVOCATION_CALLABLE_REFERENCE) {
-            return;
-        }
+        return;
     }
     if (is_forward_sibling_callee(ctx->language, node)) {
         return;

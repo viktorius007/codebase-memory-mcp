@@ -13,6 +13,7 @@
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
 #include "foundation/constants.h"
+#include "foundation/arena.h"
 #include "foundation/str_util.h" // cbm_json_escape
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
@@ -291,6 +292,17 @@ const cbm_gbuf_node_t *cbm_pipeline_rust_invocation_usage_target(const cbm_gbuf_
     return NULL;
 }
 
+static const cbm_gbuf_node_t *rust_same_module_value_target(const cbm_gbuf_t *gbuf, CBMArena *arena,
+                                                            const char *module_qn,
+                                                            const CBMUsage *usage,
+                                                            CBMRustPathKind result_kind) {
+    if (result_kind != CBM_RUST_PATH_UNKNOWN || usage->kind != CBM_USAGE_VALUE || !module_qn) {
+        return NULL;
+    }
+    const char *local_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, usage->ref_name);
+    return local_qn ? cbm_gbuf_find_by_qn(gbuf, local_qn) : NULL;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_rust_item_usage_target(const cbm_gbuf_t *gbuf,
                                                            const cbm_registry_t *registry,
                                                            const char *module_qn,
@@ -314,9 +326,15 @@ const cbm_gbuf_node_t *cbm_pipeline_rust_item_usage_target(const cbm_gbuf_t *gbu
     const cbm_gbuf_node_t *node =
         (result.kind == CBM_RUST_PATH_NOT_FUNCTION || result.kind == CBM_RUST_PATH_TYPE ||
          result.kind == CBM_RUST_PATH_FUNCTION) &&
-                result.qn && !(result.kind == CBM_RUST_PATH_FUNCTION && result.line == 0)
+                result.qn
             ? cbm_gbuf_find_by_qn(gbuf, result.qn)
             : NULL;
+    /* A standalone Rust file has no Cargo module root for the modtree to
+     * traverse. The graph's exact current-module QN is still identity proof;
+     * never widen this fallback to a registry name or suffix search. */
+    if (!node) {
+        node = rust_same_module_value_target(gbuf, &arena, module_qn, usage, result.kind);
+    }
     if (!node && result.kind == CBM_RUST_PATH_ASSOC && !result.is_trait && result.qn &&
         result.assoc) {
         const char *member = cbm_registry_rust_owner_member(

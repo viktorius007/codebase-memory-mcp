@@ -24,6 +24,11 @@
 # string as its path in the working tree, so a commit that touches only a
 # header is not covered here even if a .c file including it also changed;
 # run `make lint-tidy` for a full pass in that case.
+#
+# Whole-function metrics are also excluded here. clang-tidy reports those at
+# the function declaration whenever any body line is selected, so a line
+# filter cannot distinguish new complexity from pre-existing complexity. The
+# full `make lint-tidy` audit remains authoritative for those checks.
 
 set -euo pipefail
 
@@ -105,4 +110,6 @@ if [ "${#TARGETS[@]}" -eq 0 ]; then
 fi
 
 echo "lint-tidy-diff: ${#TARGETS[@]} changed file(s), diff-scoped clang-tidy"
-"$CLANG_TIDY" --quiet "-line-filter=${LINE_FILTER}" "${TARGETS[@]}" -- "${CFLAGS[@]}"
+"$CLANG_TIDY" --quiet \
+    --checks='-readability-function-cognitive-complexity,-readability-function-size' \
+    "-line-filter=${LINE_FILTER}" "${TARGETS[@]}" -- "${CFLAGS[@]}"

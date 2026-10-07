@@ -856,9 +856,9 @@ TEST(probe_hyprlang_directives) {
     PASS();
 }
 
-/* Hyprlang: `source` in two-file fixture → IMPORTS edge.
- * RED: Hyprlang `source` directive not resolved into IMPORTS edges. */
-TEST(probe_hyprlang_source_import_edge) {
+/* Hyprlang has no source resolver, so a source directive must not fabricate
+ * an IMPORTS edge through an unrelated same-spelling symbol. */
+TEST(probe_hyprlang_source_does_not_fabricate_import_edge) {
     static const GpfFile files[] = {
         {"colors.conf",
          "col.active_border = rgba(33ccffee)\n"
@@ -872,8 +872,7 @@ TEST(probe_hyprlang_source_import_edge) {
     };
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: Hyprlang `source` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED — no Hyprlang source resolver */
+    ASSERT_EQ(m.imports, 0);
     PASS();
 }
 
@@ -1601,7 +1600,7 @@ SUITE(grammar_probe_f) {
     /* Hyprlang */
     RUN_TEST(probe_hyprlang_section_node);
     RUN_TEST(probe_hyprlang_directives);
-    RUN_TEST(probe_hyprlang_source_import_edge);
+    RUN_TEST(probe_hyprlang_source_does_not_fabricate_import_edge);
 
     /* DeviceTree */
     RUN_TEST(probe_devicetree_root_node);

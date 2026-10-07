@@ -152,6 +152,8 @@ static int usage_count(const CBMFileResult *result, const char *caller, const ch
     int count = 0;
     for (int i = 0; i < result->usages.count; i++) {
         const CBMUsage *usage = &result->usages.items[i];
+        if (usage->unresolved_filter)
+            continue;
         if (usage->ref_name && strcmp(usage->ref_name, target) == 0 &&
             (!caller || qn_has_terminal_name(usage->enclosing_func_qn, caller))) {
             count++;
@@ -165,6 +167,8 @@ static int usage_kind_count(const CBMFileResult *result, const char *caller, con
     int count = 0;
     for (int i = 0; i < result->usages.count; i++) {
         const CBMUsage *usage = &result->usages.items[i];
+        if (usage->unresolved_filter)
+            continue;
         if (usage->kind == kind && usage->ref_name && strcmp(usage->ref_name, target) == 0 &&
             (!caller || qn_has_terminal_name(usage->enclosing_func_qn, caller))) {
             count++;
@@ -178,6 +182,8 @@ static int local_shadow_usage_count(const CBMFileResult *result, const char *cal
     int count = 0;
     for (int i = 0; i < result->usages.count; i++) {
         const CBMUsage *usage = &result->usages.items[i];
+        if (usage->unresolved_filter)
+            continue;
         if (usage->kind == CBM_USAGE_VALUE && usage->semantic_reference_blocked &&
             usage->semantic_reference_local_shadow && usage->ref_name &&
             strcmp(usage->ref_name, target) == 0 &&

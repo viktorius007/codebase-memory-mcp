@@ -35,6 +35,8 @@ static int raw_usage_count(const CBMFileResult *r, const char *caller, const cha
     int count = 0;
     for (int i = 0; i < r->usages.count; i++) {
         const CBMUsage *u = &r->usages.items[i];
+        if (u->unresolved_filter)
+            continue;
         if (u->ref_name && strcmp(u->ref_name, target) == 0 &&
             qn_ends_with_name(u->enclosing_func_qn, caller)) {
             count++;
@@ -48,6 +50,8 @@ static int raw_usage_count_kind(const CBMFileResult *r, const char *caller, cons
     int count = 0;
     for (int i = 0; i < r->usages.count; i++) {
         const CBMUsage *u = &r->usages.items[i];
+        if (u->unresolved_filter)
+            continue;
         if (u->kind == kind && u->ref_name && strcmp(u->ref_name, target) == 0 &&
             qn_ends_with_name(u->enclosing_func_qn, caller)) {
             count++;
@@ -61,6 +65,8 @@ static int raw_usage_candidate_count(const CBMFileResult *r, const char *caller,
     int count = 0;
     for (int i = 0; i < r->usages.count; i++) {
         const CBMUsage *u = &r->usages.items[i];
+        if (u->unresolved_filter)
+            continue;
         if (u->kind == CBM_USAGE_VALUE && u->may_be_call_reference && u->ref_name &&
             strcmp(u->ref_name, target) == 0 && qn_ends_with_name(u->enclosing_func_qn, caller)) {
             count++;

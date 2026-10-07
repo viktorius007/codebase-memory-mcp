@@ -35,6 +35,8 @@ static int usage_count(const CBMFileResult *r, const char *caller, const char *t
     int count = 0;
     for (int i = 0; i < r->usages.count; i++) {
         const CBMUsage *usage = &r->usages.items[i];
+        if (usage->unresolved_filter)
+            continue;
         if (usage->kind == CBM_USAGE_VALUE && usage->ref_name &&
             strcmp(usage->ref_name, target) == 0 &&
             (!caller || qn_ends_with(usage->enclosing_func_qn, caller))) {
@@ -48,6 +50,8 @@ static int call_reference_count(const CBMFileResult *r, const char *caller, cons
     int count = 0;
     for (int i = 0; i < r->usages.count; i++) {
         const CBMUsage *usage = &r->usages.items[i];
+        if (usage->unresolved_filter)
+            continue;
         if (usage->kind == CBM_USAGE_CALL_REFERENCE && usage->ref_name &&
             strcmp(usage->ref_name, target) == 0 &&
             (!caller || qn_ends_with(usage->enclosing_func_qn, caller))) {
@@ -74,6 +78,8 @@ static int exact_usage_count(const CBMFileResult *r, const char *caller_qn, cons
     int count = 0;
     for (int i = 0; i < r->usages.count; i++) {
         const CBMUsage *usage = &r->usages.items[i];
+        if (usage->unresolved_filter)
+            continue;
         if (usage->kind == CBM_USAGE_VALUE && usage->ref_name && usage->enclosing_func_qn &&
             strcmp(usage->ref_name, target) == 0 &&
             strcmp(usage->enclosing_func_qn, caller_qn) == 0) {

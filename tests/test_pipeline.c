@@ -9223,7 +9223,8 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
                                                  store, project);
             break;
         case 7:
-            correct = cross_file_edge_exists(store, project, "enclosing", "helper", "USAGE");
+            correct = cross_file_edge_exists(store, project, "enclosing", "helper", "CALLS") &&
+                      !cross_file_edge_exists(store, project, "enclosing", "helper", "USAGE");
             break;
         case 8:
             correct =
@@ -9388,12 +9389,12 @@ TEST(pipeline_rust_function_value_scope_parallel) {
     PASS();
 }
 
-TEST(pipeline_rust_block_function_usage_sequential) {
+TEST(pipeline_rust_block_function_call_sequential) {
     ASSERT_EQ(check_rust_occurrence_proof(true, 7), 0);
     PASS();
 }
 
-TEST(pipeline_rust_block_function_usage_parallel) {
+TEST(pipeline_rust_block_function_call_parallel) {
     ASSERT_EQ(check_rust_occurrence_proof(false, 7), 0);
     PASS();
 }
@@ -19657,8 +19658,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_proto_namespace_parallel);
     RUN_TEST(pipeline_rust_function_value_scope_sequential);
     RUN_TEST(pipeline_rust_function_value_scope_parallel);
-    RUN_TEST(pipeline_rust_block_function_usage_sequential);
-    RUN_TEST(pipeline_rust_block_function_usage_parallel);
+    RUN_TEST(pipeline_rust_block_function_call_sequential);
+    RUN_TEST(pipeline_rust_block_function_call_parallel);
     RUN_TEST(pipeline_rust_external_value_path_sequential);
     RUN_TEST(pipeline_rust_external_value_path_parallel);
     RUN_TEST(pipeline_rust_macro_argument_paths_sequential);

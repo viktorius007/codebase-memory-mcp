@@ -5583,7 +5583,7 @@ static rust_semantic_coverage_t rust_semantic_coverage_get(cbm_store_t *store,
 
 static yyjson_mut_val *rust_unresolved_json(yyjson_mut_doc *doc, cbm_store_t *store,
                                             const char *project, const char *path,
-                                            const char *caller) {
+                                            const char *caller, int64_t *out_total) {
     yyjson_mut_val *result = yyjson_mut_obj(doc);
     yyjson_mut_val *files = yyjson_mut_arr(doc);
     sqlite3_stmt *stmt = NULL;
@@ -5622,6 +5622,9 @@ static yyjson_mut_val *rust_unresolved_json(yyjson_mut_doc *doc, cbm_store_t *st
         }
     }
     sqlite3_finalize(stmt);
+    if (out_total) {
+        *out_total = rc == SQLITE_DONE ? calls + usages : CBM_NOT_FOUND;
+    }
     yyjson_mut_obj_add_str(doc, result, "lookup", rc == SQLITE_DONE ? "complete" : "error");
     if (rc == SQLITE_DONE) {
         yyjson_mut_obj_add_int(doc, result, "calls", calls);
@@ -6387,7 +6390,7 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     rust_semantic_add_object(doc, root, semantic_coverage);
     bool ignored_total_authoritative = generation_matches && meta.ignored_files_total >= ni_file_n;
     yyjson_mut_obj_add_val(doc, root, "unresolved_sites",
-                           rust_unresolved_json(doc, store, project, NULL, NULL));
+                           rust_unresolved_json(doc, store, project, NULL, NULL, NULL));
     int ni_file_total = ni_file_n;
     if (ignored_total_authoritative) {
         ni_file_total = meta.ignored_files_total;
@@ -6849,7 +6852,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             yyjson_mut_obj_add_strcpy(doc, item, "path", rel);
             rust_semantic_add_path_fields(doc, item, rel, semantic_coverage);
             yyjson_mut_obj_add_val(doc, item, "unresolved_sites",
-                                   rust_unresolved_json(doc, store, project, rel, NULL));
+                                   rust_unresolved_json(doc, store, project, rel, NULL, NULL));
             cbm_coverage_row_t *rows = NULL;
             int row_count = 0;
             int cov_rc = cbm_store_coverage_get_path(store, project, rel, &rows, &row_count);
@@ -9277,7 +9280,7 @@ static char *handle_unresolved_sites(cbm_store_t *store, const char *project, co
                                    true);
     }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = rust_unresolved_json(doc, store, project, path, caller);
+    yyjson_mut_val *root = rust_unresolved_json(doc, store, project, path, caller, NULL);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_val *rows = yyjson_mut_arr(doc);
     sqlite3_stmt *stmt = NULL;
@@ -9816,13 +9819,16 @@ render_trace_output:;
         }
         rust_semantic_add_note_tree(&sb, trace_semantic_affected);
         yyjson_mut_doc *gap_doc = yyjson_mut_doc_new(NULL);
-        yyjson_mut_val *gaps =
-            rust_unresolved_json(gap_doc, store, project, NULL,
-                                 do_inbound || node_count != 1 ? NULL : nodes[0].qualified_name);
+        int64_t gap_total = 0;
+        yyjson_mut_val *gaps = rust_unresolved_json(
+            gap_doc, store, project, NULL,
+            do_inbound || node_count != SKIP_ONE ? NULL : nodes[0].qualified_name, &gap_total);
         yyjson_mut_doc_set_root(gap_doc, gaps);
-        char *gap_json = yyjson_mut_write(gap_doc, 0, NULL);
-        cbm_tree_scalar_str(&sb, "unresolved_sites", gap_json ? gap_json : "lookup error");
-        safe_free(gap_json);
+        if (gap_total != 0) {
+            const char *gap_json = yyjson_mut_write(gap_doc, 0, NULL);
+            cbm_tree_scalar_str(&sb, "unresolved_sites", gap_json ? gap_json : "lookup error");
+            safe_str_free(&gap_json);
+        }
         yyjson_mut_doc_free(gap_doc);
         json = cbm_sb_finish(&sb);
     } else {
@@ -9831,10 +9837,14 @@ render_trace_output:;
         yyjson_mut_doc_set_root(doc, root);
 
         yyjson_mut_obj_add_str(doc, root, "function", func_name);
-        yyjson_mut_obj_add_val(
-            doc, root, "unresolved_sites",
-            rust_unresolved_json(doc, store, project, NULL,
-                                 do_inbound || node_count != 1 ? NULL : nodes[0].qualified_name));
+        int64_t unresolved_total = 0;
+        yyjson_mut_val *unresolved = rust_unresolved_json(
+            doc, store, project, NULL,
+            do_inbound || node_count != SKIP_ONE ? NULL : nodes[0].qualified_name,
+            &unresolved_total);
+        if (unresolved_total != 0) {
+            yyjson_mut_obj_add_val(doc, root, "unresolved_sites", unresolved);
+        }
         yyjson_mut_obj_add_str(doc, root, "direction", direction);
         if (mode) {
             yyjson_mut_obj_add_str(doc, root, "mode", mode);
