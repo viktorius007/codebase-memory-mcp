@@ -9148,8 +9148,30 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
 
         "const KEY: &str = \"key\"; fn json_key() { let _ = serde_json::json!({ KEY: 1 }); }\n",
 
+        "use dep::Item; fn consume(_: Item) {}\n",
+        "mod child; pub use child::*; mod schema; pub use schema::*;\n",
+        "mod child; pub use child::*; fn read() { let _ = child; }\n",
+        "fn helper() {} fn field() {} macro_rules! ignore { ($($t:tt)*) => { () }; } "
+        "fn quoted() { let _ = stringify!(helper()); } fn discarded() { ignore!(helper()); } "
+        "fn member() { ignore!(self.field); } fn value() { let _ = helper; }\n",
     };
     write_temp_file(tmp, "src/lib.rs", sources[scenario]);
+    if (scenario == 25) {
+        write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"consumer\"]\n[workspace.dependencies]\ndep = { path = \"dep\" }\n");
+        write_temp_file(tmp, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        write_temp_file(tmp, "dep/src/lib.rs", "pub struct Item;\n");
+        write_temp_file(tmp, "consumer/Cargo.toml", "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep.workspace = true\n");
+        write_temp_file(tmp, "consumer/src/lib.rs", sources[scenario]);
+    }
+    if (scenario == 26 || scenario == 27) {
+        write_temp_file(tmp, "src/child.rs", "pub fn child() {}\n");
+        if (scenario == 26) {
+            write_temp_file(tmp, "child.toml", "value = true\n");
+            write_temp_file(tmp, "src/schema.rs", "pub fn schema() {}\n");
+            write_temp_file(tmp, "schema.proto", "syntax = \"proto3\"; message Item {}\n");
+        }
+    }
+
     if (scenario == 11 || scenario == 14)
         write_temp_file(tmp, "Cargo.toml",
                         "[package]\nname = \"fixture\"\nversion = "
@@ -9302,6 +9324,24 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
             correct = rust_inline_variable_edges("src.lib.json_key", "src.lib.KEY", store, project);
             break;
 
+        case 25:
+            correct = cross_file_edge_exists(store, project, "lib.rs", "Item", "IMPORTS") &&
+                      cross_file_edge_exists(store, project, "consume", "Item", "USAGE");
+            break;
+        case 26:
+            correct = !cross_file_edge_exists(store, project, "lib.rs", "child.toml", "IMPORTS") &&
+                      !cross_file_edge_exists(store, project, "lib.rs", "schema.proto", "IMPORTS");
+            break;
+        case 27:
+            correct = !rust_inline_variable_edges("src.lib", "src.child.child", store, project);
+            break;
+        case 28:
+            correct = !cross_file_edge_exists(store, project, "quoted", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "discarded", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "member", "field", "USAGE") &&
+                      cross_file_edge_exists(store, project, "value", "helper", "USAGE");
+            break;
+
         }
     }
     if (store)
@@ -9316,6 +9356,46 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
     ASSERT_EQ(status, 0);
     ASSERT_TRUE(correct);
     return 0;
+}
+
+TEST(pipeline_rust_dotted_workspace_dependency_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 25), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_dotted_workspace_dependency_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 25), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_glob_import_rejects_other_languages_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 26), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_glob_import_rejects_other_languages_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 26), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_module_binding_is_not_a_function_usage_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 27), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_module_binding_is_not_a_function_usage_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 27), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 28), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 28), 0);
+    PASS();
 }
 
 TEST(pipeline_rust_enum_variant_qualifier_sequential) {
@@ -19643,6 +19723,14 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_inline_read_write_parallel_requires_an_owner);
     RUN_TEST(pipeline_rust_inline_namesake_fields_have_distinct_owners);
     RUN_TEST(pipeline_rust_struct_literal_fields_follow_nested_module_globs);
+    RUN_TEST(pipeline_rust_dotted_workspace_dependency_sequential);
+    RUN_TEST(pipeline_rust_dotted_workspace_dependency_parallel);
+    RUN_TEST(pipeline_rust_glob_import_rejects_other_languages_sequential);
+    RUN_TEST(pipeline_rust_glob_import_rejects_other_languages_parallel);
+    RUN_TEST(pipeline_rust_module_binding_is_not_a_function_usage_sequential);
+    RUN_TEST(pipeline_rust_module_binding_is_not_a_function_usage_parallel);
+    RUN_TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_sequential);
+    RUN_TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_parallel);
     RUN_TEST(pipeline_rust_enum_variant_qualifier_sequential);
     RUN_TEST(pipeline_rust_enum_variant_qualifier_parallel);
     RUN_TEST(pipeline_rust_block_use_type_sequential);

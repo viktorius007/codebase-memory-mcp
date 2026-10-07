@@ -385,7 +385,8 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         cbm_pipeline_lsp_reference_index_build(&result->resolved_calls, &reference_index);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
-        if (lang == CBM_LANG_RUST && usage->unresolved_filter) {
+        if (lang == CBM_LANG_RUST && usage->unresolved_filter &&
+            usage->unresolved_filter != CBM_USAGE_MACRO_FILTERED) {
             cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name, rel,
                                                  usage, result, NULL);
             continue;
@@ -469,6 +470,11 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                             usage);
             if (tgt)
                 publishing_rule = "invocation";
+        }
+        if (lang == CBM_LANG_RUST && usage->unresolved_filter && !tgt) {
+            cbm_pipeline_record_unresolved_usage(ctx->gbuf, ctx->gbuf, ctx->project_name, rel,
+                                                 usage, result, NULL);
+            continue;
         }
         if (!tgt && lang == CBM_LANG_RUST) {
             tgt = cbm_pipeline_rust_item_usage_target(ctx->gbuf, ctx->registry, module_qn, usage);

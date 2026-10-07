@@ -9880,9 +9880,49 @@ static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const
     return o.buf;
 }
 
+extern const TSLanguage *tree_sitter_rust(void);
+/* Reuse the ordinary usage extractor on the expression AST that expansion
+ * actually kept. Only mapped invocation bytes can release a raw token; tokens
+ * inside a nested opaque macro remain filtered by the extractor. */
+static void rust_prove_macro_usages(RustLSPContext *ctx, TSNode body) {
+    if (!ctx->macro_usages || !ctx->site_map_active || ts_node_has_error(body))
+        return;
+    CBMFileResult parsed = {.module_qn = ctx->module_qn};
+    CBMExtractCtx extract = {.arena = ctx->arena,
+                             .source = ctx->source,
+                             .source_len = ctx->source_len,
+                             .language = CBM_LANG_RUST,
+                             .project = "rust",
+                             .rel_path = "macro.rs",
+                             .root = body,
+                             .result = &parsed,
+                             .module_qn = ctx->module_qn};
+    cbm_extract_unified(&extract);
+    for (int i = 0; i < parsed.usages.count; i++) {
+        const CBMUsage *syntax = &parsed.usages.items[i];
+        uint32_t start = 0, end = 0;
+        if (syntax->unresolved_filter || !syntax->ref_name ||
+            !rust_map_source_range(ctx, syntax->site_start_byte, syntax->site_end_byte,
+                                   &start, &end))
+            continue;
+        for (int j = 0; j < ctx->macro_usages->count; j++) {
+            CBMUsage *raw = &ctx->macro_usages->items[j];
+            if (raw->unresolved_filter != CBM_USAGE_MACRO_FILTERED ||
+                raw->site_start_byte < start || raw->site_end_byte != end ||
+                !raw->ref_name || strcmp(raw->ref_name, syntax->ref_name) != 0)
+                continue;
+            raw->unresolved_filter = CBM_USAGE_NOT_FILTERED;
+            raw->kind = syntax->kind;
+            raw->is_member_access = syntax->is_member_access;
+            raw->may_be_call_reference = syntax->may_be_call_reference;
+            raw->semantic_reference_blocked |= syntax->semantic_reference_blocked;
+            raw->semantic_reference_local_shadow |= syntax->semantic_reference_local_shadow;
+        }
+    }
+}
+
 /* Re-parse a user macro's transcriber body as a synthetic Rust
  * function and walk it for calls. */
-extern const TSLanguage *tree_sitter_rust(void);
 static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
     if (!ctx || !mname)
         return;
@@ -10023,6 +10063,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             ctx->emit_site_end_byte = 0;
             ctx->inject_syn_calls++;
             rust_resolve_calls_in_node(ctx, body);
+            rust_prove_macro_usages(ctx, body);
             ctx->inject_syn_calls--;
             ctx->source = saved_source;
             ctx->source_len = saved_len;
@@ -10443,6 +10484,7 @@ static void rust_reparse_macro_region(RustLSPContext *ctx, uint32_t src_start, c
          * no CBMCall to pair with. Inject matching synthetic calls. */
         ctx->inject_syn_calls++;
         rust_resolve_calls_in_node(ctx, body);
+        rust_prove_macro_usages(ctx, body);
         ctx->inject_syn_calls--;
         ctx->source = saved_source;
         ctx->source_len = saved_len;
@@ -16541,7 +16583,7 @@ static void rust_resolve_against_registry(
     CBMArena *arena, const char *source, int source_len, const char *module_qn,
     const char *relative_module_qn, const CBMTypeRegistry *reg, const char **import_names,
     const char **import_qns, int import_count, TSNode root, const struct CBMCargoManifest *manifest,
-    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+    const CBMRustImportSource *imports, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls, CBMUsageArray *macro_usages,
     CBMRustImplLinkArray *impl_links) {
     if (impl_links) {
         rust_collect_impl_links(arena, source, source_len, module_qn, relative_module_qn, reg, root,
@@ -16553,6 +16595,7 @@ static void rust_resolve_against_registry(
     ctx.cargo_manifest = manifest;
     ctx.imports = imports;
     ctx.syn_calls = synthetic_calls;
+    ctx.macro_usages = macro_usages;
     if (relative_module_qn) {
         for (int i = 0; i < import_count; i++) {
             if (import_names[i] && import_qns[i]) {
@@ -16631,7 +16674,7 @@ void cbm_run_rust_lsp_cross_with_registry(
     const char *relative_module_qn, const CBMTypeRegistry *reg, const char **import_names,
     const char **import_qns, int import_count, TSTree *cached_tree,
     const struct CBMCargoManifest *manifest, const CBMRustImportSource *imports,
-    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls, CBMUsageArray *macro_usages,
     CBMRustImplLinkArray *impl_links) {
     if (!source || source_len <= 0 || !out || !reg)
         return;
@@ -16653,7 +16696,7 @@ void cbm_run_rust_lsp_cross_with_registry(
     TSNode root = ts_tree_root_node(tree);
     rust_resolve_against_registry(arena, source, source_len, module_qn, relative_module_qn, reg,
                                   import_names, import_qns, import_count, root, manifest, imports,
-                                  out, synthetic_calls, impl_links);
+                                  out, synthetic_calls, macro_usages, impl_links);
     if (owns_tree) {
         ts_tree_delete(tree);
         if (parser)
@@ -16666,7 +16709,7 @@ void cbm_run_rust_lsp_cross_with_manifest(
     const char *relative_module_qn, CBMRustLSPDef *defs, int def_count, const char **import_names,
     const char **import_qns, int import_count, TSTree *cached_tree,
     const struct CBMCargoManifest *manifest, const CBMRustImportSource *imports,
-    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls, CBMUsageArray *macro_usages,
     CBMRustImplLinkArray *impl_links) {
     if (!source || source_len <= 0 || !out)
         return;
@@ -16695,7 +16738,7 @@ void cbm_run_rust_lsp_cross_with_manifest(
 
     rust_resolve_against_registry(arena, source, source_len, module_qn, relative_module_qn, &reg,
                                   import_names, import_qns, import_count, root, manifest, imports,
-                                  out, synthetic_calls, impl_links);
+                                  out, synthetic_calls, macro_usages, impl_links);
 
     if (owns_tree) {
         ts_tree_delete(tree);
@@ -16713,7 +16756,7 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             TSTree *cached_tree, CBMResolvedCallArray *out) {
     cbm_run_rust_lsp_cross_with_manifest(arena, source, source_len, module_qn, module_qn, defs,
                                          def_count, import_names, import_qns, import_count,
-                                         cached_tree, NULL, NULL, out, NULL, NULL);
+                                         cached_tree, NULL, NULL, out, NULL, NULL, NULL);
 }
 
 void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int file_count,

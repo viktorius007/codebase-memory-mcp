@@ -2152,7 +2152,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         cbm_run_rust_lsp_cross_with_manifest(
             &scratch, source, source_len, source_module_qn, relative_module_qn, rdefs, def_count,
             imp_names, imp_qns, imp_count, tree, g_pxc_rust_manifest,
-            cbm_pxc_get_rust_import_source(), &out, &synthetic_calls, &impl_links);
+            cbm_pxc_get_rust_import_source(), &out, &synthetic_calls, &r->usages, &impl_links);
         pxc_store_rust_impl_links(r, &impl_links);
         break;
     }
@@ -2396,7 +2396,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_run_rust_lsp_cross_with_registry(
                 &scratch, source, source_len, source_module_qn, relative_module_qn, shared,
                 imp_keys, imp_vals, imp_count, result->cached_tree, cbm_pxc_get_rust_manifest(),
-                cbm_pxc_get_rust_import_source(), &out, &synthetic_calls, &impl_links);
+                cbm_pxc_get_rust_import_source(), &out, &synthetic_calls, &result->usages,
+                &impl_links);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_store_rust_impl_links(result, &impl_links);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);

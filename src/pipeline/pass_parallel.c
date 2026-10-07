@@ -2893,7 +2893,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         cbm_pipeline_lsp_reference_index_build(&result->resolved_calls, &reference_index);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
-        if (lang == CBM_LANG_RUST && usage->unresolved_filter) {
+        if (lang == CBM_LANG_RUST && usage->unresolved_filter &&
+            usage->unresolved_filter != CBM_USAGE_MACRO_FILTERED) {
             cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
                                                  rc->project_name, rel, usage, result, NULL);
             continue;
@@ -2972,6 +2973,11 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                                             usage);
             if (tgt)
                 publishing_rule = "invocation";
+        }
+        if (lang == CBM_LANG_RUST && usage->unresolved_filter && !tgt) {
+            cbm_pipeline_record_unresolved_usage(ws->local_edge_buf, rc->main_gbuf,
+                                                 rc->project_name, rel, usage, result, NULL);
+            continue;
         }
         if (!tgt && lang == CBM_LANG_RUST) {
             tgt =
@@ -3375,6 +3381,12 @@ static int pp_qualified_lsp_site_count(const CBMFileResult *result) {
  * zero or already fully qualified. Zero-span generated semantics are excluded:
  * without source provenance they cannot safely join a graph carrier. */
 static bool pp_has_pending_lsp_site(const CBMFileResult *result) {
+    /* Raw macro usages still need the project's expansion/expression walk,
+     * even when there are no unresolved invocation or callable-reference rows. */
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].unresolved_filter == CBM_USAGE_MACRO_FILTERED)
+            return true;
+    }
     for (int i = 0; i < result->resolved_calls.count; i++) {
         const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
         if (resolved->kind != CBM_RESOLVED_INVOCATION &&

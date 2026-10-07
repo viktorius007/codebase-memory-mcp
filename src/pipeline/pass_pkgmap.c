@@ -1620,6 +1620,9 @@ static bool import_symbol_label_allowed(CBMLanguage lang, const char *label) {
  * example). The requested filename must match the actual target filename. */
 static bool import_target_language_allowed(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
                                            const CBMImport *imp, const cbm_gbuf_node_t *target) {
+    if (lang == CBM_LANG_RUST)
+        return target->file_path &&
+               cbm_language_for_filename(path_basename(target->file_path)) == CBM_LANG_RUST;
     if (!cbm_suppress_cross_language_code_match(lang, ctx->repo_path, target->file_path))
         return true;
     const char *module_path = imp->module_path;
@@ -2387,8 +2390,18 @@ static int link_import_targets(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *s
             import_target_language_allowed(ctx, lang, imp, targets[i])) {
             cbm_gbuf_insert_edge(ctx->gbuf, source->id, targets[i]->id, "IMPORTS", props);
             linked++;
+        } else if (lang == CBM_LANG_RUST && targets[i]->id != source->id) {
+            cbm_pipeline_record_unresolved(ctx->gbuf, ctx->project_name, source->file_path,
+                                           source->qualified_name, imp->module_path, "import",
+                                           "cross_language_candidate_rejected", imp->start_line,
+                                           imp->scope_byte, imp->site_end_byte);
         }
     }
+    if (lang == CBM_LANG_RUST && count <= 0)
+        cbm_pipeline_record_unresolved(ctx->gbuf, ctx->project_name, source->file_path,
+                                       source->qualified_name, imp->module_path, "import",
+                                       "import_path_not_proven", imp->start_line, imp->scope_byte,
+                                       imp->site_end_byte);
     return linked;
 }
 

@@ -1325,21 +1325,21 @@ TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, typed, (int)strlen(typed), "test.src.caller",
                                          "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
-                                         NULL, NULL, &out, NULL, NULL);
+                                         NULL, NULL, &out, NULL, NULL, NULL);
     ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&out), "From<&'static str>"));
 
     const char *owned = "fn run(o: Other) { let _ = Label::from(o); }\n";
     CBMResolvedCallArray out_owned = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, owned, (int)strlen(owned), "test.src.caller",
                                          "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
-                                         NULL, NULL, &out_owned, NULL, NULL);
+                                         NULL, NULL, &out_owned, NULL, NULL, NULL);
     ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&out_owned), "From<Other>"));
 
     const char *unknown = "fn run() { let _ = Label::from(missing()); }\n";
     CBMResolvedCallArray out_unknown = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, unknown, (int)strlen(unknown), "test.src.caller",
                                          "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
-                                         NULL, NULL, &out_unknown, NULL, NULL);
+                                         NULL, NULL, &out_unknown, NULL, NULL, NULL);
     ASSERT_NULL(rustlsp_from_impl_key(&out_unknown));
 
     cbm_arena_destroy(&arena);
@@ -1459,7 +1459,7 @@ TEST(rustlsp_crossfile_type_path_call_prefers_inherent_over_trait_impl) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, plain, (int)strlen(plain), "test.src.caller",
                                          "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
-                                         NULL, NULL, &out, NULL, NULL);
+                                         NULL, NULL, &out, NULL, NULL, NULL);
     const CBMResolvedCall *link = rustlsp_flush_link(&out, "caller.run");
     ASSERT_NOT_NULL(link);
     ASSERT_NULL(link->callee_impl_key);
@@ -1468,7 +1468,7 @@ TEST(rustlsp_crossfile_type_path_call_prefers_inherent_over_trait_impl) {
     CBMResolvedCallArray out_q = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, qualified, (int)strlen(qualified),
                                          "test.src.caller", "test.src.caller", registry, imp_names,
-                                         imp_qns, 2, NULL, NULL, NULL, &out_q, NULL, NULL);
+                                         imp_qns, 2, NULL, NULL, NULL, &out_q, NULL, NULL, NULL);
     ASSERT_TRUE(rustlsp_flush_link_is_not_inherent(&out_q, "caller.run"));
 
     cbm_arena_destroy(&arena);
@@ -2977,7 +2977,7 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller",
                                          "test.caller", reg, imp_names, imp_qns, 1, NULL,
                                          /*manifest=*/NULL,
-                                         /*imports=*/NULL, &out, /*synthetic_calls=*/NULL, NULL);
+                                         /*imports=*/NULL, &out, /*synthetic_calls=*/NULL, NULL, NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
 
@@ -3005,7 +3005,7 @@ TEST(rustlsp_duplicate_free_function_qn_stays_unresolved) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(
         &arena, source, (int)strlen(source), "test.src.compression_tests",
-        "test.src.compression.tests", registry, NULL, NULL, 0, NULL, NULL, NULL, &out, NULL, NULL);
+        "test.src.compression.tests", registry, NULL, NULL, 0, NULL, NULL, NULL, &out, NULL, NULL, NULL);
 
     ASSERT_LT(find_confident(&out, "check", "compressed_rollout_path"), 0);
     cbm_arena_destroy(&arena);
@@ -3037,7 +3037,7 @@ TEST(rustlsp_path_module_child_call_does_not_flatten_to_parent) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(
         &arena, source, (int)strlen(source), "test.src.update_loop_tests",
-        "test.src.update_loop.tests", registry, NULL, NULL, 0, NULL, NULL, NULL, &out, NULL, NULL);
+        "test.src.update_loop.tests", registry, NULL, NULL, 0, NULL, NULL, NULL, &out, NULL, NULL, NULL);
 
     ASSERT_LT(find_confident(&out, "check", "update_loop.run"), 0);
     cbm_arena_destroy(&arena);
@@ -3286,7 +3286,7 @@ TEST(rustlsp_resolved_calls_carry_exact_impl_identity_local_and_shared) {
     CBMResolvedCallArray shared = {0};
     cbm_run_rust_lsp_cross_with_registry(
         &arena, source, (int)strlen(source), "test.src.main", "test.src.main", registry, NULL,
-        NULL, 0, NULL, NULL, NULL, &shared, NULL, NULL);
+        NULL, 0, NULL, NULL, NULL, &shared, NULL, NULL, NULL);
     ASSERT_TRUE(rustlsp_impl_identity_rows_are_exact(&shared));
 
     CBMFileResult merged;
@@ -3349,7 +3349,7 @@ TEST(rustlsp_relative_type_requires_declared_module) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main",
                                          "test.main", registry, NULL, NULL, 0, NULL, NULL, NULL,
-                                         &out, NULL, NULL);
+                                         &out, NULL, NULL, NULL);
     int stolen = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(stolen, 0);
@@ -3366,7 +3366,7 @@ TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main",
                                          "test.main", registry, NULL, NULL, 0, NULL, NULL, NULL,
-                                         &out, NULL, NULL);
+                                         &out, NULL, NULL, NULL);
     int guessed = count_confident_strategy(&out, "lsp_trait_dispatch");
     cbm_arena_destroy(&arena);
     ASSERT_EQ(guessed, 0);
@@ -3419,7 +3419,7 @@ TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
     CBMRustImplLinkArray links = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.main",
                                          "test.main", registry, NULL, NULL, 0, NULL, NULL, NULL,
-                                         &out, NULL, &links);
+                                         &out, NULL, NULL, &links);
     ASSERT_EQ(links.count, 4);
     ASSERT_STR_EQ(links.items[0].type_qn, "test.main.Local#L1");
     ASSERT_EQ(links.items[0].type_line, 1);
@@ -3465,7 +3465,7 @@ TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier) {
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          "test.main", reg, imp_names, imp_qns, 1, NULL,
                                          /*manifest=*/NULL,
-                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL);
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL, NULL);
 
     int resolved = find_confident(&result.resolved_calls, "hidden", "lib.render");
     int carriers = 0;
@@ -3702,7 +3702,7 @@ TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact) {
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          "test.main", reg, imp_names, imp_qns, 2, NULL,
                                          /*manifest=*/NULL,
-                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL);
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL, NULL);
 
     const char *a_site = strstr(caller, "a::render()");
     const char *b_site = strstr(caller, "b::render()");
@@ -3789,7 +3789,7 @@ TEST(rustlsp_vec_macro_args_resolve_in_both_forms) {
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          "test.main", reg, imp_names, imp_qns, 1, NULL,
                                          /*manifest=*/NULL,
-                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL);
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL, NULL);
 
     bool resolved[N];
     for (int i = 0; i < N; i++) {
@@ -3830,7 +3830,7 @@ static void rustlsp_macro_arg_sites_resolve(const char *caller, const char *cons
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          "test.main", reg, imp_names, imp_qns, 1, NULL,
                                          /*manifest=*/NULL,
-                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL);
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL, NULL);
     for (int i = 0; i < n; i++) {
         const CBMResolvedCall *hit = rustlsp_vec_arg_hit(&result, caller, sites[i], leaves[i]);
         resolved[i] = reg && hit && hit->callee_qn &&
@@ -3890,7 +3890,7 @@ TEST(rustlsp_nested_macro_repeated_text_resolves_at_each_site) {
     cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
                                          "test.main", reg, imp_names, imp_qns, 1, NULL,
                                          /*manifest=*/NULL,
-                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL);
+                                         /*imports=*/NULL, &result.resolved_calls, &result.calls, NULL, NULL);
     const char *site_text = "a::one()";
     const char *first_site = strstr(caller, site_text);
     const char *second_site = first_site ? strstr(first_site + 1, site_text) : NULL;
@@ -6267,7 +6267,7 @@ static bool rustlsp_modtree_deref_reaches_target(const char *demo_use) {
     if (registry) {
         cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source), "p.src.lib",
                                              "p.src.lib", registry, imp_n, imp_q, 1, NULL, NULL,
-                                             NULL, &out, NULL, NULL);
+                                             NULL, &out, NULL, NULL, NULL);
     }
     bool reached = find_confident(&out, "run", "p.src.demo.State.ping") >= 0;
     cbm_arena_destroy(&arena);
@@ -7933,7 +7933,7 @@ TEST(rustlsp_exact_layout_receiver_recovery_keeps_recursion) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.pkg.lib",
                                          "test.pkg.lib", registry, NULL, NULL, 0, NULL, NULL, NULL,
-                                         &out, NULL, NULL);
+                                         &out, NULL, NULL, NULL);
     int found = find_confident(&out, "S.recurse", "S.recurse");
     ASSERT_GTE(found, 0);
     ASSERT_STR_EQ(out.items[found].caller_qn, "test.pkg.lib.S.recurse");
@@ -12446,7 +12446,7 @@ TEST(rustlsp_cargo_dependency_path_never_selects_binary_target) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(
         &arena, source, (int)strlen(source), "test.app.src.lib", "test.app.src.lib", registry,
-        NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL, NULL);
+        NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL, NULL, NULL);
 
     ASSERT_LT(find_confident(&out, "run", "dep.src.main.launch"), 0);
     cbm_arena_destroy(&arena);
@@ -12490,7 +12490,7 @@ TEST(rustlsp_declared_module_shadows_workspace_crate_name) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(
         &arena, source, (int)strlen(source), "test.tui.src.lib", "test.tui.src.lib", registry,
-        NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL, NULL);
+        NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL, NULL, NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "tui.src.mermaid.render"), 0);
     ASSERT_LT(find_confident(&out, "run", "test.mermaid"), 0);
@@ -12549,7 +12549,7 @@ TEST(rustlsp_super_glob_module_alias_shadows_workspace_crate_name) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(
         &arena, source, (int)strlen(source), "test.app.src.child", "test.app.src.child", registry,
-        NULL, NULL, 0, NULL, &manifest, &imports, &out, NULL, NULL);
+        NULL, NULL, 0, NULL, &manifest, &imports, &out, NULL, NULL, NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "dep.src.connectors.list"), 0);
     ASSERT_LT(find_confident(&out, "run", "test.connectors"), 0);
@@ -12587,7 +12587,7 @@ TEST(rustlsp_target_root_declared_module_uses_registered_physical_path) {
     cbm_run_rust_lsp_cross_with_registry(
         &arena, source, (int)strlen(source), "test.pkg.examples.enabled_extensions",
         "test.pkg.examples.enabled_extensions", registry, NULL, NULL, 0, NULL, &manifest, NULL,
-        &out, NULL, NULL);
+        &out, NULL, NULL, NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "enabled_extensions.shared.install"), 0);
     cbm_arena_destroy(&arena);
@@ -12638,7 +12638,7 @@ TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(
         &arena, source, (int)strlen(source), "test.caller.src.lib", "test.caller.src.lib",
-        registry, NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL, NULL);
+        registry, NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL, NULL, NULL);
 
     ASSERT_LT(find_confident(&out, "run", "Store.act"), 0);
     cbm_arena_destroy(&arena);
@@ -13382,7 +13382,7 @@ TEST(rustlsp_macro_rules_before_mod_item_expands_in_child_file) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, sources[2], (int)strlen(sources[2]),
                                          "p.src.parent.child", "p.src.parent.child", registry, NULL,
-                                         NULL, 0, NULL, NULL, &imports, &out, NULL, NULL);
+                                         NULL, 0, NULL, NULL, &imports, &out, NULL, NULL, NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "p.src.parent.child.helper"), 0);
     ASSERT_LT(find_confident(&out, "run", "p.src.parent.child.other"), 0);
@@ -13430,7 +13430,7 @@ TEST(rustlsp_value_path_receivers_type_as_their_item) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_manifest(&arena, app, (int)strlen(app), "p.src.app", "p.src.app",
                                          defs, (int)(sizeof(defs) / sizeof(defs[0])), NULL, NULL,
-                                         0, NULL, NULL, &imports, &out, NULL, NULL);
+                                         0, NULL, NULL, &imports, &out, NULL, NULL, NULL);
     ASSERT_GTE(find_confident(&out, "app.unit", "p.src.model.Tier.code"), 0);
     ASSERT_GTE(find_confident(&out, "app.tuple", "p.src.model.Tier.code"), 0);
     ASSERT_GTE(find_confident(&out, "app.marker", "p.src.model.Marker.run"), 0);
@@ -13487,7 +13487,7 @@ static int rustlsp_associated_const_targets(const char *type, const char *body,
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_manifest(&arena, body, (int)strlen(body), "p.src.app", "p.src.app",
                                          defs, duplicate ? 8 : 7, NULL, NULL, 0, NULL, NULL,
-                                         &imports, &out, NULL, NULL);
+                                         &imports, &out, NULL, NULL, NULL);
     bool linked = find_confident(&out, "run", "p.src.model.Value.act") >= 0;
     bool wrong = find_confident(&out, "run", "p.src.model.Owner.act") >= 0;
     cbm_rust_modtree_free(tree);
@@ -13686,11 +13686,11 @@ TEST(rustlsp_module_path_call_picks_namesake_of_declaring_module) {
     CBMResolvedCallArray in_q = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, sources[1], (int)strlen(sources[1]), "w.q.src.lib",
                                          "w.q.src.lib", registry, NULL, NULL, 0, NULL, NULL,
-                                         &imports, &in_q, NULL, NULL);
+                                         &imports, &in_q, NULL, NULL, NULL);
     CBMResolvedCallArray in_p = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, sources[0], (int)strlen(sources[0]), "w.p.src.lib",
                                          "w.p.src.lib", registry, NULL, NULL, 0, NULL, NULL,
-                                         &imports, &in_p, NULL, NULL);
+                                         &imports, &in_p, NULL, NULL, NULL);
     const char *module_call = rust_sole_callee(&in_q, "w.q.src.lib.go");
     const char *crate_call = rust_sole_callee(&in_p, "w.p.src.lib.start");
     ASSERT_NOT_NULL(module_call);
@@ -14050,7 +14050,7 @@ TEST(rustlsp_self_path_in_generic_impl_names_declared_self_type) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_manifest(&fx.arena, source, (int)strlen(source), "p.src.lib",
                                          "p.src.lib", defs, 2, NULL, NULL, 0, NULL, NULL, &imports,
-                                         &out, NULL, NULL);
+                                         &out, NULL, NULL, NULL);
     ASSERT_GTE(find_confident(&out, "W.run", "p.src.lib.W.helper"), 0);
     ASSERT_LT(find_confident(&out, "T.go", "helper"), 0);
     rust_modtree_fixture_free(&fx);
@@ -14112,7 +14112,7 @@ TEST(rustlsp_crate_qualified_trait_and_assoc_paths_resolve) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_manifest(&arena, app, (int)strlen(app), "w.p.src.lib",
                                          "w.p.src.lib", defs, def_count, NULL, NULL, 0, NULL,
-                                         NULL, &imports, &out, NULL, NULL);
+                                         NULL, &imports, &out, NULL, NULL, NULL);
     ASSERT_GTE(find_confident(&out, "lib.typed", "w.q.src.lib.Http.fetch"), 0);
     ASSERT_LT(find_confident(&out, "lib.typed", "Mock.fetch"), 0);
     ASSERT_GTE(find_confident(&out, "lib.dynamic", "w.q.src.lib.Backend.fetch"), 0);

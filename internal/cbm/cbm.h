@@ -314,7 +314,9 @@ typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
     bool is_file_reference;  // syntax denotes a file reference, not a namespace
-    uint32_t scope_byte;     // scoped_imports only: start byte of the `use` declaration
+    uint32_t scope_byte;     // Rust: start byte of the `use` declaration
+    uint32_t site_end_byte;  // Rust: exclusive end of the `use` declaration
+    uint32_t start_line;     // Rust: 1-based source line
 } CBMImport;
 
 typedef enum {
