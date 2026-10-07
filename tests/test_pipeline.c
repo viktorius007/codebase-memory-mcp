@@ -3045,6 +3045,121 @@ TEST(pipeline_rust_trait_method_return_types_chained_receiver) {
     PASS();
 }
 
+TEST(pipeline_rust_trait_return_known_generic_constructor) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/trait_constructor_XXXXXX",
+             getenv("CBM_RUNTIME_DIR") ? getenv("CBM_RUNTIME_DIR") : "/tmp");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod model;\nmod user;\nmod concrete;\n");
+    write_temp_file(tmp, "src/model.rs",
+                    "pub struct Item;\nimpl Item { pub fn act(&self) {} }\n"
+                    "pub struct Container<T>(T);\n"
+                    "impl<T> Container<T> { pub fn act(&self) {} pub fn item(&self) -> &T { &self.0 } }\n"
+                    "pub trait Make<Item> { fn value(&self) -> Container<Item>; }\n"
+                    "pub trait Borrow<Item> { fn value(&self) -> &Container<Item>; }\n"
+                    "pub trait Sched {}\npub struct Config<T: Sched>(T);\n"
+                    "pub trait Build<T: Sched>: Sized { fn configs(self) -> Config<T>;\n"
+                    "fn chain(self) -> Config<T> { self.configs().chain() } }\n"
+                    "impl<T: Sched> Build<T> for Config<T> { fn configs(self) -> Self { self }\n"
+                    "fn chain(self) -> Self { self } }\n"
+                    "pub struct Pair<A, B>(A, B);\npub trait PairAct { fn pair_act(&self); }\n"
+                    "impl<T> PairAct for Pair<T, T> { fn pair_act(&self) {} }\n"
+                    "pub trait MakePair<A, B> { fn pair(&self) -> Pair<A, B>; }\n"
+                    "pub trait Split<Param> { fn parts(&self) -> (Param, Container<Param>); }\n"
+                    "pub trait Method { fn wrap<T>(&self) -> Container<T>;\n"
+                    "fn identity<T>(&self, value: T) -> T; }\n");
+    write_temp_file(tmp, "src/concrete.rs",
+                    "pub struct T;\nimpl T { pub fn own_act(&self) {} }\n");
+    write_temp_file(tmp, "src/user.rs",
+                    "use crate::model::{Make, Borrow, Item, MakePair, PairAct, Split, Method};\n"
+                    "pub fn bound<T: Make<Item>>(x: &T) { x.value().act(); }\n"
+                    "pub fn object(x: &dyn Make<Item>) { x.value().act(); }\n"
+                    "pub fn borrowed<T: Borrow<Item>>(x: &T) { x.value().act(); }\n"
+                    "pub fn dependent<T: Make<Item>>(x: &T) { x.value().item().act(); }\n"
+                    "pub fn repeated<T: MakePair<u8, u8>>(x: &T) { x.pair().pair_act(); }\n"
+                    "pub fn split<T: Split<Item>>(x: &T) { let (_, c) = x.parts(); c.act(); }\n"
+                    "pub fn method<M: Method>(x: &M) { x.wrap::<Item>().act(); }\n"
+                    "pub fn method_dependent<M: Method>(x: &M) { x.wrap::<crate::concrete::T>().item().own_act(); }\n"
+                    "pub fn inferred<M: Method>(x: &M, value: crate::concrete::T) {\n"
+                    "x.identity(value).own_act(); }\n");
+    static const usage_expectation_t rows[] = {
+        {"bound", "act", "src/model.rs", 1, NULL},
+        {"object", "act", "src/model.rs", 1, NULL},
+        {"borrowed", "act", "src/model.rs", 1, NULL},
+        {"dependent", "act", "src/model.rs", 0, NULL},
+        {"chain", "chain", "src/model.rs", 1, NULL},
+        {"repeated", "pair_act", "src/model.rs", 0, NULL},
+        {"split", "act", "src/model.rs", 1, NULL},
+        {"method", "act", "src/model.rs", 1, NULL},
+        {"method_dependent", "own_act", "src/concrete.rs", 1, NULL},
+        {"inferred", "own_act", "src/concrete.rs", 1, NULL},
+    };
+    int failed = edge_expectations_hold_in_both_modes(tmp, "CALLS", rows, 10);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/sequential.db", tmp);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    sqlite3_stmt *stop = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+        "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='act' "
+        "AND caller LIKE '%.dependent' AND reason='unknown_receiver_type'", -1, &stop, NULL),
+        SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stop), SQLITE_ROW);
+    int stopped = sqlite3_column_int(stop, 0);
+    sqlite3_finalize(stop);
+    cbm_store_close(store);
+    th_rmtree(tmp);
+    ASSERT_EQ(failed, -1);
+    ASSERT_EQ(stopped, 1);
+    PASS();
+}
+
+TEST(pipeline_rust_trait_return_associated_bounds_in_default_body) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/trait_assoc_bound_XXXXXX",
+             getenv("CBM_RUNTIME_DIR") ? getenv("CBM_RUNTIME_DIR") : "/tmp");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod model;\nmod other;\n");
+    write_temp_file(tmp, "src/model.rs",
+                    "use std::fmt::Debug;\npub trait Stack { fn pop(&mut self); fn fmt(&self); }\n"
+                    "pub trait Access { type Value: Stack + Debug; fn value(&mut self) -> &mut Self::Value;\n"
+                    "fn standard_fmt(&mut self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n"
+                    "self.value().fmt(f) }\nfn consume(&mut self) { self.value().pop(); } }\n");
+    write_temp_file(tmp, "src/other.rs",
+                    "pub trait Alt { fn pop(&mut self); }\n"
+                    "pub trait OtherAccess { type Value: Alt; fn value(&mut self) -> &mut Self::Value;\n"
+                    "fn consume_other(&mut self) { self.value().pop(); } }\n");
+    static const usage_expectation_t rows[] = {
+        {"consume", "pop", "src/model.rs", 1, NULL},
+        {"consume", "pop", "src/other.rs", 0, NULL},
+        {"consume_other", "pop", "src/other.rs", 1, NULL},
+        {"consume_other", "pop", "src/model.rs", 0, NULL},
+        {"standard_fmt", "fmt", "src/model.rs", 0, NULL},
+    };
+    int failed = edge_expectations_hold_in_both_modes(tmp, "CALLS", rows, 5);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/sequential.db", tmp);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    sqlite3_stmt *stop = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+        "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='fmt' "
+        "AND caller LIKE '%.standard_fmt' AND reason='bound_declaration_not_proven'",
+        -1, &stop, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stop), SQLITE_ROW);
+    int stopped = sqlite3_column_int(stop, 0);
+    sqlite3_finalize(stop);
+    cbm_store_close(store);
+    th_rmtree(tmp);
+    ASSERT_EQ(failed, -1);
+    ASSERT_EQ(stopped, 1);
+    PASS();
+}
+
 TEST(pipeline_rust_callback_generic_input_types_closure_receiver) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/callback_generic_XXXXXX",
@@ -19789,6 +19904,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_scoped_associated_const_sequential);
     RUN_TEST(pipeline_rust_scoped_associated_const_parallel);
     RUN_TEST(pipeline_rust_trait_method_return_types_chained_receiver);
+    RUN_TEST(pipeline_rust_trait_return_known_generic_constructor);
+    RUN_TEST(pipeline_rust_trait_return_associated_bounds_in_default_body);
     RUN_TEST(pipeline_rust_callback_generic_input_types_closure_receiver);
     RUN_TEST(pipeline_rust_trait_member_needs_impl_proof_sequential);
     RUN_TEST(pipeline_rust_trait_member_needs_impl_proof_parallel);
