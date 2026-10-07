@@ -653,14 +653,15 @@ void cbm_pipeline_record_unresolved_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_t *sy
                                           "field_label_syntax_filtered",
                                           "keyword_syntax_filtered",
                                           "keyword_syntax_filtered",
-                                          "macro_token_not_resolved"};
+                                          "macro_token_not_resolved",
+                                          "macro_token_discarded"};
     if (usage->unresolved_filter)
         stop = filters[usage->unresolved_filter];
     bool macro = usage->unresolved_filter == CBM_USAGE_MACRO_FILTERED;
     bool keyword = usage->unresolved_filter == CBM_USAGE_KEYWORD_FILTERED;
     bool keyword_call = usage->unresolved_filter == CBM_USAGE_KEYWORD_CALL_FILTERED;
-    bool relevant = macro || usage->unresolved_filter == CBM_USAGE_MACRO_TOKEN_FILTERED ||
-                    keyword_call ||
+    bool relevant = macro || usage->unresolved_filter == CBM_USAGE_MACRO_DISCARDED ||
+                    usage->unresolved_filter == CBM_USAGE_MACRO_TOKEN_FILTERED || keyword_call ||
                     (!macro && !keyword &&
                      (usage->kind == CBM_USAGE_TYPE || usage->is_member_access ||
                       strstr(usage->ref_name, "::") != NULL));

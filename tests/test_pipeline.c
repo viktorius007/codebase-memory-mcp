@@ -9154,6 +9154,27 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
         "fn helper() {} fn field() {} macro_rules! ignore { ($($t:tt)*) => { () }; } "
         "fn quoted() { let _ = stringify!(helper()); } fn discarded() { ignore!(helper()); } "
         "fn member() { ignore!(self.field); } fn value() { let _ = helper; }\n",
+
+        "fn helper() {} fn unreadable() { foreign::opaque!(helper()); } "
+        "fn imported() { use foreign::stringify; stringify!(helper()); } "
+        "fn globbed() { use foreign::*; stringify!(helper()); } "
+        "fn root_alias() { use foreign as std; std::stringify!(helper()); }\n",
+        "fn helper() {} macro_rules! choose { "
+        "(drop, $x:expr) => {}; (unit, $x:expr) => { () }; (quote, $x:expr) => { stringify!($x) }; "
+        "(keep, $x:expr) => { $x }; (both, $x:expr) => { ($x, stringify!($x)) }; "
+        "(twice, $x:expr) => { (stringify!($x), stringify!($x)) }; } "
+        "fn dropped() { choose!(drop, helper()); } fn unit_drop() { choose!(unit, helper()); } "
+        "fn quoted_arm() { choose!(quote, helper()); } "
+        "fn kept() { choose!(keep, helper()); } fn both() { choose!(both, helper()); } "
+        "fn twice() { choose!(twice, helper()); }\n",
+        "#![feature(log_syntax)]\nfn helper() {} fn literal() { let _ = std::concat!(stringify!(helper)); } "
+        "fn alias() { use std::stringify as quote; let _ = quote!(helper()); } "
+        "fn logged() { std::log_syntax!(helper()); } "
+        "fn standard_root_alias() { use std as base; base::stringify!(helper()); } "
+        "fn shadowed() { macro_rules! stringify { ($x:expr) => { $x }; } stringify!(helper()); }\n",
+        "trait Marker { fn read() -> bool where Self: Sized; } struct Item; impl Marker for Item { "
+        "fn read() -> bool { true } } fn parsed() { assert!(<Item as Marker>::read()); } "
+        "fn nested() { assert_eq!(format!(\"{:p}\", &Item as &dyn Marker), \"\"); }\n",
     };
     write_temp_file(tmp, "src/lib.rs", sources[scenario]);
     if (scenario == 25) {
@@ -9342,6 +9363,33 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
                       cross_file_edge_exists(store, project, "value", "helper", "USAGE");
             break;
 
+        case 29:
+            correct = cross_file_edge_exists(store, project, "unreadable", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "imported", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "globbed", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "root_alias", "helper", "USAGE");
+            break;
+        case 30:
+            correct = !cross_file_edge_exists(store, project, "dropped", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "unit_drop", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "quoted_arm", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "twice", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "kept", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "both", "helper", "USAGE");
+            break;
+        case 31:
+            correct = !cross_file_edge_exists(store, project, "literal", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "alias", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "logged", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "standard_root_alias", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "shadowed", "helper", "USAGE");
+            break;
+
+        case 32:
+            correct = cross_file_edge_exists(store, project, "parsed", "Marker", "USAGE") &&
+                      cross_file_edge_exists(store, project, "nested", "Marker", "USAGE");
+            break;
+
         }
     }
     if (store)
@@ -9395,6 +9443,46 @@ TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_sequential) {
 
 TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_parallel) {
     ASSERT_EQ(check_rust_occurrence_proof(false, 28), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_unreadable_macro_preserves_expression_usage_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 29), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_unreadable_macro_preserves_expression_usage_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 29), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_matched_macro_arm_discards_only_unused_fragments_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 30), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_matched_macro_arm_discards_only_unused_fragments_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 30), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_expression_keeps_proved_type_usage_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 32), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_expression_keeps_proved_type_usage_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 32), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_standard_stringifiers_respect_aliases_and_shadowing_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 31), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_standard_stringifiers_respect_aliases_and_shadowing_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 31), 0);
     PASS();
 }
 
@@ -19731,6 +19819,14 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_module_binding_is_not_a_function_usage_parallel);
     RUN_TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_sequential);
     RUN_TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_parallel);
+    RUN_TEST(pipeline_rust_unreadable_macro_preserves_expression_usage_sequential);
+    RUN_TEST(pipeline_rust_unreadable_macro_preserves_expression_usage_parallel);
+    RUN_TEST(pipeline_rust_matched_macro_arm_discards_only_unused_fragments_sequential);
+    RUN_TEST(pipeline_rust_matched_macro_arm_discards_only_unused_fragments_parallel);
+    RUN_TEST(pipeline_rust_macro_expression_keeps_proved_type_usage_sequential);
+    RUN_TEST(pipeline_rust_macro_expression_keeps_proved_type_usage_parallel);
+    RUN_TEST(pipeline_rust_standard_stringifiers_respect_aliases_and_shadowing_sequential);
+    RUN_TEST(pipeline_rust_standard_stringifiers_respect_aliases_and_shadowing_parallel);
     RUN_TEST(pipeline_rust_enum_variant_qualifier_sequential);
     RUN_TEST(pipeline_rust_enum_variant_qualifier_parallel);
     RUN_TEST(pipeline_rust_block_use_type_sequential);

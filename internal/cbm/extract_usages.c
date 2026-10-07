@@ -2977,14 +2977,15 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
          * it, and the Go Field guard keys on it (#1962). */
         usage.is_member_access = strcmp(ts_node_type(node), "field_identifier") == 0;
         stamp_usage_site(ctx, &usage, node, name, state);
+        cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
         TSNode parent = ts_node_parent(node);
         if (ctx->language == CBM_LANG_RUST && !ts_node_is_null(parent) &&
             strcmp(ts_node_type(parent), "token_tree") == 0) {
-            /* Opaque tokens become usages only after an expanded expression
-             * supplies the same original-source occurrence. */
+            /* Preserve the ordinary reference carrier for unreadable macros.
+             * The semantic walk filters both carriers only on proved discard. */
             usage.unresolved_filter = CBM_USAGE_MACRO_FILTERED;
             usage.may_be_call_reference = false;
+            cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
         }
-        cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
     }
 }

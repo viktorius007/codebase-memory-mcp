@@ -9881,9 +9881,8 @@ static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const
 }
 
 extern const TSLanguage *tree_sitter_rust(void);
-/* Reuse the ordinary usage extractor on the expression AST that expansion
- * actually kept. Only mapped invocation bytes can release a raw token; tokens
- * inside a nested opaque macro remain filtered by the extractor. */
+/* Keep the expression roles already proved by argument parsing in addition
+ * to the ordinary token carrier. Proved discard is never released here. */
 static void rust_prove_macro_usages(RustLSPContext *ctx, TSNode body) {
     if (!ctx->macro_usages || !ctx->site_map_active || ts_node_has_error(body))
         return;
@@ -9905,6 +9904,13 @@ static void rust_prove_macro_usages(RustLSPContext *ctx, TSNode body) {
             !rust_map_source_range(ctx, syntax->site_start_byte, syntax->site_end_byte,
                                    &start, &end))
             continue;
+        TSNode token = ts_node_descendant_for_byte_range(body, syntax->site_start_byte,
+                                                        syntax->site_end_byte);
+        bool opaque = false;
+        for (; !ts_node_is_null(token); token = ts_node_parent(token))
+            opaque |= strcmp(ts_node_type(token), "token_tree") == 0;
+        if (opaque)
+            continue; /* An inner macro must parse its own token carrier first. */
         for (int j = 0; j < ctx->macro_usages->count; j++) {
             CBMUsage *raw = &ctx->macro_usages->items[j];
             if (raw->unresolved_filter != CBM_USAGE_MACRO_FILTERED ||
@@ -9919,6 +9925,150 @@ static void rust_prove_macro_usages(RustLSPContext *ctx, TSNode body) {
             raw->semantic_reference_local_shadow |= syntax->semantic_reference_local_shadow;
         }
     }
+}
+
+/* The vendored grammar leaves the token tree unnamed as a field. */
+static TSNode rust_macro_argument_node(TSNode invocation) {
+    TSNode args = ts_node_child_by_field_name(invocation, "arguments", 9);
+    if (!ts_node_is_null(args))
+        return args;
+    for (uint32_t i = 0; i < ts_node_named_child_count(invocation); i++) {
+        TSNode child = ts_node_named_child(invocation, i);
+        if (strcmp(ts_node_type(child), "token_tree") == 0)
+            return child;
+    }
+    return (TSNode){0};
+}
+
+/* These standard macros consume syntax, literals or paths, rather than
+ * referring to expression identifiers. A readable project definition or an
+ * imported foreign macro must win over an unqualified prelude spelling. */
+static bool rust_macro_discards_arguments(RustLSPContext *ctx, const char *name, TSNode node) {
+    if (!name)
+        return false;
+    if (rust_has_visible_macro_definition(ctx, name, node))
+        return false;
+    if (strncmp(name, "::", 2) == 0)
+        name += 2;
+    const char *root_sep = strstr(name, "::");
+    if (root_sep) {
+        char *root = cbm_arena_strndup(ctx->arena, name, (size_t)(root_sep - name));
+        const char *imported = rust_resolve_use(ctx, root);
+        if (imported && strcmp(imported, root) != 0)
+            name = cbm_arena_sprintf(ctx->arena, "%s%s", imported, root_sep);
+        if (!name)
+            return false;
+    }
+    const char *leaf = name;
+    const char *sep = strrchr(name, ':');
+    if (sep) {
+        leaf = sep + 1;
+        size_t n = (size_t)(leaf - name - 2);
+        if (!((n == 3 && strncmp(name, "std", n) == 0) ||
+              (n == 4 && strncmp(name, "core", n) == 0)))
+            return false;
+        char *head = cbm_arena_strndup(ctx->arena, name, n);
+        if (cbm_idxmemo_get(&ctx->declared_modules, head) >= 0)
+            return false;
+    } else {
+        const char *imported = rust_resolve_use(ctx, name);
+        if (imported)
+            return strstr(imported, "::") && strcmp(imported, name) != 0 &&
+                   rust_macro_discards_arguments(ctx, imported, node);
+        if (ctx->glob_count > 0)
+            return false; /* An unreadable glob may supply a macro with this name. */
+    }
+    static const char *const names[] = {"stringify", "concat", "concat_bytes", "concat_idents",
+        "env", "option_env", "include", "include_str", "include_bytes", "compile_error",
+        "cfg", "file", "line", "column", "module_path", "log_syntax", "trace_macros"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (strcmp(leaf, names[i]) == 0)
+            return true;
+    return false;
+}
+
+/* An occurrence copied more than once survives if any copy is outside a
+ * proved stringifying macro. Merely passing it to an unreadable macro keeps
+ * the earlier expression-in-scope behavior. */
+static bool rust_range_stringified(RustLSPContext *ctx, TSNode node, uint32_t start,
+                                   uint32_t end, int depth) {
+    if (depth > 64 || ts_node_is_null(node) || start < ts_node_start_byte(node) ||
+        end > ts_node_end_byte(node))
+        return false;
+    if (strcmp(ts_node_type(node), "macro_invocation") == 0) {
+        TSNode args = rust_macro_argument_node(node);
+        TSNode macro = ts_node_child_by_field_name(node, "macro", 5);
+        if (!ts_node_is_null(args) && !ts_node_is_null(macro) &&
+            start >= ts_node_start_byte(args) && end <= ts_node_end_byte(args) &&
+            rust_macro_discards_arguments(ctx, rust_node_text(ctx, macro), node))
+            return true;
+    }
+    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++)
+        if (rust_range_stringified(ctx, ts_node_named_child(node, i), start, end, depth + 1))
+            return true;
+    return false;
+}
+
+static bool rust_usage_overlaps_window(const CBMUsage *usage, const CBMRustSiteWindow *window) {
+    uint32_t end = window->original_start + window->synthetic_end - window->synthetic_start;
+    return usage->site_start_byte < end && usage->site_end_byte > window->original_start;
+}
+
+static bool rust_macro_usage_survives(RustLSPContext *ctx, const CBMUsage *usage, TSNode body,
+                                      uint32_t excluded_start, uint32_t excluded_end) {
+    for (int i = 0; i < ctx->site_window_count; i++) {
+        const CBMRustSiteWindow *w = &ctx->site_windows[i];
+        if (!rust_usage_overlaps_window(usage, w))
+            continue;
+        uint32_t start = w->synthetic_start +
+            (usage->site_start_byte > w->original_start ? usage->site_start_byte - w->original_start : 0);
+        uint32_t end = w->synthetic_start + usage->site_end_byte - w->original_start;
+        if (end > w->synthetic_end)
+            end = w->synthetic_end;
+        if (ts_node_is_null(body)) {
+            if (start < excluded_start || end > excluded_end)
+                return true;
+        } else if (ts_node_has_error(body) || !rust_range_stringified(ctx, body, start, end, 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rust_filter_macro_usages(RustLSPContext *ctx, const RustSiteWindows *input,
+                                     const RustSiteWindows *outside, TSNode body,
+                                     uint32_t excluded_start, uint32_t excluded_end) {
+    if (!ctx->macro_usages)
+        return;
+    for (int i = 0; i < ctx->macro_usages->count; i++) {
+        CBMUsage *usage = &ctx->macro_usages->items[i];
+        if (usage->unresolved_filter != CBM_USAGE_NOT_FILTERED &&
+            usage->unresolved_filter != CBM_USAGE_MACRO_FILTERED)
+            continue;
+        bool inside = false, elsewhere = false;
+        for (int j = 0; j < input->count; j++) {
+            const CBMRustSiteWindow *w = &input->items[j];
+            inside |= usage->site_start_byte >= w->original_start && usage->site_end_byte <=
+                w->original_start + w->synthetic_end - w->synthetic_start;
+        }
+        for (int j = 0; outside && j < outside->count; j++)
+            elsewhere |= rust_usage_overlaps_window(usage, &outside->items[j]);
+        if (inside && !elsewhere &&
+            !rust_macro_usage_survives(ctx, usage, body, excluded_start, excluded_end)) {
+            usage->unresolved_filter = CBM_USAGE_MACRO_DISCARDED;
+            usage->may_be_call_reference = false;
+        }
+    }
+}
+
+static void rust_filter_discarded_macro_arguments(RustLSPContext *ctx, TSNode invocation) {
+    TSNode args = rust_macro_argument_node(invocation);
+    if (ts_node_is_null(args))
+        return;
+    uint32_t start = ts_node_start_byte(args), end = ts_node_end_byte(args);
+    RustSiteWindows input = {.arena = ctx->arena};
+    rust_site_windows_carry(ctx, &input, start, end, 0);
+    rust_filter_macro_usages(ctx, &input, NULL, (TSNode){0}, start, end);
 }
 
 /* Re-parse a user macro's transcriber body as a synthetic Rust
@@ -9942,17 +10092,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     int inv_args_len = 0;
     uint32_t inv_src_start = 0;
     if (!ts_node_is_null(invocation)) {
-        TSNode args_tt = ts_node_child_by_field_name(invocation, "arguments", 9);
-        if (ts_node_is_null(args_tt)) {
-            uint32_t child_count = ts_node_child_count(invocation);
-            for (uint32_t i = 0; i < child_count; i++) {
-                TSNode child = ts_node_child(invocation, i);
-                if (!ts_node_is_null(child) && strcmp(ts_node_type(child), "token_tree") == 0) {
-                    args_tt = child;
-                    break;
-                }
-            }
-        }
+        TSNode args_tt = rust_macro_argument_node(invocation);
         if (!ts_node_is_null(args_tt)) {
             char *at = cbm_node_text(ctx->arena, args_tt, ctx->source);
             if (at) {
@@ -9986,9 +10126,23 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             break;
         }
     }
-    if (!hit || !hit->transcriber_text || hit->transcriber_len <= 0) {
+    if (!hit || !hit->transcriber_text || hit->transcriber_len < 0) {
         cbm_free(CBM_MEM_CLASS_OTHER, env);
         return;
+    }
+
+    if (hit->transcriber_len == 0) {
+        cbm_free(CBM_MEM_CLASS_OTHER, env);
+        rust_filter_discarded_macro_arguments(ctx, invocation);
+        return;
+    }
+
+    RustSiteWindows input = {.arena = ctx->arena}, outside = {.arena = ctx->arena};
+    rust_site_windows_carry(ctx, &input, inv_src_start, inv_src_start + (uint32_t)inv_args_len, 0);
+    if (ctx->site_map_active) {
+        rust_site_windows_carry(ctx, &outside, 0, inv_src_start, 0);
+        rust_site_windows_carry(ctx, &outside, inv_src_start + (uint32_t)inv_args_len,
+                                (uint32_t)ctx->source_len, 0);
     }
 
     /* Substitute the bound metavars into the transcriber body. A fragment
@@ -10062,8 +10216,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             ctx->emit_site_start_byte = 0;
             ctx->emit_site_end_byte = 0;
             ctx->inject_syn_calls++;
-            rust_resolve_calls_in_node(ctx, body);
+            rust_filter_macro_usages(ctx, &input, &outside, body, 0, 0);
             rust_prove_macro_usages(ctx, body);
+            rust_resolve_calls_in_node(ctx, body);
             ctx->inject_syn_calls--;
             ctx->source = saved_source;
             ctx->source_len = saved_len;
@@ -10483,8 +10638,8 @@ static void rust_reparse_macro_region(RustLSPContext *ctx, uint32_t src_start, c
          * macro-hidden expressions, so resolved_calls emitted here have
          * no CBMCall to pair with. Inject matching synthetic calls. */
         ctx->inject_syn_calls++;
-        rust_resolve_calls_in_node(ctx, body);
         rust_prove_macro_usages(ctx, body);
+        rust_resolve_calls_in_node(ctx, body);
         ctx->inject_syn_calls--;
         ctx->source = saved_source;
         ctx->source_len = saved_len;
@@ -13776,6 +13931,8 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                      * call sites are lost to tree-sitter's macro tokenisation, so
                      * re-parse the args to recover calls like `format!("{}",
                      * d.label())`. */
+                    if (ctx->macro_usages && rust_macro_discards_arguments(ctx, mname, node))
+                        rust_filter_discarded_macro_arguments(ctx, node);
                     RustMacroArgForm arg_form;
                     if (rust_builtin_macro_arg_form(ctx, mname, &arg_form))
                         rust_resolve_macro_arg_exprs(ctx, node, arg_form);

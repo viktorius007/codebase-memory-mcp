@@ -26,7 +26,7 @@
  * reason is a resolver stop code, never a display message. Pipeline stop codes:
  * source_item_absent, source_file_mismatch, cross_language_candidate_rejected,
  * usage_target_identity_not_proven, import_path_not_proven,
- * macro_token_not_resolved, target_not_materialized, type_path_not_proven,
+ * macro_token_not_resolved, macro_token_discarded, target_not_materialized, type_path_not_proven,
  * member_target_not_proven, value_path_not_proven, self_usage_suppressed, binding_syntax_filtered,
  * write_syntax_filtered, keyword_syntax_filtered, field_label_syntax_filtered,
  * import_syntax_filtered, macro_invocation_not_proven (the extractor owns these stops), and
