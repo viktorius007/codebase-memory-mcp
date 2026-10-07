@@ -1568,6 +1568,37 @@ const char *cbm_rust_modtree_item_module(const CBMRustModTree *tree, CBMArena *a
     return NULL;
 }
 
+/* Merge only exports of block globs whose paths name a proved module.
+ * Unknown sources keep the answer open even when another glob has a match. */
+static bool rmt_block_globs(CBMRustModTree *tree, CBMArena *arena, int module, const char *name,
+                            uint8_t ns, const char *const *names, const char *const *paths,
+                            int extra, RmtDefs *out) {
+    bool has_glob = false;
+    for (int i = 0; i < extra; i++) {
+        if (!names[i] || !paths[i] || strcmp(names[i], "*") != 0)
+            continue;
+        has_glob = true;
+        const char *segs[RMT_MAX_SEGS];
+        int count = rmt_split_path(arena, paths[i], segs, RMT_MAX_SEGS);
+        if (count < 2 || strcmp(segs[count - 1], "*") != 0) {
+            out->open = true;
+            continue;
+        }
+        RmtDefs source = {0};
+        rmt_resolve_path(tree, arena, module, segs, count - 1, RMT_NS_TYPE, true, &source, false);
+        if (source.open || source.count != 1 || source.defs[0].kind != RMT_MODULE) {
+            out->open = true;
+            continue;
+        }
+        RmtDefs found = {0};
+        RmtVisit visit = {.count = 0};
+        RmtSeers seers = {.count = 1, .items = {module}};
+        rmt_lookup(tree, source.defs[0].module, name, ns, &found, &visit, false, &seers);
+        rmt_defs_merge(out, &found, ns);
+    }
+    return has_glob && (out->open || out->count > 0);
+}
+
 /* Resolve in the source module selected by offset, or the exact physical
  * module QN for a definition header; multiple crate mounts must agree. */
 static CBMRustPathResult rmt_resolve_query(const CBMRustModTree *tree, CBMArena *arena,
@@ -1582,6 +1613,11 @@ static CBMRustPathResult rmt_resolve_query(const CBMRustModTree *tree, CBMArena 
     int file = cbm_idxmemo_get(&tree->file_by_qn, module_qn);
     const char *segs[RMT_MAX_SEGS];
     int count = file >= 0 ? rmt_split_path(arena, path, segs, RMT_MAX_SEGS) : -1;
+    bool block_globs = count == 1;
+    for (int i = 0; block_globs && i < extra_count; i++) {
+        if (extra_names[i] && strcmp(extra_names[i], segs[0]) == 0)
+            block_globs = false;
+    }
     if (count > 0) {
         count = rmt_apply_block_uses(arena, segs, count, extra_names, extra_paths, extra_count);
     }
@@ -1604,7 +1640,10 @@ static CBMRustPathResult rmt_resolve_query(const CBMRustModTree *tree, CBMArena 
         if (tree->crates[tree->modules[m].crate].edition == CBM_RUST_EDITION_UNKNOWN)
             return (CBMRustPathResult){.kind = CBM_RUST_PATH_EDITION_UNKNOWN};
         RmtDefs defs = {0};
-        rmt_resolve_path(readonly, arena, m, segs, count, ns, false, &defs, false);
+        if (!block_globs || !rmt_block_globs(readonly, arena, m, segs[0], ns, extra_names,
+                                             extra_paths, extra_count, &defs)) {
+            rmt_resolve_path(readonly, arena, m, segs, count, ns, false, &defs, false);
+        }
         CBMRustPathResult result =
             ns == RMT_NS_TYPE ? rmt_classify_type(&defs) : rmt_classify(&defs);
         if (result.kind == CBM_RUST_PATH_UNKNOWN)

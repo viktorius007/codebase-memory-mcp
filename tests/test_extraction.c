@@ -2252,9 +2252,8 @@ TEST(rust_impl_macro_rules_members) {
     PASS();
 }
 
-/* Rust: a field and a method of one type share a QN, as do two local structs of
- * one name in two functions. Each keeps a node: the callable (or the later
- * definition) keeps the QN, the other gets a line-qualified one. */
+/* Fields retain line disambiguation against methods; block-local structs
+ * instead carry their own declaration positions and never take a module name. */
 TEST(rust_shared_qn_definitions_all_survive) {
     CBMFileResult *r = extract("struct P {\n"
                                "    capture: u32,\n"
@@ -2269,8 +2268,8 @@ TEST(rust_shared_qn_definitions_all_survive) {
     const CBMDefinition *field = NULL;
     const CBMDefinition *method = NULL;
     int h_count = 0;
-    bool h_plain = false;
-    bool h_line7 = false;
+    bool h_first = false;
+    bool h_second = false;
     for (int i = 0; i < r->defs.count; i++) {
         const CBMDefinition *d = &r->defs.items[i];
         if (strcmp(d->name, "capture") == 0 && strcmp(d->label, "Field") == 0) {
@@ -2281,8 +2280,8 @@ TEST(rust_shared_qn_definitions_all_survive) {
         }
         if (strcmp(d->name, "H") == 0) {
             h_count++;
-            h_plain = h_plain || strcmp(d->qualified_name, "t.lib.H") == 0;
-            h_line7 = h_line7 || strcmp(d->qualified_name, "t.lib.H#L7") == 0;
+            h_first = h_first || strcmp(d->qualified_name, "t.lib.#B97.H") == 0;
+            h_second = h_second || strcmp(d->qualified_name, "t.lib.#B118.H") == 0;
         }
     }
     ASSERT_NOT_NULL(field);
@@ -2290,8 +2289,8 @@ TEST(rust_shared_qn_definitions_all_survive) {
     ASSERT_STR_EQ(method->qualified_name, "t.lib.P.capture");
     ASSERT_STR_EQ(field->qualified_name, "t.lib.P.capture#L2");
     ASSERT_EQ(h_count, 2);
-    ASSERT(h_plain);
-    ASSERT(h_line7);
+    ASSERT(h_first);
+    ASSERT(h_second);
     cbm_free_result(r);
     PASS();
 }

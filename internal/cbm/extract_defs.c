@@ -2030,8 +2030,52 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
 
 const char *cbm_rust_item_qn(CBMArena *a, TSNode node, const char *source, const char *module_qn,
                              const char *name) {
+    bool in_block = false;
+    for (TSNode scope = ts_node_parent(node); !ts_node_is_null(scope);
+         scope = ts_node_parent(scope))
+        in_block |= strcmp(ts_node_type(scope), "block") == 0;
+    /* An impl names the declaration it extends; its own position is not
+     * the type's identity. Resolve a bare owner in the enclosing item scopes. */
+    if (in_block && strcmp(ts_node_type(node), "impl_item") == 0) {
+        for (TSNode scope = ts_node_parent(node); !ts_node_is_null(scope);
+             scope = ts_node_parent(scope)) {
+            const char *kind = ts_node_type(scope);
+            if (strcmp(kind, "block") != 0 && strcmp(kind, "source_file") != 0 &&
+                strcmp(kind, "declaration_list") != 0)
+                continue;
+            TSNode owner = {0};
+            int matches = 0;
+            bool imported = false;
+            for (uint32_t i = 0; i < ts_node_named_child_count(scope); i++) {
+                TSNode item = ts_node_named_child(scope, i);
+                const char *item_kind = ts_node_type(item);
+                imported |= strcmp(item_kind, "use_declaration") == 0;
+                if (strcmp(item_kind, "struct_item") != 0 && strcmp(item_kind, "enum_item") != 0 &&
+                    strcmp(item_kind, "union_item") != 0 && strcmp(item_kind, "type_item") != 0)
+                    continue;
+                const char *text =
+                    cbm_node_text(a, ts_node_child_by_field_name(item, "name", 4), source);
+                if (text && strcmp(text, name) == 0) {
+                    owner = item;
+                    matches++;
+                }
+            }
+            if (matches == 1)
+                node = owner;
+            if (matches || imported)
+                break;
+        }
+    }
     const char *path = name;
+    bool block_local = false;
     for (TSNode cur = ts_node_parent(node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        if (!block_local && strcmp(ts_node_type(node), "impl_item") != 0 &&
+            strcmp(ts_node_type(cur), "block") == 0) {
+            /* Byte positions identify declarations even on the same line;
+             * the final segment remains the source name for call joining. */
+            path = cbm_arena_sprintf(a, "#B%u.%s", ts_node_start_byte(node), path);
+            block_local = true;
+        }
         if (strcmp(ts_node_type(cur), "mod_item") != 0) {
             continue;
         }

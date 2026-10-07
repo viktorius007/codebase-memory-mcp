@@ -1952,6 +1952,10 @@ static char *gather_scoped_path(RustLSPContext *ctx, TSNode node) {
 }
 
 static bool rust_original_offset(const RustLSPContext *ctx, TSNode node, uint32_t *out);
+static TSNode rust_impl_local_item(RustLSPContext *ctx, TSNode node, const char *path,
+                                   bool *shadowed);
+static const char *rust_impl_local_qn(RustLSPContext *ctx, TSNode item, bool want_trait,
+                                      uint32_t *def_line);
 
 /* The type a path in a type position names, resolved through the crate's
  * declared module tree and `use` graph exactly as a call path is: the
@@ -1959,6 +1963,22 @@ static bool rust_original_offset(const RustLSPContext *ctx, TSNode node, uint32_
  * project type (generic parameter, item outside the project, undecidable). */
 static const char *rust_type_qn_by_module_tree(RustLSPContext *ctx, TSNode node, const char *path,
                                                bool *ambiguous) {
+    if (!path)
+        return NULL;
+    bool shadowed = false;
+    TSNode local = rust_impl_local_item(ctx, node, path, &shadowed);
+    if (shadowed) {
+        if (ambiguous)
+            *ambiguous = true;
+        return NULL;
+    }
+    for (TSNode parent = local; !ts_node_is_null(parent); parent = ts_node_parent(parent)) {
+        if (strcmp(ts_node_type(parent), "block") == 0) {
+            uint32_t line = 0;
+            return rust_impl_local_qn(ctx, local, strcmp(ts_node_type(local), "trait_item") == 0,
+                                      &line);
+        }
+    }
     const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
     if (!tree) {
         TSNode scope = node;
@@ -3636,13 +3656,22 @@ static bool rust_eval_path_call_by_target(RustLSPContext *ctx, TSNode func_node,
         return false;
     }
     rust_strip_turbofish(path);
-    if (bare && (cbm_scope_lookup_callable(ctx->current_scope, path) ||
-                 cbm_scope_contains(ctx->current_scope, path))) {
-        return false;
+    const char *callable = bare ? cbm_scope_lookup_callable(ctx->current_scope, path) : NULL;
+    const char *block_identity = callable ? strstr(callable, ".#B") : NULL;
+    if (block_identity && strstr(block_identity, "#cfg(")) {
+        *out = cbm_type_unknown();
+        *out_fn = NULL;
+        *out_self_qn = NULL;
+        return true;
     }
     RustCallTarget target = {0};
-    if (!rust_module_tree_target(ctx, callee, path, &target) || !target.names_function) {
-        return false;
+    if (callable) {
+        target.func = cbm_registry_lookup_func(ctx->registry, callable);
+    } else {
+        if (bare && cbm_scope_contains(ctx->current_scope, path))
+            return false;
+        if (!rust_module_tree_target(ctx, callee, path, &target) || !target.names_function)
+            return false;
     }
     const CBMRegisteredFunc *f = target.func;
     *out = cbm_type_unknown();
@@ -6491,7 +6520,7 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
             }
         }
         /* Same-module type? */
-        const char *type_qn = cbm_rust_item_qn(ctx->arena, node, ctx->source, ctx->module_qn, name);
+        const char *type_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->item_module_qn, name);
         if (cbm_registry_lookup_type(ctx->registry, type_qn)) {
             return cbm_type_named(ctx->arena, type_qn);
         }
@@ -7156,6 +7185,54 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
  * 7. Method dispatch + field lookup
  * ════════════════════════════════════════════════════════════════════ */
 
+/* Registry field spellings are parsed in module scope. Until that metadata
+ * carries the declaration's lexical scope, a competing block type prevents
+ * proving a nominal field type on a block-local owner. Keep the field's
+ * identity, but do not let the module type drive downstream method calls. */
+static bool rust_block_field_type_unproven(RustLSPContext *ctx, const char *owner,
+                                           const CBMType *type, int depth) {
+    const char *block = strstr(owner, ".#B");
+    if (!block || !type)
+        return false;
+    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
+        return true;
+    if (type->kind == CBM_TYPE_REFERENCE)
+        return rust_block_field_type_unproven(ctx, owner, type->data.reference.elem, depth + 1);
+    if (type->kind == CBM_TYPE_POINTER)
+        return rust_block_field_type_unproven(ctx, owner, type->data.pointer.elem, depth + 1);
+    if (type->kind == CBM_TYPE_SLICE)
+        return rust_block_field_type_unproven(ctx, owner, type->data.slice.elem, depth + 1);
+    const char *qn = type->kind == CBM_TYPE_NAMED ? type->data.named.qualified_name :
+                     type->kind == CBM_TYPE_TEMPLATE ? type->data.template_type.template_name : NULL;
+    if (qn && !strstr(qn, ".#B")) {
+        const char *leaf = strrchr(qn, '.');
+        CBMTypeShortIter it;
+        cbm_registry_types_by_short_name(ctx->registry, leaf ? leaf + 1 : qn, &it);
+        int index;
+        while ((index = cbm_type_short_iter_next(&it)) >= 0) {
+            const char *candidate = it.reg->types[index].qualified_name;
+            const char *candidate_block = candidate ? strstr(candidate, ".#B") : NULL;
+            if (candidate_block && candidate_block - candidate == block - owner &&
+                strncmp(candidate, owner, (size_t)(block - owner)) == 0)
+                return true;
+        }
+    }
+    if (type->kind == CBM_TYPE_TEMPLATE) {
+        for (int i = 0; i < type->data.template_type.arg_count; i++) {
+            if (rust_block_field_type_unproven(ctx, owner,
+                    type->data.template_type.template_args[i], depth + 1))
+                return true;
+        }
+    }
+    if (type->kind == CBM_TYPE_TUPLE) {
+        for (int i = 0; i < type->data.tuple.count; i++) {
+            if (rust_block_field_type_unproven(ctx, owner, type->data.tuple.elems[i], depth + 1))
+                return true;
+        }
+    }
+    return false;
+}
+
 static const CBMType *rust_lookup_field(RustLSPContext *ctx, const char *type_qn,
                                         const char *field_name, int depth) {
     if (!type_qn || !field_name || depth > CBM_LSP_MAX_LOOKUP_DEPTH)
@@ -7170,7 +7247,8 @@ static const CBMType *rust_lookup_field(RustLSPContext *ctx, const char *type_qn
             if (strcmp(rt->field_names[i], field_name) == 0 && rt->field_types &&
                 rt->field_types[i]) {
                 ctx->field_owner_qn = rt->qualified_name;
-                return rt->field_types[i];
+                return rust_block_field_type_unproven(ctx, rt->qualified_name, rt->field_types[i], 0)
+                           ? cbm_type_unknown() : rt->field_types[i];
             }
         }
     }
@@ -11119,38 +11197,32 @@ void rust_process_statement(RustLSPContext *ctx, TSNode node) {
         }
         if (!let_type)
             let_type = cbm_type_unknown();
-        if (!ts_node_is_null(pat))
-            rust_bind_pattern(ctx, pat, let_type);
+        const char *callable_qn = NULL;
         if (!ts_node_is_null(pat) && strcmp(ts_node_type(pat), "identifier") == 0 &&
             !ts_node_is_null(val)) {
-            char *binding_name = rust_node_text(ctx, pat);
             const char *value_kind = ts_node_type(val);
-            const char *callable_qn = NULL;
-            if (strcmp(value_kind, "identifier") == 0) {
-                char *value_name = rust_node_text(ctx, val);
-                if (value_name && cbm_scope_contains(ctx->current_scope, value_name)) {
-                    callable_qn = cbm_scope_lookup_callable(ctx->current_scope, value_name);
-                } else if (value_name) {
-                    const char *resolved = rust_resolve_path_expr(ctx, value_name);
-                    const CBMRegisteredFunc *function =
-                        resolved ? cbm_registry_lookup_func(ctx->registry, resolved) : NULL;
-                    if (!function && resolved && ctx->module_qn) {
-                        function = cbm_registry_lookup_func(
-                            ctx->registry,
-                            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, resolved));
-                    }
-                    callable_qn = function ? function->qualified_name : NULL;
+            char *path = rust_node_text(ctx, val);
+            if (path && strcmp(value_kind, "identifier") == 0 &&
+                cbm_scope_contains(ctx->current_scope, path)) {
+                callable_qn = cbm_scope_lookup_callable(ctx->current_scope, path);
+            } else if (path && (strcmp(value_kind, "identifier") == 0 ||
+                                strcmp(value_kind, "scoped_identifier") == 0)) {
+                RustCallTarget target = {0};
+                if (rust_module_tree_target(ctx, val, path, &target) && target.func &&
+                    !target.func->receiver_type) {
+                    callable_qn = target.func->qualified_name;
+                } else if ((!ctx->imports || !ctx->imports->modtree) &&
+                           strcmp(value_kind, "identifier") == 0 &&
+                           ctx->glob_count == ctx->file_glob_count) {
+                    callable_qn = rust_module_fn_target(ctx, path);
                 }
-            } else if (strcmp(value_kind, "scoped_identifier") == 0) {
-                char *value_path = rust_node_text(ctx, val);
-                const char *resolved = value_path ? rust_resolve_path_expr(ctx, value_path) : NULL;
-                const CBMRegisteredFunc *function =
-                    resolved ? cbm_registry_lookup_func(ctx->registry, resolved) : NULL;
-                callable_qn = function ? function->qualified_name : NULL;
             }
-            if (binding_name && callable_qn) {
-                cbm_scope_bind_callable(ctx->current_scope, binding_name, let_type, callable_qn);
-            }
+        }
+        if (!ts_node_is_null(pat))
+            rust_bind_pattern(ctx, pat, let_type);
+        if (callable_qn) {
+            char *binding_name = rust_node_text(ctx, pat);
+            cbm_scope_bind_callable(ctx->current_scope, binding_name, let_type, callable_qn);
         }
         return;
     }
@@ -11165,7 +11237,16 @@ void rust_process_statement(RustLSPContext *ctx, TSNode node) {
                 const char *target = NULL;
                 if (strcmp(kind, "assignment_expression") == 0 &&
                     ctx->callable_control_flow_depth == 0 && !ts_node_is_null(right)) {
-                    target = rust_resolve_callable_value(ctx, right, NULL);
+                    char *path = rust_node_text(ctx, right);
+                    if (path && strcmp(ts_node_type(right), "identifier") == 0 &&
+                        cbm_scope_contains(ctx->current_scope, path)) {
+                        target = cbm_scope_lookup_callable(ctx->current_scope, path);
+                    } else if (path) {
+                        RustCallTarget proved = {0};
+                        if (rust_module_tree_target(ctx, right, path, &proved) && proved.func &&
+                            !proved.func->receiver_type)
+                            target = proved.func->qualified_name;
+                    }
                 }
                 cbm_scope_update_callable(ctx->current_scope, name, target);
             }
@@ -12135,8 +12216,7 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
     }
     const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
     uint32_t offset = 0;
-    if (!tree || !ctx->module_qn || ctx->glob_count > ctx->file_glob_count ||
-        !rust_original_offset(ctx, callee, &offset)) {
+    if (!tree || !ctx->module_qn || !rust_original_offset(ctx, callee, &offset)) {
         return false;
     }
     int block_uses = ctx->use_count > ctx->file_use_count ? ctx->use_count - ctx->file_use_count : 0;
@@ -12178,7 +12258,8 @@ static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const ch
     case CBM_RUST_PATH_AMBIGUOUS:
         /* The name's target depends on the build configuration: no link. */
         out->open_qn = path;
-        out->open_reason = "cfg_dependent_name";
+        out->open_reason =
+            ctx->glob_count > ctx->file_glob_count ? "ambiguous_name" : "cfg_dependent_name";
         return true;
     default:
         return false;
@@ -13279,6 +13360,11 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         if (strcmp(ts_node_type(actual_func), "identifier") == 0) {
             const char *alias_target = cbm_scope_lookup_callable(ctx->current_scope, path);
             if (alias_target) {
+                const char *block_identity = strstr(alias_target, ".#B");
+                if (block_identity && strstr(block_identity, "#cfg(")) {
+                    rust_emit_unresolved_call(ctx, path, "cfg_dependent_name");
+                    return;
+                }
                 /* A function item of an enclosing block is named directly;
                  * a value bound to a function is only an alias of it. */
                 const char *strategy = rust_is_block_fn_item(ctx, path, alias_target)
@@ -13291,10 +13377,10 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             if (cbm_scope_contains(ctx->current_scope, path)) {
                 return;
             }
-            /* A glob declared inside an enclosing block shadows the module's
-             * items; its source is not modelled, so the name stays open. */
+            /* A block glob is resolved before the enclosing module's items. */
             if (ctx->glob_count > ctx->file_glob_count) {
-                rust_emit_unresolved_call(ctx, path, "unresolved_glob_import");
+                if (!rust_resolve_call_by_module_tree(ctx, actual_func, path))
+                    rust_emit_unresolved_call(ctx, path, "unresolved_glob_import");
                 return;
             }
             /* The function the walked module itself declares under this
@@ -13557,6 +13643,13 @@ static void rust_declare_block_items(RustLSPContext *ctx, TSNode block) {
                                     is_fn && have_nodes && text
                                         ? rust_function_node_qn(ctx, item, text, NULL)
                                         : NULL);
+            if (have_nodes && text && strcmp(item_kind, "struct_item") == 0 &&
+                ts_node_is_null(ts_node_child_by_field_name(item, "body", 4))) {
+                const char *qn =
+                    cbm_rust_item_qn(ctx->arena, item, ctx->source, ctx->module_qn, text);
+                if (cbm_registry_lookup_type(ctx->registry, qn))
+                    cbm_scope_bind(ctx->current_scope, text, cbm_type_named(ctx->arena, qn));
+            }
         }
     }
 }
@@ -14949,6 +15042,7 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
             for (int i = 0; i < imports.count; i++) {
                 const CBMImport *imp = &imports.items[i];
                 if (strcmp(imp->local_name, "*") == 0) {
+                    rust_lsp_add_use(ctx, "*", imp->module_path);
                     size_t length = strlen(imp->module_path);
                     if (length > 2) {
                         char *module = cbm_arena_strndup(ctx->arena, imp->module_path, length - 3);
@@ -15183,6 +15277,9 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         rt.qualified_name = d->qualified_name;
         rt.short_name = d->name;
         const char *suffix = strchr(rt.qualified_name, '#');
+        /* A block position is part of the declaration, not a cfg/line suffix. */
+        while (suffix && suffix[1] == 'B' && isdigit((unsigned char)suffix[2]))
+            suffix = strchr(suffix + 1, '#');
         const char *declaration_key = cbm_arena_sprintf(arena, "RustDecl:%.*s",
             (int)(suffix ? suffix - rt.qualified_name : strlen(rt.qualified_name)),
             rt.qualified_name);
@@ -15922,6 +16019,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         rt.qualified_name = cbm_arena_strdup(arena, d->qualified_name);
         rt.short_name = cbm_arena_strdup(arena, d->short_name);
         const char *suffix = strchr(rt.qualified_name, '#');
+        /* A block position is part of the declaration, not a cfg/line suffix. */
+        while (suffix && suffix[1] == 'B' && isdigit((unsigned char)suffix[2]))
+            suffix = strchr(suffix + 1, '#');
         const char *declaration_key = cbm_arena_sprintf(arena, "RustDecl:%.*s",
             (int)(suffix ? suffix - rt.qualified_name : strlen(rt.qualified_name)),
             rt.qualified_name);

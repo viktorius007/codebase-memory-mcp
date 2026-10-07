@@ -3374,10 +3374,9 @@ TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed) {
 }
 
 /* Impl headers resolve at the block's own scope: a type parameter stays
- * unresolved, an item of the file names its own definition (line-qualified
- * when extraction separated same-QN items: the later block-local `Local`
- * keeps the plain QN), and an inline module's `super::` paths and `use`
- * bindings climb from that module. */
+ * unresolved, a module item keeps its module QN, and a block item has its
+ * declaration's byte-qualified QN. An inline module's `super::` paths and
+ * `use` bindings climb from that module. */
 TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
     const char *source = "struct Local;\n"
                          "trait Paint { fn paint(&self); }\n"
@@ -3392,7 +3391,7 @@ TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
     cbm_arena_init(&arena);
     CBMLSPDef defs[4];
     memset(defs, 0, sizeof(defs));
-    defs[0].qualified_name = "test.main.Local#L1";
+    defs[0].qualified_name = "test.main.Local";
     defs[0].short_name = "Local";
     defs[0].label = "Struct";
     defs[0].def_module_qn = "test.main";
@@ -3408,7 +3407,7 @@ TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
     defs[2].label = "Struct";
     defs[2].def_module_qn = "test";
     defs[2].lang = CBM_LANG_RUST;
-    defs[3].qualified_name = "test.main.Local";
+    defs[3].qualified_name = "test.main.#B123.Local";
     defs[3].short_name = "Local";
     defs[3].label = "Struct";
     defs[3].def_module_qn = "test.main";
@@ -3421,14 +3420,14 @@ TEST(rustlsp_impl_links_resolve_header_at_block_scope) {
                                          "test.main", registry, NULL, NULL, 0, NULL, NULL, NULL,
                                          &out, NULL, &links);
     ASSERT_EQ(links.count, 4);
-    ASSERT_STR_EQ(links.items[0].type_qn, "test.main.Local#L1");
+    ASSERT_STR_EQ(links.items[0].type_qn, "test.main.Local");
     ASSERT_EQ(links.items[0].type_line, 1);
     ASSERT_STR_EQ(links.items[0].trait_qn, "test.main.Paint");
     ASSERT_EQ(links.items[0].trait_line, 2);
     ASSERT_EQ(links.items[0].start_line, 3);
     ASSERT_EQ(links.items[0].end_line, 3);
     ASSERT_NULL(links.items[1].type_qn);
-    ASSERT_STR_EQ(links.items[2].type_qn, "test.main.Local");
+    ASSERT_STR_EQ(links.items[2].type_qn, "test.main.#B123.Local");
     ASSERT_EQ(links.items[2].type_line, 5);
     ASSERT_STR_EQ(links.items[3].type_qn, "test.Other");
     ASSERT_EQ(links.items[3].type_line, 0);
@@ -4681,7 +4680,7 @@ static bool rustlsp_has_def(const CBMFileResult *r, const char *qn) {
 }
 
 /* A function declared in another function's body (or in a method's body) is
- * its own graph node owned by the module; its calls belong to it alone. */
+ * its own graph node with a declaration identity; its calls belong to it alone. */
 TEST(rustlsp_nested_function_body_is_walked_as_its_own_node) {
     CBMFileResult *r = extract_rust("fn helper() {}\n"
                                     "fn other() {}\n"
@@ -4697,16 +4696,18 @@ TEST(rustlsp_nested_function_body_is_walked_as_its_own_node) {
                                     "}\n");
     ASSERT_NOT_NULL(r);
     bool syn = false;
-    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.inner"));
-    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.inner", "test.src.main.helper", "helper", &syn),
-              1);
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.#B46.inner"));
+    ASSERT_EQ(
+        rustlsp_body_calls(r, "test.src.main.#B46.inner", "test.src.main.helper", "helper", &syn),
+        1);
     ASSERT_TRUE(syn);
     ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.outer", "test.src.main.helper", "helper", &syn),
               0);
     ASSERT_FALSE(syn);
-    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.in_method"));
-    ASSERT_EQ(
-        rustlsp_body_calls(r, "test.src.main.in_method", "test.src.main.other", "other", &syn), 1);
+    ASSERT_TRUE(rustlsp_has_def(r, "test.src.main.#B134.in_method"));
+    ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.#B134.in_method", "test.src.main.other", "other",
+                                 &syn),
+              1);
     ASSERT_TRUE(syn);
     ASSERT_EQ(rustlsp_body_calls(r, "test.src.main.W.meth", "test.src.main.other", "other", &syn),
               0);

@@ -9328,6 +9328,159 @@ TEST(pipeline_rust_enum_variant_qualifier_parallel) {
     PASS();
 }
 
+/* These fixtures assert on the graph produced by the complete pipeline, not
+ * resolver records that the publication gate might later reject. */
+static int check_rust_block_scope(int scenario) {
+    static const char *const sources[] = {
+        "pub fn target() {} fn caller() { let f = target; f(); }\n",
+        "pub mod funcs { pub fn target() {} } fn caller() { use crate::funcs::*; target(); }\n",
+        "pub fn target() {} fn first() { fn target() {} target(); } "
+        "fn second() { fn target() {} target(); } fn caller() { target(); }\n"
+        "struct Local;\nfn types() { struct Local; impl Local { fn ping(&self) {} } Local.ping(); "
+        "}\nstruct Output; impl Output { fn read(&self) {} } "
+        "fn typed() { fn make() -> Output { Output } make().read(); }\n"
+        "fn fields() { struct Holder { value: Output } "
+        "impl Holder { fn touch(&self) { self.value.read(); } } "
+        "let h = Holder { value: Output }; h.touch(); }\n"
+        "struct Outer; fn extension() { impl Outer { fn extended(&self) {} } Outer.extended(); }\n",
+        "fn target() {} fn caller() { macro_rules! execute { ($body:block) => { $body }; } "
+        "execute!({ target(); }); }\n",
+        "mod a { pub fn target() {} } mod b { pub fn target() {} } "
+        "fn caller() { use crate::a::*; use crate::b::*; target(); }\n",
+        "fn caller() { #[cfg(feature=\"choice\")] fn target() {} "
+        "#[cfg(not(feature=\"choice\"))] fn target() {} let f = target; f(); }\n",
+        "struct Inner; impl Inner { fn target(&self) {} } "
+        "fn caller() { struct Inner; impl Inner { fn target(&self) {} } "
+        "struct Wrapped { inner: Inner } let w = Wrapped { inner: Inner }; w.inner.target(); }\n",
+    };
+    char tmp[] = "/tmp/w1-B2/block_scope_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"block_scope\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", sources[scenario]);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_store_t *store = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    bool correct = cross_file_call_exists(store, project, "caller", "target");
+    if (scenario == 2) {
+        cbm_node_t *nodes = NULL;
+        int count = 0;
+        cbm_store_find_nodes_by_name(store, project, "target", &nodes, &count);
+        correct = count == 3;
+        for (int i = 0; correct && i < count; i++) {
+            for (int j = i + 1; j < count; j++) {
+                correct = correct && strcmp(nodes[i].qualified_name, nodes[j].qualified_name) != 0;
+            }
+        }
+        cbm_store_free_nodes(nodes, count);
+        nodes = NULL;
+        cbm_store_find_nodes_by_name(store, project, "Local", &nodes, &count);
+        char module_qn[512];
+        snprintf(module_qn, sizeof(module_qn), "%s.src.lib.Local", project);
+        int module_items = 0;
+        for (int i = 0; i < count; i++)
+            module_items +=
+                strcmp(nodes[i].qualified_name, module_qn) == 0 && nodes[i].start_line == 2;
+        correct = correct && count == 2 && module_items == 1;
+        cbm_store_free_nodes(nodes, count);
+        static const char *const callers[] = {"first", "second", "caller"};
+        int64_t targets[3] = {0};
+        for (int i = 0; correct && i < 3; i++) {
+            cbm_node_t *callers_found = NULL;
+            int caller_count = 0;
+            cbm_store_find_nodes_by_name(store, project, callers[i], &callers_found, &caller_count);
+            cbm_edge_t *edges = NULL;
+            int edge_count = 0;
+            if (caller_count == 1)
+                cbm_store_find_edges_by_source_type(store, callers_found[0].id, "CALLS", &edges,
+                                                    &edge_count);
+            correct = edge_count == 1;
+            if (correct)
+                targets[i] = edges[0].target_id;
+            cbm_store_free_edges(edges, edge_count);
+            cbm_store_free_nodes(callers_found, caller_count);
+        }
+        correct = correct && targets[0] != targets[1] && targets[1] != targets[2] &&
+                  targets[0] != targets[2] &&
+                  cross_file_call_exists(store, project, "types", "ping") &&
+                  cross_file_call_exists(store, project, "typed", "read") &&
+                  cross_file_call_exists(store, project, "fields", "touch") &&
+                  cross_file_call_exists(store, project, "touch", "read") &&
+                  cross_file_call_exists(store, project, "extension", "extended");
+    } else if (scenario == 6) {
+        correct = !correct;
+        sqlite3_stmt *stmt = NULL;
+        const char *sql = "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND "
+                          "name='target' AND reason='unknown_receiver_type'";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
+            correct = correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
+        else
+            correct = false;
+        sqlite3_finalize(stmt);
+    } else if (scenario == 5) {
+        correct = !correct;
+        sqlite3_stmt *stmt = NULL;
+        const char *sql = "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='f' "
+                          "AND reason='cfg_dependent_name'";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
+            correct =
+                correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
+        else
+            correct = false;
+        sqlite3_finalize(stmt);
+    } else if (scenario == 4) {
+        correct = !correct;
+        sqlite3_stmt *stmt = NULL;
+        const char *sql = "SELECT count(*) FROM unresolved_sites WHERE name='target' AND reason IN "
+                          "('unresolved_glob_import', 'ambiguous_name')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
+            correct =
+                correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
+        else
+            correct = false;
+        sqlite3_finalize(stmt);
+    }
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pipeline_rust_fn_item_alias_published) {
+    return check_rust_block_scope(0);
+}
+
+TEST(pipeline_rust_block_glob_published) {
+    return check_rust_block_scope(1);
+}
+
+TEST(pipeline_rust_block_items_have_distinct_identity) {
+    return check_rust_block_scope(2);
+}
+
+TEST(pipeline_rust_block_macro_sees_supplied_calls) {
+    return check_rust_block_scope(3);
+}
+
+TEST(pipeline_rust_block_globs_ambiguous_recorded) {
+    return check_rust_block_scope(4);
+}
+
+TEST(pipeline_rust_block_field_type_collision_withheld) {
+    return check_rust_block_scope(6);
+}
+
+TEST(pipeline_rust_cfg_fn_item_alias_withheld) {
+    return check_rust_block_scope(5);
+}
+
 TEST(pipeline_rust_block_use_type_sequential) {
     ASSERT_EQ(check_rust_occurrence_proof(true, 1), 0);
     PASS();
@@ -19645,6 +19798,13 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_struct_literal_fields_follow_nested_module_globs);
     RUN_TEST(pipeline_rust_enum_variant_qualifier_sequential);
     RUN_TEST(pipeline_rust_enum_variant_qualifier_parallel);
+    RUN_TEST(pipeline_rust_fn_item_alias_published);
+    RUN_TEST(pipeline_rust_block_glob_published);
+    RUN_TEST(pipeline_rust_block_items_have_distinct_identity);
+    RUN_TEST(pipeline_rust_block_macro_sees_supplied_calls);
+    RUN_TEST(pipeline_rust_block_globs_ambiguous_recorded);
+    RUN_TEST(pipeline_rust_cfg_fn_item_alias_withheld);
+    RUN_TEST(pipeline_rust_block_field_type_collision_withheld);
     RUN_TEST(pipeline_rust_block_use_type_sequential);
     RUN_TEST(pipeline_rust_block_use_type_parallel);
     RUN_TEST(pipeline_rust_generic_type_shadow_sequential);
