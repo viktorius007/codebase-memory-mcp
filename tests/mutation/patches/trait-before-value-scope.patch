@@ -1,0 +1,12 @@
+diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
+--- a/internal/cbm/lsp/rust_lsp.c
++++ b/internal/cbm/lsp/rust_lsp.c
+@@ -8229,7 +8229,7 @@
+         if (inh) {
+             (void)rust_trait_out_of_scope(ctx, impl_method->impl_trait_qn, method_name,
+                                           impl_method->impl_key, &proved);
+-            if (!proved) {
++            if (false && !proved) {
+                 return NULL;
+             }
+         }

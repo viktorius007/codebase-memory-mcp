@@ -9745,6 +9745,141 @@ static RustBothModesObservation observe_rust_exact_calls_in_both_modes(
     return result;
 }
 
+TEST(pipeline_rust_guard_trait_scope_filter) {
+    char tmp[] = "/tmp/cbm_rs_guard_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"guards\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "mod model; use model::{S, Visible}; fn probe(s: &S) { s.ping(); }\nfn "
+                    "sentinel() {} fn control() { sentinel(); }\n\n");
+    write_temp_file(
+        tmp, "src/model.rs",
+        "pub struct S; pub trait Visible { fn ping(&self); } pub trait Hidden { fn ping(&self); } "
+        "impl Visible for S { fn ping(&self) {} } impl Hidden for S { fn ping(&self) {} }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustModTreeCallCase cases[] = {
+        {"visible trait survives hidden candidate", "src.lib.probe", "src.model.S.ping[Visible]",
+         true},
+        {"hidden trait excluded", "src.lib.probe", "src.model.S.ping[Hidden]", false},
+        {"indexing control", "src.lib.control", "src.lib.sentinel", true},
+    };
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_guard_trait_before_value_scope) {
+    char tmp[] = "/tmp/cbm_rs_guard_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"guards\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "#[derive(Clone, Copy)] struct S; impl S { fn go(self) {} }\nmod hidden { pub "
+                    "trait Go { fn go(&self); } }\nimpl hidden::Go for S { fn go(&self) {} }\nfn "
+                    "probe(s: &S) { s.go(); }\nfn sentinel() {} fn control() { sentinel(); }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustModTreeCallCase cases[] = {
+        {"unproved trait before value", "src.lib.probe", "src.lib.S.go[hidden::Go]", false},
+        {"indexing control", "src.lib.control", "src.lib.sentinel", true},
+    };
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_guard_default_trait_ambiguity) {
+    char tmp[] = "/tmp/cbm_rs_guard_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"guards\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "mod voices { pub struct S; pub trait Loud { fn speak(&self) {} } pub trait Quiet { fn "
+        "speak(&self) {} } impl Loud for S {} impl Quiet for S {} } use voices::{S, Loud}; fn "
+        "probe(s: &S) { s.speak(); }\nfn sentinel() {} fn control() { sentinel(); }\n\n");
+    write_rust_pad_files(tmp, 52);
+    const RustModTreeCallCase cases[] = {
+        {"competing default loud", "src.lib.probe", "src.lib.voices.Loud.speak", false},
+        {"competing default quiet", "src.lib.probe", "src.lib.voices.Quiet.speak", false},
+        {"indexing control", "src.lib.control", "src.lib.sentinel", true},
+    };
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_guard_conversion_impl_ambiguity) {
+    char tmp[] = "/tmp/cbm_rs_guard_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"guards\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "struct A; struct T; impl From<&A> for T { fn from(_: &A) -> Self { T } } impl "
+                    "From<&mut A> for T { fn from(_: &mut A) -> Self { T } } fn probe(a: A) { let "
+                    "_ = T::from(&a); }\nfn sentinel() {} fn control() { sentinel(); }\n\n");
+    write_rust_pad_files(tmp, 52);
+    const RustModTreeCallCase cases[] = {
+        {"shared conversion unproved", "src.lib.probe", "src.lib.T.from[From<&A>]", false},
+        {"mutable conversion unproved", "src.lib.probe", "src.lib.T.from[From<&mut A>]", false},
+        {"indexing control", "src.lib.control", "src.lib.sentinel", true},
+    };
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_guard_inherent_item_ambiguity) {
+    char tmp[] = "/tmp/cbm_rs_guard_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"guards\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "struct Ka; struct Kb; struct W<T>(T);\nimpl W<Ka> { fn get() {} }\nimpl W<Kb> { fn get() "
+        "{} }\nfn probe() { W::<Ka>::get(); }\nfn sentinel() {} fn control() { sentinel(); }\n\n");
+    write_rust_pad_files(tmp, 52);
+    const RustModTreeCallCase cases[] = {
+        {"generic inherent first unproved", "src.lib.probe", "src.lib.W.get#L2", false},
+        {"generic inherent second unproved", "src.lib.probe", "src.lib.W.get", false},
+        {"indexing control", "src.lib.control", "src.lib.sentinel", true},
+    };
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_guard_mutable_value_precedence) {
+    char tmp[] = "/tmp/cbm_rs_guard_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"guards\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "#[derive(Clone, Copy)] struct S; impl S { fn go(self) {} } trait Go { fn "
+                    "go(&mut self); } impl Go for S { fn go(&mut self) {} } fn probe(s: &mut S) { "
+                    "s.go(); }\nfn sentinel() {} fn control() { sentinel(); }\n\n");
+    write_rust_pad_files(tmp, 52);
+    const RustModTreeCallCase cases[] = {
+        {"mutable receiver value unproved", "src.lib.probe", "src.lib.S.go", false},
+        {"indexing control", "src.lib.control", "src.lib.sentinel", true},
+    };
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
 TEST(pipeline_rust_written_bound_calls_publish_declarations_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_bound_calls_XXXXXX");
@@ -19612,6 +19747,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_impl_edges_pin_in_file_items_to_their_line);
     RUN_TEST(pipeline_rust_instantiated_impl_methods_publish_distinct_nodes_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_call_admission_is_exact_in_both_modes);
+    RUN_TEST(pipeline_rust_guard_trait_scope_filter);
+    RUN_TEST(pipeline_rust_guard_trait_before_value_scope);
+    RUN_TEST(pipeline_rust_guard_default_trait_ambiguity);
+    RUN_TEST(pipeline_rust_guard_conversion_impl_ambiguity);
+    RUN_TEST(pipeline_rust_guard_inherent_item_ambiguity);
+    RUN_TEST(pipeline_rust_guard_mutable_value_precedence);
     RUN_TEST(pipeline_rust_written_bound_calls_publish_declarations_in_both_modes);
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes);

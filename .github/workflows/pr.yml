@@ -6,7 +6,6 @@ name: PR
 
 on:
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -54,6 +53,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       product: ${{ steps.f.outputs.product }}
+      rust: ${{ steps.f.outputs.rust }}
     steps:
       - name: Detect product-code changes
         id: f
@@ -64,13 +64,42 @@ jobs:
         run: |
           # The full .diff endpoint rejects large-but-valid PRs at 20k lines.
           # The paginated files endpoint remains filename-only for this gate.
-          FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename')
+          FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[] | .filename, (.previous_filename // empty)')
           printf '%s\n' "$FILES"
           if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)'; then
             echo "product=true" >> "$GITHUB_OUTPUT"
           else
             echo "product=false" >> "$GITHUB_OUTPUT"
           fi
+          if printf '%s\n' "$FILES" | grep -E '^(internal/cbm/|src/pipeline/|tests/|scripts/(rust-scanner-mutation|ccache-env|test)\.sh|Makefile\.cbm|\.github/workflows/)' >/dev/null; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  mutation-rust:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: Run seeded Rust mutation lane
+        run: make -f Makefile.cbm mutation-rust
+        env:
+          CBM_MUTATION_JOBS: 4
+          CBM_MUTATION_BUILD_DIR: ${{ runner.temp }}/mutation-rust
+          CBM_RUNTIME_DIR: ${{ runner.temp }}/mutation-runtime
+          CBM_CACHE_DIR: ${{ runner.temp }}/mutation-cache
+          CBM_NO_CCACHE: "1"
+      - name: Mutation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-rust
+          path: ${{ runner.temp }}/mutation-rust/artifacts
 
   # ── Light smoke: build the PRODUCTION binary and run the core smoke on the
   #    three RELIABLE NATIVE platforms. Catches built-binary regressions at PR
@@ -158,7 +187,7 @@ jobs:
     # The one required context (besides dco) — fails unless every PR stage
     # succeeded, so matrix renames can never silently deadlock merges. `skipped`
     # is OK: pr-smoke skips on docs/CI/test-only PRs (changes.product == false).
-    needs: [security, lint, test, changes, pr-smoke]
+    needs: [security, lint, test, changes, pr-smoke, mutation-rust]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

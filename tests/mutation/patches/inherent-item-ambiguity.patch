@@ -1,0 +1,12 @@
+diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
+--- a/internal/cbm/lsp/rust_lsp.c
++++ b/internal/cbm/lsp/rust_lsp.c
+@@ -7629,7 +7629,7 @@
+             return NULL;
+         }
+         /* One item reached through both registries of the chain counts once. */
+-        if (only && strcmp(only->qualified_name, candidate->qualified_name) != 0) {
++        if (false && only && strcmp(only->qualified_name, candidate->qualified_name) != 0) {
+             return NULL;
+         }
+         only = only ? only : candidate;
