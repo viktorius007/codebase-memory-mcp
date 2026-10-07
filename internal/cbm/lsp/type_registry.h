@@ -55,6 +55,7 @@ typedef struct {
      * module; the method is registered on the wrapper's QN. NULL otherwise. */
     const CBMType *rust_wrapper_impl_self;
     const CBMType *rust_reference_impl_self; /* written reference self, including mutability */
+    const CBMType *rust_inherent_impl_self; /* written inherent self, resolved in its module */
     const char **rust_unbounded_impl_params; /* source-proved unconstrained impl parameters */
     /* Rust only: per declared parameter (parallel to the signature's
      * param_types), the FUNC type of the call signature the parameter

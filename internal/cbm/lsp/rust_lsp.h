@@ -164,6 +164,7 @@ typedef struct {
      * implementations over the trait method when only one impl exists. */
     const char *self_type_qn;
     const CBMType *self_value_type; /* actual Self shape for a reference impl */
+    TSNode enclosing_impl; /* source block proving its own inherent methods on self */
     const char *self_trait_qn;
     const char *self_trait_spelling; /* raw `impl <Trait> for` text, NULL outside trait impls */
 
