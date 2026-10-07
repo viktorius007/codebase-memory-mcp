@@ -1,355 +1,403 @@
 # Rust graph: verified state and direction
 
-Dated 2026-10-01. This file is the only authority on Rust graph accuracy, its
-measurement and the work that follows. Every figure below was produced by the
-commands in "Reproduce" on that date; nothing is carried over from earlier
-reports. Earlier plans, reviews and ledgers are retired: tracked ones live in
-Git history, untracked ones in `private/archive/rust-s3-2026-10-01.tar.zst`.
-Do not act on them.
+Dated 2026-10-07, at `main` aa48ba96, amended the same day after an adversarial review
+(`private/rust-run/review/REVIEW.md`; eight reports under `review/out/`). This file is the only authority on Rust
+graph accuracy, its measurement and the work that follows. Every figure below
+comes from the two frozen score runs of that commit (`/tmp/cbm-score-aa48ba96`,
+`/tmp/cbm-score2-aa48ba96`; summaries `private/rust-run/summary-aa48ba96.txt`
+and `summary-ruff-aa48ba96.txt`), produced by the commands in "Reproduce". The
+2026-10-01 version of this file, its figures and its recommendation are
+superseded; it stays in Git history. The run's per-merge record is
+`private/rust-run/SCORE.md` (one line per merge) and `run-ledger.md`
+(git-ignored, on this disk only).
 
 ## Direction
 
-The owner decided on 2026-09-30: no rust-analyzer at index time; show only
-links provable without a compiler. That decision stands until the owner
-changes it. The measurements below show it caps Rust call coverage far below
-what the owner wants from the tool, so the tech lead recommends changing it:
+The owner's rules stand: no rust-analyzer, rustc or cargo at index time; a
+wrong link is worse than a missing one; every link the source can prove is
+published. The 2026-10-01 recommendation to take Rust links from a
+rust-analyzer SCIP index is withdrawn. The run of 1 to 7 October (244 commits
+between a44f6b73 and aa48ba96) reached, with the C resolver alone:
 
-1. Rust semantic links (calls, imports, usages, trait implementations, method
-   ownership) come from a rust-analyzer SCIP index of the repository, mapped
-   onto the tree-sitter graph nodes.
-2. tree-sitter plus the C resolver stays as the structure layer (files,
-   definitions) and as the fallback for files rust-analyzer does not cover.
-   Fallback links carry a marker that tells the reader they are partial.
-3. The C "proof-only" rebuild (`s3/proof` and its lanes I, F, L, S, plus the
-   parked macro, G17 and Stage 2 lanes) is paused and stays unmerged. If the
-   owner keeps the 2026-09-30 decision, only its name-resolution part
-   resumes, as step 5 of "Work, in order"; type propagation in C does not.
-4. The Rust grammar is forked and fixed, gated by `tools/rust-audit`.
+| Corpus | Call sites linked | Wrong-or-flagged pairs | On 2026-10-01 |
+|---|---|---|---|
+| codex-rs (measurement corpus) | 225,790 / 229,952 (98.2%) | 1 (not in the truth) | 119,996 (52.2%), 568 |
+| ruff (held-out since 6 Oct) | 103,252 / 112,301 (91.9%) | 1 (conditional) | 77,202 (68.7%), 296 on 6 Oct |
 
-Step 1 of "Work, in order" waits for the owner. Steps 2 to 5 hold under
-either decision and may start.
+Corpora the fleet never saw, scored by both review providers on 7 October with identical
+figures (bench roots `~/.cache/cbm-rust-bench-<name>`, truth by the same generator):
 
-Why, in measured terms:
+| Corpus | Calls linked | Wrong links read in source | IMPLEMENTS | IMPORTS |
+|---|---|---|---|---|
+| project-management (owner's) | 39,680 / 47,116 (84.2%) | 1 | 37.7% | 95.3% |
+| jmap (owner's) | 4,084 / 5,974 (68.4%) | 10 | 37.6% | 43.1% |
+| jmap-client (owner's) | 6,029 / 6,163 (97.8%) | 0 | 100% | 99.5% |
+| bevy | 60,036 / 84,297 (71.2%) | 72 | 44.8% | 95.2% |
 
-- The published call graph finds 52.2% of in-repository call sites; method
-  calls 33.9%. Its links are right (at most 0.6% suspect), so the failure is
-  missing links, not wrong ones.
-- Every missing method call needs the receiver's type. Reaching the 89%
-  ceiling the retired plan claimed requires generic substitution, `Deref`
-  chains and return-type propagation through dependency sources: a type
-  checker. rust-analyzer's own layers for this are 139,000 lines
-  (`hir-def` 38,873, `hir-ty` 70,798, `hir-expand` 9,680, `hir` 19,482);
-  the C resolver is 7,581 (`internal/cbm/lsp/rust_lsp.c`).
-- rust-analyzer already produces the complete answer. `tools/rust-audit`
-  turns its SCIP index into 533,785 resolved call sites in 10.6 s.
-- The parser is not the obstacle: grammar defects lose no definition, call,
-  import or impl on the measurement corpus.
+jmap's figure is a manifest defect (`jmap-core.workspace = true` is not parsed, `rust_cargo.c:35`),
+not resolution. jmap-client's 390 flagged pairs are all correct links mislabelled by the truth
+generator. Most bevy mechanisms share one cause: the resolver has no model of standard-library
+inherent methods or of trait scope, so a project item wins any name tie.
 
-Cost the owner would accept with the recommendation: the accurate mode needs a Rust
-toolchain with rust-analyzer, a repository whose `cargo metadata` succeeds,
-and the time and memory in "rust-analyzer cost" below.
+The 2026-10-01 version estimated that a C resolver without generic
+substitution reaches at most 78.4% of explicit call sites. The measured figure
+is 98.2%.
+
+The review of 7 October (two providers, identical briefs, four corpora the fleet never saw)
+withdrew three of the guarantees the fleet stated. What holds and what does not:
+
+- Every published figure in this document reproduces from independent code, and 400 randomly
+  drawn credited call sites across six corpora were all right on reading.
+- "Zero wrong links" is withdrawn. A `name @ pattern` binding never binds (the forked grammar's
+  `captured_pattern` has no fields; `rust_lsp.c:10935` reads fields), so the outer type is
+  dispatched: one wrong ruff link the harness counts as correct. On corpora the fleet never saw
+  (table below) 83 wrong links were read in source, from twelve mechanisms listed in REVIEW.md.
+- "No Rust link is a name match" is withdrawn for USAGE: `mod x; pub use x::*` publishes a
+  Module-to-function edge (658 on ruff); macro tokens that are discarded or stringified
+  publish USAGE; a field token inside a macro binds an imported free function.
+- "No link crosses languages" is withdrawn for IMPORTS: a Rust `use` or glob links into `.toml`
+  and `.proto` nodes (codex 20, ruff 2, bevy) through the generic import fallback.
+- `unresolved.py` is not a proof: it counts a site as covered when the caller links any
+  same-named target (8 codex, 2 ruff sites are neither published nor recorded).
+- The seeded mutation lane (`tests/mutation/`) has not applied since 20 September; no CI runs
+  it. Two providers showed guards whose removal no suite catches, five with a demonstrated
+  wrong link once removed.
+
+What the fleet stated, kept where it held:
+
+- No Rust link is a name match for CALLS and IMPORTS from a `use`. A `use` resolves through the module tree
+  (29b54531, 941873cb); the package-map name guess for Rust imports is gone
+  (71723861); a bare name binds a Rust type, method or constant only through a
+  `use`, a glob or module placement (f23bad8e, 390deeb5, 75e91b22).
+- No link crosses languages on a name match, for any producer (IMPORTS,
+  CALLS, USAGE, DECORATES, INHERITS, RAISES, TESTS, WRITES): one language-family
+  guard in the candidate registry (1633e0f8).
+- A call the resolver cannot prove is withheld, not guessed: trait dispatch
+  the receiver does not select (0e10fa93, 7b9e746d), `From`/`Into` with
+  several impls (8b5c22ae, 7e47aad9), channel handles and `Deref`/`dyn`
+  targets (8512665d), reference receivers with two candidate impls (903dcdc3).
+- Every Rust call or reference site the resolver gave up on is recorded with
+  its stop reason and is queryable (aa48ba96; "Unresolved sites" below).
+  `tools/rust-audit/unresolved.py` proves that every in-corpus truth site is
+  either published or recorded, on both corpora.
 
 ## Measurement setup
 
-- Corpus: codex-rs at `bc98fc69f8`, 4,698 `.rs` files, 1,879,640 lines
-  (`/tmp/cbm-rust/corpus`; recreate with
-  `git -C /Users/viktor/Projects/github/codex worktree add <dir> bc98fc69f8`).
-- Oracle: `rust-analyzer scip .` with toolchain 1.95.0 on
-  `aarch64-apple-darwin`, default features (`private/rust-s3/codex.scip`,
-  356 MB). 4,486 documents, 3,415,976 occurrences, 108,923 global
-  definitions. A fresh run on 2026-10-01 produced the same document and
-  occurrence counts.
-- Published graph: index of the corpus by main's lineage at `a44f6b73`
-  (`/tmp/cbm-rust/s3/work/cargo-roots/measure-final2.kF9hgj/cache/corpus.db`,
-  99,549 CALLS edges). Re-index with
-  `scripts/rust-corpus-measure.sh <binary> <corpus> <scip> <out>` if that
-  file is gone.
-- Truth is derived independently of the repository's own scorers
-  (`scripts/scip-*.py`): rust-analyzer's parser finds each call site, the SCIP
-  occurrence at the callee name gives its target.
+- Corpus A, measurement: codex-rs at `bc98fc69f8`, 4,698 `.rs` files,
+  1,879,640 lines, `~/.cache/cbm-rust-bench/codex/codex-rs` (read-only; never
+  edit or commit there). Oracle: `rust-analyzer scip .` with toolchain 1.95.0
+  on `aarch64-apple-darwin`, default features (`private/rust-s3/codex.scip`,
+  356 MB; copy at `/tmp/cbm-truth/frozen/codex.scip`).
+- Corpus B, held-out since 6 Oct: ruff at `b8c5e73a`, 1,953 `.rs` files,
+  763,814 lines, `~/.cache/cbm-rust-bench2/ruff`; oracle `ruff.scip` beside it,
+  produced by the stable rust-analyzer in 3 minutes. Every merge since 6 Oct
+  01:35 was scored on both corpora; a fix had to hold on ruff, which no arm
+  had seen.
+- Truth tables (`truth.tsv`, `refs.tsv` in each bench root) come from
+  `tools/rust-audit/tsdiff` (`truth`, `refs`, `scipstat` binaries, which need
+  `../rust-analyzer` for its parser crate): rust-analyzer's parser finds each
+  call site, the SCIP occurrence at the callee name gives its target. The
+  generator was corrected twice during the run: same-named definitions of
+  sibling test and bin targets are resolved by the SCIP enclosing range
+  (8f8e6299), and a `#[path]`-compiled file is re-rooted at the module path
+  the oracle defines it under (e8c84d6c, f4aa834a). Earlier tables are kept as
+  `*.pre-tg` and `*.pre-cp`. The ruff truth has been checked only through the
+  pairs the scorer flagged (all read by hand on 6 Oct: 22 graph-wrong, 3
+  scorer-wrong, 17 conditional; the 22 are gone).
+- Score command: `scripts/rust-score.sh <binary> <out-dir>` indexes the corpus
+  into a private cache (codex 48 s, ruff 16 s), exports the graph tables, runs
+  the `tools/rust-audit` scripts and prints the summary. Credit is per
+  caller-callee pair: a call site counts when a CALLS edge joins its caller to
+  its callee (positions are not stored). Sites that share a pair with another
+  credited site are an upper bound on unverified credit: 75,911 of 225,790 on
+  codex, 41,927 of 103,252 on ruff.
+- Unverifiable pairs (caller file not compiled on the oracle platform, caller
+  with no oracle data, oracle left the site unresolved) are counted and
+  reported, never credited: 5,581 on codex, 102 on ruff.
 
-Oracle limits, all measured:
-
-| Limit | Size |
-|---|---|
-| Corpus files with no oracle data (other-platform or orphan) | 212 of 4,698 |
-| Syntactic call sites with no oracle target | 5,456 of 539,241 (1.0%) |
-| Global symbols defined in more than one file (ambiguous target) | 128 of 108,546 |
-| Trait-implementation relationships in the SCIP file | 0 (take them from `impl` syntax) |
-
-## Published graph against the oracle
+## Calls
 
 Call sites whose target is defined in the corpus and whose caller is a
 function (`tools/rust-audit/join.py`):
 
-| Site kind | Published | Total | Share |
-|---|---|---|---|
-| Path call (`f()`, `m::f()`, `T::f()`) | 76,209 | 101,519 | 75.1% |
-| Method call (`x.f()`) | 29,939 | 88,386 | 33.9% |
-| Call inside macro arguments | 13,848 | 40,041 | 34.6% |
-| All | 119,996 | 229,946 | 52.2% |
+| Site kind | codex-rs | ruff |
+|---|---|---|
+| Path call (`f()`, `m::f()`, `T::f()`) | 100,915 / 101,522 (99.4%) | 30,396 / 31,119 (97.7%) |
+| Method call (`x.f()`) | 85,895 / 88,389 (97.2%) | 63,005 / 68,994 (91.3%) |
+| Call inside macro arguments | 38,980 / 40,041 (97.4%) | 9,851 / 12,188 (80.8%) |
+| All | 225,790 / 229,952 (98.2%) | 103,252 / 112,301 (91.9%) |
 
-Another 458,262 call sites target the standard library or dependencies; the
-graph has no nodes for those targets. Of the 229,946 sites above, 243 have a
-caller and 573 a callee with no graph node at that file, line and name, so
-99.6% of oracle call sites map onto existing nodes.
-
-Published Rust function-to-function CALLS pairs, 98,915
+Published Rust function-to-function CALLS pairs
 (`tools/rust-audit/precision.py`):
 
-| Verdict | Pairs | Share |
+| Verdict | codex-rs | ruff |
 |---|---|---|
-| Correct, explicit call | 87,667 | 88.6% |
-| Correct, call inside macro arguments | 7,573 | 7.7% |
-| Unverifiable, caller file not built on the oracle platform | 2,959 | 3.0% |
-| Unverifiable, caller has no oracle data | 147 | 0.1% |
-| Oracle resolves the name to another function | 301 | 0.3% |
-| Caller references no function of that name | 267 | 0.3% |
+| Correct, explicit call | 155,377 (84.6%) | 68,525 (91.8%) |
+| Correct, call inside macro arguments | 22,687 (12.4%) | 6,029 (8.1%) |
+| Unverifiable, caller file not compiled on the oracle platform | 3,614 | 9 |
+| Unverifiable, oracle left the site unresolved (dev-dependency cycle, inactive cfg) | 1,299 | 69 |
+| Unverifiable, oracle has no target for the name in macro arguments | 393 | 19 |
+| Unverifiable, caller has no oracle data | 275 | 5 |
+| Correct target, reference is not a call (fn value) | 1 | 0 |
+| Flagged | 1 | 1 |
 
-The last two rows are an upper bound on wrong links: hand checks of two
-"another function" rows found the graph right and the oracle symbol ambiguous
-(`cli/tests/login.rs` `codex_command`, `http-client/src/bin/custom_ca_probe.rs`
-`run_probe`).
+The two flagged pairs, both read against source:
 
-Missing path calls need name resolution only (`tools/rust-audit/misses.py`):
+- codex `core/src/windows_sandbox.rs:381 emit_windows_sandbox_setup_failure_metrics`
+  to `windows-sandbox-rs/src/setup_error.rs:155 extract_failure`: a
+  `cfg(windows)` path the oracle, built on macOS, never compiled. The link is
+  right; the truth has no row for it.
+- ruff `crates/ruff_formatter/src/buffer.rs:661 Recording::new` to
+  `buffer.rs:39 Buffer::elements`: the graph links the trait declaration, the
+  oracle records the blanket `&mut W` forwarder. Conditional; the scorer, not
+  the graph, labels it wrong.
 
-| Callee written as | Defined in | Published |
+Self-recursive calls are published when the receiver type proves the target
+(b31b4569); two corpus recursions stay withheld (`records_tests.rs:140`,
+`loader/local.rs:370`). A call to one of two `cfg` twins publishes nothing.
+
+## Definitions, owners, implementations
+
+Definition nodes against the oracle's definitions (`families.py`):
+
+| Kind | codex-rs | ruff |
 |---|---|---|
-| bare name | same file | 97.2% of 38,650 |
-| bare name | same crate, other file | 46.8% of 23,526 |
-| `Type::f` | same crate, other file | 66.6% of 9,712 |
-| `Type::f` | other crate | 74.0% of 11,783 |
-| `module::f` | same crate, other file | 50.6% of 3,918 |
-| `module::f` | other crate | 62.9% of 3,340 |
+| Free functions | 34,134 / 34,134 (100%) | 10,073 / 10,125 (99.5%) |
+| Methods | 19,486 / 19,486 (100%) | 16,659 / 16,684 (99.9%) |
+| `macro_rules!` | 51 / 51 | 35 / 35 |
+| Modules | 5,028 / 5,037 (99.8%) | 2,272 / 2,273 (100%) |
+| Constants and statics | 5,070 / 5,075 (99.9%) | 632 / 1,066 (59.3%) |
+| Fields and enum variants | 27,961 / 27,961 (100%) | 8,494 / 8,494 (100%) |
+| Types (struct, enum, trait, alias) | 17,232 / 17,636 (97.7%) | 11,420 / 12,524 (91.2%) |
+| Method owner link (`DEFINES_METHOD`) correct | 19,292 (99.0%) | 16,161 (96.9%) |
+| `impl Trait for Type` published as IMPLEMENTS (both in corpus) | 984 / 1,017 (96.8%) | 1,706 / 2,376 (71.8%) |
 
-Method calls by what the receiver is (in-corpus targets):
+Trait identity is one `core.*` name for `core::`, `std::` and `alloc::`
+paths, imported names and module prefixes (8fca6136).
 
-| Receiver | Published | Total |
+## Imports and usages
+
+IMPORTS, a `use` of an in-corpus item published as a File-to-item link:
+
+| | codex-rs | ruff |
 |---|---|---|
-| `self` | 8,327 | 11,888 |
-| local initialised by a path call | 6,091 | 11,211 |
-| local initialised by a method call | 1,035 | 10,970 |
-| binding from a pattern (`match`, `if let`, `for`) | 1,041 | 9,130 |
-| field of a local | 1,290 | 9,017 |
-| result of a method chain | 1,243 | 7,802 |
-| field of `self` | 2,229 | 6,687 |
-| parameter with a written type | 4,324 | 6,049 |
-| local initialised by a path call followed by `?` or `.await` | 2,351 | 5,639 |
-| result of a call | 960 | 5,127 |
-| closure parameter | 214 | 1,988 |
+| Published of oracle uses | 48,784 / 49,307 (98.9%) | 19,706 / 20,057 (98.2%) |
+| Use target has no graph node | 178 | 1,189 |
+| Published, not confirmed by the oracle | 370 | 2,649 |
+| Published, unverifiable (platform) | 1,056 | 22 |
 
-Other link families (`tools/rust-audit/families.py`):
+One IMPORTS edge differs between two indexes of ruff from run to run
+(`generate_cli_help.rs` to `ruff::lib`); its cause is open.
 
-| Family | Result |
-|---|---|
-| Function definitions | 52,925 of 53,160 have a node (99.6%) |
-| Struct, enum, trait definitions | 8,785 of 8,979 (97.8%) |
-| Type aliases and associated types | 283 of 476 (59.5%) |
-| Enum variants | 0 of 8,181: not modelled as nodes |
-| Fields | 23,949 of 27,961 (85.7%) |
-| Constants and statics | 4,389 of 5,075 (86.5%) |
-| `macro_rules!` definitions | 0 of 51 have a node |
-| Modules | not checked: module nodes are named by file path, the oracle by module name |
-| Method owner link (`DEFINES_METHOD`) | 84.4% correct, 14.8% absent, 4 wrong |
-| IMPORTS, recall | 32,902 of 48,856 uses of in-corpus items (67.3%) |
-| IMPORTS, precision | 32,902 confirmed, 21,244 not confirmed, 1,510 unverifiable |
-| USAGE to a field | 79,590 confirmed, 96,988 not confirmed |
-| USAGE to a method | 9,170 confirmed, 38,877 not confirmed |
-| USAGE to a struct | 36,942 confirmed, 20,967 not confirmed |
-| Trait implementations | 2,504 `impl Trait for Type` blocks; 0 links published |
+USAGE from Rust sources, by target kind. "Hit / mapped" is recall over the
+oracle's function-level references; module-level references (13,855 on
+codex, 9,565 on ruff) are confirmed separately by the non-`use` references in
+the enclosing Module or File span.
 
-Unconfirmed USAGE and IMPORTS links are name matches. Among USAGE links to
-fields, methods and structs, 70,963 name a target the oracle resolves
-elsewhere and 85,807 name something the function never references in the
-corpus (example: `path.display()` on a standard
-library path linked to `AbsolutePathBuf::display`,
-`app-server/src/request_processors/projects.rs:321`). Unconfirmed IMPORTS
-include links from Rust files to nodes of other languages.
+| Target kind | codex confirmed / unconfirmed / unverifiable | codex hit / mapped | ruff confirmed / unconfirmed / unverifiable | ruff hit / mapped |
+|---|---|---|---|---|
+| Struct | 81,117 / 201 / 1,327 | 71,884 / 72,500 (99.2%) | 40,242 / 1,078 / 0 | 34,537 / 34,784 (99.3%) |
+| Enum | 51,833 / 352 / 750 | 48,799 / 48,901 (99.8%) | 20,302 / 45 / 0 | 18,253 / 18,371 (99.4%) |
+| Interface (trait) | 2,395 / 4 / 2 | 1,400 / 1,427 (98.1%) | 5,209 / 1 / 0 | 3,677 / 3,679 (99.9%) |
+| Type alias | 2,728 / 5 / 14 | 2,421 / 2,667 (90.8%) | 1,525 / 2 / 0 | 1,406 / 1,593 (88.3%) |
+| Function | 43,126 / 422 / 1,590 | 72,108 / 72,413 (99.6%) | 7,316 / 1,620 / 0 | 13,491 / 13,759 (98.1%) |
+| Method | 12,880 / 232 / 148 | 107,645 / 110,862 (97.1%) | 5,840 / 73 / 0 | 61,905 / 68,081 (90.9%) |
+| Field | 169,725 / 856 / 2,463 | 169,725 / 215,967 (78.6%) | 29,938 / 118 / 19 | 29,938 / 40,953 (73.1%) |
+| Variable | 13,022 / 241 / 579 | 12,780 / 13,541 (94.4%) | 793 / 6 / 0 | 756 / 1,037 (72.9%) |
+| AssociatedConst | 108 / 0 / 0 | 101 / 131 (77.1%) | 1,099 / 12 / 0 | 1,087 / 1,164 (93.4%) |
+| EnumVariant | 0 | 0 / 66,424 | 0 | 0 / 37,429 |
+| Macro | 0 | 0 / 2,171 | 0 | 0 / 651 |
+| Module | 0 | 0 / 243 | 0 | 0 / 33 |
+
+EnumVariant, Macro and Module are not modelled as USAGE targets. Field USAGE
+comes from the resolver's field-access records (3cd84a53); a field reached by
+bare name is dropped. Rust attributes bind only `macro_rules!` and proc-macro
+nodes (c7b13d0c).
+
+## Unresolved sites
+
+A reader asking "who calls X" or "what does F call" can tell a true "nobody"
+from "unknown". Every Rust call site and type, member or value reference the
+resolver did not link is stored in `unresolved_occurrences` (file, line, byte
+span, enclosing item, written name, stop reason) with the `unresolved_sites`
+view over it. The stop reason is the resolver's own stop code from a closed
+set listed in `src/pipeline/pipeline_internal.h`, never a display message.
+`trace_path` answers carry an `unresolved_sites` block (counts of calls and
+references in scope, the scope, a paginated listing);
+`check_index_coverage` and `index_status` report the totals. Records are
+metadata, never nodes or edges; an incremental file replacement removes them.
+The published edge set is byte-identical with and without the records on
+both corpora.
+
+| | codex-rs | ruff |
+|---|---|---|
+| Records | 1,540,313 | 368,108 |
+| of which calls | 532,030 | 99,565 |
+| of which type, member or reference | 1,008,283 | 268,543 |
+
+At most 4,162 recorded codex call sites and 9,049 ruff ones are in-corpus
+truth sites (the truth total minus the sites linked); the rest target the
+standard library or dependencies, for which the graph has no nodes. Recorded
+call sites by stop reason:
+
+| Stop reason | codex-rs | ruff |
+|---|---|---|
+| `target_not_materialized` | 221,586 | 29,838 |
+| `unknown_receiver_type` | 85,906 | 17,115 |
+| `strategy_closed` | 55,682 | 8,578 |
+| `keyword_syntax_filtered` | 52,651 | 11,275 |
+| `function_not_in_registry` | 43,847 | 7,977 |
+| `method_not_found` | 41,379 | 11,263 |
+| `no_resolution` | 23,742 | 11,359 |
+| `associated_item_not_registered` | 4,745 | 1,343 |
+| `receiver_identity_not_proven` | 972 | 98 |
+| `unresolved_glob_import` | 691 | 59 |
+| `bound_declaration_not_proven` | 674 | 449 |
+| all other reasons together | 155 | 211 |
+
+Query the records of one project:
+
+```
+sqlite3 "file:<db>?mode=ro" "select kind, reason, count(*) from unresolved_sites where project='<p>' group by 1,2 order by 3 desc"
+sqlite3 "file:<db>?mode=ro" "select file_path, line, caller, name, reason from unresolved_sites where project='<p>' and name='recv'"
+```
+
+Cost of the records, measured back to back on the same machine (aa48ba96):
+score CPU within 4% of the previous commit; `score.db` 9 to 10% larger on
+codex and 4 to 5% on ruff; peak memory +7.5%.
 
 ## Parser
 
-Vendored grammar: `tree-sitter-rust` v0.24.2 (`77a3747`), byte-identical to
-upstream apart from a trailing newline. Upstream HEAD is that release
-(2026-03-27). Runtime: tree-sitter with ABI 15.
+Vendored grammar: a self-maintained fork of `tree-sitter-rust` v0.24.2
+(`77a3747`), source and corpus tests in `tools/tree-sitter-rust/`, ABI 15
+(`internal/cbm/vendored/grammars/MANIFEST.md`, entry "rust"). Against
+rust-analyzer's parser on 83,552 files of stable code (`tools/rust-audit/tsdiff`),
+disagreeing files fell from 7,137 to 6, all nightly-only syntax, excluding the
+two convention differences and the edition-2015-only files. The 50 inputs in
+`tools/rust-audit/cases/` are pinned error-free by
+`rust_audit_cases_parse_without_error_nodes` in `tests/test_parse_coverage.c`.
+No Rust file of either corpus is recorded as partially parsed or unusable in
+`index_coverage` of the frozen score databases.
 
-`tools/rust-audit/tsdiff` compares 42 fact kinds by byte range between the
-vendored parser and rust-analyzer's parser. On 83,552 valid files of stable
-code (35,380,317 lines: Cargo registry cache, codex corpus, cargo, bevy, ruff,
-serde, nextest):
+Orchard's grammar was assessed on 5 Oct (`private/rust-run/orchard/ASSESSMENT.md`):
+six lexical fixes were ported (bfccf545: Unicode in block comments, `1._m()`,
+comment between `macro_rules` and `!`, spaced and Unicode metavariables,
+custom integer suffixes, empty type arguments, raw-string ABI, higher-ranked
+bounds after `+`, labelled loop conditions); the whole grammar was rejected
+(5 of 40 audit cases error, 7 mis-shaped, 5 of 5 consumer probes regress). Of
+Orchard's 183 test inputs, 24 still error in the fork; the stable ones
+(`Vehicle<>`, `extern r#"C"# fn`, `'a: while break 'a {}`, `pub extern "C" {`
+and the rest listed in the assessment) occur in neither corpus.
 
-| Measure | Vendored grammar | Experimental patch |
-|---|---|---|
-| Files with error nodes | 6,689 | 199 |
-| Files with a wrong tree and no error node | 613 | 152 |
-| Files with any disagreement | 7,302 | 351 |
-| Codex corpus files with any disagreement | 27 | 1 |
+Fixed limits of any tree-sitter grammar: no edition switch; macro arguments
+are flat tokens. The runtime re-parses a macro argument range as Rust with
+correct byte offsets; standard macro forms (`vec!`, `format_args!`, `json!`,
+`matches!`, `select!`, `assert*!`, `insta`, `anyhow`, logging) and same-file
+and cross-file `macro_rules!` expansions are walked per site (76261787,
+a72b33a5, 7e27aec4, 3af26c81, 17daede7, 072bdb7b, 03777ea7).
 
-On the codex corpus the defects lose no definition, call, import or impl; they
-add 15 spurious call nodes.
+## Oracle cost
 
-Defects confirmed on rustc 1.98.1, one file each in `tools/rust-audit/cases/`:
+Needed only to regenerate truth, never at index time:
 
-| Case | Input | Vendored result |
-|---|---|---|
-| 01 | `&v[..=i]` | assignment, no error |
-| 02, 03, 04 | `0..*n`, `a..&b`, `..-a` | binary operator, no error |
-| 05, 23 | `break (a, b)`, `break 'l &x` | spurious call or binary operator, no error |
-| 06 | `s..(s + n)` | spurious call, no error |
-| 07, 35 | `m! {} *p = 1;`, `m! {} (a)` | joins two statements, no error |
-| 08 | `str![..]`, `str!(..)` | error; macro call lost |
-| 37 | `try!(r)` (edition 2015) | error; macro call lost |
-| 09 | `raw` as a type or binding name | error; following functions lost |
-| 10 | `type X;` in an `extern` block | error; type lost |
-| 11, 28 | closure parameter trailing comma or attribute | error |
-| 12, 13, 27 | attributes in struct patterns, tuple elements, repeated on a parameter | error |
-| 14, 18 | turbofish inside a type | error; following function lost |
-| 15, 16, 31 | `where (): T`, `where fn(u8): T`, `where mac!(u8): T`, `where dyn T: U` | error |
-| 17, 19 | function or struct named like a primitive type | error |
-| 21 | `~` or lone `$` in `macro_rules!` | error |
-| 22 | negative literal as const generic argument | error |
-| 29 | `safe fn`, `safe static` | error |
+| Workspace | Lines | Wall time | Peak memory | SCIP size |
+|---|---|---|---|---|
+| codex-rs | 1,879,640 | 470 s | 22.2 GB | 356 MB |
+| ruff | 763,814 | about 180 s | not measured | not measured |
 
-The experiment (`tools/rust-audit/grammar-experiment.patch`, also branch
-`audit/feasibility` at `c8867a6` in `../tree-sitter-rust`) fixes all but cases
-19 and 21 (lone `$`). It is not mergeable: it makes `safe` a keyword, which
-breaks identifiers named `safe` (`tui/src/insert_history.rs:547` in the
-corpus); 68 files have new errors on lines containing `raw`; and upstream's
-`tree-sitter test` reports changed trees for macro statements.
-
-Fixed limits of any tree-sitter grammar: no edition switch (37 of 83,552 files
-parse only as edition 2015); macro arguments are flat tokens. The runtime
-re-parses a macro argument range as Rust with correct byte offsets
-(`ts_parser_set_included_ranges`; verified on
-`assert_eq!(foo(a), b.bar::<T>(c)?, "m {}", x.y)`).
-
-Nightly-only syntax: 495 of 11,489 compiler and standard-library files have
-error nodes. Out of scope.
-
-## rust-analyzer cost
-
-| Workspace | Lines | Wall time | Peak memory | SCIP size | Build artefacts |
-|---|---|---|---|---|---|
-| codex-rs | 1,879,640 | 470 s | 22.2 GB | 356 MB | 978 MB |
-| nextest | 120,254 | 49 s | 3.3 GB | 18 MB | not measured |
-
-The tool's own full index of codex-rs takes 58 s. `rust-analyzer
-scip` is a batch command with no incremental mode. In a directory without
-`Cargo.toml` it exits with an error and writes no index (verified); that case
-must take the fallback path.
-
-## The retired ceiling claim
-
-The retired plan stated that 89.0% of call relations are provable without a
-type checker. A random sample of 24 sites it labelled provable was read
-against source: all 24 are derivable in principle, and the derivation needs
-return-type propagation, `Result`/`Option` through `?`, `async` returns, and
-in at least one case generic substitution plus `Deref` through a dependency
-type (`accepted_stdin_write_ids.lock().await` then `.contains(..)`,
-`exec-server/src/local_process.rs:673`). The figure is an upper bound that
-assumes that machinery exists. It was not reproduced.
-
-## Reach of the C resolver without rust-analyzer
-
-Derived from the receiver table; an estimate, not a measurement. Explicit
-in-corpus call sites total 189,905.
-
-| Capability built in C | Explicit sites reachable | Share |
-|---|---|---|
-| Complete name resolution (all path calls) | 101,519 | 53.5% |
-| plus receivers with a written type: `self`, typed parameter, typed `let`, struct literal, field of `self` | 126,891 | 66.8% |
-| plus return types of path calls, including `?` and `.await` | 148,868 | 78.4% |
-| plus method-call results, chains, fields of locals, pattern and closure bindings | needs generic substitution, `Deref` and trait lookup | not estimated |
-
-Today's figure on the same base is 106,148 (55.9%). The 40,041 macro-argument
-sites follow the same receiver mix and add re-parsing of macro arguments.
+The tool's own full index of codex-rs takes 48 s and of ruff 16 s.
 
 ## Work, in order
 
-Each step lands only when its gate passes on the corpus.
+Each item lands only when its score holds on all six corpora, the exact edge-set diff against
+the previous `main` is read, and the suites and lint pass. Owner decisions taken 7 October:
+a std receiver with a project trait method of the same name is withheld with its own stop
+reason (not guessed); the stop records are the disclosure of the tool's limits and the ranked
+gap list drives a dated, sourced table of std methods; reading std's source at index time is
+deferred until the withheld counts on the owner's projects are measured.
 
-1. **SCIP ingestion (needs the owner's decision).** Add a pass that reads a SCIP index for the repository
-   (given by path, or produced by running `rust-analyzer scip`), maps each
-   occurrence to graph nodes by file and line, and publishes CALLS, IMPORTS,
-   USAGE, trait-implementation and method-owner links for covered files.
-   `tools/rust-audit/tsdiff/src/bin/truth.rs` and `refs.rs` are the reference
-   for the mapping (protobuf reader included, no dependency).
-   Gate: `join.py` reports at least 99% for every site kind;
-   `precision.py` reports no pair outside the "correct" and "unverifiable"
-   rows other than pairs whose symbol is among the 128 ambiguous ones.
-2. **Stop publishing name-matched Rust links.** Rust USAGE and IMPORTS from
-   the generic name matcher are removed for files covered by SCIP and, for
-   uncovered files, published only when the C resolver proved the binding.
-   Gate: `families.py` reports zero "not confirmed" USAGE and IMPORTS.
-3. **Coverage reporting.** A file without SCIP data is recorded in
-   `index_coverage` with its reason (no index, other platform, stale index);
-   answers that depend on it say so. The SCIP generation and the commit it was
-   built from are stored with the project.
-4. **Grammar fork.** Vendor a fixed `tree-sitter-rust` with `grammar.js` in
-   `tools/` (as `tools/tree-sitter-arkts` does), generated at ABI 15.
-   Gate: `tsdiff` over the seven corpora in "Reproduce" reports zero files
-   with error nodes and zero with fact differences, excluding the two
-   convention differences listed there; upstream's `tree-sitter test` changes
-   are each reviewed.
-5. **Fallback quality, optional.** Cross-file name resolution for bare and
-   module-qualified paths (25,310 missing path-call sites). No type
-   propagation work.
+1. Harness: regenerate `tests/mutation/patches/*` against current source and run the lane in
+   CI; delete the `published_other_target` early return in `tools/rust-audit/unresolved.py:189`
+   and record parenthesised indirect calls; make the truth generator define `#[path]`-compiled
+   and test-crate targets (jmap-client 390 false flags, bevy `lib_main`).
+2. Located-cause resolver fixes, one arm each: `name @ pattern` binding; the dotted manifest
+   form; inherent lookup ignoring impl type arguments and `self`-less associated functions
+   (`rust_lsp.c:7553`); the IMPORTS fallback admitting non-Rust targets (`pass_pkgmap.c:1621`);
+   `mod x; pub use x::*` USAGE (`pass_usages.c:472`); discarded and stringified macro tokens
+   (`extract_usages.c:2973`); Deref dispatch skipping `rust_trait_receiver_refusal`
+   (`rust_lsp.c:13219`); reference layers stripped in trait UFCS (`rust_lsp.c:11636`);
+   explicit `<Type as Trait<..>>::m` withheld; raw-pointer receivers (`rust_lsp.c:13003`).
+3. The withhold rule for std receivers, its stop reason, the dated std-method table skeleton,
+   and the gap query over `unresolved_sites` grouped by receiver type and method.
+4. Mechanisms reported by one provider, each to be counted from the records after item 3:
+   blanket impls linked to themselves; `fold`/`sum`/`product`/`reduce` typed as the item;
+   std rules chosen by `strstr` on the type name (`rust_lsp.c:5838`); struct fields typed by
+   the struct's own generic parameter; `macro_rules!` hygiene; `try_from` with a
+   macro-generated impl; block-local items taking the module path's name; arguments of a
+   project's own `macro_rules!` never walked (pm macro recall 25.5%); the parallel pipeline
+   dropping IMPLEMENTS for empty impls; one of two cfg-twin bindings published.
+5. The earlier queue, still open: the 62 calls 903dcdc3 withheld; WORKLIST ranks 14 to 19 and 22
+   (`private/rust-run/audit/ra/measured/WORKLIST.md`); `From` argument proof; EnumVariant,
+   Macro and Module USAGE; ruff impl links 71.8% and const/static 59.3%; `registry.c:1101`;
+   `fqn.c:65`; the nondeterministic ruff IMPORTS edge; invalid UTF-8 in truncated edge
+   properties (`pass_parallel.c:1606`).
 
 ## Not measured
 
-- `s3/proof` (`e67af2a4`) and its candidate graph.
-- The installed binary `~/.local/bin/codebase-memory-mcp` reports `dev`; its
-  commit is unknown.
-- rust-analyzer behaviour when a manifest exists but `cargo metadata` fails,
-  on workspaces with several target platforms, and with non-default features.
-- Refresh strategy after edits.
-- Languages other than Rust.
+- The ruff truth beyond the flagged pairs; the truth generator's behaviour on
+  a third corpus.
+- Oracle and graph on Windows or Linux `cfg` paths: the oracle ran on
+  `aarch64-apple-darwin` only.
+- Reading std's source at index time (deferred behind the withheld-site count).
+- Graph accuracy for languages other than Rust. The cross-language guard
+  (1633e0f8) removed 843 IMPORTS, 372 CALLS, 318 USAGE, 317 DECORATES and 80
+  INHERITS edges on ruff and about 120 on codex from Python, TypeScript and
+  shell files into Rust; their replacements in those languages were not
+  scored.
+- The installed binary `~/.local/bin/codebase-memory-mcp` and its daemon:
+  never touched by the run.
 
 ## Reproduce
 
-Needs `../rust-analyzer` (source checkout, for its parser crate) and
-`../tree-sitter-rust` beside this repository.
+```
+make -f Makefile.cbm cbm BUILD_DIR=/tmp/cbm-trial -j8
+scripts/rust-score.sh /tmp/cbm-trial/codebase-memory-mcp /tmp/cbm-score-<sha8>
+CBM_RUST_BENCH=~/.cache/cbm-rust-bench2 CBM_RUST_CORPUS=~/.cache/cbm-rust-bench2/ruff \
+  scripts/rust-score.sh /tmp/cbm-trial/codebase-memory-mcp /tmp/cbm-score2-<sha8>
+scripts/rust-score.sh --rescore <out-dir>          # audit scripts only, no indexing
+python3 tools/rust-audit/unresolved.py <out-dir>   # every truth site published or recorded
+```
+
+Each out-dir holds `join.txt`, `precision.txt`, `misses.txt`, `families.txt`,
+`wrong_pairs.tsv`, `unconfirmed_sample.tsv`, `unresolved-neither.tsv`, the
+graph tables `g_*.tsv` and the database `cache/score.db`. Keep one frozen
+score directory per corpus for the current `main`; trash the previous one
+when a merge lands. Before a merge, diff the exact edge sets of the trial and
+the frozen `score.db` (key: source qualified name, target qualified name,
+edge type; grouped by source and target file extension): it caught two
+regressions the summaries and `tools/rust-audit/compare_graphs.py` missed.
+
+Regenerate truth (needs `../rust-analyzer` beside this repository):
 
 ```
-cd tools/rust-audit/tsdiff
-CARGO_TARGET_DIR=/tmp/ts-audit-target cargo build --release
-mkdir -p /tmp/ts-audit && cd /tmp/ts-audit
-find /tmp/cbm-rust/corpus -name '*.rs' -type f > codex.list
-/tmp/ts-audit-target/release/tsdiff codex.list codex 400        # parser comparison
+cd tools/rust-audit/tsdiff && CARGO_TARGET_DIR=/tmp/ts-audit-target cargo build --release
 /tmp/ts-audit-target/release/truth <index.scip> <corpus> truth.tsv
 /tmp/ts-audit-target/release/refs  <index.scip> <corpus> refs.tsv
 /tmp/ts-audit-target/release/scipstat <index.scip>
-DB=<corpus.db>
-sqlite3 -separator $'\t' "file:$DB?mode=ro" "select id,label,name,file_path,start_line,end_line from nodes where file_path like '%.rs'" > g_nodes.tsv
-sqlite3 -separator $'\t' "file:$DB?mode=ro" "select source_id,target_id,coalesce(json_extract(properties,'\$.strategy'),'') from edges where type='CALLS'" > g_calls.tsv
-for t in IMPORTS DEFINES_METHOD USAGE; do sqlite3 -separator $'\t' "file:$DB?mode=ro" "select source_id,target_id from edges where type='$t'" > g_$t.tsv; done
-cd <repo>/tools/rust-audit
-python3 join.py; python3 precision.py; python3 misses.py; python3 families.py
-python3 classify.py registry codex cargo bevy ruff serde nextest
 ```
 
-`AUDIT_DIR` (default `/tmp/ts-audit`) and `AUDIT_CORPUS` (default
-`/tmp/cbm-rust/corpus`) redirect the scripts. Build against another grammar
-with `RUST_GRAMMAR_DIR=<dir with parser.c, scanner.c, tree_sitter/>`.
-
-Parser corpora: `~/.cargo/registry/src` (73,310 files), the codex corpus,
-`../cargo`, `../bevy`, `../ruff`, `../serde`, `../nextest`; nightly:
-`../rust/{compiler,library,src}`.
-
-`tsdiff` convention differences that are not defects: rust-analyzer parses
-macro calls inside attribute values (`#[doc = concat!(..)]`), tree-sitter
-keeps them as tokens; a negative const generic argument is a literal node in
-tree-sitter and a prefix expression in rust-analyzer.
+Parser comparison: `tsdiff <file list> <name> <jobs>` over the corpora in the
+manifest entry; `RUST_GRAMMAR_DIR=<dir with parser.c, scanner.c, tree_sitter/>`
+builds against another grammar.
 
 ## Repository state
 
-- `main` at `a44f6b73` is the published line.
-- Unmerged and retired: `s3/proof`, `s3/i*`, `s3/f*`, `s3/l1`, `s3/s1`,
-  `s3/ceiling`, `s3/stage0`, `s3/mc-main`, `s3/g17*`, `s3/docs-plan`,
-  `w1/*`, `w2/join`. Their worktrees are under `/tmp/cbm-s3-*`,
-  `/tmp/cbm-w*`, `/tmp/cbm-fable-*`. Delete a branch only after confirming it
-  holds nothing step 5 wants.
-- `rm` is blocked on this machine; use `trash`. Never touch `~/.cbm`, the
-  installed binary or its daemon; never index the live codex checkout.
+- `main` at aa48ba96 is the published line, not pushed; `main` is the only
+  branch. The 75 retired branches of the run are patches under
+  `private/rust-run/retired/`.
 - Gates before a code commit: `make -f Makefile.cbm lint-ci`;
   `scripts/test.sh BUILD_DIR=<dir>` with private `CBM_RUNTIME_DIR` and
-  `CBM_CACHE_DIR`.
+  `CBM_CACHE_DIR`; both pass at aa48ba96.
+- `rm` is blocked on this machine; use `trash`. Never touch `~/.cbm`, the
+  installed binary or its daemon; never edit the corpora under
+  `~/.cache/cbm-rust-bench*`; never index the live codex checkout.
