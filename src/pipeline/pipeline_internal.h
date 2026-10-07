@@ -36,6 +36,7 @@
  * incomplete_method_registry, module_function_not_registered,
  * associated_item_not_registered, unknown_edition, cfg_dependent_name,
  * bound_declaration_not_proven, method_not_found, unknown_receiver_type,
+ * unsupported_receiver_shape,
  * unresolved_glob_import, ambiguous_name,
  * workspace_library_path_not_registered,
  * function_not_in_registry, trait_nominal_identity_ambiguous,

@@ -9727,14 +9727,13 @@ static int rust_qn_keep_rank(const CBMDefinition *d, int index) {
 }
 
 /* qsort has no context argument; extraction runs one file per thread. */
-static _Thread_local const CBMDefinition *t_qn_sort_defs;
+static _Thread_local const char *const *t_qn_sort_names;
 
 static int cmp_def_index_by_qn(const void *pa, const void *pb) {
-    const CBMDefinition *defs = t_qn_sort_defs;
     int ia = *(const int *)pa;
     int ib = *(const int *)pb;
-    const char *qa = defs[ia].qualified_name ? defs[ia].qualified_name : "";
-    const char *qb = defs[ib].qualified_name ? defs[ib].qualified_name : "";
+    const char *qa = t_qn_sort_names[ia] ? t_qn_sort_names[ia] : "";
+    const char *qb = t_qn_sort_names[ib] ? t_qn_sort_names[ib] : "";
     int c = strcmp(qa, qb);
     return c != 0 ? c : ia - ib;
 }
@@ -9772,20 +9771,25 @@ static int cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs) {
         return 0;
     }
     int *order = (int *)cbm_arena_alloc(a, (size_t)n * sizeof(int));
-    if (!order) {
+    const char **names = cbm_arena_alloc(a, (size_t)n * 2 * sizeof(const char *));
+    if (!order || !names) {
         return 0;
     }
     for (int i = 0; i < n; i++) {
         order[i] = i;
+        const char *qn = defs->items[i].qualified_name;
+        const char *block = qn ? strstr(qn, ".#B") : NULL;
+        const char *tail = block ? strchr(block + 3, '.') : NULL;
+        names[i + n] = qn;
+        names[i] = tail ? cbm_arena_sprintf(a, "%.*s%s", (int)(block - qn), qn, tail) : qn;
     }
-    t_qn_sort_defs = defs->items;
+    t_qn_sort_names = names;
     qsort(order, (size_t)n, sizeof(int), cmp_def_index_by_qn);
-    t_qn_sort_defs = NULL;
+    t_qn_sort_names = NULL;
     for (int lo = 0; lo < n;) {
-        const char *qn = defs->items[order[lo]].qualified_name;
+        const char *qn = names[order[lo]];
         int hi = lo + 1;
-        while (hi < n && qn && defs->items[order[hi]].qualified_name &&
-               strcmp(qn, defs->items[order[hi]].qualified_name) == 0) {
+        while (hi < n && qn && names[order[hi]] && strcmp(qn, names[order[hi]]) == 0) {
             hi++;
         }
         if (qn && hi - lo > 1) {
@@ -9796,9 +9800,23 @@ static int cbm_rust_separate_shared_qns(CBMArena *a, CBMDefArray *defs) {
                 }
             }
             for (int k = lo; k < hi; k++) {
-                CBMDefinition *d = &defs->items[order[k]];
-                if (order[k] != keep) {
-                    d->qualified_name = cbm_rust_line_qualified_qn(a, qn, d->start_line);
+                int index = order[k];
+                CBMDefinition *d = &defs->items[index];
+                const char *actual = names[index + n];
+                int actual_keep = keep;
+                /* Keep the predecessor's collision decision for items outside
+                 * blocks. Block items instead share only their own new QN. */
+                if (strcmp(actual, qn) != 0) {
+                    actual_keep = index;
+                    for (int j = lo; j < hi; j++) {
+                        int other = order[j];
+                        if (strcmp(actual, names[other + n]) == 0 &&
+                            rust_qn_keeps(defs->items, other, actual_keep))
+                            actual_keep = other;
+                    }
+                }
+                if (index != actual_keep) {
+                    d->qualified_name = cbm_rust_line_qualified_qn(a, actual, d->start_line);
                     separated++;
                 }
             }

@@ -341,13 +341,14 @@ TEST(rustlsp_trait_unbounded_impl_accepts_concrete_argument) {
     PASS();
 }
 
-TEST(rustlsp_trait_collapsed_block_local_types_withhold_impl) {
+TEST(rustlsp_distinct_block_types_keep_their_default_impls) {
     CBMFileResult *r =
         extract_rust("fn first() { #[derive(Default)] struct Token; Token::default(); }\n"
                      "fn second() { struct Token; impl Default for Token { fn default() -> Self { "
                      "Token } } }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_LT(find_confident(&r->resolved_calls, "main.first", "Token.default"), 0);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.first", "#B32.Token.default"), 0);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.first", "#B80.Token.default"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -14197,7 +14198,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_trait_dispatch_single_impl);
     RUN_TEST(rustlsp_trait_alias_identity_ignores_canonical_leaf_import);
     RUN_TEST(rustlsp_trait_unbounded_impl_accepts_concrete_argument);
-    RUN_TEST(rustlsp_trait_collapsed_block_local_types_withhold_impl);
+    RUN_TEST(rustlsp_distinct_block_types_keep_their_default_impls);
     RUN_TEST(rustlsp_trait_attribute_field_accessor_withholds_impl);
     RUN_TEST(rustlsp_trait_field_without_attribute_accepts_impl);
     RUN_TEST(rustlsp_trait_reexport_keeps_canonical_identity);
