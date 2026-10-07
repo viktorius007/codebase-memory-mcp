@@ -38,7 +38,8 @@
  * bound_declaration_not_proven, method_not_found, unknown_receiver_type,
  * unresolved_glob_import, workspace_library_path_not_registered,
  * function_not_in_registry, trait_nominal_identity_ambiguous,
- * trait_inherent_accessor_unknown, trait_scope_identity, trait_impl_key_unreadable,
+ * trait_inherent_accessor_unknown, trait_scope_identity, unrecognised_std_method,
+ * trait_impl_key_unreadable,
  * trait_array_length_unknown, trait_receiver_unknown, trait_owned_receiver_borrowed,
  * trait_receiver_partial, trait_receiver_scope_unproved,
  * trait_receiver_shape (shape details are not reason codes). */

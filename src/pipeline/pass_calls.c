@@ -631,14 +631,18 @@ void cbm_pipeline_record_unresolved_call(cbm_gbuf_t *gbuf, const char *project, 
     cbm_free(CBM_MEM_CLASS_GBUF_INDEX, key);
     /* The index retains the last exact occurrence, including successful rows.
      * An earlier failure must never describe a later semantic pass's result. */
+    const char *name = cbm_lsp_bare_segment(call->callee_name);
     if (row && row->reason && row->strategy && strcmp(row->strategy, "lsp_unresolved") == 0 &&
-        cbm_pipeline_invocation_leaf_matches(row, call, 2))
+        cbm_pipeline_invocation_leaf_matches(row, call, 2)) {
+        if (strcmp(row->reason, "unrecognised_std_method") == 0)
+            name = row->callee_qn;
         stop = strncmp(row->reason, "trait_receiver_shape:", 21) == 0 ? "trait_receiver_shape"
                                                                       : row->reason;
-    cbm_pipeline_record_unresolved(
-        gbuf, project, rel, call->enclosing_func_qn, cbm_lsp_bare_segment(call->callee_name),
-        "call", stop, call->unresolved_line > 0 ? call->unresolved_line : call->start_line,
-        call->site_start_byte, call->site_end_byte);
+    }
+    cbm_pipeline_record_unresolved(gbuf, project, rel, call->enclosing_func_qn, name, "call", stop,
+                                   call->unresolved_line > 0 ? call->unresolved_line
+                                                             : call->start_line,
+                                   call->site_start_byte, call->site_end_byte);
 }
 
 void cbm_pipeline_record_unresolved_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_t *symbols,

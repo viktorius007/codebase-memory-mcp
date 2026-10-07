@@ -110,7 +110,6 @@ typedef struct {
      * miss stays a miss; set only by impl-header resolution. */
     bool follow_glob_exports;
     CBMIdxMemo export_memo; /* "<module>\x1f<name>" -> 0 (miss) or 1-based export_values slot */
-    CBMIdxMemo spelled_names; /* identifier -> 1 when this file's source spells it, else 0 */
     const char **export_values;
     int export_value_count;
 
@@ -138,6 +137,8 @@ typedef struct {
     /* The registry holds this file's items only (the per-file pass), so what
      * a glob import of another module brings into scope is unseen. */
     bool registry_is_file_local;
+    uint8_t prelude_restrictions; /* source module's prelude attributes */
+    TSNode module_scope; /* original source module, for declarations without Cargo mapping */
     /* Value-namespace items declared in the blocks enclosing the walk point,
      * outermost first: the name and, for a function with its own graph node,
      * that node's QN (NULL otherwise). Entries from block_item_base on are

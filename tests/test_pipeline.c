@@ -3028,6 +3028,143 @@ static const usage_expectation_t rust_field_record_rows[] = {
     {"mkg", "n", "src/a.rs", 0, "Method"},
 };
 
+/* The graph, rather than the resolver's own selection record, is the oracle:
+ * these callers differ only in whether a real lexical import exists. */
+TEST(pipeline_rust_trait_scope_requires_a_lexical_import) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_trait_scope_XXXXXX",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname=\"scope\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub mod defs; pub mod absent; pub mod comment; pub mod string; pub mod present;\n"
+        "pub mod no_prelude; pub fn builtin(s: defs::S) { s.clone(); }\n");
+    write_temp_file(tmp, "src/defs.rs",
+                    "pub struct S; pub trait Describe { fn describe(&self) {} }\n"
+                    "impl Describe for S {}\n"
+                    "use std::clone::Clone; impl Clone for S { fn clone(&self) -> Self { S } }\n"
+                    "pub trait ToString { fn to_string(&self) {} }\n"
+                    "impl ToString for S {}\n"
+                    "pub fn declared(s: S) { s.describe(); }\n");
+    write_temp_file(tmp, "src/absent.rs",
+                    "use crate::defs::S;\n"
+                    "pub fn path(s: S) { s.describe(); }\n"
+                    "pub fn qualified(s: S) { crate::defs::Describe::describe(&s); }\n"
+                    "pub fn prelude_impostor(s: S) { s.to_string(); }\n"
+                    "mod sibling { use crate::defs::Describe; }\n"
+                    "pub fn sibling_import(s: S) { s.describe(); }\n");
+    write_temp_file(tmp, "src/comment.rs",
+                    "use crate::defs::S;\n"
+                    "// Describe is deliberately not imported.\n"
+                    "pub fn comment(s: S) { s.describe(); }\n");
+    write_temp_file(tmp, "src/string.rs",
+                    "use crate::defs::S;\n"
+                    "pub fn string(s: S) { let _ = \"Describe\"; s.describe(); }\n");
+    write_temp_file(tmp, "src/present.rs",
+                    "use crate::defs::{S, Describe as Renamed};\n"
+                    "pub fn renamed(s: S) { s.describe(); }\n"
+                    "mod glob { use crate::defs::*; pub fn imported(s: S) { s.describe(); } }\n"
+                    "mod block { use crate::defs::S;\n"
+                    "pub fn imported(s: S) { use crate::defs::Describe; s.describe(); }\n"
+                    "pub fn outside(s: S) { s.describe(); } }\n");
+    write_temp_file(tmp, "src/no_prelude.rs",
+                    "#![no_implicit_prelude]\nuse crate::defs::S; pub mod child;\n"
+                    "pub fn disabled(s: S) { s.clone(); }\n"
+                    "pub fn imported(s: S) { use ::std::clone::Clone; s.clone(); }\n");
+    write_temp_file(tmp, "src/no_prelude/child.rs",
+                    "use crate::defs::S; pub fn inherited(s: S) { s.clone(); }\n");
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = cbm_store_open_path_query(dbpath);
+    ASSERT_NOT_NULL(store);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT s.name, count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+                      "AND t.name IN ('describe','to_string','clone') AND "
+                      "((s.file_path='src/absent.rs' AND s.name!='qualified') OR "
+                      "s.file_path IN ('src/comment.rs','src/string.rs') OR "
+                      "s.name IN ('outside','disabled','inherited')) "
+                      "GROUP BY s.name";
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+          "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+          "AND t.name='describe' "
+          "AND s.name IN ('declared','renamed','imported')";
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 4);
+    sqlite3_finalize(stmt);
+    sql = "SELECT count(*) FROM unresolved_sites WHERE kind='call' "
+          "AND reason='trait_scope_identity' AND name IN ('describe','to_string','clone')";
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 8);
+    sqlite3_finalize(stmt);
+    /* std Clone's valid controls must pass the scope filter even if another
+     * pipeline gate cannot materialize the impl target. */
+    sql = "SELECT count(*) FROM unresolved_sites WHERE kind='call' "
+          "AND reason='trait_scope_identity' AND name='clone' "
+          "AND (caller LIKE '%.builtin' OR caller LIKE '%.no_prelude.imported')";
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_std_trait_collision_is_disclosed_with_receiver_and_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_std_collision_XXXXXX",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname=\"collision\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub trait Extension { fn reserve(&mut self, n: usize); }\n"
+                    "impl Extension for Vec<u32> { fn reserve(&mut self, _: usize) {} }\n"
+                    "pub fn collision(items: &mut Vec<u32>) { items.reserve(8); }\n"
+                    "pub struct Local;\n"
+                    "impl Extension for Local { fn reserve(&mut self, _: usize) {} }\n"
+                    "pub fn project(items: &mut Local) { items.reserve(8); }\n");
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = cbm_store_open_path_query(dbpath);
+    ASSERT_NOT_NULL(store);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT s.name FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "WHERE e.type='CALLS' AND s.name IN ('collision','project')";
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "project");
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sql = "SELECT name, reason FROM unresolved_sites WHERE kind='call' "
+          "AND caller LIKE '%.collision'";
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "alloc.vec.Vec.reserve");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "unrecognised_std_method");
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable) {
     char tmp[256] = "/tmp/cbm_unresolved_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -9833,14 +9970,8 @@ TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both
     PASS();
 }
 
-/* A trait impl whose self type is a std type (`Path`), a slice (`[Key]`) or
- * an in-repository alias named through another module (`super::Shown`, an
- * alias of `model::Ctx`) is found on a receiver of that type: its methods sit
- * on the QN the resolver types the receiver by (`std.path.Path`,
- * `core.slice` and `Vec` through its Deref, `model.Ctx`), not on
- * `<impl module>.Path`. The Method nodes keep their impl-file QNs. A
- * dependency's type (`dep::Line`) is not placed: its own methods are
- * unknown, so `line.render()` stays unlinked. */
+/* Project extensions directly on std types and slices are disclosed as gaps.
+ * A project alias still resolves its own method; dependency types stay unknown. */
 TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_foreign_XXXXXX");
@@ -9877,13 +10008,13 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
                     "pub fn on_line(l: Line) -> u8 { l.render() }\n");
     write_rust_pad_files(tmp, 52);
     static const RustModTreeCallCase cases[] = {
-        {"std self type, &Path receiver", "src.calls.on_path", "src.ext.Path.abs[PathExt]", true},
+        {"std self type, &Path receiver", "src.calls.on_path", "src.ext.Path.abs[PathExt]", false},
         {"std self type, as_path() receiver", "src.calls.on_as_path", "src.ext.Path.abs[PathExt]",
-         true},
+         false},
         {"slice self type, &[T] receiver", "src.calls.on_slice",
-         "src.ext.[Key].is_pressed[KeysExt]", true},
+         "src.ext.[Key].is_pressed[KeysExt]", false},
         {"slice self type, Vec<T> receiver", "src.calls.on_vec",
-         "src.ext.[Key].is_pressed[KeysExt]", true},
+         "src.ext.[Key].is_pressed[KeysExt]", false},
         {"super:: alias self type, aliased type receiver", "src.calls.on_ctx",
          "src.model.view.super::Shown.entries[Entries]", true},
         {"dependency self type is not placed", "src.calls.on_line", "src.ext.Line.render[Draw]",
@@ -9891,15 +10022,29 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
     };
     int mismatches =
         check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    for (int mode = 0; mode < 2; mode++) {
+        char dbpath[512];
+        snprintf(dbpath, sizeof(dbpath), "%s/modtree-%s.db", tmp, mode ? "par" : "seq");
+        cbm_store_t *store = cbm_store_open_path_query(dbpath);
+        ASSERT_NOT_NULL(store);
+        sqlite3_stmt *stmt = NULL;
+        const char *sql =
+            "SELECT count(*) FROM unresolved_sites WHERE kind='call' "
+            "AND reason='unrecognised_std_method' AND name IN "
+            "('std.path.Path.abs','core.slice.is_pressed','alloc.vec.Vec.is_pressed')";
+        ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 4);
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+    }
     th_rmtree(tmp);
     ASSERT_EQ(0, mismatches);
     PASS();
 }
 
-/* A module-level macro invocation (`thread_local!`) in the file of
- * `impl Ext for Path` must not leave `use std::path::Path` unresolved there:
- * the impl registers on std.path.Path as it does in a file without the
- * macro, so a `&Path` receiver in another file links to `Ext::m`. */
+/* A module macro beside the impl does not obscure the std receiver identity
+ * needed to disclose a project extension as an unrecognised std method. */
 TEST(pipeline_rust_std_impl_beside_module_macro_item_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_macro_XXXXXX");
@@ -9923,12 +10068,27 @@ TEST(pipeline_rust_std_impl_beside_module_macro_item_in_both_modes) {
     write_rust_pad_files(tmp, 52);
     static const RustModTreeCallCase cases[] = {
         {"&Path receiver, impl beside thread_local!", "src.calls.on_path", "src.ext.Path.m[Ext]",
-         true},
+         false},
         {"&PathBuf receiver, impl beside thread_local!", "src.calls.on_buf",
-         "src.ext.PathBuf.n[BufExt]", true},
+         "src.ext.PathBuf.n[BufExt]", false},
     };
     int mismatches =
         check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    for (int mode = 0; mode < 2; mode++) {
+        char dbpath[512];
+        snprintf(dbpath, sizeof(dbpath), "%s/modtree-%s.db", tmp, mode ? "par" : "seq");
+        cbm_store_t *store = cbm_store_open_path_query(dbpath);
+        ASSERT_NOT_NULL(store);
+        sqlite3_stmt *stmt = NULL;
+        const char *sql = "SELECT count(*) FROM unresolved_sites WHERE kind='call' "
+                          "AND reason='unrecognised_std_method' AND name IN "
+                          "('std.path.Path.m','std.path.PathBuf.n')";
+        ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+    }
     th_rmtree(tmp);
     ASSERT_EQ(0, mismatches);
     PASS();
@@ -19991,6 +20151,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_rust_usage_never_binds_method_by_bare_name);
     RUN_TEST(pipeline_rust_bare_name_binds_only_through_use_or_glob);
     RUN_TEST(pipeline_rust_turbofish_method_binds_written_type_argument);
+    RUN_TEST(pipeline_rust_trait_scope_requires_a_lexical_import);
+    RUN_TEST(pipeline_rust_std_trait_collision_is_disclosed_with_receiver_and_method);
     RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
     RUN_TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded);
     RUN_TEST(pipeline_rust_field_usage_from_resolver_record);
@@ -20035,6 +20197,8 @@ SUITE(pipeline_semantic_manifest_repro) {
 }
 
 SUITE(pipeline_unresolved) {
+    RUN_TEST(pipeline_rust_trait_scope_requires_a_lexical_import);
+    RUN_TEST(pipeline_rust_std_trait_collision_is_disclosed_with_receiver_and_method);
     RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
     RUN_TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded);
 }

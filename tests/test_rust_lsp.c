@@ -1311,6 +1311,7 @@ TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type) {
         defs[i].receiver_type = src->parent_class;
         defs[i].receiver_spelling = src->receiver;
         defs[i].trait_qn = src->impl_trait;
+        defs[i].is_interface = strcmp(src->label, "Trait") == 0;
         defs[i].signature_param_types = src->signature_param_types;
         defs[i].signature_param_count = src->signature_param_count;
         defs[i].def_module_qn = "test.src.main";
@@ -1318,27 +1319,28 @@ TEST(rustlsp_crossfile_from_call_selects_impl_by_argument_type) {
     }
     CBMTypeRegistry *registry = cbm_rust_build_cross_registry(&arena, defs, lib->defs.count);
     ASSERT_NOT_NULL(registry);
-    const char *imp_names[] = {"Label", "Other"};
-    const char *imp_qns[] = {"test::src::main::Label", "test::src::main::Other"};
+    const char *imp_names[] = {"Label", "Other", "From"};
+    const char *imp_qns[] = {"test::src::main::Label", "test::src::main::Other",
+                             "test::src::main::From"};
 
     const char *typed = "fn run() { let _ = Label::from(\"text\"); }\n";
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, typed, (int)strlen(typed), "test.src.caller",
-                                         "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
+                                         "test.src.caller", registry, imp_names, imp_qns, 3, NULL,
                                          NULL, NULL, &out, NULL, NULL);
     ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&out), "From<&'static str>"));
 
     const char *owned = "fn run(o: Other) { let _ = Label::from(o); }\n";
     CBMResolvedCallArray out_owned = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, owned, (int)strlen(owned), "test.src.caller",
-                                         "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
+                                         "test.src.caller", registry, imp_names, imp_qns, 3, NULL,
                                          NULL, NULL, &out_owned, NULL, NULL);
     ASSERT_TRUE(rustlsp_key_names(rustlsp_from_impl_key(&out_owned), "From<Other>"));
 
     const char *unknown = "fn run() { let _ = Label::from(missing()); }\n";
     CBMResolvedCallArray out_unknown = {0};
     cbm_run_rust_lsp_cross_with_registry(&arena, unknown, (int)strlen(unknown), "test.src.caller",
-                                         "test.src.caller", registry, imp_names, imp_qns, 2, NULL,
+                                         "test.src.caller", registry, imp_names, imp_qns, 3, NULL,
                                          NULL, NULL, &out_unknown, NULL, NULL);
     ASSERT_NULL(rustlsp_from_impl_key(&out_unknown));
 
@@ -7963,7 +7965,11 @@ TEST(rustlsp_written_reference_impl_selects_borrowed_owner) {
                                     "impl Measure for &str { fn measure(self) {} }\n"
                                     "fn run(x: &str) { x.measure(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "&str.measure[Measure]"), 0);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "&str.measure[Measure]"), 0);
+    int stop = find_resolved(r, "main.run", "core.str.measure");
+    ASSERT_GTE(stop, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[stop].reason, "unrecognised_std_method");
+    ASSERT_STR_EQ(r->resolved_calls.items[stop].strategy, "lsp_unresolved");
     cbm_free_result(r);
     PASS();
 }
@@ -7975,8 +7981,14 @@ TEST(rustlsp_written_primitive_impl_selects_canonical_owner) {
                                     "fn text(x: &str) { x.measure(); }\n"
                                     "fn number(x: u32) { x.measure(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_GTE(find_confident(&r->resolved_calls, "main.text", "str.measure[Measure]"), 0);
-    ASSERT_GTE(find_confident(&r->resolved_calls, "main.number", "u32.measure[Measure]"), 0);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.text", "str.measure[Measure]"), 0);
+    ASSERT_LT(find_confident(&r->resolved_calls, "main.number", "u32.measure[Measure]"), 0);
+    int text = find_resolved(r, "main.text", "core.str.measure");
+    int number = find_resolved(r, "main.number", "u32.measure");
+    ASSERT_GTE(text, 0);
+    ASSERT_GTE(number, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[text].reason, "unrecognised_std_method");
+    ASSERT_STR_EQ(r->resolved_calls.items[number].reason, "unrecognised_std_method");
     cbm_free_result(r);
     PASS();
 }
@@ -8000,6 +8012,9 @@ TEST(rustlsp_unknown_reference_qualifier_is_not_promoted_by_alias_expansion) {
     cbm_arena_init(&arena);
     CBMTypeRegistry registry;
     cbm_registry_init(&registry, &arena);
+    cbm_registry_add_type(&registry, (CBMRegisteredType){.qualified_name = "test.pkg.Read",
+                                                         .short_name = "Read",
+                                                         .is_interface = true});
     cbm_registry_add_type(
         &registry, (CBMRegisteredType){.qualified_name = "test.pkg.Item", .short_name = "Item"});
     cbm_registry_add_type(
@@ -9736,11 +9751,17 @@ TEST(rustlsp_cov_xf_trait_impl) {
     defs[0].qualified_name = "p.demo.Foo";
     defs[0].short_name = "Foo"; defs[0].label = "Type"; defs[0].def_module_qn = "p.demo";
     defs[1].qualified_name = "p.demo.Beep";
-    defs[1].short_name = "Beep"; defs[1].label = "Trait"; defs[1].def_module_qn = "p.demo";
+    defs[1].short_name = "Beep";
+    defs[1].label = "Trait";
+    defs[1].is_interface = true;
+    defs[1].def_module_qn = "p.demo";
     defs[2].qualified_name = "p.demo.Foo.beep";
     defs[2].short_name = "beep"; defs[2].label = "Method";
     defs[2].receiver_type = "p.demo.Foo"; defs[2].trait_qn = "p.demo.Beep";
     defs[2].def_module_qn = "p.demo";
+    defs[2].receiver_spelling = "Foo";
+    defs[2].has_rust_self = true;
+    defs[2].has_rust_shared_self = true;
     const char *imp_n[] = {"demo"}; const char *imp_q[] = {"p::demo"};
     CBMResolvedCallArray out; memset(&out, 0, sizeof(out));
     cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 3, imp_n, imp_q, 1, NULL, &out);
@@ -10866,9 +10887,8 @@ TEST(rustlsp_gap_bound_box_dyn_dispatch) {
     cbm_free_result(r); PASS();
 }
 
-/* `dyn Cell + Send` and `dyn Cell` are two types: the Box impl of the first is
- * found on a `Box<dyn Cell + Send>` before it derefs, and does not apply to a
- * `Box<dyn Cell>`, whose call derefs to `Cell::height`. */
+/* An applicable project extension on Box is disclosed as a std gap. A
+ * disjoint Box impl does not block Deref to the project trait object. */
 TEST(rustlsp_wrapper_impl_on_dyn_with_auto_trait_applies_to_same_bounds) {
     const char *src = "use demo::Renderable;\n"
                       "fn via_send(c: Box<dyn demo::Cell + Send>) -> u8 { c.height() }\n"
@@ -10898,7 +10918,17 @@ TEST(rustlsp_wrapper_impl_on_dyn_with_auto_trait_applies_to_same_bounds) {
     memset(&out, 0, sizeof(out));
     cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 5, imp_n, imp_q, 1, NULL,
                            &out);
-    ASSERT_GTE(find_confident(&out, "via_send", "p.demo.Box.height"), 0);
+    ASSERT_LT(find_confident(&out, "via_send", "p.demo.Box.height"), 0);
+    int stopped = 0;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].caller_qn && strstr(out.items[i].caller_qn, "via_send")) {
+            ASSERT_STR_EQ(out.items[i].callee_qn, "alloc.boxed.Box.height");
+            ASSERT_STR_EQ(out.items[i].reason, "unrecognised_std_method");
+            ASSERT_STR_EQ(out.items[i].strategy, "lsp_unresolved");
+            stopped++;
+        }
+    }
+    ASSERT_EQ(stopped, 1);
     ASSERT_LT(find_confident(&out, "via_send", "p.demo.Cell.height"), 0);
     ASSERT_GTE(find_confident(&out, "via_plain", "p.demo.Cell.height"), 0);
     ASSERT_LT(find_confident(&out, "via_plain", "p.demo.Box.height"), 0);

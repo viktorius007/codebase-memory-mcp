@@ -401,3 +401,62 @@ builds against another grammar.
 - `rm` is blocked on this machine; use `trash`. Never touch `~/.cbm`, the
   installed binary or its daemon; never edit the corpora under
   `~/.cache/cbm-rust-bench*`; never index the live codex checkout.
+
+## Trait scope and std dispatch disclosure (2026-10-07)
+
+Concrete dot-call trait candidates require a positive lexical identity proof.
+The existing module tree proves declarations in the innermost module, named
+`use` imports (including renames and re-exports), and unambiguous module globs;
+active block `use` paths are supplied separately. An unconditional trait
+declaration in the current source module also proves scope when the file has no
+Cargo mapping; attributed declarations do not use this fallback. Supertrait methods are
+reachable through a proved imported subtrait. A prelude proof names the canonical
+std trait, never a project trait with the same leaf name. Prelude availability
+also checks module attributes inherited through out-of-line modules: `no_core`
+and `no_implicit_prelude` disable it, and `no_std` withholds alloc-only traits.
+Conditional restrictions are conservative. `TryFrom`/`TryInto` require a proved
+2021/2024 edition, and `Future` requires 2024; a per-file pass with no crate
+edition does not assume those additions. The enclosing trait
+impl supplies its canonical trait inside its body, as Rust does. Comments, strings,
+qualified paths in unrelated expressions, and imports in siblings are no proof.
+Unknown scope stops with `trait_scope_identity`. Anonymous `as _` imports and
+block globs that this proof cannot resolve are conservatively withheld. Qualified
+trait paths, generic bounds and operator desugaring retain their separate rules.
+
+These rules follow the Rust Reference's
+[method lookup](https://doc.rust-lang.org/reference/expressions/method-call-expr.html)
+[use declarations](https://doc.rust-lang.org/reference/items/use-declarations.html),
+and [prelude availability](https://doc.rust-lang.org/reference/names/preludes.html),
+consulted on 2026-10-07. No compiler or std source is read while indexing.
+
+When a canonical std receiver has a method name supplied by a project trait,
+the dot call is withheld with `unrecognised_std_method`. On a forwarding wrapper,
+only an in-scope extension whose self type may apply competes before Deref; a disjoint
+extension does not block a method on the project pointee. This reason denotes a
+std/project-trait dispatch collision, including methods whose return type is
+already modelled: a return-type rule does not prove the absence of a preceding
+inherent method. `unresolved_sites.name` stores `receiver-head.method` for this
+reason (for example `alloc.vec.Vec.reserve`); its existing columns are unchanged.
+Deref candidates use the std head reached at that step. Other stop records retain
+their existing names.
+
+The resolver includes `internal/cbm/lsp/rust_std_methods.h` at compile time.
+Each row has its receiver, method, inference knowledge, signature source URL and
+2026-10-07 capture date. Its initial entries are copied from the previous return,
+closure-parameter, producer and legacy collection/iterator rules. The legacy
+substring matching and approximate returns are preserved here, not certified as
+correct std signatures. This task adds no std method knowledge and no new CALLS
+publication through the table. Future updates should start from the ranked gaps,
+check the cited signature, add a real indexing regression, then update the dated
+row. The table is part of the binary; deployment needs no adjacent data file.
+
+Rank the twenty largest std dispatch gaps in any graph with:
+
+```sh
+sqlite3 -header -tabs 'file:/path/to/graph.db?mode=ro' \
+  < tools/rust-audit/std-method-gaps.sql
+```
+
+The query groups by receiver head and method, counts call occurrences rather than
+caller–callee pairs, and uses deterministic tie ordering. An empty result is an
+empty disclosure for this reason, not proof of complete std coverage.

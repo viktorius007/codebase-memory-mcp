@@ -24,6 +24,16 @@
 
 typedef struct CBMRustModTree CBMRustModTree;
 
+enum { CBM_RUST_PRELUDE_DISABLED = 1, CBM_RUST_PRELUDE_CORE_ONLY = 2 };
+
+/* Prelude restrictions written on this source module (inner attributes and
+ * attributes on its enclosing `mod`); conditional restrictions are conservative. */
+uint8_t cbm_rust_prelude_restrictions(CBMArena *arena, const char *source, TSNode scope);
+/* True only when every crate mount at this occurrence enables the named
+ * standard-prelude trait, including restrictions inherited from parent modules. */
+bool cbm_rust_modtree_prelude_allows(const CBMRustModTree *tree, const char *module_qn,
+                                     uint32_t offset, const char *name);
+
 /* The `#[path = "..."]` value attached to a `mod` item, "" for an empty
  * literal, NULL when absent or not a plain string. */
 char *cbm_rust_path_attribute(CBMArena *arena, const char *source, TSNode mod_item);
@@ -67,6 +77,7 @@ typedef struct {
     const char *qn;    /* Declaring QN when known; ASSOC: the type or trait QN. */
     const char *assoc; /* ASSOC: the associated item name */
     bool is_trait;     /* ASSOC, TYPE: `qn` is a trait */
+    bool conditional;  /* TYPE: declaration/import requires an unproved cfg */
     /* FUNCTION: 1-based line of the declaring `fn`, 0 when two declarations
      * of `qn` stand in one module (cfg twins). Inline modules have their own QN. */
     uint32_t line;
@@ -84,6 +95,8 @@ typedef enum {
     CBM_RUST_EDITION_MODERN = 0,
     CBM_RUST_EDITION_2015 = 1,
     CBM_RUST_EDITION_UNKNOWN = 2,
+    CBM_RUST_EDITION_2021 = 3,
+    CBM_RUST_EDITION_2024 = 4,
 } CBMRustEdition;
 
 /* Register a crate root. `extern_name` is the name other crates use for it

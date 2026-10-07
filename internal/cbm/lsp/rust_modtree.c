@@ -74,6 +74,7 @@ typedef struct {
     int seg_count;
     bool glob;
     bool conditional;
+    bool extern_crate;
     uint8_t state;
     RmtDefs result;
 } RmtImport;
@@ -88,6 +89,7 @@ typedef struct {
     uint32_t start;
     uint32_t end;
     bool macro_items; /* item-position macro calls may declare unseen names */
+    uint8_t prelude_restrictions;
 } RmtModule;
 
 typedef struct {
@@ -162,6 +164,19 @@ void cbm_rust_modtree_free(CBMRustModTree *tree) {
     cbm_free(CBM_MEM_CLASS_OTHER, tree->imports);
     cbm_arena_destroy(&tree->arena);
     cbm_free(CBM_MEM_CLASS_OTHER, tree);
+}
+
+static uint8_t rmt_scope_prelude_restrictions(const CBMRustModTree *tree, int module) {
+    uint8_t restrictions = 0;
+    for (int parent = module; parent >= 0; parent = tree->modules[parent].parent)
+        restrictions |= tree->modules[parent].prelude_restrictions;
+    return restrictions;
+}
+
+static bool rmt_implicit_extern_allowed(const CBMRustModTree *tree, int module, const char *name) {
+    uint8_t restrictions = rmt_scope_prelude_restrictions(tree, module);
+    return !(restrictions & CBM_RUST_PRELUDE_DISABLED) &&
+           !((restrictions & CBM_RUST_PRELUDE_CORE_ONLY) && strcmp(name, "std") == 0);
 }
 
 static const char *rmt_dirname(CBMArena *arena, const char *rel) {
@@ -439,6 +454,41 @@ static const RmtItemKind RMT_ITEM_KINDS[] = {
     {"const_item", RMT_VALUE, RMT_NS_VALUE}, {"static_item", RMT_VALUE, RMT_NS_VALUE},
 };
 
+static uint8_t rmt_prelude_attribute(CBMArena *arena, const char *source, TSNode item) {
+    TSNode attr = cbm_find_child_by_kind(item, "attribute");
+    if (ts_node_is_null(attr) || ts_node_named_child_count(attr) == 0)
+        return 0;
+    const char *name = cbm_node_text(arena, ts_node_named_child(attr, 0), source);
+    if (!name)
+        return 0;
+    bool conditional = strcmp(name, "cfg_attr") == 0;
+    const char *text = conditional ? cbm_node_text(arena, attr, source) : name;
+    if (!text || strstr(text, "no_implicit_prelude"))
+        return CBM_RUST_PRELUDE_DISABLED;
+    if (strstr(text, "no_core"))
+        return CBM_RUST_PRELUDE_DISABLED | CBM_RUST_PRELUDE_CORE_ONLY;
+    return strstr(text, "no_std") ? CBM_RUST_PRELUDE_CORE_ONLY : 0;
+}
+
+uint8_t cbm_rust_prelude_restrictions(CBMArena *arena, const char *source, TSNode scope) {
+    uint8_t restrictions = 0;
+    TSNode module = strcmp(ts_node_type(scope), "mod_item") == 0 ? scope : ts_node_parent(scope);
+    if (!ts_node_is_null(module) && strcmp(ts_node_type(module), "mod_item") == 0) {
+        for (TSNode attr = ts_node_prev_named_sibling(module);
+             !ts_node_is_null(attr) && strcmp(ts_node_type(attr), "attribute_item") == 0;
+             attr = ts_node_prev_named_sibling(attr))
+            restrictions |= rmt_prelude_attribute(arena, source, attr);
+        if (ts_node_eq(scope, module))
+            scope = ts_node_child_by_field_name(module, "body", 4);
+    }
+    for (uint32_t i = 0; !ts_node_is_null(scope) && i < ts_node_named_child_count(scope); i++) {
+        TSNode item = ts_node_named_child(scope, i);
+        if (strcmp(ts_node_type(item), "inner_attribute_item") == 0)
+            restrictions |= rmt_prelude_attribute(arena, source, item);
+    }
+    return restrictions;
+}
+
 /* One fact of a file, in source order. Inline module bodies are bracketed
  * by RMF_MOD_OPEN and RMF_MOD_CLOSE. */
 typedef enum {
@@ -448,6 +498,7 @@ typedef enum {
     RMF_MOD_CLOSE, /* end of the innermost open inline module */
     RMF_IMPORT,    /* `use` / `extern crate` binding `name` (NULL when glob) to `text` */
     RMF_MACRO,     /* an item-position macro call */
+    RMF_PRELUDE,   /* item: standard-prelude restriction bits */
 } RmfOp;
 
 typedef struct {
@@ -549,6 +600,7 @@ static void rmf_scan_mod(RmfScan *scan, TSNode item) {
     TSNode body = ts_node_child_by_field_name(item, "body", 4);
     if (ts_node_is_null(body)) {
         rmf_push(scan, (RmfRecord){.op = RMF_MOD_DECL,
+                                   .item = cbm_rust_prelude_restrictions(arena, scan->source, item),
                                    .vis = rmf_visibility(scan->source, item),
                                    .name = name,
                                    .text = cbm_rust_path_attribute(arena, scan->source, item)});
@@ -619,7 +671,8 @@ static void rmf_scan_extern_crate(RmfScan *scan, TSNode item) {
     rmf_push(scan, (RmfRecord){.op = RMF_IMPORT,
                                .vis = rmf_visibility(scan->source, item),
                                .name = alias ? alias : name,
-                               .text = path});
+                               .text = path,
+                               .item = 1});
 }
 
 static void rmf_scan_item(RmfScan *scan, TSNode item) {
@@ -653,6 +706,10 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
 }
 
 static void rmf_scan_items(RmfScan *scan, TSNode container) {
+    uint8_t restrictions =
+        cbm_rust_prelude_restrictions(&scan->facts->arena, scan->source, container);
+    if (restrictions)
+        rmf_push(scan, (RmfRecord){.op = RMF_PRELUDE, .item = restrictions});
     bool saved = scan->conditional;
     scan->conditional = false;
     uint32_t count = ts_node_named_child_count(container);
@@ -763,6 +820,7 @@ static void rmt_build_mod_decl(const RmtBuild *build, const RmfRecord *decl, int
     if (child < 0) {
         return;
     }
+    tree->modules[child].prelude_restrictions = decl->item;
     rmt_add_item(tree, module, decl->name, RMT_MODULE, RMT_NS_TYPE, child, decl->vis, 0, 0);
     rmt_build_file(build, child, file, children_dir, depth + 1);
 }
@@ -815,9 +873,12 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
             int id = rmt_add_import(tree, module, record->name, record->text, record->glob,
                                     record->vis, record->conditional);
             if (id >= 0)
-                tree->imports[id].conditional = record->conditional;
+                tree->imports[id].extern_crate = record->item != 0;
             break;
         }
+        case RMF_PRELUDE:
+            tree->modules[module].prelude_restrictions |= record->item;
+            break;
         case RMF_MACRO:
             tree->modules[module].macro_items = true;
             break;
@@ -887,11 +948,13 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
     for (uint32_t i = 0; i < count; i++) {
         TSNode item = ts_node_named_child(container, i);
         const char *kind = ts_node_type(item);
-        if (strcmp(kind, "attribute_item") == 0) {
+        if (strcmp(kind, "attribute_item") == 0 || strcmp(kind, "inner_attribute_item") == 0) {
             TSNode attr = cbm_find_child_by_kind(item, "attribute");
             if (!ts_node_is_null(attr) && ts_node_named_child_count(attr) > 0) {
                 const char *name = cbm_node_text(arena, ts_node_named_child(attr, 0), d->source);
-                if (name && (strcmp(name, "cfg") == 0 || strcmp(name, "cfg_attr") == 0))
+                if (name && (strcmp(name, "cfg") == 0 || strcmp(name, "cfg_attr") == 0 ||
+                             strcmp(name, "no_implicit_prelude") == 0 ||
+                             strcmp(name, "no_core") == 0 || strcmp(name, "no_std") == 0))
                     rmt_digest_node(d, item);
             }
         } else if (strcmp(kind, "mod_item") == 0) {
@@ -1021,7 +1084,11 @@ static void rmt_import_defs(CBMRustModTree *tree, int import, bool building, uin
         out->open = true;
         return;
     }
-    rmt_defs_merge(out, &imp->result, ns);
+    RmtDefs result = imp->result;
+    if (imp->conditional)
+        for (int i = 0; i < result.count; i++)
+            result.defs[i].conditional = true;
+    rmt_defs_merge(out, &result, ns);
 }
 
 /* True when `module` may name what is declared with visibility scope `vis`. */
@@ -1102,6 +1169,9 @@ static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name,
             unknown_source |= found.open;
             continue;
         }
+        if (imp->conditional)
+            for (int i = 0; i < found.count; i++)
+                found.defs[i].conditional = true;
         rmt_defs_merge(&supplied, &found, ns);
     }
     rmt_defs_merge(out, &supplied, ns);
@@ -1176,7 +1246,9 @@ static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8
     rmt_lookup_globs(tree, module, name, ns, out, visit, building, seers);
     RmtDef external = {0};
     if (out->count == 0 && (ns & RMT_NS_TYPE) &&
-        (tree->crates[tree->modules[module].crate].edition == CBM_RUST_EDITION_MODERN) &&
+        (tree->crates[tree->modules[module].crate].edition != CBM_RUST_EDITION_2015 &&
+         tree->crates[tree->modules[module].crate].edition != CBM_RUST_EDITION_UNKNOWN) &&
+        rmt_implicit_extern_allowed(tree, module, name) &&
         rmt_use_proves_extern(tree, module, name) &&
         rmt_extern_prelude(tree, tree->modules[module].crate, name, &external)) {
         /* The same-module use rules out this name in its unknown globs and
@@ -1197,8 +1269,16 @@ static void rmt_resolve_import(CBMRustModTree *tree, int import) {
     }
     imp->state = RMT_IMPORT_ACTIVE;
     RmtDefs result = {0};
-    rmt_resolve_path(tree, &tree->arena, imp->module, imp->segs, imp->seg_count,
-                     imp->glob ? RMT_NS_TYPE : RMT_NS_ALL, true, &result, true);
+    if (imp->extern_crate && imp->seg_count == 2 && imp->segs[0][0] == '\0') {
+        RmtDef external;
+        if (rmt_extern_prelude(tree, tree->modules[imp->module].crate, imp->segs[1], &external))
+            rmt_defs_add(&result, &external);
+        else
+            result.open = true;
+    } else {
+        rmt_resolve_path(tree, &tree->arena, imp->module, imp->segs, imp->seg_count,
+                         imp->glob ? RMT_NS_TYPE : RMT_NS_ALL, true, &result, true);
+    }
     imp = &tree->imports[import];
     if (result.assoc) {
         result = (RmtDefs){.open = true};
@@ -1280,7 +1360,8 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
      * A dependency crate is not: its items publish nothing, and impl
      * receivers keep its type names file-local. */
     if (out->open && out->count == 0 && !(tree->crates[crate].edition == CBM_RUST_EDITION_2015) &&
-        (ns & RMT_NS_TYPE) && (is_use || rmt_use_proves_extern(tree, module, head)) &&
+        (ns & RMT_NS_TYPE) && rmt_implicit_extern_allowed(tree, module, head) &&
+        (is_use || rmt_use_proves_extern(tree, module, head)) &&
         rmt_extern_prelude(tree, crate, head, &def) &&
         (def.kind == RMT_MODULE || rmt_in_list(RMT_LANGUAGE_CRATES, head))) {
         *out = (RmtDefs){0};
@@ -1290,8 +1371,10 @@ static void rmt_resolve_head(CBMRustModTree *tree, int module, const char *head,
     if (out->count > 0 || out->open) {
         return;
     }
-    if (((ns & RMT_NS_TYPE) && rmt_extern_prelude(tree, crate, head, &def)) ||
-        rmt_in_list(RMT_PRELUDE, head)) {
+    if (((ns & RMT_NS_TYPE) && rmt_implicit_extern_allowed(tree, module, head) &&
+         rmt_extern_prelude(tree, crate, head, &def)) ||
+        (!(rmt_scope_prelude_restrictions(tree, module) & CBM_RUST_PRELUDE_DISABLED) &&
+         rmt_in_list(RMT_PRELUDE, head))) {
         rmt_defs_add(out, &def);
     }
 }
@@ -1304,6 +1387,15 @@ static int rmt_start(CBMRustModTree *tree, int module, const char *const *segs, 
     int crate = tree->modules[module].crate;
     if (head[0] == '\0') {
         RmtDef def;
+        uint8_t restrictions = rmt_scope_prelude_restrictions(tree, module);
+        if (count >= 2 && (restrictions & CBM_RUST_PRELUDE_CORE_ONLY) &&
+            (strcmp(segs[1], "std") == 0 ||
+             ((restrictions & CBM_RUST_PRELUDE_DISABLED) && strcmp(segs[1], "core") == 0))) {
+            RmtVisit visit = {0};
+            rmt_lookup(tree, tree->crates[crate].root_module, segs[1], RMT_NS_TYPE, cur, &visit,
+                       building, NULL);
+            return !cur->open && cur->count == 1 ? 2 : -1;
+        }
         if (count < 2 || !rmt_extern_prelude(tree, crate, segs[1], &def)) {
             return -1;
         }
@@ -1477,6 +1569,31 @@ static bool rmt_innermost(const CBMRustModTree *tree, int file, int module, uint
     return true;
 }
 
+bool cbm_rust_modtree_prelude_allows(const CBMRustModTree *tree, const char *module_qn,
+                                     uint32_t offset, const char *name) {
+    if (!tree || !module_qn || !name)
+        return false;
+    int file = cbm_idxmemo_get(&tree->file_by_qn, module_qn);
+    bool any = false;
+    for (int m = file >= 0 ? tree->files[file].first_module : -1; m >= 0;
+         m = tree->modules[m].next_in_file) {
+        if (!rmt_contains(&tree->modules[m], offset) || !rmt_innermost(tree, file, m, offset))
+            continue;
+        CBMRustEdition edition = tree->crates[tree->modules[m].crate].edition;
+        if (edition == CBM_RUST_EDITION_UNKNOWN ||
+            ((strcmp(name, "TryFrom") == 0 || strcmp(name, "TryInto") == 0) &&
+             edition != CBM_RUST_EDITION_2021 && edition != CBM_RUST_EDITION_2024) ||
+            (strcmp(name, "Future") == 0 && edition != CBM_RUST_EDITION_2024))
+            return false;
+        uint8_t restrictions = rmt_scope_prelude_restrictions(tree, m);
+        if ((restrictions & CBM_RUST_PRELUDE_DISABLED) ||
+            ((restrictions & CBM_RUST_PRELUDE_CORE_ONLY) && strcmp(name, "ToString") == 0))
+            return false;
+        any = true;
+    }
+    return any;
+}
+
 static CBMRustPathResult rmt_classify(const RmtDefs *defs) {
     CBMRustPathResult unknown = {.kind = CBM_RUST_PATH_UNKNOWN};
     if (defs->open || defs->count == 0) {
@@ -1544,11 +1661,14 @@ static CBMRustPathResult rmt_classify_type(const RmtDefs *defs) {
         def->kind == RMT_ALIAS) {
         if (def->line == 0)
             return (CBMRustPathResult){.kind = CBM_RUST_PATH_AMBIGUOUS};
-        return (CBMRustPathResult){
-            .kind = CBM_RUST_PATH_TYPE, .qn = def->qn, .is_trait = def->kind == RMT_TRAIT};
+        return (CBMRustPathResult){.kind = CBM_RUST_PATH_TYPE,
+                                   .qn = def->qn,
+                                   .is_trait = def->kind == RMT_TRAIT,
+                                   .conditional = def->conditional};
     }
     if (def->kind == RMT_EXTERNAL) {
-        return (CBMRustPathResult){.kind = CBM_RUST_PATH_NOT_FUNCTION, .qn = def->qn};
+        return (CBMRustPathResult){
+            .kind = CBM_RUST_PATH_NOT_FUNCTION, .qn = def->qn, .conditional = def->conditional};
     }
     return unknown;
 }
