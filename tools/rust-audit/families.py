@@ -94,7 +94,7 @@ for f,fi in filenode.items():
         else: bad+=1; badrows.append((f,nodes[t]))
 print(f'  published Rust File->item IMPORTS: confirmed {good}, not confirmed {bad}, unverifiable(platform) {unver}')
 random.seed(1)
-for f,n in random.sample(badrows,10): print('    not confirmed:',f,'->',n)
+for f,n in random.sample(badrows,min(10,len(badrows))): print('    not confirmed:',f,'->',n)
 # 4. usages
 fnrefs=collections.defaultdict(set)
 module_refs=collections.defaultdict(set)
