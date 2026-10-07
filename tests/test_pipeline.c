@@ -7935,41 +7935,66 @@ TEST(pipeline_rust_inherent_typestate_candidates_are_not_chosen_by_order) {
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"state-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
-                    "mod getter; mod setter; pub struct Get; pub struct Set;\n"
-                    "pub struct Address<T>(pub T);\n"
-                    "pub fn probe(a: Address<Set>) { a.name(1); }\n");
+                    "mod getter; mod setter; mod states; pub use states::{Get, Set};\n"
+                    "pub struct Address<T = Get>(pub T); pub struct Pair<T, S = Get>(pub T, pub S); pub struct Mixed<T, S>(pub T, pub S); pub struct Dependent<T = Get, S = T>(pub T, pub S);\n"
+                    "pub fn probe(a: Address<Set>) { a.name(1); }\n"
+                    "pub fn common<T: Clone>(a: Pair<T, Set>) { a.name(1); }\n"
+                    "pub fn wildcard<T: Clone>(a: Mixed<T, Get>) { a.name(); }\n"
+                    "pub fn defaulted(a: Address) { a.name(); }\n"
+                    "pub fn built() { Address::<Set>::new().name(1); }\n"
+                    "pub fn defaulted_pair<T: Clone>(a: Pair<T>) { a.name(); }\n"
+                    "pub fn dependent(a: Dependent) { a.name(); }\n");
+    write_temp_file(tmp, "src/states.rs", "pub struct Get; pub struct Set;\n");
     write_temp_file(tmp, "src/getter.rs",
-                    "use crate::{Address, Get};\n"
-                    "impl Address<Get> { pub fn name(&self) -> i32 { 0 } }\n");
+                    "use crate::*;\n"
+                    "impl Address<Get> { pub fn name(&self) -> i32 { 0 } }\n"
+                    "impl<T: Clone> Pair<T, Get> { pub fn name(&self) -> i32 { 0 } }\n"
+                    "impl<T: Clone> Mixed<T, Get> { pub fn name(&self) -> i32 { 0 } }\n"
+                    "impl Dependent<Get, Get> { pub fn name(&self) -> i32 { 0 } }\n");
     write_temp_file(tmp, "src/setter.rs",
-                    "use crate::{Address, Set};\n"
-                    "impl Address<Set> { pub fn name(&self, value: i32) {} }\n");
+                    "use crate::*; pub struct U;\n"
+                    "impl Address<Set> { pub fn new() -> Self { Address(Set) } pub fn name(&self, value: i32) {} }\n"
+                    "impl<U: Clone> Pair<U, Set> { pub fn name(&self, value: i32) {} }\n"
+                    "impl Mixed<Set, Set> { pub fn name(&self, value: i32) {} }\n"
+                    "impl Dependent<Set, Set> { pub fn name(&self, value: i32) {} }\n");
     const RustModTreeCallCase cases[] = {
         {"getter is not a setter", "src.lib.probe", "src.getter.Address.name", false},
-        {"ambiguous inherent bucket is withheld", "src.lib.probe", "src.setter.Address.name", false},
+        {"proved setter argument selects setter", "src.lib.probe", "src.setter.Address.name", true},
+        {"common bounded parameters do not block getter rejection", "src.lib.common", "src.getter.Pair.name", false},
+        {"common bounded parameters retain selected setter", "src.lib.common", "src.setter.Pair.name", true},
+        {"bounded parameter matches unknown receiver argument", "src.lib.wildcard", "src.getter.Mixed.name", true},
+        {"other position rules out concrete candidate", "src.lib.wildcard", "src.setter.Mixed.name", false},
+        {"omitted argument uses source default", "src.lib.defaulted", "src.getter.Address.name", true},
+        {"source default excludes setter", "src.lib.defaulted", "src.setter.Address.name", false},
+        {"constructor Self retains written impl argument", "src.lib.built", "src.setter.Address.name", true},
+        {"constructor Self excludes declaration default", "src.lib.built", "src.getter.Address.name", false},
+        {"partial argument list fills default", "src.lib.defaulted_pair", "src.getter.Pair.name", true},
+        {"partial argument list excludes other state", "src.lib.defaulted_pair", "src.setter.Pair.name", false},
+        {"default refers to preceding argument", "src.lib.dependent", "src.getter.Dependent.name", true},
+        {"dependent default excludes other state", "src.lib.dependent", "src.setter.Dependent.name", false},
     };
-    int mismatches = check_rust_modtree_calls_in_both_modes(tmp, cases, 2);
+    int mismatches = check_rust_modtree_calls_in_both_modes(tmp, cases, 14);
     th_rmtree(tmp);
     ASSERT_EQ(mismatches, 0);
     PASS();
 }
 
-TEST(pipeline_rust_sole_specialized_inherent_impl_requires_exact_arguments) {
+TEST(pipeline_rust_sole_generic_inherent_impl_accepts_bounded_arguments) {
     char tmp[256] = "/tmp/w1-B1/specialized_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"specialized-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
-                    "mod methods; pub struct A; pub struct B; pub struct W<T>(pub T);\n"
+                    "mod methods; #[derive(Clone)] pub struct A; #[derive(Clone)] pub struct B; pub struct W<T>(pub T);\n"
                     "pub fn good(w: W<A>) { w.hit(); }\n"
                     "pub fn wrong(w: W<B>) { w.hit(); }\n"
-                    "pub fn unknown<T>(w: W<T>) { w.hit(); }\n");
+                    "pub fn unknown<T: Clone>(w: W<T>) { w.hit(); }\n");
     write_temp_file(tmp, "src/methods.rs",
-                    "use crate::{A, W}; impl W<A> { pub fn hit(&self) {} }\n");
+                    "use crate::W; impl<T: Clone> W<T> { pub fn hit(&self) {} }\n");
     const RustModTreeCallCase cases[] = {
         {"exact argument retains method", "src.lib.good", "src.methods.W.hit", true},
-        {"different argument cannot use impl", "src.lib.wrong", "src.methods.W.hit", false},
-        {"unknown argument cannot use impl", "src.lib.unknown", "src.methods.W.hit", false},
+        {"sole impl accepts another argument", "src.lib.wrong", "src.methods.W.hit", true},
+        {"sole impl accepts a bounded parameter", "src.lib.unknown", "src.methods.W.hit", true},
     };
     int mismatches = check_rust_modtree_calls_in_both_modes(tmp, cases, 3);
     th_rmtree(tmp);
@@ -8003,18 +8028,22 @@ TEST(pipeline_rust_inherent_refusals_record_exact_stop_reasons) {
                     "[package]\nname = \"refusal-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
                     "mod first; mod second; pub struct A; pub struct B;\n"
-                    "pub struct W<T>(pub T); pub struct S<T>(pub T); pub struct C;\n"
+                    "pub struct W<T>(pub T); pub struct S<T>(pub T); pub struct C; pub struct D;\n"
                     "impl C { pub fn copy(this: &Self) {} }\n"
-                    "pub fn ambiguous(w: W<B>) { w.hit(); }\n"
+                    "pub fn ambiguous<T>(w: W<T>) { w.hit(); }\n"
                     "pub fn mismatch(s: S<B>) { s.hit(); }\n"
                     "pub fn unknown<T>(s: S<T>) { s.hit(); }\n"
-                    "pub fn associated(c: C) { c.copy(); }\n");
+                    "pub fn associated(c: C) { c.copy(); }\n"
+                    "pub struct Arr<T, S>(pub T, pub S);\n"
+                    "impl Arr<[u8; 2], A> { pub fn hit(&self) {} }\n"
+                    "impl Arr<[u8; 3], B> { pub fn hit(&self) {} }\n"
+                    "pub fn erased_length(a: Arr<[u8; 2], A>) { a.hit(); }\n");
     write_temp_file(tmp, "src/first.rs",
                     "use crate::{A, W, S};\n"
                     "impl W<A> { pub fn hit(&self) {} }\n"
                     "impl S<A> { pub fn hit(&self) {} }\n");
     write_temp_file(tmp, "src/second.rs",
-                    "use crate::{B, W}; impl W<B> { pub fn hit(&self) {} }\n");
+                    "use crate::{B, D, W, S}; impl W<B> { pub fn hit(&self) {} } impl S<D> { pub fn hit(&self) {} }\n");
     char db[512];
     snprintf(db, sizeof(db), "%s/refusals.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
@@ -8027,10 +8056,11 @@ TEST(pipeline_rust_inherent_refusals_record_exact_stop_reasons) {
         int line;
         const char *reason;
     } expected[] = {
-        {4, "inherent_method_ambiguous"},
+        {4, "inherent_receiver_not_proven"},
         {5, "inherent_receiver_mismatch"},
         {6, "inherent_receiver_not_proven"},
         {7, "inherent_associated_function"},
+        {11, "inherent_receiver_not_proven"},
     };
     sqlite3_stmt *stmt = NULL;
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
@@ -8062,6 +8092,7 @@ TEST(pipeline_rust_generic_self_proves_only_its_enclosing_impl_methods) {
                     " pub fn run(&self) { self.own(); self.specialized(); }\n"
                     "}\n"
                     "impl W<A> { pub fn specialized(&self) {} }\n"
+                    "pub struct B; impl W<B> { pub fn specialized(&self) {} }\n"
                     "pub trait Tr { fn specialized(&self); }\n"
                     "impl<T: Clone> Tr for W<T> { fn specialized(&self) { self.specialized(); } }\n");
     const RustModTreeCallCase cases[] = {
@@ -19797,7 +19828,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_type_headed_call_prefers_crossfile_inherent_method);
     RUN_TEST(pipeline_rust_captured_pattern_shadows_outer_type_and_binds_fields);
     RUN_TEST(pipeline_rust_inherent_typestate_candidates_are_not_chosen_by_order);
-    RUN_TEST(pipeline_rust_sole_specialized_inherent_impl_requires_exact_arguments);
+    RUN_TEST(pipeline_rust_sole_generic_inherent_impl_accepts_bounded_arguments);
     RUN_TEST(pipeline_rust_method_syntax_cannot_select_associated_function);
     RUN_TEST(pipeline_rust_inherent_refusals_record_exact_stop_reasons);
     RUN_TEST(pipeline_rust_generic_self_proves_only_its_enclosing_impl_methods);

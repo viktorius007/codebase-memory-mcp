@@ -1160,6 +1160,8 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                             census_len(def->impl_trait) + census_len(def->supertraits) +
                             census_len(def->type_alias) + census_list(def->type_alias_params) +
                             census_list(def->rust_type_params) +
+                            census_list(def->rust_impl_type_params) +
+                            census_list(def->rust_type_param_defaults) +
                             census_list(def->rust_unbounded_impl_params);
         }
         for (int c = 0; c < r->calls.count; c++) {
