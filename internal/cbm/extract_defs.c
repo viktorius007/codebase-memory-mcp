@@ -5028,12 +5028,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (ctx->language == CBM_LANG_RUST && strcmp(kind, "type_item") == 0) {
         extract_rust_type_alias(a, node, ctx->source, &def);
     }
-    /* A generic struct, enum or union carries its type parameter names as
+    /* A generic nominal type or trait carries its type parameter names as
      * its positional parameters, as an alias's do across files, so a use
      * written `Name<A, B>` binds each to its argument. */
     if (ctx->language == CBM_LANG_RUST &&
         (strcmp(kind, "struct_item") == 0 || strcmp(kind, "enum_item") == 0 ||
-         strcmp(kind, "union_item") == 0)) {
+         strcmp(kind, "union_item") == 0 || strcmp(kind, "trait_item") == 0)) {
         def.signature_param_types =
             rust_item_type_param_names(a, node, ctx->source, &def.signature_param_count);
     }

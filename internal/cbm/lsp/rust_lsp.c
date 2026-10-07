@@ -116,6 +116,10 @@ static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char 
 static const CBMRegisteredFunc *rust_bound_method(RustLSPContext *ctx, const char *param,
                                                   const char *method, bool receiver_method,
                                                   bool *bounded);
+static bool rust_type_unproven(const CBMType *t, const char *const *params, int depth);
+static void rust_bound_trait_declarations(RustLSPContext *ctx, const char *trait_qn,
+                                          const char *method, bool receiver_method, int depth,
+                                          const CBMRegisteredFunc **selected, bool *ambiguous);
 static void rust_collect_item_bounds(RustLSPContext *ctx, TSNode item);
 static void rust_collect_trait_bounds(RustLSPContext *ctx, const char *param, TSNode node);
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
@@ -6897,8 +6901,10 @@ const CBMType *rust_eval_expr_typed(RustLSPContext *ctx, TSNode node, const CBMT
     return synth;
 }
 
-/* `sig` with every `Self` in its first return type replaced by `self_qn`. */
-static const CBMType *rust_sig_subst_self(RustLSPContext *ctx, const CBMType *sig,
+/* Substitute `Self`, then withhold trait returns whose parameters or projections
+ * still lack a substitution proof. */
+static const CBMType *rust_sig_subst_self(RustLSPContext *ctx, const CBMRegisteredFunc *method,
+                                          const CBMType *sig,
                                           const char *self_qn) {
     if (!sig || sig->kind != CBM_TYPE_FUNC || !sig->data.func.return_types ||
         !sig->data.func.return_types[0]) {
@@ -6906,6 +6912,12 @@ static const CBMType *rust_sig_subst_self(RustLSPContext *ctx, const CBMType *si
     }
     const CBMType *ret = sig->data.func.return_types[0];
     const CBMType *sub = rust_subst_self(ctx, ret, self_qn);
+    const CBMRegisteredType *owner = method->receiver_type
+        ? cbm_registry_lookup_type(ctx->registry, method->receiver_type) : NULL;
+    if (owner && owner->is_interface &&
+        rust_type_unproven(sub, owner->type_param_names, 0)) {
+        return cbm_type_unknown();
+    }
     if (sub == ret) {
         return sig;
     }
@@ -7113,6 +7125,13 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
         if (registered)
             type_qn = registered;
         method = method_call ? rust_lookup_method(ctx, type_qn, member) : NULL;
+        const CBMRegisteredType *trait = cbm_registry_lookup_type(ctx->registry, type_qn);
+        if (method_call && !method && trait && trait->is_interface) {
+            bool ambiguous = false;
+            rust_bound_trait_declarations(ctx, type_qn, member, true, 0, &method, &ambiguous);
+            if (ambiguous)
+                return cbm_type_unknown();
+        }
     }
     if (!type_qn)
         return cbm_type_unknown();
@@ -7134,7 +7153,7 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
             sig = rust_subst_receiver_args(ctx, sig, method->type_param_names, template_args,
                                            template_count, self_t, 0);
         }
-        return rust_sig_subst_self(ctx, sig, type_qn);
+        return rust_sig_subst_self(ctx, method, sig, type_qn);
     }
 
     /* Field on the type's RegisteredType: `inner: T` read through
@@ -12417,14 +12436,64 @@ static bool rust_type_unproven(const CBMType *t, const char *const *params, int 
     }
     /* Inside the impl a parameter's name is the parameter, also where a
      * type of that name is declared. */
-    const char *dot = strrchr(qn, '.');
-    const char *leaf = dot ? dot + 1 : qn;
     for (int i = 0; params && params[i]; i++) {
-        if (strcmp(params[i], leaf) == 0) {
-            return true;
+        for (const char *seg = qn; seg; seg = strchr(seg, '.') ? strchr(seg, '.') + 1 : NULL) {
+            size_t length = strcspn(seg, ".");
+            if (strlen(params[i]) == length && strncmp(params[i], seg, length) == 0) {
+                return true;
+            }
         }
     }
     return false;
+}
+
+/* Keep a proved callback receiver head while withholding its unproved
+ * instantiation. The erased arguments cannot type a subsequent field or return. */
+static const CBMType *rust_closure_declared_type(RustLSPContext *ctx, const CBMType *t,
+                                                 const char *const *params, int depth) {
+    if (!rust_type_unproven(t, params, depth)) {
+        return t;
+    }
+    if (!t || depth > RUST_RECEIVER_SUBST_MAX_DEPTH || ctx->registry_is_file_local) {
+        return cbm_type_unknown();
+    }
+    if (t->kind == CBM_TYPE_REFERENCE) {
+        const CBMType *elem = rust_closure_declared_type(ctx, t->data.reference.elem, params,
+                                                        depth + 1);
+        return cbm_type_is_unknown(elem) ? elem : rust_reference_like(ctx->arena, elem, t);
+    }
+    const CBMRegisteredType *nominal = t->kind == CBM_TYPE_TEMPLATE
+        ? cbm_registry_lookup_type(ctx->registry, t->data.template_type.template_name) : NULL;
+    if (!nominal || nominal->is_interface || nominal->rust_undeclared ||
+        nominal->rust_nominal_identity_ambiguous || nominal->rust_attribute_methods_unknown ||
+        nominal->alias_of) {
+        return cbm_type_unknown();
+    }
+    int count = t->data.template_type.arg_count;
+    /* A partial receiver cannot select a specialized or constrained inherent
+     * impl. Keep its head only when its inherent methods apply to every argument. */
+    for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
+        for (int f = 0; f < reg->func_count; f++) {
+            const CBMRegisteredFunc *method = &reg->funcs[f];
+            if (!method->receiver_type ||
+                strcmp(method->receiver_type, nominal->qualified_name) != 0 ||
+                (method->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0) {
+                continue;
+            }
+            for (int i = 0; i < count; i++) {
+                const char *name = method->type_param_names ? method->type_param_names[i] : NULL;
+                if (!name || !rust_name_in_list(method->rust_unbounded_impl_params, name) ||
+                    rust_name_in_list(method->type_param_names + i + 1, name)) {
+                    return cbm_type_unknown();
+                }
+            }
+        }
+    }
+    const CBMType **args = cbm_arena_alloc(ctx->arena, sizeof(*args) * (size_t)count);
+    for (int i = 0; i < count; i++) {
+        args[i] = cbm_type_unknown();
+    }
+    return cbm_type_template(ctx->arena, nominal->qualified_name, args, count);
 }
 
 /* The type `Self` names in `callee`'s signature at the call whose function
@@ -12466,8 +12535,8 @@ static const CBMType *rust_callee_self_type(RustLSPContext *ctx, TSNode fn,
  * of (also as `&closure`); its parameter at the closure's position declares a
  * call signature (rust_callable_param_sig), read with the callee's impl
  * parameters replaced by the receiver's type arguments and `Self` by the
- * receiver's type. A declared type that still names an unproven type
- * (rust_type_unproven) leaves the closure parameter unknown. */
+ * receiver's type. A proved nominal head survives unknown arguments;
+ * a bare unproved parameter or associated projection leaves it unknown. */
 static void rust_callee_closure_param_types(RustLSPContext *ctx, TSNode closure,
                                             const CBMType **out) {
     TSNode arg = closure;
@@ -12508,9 +12577,7 @@ static void rust_callee_closure_param_types(RustLSPContext *ctx, TSNode closure,
         }
         const CBMType *t = rust_subst_receiver_args(ctx, declared[i], callee->type_param_names,
                                                     self_args, self_argc, self_t, 0);
-        if (!rust_type_unproven(t, callee->type_param_names, 0)) {
-            out[i] = t;
-        }
+        out[i] = rust_closure_declared_type(ctx, t, callee->type_param_names, 0);
     }
 }
 
