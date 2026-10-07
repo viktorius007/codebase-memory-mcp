@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 #[path = "../scip_defs.rs"]
 mod scip_defs;
-use scip_defs::{Definitions, to_off};
+use scip_defs::{Doc, Occ, name_of, to_off};
 use std::io::Write;
 use syntax::ast::{self, AstNode, HasName};
-use syntax::{Edition, SourceFile, SyntaxKind::*, SyntaxNode, TextRange, TextSize};
+use syntax::{Edition, SourceFile, SyntaxKind::*, TextSize};
 
 struct Rd<'a> { b: &'a [u8], p: usize }
 impl<'a> Rd<'a> {
@@ -23,8 +23,6 @@ impl<'a> Rd<'a> {
         }
     }
 }
-struct Occ { range: Vec<i32>, body: Vec<i32>, sym: u32, roles: u32 }
-struct Doc { path: String, occs: Vec<Occ>, enc: u64 }
 
 fn intern(m: &mut HashMap<String, u32>, v: &mut Vec<String>, s: &str) -> u32 {
     if let Some(&i) = m.get(s) { return i; }
@@ -32,18 +30,13 @@ fn intern(m: &mut HashMap<String, u32>, v: &mut Vec<String>, s: &str) -> u32 {
 }
 
 fn line_starts(t: &str) -> Vec<usize> { let mut v = vec![0]; for (i, b) in t.bytes().enumerate() { if b == b'\n' { v.push(i + 1); } } v }
-fn fn_like(sym: &str) -> bool { sym.ends_with(").") }
 
 
 fn kind_of(sym: &str) -> &'static str {
     if sym.ends_with(").") { "fn" } else if sym.ends_with('#') { "type" } else if sym.ends_with('/') { "module" } else if sym.ends_with('!') { "macro" }
     else if sym.ends_with(')') { "param" } else if sym.ends_with(']') { "typeparam" } else if sym.ends_with('.') { "term" } else { "other" }
 }
-fn name_of(sym: &str) -> String {
-    let d = sym.trim_end_matches(|c| c == '.' || c == '#' || c == '/' || c == '!' || c == ')' || c == '(' || c == ']');
-    let i = d.rfind(|c| c == ']' || c == '/' || c == '#' || c == ' ' || c == '.' || c == '[' || c == '(').map(|i| i + 1).unwrap_or(0);
-    d[i..].trim_matches('`').to_string()
-}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let data = std::fs::read(&a[1]).unwrap();
@@ -78,27 +71,7 @@ fn main() {
         }
         docs.push(d);
     }
-    let mut def = Definitions::default();
-    for (di, d) in docs.iter().enumerate() { for o in &d.occs { if o.roles & 1 == 1 { def.insert(o.sym, di, &o.range, &o.body); } } }
-    let mut recovered = Vec::new();
-    let recorded: std::collections::HashSet<u32> = docs.iter().flat_map(|d| &d.occs)
-        .filter(|o| o.roles & 1 == 1).map(|o| o.sym).collect();
-    // SCIP's enclosing_range is the target body, not the caller's lexical scope.
-    for (di, d) in docs.iter().enumerate() {
-        let Ok(text) = std::fs::read_to_string(format!("{}/{}", a[2], d.path)) else { continue };
-        let ls = line_starts(&text);
-        let parsed = SourceFile::parse(&text, Edition::Edition2024);
-        if !parsed.errors().is_empty() { continue; }
-        let root = parsed.syntax_node();
-        for o in &d.occs {
-            if recorded.contains(&o.sym) { continue; }
-            let Some(range) = scip_defs::source_function(&root, &text, &ls, d.enc,
-                                                        &syms[o.sym as usize], &o.body) else { continue };
-            if def.insert(o.sym, di, &range, &o.body) {
-                recovered.push((di, o.sym, range[0] + 1));
-            }
-        }
-    }
+    let (def, recovered) = scip_defs::collect_definitions(&docs, &syms, std::path::Path::new(&a[2]));
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a[3]).unwrap());
     let mut ambiguous = 0usize;
     for (document, d) in docs.iter().enumerate() {
@@ -120,7 +93,7 @@ fn main() {
         }
         for &(_, symbol, line) in recovered.iter().filter(|&&(di, _, _)| di == document) {
             let sym = &syms[symbol as usize];
-            writeln!(out, "D\t{}\t{}\tfn\t{}\t{}", d.path, line, name_of(sym), sym.splitn(5, ' ').nth(4).unwrap_or("")).unwrap();
+            writeln!(out, "D\t{}\t{}\t{}\t{}\t{}", d.path, line, kind_of(sym), name_of(sym), sym.splitn(5, ' ').nth(4).unwrap_or("")).unwrap();
         }
         for o in &d.occs {
             let sym = &syms[o.sym as usize];
@@ -129,7 +102,7 @@ fn main() {
                 writeln!(out, "D\t{}\t{}\t{}\t{}\t{}", d.path, o.range[0] + 1, kind_of(sym), name_of(sym), sym.splitn(5, ' ').nth(4).unwrap_or("")).unwrap();
                 continue;
             }
-            let (di, dl) = match def.resolve(o.sym, document, &o.body) {
+            let (di, dl) = match def.resolve(o.sym, document, &o.body, &o.range) {
                 Ok(Some(site)) => site,
                 Ok(None) => continue,
                 Err(()) => { ambiguous += 1; continue; }
