@@ -3604,6 +3604,14 @@ static const CBMType *rust_eval_literal_type(RustLSPContext *ctx, const char *ki
                 return cbm_type_builtin(ctx->arena, suffixes[i]);
             }
         }
+        /* Decimal integer tokens can carry a float suffix; hex digits f32/f64 are not suffixes. */
+        if (integer && text && !(text[0] == '0' && (text[1] == 'x' || text[1] == 'o' || text[1] == 'b'))) {
+            for (size_t i = 0; i < sizeof(float_suffixes) / sizeof(float_suffixes[0]); i++) {
+                size_t suffix_length = strlen(float_suffixes[i]);
+                if (length > suffix_length && strcmp(text + length - suffix_length, float_suffixes[i]) == 0)
+                    return cbm_type_builtin(ctx->arena, float_suffixes[i]);
+            }
+        }
         /* A default numeric type is not source evidence, including when the
          * literal flows through an inferred binding into impl selection. */
         return cbm_type_unknown();
@@ -6662,11 +6670,15 @@ static const CBMType *rust_sequence_index_output(RustLSPContext *ctx, const CBMT
                                                 const CBMType *index) {
     const CBMType *elem = NULL;
     if (base && base->kind == CBM_TYPE_SLICE) elem = base->data.slice.elem;
-    if (base && base->kind == CBM_TYPE_TEMPLATE && base->data.template_type.arg_count == 1 &&
-        rust_std_family_of(ctx, base->data.template_type.template_name) == RUST_STD_VEC)
+    const char *receiver = rust_std_type_head(base);
+    bool deque = receiver && (strcmp(receiver, "std.collections.VecDeque") == 0 ||
+                               strcmp(receiver, "alloc.collections.VecDeque") == 0);
+    if (base && base->kind == CBM_TYPE_TEMPLATE && base->data.template_type.arg_count > 0 &&
+        (deque || rust_std_family_of(ctx, base->data.template_type.template_name) == RUST_STD_VEC))
         elem = base->data.template_type.template_args[0];
     if (!elem || !index) return NULL;
     if (index->kind == CBM_TYPE_BUILTIN && strcmp(index->data.builtin.name, "usize") == 0) return elem;
+    if (deque) return NULL; /* VecDeque has scalar Index, not range Index. */
     const char *head = rust_std_type_head(index);
     if (!head) return NULL;
     if (strncmp(head, "std.ops.", 8) == 0) head += 8;
@@ -6908,13 +6920,13 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 || strcmp(op, "<") == 0 ||
             strcmp(op, ">") == 0 || strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 ||
             strcmp(op, "&&") == 0 || strcmp(op, "||") == 0) return cbm_type_builtin(ctx->arena, "bool");
-        const CBMType *a = rust_eval_expr_type(ctx, left);
-        const CBMType *b = rust_eval_expr_type(ctx, right);
-        if (rust_numeric_primitive(a, false) &&
-            (strcmp(ts_node_type(right), "integer_literal") == 0 || strcmp(ts_node_type(right), "float_literal") == 0))
+        const CBMType *a = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, left), 0);
+        const CBMType *b = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, right), 0);
+        if ((strcmp(ts_node_type(right), "integer_literal") == 0 && rust_numeric_primitive(a, true)) ||
+            (strcmp(ts_node_type(right), "float_literal") == 0 && rust_numeric_primitive(a, false) && !rust_numeric_primitive(a, true)))
             b = rust_eval_expr_typed(ctx, right, a);
-        if (rust_numeric_primitive(b, false) &&
-            (strcmp(ts_node_type(left), "integer_literal") == 0 || strcmp(ts_node_type(left), "float_literal") == 0))
+        if ((strcmp(ts_node_type(left), "integer_literal") == 0 && rust_numeric_primitive(b, true)) ||
+            (strcmp(ts_node_type(left), "float_literal") == 0 && rust_numeric_primitive(b, false) && !rust_numeric_primitive(b, true)))
             a = rust_eval_expr_typed(ctx, left, b);
         bool shift = strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0;
         bool bits = strcmp(op, "&") == 0 || strcmp(op, "|") == 0 || strcmp(op, "^") == 0;
@@ -6937,8 +6949,15 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         const char *head = rust_std_type_head(base);
         const CBMRegisteredType *owner = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
         if (actual != base && owner && owner->rust_operator_impls) return cbm_type_unknown();
-        output = rust_sequence_index_output(ctx, base, idx);
-        return output ? output : cbm_type_unknown();
+        for (int hop = 0; base && hop < RUST_DEREF_MAX_HOPS; hop++) {
+            output = rust_sequence_index_output(ctx, base, idx);
+            if (output) return output;
+            const char *deref_head = rust_std_type_head(base);
+            if (!deref_head || rust_std_family_of(ctx, deref_head) != RUST_STD_BOX) break;
+            base = rust_std_deref_target(ctx, base);
+            base = rust_strip_references(base);
+        }
+        return cbm_type_unknown();
     }
 
     /* parenthesized_expression */
@@ -14207,6 +14226,21 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
      * receivers can route via the bound trait. */
     int saved_bound_count = ctx->type_param_bound_count;
     rust_collect_item_bounds(ctx, func_node);
+
+    /* Const parameters are values of their written type, including impl parameters. */
+    for (TSNode item = func_node; !ts_node_is_null(item); item = ts_node_parent(item)) {
+        if (!ts_node_eq(item, func_node) && strcmp(ts_node_type(item), "function_item") == 0) break;
+        TSNode generics = ts_node_child_by_field_name(item, "type_parameters", 15);
+        if (ts_node_is_null(generics)) continue;
+        for (uint32_t i = 0; i < ts_node_named_child_count(generics); i++) {
+            TSNode param = ts_node_named_child(generics, i);
+            if (strcmp(ts_node_type(param), "const_parameter") != 0) continue;
+            TSNode name = ts_node_child_by_field_name(param, "name", 4);
+            TSNode type = ts_node_child_by_field_name(param, "type", 4);
+            if (!ts_node_is_null(name) && !ts_node_is_null(type))
+                cbm_scope_bind(ctx->current_scope, rust_node_text(ctx, name), rust_parse_type_node(ctx, type));
+        }
+    }
 
     /* Bind self for impl/trait methods. */
     TSNode params = ts_node_child_by_field_name(func_node, "parameters", 10);

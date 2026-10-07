@@ -8911,11 +8911,25 @@ static int check_rust_expression_results(bool sequential, int scenario) {
         "pub fn product(x: Left, y: Right) { let z = x * y; z.result(); }\n"
         "impl Mul<Left> for Left { type Output = Alternate; fn mul(self, _: Left) -> Alternate { Alternate } }\n"
         "pub fn other_rhs(x: Left, y: Left) { let z = x * y; z.result(); }\n"
+        "impl Mul<f64> for Left { type Output = Product; fn mul(self, _: f64) -> Product { Product } }\n"
+        "pub fn explicit_literal(x: Left) { (x * 1f64).result(); }\n"
         "pub fn unsupported(x: std::time::Duration, y: u32) { let z = x * y; z.as_secs(); }\n",
         "pub struct Entity; impl Entity { pub fn iter(&self) {} }\n"
         "pub fn literal(v: Vec<Entity>) { v[1..].iter(); }\n"
         "pub fn bound(v: Vec<Entity>, r: std::ops::Range<usize>) { v[r].iter(); }\n"
         "pub fn element(v: Vec<Entity>) { v[0].iter(); }\n"
+        "pub fn deque(v: std::collections::VecDeque<Entity>, i: usize) { v[i].iter(); }\n"
+        "use std::collections::VecDeque as Queue;\n"
+        "pub fn deque_alias(v: Queue<Entity>, i: usize) { v[i].iter(); }\n"
+        "pub fn slice(v: &[Entity], i: usize) { v[i].iter(); }\n"
+        "pub fn array(v: [Entity; 2], i: usize) { v[i].iter(); }\n"
+        "pub type Slot = usize; pub fn alias_index(v: Vec<Entity>, i: Slot) { v[i - 1].iter(); }\n"
+        "pub fn boxed(v: Box<[Entity]>, i: usize) { v[i].iter(); }\n"
+        "pub fn opaque<I: std::slice::SliceIndex<[Entity], Output = [Entity]>>(v: Vec<Entity>, i: I) { v[i].iter(); }\n"
+        "pub fn opaque_slice<I: std::slice::SliceIndex<[Entity], Output = [Entity]>>(v: &[Entity], i: I) { v[i].iter(); }\n"
+        "pub fn const_index<const N: usize>(v: [Entity; N]) { for i in (0..N).rev() { v[i].iter(); } }\n"
+        "pub struct ArrayHolder<const N: usize> { pub values: [Entity; N] }\n"
+        "impl<const N: usize> ArrayHolder<N> { pub fn const_impl(&self) { for i in (0..N).rev() { self.values[i].iter(); } } }\n"
         "pub struct Window; pub struct BorrowedWindow; pub struct Container;\n"
         "impl Window { pub fn result(&self) {} }\n"
         "impl BorrowedWindow { pub fn result(&self) {} }\n"
@@ -8980,12 +8994,24 @@ static int check_rust_expression_results(bool sequential, int scenario) {
             snprintf(target, sizeof(target), "%s.src.lib.Alternate.result", project);
             correct = correct && exact_call_qns_exist(store, project, caller, target) &&
                       !exact_call_qns_exist(store, project, caller, wrong);
+            snprintf(caller, sizeof(caller), "%s.src.lib.explicit_literal", project);
+            snprintf(target, sizeof(target), "%s.src.lib.Product.result", project);
+            correct = correct && exact_call_qns_exist(store, project, caller, target) &&
+                      !exact_call_qns_exist(store, project, caller, wrong);
         } else if (scenario == 1) {
-            snprintf(caller, sizeof(caller), "%s.src.lib.element", project);
-            correct = exact_call_qns_exist(store, project, caller, target);
+            static const char *const scalar_callers[] = {"element", "deque", "deque_alias", "slice", "array", "boxed", "const_index", "ArrayHolder.const_impl", "alias_index"};
+            correct = true;
+            for (int i = 0; i < 9; i++) {
+                snprintf(caller, sizeof(caller), "%s.src.lib.%s", project, scalar_callers[i]);
+                correct = correct && exact_call_qns_exist(store, project, caller, target);
+            }
             snprintf(caller, sizeof(caller), "%s.src.lib.literal", project);
             correct = correct && !exact_call_qns_exist(store, project, caller, target);
             snprintf(caller, sizeof(caller), "%s.src.lib.bound", project);
+            correct = correct && !exact_call_qns_exist(store, project, caller, target);
+            snprintf(caller, sizeof(caller), "%s.src.lib.opaque", project);
+            correct = correct && !exact_call_qns_exist(store, project, caller, target);
+            snprintf(caller, sizeof(caller), "%s.src.lib.opaque_slice", project);
             correct = correct && !exact_call_qns_exist(store, project, caller, target);
             snprintf(caller, sizeof(caller), "%s.src.lib.custom", project);
             snprintf(target, sizeof(target), "%s.src.lib.Window.result", project);
@@ -9023,13 +9049,23 @@ static int check_rust_expression_results(bool sequential, int scenario) {
                 "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.unsupported' AND kind='call' AND reason='unknown_receiver_type'" :
                 scenario == 1 ?
                 "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.literal' OR caller LIKE '%.bound') AND kind='call'" :
-                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.foreign_default' AND name='default' AND kind='call'";
+                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.foreign_default' AND name='default' AND kind='call' AND reason='default_impl_not_proven'";
             sqlite3_stmt *stmt = NULL;
             int count = 0;
             if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK &&
                 sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
             sqlite3_finalize(stmt);
             correct = correct && count == (scenario == 1 ? 2 : 1);
+            if (scenario == 0 || scenario == 1) {
+                count = -1;
+                const char *stop = scenario == 0 ?
+                    "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.unsupported' AND reason='operator_output_not_proven'" :
+                    "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.opaque' OR caller LIKE '%.opaque_slice') AND reason='index_output_not_proven'";
+                if (sqlite3_prepare_v2(cbm_store_get_db(store), stop, -1, &stmt, NULL) == SQLITE_OK &&
+                    sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+                sqlite3_finalize(stmt);
+                correct = correct && count == (scenario == 1 ? 2 : 1);
+            }
             if (scenario == 1) {
                 count = -1;
                 if (sqlite3_prepare_v2(cbm_store_get_db(store),
