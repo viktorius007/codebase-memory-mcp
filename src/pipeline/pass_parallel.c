@@ -1603,7 +1603,12 @@ typedef struct {
 /* Sanitize expression string for JSON (in-place). */
 static void sanitize_expr(char *expr_buf, const char *expr) {
     if (expr) {
-        snprintf(expr_buf, 128, "%.*s", 120, expr);
+        size_t length = strnlen(expr, 120);
+        while (length > 0 && ((unsigned char)expr[length] & 0xc0) == 0x80) {
+            length--;
+        }
+        memcpy(expr_buf, expr, length);
+        expr_buf[length] = '\0';
         for (char *p = expr_buf; *p; p++) {
             if (*p == '"') {
                 *p = '\'';
@@ -2587,9 +2592,9 @@ static const cbm_gbuf_node_t *resolve_file_call_target(resolve_ctx_t *rc,
 
 static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                             CBMCall *call, const cbm_gbuf_node_t *source_node,
-                                            const char *resolved_qn, const char *module_qn,
-                                            const char **imp_keys, const char **imp_vals,
-                                            int imp_count) {
+                                            const char *resolved_qn, int resolved_candidates,
+                                            const char *module_qn, const char **imp_keys,
+                                            const char **imp_vals, int imp_count) {
     cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
     if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
         const char *cu = call->first_string_arg;
@@ -2610,7 +2615,9 @@ static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_st
     }
 
     if (!resolved_qn || resolved_qn[0] == '\0') {
-        if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
+        if (resolved_candidates <= 1 &&
+            cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
             cbm_resolution_t fake_res = {
                 .qualified_name = call->callee_name,
                 .confidence = PP_HALF_CONF,
@@ -2619,6 +2626,7 @@ static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_st
             emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                               module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
                               false, NULL);
+            return true;
         } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
             /* Native `fetch()` (#856): only the global API once resolution
              * has failed to find a local/imported `fetch`. Call the low-level
@@ -2634,9 +2642,10 @@ static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_st
                 };
                 emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
                                              CBM_SVC_HTTP, u);
+                return true;
             }
         }
-        return true;
+        return false;
     }
     return false;
 }
@@ -2713,8 +2722,14 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
      * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
      * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
      * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
-    if (emit_file_call_service_fallback(rc, ws, call, source_node, res.qualified_name, module_qn,
-                                        imp_keys, imp_vals, imp_count)) {
+    if (emit_file_call_service_fallback(rc, ws, call, source_node, res.qualified_name,
+                                        res.candidate_count, module_qn, imp_keys, imp_vals,
+                                        imp_count)) {
+        return;
+    }
+    if (!res.qualified_name || !res.qualified_name[0]) {
+        cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call, NULL,
+                                            "name_binding_not_proven");
         return;
     }
     /* Reuse lsp_target as target_node when LSP resolved — avoids a

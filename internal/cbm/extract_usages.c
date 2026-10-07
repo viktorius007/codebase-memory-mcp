@@ -2979,7 +2979,10 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
              * macro invokes it is unproved. Keep the ordinary USAGE resolver
              * carrier and a separate invocation-stop candidate. */
             usage.unresolved_filter = CBM_USAGE_MACRO_FILTERED;
-            usage.may_be_call_reference = false;
+            TSNode next = ts_node_next_sibling(node);
+            usage.may_be_call_reference = !ts_node_is_null(next) &&
+                                          strcmp(ts_node_type(next), "token_tree") == 0 &&
+                                          ctx->source[ts_node_start_byte(next)] == '(';
             cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
         }
     }

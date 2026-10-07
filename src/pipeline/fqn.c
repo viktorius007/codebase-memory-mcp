@@ -5,6 +5,7 @@
  * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
  */
 #include "pipeline/pipeline.h"
+#include "helpers.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h"
@@ -64,6 +65,9 @@ static char *join_segments(const char **segments, int count) {
 
 /* Strip file extension from the last path component. */
 static void strip_file_extension(char *path) {
+    if (cbm_fqn_preserves_extension(path)) {
+        return;
+    }
     char *last_slash = strrchr(path, '/');
     char *start = last_slash ? last_slash + SKIP_ONE : path;
     char *ext = strrchr(start, '.');

@@ -222,6 +222,9 @@ bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang);
 // --- FQN computation ---
 
 // Compute qualified name: project.rel_path_parts.name
+// Schema/config extensions remain distinct from same-stem source modules.
+bool cbm_fqn_preserves_extension(const char *path);
+
 char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, const char *name);
 
 // Module QN (file without name): project.rel_path_parts

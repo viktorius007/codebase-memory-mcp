@@ -482,11 +482,9 @@ TEST(resolve_suffix_match) {
     cbm_registry_add(r, "Process", "proj.svcA.Process", "Function");
     cbm_registry_add(r, "Process", "proj.svcB.Process", "Function");
 
-    /* Caller in svcA — should prefer svcA via import distance */
+    /* Import distance does not bind a bare name to another file. */
     cbm_resolution_t res = cbm_registry_resolve(r, "Process", "proj.svcA.caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(res.qualified_name, "proj.svcA.Process");
-    ASSERT_STR_EQ(res.strategy, "suffix_match");
-    ASSERT_TRUE(res.confidence >= 0.50 && res.confidence <= 0.60);
+    ASSERT_NULL(res.qualified_name);
 
     cbm_registry_free(r);
     PASS();
@@ -585,11 +583,11 @@ TEST(negative_import_rejects_unimported) {
     cbm_registry_add(r, "Process", "proj.billing.Process", "Function");
     cbm_registry_add(r, "Process", "proj.handler.Process", "Function");
 
-    /* Import only handler's module — suffix_match should prefer handler */
+    /* Importing a module does not bind its members as bare identifiers. */
     const char *keys[] = {"handler"};
     const char *vals[] = {"proj.handler"};
     cbm_resolution_t res = cbm_registry_resolve(r, "Process", "proj.caller", keys, vals, 1);
-    ASSERT_STR_EQ(res.qualified_name, "proj.handler.Process");
+    ASSERT_NULL(res.qualified_name);
 
     cbm_registry_free(r);
     PASS();

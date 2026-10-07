@@ -1720,9 +1720,10 @@ static bool rmt_use_agree(RmtDefs *agreed, bool *any, const RmtDefs *defs) {
     return true;
 }
 
-/* Write the project items of an agreed `use` answer; -1 when it names a
- * module or an item without a QN. */
-static int rmt_use_emit(const RmtDefs *agreed, const char **out_qns, int max) {
+/* Write the project items or modules of an agreed `use` answer;
+ * -1 when an item has no materializable QN. */
+static int rmt_use_emit(const CBMRustModTree *tree, const RmtDefs *agreed, const char **out_qns,
+                        int max) {
     for (int i = 0; i < agreed->count; i++) {
         if (agreed->defs[i].kind != RMT_EXTERNAL && agreed->defs[i].line == 0 &&
             agreed->defs[i].kind != RMT_MODULE && agreed->defs[i].kind != RMT_OPAQUE)
@@ -1737,11 +1738,12 @@ static int rmt_use_emit(const RmtDefs *agreed, const char **out_qns, int max) {
         if (def->kind == RMT_EXTERNAL) {
             continue;
         }
-        if (def->kind == RMT_MODULE || def->kind == RMT_OPAQUE || !def->qn) {
+        const char *qn = def->kind == RMT_MODULE ? tree->modules[def->module].qn : def->qn;
+        if (def->kind == RMT_OPAQUE || !qn) {
             return -1;
         }
         if (found < max) {
-            out_qns[found++] = def->qn;
+            out_qns[found++] = qn;
         }
     }
     return found;
@@ -1775,7 +1777,7 @@ int cbm_rust_modtree_use_items_at(const CBMRustModTree *tree, CBMArena *arena, c
             return -1;
         }
     }
-    return any ? rmt_use_emit(&agreed, out_qns, max) : -1;
+    return any ? rmt_use_emit(tree, &agreed, out_qns, max) : -1;
 }
 
 int cbm_rust_modtree_use_items(const CBMRustModTree *tree, CBMArena *arena, const char *rel_path,
@@ -1807,5 +1809,5 @@ int cbm_rust_modtree_use_items(const CBMRustModTree *tree, CBMArena *arena, cons
             return -1;
         }
     }
-    return any ? rmt_use_emit(&agreed, out_qns, max) : -1;
+    return any ? rmt_use_emit(tree, &agreed, out_qns, max) : -1;
 }

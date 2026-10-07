@@ -1311,7 +1311,13 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         return (cbm_resolution_t){arr->items[0], "unique_name", conf, REG_RESOLVED};
     }
 
-    /* Strategy 4: multiple candidates. */
+    /* A short name shared by several files has no proven binding outside
+     * the Rust module tree. Import distance is not declaration identity. */
+    const CBMRustModTree *tree = rust_file_modtree(module_qn);
+    if (!tree) {
+        return (cbm_resolution_t){.candidate_count = arr->count};
+    }
+    /* Strategy 4: multiple candidates bound through the Rust module tree. */
     cbm_resolution_t legacy = empty_result();
     if (import_vals && import_count > 0) {
         legacy = resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
@@ -1325,10 +1331,6 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     }
     /* A Rust file binds by `use` and module placement, also when it has no
      * IMPORTS edge (a glob makes none). */
-    const CBMRustModTree *tree = rust_file_modtree(module_qn);
-    if (!tree) {
-        return legacy;
-    }
     return resolve_multi_rust(r, tree, arr, callee_name, lookup, module_qn, import_keys,
                               import_vals, import_count, legacy);
 }

@@ -351,6 +351,21 @@ int cbm_json_escape(char *buf, int bufsize, const char *src) {
                 break;
             }
             pos += snprintf(buf + pos, 7, "\\u%04x", c);
+        } else if (c >= 0x80) {
+            int width = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 0;
+            if (!width || pos + width > bufsize - JSON_NUL_RESERVE) {
+                break;
+            }
+            int length = 1;
+            while (length < width && ((unsigned char)src[i + length] & 0xc0) == 0x80) {
+                length++;
+            }
+            if (length != width) {
+                break;
+            }
+            memcpy(buf + pos, src + i, (size_t)width);
+            pos += width;
+            i += width - 1;
         } else {
             buf[pos++] = (char)c;
         }

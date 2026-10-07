@@ -13142,7 +13142,7 @@ TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module) {
     /* A `use` names the item its path resolves to: through a by-name
      * `pub use`, through a `#[path]` module, and from the inline module that
      * declares it. A re-exported std item is proven outside the project (0);
-     * an unknown name and a module are left undecided (-1). */
+     * an unknown name is undecided (-1); a module retains its own QN. */
     static const char *const rels[] = {"src/lib.rs", "src/cli.rs", "src/device_buffers.rs",
                                        "src/aaa.rs", "src/user.rs"};
     static const char *const qns[] = {"p.src.lib", "p.src.cli", "p.src.device_buffers",
@@ -13177,7 +13177,8 @@ TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module) {
                                          out, 2),
               -1);
     ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/user.rs", "cli", "crate::cli", out, 2),
-              -1);
+              1);
+    ASSERT_STR_EQ(out[0], "p.src.cli");
     /* A block-level `use` is not declared by any module: its path is
      * resolved from the file's modules, which must agree. */
     ASSERT_EQ(cbm_rust_modtree_use_items(tree, &arena, "src/cli.rs", "Frame",
