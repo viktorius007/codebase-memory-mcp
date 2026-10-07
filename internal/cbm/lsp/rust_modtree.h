@@ -163,6 +163,14 @@ CBMRustPathResult cbm_rust_modtree_resolve_type(const CBMRustModTree *tree, CBMA
                                                 const char *path, const char *const *extra_names,
                                                 const char *const *extra_paths, int extra_count);
 
+/* Prove a trait binding at this site, including renamed and anonymous
+ * imports reached through module globs. Extra globs are raw block-use paths. */
+bool cbm_rust_modtree_trait_in_scope(const CBMRustModTree *tree, CBMArena *arena,
+                                      const char *module_qn, uint32_t offset, const char *qn,
+                                      const char *const *extra_names,
+                                      const char *const *extra_paths, int extra_count,
+                                      const char *const *extra_globs, int glob_count);
+
 /* Physical module containing a declared item QN, or NULL if unregistered. */
 const char *cbm_rust_modtree_item_module(const CBMRustModTree *tree, CBMArena *arena,
                                          const char *item_qn);

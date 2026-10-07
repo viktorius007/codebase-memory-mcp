@@ -89,6 +89,7 @@ typedef struct {
     int file_use_count; /* entries below this index are file-level, above are block `use`s */
 
     const char **glob_module_qns;
+    const char **glob_raw_paths;
     int glob_count;
     /* Globs declared at file level; any glob beyond this index belongs to an
      * enclosing block and shadows the module's own items. */
@@ -434,6 +435,11 @@ typedef struct CBMRustImportSource {
      * before the `mod` item that loads it (textual scope across files). */
     const struct CBMRustMacroTable *macros;
 } CBMRustImportSource;
+
+/* Selected local macro_rules! transcriber after matching and substitution,
+ * or NULL for missing/unsupported rules. Arena-owned; does not run proc macros. */
+char *cbm_rust_expand_local_item_macro(CBMArena *arena, const char *source, TSNode root,
+                                       TSNode invocation);
 
 /* One file's macro facts: its file-level `macro_rules!` definitions and its
  * out-of-line `mod name;` declarations, in source order. NULL when the file

@@ -225,6 +225,30 @@ static CBMCargoTarget *append_target(CBMArena *arena, CBMCargoManifest *manifest
     return target;
 }
 
+/* Quoted "edition.workspace" is one key, unlike edition.workspace. */
+static int cargo_key_path(CBMArena *arena, const char *s, int len, int from,
+                            const char **out) {
+    const char *path = "";
+    while (from < len) {
+        while (from < len && (s[from] == ' ' || s[from] == '\t')) from++;
+        const char *part = NULL;
+        int start = from;
+        if (from < len && (s[from] == '"' || s[from] == '\''))
+            from = parse_string(arena, s, len, from, &part);
+        else {
+            while (from < len && is_ident_char(s[from]) && s[from] != '.') from++;
+            if (from > start) part = cbm_arena_strndup(arena, s + start, (size_t)(from - start));
+        }
+        if (!part || !*part || strchr(part, '\x1f')) return start;
+        path = cbm_arena_sprintf(arena, "%s%s%s", path, *path ? "\x1f" : "", part);
+        while (from < len && (s[from] == ' ' || s[from] == '\t')) from++;
+        if (from >= len || s[from] != '.') break;
+        from++;
+    }
+    *out = path;
+    return from;
+}
+
 /* For the `[dependencies]` / `[dev-dependencies]` / `[workspace.dependencies]`
  * sections, parse `key = value` lines until the next section. The value
  * may be a string (the version) or an inline table. We capture both
@@ -235,11 +259,24 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
     from = skip_ws_and_comment(s, len, from);
     if (from >= len || s[from] == '[') return from;
     const char* key = NULL;
-    from = parse_key(a, s, len, from, &key);
+    from = cargo_key_path(a, s, len, from, &key);
     from = skip_ws_and_comment(s, len, from);
     if (from < len && s[from] == '=') {
         from++;
         from = skip_ws_and_comment(s, len, from);
+    }
+    const char *field = key ? strchr(key, '\x1f') : NULL;
+    if (field) {
+        const char *name = cbm_arena_strndup(a, key, (size_t)(field - key));
+        CBMCargoDep *dep = NULL;
+        for (int i = 0; i < out->dep_count; i++)
+            if (strcmp(out->deps[i].name, name) == 0) dep = &out->deps[i];
+        if (!dep && out->dep_count < CBM_CARGO_MAX_DEPS) {
+            dep = &out->deps[out->dep_count++];
+            dep->name = name;
+        }
+        return dep && strcmp(field + 1, "path") == 0
+            ? parse_string(a, s, len, from, &dep->path) : skip_value(s, len, from);
     }
     const char* path_val = NULL;
     if (from < len && s[from] == '{') {
@@ -274,30 +311,6 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
         out->deps[out->dep_count].path = path_val;
         out->dep_count++;
     }
-    return from;
-}
-
-/* Quoted "edition.workspace" is one key, unlike edition.workspace. */
-static int cargo_key_path(CBMArena *arena, const char *s, int len, int from,
-                            const char **out) {
-    const char *path = "";
-    while (from < len) {
-        while (from < len && (s[from] == ' ' || s[from] == '\t')) from++;
-        const char *part = NULL;
-        int start = from;
-        if (from < len && (s[from] == '"' || s[from] == '\''))
-            from = parse_string(arena, s, len, from, &part);
-        else {
-            while (from < len && is_ident_char(s[from]) && s[from] != '.') from++;
-            if (from > start) part = cbm_arena_strndup(arena, s + start, (size_t)(from - start));
-        }
-        if (!part || !*part || strchr(part, '\x1f')) return start;
-        path = cbm_arena_sprintf(arena, "%s%s%s", path, *path ? "\x1f" : "", part);
-        while (from < len && (s[from] == ' ' || s[from] == '\t')) from++;
-        if (from >= len || s[from] != '.') break;
-        from++;
-    }
-    *out = path;
     return from;
 }
 

@@ -407,38 +407,72 @@ builds against another grammar.
 Concrete dot-call trait candidates require a positive lexical identity proof.
 The existing module tree proves declarations in the innermost module, named
 `use` imports (including renames and re-exports), and unambiguous module globs;
-active block `use` paths are supplied separately. An unconditional trait
+active block `use` paths, anonymous imports, and globs are supplied separately.
+Renamed bindings and anonymous imports propagate through proved ancestor globs
+and crate prelude re-exports. Root `extern crate ... as ...` bindings, including
+`extern crate self as ...`, enter the extern prelude of child modules. Imports
+left open by a recursive re-export are retried after their dependencies settle.
+Declared procedural macro exports occupy the macro namespace, so a derive import
+does not hide a same-named trait imported by name or a glob. Dotted Cargo dependency fields such as
+`facade.workspace = true` name the dependency `facade`, allowing its re-exports
+to be followed. Block imports use Rust’s import-path resolution rules. An unconditional trait
 declaration in the current source module also proves scope when the file has no
 Cargo mapping; attributed declarations do not use this fallback. Supertrait methods are
 reachable through a proved imported subtrait. A prelude proof names the canonical
 std trait, never a project trait with the same leaf name. Prelude availability
 also checks module attributes inherited through out-of-line modules: `no_core`
 and `no_implicit_prelude` disable it, and `no_std` withholds alloc-only traits.
-Conditional restrictions are conservative. `TryFrom`/`TryInto` require a proved
+Conditional restrictions are conservative. `FromIterator`/`TryFrom`/`TryInto` require a proved
 2021/2024 edition, and `Future` requires 2024; a per-file pass with no crate
-edition does not assume those additions. The enclosing trait
-impl supplies its canonical trait inside its body, as Rust does. Comments, strings,
+edition does not assume those additions. For a registered file whose item macro
+leaves its module mount unknown, only edition-independent prelude names are
+eligible, and any recorded prelude restriction is conservatively a possible
+ancestor restriction. The enclosing trait
+impl supplies its canonical trait inside its body, as Rust does. Explicit root
+`extern crate std` declarations remain available to child modules under `no_std`;
+only the automatic std entry is omitted. Comments, strings,
 qualified paths in unrelated expressions, and imports in siblings are no proof.
-Unknown scope stops with `trait_scope_identity`. Anonymous `as _` imports and
-block globs that this proof cannot resolve are conservatively withheld. Qualified
+Unknown scope stops with `trait_scope_identity`. Local item macros reuse the
+existing rule matcher and transcriber substitution to prove generated traits;
+item-shaped arguments consumed by a macro establish nothing. Unsupported
+expansions remain opaque. Qualified
 trait paths, generic bounds and operator desugaring retain their separate rules.
 
 These rules follow the Rust Reference's
 [method lookup](https://doc.rust-lang.org/reference/expressions/method-call-expr.html)
 [use declarations](https://doc.rust-lang.org/reference/items/use-declarations.html),
-and [prelude availability](https://doc.rust-lang.org/reference/names/preludes.html),
+[prelude availability](https://doc.rust-lang.org/reference/names/preludes.html),
+and [namespaces](https://doc.rust-lang.org/reference/names/namespaces.html),
 consulted on 2026-10-07. No compiler or std source is read while indexing.
 
 When a canonical std receiver has a method name supplied by a project trait,
-the dot call is withheld with `unrecognised_std_method`. On a forwarding wrapper,
-only an in-scope extension whose self type may apply competes before Deref; a disjoint
-extension does not block a method on the project pointee. This reason denotes a
+the dot call is withheld with `unrecognised_std_method`. A trait candidate found
+through Deref retains the original std wrapper for this decision. Project
+inherent candidates on the pointee remain eligible. This reason denotes a
 std/project-trait dispatch collision, including methods whose return type is
 already modelled: a return-type rule does not prove the absence of a preceding
 inherent method. `unresolved_sites.name` stores `receiver-head.method` for this
 reason (for example `alloc.vec.Vec.reserve`); its existing columns are unchanged.
-Deref candidates use the std head reached at that step. Other stop records retain
-their existing names.
+Deref candidates disclose the original std wrapper, or a std head reached later
+when the original receiver is a project type. Project inherent methods
+are exempt from both the trait-scope and std-collision rules. Method selection
+checks inherent precedence at each receiver shape, including mutable references,
+and trait-object methods inherited from supertraits. Unproved reference, mutable,
+and wrapper dispatch each have their own stop reason. Calls withheld inside
+expression macros receive a source-site carrier so their stop records reach
+`unresolved_sites`; a trait stop cannot replace an unrelated neighbouring call.
+A generic-bound target whose reachable supertraits are unavailable is withheld
+with `bound_declaration_not_proven`, including in expression macros. This loses
+some previously credited calls: an unknown supertrait can define a competing
+method, so ignoring it would not prove dispatch. The current std table supplies
+inference rules rather than complete trait method sets; no negative knowledge
+about those unindexed supertraits is claimed. Call-shaped tokens in an opaque macro carry
+`macro_call_not_proven` records; these are candidates, not proof that the macro
+evaluates them. The resolver publishes no link from this fallback. Inherent
+methods competing through closed instantiated self types compare their written arguments
+with the receiver before choosing an overload or inferring its return type;
+an undecidable comparison records `inherent_self_type_not_proven`. This keeps
+newly reachable workspace dependencies from selecting getters for builder types.
 
 The resolver includes `internal/cbm/lsp/rust_std_methods.h` at compile time.
 Each row has its receiver, method, inference knowledge, signature source URL and

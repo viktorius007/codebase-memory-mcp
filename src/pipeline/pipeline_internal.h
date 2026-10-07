@@ -42,6 +42,8 @@
  * trait_impl_key_unreadable,
  * trait_array_length_unknown, trait_receiver_unknown, trait_owned_receiver_borrowed,
  * trait_receiver_partial, trait_receiver_scope_unproved,
+ * trait_reference_dispatch_unproved, trait_mutable_dispatch_unproved,
+ * trait_wrapper_dispatch_unproved, inherent_self_type_not_proven, macro_call_not_proven,
  * trait_receiver_shape (shape details are not reason codes). */
 void cbm_pipeline_record_unresolved(cbm_gbuf_t *gbuf, const char *project, const char *rel,
                                     const char *caller, const char *name, const char *kind,

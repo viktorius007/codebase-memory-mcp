@@ -54,6 +54,7 @@ typedef struct {
      * (`impl Tr for Box<dyn X>`) as written, its names resolved in the impl's
      * module; the method is registered on the wrapper's QN. NULL otherwise. */
     const CBMType *rust_wrapper_impl_self;
+    const CBMType *rust_inherent_impl_self; /* written instantiated self for inherent selection */
     const CBMType *rust_reference_impl_self; /* written reference self, including mutability */
     const char **rust_unbounded_impl_params; /* source-proved unconstrained impl parameters */
     /* Rust only: per declared parameter (parallel to the signature's

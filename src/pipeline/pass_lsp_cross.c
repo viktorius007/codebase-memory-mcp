@@ -1634,6 +1634,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         bool trait_stop = src->kind == CBM_RESOLVED_INVOCATION && src->reason && src->strategy &&
                           strcmp(src->strategy, "lsp_unresolved") == 0 &&
                           (strcmp(src->reason, "unrecognised_std_method") == 0 ||
+                           strcmp(src->reason, "inherent_self_type_not_proven") == 0 ||
                            strcmp(src->reason, "trait_scope_identity") == 0);
         bool supersedes =
             trait_stop || (src->strategy && (strcmp(src->strategy, "lsp_cross_crate") == 0 ||
@@ -1650,6 +1651,16 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
                 dst->source_origin != src->source_origin ||
                 strcmp(dst->caller_qn, src->caller_qn) != 0) {
                 continue;
+            }
+            /* A macro argument carrier can cover several different calls.
+             * A trait stop closes only its method, never an inherent neighbour. */
+            if (trait_stop) {
+                const char *old_leaf = cbm_lsp_bare_segment(dst->callee_qn);
+                const char *new_leaf = cbm_lsp_bare_segment(src->callee_qn);
+                size_t old_len = cbm_pipeline_lsp_method_leaf_len(old_leaf);
+                size_t new_len = cbm_pipeline_lsp_method_leaf_len(new_leaf);
+                if (!old_leaf || old_len != new_len || strncmp(old_leaf, new_leaf, old_len) != 0)
+                    continue;
             }
             dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
             dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);

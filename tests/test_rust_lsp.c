@@ -1850,8 +1850,8 @@ TEST(rustlsp_crossfile_return_box_with_written_argument) {
 }
 
 /* An opaque `impl Future<Output = T>` awaits to T; an opaque project trait
- * hides the impl a call on it reaches, so it publishes nothing, while a
- * trait object reaches the trait's declaration. */
+ * hides the impl a call on it reaches, so it publishes nothing. A trait
+ * object behind Box is disclosed with the original std wrapper identity. */
 TEST(rustlsp_crossfile_return_opaque_types) {
     const char *awaited = "async fn run() -> bool { demo::make().await.ping() }\n";
     const char *direct = "fn run() -> bool { demo::make().ping() }\n";
@@ -1859,7 +1859,7 @@ TEST(rustlsp_crossfile_return_opaque_types) {
                                               "Conn.ping"),
                0);
     ASSERT_EQ(rustlsp_declared_return_target("impl Pinger", direct, "ping"), -1);
-    ASSERT_GTE(rustlsp_declared_return_target("Box<dyn Pinger>", direct, "Pinger.ping"), 0);
+    ASSERT_EQ(rustlsp_declared_return_target("Box<dyn Pinger>", direct, "Pinger.ping"), -1);
     PASS();
 }
 
@@ -5784,7 +5784,7 @@ TEST(rustlsp_project_reexport_does_not_select_same_named_local_type) {
     PASS();
 }
 
-TEST(rustlsp_box_dyn_selects_declaration_over_concrete_inherent) {
+TEST(rustlsp_box_dyn_discloses_std_collision_before_declaration) {
     const char *source = "fn run(b: Box<dyn Tr>) { b.ping(); }\n";
     CBMRustLSPDef defs[] = {
         {.qualified_name = "p.main.Tr", .short_name = "Tr", .label = "Trait",
@@ -5800,7 +5800,10 @@ TEST(rustlsp_box_dyn_selects_declaration_over_concrete_inherent) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross(&arena, source, (int)strlen(source), "p.main", defs, 4,
                            NULL, NULL, 0, NULL, &out);
-    ASSERT_GTE(find_confident(&out, "run", "p.main.Tr.ping"), 0);
+    ASSERT_EQ(find_confident(&out, "run", "p.main.Tr.ping"), -1);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_STR_EQ(out.items[0].reason, "unrecognised_std_method");
+    ASSERT_STR_EQ(out.items[0].callee_qn, "alloc.boxed.Box.ping");
     ASSERT_EQ(find_confident(&out, "run", "p.main.Inner.ping"), -1);
     cbm_arena_destroy(&arena);
     PASS();
@@ -8102,7 +8105,14 @@ TEST(rustlsp_reference_impl_disjoint_referent_does_not_block_unknown_qualifier) 
         ctx.enclosing_func_qn = "test.pkg.run";
         cbm_scope_bind(ctx.current_scope, "x", receivers[i]);
         rust_lsp_process_file(&ctx, ts_tree_root_node(tree));
-        ASSERT_GTE(find_confident(&out, "test.pkg.run", targets[i]), 0);
+        if (i == 0)
+            ASSERT_GTE(find_confident(&out, "test.pkg.run", targets[i]), 0);
+        else {
+            ASSERT_EQ(find_confident(&out, "test.pkg.run", targets[i]), -1);
+            ASSERT_EQ(out.count, 1);
+            ASSERT_STR_EQ(out.items[0].reason, "unrecognised_std_method");
+            ASSERT_STR_EQ(out.items[0].callee_qn, "alloc.boxed.Box.read");
+        }
         ASSERT_EQ(find_confident(&out, "test.pkg.run", "&str.read[Read]"), -1);
     }
     ts_tree_delete(tree);
@@ -10887,8 +10897,8 @@ TEST(rustlsp_gap_bound_box_dyn_dispatch) {
     cbm_free_result(r); PASS();
 }
 
-/* An applicable project extension on Box is disclosed as a std gap. A
- * disjoint Box impl does not block Deref to the project trait object. */
+/* Both the applicable wrapper impl and the trait-object Deref candidate
+ * keep the original std receiver in the disclosure. */
 TEST(rustlsp_wrapper_impl_on_dyn_with_auto_trait_applies_to_same_bounds) {
     const char *src = "use demo::Renderable;\n"
                       "fn via_send(c: Box<dyn demo::Cell + Send>) -> u8 { c.height() }\n"
@@ -10930,7 +10940,16 @@ TEST(rustlsp_wrapper_impl_on_dyn_with_auto_trait_applies_to_same_bounds) {
     }
     ASSERT_EQ(stopped, 1);
     ASSERT_LT(find_confident(&out, "via_send", "p.demo.Cell.height"), 0);
-    ASSERT_GTE(find_confident(&out, "via_plain", "p.demo.Cell.height"), 0);
+    ASSERT_LT(find_confident(&out, "via_plain", "p.demo.Cell.height"), 0);
+    int plain_stops = 0;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].caller_qn && strstr(out.items[i].caller_qn, "via_plain")) {
+            ASSERT_STR_EQ(out.items[i].reason, "unrecognised_std_method");
+            ASSERT_STR_EQ(out.items[i].callee_qn, "alloc.boxed.Box.height");
+            plain_stops++;
+        }
+    }
+    ASSERT_EQ(plain_stops, 1);
     ASSERT_LT(find_confident(&out, "via_plain", "p.demo.Box.height"), 0);
     cbm_arena_destroy(&a);
     PASS();
@@ -12624,7 +12643,7 @@ TEST(rustlsp_target_root_declared_module_uses_registered_physical_path) {
     PASS();
 }
 
-TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved) {
+TEST(rustlsp_cross_package_inherent_precedes_trait) {
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMLSPDef defs[4];
@@ -12670,7 +12689,7 @@ TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved) {
         &arena, source, (int)strlen(source), "test.caller.src.lib", "test.caller.src.lib",
         registry, NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL, NULL);
 
-    ASSERT_LT(find_confident(&out, "run", "Store.act"), 0);
+    ASSERT_GTE(find_confident(&out, "run", "Store.act"), 0);
     cbm_arena_destroy(&arena);
     PASS();
 }
@@ -14462,7 +14481,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_foreign_signal_receiver_does_not_select_project_recv);
     RUN_TEST(rustlsp_deref_foreign_target_does_not_select_project_method);
     RUN_TEST(rustlsp_project_reexport_does_not_select_same_named_local_type);
-    RUN_TEST(rustlsp_box_dyn_selects_declaration_over_concrete_inherent);
+    RUN_TEST(rustlsp_box_dyn_discloses_std_collision_before_declaration);
     RUN_TEST(rustlsp_local_deref_waits_for_project_registry);
     RUN_TEST(rustlsp_arc_generic_forwarding_impl_withholds_deref_guess);
     RUN_TEST(rustlsp_strict_box_deref_to_inner);
@@ -15050,7 +15069,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_declared_module_shadows_workspace_crate_name);
     RUN_TEST(rustlsp_super_glob_module_alias_shadows_workspace_crate_name);
     RUN_TEST(rustlsp_target_root_declared_module_uses_registered_physical_path);
-    RUN_TEST(rustlsp_cross_package_inherent_trait_collision_stays_unresolved);
+    RUN_TEST(rustlsp_cross_package_inherent_precedes_trait);
     RUN_TEST(rustlsp_inline_module_body_attaches_to_its_own_node);
     RUN_TEST(rustlsp_cfg_duplicate_method_bodies_attach_to_their_own_nodes);
     RUN_TEST(rustlsp_extra_proc_macro_tokio_main);

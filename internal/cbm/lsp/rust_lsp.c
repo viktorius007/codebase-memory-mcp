@@ -100,6 +100,8 @@ static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMT
 static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
     const char *trait_qn, const char *method_name, bool allow_abstract);
 static const char *rust_impl_key_part(const char *key, int index, size_t *part_len);
+static const CBMRegisteredFunc *rust_inherent_self_candidate(RustLSPContext *ctx,
+    const CBMRegisteredFunc *method, const CBMType *recv, bool *unproved);
 static const char *rust_trait_spelling_leaf(CBMArena *arena, const char *spelling);
 static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
                                     const char *method_name, bool *proved);
@@ -204,15 +206,20 @@ void rust_lsp_add_glob(RustLSPContext *ctx, const char *module_qn) {
         int new_cap = ctx->glob_count + 16;
         const char **ng =
             (const char **)cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(char *));
-        if (!ng) {
+        const char **raw = cbm_arena_alloc(ctx->arena, (new_cap + 1) * sizeof(*raw));
+        if (!ng || !raw) {
             return;
         }
         if (ctx->glob_module_qns && ctx->glob_count > 0) {
             memcpy(ng, ctx->glob_module_qns, ctx->glob_count * sizeof(char *));
+            memcpy(raw, ctx->glob_raw_paths, ctx->glob_count * sizeof(char *));
         }
         ctx->glob_module_qns = ng;
+        ctx->glob_raw_paths = raw;
     }
-    ctx->glob_module_qns[ctx->glob_count++] = cbm_arena_strdup(ctx->arena, module_qn);
+    ctx->glob_module_qns[ctx->glob_count] = cbm_arena_strdup(ctx->arena, module_qn);
+    ctx->glob_raw_paths[ctx->glob_count] = ctx->glob_module_qns[ctx->glob_count];
+    ctx->glob_count++;
 }
 
 static char *rust_node_text(RustLSPContext *ctx, TSNode node) {
@@ -462,6 +469,7 @@ static const RustPreludeEntry RUST_PRELUDE[] = {{"String", "alloc.string.String"
                                                 {"Err", "core.result.Result.Err"},
                                                 {"Iterator", "core.iter.Iterator"},
                                                 {"IntoIterator", "core.iter.IntoIterator"},
+                                                {"FromIterator", "core.iter.FromIterator"},
                                                 {"Future", "core.future.Future"},
                                                 {"Clone", "core.clone.Clone"},
                                                 {"Copy", "core.marker.Copy"},
@@ -829,7 +837,14 @@ static const char *rust_trait_qn_by_module_tree(CBMArena *arena, const CBMTypeRe
         return NULL;
     }
     if (r.kind == CBM_RUST_PATH_NOT_FUNCTION) {
-        return rust_facade_trait_qn(arena, reg, index, r.qn);
+        const char *canonical = rust_facade_trait_qn(arena, reg, index, r.qn);
+        if (canonical)
+            return canonical;
+        /* A bare prelude spelling can also name an external derive macro.
+         * Only a qualified trait header establishes that external identity. */
+        if (rust_lookup_prelude(path) && !strstr(path, "::"))
+            return NULL;
+        return strchr(r.qn, '.') ? r.qn : NULL;
     }
     if (r.kind != CBM_RUST_PATH_TYPE) {
         return NULL;
@@ -894,7 +909,8 @@ static const char *rust_canonical_impl_trait(CBMArena *arena, const CBMTypeRegis
         lookup_name = used;
     }
     if (rust_qn_has_facade_root(lookup_name)) {
-        return rust_facade_trait_qn(arena, reg, index, lookup_name);
+        const char *canonical = rust_facade_trait_qn(arena, reg, index, lookup_name);
+        return canonical ? canonical : lookup_name;
     }
 
     const char *exact = rust_trait_name_index_lookup(index, reg, lookup_name);
@@ -907,8 +923,8 @@ static const char *rust_canonical_impl_trait(CBMArena *arena, const CBMTypeRegis
     if (!strchr(lookup_name, '.')) {
         const char *prelude = rust_lookup_prelude(lookup_name);
         const char *prelude_qn = rust_trait_name_index_lookup(index, reg, prelude);
-        if (prelude_qn) {
-            return prelude_qn;
+        if (prelude_qn || (prelude && strcmp(lookup_name, "FromIterator") == 0)) {
+            return prelude_qn ? prelude_qn : prelude;
         }
     }
 
@@ -6794,6 +6810,10 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
         if (registered)
             type_qn = registered;
         method = method_call ? rust_lookup_method(ctx, type_qn, member) : NULL;
+        bool unproved = false;
+        method = rust_inherent_self_candidate(ctx, method, recv, &unproved);
+        if (unproved)
+            return cbm_type_unknown();
     }
     if (!type_qn)
         return cbm_type_unknown();
@@ -7050,7 +7070,7 @@ static RustImplSelfMatch rust_impl_self_match(RustLSPContext *ctx, const CBMType
             ? other->data.template_type.template_name : NULL;
         const CBMRegisteredType *nominal = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
         bool concrete_head =
-            (nominal && !nominal->is_interface && !nominal->rust_undeclared &&
+            (nominal && !nominal->rust_undeclared &&
              !nominal->alias_of && !nominal->alias_type) ||
             rust_type_leaf_concrete(ctx, other) || other->kind == CBM_TYPE_SLICE ||
             other->kind == CBM_TYPE_TUPLE ||
@@ -7363,21 +7383,18 @@ static bool rust_trait_identity_proves(RustLSPContext *ctx, const char *identity
                                        const char *trait_qn, const char *method_name) {
     if (!identity)
         return false;
-    for (int depth = 0; depth < RUST_ALIAS_EXPAND_MAX_DEPTH; depth++) {
-        const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, identity);
-        if (!type || !type->alias_of)
-            break;
-        identity = type->alias_of;
-    }
+    const CBMRegisteredType *imported = cbm_registry_resolve_alias(ctx->registry, identity);
+    const CBMRegisteredType *target = cbm_registry_resolve_alias(ctx->registry, trait_qn);
+    if (imported && !imported->alias_of)
+        identity = imported->qualified_name;
+    if (target && !target->alias_of)
+        trait_qn = target->qualified_name;
     if (strcmp(identity, trait_qn) == 0)
         return true;
     /* std re-exports the canonical core/alloc traits in the seed map.
      * An explicit std path remains a proof when the stored identity is core. */
-    const char *leaf = strrchr(trait_qn, '.');
-    const char *canonical = leaf ? rust_lookup_prelude(leaf + 1) : NULL;
-    if (canonical && strcmp(canonical, trait_qn) == 0 && strncmp(identity, "std.", 4) == 0 &&
-        (strncmp(trait_qn, "core.", 5) == 0 || strncmp(trait_qn, "alloc.", 6) == 0) &&
-        strcmp(identity + 3, strchr(trait_qn, '.')) == 0)
+    if (rust_qn_has_facade_root(identity) && rust_qn_has_facade_root(trait_qn) &&
+        strcmp(strchr(identity, '.'), strchr(trait_qn, '.')) == 0)
         return true;
     const CBMRegisteredFunc *inherited =
         rust_lookup_method_in_trait(ctx, identity, method_name, true);
@@ -7419,24 +7436,27 @@ static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
         *proved = false;
     if (!ctx || !trait_qn || !ctx->module_qn)
         return true;
+    const CBMRegisteredType *canonical = cbm_registry_resolve_alias(ctx->registry, trait_qn);
+    if (canonical && !canonical->alias_of)
+        trait_qn = canonical->qualified_name;
     const char *dot = strrchr(trait_qn, '.');
     const char *leaf = dot ? dot + 1 : trait_qn;
     const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
     const CBMRegisteredFunc *caller =
         ctx->enclosing_func_qn ? cbm_registry_lookup_func(ctx->registry, ctx->enclosing_func_qn)
                                : NULL;
-    bool visible = caller && caller->impl_trait_qn && strcmp(caller->impl_trait_qn, trait_qn) == 0;
+    bool visible = caller && caller->impl_trait_qn &&
+                   rust_trait_identity_proves(ctx, caller->impl_trait_qn, trait_qn, method_name);
+    visible |= ctx->self_trait_qn &&
+               rust_trait_identity_proves(ctx, ctx->self_trait_qn, trait_qn, method_name);
     int block_uses = ctx->use_count - ctx->file_use_count;
     const char *const *names = block_uses > 0 ? ctx->use_local_names + ctx->file_use_count : NULL;
     const char *const *paths = block_uses > 0 ? ctx->use_raw_paths + ctx->file_use_count : NULL;
-    if (ctx->glob_count > ctx->file_glob_count)
-        return true;
     if (tree) {
         CBMRustPathResult result = cbm_rust_modtree_resolve_type(tree, ctx->arena, ctx->module_qn,
                                                                  ctx->emit_site_start_byte, leaf,
                                                                  names, paths, block_uses);
-        visible |= !result.conditional &&
-                   (result.is_trait || result.kind == CBM_RUST_PATH_NOT_FUNCTION) &&
+        visible |= (result.is_trait || result.kind == CBM_RUST_PATH_NOT_FUNCTION) &&
                    rust_trait_identity_proves(ctx, result.qn, trait_qn, method_name);
         if (!visible && result.kind == CBM_RUST_PATH_UNKNOWN)
             visible = rust_source_declares_trait(ctx, leaf, trait_qn);
@@ -7449,14 +7469,15 @@ static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
     }
     for (int i = ctx->use_count - 1; !visible && i >= 0; i--) {
         const char *name = ctx->use_local_names[i];
-        if (!name || strcmp(name, "_") == 0 ||
-            rust_resolve_use(ctx, name) != ctx->use_module_paths[i])
+        if (!name || (tree && strcmp(name, "_") == 0 && i < ctx->file_use_count) ||
+            (strcmp(name, "_") != 0 &&
+            rust_resolve_use(ctx, name) != ctx->use_module_paths[i]))
             continue;
         if (tree) {
             CBMRustPathResult result = cbm_rust_modtree_resolve_type(
-                tree, ctx->arena, ctx->module_qn, ctx->emit_site_start_byte, name, names, paths,
-                block_uses);
-            visible = !result.conditional &&
+                tree, ctx->arena, ctx->module_qn, ctx->emit_site_start_byte,
+                name, names, paths, block_uses);
+            visible =
                       (result.is_trait || result.kind == CBM_RUST_PATH_NOT_FUNCTION) &&
                       rust_trait_identity_proves(ctx, result.qn, trait_qn, method_name);
         } else {
@@ -7483,6 +7504,23 @@ static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
         visible = glob && glob->is_interface &&
                   rust_trait_identity_proves(ctx, glob->qualified_name, trait_qn, method_name);
     }
+    if (!visible && tree) {
+        int block_globs = ctx->glob_count - ctx->file_glob_count;
+        visible = cbm_rust_modtree_trait_in_scope(
+            tree, ctx->arena, ctx->module_qn, ctx->emit_site_start_byte, trait_qn,
+            names, paths, block_uses,
+            block_globs > 0 ? ctx->glob_raw_paths + ctx->file_glob_count : NULL, block_globs);
+        for (int i = 0; !visible && i < ctx->registry->type_count; i++) {
+            const CBMRegisteredType *subtrait = &ctx->registry->types[i];
+            if (!subtrait->is_interface || !subtrait->embedded_types ||
+                !rust_trait_identity_proves(ctx, subtrait->qualified_name, trait_qn, method_name))
+                continue;
+            visible = cbm_rust_modtree_trait_in_scope(
+                tree, ctx->arena, ctx->module_qn, ctx->emit_site_start_byte,
+                subtrait->qualified_name, names, paths, block_uses,
+                block_globs > 0 ? ctx->glob_raw_paths + ctx->file_glob_count : NULL, block_globs);
+        }
+    }
     /* Prelude proof is by canonical identity: a project ToString is not std's. */
     const char *prelude = rust_lookup_prelude(leaf);
     bool prelude_name = !rust_name_needs_import(leaf) || (tree && strcmp(leaf, "Future") == 0);
@@ -7491,8 +7529,13 @@ static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
                                 : !(ctx->prelude_restrictions & CBM_RUST_PRELUDE_DISABLED) &&
                                       !((ctx->prelude_restrictions & CBM_RUST_PRELUDE_CORE_ONLY) &&
                                         strcmp(leaf, "ToString") == 0) &&
-                                      strcmp(leaf, "TryFrom") != 0 && strcmp(leaf, "TryInto") != 0;
-    visible |= prelude && prelude_name && prelude_allowed && strcmp(trait_qn, prelude) == 0;
+                                      strcmp(leaf, "TryFrom") != 0 && strcmp(leaf, "TryInto") != 0 &&
+                                      strcmp(leaf, "FromIterator") != 0;
+    visible |= prelude && prelude_name && prelude_allowed &&
+               !(ctx->prelude_restrictions & CBM_RUST_PRELUDE_DISABLED) &&
+               !((ctx->prelude_restrictions & CBM_RUST_PRELUDE_CORE_ONLY) &&
+                 strcmp(leaf, "ToString") == 0) &&
+               rust_trait_identity_proves(ctx, prelude, trait_qn, method_name);
     if (proved)
         *proved = visible;
     return !visible;
@@ -7517,6 +7560,53 @@ static const char *rust_impl_key_part(const char *key, int index, size_t *part_l
         key = part + len;
     }
     return NULL;
+}
+
+/* An inherent bucket erases impl arguments. When it chooses a closed
+ * instantiated self type, compare the written impls with the actual receiver
+ * before selecting a different specialization or publishing its return type. */
+static const CBMRegisteredFunc *rust_inherent_self_candidate(RustLSPContext *ctx,
+    const CBMRegisteredFunc *method, const CBMType *recv, bool *unproved) {
+    if (!method || (method->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL))
+        return method;
+    const CBMType *self = method->rust_inherent_impl_self;
+    if (!self || self->kind != CBM_TYPE_TEMPLATE || !self->data.template_type.arg_count ||
+        rust_impl_self_match(ctx, self, self, false) != RUST_IMPL_SELF_SAME)
+        return method;
+    /* Preserve the existing nominal lookup when there is no competing
+     * inherent implementation. This comparison repairs erased overload
+     * arguments; it does not impose new applicability inference on a singleton. */
+    CBMMethodIter it;
+    int candidates = 0;
+    cbm_registry_methods_chain(ctx->registry, method->receiver_type, method->short_name, &it);
+    for (int i; (i = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &it.reg->funcs[i];
+        if (!(candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) &&
+            !rust_method_hidden_from_caller(ctx, candidate))
+            candidates++;
+    }
+    if (candidates < 2)
+        return method;
+    const CBMRegisteredFunc *selected = NULL;
+    bool open = false;
+    cbm_registry_methods_chain(ctx->registry, method->receiver_type, method->short_name, &it);
+    for (int i; (i = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &it.reg->funcs[i];
+        if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) ||
+            rust_method_hidden_from_caller(ctx, candidate))
+            continue;
+        const CBMType *pattern = candidate->rust_inherent_impl_self;
+        RustImplSelfMatch match = rust_impl_self_match(ctx, pattern, rust_strip_references(recv), false);
+        if (match == RUST_IMPL_SELF_UNDECIDED)
+            open = true;
+        if (match != RUST_IMPL_SELF_SAME)
+            continue;
+        if (selected && strcmp(selected->qualified_name, candidate->qualified_name) != 0)
+            open = true;
+        selected = selected ? selected : candidate;
+    }
+    *unproved = open || !selected;
+    return *unproved ? NULL : selected;
 }
 
 /* Last path segment of a trait path as written (`a::b::Tr<X>` -> `Tr`). */
@@ -7835,6 +7925,10 @@ static const char *rust_std_unrecognised_method(RustLSPContext *ctx, const CBMTy
     const char *head = rust_std_receiver_head(recv);
     if (!head)
         return NULL;
+    const CBMRegisteredFunc *inherent = rust_registry_lookup_inherent_method_aliased(
+        ctx, ctx->registry, head, name);
+    if (inherent && rust_qn_in_project(ctx, inherent->qualified_name))
+        return NULL;
     const CBMType *base = rust_strip_references(recv);
     bool wrapper = rust_wrapper_head_qn(ctx, head) != NULL;
     for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
@@ -7861,6 +7955,12 @@ static bool rust_reference_impl_may_precede(RustLSPContext *ctx, const CBMType *
     if (!receiver || receiver->kind != CBM_TYPE_REFERENCE || !method->impl_trait_qn) {
         return false;
     }
+    const char *self = rust_impl_key_part(method->impl_key, 1, NULL);
+    bool mutable_self = (method->flags & CBM_FUNC_FLAG_RUST_SELF) &&
+        !(method->flags & (CBM_FUNC_FLAG_RUST_SHARED_SELF | CBM_FUNC_FLAG_RUST_VALUE_SELF));
+    if (self && *self != '&' && receiver->data.reference.rust_mutable && mutable_self &&
+        receiver->data.reference.elem && receiver->data.reference.elem->kind != CBM_TYPE_REFERENCE)
+        return false;
     const char *dot = strrchr(method->impl_trait_qn, '.');
     const char *leaf = dot ? dot + 1 : method->impl_trait_qn;
     for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
@@ -7939,16 +8039,6 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(
     const CBMRegisteredFunc *inh =
         rust_registry_lookup_inherent_method_aliased(ctx, reg, receiver_type_qn, method_name);
     if (inh && !(borrowed && (inh->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0)) {
-        bool trait_ambiguous = false;
-        const CBMRegisteredFunc *trait_method = rust_registry_lookup_trait_impl_method(
-            reg, receiver_type_qn, NULL, method_name, &trait_ambiguous);
-        const CBMCargoMember *caller_member = rust_package_member(ctx, ctx->module_qn);
-        const CBMCargoMember *receiver_member = rust_package_member(ctx, receiver_type_qn);
-        if (trait_method && caller_member && receiver_member && caller_member != receiver_member) {
-            if (out_impl_count)
-                *out_impl_count = 2;
-            return NULL;
-        }
         if (out_impl_count)
             *out_impl_count = 1;
         return inh;
@@ -8218,7 +8308,7 @@ static const CBMType *rust_trait_assoc_fn_type(RustLSPContext *ctx, const char *
  * call expressions. We do this so calls inside `vec![foo()]`,
  * `assert_eq!(a.bar(), 0)`, and `dbg!(get_value())` still get attributed
  * to the enclosing function. */
-static void rust_walk_macro_tokens(RustLSPContext *ctx, TSNode node) {
+static void rust_walk_macro_tokens(RustLSPContext *ctx, TSNode node, bool disclose) {
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);
@@ -8230,8 +8320,42 @@ static void rust_walk_macro_tokens(RustLSPContext *ctx, TSNode node) {
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(node, i);
+        TSNode args = i + 1 < nc ? ts_node_child(node, i + 1) : (TSNode){0};
+        if (disclose && !ts_node_is_null(c) && !ts_node_is_null(args) &&
+            strcmp(ts_node_type(c), "identifier") == 0 &&
+            strcmp(ts_node_type(args), "token_tree") == 0 &&
+            ctx->source[ts_node_start_byte(args)] == '(') {
+            uint32_t start = 0, end = 0;
+            if (rust_map_source_range(ctx, ts_node_start_byte(c), ts_node_end_byte(args),
+                                      &start, &end)) {
+                const char *name = rust_node_text(ctx, c);
+                bool recorded = false;
+                for (int r = 0; ctx->resolved_calls && r < ctx->resolved_calls->count; r++) {
+                    const CBMResolvedCall *call = &ctx->resolved_calls->items[r];
+                    const char *leaf = call->callee_qn ? strrchr(call->callee_qn, '.') : NULL;
+                    leaf = leaf ? leaf + 1 : call->callee_qn;
+                    size_t len = leaf ? strcspn(leaf, "[") : 0;
+                    if (call->site_start_byte <= start && end <= call->site_end_byte &&
+                        leaf && strlen(name) == len && strncmp(leaf, name, len) == 0) {
+                        recorded = true;
+                        break;
+                    }
+                }
+                if (!recorded) {
+                    uint32_t saved_start = ctx->emit_site_start_byte;
+                    uint32_t saved_end = ctx->emit_site_end_byte;
+                    ctx->emit_site_start_byte = start;
+                    ctx->emit_site_end_byte = end;
+                    ctx->inject_syn_calls++;
+                    rust_emit_unresolved_call(ctx, name, "macro_call_not_proven");
+                    ctx->inject_syn_calls--;
+                    ctx->emit_site_start_byte = saved_start;
+                    ctx->emit_site_end_byte = saved_end;
+                }
+            }
+        }
         if (!ts_node_is_null(c))
-            rust_walk_macro_tokens(ctx, c);
+            rust_walk_macro_tokens(ctx, c, disclose);
     }
 }
 
@@ -8939,7 +9063,7 @@ static bool rust_has_visible_macro_definition(RustLSPContext *ctx, const char *m
  * re-parses the result so any calls inside are visible to the
  * resolver. */
 
-#define RUST_MACRO_MAX_BINDINGS 256
+#define RUST_MACRO_MAX_BINDINGS 512
 #define RUST_MACRO_MAX_REPS 128
 #define RUST_MACRO_MAX_DEPTH 4
 #define RUST_MACRO_NAME_MAX 32
@@ -9656,15 +9780,14 @@ static char *macro_substitute(CBMArena *arena, const char *xs, int xs_len, const
 /* Re-parse a user macro's transcriber body as a synthetic Rust
  * function and walk it for calls. */
 extern const TSLanguage *tree_sitter_rust(void);
-static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
-    if (!ctx || !mname)
-        return;
-    if (ctx->macro_expand_depth >= 8)
-        return;
-
+/* Shared matching rules for call expansion and module trait declarations. */
+static MacroEnv *rust_macro_bind_invocation(RustLSPContext *ctx, const char *mname,
+                                            TSNode invocation, RustMacroRule **rule,
+                                            const char **args, int *args_len,
+                                            uint32_t *args_start) {
     RustMacroRule *visible = rust_macro_definition_for(ctx, mname, invocation);
     if (!visible)
-        return;
+        return NULL;
 
     /* Try each rule from the lexically selected definition until one matches;
      * first matching rule wins. */
@@ -9696,10 +9819,10 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     }
 
     if (!inv_args)
-        return;
+        return NULL;
     MacroEnv *env = (MacroEnv *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*env));
     if (!env)
-        return;
+        return NULL;
     for (int i = 0; i < ctx->macro_rules_count; i++) {
         RustMacroRule *r = ctx->macro_rules_arr[i];
         if (strcmp(r->macro_name, mname) != 0 || r->external_id != visible->external_id ||
@@ -9721,8 +9844,53 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     }
     if (!hit || !hit->transcriber_text || hit->transcriber_len <= 0) {
         cbm_free(CBM_MEM_CLASS_OTHER, env);
-        return;
+        return NULL;
     }
+    *rule = hit;
+    *args = inv_args;
+    *args_len = inv_args_len;
+    *args_start = inv_src_start;
+    return env;
+}
+
+/* Only the selected local macro's transcriber establishes a declaration;
+ * parsing its argument alone would let a token-consuming macro invent traits. */
+char *cbm_rust_expand_local_item_macro(CBMArena *arena, const char *source, TSNode root,
+                                       TSNode invocation) {
+    RustLSPContext ctx;
+    rust_lsp_init(&ctx, arena, source, (int)strlen(source), NULL, NULL, NULL);
+    rust_collect_macro_rules(&ctx, root);
+    TSNode name = ts_node_child_by_field_name(invocation, "macro", 5);
+    const char *mname = cbm_node_text(arena, name, source);
+    if (!mname)
+        return NULL;
+    RustMacroRule *hit = NULL;
+    const char *args = NULL;
+    int len = 0;
+    uint32_t start = 0;
+    MacroEnv *env = rust_macro_bind_invocation(&ctx, mname, invocation, &hit, &args, &len, &start);
+    if (!env)
+        return NULL;
+    char *expanded = macro_substitute(arena, hit->transcriber_text, hit->transcriber_len,
+                                      env, NULL, 0);
+    cbm_free(CBM_MEM_CLASS_OTHER, env);
+    return expanded;
+}
+
+static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
+    if (!ctx || !mname)
+        return;
+    if (ctx->macro_expand_depth >= 8)
+        return;
+
+    RustMacroRule *hit = NULL;
+    const char *inv_args = NULL;
+    int inv_args_len = 0;
+    uint32_t inv_src_start = 0;
+    MacroEnv *env = rust_macro_bind_invocation(ctx, mname, invocation, &hit, &inv_args,
+                                               &inv_args_len, &inv_src_start);
+    if (!env)
+        return;
 
     /* Substitute the bound metavars into the transcriber body. A fragment
      * copied from the invocation keeps its original bytes, so calls inside it
@@ -10729,9 +10897,11 @@ static void rust_bind_pattern(RustLSPContext *ctx, TSNode pattern, const CBMType
             sub_t = type && type->kind == CBM_TYPE_REFERENCE ? type->data.reference.elem
                                                              : cbm_type_unknown();
         } else if (strcmp(kind, "ref_pattern") == 0) {
-            sub_t = rust_reference_type(
-                ctx->arena, type,
-                ts_node_is_null(cbm_find_child_by_kind(pattern, "mutable_specifier")));
+            uint32_t count = ts_node_named_child_count(pattern);
+        TSNode child = count ? ts_node_named_child(pattern, count - 1) : (TSNode){0};
+            bool mutable = !ts_node_is_null(cbm_find_child_by_kind(pattern, "mutable_specifier")) ||
+                           strcmp(ts_node_type(child), "mut_pattern") == 0;
+            sub_t = rust_reference_type(ctx->arena, type, !mutable);
         }
         uint32_t nc = ts_node_named_child_count(pattern);
         if (nc > 0) {
@@ -11079,6 +11249,7 @@ static void rust_emit_resolved_call_reason(RustLSPContext *ctx, const char *call
         .site_end_byte = ctx->emit_site_end_byte,
     };
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+
     if (ctx->inject_syn_calls > 0 && ctx->emit_site_end_byte > ctx->emit_site_start_byte) {
         rust_inject_syn_call(ctx, callee_qn);
     }
@@ -11308,6 +11479,8 @@ static void rust_emit_unresolved_call(RustLSPContext *ctx, const char *expr_text
         .site_end_byte = ctx->emit_site_end_byte,
     };
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+    if (ctx->inject_syn_calls > 0 && ctx->emit_site_end_byte > ctx->emit_site_start_byte)
+        rust_inject_syn_call(ctx, rc.callee_qn);
 }
 
 static void rust_emit_trait_refusal(RustLSPContext *ctx, const CBMRegisteredFunc *method,
@@ -11452,10 +11625,19 @@ static const CBMRegisteredFunc *rust_trait_ufcs_by_receiver(RustLSPContext *ctx,
  * answers to that and the file neither imports the name nor has a glob
  * import that could supply it, the name is the prelude's. */
 static const char *rust_type_name_identity(RustLSPContext *ctx, const char *qn) {
-    const char *registered = rust_registered_type_qn(ctx, qn);
-    if (registered) {
-        return registered;
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    const char *owner = tree ? cbm_rust_modtree_item_module(tree, ctx->arena, qn) : NULL;
+    size_t owner_len = owner ? strlen(owner) : 0;
+    if (owner_len && !strchr(qn + owner_len + 1, '.')) {
+        CBMRustPathResult type = cbm_rust_modtree_resolve_type_in_file(
+            tree, ctx->arena, owner, qn + owner_len + 1);
+        if (type.qn && (type.kind == CBM_RUST_PATH_TYPE ||
+                        type.kind == CBM_RUST_PATH_NOT_FUNCTION))
+            return type.qn;
     }
+    const char *registered = rust_registered_type_qn(ctx, qn);
+    if (registered)
+        return registered;
     size_t module_len = ctx->module_qn ? strlen(ctx->module_qn) : 0;
     if (module_len == 0 || strncmp(qn, ctx->module_qn, module_len) != 0 ||
         qn[module_len] != '.' || strchr(qn + module_len + 1, '.') || ctx->glob_count > 0) {
@@ -11622,7 +11804,11 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
                 ctx->enclosing_func_qn[strlen(recursive)] != '[' || ts_node_is_null(first_arg) ||
                 !cbm_type_equal(rust_eval_expr_type(ctx, first_arg),
                                 cbm_scope_lookup(ctx->current_scope, "self")))
+            {
+                out->open_qn = qn;
+                out->open_reason = "bound_declaration_not_proven";
                 return true;
+            }
         }
     }
     /* `Alias::f` names the aliased type's `f` unless the alias itself
@@ -12457,8 +12643,11 @@ static void rust_bound_trait_declarations(RustLSPContext *ctx, const char *trait
     if (*ambiguous)
         return;
     const CBMRegisteredType *trait = cbm_registry_lookup_type(ctx->registry, trait_qn);
-    if (!trait || !trait->is_interface || trait->rust_nominal_identity_ambiguous ||
-        depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
+    if (!trait || !trait->is_interface) {
+        *ambiguous = true;
+        return;
+    }
+    if (trait->rust_nominal_identity_ambiguous || depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
         *ambiguous = true;
         return;
     }
@@ -12539,8 +12728,20 @@ static const char *rust_trait_receiver_refusal(RustLSPContext *ctx, const CBMReg
         (!method->impl_trait_qn ||
          rust_trait_out_of_scope(ctx, method->impl_trait_qn, method->short_name, NULL)))
         return "trait_scope_identity";
-    if (!method->impl_key)
+    if (!method->impl_key) {
+        /* Synthetized derive signatures are useful for result inference even
+         * though their generated declaration cannot prove a published target. */
+        const CBMType *base = recv;
+        while (base && base->kind == CBM_TYPE_REFERENCE)
+            base = base->data.reference.elem;
+        const char *head = base && base->kind == CBM_TYPE_NAMED
+            ? base->data.named.qualified_name : base && base->kind == CBM_TYPE_TEMPLATE
+            ? base->data.template_type.template_name : NULL;
+        if (!prove_dispatch && head && method->receiver_type &&
+            strcmp(head, method->receiver_type) == 0)
+            return NULL;
         return "trait_impl_key_unreadable";
+    }
     const CBMRegisteredType *owner = method->receiver_type
         ? cbm_registry_lookup_type(ctx->registry, method->receiver_type) : NULL;
     if (owner && owner->rust_nominal_identity_ambiguous) {
@@ -12588,16 +12789,6 @@ static const char *rust_trait_receiver_refusal(RustLSPContext *ctx, const CBMReg
     }
     if (!self || !recv) {
         return "trait_receiver_unknown";
-    }
-    if (tree && method->impl_trait_qn &&
-        (self->kind == CBM_TYPE_BUILTIN || method->rust_reference_impl_self)) {
-        const char *leaf = strrchr(method->impl_trait_qn, '.');
-        leaf = leaf ? leaf + 1 : method->impl_trait_qn;
-        CBMRustPathResult in_scope = cbm_rust_modtree_resolve_type(
-            tree, ctx->arena, ctx->module_qn, ctx->emit_site_start_byte, leaf, NULL, NULL, 0);
-        if (!in_scope.qn || strcmp(in_scope.qn, method->impl_trait_qn) != 0) {
-            return "trait_receiver_scope_unproved";
-        }
     }
     const CBMType *actual = recv;
     if (self->kind != CBM_TYPE_REFERENCE) {
@@ -12728,6 +12919,17 @@ static const CBMRegisteredFunc *rust_reference_method_before_autoderef(
     RustLSPContext *ctx, const CBMType *recv, const char *name, const CBMRegisteredFunc *inner,
     const char *own_trait, bool *blocked, bool *scope_filtered) {
     *blocked = false;
+    const CBMRegisteredType *owner = inner && inner->receiver_type
+        ? cbm_registry_lookup_type(ctx->registry, inner->receiver_type) : NULL;
+    if (owner && owner->is_interface && recv && recv->kind == CBM_TYPE_REFERENCE &&
+        recv->data.reference.elem && recv->data.reference.elem->kind == CBM_TYPE_NAMED &&
+        rust_lookup_method_in_trait(ctx,
+            recv->data.reference.elem->data.named.qualified_name, name, true) == inner &&
+        ((inner->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF)
+             ? recv->data.reference.rust_shared
+             : (inner->flags & CBM_FUNC_FLAG_RUST_SELF) &&
+               !(inner->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) && recv->data.reference.rust_mutable))
+        return NULL;
     for (const CBMType *shape = recv; shape && shape->kind == CBM_TYPE_REFERENCE;
          shape = shape->data.reference.elem) {
         const CBMType *referent = shape->data.reference.elem;
@@ -12759,6 +12961,12 @@ static const CBMRegisteredFunc *rust_reference_method_before_autoderef(
         }
         if (candidate)
             return candidate;
+        const char *self = inner ? rust_impl_key_part(inner->impl_key, 1, NULL) : NULL;
+        if (inner && self && *self != '&' && shape == recv &&
+            shape->data.reference.rust_mutable && referent &&
+            referent->kind != CBM_TYPE_REFERENCE && (inner->flags & CBM_FUNC_FLAG_RUST_SELF) &&
+            !(inner->flags & (CBM_FUNC_FLAG_RUST_SHARED_SELF | CBM_FUNC_FLAG_RUST_VALUE_SELF)))
+            return NULL;
         const CBMType *borrowed = rust_reference_type(ctx->arena, shape, true);
         candidate =
             rust_reference_method_at_shape(ctx, borrowed, name, own_trait, blocked, scope_filtered);
@@ -12883,6 +13091,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             return;
         }
         if (wrapper_blocked) {
+            rust_emit_unresolved_call(ctx, mname, "trait_wrapper_dispatch_unproved");
             return;
         }
         if (type_qn) {
@@ -12893,10 +13102,23 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             const char *imported = rust_resolve_use(ctx, leaf);
             /* A recorded local name can coexist with a cfg-gated foreign
              * import. Without selecting cfg, the local receiver is unproved. */
+            const CBMRegisteredType *import_type = rust_lookup_type_variants(
+                ctx, convert_path_to_qn(ctx->arena, imported ? imported : type_qn));
             if (imported && ctx->module_qn &&
                 strcmp(type_qn, cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, leaf)) == 0 &&
-                !rust_lookup_type_variants(ctx, convert_path_to_qn(ctx->arena, imported))) {
+                !import_type) {
                 identity_refusal = "receiver_import_identity_not_proven";
+            }
+            if (identity_refusal && ctx->imports && ctx->imports->modtree) {
+                int count = ctx->use_count - ctx->file_use_count;
+                CBMRustPathResult imported_type = cbm_rust_modtree_resolve_type(
+                    ctx->imports->modtree, ctx->arena, ctx->module_qn, ctx->emit_site_start_byte,
+                    leaf, count > 0 ? ctx->use_local_names + ctx->file_use_count : NULL,
+                    count > 0 ? ctx->use_raw_paths + ctx->file_use_count : NULL, count);
+                if (imported_type.kind == CBM_RUST_PATH_TYPE && imported_type.qn) {
+                    type_qn = imported_type.qn;
+                    identity_refusal = NULL;
+                }
             }
             const char *registered = rust_registered_type_qn(ctx, type_qn);
             /* A qualified path cannot acquire a project receiver merely by
@@ -12916,6 +13138,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 ctx, type_qn, mname, &impl_count, &trait_dispatch,
                 recv && recv->kind == CBM_TYPE_REFERENCE && recv->data.reference.rust_shared, true,
                 &scope_filtered);
+            bool inherent_unproved = false;
+            m = rust_inherent_self_candidate(ctx, m, recv, &inherent_unproved);
+            if (inherent_unproved) {
+                rust_emit_unresolved_call(ctx, mname, "inherent_self_type_not_proven");
+                return;
+            }
             const CBMRegisteredFunc *caller = ctx->enclosing_func_qn
                 ? cbm_registry_lookup_func(ctx->registry, ctx->enclosing_func_qn) : NULL;
             scope_filtered |= wrapper_scope_filtered;
@@ -12933,8 +13161,10 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             bool reference_blocked = false;
             const CBMRegisteredFunc *reference_method = rust_reference_method_before_autoderef(
                 ctx, recv, mname, m, own_trait, &reference_blocked, &scope_filtered);
-            if (reference_blocked)
+            if (reference_blocked) {
+                rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
                 return;
+            }
             if (reference_method) {
                 rust_emit_resolved_call(ctx, reference_method->qualified_name,
                                         reference_method->impl_key, "lsp_trait_dispatch",
@@ -12946,11 +13176,14 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                     (m->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0) {
                     const CBMRegisteredFunc *shared_candidate = rust_resolve_trait_method(
                         ctx, type_qn, mname, NULL, NULL, true, true, NULL);
-                    if (shared_candidate != m) {
+                    if (shared_candidate != m &&
+                        (m->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0) {
+                        rust_emit_unresolved_call(ctx, mname, "trait_mutable_dispatch_unproved");
                         return;
                     }
                 }
                 if (rust_reference_impl_may_precede(ctx, recv, m)) {
+                    rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
                     return;
                 }
                 /* Leaf-name recovery does not prove that a foreign receiver
@@ -13030,8 +13263,10 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                                             CBM_RUST_CONF_PROMOTED);
                     return;
                 }
-                if (wrapper_blocked)
+                if (wrapper_blocked) {
+                    rust_emit_unresolved_call(ctx, mname, "trait_wrapper_dispatch_unproved");
                     return;
+                }
                 const char *next_qn = NULL;
                 if (next->kind == CBM_TYPE_NAMED)
                     next_qn = next->data.named.qualified_name;
@@ -13075,8 +13310,17 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                                               "deref_requires_project_registry");
                     return;
                 }
-                if (hm && rust_std_trait_collision(ctx, next, hm)) {
-                    rust_emit_trait_refusal(ctx, hm, next, "unrecognised_std_method");
+                if (hm && (rust_std_trait_collision(ctx, base, hm) ||
+                           rust_std_trait_collision(ctx, next, hm))) {
+                    rust_emit_trait_refusal(ctx, hm,
+                        rust_std_trait_collision(ctx, base, hm) ? base : next,
+                        "unrecognised_std_method");
+                    return;
+                }
+                bool inherent_unproved = false;
+                hm = rust_inherent_self_candidate(ctx, hm, next, &inherent_unproved);
+                if (inherent_unproved) {
+                    rust_emit_unresolved_call(ctx, mname, "inherent_self_type_not_proven");
                     return;
                 }
                 if (hm) {
@@ -13577,6 +13821,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
             ctx->macro_origin_valid = true;
         }
 
+        bool args_proven = false;
         TSNode mname_node = ts_node_child_by_field_name(node, "macro", 5);
         if (!ts_node_is_null(mname_node)) {
             char *mname = rust_node_text(ctx, mname_node);
@@ -13585,6 +13830,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                  * macros with the same name. Do this before applying any
                  * built-in argument grammar or canonical std path. */
                 if (rust_has_visible_macro_definition(ctx, mname, node)) {
+                    args_proven = true;
                     rust_expand_user_macro(ctx, mname, node);
                 } else {
                     /* For known std macros emit a synthetic call under their
@@ -13595,8 +13841,15 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                      * re-parse the args to recover calls like `format!("{}",
                      * d.label())`. */
                     RustMacroArgForm arg_form;
-                    if (rust_builtin_macro_arg_form(ctx, mname, &arg_form))
+                    if (rust_builtin_macro_arg_form(ctx, mname, &arg_form)) {
                         rust_resolve_macro_arg_exprs(ctx, node, arg_form);
+                        const char *imported = rust_resolve_use(ctx, mname);
+                        /* The select grammar above models futures, not channel
+                         * selection. Its handler tokens remain opaque. */
+                        args_proven = !imported ||
+                            (strcmp(imported, "crossbeam_channel::select") != 0 &&
+                             strcmp(imported, "crossbeam::select") != 0);
+                    }
                     if (strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
                         strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
                         strcmp(mname, "format") == 0 || strcmp(mname, "write") == 0 ||
@@ -13632,8 +13885,10 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
             }
         }
         TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
+        if (ts_node_is_null(args))
+            args = cbm_find_child_by_kind(node, "token_tree");
         if (!ts_node_is_null(args))
-            rust_walk_macro_tokens(ctx, args);
+            rust_walk_macro_tokens(ctx, args, !args_proven);
         ctx->macro_origin_byte = saved_macro_origin;
         ctx->macro_origin_valid = saved_macro_origin_valid;
         ctx->emit_site_start_byte = saved_start;
@@ -14823,8 +15078,9 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
                         const char *module_qn = rust_resolve_module_path(ctx, module);
                         rust_lsp_add_glob(ctx, module_qn ? module_qn
                                                          : convert_path_to_qn(ctx->arena, module));
+                        ctx->glob_raw_paths[ctx->glob_count - 1] = module;
                     }
-                } else if (strcmp(imp->local_name, "_") != 0) {
+                } else {
                     const char *path = imp->module_path;
                     bool needs_relative_module =
                         strncmp(path, "self::", 6) == 0 || strncmp(path, "super::", 7) == 0;
@@ -15683,6 +15939,9 @@ static void rust_register_func_on(CBMArena *arena, CBMTypeRegistry *reg, CBMIdxM
         }
     }
     if (rf.receiver_type && d->receiver_spelling) {
+        if (!(rf.flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL))
+            rf.rust_inherent_impl_self = rust_wrapper_impl_self_type(
+                arena, d->receiver_spelling, rf.receiver_type, def_mod, tree);
         /* Keyed whether or not the trait is registered: the key is what tells
          * two impls of unregistered traits on one type apart. */
         rf.impl_key =
