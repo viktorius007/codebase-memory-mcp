@@ -11649,7 +11649,7 @@ TEST(rustlsp_gap_stdlib_atomic_compare_exchange) {
     cbm_free_result(r); PASS();
 }
 
-TEST(rustlsp_gap_stdlib_duration_arithmetic) {
+TEST(rustlsp_duration_operator_without_declared_output_stays_untyped) {
     CBMFileResult *r = extract_rust(
         "use std::time::Duration;\n"
         "fn run() -> u128 {\n"
@@ -11658,7 +11658,13 @@ TEST(rustlsp_gap_stdlib_duration_arithmetic) {
         "}\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "run", "Duration.from_secs"), 0);
-    ASSERT_GTE(require_resolved(r, "run", "Duration.as_millis"), 0);
+    ASSERT_EQ(find_resolved(r, "run", "Duration.as_millis"), -1);
+    bool stopped = false;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        stopped = stopped || (call->reason && strcmp(call->reason, "operator_output_not_proven") == 0);
+    }
+    ASSERT_TRUE(stopped);
     cbm_free_result(r); PASS();
 }
 
@@ -14173,8 +14179,17 @@ TEST(rustlsp_default_default_follows_declared_expected_type) {
     ASSERT_GTE(require_resolved(r, "site_let", "X.default"), 0);
     ASSERT_GTE(require_resolved(r, "site_ret", "Y.default"), 0);
     ASSERT_EQ(count_resolved(r, "site_base", "Y.default"), 0);
-    ASSERT_EQ(count_resolved(r, "site_derived", "default"), 0);
-    ASSERT_EQ(count_resolved(r, "site_untyped", "default"), 0);
+    int stopped = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        if (!call->caller_qn || (!strstr(call->caller_qn, "site_derived") &&
+                                !strstr(call->caller_qn, "site_untyped"))) continue;
+        if (!call->callee_qn || !strstr(call->callee_qn, "default")) continue;
+        ASSERT_STR_EQ(call->strategy, "lsp_unresolved");
+        ASSERT_STR_EQ(call->reason, "default_impl_not_proven");
+        stopped++;
+    }
+    ASSERT_EQ(stopped, 2);
     cbm_free_result(r);
     PASS();
 }
@@ -14976,7 +14991,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_stdlib_io_buf_read_lines);
     RUN_TEST(rustlsp_gap_stdlib_path_extension_chain);
     RUN_TEST(rustlsp_gap_stdlib_atomic_compare_exchange);
-    RUN_TEST(rustlsp_gap_stdlib_duration_arithmetic);
+    RUN_TEST(rustlsp_duration_operator_without_declared_output_stays_untyped);
 
     /* FOLLOWUP A1: derive synthesis */
     RUN_TEST(rustlsp_followup_a1_derive_clone);

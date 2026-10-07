@@ -8899,6 +8899,178 @@ TEST(pipeline_rust_path_module_inline_scope_does_not_use_file_identity) {
     PASS();
 }
 
+/* Same-named methods make result-type confusion observable in the stored graph. */
+static int check_rust_expression_results(bool sequential, int scenario) {
+    static const char *const sources[] = {
+        "use std::ops::Mul;\n"
+        "pub struct Left; pub struct Right; pub struct Product; pub struct Alternate;\n"
+        "impl Left { pub fn result(&self) {} }\n"
+        "impl Product { pub fn result(&self) {} }\n"
+        "impl Alternate { pub fn result(&self) {} }\n"
+        "impl Mul<Right> for Left { type Output = Product; fn mul(self, _: Right) -> Product { Product } }\n"
+        "pub fn product(x: Left, y: Right) { let z = x * y; z.result(); }\n"
+        "impl Mul<Left> for Left { type Output = Alternate; fn mul(self, _: Left) -> Alternate { Alternate } }\n"
+        "pub fn other_rhs(x: Left, y: Left) { let z = x * y; z.result(); }\n"
+        "pub fn unsupported(x: std::time::Duration, y: u32) { let z = x * y; z.as_secs(); }\n",
+        "pub struct Entity; impl Entity { pub fn iter(&self) {} }\n"
+        "pub fn literal(v: Vec<Entity>) { v[1..].iter(); }\n"
+        "pub fn bound(v: Vec<Entity>, r: std::ops::Range<usize>) { v[r].iter(); }\n"
+        "pub fn element(v: Vec<Entity>) { v[0].iter(); }\n"
+        "pub struct Window; pub struct BorrowedWindow; pub struct Container;\n"
+        "impl Window { pub fn result(&self) {} }\n"
+        "impl BorrowedWindow { pub fn result(&self) {} }\n"
+        "impl std::ops::Index<std::ops::Range<usize>> for Container { type Output = Window;\n"
+        "fn index(&self, _: std::ops::Range<usize>) -> &Window { todo!() } }\n"
+        "pub fn custom(c: Container) { c[1..2].result(); }\n"
+        "impl std::ops::Index<std::ops::Range<usize>> for &Container { type Output = BorrowedWindow;\n"
+        "fn index(&self, _: std::ops::Range<usize>) -> &BorrowedWindow { todo!() } }\n"
+        "pub fn borrowed(c: &Container) { c[1..2].result(); }\n",
+        "pub struct IntoIter; impl Default for IntoIter { fn default() -> Self { Self } }\n"
+        "pub fn take(_: std::vec::IntoIter<u8>) {}\n"
+        "pub fn foreign_default() { take(Default::default()); }\n"
+        "pub fn local_default() { let _: IntoIter = Default::default(); }\n",
+        "pub struct Item; impl Item { pub fn result(&self) {} }\n"
+        "pub fn make() -> Item { Item }\n"
+        "pub struct Factory { pub get: fn() -> Item }\n"
+        "pub fn parameter(f: fn() -> Item) { f().result(); }\n"
+        "pub fn field(f: Factory) { (f.get)().result(); }\n"
+        "pub fn alias() { let f: fn() -> Item = make; f().result(); }\n"
+        "pub fn returned(f: fn() -> fn() -> Item) { f()().result(); }\n"
+        "pub fn closure() { let f = || { let value = Item; value }; f().result(); }\n"
+        "pub fn typed_closure() { let f = |value: Item| value; f(Item).result(); }\n"
+        "pub struct Model { pub n: u8 } impl Model { pub fn result(&self) {} }\n"
+        "pub struct Other; impl Other { pub fn result(&self) {} }\n"
+        "pub fn shadow() { let f = |Model| Model; f(Other).result(); }\n"
+    };
+    char tmp[512];
+    const char *temp_root = getenv("TMPDIR");
+    snprintf(tmp, sizeof(tmp), "%s/expression_XXXXXX", temp_root ? temp_root : "/tmp");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"expr\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", sources[scenario]);
+    if (!sequential) {
+        for (int i = 0; i < 55; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "padding/p%d.rs", i);
+            write_temp_file(tmp, name, "pub fn padding() {}\n");
+        }
+    }
+    const char *previous = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved = previous ? strdup(previous) : NULL;
+    if (sequential) cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    else cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    int status = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = cbm_store_open_path(db);
+    bool correct = false;
+    if (store && pipeline && status == 0) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        char caller[512], target[512], wrong[512];
+        snprintf(target, sizeof(target), "%s.src.lib.%s", project,
+                 scenario == 0 ? "Product.result" : scenario == 1 ? "Entity.iter" :
+                 scenario == 2 ? "IntoIter.default[Default]" : "Item.result");
+        snprintf(wrong, sizeof(wrong), "%s.src.lib.Left.result", project);
+        if (scenario == 0) {
+            snprintf(caller, sizeof(caller), "%s.src.lib.product", project);
+            correct = exact_call_qns_exist(store, project, caller, target) &&
+                      !exact_call_qns_exist(store, project, caller, wrong);
+            snprintf(caller, sizeof(caller), "%s.src.lib.other_rhs", project);
+            snprintf(target, sizeof(target), "%s.src.lib.Alternate.result", project);
+            correct = correct && exact_call_qns_exist(store, project, caller, target) &&
+                      !exact_call_qns_exist(store, project, caller, wrong);
+        } else if (scenario == 1) {
+            snprintf(caller, sizeof(caller), "%s.src.lib.element", project);
+            correct = exact_call_qns_exist(store, project, caller, target);
+            snprintf(caller, sizeof(caller), "%s.src.lib.literal", project);
+            correct = correct && !exact_call_qns_exist(store, project, caller, target);
+            snprintf(caller, sizeof(caller), "%s.src.lib.bound", project);
+            correct = correct && !exact_call_qns_exist(store, project, caller, target);
+            snprintf(caller, sizeof(caller), "%s.src.lib.custom", project);
+            snprintf(target, sizeof(target), "%s.src.lib.Window.result", project);
+            correct = correct && exact_call_qns_exist(store, project, caller, target);
+            snprintf(caller, sizeof(caller), "%s.src.lib.borrowed", project);
+            correct = correct && !exact_call_qns_exist(store, project, caller, target);
+            snprintf(target, sizeof(target), "%s.src.lib.BorrowedWindow.result", project);
+            correct = correct && exact_call_qns_exist(store, project, caller, target);
+        } else if (scenario == 2) {
+            snprintf(caller, sizeof(caller), "%s.src.lib.foreign_default", project);
+            correct = !exact_call_qns_exist(store, project, caller, target);
+            snprintf(caller, sizeof(caller), "%s.src.lib.local_default", project);
+            correct = correct && exact_call_qns_exist(store, project, caller, target);
+        } else {
+            static const char *const callers[] = {"parameter", "field", "alias", "returned", "closure", "typed_closure"};
+            correct = true;
+            for (int i = 0; i < 6; i++) {
+                snprintf(caller, sizeof(caller), "%s.src.lib.%s", project, callers[i]);
+                correct = correct && exact_call_qns_exist(store, project, caller, target);
+            }
+            snprintf(caller, sizeof(caller), "%s.src.lib.shadow", project);
+            snprintf(target, sizeof(target), "%s.src.lib.Model.result", project);
+            correct = correct && !exact_call_qns_exist(store, project, caller, target);
+            sqlite3_stmt *stmt = NULL;
+            int count = 0;
+            if (sqlite3_prepare_v2(cbm_store_get_db(store),
+                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.shadow' AND name='result' AND reason='unknown_receiver_type'",
+                -1, &stmt, NULL) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
+                count = sqlite3_column_int(stmt, 0);
+            sqlite3_finalize(stmt);
+            correct = correct && count == 1;
+        }
+        if (scenario < 3) {
+            const char *sql = scenario == 0 ?
+                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.unsupported' AND kind='call' AND reason='unknown_receiver_type'" :
+                scenario == 1 ?
+                "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.literal' OR caller LIKE '%.bound') AND kind='call'" :
+                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.foreign_default' AND name='default' AND kind='call'";
+            sqlite3_stmt *stmt = NULL;
+            int count = 0;
+            if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK &&
+                sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+            sqlite3_finalize(stmt);
+            correct = correct && count == (scenario == 1 ? 2 : 1);
+            if (scenario == 1) {
+                count = -1;
+                if (sqlite3_prepare_v2(cbm_store_get_db(store),
+                    "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.custom' OR caller LIKE '%.borrowed') AND reason='index_output_not_proven'",
+                    -1, &stmt, NULL) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
+                    count = sqlite3_column_int(stmt, 0);
+                sqlite3_finalize(stmt);
+                correct = correct && count == 0;
+            }
+        }
+    }
+    if (store) cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    if (saved) { cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved, 1); free(saved); }
+    else cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    th_rmtree(tmp);
+    ASSERT_EQ(status, 0);
+    ASSERT_TRUE(correct);
+    return 0;
+}
+
+TEST(pipeline_rust_operator_result_sequential) { ASSERT_EQ(check_rust_expression_results(true, 0), 0); PASS(); }
+TEST(pipeline_rust_operator_result_parallel) { ASSERT_EQ(check_rust_expression_results(false, 0), 0); PASS(); }
+TEST(pipeline_rust_range_index_result_sequential) { ASSERT_EQ(check_rust_expression_results(true, 1), 0); PASS(); }
+TEST(pipeline_rust_range_index_result_parallel) { ASSERT_EQ(check_rust_expression_results(false, 1), 0); PASS(); }
+TEST(pipeline_rust_default_expected_identity_sequential) { ASSERT_EQ(check_rust_expression_results(true, 2), 0); PASS(); }
+TEST(pipeline_rust_default_expected_identity_parallel) { ASSERT_EQ(check_rust_expression_results(false, 2), 0); PASS(); }
+TEST(pipeline_rust_callable_result_sequential) { ASSERT_EQ(check_rust_expression_results(true, 3), 0); PASS(); }
+TEST(pipeline_rust_callable_result_parallel) { ASSERT_EQ(check_rust_expression_results(false, 3), 0); PASS(); }
+
+SUITE(pipeline_expression) {
+    RUN_TEST(pipeline_rust_operator_result_sequential);
+    RUN_TEST(pipeline_rust_operator_result_parallel);
+    RUN_TEST(pipeline_rust_range_index_result_sequential);
+    RUN_TEST(pipeline_rust_range_index_result_parallel);
+    RUN_TEST(pipeline_rust_default_expected_identity_sequential);
+    RUN_TEST(pipeline_rust_default_expected_identity_parallel);
+    RUN_TEST(pipeline_rust_callable_result_sequential);
+    RUN_TEST(pipeline_rust_callable_result_parallel);
+}
+
 static bool rust_inline_variable_edges(const char *source_suffix, const char *target_suffix,
                                        cbm_store_t *store, const char *project) {
     char source_qn[512], target_qn[512];
@@ -18720,7 +18892,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":14") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":15") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -19532,6 +19704,7 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    suite_pipeline_expression();
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);

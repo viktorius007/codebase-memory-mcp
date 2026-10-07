@@ -1137,6 +1137,7 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
     dst->trait_qn = cbm_arena_strdup(arena, impl->trait_name); /* raw; canonicalized later */
     dst->impl_target = impl->target_type ? cbm_arena_strdup(arena, impl->target_type) : NULL;
     dst->impl_item = impl->item_type ? cbm_arena_strdup(arena, impl->item_type) : NULL;
+    dst->impl_output = impl->output_type ? cbm_arena_strdup(arena, impl->output_type) : NULL;
     dst->lang = CBM_LANG_RUST;
     dst->is_rust_impl_relation = true;
     return 0;
@@ -2069,6 +2070,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].receiver_spelling = defs[i].receiver_spelling;
         out[i].impl_target = defs[i].impl_target;
         out[i].impl_item = defs[i].impl_item;
+        out[i].impl_output = defs[i].impl_output;
         out[i].decorators = defs[i].decorators;
         out[i].is_interface = defs[i].is_interface;
         out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;

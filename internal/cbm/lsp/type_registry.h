@@ -77,6 +77,15 @@ typedef struct CBMRustIteratorImpl {
     struct CBMRustIteratorImpl *next;
 } CBMRustIteratorImpl;
 
+/* Written operator impls retain both operands; method-name buckets erase Rhs. */
+typedef struct CBMRustOperatorImpl {
+    const char *trait_qn;
+    const CBMType *self_type;
+    const CBMType *rhs_type;
+    const CBMType *output_type;
+    struct CBMRustOperatorImpl *next;
+} CBMRustOperatorImpl;
+
 // Registered type with fields and method names.
 typedef struct {
     const char *qualified_name;    // e.g., "proj.pkg.TypeName"
@@ -95,6 +104,7 @@ typedef struct {
     const CBMType *deref_target;
     const char **deref_param_names;
     CBMRustIteratorImpl *rust_iterator_impls;
+    CBMRustOperatorImpl *rust_operator_impls;
     /* Rust: declaration types of associated constants, keyed by short name.
      * Duplicate declarations bind UNKNOWN; constants never enter callable indexes. */
     struct CBMScope *rust_assoc_consts;

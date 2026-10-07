@@ -36,6 +36,7 @@
  * incomplete_method_registry, module_function_not_registered,
  * associated_item_not_registered, unknown_edition, cfg_dependent_name,
  * bound_declaration_not_proven, method_not_found, unknown_receiver_type,
+ * operator_output_not_proven, index_output_not_proven, default_impl_not_proven,
  * unresolved_glob_import, workspace_library_path_not_registered,
  * function_not_in_registry, trait_nominal_identity_ambiguous,
  * trait_inherent_accessor_unknown, trait_scope_identity, trait_impl_key_unreadable,
