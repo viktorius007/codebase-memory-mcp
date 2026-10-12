@@ -18,12 +18,30 @@ with open(sys.argv[1], 'rb') as binary:
     print(digest.hexdigest())
 PY
 )"
+# A worker never reads the resource policy from config or environment: its
+# supervisor resolves the policy and sends it in the request, and a request
+# without one is refused. This script plays the supervisor, so it sends what
+# the supervisor sends by default: both limits off.
 ARGS="$(python3 - "$REPO" "$NAME" "$MODE" <<'PY'
 import json, sys
-print(json.dumps(dict(repo_path=sys.argv[1], name=sys.argv[2], mode=sys.argv[3])))
+policy = dict(index_max_files="off", index_max_source_mb="off")
+print(json.dumps(dict(repo_path=sys.argv[1], name=sys.argv[2], mode=sys.argv[3],
+                      _cbm_index_policy=policy)))
 PY
 )"
 RESPONSE="$(mktemp "${TMPDIR:-/tmp}/cbm-local-response.XXXXXX")"
 trap 'rm -f "$RESPONSE"' EXIT
 "$BIN" cli --index-worker --index-worker-build "$FINGERPRINT" \
     index_repository "$ARGS" --response-out "$RESPONSE"
+# The worker exits 0 on a refused request; the response says so.
+python3 - "$RESPONSE" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    text = handle.read()
+try:
+    response = json.loads(text)
+except ValueError:
+    response = None
+if not isinstance(response, dict) or response.get("isError"):
+    sys.exit("index worker refused or failed: " + (text.strip() or "no response"))
+PY

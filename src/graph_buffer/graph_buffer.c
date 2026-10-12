@@ -39,6 +39,7 @@ enum {
 #include "foundation/mem_core.h"
 #include <sqlite3.h>
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -847,6 +848,162 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
     gb->next_id = next_id;
 }
 
+/* ── Definition variants ─────────────────────────────────────────────
+ * One name defined more than once under mutually exclusive conditions —
+ * C-family #if/#else, Rust #[cfg], build-tagged files, a definition under an
+ * `if` — is ONE identity: one QN, one node, whose edges are the union of
+ * every variant's body. The collision rule below keeps one canonical winner
+ * for name, file, lines and properties; every variant's span survives in the
+ * node's `variants` property ([{"file_path","start_line","end_line"}],
+ * sorted, unique), so a change in any variant maps to the node. Recorded only
+ * between definitions of the same label with real spans: a different kind
+ * sharing the QN (C: struct vs function) is no variant, a span on line 0 is
+ * no location (delta-route proxies), and a full tie is the same entity. */
+static void *gb_yy_malloc(void *ctx, size_t size) {
+    (void)ctx;
+    return cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, size);
+}
+
+static void *gb_yy_realloc(void *ctx, void *block, size_t old_size, size_t size) {
+    (void)ctx;
+    (void)old_size;
+    return cbm_realloc(CBM_MEM_CLASS_GBUF_STRING, block, size);
+}
+
+static void gb_yy_free(void *ctx, void *block) {
+    (void)ctx;
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, block);
+}
+
+static const yyjson_alc gb_yy_alc = {gb_yy_malloc, gb_yy_realloc, gb_yy_free, NULL};
+
+enum { GB_VARIANTS_MAX = 64 };
+
+typedef struct {
+    const char *file;
+    int start;
+    int end;
+} gb_span_t;
+
+static bool gb_variant_label(const char *label) {
+    static const char *const labels[] = {"Function", "Method", "Class", "Interface", "Enum",
+                                         "Struct",   "Trait",  "Type",  "Macro"};
+    for (size_t i = 0; label && i < sizeof(labels) / sizeof(labels[0]); i++) {
+        if (strcmp(label, labels[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int gb_span_cmp(const void *a, const void *b) {
+    const gb_span_t *x = a;
+    const gb_span_t *y = b;
+    int c = strcmp(x->file, y->file);
+    if (c == 0) {
+        c = (x->start > y->start) - (x->start < y->start);
+    }
+    if (c == 0) {
+        c = (x->end > y->end) - (x->end < y->end);
+    }
+    return c;
+}
+
+/* A definition's spans: its `variants` property, else its own span. */
+static int gb_spans_of(yyjson_doc *doc, const char *file, int start, int end, gb_span_t *out,
+                       int n) {
+    yyjson_val *list = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "variants") : NULL;
+    if (yyjson_is_arr(list) && yyjson_arr_size(list) > 0) {
+        size_t i;
+        size_t max;
+        yyjson_val *v;
+        yyjson_arr_foreach(list, i, max, v) {
+            const char *f = yyjson_get_str(yyjson_obj_get(v, "file_path"));
+            int s = (int)yyjson_get_int(yyjson_obj_get(v, "start_line"));
+            int e = (int)yyjson_get_int(yyjson_obj_get(v, "end_line"));
+            if (f && s > 0 && n < GB_VARIANTS_MAX) {
+                out[n++] = (gb_span_t){f, s, e};
+            }
+        }
+        return n;
+    }
+    if (start > 0 && n < GB_VARIANTS_MAX) {
+        out[n++] = (gb_span_t){file ? file : "", start, end};
+    }
+    return n;
+}
+
+/* The survivor's properties with the union of both definitions' variant
+ * spans. Returns a GBUF_STRING-owned JSON string, or NULL when there is
+ * nothing to record (fewer than two distinct spans) or on any failure — the
+ * survivor then keeps its own properties: a lost variants list costs
+ * precision, never data. */
+static char *gb_variants_props(const char *survivor_props, const char *a_props, const char *a_file,
+                               int a_start, int a_end, const char *b_props, const char *b_file,
+                               int b_start, int b_end) {
+    if (a_start <= 0 || b_start <= 0) {
+        return NULL;
+    }
+    yyjson_doc *a_doc =
+        a_props ? yyjson_read_opts((char *)a_props, strlen(a_props), 0, &gb_yy_alc, NULL) : NULL;
+    yyjson_doc *b_doc =
+        b_props ? yyjson_read_opts((char *)b_props, strlen(b_props), 0, &gb_yy_alc, NULL) : NULL;
+    gb_span_t spans[GB_VARIANTS_MAX * 2];
+    int n = gb_spans_of(a_doc, a_file, a_start, a_end, spans, 0);
+    n = gb_spans_of(b_doc, b_file, b_start, b_end, spans, n);
+    qsort(spans, (size_t)n, sizeof(spans[0]), gb_span_cmp);
+    int unique = 0;
+    for (int i = 0; i < n; i++) {
+        if (unique == 0 || gb_span_cmp(&spans[unique - 1], &spans[i]) != 0) {
+            spans[unique++] = spans[i];
+        }
+    }
+    char *out = NULL;
+    if (unique >= 2) {
+        yyjson_mut_doc *mut = yyjson_mut_doc_new(&gb_yy_alc);
+        yyjson_doc *s_doc = survivor_props
+                                ? yyjson_read_opts((char *)survivor_props, strlen(survivor_props),
+                                                   0, &gb_yy_alc, NULL)
+                                : NULL;
+        yyjson_mut_val *root = s_doc && yyjson_is_obj(yyjson_doc_get_root(s_doc))
+                                   ? yyjson_val_mut_copy(mut, yyjson_doc_get_root(s_doc))
+                                   : yyjson_mut_obj(mut);
+        yyjson_mut_val *list = yyjson_mut_arr(mut);
+        for (int i = 0; root && list && i < unique; i++) {
+            yyjson_mut_val *v = yyjson_mut_arr_add_obj(mut, list);
+            yyjson_mut_obj_add_strcpy(mut, v, "file_path", spans[i].file);
+            yyjson_mut_obj_add_int(mut, v, "start_line", spans[i].start);
+            yyjson_mut_obj_add_int(mut, v, "end_line", spans[i].end);
+        }
+        if (mut && root && list) {
+            yyjson_mut_obj_remove_key(root, "variants");
+            yyjson_mut_obj_add_val(mut, root, "variants", list);
+            yyjson_mut_doc_set_root(mut, root);
+            out = yyjson_mut_write_opts(mut, 0, &gb_yy_alc, NULL, NULL);
+        }
+        yyjson_doc_free(s_doc);
+        yyjson_mut_doc_free(mut);
+    }
+    yyjson_doc_free(a_doc);
+    yyjson_doc_free(b_doc);
+    return out;
+}
+
+/* Record the variant spans of a same-QN collision on the surviving node. */
+static void gb_record_variants(cbm_gbuf_node_t *survivor, const char *a_label, const char *a_props,
+                               const char *a_file, int a_start, int a_end, const char *b_label,
+                               const char *b_props, const char *b_file, int b_start, int b_end) {
+    if (!gb_variant_label(a_label) || !b_label || strcmp(a_label, b_label) != 0) {
+        return;
+    }
+    char *merged = gb_variants_props(survivor->properties_json, a_props, a_file, a_start, a_end,
+                                     b_props, b_file, b_start, b_end);
+    if (merged) {
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, survivor->properties_json);
+        survivor->properties_json = merged;
+    }
+}
+
 /* ── Node operations ─────────────────────────────────────────────── */
 
 /* True when the file at `module_path` is the folder `folder_path` plus an
@@ -889,6 +1046,20 @@ static void upsert_folder_sibling_module(cbm_gbuf_t *gb, const cbm_gbuf_node_t *
     (void)cbm_gbuf_upsert_node(gb, label, name, qn, file_path, start_line, end_line,
                                properties_json);
     cbm_free(CBM_MEM_CLASS_GBUF_STRING, qn);
+}
+
+/* First key of the canonical same-QN collision order: how strong a claim the
+ * entity has on a qualified name. A macro is the weakest: when a "Macro" and
+ * a definition share a QN, the definition, which carries the body, the
+ * signature and every edge, owns it whichever comes first.
+ *
+ * C-preprocessor macros no longer get here: their QN carries its own
+ * namespace (`...#macro`, CBM_MACRO_QN_SUFFIX) and cannot equal a definition's.
+ * The case left is Chialisp, whose `defmacro` / `defmac` defs are labelled
+ * "Macro" under a plain QN: a macro and a `defun` of one name in one file, or
+ * in a same-stem `.clsp` / `.clib` pair (one module QN). */
+static int gb_qn_claim_rank(const char *label) {
+    return (label && strcmp(label, "Macro") == 0) ? 0 : 1;
 }
 
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
@@ -936,8 +1107,13 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * of the same entity with new content) replaces the earlier one,
          * deterministically, because intra-file arrival order is fixed. A
          * full tie is the same entity re-upserted → refresh in place.
-         * Kind-disambiguated QNs (the real cure) remain a follow-up. */
-        int c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+         * Ahead of all of these, a definition beats a macro
+         * (gb_qn_claim_rank). Kind-disambiguated QNs (the real cure) remain
+         * a follow-up. */
+        int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(label);
+        if (c == 0) {
+            c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - start_line;
         }
@@ -948,7 +1124,18 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
             c = strcmp(existing->label ? existing->label : "", label ? label : "");
         }
         if (c > 0) {
+            gb_record_variants(existing, existing->label, existing->properties_json,
+                               existing->file_path, existing->start_line, existing->end_line, label,
+                               properties_json, file_path, start_line, end_line);
             return existing->id; /* existing entity is the canonical winner */
+        }
+        /* The arrival wins: its properties, plus every variant span both carry. */
+        char *variant_props = NULL;
+        if (gb_variant_label(label) && existing->label && strcmp(existing->label, label) == 0) {
+            variant_props =
+                gb_variants_props(properties_json, existing->properties_json, existing->file_path,
+                                  existing->start_line, existing->end_line, properties_json,
+                                  file_path, start_line, end_line);
         }
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
@@ -959,7 +1146,9 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * label/name — cbm_gbuf_find_by_label/name then missed or mis-listed it,
          * which is how the flickering Function set reached the semantic pass). */
         char *new_name = heap_strdup(name);
-        char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
+        char *new_props = variant_props     ? variant_props
+                          : properties_json ? heap_strdup(properties_json)
+                                            : NULL;
         const char *new_label_interned = gb_intern(gb, label);
         bool label_changed = !existing->label || !new_label_interned ||
                              strcmp(existing->label, new_label_interned) != 0;
@@ -1591,9 +1780,13 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
          * the node set (and every downstream consumer) run to run. Winner =
          * smallest file_path, then LARGEST start_line, then largest
          * name/label — one total order, commutative, scheduling-free; a full
-         * tie is the same entity → refresh from src. */
-        int c = strcmp(sn->file_path ? sn->file_path : "",
+         * tie is the same entity → refresh from src. A definition beats a
+         * macro ahead of all of these (gb_qn_claim_rank). */
+        int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(sn->label);
+        if (c == 0) {
+            c = strcmp(sn->file_path ? sn->file_path : "",
                        existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - sn->start_line;
         }
@@ -1604,7 +1797,22 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             c = strcmp(existing->label ? existing->label : "", sn->label ? sn->label : "");
         }
         bool sn_wins = c <= 0;
+        if (!sn_wins) {
+            gb_record_variants(existing, existing->label, existing->properties_json,
+                               existing->file_path, existing->start_line, existing->end_line,
+                               sn->label, sn->properties_json, sn->file_path, sn->start_line,
+                               sn->end_line);
+        }
         if (sn_wins) {
+            /* src's properties, plus every variant span both carry. */
+            char *variant_props = NULL;
+            if (gb_variant_label(sn->label) && existing->label &&
+                strcmp(existing->label, sn->label) == 0) {
+                variant_props = gb_variants_props(sn->properties_json, existing->properties_json,
+                                                  existing->file_path, existing->start_line,
+                                                  existing->end_line, sn->properties_json,
+                                                  sn->file_path, sn->start_line, sn->end_line);
+            }
             /* Keep the secondary indexes consistent when the surviving
              * label/name changes (the old code left the node listed under its
              * original label/name, so find_by_label/name mis-listed it). */
@@ -1629,9 +1837,10 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             existing->file_path = (char *)gb_intern(dst, sn->file_path);
             existing->start_line = sn->start_line;
             existing->end_line = sn->end_line;
-            if (sn->properties_json) {
+            if (variant_props || sn->properties_json) {
                 cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->properties_json);
-                existing->properties_json = heap_strdup(sn->properties_json);
+                existing->properties_json =
+                    variant_props ? variant_props : heap_strdup(sn->properties_json);
             }
             if (label_changed) {
                 node_ptr_array_t *by_label = get_or_create_node_array(
@@ -1955,6 +2164,32 @@ static void log_dump_summary(int node_count, int edge_count) {
     cbm_log_info("gbuf.dump", "nodes", b1, "edges", b2);
 }
 
+/* A dump that published nothing gets exactly one signature in the log.
+ * Without it the writer's return code is the only evidence, and it reaches
+ * the user as a generic pipeline failure that blames their repository
+ * (#1620, #2001).
+ *
+ * failure_errno is read by the caller at the point of failure: the value is
+ * only meaningful before the next library call. Zero means the failure did
+ * not originate at the publish boundary — an append that failed many calls
+ * earlier — and the field is omitted rather than claim a reason this record
+ * does not have. */
+static void log_dump_failed(int rc, int failure_errno, int node_count, int edge_count) {
+    char b1[CBM_SZ_16];
+    char b3[CBM_SZ_16];
+    char b4[CBM_SZ_16];
+    snprintf(b1, sizeof(b1), "%d", rc);
+    snprintf(b3, sizeof(b3), "%d", node_count);
+    snprintf(b4, sizeof(b4), "%d", edge_count);
+    if (failure_errno == 0) {
+        cbm_log_error("gbuf.dump_failed", "rc", b1, "nodes", b3, "edges", b4);
+        return;
+    }
+    char b2[CBM_SZ_16];
+    snprintf(b2, sizeof(b2), "%d", failure_errno);
+    cbm_log_error("gbuf.dump_failed", "rc", b1, "errno", b2, "nodes", b3, "edges", b4);
+}
+
 static void free_dump_resources(char **url_paths, char **local_names, int edge_count,
                                 CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes,
                                 int64_t *temp_to_final) {
@@ -2027,6 +2262,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     int64_t max_temp_id = gb->next_id;
     int64_t *temp_to_final = cbm_calloc(CBM_MEM_CLASS_DUMP, (size_t)max_temp_id * sizeof(int64_t));
     if (!temp_to_final) {
+        log_dump_failed(CBM_NOT_FOUND, errno, 0, 0);
         return CBM_NOT_FOUND;
     }
 
@@ -2057,6 +2293,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * uninitialized budget from ever triggering the free). */
     cbm_db_writer_t *w = cbm_writer_open(path);
     if (!w) {
+        log_dump_failed(CBM_NOT_FOUND, errno, node_idx, 0);
         cbm_free(CBM_MEM_CLASS_DUMP, src_nodes);
         cbm_free(CBM_MEM_CLASS_DUMP, dump_nodes);
         cbm_free(CBM_MEM_CLASS_DUMP, temp_to_final);
@@ -2076,7 +2313,12 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         if (rc != 0) {
             break;
         }
-        free_heavy = free_heavy || (cbm_mem_budget() > 0 && cbm_mem_over_budget());
+        /* cbm_mem_should_relieve, not cbm_mem_over_budget: the dump is where
+         * the run died on 2026-09-18 with our charge UNDER budget and the host
+         * out of memory, so the only signal that would have fired here is the
+         * machine's. Dropping the property strings we have already written is
+         * pure relief — the rows are in the file by now. */
+        free_heavy = free_heavy || (cbm_mem_budget() > 0 && cbm_mem_should_relieve());
         if (free_heavy && src_nodes) {
             for (int j = off; j < off + chunk; j++) {
                 cbm_free(CBM_MEM_CLASS_GBUF_STRING, src_nodes[j]->properties_json);
@@ -2106,14 +2348,22 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
                                   dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
                                   gb->dump_token_vecs, gb->dump_token_vec_count);
+    /* Read errno before anything else can touch it: the profiling macro
+     * below is already one library call away from losing the reason. */
+    int finalize_errno = errno;
     CBM_PROF_END_N("dump", "6_write_db_finalize", t_finalize, node_idx + edge_idx);
     if (rc == 0) {
         rc = frc;
     }
 
-    if (rc == 0)
+    if (rc == 0) {
         rc = dump_unresolved_sites(gb, path);
-    log_dump_summary(node_idx, edge_idx);
+    }
+    if (rc != 0) {
+        log_dump_failed(rc, finalize_errno, node_idx, edge_idx);
+    } else {
+        log_dump_summary(node_idx, edge_idx);
+    }
     free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
     cbm_free(CBM_MEM_CLASS_DUMP, src_nodes);
     return rc;

@@ -26,6 +26,16 @@ SUITE_NAME = re.compile(r"^[a-z0-9_]+$")
 SUMMARY = re.compile(r"^  (?P<passed>[0-9]+) passed")
 FAILED = re.compile(r"(?:^|, )(?P<failed>[0-9]+) failed")
 SKIPPED = re.compile(r"(?:^|, )(?P<skipped>[0-9]+) skipped")
+# Suites on the slow tier carry a stated reason (O10: no unexplained
+# entries). incremental/store_arch/daemon_runtime: the heaviest sanitized
+# suites by steady-state cost. node_creation_probe/grammar_probe_b: full-
+# pipeline indexing probes whose FIRST run in a fresh checkout pays a
+# one-time environment tax (every artifact is AV-scan-cold on the Windows
+# VM; grammar_probe_b hit it 2026-08-? under host contention, node_creation
+# _probe 2026-08-28 at exactly 900s on a new run checkout, both green on
+# the warm rerun). That state is deterministic, not racy — the stable-state
+# budget rule applies.
+#
 # Suites whose honest runtime does not fit the default per-suite budget, and so
 # get --slow-timeout instead. This is a statement about SIZE, never about
 # flakiness: every suite here is deterministic and simply long, and a racy suite
@@ -38,7 +48,16 @@ SKIPPED = re.compile(r"(?:^|, )(?P<skipped>[0-9]+) skipped")
 # stack_overflow_b 277s vs 76s). 497s at that ratio cannot fit, so the suite was
 # killed at 900s and reported as hung. daemon_runtime, at 842s on that same
 # runner, survives only because it was already listed here.
-SLOW_SUITES = frozenset(("incremental", "store_arch", "daemon_runtime", "cli"))
+SLOW_SUITES = frozenset(
+    (
+        "incremental",
+        "store_arch",
+        "daemon_runtime",
+        "cli",
+        "node_creation_probe",
+        "grammar_probe_b",
+    )
+)
 POLL_SECONDS = 0.05
 
 # WHY: the Windows descendant probe below is a cold `powershell.exe` + CIM
@@ -54,6 +73,16 @@ POLL_SECONDS = 0.05
 # unfinished probe rather than as a leaked tree.
 WINDOWS_DESCENDANT_PROBE_SECONDS = 15
 WINDOWS_DESCENDANT_PROBE_ATTEMPTS = 2
+
+# WHY: the same defect as the probe above, one call earlier. `taskkill /F`
+# cannot be resisted -- a live tree is terminated as soon as the tool runs --
+# so what bounding it measures is taskkill.exe's own cold start on the runner,
+# not the tree. Timed with --kill-grace (1s in the harness contract), a slow
+# start was reported as "taskkill could not prove process-tree cleanup" for an
+# ordinary hung suite (#2345). The tree does not change while the tool starts,
+# so this is a stable-state budget; --kill-grace keeps bounding what it names:
+# how long the leader may take to be reaped once taskkill has succeeded.
+WINDOWS_TASKKILL_SECONDS = 15
 
 
 @dataclass
@@ -225,6 +254,27 @@ def windows_tree_cleanup_blocker(pid: int) -> str | None:
     return unproven
 
 
+def windows_taskkill_tree(pid: int) -> bool:
+    """Force-terminate `pid` and its whole tree; True only on proven success.
+
+    A tool that cannot start, cannot finish within its own budget, or reports
+    failure is never read as success -- the caller refuses to call the tree
+    clean.
+    """
+    try:
+        completed = subprocess.run(
+            ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=WINDOWS_TASKKILL_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
 def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
     process = active.process
     leader_exited = process.poll() is not None
@@ -243,24 +293,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
                     f"could not be proven: {blocker}"
                 )
             return
-        try:
-            completed = subprocess.run(
-                [
-                    "taskkill.exe",
-                    "/PID",
-                    str(process.pid),
-                    "/T",
-                    "/F",
-                ],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=kill_grace,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            completed = None
-        if completed is None or completed.returncode != 0:
+        if not windows_taskkill_tree(process.pid):
             if process.poll() is None:
                 process.kill()
                 try:

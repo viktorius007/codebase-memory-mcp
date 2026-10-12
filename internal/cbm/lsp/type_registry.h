@@ -66,6 +66,9 @@ typedef struct {
      * (`fn f<T, U>`), NULL-ended, NULL when none. `type_param_names` holds
      * the enclosing impl's parameters by self-type position instead. */
     const char **rust_fn_type_params;
+    /* Callable identity (#2061): this overload's signature suffix; its graph
+     * QN is qualified_name + sig. NULL = none (always, until enabled). */
+    const char *sig;
 } CBMRegisteredFunc;
 
 /* Rust impl records retain the self shape: owned and borrowed impls can
@@ -114,6 +117,12 @@ typedef struct {
     const CBMType *index_value_type; // V or NULL
     // Generic constraints, parallel to type_param_names. NULL or shorter array means "any".
     const CBMType **type_param_constraints; // NULL-terminated, parallel to type_param_names
+
+    // --- C#-specific (NULL for every other language) ---
+    // Declared namespace of a TOP-LEVEL project type. Graph QNs are path-derived,
+    // so this is the only way to bind a short name through `using` directives and
+    // enclosing namespaces (#2120). NULL for nested types and unknown namespaces.
+    const char *namespace_qn;
 } CBMRegisteredType;
 
 // Hash-table bucket entry. Chains collisions via next-index list for overload sets.

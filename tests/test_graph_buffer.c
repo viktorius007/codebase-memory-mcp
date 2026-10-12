@@ -9,6 +9,10 @@
 #include "foundation/mem_core.h"
 #include <stdatomic.h>
 #include "store/store.h"
+#include "../src/foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/log.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ── Node operations ───────────────────────────────────────────── */
@@ -613,6 +617,71 @@ TEST(gbuf_upsert_same_qn_updates_all_fields) {
     PASS();
 }
 
+/* PR C1: when a Macro and a definition share a QN, the definition owns it whichever
+ * line comes first; before, the later line won. C-preprocessor macros no longer get
+ * here (their QN ends in "#macro" and cannot equal a definition's). Chialisp does:
+ * `defmacro` / `defmac` defs are labelled Macro under a plain QN, so a macro and a
+ * `defun` of one name collide in one file or in a same-stem .clsp / .clib pair. */
+TEST(gbuf_upsert_definition_beats_same_qn_macro_c1) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    /* macro AFTER the function */
+    cbm_gbuf_upsert_node(gb, "Function", "assert", "p.cond.assert", "cond.clsp", 742, 779, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "assert", "p.cond.assert", "cond.clsp", 781, 782, "{}");
+    /* macro BEFORE the definition */
+    cbm_gbuf_upsert_node(gb, "Macro", "curry", "p.util.curry", "util.clib", 464, 465, "{}");
+    cbm_gbuf_upsert_node(gb, "Function", "curry", "p.util.curry", "util.clib", 3193, 3209, "{}");
+    /* a macro in the smaller path (.clib sorts before .clsp) still loses */
+    cbm_gbuf_upsert_node(gb, "Constant", "limit", "p.x.limit", "x.clsp", 653, 653, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "limit", "p.x.limit", "x.clib", 9, 10, "{}");
+    /* two macros: the classic contract (later line wins) is unchanged */
+    cbm_gbuf_upsert_node(gb, "Macro", "M", "p.m.M", "m.clib", 1, 2, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "M", "p.m.M", "m.clib", 9, 10, "{}");
+
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, "p.cond.assert");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Function");
+    ASSERT_EQ(n->start_line, 742);
+    n = cbm_gbuf_find_by_qn(gb, "p.util.curry");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Function");
+    ASSERT_EQ(n->start_line, 3193);
+    n = cbm_gbuf_find_by_qn(gb, "p.x.limit");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Constant");
+    ASSERT_STR_EQ(n->file_path, "x.clsp");
+    n = cbm_gbuf_find_by_qn(gb, "p.m.M");
+    ASSERT_NOT_NULL(n);
+    ASSERT_EQ(n->start_line, 9);
+    /* the label index follows the survivor: only the macro-vs-macro QN keeps one */
+    const cbm_gbuf_node_t **macros = NULL;
+    int macro_count = -1;
+    ASSERT_EQ(cbm_gbuf_find_by_label(gb, "Macro", &macros, &macro_count), 0);
+    ASSERT_EQ(macro_count, 1);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* The parallel merge (worker gbuf -> main gbuf) applies the same rule in both
+ * directions, so the survivor never depends on worker merge order. */
+TEST(gbuf_merge_definition_beats_same_qn_macro_c1) {
+    for (int order = 0; order < 2; order++) {
+        cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *with_fn = order == 0 ? dst : src;
+        cbm_gbuf_t *with_macro = order == 0 ? src : dst;
+        cbm_gbuf_upsert_node(with_fn, "Function", "f", "p.a.f", "a.clsp", 10, 20, "{}");
+        cbm_gbuf_upsert_node(with_macro, "Macro", "f", "p.a.f", "a.clsp", 30, 31, "{}");
+        ASSERT_EQ(cbm_gbuf_merge(dst, src), 0);
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(dst, "p.a.f");
+        ASSERT_NOT_NULL(n);
+        ASSERT_STR_EQ(n->label, "Function");
+        ASSERT_EQ(n->start_line, 10);
+        cbm_gbuf_free(dst);
+        cbm_gbuf_free(src);
+    }
+    PASS();
+}
+
 TEST(gbuf_upsert_long_qn) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
 
@@ -1155,6 +1224,72 @@ TEST(gbuf_flush_skips_orphan_edges) {
     PASS();
 }
 
+/* ── Publish failure reporting ───────────────────────────────── */
+
+static char g_log_capture[4096];
+static CBMLogLevel g_prev_log_level;
+static CBMLogFormat g_prev_log_format;
+
+static void capture_log_sink(const char *line) {
+    size_t used = strlen(g_log_capture);
+    size_t avail = sizeof(g_log_capture) - used;
+    if (avail <= 1) {
+        return;
+    }
+    int n = snprintf(g_log_capture + used, avail, "%s\n", line);
+    if (n < 0 || (size_t)n >= avail) {
+        g_log_capture[sizeof(g_log_capture) - 1] = '\0';
+    }
+}
+
+static void capture_logs_start(void) {
+    g_log_capture[0] = '\0';
+    g_prev_log_level = cbm_log_get_level();
+    g_prev_log_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    /* The assertions below read the text encoding, so pin it rather than
+     * inherit whatever CBM_LOG_FORMAT left set. */
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink(capture_log_sink);
+}
+
+static const char *capture_logs_end(void) {
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(g_prev_log_level);
+    cbm_log_set_format(g_prev_log_format);
+    return g_log_capture;
+}
+
+/* A dump that publishes nothing has to say so, and say why. Renaming onto an
+ * existing directory is how test_sqlite_writer already forces the publish to
+ * fail; here it stands in for any host that denies the rename (#1620). */
+TEST(gbuf_dump_failure_logs_reason) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_gbuf_pub_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/repo");
+    ASSERT_NOT_NULL(gb);
+    int64_t id = cbm_gbuf_upsert_node(gb, "Function", "main", "pkg.main", "main.go", 1, 10, "{}");
+    ASSERT_GT(id, 0);
+
+    capture_logs_start();
+    int rc = cbm_gbuf_dump_to_sqlite(gb, dir);
+    const char *logs = capture_logs_end();
+
+    ASSERT(rc != 0);
+    ASSERT_NOT_NULL(strstr(logs, "gbuf.dump_failed"));
+    /* The reason survived the cleanup unlink. */
+    ASSERT_NOT_NULL(strstr(logs, "errno="));
+    ASSERT(strstr(logs, "errno=0 ") == NULL);
+    /* And the run is not also reported as a successful dump. */
+    ASSERT(strstr(logs, "msg=gbuf.dump ") == NULL);
+
+    cbm_gbuf_free(gb);
+    cbm_rmdir(dir);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 /* A worker buffer draws ids from the shared counter, so a dense id -> node
@@ -1216,6 +1351,8 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_upsert_null_qn);
     RUN_TEST(gbuf_upsert_empty_qn);
     RUN_TEST(gbuf_upsert_same_qn_updates_all_fields);
+    RUN_TEST(gbuf_upsert_definition_beats_same_qn_macro_c1);
+    RUN_TEST(gbuf_merge_definition_beats_same_qn_macro_c1);
     RUN_TEST(gbuf_upsert_long_qn);
     RUN_TEST(gbuf_find_by_qn_missing);
     RUN_TEST(gbuf_find_by_id_missing);
@@ -1257,4 +1394,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_shared_ids_null_fallback);
     RUN_TEST(gbuf_next_id_set_next_id_roundtrip);
     RUN_TEST(gbuf_next_id_null_safe);
+
+    /* Publish failure reporting */
+    RUN_TEST(gbuf_dump_failure_logs_reason);
 }

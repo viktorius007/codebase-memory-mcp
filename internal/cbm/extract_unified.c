@@ -1158,13 +1158,16 @@ static const char *compute_func_qn_shared(CBMExtractCtx *ctx, TSNode node, const
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
-     * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
+     * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality).
+     * C-family platform variants share their platform-neutral QN — the same
+     * rule extract_func_def applies, so in-body calls source to the def. */
     const char *plain = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
                                                     qn_name, ctx->language);
     if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "function_item") == 0) {
         return cbm_rust_cfg_scope_qn(ctx->arena, node, ctx->source, plain);
     }
-    return plain;
+    return cbm_platform_variant_qn(ctx->arena, ctx->language, ctx->project, ctx->rel_path, qn_name,
+                                   plain, node);
 }
 
 /* A Rust function_item's body takes the identity of its extracted definition:
@@ -1172,6 +1175,12 @@ static const char *compute_func_qn_shared(CBMExtractCtx *ctx, TSNode node, const
  * nested in a body, so its calls source from its own node. */
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
+    /* Raw configured definitions already own the canonical QN, including
+     * namespace scope. Never rederive it from the bare macro identifier. */
+    const char *configured_qn = cbm_test_definition_qn(ctx, node);
+    if (configured_qn) {
+        return configured_qn;
+    }
     if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "function_item") == 0) {
         const char *def_qn = rust_function_def_qn(ctx, node);
         if (def_qn) {
@@ -2451,7 +2460,12 @@ static void push_lexical_boundary(TSNode node, WalkState *state, uint32_t depth)
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth,
                                  const CBMInvocationDescriptor *invocation) {
-    if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
+    const char *configured_body_qn = NULL;
+    if (ctx->language == CBM_LANG_C && strcmp(ts_node_type(node), "compound_statement") == 0)
+        configured_body_qn = cbm_test_definition_qn(ctx, node);
+    if (configured_body_qn) {
+        (void)push_function_scope(state, depth, configured_body_qn, node);
+    } else if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
         /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
          * but the def walk does not descend into function bodies, so it emits no
          * node for it. Pushing a func scope here would attribute in-body calls to
@@ -2681,31 +2695,31 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     uint32_t depth = 0;
     uint32_t visited = 0;
 #ifdef CBM_ENABLE_TEST_SEAMS
-    /* CBM_TEST_WALK_BUDGET_NODES=<n>: the budget is "spent" after n nodes,
-     * no real timing involved. */
-    uint32_t seam_budget_nodes = 0;
+    /* CBM_TEST_WALK_BUDGET_NODES=<n>: spend the budget after n nodes. Production
+     * now counts nodes too, so this seam only shortens the budget; it no longer
+     * has to stand in for a mechanism of its own. */
+    uint32_t budget_nodes = ctx->walk_budget_nodes;
     {
         const char *seam = getenv("CBM_TEST_WALK_BUDGET_NODES");
         if (seam && seam[0]) {
-            seam_budget_nodes = (uint32_t)strtoul(seam, NULL, 10);
+            budget_nodes = (uint32_t)strtoul(seam, NULL, 10);
         }
     }
+#else
+    const uint32_t budget_nodes = ctx->walk_budget_nodes;
 #endif
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         visited++;
-        if (ctx->walk_deadline_cpu_ns != 0 && (visited & 1023u) == 0 &&
-            cbm_thread_cpu_time_ns() > ctx->walk_deadline_cpu_ns) {
+        /* The budget is spent in nodes, so the walk of a given file always ends
+         * on the same node — on any machine, under any load. A CPU deadline
+         * here made the graph differ between two runs on one machine; see
+         * CBM_WALK_MAX_NODES_DEFAULT (cbm.c). */
+        if (budget_nodes != 0 && visited > budget_nodes) {
             ctx->walk_budget_exhausted = true;
             break;
         }
-#ifdef CBM_ENABLE_TEST_SEAMS
-        if (seam_budget_nodes != 0 && visited > seam_budget_nodes) {
-            ctx->walk_budget_exhausted = true;
-            break;
-        }
-#endif
         bool trivia = is_unified_trivia_node(node);
         if (!trivia) {
             /* Trivia consumes no semantic state. Scope expiry may be deferred
@@ -2759,6 +2773,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     }
 
     cbm_finalize_lexical_usages(ctx, &state);
+    ctx->walk_nodes_visited = visited;
     ts_tree_cursor_delete(&occurrence_cursor);
     ts_tree_cursor_delete(&cursor);
 }

@@ -238,7 +238,9 @@ run_case missing-source 2 '^FAIL coverage-rust: required coverage source is miss
     FAKE_SOURCE_ROOT="$MISSING_SOURCE_ROOT"
 
 # Static contract: coverage flags reach C, C++, grammar objects and the test
-# link, while the production flag definitions remain independent.
+# link, while the production flag definitions remain independent. Production
+# may carry $(TEST_COVERAGE_FLAGS), the separate opt-in per-test coverage
+# build (TEST_COVERAGE=1), so only the exact $(COVERAGE_FLAGS) token counts.
 for variable in CFLAGS_TEST CXXFLAGS_TEST GRAMMAR_CFLAGS_TEST LDFLAGS_TEST; do
     if ! awk -v name="$variable" '
         $0 ~ "^" name "[[:space:]]*=" { active=1 }
@@ -252,7 +254,7 @@ done
 if awk '
     /^CFLAGS_PROD[[:space:]]*=/ { active=1 }
     active { text=text " " $0 }
-    active && $0 !~ /\\$/ { exit(index(text, "COVERAGE_FLAGS") ? 0 : 1) }
+    active && $0 !~ /\\$/ { exit(index(text, "$(COVERAGE_FLAGS)") ? 0 : 1) }
     END { if (!active) exit 1 }
 ' "$ROOT/Makefile.cbm"; then
     fail "production C flags unexpectedly include coverage instrumentation"

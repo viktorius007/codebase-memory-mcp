@@ -18,6 +18,7 @@
 #include "discover/discover.h"
 #include "foundation/platform.h"
 #include "foundation/log.h"
+#include "foundation/mem.h"
 #include "cbm.h"
 #include "result_spill.h"
 
@@ -128,6 +129,33 @@ static int setup_parallel_repo(void) {
     fprintf(f, "pub trait Named { fn name(&self) -> &'static str; }\n"
                "pub struct Thing;\n"
                "impl Named for Thing { fn name(&self) -> &'static str { \"thing\" } }\n");
+    fclose(f);
+
+    /* NAMESPACE-declaring files whose import resolves through the namespace
+     * map (PHP `use`; C# `using` and Java package imports take the same path).
+     * Without these the spill-parity test compared a Go+Java fixture that never
+     * touches that map, so it passed while spilling silently changed import
+     * resolution for every namespaced repository: the map is built from the
+     * in-memory result cache, where a PARKED result is NULL, so a spilled file
+     * contributed no namespace at all and its imports fell through to the
+     * looser fallback (php corpus, 2026-09-18: 57,182 edges in memory against
+     * 59,379 while spilling, same binary, reproducible 3/3 each way). */
+    snprintf(path, sizeof(path), "%s/app", g_par_tmpdir);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/app/Models.php", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "<?php\nnamespace App\\Models;\n\n"
+               "class User {\n    public function name() { return \"u\"; }\n}\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/app/Services.php", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "<?php\nnamespace App\\Services;\n\nuse App\\Models\\User;\n\n"
+               "class UserService {\n"
+               "    public function make() { $u = new User(); return $u->name(); }\n}\n");
     fclose(f);
 
     return 0;
@@ -287,6 +315,8 @@ static cbm_gbuf_t *run_sequential_with_lsp_cross(const char *project, const char
  * run_parallel_pipeline does) and records how many results the store parked. */
 static bool g_harness_spill = false;
 static int64_t g_harness_parked = -1;
+/* Opt-in: hand cbm_parallel_resolve the production Tier-2 C# registry. */
+static bool g_harness_cs_registry = false;
 
 static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     const char *project, const char *repo_path, cbm_file_info_t *files, int file_count,
@@ -358,9 +388,17 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
 
+    /* C# has no per-file cross path (cbm_pxc_run_one has no C# case): production
+     * resolves it only through the Tier-2 registry, so a harness run that opts
+     * in builds that one registry exactly as run_parallel_pipeline does. */
+    CBMCrossLspRegistries harness_registries = {0};
+    if (g_harness_cs_registry && all_defs) {
+        harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
+    }
     cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
                          def_count, def_modules, module_def_index,
-                         NULL /* cross_registries — tests use per-file path */);
+                         g_harness_cs_registry ? &harness_registries
+                                               : NULL /* tests use per-file path */);
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_pxc_free_module_def_index(module_def_index);
@@ -597,6 +635,148 @@ TEST(parallel_spill_mode_builds_the_same_graph) {
         ASSERT_EQ(in_memory, on_disk);
     }
     cbm_gbuf_free(spilled);
+    PASS();
+}
+
+/* ── #2184: the post-extraction phases are charged before they run ─── */
+
+/* Order-independent fingerprint of a whole graph: every node (label, QN, file,
+ * lines, properties) and every edge (type, source QN, target QN, properties)
+ * hashed and folded with a sum and an xor. Two graphs that differ in any field
+ * of any node or edge -- not just in a per-type count -- disagree here. */
+typedef struct {
+    const cbm_gbuf_t *gb;
+    uint64_t sum;
+    uint64_t xr;
+    long count;
+} graph_fp_t;
+
+static uint64_t fp_mix(uint64_t h, const char *s) {
+    for (const unsigned char *p = (const unsigned char *)(s ? s : "\x01"); *p; p++) {
+        h = (h ^ *p) * 1099511628211ULL; /* FNV-1a */
+    }
+    return (h ^ 0xffU) * 1099511628211ULL; /* field separator */
+}
+
+static uint64_t fp_mix_int(uint64_t h, long long v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", v);
+    return fp_mix(h, buf);
+}
+
+static void fp_fold(graph_fp_t *fp, uint64_t h) {
+    fp->sum += h;
+    fp->xr ^= h * 0x9E3779B97F4A7C15ULL;
+    fp->count++;
+}
+
+static void fp_visit_node(const cbm_gbuf_node_t *n, void *ud) {
+    uint64_t h = fp_mix(1469598103934665603ULL, "N");
+    h = fp_mix(h, n->label);
+    h = fp_mix(h, n->qualified_name);
+    h = fp_mix(h, n->file_path);
+    h = fp_mix_int(h, n->start_line);
+    h = fp_mix_int(h, n->end_line);
+    h = fp_mix(h, n->properties_json);
+    fp_fold(ud, h);
+}
+
+static void fp_visit_edge(const cbm_gbuf_edge_t *e, void *ud) {
+    graph_fp_t *fp = ud;
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(fp->gb, e->source_id);
+    const cbm_gbuf_node_t *dst = cbm_gbuf_find_by_id(fp->gb, e->target_id);
+    uint64_t h = fp_mix(1469598103934665603ULL, "E");
+    h = fp_mix(h, e->type);
+    h = fp_mix(h, src ? src->qualified_name : NULL);
+    h = fp_mix(h, dst ? dst->qualified_name : NULL);
+    h = fp_mix(h, e->properties_json);
+    fp_fold(fp, h);
+}
+
+static graph_fp_t graph_fingerprint(const cbm_gbuf_t *gb) {
+    graph_fp_t fp = {.gb = gb};
+    cbm_gbuf_foreach_node(gb, fp_visit_node, &fp);
+    cbm_gbuf_foreach_edge(gb, fp_visit_edge, &fp);
+    return fp;
+}
+
+/* Mutator hook: runs between extraction and registry build, i.e. exactly where
+ * the post-extraction phases start. Records how many results are still held
+ * in memory there. */
+static void count_cached_results(CBMFileResult **cache, int file_count, void *ud) {
+    int n = 0;
+    for (int i = 0; i < file_count; i++) {
+        n += cache[i] != NULL;
+    }
+    *(int *)ud = n;
+}
+
+/* #2184: spill was entered only DURING extraction, when the charge crossed
+ * budget - budget/16. A run that ended extraction just under that line kept
+ * every result in memory, and the phases that cannot spill (registry build,
+ * cross-LSP prepare, resolve) then grew the process past the budget -- openclaw
+ * at 8 workers, 4079 MB budget: 3678 MB at extraction end, 5829 MB in resolve.
+ * The extraction end now projects that growth from the result counts and
+ * spills first when budget - budget/16 would be crossed.
+ *
+ * The charge is pinned through the test seam (it is the process footprint
+ * otherwise): run A ends extraction ONE BYTE under the latch -- the extraction
+ * gate never fires, only the projection can spill; run B has the whole budget
+ * free -- the projection fits and nothing may spill. Both graphs must be
+ * identical, field for field, to each other and to the plain in-memory run. */
+TEST(parallel_post_extract_projection_spills_before_resolve) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_par_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    const size_t saved_budget = cbm_mem_budget();
+    const size_t budget = (size_t)1024 * 1024 * 1024;
+    const size_t latch = budget - budget / 16; /* spill latches on charged > latch */
+    cbm_mem_set_budget_for_tests(budget);
+    g_harness_spill = true;
+
+    cbm_mem_set_charged_for_tests(latch);
+    int cached_near = -1;
+    cbm_gbuf_t *gb_near =
+        run_parallel_with_extract_opts_and_mutator("par-test", g_par_tmpdir, files, file_count, 2,
+                                                   NULL, count_cached_results, &cached_near, false);
+    int64_t parked_near = g_harness_parked;
+
+    cbm_mem_set_charged_for_tests((size_t)1);
+    int cached_roomy = -1;
+    cbm_gbuf_t *roomy = run_parallel_with_extract_opts_and_mutator(
+        "par-test", g_par_tmpdir, files, file_count, 2, NULL, count_cached_results, &cached_roomy,
+        false);
+    int64_t parked_roomy = g_harness_parked;
+
+    cbm_mem_set_charged_for_tests(0);
+    g_harness_spill = false;
+    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_discover_free(files, file_count);
+    ASSERT(gb_near != NULL);
+    ASSERT(roomy != NULL);
+
+    /* A: every result went to disk before registry build. */
+    ASSERT_EQ((int)parked_near, file_count);
+    ASSERT_EQ(cached_near, 0);
+    /* B: the projection fits, so no store was opened and results stay cached. */
+    ASSERT_EQ((int)parked_roomy, -1);
+    ASSERT_GT(cached_roomy, 0);
+
+    graph_fp_t fp_near = graph_fingerprint(gb_near);
+    graph_fp_t fp_roomy = graph_fingerprint(roomy);
+    graph_fp_t fp_mem = graph_fingerprint(g_par_gbuf);
+    ASSERT_GT(fp_mem.count, 0);
+    ASSERT_EQ(fp_near.count, fp_mem.count);
+    ASSERT_EQ(fp_roomy.count, fp_mem.count);
+    ASSERT_TRUE(fp_near.sum == fp_mem.sum && fp_near.xr == fp_mem.xr);
+    ASSERT_TRUE(fp_roomy.sum == fp_mem.sum && fp_roomy.xr == fp_mem.xr);
+    cbm_gbuf_free(gb_near);
+    cbm_gbuf_free(roomy);
     PASS();
 }
 
@@ -2625,6 +2805,191 @@ static kotlin_implicit_probe_t probe_kotlin_implicit_site(const CBMFileResult *r
     return probe;
 }
 
+/* #2120: two C# projects declare a class with the same simple name in
+ * namespaces that share a root (Contoso.Platform.Identity.UserIdentityInfo vs
+ * Contoso.Platform.BackOffice.Identity.UserIdentityInfo). Graph QNs are
+ * path-derived, so the namespace-prefix lookups never hit a project type and
+ * the short-name fallback scored both variants 0 against the file namespace:
+ * registration order picked the target, ignoring the caller's `using`
+ * directive. Each caller below can see exactly ONE variant (C# binding rules),
+ * so exactly one edge per caller is correct whatever the file order: plain
+ * `using` (both directions), enclosing-namespace proximity, and a
+ * fully-qualified name. The last case is a reference-assembly shape: one file
+ * declaring several namespaces, whose file-level namespace is only the FIRST
+ * one; the decoy is registered first, so a mislabeled namespace falls back to
+ * it. `partial` pieces of one type are separate registry entries, so a member
+ * declared on another piece must still bind to that piece. */
+TEST(parallel_csharp_same_name_class_binds_by_namespace) {
+    static const char platform_src[] =
+        "namespace Contoso.Platform.Identity;\n"
+        "public class UserIdentityInfo {\n"
+        "    public static UserIdentityInfo ParseFromClaim(string c)\n"
+        "        => new UserIdentityInfo();\n"
+        "}\n";
+    static const char backoffice_src[] =
+        "namespace Contoso.Platform.BackOffice.Identity;\n"
+        "public class UserIdentityInfo {\n"
+        "    public static UserIdentityInfo ParseFromClaim(string c)\n"
+        "        => new UserIdentityInfo();\n"
+        "}\n";
+    static const char bo_handler_src[] =
+        "using Contoso.Platform.BackOffice.Identity;\n"
+        "namespace Contoso.Platform.BackOffice.CqrsHandlers;\n"
+        "public class Handler {\n"
+        "    public string Handle(string claim) {\n"
+        "        var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "        return info.ToString();\n"
+        "    }\n"
+        "}\n";
+    static const char pf_handler_src[] =
+        "using Contoso.Platform.Identity;\n"
+        "namespace Contoso.Platform.Api;\n"
+        "public class PlatformHandler {\n"
+        "    public string Handle(string claim) {\n"
+        "        var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "        return info.ToString();\n"
+        "    }\n"
+        "}\n";
+    static const char nested_ns_src[] =
+        "namespace Contoso.Platform.BackOffice.Identity.Claims\n"
+        "{\n"
+        "    public class ClaimReader {\n"
+        "        public string Read(string claim) {\n"
+        "            var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "            return info.ToString();\n"
+        "        }\n"
+        "    }\n"
+        "}\n";
+    static const char fq_src[] = "namespace Contoso.Platform.Reports;\n"
+                                 "public class Report {\n"
+                                 "    public string Build(string claim) {\n"
+                                 "        var info = Contoso.Platform.BackOffice.Identity"
+                                 ".UserIdentityInfo.ParseFromClaim(claim);\n"
+                                 "        return info.ToString();\n"
+                                 "    }\n"
+                                 "}\n";
+    static const char decoy_src[] = "namespace Contoso.Decoy;\n"
+                                    "public class Worker {\n"
+                                    "    public void Start() { }\n"
+                                    "    public void Beta() { }\n"
+                                    "}\n";
+    static const char multi_ns_src[] = "namespace Contoso.Win32 { public class SafeHandle { } }\n"
+                                       "namespace Contoso.Threading {\n"
+                                       "    public class Worker { public void Start() { } }\n"
+                                       "}\n";
+    static const char runner_src[] = "using Contoso.Threading;\n"
+                                     "namespace Contoso.App;\n"
+                                     "public class Runner {\n"
+                                     "    public void Run() {\n"
+                                     "        var w = new Worker();\n"
+                                     "        w.Start();\n"
+                                     "    }\n"
+                                     "}\n";
+    static const char part_a_src[] = "namespace Contoso.Parts;\n"
+                                     "public partial class Thing { public void Alpha() { } }\n";
+    static const char part_b_src[] = "namespace Contoso.Parts;\n"
+                                     "public partial class Thing { public void Beta() { } }\n";
+    static const char part_user_src[] = "using Contoso.Parts;\n"
+                                        "namespace Contoso.App;\n"
+                                        "public class PartUser {\n"
+                                        "    public void Use() {\n"
+                                        "        var t = new Thing();\n"
+                                        "        t.Alpha();\n"
+                                        "        t.Beta();\n"
+                                        "    }\n"
+                                        "}\n";
+    const char *project = "cbm_cs_same_name";
+    static const char *rels[] = {
+        "src/Decoy/Worker.cs",
+        "src/Contoso.Platform/Identity/UserIdentityInfo.cs",
+        "src/Contoso.Platform.BackOffice/Identity/UserIdentityInfo.cs",
+        "src/Contoso.Platform.BackOffice/CqrsHandlers/Handler.cs",
+        "src/Contoso.Platform/Api/PlatformHandler.cs",
+        "src/Contoso.Platform.BackOffice/Identity/Claims/ClaimReader.cs",
+        "src/Contoso.Platform/Reports/Report.cs",
+        "src/Ref/Threading.cs",
+        "src/App/Runner.cs",
+        "src/Parts/Thing.A.cs",
+        "src/Parts/Thing.B.cs",
+        "src/App/PartUser.cs",
+    };
+    const char *srcs[] = {decoy_src,      platform_src,  backoffice_src, bo_handler_src,
+                          pf_handler_src, nested_ns_src, fq_src,         multi_ns_src,
+                          runner_src,     part_a_src,    part_b_src,     part_user_src};
+    enum { N_FILES = 12, N_CHECKS = 13 };
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_same_name_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[N_FILES][512];
+    cbm_file_info_t files[N_FILES] = {0};
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], srcs[i]) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write C# same-name fixture");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_CSHARP;
+    }
+
+    cbm_gbuf_t *graphs[2] = {run_sequential_with_lsp_cross(project, tmpdir, files, N_FILES), NULL};
+    g_harness_cs_registry = true;
+    graphs[1] = run_parallel(project, tmpdir, files, N_FILES, 2);
+    g_harness_cs_registry = false;
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+
+    const char *pf = "cbm_cs_same_name.src.Contoso.Platform.Identity.UserIdentityInfo."
+                     "UserIdentityInfo.ParseFromClaim";
+    const char *bo = "cbm_cs_same_name.src.Contoso.Platform.BackOffice.Identity."
+                     "UserIdentityInfo.UserIdentityInfo.ParseFromClaim";
+    const char *ref_start = "cbm_cs_same_name.src.Ref.Threading.Worker.Start";
+    const char *decoy_start = "cbm_cs_same_name.src.Decoy.Worker.Worker.Start";
+    const char *part_alpha = "cbm_cs_same_name.src.Parts.Thing.A.Thing.Alpha";
+    const char *part_beta = "cbm_cs_same_name.src.Parts.Thing.B.Thing.Beta";
+    const char *decoy_beta = "cbm_cs_same_name.src.Decoy.Worker.Worker.Beta";
+    bool ok[2][N_CHECKS];
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        cbm_gbuf_t *gb = graphs[g];
+        ok[g][0] = has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
+        ok[g][1] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", pf, "CALLS");
+        ok[g][2] = has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
+        ok[g][3] = !has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", bo, "CALLS");
+        ok[g][4] = has_edge_from_callable_to_qn(gb, "ClaimReader.Read", bo, "CALLS");
+        ok[g][5] = !has_edge_from_callable_to_qn(gb, "ClaimReader.Read", pf, "CALLS");
+        ok[g][6] = has_edge_from_callable_to_qn(gb, "Report.Build", bo, "CALLS");
+        ok[g][7] = !has_edge_from_callable_to_qn(gb, "Report.Build", pf, "CALLS");
+        ok[g][8] = has_edge_from_callable_to_qn(gb, "Runner.Run", ref_start, "CALLS");
+        ok[g][9] = !has_edge_from_callable_to_qn(gb, "Runner.Run", decoy_start, "CALLS");
+        ok[g][10] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_alpha, "CALLS");
+        ok[g][11] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_beta, "CALLS");
+        ok[g][12] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", decoy_beta, "CALLS");
+        for (int k = 0; k < N_CHECKS; k++) {
+            all = all && ok[g][k];
+        }
+    }
+    if (!all) {
+        for (int g = 0; g < 2; g++) {
+            printf("  C# same-name diagnostic %s: using_bo=%d/%d using_pf=%d/%d "
+                   "enclosing_ns=%d/%d fully_qualified=%d/%d multi_ns_file=%d/%d "
+                   "partial=%d/%d/%d\n",
+                   g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
+                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9], ok[g][10], ok[g][11],
+                   ok[g][12]);
+        }
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
+}
+
 /* External Kotlin protocol targets must not borrow a project method merely
  * because the final Class.method segments agree. Raw assertions prove that the
  * iterator/destructuring carriers and their stdlib semantic rows really exist;
@@ -3467,6 +3832,40 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     unlink(kpath);
     unlink(jpath);
     rmdir(tmpdir);
+    PASS();
+}
+
+/* #2053 contract for cbm_pipeline_rust_external_target: only a Rust row whose
+ * strategy names a registered target, and whose QN lies outside the project
+ * prefix, counts as external. The end-to-end probes live in test_pipeline.c
+ * (pipeline_rust_std_receiver_never_binds_project_method*). */
+TEST(parallel_rust_external_target_contract) {
+    const char *proj = "proj";
+    /* External: registered std / seeded-crate targets. */
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_method_dispatch",
+                                                  "std.path.Path.join", proj));
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_deref_dispatch",
+                                                  "std.path.Path.join", proj));
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_constructor",
+                                                  "core.sync.atomic.AtomicUsize.new", proj));
+    /* A prefix that is not a whole segment is still outside the project. */
+    ASSERT_TRUE(
+        cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "projx.helper", proj));
+    /* Project-prefixed targets keep the registry fallback. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_method_dispatch",
+                                                   "proj.src.lib.EvidenceTier.join", proj));
+    /* Synthesized / non-registered strategies are not evidence. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_prelude_trait",
+                                                   "std.path.PathBuf.clone", proj));
+    ASSERT_FALSE(
+        cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_unresolved", "root.join", proj));
+    /* Per-language: no other language is affected. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_GO, "lsp_method_dispatch",
+                                                   "std.path.Path.join", proj));
+    /* Defensive NULL/empty inputs. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, NULL, "std.x", proj));
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "std.x", NULL));
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "", proj));
     PASS();
 }
 
@@ -4833,6 +5232,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_typescript_module_value_usage_respects_lexical_shadows);
     RUN_TEST(parallel_typescript_import_namespace_exact_parity);
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
+    RUN_TEST(parallel_csharp_same_name_class_binds_by_namespace);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_workspace_manifest_routes_call_to_declared_member_only);
@@ -4851,6 +5251,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_go_cross_package_field_chain_resolves);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_rust_external_target_contract);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
@@ -4862,6 +5263,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_semantic_fixture_expected_counts);
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_spill_mode_builds_the_same_graph);
+    RUN_TEST(parallel_post_extract_projection_spills_before_resolve);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
 

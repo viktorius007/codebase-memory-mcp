@@ -112,6 +112,9 @@ typedef struct {
     /* Rust-only: type parameter names the function declares on itself
      * (`fn f<T>`), NULL-ended, NULL when none. */
     const char **type_params;
+    /* Callable identity (#2061): signature suffix of this def's graph QN;
+     * qualified_name stays the base QN. NULL = none (always, until enabled). */
+    const char *sig;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

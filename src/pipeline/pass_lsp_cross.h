@@ -190,6 +190,10 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manife
                                  struct CBMCargoManifest *out_manifest,
                                  const cbm_file_info_t *files, int file_count);
 void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
+/* A resolve worker keeps its per-file cross-LSP scratch arenas between files
+ * from _begin to _end; _end must run on the same thread before it exits. */
+void cbm_pxc_thread_scratch_begin(void);
+void cbm_pxc_thread_scratch_end(void);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* CBM_RUST_RESOLVE_DUMP development lane (see pass_lsp_cross.c). */
