@@ -691,6 +691,7 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
  * uses, plus the facts the external-base gate reads. NULL (the surface-probe
  * path) keeps every base at its raw spelling. */
 typedef struct {
+    const cbm_pipeline_ctx_t *ctx;
     const cbm_registry_t *reg;
     const char **imp_keys;
     const char **imp_vals;
@@ -721,6 +722,11 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
         return NULL;
     }
     if (!cbm_label_is_type_like(cbm_registry_label_of(bs->reg, res.qualified_name))) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *candidate = cbm_gbuf_find_by_qn(bs->gbuf, res.qualified_name);
+    if (cbm_external_import_binding_leaves_corpus(bs->ctx, bs->lang, bs->imports, raw, bs->rel,
+                                                  candidate)) {
         return NULL;
     }
     /* `unittest.TestCase` under an external `import unittest` survives the
@@ -1397,7 +1403,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
          * that consume resolved base QNs, and only when a caller supplied the
          * pipeline context (the surface-probe path passes NULL and keeps the
          * raw spelling). */
-        pxc_base_scope_t bs = {.imports = &fr->imports,
+        pxc_base_scope_t bs = {.ctx = ctx,
+                               .imports = &fr->imports,
                                .project_name = project_name,
                                .rel = files[fi].rel_path,
                                .lang = files[fi].language};

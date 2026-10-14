@@ -4230,6 +4230,17 @@ static void write_f1_guard_fixture(const char *tmp, int pad_files) {
     write_temp_file(tmp, "child.py", "class Child(SharedBase):\n    pass\n");
     write_temp_file(tmp, "py_other.py", "class ViewToken:\n    pass\n");
     write_temp_file(tmp, "use.tsx", "export function render() {\n  return ViewToken;\n}\n");
+    write_temp_file(tmp, "external_foo.tsx",
+                    "import { Foo } from 'react';\n"
+                    "export function externalFoo() { return Foo; }\n");
+    write_temp_file(tmp, "relative_foo.tsx",
+                    "import { Foo } from './foo_target';\n"
+                    "export function relativeFoo() { return Foo; }\n");
+    write_temp_file(tmp, "foo_target.tsx", "export interface Foo {}\nexport interface Bar {}\n");
+    write_temp_file(tmp, "py_foo.py", "class Foo:\n    pass\n");
+    write_temp_file(tmp, "bar_target.py", "class pydantic:\n    class Bar:\n        pass\n");
+    write_temp_file(tmp, "external_bar.py",
+                    "from pydantic import Bar\nclass ExternalChild(Bar):\n    pass\n");
     write_temp_file(tmp, "u1.py", "class AmbiguousUse:\n    pass\n");
     write_temp_file(tmp, "u2.py", "class AmbiguousUse:\n    pass\n");
     write_temp_file(tmp, "uuser.py", "def read():\n    return AmbiguousUse\n");
@@ -4316,6 +4327,39 @@ TEST(pipeline_tsx_usage_recovers_single_language_candidate) {
         "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
         "AND s.file_path='use.tsx' AND t.file_path='other.tsx' AND t.name='ViewToken'";
     ASSERT_EQ(f1_guard_query_both_modes("tsx-usage", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_tsx_external_import_binding_is_withheld_and_recorded) {
+    const char *sql = "SELECT 100 * EXISTS(SELECT 1 FROM unresolved_sites "
+                      "WHERE file_path='external_foo.tsx' AND name='Foo' "
+                      "AND reason='name_binding_not_proven') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='external_foo.tsx' AND t.file_path='foo_target.tsx' "
+                      "AND t.name='Foo')";
+    ASSERT_EQ(f1_guard_query_both_modes("external-tsx", sql, 100), 2);
+    PASS();
+}
+
+TEST(pipeline_python_external_import_binding_is_withheld_and_recorded) {
+    const char *sql = "SELECT 100 * EXISTS(SELECT 1 FROM unresolved_sites "
+                      "WHERE file_path='external_bar.py' AND name='Bar' "
+                      "AND reason='name_binding_not_proven') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
+                      "AND s.file_path='external_bar.py' AND t.file_path='bar_target.py' "
+                      "AND t.name='Bar')";
+    ASSERT_EQ(f1_guard_query_both_modes("external-python", sql, 100), 2);
+    PASS();
+}
+
+TEST(pipeline_tsx_relative_import_binding_still_links) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='relative_foo.tsx' AND t.file_path='foo_target.tsx' "
+                      "AND t.name='Foo'";
+    ASSERT_EQ(f1_guard_query_both_modes("relative-tsx", sql, 1), 2);
     PASS();
 }
 
@@ -31159,6 +31203,9 @@ SUITE(pipeline_unresolved) {
     RUN_TEST(pipeline_call_argument_properties_keep_utf8_boundaries);
     RUN_TEST(pipeline_python_inherits_recovers_single_language_candidate);
     RUN_TEST(pipeline_tsx_usage_recovers_single_language_candidate);
+    RUN_TEST(pipeline_tsx_external_import_binding_is_withheld_and_recorded);
+    RUN_TEST(pipeline_python_external_import_binding_is_withheld_and_recorded);
+    RUN_TEST(pipeline_tsx_relative_import_binding_still_links);
     RUN_TEST(pipeline_multicandidate_usage_records_name_binding_stop);
     RUN_TEST(pipeline_multicandidate_write_records_name_binding_stop);
     RUN_TEST(pipeline_multicandidate_inherits_records_name_binding_stop);
