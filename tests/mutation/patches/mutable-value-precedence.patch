@@ -10,3 +10,11 @@ diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
                          if ((m->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0) {
                              rust_emit_unresolved_call(ctx, mname,
                                                        "trait_mutable_dispatch_unproved");
+@@ -14601,6 +14601,6 @@
+                     }
+                 }
+-                if (rust_reference_impl_may_precede(ctx, recv, m)) {
++                if (false && rust_reference_impl_may_precede(ctx, recv, m)) {
+                     rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
+                     return;
+                 }
