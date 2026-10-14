@@ -1,34 +1,55 @@
 #!/usr/bin/env python3
-"""Generate a conservative method-name superset from offline rustdoc format 61."""
+"""Generate a conservative std method inventory from rustdoc and rust-src."""
 import argparse
 from collections import Counter, defaultdict
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TOOLCHAIN = Path.home() / '.rustup/toolchains/nightly-2026-08-10-aarch64-apple-darwin'
 TYPE_KINDS = {'primitive', 'struct', 'enum', 'union', 'trait', 'type_alias'}
-# These erased containers expose a generic element, even without implementing Deref.
+# These receivers have a generic pointee that method lookup can dereference.
 ELEMENT_CONTAINERS = {
-    'core.cell.Cell', 'core.cell.RefCell', 'core.cell.UnsafeCell',
-    'core.cell.once.OnceCell', 'core.cell.lazy.LazyCell', 'std.sync.once_lock.OnceLock',
-    'std.sync.lazy_lock.LazyLock', 'std.sync.poison.mutex.Mutex',
-    'std.sync.poison.rwlock.RwLock', 'alloc.rc.Weak', 'alloc.sync.Weak',
-    'core.ptr.non_null.NonNull', 'core.ops.deref.Deref', 'core.ops.deref.DerefMut',
+    'core.cell.lazy.LazyCell', 'std.sync.lazy_lock.LazyLock',
+    'core.ops.deref.Deref', 'core.ops.deref.DerefMut',
 }
 # Rustdoc JSON omits the inherent dyn-trait blocks, not merely their impl bounds.
 MISSING_CLASSES = {
     'core.any.Any': 'trait-object inherent impls: dyn Any is/downcast_ref absent from JSON',
     'core.error.Error': 'trait-object inherent impls: dyn Error downcast_ref absent from JSON',
 }
+# rustdoc omits these stable cross-crate incoherent inherent impls. Each entry is
+# checked against pinned rust-src before it can contribute a generated row.
+SOURCE_IMPLS = {
+    'core.slice': {
+        'alloc/src/slice.rs': {
+            'sort', 'sort_by', 'sort_by_key', 'sort_by_cached_key', 'to_vec',
+            'into_vec', 'repeat', 'concat', 'join', 'connect',
+        },
+    },
+    'core.ffi.c_str.CStr': {
+        'alloc/src/ffi/c_str.rs': {'to_string_lossy'},
+    },
+    'core.io.error.Error': {
+        'alloc/src/io/error.rs': {'into_inner', 'downcast'},
+    },
+}
+# The resolver erases Box's pointee, so retain the compiler-proven slice method
+# on that public receiver identity as a safe conditional name.
+RECEIVER_SOURCE_IMPLS = {
+    'RUST_STD_BOX': {
+        'into_vec': ('deref:core.slice', 'rust-src:alloc/src/slice.rs#into_vec'),
+    },
+}
 
 
 class Rustdoc:
     """Resolve crate-local IDs and retain every conditional reachability witness."""
-    def __init__(self, directory):
+    def __init__(self, directory, source_directory):
         self.docs = {}
         self.items = {}
         self.hashes = {}
@@ -40,12 +61,24 @@ class Rustdoc:
             if doc['format_version'] != 61:
                 raise ValueError(f'{crate}: format_version {doc["format_version"]}, expected 61')
             self.docs[crate] = doc
-            self.hashes[crate] = hashlib.sha256(raw).hexdigest()
+            self.hashes[crate + '.json'] = hashlib.sha256(raw).hexdigest()
             for ident, path in doc['paths'].items():
                 item = doc['index'].get(ident)
                 if item and item['crate_id'] == 0 and path['kind'] in TYPE_KINDS:
                     name = self.path(crate, ident)
                     self.items.setdefault(name, (crate, item))
+        self.source_methods = defaultdict(dict)
+        for receiver, files in SOURCE_IMPLS.items():
+            for relative, methods in files.items():
+                raw = (source_directory / relative).read_bytes()
+                self.hashes['rust-src/' + relative] = hashlib.sha256(raw).hexdigest()
+                source = raw.decode()
+                for method in methods:
+                    pattern = re.compile(r'\b(?:pub\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+' +
+                                         re.escape(method) + r'(?:\s*<|\s*\()')
+                    if not pattern.search(source):
+                        raise ValueError(f'{relative}: method {method} not found')
+                    self.source_methods[receiver][method] = f'rust-src:{relative}#{method}'
         for crate, doc in self.docs.items():
             for ident, item in doc['index'].items():
                 inner = item['inner']
@@ -74,7 +107,16 @@ class Rustdoc:
         if 'borrowed_ref' in ty:
             return self.head(crate, ty['borrowed_ref']['type'])
         if 'resolved_path' in ty:
-            return self.path(crate, ty['resolved_path']['id'])
+            path = self.path(crate, ty['resolved_path']['id'])
+            visited = set()
+            while path in self.items and path not in visited:
+                visited.add(path)
+                owner, item = self.items[path]
+                alias = item['inner'].get('type_alias')
+                if not alias:
+                    break
+                path = self.head(owner, alias['type'])
+            return path
         if 'primitive' in ty:
             return 'core.' + ty['primitive']
         if 'slice' in ty or 'array' in ty:
@@ -144,6 +186,7 @@ class Rustdoc:
         if 'trait' in item['inner']:
             self.witnesses[path][f'trait-impl:{path}'].add(f'{crate}.json#/index/{item["id"]}')
             rows[f'trait-impl:{path}'].update(self.trait_methods(crate, {'id': item['id']}, issues))
+        rows['inherent'].update(self.source_methods[path])
         impls = set(self.impls[path]) | self.impls[None]
         impls.update((crate, ident) for ident in body.get('impls', []))
         for owner, ident in sorted(impls):
@@ -196,8 +239,11 @@ def inventory(doc, receivers):
         for reach in sorted(classes, key=lambda r: (priority[r.split(':')[0]], r)):
             for method, source in sorted(classes[reach].items()):
                 chosen.setdefault(method, (reach, source))
+        for method, source in RECEIVER_SOURCE_IMPLS.get(receiver, {}).items():
+            chosen.setdefault(method, source)
         status = 'incomplete' if issues else 'complete_except_deref' if deferred else 'complete'
-        reason = '; '.join(sorted(issues or deferred)) if issues or deferred else 'all JSON receiver candidate classes enumerated as a superset'
+        reason = ('; '.join(sorted(issues or deferred)) if issues or deferred else
+                  'rustdoc/rust-src candidates; compiler-probe contract required')
         stamps.append((receiver, status, reason))
         rows.extend((receiver, method, reach, source) for method, (reach, source) in sorted(chosen.items()))
         definition = path
@@ -215,7 +261,7 @@ def render(doc, rows, stamps, version):
     method_lines = ['CBM_STD_METHOD(' + ', '.join(map(json.dumps, (*row, version))) + ')' for row in rows]
     stamp_lines = ['CBM_STD_STAMP(' + ', '.join(map(json.dumps, stamp)) + ')' for stamp in stamps]
     counts = Counter(stamp[1] for stamp in stamps)
-    provenance = '\n'.join(f' * {crate}.json sha256 {digest}' for crate, digest in sorted(doc.hashes.items()))
+    provenance = '\n'.join(f' * {source} sha256 {digest}' for source, digest in sorted(doc.hashes.items()))
     prefix = f'''/* Generated by tools/std-inventory/generate.py; captured 2026-10-14.
  * Toolchain: {version}; rustdoc JSON format 61.
 {provenance}
@@ -254,7 +300,8 @@ def main():
     parser.add_argument('--audit-out', type=Path, help='write per-class witnesses and counts as JSON')
     args = parser.parse_args()
     version = subprocess.check_output([str(args.toolchain / 'bin/rustc'), '--version'], text=True).strip()
-    doc = Rustdoc(args.toolchain / 'share/doc/rust/json')
+    doc = Rustdoc(args.toolchain / 'share/doc/rust/json',
+                  args.toolchain / 'lib/rustlib/src/rust/library')
     receivers = json.loads((Path(__file__).with_name('receivers.json')).read_text())
     rows, stamps, audit = inventory(doc, receivers)
     output = render(doc, rows, stamps, version).encode()

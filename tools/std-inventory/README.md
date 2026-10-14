@@ -7,8 +7,32 @@ class, method-item pointer, implementation witness, retained row count and stamp
 The installed nightly-2026-08-10 toolchain is the default; `--toolchain` selects
 another installed toolchain. Format versions other than 61 are rejected. Python's
 standard library is the only dependency. `rustc --version` runs during manual
-regeneration only; indexing needs neither a compiler nor an LSP. The fixed capture
-date, full version and input SHA256s make the snapshot reproducible.
+regeneration only; indexing needs neither a compiler nor an LSP. The generator also
+reads three pinned rust-src files that contain stable cross-crate incoherent inherent
+impls omitted by rustdoc. It verifies every named method and records the source hashes.
+The fixed capture date, full version and input SHA256s make the snapshot reproducible.
+
+The independent completeness oracle is run by hand with stable rustc 1.99.0:
+
+```
+make -C tools/std-inventory probe WORK_DIR=/tmp/std-inventory-probe
+```
+
+The caller owns `WORK_DIR`; the probe neither reads nor writes user configuration.
+It compiles 2,707 method names against 314 concrete receiver specifications and 50
+pointee specifications: 985,348 method-call expressions across 122 of the 126 stamped
+identities. Candidate names come independently from stable rust-src, rustdoc JSON and
+the table. All importable std traits in `probe_traits.rs` are in scope. A call is
+callable when rustc accepts it or rejects it for anything other than E0599 (no method),
+E0624 (private), or E0658 (unstable). The command fails on any callable unlisted name
+for a `complete` receiver. For `complete_except_deref`, it subtracts names supplied by
+the concrete pointee or its own inventory. The two erased Option heads and two Windows
+handle types are the four unprobed identities on Darwin.
+
+Compiler probing is deliberately a committed-table test, not a generator stage. It is
+too expensive for ordinary regeneration, while keeping it separate prevents the
+rustdoc-derived candidate set from certifying itself. Neither generation nor probing
+runs while indexing a repository.
 
 `receivers.json` maps resolver heads and public re-exports to audited definition
 paths. Primitive definitions win over same-path modules. Primitive implementations
@@ -37,8 +61,10 @@ It does not decide dispatch, bound satisfaction, mutability or stability.
 The generator enumerates these classes without filtering cfg, visibility,
 stability, feature, edition, target, bounds or generic arguments:
 
-- `inherent`: every attached or whole-index impl with the receiver's definition
-  head, including specialized generic arguments and dyn-trait variants.
+- `inherent`: every attached or whole-index impl with the receiver's normalized
+  definition head, including impls written against aliases, specialized generic
+  arguments and dyn-trait variants. Stable cross-crate incoherent inherent methods
+  absent from rustdoc are verified in pinned rust-src and included here.
 - `trait-impl:<trait>`: explicit implementations, trait methods, defaults and
   recursive supertrait methods, plus the own methods of a trait receiver.
 - `blanket:<trait>`: attached rustdoc blanket impls and **every** generic-self impl
@@ -62,13 +88,15 @@ Windows/WASI/Unix extension traits and unstable items; target metadata is not a
 filter. Completeness concerns this pinned std snapshot, not future toolchains or
 third-party extension traits.
 
-`complete` means all these JSON candidate classes were enumerated as a superset.
+`complete` means all rustdoc/rust-src candidate classes were enumerated as a superset
+and the committed table must pass the compiler oracle above.
 `complete_except_deref` means the own union is complete but a generic
 Deref::Target/projection or an erased pointer/container element is deferred to its
-own receiver inventory. This includes Box/Rc/Arc/Pin/Cow/ManuallyDrop and
-RefCell/Mutex/RwLock/Cell/OnceLock/Weak/NonNull. Vec remains complete: its target
-head is the enumerable slice, and slice lookup does not dereference its elements.
-The Deref/DerefMut trait heads themselves defer their associated Target.
+own receiver inventory. This includes Box/Rc/Arc/Pin/Cow/ManuallyDrop/LazyCell/
+LazyLock and the Deref/DerefMut trait heads. Cell, RefCell, UnsafeCell, OnceCell,
+OnceLock, Mutex, RwLock, both Weak identities and NonNull do not implement Deref;
+their compiler-probed own sets are therefore `complete`. Vec remains complete: its
+target head is the enumerable slice, including alloc's rustdoc-omitted slice impl.
 
 `incomplete` identifies a concrete unavailable JSON class. The pinned JSON lacks
 inherent dyn Any and dyn Error methods (`is`/`downcast_ref`); their documented
