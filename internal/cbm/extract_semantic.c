@@ -38,7 +38,8 @@ static bool is_throw_node(TSNode node, const CBMLangSpec *spec) {
 }
 
 // Resolve exception name from the first meaningful child of a throw/raise node.
-static char *resolve_exception_name(CBMArena *a, TSNode throw_node, const char *source) {
+static char *resolve_exception_name(CBMArena *a, TSNode throw_node, const char *source,
+                                    TSNode *name_node) {
     uint32_t nc = ts_node_child_count(throw_node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode child = ts_node_child(throw_node, i);
@@ -64,9 +65,11 @@ static char *resolve_exception_name(CBMArena *a, TSNode throw_node, const char *
                 fn = ts_node_named_child(child, 0);
             }
             if (!ts_node_is_null(fn)) {
+                *name_node = fn;
                 return cbm_node_text(a, fn, source);
             }
         } else {
+            *name_node = child;
             return cbm_node_text(a, child, source);
         }
         break;
@@ -97,7 +100,11 @@ static void extract_throws_clause(CBMExtractCtx *ctx, TSNode node, const CBMLang
             strcmp(ck, "scoped_type_identifier") == 0) {
             char *exc = cbm_node_text(ctx->arena, child, ctx->source);
             if (exc && exc[0]) {
-                CBMThrow thr = {.exception_name = exc, .enclosing_func_qn = func_qn};
+                CBMThrow thr = {.exception_name = exc,
+                                .enclosing_func_qn = func_qn,
+                                .start_line = (int)ts_node_start_point(child).row + TS_LINE_OFFSET,
+                                .site_start_byte = ts_node_start_byte(child),
+                                .site_end_byte = ts_node_end_byte(child)};
                 cbm_throws_push(&ctx->result->throws, ctx->arena, thr);
             }
         }
@@ -107,14 +114,17 @@ static void extract_throws_clause(CBMExtractCtx *ctx, TSNode node, const CBMLang
 // Process a single node for throw extraction (called from iterative walker).
 static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     if (is_throw_node(node, spec)) {
-        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
+        TSNode name_node = {0};
+        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source, &name_node);
         if (exc_name && exc_name[0]) {
             if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {
                 exc_name[MAX_EXCEPTION_NAME_LEN] = '\0';
             }
-            CBMThrow thr;
-            thr.exception_name = exc_name;
-            thr.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
+            CBMThrow thr = {.exception_name = exc_name,
+                            .enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node),
+                            .start_line = (int)ts_node_start_point(name_node).row + TS_LINE_OFFSET,
+                            .site_start_byte = ts_node_start_byte(name_node),
+                            .site_end_byte = ts_node_end_byte(name_node)};
             cbm_throws_push(&ctx->result->throws, ctx->arena, thr);
         }
     }
@@ -270,6 +280,7 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
                           : left;
         rw.site_start_byte = ts_node_start_byte(site);
         rw.site_end_byte = ts_node_end_byte(site);
+        rw.start_line = (int)ts_node_start_point(site).row + TS_LINE_OFFSET;
         cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
     }
 }
@@ -318,14 +329,17 @@ void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     }
 
     if (has_throws && is_throw_node(node, spec)) {
-        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
+        TSNode name_node = {0};
+        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source, &name_node);
         if (exc_name && exc_name[0]) {
             if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {
                 exc_name[MAX_EXCEPTION_NAME_LEN] = '\0';
             }
-            CBMThrow thr;
-            thr.exception_name = exc_name;
-            thr.enclosing_func_qn = state->enclosing_func_qn;
+            CBMThrow thr = {.exception_name = exc_name,
+                            .enclosing_func_qn = state->enclosing_func_qn,
+                            .start_line = (int)ts_node_start_point(name_node).row + TS_LINE_OFFSET,
+                            .site_start_byte = ts_node_start_byte(name_node),
+                            .site_end_byte = ts_node_end_byte(name_node)};
             cbm_throws_push(&ctx->result->throws, ctx->arena, thr);
         }
     }
@@ -355,6 +369,7 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                   : left;
                 rw.site_start_byte = ts_node_start_byte(site);
                 rw.site_end_byte = ts_node_end_byte(site);
+                rw.start_line = (int)ts_node_start_point(site).row + TS_LINE_OFFSET;
                 cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
             }
         }

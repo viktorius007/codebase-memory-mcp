@@ -453,11 +453,44 @@ static bool is_checked_exception(const char *name) {
     return true;
 }
 
-static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
-                                    const char *module_qn, const char **imp_keys,
-                                    const char **imp_vals, int imp_count) {
+static const char *resolve_as_class(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
+                                    const char *name, const char *module_qn, const char **imp_keys,
+                                    const char **imp_vals, int imp_count, CBMLanguage lang,
+                                    int *candidate_count) {
     cbm_resolution_t res =
         cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
+    if (candidate_count) {
+        *candidate_count = res.candidate_count;
+    }
+    /* The generic ambiguity set mixes languages. For Python inheritance, a
+     * single Python type is the only candidate that can satisfy this edge. */
+    if ((!res.qualified_name || res.qualified_name[0] == '\0') && lang == CBM_LANG_PYTHON &&
+        res.candidate_count > SKIP_ONE && !strchr(name, '.')) {
+        const char **qns = NULL;
+        int count = 0;
+        const char *only = NULL;
+        cbm_registry_find_by_name(reg, name, &qns, &count);
+        for (int i = 0; i < count; i++) {
+            const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, qns[i]);
+            CBMLanguage candidate_lang =
+                node ? cbm_registry_synthetic_path_language(node->file_path) : CBM_LANG_COUNT;
+            if (node && candidate_lang == CBM_LANG_COUNT) {
+                candidate_lang = cbm_language_for_filename(node->file_path);
+            }
+            if (!node || candidate_lang != CBM_LANG_PYTHON ||
+                !cbm_label_is_type_like(node->label)) {
+                continue;
+            }
+            if (only) {
+                only = NULL;
+                break;
+            }
+            only = qns[i];
+        }
+        if (only) {
+            res.qualified_name = only;
+        }
+    }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
@@ -3325,6 +3358,8 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
     }
     if (target_node && source_node->id != target_node->id &&
         cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+        cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call, NULL,
+                                            "cross_language_candidate_rejected");
         /* #725: same guard as pass_calls.c — do not emit a suffix_match
          * CALLS edge across a language boundary. A route registration
          * behind the refused binding still gets its Route. */
@@ -3348,11 +3383,15 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
          * language guard is designed to reject. Java/Kotlin calls legitimately
          * cross source languages inside one JVM project. */
         bool exact_lsp_target = lsp_target && target_node->id == lsp_target->id;
+        /* Configuration relations may target TOML, but an executable CALLS
+         * edge cannot: a TOML section is never a callable. */
+        CBMLanguage target_lang = cbm_language_for_filename(target_node->file_path);
         bool cross_language =
-            !exact_lsp_target && cbm_suppress_cross_language_code_match(source_lang, rc->repo_path,
-                                                                        target_node->file_path);
+            !exact_lsp_target && ((target_lang == CBM_LANG_TOML && source_lang != CBM_LANG_TOML) ||
+                                  cbm_suppress_cross_language_code_match(source_lang, rc->repo_path,
+                                                                         target_node->file_path));
         drop_plain_call |= cross_language;
-        if (lang == CBM_LANG_RUST && cross_language)
+        if (cross_language)
             cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call,
                                                 NULL, "cross_language_candidate_rejected");
     }
@@ -3691,7 +3730,50 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                                    imp_keys, imp_vals, imp_count)
                     : cbm_registry_resolve(rc->registry, usage->ref_name, module_qn, imp_keys,
                                            imp_vals, imp_count);
+            /* TSX references cannot bind definitions from an incompatible
+             * language; recover only when that filtering proves one target. */
+            if ((!res.qualified_name || res.qualified_name[0] == '\0') && lang == CBM_LANG_TSX &&
+                res.candidate_count > SKIP_ONE && !strchr(usage->ref_name, '.')) {
+                const char **qns = NULL;
+                int count = 0;
+                const char *only = NULL;
+                cbm_registry_find_by_name(rc->registry, usage->ref_name, &qns, &count);
+                for (int i = 0; i < count; i++) {
+                    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(rc->main_gbuf, qns[i]);
+                    CBMLanguage candidate_lang =
+                        node ? cbm_registry_synthetic_path_language(node->file_path)
+                             : CBM_LANG_COUNT;
+                    if (node && candidate_lang == CBM_LANG_COUNT) {
+                        candidate_lang = cbm_language_for_filename(node->file_path);
+                    }
+                    if (!node || candidate_lang == CBM_LANG_COUNT ||
+                        !cbm_lang_resolution_compatible(lang, candidate_lang)) {
+                        continue;
+                    }
+                    if (only) {
+                        only = NULL;
+                        break;
+                    }
+                    only = qns[i];
+                }
+                if (only) {
+                    res = (cbm_resolution_t){only, "unique_name", 1.0, SKIP_ONE};
+                }
+            }
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
+                if (res.candidate_count > SKIP_ONE) {
+                    int line = usage->start_line;
+                    for (const char *p = usage->ref_name; *p; p++) {
+                        line += *p == '\n';
+                    }
+                    cbm_pipeline_record_unresolved(ws->local_edge_buf, rc->project_name, rel,
+                                                   usage->enclosing_func_qn, usage->ref_name,
+                                                   usage->kind == CBM_USAGE_TYPE ? "type"
+                                                   : usage->is_member_access     ? "member"
+                                                                                 : "reference",
+                                                   "name_binding_not_proven", line,
+                                                   usage->site_start_byte, usage->site_end_byte);
+                }
                 continue;
             }
             if (!cbm_pipeline_reference_candidate_fallback_allowed(lang, usage, res.strategy,
@@ -3800,6 +3882,12 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         cbm_resolution_t res = cbm_registry_resolve(rc->registry, thr->exception_name, module_qn,
                                                     imp_keys, imp_vals, imp_count);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            if (res.candidate_count > SKIP_ONE) {
+                cbm_pipeline_record_unresolved(ws->local_edge_buf, rc->project_name, rel,
+                                               thr->enclosing_func_qn, thr->exception_name, "type",
+                                               "name_binding_not_proven", thr->start_line,
+                                               thr->site_start_byte, thr->site_end_byte);
+            }
             continue;
         }
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
@@ -3861,6 +3949,12 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         cbm_resolution_t res = cbm_registry_resolve(rc->registry, rw->var_name, module_qn, imp_keys,
                                                     imp_vals, imp_count);
         if (lang != CBM_LANG_RUST && (!res.qualified_name || res.qualified_name[0] == '\0')) {
+            if (res.candidate_count > SKIP_ONE) {
+                cbm_pipeline_record_unresolved(
+                    ws->local_edge_buf, rc->project_name, rel, rw->enclosing_func_qn, rw->var_name,
+                    rw->is_member_access ? "member" : "reference", "name_binding_not_proven",
+                    rw->start_line, rw->site_start_byte, rw->site_end_byte);
+            }
             continue;
         }
         const cbm_gbuf_node_t *tgt =
@@ -3911,11 +4005,21 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         return;
     }
     for (int b = 0; def->base_classes[b]; b++) {
-        const char *bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic);
+        int candidate_count = 0;
+        const char *bqn = resolve_as_class(rc->registry, rc->main_gbuf, def->base_classes[b], mq,
+                                           ik, iv, ic, fs->lang, &candidate_count);
         /* Same external-base gate as the sequential semantic pass. */
         if (!bqn ||
             cbm_python_external_base_contradicts(fs->lang, fs->imports, def->base_classes[b], bqn,
                                                  rc->main_gbuf, rc->project_name, fs->rel)) {
+            if (!bqn && candidate_count > SKIP_ONE) {
+                uint32_t start = def->base_class_start_bytes ? def->base_class_start_bytes[b] : 0;
+                uint32_t end = def->base_class_end_bytes ? def->base_class_end_bytes[b] : start;
+                cbm_pipeline_record_unresolved(ws->local_edge_buf, rc->project_name, fs->rel,
+                                               def->qualified_name, def->base_classes[b], "type",
+                                               "name_binding_not_proven", (int)def->start_line,
+                                               start, end);
+            }
             continue;
         }
         const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, bqn);
@@ -4028,10 +4132,10 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!it->trait_name || !it->struct_name) {
             continue;
         }
-        const char *tqn = resolve_as_class(rc->registry, it->trait_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
-        const char *sqn = resolve_as_class(rc->registry, it->struct_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+        const char *tqn = resolve_as_class(rc->registry, rc->main_gbuf, it->trait_name, module_qn,
+                                           imp_keys, imp_vals, imp_count, lang, NULL);
+        const char *sqn = resolve_as_class(rc->registry, rc->main_gbuf, it->struct_name, module_qn,
+                                           imp_keys, imp_vals, imp_count, lang, NULL);
         if (!tqn || !sqn) {
             continue;
         }

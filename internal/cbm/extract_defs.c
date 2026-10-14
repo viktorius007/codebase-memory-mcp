@@ -4762,6 +4762,39 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
     return find_base_from_children(a, node, source, base_types);
 }
 
+static void capture_base_class_spans(CBMArena *arena, TSNode node, const char *source,
+                                     CBMDefinition *def) {
+    int count = 0;
+    while (def->base_classes && def->base_classes[count]) {
+        count++;
+    }
+    if (count == 0) {
+        return;
+    }
+    uint32_t *starts = cbm_arena_alloc(arena, (size_t)count * sizeof(*starts));
+    uint32_t *ends = cbm_arena_alloc(arena, (size_t)count * sizeof(*ends));
+    if (!starts || !ends) {
+        return;
+    }
+    uint32_t cursor = ts_node_start_byte(node);
+    uint32_t node_end = ts_node_end_byte(node);
+    for (int i = 0; i < count; i++) {
+        size_t length = strlen(def->base_classes[i]);
+        starts[i] = 0;
+        ends[i] = 0;
+        for (; length > 0 && cursor + length <= node_end; cursor++) {
+            if (memcmp(source + cursor, def->base_classes[i], length) == 0) {
+                starts[i] = cursor;
+                ends[i] = cursor + (uint32_t)length;
+                cursor = ends[i];
+                break;
+            }
+        }
+    }
+    def->base_class_start_bytes = starts;
+    def->base_class_end_bytes = ends;
+}
+
 // Classify class label from AST node kind
 static const char *class_label_for_kind(const char *kind) {
     if (strcmp(kind, "interface_declaration") == 0 || strcmp(kind, "interface_type") == 0 ||
@@ -8292,6 +8325,7 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
     }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    capture_base_class_spans(a, node, ctx->source, &def);
     if (ctx->language == CBM_LANG_RUST && strcmp(kind, "trait_item") == 0) {
         def.supertraits = extract_rust_supertraits(a, node, ctx->source);
     }
@@ -13407,6 +13441,7 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
                 }
                 result[bcount] = NULL;
                 def.base_classes = result;
+                capture_base_class_spans(a, err_node, ctx->source, &def);
             }
         }
         cbm_defs_push(&ctx->result->defs, a, def);

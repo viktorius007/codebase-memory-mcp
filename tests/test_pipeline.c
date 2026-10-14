@@ -4221,6 +4221,141 @@ TEST(pipeline_same_language_suffix_without_binding_is_withheld) {
     PASS();
 }
 
+static void write_f1_guard_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "py_base.py", "class SharedBase:\n    pass\n");
+    write_temp_file(tmp, "other.tsx", "export class SharedBase {}\nexport class ViewToken {}\n");
+    write_temp_file(tmp, "child.py", "class Child(SharedBase):\n    pass\n");
+    write_temp_file(tmp, "py_other.py", "class ViewToken:\n    pass\n");
+    write_temp_file(tmp, "use.tsx", "export function render() {\n  return ViewToken;\n}\n");
+    write_temp_file(tmp, "u1.py", "class AmbiguousUse:\n    pass\n");
+    write_temp_file(tmp, "u2.py", "class AmbiguousUse:\n    pass\n");
+    write_temp_file(tmp, "uuser.py", "def read():\n    return AmbiguousUse\n");
+    write_temp_file(tmp, "w1.py", "class State:\n    pass\n");
+    write_temp_file(tmp, "w2.py", "class State:\n    pass\n");
+    write_temp_file(tmp, "wuser.py", "def write():\n    State = 1\n    return State\n");
+    write_temp_file(tmp, "i1.py", "class AmbiguousBase:\n    pass\n");
+    write_temp_file(tmp, "i2.py", "class AmbiguousBase:\n    pass\n");
+    write_temp_file(tmp, "ichild.py", "class AmbiguousChild(AmbiguousBase):\n    pass\n");
+    write_temp_file(tmp, "t1.py", "class Problem(Exception):\n    pass\n");
+    write_temp_file(tmp, "t2.py", "class Problem(Exception):\n    pass\n");
+    write_temp_file(tmp, "tuser.py", "def fail():\n    raise Problem\n");
+    write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"crates/demo\"]\n");
+    write_temp_file(tmp, "crates/demo/Cargo.toml",
+                    "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n"
+                    "[lib]\nname = \"fixture_lib\"\npath = \"src/lib.rs\"\n");
+    write_temp_file(tmp, "crates/demo/src/lib.rs", "pub fn fixture() {}\n");
+    write_temp_file(tmp, "scripts/lib/verify-tuning-defaults.sh", "verify_defaults() { :; }\n");
+    write_temp_file(tmp, "scripts/verify-wave-build-and-install-cold.sh",
+                    "#!/bin/sh\n# shellcheck source=lib/verify-tuning-defaults.sh\n"
+                    "ROOT=\"$(pwd)\"\n"
+                    ". \"$ROOT/scripts/lib/verify-tuning-defaults.sh\"\n"
+                    "start_release_build() {\n  sh -c 'true'\n}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char path[64];
+        char source[128];
+        snprintf(path, sizeof(path), "pad/filler%d.py", i);
+        snprintf(source, sizeof(source), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, path, source);
+    }
+}
+
+static int f1_guard_query_both_modes(const char *tag, const char *sql, int expected) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-f1-%s-XXXXXX", cbm_tmpdir(), tag);
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    int matches = 0;
+    for (int mode = 0; mode < 2; mode++) {
+        write_f1_guard_fixture(tmp, mode ? 52 : 0);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/%s.db", tmp, mode ? "parallel" : "sequential");
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        if (!pipeline || cbm_pipeline_run(pipeline) != 0) {
+            cbm_pipeline_free(pipeline);
+            th_rmtree(tmp);
+            return -1;
+        }
+        cbm_store_t *store = cbm_store_open_path_query(db);
+        sqlite3_stmt *stmt = NULL;
+        int value = -1;
+        if (store &&
+            sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            value = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+        cbm_pipeline_free(pipeline);
+        if ((expected >= 0 && value == expected) || (expected < 0 && value >= -expected)) {
+            matches++;
+        } else {
+            fprintf(stderr, "f1 guard fixture %s (%s) returned %d, expected %d\n", tag,
+                    mode ? "parallel" : "sequential", value, expected);
+        }
+    }
+    th_rmtree(tmp);
+    return matches;
+}
+
+TEST(pipeline_python_inherits_recovers_single_language_candidate) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
+                      "AND s.file_path='child.py' AND s.name='Child' "
+                      "AND t.file_path='py_base.py' AND t.name='SharedBase'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-inherits", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_tsx_usage_recovers_single_language_candidate) {
+    const char *sql =
+        "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+        "AND s.file_path='use.tsx' AND t.file_path='other.tsx' AND t.name='ViewToken'";
+    ASSERT_EQ(f1_guard_query_both_modes("tsx-usage", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_multicandidate_usage_records_name_binding_stop) {
+    const char *sql = "SELECT count(*) FROM unresolved_sites WHERE file_path='uuser.py' "
+                      "AND name='AmbiguousUse' AND reason='name_binding_not_proven'";
+    ASSERT_EQ(f1_guard_query_both_modes("usage-stop", sql, -1), 2);
+    PASS();
+}
+
+TEST(pipeline_multicandidate_write_records_name_binding_stop) {
+    const char *sql = "SELECT count(*) FROM unresolved_sites WHERE file_path='wuser.py' "
+                      "AND name='State' AND reason='name_binding_not_proven'";
+    ASSERT_EQ(f1_guard_query_both_modes("write-stop", sql, -1), 2);
+    PASS();
+}
+
+TEST(pipeline_multicandidate_inherits_records_name_binding_stop) {
+    const char *sql = "SELECT count(*) FROM unresolved_sites WHERE file_path='ichild.py' "
+                      "AND name='AmbiguousBase' AND reason='name_binding_not_proven'";
+    ASSERT_EQ(f1_guard_query_both_modes("inherits-stop", sql, -1), 2);
+    PASS();
+}
+
+TEST(pipeline_multicandidate_throw_records_name_binding_stop) {
+    const char *sql = "SELECT count(*) FROM unresolved_sites WHERE file_path='tuser.py' "
+                      "AND name='Problem' AND reason='name_binding_not_proven'";
+    ASSERT_EQ(f1_guard_query_both_modes("throw-stop", sql, -1), 2);
+    PASS();
+}
+
+TEST(pipeline_shell_call_never_targets_toml_and_records_stop) {
+    const char *sql = "SELECT 100 * (SELECT count(*) FROM unresolved_sites WHERE "
+                      "file_path='scripts/verify-wave-build-and-install-cold.sh' "
+                      "AND name='sh' AND reason='cross_language_candidate_rejected') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+                      "AND s.file_path='scripts/verify-wave-build-and-install-cold.sh' "
+                      "AND t.file_path='crates/demo/Cargo.toml')";
+    ASSERT_EQ(f1_guard_query_both_modes("shell-toml", sql, 100), 2);
+    PASS();
+}
+
 TEST(pipeline_same_stem_schema_and_source_keep_definitions) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm-q-identity-XXXXXX", cbm_tmpdir());
@@ -28042,6 +28177,13 @@ SUITE(pipeline_unresolved) {
     RUN_TEST(pipeline_parenthesized_indirect_call_records_stop);
     RUN_TEST(pipeline_macro_argument_without_definition_records_stop);
     RUN_TEST(pipeline_call_argument_properties_keep_utf8_boundaries);
+    RUN_TEST(pipeline_python_inherits_recovers_single_language_candidate);
+    RUN_TEST(pipeline_tsx_usage_recovers_single_language_candidate);
+    RUN_TEST(pipeline_multicandidate_usage_records_name_binding_stop);
+    RUN_TEST(pipeline_multicandidate_write_records_name_binding_stop);
+    RUN_TEST(pipeline_multicandidate_inherits_records_name_binding_stop);
+    RUN_TEST(pipeline_multicandidate_throw_records_name_binding_stop);
+    RUN_TEST(pipeline_shell_call_never_targets_toml_and_records_stop);
     RUN_TEST(pipeline_rust_workspace_trait_reexport_and_block_import_are_proved);
     RUN_TEST(pipeline_rust_macro_std_stop_has_a_site_record);
     RUN_TEST(pipeline_rust_macro_import_does_not_shadow_a_trait);

@@ -180,11 +180,44 @@ static void free_import_map(const char **keys, const char **vals, int count) {
 }
 
 /* Resolve a class/type name through the registry. Returns borrowed QN or NULL. */
-static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
-                                    const char *module_qn, const char **imp_keys,
-                                    const char **imp_vals, int imp_count) {
+static const char *resolve_as_class(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
+                                    const char *name, const char *module_qn, const char **imp_keys,
+                                    const char **imp_vals, int imp_count, CBMLanguage lang,
+                                    int *candidate_count) {
     cbm_resolution_t res =
         cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
+    if (candidate_count) {
+        *candidate_count = res.candidate_count;
+    }
+    /* The generic ambiguity set mixes languages. For Python inheritance, a
+     * single Python type is the only candidate that can satisfy this edge. */
+    if ((!res.qualified_name || res.qualified_name[0] == '\0') && lang == CBM_LANG_PYTHON &&
+        res.candidate_count > SKIP_ONE && !strchr(name, '.')) {
+        const char **qns = NULL;
+        int count = 0;
+        const char *only = NULL;
+        cbm_registry_find_by_name(reg, name, &qns, &count);
+        for (int i = 0; i < count; i++) {
+            const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, qns[i]);
+            CBMLanguage candidate_lang =
+                node ? cbm_registry_synthetic_path_language(node->file_path) : CBM_LANG_COUNT;
+            if (node && candidate_lang == CBM_LANG_COUNT) {
+                candidate_lang = cbm_language_for_filename(node->file_path);
+            }
+            if (!node || candidate_lang != CBM_LANG_PYTHON ||
+                !cbm_label_is_type_like(node->label)) {
+                continue;
+            }
+            if (only) {
+                only = NULL;
+                break;
+            }
+            only = qns[i];
+        }
+        if (only) {
+            res.qualified_name = only;
+        }
+    }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
@@ -635,11 +668,22 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     }
     if (def->base_classes) {
         for (int b = 0; def->base_classes[b]; b++) {
-            const char *base_qn = resolve_as_class(ctx->registry, def->base_classes[b], module_qn,
-                                                   imp_keys, imp_vals, imp_count);
+            int candidate_count = 0;
+            const char *base_qn =
+                resolve_as_class(ctx->registry, ctx->gbuf, def->base_classes[b], module_qn,
+                                 imp_keys, imp_vals, imp_count, lang, &candidate_count);
             if (!base_qn || cbm_python_external_base_contradicts(
                                 fi->language, &result->imports, def->base_classes[b], base_qn,
                                 ctx->gbuf, ctx->project_name, fi->rel_path)) {
+                if (!base_qn && candidate_count > SKIP_ONE) {
+                    uint32_t start =
+                        def->base_class_start_bytes ? def->base_class_start_bytes[b] : 0;
+                    uint32_t end = def->base_class_end_bytes ? def->base_class_end_bytes[b] : start;
+                    cbm_pipeline_record_unresolved(ctx->gbuf, ctx->project_name, fi->rel_path,
+                                                   def->qualified_name, def->base_classes[b],
+                                                   "type", "name_binding_not_proven",
+                                                   (int)def->start_line, start, end);
+                }
                 continue; /* unresolved, or an external base (`unittest.TestCase`) */
             }
             const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
@@ -781,13 +825,14 @@ static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         if (!it->trait_name || !it->struct_name) {
             continue;
         }
-        const char *trait_qn = resolve_as_class(ctx->registry, it->trait_name, module_qn, imp_keys,
-                                                imp_vals, imp_count);
+        const char *trait_qn = resolve_as_class(ctx->registry, ctx->gbuf, it->trait_name, module_qn,
+                                                imp_keys, imp_vals, imp_count, lang, NULL);
         if (!trait_qn) {
             continue;
         }
-        const char *struct_qn = resolve_as_class(ctx->registry, it->struct_name, module_qn,
-                                                 imp_keys, imp_vals, imp_count);
+        const char *struct_qn =
+            resolve_as_class(ctx->registry, ctx->gbuf, it->struct_name, module_qn, imp_keys,
+                             imp_vals, imp_count, lang, NULL);
         if (!struct_qn) {
             continue;
         }

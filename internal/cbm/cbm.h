@@ -227,13 +227,15 @@ typedef struct {
     const char *file_path;      // relative path
     uint32_t start_line;
     uint32_t end_line;
-    const char *signature;              // parameter text (NULL if none)
-    const char *return_type;            // return type text (NULL if none)
-    const char *receiver;               // exact Go/Rust method receiver spelling (NULL if none)
-    const char *docstring;              // leading doc comment (NULL if none)
-    const char *parent_class;           // enclosing class QN for methods (NULL if none)
-    const char **decorators;            // NULL-terminated array (NULL if none)
-    const char **base_classes;          // NULL-terminated array (NULL if none)
+    const char *signature;            // parameter text (NULL if none)
+    const char *return_type;          // return type text (NULL if none)
+    const char *receiver;             // exact Go/Rust method receiver spelling (NULL if none)
+    const char *docstring;            // leading doc comment (NULL if none)
+    const char *parent_class;         // enclosing class QN for methods (NULL if none)
+    const char **decorators;          // NULL-terminated array (NULL if none)
+    const char **base_classes;        // NULL-terminated array (NULL if none)
+    uint32_t *base_class_start_bytes; // exact source span per base_classes entry
+    uint32_t *base_class_end_bytes;
     const char **param_names;           // NULL-terminated array (NULL if none)
     const char **param_types;           // NULL-terminated array (NULL if none)
     const char **signature_param_types; // ordered internal signature types; "?" means unknown
@@ -470,6 +472,9 @@ typedef struct {
 typedef struct {
     const char *exception_name;    // exception class/type name
     const char *enclosing_func_qn; // QN of enclosing function
+    int start_line;
+    uint32_t site_start_byte;
+    uint32_t site_end_byte;
 } CBMThrow;
 
 typedef struct {
@@ -477,6 +482,7 @@ typedef struct {
     const char *enclosing_func_qn; // QN of enclosing function
     uint32_t site_start_byte;      // original assignment member token
     uint32_t site_end_byte;
+    int start_line;
     bool is_write;         // true = write, false = read
     bool is_member_access; // var_name is the field half of a selector/member LHS
                            // (`t.err = x` → "err"); the receiver is stripped here,
