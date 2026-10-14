@@ -3020,11 +3020,11 @@ static const cbm_gbuf_node_t *resolve_file_call_target(resolve_ctx_t *rc,
                                                        resolve_worker_state_t *ws,
                                                        pp_file_calls_t *fc, CBMCall *call,
                                                        const CBMResolvedCall *lsp, bool allow_tail,
-                                                       cbm_resolution_t *res, bool *arrow_bound) {
+                                                       cbm_resolution_t *res, bool *field_bound) {
     CBMLanguage lang = fc->lang;
     uint64_t _rc_t0 = extract_now_ns();
     const cbm_gbuf_node_t *lsp_target = NULL;
-    *arrow_bound = false;
+    *field_bound = false;
     if (lsp) {
         /* Canonicalise to the gbuf node's QN so res->qualified_name matches
          * the gbuf even when the cross-file fallback had to prefix the
@@ -3066,11 +3066,12 @@ static const cbm_gbuf_node_t *resolve_file_call_target(resolve_ctx_t *rc,
                                     fc->imp_vals, fc->imp_count);
     }
     /* `p->open(fd)`: the registry does not split a callee on the arrow.
-     * The object's type decides, as for the dot call handled further
-     * down. Mirrors pass_calls.c. */
+     * The object's type also decides an ambiguous dot member. Mirrors
+     * pass_calls.c. */
     if ((!res->qualified_name || !res->qualified_name[0]) && !call->requires_lsp_resolution &&
-        cbm_c_arrow_member_call(lang, call->callee_name)) {
-        *arrow_bound = cbm_pipeline_c_member_call_resolve(
+        (cbm_c_arrow_member_call(lang, call->callee_name) ||
+         ((lang == CBM_LANG_C || lang == CBM_LANG_CPP) && strchr(call->callee_name, '.')))) {
+        *field_bound = cbm_pipeline_c_member_call_resolve(
                            &fc->result->resolved_calls, pp_file_field_index(fc), rc->main_gbuf,
                            rc->registry, rc->project_name, call->enclosing_func_qn,
                            call->callee_name, cbm_c_member_rule_file(lang, fc->rel), res) != NULL;
@@ -3221,13 +3222,13 @@ static const cbm_gbuf_node_t *pp_field_call_target(resolve_ctx_t *rc, pp_file_ca
                                                    const CBMCall *call,
                                                    const cbm_gbuf_node_t *source_node,
                                                    const cbm_gbuf_node_t *target_node,
-                                                   bool arrow_bound, cbm_resolution_t *res) {
+                                                   bool field_bound, cbm_resolution_t *res) {
     cbm_field_call_policy_t field_policy = cbm_call_onto_field_policy(
         fc->lang, call->callee_name, target_node->label, target_node->file_path);
     if (field_policy == CBM_FIELD_CALL_DROP) {
         return NULL;
     }
-    if (field_policy != CBM_FIELD_CALL_BY_OWNER || arrow_bound) {
+    if (field_policy != CBM_FIELD_CALL_BY_OWNER || field_bound) {
         return target_node;
     }
     const cbm_gbuf_node_t *field = cbm_pipeline_c_member_call_resolve(
@@ -3240,7 +3241,7 @@ static const cbm_gbuf_node_t *pp_field_call_target(resolve_ctx_t *rc, pp_file_ca
 static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                     pp_file_calls_t *fc, CBMCall *call, cbm_resolution_t res,
                                     const cbm_gbuf_node_t *source_node,
-                                    const cbm_gbuf_node_t *lsp_target, bool arrow_bound,
+                                    const cbm_gbuf_node_t *lsp_target, bool field_bound,
                                     const CBMResolvedCall *lsp) {
     CBMLanguage lang = fc->lang;
     const char *rel = fc->rel;
@@ -3317,7 +3318,7 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
                               memory_order_relaxed);
     if (target_node && source_node->id != target_node->id) {
         target_node =
-            pp_field_call_target(rc, fc, call, source_node, target_node, arrow_bound, &res);
+            pp_field_call_target(rc, fc, call, source_node, target_node, field_bound, &res);
         if (!target_node) {
             return;
         }
@@ -3495,9 +3496,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                 reasons, closure);
             continue;
         }
-        bool arrow_bound = false;
+        bool field_bound = false;
         const cbm_gbuf_node_t *lsp_target =
-            resolve_file_call_target(rc, ws, &fc, call, lsp, allow_tail, &res, &arrow_bound);
+            resolve_file_call_target(rc, ws, &fc, call, lsp, allow_tail, &res, &field_bound);
 
         /* A synthetic semantic candidate is an invocation only when the LSP
          * resolved it to a concrete graph node. Never let registry, field-name,
@@ -3505,7 +3506,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (!lsp_target && pp_unmaterialized_call(rc, ws, &fc, call, source_node, &res, reasons)) {
             continue;
         }
-        emit_resolved_file_call(rc, ws, &fc, call, res, source_node, lsp_target, arrow_bound, lsp);
+        emit_resolved_file_call(rc, ws, &fc, call, res, source_node, lsp_target, field_bound, lsp);
     }
     cbm_pipeline_unresolved_reasons_free(reasons);
     if (lsp_exact_idx) {

@@ -1971,6 +1971,18 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         return (cbm_resolution_t){arr->items[0], "unique_name", conf, REG_RESOLVED};
     }
 
+    /* A method and its fenced field are separate namespaces of one owner,
+     * not competing declarations. Value accesses select the field below. */
+    if (arr->count == 2) {
+        for (int i = 0; i < arr->count; i++) {
+            if (cbm_registry_value_target(r, arr->items[i]) == arr->items[1 - i] &&
+                receiver_chain_admits(callee_name, arr->items[i])) {
+                return (cbm_resolution_t){arr->items[i], "unique_name", CONF_UNIQUE_NAME,
+                                          REG_RESOLVED};
+            }
+        }
+    }
+
     /* A short name shared by several files has no proven binding outside
      * the Rust module tree. Import distance is not declaration identity. */
     const CBMRustModTree *tree = rust_file_modtree(module_qn);

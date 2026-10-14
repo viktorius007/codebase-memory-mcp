@@ -1048,12 +1048,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     }
     /* `p->open(fd)`: the registry does not split a callee on the arrow, and a
      * member is not a name it could resolve anyway. The object's type decides,
-     * exactly as for the dot call handled further down. MUST match
+     * including when a dot member has ambiguous registry candidates. MUST match
      * pass_parallel.c. */
-    bool arrow_bound = false;
+    bool field_bound = false;
     if ((!res.qualified_name || res.qualified_name[0] == '\0') &&
-        cbm_c_arrow_member_call(lang, call->callee_name)) {
-        arrow_bound = cbm_pipeline_c_member_call_resolve(
+        (cbm_c_arrow_member_call(lang, call->callee_name) ||
+         ((lang == CBM_LANG_C || lang == CBM_LANG_CPP) && strchr(call->callee_name, '.')))) {
+        field_bound = cbm_pipeline_c_member_call_resolve(
                           lsp_calls, NULL, ctx->gbuf, ctx->registry, ctx->project_name,
                           call->enclosing_func_qn, call->callee_name,
                           cbm_c_member_rule_file(lang, rel), &res) != NULL;
@@ -1167,8 +1168,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     case CBM_FIELD_CALL_DROP:
         return 0;
     case CBM_FIELD_CALL_BY_OWNER:
-        /* An arrow call was already bound this way above. */
-        if (!arrow_bound) {
+        /* An empty registry result was already bound by owner above. */
+        if (!field_bound) {
             target_node = cbm_pipeline_c_member_call_resolve(
                 lsp_calls, NULL, ctx->gbuf, ctx->registry, ctx->project_name,
                 call->enclosing_func_qn, call->callee_name, cbm_c_member_rule_file(lang, rel),
