@@ -569,7 +569,50 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                    imp_keys, imp_vals, imp_count)
                     : cbm_registry_resolve(ctx->registry, usage->ref_name, module_qn, imp_keys,
                                            imp_vals, imp_count);
+            /* TSX references cannot bind definitions from an incompatible
+             * language; recover only when that filtering proves one target. */
+            if ((!res.qualified_name || res.qualified_name[0] == '\0') && lang == CBM_LANG_TSX &&
+                res.candidate_count > SKIP_ONE && !strchr(usage->ref_name, '.')) {
+                const char **qns = NULL;
+                int count = 0;
+                const char *only = NULL;
+                cbm_registry_find_by_name(ctx->registry, usage->ref_name, &qns, &count);
+                for (int i = 0; i < count; i++) {
+                    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, qns[i]);
+                    CBMLanguage candidate_lang =
+                        node ? cbm_registry_synthetic_path_language(node->file_path)
+                             : CBM_LANG_COUNT;
+                    if (node && candidate_lang == CBM_LANG_COUNT) {
+                        candidate_lang = cbm_language_for_filename(node->file_path);
+                    }
+                    if (!node || candidate_lang == CBM_LANG_COUNT ||
+                        !cbm_lang_resolution_compatible(lang, candidate_lang)) {
+                        continue;
+                    }
+                    if (only) {
+                        only = NULL;
+                        break;
+                    }
+                    only = qns[i];
+                }
+                if (only) {
+                    res = (cbm_resolution_t){only, "unique_name", 1.0, SKIP_ONE};
+                }
+            }
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
+                if (res.candidate_count > SKIP_ONE) {
+                    int line = usage->start_line;
+                    for (const char *p = usage->ref_name; *p; p++) {
+                        line += *p == '\n';
+                    }
+                    cbm_pipeline_record_unresolved(ctx->gbuf, ctx->project_name, rel,
+                                                   usage->enclosing_func_qn, usage->ref_name,
+                                                   usage->kind == CBM_USAGE_TYPE ? "type"
+                                                   : usage->is_member_access     ? "member"
+                                                                                 : "reference",
+                                                   "name_binding_not_proven", line,
+                                                   usage->site_start_byte, usage->site_end_byte);
+                }
                 continue;
             }
             if (!cbm_pipeline_reference_candidate_fallback_allowed(lang, usage, res.strategy,
@@ -676,6 +719,12 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         if (res.qualified_name && res.qualified_name[0]) {
             tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
         }
+        if (!tgt && res.candidate_count > SKIP_ONE) {
+            cbm_pipeline_record_unresolved(ctx->gbuf, ctx->project_name, rel,
+                                           thr->enclosing_func_qn, thr->exception_name, "type",
+                                           "name_binding_not_proven", thr->start_line,
+                                           thr->site_start_byte, thr->site_end_byte);
+        }
         if (!tgt || src->id == tgt->id ||
             cbm_suppress_cross_language_code_match(cbm_language_for_filename(src->file_path),
                                                    ctx->repo_path, tgt->file_path)) {
@@ -740,6 +789,12 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         cbm_resolution_t res = cbm_registry_resolve(ctx->registry, rw->var_name, module_qn,
                                                     imp_keys, imp_vals, imp_count);
         if (lang != CBM_LANG_RUST && (!res.qualified_name || res.qualified_name[0] == '\0')) {
+            if (res.candidate_count > SKIP_ONE) {
+                cbm_pipeline_record_unresolved(
+                    ctx->gbuf, ctx->project_name, rel, rw->enclosing_func_qn, rw->var_name,
+                    rw->is_member_access ? "member" : "reference", "name_binding_not_proven",
+                    rw->start_line, rw->site_start_byte, rw->site_end_byte);
+            }
             continue;
         }
 

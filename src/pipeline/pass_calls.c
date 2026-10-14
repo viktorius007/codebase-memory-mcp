@@ -1193,6 +1193,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * Store.commit() call to a JS function named commit (or a Bash main
      * to a Python main). Drop that weak cross-language edge. */
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+        cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+                                            "cross_language_candidate_rejected");
         /* Refusing the binding leaves the callee unresolved, and an
          * unresolved route-registration callee is still a registration:
          * `Route::get('/x', ...)` beside a JS `get`, `app.get('/x', h)`
@@ -1220,8 +1222,17 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         if (n >= 0 && (size_t)n < sizeof(source_path))
             source_lang = cbm_detect_file_language(source_node->file_path, source_path);
     }
-    drop_plain_call |=
+    /* Configuration relations may target TOML, but an executable CALLS edge
+     * cannot: a TOML section is never a callable. */
+    CBMLanguage target_lang = cbm_language_for_filename(target_node->file_path);
+    bool cross_language =
+        (target_lang == CBM_LANG_TOML && source_lang != CBM_LANG_TOML) ||
         cbm_suppress_cross_language_code_match(source_lang, ctx->repo_path, target_node->file_path);
+    drop_plain_call |= cross_language;
+    if (cross_language) {
+        cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+                                            "cross_language_candidate_rejected");
+    }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count, drop_plain_call, route_mount);
     return SKIP_ONE;

@@ -262,6 +262,14 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->parent_class);
     cr_list(c, &d->decorators);
     cr_list(c, &d->base_classes);
+    int base_count = 0;
+    while (d->base_classes && d->base_classes[base_count]) {
+        base_count++;
+    }
+    cr_blob(c, (const void **)&d->base_class_start_bytes,
+            (size_t)base_count * sizeof(*d->base_class_start_bytes));
+    cr_blob(c, (const void **)&d->base_class_end_bytes,
+            (size_t)base_count * sizeof(*d->base_class_end_bytes));
     cr_list(c, &d->param_names);
     cr_list(c, &d->param_types);
     cr_counted_list(c, &d->signature_param_types, d->signature_param_count);
