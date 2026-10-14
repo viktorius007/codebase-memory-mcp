@@ -1891,8 +1891,17 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
      * preventing the stale local result from out-ranking manifest evidence. */
     for (int j = 0; j < src_out->count; j++) {
         const CBMResolvedCall *src = &src_out->items[j];
-        bool supersedes = src->strategy && (strcmp(src->strategy, "lsp_cross_crate") == 0 ||
-                                            strcmp(src->strategy, "lsp_module_path") == 0);
+        /* These project-registry refusals must also replace an earlier
+         * file-local guess for the same invocation, rather than compete by
+         * confidence with a target the complete scope no longer proves. */
+        bool trait_stop = src->kind == CBM_RESOLVED_INVOCATION && src->reason && src->strategy &&
+                          strcmp(src->strategy, "lsp_unresolved") == 0 &&
+                          (strcmp(src->reason, "unrecognised_std_method") == 0 ||
+                           strcmp(src->reason, "inherent_self_type_not_proven") == 0 ||
+                           strcmp(src->reason, "trait_scope_identity") == 0);
+        bool supersedes =
+            trait_stop || (src->strategy && (strcmp(src->strategy, "lsp_cross_crate") == 0 ||
+                                             strcmp(src->strategy, "lsp_module_path") == 0));
         if (!supersedes || !src->caller_qn || !src->callee_qn ||
             src->site_end_byte <= src->site_start_byte) {
             continue;
@@ -1905,6 +1914,16 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
                 dst->source_origin != src->source_origin ||
                 strcmp(dst->caller_qn, src->caller_qn) != 0) {
                 continue;
+            }
+            /* A macro argument carrier can cover several different calls.
+             * A trait stop closes only its method, never an inherent neighbour. */
+            if (trait_stop) {
+                const char *old_leaf = cbm_lsp_bare_segment(dst->callee_qn);
+                const char *new_leaf = cbm_lsp_bare_segment(src->callee_qn);
+                size_t old_len = cbm_pipeline_lsp_method_leaf_len(old_leaf);
+                size_t new_len = cbm_pipeline_lsp_method_leaf_len(new_leaf);
+                if (!old_leaf || old_len != new_len || strncmp(old_leaf, new_leaf, old_len) != 0)
+                    continue;
             }
             dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
             dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
@@ -3048,6 +3067,8 @@ static void pxc_rust_add_package_crates(PXCRustCrates *crates, PXCRustPackage *p
     const char *edition = cbm_cargo_effective_edition(m, inherited);
     CBMRustEdition tree_edition = !edition                       ? CBM_RUST_EDITION_UNKNOWN
                                   : strcmp(edition, "2015") == 0 ? CBM_RUST_EDITION_2015
+                                  : strcmp(edition, "2021") == 0 ? CBM_RUST_EDITION_2021
+                                  : strcmp(edition, "2024") == 0 ? CBM_RUST_EDITION_2024
                                                                  : CBM_RUST_EDITION_MODERN;
     for (int t = 0; t < m->target_count; t++) {
         const CBMCargoTarget *target = &m->targets[t];
