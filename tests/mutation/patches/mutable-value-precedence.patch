@@ -1,15 +1,6 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -14549,7 +14549,7 @@
-                 rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
-                 return;
-             }
--            if (reference_method) {
-+            if (false && reference_method) {
-                 rust_emit_resolved_call(ctx, reference_method->qualified_name,
-                                         reference_method->impl_key, "lsp_trait_dispatch",
-                                         CBM_RUST_CONF_TRAIT_SOLE);
 @@ -14588,7 +14588,7 @@
                      }
                      const CBMRegisteredFunc *shared_candidate = rust_resolve_trait_method(
