@@ -10675,7 +10675,7 @@ static int check_rust_modtree_calls_in_both_modes(const char *root,
 }
 
 TEST(pipeline_rust_captured_pattern_shadows_outer_type_and_binds_fields) {
-    char tmp[256] = "/tmp/w1-B1/captured_XXXXXX";
+    char tmp[256] = "/tmp/cbm_rust_captured_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"capture-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
@@ -10701,7 +10701,7 @@ TEST(pipeline_rust_captured_pattern_shadows_outer_type_and_binds_fields) {
 }
 
 TEST(pipeline_rust_inherent_typestate_candidates_are_not_chosen_by_order) {
-    char tmp[256] = "/tmp/w1-B1/typestate_XXXXXX";
+    char tmp[256] = "/tmp/cbm_rust_typestate_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"state-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
@@ -10751,7 +10751,7 @@ TEST(pipeline_rust_inherent_typestate_candidates_are_not_chosen_by_order) {
 }
 
 TEST(pipeline_rust_sole_generic_inherent_impl_accepts_bounded_arguments) {
-    char tmp[256] = "/tmp/w1-B1/specialized_XXXXXX";
+    char tmp[256] = "/tmp/cbm_rust_specialized_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"specialized-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
@@ -10774,7 +10774,7 @@ TEST(pipeline_rust_sole_generic_inherent_impl_accepts_bounded_arguments) {
 }
 
 TEST(pipeline_rust_method_syntax_cannot_select_associated_function) {
-    char tmp[256] = "/tmp/w1-B1/associated_XXXXXX";
+    char tmp[256] = "/tmp/cbm_rust_associated_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"associated-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
@@ -10793,7 +10793,7 @@ TEST(pipeline_rust_method_syntax_cannot_select_associated_function) {
 }
 
 TEST(pipeline_rust_inherent_refusals_record_exact_stop_reasons) {
-    char tmp[256] = "/tmp/w1-B1/refusals_XXXXXX";
+    char tmp[256] = "/tmp/cbm_rust_refusals_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"refusal-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
@@ -10852,7 +10852,7 @@ TEST(pipeline_rust_inherent_refusals_record_exact_stop_reasons) {
 }
 
 TEST(pipeline_rust_generic_self_proves_only_its_enclosing_impl_methods) {
-    char tmp[256] = "/tmp/w1-B1/self_impl_XXXXXX";
+    char tmp[256] = "/tmp/cbm_rust_self_impl_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"self-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
