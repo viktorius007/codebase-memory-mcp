@@ -283,6 +283,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->variants);
     cr_list(c, &d->extra_props);
     cr_str(c, &d->decl_namespace);
+    cr_str(c, &d->variant_key);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
@@ -299,11 +300,60 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
         for (int i = 0; i < argc && call->args; i++) {
             cr_str(c, &call->args[i].expr);
             cr_str(c, &call->args[i].value);
+            cr_str(c, &call->args[i].url_value);
             cr_str(c, &call->args[i].keyword);
         }
     } else if (c->phase == CR_COPY) {
         call->args = NULL;
         call->arg_count = 0;
+    }
+}
+
+/* Facts have counted lists, not sentinel arrays. Bail before touching a failed
+ * array copy so no string rewrite can land in the original result's storage. */
+static bool cr_py_size(cr_ctx_t *c, size_t size) {
+    if (c->failed)
+        return false;
+    if (c->phase == CR_MEASURE &&
+        (size > SIZE_MAX - CR_ALIGN || c->bytes > SIZE_MAX - cr_aligned(size))) {
+        c->failed = true;
+        return false;
+    }
+    return true;
+}
+
+static bool cr_py_string(cr_ctx_t *c, const char **field) {
+    if (!*field)
+        return true;
+    if (c->phase == CR_COUNT && c->refs == SIZE_MAX) {
+        c->failed = true;
+        return false;
+    }
+    if (c->phase == CR_MEASURE && !cr_py_size(c, strlen(*field) + 1))
+        return false;
+    cr_str(c, field);
+    return !c->failed;
+}
+
+static void cr_walk_py_namespace(cr_ctx_t *c, CBMPyNamespaceFacts *facts) {
+    if (!cr_py_size(c, (size_t)facts->count * sizeof(*facts->items)))
+        return;
+    cr_array(c, (void **)&facts->items, facts->count, sizeof(*facts->items));
+    if (c->failed)
+        return;
+    for (int i = 0; i < facts->count; i++) {
+        CBMPyNamespaceFact *f = &facts->items[i];
+        if (!cr_py_string(c, &f->local_name) || !cr_py_string(c, &f->module_name) ||
+            !cr_py_string(c, &f->member_name) ||
+            !cr_py_size(c, (size_t)f->name_count * sizeof(*f->names)))
+            return;
+        cr_array(c, (void **)&f->names, f->name_count, sizeof(*f->names));
+        if (c->failed)
+            return;
+        for (int j = 0; j < f->name_count; j++) {
+            if (!cr_py_string(c, &f->names[j]))
+                return;
+        }
     }
 }
 
@@ -320,6 +370,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     for (int i = 0; i < r->imports.count && r->imports.items; i++) {
         cr_str(c, &r->imports.items[i].local_name);
         cr_str(c, &r->imports.items[i].module_path);
+        cr_str(c, &r->imports.items[i].member);
     }
     cr_array(c, (void **)&r->scoped_imports.items, r->scoped_imports.count, sizeof(CBMImport));
     for (int i = 0; i < r->scoped_imports.count && r->scoped_imports.items; i++) {
@@ -396,6 +447,16 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->infra_bindings.items[i].target_url);
         cr_str(c, &r->infra_bindings.items[i].broker);
     }
+    cr_array(c, (void **)&r->k8s_facts.items, r->k8s_facts.count, sizeof(CBMK8sFact));
+    for (int i = 0; i < r->k8s_facts.count && r->k8s_facts.items; i++) {
+        cr_str(c, &r->k8s_facts.items[i].kind);
+        cr_str(c, &r->k8s_facts.items[i].ns);
+        cr_str(c, &r->k8s_facts.items[i].name);
+        cr_str(c, &r->k8s_facts.items[i].via);
+        cr_str(c, &r->k8s_facts.items[i].edge);
+        cr_str(c, &r->k8s_facts.items[i].route);
+        cr_str(c, &r->k8s_facts.items[i].container);
+    }
     cr_array(c, (void **)&r->diagram_arrows.items, r->diagram_arrows.count,
              sizeof(CBMDiagramArrow));
     for (int i = 0; i < r->diagram_arrows.count && r->diagram_arrows.items; i++) {
@@ -432,6 +493,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     }
     cr_str(c, &r->doc_scope);
     cr_blob(c, (const void **)&r->source, r->source ? (size_t)r->source_len + SKIP_ONE : 0);
+    cr_walk_py_namespace(c, &r->py_namespace);
 }
 
 void cbm_result_relocate(CBMFileResult *result, const char *old_base, size_t len, char *new_base) {
@@ -514,7 +576,8 @@ static void cr_scratch_put(cr_ctx_t *c) {
 }
 
 void cbm_result_compact(CBMFileResult *result) {
-    if (!result || result->arena.nblocks == 0) {
+    if (!result || result->arena.nblocks == 0 ||
+        !cbm_py_namespace_facts_valid(&result->py_namespace)) {
         return;
     }
     cr_ctx_t c;
@@ -526,14 +589,23 @@ void cbm_result_compact(CBMFileResult *result) {
 
     c.phase = CR_COUNT;
     cr_walk(&c, &tmp);
+    /* Bound intern-table/replay sizing before the existing power-of-two step. */
+    if (c.failed || c.refs > (SIZE_MAX / (sizeof(cr_slot_t) * 8) - CR_MIN_TABLE))
+        return;
 
     c.cap = cr_pow2_at_least(c.refs * CR_TABLE_LOAD + CR_MIN_TABLE);
+    if (c.cap > UINT32_MAX) /* replay entries store slot indexes in uint32_t */
+        return;
     if (!cr_scratch_get(&c)) {
         return;
     }
 
     c.phase = CR_MEASURE;
     cr_walk(&c, &tmp);
+    if (c.failed) {
+        cr_scratch_put(&c);
+        return;
+    }
     for (size_t i = 0; i < c.cap; i++) {
         c.slots[i].dst = NULL; /* MEASURE used dst as a booked marker */
     }
@@ -559,6 +631,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.calls.cap = tmp.calls.count;
     tmp.imports.cap = tmp.imports.count;
     tmp.scoped_imports.cap = tmp.scoped_imports.count;
+    tmp.py_namespace.cap = tmp.py_namespace.count;
     tmp.usages.cap = tmp.usages.count;
     tmp.throws.cap = tmp.throws.count;
     tmp.rw.cap = tmp.rw.count;
@@ -570,6 +643,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.resolved_calls.cap = tmp.resolved_calls.count;
     tmp.string_refs.cap = tmp.string_refs.count;
     tmp.infra_bindings.cap = tmp.infra_bindings.count;
+    tmp.k8s_facts.cap = tmp.k8s_facts.count;
     tmp.channels.cap = tmp.channels.count;
     tmp.diagram_arrows.cap = tmp.diagram_arrows.count;
     tmp.field_types.cap = tmp.field_types.count;

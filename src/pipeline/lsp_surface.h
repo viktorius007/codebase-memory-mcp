@@ -12,8 +12,10 @@
  * unchanged — a body edit — and skip recomputing its dependents, and
  * (b) rehydrate the cross registries for files it does not re-parse.
  *
- * The JSON is a versioned object {"v":2,"lsp":[...],"reg":[...],"imp":[...]}. Field
- * order and array order are fixed by the writer, so byte equality of the
+ * The JSON is a versioned object {"v":15,"lang":N,"lsp":[...],"reg":[...],"imp":[...],"py":...}.
+ * Python rows carry content-only namespace facts, including ordered binding
+ * events and unknown effects; other languages carry an explicit null.
+ * Field order and array order are fixed by the writer, so byte equality of the
  * serialization is surface equality; the sha256 of these bytes is the
  * stored surface_sha. Rows written by a different codec version fail the
  * "v" check on load and route the run to a full rebuild.
@@ -30,7 +32,8 @@
  * all_defs[def_starts[i] .. def_starts[i+1]) are file i's defs. Rows carry
  * heap strings; release with cbm_store_free_lsp_surfaces. Files with an
  * empty surface still get a row (empty arrays hash too — "no defs" must be
- * distinguishable from "no data"). Returns 0, or -1 on allocation failure. */
+ * distinguishable from "no data"). Returns 0, or -1 on allocation failure
+ * or invalid/incomplete Python namespace metadata. */
 int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *project,
                                CBMFileResult **cache, const cbm_file_info_t *files, int file_count,
                                const CBMLSPDef *all_defs, const int *def_starts,
@@ -54,5 +57,29 @@ int cbm_lsp_surface_imports_from_json(CBMArena *arena, const char *defs_json,
  * (non-Rust row, facts never recorded, malformed, other codec version). */
 int cbm_lsp_surface_rust_path_facts_from_json(CBMArena *arena, const char *defs_json,
                                               CBMRustPathFacts *out);
+/* A restored Python namespace retains its raw module identity and source path.
+ * Facts and origin strings live in the caller arena; no JSON storage is borrowed. */
+typedef struct {
+    const char *module_qn;
+    const char *rel_path;
+    CBMPyNamespaceFacts facts;
+} cbm_lsp_python_namespace_t;
+
+/* Returns 1 for a complete Python payload, 0 for a valid non-Python row, or
+ * -1 for invalid/incomplete metadata or allocation failure. Output is empty
+ * unless a complete Python payload was copied successfully. */
+int cbm_lsp_surface_python_namespace_from_json(CBMArena *arena, const char *json,
+                                               cbm_lsp_python_namespace_t *out);
+
+/* Conservative namespace admission for incremental planning. Both rows must
+ * have a current, valid fact envelope before any equality shortcut is used.
+ * Returns -1 for invalid/incomplete metadata, 0 when both rows are non-Python
+ * or their complete Python surfaces are identical, and 1 for a Python surface
+ * change or a language transition involving Python. A NULL new_json denotes
+ * deletion: valid Python metadata returns 1, valid non-Python metadata 0.
+ * NULL old_json is invalid. The full Python surface comparison deliberately
+ * includes definition properties until a narrower dependency closure is proven.
+ */
+int cbm_lsp_surface_python_change(const char *old_json, const char *new_json);
 
 #endif /* CBM_PIPELINE_LSP_SURFACE_H */
