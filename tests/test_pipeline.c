@@ -5434,21 +5434,54 @@ TEST(pipeline_rust_field_usage_from_resolver_record) {
     PASS();
 }
 
-/* The Rust rule above is Rust's own: Python and Go files of the same shape
- * (import a from m, then a bare `b` that m and other both define) keep the
- * import-reachability pick of m.b. */
+/* A Python named import of `a` does not bind bare `b`, and a Go package import
+ * does not bind bare `B`. A Python star import does bind every exported name. */
 static const usage_expectation_t python_bare_binding_rows[] = {
-    {"f", "b", "m.py", 1, NULL},
+    {"f", "b", "m.py", 0, NULL},
     {"f", "b", "other.py", 0, NULL},
     {"h", "b", "m.py", 1, NULL},
     {"h", "b", "other.py", 0, NULL},
 };
 static const usage_expectation_t go_bare_binding_rows[] = {
-    {"F", "B", "m/m.go", 1, NULL},
+    {"F", "B", "m/m.go", 0, NULL},
     {"F", "B", "other/other.go", 0, NULL},
 };
 
-TEST(pipeline_python_and_go_bare_name_keep_import_reachability) {
+static int bare_binding_stops_in_both_modes(const char *root, const char *file,
+                                            const char *name) {
+    int total = 0;
+    for (int mode = 0; mode < 2; mode++) {
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", root, mode ? "parallel" : "sequential");
+        cbm_store_t *store = cbm_store_open_path_query(db_path);
+        if (!store) {
+            return -1;
+        }
+        sqlite3_stmt *stmt = NULL;
+        int prepared = sqlite3_prepare_v2(
+            cbm_store_get_db(store),
+            "SELECT count(*) FROM unresolved_sites WHERE kind='reference' AND file_path=?1 "
+            "AND name=?2 AND reason='name_binding_not_proven'",
+            -1, &stmt, NULL);
+        if (prepared != SQLITE_OK) {
+            cbm_store_close(store);
+            return -1;
+        }
+        sqlite3_bind_text(stmt, 1, file, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, name, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_int(stmt, 0) != 1) {
+            sqlite3_finalize(stmt);
+            cbm_store_close(store);
+            return -1;
+        }
+        total++;
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+    }
+    return total;
+}
+
+TEST(pipeline_python_and_go_unbound_bare_names_are_recorded) {
     char py[256];
     snprintf(py, sizeof(py), "/tmp/cbm_py_bare_bind_XXXXXX");
     if (!cbm_mkdtemp(py)) {
@@ -5461,6 +5494,7 @@ TEST(pipeline_python_and_go_bare_name_keep_import_reachability) {
     int py_failed = usage_expectations_hold_in_both_modes(
         py, python_bare_binding_rows,
         (int)(sizeof(python_bare_binding_rows) / sizeof(python_bare_binding_rows[0])));
+    int py_stops = bare_binding_stops_in_both_modes(py, "user.py", "b");
     th_rmtree(py);
 
     char go[256];
@@ -5478,10 +5512,13 @@ TEST(pipeline_python_and_go_bare_name_keep_import_reachability) {
     int go_failed = usage_expectations_hold_in_both_modes(
         go, go_bare_binding_rows,
         (int)(sizeof(go_bare_binding_rows) / sizeof(go_bare_binding_rows[0])));
+    int go_stops = bare_binding_stops_in_both_modes(go, "user/user.go", "B");
     th_rmtree(go);
 
     ASSERT_EQ(py_failed, -1);
     ASSERT_EQ(go_failed, -1);
+    ASSERT_EQ(py_stops, 2);
+    ASSERT_EQ(go_stops, 2);
     PASS();
 }
 
@@ -31206,7 +31243,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
     RUN_TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded);
     RUN_TEST(pipeline_rust_field_usage_from_resolver_record);
-    RUN_TEST(pipeline_python_and_go_bare_name_keep_import_reachability);
+    RUN_TEST(pipeline_python_and_go_unbound_bare_names_are_recorded);
     RUN_TEST(pipeline_staged_publish_commits_below_full_sync_issue1419);
     RUN_TEST(incremental_k8s_edits_reach_other_files);
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);

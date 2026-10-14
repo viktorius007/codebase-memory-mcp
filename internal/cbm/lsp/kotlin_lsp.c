@@ -977,10 +977,30 @@ const char *kotlin_resolve_class_name(KotlinLSPContext *ctx, const char *name) {
     if (!ctx || !name || !*name) {
         return NULL;
     }
-    /* Already qualified? */
-    if (strchr(name, '.')) {
-        /* Prefix with project? Best-effort heuristic: leave as-is, the
-         * pipeline will retry with project prefix on miss. */
+    /* A dotted source spelling can be either a fully-qualified type or a
+     * nested type such as Result.Ok.  Prove the latter by resolving its
+     * outer type and requiring the composed nested QN to exist. */
+    const char *last_dot = strrchr(name, '.');
+    if (last_dot) {
+        if (ctx->registry && cbm_registry_lookup_type(ctx->registry, name)) {
+            return cbm_arena_strdup(ctx->arena, name);
+        }
+        if (last_dot > name && last_dot[1]) {
+            size_t outer_len = (size_t)(last_dot - name);
+            char *outer_name = (char *)cbm_arena_alloc(ctx->arena, outer_len + 1);
+            if (outer_name) {
+                memcpy(outer_name, name, outer_len);
+                outer_name[outer_len] = '\0';
+                const char *outer_qn = kotlin_resolve_class_name(ctx, outer_name);
+                char *nested_qn = kt_join_dot(ctx->arena, outer_qn, last_dot + 1);
+                if (nested_qn && ctx->registry &&
+                    cbm_registry_lookup_type(ctx->registry, nested_qn)) {
+                    return nested_qn;
+                }
+            }
+        }
+        /* Preserve a source-qualified external name for later exact lookup;
+         * never choose among same-leaf project types here. */
         return cbm_arena_strdup(ctx->arena, name);
     }
 

@@ -584,6 +584,24 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         }
         if (!cbm_pipeline_invocation_targets_equal(best_exact_caller->callee_qn, rc->callee_qn,
                                                    gbuf, project_name, allow_tail_match)) {
+            const cbm_gbuf_node_t *best_target = cbm_pipeline_lsp_target_node_policy(
+                gbuf, project_name, best_exact_caller->callee_qn, false, false);
+            const cbm_gbuf_node_t *row_target = cbm_pipeline_lsp_target_node_policy(
+                gbuf, project_name, rc->callee_qn, false, false);
+            if (!cbm_pipeline_node_is_callable_target(best_target)) {
+                best_target = NULL;
+            }
+            if (!cbm_pipeline_node_is_callable_target(row_target)) {
+                row_target = NULL;
+            }
+            if (!best_target && row_target) {
+                best_exact_caller = rc;
+                exact_caller_ambiguous = false;
+                continue;
+            }
+            if (best_target && !row_target) {
+                continue;
+            }
             exact_caller_ambiguous = true;
             continue;
         }

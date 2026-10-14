@@ -3161,7 +3161,13 @@ static const cbm_gbuf_node_t *resolve_file_call_target(resolve_ctx_t *rc,
     if ((!res->qualified_name || !res->qualified_name[0]) && !call->requires_lsp_resolution &&
         lang != CBM_LANG_RUST && !cbm_pipeline_php_vendor_call(fc->php_vendor, fc->result, call) &&
         !(lsp && !lsp_target && cbm_pipeline_lsp_external_receiver(lsp))) {
-        *res = cbm_registry_resolve_call_lang(rc->registry, call->callee_name, fc->module_qn,
+        char declared_callee[CBM_SZ_512];
+        const char *registry_callee =
+            cbm_pipeline_declared_parameter_callee(fc->result, call, lang, declared_callee,
+                                                   sizeof(declared_callee))
+                ? declared_callee
+                : call->callee_name;
+        *res = cbm_registry_resolve_call_lang(rc->registry, registry_callee, fc->module_qn,
                                               fc->imp_keys, fc->imp_vals, fc->imp_count, lang);
     }
     /* `p->open(fd)`: the registry does not split a callee on the arrow.
@@ -3235,7 +3241,8 @@ static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_st
     }
 
     if (!res->qualified_name || res->qualified_name[0] == '\0') {
-        if (res->candidate_count <= 1 &&
+        if ((res->candidate_count <= 1 ||
+             cbm_pipeline_route_registration_binding(fc->result, call, fc->lang, fc->rel)) &&
             cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
             call->first_string_arg[0] == '/') {
             cbm_resolution_t fake_res = {

@@ -12179,16 +12179,7 @@ void rust_process_statement(RustLSPContext *ctx, TSNode node) {
                 const char *target = NULL;
                 if (strcmp(kind, "assignment_expression") == 0 &&
                     ctx->callable_control_flow_depth == 0 && !ts_node_is_null(right)) {
-                    char *path = rust_node_text(ctx, right);
-                    if (path && strcmp(ts_node_type(right), "identifier") == 0 &&
-                        cbm_scope_contains(ctx->current_scope, path)) {
-                        target = cbm_scope_lookup_callable(ctx->current_scope, path);
-                    } else if (path) {
-                        RustCallTarget proved = {0};
-                        if (rust_module_tree_target(ctx, right, path, &proved) && proved.func &&
-                            !proved.func->receiver_type)
-                            target = proved.func->qualified_name;
-                    }
+                    target = rust_resolve_callable_value(ctx, right, NULL);
                 }
                 cbm_scope_update_callable(ctx->current_scope, name, target);
             }

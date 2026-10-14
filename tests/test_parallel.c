@@ -1587,8 +1587,8 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
          1, "rust_call_gate.nested_use.target"},
         {"rust_nested_function", "nested_fn.rs", CBM_LANG_RUST,
          "fn target() {}\nfn caller() { fn target() {} target(); }\n",
-         /* The module fn takes the `#L1` twin; the block item keeps the plain QN. */
-         1, "rust_call_gate.nested_fn.target"},
+         /* The lexical block item is identified by its declaration byte. */
+         1, "rust_call_gate.nested_fn.#B29.target"},
         {"rust_const_shadow", "const_shadow.rs", CBM_LANG_RUST,
          "fn target() {}\nfn other() {}\n"
          "fn caller() { target(); const target: fn() = other; }\n", 0, NULL},
@@ -1601,8 +1601,8 @@ TEST(rust_exact_calls_survive_without_name_fallback_in_both_modes) {
          "fn target(_: i32) {}\nfn caller() { struct target(i32); target(1); }\n", 0, NULL},
         {"rust_foreign_shadow", "foreign_shadow.rs", CBM_LANG_RUST,
          "fn target() {}\nfn caller() { extern \"C\" { fn target(); } unsafe { target(); } }\n",
-         /* The extern-block fn keeps the plain QN, as the nested fn above. */
-         1, "rust_call_gate.foreign_shadow.target"},
+         /* The lexical foreign item is identified by its declaration byte. */
+         1, "rust_call_gate.foreign_shadow.#B42.target"},
         {"rust_method_caller", "method_caller.rs", CBM_LANG_RUST,
          "fn target() {}\nstruct Worker;\nimpl Worker { fn caller() { target(); } }\n",
          1, "rust_call_gate.method_caller.target"},
@@ -4878,6 +4878,39 @@ TEST(lsp_resolve_project_prefixed_duplicate_is_not_ambiguous) {
     PASS();
 }
 
+TEST(lsp_resolve_materialized_target_beats_nonmaterialized_same_site_guess) {
+    const char *project = "proj";
+    cbm_gbuf_t *gbuf = cbm_gbuf_new(project, "/tmp");
+    ASSERT_NOT_NULL(gbuf);
+    int64_t module_id =
+        cbm_gbuf_upsert_node(gbuf, "Module", "Widget.cs", "proj.Widget", "Widget.cs", 1, 1,
+                             "{}");
+    int64_t target_id = cbm_gbuf_upsert_node(gbuf, "Method", "Widget",
+                                             "proj.Widget.Widget.Widget", "Widget.cs", 1, 1,
+                                             "{}");
+    ASSERT_GT(module_id, 0);
+    ASSERT_GT(target_id, 0);
+
+    CBMCall call = make_call("proj.Factory.Factory.Make", "Widget");
+    call.site_start_byte = 110;
+    call.site_end_byte = 126;
+    CBMResolvedCall guess = make_rc("proj.Factory.Factory.Make", "Widget", 0.85f);
+    guess.site_start_byte = call.site_start_byte;
+    guess.site_end_byte = call.site_end_byte;
+    CBMResolvedCall exact =
+        make_rc("proj.Factory.Factory.Make", "proj.Widget.Widget.Widget", 0.95f);
+    exact.site_start_byte = call.site_start_byte;
+    exact.site_end_byte = call.site_end_byte;
+    CBMResolvedCall items[] = {guess, exact};
+    CBMResolvedCallArray arr = {items, 2, 2};
+
+    const CBMResolvedCall *hit =
+        cbm_pipeline_find_lsp_resolution_in_graph(&arr, &call, false, gbuf, project);
+    cbm_gbuf_free(gbuf);
+    ASSERT(hit == &items[1]);
+    PASS();
+}
+
 TEST(lsp_resolve_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist) {
     const char *project = "proj";
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, "/tmp");
@@ -5715,6 +5748,7 @@ SUITE(parallel) {
     RUN_TEST(lsp_resolve_duplicate_exact_caller_rows_same_target_are_not_ambiguous);
     RUN_TEST(lsp_resolve_distinct_exact_caller_site_targets_are_ambiguous);
     RUN_TEST(lsp_resolve_project_prefixed_duplicate_is_not_ambiguous);
+    RUN_TEST(lsp_resolve_materialized_target_beats_nonmaterialized_same_site_guess);
     RUN_TEST(lsp_resolve_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist);
     RUN_TEST(lsp_resolve_jvm_package_alias_of_materialized_target_is_not_ambiguous);
     RUN_TEST(lsp_resolve_jvm_two_tail_only_packages_stay_ambiguous);

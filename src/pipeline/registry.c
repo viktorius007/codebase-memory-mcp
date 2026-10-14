@@ -2582,3 +2582,60 @@ bool cbm_registry_is_import_reachable(const char *candidate_qn, const char **imp
                                       int import_count) {
     return is_import_reachable(candidate_qn, import_vals, import_count);
 }
+bool cbm_pipeline_declared_parameter_callee(const CBMFileResult *result, const CBMCall *call,
+                                            CBMLanguage lang, char *out, size_t out_size) {
+    if (lang != CBM_LANG_SCALA || !result || !call || !call->callee_name ||
+        !call->enclosing_func_qn || !out || out_size == 0) {
+        return false;
+    }
+    const char *dot = strchr(call->callee_name, '.');
+    if (!dot || dot == call->callee_name || !dot[1] || strchr(dot + 1, '.')) {
+        return false;
+    }
+    size_t receiver_len = (size_t)(dot - call->callee_name);
+    for (int d = 0; d < result->defs.count; d++) {
+        const CBMDefinition *def = &result->defs.items[d];
+        if (!def->qualified_name || strcmp(def->qualified_name, call->enclosing_func_qn) != 0 ||
+            !def->param_names || !def->signature_param_types) {
+            continue;
+        }
+        for (int i = 0; i < def->signature_param_count && def->param_names[i]; i++) {
+            const char *name = def->param_names[i];
+            const char *type = def->signature_param_types[i];
+            if (strlen(name) != receiver_len ||
+                strncmp(name, call->callee_name, receiver_len) != 0 || !type || !type[0] ||
+                strcmp(type, "?") == 0) {
+                continue;
+            }
+            const char *owner = type;
+            bool direct_method = false;
+            for (int m = 0; m < result->defs.count; m++) {
+                const CBMDefinition *candidate = &result->defs.items[m];
+                if (!candidate->name || !candidate->parent_class ||
+                    strcmp(candidate->name, dot + 1) != 0) {
+                    continue;
+                }
+                const char *parent = strrchr(candidate->parent_class, '.');
+                parent = parent ? parent + 1 : candidate->parent_class;
+                if (strcmp(parent, type) == 0) {
+                    direct_method = true;
+                    break;
+                }
+            }
+            if (!direct_method) {
+                for (int t = 0; t < result->defs.count; t++) {
+                    const CBMDefinition *decl = &result->defs.items[t];
+                    if (!decl->name || strcmp(decl->name, type) != 0 || !decl->base_classes ||
+                        !decl->base_classes[0] || decl->base_classes[1]) {
+                        continue;
+                    }
+                    owner = decl->base_classes[0];
+                    break;
+                }
+            }
+            int written = snprintf(out, out_size, "%s.%s", owner, dot + 1);
+            return written > 0 && (size_t)written < out_size;
+        }
+    }
+    return false;
+}

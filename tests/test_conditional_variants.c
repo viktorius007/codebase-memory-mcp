@@ -485,7 +485,8 @@ typedef struct {
  * and name compute (findability: a lookup by that QN finds it); it calls what
  * its own body calls; all of them carry the platform-neutral QN
  * `<project>.<neutral>.pick` as variant_key, which relates them, and no
- * `variants` list; a caller in a shared file binds to one of them. */
+ * `variants` list. A caller in a shared file cannot prove which platform
+ * variant is built, so its call is withheld and recorded. */
 static int cv_platform_check(const char *lang, const cv_file_t *files, int count,
                              const cv_platform_t *variants, int variant_count,
                              const char *neutral) {
@@ -543,13 +544,48 @@ static int cv_platform_check(const char *lang, const cv_file_t *files, int count
                                "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
                                "e.type='CALLS' AND s.name='caller' AND t.name='pick'",
                                NULL, NULL);
-    if (listed != 0 || from_caller < 1) {
-        fprintf(stderr, "  [%s] pick nodes with variants=%d caller->pick=%d\n", lang, listed,
-                from_caller);
+    int stopped = cv_count(&p,
+                           "SELECT COUNT(*) FROM unresolved_sites WHERE kind='call' "
+                           "AND name='pick' AND reason='name_binding_not_proven'",
+                           NULL, NULL);
+    if (listed != 0 || from_caller != 0 || stopped != 1) {
+        fprintf(stderr,
+                "  [%s] pick nodes with variants=%d caller->pick=%d binding stops=%d\n", lang,
+                listed, from_caller, stopped);
         ok = 0;
     }
     cbm_arena_destroy(&arena);
     cv_cleanup(&p);
+
+    /* Discriminator: remove the competing variant while preserving the
+     * caller. The sole definition is then a proved call and no stop remains. */
+    if (variant_count > 0 && count > 1) {
+        const cv_file_t unique_files[] = {files[0], files[count - 1]};
+        cv_proj_t unique;
+        if (!cv_index(&unique, unique_files, 2)) {
+            fprintf(stderr, "  [%s] unique-variant discriminator could not be indexed\n", lang);
+            cv_cleanup(&unique);
+            ok = 0;
+        } else {
+            int unique_call = cv_count(
+                &unique,
+                "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='CALLS' "
+                "AND s.name='caller' AND t.name='pick'",
+                NULL, NULL);
+            int unique_stop = cv_count(
+                &unique,
+                "SELECT COUNT(*) FROM unresolved_sites WHERE kind='call' AND name='pick' "
+                "AND reason='name_binding_not_proven'",
+                NULL, NULL);
+            if (unique_call != 1 || unique_stop != 0) {
+                fprintf(stderr, "  [%s] unique caller->pick=%d binding stops=%d\n", lang,
+                        unique_call, unique_stop);
+                ok = 0;
+            }
+            cv_cleanup(&unique);
+        }
+    }
     return ok;
 }
 

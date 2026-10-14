@@ -422,6 +422,23 @@ TEST(ktlsp_when_smartcast) {
     PASS();
 }
 
+TEST(ktlsp_when_smartcast_nested_sealed_variants) {
+    CBMFileResult *r = extract_kotlin(
+        "sealed class Result {\n"
+        "    data class Ok(val value: String) : Result() { fun display() = value }\n"
+        "    data class Err(val msg: String) : Result() { fun display() = msg }\n"
+        "}\n"
+        "fun describe(r: Result): String = when (r) {\n"
+        "    is Result.Ok -> r.display()\n"
+        "    is Result.Err -> r.display()\n"
+        "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(count_resolved(r, "describe", "Result.Ok.display"), 1);
+    ASSERT_GTE(count_resolved(r, "describe", "Result.Err.display"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 10. Safe calls / nullable ─────────────────────────────── */
 
 TEST(ktlsp_safe_call) {
@@ -1446,6 +1463,7 @@ SUITE(kotlin_lsp) {
     RUN_TEST(ktlsp_smartcast_is);
     RUN_TEST(ktlsp_smartcast_as);
     RUN_TEST(ktlsp_when_smartcast);
+    RUN_TEST(ktlsp_when_smartcast_nested_sealed_variants);
     RUN_TEST(ktlsp_safe_call);
     RUN_TEST(ktlsp_not_null_assertion);
     RUN_TEST(ktlsp_lambda_it_string);

@@ -56,6 +56,12 @@ static const char *extract_constructor_type(CBMArena *a, TSNode rhs, const char 
             if (fname && fname[0] >= 'A' && fname[0] <= 'Z') {
                 return fname;
             }
+            /* Express's documented factory is lower-case. Retain this exact
+             * constructor spelling so route classification can prove that
+             * `app.get(...)` is called on the value returned by express(). */
+            if (fname && strcmp(fname, "express") == 0) {
+                return fname;
+            }
             /* Lower-cased package prefix: Go-style `pb.NewFooClient(...)` and
              * Java-style `fooGrpc.newBlockingStub(...)`. Accept the qualified
              * name when the last segment matches a typed-stub factory pattern.
