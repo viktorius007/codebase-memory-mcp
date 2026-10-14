@@ -8714,6 +8714,19 @@ static bool rust_reference_impl_may_precede(RustLSPContext *ctx, const CBMType *
     return false;
 }
 
+static int rust_reference_probe_rank(const CBMRegisteredFunc *method, const CBMType *recv) {
+    if (!method || !recv || recv->kind != CBM_TYPE_REFERENCE)
+        return -1;
+    bool value = (method->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0;
+    bool shared = (method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) != 0;
+    bool mutable = (method->flags & CBM_FUNC_FLAG_RUST_SELF) != 0 && !value && !shared;
+    if (recv->data.reference.rust_shared)
+        return shared ? 0 : value ? 1 : -1;
+    if (recv->data.reference.rust_mutable)
+        return mutable ? 0 : value ? 1 : shared ? 2 : -1;
+    return -1;
+}
+
 /* Resolve an ordinary method call with Rust precedence: inherent first,
  * concrete trait override second (of a registered trait or, on a project
  * type, of an unregistered one), then an unambiguous trait default. */
@@ -8750,9 +8763,7 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         return trait_method;
     }
 
-    /* At the same receiver shape, inherent methods precede trait methods.
-     * A borrowed receiver reaches a shared trait method before autoderef
-     * reaches a value-taking inherent method. */
+    /* At the same receiver probe, inherent methods precede trait methods. */
     const char *inherent_stop = NULL;
     const CBMRegisteredFunc *inh =
         rust_registry_lookup_inherent_method_aliased(ctx, reg, receiver_type_qn, method_name,
@@ -8762,7 +8773,10 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
             *stop = inherent_stop;
         return NULL;
     }
-    if (inh && !(borrowed && (inh->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0)) {
+    bool reference_probe = recv && recv->kind == CBM_TYPE_REFERENCE;
+    int inherent_rank = rust_reference_probe_rank(inh, recv);
+    if (inh && !reference_probe &&
+        !(borrowed && (inh->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0)) {
         if (out_impl_count)
             *out_impl_count = 1;
         return inh;
@@ -8817,7 +8831,19 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
                 return NULL;
             }
         }
-        if (inh && (impl_method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0) {
+        if (reference_probe && inh) {
+            int trait_rank = rust_reference_probe_rank(impl_method, recv);
+            if (trait_rank < 0) {
+                if (inherent_rank >= 0)
+                    return inh;
+                if (stop)
+                    *stop = "trait_mutable_dispatch_unproved";
+                return NULL;
+            }
+            if (inherent_rank >= 0 && inherent_rank <= trait_rank) {
+                return inh;
+            }
+        } else if (inh && (impl_method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0) {
             return NULL;
         }
         if (out_impl_count) {
@@ -8887,7 +8913,19 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         default_method = unregistered_method;
     }
     if (default_method) {
-        if (inh && (default_method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0) {
+        if (reference_probe && inh) {
+            int trait_rank = rust_reference_probe_rank(default_method, recv);
+            if (trait_rank < 0) {
+                if (inherent_rank >= 0)
+                    return inh;
+                if (stop)
+                    *stop = "trait_mutable_dispatch_unproved";
+                return NULL;
+            }
+            if (inherent_rank >= 0 && inherent_rank <= trait_rank) {
+                return inh;
+            }
+        } else if (inh && (default_method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0) {
             return NULL;
         }
         if (out_impl_count) {
@@ -11778,6 +11816,7 @@ static const CBMType *rust_pattern_bind_through(RustLSPContext *ctx, const CBMTy
     }
     CBMType *borrowed = (CBMType *)cbm_type_reference(ctx->arena, part);
     borrowed->data.reference.rust_shared = shared;
+    borrowed->data.reference.rust_mutable = !shared;
     return borrowed;
 }
 
@@ -14202,8 +14241,20 @@ static const CBMRegisteredFunc *rust_reference_method_before_autoderef(
         }
         const CBMRegisteredFunc *candidate =
             rust_reference_method_at_shape(ctx, shape, name, own_trait, blocked, scope_filtered);
-        if (*blocked)
+        if (*blocked) {
+            bool exact_nominal = shape == recv && shape->data.reference.elem &&
+                                 shape->data.reference.elem->kind != CBM_TYPE_REFERENCE;
+            int inner_rank = exact_nominal ? rust_reference_probe_rank(inner, recv) : -1;
+            if (inner_rank >= 0 && shape->data.reference.rust_shared) {
+                *blocked = false;
+                return NULL;
+            }
+            if (inner_rank == 0 && shape->data.reference.rust_mutable) {
+                *blocked = false;
+                return inner;
+            }
             return NULL;
+        }
         if (candidate && (candidate->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) && shape != recv &&
             shape->data.reference.rust_mutable) {
             *blocked = true;
@@ -14399,9 +14450,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             const char *inherent_stop = NULL;
             bool scope_filtered = false;
             const CBMRegisteredFunc *m = rust_resolve_trait_method(
-                ctx, type_qn, mname, &impl_count, &trait_dispatch,
-                recv && recv->kind == CBM_TYPE_REFERENCE && recv->data.reference.rust_shared, true,
-                &scope_filtered, &inherent_stop, recv);
+                ctx, type_qn, mname, &impl_count, &trait_dispatch, false, true, &scope_filtered,
+                &inherent_stop, recv);
             if (inherent_stop) {
                 rust_emit_unresolved_call(ctx, mname, inherent_stop);
                 return;
@@ -14439,21 +14489,6 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                     if (refusal) {
                         rust_emit_unresolved_call(ctx, mname, refusal);
                         return;
-                    }
-                }
-                if (recv && recv->kind == CBM_TYPE_REFERENCE && !recv->data.reference.rust_shared &&
-                    (m->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0) {
-                    const CBMRegisteredFunc *shared_candidate = rust_resolve_trait_method(
-                        ctx, type_qn, mname, NULL, NULL, true, true, NULL, NULL, recv);
-                    if (shared_candidate != m) {
-                        if ((m->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0) {
-                            rust_emit_unresolved_call(ctx, mname,
-                                                      "trait_mutable_dispatch_unproved");
-                            return;
-                        }
-                        if (shared_candidate &&
-                            (shared_candidate->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0)
-                            return;
                     }
                 }
                 if (rust_reference_impl_may_precede(ctx, recv, m)) {

@@ -14550,6 +14550,63 @@ TEST(pipeline_rust_guard_mutable_value_precedence) {
     PASS();
 }
 
+TEST(pipeline_rust_shared_copy_receiver_selects_shared_trait_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_shared_trait_XXXXXX",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname=\"precedence\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "#[derive(Clone, Copy)] pub struct Shared;\n"
+                    "impl Shared { pub fn pick(self) -> u8 { 11 } }\n"
+                    "pub trait SharedPick { fn pick(&self) -> u8 { 12 } }\n"
+                    "impl SharedPick for Shared {}\n"
+                    "pub fn probe(value: &Shared) { value.pick(); }\n"
+                    "pub fn sentinel() {} pub fn control() { sentinel(); }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustModTreeCallCase cases[] = {
+        {"shared trait receiver precedes autoderef value", "src.lib.probe",
+         "src.lib.SharedPick.pick", true},
+        {"autoderef value is not selected", "src.lib.probe", "src.lib.Shared.pick", false},
+        {"indexing control", "src.lib.control", "src.lib.sentinel", true},
+    };
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+TEST(pipeline_rust_shared_copy_receiver_skips_mutable_trait_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_shared_inherent_XXXXXX",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname=\"precedence\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "#[derive(Clone, Copy)] pub struct Shared;\n"
+                    "impl Shared { pub fn pick(self) -> u8 { 21 } }\n"
+                    "pub trait MutablePick { fn pick(&mut self) -> u8 { 22 } }\n"
+                    "impl MutablePick for Shared {}\n"
+                    "pub fn probe(value: &Shared) { value.pick(); }\n"
+                    "pub fn sentinel() {} pub fn control() { sentinel(); }\n");
+    write_rust_pad_files(tmp, 52);
+    const RustModTreeCallCase cases[] = {
+        {"autoderef value follows inapplicable mutable trait", "src.lib.probe",
+         "src.lib.Shared.pick", true},
+        {"mutable trait cannot borrow a shared receiver", "src.lib.probe",
+         "src.lib.MutablePick.pick", false},
+        {"indexing control", "src.lib.control", "src.lib.sentinel", true},
+    };
+    int mismatches =
+        check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
+    th_rmtree(tmp);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
 TEST(pipeline_rust_written_bound_calls_publish_declarations_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_bound_calls_XXXXXX");
@@ -27988,6 +28045,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_rust_macro_transcriber_proves_trait_declaration);
     RUN_TEST(pipeline_rust_trait_scope_follows_reexports_and_anonymous_imports);
     RUN_TEST(pipeline_rust_mutable_copy_receiver_selects_inherent_method);
+    RUN_TEST(pipeline_rust_shared_copy_receiver_selects_shared_trait_method);
+    RUN_TEST(pipeline_rust_shared_copy_receiver_skips_mutable_trait_method);
     RUN_TEST(pipeline_rust_trait_scope_requires_a_lexical_import);
     RUN_TEST(pipeline_rust_std_trait_collision_is_disclosed_with_receiver_and_method);
     RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
@@ -28052,6 +28111,8 @@ SUITE(pipeline_unresolved) {
     RUN_TEST(pipeline_rust_macro_transcriber_proves_trait_declaration);
     RUN_TEST(pipeline_rust_trait_scope_follows_reexports_and_anonymous_imports);
     RUN_TEST(pipeline_rust_mutable_copy_receiver_selects_inherent_method);
+    RUN_TEST(pipeline_rust_shared_copy_receiver_selects_shared_trait_method);
+    RUN_TEST(pipeline_rust_shared_copy_receiver_skips_mutable_trait_method);
     RUN_TEST(pipeline_rust_trait_scope_requires_a_lexical_import);
     RUN_TEST(pipeline_rust_std_trait_collision_is_disclosed_with_receiver_and_method);
     RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
