@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 #[path = "../scip_defs.rs"]
 mod scip_defs;
-use scip_defs::{Definitions, to_off};
+use scip_defs::{Doc, Occ, to_off};
 use std::io::Write;
 use syntax::ast::{self, AstNode, HasName};
 use syntax::{Edition, SourceFile, SyntaxKind::*, SyntaxNode, TextRange, TextSize};
@@ -23,8 +23,6 @@ impl<'a> Rd<'a> {
         }
     }
 }
-struct Occ { range: Vec<i32>, body: Vec<i32>, sym: u32, roles: u32 }
-struct Doc { path: String, occs: Vec<Occ>, enc: u64 }
 
 fn intern(m: &mut HashMap<String, u32>, v: &mut Vec<String>, s: &str) -> u32 {
     if let Some(&i) = m.get(s) { return i; }
@@ -141,24 +139,7 @@ fn main() {
     }
     eprintln!("docs={} symbols={} enc_of_first={}", docs.len(), syms.len(), docs.first().map(|d| d.enc).unwrap_or(9));
     // definition sites
-    let mut def = Definitions::default();
-    for (di, d) in docs.iter().enumerate() { for o in &d.occs { if o.roles & 1 == 1 { def.insert(o.sym, di, &o.range, &o.body); } } }
-    let recorded: std::collections::HashSet<u32> = docs.iter().flat_map(|d| &d.occs)
-        .filter(|o| o.roles & 1 == 1).map(|o| o.sym).collect();
-    // SCIP's enclosing_range is the target body, not the caller's lexical scope.
-    for (di, d) in docs.iter().enumerate() {
-        let Ok(text) = std::fs::read_to_string(format!("{}/{}", a[2], d.path)) else { continue };
-        let ls = line_starts(&text);
-        let parsed = SourceFile::parse(&text, Edition::Edition2024);
-        if !parsed.errors().is_empty() { continue; }
-        let root = parsed.syntax_node();
-        for o in &d.occs {
-            if recorded.contains(&o.sym) { continue; }
-            let Some(range) = scip_defs::source_function(&root, &text, &ls, d.enc,
-                                                        &syms[o.sym as usize], &o.body) else { continue };
-            def.insert(o.sym, di, &range, &o.body);
-        }
-    }
+    let (def, _recovered) = scip_defs::collect_definitions(&docs, &syms, std::path::Path::new(&a[2]));
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a[3]).unwrap());
     let (mut nofile, mut raerr) = (0, 0);
     let mut ambiguous = 0usize;
@@ -182,15 +163,21 @@ fn main() {
         let look = |r: TextRange| by_range.get(&(u32::from(r.start()) as usize, u32::from(r.end()) as usize)).copied();
         let mut used: std::collections::HashSet<(usize, usize)> = Default::default();
         let mut emit = |kind: &str, node: &SyntaxNode, name_r: TextRange, shape: &str, wr: &str, out: &mut dyn Write| {
-            let Some((sym, roles, oi)) = look(name_r) else { writeln!(out, "{}\t{}\t{}_unresolved\t-\t-\t-\t-\t-\t-\t{}\t{}", d.path, line_of(u32::from(name_r.start()) as usize), kind, shape, wr).unwrap(); return };
-            used.insert((u32::from(name_r.start()) as usize, u32::from(name_r.end()) as usize));
-            if roles & 1 == 1 || !fn_like(&syms[sym as usize]) { return; }
             let fnode = node.ancestors().find(|n| n.kind() == FN);
             let (cf, cl, cn) = match fnode.as_ref().and_then(|f| ast::Fn::cast(f.clone())).and_then(|f| f.name()) {
                 Some(nm) => (d.path.clone(), line_of(u32::from(nm.syntax().text_range().start()) as usize).to_string(), nm.text().to_string()),
                 None => ("-".into(), "-".into(), "-".into()),
             };
-            let (df, dl) = match def.resolve(sym, document, &d.occs[oi].body) {
+            let occurrence = look(name_r);
+            if kind == "indirect" && occurrence.is_none_or(|(sym, _, _)| !fn_like(&syms[sym as usize])) {
+                writeln!(out, "{}\t{}\tindirect_unresolved\t{}\t{}\t{}\t-\t-\t-\t{}\t{}",
+                    d.path, line_of(u32::from(name_r.start()) as usize), cf, cl, cn, shape, wr).unwrap();
+                return;
+            }
+            let Some((sym, roles, oi)) = occurrence else { writeln!(out, "{}\t{}\t{}_unresolved\t-\t-\t-\t-\t-\t-\t{}\t{}", d.path, line_of(u32::from(name_r.start()) as usize), kind, shape, wr).unwrap(); return };
+            used.insert((u32::from(name_r.start()) as usize, u32::from(name_r.end()) as usize));
+            if roles & 1 == 1 || !fn_like(&syms[sym as usize]) { return; }
+            let (df, dl) = match def.resolve(sym, document, &d.occs[oi].body, &d.occs[oi].range) {
                 Ok(Some((di, l))) => (docs[di].path.clone(), (l + 1).to_string()),
                 Ok(None) => ("ext".into(), "-".into()),
                 Err(()) => { ambiguous += 1; ("-".into(), "-".into()) }
@@ -202,8 +189,19 @@ fn main() {
             match n.kind() {
                 CALL_EXPR => {
                     let c = ast::CallExpr::cast(n.clone()).unwrap();
-                    if let Some(ast::Expr::PathExpr(p)) = c.expr() {
-                        if let Some(nr) = p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref()) { emit("path", &n, nr.syntax().text_range(), "-", "-", &mut out); }
+                    if let Some(expr) = c.expr() {
+                        if let ast::Expr::PathExpr(p) = expr {
+                            if let Some(nr) = p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref()) { emit("path", &n, nr.syntax().text_range(), "-", "-", &mut out); }
+                        } else {
+                            let shape = expr.syntax().text().to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+                            let e = strip(expr, &mut String::new());
+                            let range = match e {
+                                ast::Expr::PathExpr(p) => p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref())
+                                    .map(|nr| nr.syntax().text_range()).unwrap_or(n.text_range()),
+                                other => other.syntax().text_range(),
+                            };
+                            emit("indirect", &n, range, &shape, "-", &mut out);
+                        }
                     }
                 }
                 METHOD_CALL_EXPR => {
@@ -231,7 +229,7 @@ fn main() {
                 Some(nm) => (d.path.clone(), line_of(u32::from(nm.syntax().text_range().start()) as usize).to_string(), nm.text().to_string()),
                 None => ("-".into(), "-".into(), "-".into()),
             };
-            let (df, dl) = match def.resolve(sym, document, &d.occs[oi].body) {
+            let (df, dl) = match def.resolve(sym, document, &d.occs[oi].body, &d.occs[oi].range) {
                 Ok(Some((di, l))) => (docs[di].path.clone(), (l + 1).to_string()),
                 Ok(None) => ("ext".into(), "-".into()),
                 Err(()) => { ambiguous += 1; ("-".into(), "-".into()) }
@@ -241,4 +239,231 @@ fn main() {
     }
     eprintln!("ambiguous_definition_references={ambiguous}");
     eprintln!("missing_files={nofile} reference_parse_errors={raerr}");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn varint(mut value: u64) -> Vec<u8> {
+        let mut result = Vec::new();
+        while value > 127 { result.push((value as u8 & 127) | 128); value >>= 7; }
+        result.push(value as u8);
+        result
+    }
+
+    fn field(number: u64, value: &[u8]) -> Vec<u8> {
+        [varint(number * 8 + 2), varint(value.len() as u64), value.to_vec()].concat()
+    }
+
+    fn occurrence(symbol: &str, range: &[u64], body: &[u64], definition: bool) -> Vec<u8> {
+        let mut result = field(1, &range.iter().flat_map(|&v| varint(v)).collect::<Vec<_>>());
+        result.extend(field(2, symbol.as_bytes()));
+        result.extend([24, u8::from(definition)]);
+        result.extend(field(7, &body.iter().flat_map(|&v| varint(v)).collect::<Vec<_>>()));
+        field(2, &result)
+    }
+
+    fn extract(files: &[(&str, &str, Vec<Vec<u8>>)]) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+        let root = PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp/w1-T".into()))
+            .join(format!("truth-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut index = Vec::new();
+        for (path, source, occurrences) in files {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, source).unwrap();
+            let mut document = field(1, path.as_bytes());
+            document.extend(occurrences.concat());
+            document.extend([48, 1]);
+            index.extend(field(2, &document));
+        }
+        let scip = root.join("index.scip");
+        std::fs::write(&scip, index).unwrap();
+        let bins = PathBuf::from(std::env::var("TSDIFF_TEST_BIN_DIR").expect("build truth/refs and set TSDIFF_TEST_BIN_DIR"));
+        let outputs: Vec<Vec<Vec<String>>> = ["truth", "refs"].iter().map(|program| {
+            let output = root.join(format!("{program}.tsv"));
+            let result = std::process::Command::new(bins.join(program))
+                .args([scip.as_os_str(), root.as_os_str(), output.as_os_str()]).output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            std::fs::read_to_string(output).unwrap().lines()
+                .map(|line| line.split('\t').map(String::from).collect()).collect()
+        }).collect();
+        std::fs::remove_dir_all(root).unwrap();
+        (outputs[0].clone(), outputs[1].clone())
+    }
+
+    #[test]
+    fn path_compiled_module_definitions_are_recovered_from_the_module_declaration() {
+        let module = "rust-analyzer cargo fixture 0 alternate/";
+        let old = "rust-analyzer cargo fixture 0 original/target().";
+        let target = "rust-analyzer cargo fixture 0 alternate/target().";
+        let (truth, refs) = extract(&[
+            ("lib.rs", "#[path = \"shared.rs\"]\nmod alternate;\nfn caller() { alternate::target(); }\n", vec![
+                occurrence(module, &[1, 4, 13], &[], false),
+                occurrence(target, &[2, 25, 31], &[], false)]),
+            ("shared.rs", "pub fn target() {}\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 original/", &[0, 0, 1, 0], &[0, 0, 1, 0], true),
+                occurrence(old, &[0, 7, 13], &[0, 0, 18], true)]),
+        ]);
+        assert_eq!(truth[0][7..9], ["shared.rs", "1"]);
+        assert!(refs.iter().any(|row| row == &vec!["D", "shared.rs", "1", "fn", "target", "alternate/target()."]));
+    }
+
+    #[test]
+    fn nested_path_compiled_module_without_a_root_occurrence_is_recovered() {
+        let alias = "rust-analyzer cargo fixture 0 alternate/inner/target().";
+        let (truth, refs) = extract(&[
+            ("lib.rs", "#[path = \"outer/mod.rs\"] mod alternate;\nfn caller() { alternate::inner::target(); }\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 crate/", &[0, 0, 2, 0], &[0, 0, 2, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 alternate/", &[0, 29, 38], &[], false),
+                occurrence(alias, &[1, 32, 38], &[], false)]),
+            ("outer/mod.rs", "pub mod inner;\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 original/", &[0, 0, 1, 0], &[0, 0, 1, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 original/inner/", &[0, 8, 13], &[], false)]),
+            ("outer/inner.rs", "pub fn target() {}\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 original/inner/", &[0, 0, 1, 0], &[0, 0, 1, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 original/inner/target().", &[0, 7, 13], &[0, 0, 18], true)]),
+        ]);
+        assert_eq!(truth[0][7..9], ["outer/inner.rs", "1"]);
+        assert!(refs.iter().any(|r| r[0] == "D" && r[1] == "outer/inner.rs" && r[5] == "alternate/inner/target()."));
+    }
+
+    #[test]
+    fn path_override_changes_the_default_child_directory() {
+        let alias = "rust-analyzer cargo fixture 0 alternate/inner/target().";
+        let (truth, _) = extract(&[
+            ("lib.rs", "#[path = \"outer.rs\"] mod alternate;\n#[path = \"inner.rs\"] mod standalone;\nfn caller() { alternate::inner::target(); }\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 crate/", &[0, 0, 3, 0], &[0, 0, 3, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 alternate/", &[0, 25, 34], &[], false),
+                occurrence("rust-analyzer cargo fixture 0 standalone/", &[1, 25, 35], &[], false),
+                occurrence(alias, &[2, 32, 38], &[], false)]),
+            ("other.rs", "mod outer;\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 crate/", &[0, 0, 1, 0], &[0, 0, 1, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 outer/", &[0, 4, 9], &[], false)]),
+            ("outer.rs", "pub mod inner;\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 outer/", &[0, 0, 1, 0], &[0, 0, 1, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 outer/inner/", &[0, 8, 13], &[], false)]),
+            ("outer/inner.rs", "pub fn target() {}\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 outer/inner/", &[0, 0, 1, 0], &[0, 0, 1, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 outer/inner/target().", &[0, 7, 13], &[0, 0, 18], true)]),
+            ("inner.rs", "pub fn target() {}", vec![
+                occurrence("rust-analyzer cargo fixture 0 standalone/", &[0, 0, 18], &[0, 0, 18], true),
+                occurrence("rust-analyzer cargo fixture 0 standalone/target().", &[0, 7, 13], &[0, 0, 18], true)]),
+        ]);
+        assert_eq!(truth[0][7..9], ["inner.rs", "1"]);
+    }
+
+    #[test]
+    fn path_compiled_literal_type_and_its_inherent_method_keep_their_sites() {
+        let target = "rust-analyzer cargo fixture 0 alternate/impl#[Thing]target().";
+        let (truth, refs) = extract(&[
+            ("lib.rs", "#[path = \"shared.rs\"]\nmod alternate;\nfn caller() { alternate::Thing::target(); }\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 alternate/", &[1, 4, 13], &[], false),
+                occurrence("rust-analyzer cargo fixture 0 alternate/Thing#", &[2, 25, 30], &[], false),
+                occurrence(target, &[2, 32, 38], &[], false)]),
+            ("shared.rs", "pub struct Thing;\nimpl Thing { pub fn target() {} }\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 original/", &[0, 0, 2, 0], &[0, 0, 2, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 original/Thing#", &[0, 11, 16], &[0, 0, 17], true),
+                occurrence("rust-analyzer cargo fixture 0 original/impl#[Thing]target().", &[1, 20, 26], &[1, 13, 31], true)]),
+        ]);
+        assert_eq!(truth[0][7..9], ["shared.rs", "2"]);
+        assert!(refs.iter().any(|row| row == &vec!["D", "shared.rs", "1", "type", "Thing", "alternate/Thing#"]));
+    }
+
+    #[test]
+    fn alternate_module_with_cfg_twins_stays_ambiguous() {
+        let target = "rust-analyzer cargo fixture 0 alternate/target().";
+        let (truth, _) = extract(&[
+            ("lib.rs", "#[path = \"shared.rs\"]\nmod alternate;\nfn caller() { alternate::target(); }\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 alternate/", &[1, 4, 13], &[], false),
+                occurrence(target, &[2, 25, 31], &[], false)]),
+            ("shared.rs", "#[cfg(a)]\nfn target() {}\n#[cfg(b)]\nfn target() {}\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 original/", &[0, 0, 4, 0], &[0, 0, 4, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 original/target().", &[1, 3, 9], &[0, 0, 1, 14], true)]),
+        ]);
+        assert_eq!(truth[0][2], "path_unresolved");
+        assert_eq!(truth[0][7..9], ["-", "-"]);
+    }
+
+    #[test]
+    fn explicit_parent_import_selects_the_definition_in_its_test_crate() {
+        let target = "rust-analyzer cargo fixture 0 target().";
+        let (truth, refs) = extract(&[
+            ("a.rs", "fn target() {}\n", vec![occurrence(target, &[0, 3, 9], &[0, 0, 14], true)]),
+            ("tests/main.rs", "mod child;\nfn target() {}\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 crate/", &[0, 0, 2, 0], &[0, 0, 2, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 child/", &[0, 4, 9], &[], false),
+                occurrence(target, &[1, 3, 9], &[1, 0, 14], true)]),
+            ("tests/child.rs", "use super::target;\nfn caller() { target(); }\nfn other() { dependency::target(); }\n", vec![
+                occurrence(target, &[0, 11, 17], &[], false),
+                occurrence(target, &[1, 14, 20], &[], false),
+                occurrence(target, &[2, 25, 31], &[], false)]),
+        ]);
+        assert_eq!(truth[0][7..9], ["tests/main.rs", "2"]);
+        assert_eq!(truth[1][7..9], ["-", "-"]);
+        assert!(refs.iter().any(|row| row[0] == "R" && row[1] == "tests/child.rs" && row[6..8] == ["tests/main.rs", "2"]));
+        let target = "rust-analyzer cargo fixture 0 sibling/target().";
+        let (truth, _) = extract(&[
+            ("tests/main.rs", "mod sibling;\nmod child;\npub use sibling::target;\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 crate/", &[0, 0, 3, 0], &[0, 0, 3, 0], true),
+                occurrence("rust-analyzer cargo fixture 0 sibling/", &[0, 4, 11], &[], false),
+                occurrence("rust-analyzer cargo fixture 0 child/", &[1, 4, 9], &[], false)]),
+            ("tests/other_main.rs", "#[path = \"child.rs\"] mod child;\npub use sibling::target;\n", vec![
+                occurrence("rust-analyzer cargo other 0 crate/", &[0, 0, 2, 0], &[0, 0, 2, 0], true),
+                occurrence("rust-analyzer cargo other 0 child/", &[0, 25, 30], &[], false)]),
+            ("tests/sibling.rs", "pub fn target() {}\n", vec![
+                occurrence("rust-analyzer cargo fixture 0 sibling/", &[0, 0, 1, 0], &[0, 0, 1, 0], true),
+                occurrence(target, &[0, 7, 13], &[0, 0, 18], true)]),
+            ("tests/child.rs", "use super::target;\nfn caller() { target(); }\n", vec![
+                occurrence(target, &[0, 11, 17], &[], false),
+                occurrence(target, &[1, 14, 20], &[], false)]),
+        ]);
+        assert_eq!(truth[0][7..9], ["tests/sibling.rs", "1"]);
+    }
+
+    #[test]
+    fn library_target_compiled_under_another_crate_gets_its_own_definition() {
+        let target = "rust-analyzer cargo fixture 0.1.0 target().";
+        let (truth, refs) = extract(&[
+            ("Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[lib]\npath = \"source.rs\"\n", vec![]),
+            ("source.rs", "pub fn target() {}\n", vec![
+                occurrence("rust-analyzer cargo host 1.0.0 crate/", &[0, 0, 1, 0], &[0, 0, 1, 0], true),
+                occurrence("rust-analyzer cargo host 1.0.0 target().", &[0, 7, 13], &[0, 0, 18], true)]),
+            ("src/main.rs", "use fixture::target as imported;\nfn target() { imported(); }\n", vec![
+                occurrence("rust-analyzer cargo fixture 0.1.0 crate/", &[0, 0, 2, 0], &[0, 0, 2, 0], true),
+                occurrence("rust-analyzer cargo fixture 0.1.0 crate/", &[0, 4, 11], &[], false),
+                occurrence(target, &[0, 13, 19], &[], false),
+                occurrence(target, &[1, 3, 9], &[1, 0, 27], true),
+                occurrence(target, &[1, 14, 22], &[], false)]),
+        ]);
+        assert_eq!(truth[0][7..9], ["source.rs", "1"]);
+        assert!(refs.iter().any(|row| row == &vec!["D", "source.rs", "1", "fn", "target", "target()."]));
+    }
+
+    #[test]
+    fn an_import_without_a_local_body_cannot_select_the_local_namesake() {
+        let target = "rust-analyzer cargo fixture 0 target().";
+        let (truth, _) = extract(&[("main.rs", "use dependency::target as imported;\nfn target() { imported(); }\n", vec![
+            occurrence("rust-analyzer cargo fixture 0 crate/", &[0, 4, 14], &[], false),
+            occurrence(target, &[0, 16, 22], &[], false),
+            occurrence(target, &[1, 3, 9], &[1, 0, 27], true),
+            occurrence(target, &[1, 14, 22], &[], false),
+        ])]);
+        assert_eq!(truth[0][2], "path_unresolved");
+        assert_eq!(truth[0][7..9], ["-", "-"]);
+    }
+
+    #[test]
+    fn parenthesised_parameter_calls_are_indirect_sites() {
+        let (truth, _) = extract(&[("lib.rs", "fn caller(f: fn()) { (f)(); }\n", vec![
+            occurrence("local 0", &[0, 10, 11], &[0, 10, 11], true),
+            occurrence("local 0", &[0, 22, 23], &[0, 10, 11], false),
+        ])]);
+        assert_eq!(truth.len(), 1);
+        assert_eq!(truth[0], vec!["lib.rs", "1", "indirect_unresolved", "lib.rs", "1", "caller", "-", "-", "-", "(f)", "-"]);
+    }
 }

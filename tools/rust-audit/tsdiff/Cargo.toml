@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 syntax = { path = "../../../../rust-analyzer/crates/syntax" }
 
+toml = "0.8.23"
+
 [build-dependencies]
 cc = "1"
 

@@ -54,27 +54,9 @@ def main():
     for row in nodes.values():
         by_file[row['file_path']].append(row)
         by_name[row['file_path'], leaf(row['name'])].append(row)
-    published_lines = set()
-    published_spellings = collections.defaultdict(list)
-    for row in connection.execute("SELECT e.source_id,e.target_id,CAST(e.properties AS BLOB) AS properties FROM edges e WHERE e.type='CALLS'"):
-        source = nodes.get(row['source_id'])
-        properties = json.loads((row['properties'] or b'{}').decode('utf-8', errors='replace'))
-        line = properties.get('line', 0)
-        callee = str(properties.get('callee', '')).replace('\\n', '\n')
-        if source:
-            spelling = leaf(callee)
-            if re.fullmatch(r'[A-Za-z_]\w*', spelling):
-                published_spellings[source['file_path']].append((source, spelling))
-            target = nodes.get(row['target_id'])
-            if target and target['label'] in {'Function', 'Method'}:
-                published_spellings[source['file_path']].append((source, leaf(target['name'])))
-            if line:
-                # CALLS coordinates begin at the receiver, before its leaf.
-                published_lines.add((source['file_path'], line + callee.count('\n')))
     corpus = pathlib.Path(os.environ.get('CBM_RUST_CORPUS',
                          str(pathlib.Path.home() / '.cache/cbm-rust-bench/codex/codex-rs')))
     aliases = {}
-    source_lines = {}
     occurrence_lines = collections.defaultdict(list)
     by_source = collections.defaultdict(list)
     for row in sites:
@@ -143,25 +125,13 @@ def main():
     def classify(family, path, line, name, caller, target, types, original, external=False):
         published = caller is not None and target is not None and any(
             (caller['id'], target['id']) in edges[kind] for kind in types)
-        if name == '-':
-            if (path, int(line)) in published_lines:
-                published = True
-            if path not in source_lines:
-                source_lines[path] = (corpus / path).read_text(errors='replace').splitlines()
-            written = source_lines[path][int(line) - 1]
-            # CALLS is pair-deduplicated: the stored line is the last invocation.
-            # For oracle rows lacking a target, use an actual written call and
-            # its enclosing published pair at the harness's file/line granularity.
-            published |= any(source['start_line'] <= int(line) <= source['end_line'] and
-                             re.search(r'\b' + re.escape(spelling) + r'\s*(?:\(|::<)', written)
-                             for source, spelling in published_spellings[path])
         matching = list(by_site.get((path, int(line), leaf(name)), ()))
         for alias in written_aliases(path, name):
             matching.extend(by_site.get((path, int(line), alias), ()))
         if target is not None:
             for alias in reexports[pathlib.Path(target['file_path']).stem, leaf(name)]:
                 matching.extend(by_site.get((path, int(line), alias), ()))
-        if family == 'call' and leaf(name) in operators:
+        if family in {'call', 'indirect'} and leaf(name) in operators:
             matching.extend(row for row in by_site.get((path, int(line), operators[leaf(name)]), ())
                             if row['reason'] == 'macro_token_not_resolved')
         if family == 'type_or_field' and target is not None and caller is not None and \
@@ -175,7 +145,7 @@ def main():
                        (node['label'] == 'File' or node['start_line'] <= int(line) <= node['end_line'])
                        for node in by_file[path])
         matching = [row for row in matching
-                    if (family != 'call' or row['kind'] in {'call', 'reference'}) and
+                    if (family not in {'call', 'indirect'} or row['kind'] in {'call', 'reference'}) and
                     (caller is None or row['caller'] == caller['qualified_name'] or
                      ((caller['label'] in {'Module', 'File'} or
                        row['reason'] in {'macro_invocation_not_proven', 'macro_token_not_resolved'} or
@@ -191,16 +161,12 @@ def main():
                           leaf(entry[1]['name']) == leaf(name) and
                           (caller is None or entry[0]['qualified_name'] == caller['qualified_name'])]
             if candidates:
-                # The omission check concerns sites, while join.py scores exact
-                # oracle pairs. Preserve this distinction and expose the actual
-                # successful resolver result for review; do not invent a stop.
-                counts[family, 'published_other_target'] += 1
                 source, destination, edge_kind, strategy = candidates[0]
                 other_publications.append((family, path, line, source['qualified_name'],
                                            destination['qualified_name'], edge_kind, strategy, original))
-                return
             verdict = 'neither'
-            reason = 'caller_not_mapped'  if caller is None else 'target_not_mapped' \
+            reason = 'published_pair_has_other_target' if candidates else \
+                'caller_not_mapped' if caller is None else 'target_not_mapped' \
                 if target is None else 'no_published_pair_or_occurrence_record'
             neither.append(f'{family}\t{reason}\t{original}')
             if not external:
@@ -213,11 +179,14 @@ def main():
             continue
         callee = symbol.rsplit('().', 1)[0]
         callee = callee[max(callee.rfind(']'), callee.rfind('/'), callee.rfind('#'), callee.rfind(' ')) + 1:]
+        if kind.startswith('indirect') and callee == '-':
+            callee = _shape.strip('() &*')
         # Calls without an oracle target are still accounted for, separately.
         caller = None if cf == '-' else find(cf, cl, cn, {'Function', 'Method'})
         target = None if df in {'ext', '-'} else find(df, dl, callee, {'Function', 'Method'})
         types = ['CALLS', 'CALL_REFERENCE', 'USAGE'] if kind.startswith('ref_') else ['CALLS']
-        classify('call', path, line, callee, caller, target, types, raw, df == 'ext')
+        classify('indirect' if kind.startswith('indirect') else 'call',
+                 path, line, callee, caller, target, types, raw, df == 'ext')
     for raw in (directory / 'refs.tsv').read_text(errors='replace').splitlines():
         parts = raw.split('\t')
         if parts[0] != 'R':
@@ -244,9 +213,9 @@ def main():
     (directory / 'unresolved-other-publication.tsv').write_text(
         '\n'.join('\t'.join(map(str, row)) for row in other_publications) + '\n')
     (directory / 'unresolved-neither.tsv').write_text('\n'.join(neither) + '\n')
-    for family in ('call', 'type_or_field'):
-        totals = {verdict: counts[family, verdict] for verdict in ('published', 'published_other_target', 'recorded', 'neither')}
-        print(f'{family}: {json.dumps(totals)}; accounted: {sum(totals.values())}')
+    for family in ('call', 'indirect', 'type_or_field'):
+        totals = {verdict: counts[family, verdict] for verdict in ('published', 'recorded', 'neither')}
+        print(f"{family}: {json.dumps(totals)}; covered: {totals['published'] + totals['recorded']}; total: {sum(totals.values())}")
     reasons = collections.Counter(row['reason'] for row in sites)
     print('stop reasons: ' + json.dumps(dict(sorted(reasons.items()))))
     for (family, reason), count in sorted(required_gaps.items()):
@@ -259,3 +228,67 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+# Run with: python3 -m unittest discover -s tools/rust-audit -p unresolved.py
+import unittest
+
+
+class SiteAccountingTests(unittest.TestCase):
+    def audit(self, target=2, indirect=False, recorded=False, recorded_name='f'):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as temporary:
+            root = pathlib.Path(temporary)
+            (root / 'cache').mkdir()
+            (root / 'f.rs').write_text('fn caller(f: fn()) { (f)(); }\n' if indirect else
+                                      'fn caller() { first::target(); }\n'
+                                      'mod first { pub fn target() {} }\nmod second { pub fn target() {} }\n')
+            with sqlite3.connect(root / 'cache/score.db') as db:
+                db.executescript('''
+                    CREATE TABLE nodes(id INTEGER, label TEXT, name TEXT, file_path TEXT,
+                                       start_line INTEGER, end_line INTEGER, qualified_name TEXT);
+                    CREATE TABLE edges(source_id INTEGER, target_id INTEGER, type TEXT, properties TEXT);
+                    CREATE TABLE unresolved_sites(file_path TEXT, caller TEXT, name TEXT, reason TEXT,
+                        line INTEGER, site_start_byte INTEGER, site_end_byte INTEGER, kind TEXT);
+                ''')
+                db.executemany('INSERT INTO nodes VALUES (?,?,?,?,?,?,?)', [
+                    (1, 'Function', 'caller', 'f.rs', 1, 1, 'fixture.caller'),
+                    (2, 'Function', 'target', 'f.rs', 2, 2, 'fixture.first.target'),
+                    (3, 'Function', 'target', 'f.rs', 3, 3, 'fixture.second.target')])
+                db.execute('INSERT INTO edges VALUES (1,?,\'CALLS\',?)',
+                           (target, json.dumps({'callee': 'target', 'line': 1})))
+                if recorded:
+                    db.execute("INSERT INTO unresolved_sites VALUES ('f.rs','fixture.caller',?,"
+                               "'no_resolution',1,21,22,'call')", (recorded_name,))
+            (root / 'refs.tsv').write_text('')
+            (root / 'truth.tsv').write_text(
+                'f.rs\t1\tindirect_unresolved\tf.rs\t1\tcaller\t-\t-\t-\t(f)\t-\n' if indirect else
+                'f.rs\t1\tpath\tf.rs\t1\tcaller\trust-analyzer cargo fixture 0 target().\tf.rs\t2\t-\t-\n')
+            result = subprocess.run([sys.executable, __file__, str(root)],
+                                    env=dict(os.environ, CBM_RUST_CORPUS=str(root)),
+                                    capture_output=True, text=True)
+            return result, (root / 'unresolved-neither.tsv').read_text()
+
+    def test_same_named_other_target_is_an_uncovered_site(self):
+        result, gaps = self.audit(target=3)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('call\tpublished_pair_has_other_target\tf.rs\t1\tpath', gaps)
+        self.assertIn('"published": 0, "recorded": 0, "neither": 1', result.stdout)
+
+    def test_own_target_pair_covers_the_site(self):
+        result, gaps = self.audit(target=2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(gaps.strip(), '')
+        self.assertIn('call: {"published": 1,', result.stdout)
+
+    def test_parenthesised_indirect_site_needs_its_own_record(self):
+        result, gaps = self.audit(indirect=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('indirect\ttarget_not_mapped\tf.rs\t1\tindirect_unresolved', gaps)
+        result, gaps = self.audit(indirect=True, recorded=True, recorded_name='other')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        result, gaps = self.audit(indirect=True, recorded=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(gaps.strip(), '')
+        self.assertIn('indirect: {"published": 0, "recorded": 1, "neither": 0}', result.stdout)
