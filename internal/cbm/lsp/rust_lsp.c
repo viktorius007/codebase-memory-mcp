@@ -3843,6 +3843,7 @@ typedef enum {
     RUST_TEMPFILE_PATH,
     RUST_TEMPFILE_BUILDER,
 } RustStdFamily;
+#include "rust_std_inventory.h"
 
 typedef struct {
     RustStdFamily family;
