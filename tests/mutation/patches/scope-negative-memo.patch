@@ -1,9 +1,11 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -8306,7 +8306,7 @@
+@@ -9003,9 +9003,9 @@
          return default_method;
      }
+     if (out_scope_filtered)
+         *out_scope_filtered = scope_filtered;
      /* A miss that depends on this scope's imports is not a registry fact. */
 -    if (nm_active && !scope_filtered) {
 +    if (nm_active) {
