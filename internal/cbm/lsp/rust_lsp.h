@@ -246,6 +246,7 @@ typedef struct {
      * callers provide a separate output array and merge it into the owning
      * file result with explicit arena-aware copying. */
     CBMCallArray *syn_calls;
+    CBMUsageArray *macro_usages; /* raw tokens admitted only by mapped expression syntax */
 
     /* While >0, rust_emit_resolved_call also injects a matching synthetic
      * CBMCall into `syn_calls` so the recovered call becomes an edge. Set
@@ -463,7 +464,7 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
                                           const CBMRustImportSource *imports,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls, CBMUsageArray *macro_usages,
                                           CBMRustImplLinkArray *impl_links);
 
 /* Both cross entry points take an optional `impl_links` output (arena-owned,
@@ -495,7 +496,7 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
                                           TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
                                           const CBMRustImportSource *imports,
-                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls,
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls, CBMUsageArray *macro_usages,
                                           CBMRustImplLinkArray *impl_links);
 
 /* Per-file input for batch cross-file Rust LSP processing. */

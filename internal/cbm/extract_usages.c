@@ -869,6 +869,11 @@ static bool cfml_argument_tag_name_binding(CBMExtractCtx *ctx, TSNode node) {
 static bool is_exact_language_binding(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
     const char *kind = ts_node_type(node);
     switch (ctx->language) {
+    case CBM_LANG_RUST: {
+        TSNode parent = ts_node_parent(node);
+        return !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "mod_item") == 0 &&
+               ts_node_eq(node, ts_node_child_by_field_name(parent, "name", 4));
+    }
     case CBM_LANG_OCAML: {
         if (strcmp(kind, "value_pattern") != 0) {
             return false;
@@ -2606,7 +2611,8 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
     }
     for (int i = state->usage_start_index; i < ctx->result->usages.count; i++) {
         CBMUsage *usage = &ctx->result->usages.items[i];
-        if (usage->unresolved_filter || !usage->ref_name || !usage->ref_name[0]) {
+        if ((usage->unresolved_filter && usage->unresolved_filter != CBM_USAGE_MACRO_FILTERED) ||
+            !usage->ref_name || !usage->ref_name[0]) {
             continue;
         }
         const char *name = lexical_binding_key(ctx, state, usage->ref_name);
@@ -3010,9 +3016,8 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         TSNode parent = ts_node_parent(node);
         if (ctx->language == CBM_LANG_RUST && !ts_node_is_null(parent) &&
             strcmp(ts_node_type(parent), "token_tree") == 0) {
-            /* A token-tree function name is a reference, but whether an opaque
-             * macro invokes it is unproved. Keep the ordinary USAGE resolver
-             * carrier and a separate invocation-stop candidate. */
+            /* Preserve the ordinary reference carrier for unreadable macros.
+             * The semantic walk filters both carriers only on proved discard. */
             usage.unresolved_filter = CBM_USAGE_MACRO_FILTERED;
             TSNode next = ts_node_next_sibling(node);
             usage.may_be_call_reference = !ts_node_is_null(next) &&

@@ -12087,8 +12087,51 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
 
         "const KEY: &str = \"key\"; fn json_key() { let _ = serde_json::json!({ KEY: 1 }); }\n",
 
+        "use dep::Item; fn consume(_: Item) {}\n",
+        "mod child; pub use child::*; mod schema; pub use schema::*;\n",
+        "mod child; pub use child::*; fn read() { let _ = child; }\n",
+        "fn helper() {} fn field() {} macro_rules! ignore { ($($t:tt)*) => { () }; } "
+        "fn quoted() { let _ = stringify!(helper()); } fn discarded() { ignore!(helper()); } "
+        "fn member() { ignore!(self.field); } fn value() { let _ = helper; }\n",
+
+        "fn helper() {} fn unreadable() { foreign::opaque!(helper()); } "
+        "fn imported() { use foreign::stringify; stringify!(helper()); } "
+        "fn globbed() { use foreign::*; stringify!(helper()); } "
+        "fn root_alias() { use foreign as std; std::stringify!(helper()); }\n",
+        "fn helper() {} macro_rules! choose { "
+        "(drop, $x:expr) => {}; (unit, $x:expr) => { () }; (quote, $x:expr) => { stringify!($x) }; "
+        "(keep, $x:expr) => { $x }; (both, $x:expr) => { ($x, stringify!($x)) }; "
+        "(twice, $x:expr) => { (stringify!($x), stringify!($x)) }; } "
+        "fn dropped() { choose!(drop, helper()); } fn unit_drop() { choose!(unit, helper()); } "
+        "fn quoted_arm() { choose!(quote, helper()); } "
+        "fn kept() { choose!(keep, helper()); } fn both() { choose!(both, helper()); } "
+        "fn twice() { choose!(twice, helper()); }\n",
+        "#![feature(log_syntax)]\nfn helper() {} fn literal() { let _ = std::concat!(stringify!(helper)); } "
+        "fn alias() { use std::stringify as quote; let _ = quote!(helper()); } "
+        "fn logged() { std::log_syntax!(helper()); } "
+        "fn standard_root_alias() { use std as base; base::stringify!(helper()); } "
+        "fn shadowed() { macro_rules! stringify { ($x:expr) => { $x }; } stringify!(helper()); }\n",
+        "trait Marker { fn read() -> bool where Self: Sized; } struct Item; impl Marker for Item { "
+        "fn read() -> bool { true } } fn parsed() { assert!(<Item as Marker>::read()); } "
+        "fn nested() { assert_eq!(format!(\"{:p}\", &Item as &dyn Marker), \"\"); }\n",
     };
     write_temp_file(tmp, "src/lib.rs", sources[scenario]);
+    if (scenario == 25) {
+        write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"consumer\"]\n[workspace.dependencies]\ndep = { path = \"dep\" }\n");
+        write_temp_file(tmp, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        write_temp_file(tmp, "dep/src/lib.rs", "pub struct Item;\n");
+        write_temp_file(tmp, "consumer/Cargo.toml", "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep.workspace = true\n");
+        write_temp_file(tmp, "consumer/src/lib.rs", sources[scenario]);
+    }
+    if (scenario == 26 || scenario == 27) {
+        write_temp_file(tmp, "src/child.rs", "pub fn child() {}\n");
+        if (scenario == 26) {
+            write_temp_file(tmp, "child.toml", "value = true\n");
+            write_temp_file(tmp, "src/schema.rs", "pub fn schema() {}\n");
+            write_temp_file(tmp, "schema.proto", "syntax = \"proto3\"; message Item {}\n");
+        }
+    }
+
     if (scenario == 11 || scenario == 14)
         write_temp_file(tmp, "Cargo.toml",
                         "[package]\nname = \"fixture\"\nversion = "
@@ -12242,6 +12285,51 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
             correct = rust_inline_variable_edges("src.lib.json_key", "src.lib.KEY", store, project);
             break;
 
+        case 25:
+            correct = cross_file_edge_exists(store, project, "lib.rs", "Item", "IMPORTS") &&
+                      cross_file_edge_exists(store, project, "consume", "Item", "USAGE");
+            break;
+        case 26:
+            correct = !cross_file_edge_exists(store, project, "lib.rs", "child.toml", "IMPORTS") &&
+                      !cross_file_edge_exists(store, project, "lib.rs", "schema.proto", "IMPORTS");
+            break;
+        case 27:
+            correct = !rust_inline_variable_edges("src.lib", "src.child.child", store, project);
+            break;
+        case 28:
+            correct = !cross_file_edge_exists(store, project, "quoted", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "discarded", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "member", "field", "USAGE") &&
+                      cross_file_edge_exists(store, project, "value", "helper", "USAGE");
+            break;
+
+        case 29:
+            correct = cross_file_edge_exists(store, project, "unreadable", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "imported", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "globbed", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "root_alias", "helper", "USAGE");
+            break;
+        case 30:
+            correct = !cross_file_edge_exists(store, project, "dropped", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "unit_drop", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "quoted_arm", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "twice", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "kept", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "both", "helper", "USAGE");
+            break;
+        case 31:
+            correct = !cross_file_edge_exists(store, project, "literal", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "alias", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "logged", "helper", "USAGE") &&
+                      !cross_file_edge_exists(store, project, "standard_root_alias", "helper", "USAGE") &&
+                      cross_file_edge_exists(store, project, "shadowed", "helper", "USAGE");
+            break;
+
+        case 32:
+            correct = cross_file_edge_exists(store, project, "parsed", "Marker", "USAGE") &&
+                      cross_file_edge_exists(store, project, "nested", "Marker", "USAGE");
+            break;
+
         }
     }
     if (store)
@@ -12256,6 +12344,86 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
     ASSERT_EQ(status, 0);
     ASSERT_TRUE(correct);
     return 0;
+}
+
+TEST(pipeline_rust_dotted_workspace_dependency_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 25), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_dotted_workspace_dependency_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 25), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_glob_import_rejects_other_languages_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 26), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_glob_import_rejects_other_languages_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 26), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_module_binding_is_not_a_function_usage_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 27), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_module_binding_is_not_a_function_usage_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 27), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 28), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 28), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_unreadable_macro_preserves_expression_usage_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 29), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_unreadable_macro_preserves_expression_usage_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 29), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_matched_macro_arm_discards_only_unused_fragments_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 30), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_matched_macro_arm_discards_only_unused_fragments_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 30), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_expression_keeps_proved_type_usage_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 32), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_macro_expression_keeps_proved_type_usage_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 32), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_standard_stringifiers_respect_aliases_and_shadowing_sequential) {
+    ASSERT_EQ(check_rust_occurrence_proof(true, 31), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_standard_stringifiers_respect_aliases_and_shadowing_parallel) {
+    ASSERT_EQ(check_rust_occurrence_proof(false, 31), 0);
+    PASS();
 }
 
 TEST(pipeline_rust_enum_variant_qualifier_sequential) {
@@ -25798,6 +25966,22 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_inline_read_write_parallel_requires_an_owner);
     RUN_TEST(pipeline_rust_inline_namesake_fields_have_distinct_owners);
     RUN_TEST(pipeline_rust_struct_literal_fields_follow_nested_module_globs);
+    RUN_TEST(pipeline_rust_dotted_workspace_dependency_sequential);
+    RUN_TEST(pipeline_rust_dotted_workspace_dependency_parallel);
+    RUN_TEST(pipeline_rust_glob_import_rejects_other_languages_sequential);
+    RUN_TEST(pipeline_rust_glob_import_rejects_other_languages_parallel);
+    RUN_TEST(pipeline_rust_module_binding_is_not_a_function_usage_sequential);
+    RUN_TEST(pipeline_rust_module_binding_is_not_a_function_usage_parallel);
+    RUN_TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_sequential);
+    RUN_TEST(pipeline_rust_opaque_macro_tokens_are_not_usages_parallel);
+    RUN_TEST(pipeline_rust_unreadable_macro_preserves_expression_usage_sequential);
+    RUN_TEST(pipeline_rust_unreadable_macro_preserves_expression_usage_parallel);
+    RUN_TEST(pipeline_rust_matched_macro_arm_discards_only_unused_fragments_sequential);
+    RUN_TEST(pipeline_rust_matched_macro_arm_discards_only_unused_fragments_parallel);
+    RUN_TEST(pipeline_rust_macro_expression_keeps_proved_type_usage_sequential);
+    RUN_TEST(pipeline_rust_macro_expression_keeps_proved_type_usage_parallel);
+    RUN_TEST(pipeline_rust_standard_stringifiers_respect_aliases_and_shadowing_sequential);
+    RUN_TEST(pipeline_rust_standard_stringifiers_respect_aliases_and_shadowing_parallel);
     RUN_TEST(pipeline_rust_enum_variant_qualifier_sequential);
     RUN_TEST(pipeline_rust_enum_variant_qualifier_parallel);
     RUN_TEST(pipeline_rust_block_use_type_sequential);

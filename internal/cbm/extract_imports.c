@@ -790,7 +790,14 @@ static void rust_push_use(CBMExtractCtx *ctx, TSNode use) {
     }
     TSNode argument = ts_node_child_by_field_name(use, TS_FIELD("argument"));
     if (scope == RUST_USE_TOP) {
+        int first = ctx->result->imports.count;
         cbm_extract_rust_use_tree(ctx->arena, argument, ctx->source, &ctx->result->imports);
+        for (int i = first; i < ctx->result->imports.count; i++) {
+            CBMImport *imp = &ctx->result->imports.items[i];
+            imp->scope_byte = ts_node_start_byte(use);
+            imp->site_end_byte = ts_node_end_byte(use);
+            imp->start_line = ts_node_start_point(use).row + 1;
+        }
         return;
     }
     CBMImportArray uses = {0};
@@ -803,6 +810,8 @@ static void rust_push_use(CBMExtractCtx *ctx, TSNode use) {
             continue;
         }
         imp.scope_byte = ts_node_start_byte(use);
+        imp.site_end_byte = ts_node_end_byte(use);
+        imp.start_line = ts_node_start_point(use).row + 1;
         cbm_imports_push(&ctx->result->scoped_imports, ctx->arena, imp);
     }
 }

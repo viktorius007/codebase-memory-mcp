@@ -34,7 +34,7 @@ static int skip_ws_and_comment(const char* s, int len, int from) {
 
 static bool is_ident_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+           (c >= '0' && c <= '9') || c == '_' || c == '-';
 }
 
 /* Cargo uses TOML strings and tables, including quoted/dotted keys and

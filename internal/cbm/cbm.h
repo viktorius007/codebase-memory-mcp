@@ -416,7 +416,9 @@ typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
     bool is_file_reference;  // syntax denotes a file reference, not a namespace
-    uint32_t scope_byte;     // scoped_imports only: start byte of the `use` declaration
+    uint32_t scope_byte;     // Rust: start byte of the `use` declaration
+    uint32_t site_end_byte;  // Rust: exclusive end of the `use` declaration
+    uint32_t start_line;     // Rust: 1-based source line
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
@@ -438,6 +440,7 @@ typedef enum {
     CBM_USAGE_KEYWORD_FILTERED,
     CBM_USAGE_KEYWORD_CALL_FILTERED,
     CBM_USAGE_MACRO_TOKEN_FILTERED,
+    CBM_USAGE_MACRO_DISCARDED,
 } CBMUsageFilter;
 
 typedef struct {
