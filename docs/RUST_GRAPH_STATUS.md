@@ -459,9 +459,12 @@ a proved project pointee, and otherwise withholds with
 knowledge only and never supplies a target or a positive dispatch proof.
 Project inherent methods are exempt from both the trait-scope and std-collision
 rules. Method selection
-checks inherent precedence at each receiver shape, including mutable references,
-and trait-object methods inherited from supertraits. Unproved reference, mutable,
-and wrapper dispatch each have their own stop reason. Calls withheld inside
+places inherent and trait candidates in one Rust probe order: by-value, shared,
+then mutable at each autoderef step, with inherent methods winning only at an
+equal rank. A missing method-self or impl-self shape withholds the site instead
+of granting inherent precedence; this applies to owned, reference, Box, Rc and
+Arc receivers. Trait-object methods inherited from supertraits remain eligible.
+Unproved reference, mutable, and wrapper dispatch each have their own stop reason. Calls withheld inside
 expression macros receive a source-site carrier so their stop records reach
 `unresolved_sites`; a trait stop cannot replace an unrelated neighbouring call.
 A generic-bound target whose reachable supertraits are unavailable is withheld

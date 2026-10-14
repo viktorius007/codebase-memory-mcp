@@ -8116,14 +8116,15 @@ TEST(rustlsp_reference_impl_disjoint_referent_does_not_block_unknown_qualifier) 
     PASS();
 }
 
-TEST(rustlsp_reference_impl_unknown_referent_does_not_prove_different_depth) {
+TEST(rustlsp_unbounded_reference_impl_precedes_inner_inherent) {
     CBMFileResult *r = extract_rust(
         "struct Item; impl Item { fn read(&self) {} }\n"
         "trait Read { fn read(self); }\n"
         "impl<T> Read for &T { fn read(self) {} }\n"
         "fn run(x: &&Item) { x.read(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "read"), -1);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "&T.read[Read]"), 0);
+    ASSERT_EQ(find_resolved(r, "main.run", "main.Item.read"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -8219,13 +8220,14 @@ TEST(rustlsp_mutable_reference_wrapper_precedes_shared_inner) {
     PASS();
 }
 
-TEST(rustlsp_unproved_mutable_reference_receiver_blocks_inner) {
+TEST(rustlsp_mutable_reference_receiver_precedes_inner_inherent) {
     CBMFileResult *r = extract_rust("trait Change { fn change(&mut self); }\n"
                                     "struct Item; impl Item { fn change(&self) {} }\n"
                                     "impl Change for &Item { fn change(&mut self) {} }\n"
                                     "fn run(x: &mut &Item) { x.change(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_EQ(find_confident(&r->resolved_calls, "main.run", "change"), -1);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "&Item.change[Change]"), 0);
+    ASSERT_EQ(find_resolved(r, "main.run", "main.Item.change"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -8468,6 +8470,59 @@ TEST(rustlsp_reference_shared_trait_precedes_value_inherent) {
     ASSERT_EQ(count_resolved(r, "iterator", "Span.start"), 0);
     ASSERT_GTE(require_resolved(r, "callback", "Located.start"), 0);
     ASSERT_EQ(count_resolved(r, "callback", "Span.start"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_owned_value_trait_precedes_shared_inherent) {
+    CBMFileResult *r = extract_rust(
+        "struct S; impl S { fn m(&self) {} }\n"
+        "trait Tr { fn m(self); } impl Tr for S { fn m(self) {} }\n"
+        "fn run(v: S) { v.m(); }\n");
+    ASSERT_NOT_NULL(r);
+    int call = require_resolved(r, "run", "S.m[Tr]");
+    ASSERT_GTE(call, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[call].callee_qn, "test.src.main.S.m[Tr]");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_boxed_shared_trait_precedes_mutable_inherent) {
+    CBMFileResult *r = extract_rust(
+        "struct S; impl S { fn m(&mut self) {} }\n"
+        "trait Tr { fn m(&self); } impl Tr for S { fn m(&self) {} }\n"
+        "fn run(mut v: Box<S>) { v.m(); }\n");
+    ASSERT_NOT_NULL(r);
+    int call = require_resolved(r, "run", "S.m[Tr]");
+    ASSERT_GTE(call, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[call].callee_qn, "test.src.main.S.m[Tr]");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_rc_shared_trait_precedes_mutable_inherent) {
+    CBMFileResult *r = extract_rust(
+        "use std::rc::Rc;\n"
+        "struct S; impl S { fn m(&mut self) {} }\n"
+        "trait Tr { fn m(&self); } impl Tr for S { fn m(&self) {} }\n"
+        "fn run(v: Rc<S>) { v.m(); }\n");
+    ASSERT_NOT_NULL(r);
+    int call = require_resolved(r, "run", "S.m[Tr]");
+    ASSERT_GTE(call, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[call].callee_qn, "test.src.main.S.m[Tr]");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_mutable_trait_object_reference_blanket_without_bound_shape_is_withheld) {
+    CBMFileResult *r = extract_rust(
+        "trait Buffer { fn snapshot(&self); }\n"
+        "impl<W: Buffer + ?Sized> Buffer for &mut W { fn snapshot(&self) {} }\n"
+        "fn run(buffer: &mut dyn Buffer) { buffer.snapshot(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "run", "snapshot"), -1);
+    ASSERT_EQ(r->resolved_calls.count, 1);
+    ASSERT_STR_EQ(r->resolved_calls.items[0].reason, "trait_receiver_partial");
     cbm_free_result(r);
     PASS();
 }
@@ -12625,7 +12680,7 @@ TEST(rustlsp_target_root_declared_module_uses_registered_physical_path) {
     PASS();
 }
 
-TEST(rustlsp_cross_package_inherent_precedes_trait) {
+TEST(rustlsp_cross_package_unknown_self_shapes_stay_unresolved) {
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMLSPDef defs[4];
@@ -12671,7 +12726,9 @@ TEST(rustlsp_cross_package_inherent_precedes_trait) {
         &arena, source, (int)strlen(source), "test.caller.src.lib", "test.caller.src.lib",
         registry, NULL, NULL, 0, NULL, &manifest, NULL, &out, NULL, NULL, NULL);
 
-    ASSERT_GTE(find_confident(&out, "run", "Store.act"), 0);
+    ASSERT_LT(find_confident(&out, "run", "Store.act"), 0);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_STR_EQ(out.items[0].reason, "inherent_receiver_not_proven");
     cbm_arena_destroy(&arena);
     PASS();
 }
@@ -14642,11 +14699,11 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_reference_impl_generic_shadowing_withholds_unproved_bound);
     RUN_TEST(rustlsp_inherent_shared_receiver_precedes_unproved_blanket);
     RUN_TEST(rustlsp_mutable_reference_wrapper_precedes_shared_inner);
-    RUN_TEST(rustlsp_unproved_mutable_reference_receiver_blocks_inner);
+    RUN_TEST(rustlsp_mutable_reference_receiver_precedes_inner_inherent);
     RUN_TEST(rustlsp_primitive_unsupported_method_receiver_is_withheld);
     RUN_TEST(rustlsp_shared_inherent_method_through_borrowed_mutable_reference);
     RUN_TEST(rustlsp_reference_impl_disjoint_referent_does_not_block_unknown_qualifier);
-    RUN_TEST(rustlsp_reference_impl_unknown_referent_does_not_prove_different_depth);
+    RUN_TEST(rustlsp_unbounded_reference_impl_precedes_inner_inherent);
     RUN_TEST(rustlsp_shared_self_uses_enclosing_trait_impl_before_reference_wrappers);
     RUN_TEST(rustlsp_borrowed_mutable_reference_cannot_be_consumed);
     RUN_TEST(rustlsp_reference_blanket_without_forwarding_stays_withheld);
@@ -14665,6 +14722,10 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_type_headed_recursion_proves_self_argument);
     RUN_TEST(rustlsp_foreign_receiver_leaf_is_not_recursion);
     RUN_TEST(rustlsp_reference_shared_trait_precedes_value_inherent);
+    RUN_TEST(rustlsp_owned_value_trait_precedes_shared_inherent);
+    RUN_TEST(rustlsp_boxed_shared_trait_precedes_mutable_inherent);
+    RUN_TEST(rustlsp_rc_shared_trait_precedes_mutable_inherent);
+    RUN_TEST(rustlsp_mutable_trait_object_reference_blanket_without_bound_shape_is_withheld);
     RUN_TEST(rustlsp_generic_static_call_selects_trait_declaration);
     RUN_TEST(rustlsp_generic_receiver_selects_trait_declaration);
     RUN_TEST(rustlsp_ambiguous_generic_bounds_withhold_target);
@@ -15061,7 +15122,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_declared_module_shadows_workspace_crate_name);
     RUN_TEST(rustlsp_super_glob_module_alias_shadows_workspace_crate_name);
     RUN_TEST(rustlsp_target_root_declared_module_uses_registered_physical_path);
-    RUN_TEST(rustlsp_cross_package_inherent_precedes_trait);
+    RUN_TEST(rustlsp_cross_package_unknown_self_shapes_stay_unresolved);
     RUN_TEST(rustlsp_inline_module_body_attaches_to_its_own_node);
     RUN_TEST(rustlsp_cfg_duplicate_method_bodies_attach_to_their_own_nodes);
     RUN_TEST(rustlsp_extra_proc_macro_tokio_main);
