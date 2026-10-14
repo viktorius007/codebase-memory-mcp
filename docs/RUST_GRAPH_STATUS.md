@@ -319,9 +319,13 @@ only: it never supplies a target or a positive dispatch proof.
 Method selection (B1F, 15 October, superseding M5c's reference-only ranking)
 places inherent and trait candidates in one Rust probe order: by-value, shared,
 then mutable at each autoderef step, with inherent methods winning only at an
-equal rank. A missing method-self or impl-self shape withholds the site instead
-of granting inherent precedence; this applies to owned, reference, Box, Rc and
-Arc receivers. Trait-object methods inherited from supertraits remain eligible.
+equal rank. The probe order does not consult `Copy`: move legality follows
+selection, and a compiling call proves that legality. A same-named impl that is
+out of scope or has a provably different receiver shape has no vote; only an
+unproved shape that could precede the selected candidate withholds the call. A
+missing method-self or impl-self shape withholds the site instead of granting
+inherent precedence; this applies to owned, reference, Box, Rc and Arc receivers.
+Trait-object methods inherited from supertraits remain eligible.
 Unproved reference, mutable, and wrapper dispatch each have their own stop
 reason; ambiguity is withheld with a specific closed reason. Raw pointers never autoderef implicitly. Explicit
 trait paths, reference layers, generic bounds, inherent self types, and Deref
