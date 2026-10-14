@@ -1,16 +1,18 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -8855,7 +8855,14 @@
+@@ -8855,7 +8855,16 @@
      const char *inherent_stop = NULL;
      const CBMRegisteredFunc *inh =
          rust_registry_lookup_inherent_method_aliased(ctx, reg, receiver_type_qn, method_name,
                                                       &inherent_stop, recv);
 +    if (!inh) {
++        const char *unshaped_stop = NULL;
 +        const CBMRegisteredFunc *unshaped = rust_registry_lookup_inherent_method_aliased(
-+            ctx, reg, receiver_type_qn, method_name, &inherent_stop, NULL);
++            ctx, reg, receiver_type_qn, method_name, &unshaped_stop, NULL);
 +        if (unshaped && (unshaped->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0) {
 +            inh = unshaped;
++            inherent_stop = unshaped_stop;
 +        }
 +    }
      if (inherent_stop) {
