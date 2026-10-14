@@ -184,11 +184,15 @@ static void free_import_map(const char **keys, const char **vals, int count) {
 static const char *resolve_as_class(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
                                     const char *name, const char *module_qn, const char **imp_keys,
                                     const char **imp_vals, int imp_count, CBMLanguage lang,
-                                    int *candidate_count) {
+                                    int *candidate_count, bool *import_proved) {
     cbm_resolution_t res =
         cbm_registry_resolve_lang(reg, name, module_qn, imp_keys, imp_vals, imp_count, lang);
     if (candidate_count) {
         *candidate_count = res.candidate_count;
+    }
+    if (import_proved) {
+        *import_proved = res.strategy && (strcmp(res.strategy, "import_map") == 0 ||
+                                          strcmp(res.strategy, "import_map_suffix") == 0);
     }
     /* The generic ambiguity set mixes languages. For Python inheritance, a
      * single Python type is the only candidate that can satisfy this edge. */
@@ -676,16 +680,19 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
                 continue;
             }
             int candidate_count = 0;
-            const char *base_qn =
-                resolve_as_class(ctx->registry, ctx->gbuf, def->base_classes[b], module_qn,
-                                 imp_keys, imp_vals, imp_count, lang, &candidate_count);
-            bool external_binding = cbm_external_import_binding_leaves_corpus(
-                ctx, fi->language, &result->imports, def->base_classes[b], fi->rel_path,
-                base_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, base_qn) : NULL);
+            bool import_proved = false;
+            const char *base_qn = resolve_as_class(ctx->registry, ctx->gbuf, def->base_classes[b],
+                                                   module_qn, imp_keys, imp_vals, imp_count, lang,
+                                                   &candidate_count, &import_proved);
+            bool external_binding =
+                !import_proved &&
+                cbm_external_import_binding_leaves_corpus(
+                    ctx, fi->language, &result->imports, def->base_classes[b], fi->rel_path,
+                    base_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, base_qn) : NULL);
             if (!base_qn || external_binding ||
-                cbm_python_external_base_contradicts(fi->language, &result->imports,
-                                                     def->base_classes[b], base_qn, ctx->gbuf,
-                                                     ctx->project_name, fi->rel_path)) {
+                (!import_proved && cbm_python_external_base_contradicts(
+                                       fi->language, &result->imports, def->base_classes[b],
+                                       base_qn, ctx->gbuf, ctx->project_name, fi->rel_path))) {
                 if (external_binding || (!base_qn && candidate_count > SKIP_ONE)) {
                     uint32_t start =
                         def->base_class_start_bytes ? def->base_class_start_bytes[b] : 0;
@@ -836,14 +843,15 @@ static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         if (!it->trait_name || !it->struct_name) {
             continue;
         }
-        const char *trait_qn = resolve_as_class(ctx->registry, ctx->gbuf, it->trait_name, module_qn,
-                                                imp_keys, imp_vals, imp_count, CBM_LANG_RUST, NULL);
+        const char *trait_qn =
+            resolve_as_class(ctx->registry, ctx->gbuf, it->trait_name, module_qn, imp_keys,
+                             imp_vals, imp_count, CBM_LANG_RUST, NULL, NULL);
         if (!trait_qn) {
             continue;
         }
         const char *struct_qn =
             resolve_as_class(ctx->registry, ctx->gbuf, it->struct_name, module_qn, imp_keys,
-                             imp_vals, imp_count, CBM_LANG_RUST, NULL);
+                             imp_vals, imp_count, CBM_LANG_RUST, NULL, NULL);
         if (!struct_qn) {
             continue;
         }

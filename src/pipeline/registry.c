@@ -1539,6 +1539,10 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     if (!resolved) {
         return empty_result();
     }
+    if (!resolved[0]) {
+        return (cbm_resolution_t){"__cbm_unresolved_import_binding__", "import_map_blocked", 0.0,
+                                  CBM_SZ_256};
+    }
 
     /* Build candidate: resolved.suffix or resolved.prefix.
      * When the callee has a dot ("pkg.Func"), prefix="pkg" is the import key
@@ -1771,7 +1775,7 @@ static cbm_resolution_t resolve_multi_rust(const cbm_registry_t *r, const CBMRus
 /* Strategy 4: multiple candidates with import filtering. */
 static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
                                                    const char *module_qn, const char **import_vals,
-                                                   int import_count, bool require_unique) {
+                                                   int import_count) {
     const char *filtered[CBM_SZ_256];
     uint8_t filtered_test[CBM_SZ_256];
     uint8_t filtered_lang[CBM_SZ_256];
@@ -1793,9 +1797,6 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
     if (fcount == SKIP_ONE) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
         return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
-    }
-    if (require_unique) {
-        return (cbm_resolution_t){.candidate_count = arr->count};
     }
     if (fcount > SKIP_ONE) {
         const char *best = best_by_import_distance(r, filtered, flags ? filtered_test : NULL,
@@ -2039,18 +2040,12 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
      * the Rust module tree. Import distance is not declaration identity. */
     const CBMRustModTree *tree = rust_file_modtree(module_qn);
     if (!tree) {
-        for (int i = 0; import_keys && i < import_count; i++) {
-            if (strcmp(import_keys[i], "*") == 0) {
-                return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count,
-                                                  true);
-            }
-        }
         return (cbm_resolution_t){.candidate_count = arr->count};
     }
     /* Strategy 4: multiple candidates bound through the Rust module tree. */
     cbm_resolution_t legacy = empty_result();
     if (import_vals && import_count > 0) {
-        legacy = resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count, false);
+        legacy = resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
     } else {
         const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
                                                    qn_lang_flags(arr), arr->count, module_qn);
@@ -2277,8 +2272,12 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
      * for the name; a C member call and every other language keep them. */
     bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
                         !strstr(callee_name, "->");
-    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), skip_members);
+    cbm_resolution_t res =
+        registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, lang_scope_len(module_qn, lang), skip_members);
+    if (res.strategy && strcmp(res.strategy, "import_map_blocked") == 0)
+        return (cbm_resolution_t){.candidate_count = res.candidate_count};
+    return res;
 }
 
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */

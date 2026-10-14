@@ -724,15 +724,18 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
     if (!cbm_label_is_type_like(cbm_registry_label_of(bs->reg, res.qualified_name))) {
         return NULL;
     }
+    bool import_proved = res.strategy && (strcmp(res.strategy, "import_map") == 0 ||
+                                          strcmp(res.strategy, "import_map_suffix") == 0);
     const cbm_gbuf_node_t *candidate = cbm_gbuf_find_by_qn(bs->gbuf, res.qualified_name);
-    if (cbm_external_import_binding_leaves_corpus(bs->ctx, bs->lang, bs->imports, raw, bs->rel,
-                                                  candidate)) {
+    if (!import_proved && cbm_external_import_binding_leaves_corpus(bs->ctx, bs->lang, bs->imports,
+                                                                    raw, bs->rel, candidate)) {
         return NULL;
     }
     /* `unittest.TestCase` under an external `import unittest` survives the
      * weak-strategy veto through the same-module suffix fallback; the shared
      * external-base gate keeps it at its source spelling. */
-    if (cbm_python_external_base_contradicts(bs->lang, bs->imports, raw, res.qualified_name,
+    if (!import_proved &&
+        cbm_python_external_base_contradicts(bs->lang, bs->imports, raw, res.qualified_name,
                                              bs->gbuf, bs->project_name, bs->rel)) {
         return NULL;
     }
@@ -1552,56 +1555,418 @@ static bool pxc_import_map_has_local(const char *const *keys, int count, const c
     return false;
 }
 
-/* Recover a Python import directly from extraction metadata when graph import
- * materialization produced no edge. Prefer an already materialized exact node
- * (including the shared project-prefix rule); otherwise accept only the
- * ordinary non-aliased dotted spelling and let the sealed Python registry
- * decide whether that QN denotes a class/function. A wrong candidate cannot
- * earn a semantic edge because the resolver requires registry materialization. */
-static char *pxc_python_import_from_metadata(const cbm_gbuf_t *gbuf, const char *project_name,
-                                             const char *local_name, const char *module_path) {
-    if (!gbuf || !local_name || !module_path)
-        return NULL;
-    const char *source_leaf = pxc_import_leaf(module_path);
-    if (!source_leaf || strcmp(source_leaf, local_name) != 0 || module_path[0] == '.')
-        return NULL;
+typedef struct {
+    const char **keys;
+    const char **vals;
+    int count;
+    int capacity;
+} PXCPythonImportMap;
 
-    const cbm_gbuf_node_t *exact =
-        cbm_pipeline_lsp_target_node(gbuf, project_name, module_path, false);
-    if (exact && exact->qualified_name)
-        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, exact->qualified_name);
+/* FQN helpers retain their historical libc allocation contract. Keep that
+ * boundary in one place while resolver-owned buffers use mem_core. */
+static void pxc_free_fqn(char *qn) {
+    free(qn);
+}
 
-    const char *last_dot = strrchr(module_path, '.');
-    if (last_dot && last_dot > module_path) {
-        size_t module_len = (size_t)(last_dot - module_path);
-        char *module = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, module_len + 1);
-        if (!module)
-            return NULL;
-        memcpy(module, module_path, module_len);
-        module[module_len] = '\0';
-        const cbm_gbuf_node_t *module_node =
-            cbm_pipeline_lsp_target_node(gbuf, project_name, module, false);
-        cbm_free(CBM_MEM_CLASS_OTHER, module);
-        if (module_node && module_node->qualified_name && module_node->label &&
-            (strcmp(module_node->label, "Module") == 0 ||
-             strcmp(module_node->label, "Folder") == 0)) {
-            size_t need = strlen(module_node->qualified_name) + 1 + strlen(source_leaf) + 1;
-            char *qualified = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, need);
-            if (!qualified)
-                return NULL;
-            snprintf(qualified, need, "%s.%s", module_node->qualified_name, source_leaf);
-            return qualified;
+static void pxc_python_map_free(PXCPythonImportMap *map) {
+    if (!map)
+        return;
+    for (int i = 0; i < map->count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)map->keys[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)map->vals[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, map->keys);
+    cbm_free(CBM_MEM_CLASS_OTHER, map->vals);
+    memset(map, 0, sizeof(*map));
+}
+
+static int pxc_python_map_find(const PXCPythonImportMap *map, const char *key) {
+    for (int i = 0; map && key && i < map->count; i++) {
+        if (strcmp(map->keys[i], key) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static bool pxc_python_map_reserve(PXCPythonImportMap *map) {
+    if (map->count < map->capacity)
+        return true;
+    int capacity = map->capacity ? map->capacity * 2 : CBM_SZ_16;
+    const char **keys = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)capacity * sizeof(*keys));
+    const char **vals = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)capacity * sizeof(*vals));
+    if (!keys || !vals) {
+        cbm_free(CBM_MEM_CLASS_OTHER, keys);
+        cbm_free(CBM_MEM_CLASS_OTHER, vals);
+        return false;
+    }
+    if (map->count > 0) {
+        memcpy(keys, map->keys, (size_t)map->count * sizeof(*keys));
+        memcpy(vals, map->vals, (size_t)map->count * sizeof(*vals));
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, map->keys);
+    cbm_free(CBM_MEM_CLASS_OTHER, map->vals);
+    map->keys = keys;
+    map->vals = vals;
+    map->capacity = capacity;
+    return true;
+}
+
+/* An empty value is a proved Python binding with no proved project identity.
+ * The registry treats it as a blocker instead of falling through to a weaker
+ * same-module or unique-name guess. */
+static bool pxc_python_map_set(PXCPythonImportMap *map, const char *key, const char *value) {
+    if (!map || !key || !key[0])
+        return false;
+    char *copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, value ? value : "");
+    if (!copy)
+        return false;
+    int found = pxc_python_map_find(map, key);
+    if (found >= 0) {
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)map->vals[found]);
+        map->vals[found] = copy;
+        return true;
+    }
+    if (!pxc_python_map_reserve(map)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, copy);
+        return false;
+    }
+    char *key_copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+    if (!key_copy) {
+        cbm_free(CBM_MEM_CLASS_OTHER, copy);
+        return false;
+    }
+    map->keys[map->count] = key_copy;
+    map->vals[map->count] = copy;
+    map->count++;
+    return true;
+}
+
+static void pxc_python_map_block_all(PXCPythonImportMap *map) {
+    for (int i = 0; map && i < map->count; i++)
+        (void)pxc_python_map_set(map, map->keys[i], NULL);
+}
+
+static bool pxc_python_name_in_list(const CBMPyNamespaceFact *fact, const char *name) {
+    for (int i = 0; fact && name && i < fact->name_count; i++) {
+        if (fact->names[i] && strcmp(fact->names[i], name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Evaluate the final __all__ value for one name. A dynamic value is not an
+ * export oracle; deletion restores Python's public-name rule. */
+static bool pxc_python_name_is_exported(const CBMPyNamespaceFacts *facts, const char *name,
+                                        bool *out_has_all, bool *out_known) {
+    bool has_all = false;
+    bool known = true;
+    bool member = false;
+    for (int i = 0; facts && i < facts->count; i++) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        if (fact->kind == CBM_PY_NS_ALL_SET) {
+            has_all = true;
+            known = true;
+            member = pxc_python_name_in_list(fact, name);
+        } else if (fact->kind == CBM_PY_NS_ALL_APPEND) {
+            if (!has_all || !known) {
+                has_all = true;
+                known = false;
+            } else {
+                member = member || pxc_python_name_in_list(fact, name);
+            }
+        } else if (fact->kind == CBM_PY_NS_ALL_UNKNOWN) {
+            has_all = true;
+            known = false;
+            member = false;
+        } else if (fact->kind == CBM_PY_NS_ALL_DELETE) {
+            has_all = false;
+            known = true;
+            member = false;
         }
     }
+    if (out_has_all)
+        *out_has_all = has_all;
+    if (out_known)
+        *out_known = known;
+    return has_all ? known && member : name && name[0] != '_';
+}
 
-    if (!project_name || !project_name[0])
-        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, module_path);
-    size_t need = strlen(project_name) + 1 + strlen(module_path) + 1;
-    char *qualified = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, need);
-    if (!qualified)
+static bool pxc_python_fact_path(const CBMPyNamespaceFact *fact, bool include_member, char *path,
+                                 size_t capacity) {
+    if (!fact || !path || capacity == 0 || (size_t)fact->relative_level >= capacity)
+        return false;
+    size_t used = fact->relative_level;
+    memset(path, '.', used);
+    const char *module = fact->module_name ? fact->module_name : "";
+    size_t module_len = strlen(module);
+    if (module_len >= capacity - used)
+        return false;
+    memcpy(path + used, module, module_len);
+    used += module_len;
+    if (include_member && fact->member_name && fact->member_name[0]) {
+        size_t member_len = strlen(fact->member_name);
+        bool separator = module_len > 0;
+        if (member_len + (separator ? 1U : 0U) >= capacity - used)
+            return false;
+        if (separator)
+            path[used++] = '.';
+        memcpy(path + used, fact->member_name, member_len);
+        used += member_len;
+    }
+    path[used] = '\0';
+    return used > 0;
+}
+
+static const cbm_gbuf_node_t *pxc_python_fact_target(const cbm_pipeline_ctx_t *ctx,
+                                                     const char *rel_path, const char *file_qn,
+                                                     const CBMPyNamespaceFact *fact,
+                                                     bool include_member) {
+    char path[CBM_PATH_MAX];
+    if (!pxc_python_fact_path(fact, include_member, path, sizeof(path)))
         return NULL;
-    snprintf(qualified, need, "%s.%s", project_name, module_path);
-    return qualified;
+    CBMImport imp = {.local_name = fact->local_name, .module_path = path};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, &imp, NULL);
+    if (target && cbm_suppress_cross_language_code_match(CBM_LANG_PYTHON, ctx->repo_path,
+                                                         target->file_path)) {
+        return NULL;
+    }
+    return target;
+}
+
+static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                        const char *rel_path, const char *module_qn,
+                                        const CBMPyNamespaceFacts *facts, PXCPythonImportMap *map,
+                                        bool collect_exports, int depth);
+
+static bool pxc_python_load_namespace(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                      const cbm_gbuf_node_t *module, PXCPythonImportMap *map,
+                                      CBMFileResult **out_result, int depth) {
+    *out_result = NULL;
+    if (!ctx || !ctx->repo_path || !module || !module->file_path || !module->qualified_name ||
+        depth > CBM_SZ_16)
+        return false;
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, module->file_path);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return false;
+    int source_len = 0;
+    char *source = pxc_read_file(path, &source_len);
+    if (!source)
+        return false;
+    CBMFileResult *result = cbm_extract_file(source, source_len, CBM_LANG_PYTHON, project_name,
+                                             module->file_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+    if (!result || result->py_namespace.status != CBM_PY_NS_COMPLETE ||
+        !cbm_py_namespace_facts_valid(&result->py_namespace)) {
+        cbm_free_result(result);
+        return false;
+    }
+    if (!pxc_python_replay_namespace(ctx, project_name, module->file_path, module->qualified_name,
+                                     &result->py_namespace, map, true, depth + 1)) {
+        cbm_free_result(result);
+        return false;
+    }
+    *out_result = result;
+    return true;
+}
+
+static bool pxc_python_apply_star(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                  const char *rel_path, const char *file_qn,
+                                  const CBMPyNamespaceFact *fact, PXCPythonImportMap *map,
+                                  int depth) {
+    const cbm_gbuf_node_t *module = pxc_python_fact_target(ctx, rel_path, file_qn, fact, false);
+    PXCPythonImportMap exported = {0};
+    CBMFileResult *source = NULL;
+    if (!pxc_python_load_namespace(ctx, project_name, module, &exported, &source, depth)) {
+        pxc_python_map_free(&exported);
+        return false;
+    }
+    bool has_all = false;
+    bool known = true;
+    (void)pxc_python_name_is_exported(&source->py_namespace, "", &has_all, &known);
+    if (!known) {
+        cbm_free_result(source);
+        pxc_python_map_free(&exported);
+        return false;
+    }
+    for (int i = 0; i < exported.count; i++) {
+        const char *value =
+            pxc_python_name_is_exported(&source->py_namespace, exported.keys[i], NULL, NULL)
+                ? exported.vals[i]
+                : NULL;
+        if (!pxc_python_map_set(map, exported.keys[i], value)) {
+            cbm_free_result(source);
+            pxc_python_map_free(&exported);
+            return false;
+        }
+    }
+    if (has_all) {
+        for (int i = 0; i < source->py_namespace.count; i++) {
+            const CBMPyNamespaceFact *all = &source->py_namespace.items[i];
+            if (all->kind != CBM_PY_NS_ALL_SET && all->kind != CBM_PY_NS_ALL_APPEND)
+                continue;
+            for (int j = 0; j < all->name_count; j++) {
+                const char *name = all->names[j];
+                if (!name || !pxc_python_name_is_exported(&source->py_namespace, name, NULL, NULL))
+                    continue;
+                int found = pxc_python_map_find(&exported, name);
+                const char *value = found >= 0 ? exported.vals[found] : NULL;
+                if (!pxc_python_map_set(map, name, value)) {
+                    cbm_free_result(source);
+                    pxc_python_map_free(&exported);
+                    return false;
+                }
+            }
+        }
+    }
+    cbm_free_result(source);
+    pxc_python_map_free(&exported);
+    return true;
+}
+
+static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                        const char *rel_path, const char *module_qn,
+                                        const CBMPyNamespaceFacts *facts, PXCPythonImportMap *map,
+                                        bool collect_exports, int depth) {
+    if (!ctx || !facts || !map || depth > CBM_SZ_16)
+        return false;
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    for (int i = 0; i < facts->count; i++) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        if (fact->kind == CBM_PY_NS_OWN_DEF && fact->local_name) {
+            int existing = pxc_python_map_find(map, fact->local_name);
+            char qn[CBM_PATH_MAX];
+            int n = snprintf(qn, sizeof(qn), "%s.%s", module_qn, fact->local_name);
+            const cbm_gbuf_node_t *node =
+                n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+            if ((collect_exports || existing >= 0) &&
+                !pxc_python_map_set(map, fact->local_name, node ? node->qualified_name : NULL)) {
+                pxc_free_fqn(file_qn);
+                return false;
+            }
+        } else if ((fact->kind == CBM_PY_NS_IMPORT_NAME || fact->kind == CBM_PY_NS_IMPORT_MODULE) &&
+                   fact->local_name) {
+            bool root = fact->kind == CBM_PY_NS_IMPORT_MODULE &&
+                        (fact->flags & CBM_PY_NS_IMPORT_BINDS_ROOT);
+            const cbm_gbuf_node_t *target = NULL;
+            if (fact->kind == CBM_PY_NS_IMPORT_NAME && fact->module_name && fact->module_name[0]) {
+                const cbm_gbuf_node_t *module =
+                    pxc_python_fact_target(ctx, rel_path, file_qn, fact, false);
+                if ((!module || !module->label || strcmp(module->label, "Module") != 0) &&
+                    fact->relative_level == 0) {
+                    module = cbm_pipeline_lsp_target_node(ctx->gbuf, project_name,
+                                                          fact->module_name, false);
+                }
+                if (module && module->label &&
+                    (strcmp(module->label, "Module") == 0 ||
+                     strcmp(module->label, "Folder") == 0) &&
+                    fact->member_name) {
+                    char qn[CBM_PATH_MAX];
+                    int n = snprintf(qn, sizeof(qn), "%s.%s", module->qualified_name,
+                                     fact->member_name);
+                    target =
+                        n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+                }
+            } else {
+                target = pxc_python_fact_target(ctx, rel_path, file_qn, fact,
+                                                fact->kind == CBM_PY_NS_IMPORT_NAME);
+            }
+            if (root && fact->module_name) {
+                CBMPyNamespaceFact root_fact = *fact;
+                const char *dot = strchr(fact->module_name, '.');
+                char root_name[CBM_PATH_MAX];
+                size_t len = dot ? (size_t)(dot - fact->module_name) : strlen(fact->module_name);
+                if (len < sizeof(root_name)) {
+                    memcpy(root_name, fact->module_name, len);
+                    root_name[len] = '\0';
+                    root_fact.module_name = root_name;
+                    target = pxc_python_fact_target(ctx, rel_path, file_qn, &root_fact, false);
+                } else {
+                    target = NULL;
+                }
+            }
+            if ((target || fact->kind == CBM_PY_NS_IMPORT_NAME) &&
+                !pxc_python_map_set(map, fact->local_name,
+                                    target ? target->qualified_name : NULL)) {
+                pxc_free_fqn(file_qn);
+                return false;
+            }
+        } else if (fact->kind == CBM_PY_NS_IMPORT_STAR) {
+            if (!pxc_python_apply_star(ctx, project_name, rel_path, file_qn, fact, map, depth))
+                pxc_python_map_block_all(map);
+        } else if (fact->kind == CBM_PY_NS_SHADOW && fact->local_name &&
+                   fact->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS) {
+            int existing = pxc_python_map_find(map, fact->local_name);
+            char qn[CBM_PATH_MAX];
+            int n = snprintf(qn, sizeof(qn), "%s.%s", module_qn, fact->local_name);
+            const cbm_gbuf_node_t *node =
+                n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+            if ((collect_exports || existing >= 0) &&
+                !pxc_python_map_set(map, fact->local_name, node ? node->qualified_name : NULL)) {
+                pxc_free_fqn(file_qn);
+                return false;
+            }
+        } else if ((fact->kind == CBM_PY_NS_SHADOW || fact->kind == CBM_PY_NS_DELETE) &&
+                   fact->local_name) {
+            if (!pxc_python_map_set(map, fact->local_name, NULL)) {
+                pxc_free_fqn(file_qn);
+                return false;
+            }
+        }
+    }
+    pxc_free_fqn(file_qn);
+    return true;
+}
+
+/* The legacy CBMImport projection spells `from . import m2` as `..m2` and
+ * cannot represent that m2 is a module binding. Ordered namespace facts own
+ * this proof, so remove the contradictory compatibility row before the
+ * parallel semantic gate reads it. */
+static void pxc_python_repair_module_attribute_imports(const char *rel_path,
+                                                       const CBMFileResult *result) {
+    if (!rel_path || !result)
+        return;
+    CBMFileResult *mutable_result = (CBMFileResult *)(uintptr_t)result;
+    for (int i = 0; i < result->py_namespace.count; i++) {
+        const CBMPyNamespaceFact *fact = &result->py_namespace.items[i];
+        if (fact->kind != CBM_PY_NS_IMPORT_NAME || !fact->local_name ||
+            (fact->module_name && fact->module_name[0]) || fact->relative_level == 0)
+            continue;
+        for (int j = 0; j < mutable_result->imports.count;) {
+            CBMImport *imp = &mutable_result->imports.items[j];
+            if (!imp->local_name || strcmp(imp->local_name, fact->local_name) != 0) {
+                j++;
+                continue;
+            }
+            memmove(imp, imp + 1, (size_t)(mutable_result->imports.count - j - 1) * sizeof(*imp));
+            mutable_result->imports.count--;
+        }
+    }
+}
+
+static int pxc_python_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                       const char *rel_path, const CBMFileResult *result,
+                                       const char ***out_keys, const char ***out_vals,
+                                       int *out_count) {
+    PXCPythonImportMap map = {0};
+    if (!result || result->py_namespace.status != CBM_PY_NS_COMPLETE ||
+        !cbm_py_namespace_facts_valid(&result->py_namespace)) {
+        return 0;
+    }
+    pxc_python_repair_module_attribute_imports(rel_path, result);
+    char *module_qn = cbm_pipeline_fqn_module_dir(project_name, rel_path, false);
+    bool ok = module_qn && pxc_python_replay_namespace(ctx, project_name, rel_path, module_qn,
+                                                       &result->py_namespace, &map, false, 0);
+    pxc_free_fqn(module_qn);
+    if (!ok) {
+        pxc_python_map_free(&map);
+        return 0;
+    }
+    *out_keys = map.keys;
+    *out_vals = map.vals;
+    *out_count = map.count;
+    return 0;
 }
 
 /* Build the private per-file import map from graph and extraction bindings.
@@ -1614,6 +1979,9 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
+    if (lang == CBM_LANG_PYTHON)
+        return pxc_python_build_import_map(ctx, project_name, rel_path, result, out_keys, out_vals,
+                                           out_count);
 
     const cbm_gbuf_edge_t **edges = NULL;
     int edge_count = 0;
@@ -1626,15 +1994,7 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
         edge_count = 0;
     }
 
-    int metadata_count =
-        (lang == CBM_LANG_PYTHON || lang == CBM_LANG_KOTLIN) && result ? result->imports.count : 0;
-    int python_star_count = 0;
-    if (lang == CBM_LANG_PYTHON && result) {
-        for (int i = 0; i < result->py_namespace.count; i++) {
-            python_star_count +=
-                result->py_namespace.items[i].kind == CBM_PY_NS_IMPORT_STAR ? 1 : 0;
-        }
-    }
+    int metadata_count = lang == CBM_LANG_KOTLIN && result ? result->imports.count : 0;
     /* A completed PHP binding snapshot can establish a genuinely empty map.
      * The ordinary map remains a compatibility projection; only the separate
      * typed snapshot may prove that an import was left unresolved. */
@@ -1646,8 +2006,7 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
     if (edge_count == 0 && (!result || result->imports.count == 0) && !authoritative_empty)
         return 0;
 
-    size_t capacity = (size_t)edge_count + (result ? (size_t)result->imports.count : 0) +
-                      (size_t)python_star_count;
+    size_t capacity = (size_t)edge_count + (result ? (size_t)result->imports.count : 0);
     if (capacity == 0)
         capacity = 1;
     const char **keys =
@@ -1729,10 +2088,7 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
         const char *path = pxc_unique_import_path(result, imp->local_name, &ambiguous);
         if (ambiguous || !path)
             continue;
-        char *value =
-            lang == CBM_LANG_KOTLIN
-                ? pxc_kotlin_import_from_metadata(result, imp->local_name)
-                : pxc_python_import_from_metadata(gbuf, project_name, imp->local_name, path);
+        char *value = pxc_kotlin_import_from_metadata(result, imp->local_name);
         if (!value)
             continue;
         char *local = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, imp->local_name);
@@ -1743,41 +2099,6 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
         keys[count] = local;
         vals[count] = value;
         count++;
-    }
-    if (python_star_count > 0) {
-        for (int i = 0; i < result->py_namespace.count; i++) {
-            const CBMPyNamespaceFact *fact = &result->py_namespace.items[i];
-            if (fact->kind != CBM_PY_NS_IMPORT_STAR || !fact->module_name) {
-                continue;
-            }
-            char module_path[CBM_PATH_MAX];
-            size_t module_len = strlen(fact->module_name);
-            if ((size_t)fact->relative_level + module_len >= sizeof(module_path)) {
-                continue;
-            }
-            memset(module_path, '.', fact->relative_level);
-            memcpy(module_path + fact->relative_level, fact->module_name, module_len + 1);
-            const cbm_gbuf_node_t *target = NULL;
-            for (int j = 0; j < result->imports.count; j++) {
-                const CBMImport *imp = &result->imports.items[j];
-                if (imp->module_path && strcmp(imp->module_path, module_path) == 0) {
-                    target = cbm_pipeline_resolve_import_node(
-                        ctx, rel_path, file_node ? file_node->qualified_name : NULL, imp, NULL);
-                    break;
-                }
-            }
-            if (!target || !target->qualified_name) {
-                continue;
-            }
-            keys[count] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, "*");
-            vals[count] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, target->qualified_name);
-            if (!keys[count] || !vals[count]) {
-                cbm_free(CBM_MEM_CLASS_OTHER, (void *)keys[count]);
-                cbm_free(CBM_MEM_CLASS_OTHER, (void *)vals[count]);
-                continue;
-            }
-            count++;
-        }
     }
     *out_keys = keys;
     *out_vals = vals;
@@ -2190,6 +2511,84 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
     pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
 }
 
+static bool pxc_python_has_star_import(const CBMFileResult *result) {
+    for (int i = 0; result && i < result->py_namespace.count; i++) {
+        if (result->py_namespace.items[i].kind == CBM_PY_NS_IMPORT_STAR)
+            return true;
+    }
+    return false;
+}
+
+static bool pxc_def_qn_exists(const CBMLSPDef *defs, int count, const char *qn) {
+    for (int i = 0; defs && qn && i < count; i++) {
+        if (defs[i].qualified_name && strcmp(defs[i].qualified_name, qn) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Python's AST resolver deliberately invalidates every name at a star import
+ * because it has no export oracle. The shared import-map builder does have
+ * that oracle, so restore only exact bare invocations whose final binding is
+ * a registered project definition. */
+static void pxc_python_append_star_calls(CBMArena *arena, CBMFileResult *result,
+                                         const CBMLSPDef *defs, int def_count,
+                                         const char **imp_keys, const char **imp_vals,
+                                         int imp_count, CBMResolvedCallArray *out) {
+    if (!pxc_python_has_star_import(result))
+        return;
+    for (int i = 0; i < result->calls.count; i++) {
+        CBMCall *call = &result->calls.items[i];
+        if (!call->callee_name || !call->enclosing_func_qn || call->is_method ||
+            strchr(call->callee_name, '.') || strstr(call->callee_name, "::") ||
+            call->site_end_byte <= call->site_start_byte)
+            continue;
+        const char *target = NULL;
+        bool blocked = false;
+        for (int j = 0; j < imp_count; j++) {
+            if (!imp_keys[j] || !imp_vals[j] || strcmp(imp_keys[j], call->callee_name) != 0)
+                continue;
+            if (!imp_vals[j][0]) {
+                /* The sequential CALLS pass rebuilds a legacy import map that
+                 * cannot carry an empty exact binding. Preserve the proof
+                 * requirement so its short-name fallback cannot publish the
+                 * excluded target; the paired type site records the stop. */
+                call->requires_lsp_resolution = true;
+                call->callee_is_locally_bound = false;
+                blocked = true;
+                break;
+            }
+            target = imp_vals[j];
+            break;
+        }
+        if (blocked || call->callee_is_locally_bound)
+            continue;
+        if (!target || !pxc_def_qn_exists(defs, def_count, target))
+            continue;
+        bool already_resolved = false;
+        for (int j = 0; j < out->count; j++) {
+            const CBMResolvedCall *row = &out->items[j];
+            already_resolved = row->kind == CBM_RESOLVED_INVOCATION &&
+                               row->site_start_byte == call->site_start_byte &&
+                               row->site_end_byte == call->site_end_byte && row->caller_qn &&
+                               strcmp(row->caller_qn, call->enclosing_func_qn) == 0;
+            if (already_resolved)
+                break;
+        }
+        if (!already_resolved) {
+            CBMResolvedCall row = {.caller_qn = call->enclosing_func_qn,
+                                   .callee_qn = target,
+                                   .strategy = "python_import_binding",
+                                   .confidence = 0.95f,
+                                   .kind = CBM_RESOLVED_INVOCATION,
+                                   .site_start_byte = call->site_start_byte,
+                                   .site_end_byte = call->site_end_byte,
+                                   .source_origin = call->source_origin};
+            cbm_resolvedcall_push(out, arena, row);
+        }
+    }
+}
+
 /* ── Rust workspace manifest (Cargo.toml) for cross-CRATE resolution ──
  *
  * cbm_pxc_run_one's signature is shared with the parallel pass
@@ -2578,6 +2977,9 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
         break;
     }
 
+    if (lang == CBM_LANG_PYTHON)
+        pxc_python_append_star_calls(&scratch, r, defs, def_count, imp_names, imp_qns, imp_count,
+                                     &out);
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
@@ -2790,6 +3192,9 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             break;
         }
         if (used_prebuilt) {
+            if (lang == CBM_LANG_PYTHON)
+                pxc_python_append_star_calls(&scratch, result, all_defs, all_def_count, imp_keys,
+                                             imp_vals, imp_count, &out);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
         }
@@ -3819,7 +4224,7 @@ static bool pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
     if (pxc_import_probe_allocations_left > 0)
         pxc_import_probe_allocations_left--;
 #endif
-    char *candidate = (char *)malloc(import_len + sizeof(init_seg));
+    char *candidate = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, import_len + sizeof(init_seg));
     if (!candidate)
         return false;
     memcpy(candidate, import_qn, import_len + 1);
@@ -3888,7 +4293,7 @@ static bool pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
             *dot = '\0';
         }
     }
-    free(candidate);
+    cbm_free(CBM_MEM_CLASS_OTHER, candidate);
     return true;
 }
 
