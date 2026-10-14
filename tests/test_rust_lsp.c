@@ -1851,8 +1851,8 @@ TEST(rustlsp_crossfile_return_box_with_written_argument) {
 }
 
 /* An opaque `impl Future<Output = T>` awaits to T; an opaque project trait
- * hides the impl a call on it reaches, so it publishes nothing. A trait
- * object behind Box is disclosed with the original std wrapper identity. */
+ * hides the impl a call on it reaches, so it publishes nothing. Box's
+ * complete-except-deref stamp lets its project trait-object pointee decide. */
 TEST(rustlsp_crossfile_return_opaque_types) {
     const char *awaited = "async fn run() -> bool { demo::make().await.ping() }\n";
     const char *direct = "fn run() -> bool { demo::make().ping() }\n";
@@ -1860,7 +1860,7 @@ TEST(rustlsp_crossfile_return_opaque_types) {
                                               "Conn.ping"),
                0);
     ASSERT_EQ(rustlsp_declared_return_target("impl Pinger", direct, "ping"), -1);
-    ASSERT_EQ(rustlsp_declared_return_target("Box<dyn Pinger>", direct, "Pinger.ping"), -1);
+    ASSERT_GTE(rustlsp_declared_return_target("Box<dyn Pinger>", direct, "Pinger.ping"), 0);
     PASS();
 }
 
@@ -5786,7 +5786,7 @@ TEST(rustlsp_project_reexport_does_not_select_same_named_local_type) {
     PASS();
 }
 
-TEST(rustlsp_box_dyn_discloses_std_collision_before_declaration) {
+TEST(rustlsp_box_dyn_uses_project_pointee_when_std_name_is_absent) {
     const char *source = "fn run(b: Box<dyn Tr>) { b.ping(); }\n";
     CBMRustLSPDef defs[] = {
         {.qualified_name = "p.main.Tr", .short_name = "Tr", .label = "Trait",
@@ -5802,10 +5802,10 @@ TEST(rustlsp_box_dyn_discloses_std_collision_before_declaration) {
     CBMResolvedCallArray out = {0};
     cbm_run_rust_lsp_cross(&arena, source, (int)strlen(source), "p.main", defs, 4,
                            NULL, NULL, 0, NULL, &out);
-    ASSERT_EQ(find_confident(&out, "run", "p.main.Tr.ping"), -1);
+    ASSERT_GTE(find_confident(&out, "run", "p.main.Tr.ping"), 0);
     ASSERT_EQ(out.count, 1);
-    ASSERT_STR_EQ(out.items[0].reason, "unrecognised_std_method");
-    ASSERT_STR_EQ(out.items[0].callee_qn, "alloc.boxed.Box.ping");
+    ASSERT_NULL(out.items[0].reason);
+    ASSERT_STR_EQ(out.items[0].callee_qn, "p.main.Tr.ping");
     ASSERT_EQ(find_confident(&out, "run", "p.main.Inner.ping"), -1);
     cbm_arena_destroy(&arena);
     PASS();
@@ -7971,11 +7971,8 @@ TEST(rustlsp_written_reference_impl_selects_borrowed_owner) {
                                     "impl Measure for &str { fn measure(self) {} }\n"
                                     "fn run(x: &str) { x.measure(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_LT(find_confident(&r->resolved_calls, "main.run", "&str.measure[Measure]"), 0);
-    int stop = find_resolved(r, "main.run", "core.str.measure");
-    ASSERT_GTE(stop, 0);
-    ASSERT_STR_EQ(r->resolved_calls.items[stop].reason, "unrecognised_std_method");
-    ASSERT_STR_EQ(r->resolved_calls.items[stop].strategy, "lsp_unresolved");
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.run", "&str.measure[Measure]"), 0);
+    ASSERT_EQ(find_resolved(r, "main.run", "core.str.measure"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -7987,14 +7984,9 @@ TEST(rustlsp_written_primitive_impl_selects_canonical_owner) {
                                     "fn text(x: &str) { x.measure(); }\n"
                                     "fn number(x: u32) { x.measure(); }\n");
     ASSERT_NOT_NULL(r);
-    ASSERT_LT(find_confident(&r->resolved_calls, "main.text", "str.measure[Measure]"), 0);
-    ASSERT_LT(find_confident(&r->resolved_calls, "main.number", "u32.measure[Measure]"), 0);
-    int text = find_resolved(r, "main.text", "core.str.measure");
-    int number = find_resolved(r, "main.number", "u32.measure");
-    ASSERT_GTE(text, 0);
-    ASSERT_GTE(number, 0);
-    ASSERT_STR_EQ(r->resolved_calls.items[text].reason, "unrecognised_std_method");
-    ASSERT_STR_EQ(r->resolved_calls.items[number].reason, "unrecognised_std_method");
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.text", "str.measure[Measure]"), 0);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.number", "u32.measure[Measure]"), 0);
+    ASSERT_EQ(find_resolved(r, "main.text", "core.str.measure"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -10931,28 +10923,9 @@ TEST(rustlsp_wrapper_impl_on_dyn_with_auto_trait_applies_to_same_bounds) {
     memset(&out, 0, sizeof(out));
     cbm_run_rust_lsp_cross(&a, src, (int)strlen(src), "p.caller", defs, 5, imp_n, imp_q, 1, NULL,
                            &out);
-    ASSERT_LT(find_confident(&out, "via_send", "p.demo.Box.height"), 0);
-    int stopped = 0;
-    for (int i = 0; i < out.count; i++) {
-        if (out.items[i].caller_qn && strstr(out.items[i].caller_qn, "via_send")) {
-            ASSERT_STR_EQ(out.items[i].callee_qn, "alloc.boxed.Box.height");
-            ASSERT_STR_EQ(out.items[i].reason, "unrecognised_std_method");
-            ASSERT_STR_EQ(out.items[i].strategy, "lsp_unresolved");
-            stopped++;
-        }
-    }
-    ASSERT_EQ(stopped, 1);
+    ASSERT_GTE(find_confident(&out, "via_send", "p.demo.Box.height"), 0);
     ASSERT_LT(find_confident(&out, "via_send", "p.demo.Cell.height"), 0);
-    ASSERT_LT(find_confident(&out, "via_plain", "p.demo.Cell.height"), 0);
-    int plain_stops = 0;
-    for (int i = 0; i < out.count; i++) {
-        if (out.items[i].caller_qn && strstr(out.items[i].caller_qn, "via_plain")) {
-            ASSERT_STR_EQ(out.items[i].reason, "unrecognised_std_method");
-            ASSERT_STR_EQ(out.items[i].callee_qn, "alloc.boxed.Box.height");
-            plain_stops++;
-        }
-    }
-    ASSERT_EQ(plain_stops, 1);
+    ASSERT_GTE(find_confident(&out, "via_plain", "p.demo.Cell.height"), 0);
     ASSERT_LT(find_confident(&out, "via_plain", "p.demo.Box.height"), 0);
     cbm_arena_destroy(&a);
     PASS();
@@ -14500,7 +14473,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_foreign_signal_receiver_does_not_select_project_recv);
     RUN_TEST(rustlsp_deref_foreign_target_does_not_select_project_method);
     RUN_TEST(rustlsp_project_reexport_does_not_select_same_named_local_type);
-    RUN_TEST(rustlsp_box_dyn_discloses_std_collision_before_declaration);
+    RUN_TEST(rustlsp_box_dyn_uses_project_pointee_when_std_name_is_absent);
     RUN_TEST(rustlsp_local_deref_waits_for_project_registry);
     RUN_TEST(rustlsp_arc_generic_forwarding_impl_withholds_deref_guess);
     RUN_TEST(rustlsp_strict_box_deref_to_inner);

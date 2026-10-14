@@ -11268,7 +11268,7 @@ typedef struct {
     bool field_receiver;     /* self.runtime.execute() through a `use crate::a::Runtime` field */
     bool let_bound_receiver; /* started.initial_event() typed by the method's return */
     bool trait_impl_caller;  /* D.notify[Host] owns its body's calls */
-    bool dyn_receiver;       /* Arc<dyn Host> trait publication stays closed */
+    bool dyn_receiver;       /* Arc<dyn Host> follows an unlisted name to the project pointee */
     bool dyn_std_stop;
     bool reexport_path;      /* crate::Runtime follows lib.rs `pub use a::Runtime` */
     bool glob_import;        /* `use crate::a::*` binds a unique glob source */
@@ -11412,8 +11412,8 @@ TEST(pipeline_rust_module_paths_resolve_exact_calls_in_both_modes) {
         ASSERT_TRUE(modes[i]->field_receiver);
         ASSERT_TRUE(modes[i]->let_bound_receiver);
         ASSERT_TRUE(modes[i]->trait_impl_caller);
-        ASSERT_FALSE(modes[i]->dyn_receiver);
-        ASSERT_TRUE(modes[i]->dyn_std_stop);
+        ASSERT_TRUE(modes[i]->dyn_receiver);
+        ASSERT_FALSE(modes[i]->dyn_std_stop);
         ASSERT_TRUE(modes[i]->reexport_path);
         ASSERT_TRUE(modes[i]->glob_import);
         ASSERT_TRUE(modes[i]->cfg_caller);
@@ -12043,7 +12043,7 @@ static const RustModTreeCallCase rust_dyn_trait_cases[] = {
     {"&(dyn Send + Trait) parameter: the principal trait", "core.src.calls.via_param_marker_first",
      "core.src.svc.Service.call", true},
     {"supertrait method through Arc<dyn Trait>", "core.src.calls.via_super",
-     "core.src.svc.Named.name", false},
+     "core.src.svc.Named.name", true},
     {"Box<dyn Trait> whose Box has its own impl of the trait", "core.src.calls.via_box",
      "core.src.out.Out.log", false},
     /* `impl<S: Sink> Sink for Box<S>` needs S: Sized, so it does not apply to
@@ -12053,7 +12053,7 @@ static const RustModTreeCallCase rust_dyn_trait_cases[] = {
     {"return-position impl Trait is not a trait object", "core.src.calls.via_ret",
      "core.src.svc.Service.call", false},
     {"Box<dyn Trait> with the trait out of scope: the trait object's method",
-     "core.src.calls_bare.via_box_bare", "core.src.out.Out.log", false},
+     "core.src.calls_bare.via_box_bare", "core.src.out.Out.log", true},
 };
 
 TEST(pipeline_rust_dyn_trait_calls_link_trait_declaration) {
@@ -12287,17 +12287,18 @@ TEST(pipeline_rust_trait_impl_out_of_scope_not_linked) {
 /* `impl Renderable for Box<dyn Cell>` is found on the Box before the call
  * derefs to `dyn Cell`, so `Box<dyn Cell>.height()` is not `Cell::height`.
  * The impl file's unknown glob leaves `Box` to the prelude. The impl does not
- * apply to `Box<dyn Renderable>` or `Box<Plain>`. Their pointee trait
- * candidates are also withheld with the original std wrapper identity. */
+ * apply to `Box<dyn Renderable>` or `Box<Plain>`. The Box inventory stamp is
+ * complete-except-deref, so those proved project pointees select their own
+ * project methods when the name is absent from Box's inventory rows. */
 static const RustModTreeCallCase rust_wrapper_impl_cases[] = {
     {"Box<dyn Cell> with a project impl on Box<dyn Cell>", "core.src.user.via_cell",
      "core.src.cell.Cell.height", false},
     {"Box<dyn Renderable>: the Box<dyn Cell> impl does not apply", "core.src.user.via_render",
-     "core.src.render.Renderable.height", false},
+     "core.src.render.Renderable.height", true},
     {"Box<dyn Renderable>: not the Box<dyn Cell> impl", "core.src.user.via_render",
      "core.src.cell.Box.height[Renderable]", false},
     {"Box<Plain>: derefs to Plain's override", "core.src.user.via_plain",
-     "core.src.user.Plain.depth[Renderable]", false},
+     "core.src.user.Plain.depth[Renderable]", true},
     {"Box<Plain>: not the trait default through Box", "core.src.user.via_plain",
      "core.src.render.Renderable.depth", false},
 };
@@ -12480,6 +12481,75 @@ static int check_rust_receiver_calls(const char *source, const RustReceiverCase 
     }
     th_rmtree(tmp);
     return failures;
+}
+
+/* `RUST_STD_VEC.reserve` is an inventory row, while
+ * `RUST_STD_VEC.inventory_complete_absent` is absent under the
+ * `RUST_STD_VEC` complete stamp. Absence only removes the std collision:
+ * the hidden trait still has to fail the ordinary lexical-scope proof. */
+TEST(pipeline_rust_std_inventory_listed_complete_and_scope_verdicts_in_both_modes) {
+    const char *source =
+        "pub mod ext {\n"
+        " pub trait VecExt { fn inventory_complete_absent(&self); fn reserve(&mut self, n: usize); }\n"
+        " impl VecExt for Vec<u32> {\n"
+        "  fn inventory_complete_absent(&self) {}\n"
+        "  fn reserve(&mut self, _: usize) {}\n"
+        " }\n"
+        " pub trait HiddenExt { fn inventory_scope_absent(&self); }\n"
+        " impl HiddenExt for Vec<u32> { fn inventory_scope_absent(&self) {} }\n"
+        "}\n"
+        "use ext::VecExt;\n"
+        "pub fn inventory_listed(v: &mut Vec<u32>) { v.reserve(1); }\n"
+        "pub fn inventory_complete(v: &Vec<u32>) { v.inventory_complete_absent(); }\n"
+        "pub fn inventory_scope(v: &Vec<u32>) { v.inventory_scope_absent(); }\n";
+    const RustReceiverCase cases[] = {
+        {"inventory_listed", 0, "unrecognised_std_method"},
+        {"inventory_complete", 4, NULL},
+        {"inventory_scope", 0, "trait_scope_identity"},
+    };
+    ASSERT_EQ(check_rust_receiver_calls(source, cases, 3), 0);
+    PASS();
+}
+
+/* The `RUST_STD_ARC` complete_except_deref stamp defers absent names to the
+ * pointee. A project pointee and an unlisted-complete `RUST_STD_VEC` pointee
+ * can continue through project-side dispatch; `RUST_STD_VEC.reserve` still
+ * stops. An unknown pointee has its own deref proof stop. The
+ * `RUST_STD_ANY` incomplete stamp and unstamped `char` head remain closed. */
+TEST(pipeline_rust_std_inventory_deref_and_uncertain_verdicts_in_both_modes) {
+    const char *source =
+        "pub mod ext {\n"
+        " use std::any::Any; use std::sync::Arc;\n"
+        " pub struct Local;\n"
+        " pub trait LocalExt { fn inventory_project_pointee(&self); }\n"
+        " impl LocalExt for Local { fn inventory_project_pointee(&self) {} }\n"
+        " pub trait VecExt { fn inventory_std_pointee(&self); fn reserve(&mut self, n: usize); }\n"
+        " impl VecExt for Vec<u32> { fn inventory_std_pointee(&self) {} fn reserve(&mut self, _: usize) {} }\n"
+        " pub trait GenericExt { fn inventory_unknown_pointee(&self); }\n"
+        " impl<T> GenericExt for Arc<T> { fn inventory_unknown_pointee(&self) {} }\n"
+        " pub trait AnyExt { fn inventory_incomplete(&self); }\n"
+        " impl AnyExt for dyn Any { fn inventory_incomplete(&self) {} }\n"
+        " pub trait CharExt { fn inventory_missing_stamp(&self); }\n"
+        " impl CharExt for char { fn inventory_missing_stamp(&self) {} }\n"
+        "}\n"
+        "use std::any::Any; use std::sync::Arc;\n"
+        "use ext::{AnyExt, CharExt, GenericExt, Local, LocalExt, VecExt};\n"
+        "pub fn inventory_project(v: Arc<Local>) { v.inventory_project_pointee(); }\n"
+        "pub fn inventory_std(v: Arc<Vec<u32>>) { v.inventory_std_pointee(); }\n"
+        "pub fn inventory_std_listed(mut v: Arc<Vec<u32>>) { v.reserve(1); }\n"
+        "pub fn inventory_unknown<T>(v: Arc<T>) { v.inventory_unknown_pointee(); }\n"
+        "pub fn inventory_incomplete(v: &dyn Any) { v.inventory_incomplete(); }\n"
+        "pub fn inventory_unstamped(v: char) { v.inventory_missing_stamp(); }\n";
+    const RustReceiverCase cases[] = {
+        {"inventory_project", 5, NULL},
+        {"inventory_std", 7, NULL},
+        {"inventory_std_listed", 0, "unrecognised_std_method"},
+        {"inventory_unknown", 0, "deref_receiver_identity_not_proven"},
+        {"inventory_incomplete", 0, "unrecognised_std_method"},
+        {"inventory_unstamped", 0, "unrecognised_std_method"},
+    };
+    ASSERT_EQ(check_rust_receiver_calls(source, cases, 6), 0);
+    PASS();
 }
 
 TEST(pipeline_rust_raw_pointer_does_not_autoderef_to_pointee) {
@@ -14541,6 +14611,8 @@ TEST(pipeline_rust_guard_mutable_value_precedence) {
     write_rust_pad_files(tmp, 52);
     const RustModTreeCallCase cases[] = {
         {"mutable receiver value unproved", "src.lib.probe", "src.lib.S.go", false},
+        {"mutable receiver selects mutable trait impl", "src.lib.probe", "src.lib.S.go[Go]",
+         true},
         {"indexing control", "src.lib.control", "src.lib.sentinel", true},
     };
     int mismatches =
@@ -14676,13 +14748,13 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
                     "pub fn on_line(l: Line) -> u8 { l.render() }\n");
     write_rust_pad_files(tmp, 52);
     static const RustModTreeCallCase cases[] = {
-        {"std self type, &Path receiver", "src.calls.on_path", "src.ext.Path.abs[PathExt]", false},
+        {"std self type, &Path receiver", "src.calls.on_path", "src.ext.Path.abs[PathExt]", true},
         {"std self type, as_path() receiver", "src.calls.on_as_path", "src.ext.Path.abs[PathExt]",
-         false},
+         true},
         {"slice self type, &[T] receiver", "src.calls.on_slice",
-         "src.ext.[Key].is_pressed[KeysExt]", false},
+         "src.ext.[Key].is_pressed[KeysExt]", true},
         {"slice self type, Vec<T> receiver", "src.calls.on_vec",
-         "src.ext.[Key].is_pressed[KeysExt]", false},
+         "src.ext.[Key].is_pressed[KeysExt]", true},
         {"super:: alias self type, aliased type receiver", "src.calls.on_ctx",
          "src.model.view.super::Shown.entries[Entries]", true},
         {"dependency self type is not placed", "src.calls.on_line", "src.ext.Line.render[Draw]",
@@ -14702,7 +14774,7 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
             "('std.path.Path.abs','core.slice.is_pressed','alloc.vec.Vec.is_pressed')";
         ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
         ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
-        ASSERT_EQ(sqlite3_column_int(stmt, 0), 4);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
         sqlite3_finalize(stmt);
         cbm_store_close(store);
     }
@@ -14711,8 +14783,9 @@ TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes) {
     PASS();
 }
 
-/* A module macro beside the impl does not obscure the std receiver identity
- * needed to disclose a project extension as an unrecognised std method. */
+/* A module macro beside the impl does not obscure either the std receiver
+ * inventory lookup or the project extension proof that follows an absent
+ * method under a complete stamp. */
 TEST(pipeline_rust_std_impl_beside_module_macro_item_in_both_modes) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_impl_macro_XXXXXX");
@@ -14736,9 +14809,9 @@ TEST(pipeline_rust_std_impl_beside_module_macro_item_in_both_modes) {
     write_rust_pad_files(tmp, 52);
     static const RustModTreeCallCase cases[] = {
         {"&Path receiver, impl beside thread_local!", "src.calls.on_path", "src.ext.Path.m[Ext]",
-         false},
+         true},
         {"&PathBuf receiver, impl beside thread_local!", "src.calls.on_buf",
-         "src.ext.PathBuf.n[BufExt]", false},
+         "src.ext.PathBuf.n[BufExt]", true},
     };
     int mismatches =
         check_rust_modtree_calls_in_both_modes(tmp, cases, (int)(sizeof(cases) / sizeof(cases[0])));
@@ -14753,7 +14826,7 @@ TEST(pipeline_rust_std_impl_beside_module_macro_item_in_both_modes) {
                           "('std.path.Path.m','std.path.PathBuf.n')";
         ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
         ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
-        ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
         sqlite3_finalize(stmt);
         cbm_store_close(store);
     }
@@ -27518,6 +27591,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_guard_inherent_item_ambiguity);
     RUN_TEST(pipeline_rust_guard_mutable_value_precedence);
     RUN_TEST(pipeline_rust_written_bound_calls_publish_declarations_in_both_modes);
+    RUN_TEST(pipeline_rust_std_inventory_listed_complete_and_scope_verdicts_in_both_modes);
+    RUN_TEST(pipeline_rust_std_inventory_deref_and_uncertain_verdicts_in_both_modes);
     RUN_TEST(pipeline_rust_generic_and_foreign_type_impl_methods_own_their_calls_in_both_modes);
     RUN_TEST(pipeline_rust_child_file_impl_methods_belong_to_declared_type_in_both_modes);
     RUN_TEST(pipeline_rust_trait_impl_on_std_slice_and_alias_self_types_in_both_modes);
@@ -27990,6 +28065,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_rust_mutable_copy_receiver_selects_inherent_method);
     RUN_TEST(pipeline_rust_trait_scope_requires_a_lexical_import);
     RUN_TEST(pipeline_rust_std_trait_collision_is_disclosed_with_receiver_and_method);
+    RUN_TEST(pipeline_rust_std_inventory_listed_complete_and_scope_verdicts_in_both_modes);
+    RUN_TEST(pipeline_rust_std_inventory_deref_and_uncertain_verdicts_in_both_modes);
     RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
     RUN_TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded);
     RUN_TEST(pipeline_rust_field_usage_from_resolver_record);
@@ -28054,6 +28131,8 @@ SUITE(pipeline_unresolved) {
     RUN_TEST(pipeline_rust_mutable_copy_receiver_selects_inherent_method);
     RUN_TEST(pipeline_rust_trait_scope_requires_a_lexical_import);
     RUN_TEST(pipeline_rust_std_trait_collision_is_disclosed_with_receiver_and_method);
+    RUN_TEST(pipeline_rust_std_inventory_listed_complete_and_scope_verdicts_in_both_modes);
+    RUN_TEST(pipeline_rust_std_inventory_deref_and_uncertain_verdicts_in_both_modes);
     RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
     RUN_TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded);
 }

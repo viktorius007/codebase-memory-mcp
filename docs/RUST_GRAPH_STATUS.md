@@ -446,16 +446,19 @@ and [namespaces](https://doc.rust-lang.org/reference/names/namespaces.html),
 consulted on 2026-10-07. No compiler or std source is read while indexing.
 
 When a canonical std receiver has a method name supplied by a project trait,
-the dot call is withheld with `unrecognised_std_method`. A trait candidate found
-through Deref retains the original std wrapper for this decision. Project
-inherent candidates on the pointee remain eligible. This reason denotes a
-std/project-trait dispatch collision, including methods whose return type is
-already modelled: a return-type rule does not prove the absence of a preceding
-inherent method. `unresolved_sites.name` stores `receiver-head.method` for this
-reason (for example `alloc.vec.Vec.reserve`); its existing columns are unchanged.
-Deref candidates disclose the original std wrapper, or a std head reached later
-when the original receiver is a project type. Project inherent methods
-are exempt from both the trait-scope and std-collision rules. Method selection
+the resolver consults the committed `rust_std_inventory.h` receiver/name rows
+and completeness stamp. A listed name, an incomplete stamp, or a missing stamp
+withholds with `unrecognised_std_method`; `unresolved_sites.name` stores
+`receiver-head.method` (for example `alloc.vec.Vec.reserve`). An unlisted name
+under a `complete` stamp proves only that std supplies no competing method: the
+link still requires the ordinary project trait-scope, applicable-impl, and
+receiver-shape proofs. An unlisted name under `complete_except_deref` repeats
+the check on a proved std pointee, permits normal project-type method lookup on
+a proved project pointee, and otherwise withholds with
+`deref_receiver_identity_not_proven`. Thus the inventory licenses negative
+knowledge only and never supplies a target or a positive dispatch proof.
+Project inherent methods are exempt from both the trait-scope and std-collision
+rules. Method selection
 checks inherent precedence at each receiver shape, including mutable references,
 and trait-object methods inherited from supertraits. Unproved reference, mutable,
 and wrapper dispatch each have their own stop reason. Calls withheld inside

@@ -110,8 +110,12 @@ static const CBMRegisteredFunc *rust_inherent_self_candidate(RustLSPContext *ctx
 static const char *rust_trait_spelling_leaf(CBMArena *arena, const char *spelling);
 static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
                                     const char *method_name, const char *impl_key, bool *proved);
-static const char *rust_std_trait_collision(RustLSPContext *ctx, const CBMType *recv,
-                                            const CBMRegisteredFunc *method);
+typedef struct {
+    const char *head;
+    const char *reason;
+} RustStdCollision;
+static RustStdCollision rust_std_trait_collision(RustLSPContext *ctx, const CBMType *recv,
+                                                 const CBMRegisteredFunc *method);
 static bool rust_bound_is_marker(const char *bound, size_t len);
 static const char *rust_dyn_markers_text(CBMArena *arena, const char *text);
 static const CBMType *rust_type_with_dyn_markers(CBMArena *arena, const CBMType *t,
@@ -8612,10 +8616,107 @@ static const char *rust_std_receiver_head(const CBMType *recv) {
                : NULL;
 }
 
-static const char *rust_std_trait_collision(RustLSPContext *ctx, const CBMType *recv,
-                                            const CBMRegisteredFunc *method) {
+static const char *rust_std_inventory_receiver(RustLSPContext *ctx, const char *head) {
+    switch (rust_std_family_of(ctx, head)) {
+    case RUST_STD_OPTION: return "RUST_STD_OPTION";
+    case RUST_STD_RESULT: return "RUST_STD_RESULT";
+    case RUST_STD_ARC: return "RUST_STD_ARC";
+    case RUST_STD_RC: return "RUST_STD_RC";
+    case RUST_STD_WEAK_SYNC: return "RUST_STD_WEAK_SYNC";
+    case RUST_STD_WEAK_RC: return "RUST_STD_WEAK_RC";
+    case RUST_STD_MUTEX: return "RUST_STD_MUTEX";
+    case RUST_STD_RWLOCK: return "RUST_STD_RWLOCK";
+    case RUST_STD_REFCELL: return "RUST_STD_REFCELL";
+    case RUST_STD_CELL: return "RUST_STD_CELL";
+    case RUST_STD_PATHBUF: return "RUST_STD_PATHBUF";
+    case RUST_STD_PATH: return "RUST_STD_PATH";
+    case RUST_STD_STRING: return "RUST_STD_STRING";
+    case RUST_STD_VEC: return "RUST_STD_VEC";
+    case RUST_STD_ANY: return "RUST_STD_ANY";
+    case RUST_STD_ERROR: return "RUST_STD_ERROR";
+    case RUST_STD_ONCELOCK: return "RUST_STD_ONCELOCK";
+    case RUST_STD_PIN: return "RUST_STD_PIN";
+    case RUST_STD_BOX: return "RUST_STD_BOX";
+    case RUST_STD_FUTURE: return "RUST_STD_FUTURE";
+    default: return head;
+    }
+}
+
+static bool rust_std_inventory_has_method(const char *receiver, const char *method) {
+    size_t lo = 0;
+    size_t hi = sizeof(cbm_rust_std_inventory) / sizeof(cbm_rust_std_inventory[0]);
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(cbm_rust_std_inventory[mid][0], receiver);
+        if (cmp == 0)
+            cmp = strcmp(cbm_rust_std_inventory[mid][1], method);
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < sizeof(cbm_rust_std_inventory) / sizeof(cbm_rust_std_inventory[0]) &&
+           strcmp(cbm_rust_std_inventory[lo][0], receiver) == 0 &&
+           strcmp(cbm_rust_std_inventory[lo][1], method) == 0;
+}
+
+static const char *rust_std_inventory_status(const char *receiver) {
+    size_t lo = 0;
+    size_t hi = sizeof(cbm_rust_std_inventory_stamps) /
+                sizeof(cbm_rust_std_inventory_stamps[0]);
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(cbm_rust_std_inventory_stamps[mid][0], receiver);
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < sizeof(cbm_rust_std_inventory_stamps) /
+                    sizeof(cbm_rust_std_inventory_stamps[0]) &&
+                   strcmp(cbm_rust_std_inventory_stamps[lo][0], receiver) == 0
+               ? cbm_rust_std_inventory_stamps[lo][1]
+               : NULL;
+}
+
+static RustStdCollision rust_std_inventory_collision(RustLSPContext *ctx, const CBMType *recv,
+                                                      const char *method, int depth) {
+    RustStdCollision none = {0};
+    const char *head = rust_std_receiver_head(recv);
+    if (!head)
+        return none;
+    const char *receiver = rust_std_inventory_receiver(ctx, head);
+    if (!method || rust_std_inventory_has_method(receiver, method))
+        return (RustStdCollision){head, "unrecognised_std_method"};
+    const char *status = rust_std_inventory_status(receiver);
+    if (status && strcmp(status, "complete") == 0)
+        return none;
+    if (!status || strcmp(status, "complete_except_deref") != 0)
+        return (RustStdCollision){head, "unrecognised_std_method"};
+    if (depth >= RUST_DEREF_MAX_HOPS)
+        return (RustStdCollision){head, "deref_receiver_identity_not_proven"};
+
+    const CBMType *pointee = rust_deref_step(ctx, rust_strip_references(recv));
+    while (pointee && pointee->kind == CBM_TYPE_REFERENCE)
+        pointee = pointee->data.reference.elem;
+    if (!pointee)
+        return (RustStdCollision){head, "deref_receiver_identity_not_proven"};
+    if (rust_std_receiver_head(pointee))
+        return rust_std_inventory_collision(ctx, pointee, method, depth + 1);
+
+    const char *pointee_head = rust_std_type_head(pointee);
+    const char *qn = pointee_head ? convert_path_to_qn(ctx->arena, pointee_head) : NULL;
+    const char *registered = qn ? rust_registered_type_qn(ctx, qn) : NULL;
+    if (rust_qn_in_project(ctx, registered ? registered : qn))
+        return none;
+    return (RustStdCollision){head, "deref_receiver_identity_not_proven"};
+}
+
+static RustStdCollision rust_std_trait_collision(RustLSPContext *ctx, const CBMType *recv,
+                                                 const CBMRegisteredFunc *method) {
+    RustStdCollision none = {0};
     if (!method)
-        return NULL;
+        return none;
     const CBMRegisteredType *owner =
         method->receiver_type ? cbm_registry_lookup_type(ctx->registry, method->receiver_type)
                               : NULL;
@@ -8623,22 +8724,23 @@ static const char *rust_std_trait_collision(RustLSPContext *ctx, const CBMType *
                         rust_qn_in_project(ctx, method->qualified_name);
     if (!project_impl &&
         !(owner && owner->is_interface && rust_qn_in_project(ctx, owner->qualified_name)))
-        return NULL;
-    return rust_std_receiver_head(recv);
+        return none;
+    return rust_std_inventory_collision(ctx, recv, method->short_name, 0);
 }
 
 /* A missing std method must be disclosed even when later lookup loses the
  * competing trait candidate. Wrappers can reach project methods through Deref;
  * only an impl whose self type may apply to the wrapper competes at that step. */
-static const char *rust_std_unrecognised_method(RustLSPContext *ctx, const CBMType *recv,
-                                                const char *name) {
+static RustStdCollision rust_std_unrecognised_method(RustLSPContext *ctx, const CBMType *recv,
+                                                     const char *name) {
+    RustStdCollision none = {0};
     const char *head = rust_std_receiver_head(recv);
     if (!head)
-        return NULL;
+        return none;
     const CBMRegisteredFunc *inherent = rust_registry_lookup_inherent_method_aliased(
         ctx, ctx->registry, head, name, NULL, recv);
     if (inherent && rust_qn_in_project(ctx, inherent->qualified_name))
-        return NULL;
+        return none;
     const CBMType *base = rust_strip_references(recv);
     bool wrapper = rust_wrapper_head_qn(ctx, head) != NULL;
     for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
@@ -8651,11 +8753,12 @@ static const char *rust_std_unrecognised_method(RustLSPContext *ctx, const CBMTy
                              rust_impl_self_match(ctx, method->rust_wrapper_impl_self, base,
                                                   false, NULL) == RUST_IMPL_SELF_DIFFERS)))
                 continue;
-            if (rust_std_trait_collision(ctx, recv, method))
-                return head;
+            RustStdCollision collision = rust_std_trait_collision(ctx, recv, method);
+            if (collision.reason)
+                return collision;
         }
     }
-    return NULL;
+    return none;
 }
 
 /* A reference impl can precede a concrete method after autoderef. Its
@@ -12423,9 +12526,10 @@ static void rust_emit_unresolved_call(RustLSPContext *ctx, const char *expr_text
 
 static void rust_emit_trait_refusal(RustLSPContext *ctx, const CBMRegisteredFunc *method,
                                     const CBMType *recv, const char *reason) {
-    const char *head = rust_std_trait_collision(ctx, recv, method);
-    const char *name = head && strcmp(reason, "unrecognised_std_method") == 0
-                           ? cbm_arena_sprintf(ctx->arena, "%s.%s", head, method->short_name)
+    RustStdCollision collision = rust_std_trait_collision(ctx, recv, method);
+    const char *name = collision.head && strcmp(reason, "unrecognised_std_method") == 0
+                           ? cbm_arena_sprintf(ctx->arena, "%s.%s", collision.head,
+                                               method->short_name)
                            : method->qualified_name;
     rust_emit_unresolved_call(ctx, name, reason);
 }
@@ -12929,11 +13033,13 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
             if (refusal && (block_alias || strcmp(refusal, "trait_inherent_accessor_unknown") == 0 ||
                             strcmp(refusal, "trait_nominal_identity_ambiguous") == 0 ||
                             strcmp(refusal, "trait_scope_identity") == 0 ||
+                            strcmp(refusal, "deref_receiver_identity_not_proven") == 0 ||
                             strcmp(refusal, "unrecognised_std_method") == 0)) {
-                const char *std_head = rust_std_trait_collision(
+                RustStdCollision collision = rust_std_trait_collision(
                     ctx, cbm_type_named(ctx->arena, unique->receiver_type), unique);
-                out->open_qn = std_head && strcmp(refusal, "unrecognised_std_method") == 0
-                                   ? cbm_arena_sprintf(ctx->arena, "%s.%s", std_head, short_name)
+                out->open_qn = collision.head && strcmp(refusal, "unrecognised_std_method") == 0
+                                   ? cbm_arena_sprintf(ctx->arena, "%s.%s", collision.head,
+                                                       short_name)
                                    : unique->qualified_name;
                 out->open_reason = refusal;
                 return true;
@@ -12996,11 +13102,13 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
         if (refusal && (block_alias || strcmp(refusal, "trait_inherent_accessor_unknown") == 0 ||
                         strcmp(refusal, "trait_nominal_identity_ambiguous") == 0 ||
                         strcmp(refusal, "trait_scope_identity") == 0 ||
+                        strcmp(refusal, "deref_receiver_identity_not_proven") == 0 ||
                         strcmp(refusal, "unrecognised_std_method") == 0)) {
-            const char *std_head =
+            RustStdCollision collision =
                 rust_std_trait_collision(ctx, cbm_type_named(ctx->arena, receiver), tm);
-            out->open_qn = std_head && strcmp(refusal, "unrecognised_std_method") == 0
-                               ? cbm_arena_sprintf(ctx->arena, "%s.%s", std_head, short_name)
+            out->open_qn = collision.head && strcmp(refusal, "unrecognised_std_method") == 0
+                               ? cbm_arena_sprintf(ctx->arena, "%s.%s", collision.head,
+                                                   short_name)
                                : tm->qualified_name;
             out->open_reason = refusal;
             return true;
@@ -13944,8 +14052,11 @@ static const char *rust_method_receiver_refusal_at_type(RustLSPContext *ctx,
                                                         const CBMRegisteredFunc *method,
                                                         const CBMType *recv, bool slice_deref,
                                                         bool prove_dispatch) {
-    if (prove_dispatch && rust_std_trait_collision(ctx, recv, method))
-        return "unrecognised_std_method";
+    if (prove_dispatch) {
+        RustStdCollision collision = rust_std_trait_collision(ctx, recv, method);
+        if (collision.reason)
+            return collision.reason;
+    }
     if ((method->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0)
         return NULL;
     if (prove_dispatch &&
@@ -14162,7 +14273,8 @@ static const CBMRegisteredFunc *rust_reference_method_at_shape(RustLSPContext *c
         }
         const char *refusal = rust_trait_receiver_refusal(ctx, candidate, self, true);
         if (refusal) {
-            if (strcmp(refusal, "unrecognised_std_method") == 0)
+            if (strcmp(refusal, "unrecognised_std_method") == 0 ||
+                strcmp(refusal, "deref_receiver_identity_not_proven") == 0)
                 rust_emit_trait_refusal(ctx, candidate, self, refusal);
             *blocked = true;
             return NULL;
@@ -14280,8 +14392,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 ctx->enclosing_func_qn &&
                 strcmp(exact->qualified_name, ctx->enclosing_func_qn) == 0 &&
                 cbm_type_equal(recv, cbm_scope_lookup(ctx->current_scope, "self"))) {
-                if (rust_std_trait_collision(ctx, recv, exact)) {
-                    rust_emit_trait_refusal(ctx, exact, recv, "unrecognised_std_method");
+                RustStdCollision collision = rust_std_trait_collision(ctx, recv, exact);
+                if (collision.reason) {
+                    rust_emit_trait_refusal(ctx, exact, recv, collision.reason);
                     return;
                 }
                 rust_emit_resolved_call(ctx, exact->qualified_name, exact->impl_key,
@@ -14321,10 +14434,13 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             type_qn = "core.slice";
         }
 
-        const char *std_gap = rust_std_unrecognised_method(ctx, recv, mname);
-        if (std_gap) {
-            rust_emit_unresolved_call(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", std_gap, mname),
-                                      "unrecognised_std_method");
+        RustStdCollision std_gap = rust_std_unrecognised_method(ctx, recv, mname);
+        if (std_gap.reason) {
+            const char *gap_name = strcmp(std_gap.reason, "unrecognised_std_method") == 0
+                                       ? cbm_arena_sprintf(ctx->arena, "%s.%s", std_gap.head,
+                                                           mname)
+                                       : mname;
+            rust_emit_unresolved_call(ctx, gap_name, std_gap.reason);
             return;
         }
         if (type_qn) {
@@ -14345,9 +14461,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         bool wrapper_scope_filtered = false;
         const CBMRegisteredFunc *wrapper_method = rust_wrapper_corpus_trait_method(
             ctx, base, mname, &wrapper_blocked, &wrapper_scope_filtered);
-        if (wrapper_method && rust_std_trait_collision(ctx, base, wrapper_method)) {
-            rust_emit_trait_refusal(ctx, wrapper_method, base, "unrecognised_std_method");
-            return;
+        if (wrapper_method) {
+            RustStdCollision collision = rust_std_trait_collision(ctx, base, wrapper_method);
+            if (collision.reason) {
+                rust_emit_trait_refusal(ctx, wrapper_method, base, collision.reason);
+                return;
+            }
         }
         if (wrapper_method) {
             rust_emit_resolved_call(ctx, wrapper_method->qualified_name, wrapper_method->impl_key,
@@ -14444,6 +14563,29 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 }
                 if (recv && recv->kind == CBM_TYPE_REFERENCE && !recv->data.reference.rust_shared &&
                     (m->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0) {
+                    bool mutable_ambiguous = false;
+                    const CBMRegisteredFunc *mutable_candidate =
+                        rust_registry_lookup_trait_impl_method_scoped(
+                            ctx, ctx->registry, type_qn, NULL, mname, &mutable_ambiguous, NULL);
+                    if (mutable_ambiguous) {
+                        rust_emit_unresolved_call(ctx, mname, "trait_mutable_dispatch_unproved");
+                        return;
+                    }
+                    if (mutable_candidate &&
+                        (mutable_candidate->flags & CBM_FUNC_FLAG_RUST_SELF) != 0 &&
+                        (mutable_candidate->flags &
+                         (CBM_FUNC_FLAG_RUST_SHARED_SELF | CBM_FUNC_FLAG_RUST_VALUE_SELF)) == 0) {
+                        const char *refusal =
+                            rust_trait_receiver_refusal(ctx, mutable_candidate, recv, true);
+                        if (refusal) {
+                            rust_emit_trait_refusal(ctx, mutable_candidate, recv, refusal);
+                            return;
+                        }
+                        rust_emit_resolved_call(ctx, mutable_candidate->qualified_name,
+                                                mutable_candidate->impl_key,
+                                                "lsp_trait_dispatch", CBM_RUST_CONF_TRAIT_SOLE);
+                        return;
+                    }
                     const CBMRegisteredFunc *shared_candidate = rust_resolve_trait_method(
                         ctx, type_qn, mname, NULL, NULL, true, true, NULL, NULL, recv);
                     if (shared_candidate != m) {
@@ -14529,10 +14671,13 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 const CBMRegisteredFunc *hop_wrapper_method = rust_wrapper_corpus_trait_method(
                     ctx, next, mname, &wrapper_blocked, &wrapper_scope_filtered);
                 scope_filtered |= wrapper_scope_filtered;
-                if (hop_wrapper_method && rust_std_trait_collision(ctx, next, hop_wrapper_method)) {
-                    rust_emit_trait_refusal(ctx, hop_wrapper_method, next,
-                                            "unrecognised_std_method");
-                    return;
+                if (hop_wrapper_method) {
+                    RustStdCollision collision =
+                        rust_std_trait_collision(ctx, next, hop_wrapper_method);
+                    if (collision.reason) {
+                        rust_emit_trait_refusal(ctx, hop_wrapper_method, next, collision.reason);
+                        return;
+                    }
                 }
                 if (hop_wrapper_method) {
                     rust_emit_resolved_call(ctx, hop_wrapper_method->qualified_name,
@@ -14558,11 +14703,13 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 }
                 if (!next_qn)
                     break;
-                const char *hop_gap = rust_std_unrecognised_method(ctx, next, mname);
-                if (hop_gap) {
-                    rust_emit_unresolved_call(
-                        ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", hop_gap, mname),
-                        "unrecognised_std_method");
+                RustStdCollision hop_gap = rust_std_unrecognised_method(ctx, next, mname);
+                if (hop_gap.reason) {
+                    const char *gap_name = strcmp(hop_gap.reason, "unrecognised_std_method") == 0
+                                               ? cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                                                   hop_gap.head, mname)
+                                               : mname;
+                    rust_emit_unresolved_call(ctx, gap_name, hop_gap.reason);
                     return;
                 }
                 const char *next_registered = rust_registered_type_qn(ctx, next_qn);
@@ -14593,12 +14740,17 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                                               "deref_requires_project_registry");
                     return;
                 }
-                if (hm && (rust_std_trait_collision(ctx, base, hm) ||
-                           rust_std_trait_collision(ctx, next, hm))) {
-                    rust_emit_trait_refusal(ctx, hm,
-                        rust_std_trait_collision(ctx, base, hm) ? base : next,
-                        "unrecognised_std_method");
-                    return;
+                if (hm) {
+                    RustStdCollision collision = rust_std_trait_collision(ctx, base, hm);
+                    const CBMType *collision_recv = base;
+                    if (!collision.reason) {
+                        collision = rust_std_trait_collision(ctx, next, hm);
+                        collision_recv = next;
+                    }
+                    if (collision.reason) {
+                        rust_emit_trait_refusal(ctx, hm, collision_recv, collision.reason);
+                        return;
+                    }
                 }
                 if (hm) {
                     const char *refusal = rust_method_receiver_refusal(ctx, hm, next);
@@ -14618,8 +14770,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
 
             if (scope_filtered) {
                 const CBMRegisteredFunc *candidate = rust_lookup_method(ctx, receiver_qn, mname);
-                if (rust_std_trait_collision(ctx, recv, candidate)) {
-                    rust_emit_trait_refusal(ctx, candidate, recv, "unrecognised_std_method");
+                RustStdCollision collision = rust_std_trait_collision(ctx, recv, candidate);
+                if (collision.reason) {
+                    rust_emit_trait_refusal(ctx, candidate, recv, collision.reason);
                     return;
                 }
                 rust_emit_unresolved_call(ctx, mname, "trait_scope_identity");
