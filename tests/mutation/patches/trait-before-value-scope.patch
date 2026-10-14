@@ -1,6 +1,15 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
+@@ -8855,7 +8855,7 @@
+     const char *inherent_stop = NULL;
+     const CBMRegisteredFunc *inh =
+         rust_registry_lookup_inherent_method_aliased(ctx, reg, receiver_type_qn, method_name,
+-                                                     &inherent_stop, recv);
++                                                     &inherent_stop, NULL);
+     if (inherent_stop) {
+         if (stop)
+             *stop = inherent_stop;
 @@ -8890,7 +8890,7 @@
      bool trait_ambiguous = false;
      bool scope_filtered = false; /* a candidate was dropped for this file's scope */

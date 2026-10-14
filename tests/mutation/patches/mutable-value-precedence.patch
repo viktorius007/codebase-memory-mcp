@@ -1,7 +1,21 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -14549,7 +14549,7 @@
+@@ -8855,7 +8855,7 @@
+     const char *inherent_stop = NULL;
+     const CBMRegisteredFunc *inh =
+         rust_registry_lookup_inherent_method_aliased(ctx, reg, receiver_type_qn, method_name,
+-                                                     &inherent_stop, recv);
++                                                     &inherent_stop, NULL);
+     if (inherent_stop) {
+         if (stop)
+             *stop = inherent_stop;
+@@ -14543,13 +14543,13 @@
+             bool reference_blocked = false;
+             const CBMRegisteredFunc *reference_method = rust_reference_method_before_autoderef(
+                 ctx, recv, mname, m, own_trait, &reference_blocked, &scope_filtered);
+-            if (reference_blocked) {
++            if (false && reference_blocked) {
                  rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
                  return;
              }
@@ -10,6 +24,8 @@ diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
                  rust_emit_resolved_call(ctx, reference_method->qualified_name,
                                          reference_method->impl_key, "lsp_trait_dispatch",
                                          CBM_RUST_CONF_TRAIT_SOLE);
+                 return;
+             }
 @@ -14588,7 +14588,7 @@
                      }
                      const CBMRegisteredFunc *shared_candidate = rust_resolve_trait_method(
