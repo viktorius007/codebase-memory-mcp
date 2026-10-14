@@ -681,7 +681,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 static int emit_unresolved_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                 const cbm_gbuf_node_t *source_node, const char *module_qn,
                                 const char **imp_keys, const char **imp_vals, int imp_count,
-                                const char *route_mount) {
+                                int candidate_count, const char *route_mount) {
     /* Resolution is empty when the callee belongs to an EXTERNAL client
      * library whose source is not in the indexed tree (e.g. `requests.get`,
      * `httpx.post`) — the import map skips it (no node) and no project symbol
@@ -701,8 +701,8 @@ static int emit_unresolved_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * apps. Classify by callee suffix + path-shaped first arg, exactly
      * like the parallel path's callee_suffix fallback; without this the
      * sequential path minted zero Route nodes for such files. */
-    if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
-        call->first_string_arg[0] == '/') {
+    if (candidate_count <= 1 && cbm_service_pattern_route_method(call->callee_name) != NULL &&
+        call->first_string_arg && call->first_string_arg[0] == '/') {
         handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count,
                                   route_mount);
         return SKIP_ONE;
@@ -1067,8 +1067,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         return SKIP_ONE;
     }
     if (!res.qualified_name || !res.qualified_name[0]) {
-        return emit_unresolved_call(ctx, call, source_node, module_qn, imp_keys, imp_vals,
-                                    imp_count, route_mount);
+        int emitted = emit_unresolved_call(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                           imp_count, res.candidate_count, route_mount);
+        if (!emitted) {
+            cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+                                                "name_binding_not_proven");
+        }
+        return emitted;
     }
 
     /* Perl call-graph noise guard (#476). Perl has no LSP resolver, so the

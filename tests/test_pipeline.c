@@ -3903,6 +3903,236 @@ static const usage_expectation_t rust_field_record_rows[] = {
     {"mkg", "n", "src/a.rs", 0, "Method"},
 };
 
+TEST(pipeline_module_import_is_stable_with_competing_manifest_name) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-import-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[workspace]\nmembers = [\"tool\", \"dep\"]\nresolver = \"2\"\n");
+    write_temp_file(tmp, "pyproject.toml", "[project]\nname = \"dep\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "dep/Cargo.toml",
+                    "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "dep/src/lib.rs", "pub mod args;\n");
+    write_temp_file(tmp, "dep/src/args.rs", "pub fn target() {}\n");
+    write_temp_file(tmp, "tool/Cargo.toml",
+                    "[package]\nname = \"tool\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    "[dependencies]\ndep = { path = \"../dep\" }\n");
+    write_temp_file(tmp, "tool/src/lib.rs",
+                    "use dep::args;\npub fn caller() { args::target(); }\n");
+    char *sets[2] = {NULL, NULL};
+    for (int run = 0; run < 2; run++) {
+        char db[512];
+        snprintf(db, sizeof(db), "%s/run%d.db", tmp, run);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        cbm_store_t *store = cbm_store_open_path(db);
+        ASSERT_NOT_NULL(store);
+        sqlite3_stmt *stmt = NULL;
+        ASSERT_EQ(
+            sqlite3_prepare_v2(cbm_store_get_db(store),
+                               "SELECT group_concat(link, char(10)) FROM (SELECT e.type || '|' || "
+                               "s.qualified_name || '|' || t.qualified_name AS link FROM edges e "
+                               "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+                               "ORDER BY link)",
+                               -1, &stmt, NULL),
+            SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        sets[run] = strdup((const char *)sqlite3_column_text(stmt, 0));
+        sqlite3_finalize(stmt);
+        ASSERT_EQ(sqlite3_prepare_v2(
+                      cbm_store_get_db(store),
+                      "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='IMPORTS' "
+                      "AND s.file_path='tool/src/lib.rs' AND t.file_path='dep/src/args.rs'",
+                      -1, &stmt, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+        cbm_pipeline_free(p);
+    }
+    ASSERT_STR_EQ(sets[0], sets[1]);
+    free(sets[0]);
+    free(sets[1]);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_same_language_suffix_without_binding_is_withheld) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-suffix-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "a.py", "def helper():\n    return 1\ndef get(key):\n    return key\n");
+    write_temp_file(tmp, "b.py", "def helper():\n    return 2\ndef get(key):\n    return key\n");
+    write_temp_file(tmp, "caller.py", "def caller(box):\n    helper()\n    box.get('value')\n    box.get('/route')\n");
+    const usage_expectation_t rows[] = {
+        {"caller", "helper", "a.py", 0, NULL},
+        {"caller", "helper", "b.py", 0, NULL},
+    };
+    int failed = edge_expectations_hold_in_both_modes(tmp, "CALLS", rows, 2);
+    ASSERT_EQ(failed, -1);
+    for (int mode = 0; mode < 2; mode++) {
+        char db[512];
+        snprintf(db, sizeof(db), "%s/%s.db", tmp, mode ? "parallel" : "sequential");
+        cbm_store_t *store = cbm_store_open_path(db);
+        ASSERT_NOT_NULL(store);
+        sqlite3_stmt *stmt = NULL;
+        ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+            "SELECT count(*) FROM unresolved_sites WHERE name='helper' "
+            "AND reason='name_binding_not_proven'", -1, &stmt, NULL), SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+        sqlite3_finalize(stmt);
+        ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+            "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+            "WHERE e.type='CALLS' AND s.file_path='caller.py'", -1, &stmt, NULL), SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_same_stem_schema_and_source_keep_definitions) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-identity-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "mod frame; pub fn caller() { frame::target(); }\n");
+    write_temp_file(tmp, "src/frame.rs", "pub struct Frame {}\npub fn target() {}\n");
+    write_temp_file(tmp, "src/frame.proto", "syntax = \"proto3\";\nmessage Frame {}\n");
+    write_temp_file(tmp, "src/frame.toml", "[Frame]\nx = 1\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/identity.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+                                 "SELECT count(DISTINCT file_path) FROM nodes WHERE name='Frame'",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 3);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(named_edge_to_file_count(store, cbm_pipeline_project_name(p), "CALLS", "caller",
+                                       "target", "src/frame.rs"),
+              1);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_parenthesized_indirect_call_records_stop) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-indirect-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "src/lib.rs", "pub fn indirect(f: fn()) { (f)(); }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/indirect.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  cbm_store_get_db(store),
+                  "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND "
+                  "reason='indirect_call_target_not_proven' AND site_end_byte > site_start_byte",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_macro_argument_without_definition_records_stop) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-macro-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "src/lib.rs",
+                    "pub struct Payload;\n"
+                    "macro_rules! accessor {\n"
+                    "    ($name:ident) => { impl Payload { pub fn $name(&self) -> Option<()> { None } } };\n"
+                    "}\naccessor!(generated_accessor);\n"
+                    "pub fn caller(x: Payload) { assert!(x.generated_accessor().is_none()); }\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/macro.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  cbm_store_get_db(store),
+                  "SELECT count(*) FROM unresolved_sites WHERE name='generated_accessor' AND "
+                  "reason='macro_invocation_not_proven' AND caller LIKE '%.caller' AND line=6 "
+                  "AND site_end_byte > site_start_byte",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_call_argument_properties_keep_utf8_boundaries) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-utf8-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char body[2048];
+    char ascii[256];
+    memset(ascii, 'a', sizeof(ascii) - 1);
+    ascii[sizeof(ascii) - 1] = '\0';
+    snprintf(body, sizeof(body),
+             "pub fn sink(_: &str) {}\npub fn caller() { sink(\"%.*sé€🙂\"); }\n", 118, ascii);
+    write_temp_file(tmp, "lib.rs", body);
+    for (int i = 0; i < 60; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pad%d.rs", i);
+        write_temp_file(tmp, name, "// parallel threshold\n");
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/utf8.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_type(store, cbm_pipeline_project_name(p), "CALLS", &edges, &count),
+        CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    yyjson_doc *doc = yyjson_read(edges[0].properties_json, strlen(edges[0].properties_json), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(doc), "args")), 1);
+    yyjson_doc_free(doc);
+    cbm_store_free_edges(edges, count);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable) {
     char tmp[256] = "/tmp/cbm_unresolved_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -11756,8 +11986,8 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
             break;
         case 5:
             correct =
-                rust_inline_variable_edges("src.schema", "src.schema.Loader", store, project) &&
-                !rust_inline_variable_edges("src.schema", "src.lib.Loader", store, project);
+                rust_inline_variable_edges("src.schema.proto", "src.schema.proto.Loader", store, project) &&
+                !rust_inline_variable_edges("src.schema.proto", "src.lib.Loader", store, project);
             break;
         case 6:
             correct = rust_inline_variable_edges("src.lib.child.reference", "src.lib.child.target",
@@ -19265,9 +19495,7 @@ TEST(registry_confidence_suffix_match) {
     cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.svcA.caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "proj.svcA.Process");
-    ASSERT(r.confidence > 0.50 && r.confidence <= 0.60);
-    ASSERT_STR_EQ(r.strategy, "suffix_match");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
@@ -19438,7 +19666,7 @@ TEST(registry_negative_import_rejects) {
     const char *keys[] = {"handler"};
     const char *vals[] = {"proj.handler"};
     cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.caller", keys, vals, 1);
-    ASSERT_STR_EQ(r.qualified_name, "proj.handler.Process");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
@@ -25115,6 +25343,13 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_fixture_node_count_requires_exact_source_nodes);
     RUN_TEST(pipeline_nested_fixture_graph_has_endpoints);
     RUN_TEST(pipeline_lsp_surface_large_object_array_decode);
+    RUN_TEST(pipeline_module_import_is_stable_with_competing_manifest_name);
+    RUN_TEST(pipeline_same_language_suffix_without_binding_is_withheld);
+    RUN_TEST(pipeline_same_stem_schema_and_source_keep_definitions);
+    RUN_TEST(pipeline_parenthesized_indirect_call_records_stop);
+    RUN_TEST(pipeline_macro_argument_without_definition_records_stop);
+    RUN_TEST(pipeline_call_argument_properties_keep_utf8_boundaries);
+
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -25680,6 +25915,13 @@ SUITE(pipeline_semantic_manifest_repro) {
 }
 
 SUITE(pipeline_unresolved) {
+    RUN_TEST(pipeline_module_import_is_stable_with_competing_manifest_name);
+    RUN_TEST(pipeline_same_language_suffix_without_binding_is_withheld);
+    RUN_TEST(pipeline_same_stem_schema_and_source_keep_definitions);
+    RUN_TEST(pipeline_parenthesized_indirect_call_records_stop);
+    RUN_TEST(pipeline_macro_argument_without_definition_records_stop);
+    RUN_TEST(pipeline_call_argument_properties_keep_utf8_boundaries);
+
     RUN_TEST(pipeline_rust_unresolved_sites_are_recorded_and_queryable);
     RUN_TEST(pipeline_rust_filtered_references_and_multiline_calls_are_recorded);
 }

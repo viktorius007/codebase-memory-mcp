@@ -460,6 +460,9 @@ static inline const char *cbm_pipeline_plain_call_closure(CBMLanguage lang, cons
     if (!call || !module_qn || !call->callee_name || !call->enclosing_func_qn) {
         return "malformed_carrier";
     }
+    if (call->callee_name[0] == '(' && call->callee_name[strlen(call->callee_name) - 1] == ')') {
+        return "indirect_call_target_not_proven";
+    }
     if (!resolved || !resolved->callee_qn || !resolved->strategy) {
         return "no_resolution";
     }

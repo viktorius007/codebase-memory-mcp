@@ -1957,11 +1957,12 @@ typedef struct {
 /* Sanitize expression string for JSON (in-place). */
 static void sanitize_expr(char *expr_buf, const char *expr) {
     if (expr) {
-        snprintf(expr_buf, 128, "%.*s", 120, expr);
-        /* The 120-byte cut can land inside a multibyte character; a torn
-         * sequence persisted as invalid UTF-8 in edge properties (2026-09-16
-         * probe: rust, java, typescript stores). */
-        cbm_utf8_trim_partial(expr_buf);
+        size_t length = strnlen(expr, 120);
+        while (length > 0 && ((unsigned char)expr[length] & 0xc0) == 0x80) {
+            length--;
+        }
+        memcpy(expr_buf, expr, length);
+        expr_buf[length] = '\0';
         for (char *p = expr_buf; *p; p++) {
             if (*p == '"') {
                 *p = '\'';
@@ -3132,7 +3133,9 @@ static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_st
     }
 
     if (!res->qualified_name || res->qualified_name[0] == '\0') {
-        if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
+        if (res->candidate_count <= 1 &&
+            cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
             cbm_resolution_t fake_res = {
                 .qualified_name = call->callee_name,
                 .confidence = PP_HALF_CONF,
@@ -3145,6 +3148,7 @@ static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_st
             emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                               fc->module_qn, rc->registry, rc->main_gbuf, fc->imp_keys,
                               fc->imp_vals, fc->imp_count, true, fc->route_mount, NULL);
+            return true;
         } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
             /* Native `fetch()` (#856): only the global API once resolution
              * has failed to find a local/imported `fetch`. Call the low-level
@@ -3160,9 +3164,10 @@ static bool emit_file_call_service_fallback(resolve_ctx_t *rc, resolve_worker_st
                 };
                 emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
                                              CBM_SVC_HTTP, u);
+                return true;
             }
         }
-        return true;
+        return false;
     }
     return false;
 }
@@ -3290,6 +3295,11 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
      * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
      * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
     if (emit_file_call_service_fallback(rc, ws, fc, call, source_node, &res)) {
+        return;
+    }
+    if (!res.qualified_name || !res.qualified_name[0]) {
+        cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call, NULL,
+                                            "name_binding_not_proven");
         return;
     }
     /* Reuse lsp_target as target_node when LSP resolved — avoids a

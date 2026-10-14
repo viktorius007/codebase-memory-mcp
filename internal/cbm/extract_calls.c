@@ -2289,6 +2289,13 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
         }
     }
 
+    if (lang == CBM_LANG_RUST) {
+        TSNode function = ts_node_child_by_field_name(node, TS_FIELD("function"));
+        if (!ts_node_is_null(function) &&
+            strcmp(ts_node_type(function), "parenthesized_expression") == 0) {
+            return cbm_node_text(a, function, source);
+        }
+    }
     // Try common field-based resolution first
     char *name = extract_callee_from_fields(a, node, source);
     if (name) {

@@ -1779,8 +1779,18 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang) {
 // --- FQN computation ---
 // Mirrors Go's fqn.Compute(): project + path_parts_dotted + name
 
+/* Schema and configuration files are independent modules, never source
+ * declaration/definition companions. Retain their extension namespace. */
+bool cbm_fqn_preserves_extension(const char *path) {
+    const char *ext = strrchr(path, '.');
+    return ext && (strcmp(ext, ".proto") == 0 || strcmp(ext, ".toml") == 0);
+}
+
 // Internal helper: find extension start in basename (returns length without ext)
 static size_t strip_ext_len(const char *s, size_t len) {
+    if (cbm_fqn_preserves_extension(s)) {
+        return len;
+    }
     for (size_t i = len; i > 0; i--) {
         if (s[i - SKIP_ONE] == '.') {
             /* A dot at the very start of a filename segment (index 0, or right
