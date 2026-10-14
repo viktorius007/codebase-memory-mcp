@@ -19,3 +19,19 @@ diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
                  return NULL;
              }
          }
+@@ -14544,6 +14544,6 @@
+             const CBMRegisteredFunc *reference_method = rust_reference_method_before_autoderef(
+                 ctx, recv, mname, m, own_trait, &reference_blocked, &scope_filtered);
+-            if (reference_blocked) {
++            if (false && reference_blocked) {
+                 rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
+                 return;
+             }
+@@ -14601,6 +14601,6 @@
+                     }
+                 }
+-                if (rust_reference_impl_may_precede(ctx, recv, m)) {
++                if (false && rust_reference_impl_may_precede(ctx, recv, m)) {
+                     rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
+                     return;
+                 }
