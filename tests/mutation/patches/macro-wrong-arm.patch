@@ -1,31 +1,12 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
-index b46cc84e..2137bff5 100644
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -3549,16 +3549,6 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
-     int inv_args_len = 0;
-     if (!ts_node_is_null(invocation)) {
-         TSNode args_tt = ts_node_child_by_field_name(invocation, "arguments", 9);
--        if (ts_node_is_null(args_tt)) {
--            uint32_t child_count = ts_node_child_count(invocation);
--            for (uint32_t i = 0; i < child_count; i++) {
--                TSNode child = ts_node_child(invocation, i);
--                if (!ts_node_is_null(child) && strcmp(ts_node_type(child), "token_tree") == 0) {
--                    args_tt = child;
--                    break;
--                }
--            }
--        }
-         if (!ts_node_is_null(args_tt)) {
-             char *at = cbm_node_text(ctx->arena, args_tt, ctx->source);
-             if (at) {
-@@ -3581,6 +3571,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
+@@ -9941,7 +9941,7 @@
+                                           env);
+         if (matched == MACRO_UNMODELLED)
+             break;
+-        if (matched >= 0) {
++        if (matched >= 0 || !hit) {
              hit = r;
              break;
          }
-+        /* Historical defect: absent arguments selected a wrong arm. */
-+        if (!hit)
-+            hit = r;
-     }
-     if (!hit || !hit->transcriber_text || hit->transcriber_len <= 0)
-         return;

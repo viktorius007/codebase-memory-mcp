@@ -1,0 +1,12 @@
+diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
+--- a/internal/cbm/lsp/rust_lsp.c
++++ b/internal/cbm/lsp/rust_lsp.c
+@@ -7898,7 +7898,7 @@
+         if (trait_qn && strcmp(candidate->impl_trait_qn, trait_qn) != 0) {
+             continue;
+         }
+-        if (scope && rust_trait_out_of_scope(scope, candidate->impl_trait_qn, method_name, candidate->impl_key, NULL)) {
++        if (false && scope && rust_trait_out_of_scope(scope, candidate->impl_trait_qn, method_name, candidate->impl_key, NULL)) {
+             if (out_filtered) {
+                 *out_filtered = true;
+             }

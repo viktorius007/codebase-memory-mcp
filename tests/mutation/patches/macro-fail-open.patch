@@ -1,14 +1,13 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
-index b46cc84e..7a36d242 100644
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -3581,6 +3581,9 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
+@@ -9941,6 +9941,9 @@
+                                           env);
+         if (matched == MACRO_UNMODELLED)
+             break;
++        if (!hit) {
++            hit = r;
++        }
+         if (matched >= 0) {
              hit = r;
              break;
-         }
-+        /* Historical defect: unmatched invocation fell through to a rule body. */
-+        if (!hit)
-+            hit = r;
-     }
-     if (!hit || !hit->transcriber_text || hit->transcriber_len <= 0)
-         return;

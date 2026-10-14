@@ -9,7 +9,6 @@ name: PR
 
 on:
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -118,6 +117,7 @@ jobs:
       full: ${{ steps.select.outputs.full }}
       lanes: ${{ steps.select.outputs.lanes }}
       smoke: ${{ steps.select.outputs.smoke }}
+      rust: ${{ steps.rust.outputs.rust }}
     steps:
       - name: List the changed files
         env:
@@ -149,6 +149,15 @@ jobs:
           printf '%s\n' "$FILES" > "$RUNNER_TEMP/changed-files.txt"
           cat "$RUNNER_TEMP/changed-files.txt"
 
+      - name: Select Rust mutation lane
+        id: rust
+        run: |
+          if grep -E '^(internal/cbm/|src/pipeline/|tests/|scripts/(rust-scanner-mutation|ccache-env|test)\.sh|Makefile\.cbm|\.github/workflows/)' "$RUNNER_TEMP/changed-files.txt" >/dev/null; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # The selector is PR code: it runs in its own step, after the
       # token-bearing one, from a checkout that keeps no credentials.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -170,6 +179,31 @@ jobs:
           SMOKE='[{"os":"ubuntu-latest","lane":"smoke-ubuntu"},{"os":"macos-14","lane":"smoke-mac"},{"os":"windows-latest","lane":"smoke-win"}]'
           LANES=$(sed -n 's/^lanes=//p' "$RUNNER_TEMP/selection.txt")
           echo "smoke={\"include\":$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$SMOKE")}" >> "$GITHUB_OUTPUT"
+
+  mutation-rust:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: Run seeded Rust mutation lane
+        run: make -f Makefile.cbm mutation-rust
+        env:
+          CBM_MUTATION_JOBS: 4
+          CBM_MUTATION_BUILD_DIR: ${{ runner.temp }}/mutation-rust
+          CBM_RUNTIME_DIR: ${{ runner.temp }}/mutation-runtime
+          CBM_CACHE_DIR: ${{ runner.temp }}/mutation-cache
+          CBM_NO_CCACHE: "1"
+      - name: Mutation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-rust
+          path: ${{ runner.temp }}/mutation-rust/artifacts
+
 
   # ── Light smoke: build the PRODUCTION binary and run the core smoke on the
   #    three RELIABLE NATIVE platforms. Catches built-binary regressions at PR
@@ -347,7 +381,7 @@ jobs:
     # every lane the selector chose ran green: `skipped` is OK only for a lane
     # nobody selected (a selected lane that skipped is a silent gate loss).
     # memwaste and the test-impact shadow are report-only and not needed here.
-    needs: [changes, security, lint, test, pr-smoke, contracts]
+    needs: [changes, security, lint, test, pr-smoke, contracts, mutation-rust]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

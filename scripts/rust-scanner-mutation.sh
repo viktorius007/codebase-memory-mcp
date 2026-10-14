@@ -265,11 +265,13 @@ printf 'seed\toutcome\tdetail\n' >"$ARTIFACT_DIR/results.tsv"
 while IFS=$'\t' read -r seed_id patch_path suite failure_regex; do
     total=$((total + 1))
     STEP="running seed $seed_id"
-    seed_root="$BUILD_ROOT/seeds/$seed_id"
+    seed_root="$BUILD_ROOT/seed"
+    # Keep one disposable snapshot: full grammar sources dominate disk usage.
+    rm -rf "$seed_root"
     seed_log_dir="$ARTIFACT_DIR/$seed_id"
     mkdir -p "$seed_root" "$seed_log_dir"
-    if ! cp -cR "$BASELINE/." "$seed_root" 2>"$seed_log_dir/copy.log"; then
-        cp -R "$BASELINE/." "$seed_root" 2>>"$seed_log_dir/copy.log"
+    if ! cp -cpR "$BASELINE/." "$seed_root" 2>"$seed_log_dir/copy.log"; then
+        cp -pR "$BASELINE/." "$seed_root" 2>>"$seed_log_dir/copy.log"
     fi
 
     if ! grep -Fxq "$suite" "$ARTIFACT_DIR/baseline-suites.txt"; then
@@ -352,6 +354,8 @@ while IFS=$'\t' read -r seed_id patch_path suite failure_regex; do
             >>"$ARTIFACT_DIR/results.tsv"
     fi
 done <"$SEED_TABLE"
+
+rm -rf "$BUILD_ROOT/seed"
 
 STEP="verifying source checkout remained unchanged"
 if ! FINAL_STATE="$(checkout_state 2>>"$ARTIFACT_DIR/checkout-state.log")"; then

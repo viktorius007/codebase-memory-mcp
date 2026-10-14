@@ -4,3 +4,10 @@ macro-wrong-arm	tests/mutation/patches/macro-wrong-arm.patch	rust_lsp	rustlsp_ga
 cargo-parallel-manifest-loss	tests/mutation/patches/cargo-parallel-manifest-loss.patch	pipeline	assert_rust_cargo_route\(&parallel\) == 1, expected 0 == 0
 cargo-incremental-manifest-loss	tests/mutation/patches/cargo-incremental-manifest-loss.patch	pipeline	assert_rust_cargo_route\(&incremental\) == 1, expected 0 == 0
 impl-return-loss	tests/mutation/patches/impl-return-loss.patch	extraction	rust_struct.*"\(null\)" != "Self"
+trait-scope-filter	tests/mutation/patches/trait-scope-filter.patch	pipeline	Rust module-tree mismatch: .*case="visible trait survives hidden candidate".*found=0
+trait-before-value-scope	tests/mutation/patches/trait-before-value-scope.patch	pipeline	Rust module-tree mismatch: .*case="unproved trait before value".*found=1
+default-trait-ambiguity	tests/mutation/patches/default-trait-ambiguity.patch	pipeline	Rust module-tree mismatch: .*case="competing default (loud|quiet)".*found=1
+conversion-impl-ambiguity	tests/mutation/patches/conversion-impl-ambiguity.patch	pipeline	Rust module-tree mismatch: .*case="(shared|mutable) conversion unproved".*found=1
+inherent-item-ambiguity	tests/mutation/patches/inherent-item-ambiguity.patch	pipeline	Rust module-tree mismatch: .*case="generic inherent (first|second) unproved".*found=1
+mutable-value-precedence	tests/mutation/patches/mutable-value-precedence.patch	pipeline	Rust module-tree mismatch: .*case="mutable receiver value unproved".*found=1
+# 2026-10-07: scope-negative-memo moved to pending after its one permitted attempt survived.

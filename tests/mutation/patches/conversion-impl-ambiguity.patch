@@ -1,0 +1,12 @@
+diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
+--- a/internal/cbm/lsp/rust_lsp.c
++++ b/internal/cbm/lsp/rust_lsp.c
+@@ -11788,7 +11788,7 @@
+             same_base++;
+         }
+         if (rust_param_type_is(ctx, param, arg, 0)) {
+-            if (exact && strcmp(exact->impl_key, f->impl_key) != 0) {
++            if (false && exact && strcmp(exact->impl_key, f->impl_key) != 0) {
+                 return NULL;
+             }
+             exact = f;
