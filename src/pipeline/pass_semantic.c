@@ -185,7 +185,7 @@ static const char *resolve_as_class(const cbm_registry_t *reg, const cbm_gbuf_t 
                                     const char **imp_vals, int imp_count, CBMLanguage lang,
                                     int *candidate_count) {
     cbm_resolution_t res =
-        cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
+        cbm_registry_resolve_lang(reg, name, module_qn, imp_keys, imp_vals, imp_count, lang);
     if (candidate_count) {
         *candidate_count = res.candidate_count;
     }
@@ -598,8 +598,8 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     if (func_name[0] == '\0') {
         return;
     }
-    cbm_resolution_t res =
-        cbm_registry_resolve(ctx->registry, func_name, module_qn, imp_keys, imp_vals, imp_count);
+    cbm_resolution_t res = cbm_registry_resolve_lang(ctx->registry, func_name, module_qn, imp_keys,
+                                                     imp_vals, imp_count, lang);
     if ((!res.qualified_name || res.qualified_name[0] == '\0') && !strchr(func_name, '.')) {
         /* C# attributes are referenced by their short name (`[Log]`) but declared
          * with the conventional `Attribute` suffix (`class LogAttribute`).  Retry
@@ -607,8 +607,8 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
         char with_suffix[CBM_SZ_256];
         int wn = snprintf(with_suffix, sizeof(with_suffix), "%sAttribute", func_name);
         if (wn > 0 && (size_t)wn < sizeof(with_suffix)) {
-            res = cbm_registry_resolve(ctx->registry, with_suffix, module_qn, imp_keys, imp_vals,
-                                       imp_count);
+            res = cbm_registry_resolve_lang(ctx->registry, with_suffix, module_qn, imp_keys,
+                                            imp_vals, imp_count, lang);
         }
     }
     const cbm_gbuf_node_t *dec = NULL;
@@ -657,17 +657,23 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
                                   const cbm_file_info_t *fi, const CBMFileResult *result,
                                   const char *module_qn, const char **imp_keys,
                                   const char **imp_vals, int imp_count, int *inherits_count,
-                                  int *decorates_count) {
+                                  int *decorates_count, CBMLanguage lang,
+                                  const cbm_php_vendor_names_t *php_vendor) {
     if (!def->qualified_name) {
         return;
     }
-    CBMLanguage lang = fi->language;
     const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
     if (!node) {
         return;
     }
     if (def->base_classes) {
         for (int b = 0; def->base_classes[b]; b++) {
+            /* #1186: `extends Request` with `use Saloon\Http\Request` names the
+             * vendor class, never a same-named project class. Mirrors
+             * pass_parallel.c. */
+            if (cbm_pipeline_php_vendor_bound(php_vendor, def->base_classes[b])) {
+                continue;
+            }
             int candidate_count = 0;
             const char *base_qn =
                 resolve_as_class(ctx->registry, ctx->gbuf, def->base_classes[b], module_qn,
@@ -826,13 +832,13 @@ static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
         const char *trait_qn = resolve_as_class(ctx->registry, ctx->gbuf, it->trait_name, module_qn,
-                                                imp_keys, imp_vals, imp_count, lang, NULL);
+                                                imp_keys, imp_vals, imp_count, CBM_LANG_RUST, NULL);
         if (!trait_qn) {
             continue;
         }
         const char *struct_qn =
             resolve_as_class(ctx->registry, ctx->gbuf, it->struct_name, module_qn, imp_keys,
-                             imp_vals, imp_count, lang, NULL);
+                             imp_vals, imp_count, CBM_LANG_RUST, NULL);
         if (!struct_qn) {
             continue;
         }
@@ -886,6 +892,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_vals = NULL;
         int imp_count = 0;
         build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_php_vendor_names_t php_vendor;
+        cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       ps_module_is_dir(files[i].language));
@@ -893,7 +901,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         /* ── INHERITS + DECORATES from definitions ──────────────── */
         for (int d = 0; d < result->defs.count; d++) {
             sem_process_def_edges(ctx, &result->defs.items[d], &files[i], result, module_qn,
-                                  imp_keys, imp_vals, imp_count, &inherits_count, &decorates_count);
+                                  imp_keys, imp_vals, imp_count, &inherits_count, &decorates_count,
+                                  files[i].language, &php_vendor);
         }
 
         /* Textual Rust impl names are not a semantic identity oracle. */
@@ -905,6 +914,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         }
 
         free(module_qn);
+        cbm_pipeline_php_vendor_names_free(&php_vendor);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);

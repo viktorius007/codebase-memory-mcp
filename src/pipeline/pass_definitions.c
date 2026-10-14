@@ -312,9 +312,10 @@ void cbm_pipeline_build_def_props(char *buf, size_t bufsize, const CBMDefinition
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
-    /* Right after the docstring: the buffer is sized for exactly these two
-     * uncapped fields (pd_props_buf), so neither can be squeezed out. */
+    /* Right after the docstring: the buffer is sized for exactly these three
+     * uncapped fields (pd_props_buf), so none can be squeezed out. */
     append_json_raw(buf, bufsize, &pos, "variants", def->variants);
+    append_json_string(buf, bufsize, &pos, "variant_key", def->variant_key);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
     append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
@@ -356,10 +357,10 @@ void cbm_pipeline_build_def_props(char *buf, size_t bufsize, const CBMDefinition
 }
 
 /* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring and variants fields, which have no length cap (a field
- * that does not fit is dropped whole). Returns `stack` for a def with neither,
- * or when the larger buffer cannot be allocated. Twin of pass_parallel.c --
- * keep both in sync. */
+ * serialized docstring, variants and variant_key fields, which have no length
+ * cap (a field that does not fit is dropped whole). Returns `stack` for a def
+ * with none of them, or when the larger buffer cannot be allocated. Twin of
+ * pass_parallel.c -- keep both in sync. */
 static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     size_t need = *size;
     if (def->docstring && def->docstring[0]) {
@@ -367,6 +368,10 @@ static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     }
     if (def->variants && def->variants[0]) {
         need += strlen("variants") + strlen(def->variants) + PD_JSON_FIELD_OVERHEAD;
+    }
+    if (def->variant_key && def->variant_key[0]) {
+        need +=
+            strlen("variant_key") + def_json_escaped_len(def->variant_key) + PD_JSON_FIELD_OVERHEAD;
     }
     if (need == *size) {
         return stack;
@@ -422,9 +427,15 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     size_t props_size = sizeof(stack);
     char *props = pd_props_buf(def, stack, &props_size);
     cbm_pipeline_build_def_props(props, props_size, def);
-    int64_t node_id = cbm_gbuf_upsert_node(
-        ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
-        def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    const char *def_rel = def->file_path ? def->file_path : rel;
+    char marked[CBM_SZ_4K];
+    const char *qn = def->label && strcmp(def->label, "Module") == 0
+                         ? cbm_stem_marks_module_qn(ctx->stem_marks, def->qualified_name, def_rel,
+                                                    lang, marked, sizeof(marked))
+                         : def->qualified_name;
+    int64_t node_id =
+        cbm_gbuf_upsert_node(ctx->gbuf, def->label ? def->label : "Function", def->name, qn,
+                             def_rel, (int)def->start_line, (int)def->end_line, props);
     if (props != stack) {
         cbm_free(CBM_MEM_CLASS_GBUF_STRING, props);
     }
@@ -562,15 +573,20 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         free(file_qn);
         return 0;
     }
-    for (int j = 0; j < result->imports.count; j++) {
-        const CBMImport *imp = &result->imports.items[j];
-        if (!imp->module_path) {
-            continue;
+    if (cbm_language_for_filename(rel) == CBM_LANG_PHP) {
+        count = cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source_node,
+                                                     namespace_map);
+    } else {
+        for (int j = 0; j < result->imports.count; j++) {
+            const CBMImport *imp = &result->imports.items[j];
+            if (!imp->module_path) {
+                continue;
+            }
+            if (rust) {
+                cbm_pipeline_rust_imports_add(ctx, rel, imp);
+            }
+            count += cbm_pipeline_link_import(ctx, source_node, rel, file_qn, imp, namespace_map);
         }
-        if (rust) {
-            cbm_pipeline_rust_imports_add(ctx, rel, imp);
-        }
-        count += cbm_pipeline_link_import(ctx, source_node, rel, file_qn, imp, namespace_map);
     }
     count += cbm_pipeline_link_scoped_imports(ctx, source_node, rel, result);
     free(file_qn);
