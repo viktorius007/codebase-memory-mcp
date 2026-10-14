@@ -342,8 +342,8 @@ const char *cbm_rust_cfg_scope_qn(CBMArena *a, TSNode func_node, const char *sou
  * asks the file's definitions; the resolver (rust_lsp.c) asks its registry. */
 const char *cbm_rust_line_qualified_qn(CBMArena *a, const char *qn, unsigned start_line);
 
-/* Rust item identity: file module plus every enclosing inline `mod` name,
- * then `name`. The item's own module name belongs in `name`, not the prefix. */
+/* Rust item identity: file module, inline mods and a block item's byte position,
+ * then `name`. An impl shares the identity of its declaring type. */
 const char *cbm_rust_item_qn(CBMArena *a, TSNode node, const char *source, const char *module_qn,
                              const char *name);
 

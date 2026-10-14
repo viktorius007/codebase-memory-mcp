@@ -66,6 +66,7 @@ typedef struct {
     int source_len;
     const char *root_source; /* immutable original file buffer */
     int root_source_len;
+    TSNode root_node; /* borrowed original tree for block declaration types */
 
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
