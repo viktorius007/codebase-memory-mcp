@@ -11344,7 +11344,7 @@ typedef struct {
 } RustReceiverCase;
 
 static int check_rust_receiver_calls(const char *source, const RustReceiverCase *cases, int count) {
-    char tmp[256] = "/tmp/w1-D/receiver_XXXXXX";
+    char tmp[256] = "/tmp/cbm_rust_receiver_XXXXXX";
     if (!cbm_mkdtemp(tmp))
         return -1;
     write_temp_file(tmp, "Cargo.toml",
