@@ -1,12 +1,12 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -13114,7 +13114,7 @@
-                     (m->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0) {
+@@ -14588,7 +14588,7 @@
+                     }
                      const CBMRegisteredFunc *shared_candidate = rust_resolve_trait_method(
-                         ctx, type_qn, mname, NULL, NULL, true);
+                         ctx, type_qn, mname, NULL, NULL, true, true, NULL, NULL, recv);
 -                    if (shared_candidate != m) {
 +                    if (false && shared_candidate != m) {
-                         return;
-                     }
-                 }
+                         if ((m->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0) {
+                             rust_emit_unresolved_call(ctx, mname,
+                                                       "trait_mutable_dispatch_unproved");
