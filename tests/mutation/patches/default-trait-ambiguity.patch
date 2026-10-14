@@ -1,7 +1,16 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -8274,7 +8274,7 @@
+@@ -8954,7 +8954,7 @@
+             if (!candidate) {
+                 continue;
+             }
+-            if (seen_default_trait && strcmp(seen_default_trait, trait_qn) != 0) {
++            if (false && seen_default_trait && strcmp(seen_default_trait, trait_qn) != 0) {
+                 if (out_impl_count) {
+                     *out_impl_count = 2;
+                 }
+@@ -8971,7 +8971,7 @@
              if (inh && !proved) {
                  return NULL;
              }

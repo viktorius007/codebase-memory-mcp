@@ -64,6 +64,11 @@ CANONICAL = re.compile(
     r"|scripts/test-windows\.ps1"
     r"|pkg/glama/verify\.sh"
 )
+# The mutation lane's public entry is deliberately the Make target: it keeps
+# local and CI invocation identical while the target delegates immediately to
+# scripts/rust-scanner-mutation.sh.  Admit only that exact target, never make
+# generally, so another product-exercising recipe remains a contract failure.
+CANONICAL_MAKE = re.compile(r"^make\s+-f\s+Makefile\.cbm\s+mutation-rust\s*$")
 
 # ── Layer 1: forbidden in ANY workflow (the known drift signatures) ──
 FORBIDDEN = [
@@ -160,6 +165,8 @@ def classify_line(line: str, allowed: set[str]) -> bool:
     if first in {"bash", "sh", "pwsh", "powershell", "powershell.exe", "&"}:
         # interpreter prefix: the thing being run must itself be canonical
         return bool(CANONICAL.search(s))
+    if CANONICAL_MAKE.fullmatch(s):
+        return True
     if CANONICAL.search(s):
         return True
     # data fragments: quoted strings, JSON, heredoc bodies, YAML-ish keys

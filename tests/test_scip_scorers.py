@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SITE_SCORER = ROOT / "scripts" / "scip-site-join.py"
 HARNESS_SCORER = ROOT / "scripts" / "scip-harness-join.py"
 SITES_INVENTORY = ROOT / "scripts" / "scip_rust_sites.py"
+IDENTITY_SCORER = ROOT / "scripts" / "scip_rust_identity.py"
 
 
 def varint(value):
@@ -239,6 +240,20 @@ class ScorerFixture:
 
 
 class ScipScorerTests(unittest.TestCase):
+    def test_scorer_modules_import_on_supported_python(self):
+        modules = (
+            ("scip_rust_sites_import_contract", SITES_INVENTORY, "ScoredEdge"),
+            ("scip_rust_identity_import_contract", IDENTITY_SCORER, "IdentityOutcome"),
+        )
+        for name, path, exported_type in modules:
+            with self.subTest(module=name):
+                spec = importlib.util.spec_from_file_location(name, path)
+                module = importlib.util.module_from_spec(spec)
+
+                spec.loader.exec_module(module)
+
+                self.assertTrue(hasattr(module, exported_type))
+
     def test_external_oracle_target_is_compared_with_published_target(self):
         source = "fn target() {}\nfn caller() { target(); }\n"
         with tempfile.TemporaryDirectory() as temporary:
