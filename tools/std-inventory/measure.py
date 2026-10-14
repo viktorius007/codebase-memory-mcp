@@ -38,9 +38,10 @@ def measurement_sql(methods, stamps, aliases):
   WHERE kind='call' AND reason='unrecognised_std_method'
     AND j.key=json_array_length('["' || replace(name,'.','","') || '"]')-1
 ), classified AS (
- SELECT CASE
+ SELECT sites.qn AS receiver_type, sites.method, CASE
    WHEN inventory.method IS NOT NULL THEN 'listed'
    WHEN stamps.status='complete' THEN 'unlisted-complete'
+   WHEN stamps.status='complete_except_deref' THEN 'unlisted-except-deref'
    WHEN stamps.status='incomplete' THEN 'unlisted-incomplete'
    ELSE 'not-covered' END AS class
  FROM sites LEFT JOIN aliases USING(qn)
@@ -49,6 +50,7 @@ def measurement_sql(methods, stamps, aliases):
 )
 SELECT labels.class,count(classified.class)
 FROM (SELECT 'listed' AS class UNION ALL SELECT 'unlisted-complete'
+      UNION ALL SELECT 'unlisted-except-deref'
       UNION ALL SELECT 'unlisted-incomplete' UNION ALL SELECT 'not-covered') AS labels
 LEFT JOIN classified USING(class)
 GROUP BY labels.class ORDER BY labels.class;''')
@@ -59,6 +61,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('db', type=Path)
     parser.add_argument('--sql-out', type=Path, required=True)
+    parser.add_argument('--pairs-out', type=Path, help='write receiver/method/class/site counts as TSV')
     args = parser.parse_args()
     header = ROOT / 'internal/cbm/lsp/rust_std_inventory.h'
     methods = read_rows(header, 'CBM_STD_METHOD')
@@ -69,13 +72,20 @@ def main():
         if ident in aliases:
             aliases[qn] = ident
     sql = measurement_sql(methods, stamps, aliases)
-    args.sql_out.write_text(sql)
+    query = sql[sql.index('WITH sites AS'):]
+    pair_query = query[:query.index('SELECT labels.class')] + (
+        'SELECT receiver_type,method,class,count(*) AS sites FROM classified '
+        'GROUP BY receiver_type,method,class ORDER BY receiver_type,method,class;')
+    args.sql_out.write_text(sql + pair_query + '\n')
     with sqlite3.connect(args.db.resolve().as_uri() + '?mode=ro', uri=True) as db:
         db.executescript(sql)
         # executescript discards SELECT results; execute the final SELECT separately.
-        query = sql[sql.index('WITH sites AS'):]
         counts = dict(db.execute(query))
+        pairs = db.execute(pair_query).fetchall()
         gaps = db.execute((ROOT / 'tools/rust-audit/std-method-gaps.sql').read_text()).fetchall()
+    if args.pairs_out:
+        args.pairs_out.write_text('receiver_type\tmethod\tclass\tsites\n' +
+                                  ''.join('\t'.join(map(str, row)) + '\n' for row in pairs))
     covered = {r[0] for r in stamps}
     missing = sorted({r[0] for r in gaps if aliases.get(r[0]) not in covered})
     status = 'FAIL' if missing or counts.get('not-covered', 0) else 'PASS'
