@@ -11629,14 +11629,61 @@ static const CBMRegisteredFunc *rust_trait_method_for_type(RustLSPContext *ctx,
 static const CBMRegisteredFunc *rust_trait_ufcs_by_receiver(RustLSPContext *ctx,
                                                             const char *trait_qn,
                                                             const char *method_name,
-                                                            TSNode receiver) {
+                                                            TSNode receiver, const char **refusal) {
+    *refusal = NULL;
     if (ts_node_is_null(receiver)) {
         return NULL;
     }
+    const CBMRegisteredFunc *declaration =
+        rust_lookup_method_in_trait_own(ctx, trait_qn, method_name, true);
     const CBMType *base = rust_eval_expr_type(ctx, receiver);
-    while (base && (base->kind == CBM_TYPE_REFERENCE || base->kind == CBM_TYPE_POINTER)) {
-        base = base->kind == CBM_TYPE_REFERENCE ? base->data.reference.elem
-                                                : base->data.pointer.elem;
+    /* External trait seeds can omit the receiver declaration; the concrete
+     * impl still proves whether one borrow belongs to the method's self. */
+    if (!declaration && base && base->kind == CBM_TYPE_REFERENCE) {
+        const CBMType *referent = base->data.reference.elem;
+        const char *head = referent && referent->kind == CBM_TYPE_NAMED
+                               ? referent->data.named.qualified_name
+                           : referent && referent->kind == CBM_TYPE_TEMPLATE
+                               ? referent->data.template_type.template_name
+                               : NULL;
+        const char *registered = head ? rust_registered_type_qn(ctx, head) : NULL;
+        declaration =
+            registered ? rust_trait_method_for_type(ctx, registered, trait_qn, method_name) : NULL;
+    }
+    /* UFCS has no autoderef search: a borrowed self consumes one layer,
+     * leaving the implementation's Self, including any reference layers. */
+    if (declaration && !(declaration->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) && base &&
+        base->kind == CBM_TYPE_REFERENCE) {
+        base = base->data.reference.elem;
+    }
+    if (base && base->kind == CBM_TYPE_REFERENCE) {
+        const CBMRegisteredFunc *selected = NULL;
+        CBMMethodIter it;
+        cbm_registry_methods_chain(ctx->registry, "core.reference", method_name, &it);
+        for (int i; (i = cbm_method_iter_next(&it)) >= 0;) {
+            const CBMRegisteredFunc *candidate = &it.reg->funcs[i];
+            if (!candidate->impl_trait_qn || strcmp(candidate->impl_trait_qn, trait_qn) != 0)
+                continue;
+            RustImplSelfMatch match =
+                rust_impl_self_match(ctx, candidate->rust_reference_impl_self, base, true);
+            if (match == RUST_IMPL_SELF_DIFFERS)
+                continue;
+            if (match == RUST_IMPL_SELF_UNDECIDED) {
+                *refusal = "trait_receiver_partial";
+                return NULL;
+            }
+            *refusal = rust_trait_receiver_refusal(ctx, candidate, base);
+            if (*refusal)
+                return NULL;
+            if (selected && strcmp(selected->impl_key, candidate->impl_key) != 0) {
+                *refusal = "trait_reference_impl_not_proven";
+                return NULL;
+            }
+            selected = candidate;
+        }
+        if (!selected)
+            *refusal = "trait_reference_impl_not_proven";
+        return selected;
     }
     const char *type_qn = NULL;
     if (base && base->kind == CBM_TYPE_NAMED) {
@@ -11877,8 +11924,14 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
     if (trait_qn) {
         /* A typed first argument is the receiver `recv.method()` would
          * dispatch on, so the target carries the same proof and strategy. */
+        const char *refusal = NULL;
         const CBMRegisteredFunc *typed =
-            rust_trait_ufcs_by_receiver(ctx, trait_qn, short_name, first_arg);
+            rust_trait_ufcs_by_receiver(ctx, trait_qn, short_name, first_arg, &refusal);
+        if (refusal) {
+            out->open_qn = qn;
+            out->open_reason = refusal;
+            return true;
+        }
         if (typed) {
             rust_call_target_set(out, typed, typed->qualified_name, "lsp_trait_dispatch",
                                  CBM_RUST_CONF_UFCS);
@@ -12123,6 +12176,81 @@ static const CBMRegisteredFunc *rust_module_function_node(RustLSPContext *ctx, c
     return f ? f : cbm_registry_lookup_func(ctx->registry, qn);
 }
 
+/* An explicit trait path supplies both Self and the trait arguments. Match
+ * those written types against the impl, never the erased method bucket. */
+static bool rust_explicit_trait_target(RustLSPContext *ctx, TSNode callee, RustCallTarget *out) {
+    TSNode head = ts_node_child_by_field_name(callee, "path", 4);
+    if (ts_node_is_null(head) || strcmp(ts_node_type(head), "bracketed_type") != 0)
+        return false;
+    TSNode qualified = ts_node_named_child(head, 0);
+    if (strcmp(ts_node_type(qualified), "qualified_type") != 0)
+        return false;
+    const CBMType *self = rust_expand_type_aliases(
+        ctx, rust_parse_type_node(ctx, ts_node_child_by_field_name(qualified, "type", 4)), 0);
+    const CBMType *trait =
+        rust_parse_type_node(ctx, ts_node_child_by_field_name(qualified, "alias", 5));
+    const char *trait_qn = trait->kind == CBM_TYPE_NAMED ? trait->data.named.qualified_name
+                           : trait->kind == CBM_TYPE_TEMPLATE
+                               ? trait->data.template_type.template_name
+                               : NULL;
+    const char *self_qn = self->kind == CBM_TYPE_NAMED      ? self->data.named.qualified_name
+                          : self->kind == CBM_TYPE_TEMPLATE ? self->data.template_type.template_name
+                          : self->kind == CBM_TYPE_REFERENCE ? "core.reference"
+                                                             : NULL;
+    const CBMRegisteredType *rt =
+        trait_qn ? cbm_registry_lookup_type(ctx->registry, trait_qn) : NULL;
+    const char *name = rust_node_text(ctx, ts_node_child_by_field_name(callee, "name", 4));
+    out->names_function = true;
+    out->open_qn = rust_node_text(ctx, callee);
+    out->open_reason = "explicit_trait_impl_not_proven";
+    if (!rt || !rt->is_interface || !self_qn || !name)
+        return true;
+    const CBMRegisteredFunc *selected = NULL;
+    CBMMethodIter it;
+    cbm_registry_methods_chain(ctx->registry, self_qn, name, &it);
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    for (int i; (i = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &it.reg->funcs[i];
+        if (!candidate->impl_trait_qn || strcmp(candidate->impl_trait_qn, trait_qn) != 0)
+            continue;
+        size_t self_len = 0;
+        size_t trait_len = 0;
+        const char *self_part = rust_impl_key_part(candidate->impl_key, 1, &self_len);
+        const char *trait_part = rust_impl_key_part(candidate->impl_key, 2, &trait_len);
+        if (!self_part || !trait_part)
+            return true;
+        const char *module =
+            tree ? cbm_rust_modtree_item_module(tree, ctx->arena, candidate->qualified_name) : NULL;
+        if (!module) {
+            const char *dot = strrchr(candidate->receiver_type, '.');
+            module = dot ? cbm_arena_strndup(ctx->arena, candidate->receiver_type,
+                                             (size_t)(dot - candidate->receiver_type))
+                         : ctx->module_qn;
+        }
+        const CBMType *impl_self =
+            candidate->rust_reference_impl_self
+                ? candidate->rust_reference_impl_self
+                : rust_parse_def_type_text(
+                      ctx->arena, cbm_arena_strndup(ctx->arena, self_part, self_len), module, tree);
+        const CBMType *impl_trait = rust_parse_def_type_text(
+            ctx->arena, cbm_arena_strndup(ctx->arena, trait_part, trait_len), module, tree);
+        RustImplSelfMatch match = rust_impl_self_match(ctx, impl_self, self, true);
+        if (match == RUST_IMPL_SELF_DIFFERS ||
+            rust_impl_self_match(ctx, impl_trait, trait, true) != RUST_IMPL_SELF_SAME)
+            continue;
+        if (match != RUST_IMPL_SELF_SAME ||
+            (selected && strcmp(selected->impl_key, candidate->impl_key) != 0))
+            return true;
+        selected = candidate;
+    }
+    if (selected) {
+        rust_call_target_set(out, selected, selected->qualified_name, "lsp_ufcs",
+                             CBM_RUST_CONF_UFCS);
+        out->receiver_qn = self_qn;
+    }
+    return true;
+}
+
 /* Resolve a call path through the crate's declared module tree and `use`
  * graph into `out`. True when the tree settled the call; false leaves it to
  * the file-layout fallbacks (file outside every crate, undecidable name).
@@ -12130,6 +12258,8 @@ static const CBMRegisteredFunc *rust_module_function_node(RustLSPContext *ctx, c
  * in-project function (a variant, a type, an external item). */
 static bool rust_module_tree_target(RustLSPContext *ctx, TSNode callee, const char *path,
                                     RustCallTarget *out) {
+    if (rust_explicit_trait_target(ctx, callee, out))
+        return true;
     if (strncmp(path, "Self::", 6) == 0) {
         return rust_self_path_target(ctx, callee, path, out);
     }
@@ -13001,9 +13131,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             }
         }
         const CBMType *base = recv;
-        while (base && (base->kind == CBM_TYPE_REFERENCE || base->kind == CBM_TYPE_POINTER)) {
-            base = (base->kind == CBM_TYPE_REFERENCE) ? base->data.reference.elem
-                                                      : base->data.pointer.elem;
+        while (base && base->kind == CBM_TYPE_REFERENCE) {
+            base = base->data.reference.elem;
+        }
+        if (base && base->kind == CBM_TYPE_POINTER) {
+            rust_emit_unresolved_call(ctx, mname, "raw_pointer_autoderef_not_allowed");
+            return;
         }
 
         const char *type_qn = NULL;
@@ -13177,10 +13310,12 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 if (!next)
                     break;
                 /* Unwrap reference layers introduced by deref. */
-                while (next &&
-                       (next->kind == CBM_TYPE_REFERENCE || next->kind == CBM_TYPE_POINTER)) {
-                    next = (next->kind == CBM_TYPE_REFERENCE) ? next->data.reference.elem
-                                                              : next->data.pointer.elem;
+                while (next && next->kind == CBM_TYPE_REFERENCE) {
+                    next = next->data.reference.elem;
+                }
+                if (next && next->kind == CBM_TYPE_POINTER) {
+                    rust_emit_unresolved_call(ctx, mname, "raw_pointer_autoderef_not_allowed");
+                    return;
                 }
                 if (!next)
                     break;
@@ -13229,6 +13364,11 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                     return;
                 }
                 if (hm) {
+                    const char *refusal = rust_trait_receiver_refusal(ctx, hm, next);
+                    if (refusal) {
+                        rust_emit_unresolved_call(ctx, hm->qualified_name, refusal);
+                        return;
+                    }
                     rust_emit_resolved_call(ctx, hm->qualified_name, hm->impl_key,
                                             "lsp_deref_dispatch",
                                             CBM_RUST_CONF_PROMOTED);

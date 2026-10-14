@@ -11334,6 +11334,174 @@ TEST(pipeline_rust_method_on_path_call_result_uses_published_producer) {
     PASS();
 }
 
+/* Each row owns the expected callee's source line, or the semantic stop.
+ * Observing the stored graph exercises extraction, both resolver passes and
+ * admission; an absent edge alone cannot satisfy a refusal row. */
+typedef struct {
+    const char *caller;
+    int callee_line;
+    const char *reason;
+} RustReceiverCase;
+
+static int check_rust_receiver_calls(const char *source, const RustReceiverCase *cases, int count) {
+    char tmp[256] = "/tmp/w1-D/receiver_XXXXXX";
+    if (!cbm_mkdtemp(tmp))
+        return -1;
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"receiver\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", source);
+    int failures = 0;
+    const cbm_index_mode_t modes[] = {CBM_MODE_FULL, CBM_MODE_FAST};
+    for (int mode = 0; mode < 2; mode++) {
+        char db[512];
+        snprintf(db, sizeof(db), "%s/%d.db", tmp, mode);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, modes[mode]);
+        if (!pipeline) {
+            failures++;
+            continue;
+        }
+        failures += cbm_pipeline_run(pipeline) != 0;
+        cbm_pipeline_free(pipeline);
+        sqlite3 *store = NULL;
+        if (sqlite3_open(db, &store) != SQLITE_OK) {
+            failures++;
+            sqlite3_close(store);
+            continue;
+        }
+        for (int i = 0; i < count; i++) {
+            char *sql = sqlite3_mprintf(
+                "SELECT t.start_line FROM edges e JOIN nodes s ON s.id=e.source_id "
+                "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name=%Q",
+                cases[i].caller);
+            sqlite3_stmt *stmt = NULL;
+            int edges = 0;
+            bool correct = false;
+            if (sqlite3_prepare_v2(store, sql, -1, &stmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    edges++;
+                    correct = sqlite3_column_int(stmt, 0) == cases[i].callee_line;
+                }
+            }
+            sqlite3_finalize(stmt);
+            sqlite3_free(sql);
+            bool ok = cases[i].reason ? edges == 0 : edges == 1 && correct;
+            if (cases[i].reason) {
+                sql = sqlite3_mprintf(
+                    "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%%.' || %Q "
+                    "AND reason=%Q",
+                    cases[i].caller, cases[i].reason);
+                stmt = NULL;
+                ok = ok && sqlite3_prepare_v2(store, sql, -1, &stmt, NULL) == SQLITE_OK &&
+                     sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
+                sqlite3_finalize(stmt);
+                sqlite3_free(sql);
+            }
+            if (!ok) {
+                printf("\n  receiver mode=%d caller=%s edges=%d expected_line=%d stop=%s\n", mode,
+                       cases[i].caller, edges, cases[i].callee_line,
+                       cases[i].reason ? cases[i].reason : "-");
+                failures++;
+            }
+        }
+        sqlite3_close(store);
+    }
+    th_rmtree(tmp);
+    return failures;
+}
+
+TEST(pipeline_rust_raw_pointer_does_not_autoderef_to_pointee) {
+    const char *source = "pub struct S;\n"
+                         "impl S { pub fn hit(&self) -> u8 { 10 } }\n"
+                         "pub trait P { fn hit(self) -> u8; }\n"
+                         "impl P for *const S { fn hit(self) -> u8 { 20 } }\n"
+                         "impl P for *mut S { fn hit(self) -> u8 { 30 } }\n"
+                         "pub fn const_pointer(p: *const S) -> u8 { p.hit() }\n"
+                         "pub fn mut_pointer(p: *mut S) -> u8 { p.hit() }\n"
+                         "pub fn borrowed_pointer(p: &*const S) -> u8 { p.hit() }\n"
+                         "pub fn explicit(p: *const S) -> u8 { unsafe { (*p).hit() } }\n";
+    const RustReceiverCase cases[] = {
+        {"const_pointer", 0, "raw_pointer_autoderef_not_allowed"},
+        {"mut_pointer", 0, "raw_pointer_autoderef_not_allowed"},
+        {"borrowed_pointer", 0, "raw_pointer_autoderef_not_allowed"},
+        {"explicit", 2, NULL},
+    };
+    ASSERT_EQ(check_rust_receiver_calls(source, cases, 4), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_deref_checks_trait_receiver_shape) {
+    const char *source = "pub struct A; pub struct B; pub struct W<T>(pub T);\n"
+                         "pub trait Hit { fn hit(&self) -> u8 { 30 } }\n"
+                         "impl Hit for W<A> { fn hit(&self) -> u8 { 10 } }\n"
+                         "impl Hit for W<B> {}\n"
+                         "pub struct Outer(pub W<B>);\n"
+                         "impl std::ops::Deref for Outer {\n"
+                         " type Target = W<B>;\n"
+                         " fn deref(&self) -> &W<B> { &self.0 }\n"
+                         "}\n"
+                         "pub fn through_deref(o: Outer) -> u8 { o.hit() }\n"
+                         "pub struct Inner;\n"
+                         "impl Inner { pub fn good(&self) {} }\n"
+                         "pub fn proved(o: Box<Inner>) { o.good(); }\n";
+    const RustReceiverCase cases[] = {
+        {"through_deref", 0, "trait_receiver_shape"},
+        {"proved", 12, NULL},
+    };
+    ASSERT_EQ(check_rust_receiver_calls(source, cases, 2), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_trait_ufcs_preserves_reference_self) {
+    const char *source = "pub trait Store { fn all(&mut self) -> u8; }\n"
+                         "pub struct Adapter;\n"
+                         "impl Store for Adapter { fn all(&mut self) -> u8 { 1 } }\n"
+                         "impl Store for &mut Adapter { fn all(&mut self) -> u8 { 2 } }\n"
+                         "pub fn forward(mut x: Adapter) -> u8 { Store::all(&mut &mut x) }\n"
+                         "pub fn direct(mut x: Adapter) -> u8 { Store::all(&mut x) }\n"
+                         "pub trait Generic { fn read(&mut self) -> u8; }\n"
+                         "impl Generic for Adapter { fn read(&mut self) -> u8 { 3 } }\n"
+                         "impl<T: Generic> Generic for &mut T { fn read(&mut self) -> u8 { 4 } }\n"
+                         "pub fn unproved(mut x: Adapter) -> u8 { Generic::read(&mut &mut x) }\n"
+        "pub struct H;\n"
+        "impl std::hash::Hasher for H {\n"
+        " fn finish(&self) -> u64 { 5 }\n"
+        " fn write(&mut self, bytes: &[u8]) {}\n"
+        "}\n"
+        "pub fn external(h: H) -> u64 { core::hash::Hasher::finish(&h) }\n";
+    const RustReceiverCase cases[] = {
+        {"forward", 4, NULL},
+        {"direct", 3, NULL},
+        {"unproved", 0, "trait_receiver_partial"},
+        {"external", 13, NULL},
+    };
+    ASSERT_EQ(check_rust_receiver_calls(source, cases, 4), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_explicit_trait_path_selects_named_impl) {
+    const char *source = "pub struct S; pub struct A; pub struct B;\n"
+                         "pub trait Pick<T> { fn pick(&self) -> u8; fn make() -> u8; }\n"
+                         "impl Pick<A> for S { fn pick(&self) -> u8 { 1 } fn make() -> u8 { 1 } }\n"
+                         "impl Pick<B> for S { fn pick(&self) -> u8 { 2 } fn make() -> u8 { 2 } }\n"
+                         "pub fn explicit_a(s: &S) -> u8 { <S as Pick<A>>::pick(s) }\n"
+                         "pub fn explicit_b(s: &S) -> u8 { <S as Pick<B>>::pick(s) }\n"
+                         "pub fn associated() -> u8 { <S as Pick<B>>::make() }\n"
+                         "pub struct Missing;\n"
+                         "pub fn absent(s: &Missing) -> u8 { <Missing as Pick<A>>::pick(s) }\n"
+                         "pub trait RefPick<T> { fn read(&self) -> u8; }\n"
+                         "impl RefPick<&A> for S { fn read(&self) -> u8 { 3 } }\n"
+                         "impl RefPick<&mut A> for S { fn read(&self) -> u8 { 4 } }\n"
+                         "pub fn shared(s: &S) -> u8 { <S as RefPick<&A>>::read(s) }\n"
+                         "pub fn mutable(s: &S) -> u8 { <S as RefPick<&mut A>>::read(s) }\n";
+    const RustReceiverCase cases[] = {
+        {"explicit_a", 3, NULL}, {"explicit_b", 4, NULL},
+        {"associated", 4, NULL}, {"absent", 0, "explicit_trait_impl_not_proven"},
+        {"shared", 11, NULL},    {"mutable", 12, NULL},
+    };
+    ASSERT_EQ(check_rust_receiver_calls(source, cases, 6), 0);
+    PASS();
+}
+
 /* Whether `run` -> `Conn.ping` is linked in the graph at db_path. */
 static bool rust_await_ping_linked(const char *db_path, const char *project) {
     cbm_store_t *store = cbm_store_open_path(db_path);
@@ -25469,6 +25637,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_reference_forwarding_is_not_published_as_recursion);
     RUN_TEST(pipeline_rust_declared_module_tree_resolves_path_calls_in_both_modes);
     RUN_TEST(pipeline_rust_method_on_path_call_result_uses_published_producer);
+    RUN_TEST(pipeline_rust_raw_pointer_does_not_autoderef_to_pointee);
+    RUN_TEST(pipeline_rust_deref_checks_trait_receiver_shape);
+    RUN_TEST(pipeline_rust_trait_ufcs_preserves_reference_self);
+    RUN_TEST(pipeline_rust_explicit_trait_path_selects_named_impl);
     RUN_TEST(pipeline_rust_type_names_resolve_through_declared_module_tree);
     RUN_TEST(pipeline_rust_await_async_fn_output_survives_closure_repair);
     RUN_TEST(pipeline_rust_return_type_alias_survives_closure_repair);
