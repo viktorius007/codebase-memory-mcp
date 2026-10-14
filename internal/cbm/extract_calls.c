@@ -2298,6 +2298,31 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
         }
     }
 
+    /* Preserve the other Laravel registrar spelling for the resolve passes.
+     * Generic PHP member calls intentionally keep only the method name, but a
+     * literal `$router` receiver is the framework binding used by Laravel and
+     * Lumen route files.  Qualifying only that exact receiver and only known
+     * route verbs keeps `$request->get('/x')` and bare `get('/x')` from
+     * masquerading as registrations after same-language resolution refuses an
+     * ambiguous name. */
+    if (lang == CBM_LANG_PHP && strcmp(ts_node_type(node), "member_call_expression") == 0) {
+        TSNode object = ts_node_child_by_field_name(node, TS_FIELD("object"));
+        TSNode mname = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        if (!ts_node_is_null(object) && !ts_node_is_null(mname)) {
+            char *receiver = cbm_node_text(a, object, source);
+            char *method = cbm_node_text(a, mname, source);
+            if (receiver && method && strcmp(receiver, "$router") == 0) {
+                /* Store the proven receiver with the registry's common member
+                 * separator; the route table deliberately has no generic
+                 * `->get` suffix because arbitrary PHP objects use it. */
+                char *qualified = cbm_arena_sprintf(a, "%s.%s", receiver, method);
+                if (qualified && cbm_service_pattern_route_method(qualified) != NULL) {
+                    return qualified;
+                }
+            }
+        }
+    }
+
     if (lang == CBM_LANG_RUST) {
         TSNode function = ts_node_child_by_field_name(node, TS_FIELD("function"));
         if (!ts_node_is_null(function) &&

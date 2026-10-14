@@ -5,11 +5,90 @@
  * resolution strategies, and qualified name computation.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h" /* cbm_python_import_binding_contradicts (#2127) */
+#include "store/store.h"
 
+#include <sqlite3.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static int registry_binding_counts(const char *repo, const char *db_path, int *calls, int *stops) {
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!pipeline || cbm_pipeline_run(pipeline) != 0) {
+        cbm_pipeline_free(pipeline);
+        return -1;
+    }
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store) {
+        return -1;
+    }
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT "
+        "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        " JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+        " AND s.name='run' AND t.name='choose'), "
+        "(SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='choose' "
+        " AND reason='name_binding_not_proven')";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        cbm_store_close(store);
+        return -1;
+    }
+    *calls = sqlite3_column_int(stmt, 0);
+    *stops = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    return 0;
+}
+
+static bool registry_ambiguity_stop_contract_holds(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    cached = 0;
+    const char *runtime = getenv("CBM_RUNTIME_DIR");
+    if (!runtime || !runtime[0]) {
+        return false;
+    }
+    char root[512];
+    snprintf(root, sizeof(root), "%s/registry-stop-XXXXXX", runtime);
+    if (!cbm_mkdtemp(root)) {
+        return false;
+    }
+    char a_path[640], b_path[640], main_path[640], ambiguous_db[640], unique_db[640];
+    snprintf(a_path, sizeof(a_path), "%s/a.c", root);
+    snprintf(b_path, sizeof(b_path), "%s/b.c", root);
+    snprintf(main_path, sizeof(main_path), "%s/main.c", root);
+    snprintf(ambiguous_db, sizeof(ambiguous_db), "%s/ambiguous.db", root);
+    snprintf(unique_db, sizeof(unique_db), "%s/unique.db", root);
+    if (th_write_file(a_path, "void choose(void) {}\n") != 0 ||
+        th_write_file(b_path, "void choose(void) {}\n") != 0 ||
+        th_write_file(main_path, "void run(void) { choose(); }\n") != 0) {
+        th_rmtree(root);
+        return false;
+    }
+    int ambiguous_calls = -1, ambiguous_stops = -1;
+    int unique_calls = -1, unique_stops = -1;
+    bool ambiguous_ok = registry_binding_counts(root, ambiguous_db, &ambiguous_calls,
+                                                &ambiguous_stops) == 0;
+    if (remove(b_path) != 0) {
+        th_rmtree(root);
+        return false;
+    }
+    bool unique_ok = registry_binding_counts(root, unique_db, &unique_calls, &unique_stops) == 0;
+    cached = ambiguous_ok && unique_ok && ambiguous_calls == 0 && ambiguous_stops == 1 &&
+             unique_calls == 1 && unique_stops == 0;
+    th_rmtree(root);
+    return cached != 0;
+}
 
 /* ── FQN computation ──────────────────────────────────────────────── */
 
@@ -917,9 +996,8 @@ TEST(cross_language_config_caller_drops_unique_name_too) {
  * to be settled by bucket position, i.e. by the order files were registered:
  * two indexes of one kernel tree differed by 632 CALLS edges, `dev_name`
  * landing on any of twenty same-named struct fields or on nothing at all.
- * The tie is now a function of the candidate set: the more plainly callable
- * candidate (the function over the fields), then the smaller QN, whichever
- * order the registry was built in (O9). */
+ * Registration order, node kind, lexical QN order, and proximity are not
+ * binding facts, so all such choices are withheld. */
 TEST(registry_tie_break_is_independent_of_registration_order) {
     const char *cands[] = {
         "proj.drivers.media.cec.i2c.ch7322.ch7322_conn_match.dev_name", /* struct field */
@@ -942,14 +1020,12 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
         cbm_registry_resolve(forward, "dev_name", "proj.kernel.irq.msi", NULL, NULL, 0);
     cbm_resolution_t b =
         cbm_registry_resolve(backward, "dev_name", "proj.kernel.irq.msi", NULL, NULL, 0);
-    ASSERT_NOT_NULL(f.qualified_name);
-    ASSERT_NOT_NULL(b.qualified_name);
-    ASSERT_STR_EQ(f.qualified_name, "proj.include.linux.device.dev_name");
-    ASSERT_STR_EQ(b.qualified_name, "proj.include.linux.device.dev_name");
-    ASSERT_STR_EQ(f.strategy, "suffix_match");
-    ASSERT_STR_EQ(b.strategy, "suffix_match");
+    ASSERT_NULL(f.qualified_name);
+    ASSERT_NULL(b.qualified_name);
+    ASSERT_EQ(f.candidate_count, 4);
+    ASSERT_EQ(b.candidate_count, 4);
 
-    /* Equal kind: the smaller QN, from either order. */
+    /* Equal kind and lexical order still prove nothing. */
     cbm_registry_t *lex_a = cbm_registry_new();
     cbm_registry_t *lex_b = cbm_registry_new();
     cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
@@ -960,32 +1036,33 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
         cbm_registry_resolve(lex_a, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
     cbm_resolution_t lb =
         cbm_registry_resolve(lex_b, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
-    ASSERT_STR_EQ(la.qualified_name, "proj.include.linux.scatterlist.sg_next");
-    ASSERT_STR_EQ(lb.qualified_name, "proj.include.linux.scatterlist.sg_next");
+    ASSERT_NULL(la.qualified_name);
+    ASSERT_NULL(lb.qualified_name);
+    ASSERT_EQ(la.candidate_count, 2);
+    ASSERT_EQ(lb.candidate_count, 2);
 
-    /* Proximity outranks the tie order: the sibling wins over a shallower stranger. */
+    /* A nearer directory is not a binding fact. */
     cbm_registry_t *near = cbm_registry_new();
     cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
     cbm_registry_add(near, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
                      "Function");
     cbm_resolution_t nr = cbm_registry_resolve(near, "vnic_rq_free",
                                                "proj.drivers.scsi.fnic.fnic_res", NULL, NULL, 0);
-    ASSERT_STR_EQ(nr.qualified_name, "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free");
+    ASSERT_NULL(nr.qualified_name);
+    ASSERT_EQ(nr.candidate_count, 2);
 
     cbm_registry_free(forward);
     cbm_registry_free(backward);
     cbm_registry_free(lex_a);
     cbm_registry_free(lex_b);
     cbm_registry_free(near);
+    ASSERT_TRUE(registry_ambiguity_stop_contract_holds());
     PASS();
 }
 
-/* A call names something callable. When same-named candidates tie, a method
- * must not lose to a property or field that merely shares its name. Exposed
- * (Kotlin): `cities.selectAll().where { ... }` bound to the property
- * `AbstractQuery.where` instead of the jdbc `Query.where` function, because the
- * two QNs have the same depth and "exposed-core" sorts first; main moved 785 ->
- * 1,648 Kotlin CALLS edges onto Variable/Field targets this way. */
+/* Callable shape does not prove which same-named declaration is bound. Exposed
+ * (Kotlin) contains both properties and methods named `where` and `limit`; the
+ * receiver type, not node kind or QN shape, must decide between them. */
 TEST(registry_tie_prefers_callable_over_property) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(
@@ -995,7 +1072,7 @@ TEST(registry_tie_prefers_callable_over_property) {
     cbm_registry_add(r, "where",
                      "proj.exposed-jdbc.src.main.kotlin.org.jetbrains.exposed.v1.jdbc.Query.where",
                      "Method");
-    /* A deeper method still beats a shallower field: kind decides before order. */
+    /* A deeper Method and shallower Field remain ambiguous without a receiver. */
     cbm_registry_add(r, "limit", "proj.exposed-core.Table.limit", "Field");
     cbm_registry_add(r, "limit", "proj.exposed-jdbc.src.main.kotlin.jdbc.Query.limit", "Method");
 
@@ -1003,10 +1080,12 @@ TEST(registry_tie_prefers_callable_over_property) {
         "proj.exposed-tests.src.test.kotlin.org.jetbrains.exposed.v1.tests.SelectTests";
     cbm_resolution_t w = cbm_registry_resolve(r, "where", caller, NULL, NULL, 0);
     cbm_resolution_t l = cbm_registry_resolve(r, "limit", caller, NULL, NULL, 0);
-    ASSERT_STR_EQ(w.qualified_name,
-                  "proj.exposed-jdbc.src.main.kotlin.org.jetbrains.exposed.v1.jdbc.Query.where");
-    ASSERT_STR_EQ(l.qualified_name, "proj.exposed-jdbc.src.main.kotlin.jdbc.Query.limit");
+    ASSERT_NULL(w.qualified_name);
+    ASSERT_NULL(l.qualified_name);
+    ASSERT_EQ(w.candidate_count, 2);
+    ASSERT_EQ(l.candidate_count, 2);
     cbm_registry_free(r);
+    ASSERT_TRUE(registry_ambiguity_stop_contract_holds());
     PASS();
 }
 
@@ -1014,27 +1093,25 @@ TEST(registry_tie_prefers_callable_over_property) {
  * django: `Model.objects.filter(...)` from tests/ tied between
  * `QuerySet.filter` and the template `Library.filter`; "least nested wins"
  * picked Library (one segment shallower) for most of the ~5,600 `objects.X`
- * calls (QuerySet share 57 % -> 24 %). Equal-kind ties now fall to the QN
- * order alone, which is still a pure function of the candidate set (O9). */
+ * calls (QuerySet share 57 % -> 24 %). Neither nesting depth nor QN order is
+ * binding evidence. */
 TEST(registry_tie_ignores_nesting_depth) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "filter", "proj.django.template.library.Library.filter", "Method");
     cbm_registry_add(r, "filter", "proj.django.db.models.query.QuerySet.filter", "Method");
     cbm_resolution_t f =
         cbm_registry_resolve(r, "filter", "proj.tests.lookup.tests", NULL, NULL, 0);
-    ASSERT_STR_EQ(f.qualified_name, "proj.django.db.models.query.QuerySet.filter");
-    ASSERT_STR_EQ(f.strategy, "suffix_match");
+    ASSERT_NULL(f.qualified_name);
+    ASSERT_EQ(f.candidate_count, 2);
     cbm_registry_free(r);
+    ASSERT_TRUE(registry_ambiguity_stop_contract_holds());
     PASS();
 }
 
-/* .NET reference assemblies (`src/libraries/<Asm>/ref/<Asm>.cs`) declare every
- * public member of an assembly with a `throw null` body in one shallow file.
- * A call that ties between such a stub and the implementation must reach the
- * implementation: dotnet/runtime had 14.1 % of its CALLS on ref/ stubs (4.9 %
- * in v0.11.0) once ties preferred the shallower, then the smaller ("ref" <
- * "src") QN. The preference is C#'s alone: elsewhere a `ref` directory is an
- * ordinary name. */
+/* .NET reference assemblies (`src/libraries/<Asm>/ref/<Asm>.cs`) duplicate
+ * public member spellings from implementations. File naming and declaration
+ * bodies do not establish which assembly the caller references, so neither
+ * the stub nor implementation may win without a binding fact. */
 TEST(registry_tie_prefers_csharp_implementation_over_ref_stub) {
     cbm_registry_t *r = cbm_registry_new();
     /* Shallower stub vs deeper implementation (MemoryStream). */
@@ -1055,7 +1132,7 @@ TEST(registry_tie_prefers_csharp_implementation_over_ref_stub) {
                           "proj.src.libraries.System.Linq.Parallel.src.System.Linq."
                           "ParallelEnumerable.WithCancellation",
                           "Method", CBM_LANG_CSHARP);
-    /* Not C#: a `ref` directory gets no special treatment. */
+    /* A `ref` directory is not binding evidence in any language. */
     cbm_registry_add_lang(r, "resolve", "proj.lib.ref.Resolver.resolve", "Method", CBM_LANG_JAVA);
     cbm_registry_add_lang(r, "resolve", "proj.lib.src.Resolver.resolve", "Method", CBM_LANG_JAVA);
 
@@ -1063,13 +1140,14 @@ TEST(registry_tie_prefers_csharp_implementation_over_ref_stub) {
     cbm_resolution_t ms = cbm_registry_resolve(r, "MemoryStream", caller, NULL, NULL, 0);
     cbm_resolution_t wc = cbm_registry_resolve(r, "WithCancellation", caller, NULL, NULL, 0);
     cbm_resolution_t jv = cbm_registry_resolve(r, "resolve", "proj.app.Main", NULL, NULL, 0);
-    ASSERT_STR_EQ(
-        ms.qualified_name,
-        "proj.src.libraries.System.Private.CoreLib.src.System.IO.MemoryStream.MemoryStream");
-    ASSERT_STR_EQ(wc.qualified_name, "proj.src.libraries.System.Linq.Parallel.src.System.Linq."
-                                     "ParallelEnumerable.WithCancellation");
-    ASSERT_STR_EQ(jv.qualified_name, "proj.lib.ref.Resolver.resolve");
+    ASSERT_NULL(ms.qualified_name);
+    ASSERT_NULL(wc.qualified_name);
+    ASSERT_NULL(jv.qualified_name);
+    ASSERT_EQ(ms.candidate_count, 2);
+    ASSERT_EQ(wc.candidate_count, 2);
+    ASSERT_EQ(jv.candidate_count, 2);
     cbm_registry_free(r);
+    ASSERT_TRUE(registry_ambiguity_stop_contract_holds());
     PASS();
 }
 
@@ -1125,15 +1203,15 @@ TEST(name_guess_vetoed_across_languages) {
     res = xl_resolve(r, CBM_LANG_PYTHON, "d.get", "proj.tool");
     ASSERT_STR_EQ(res.qualified_name, "builtins.dict.get");
     ASSERT_STR_EQ(res.strategy, "unique_name");
-    /* Two same-named candidates: the chain still picks by import distance;
-     * the answer stands only for a caller that can call the winner. */
+    /* Two same-named candidates cannot be selected by import distance or
+     * caller proximity without an actual import or receiver binding. */
     res = xl_resolve(r, CBM_LANG_PYTHON, "patch", "proj.api.x");
-    ASSERT_STR_EQ(res.qualified_name, "proj.api.client.patch");
-    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_EQ(res.candidate_count, 2);
     res = xl_resolve(r, CBM_LANG_TYPESCRIPT, "patch", "proj.api.x");
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
     res = xl_resolve(r, CBM_LANG_TYPESCRIPT, "patch", "proj.web.ui");
-    ASSERT_STR_EQ(res.qualified_name, "proj.web.Panel.patch");
+    ASSERT_NULL(res.qualified_name);
     /* Unknown-language entries and an unknown caller are never vetoed. */
     res = xl_resolve(r, CBM_LANG_GO, "legacy", "proj.go");
     ASSERT_STR_EQ(res.qualified_name, "proj.x.legacy");
@@ -1153,6 +1231,7 @@ TEST(name_guess_vetoed_across_languages) {
     ASSERT_TRUE(cbm_registry_name_guess_vetoed(r, CBM_LANG_JAVASCRIPT, &imp));
     ASSERT_FALSE(cbm_registry_name_guess_vetoed(r, CBM_LANG_PYTHON, &imp));
     cbm_registry_free(r);
+    ASSERT_TRUE(registry_ambiguity_stop_contract_holds());
     PASS();
 }
 
@@ -1295,9 +1374,11 @@ TEST(c_bare_call_does_not_weigh_field_namesakes) {
     /* The reference resolver and C++ (which reaches its own members bare) still
      * weigh the member: two candidates. */
     res = cbm_registry_resolve_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_C);
-    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_EQ(res.candidate_count, 2);
     res = cbm_registry_resolve_call_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_CPP);
-    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_EQ(res.candidate_count, 2);
     /* A name only members carry is no bare C call target at all -- neither a
      * struct member nor a C++ method: redis's libc `read()` became the unique
      * name of a Qt adapter's `read` Method once only Fields were set aside. */
@@ -1310,10 +1391,13 @@ TEST(c_bare_call_does_not_weigh_field_namesakes) {
                           CBM_LANG_C);
     res = cbm_registry_resolve_call_lang(r, "read", mod, NULL, NULL, 0, CBM_LANG_C);
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
-    /* C++ still reaches the method by name. */
+    /* C++ still admits both member kinds, but their shared spelling cannot
+     * choose the Method over the Field. */
     res = cbm_registry_resolve_call_lang(r, "read", mod, NULL, NULL, 0, CBM_LANG_CPP);
-    ASSERT_TRUE(res.qualified_name && res.qualified_name[0] != '\0');
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_EQ(res.candidate_count, 2);
     cbm_registry_free(r);
+    ASSERT_TRUE(registry_ambiguity_stop_contract_holds());
     PASS();
 }
 
@@ -1815,14 +1899,10 @@ TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring) {
     cbm_resolution_t raw = cbm_registry_resolve(r, "choose", "proj.pkg.__init__", NULL, NULL, 0);
     cbm_resolution_t python =
         cbm_registry_resolve_lang(r, "choose", "proj.pkg.__init__", NULL, NULL, 0, CBM_LANG_PYTHON);
-    bool scoring =
-        raw.qualified_name && python.qualified_name && raw.strategy && python.strategy &&
-        strcmp(raw.qualified_name, "proj.pkg.__init__.child.choose") == 0 &&
-        strcmp(python.qualified_name, raw.qualified_name) == 0 &&
-        strcmp(raw.strategy, "suffix_match") == 0 && strcmp(python.strategy, raw.strategy) == 0 &&
-        python.confidence == raw.confidence && python.candidate_count == raw.candidate_count;
+    bool withheld = !raw.qualified_name && !python.qualified_name && raw.candidate_count == 2 &&
+                    python.candidate_count == 2;
     cbm_registry_free(r);
-    ASSERT_TRUE(seeded && precedence && scoring);
+    ASSERT_TRUE(seeded && precedence && withheld && registry_ambiguity_stop_contract_holds());
     PASS();
 }
 

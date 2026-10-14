@@ -76,6 +76,14 @@ void cbm_pipeline_record_unresolved_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_t *sy
                                           const char *project, const char *rel,
                                           const CBMUsage *usage, const CBMFileResult *result,
                                           const char *stop);
+/* Rewrite `receiver.member` to `DeclaredType.member` only when `receiver` is a
+ * parameter whose occurrence-preserving signature entry declares that type. */
+bool cbm_pipeline_declared_parameter_callee(const CBMFileResult *result, const CBMCall *call,
+                                            CBMLanguage lang, char *out, size_t out_size);
+/* True only when route syntax is backed by a framework binding: an Express
+ * factory assignment, or Laravel's injected route receiver in routes/. */
+bool cbm_pipeline_route_registration_binding(const CBMFileResult *result, const CBMCall *call,
+                                             CBMLanguage lang, const char *rel);
 typedef struct cbm_pipeline_frozen cbm_pipeline_frozen_t;
 
 typedef enum {

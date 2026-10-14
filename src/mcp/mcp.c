@@ -636,7 +636,7 @@ static const tool_def_t TOOLS[] = {
      "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\",\"topology\","
      "\"deploy\",\"run\"],"
      "\"default\":\"calls\",\"description\":\"calls; argument-aware data_flow; service edges; "
-     "topology: infra objects, routes, controllers (from a Resource/Route); deploy: what CI "
+     "topology: infra, routes, controllers (Resource/Route); deploy: what CI "
      "jobs and scripts run and deploy; run: what a Service runs (image, Dockerfile, program, "
      "env).\"},"
      "\"parameter_name\":{\"type\":\"string\",\"description\":\"data_flow parameter filter.\"},"

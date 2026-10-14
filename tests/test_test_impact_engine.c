@@ -15,8 +15,11 @@
 #include "foundation/platform.h"
 #include "foundation/subprocess.h"
 #include "mcp/test_impact_engine.h"
+#include "pipeline/pipeline.h"
+#include "store/store.h"
 
 #include <limits.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -210,6 +213,36 @@ static char *tie_answer_with(tie_fixture_t *fx, const char *bundle, const char *
 
 static char *tie_answer(tie_fixture_t *fx) {
     return tie_answer_with(fx, NULL, NULL, false);
+}
+
+static int tie_unresolved_call_count(tie_fixture_t *fx, const char *name, const char *reason) {
+    char db_path[PATH_MAX];
+    snprintf(db_path, sizeof(db_path), "%s/stop.db", fx->home);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(fx->repo, db_path, CBM_MODE_FULL);
+    if (!pipeline || cbm_pipeline_run(pipeline) != 0) {
+        cbm_pipeline_free(pipeline);
+        return -1;
+    }
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int prepared = sqlite3_prepare_v2(
+        cbm_store_get_db(store),
+        "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name=?1 AND reason=?2",
+        -1, &stmt, NULL);
+    if (prepared != SQLITE_OK) {
+        cbm_store_close(store);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, reason, -1, SQLITE_STATIC);
+    int count = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    return count;
 }
 
 /* The "reasons" array of one suite's entry in the answer. */
@@ -524,9 +557,8 @@ TEST(test_impact_engine_variant_tests_are_one_test) {
 }
 
 /* Platform variants of one function (pick_posix.c / pick_win.c) are separate
- * graph nodes sharing a variant_key, and the test's call binds to one of
- * them. A change confined to EITHER variant reaches the test, whichever
- * variant the call bound to: the other platform's build runs the other. */
+ * graph nodes sharing a variant_key. The fixture has no build fact selecting
+ * a platform, so beta's bare call is withheld and neither variant reaches it. */
 static const char tie_pick_posix[] = "int pick(void) {\n"
                                      "    return 1;\n"
                                      "}\n";
@@ -541,7 +573,7 @@ static const char tie_pick_beta[] = "int pick(void);\n"
                                     "    RUN_TEST(beta_picks);\n"
                                     "}\n";
 
-TEST(test_impact_engine_platform_variants_reach_each_others_callers) {
+TEST(test_impact_engine_unbound_platform_variants_do_not_reach_callers) {
     const char *const extra[] = {"src/pick_posix.c",  tie_pick_posix, /* variant A */
                                  "src/pick_win.c",    tie_pick_win,   /* variant B */
                                  "tests/test_beta.c", tie_pick_beta};
@@ -557,13 +589,25 @@ TEST(test_impact_engine_platform_variants_reach_each_others_callers) {
         ASSERT_TRUE(tie_commit(&fx, "change one platform variant"));
         char *json = tie_answer(&fx);
         ASSERT_NOT_NULL(json);
-        if (!tie_suite_has(json, "beta", "STATIC")) {
+        if (tie_suite_has(json, "beta", "STATIC")) {
             printf("  %s changed: %.900s\n", changes[i][0], json);
         }
-        ASSERT_TRUE(tie_suite_has(json, "beta", "STATIC"));
+        ASSERT_FALSE(tie_suite_has(json, "beta", "STATIC"));
         ASSERT_FALSE(tie_suite_has(json, "alpha", "STATIC"));
         free(json);
     }
+    ASSERT_EQ(tie_unresolved_call_count(&fx, "pick", "name_binding_not_proven"), 1);
+
+    /* Discriminator: with the competing platform definition absent, the
+     * remaining definition is the sole binding and its change reaches beta. */
+    ASSERT_TRUE(tie_git(&fx, reset));
+    ASSERT_TRUE(tie_write(&fx, "src/pick_win.c", "/* platform not present */\n"));
+    ASSERT_TRUE(tie_write(&fx, "src/pick_posix.c", "int pick(void) {\n    return 1 + 0;\n}\n"));
+    ASSERT_TRUE(tie_commit(&fx, "change sole platform definition"));
+    char *unique = tie_answer(&fx);
+    ASSERT_NOT_NULL(unique);
+    ASSERT_TRUE(tie_suite_has(unique, "beta", "STATIC"));
+    free(unique);
     tie_close(&fx);
     PASS();
 }
@@ -617,7 +661,7 @@ TEST(test_impact_engine_spawning_tests_follow_main) {
 
 SUITE(test_impact_engine) {
     RUN_TEST(test_impact_engine_variant_tests_are_one_test);
-    RUN_TEST(test_impact_engine_platform_variants_reach_each_others_callers);
+    RUN_TEST(test_impact_engine_unbound_platform_variants_do_not_reach_callers);
     RUN_TEST(test_impact_engine_spawning_tests_follow_main);
     RUN_TEST(test_impact_engine_reached_suites_carry_static);
     RUN_TEST(test_impact_engine_macro_registered_tests_select_their_suite);

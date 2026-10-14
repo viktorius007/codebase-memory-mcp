@@ -867,9 +867,56 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
     return src;
 }
 
+bool cbm_pipeline_route_registration_binding(const CBMFileResult *result, const CBMCall *call,
+                                             CBMLanguage lang, const char *rel) {
+    if (!result || !call || !call->callee_name || !call->first_string_arg ||
+        call->first_string_arg[0] != '/') {
+        return false;
+    }
+    if (lang == CBM_LANG_PHP && rel &&
+        (strncmp(rel, "routes/", strlen("routes/")) == 0 || strstr(rel, "/routes/") != NULL)) {
+        return strncmp(call->callee_name, "Route::", strlen("Route::")) == 0 ||
+               strncmp(call->callee_name, "$router.", strlen("$router.")) == 0;
+    }
+    if (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) {
+        return false;
+    }
+    const char *dot = strrchr(call->callee_name, '.');
+    if (!dot || dot == call->callee_name || strchr(call->callee_name, ':')) {
+        return false;
+    }
+    size_t receiver_len = (size_t)(dot - call->callee_name);
+    bool imports_express = false;
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *imp = &result->imports.items[i];
+        if (imp->local_name && imp->module_path && strcmp(imp->local_name, "express") == 0 &&
+            strcmp(imp->module_path, "express") == 0) {
+            imports_express = true;
+            break;
+        }
+    }
+    if (!imports_express) {
+        return false;
+    }
+    for (int i = 0; i < result->type_assigns.count; i++) {
+        const CBMTypeAssign *assign = &result->type_assigns.items[i];
+        if (!assign->var_name || !assign->type_name || strlen(assign->var_name) != receiver_len ||
+            strncmp(assign->var_name, call->callee_name, receiver_len) != 0 ||
+            strcmp(assign->type_name, "express") != 0) {
+            continue;
+        }
+        if (!assign->enclosing_func_qn ||
+            (call->enclosing_func_qn &&
+             strcmp(assign->enclosing_func_qn, call->enclosing_func_qn) == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Classify a call the registry left unresolved: a route registration or an
  * external service client call still gets its edge. Returns 1 if emitted. */
-static int emit_unresolved_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
+static int emit_unresolved_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBMFileResult *result,
                                 const cbm_gbuf_node_t *source_node, const char *module_qn,
                                 const char **imp_keys, const char **imp_vals, int imp_count,
                                 int candidate_count, const char *route_mount, CBMLanguage lang,
@@ -894,8 +941,10 @@ static int emit_unresolved_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * apps. Classify by callee suffix + path-shaped first arg, exactly
      * like the parallel path's callee_suffix fallback; without this the
      * sequential path minted zero Route nodes for such files. */
-    if (candidate_count <= 1 && cbm_service_pattern_route_method(call->callee_name) != NULL &&
-        call->first_string_arg && call->first_string_arg[0] == '/') {
+    if ((candidate_count <= 1 ||
+         cbm_pipeline_route_registration_binding(result, call, lang, rel)) &&
+        cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+        call->first_string_arg[0] == '/') {
         handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count,
                                   route_mount, lang);
         return SKIP_ONE;
@@ -1275,7 +1324,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * likewise never bind a same-named project item through the registry. */
     cbm_resolution_t res = {0};
     if (!php_vendor_call) {
-        res = cbm_registry_resolve_call_lang(ctx->registry, call->callee_name, module_qn, imp_keys,
+        char declared_callee[CBM_SZ_512];
+        const char *registry_callee =
+            cbm_pipeline_declared_parameter_callee(result, call, lang, declared_callee,
+                                                   sizeof(declared_callee))
+                ? declared_callee
+                : call->callee_name;
+        res = cbm_registry_resolve_call_lang(ctx->registry, registry_callee, module_qn, imp_keys,
                                              imp_vals, imp_count, lang);
         if (cbm_registry_name_guess_vetoed(ctx->registry, lang, &res)) {
             res = (cbm_resolution_t){0};
@@ -1303,9 +1358,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         return SKIP_ONE;
     }
     if (!res.qualified_name || !res.qualified_name[0]) {
-        int emitted =
-            emit_unresolved_call(ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count,
-                                 res.candidate_count, route_mount, lang, rel, imports, ext_imports);
+        int emitted = emit_unresolved_call(ctx, call, result, source_node, module_qn, imp_keys,
+                                           imp_vals, imp_count, res.candidate_count, route_mount,
+                                           lang, rel, imports, ext_imports);
         if (!emitted) {
             cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
                                                 "name_binding_not_proven");
