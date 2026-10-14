@@ -656,6 +656,21 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                     ctx->gbuf, ctx->project_name, ctx->registry, &result->resolved_calls, usage);
             }
         }
+        if (tgt && (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) &&
+            cbm_external_import_binding_leaves_corpus(ctx, lang, &result->imports, usage->ref_name,
+                                                      rel, tgt)) {
+            int line = usage->start_line;
+            for (const char *p = usage->ref_name; *p; p++) {
+                line += *p == '\n';
+            }
+            cbm_pipeline_record_unresolved(
+                ctx->gbuf, ctx->project_name, rel, usage->enclosing_func_qn, usage->ref_name,
+                usage->kind == CBM_USAGE_TYPE ? "type"
+                : usage->is_member_access     ? "member"
+                                              : "reference",
+                "name_binding_not_proven", line, usage->site_start_byte, usage->site_end_byte);
+            continue;
+        }
         if (!tgt || src->id == tgt->id ||
             (cbm_language_for_filename(src->file_path) == CBM_LANG_PROTOBUF &&
              cbm_suppress_cross_language_ref(CBM_LANG_PROTOBUF, tgt->file_path)) ||

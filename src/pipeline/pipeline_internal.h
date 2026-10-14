@@ -932,6 +932,14 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
                                            const char *resolved_qn, const cbm_gbuf_t *gbuf,
                                            const char *project_name, const char *rel_path);
 
+/* True when a Python or TypeScript-family identifier is bound by an import
+ * whose module path names no in-project node. Such a binding owns the name,
+ * so later short-name recovery must not replace it with another definition. */
+bool cbm_external_import_binding_leaves_corpus(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
+                                               const CBMImportArray *imports, const char *name,
+                                               const char *rel_path,
+                                               const cbm_gbuf_node_t *candidate);
+
 /* Base-class twin: true when a Python base spelling (`unittest.TestCase`,
  * `TestCase` under `from unittest import TestCase`, `ut.TestCase` under
  * `import unittest as ut`) is bound by an EXTERNAL import whose chain

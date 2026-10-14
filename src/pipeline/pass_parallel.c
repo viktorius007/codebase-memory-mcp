@@ -3819,6 +3819,22 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                     rc->main_gbuf, rc->project_name, rc->registry, &result->resolved_calls, usage);
             }
         }
+        if (tgt && (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) &&
+            cbm_external_import_binding_leaves_corpus(rc->pctx, lang, &result->imports,
+                                                      usage->ref_name, rel, tgt)) {
+            int line = usage->start_line;
+            for (const char *p = usage->ref_name; *p; p++) {
+                line += *p == '\n';
+            }
+            cbm_pipeline_record_unresolved(ws->local_edge_buf, rc->project_name, rel,
+                                           usage->enclosing_func_qn, usage->ref_name,
+                                           usage->kind == CBM_USAGE_TYPE ? "type"
+                                           : usage->is_member_access     ? "member"
+                                                                         : "reference",
+                                           "name_binding_not_proven", line, usage->site_start_byte,
+                                           usage->site_end_byte);
+            continue;
+        }
         if (!tgt || src->id == tgt->id ||
             (cbm_language_for_filename(src->file_path) == CBM_LANG_PROTOBUF &&
              cbm_suppress_cross_language_ref(CBM_LANG_PROTOBUF, tgt->file_path)) ||
@@ -4009,10 +4025,13 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         const char *bqn = resolve_as_class(rc->registry, rc->main_gbuf, def->base_classes[b], mq,
                                            ik, iv, ic, fs->lang, &candidate_count);
         /* Same external-base gate as the sequential semantic pass. */
-        if (!bqn ||
+        bool external_binding = cbm_external_import_binding_leaves_corpus(
+            rc->pctx, fs->lang, fs->imports, def->base_classes[b], fs->rel,
+            bqn ? cbm_gbuf_find_by_qn(rc->main_gbuf, bqn) : NULL);
+        if (!bqn || external_binding ||
             cbm_python_external_base_contradicts(fs->lang, fs->imports, def->base_classes[b], bqn,
                                                  rc->main_gbuf, rc->project_name, fs->rel)) {
-            if (!bqn && candidate_count > SKIP_ONE) {
+            if (external_binding || (!bqn && candidate_count > SKIP_ONE)) {
                 uint32_t start = def->base_class_start_bytes ? def->base_class_start_bytes[b] : 0;
                 uint32_t end = def->base_class_end_bytes ? def->base_class_end_bytes[b] : start;
                 cbm_pipeline_record_unresolved(ws->local_edge_buf, rc->project_name, fs->rel,

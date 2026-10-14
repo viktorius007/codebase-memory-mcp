@@ -672,10 +672,14 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
             const char *base_qn =
                 resolve_as_class(ctx->registry, ctx->gbuf, def->base_classes[b], module_qn,
                                  imp_keys, imp_vals, imp_count, lang, &candidate_count);
-            if (!base_qn || cbm_python_external_base_contradicts(
-                                fi->language, &result->imports, def->base_classes[b], base_qn,
-                                ctx->gbuf, ctx->project_name, fi->rel_path)) {
-                if (!base_qn && candidate_count > SKIP_ONE) {
+            bool external_binding = cbm_external_import_binding_leaves_corpus(
+                ctx, fi->language, &result->imports, def->base_classes[b], fi->rel_path,
+                base_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, base_qn) : NULL);
+            if (!base_qn || external_binding ||
+                cbm_python_external_base_contradicts(fi->language, &result->imports,
+                                                     def->base_classes[b], base_qn, ctx->gbuf,
+                                                     ctx->project_name, fi->rel_path)) {
+                if (external_binding || (!base_qn && candidate_count > SKIP_ONE)) {
                     uint32_t start =
                         def->base_class_start_bytes ? def->base_class_start_bytes[b] : 0;
                     uint32_t end = def->base_class_end_bytes ? def->base_class_end_bytes[b] : start;
