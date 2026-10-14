@@ -110,6 +110,9 @@ static const CBMRegisteredFunc *rust_inherent_self_candidate(RustLSPContext *ctx
 static const char *rust_trait_spelling_leaf(CBMArena *arena, const char *spelling);
 static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
                                     const char *method_name, const char *impl_key, bool *proved);
+static const char *rust_trait_receiver_refusal(RustLSPContext *ctx,
+                                               const CBMRegisteredFunc *method,
+                                               const CBMType *recv, bool prove_dispatch);
 typedef struct {
     const char *head;
     const char *reason;
@@ -7147,7 +7150,8 @@ static const char *rust_method_receiver_refusal(RustLSPContext *ctx, const CBMRe
 static const char *rust_method_receiver_refusal_at_type(RustLSPContext *ctx,
                                                         const CBMRegisteredFunc *method,
                                                         const CBMType *recv, bool slice_deref,
-                                                        bool prove_dispatch);
+                                                        bool prove_dispatch,
+                                                        const CBMType *proved_impl_self);
 static const char *rust_trait_receiver_refusal(RustLSPContext *ctx, const CBMRegisteredFunc *method,
                                                const CBMType *recv, bool prove_dispatch);
 
@@ -8761,74 +8765,519 @@ static RustStdCollision rust_std_unrecognised_method(RustLSPContext *ctx, const 
     return none;
 }
 
-/* A reference impl can precede a concrete method after autoderef. Its
- * bounds are not proved here. A concrete `&self` method at exactly one
- * reference layer precedes a reference impl's `&self` method. */
-static bool rust_reference_impl_may_precede(RustLSPContext *ctx, const CBMType *receiver,
-                                            const CBMRegisteredFunc *method) {
-    if (!receiver || receiver->kind != CBM_TYPE_REFERENCE || !method->impl_trait_qn) {
-        return false;
-    }
-    const char *self = rust_impl_key_part(method->impl_key, 1, NULL);
-    bool mutable_self = (method->flags & CBM_FUNC_FLAG_RUST_SELF) &&
-        !(method->flags & (CBM_FUNC_FLAG_RUST_SHARED_SELF | CBM_FUNC_FLAG_RUST_VALUE_SELF));
-    if (self && *self != '&' && receiver->data.reference.rust_mutable && mutable_self &&
-        receiver->data.reference.elem && receiver->data.reference.elem->kind != CBM_TYPE_REFERENCE)
-        return false;
-    const char *dot = strrchr(method->impl_trait_qn, '.');
-    const char *leaf = dot ? dot + 1 : method->impl_trait_qn;
-    for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
-        CBMTypeEmbedIter types;
-        cbm_registry_types_by_embedded_bare(reg, leaf, &types);
-        for (int ti; (ti = cbm_type_embed_iter_next(&types)) >= 0;) {
-            CBMMethodIter methods;
-            cbm_registry_methods(reg, reg->types[ti].qualified_name, method->short_name, &methods);
-            for (int mi; (mi = cbm_method_iter_next(&methods)) >= 0;) {
-                const CBMRegisteredFunc *candidate = &reg->funcs[mi];
-                if (!candidate->impl_trait_qn ||
-                    strcmp(candidate->impl_trait_qn, method->impl_trait_qn) != 0) {
-                    continue;
-                }
-                size_t self_len = 0;
-                const char *self = rust_impl_key_part(candidate->impl_key, 1, &self_len);
-                if (!self || *self != '&') {
-                    continue;
-                }
-                size_t qualifier = 1;
-                while (qualifier < self_len && isspace((unsigned char)self[qualifier])) {
-                    qualifier++;
-                }
-                /* Inferred reference types erase mutability. These impl
-                 * shapes can precede a shared concrete method. */
-                if (qualifier == self_len || self[qualifier] == '\'' ||
-                    (self_len - qualifier >= 3 && strncmp(self + qualifier, "mut", 3) == 0)) {
-                    return true;
-                }
-                const char *selected_self = rust_impl_key_part(method->impl_key, 1, NULL);
-                bool exact_borrow = receiver->data.reference.elem &&
-                                    receiver->data.reference.elem->kind != CBM_TYPE_REFERENCE &&
-                                    (method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) != 0 &&
-                                    selected_self && *selected_self != '&';
-                if (!exact_borrow || (candidate->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0) {
-                    return true;
-                }
-            }
+enum { RUST_METHOD_PROBE_UNKNOWN = -2, RUST_METHOD_PROBE_INAPPLICABLE = -1 };
+
+static const char *rust_method_probe_head(const CBMType *type) {
+    if (!type)
+        return NULL;
+    if (type->kind == CBM_TYPE_NAMED)
+        return type->data.named.qualified_name;
+    if (type->kind == CBM_TYPE_TEMPLATE)
+        return type->data.template_type.template_name;
+    if (type->kind == CBM_TYPE_BUILTIN)
+        return type->data.builtin.name;
+    return NULL;
+}
+
+static bool rust_method_probe_reference_shapes_differ(
+    RustLSPContext *ctx, const CBMType *candidate, const CBMType *probe,
+    const char *const *params) {
+    int param_count = 0;
+    while (params && params[param_count])
+        param_count++;
+    while (candidate && probe && (candidate->kind == CBM_TYPE_REFERENCE ||
+                                  probe->kind == CBM_TYPE_REFERENCE)) {
+        if (candidate->kind != CBM_TYPE_REFERENCE || probe->kind != CBM_TYPE_REFERENCE) {
+            if (candidate->kind != CBM_TYPE_REFERENCE &&
+                rust_receiver_param_index(ctx, candidate, params, param_count) >= 0)
+                return false;
+            return true;
         }
+        if (candidate->data.reference.rust_shared != probe->data.reference.rust_shared ||
+            candidate->data.reference.rust_mutable != probe->data.reference.rust_mutable)
+            return true;
+        candidate = candidate->data.reference.elem;
+        probe = probe->data.reference.elem;
     }
     return false;
 }
 
-static int rust_reference_probe_rank(const CBMRegisteredFunc *method, const CBMType *recv) {
-    if (!method || !recv || recv->kind != CBM_TYPE_REFERENCE)
-        return -1;
-    bool value = (method->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0;
-    bool shared = (method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) != 0;
-    bool mutable = (method->flags & CBM_FUNC_FLAG_RUST_SELF) != 0 && !value && !shared;
-    if (recv->data.reference.rust_shared)
-        return shared ? 0 : value ? 1 : -1;
-    if (recv->data.reference.rust_mutable)
-        return mutable ? 0 : value ? 1 : shared ? 2 : -1;
-    return -1;
+static bool rust_method_probe_heads_differ(const CBMType *candidate,
+                                           const CBMType *probe) {
+    while (candidate && candidate->kind == CBM_TYPE_REFERENCE)
+        candidate = candidate->data.reference.elem;
+    while (probe && probe->kind == CBM_TYPE_REFERENCE)
+        probe = probe->data.reference.elem;
+    if (!candidate || !probe)
+        return false;
+    const char *candidate_head = rust_method_probe_head(candidate);
+    const char *probe_head = rust_method_probe_head(probe);
+    const char *candidate_canonical = candidate_head
+                                          ? rust_std_wrapper_canonical(candidate_head)
+                                          : NULL;
+    const char *probe_canonical = probe_head ? rust_std_wrapper_canonical(probe_head) : NULL;
+    if (candidate_canonical)
+        candidate_head = candidate_canonical;
+    if (probe_canonical)
+        probe_head = probe_canonical;
+    return candidate_head && probe_head && strcmp(candidate_head, probe_head) != 0;
+}
+
+static bool rust_method_probe_head_is_concrete(RustLSPContext *ctx, const CBMType *type,
+                                                const char *const *params) {
+    while (type && type->kind == CBM_TYPE_REFERENCE)
+        type = type->data.reference.elem;
+    int param_count = 0;
+    while (params && params[param_count])
+        param_count++;
+    if (!type || rust_receiver_param_index(ctx, type, params, param_count) >= 0)
+        return false;
+    const char *head = rust_method_probe_head(type);
+    if (!head)
+        return false;
+    if (rust_std_wrapper_canonical(head) || is_rust_primitive(head))
+        return true;
+    const CBMRegisteredType *registered = cbm_registry_lookup_type(ctx->registry, head);
+    return registered && !registered->rust_undeclared && !registered->alias_of;
+}
+
+static bool rust_method_probe_concrete_kinds_differ(const CBMType *candidate,
+                                                     const CBMType *probe) {
+    while (candidate && candidate->kind == CBM_TYPE_REFERENCE)
+        candidate = candidate->data.reference.elem;
+    while (probe && probe->kind == CBM_TYPE_REFERENCE)
+        probe = probe->data.reference.elem;
+    if (!candidate || !probe || candidate->kind == probe->kind)
+        return false;
+    return candidate->kind == CBM_TYPE_POINTER || probe->kind == CBM_TYPE_POINTER ||
+           candidate->kind == CBM_TYPE_SLICE || probe->kind == CBM_TYPE_SLICE ||
+           candidate->kind == CBM_TYPE_TUPLE || probe->kind == CBM_TYPE_TUPLE;
+}
+
+static const CBMType *rust_method_impl_self(RustLSPContext *ctx,
+                                            const CBMRegisteredFunc *method,
+                                            const CBMType *recv) {
+    if (!method || !(method->flags & CBM_FUNC_FLAG_RUST_SELF))
+        return NULL;
+    if (method->rust_reference_impl_self)
+        return method->rust_reference_impl_self;
+    if (method->rust_wrapper_impl_self)
+        return method->rust_wrapper_impl_self;
+    if (method->rust_inherent_impl_self)
+        return method->rust_inherent_impl_self;
+    const CBMRegisteredType *method_owner = method->receiver_type
+                                                ? cbm_registry_lookup_type(ctx->registry,
+                                                                           method->receiver_type)
+                                                : NULL;
+    if (method_owner && method_owner->is_interface) {
+        const CBMType *shape = recv;
+        for (int step = 0; shape && step < RUST_DEREF_MAX_HOPS; step++) {
+            const CBMType *base = rust_strip_references(shape);
+            const char *head = rust_method_probe_head(base);
+            const CBMRegisteredType *actual = head
+                                                  ? cbm_registry_lookup_type(ctx->registry, head)
+                                                  : NULL;
+            for (int i = 0; actual && actual->embedded_types && actual->embedded_types[i]; i++) {
+                if (strcmp(actual->embedded_types[i], method->receiver_type) == 0)
+                    return base;
+            }
+            shape = rust_deref_step(ctx, base);
+        }
+    }
+    size_t self_len = 0;
+    const char *self = rust_impl_key_part(method->impl_key, 1, &self_len);
+    if (self) {
+        const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+        const char *module = tree
+            ? cbm_rust_modtree_item_module(tree, ctx->arena, method->qualified_name) : NULL;
+        if (!module && method->receiver_type) {
+            const char *dot = strrchr(method->receiver_type, '.');
+            module = dot ? cbm_arena_strndup(ctx->arena, method->receiver_type,
+                                             (size_t)(dot - method->receiver_type))
+                         : ctx->module_qn;
+        }
+        const CBMType *parsed = rust_parse_def_type_text(
+            ctx->arena, cbm_arena_strndup(ctx->arena, self, self_len), module, tree);
+        const char *head = rust_method_probe_head(parsed);
+        const char *owner_qn = method->receiver_type;
+        const char *owner_leaf = owner_qn ? strrchr(owner_qn, '.') : NULL;
+        owner_leaf = owner_leaf ? owner_leaf + 1 : owner_qn;
+        const CBMRegisteredType *declared_owner = owner_qn
+                                                      ? cbm_registry_lookup_type(ctx->registry,
+                                                                                 owner_qn)
+                                                      : NULL;
+        const char *imported = owner_leaf ? rust_resolve_use(ctx, owner_leaf) : NULL;
+        const char *prelude = owner_leaf && !imported
+                                  ? rust_prelude_in_scope(ctx, owner_leaf)
+                                  : NULL;
+        if (imported || prelude) {
+            const char *resolved = imported
+                                       ? convert_path_to_qn(ctx->arena, imported)
+                                       : prelude;
+            bool resolved_std = strncmp(resolved, "std.", 4) == 0 ||
+                                strncmp(resolved, "core.", 5) == 0 ||
+                                strncmp(resolved, "alloc.", 6) == 0;
+            if (resolved_std || !declared_owner || declared_owner->rust_undeclared) {
+                const char *registered = rust_registered_type_qn(ctx, resolved);
+                owner_qn = registered ? registered : resolved;
+            }
+        } else if (owner_leaf && (!declared_owner || declared_owner->rust_undeclared)) {
+            const CBMType *actual = rust_strip_references(recv);
+            const char *actual_head = rust_method_probe_head(actual);
+            const char *actual_leaf = actual_head ? strrchr(actual_head, '.') : NULL;
+            actual_leaf = actual_leaf ? actual_leaf + 1 : actual_head;
+            const CBMRegisteredType *actual_type = actual_head
+                                                       ? cbm_registry_lookup_type(ctx->registry,
+                                                                                  actual_head)
+                                                       : NULL;
+            if (actual_leaf && strcmp(actual_leaf, owner_leaf) == 0 && actual_type &&
+                !actual_type->rust_undeclared)
+                owner_qn = actual_head;
+        }
+        bool bare_owner_self = owner_leaf && strlen(owner_leaf) == self_len &&
+                               strncmp(self, owner_leaf, self_len) == 0;
+        size_t head_len = head ? strlen(head) : 0;
+        size_t owner_len = owner_qn ? strlen(owner_qn) : 0;
+        bool owner_suffix_self = head_len > 0 && owner_len >= head_len &&
+                                 strcmp(owner_qn + owner_len - head_len, head) == 0 &&
+                                 (owner_len == head_len ||
+                                  owner_qn[owner_len - head_len - 1] == '.');
+        if (head && owner_leaf &&
+            (bare_owner_self || owner_suffix_self ||
+             (!strchr(head, '.') && strcmp(head, owner_leaf) == 0))) {
+            if (parsed->kind == CBM_TYPE_TEMPLATE)
+                return cbm_type_template(ctx->arena, owner_qn,
+                                         parsed->data.template_type.template_args,
+                                         parsed->data.template_type.arg_count);
+            if (parsed->kind == CBM_TYPE_NAMED)
+                return cbm_type_named(ctx->arena, owner_qn);
+        }
+        return parsed;
+    }
+    if (!method->receiver_type)
+        return NULL;
+    const CBMType *shape = recv;
+    for (int step = 0; shape && step < RUST_DEREF_MAX_HOPS; step++) {
+        const CBMType *base = rust_strip_references(shape);
+        const char *head = rust_method_probe_head(base);
+        const char *canonical = head ? rust_std_wrapper_canonical(head) : NULL;
+        const char *receiver_canonical = rust_std_wrapper_canonical(method->receiver_type);
+        if (head && (strcmp(head, method->receiver_type) == 0 ||
+                     (canonical && receiver_canonical &&
+                      strcmp(canonical, receiver_canonical) == 0)))
+            return base;
+        shape = rust_deref_step(ctx, base);
+    }
+    return cbm_type_named(ctx->arena, method->receiver_type);
+}
+
+static bool rust_method_probe_type_is_copy(RustLSPContext *ctx, const CBMType *type) {
+    if (!type)
+        return false;
+    if (type->kind == CBM_TYPE_REFERENCE)
+        return type->data.reference.rust_shared;
+    if (type->kind == CBM_TYPE_BUILTIN)
+        return type->data.builtin.name && strcmp(type->data.builtin.name, "str") != 0;
+    const char *head = rust_method_probe_head(type);
+    const CBMRegisteredType *registered = head
+                                              ? cbm_registry_lookup_type(ctx->registry, head)
+                                              : NULL;
+    for (int i = 0; registered && registered->embedded_types &&
+                    registered->embedded_types[i]; i++) {
+        if (strcmp(registered->embedded_types[i], "core.marker.Copy") == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Rust probes T, &T, then &mut T at each autoderef step. The impl self type
+ * supplies T; the method self parameter supplies which of those three shapes
+ * the candidate accepts. Unknown input is distinct from a proved mismatch. */
+static int rust_method_probe_rank(RustLSPContext *ctx, const CBMRegisteredFunc *method,
+                                  const CBMType *recv, int *possible_rank) {
+    if (possible_rank)
+        *possible_rank = RUST_METHOD_PROBE_INAPPLICABLE;
+    const CBMType *impl_self = rust_expand_type_aliases(
+        ctx, rust_method_impl_self(ctx, method, recv), 0);
+    if (!impl_self || !recv)
+        return RUST_METHOD_PROBE_UNKNOWN;
+    const CBMType *effective = impl_self;
+    const CBMType *enclosing_self = ctx->enclosing_func_qn && method->qualified_name &&
+                                           strcmp(ctx->enclosing_func_qn,
+                                                  method->qualified_name) == 0
+                                       ? cbm_scope_lookup(ctx->current_scope, "self")
+                                       : NULL;
+    if (enclosing_self)
+        effective = enclosing_self;
+    else if (method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF)
+        effective = rust_reference_type(ctx->arena, impl_self, true);
+    else if (!(method->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF))
+        effective = rust_reference_type(ctx->arena, impl_self, false);
+    const CBMType *shape = recv;
+    const char **params = method->rust_unbounded_impl_params;
+    bool mutable_available = recv->kind != CBM_TYPE_REFERENCE ||
+                             recv->data.reference.rust_mutable;
+    bool value_available = true;
+    for (int step = 0; shape && step < RUST_DEREF_MAX_HOPS; step++) {
+        const CBMType *probes[] = {shape, rust_reference_type(ctx->arena, shape, true),
+                                   rust_reference_type(ctx->arena, shape, false)};
+        for (int borrow = 0; borrow < 3; borrow++) {
+            if (borrow == 0 && !value_available)
+                continue;
+            if (borrow == 2 && !mutable_available)
+                continue;
+            if (rust_method_probe_reference_shapes_differ(ctx, effective, probes[borrow],
+                                                          params))
+                continue;
+            bool heads_differ = rust_method_probe_heads_differ(effective, probes[borrow]);
+            const CBMType *base = rust_strip_references(shape);
+            const char *head = rust_method_probe_head(base);
+            if ((heads_differ &&
+                 ((head && rust_wrapper_head_qn(ctx, head)) ||
+                  (rust_method_probe_head_is_concrete(ctx, effective, params) &&
+                   rust_method_probe_head_is_concrete(ctx, probes[borrow], params)))) ||
+                rust_method_probe_concrete_kinds_differ(effective, probes[borrow]))
+                continue;
+            if (!heads_differ && cbm_type_equal(effective, probes[borrow]))
+                return step * 3 + borrow;
+            RustImplSelfMatch match =
+                rust_impl_self_match(ctx, effective, probes[borrow], true, params);
+            if (match == RUST_IMPL_SELF_SAME)
+                return step * 3 + borrow;
+            if (match == RUST_IMPL_SELF_UNDECIDED) {
+                const char *refusal = rust_method_receiver_refusal_at_type(
+                    ctx, method, probes[borrow], true, true, NULL);
+                if (!refusal)
+                    return step * 3 + borrow;
+                if (possible_rank)
+                    *possible_rank = step * 3 + borrow;
+                return RUST_METHOD_PROBE_UNKNOWN;
+            }
+        }
+        if (shape->kind == CBM_TYPE_REFERENCE && !shape->data.reference.rust_mutable)
+            mutable_available = false;
+        const CBMType *next = rust_std_deref_target(ctx, shape);
+        if (next)
+            value_available = rust_method_probe_type_is_copy(ctx, next);
+        shape = next;
+    }
+    return RUST_METHOD_PROBE_INAPPLICABLE;
+}
+
+static const CBMRegisteredFunc *rust_reference_probe_candidate(
+    RustLSPContext *ctx, const CBMType *recv, const char *name, bool require_scope,
+    const char *recovery_module, int *rank, bool *blocked, bool *scope_filtered,
+    int *uncertain_rank, const char **uncertain_stop, const char **stop) {
+    const CBMRegisteredFunc *selected = NULL;
+    *rank = RUST_METHOD_PROBE_INAPPLICABLE;
+    *blocked = false;
+    *uncertain_rank = RUST_METHOD_PROBE_INAPPLICABLE;
+    const CBMType *receiver_base = rust_strip_references(recv);
+    const char *receiver_head = rust_method_probe_head(receiver_base);
+    bool defer_wrapper_pointee = receiver_head && rust_wrapper_head_qn(ctx, receiver_head);
+    CBMMethodIter it;
+    cbm_registry_methods_chain(ctx->registry, "core.reference", name, &it);
+    for (int i; (i = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &it.reg->funcs[i];
+        if (!candidate->rust_reference_impl_self || !candidate->impl_trait_qn)
+            continue;
+        if (require_scope && rust_trait_out_of_scope(ctx, candidate->impl_trait_qn, name,
+                                                     candidate->impl_key, NULL)) {
+            *scope_filtered = true;
+            continue;
+        }
+        int possible_rank = RUST_METHOD_PROBE_INAPPLICABLE;
+        int candidate_rank = rust_method_probe_rank(ctx, candidate, recv, &possible_rank);
+        if (candidate_rank == RUST_METHOD_PROBE_UNKNOWN) {
+            if (defer_wrapper_pointee && possible_rank >= 3)
+                continue;
+            if (possible_rank < 0)
+                *blocked = true;
+            else if (*uncertain_rank < 0 || possible_rank < *uncertain_rank)
+                *uncertain_rank = possible_rank;
+            continue;
+        }
+        if (defer_wrapper_pointee && candidate_rank >= 3)
+            continue;
+        if (candidate_rank < 0)
+            continue;
+        const char *refusal =
+            rust_trait_receiver_refusal(ctx, candidate, candidate->rust_reference_impl_self, true);
+        if (refusal) {
+            *blocked = true;
+            if (uncertain_stop && !*uncertain_stop)
+                *uncertain_stop = refusal;
+            continue;
+        }
+        if (!selected || candidate_rank < *rank) {
+            selected = candidate;
+            *rank = candidate_rank;
+            continue;
+        }
+        if (candidate_rank == *rank && strcmp(selected->impl_key, candidate->impl_key) != 0) {
+            *blocked = true;
+        }
+    }
+    size_t module_len = recovery_module ? strlen(recovery_module) : 0;
+    for (const CBMTypeRegistry *reg = recovery_module ? ctx->registry : NULL; reg;
+         reg = reg->fallback) {
+        for (int i = 0; i < reg->func_count; i++) {
+            const CBMRegisteredFunc *candidate = &reg->funcs[i];
+            if ((candidate->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 ||
+                !candidate->short_name || strcmp(candidate->short_name, name) != 0 ||
+                !candidate->qualified_name || module_len == 0 ||
+                strncmp(candidate->qualified_name, recovery_module, module_len) != 0 ||
+                candidate->qualified_name[module_len] != '.')
+                continue;
+            int possible_rank = RUST_METHOD_PROBE_INAPPLICABLE;
+            int candidate_rank = rust_method_probe_rank(ctx, candidate, recv, &possible_rank);
+            if (candidate_rank == RUST_METHOD_PROBE_UNKNOWN) {
+                const CBMType *candidate_self = rust_method_impl_self(ctx, candidate, recv);
+                RustStdCollision collision = rust_std_trait_collision(
+                    ctx, candidate_self ? candidate_self : recv, candidate);
+                const char *refusal = collision.reason;
+                const char *std_head = candidate_self
+                                           ? rust_std_receiver_head(candidate_self) : NULL;
+                const char *inventory = std_head
+                                            ? rust_std_inventory_receiver(ctx, std_head) : NULL;
+                const char *inventory_status = inventory
+                                                   ? rust_std_inventory_status(inventory) : NULL;
+                const CBMType *pointee = candidate_self
+                                             ? rust_std_deref_target(ctx, candidate_self) : NULL;
+                if (!refusal && inventory_status &&
+                    strcmp(inventory_status, "complete_except_deref") == 0 && pointee &&
+                    rust_type_unproven(pointee, candidate->rust_unbounded_impl_params, 0))
+                    refusal = "deref_receiver_identity_not_proven";
+                if (!refusal)
+                    refusal = rust_trait_receiver_refusal(ctx, candidate, recv, true);
+                if (refusal && uncertain_stop && !*uncertain_stop)
+                    *uncertain_stop = refusal;
+                if (possible_rank < 0)
+                    *blocked = true;
+                else if (*uncertain_rank < 0 || possible_rank < *uncertain_rank)
+                    *uncertain_rank = possible_rank;
+                continue;
+            }
+            if (candidate_rank < 0)
+                continue;
+            const CBMType *actual = rust_method_impl_self(ctx, candidate, recv);
+            const char *refusal = rust_method_receiver_refusal_at_type(
+                ctx, candidate, actual, true, true, actual);
+            if (refusal) {
+                *blocked = true;
+                if (uncertain_stop && !*uncertain_stop)
+                    *uncertain_stop = refusal;
+                continue;
+            }
+            if (!selected || candidate_rank < *rank) {
+                selected = candidate;
+                *rank = candidate_rank;
+            } else if (candidate_rank == *rank &&
+                       strcmp(selected->impl_key, candidate->impl_key) != 0) {
+                *blocked = true;
+            }
+        }
+    }
+    return selected;
+}
+
+static bool rust_interface_has_reference_impl(RustLSPContext *ctx,
+                                              const char *trait_qn,
+                                              const char *name) {
+    CBMMethodIter it;
+    cbm_registry_methods_chain(ctx->registry, "core.reference", name, &it);
+    for (int i; (i = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &it.reg->funcs[i];
+        if (candidate->rust_reference_impl_self && candidate->impl_trait_qn &&
+            strcmp(candidate->impl_trait_qn, trait_qn) == 0)
+            return true;
+    }
+    return false;
+}
+
+static const CBMRegisteredFunc *rust_method_probe_choice(
+    RustLSPContext *ctx, const CBMRegisteredFunc *inherent,
+    const CBMRegisteredFunc *trait_method, const CBMType *recv, const char *name,
+    bool require_scope, bool *scope_filtered, const char **stop) {
+    int inherent_rank = inherent ? rust_method_probe_rank(ctx, inherent, recv, NULL)
+                                 : RUST_METHOD_PROBE_INAPPLICABLE;
+    int trait_rank = trait_method ? rust_method_probe_rank(ctx, trait_method, recv, NULL)
+                                  : RUST_METHOD_PROBE_INAPPLICABLE;
+    int reference_rank = RUST_METHOD_PROBE_INAPPLICABLE;
+    int reference_uncertain_rank = RUST_METHOD_PROBE_INAPPLICABLE;
+    const char *reference_uncertain_stop = NULL;
+    bool reference_blocked = false;
+    const char *recovery_module = NULL;
+    if (inherent && inherent->receiver_type) {
+        const char *dot = strrchr(inherent->receiver_type, '.');
+        if (dot)
+            recovery_module = cbm_arena_strndup(ctx->arena, inherent->receiver_type,
+                                                (size_t)(dot - inherent->receiver_type));
+    }
+    if (!recovery_module) {
+        const CBMType *base = rust_strip_references(recv);
+        const char *head = rust_method_probe_head(base);
+        if (!head || !rust_wrapper_head_qn(ctx, head))
+            recovery_module = ctx->item_module_qn;
+    }
+    const CBMRegisteredFunc *reference = rust_reference_probe_candidate(
+        ctx, recv, name, require_scope, recovery_module, &reference_rank,
+        &reference_blocked, scope_filtered, &reference_uncertain_rank,
+        &reference_uncertain_stop, stop);
+    int proved_rank = inherent_rank >= 0 ? inherent_rank : trait_rank;
+    bool proved_inherent = inherent_rank >= 0 &&
+                           (trait_rank < 0 || inherent_rank <= trait_rank);
+    if (!proved_inherent && trait_rank >= 0)
+        proved_rank = trait_rank;
+    if (reference_rank >= 0 && (proved_rank < 0 || reference_rank < proved_rank)) {
+        proved_rank = reference_rank;
+        proved_inherent = false;
+    }
+    if (reference_uncertain_rank >= 0 &&
+        (proved_rank < 0 || reference_uncertain_rank < proved_rank ||
+         (reference_uncertain_rank == proved_rank && !proved_inherent)))
+        reference_blocked = true;
+    /* A unique inherent target needs no precedence decision. This preserves
+     * cross-file and built-in seed declarations that predate stored self
+     * shapes. The moment a trait or reference candidate exists, every choice
+     * must be ranked and an unknown shape withholds the site. */
+    if (inherent && inherent_rank == RUST_METHOD_PROBE_UNKNOWN && !trait_method &&
+        !reference && !reference_blocked)
+        return inherent;
+    if (inherent_rank == RUST_METHOD_PROBE_UNKNOWN || trait_rank == RUST_METHOD_PROBE_UNKNOWN) {
+        if (stop)
+            *stop = inherent_rank == RUST_METHOD_PROBE_UNKNOWN
+                        ? "inherent_receiver_not_proven" : "trait_receiver_unknown";
+        return NULL;
+    }
+    if (reference_blocked) {
+        if (stop && !*stop)
+            *stop = reference_uncertain_stop
+                        ? reference_uncertain_stop : "trait_reference_dispatch_unproved";
+        return NULL;
+    }
+    if (inherent_rank >= 0 && (trait_rank < 0 || inherent_rank <= trait_rank) &&
+        (reference_rank < 0 || inherent_rank <= reference_rank))
+        return inherent;
+    if (trait_rank >= 0 && (reference_rank < 0 || trait_rank < reference_rank))
+        return trait_method;
+    if (reference_rank >= 0 && (trait_rank < 0 || reference_rank < trait_rank))
+        return reference;
+    bool same_trait_reference = trait_method && reference &&
+                                trait_method->qualified_name && reference->qualified_name &&
+                                strcmp(trait_method->qualified_name,
+                                       reference->qualified_name) == 0 &&
+                                ((!trait_method->impl_key && !reference->impl_key) ||
+                                 (trait_method->impl_key && reference->impl_key &&
+                                  strcmp(trait_method->impl_key, reference->impl_key) == 0));
+    if (trait_rank >= 0 && reference_rank == trait_rank && !same_trait_reference) {
+        if (stop)
+            *stop = "trait_reference_dispatch_unproved";
+        return NULL;
+    }
+    if (trait_method && trait_rank == RUST_METHOD_PROBE_INAPPLICABLE && stop)
+        *stop = "trait_mutable_dispatch_unproved";
+    return trait_rank >= 0 ? trait_method : reference;
 }
 
 /* Resolve an ordinary method call with Rust precedence: inherent first,
@@ -8858,13 +9307,31 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
     if (receiver_type && receiver_type->is_interface) {
         const CBMRegisteredFunc *trait_method =
             rust_lookup_method_in_trait(ctx, receiver_type_qn, method_name, true);
-        if (trait_method && out_impl_count) {
-            *out_impl_count = 2; /* dynamic/bound trait dispatch */
+        const CBMRegisteredFunc *selected = trait_method;
+        if (trait_method && recv && rust_qn_in_project(ctx, receiver_type_qn) &&
+            rust_interface_has_reference_impl(ctx, receiver_type_qn, method_name)) {
+            selected = rust_method_probe_choice(
+                ctx, NULL, trait_method, recv, method_name, require_scope,
+                out_scope_filtered, stop);
+            /* Registry-only legacy definitions can name a trait method without
+             * carrying its self parameter. With no competing placeable
+             * candidate, retain dynamic dispatch; a ranked or possibly-earlier
+             * reference candidate still withholds through the stop above. */
+            if (!selected && stop && *stop &&
+                strcmp(*stop, "trait_receiver_unknown") == 0) {
+                *stop = NULL;
+                selected = trait_method;
+            }
         }
-        if (trait_method && out_trait_dispatch) {
+        if (selected && out_impl_count) {
+            *out_impl_count = selected == trait_method
+                                  ? 2 /* dynamic/bound trait dispatch */
+                                  : 1;
+        }
+        if (selected && out_trait_dispatch) {
             *out_trait_dispatch = true;
         }
-        return trait_method;
+        return selected;
     }
 
     /* At the same receiver probe, inherent methods precede trait methods. */
@@ -8877,9 +9344,7 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
             *stop = inherent_stop;
         return NULL;
     }
-    bool reference_probe = recv && recv->kind == CBM_TYPE_REFERENCE;
-    int inherent_rank = rust_reference_probe_rank(inh, recv);
-    if (inh && !reference_probe &&
+    if (inh && !recv &&
         !(borrowed && (inh->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) != 0)) {
         if (out_impl_count)
             *out_impl_count = 1;
@@ -8894,6 +9359,16 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
      * no trait default) is memoized, preserving out_impl_count fidelity for
      * the ambiguous (>=2 impls) case. */
     bool nm_active = reg && reg->read_only && !inh;
+    if (nm_active && recv) {
+        CBMMethodIter references;
+        cbm_registry_methods_chain(reg, "core.reference", method_name, &references);
+        for (int i; (i = cbm_method_iter_next(&references)) >= 0;) {
+            if (references.reg->funcs[i].rust_reference_impl_self) {
+                nm_active = false;
+                break;
+            }
+        }
+    }
     uint64_t nm_key = 0;
     if (nm_active) {
         nm_key = cbm_negmemo_key(1, receiver_type_qn, method_name);
@@ -8935,20 +9410,24 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
                 return NULL;
             }
         }
-        if (reference_probe && inh) {
-            int trait_rank = rust_reference_probe_rank(impl_method, recv);
-            if (trait_rank < 0) {
-                if (inherent_rank >= 0)
-                    return inh;
-                if (stop)
-                    *stop = "trait_mutable_dispatch_unproved";
+        if (recv) {
+            const CBMRegisteredFunc *selected =
+                rust_method_probe_choice(ctx, inh, impl_method, recv, method_name, require_scope,
+                                         &scope_filtered, stop);
+            if (!selected)
                 return NULL;
-            }
-            if (inherent_rank >= 0 && inherent_rank <= trait_rank) {
+            if (selected == inh) {
+                if (out_impl_count)
+                    *out_impl_count = 1;
                 return inh;
             }
-        } else if (inh && (impl_method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0) {
-            return NULL;
+            if (selected != impl_method) {
+                if (out_impl_count)
+                    *out_impl_count = 1;
+                if (out_trait_dispatch)
+                    *out_trait_dispatch = true;
+                return selected;
+            }
         }
         if (out_impl_count) {
             *out_impl_count = 1;
@@ -9017,20 +9496,24 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         default_method = unregistered_method;
     }
     if (default_method) {
-        if (reference_probe && inh) {
-            int trait_rank = rust_reference_probe_rank(default_method, recv);
-            if (trait_rank < 0) {
-                if (inherent_rank >= 0)
-                    return inh;
-                if (stop)
-                    *stop = "trait_mutable_dispatch_unproved";
+        if (recv) {
+            const CBMRegisteredFunc *selected =
+                rust_method_probe_choice(ctx, inh, default_method, recv, method_name,
+                                         require_scope, &scope_filtered, stop);
+            if (!selected)
                 return NULL;
-            }
-            if (inherent_rank >= 0 && inherent_rank <= trait_rank) {
+            if (selected == inh) {
+                if (out_impl_count)
+                    *out_impl_count = 1;
                 return inh;
             }
-        } else if (inh && (default_method->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) == 0) {
-            return NULL;
+            if (selected != default_method) {
+                if (out_impl_count)
+                    *out_impl_count = 1;
+                if (out_trait_dispatch)
+                    *out_trait_dispatch = true;
+                return selected;
+            }
         }
         if (out_impl_count) {
             *out_impl_count = 1;
@@ -9040,13 +9523,23 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         }
         return default_method;
     }
+    const CBMRegisteredFunc *selected = recv
+        ? rust_method_probe_choice(ctx, inh, NULL, recv, method_name, require_scope,
+                                   &scope_filtered, stop)
+        : inh;
+    if (selected && out_impl_count)
+        *out_impl_count = 1;
+    if (selected && selected != inh) {
+        if (out_trait_dispatch)
+            *out_trait_dispatch = true;
+    }
     if (out_scope_filtered)
         *out_scope_filtered = scope_filtered;
     /* A miss that depends on this scope's imports is not a registry fact. */
-    if (nm_active && !scope_filtered) {
+    if (!selected && nm_active && !scope_filtered && (!stop || !*stop)) {
         cbm_negmemo_insert(&ctx->neg_memo, ctx->arena, nm_key);
     }
-    return inh;
+    return selected;
 }
 
 // Find the sole concrete implementer of trait `trait_qn` that declares
@@ -13063,7 +13556,7 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
             const char *refusal =
                 block_alias
                     ? rust_method_receiver_refusal_at_type(ctx, unique, alias_receiver, false,
-                                                           false)
+                                                           false, NULL)
                     : rust_trait_receiver_refusal(
                           ctx, unique, cbm_type_named(ctx->arena, unique->receiver_type), true);
             if (!refusal && block_alias) {
@@ -13133,7 +13626,8 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
         }
         const char *refusal =
             block_alias
-                ? rust_method_receiver_refusal_at_type(ctx, tm, alias_receiver, false, false)
+                ? rust_method_receiver_refusal_at_type(ctx, tm, alias_receiver, false, false,
+                                                       NULL)
                 : rust_trait_receiver_refusal(ctx, tm, cbm_type_named(ctx->arena, receiver), true);
         if (!refusal && block_alias) {
             refusal = rust_trait_receiver_refusal(ctx, tm, alias_receiver, true);
@@ -14090,7 +14584,8 @@ static bool rust_resolve_default_by_expected_type(RustLSPContext *ctx, TSNode ca
 static const char *rust_method_receiver_refusal_at_type(RustLSPContext *ctx,
                                                         const CBMRegisteredFunc *method,
                                                         const CBMType *recv, bool slice_deref,
-                                                        bool prove_dispatch) {
+                                                        bool prove_dispatch,
+                                                        const CBMType *proved_impl_self) {
     if (prove_dispatch) {
         RustStdCollision collision = rust_std_trait_collision(ctx, recv, method);
         if (collision.reason)
@@ -14149,11 +14644,12 @@ static const char *rust_method_receiver_refusal_at_type(RustLSPContext *ctx,
         module = dot ? cbm_arena_strndup(ctx->arena, method->receiver_type,
                                        (size_t)(dot - method->receiver_type)) : ctx->module_qn;
     }
-    const CBMType *self = rust_expand_type_aliases(
-        ctx,
-                                 method->rust_reference_impl_self
-                                     ? method->rust_reference_impl_self
-                                     : rust_parse_def_type_text(ctx->arena, spelling, module, tree), 0);
+    const CBMType *self = proved_impl_self
+                              ? proved_impl_self
+                              : method->rust_reference_impl_self
+                                    ? method->rust_reference_impl_self
+                                    : rust_parse_def_type_text(ctx->arena, spelling, module, tree);
+    self = rust_expand_type_aliases(ctx, self, 0);
     if (self && method->receiver_type && strstr(method->receiver_type, ".#B")) {
         const char *owner = strrchr(method->receiver_type, '.');
         const char *path = cbm_rust_impl_owner_name(ctx->arena, spelling);
@@ -14252,7 +14748,7 @@ static const char *rust_method_receiver_refusal_at_type(RustLSPContext *ctx,
 static const char *rust_trait_receiver_refusal(RustLSPContext *ctx,
                                                const CBMRegisteredFunc *method,
                                                const CBMType *recv, bool prove_dispatch) {
-    return rust_method_receiver_refusal_at_type(ctx, method, recv, true, prove_dispatch);
+    return rust_method_receiver_refusal_at_type(ctx, method, recv, true, prove_dispatch, NULL);
 }
 
 /* Value receivers can dereference Vec to a slice; a type-headed alias call
@@ -14265,139 +14761,7 @@ static const char *rust_method_receiver_refusal(RustLSPContext *ctx,
                (method->flags & CBM_FUNC_FLAG_RUST_SELF) == 0
                    ? "inherent_associated_function" : NULL;
     }
-    return rust_method_receiver_refusal_at_type(ctx, method, recv, true, true);
-}
-
-/* Probe reference impls at the receiver shape Rust visits, before autoderef.
- * An undecided self type blocks selection rather than supplying a target. */
-static const CBMRegisteredFunc *rust_reference_method_at_shape(RustLSPContext *ctx,
-                                                               const CBMType *shape,
-                                                               const char *name,
-                                                               const char *own_trait, bool *blocked,
-                                                               bool *scope_filtered) {
-    const CBMRegisteredFunc *selected = NULL;
-    CBMMethodIter it;
-    cbm_registry_methods_chain(ctx->registry, "core.reference", name, &it);
-    for (int i; (i = cbm_method_iter_next(&it)) >= 0;) {
-        const CBMRegisteredFunc *candidate = &it.reg->funcs[i];
-        const CBMType *self = candidate->rust_reference_impl_self;
-        if (!self || !candidate->impl_trait_qn ||
-            (own_trait && (candidate->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) &&
-             strcmp(own_trait, candidate->impl_trait_qn) == 0)) {
-            continue;
-        }
-        const CBMType *effective = self;
-        if (candidate->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) {
-            effective = rust_reference_type(ctx->arena, self, true);
-        } else if (!(candidate->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF)) {
-            if ((candidate->flags & CBM_FUNC_FLAG_RUST_SELF) && shape->kind == CBM_TYPE_REFERENCE &&
-                rust_impl_self_match(ctx, self, shape->data.reference.elem, true, NULL) !=
-                    RUST_IMPL_SELF_DIFFERS) {
-                *blocked = true;
-                return NULL;
-            }
-            continue;
-        }
-        RustImplSelfMatch match = rust_impl_self_match(ctx, effective, shape, true, NULL);
-        if (match == RUST_IMPL_SELF_DIFFERS)
-            continue;
-        if (rust_trait_out_of_scope(ctx, candidate->impl_trait_qn, name, candidate->impl_key,
-                                    NULL)) {
-            *scope_filtered = true;
-            continue;
-        }
-        if (match == RUST_IMPL_SELF_UNDECIDED) {
-            *blocked = true;
-            return NULL;
-        }
-        const char *refusal = rust_trait_receiver_refusal(ctx, candidate, self, true);
-        if (refusal) {
-            if (strcmp(refusal, "unrecognised_std_method") == 0 ||
-                strcmp(refusal, "deref_receiver_identity_not_proven") == 0)
-                rust_emit_trait_refusal(ctx, candidate, self, refusal);
-            *blocked = true;
-            return NULL;
-        }
-        if (selected && strcmp(selected->impl_key, candidate->impl_key) != 0) {
-            *blocked = true;
-            return NULL;
-        }
-        selected = candidate;
-    }
-    return selected;
-}
-
-static const CBMRegisteredFunc *rust_reference_method_before_autoderef(
-    RustLSPContext *ctx, const CBMType *recv, const char *name, const CBMRegisteredFunc *inner,
-    const char *own_trait, bool *blocked, bool *scope_filtered) {
-    *blocked = false;
-    const CBMRegisteredType *owner = inner && inner->receiver_type
-        ? cbm_registry_lookup_type(ctx->registry, inner->receiver_type) : NULL;
-    if (owner && owner->is_interface && recv && recv->kind == CBM_TYPE_REFERENCE &&
-        recv->data.reference.elem && recv->data.reference.elem->kind == CBM_TYPE_NAMED &&
-        rust_lookup_method_in_trait(ctx,
-            recv->data.reference.elem->data.named.qualified_name, name, true) == inner &&
-        ((inner->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF)
-             ? recv->data.reference.rust_shared
-             : (inner->flags & CBM_FUNC_FLAG_RUST_SELF) &&
-               !(inner->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) && recv->data.reference.rust_mutable))
-        return NULL;
-    for (const CBMType *shape = recv; shape && shape->kind == CBM_TYPE_REFERENCE;
-         shape = shape->data.reference.elem) {
-        const CBMType *referent = shape->data.reference.elem;
-        if (shape->data.reference.rust_shared && referent && referent->kind == CBM_TYPE_NAMED &&
-            inner && inner->receiver_type &&
-            (inner->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) &&
-            !(inner->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) &&
-            strcmp(inner->receiver_type, referent->data.named.qualified_name) == 0) {
-            return NULL;
-        }
-        const CBMRegisteredFunc *candidate =
-            rust_reference_method_at_shape(ctx, shape, name, own_trait, blocked, scope_filtered);
-        if (*blocked) {
-            bool exact_nominal = shape == recv && shape->data.reference.elem &&
-                                 shape->data.reference.elem->kind != CBM_TYPE_REFERENCE;
-            int inner_rank = exact_nominal ? rust_reference_probe_rank(inner, recv) : -1;
-            if (inner_rank >= 0 && shape->data.reference.rust_shared) {
-                *blocked = false;
-                return NULL;
-            }
-            if (inner_rank == 0 && shape->data.reference.rust_mutable) {
-                *blocked = false;
-                return inner;
-            }
-            return NULL;
-        }
-        if (candidate && (candidate->flags & CBM_FUNC_FLAG_RUST_VALUE_SELF) && shape != recv &&
-            shape->data.reference.rust_mutable) {
-            *blocked = true;
-            return NULL;
-        }
-        /* A concrete shared method on the referent competes at this exact
-         * shape; an inherent one wins, two trait methods remain ambiguous. */
-        if (inner && (inner->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) &&
-            shape->data.reference.rust_shared && shape->data.reference.elem &&
-            shape->data.reference.elem->kind != CBM_TYPE_REFERENCE) {
-            if (!candidate || !(inner->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL))
-                return NULL;
-            *blocked = true;
-            return NULL;
-        }
-        if (candidate)
-            return candidate;
-        const char *self = inner ? rust_impl_key_part(inner->impl_key, 1, NULL) : NULL;
-        if (inner && self && *self != '&' && shape == recv &&
-            shape->data.reference.rust_mutable && referent &&
-            referent->kind != CBM_TYPE_REFERENCE && (inner->flags & CBM_FUNC_FLAG_RUST_SELF) &&
-            !(inner->flags & (CBM_FUNC_FLAG_RUST_SHARED_SELF | CBM_FUNC_FLAG_RUST_VALUE_SELF)))
-            return NULL;
-        const CBMType *borrowed = rust_reference_type(ctx->arena, shape, true);
-        candidate =
-            rust_reference_method_at_shape(ctx, borrowed, name, own_trait, blocked, scope_filtered);
-        if (*blocked || candidate)
-            return candidate;
-    }
-    return NULL;
+    return rust_method_receiver_refusal_at_type(ctx, method, recv, true, true, NULL);
 }
 
 static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node) {
@@ -14576,33 +14940,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 rust_emit_unresolved_call(ctx, mname, inherent_stop);
                 return;
             }
-            const CBMRegisteredFunc *caller = ctx->enclosing_func_qn
-                ? cbm_registry_lookup_func(ctx->registry, ctx->enclosing_func_qn) : NULL;
             scope_filtered |= wrapper_scope_filtered;
-            /* The enclosing impl proves its shared method at &Self, the
-             * written self receiver's exact shape. Another impl of the same
-             * trait cannot replace that impl at Self; other traits still probe. */
-            const char *own_trait = strcmp(ts_node_type(value), "self") == 0 &&
-                recv && recv->kind == CBM_TYPE_REFERENCE && recv->data.reference.rust_shared &&
-                cbm_type_equal(recv, cbm_scope_lookup(ctx->current_scope, "self")) &&
-                caller && (caller->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) &&
-                m && (m->flags & CBM_FUNC_FLAG_RUST_SHARED_SELF) &&
-                caller->impl_key && m->impl_key && caller->impl_trait_qn && m->impl_trait_qn &&
-                strcmp(caller->impl_key, m->impl_key) == 0 &&
-                strcmp(caller->impl_trait_qn, m->impl_trait_qn) == 0 ? m->impl_trait_qn : NULL;
-            bool reference_blocked = false;
-            const CBMRegisteredFunc *reference_method = rust_reference_method_before_autoderef(
-                ctx, recv, mname, m, own_trait, &reference_blocked, &scope_filtered);
-            if (reference_blocked) {
-                rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
-                return;
-            }
-            if (reference_method) {
-                rust_emit_resolved_call(ctx, reference_method->qualified_name,
-                                        reference_method->impl_key, "lsp_trait_dispatch",
-                                        CBM_RUST_CONF_TRAIT_SOLE);
-                return;
-            }
             if (m) {
                 if ((m->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0) {
                     const char *refusal = rust_method_receiver_refusal(ctx, m, recv);
@@ -14610,10 +14948,6 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                         rust_emit_unresolved_call(ctx, mname, refusal);
                         return;
                     }
-                }
-                if (rust_reference_impl_may_precede(ctx, recv, m)) {
-                    rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
-                    return;
                 }
                 /* Leaf-name recovery does not prove that a foreign receiver
                  * is the enclosing type, even when the method names match. */
@@ -14639,7 +14973,11 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                                      : NULL;
                 if ((m->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0 ||
                     (method_owner && method_owner->is_interface) || trait_dispatch) {
-                    const char *refusal = rust_trait_receiver_refusal(ctx, m, recv, true);
+                    const char *refusal = m->rust_reference_impl_self
+                        ? NULL : rust_trait_receiver_refusal(ctx, m, recv, true);
+                    if (refusal && strncmp(refusal, "trait_receiver_shape", 20) == 0 &&
+                        rust_method_probe_rank(ctx, m, recv, NULL) >= 0)
+                        refusal = NULL;
                     if (refusal) {
                         rust_emit_trait_refusal(ctx, m, recv, refusal);
                         return;
