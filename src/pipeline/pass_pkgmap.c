@@ -1695,10 +1695,10 @@ bool cbm_python_import_path_matches_qn(const char *module_path, const char *name
  * internal binding is never judged here -- a project module can re-export a
  * name from anywhere -- and a chain consistent with the target (src/ layout)
  * keeps the edge. `gbuf` NULL means "no IMPORTS edges" (all external). */
-static bool python_import_local_materialized(const cbm_gbuf_t *gbuf, const char *project_name,
-                                             const char *rel_path, const char *local_name) {
+static const cbm_gbuf_node_t *import_local_target(const cbm_gbuf_t *gbuf, const char *project_name,
+                                                  const char *rel_path, const char *local_name) {
     if (!gbuf || !rel_path) {
-        return false;
+        return NULL;
     }
     char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
     const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
@@ -1707,16 +1707,109 @@ static bool python_import_local_materialized(const cbm_gbuf_t *gbuf, const char 
     int edge_count = 0;
     if (!file_node || cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
                                                          &edge_count) != 0) {
-        return false;
+        return NULL;
     }
     char needle[CBM_SZ_256];
     snprintf(needle, sizeof(needle), "\"local_name\":\"%s\"", local_name);
     for (int i = 0; i < edge_count; i++) {
         if (edges[i]->properties_json && strstr(edges[i]->properties_json, needle)) {
-            return true;
+            return cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
         }
     }
-    return false;
+    return NULL;
+}
+
+static bool python_import_module_in_project(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                            const char *module_path);
+static bool python_is_plain_module_import(const CBMImport *imp);
+
+static bool path_has_module_suffix(const char *file_path, const char *module_path,
+                                   const char *suffix) {
+    char expected[1024];
+    snprintf(expected, sizeof(expected), "%s%s", module_path, suffix);
+    size_t file_len = strlen(file_path);
+    size_t expected_len = strlen(expected);
+    return file_len >= expected_len && strcmp(file_path + file_len - expected_len, expected) == 0 &&
+           (file_len == expected_len || file_path[file_len - expected_len - SKIP_ONE] == '/');
+}
+
+static bool python_import_target_matches_module(const CBMImport *imp,
+                                                const cbm_gbuf_node_t *target) {
+    if (!imp || !imp->module_path || !target || !target->file_path) {
+        return false;
+    }
+    if (imp->module_path[0] == '.') {
+        return true;
+    }
+    char module[1024];
+    snprintf(module, sizeof(module), "%s", imp->module_path);
+    char *as = strstr(module, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    if (!python_is_plain_module_import(imp)) {
+        char *dot = strrchr(module, '.');
+        if (dot) {
+            *dot = '\0';
+        }
+    }
+    for (char *p = module; *p; p++) {
+        if (*p == '.') {
+            *p = '/';
+        }
+    }
+    return path_has_module_suffix(target->file_path, module, ".py") ||
+           path_has_module_suffix(target->file_path, module, "/__init__.py");
+}
+
+static bool ts_import_module_in_project(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                        const CBMImport *imp) {
+    if (imp->is_file_reference) {
+        return true;
+    }
+    char *qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
+    bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
+    safe_free(qn);
+    return found;
+}
+
+bool cbm_external_import_binding_leaves_corpus(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
+                                               const CBMImportArray *imports, const char *name,
+                                               const char *rel_path,
+                                               const cbm_gbuf_node_t *candidate) {
+    bool supported = lang == CBM_LANG_PYTHON || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+    if (!ctx || !supported || !imports || imports->count <= 0 || !name || !name[0]) {
+        return false;
+    }
+    if (candidate && cbm_registry_synthetic_path_language(candidate->file_path) != CBM_LANG_COUNT) {
+        return false;
+    }
+    const char *root_end = strchr(name, '.');
+    size_t root_len = root_end ? (size_t)(root_end - name) : strlen(name);
+    bool bound = false;
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || strlen(imp->local_name) != root_len ||
+            strncmp(imp->local_name, name, root_len) != 0) {
+            continue;
+        }
+        const cbm_gbuf_node_t *import_target =
+            import_local_target(ctx->gbuf, ctx->project_name, rel_path, imp->local_name);
+        if (!import_target) {
+            bound = true;
+            continue;
+        }
+        bool module_in_project =
+            lang == CBM_LANG_PYTHON
+                ? (python_import_module_in_project(ctx, rel_path, imp->module_path) ||
+                   python_import_target_matches_module(imp, import_target))
+                : ts_import_module_in_project(ctx, rel_path, imp);
+        if (module_in_project) {
+            return false;
+        }
+        bound = true;
+    }
+    return bound;
 }
 
 bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
@@ -1760,7 +1853,7 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
         const char *leaf = strrchr(full, '.');
         leaf = leaf ? leaf + SKIP_ONE : full;
         if (cbm_python_import_path_matches_qn(full, leaf, resolved_qn) ||
-            python_import_local_materialized(gbuf, project_name, rel_path, imp->local_name)) {
+            import_local_target(gbuf, project_name, rel_path, imp->local_name)) {
             return false; /* consistent with the target, or a project import */
         }
         bound = true;
