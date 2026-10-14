@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+from typing import Optional
 
 
 SCIP_KINDS_BY_GRAPH_LABEL = {
@@ -58,13 +59,13 @@ class IdentityOutcome:
     """The exact SCIP identity for one graph node, or why none is assigned."""
 
     status: str
-    symbol: str | None = None
-    reason: str | None = None
+    symbol: Optional[str] = None
+    reason: Optional[str] = None
     candidates: tuple[str, ...] = ()
-    derive: str | None = None
-    owner: str | None = None
-    definition_path: str | None = field(default=None, compare=False)
-    definition_range: tuple[int, int, int, int] | None = field(
+    derive: Optional[str] = None
+    owner: Optional[str] = None
+    definition_path: Optional[str] = field(default=None, compare=False)
+    definition_range: Optional[tuple[int, int, int, int]] = field(
         default=None, compare=False
     )
 

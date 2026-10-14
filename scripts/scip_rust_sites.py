@@ -19,7 +19,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 
 CALL_THROUGH_VALUE = "call_through_value"
@@ -115,47 +115,47 @@ class ScoredEdge(NamedTuple):
     callee_start_byte: int
     callee_end_byte: int
     caller_qualified_name: str
-    caller_symbol: str | None
+    caller_symbol: Optional[str]
     target_qualified_name: str
-    target_symbol: str | None
+    target_symbol: Optional[str]
     strategy: str
     call_form: str
-    oracle_caller_symbol: str | None
-    oracle_symbol: str | None
+    oracle_caller_symbol: Optional[str]
+    oracle_symbol: Optional[str]
     outcome: str
     reason: str
-    caller_identity: DefinitionIdentity | None = None
-    oracle_caller_identity: DefinitionIdentity | None = None
-    target_identity: DefinitionIdentity | None = None
-    oracle_target_identity: DefinitionIdentity | None = None
+    caller_identity: Optional[DefinitionIdentity] = None
+    oracle_caller_identity: Optional[DefinitionIdentity] = None
+    target_identity: Optional[DefinitionIdentity] = None
+    oracle_target_identity: Optional[DefinitionIdentity] = None
 
 
 class CallerOutcome(NamedTuple):
-    graph_symbol: str | None
-    oracle_symbol: str | None
+    graph_symbol: Optional[str]
+    oracle_symbol: Optional[str]
     outcome: str
     reason: str
-    graph_identity: DefinitionIdentity | None = None
-    oracle_identity: DefinitionIdentity | None = None
+    graph_identity: Optional[DefinitionIdentity] = None
+    oracle_identity: Optional[DefinitionIdentity] = None
 
 
 class OracleDefinition(NamedTuple):
     symbol: str
-    identity: DefinitionIdentity | None
+    identity: Optional[DefinitionIdentity]
 
 
 class RecallOccurrence(NamedTuple):
     relative_path: str
     callee_start_byte: int
     callee_end_byte: int
-    oracle_caller_symbol: str | None
+    oracle_caller_symbol: Optional[str]
     caller_category: str
     oracle_symbol: str
     call_form: str
     strategy: str
     outcome: str
-    oracle_caller_identity: DefinitionIdentity | None = None
-    oracle_target_identity: DefinitionIdentity | None = None
+    oracle_caller_identity: Optional[DefinitionIdentity] = None
+    oracle_target_identity: Optional[DefinitionIdentity] = None
     target_category: str = "scip_definition"
 
 
