@@ -1928,13 +1928,14 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                 str_def_lists += census_len(def->signature_param_types[k]) + sizeof(char *);
             }
             str_def_fp += def->fingerprint ? (size_t)def->fingerprint_k * sizeof(uint32_t) : 0;
-            str_def_misc += census_len(def->route_path) + census_len(def->route_method) +
-                            census_len(def->impl_trait) + census_len(def->supertraits) +
-                            census_len(def->type_alias) + census_list(def->type_alias_params) +
-                            census_list(def->rust_type_params) +
-                            census_list(def->rust_unbounded_impl_params) +
-                            census_len(def->http_base_url) + census_list(def->extra_props) +
-                            census_len(def->decl_namespace);
+            str_def_misc +=
+                census_len(def->route_path) + census_len(def->route_method) +
+                census_len(def->impl_trait) + census_len(def->supertraits) +
+                census_len(def->type_alias) + census_list(def->type_alias_params) +
+                census_list(def->rust_type_params) + census_list(def->rust_impl_type_params) +
+                census_list(def->rust_type_param_defaults) +
+                census_list(def->rust_unbounded_impl_params) + census_len(def->http_base_url) +
+                census_list(def->extra_props) + census_len(def->decl_namespace);
         }
         for (int c = 0; c < r->calls.count; c++) {
             const CBMCall *call = &r->calls.items[c];

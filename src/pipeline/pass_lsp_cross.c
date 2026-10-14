@@ -971,9 +971,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->has_rust_value_self = src->has_rust_value_self;
         dst->has_rust_shared_self = src->has_rust_shared_self;
         dst->rust_impl_self_needs_proof = src->rust_impl_self_needs_proof;
-        const char *const *lists[] = {src->rust_type_params, src->rust_unbounded_impl_params};
-        const char ***copies[] = {&dst->type_params, &dst->rust_unbounded_impl_params};
-        for (int list = 0; list < 2; list++) {
+        const char *const *lists[] = {src->rust_type_params, src->rust_unbounded_impl_params,
+                                      src->rust_impl_type_params, src->rust_type_param_defaults};
+        const char ***copies[] = {&dst->type_params, &dst->rust_unbounded_impl_params,
+                                  &dst->rust_impl_type_params, &dst->rust_type_param_defaults};
+        for (int list = 0; list < 4; list++) {
             int n = 0;
             while (lists[list] && lists[list][n]) {
                 n++;
@@ -2339,6 +2341,8 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].has_rust_value_self = defs[i].has_rust_value_self;
         out[i].has_rust_shared_self = defs[i].has_rust_shared_self;
         out[i].rust_impl_self_needs_proof = defs[i].rust_impl_self_needs_proof;
+        out[i].rust_impl_type_params = defs[i].rust_impl_type_params;
+        out[i].rust_type_param_defaults = defs[i].rust_type_param_defaults;
         out[i].rust_unbounded_impl_params = defs[i].rust_unbounded_impl_params;
         out[i].type_params = defs[i].type_params;
     }

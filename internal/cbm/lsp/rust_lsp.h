@@ -398,6 +398,8 @@ typedef struct {
     bool has_rust_value_self;     /* unborrowed `self` or `mut self` */
     bool has_rust_shared_self;    /* explicit shared `&self` receiver */
     bool rust_impl_self_needs_proof; /* type/const impl parameters or a where clause */
+    const char **rust_impl_type_params; /* source-declared impl parameters, including bounded ones */
+    const char **rust_type_param_defaults; /* positional source defaults; empty means absent */
     const char **rust_unbounded_impl_params; /* declared impl parameters with no bounds */
     const char **type_params;     /* the fn's own type parameter names, NULL-ended */
 } CBMRustLSPDef;

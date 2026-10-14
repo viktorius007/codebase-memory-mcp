@@ -277,6 +277,8 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->type_alias);
     cr_list(c, &d->type_alias_params);
     cr_list(c, &d->rust_type_params);
+    cr_list(c, &d->rust_impl_type_params);
+    cr_list(c, &d->rust_type_param_defaults);
     cr_list(c, &d->rust_unbounded_impl_params);
     cr_str(c, &d->http_client);
     cr_str(c, &d->http_base_url);

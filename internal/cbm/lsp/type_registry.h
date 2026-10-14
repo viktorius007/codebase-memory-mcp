@@ -55,6 +55,8 @@ typedef struct {
      * module; the method is registered on the wrapper's QN. NULL otherwise. */
     const CBMType *rust_wrapper_impl_self;
     const CBMType *rust_reference_impl_self; /* written reference self, including mutability */
+    const CBMType *rust_inherent_impl_self; /* written inherent self, resolved in its module */
+    const char **rust_impl_type_params; /* source-declared impl parameters, including bounded ones */
     const char **rust_unbounded_impl_params; /* source-proved unconstrained impl parameters */
     /* Rust only: per declared parameter (parallel to the signature's
      * param_types), the FUNC type of the call signature the parameter
@@ -95,6 +97,7 @@ typedef struct {
     // Rust: `type Target` of the type's `impl Deref`; UNKNOWN when its impls do not agree on
     // one readable target, NULL when it has none. TYPE_PARAMs name deref_param_names, the
     // names the impl's self type spells at the type's argument positions.
+    const CBMType **rust_type_param_defaults; /* parallel to type_param_names, NULL-ended */
     const CBMType *deref_target;
     const char **deref_param_names;
     CBMRustIteratorImpl *rust_iterator_impls;

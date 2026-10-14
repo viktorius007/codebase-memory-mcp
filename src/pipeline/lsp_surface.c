@@ -116,6 +116,8 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         yyjson_mut_obj_add_bool(doc, o, "vs", d->has_rust_value_self);
         yyjson_mut_obj_add_bool(doc, o, "ss", d->has_rust_shared_self);
         yyjson_mut_obj_add_bool(doc, o, "iu", d->rust_impl_self_needs_proof);
+        add_str_array_or_null(doc, o, "td", d->rust_type_param_defaults, -1);
+        add_str_array_or_null(doc, o, "ip", d->rust_impl_type_params, -1);
         add_str_array_or_null(doc, o, "up", d->rust_unbounded_impl_params, -1);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
         add_str_array_or_null(doc, o, "tp", d->type_params, -1);
@@ -434,6 +436,10 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         int impl_param_count = 0;
         d->rust_unbounded_impl_params =
             arena_str_array(arena, yyjson_obj_get(o, "up"), true, &impl_param_count);
+        d->rust_impl_type_params =
+            arena_str_array(arena, yyjson_obj_get(o, "ip"), true, &impl_param_count);
+        d->rust_type_param_defaults =
+            arena_str_array(arena, yyjson_obj_get(o, "td"), true, &impl_param_count);
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
         int type_param_count = 0;

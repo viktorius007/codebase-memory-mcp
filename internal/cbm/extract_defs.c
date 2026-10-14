@@ -4397,6 +4397,29 @@ static const char **rust_item_type_param_names(CBMArena *a, TSNode item, const c
     return count > 0 ? names : NULL;
 }
 
+/* Defaults in declaration order, with lifetimes omitted like the names.
+ * An empty slot is not a default and never supplies an argument. */
+static const char **rust_item_type_param_defaults(CBMArena *a, TSNode item, const char *source) {
+    TSNode params = ts_node_child_by_field_name(item, TS_FIELD("type_parameters"));
+    uint32_t nc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+    if (nc == 0)
+        return NULL;
+    const char **defaults = cbm_arena_alloc(a, (size_t)(nc + 1) * sizeof(*defaults));
+    int count = 0;
+    bool any = false;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode param = ts_node_named_child(params, i);
+        const char *name = rust_generic_param_name(a, param, source);
+        if (!name || !name[0])
+            continue;
+        TSNode value = ts_node_child_by_field_name(param, TS_FIELD("default_type"));
+        defaults[count++] = ts_node_is_null(value) ? "" : cbm_node_text(a, value, source);
+        any = any || !ts_node_is_null(value);
+    }
+    defaults[count] = NULL;
+    return any ? defaults : NULL;
+}
+
 /* Rust `type Name<P..> = Target;`: the target as written and the type
  * parameter names, in order, into `def`. */
 static void extract_rust_type_alias(CBMArena *a, TSNode item, const char *source,
@@ -8239,6 +8262,7 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
          strcmp(kind, "union_item") == 0)) {
         def.signature_param_types =
             rust_item_type_param_names(a, node, ctx->source, &def.signature_param_count);
+        def.rust_type_param_defaults = rust_item_type_param_defaults(a, node, ctx->source);
     }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
@@ -9062,6 +9086,7 @@ static void extract_rust_impl_member(CBMExtractCtx *ctx, TSNode child, const Rus
     def.receiver = owner->receiver_name;
     def.parent_class = owner->type_qn;
     def.impl_trait = impl_trait;
+    def.rust_impl_type_params = owner->type_params;
     def.rust_unbounded_impl_params = owner->unbounded_params;
     def.rust_impl_self_needs_proof = owner->self_needs_proof;
     def.is_async = rust_fn_is_async(child);
