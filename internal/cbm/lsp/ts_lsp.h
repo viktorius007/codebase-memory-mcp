@@ -110,8 +110,8 @@ void ts_process_statement(TSLSPContext *ctx, TSNode node);
 
 // Single-file LSP. Builds a registry from result->defs + the TS stdlib subset, runs
 // resolution, and writes resolved calls into result->resolved_calls.
-void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                    TSNode root, bool js_mode, bool jsx_mode, bool dts_mode);
+void cbm_run_ts_lsp(CBMArena *arena, CBMArena *scratch, CBMFileResult *result, const char *source,
+                    int source_len, TSNode root, bool js_mode, bool jsx_mode, bool dts_mode);
 
 // Cross-file LSP. Caller passes in cross-file definitions (CBMLSPDef list) and the
 // resolved import → module-QN map. Re-parses source if cached_tree is NULL.

@@ -251,9 +251,12 @@ static void ts_emit_resolved_call_at(TSLSPContext *ctx, const char *callee_qn, c
                                      float confidence, TSNode site) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
+    const char *retained_callee_qn = cbm_arena_strdup(ctx->arena, callee_qn);
+    if (!retained_callee_qn)
+        return;
     CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
-    rc.callee_qn = callee_qn;
+    rc.callee_qn = retained_callee_qn;
     rc.strategy = strategy ? strategy : "lsp_ts";
     rc.confidence = confidence;
     rc.reason = NULL;
@@ -271,9 +274,12 @@ static void ts_emit_resolved_reference(TSLSPContext *ctx, const char *callee_qn,
         ts_node_is_null(site)) {
         return;
     }
+    const char *retained_callee_qn = cbm_arena_strdup(ctx->arena, callee_qn);
+    if (!retained_callee_qn)
+        return;
     CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
-    rc.callee_qn = callee_qn;
+    rc.callee_qn = retained_callee_qn;
     rc.strategy = strategy ? strategy : "lsp_ts_value_reference";
     rc.confidence = confidence;
     rc.reason = NULL;
@@ -5638,8 +5644,8 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
     }
 }
 
-void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                    TSNode root, bool js_mode, bool jsx_mode, bool dts_mode) {
+void cbm_run_ts_lsp(CBMArena *arena, CBMArena *scratch, CBMFileResult *result, const char *source,
+                    int source_len, TSNode root, bool js_mode, bool jsx_mode, bool dts_mode) {
     if (!arena || !result || !source || ts_node_is_null(root))
         return;
     ts_type_budget_reset((size_t)source_len);
@@ -5651,10 +5657,13 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     if (disabled && disabled[0] && disabled[0] != '0')
         return;
 
+    /* Registry storage is lookup-only during this call; retaining its growable
+     * tables in the result arena charges every indexed file for resolver scratch. */
+    CBMArena *registry_arena = scratch ? scratch : arena;
     CBMTypeRegistry reg;
-    cbm_registry_init(&reg, arena);
-    cbm_ts_stdlib_register(&reg, arena);
-    register_file_defs(arena, &reg, result, result->module_qn);
+    cbm_registry_init(&reg, registry_arena);
+    cbm_ts_stdlib_register(&reg, registry_arena);
+    register_file_defs(registry_arena, &reg, result, result->module_qn);
 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, result->module_qn, js_mode, jsx_mode,

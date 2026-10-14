@@ -3118,7 +3118,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                 if (rl >= 5 && strcmp(rel_path + rl - 5, ".d.ts") == 0)
                     dts_mode = true;
             }
-            cbm_run_ts_lsp(a, result, source, source_len, root, js_mode, jsx_mode, dts_mode);
+            cbm_run_ts_lsp(a, scratch, result, source, source_len, root, js_mode, jsx_mode,
+                           dts_mode);
         }
         if (language == CBM_LANG_CSHARP) {
             cbm_run_cs_lsp(a, result, source, source_len, root);
