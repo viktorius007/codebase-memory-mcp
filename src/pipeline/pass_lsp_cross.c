@@ -1628,6 +1628,13 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
 
     int metadata_count =
         (lang == CBM_LANG_PYTHON || lang == CBM_LANG_KOTLIN) && result ? result->imports.count : 0;
+    int python_star_count = 0;
+    if (lang == CBM_LANG_PYTHON && result) {
+        for (int i = 0; i < result->py_namespace.count; i++) {
+            python_star_count +=
+                result->py_namespace.items[i].kind == CBM_PY_NS_IMPORT_STAR ? 1 : 0;
+        }
+    }
     /* A completed PHP binding snapshot can establish a genuinely empty map.
      * The ordinary map remains a compatibility projection; only the separate
      * typed snapshot may prove that an import was left unresolved. */
@@ -1639,7 +1646,8 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
     if (edge_count == 0 && (!result || result->imports.count == 0) && !authoritative_empty)
         return 0;
 
-    size_t capacity = (size_t)edge_count + (result ? (size_t)result->imports.count : 0);
+    size_t capacity = (size_t)edge_count + (result ? (size_t)result->imports.count : 0) +
+                      (size_t)python_star_count;
     if (capacity == 0)
         capacity = 1;
     const char **keys =
@@ -1735,6 +1743,41 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
         keys[count] = local;
         vals[count] = value;
         count++;
+    }
+    if (python_star_count > 0) {
+        for (int i = 0; i < result->py_namespace.count; i++) {
+            const CBMPyNamespaceFact *fact = &result->py_namespace.items[i];
+            if (fact->kind != CBM_PY_NS_IMPORT_STAR || !fact->module_name) {
+                continue;
+            }
+            char module_path[CBM_PATH_MAX];
+            size_t module_len = strlen(fact->module_name);
+            if ((size_t)fact->relative_level + module_len >= sizeof(module_path)) {
+                continue;
+            }
+            memset(module_path, '.', fact->relative_level);
+            memcpy(module_path + fact->relative_level, fact->module_name, module_len + 1);
+            const cbm_gbuf_node_t *target = NULL;
+            for (int j = 0; j < result->imports.count; j++) {
+                const CBMImport *imp = &result->imports.items[j];
+                if (imp->module_path && strcmp(imp->module_path, module_path) == 0) {
+                    target = cbm_pipeline_resolve_import_node(
+                        ctx, rel_path, file_node ? file_node->qualified_name : NULL, imp, NULL);
+                    break;
+                }
+            }
+            if (!target || !target->qualified_name) {
+                continue;
+            }
+            keys[count] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, "*");
+            vals[count] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, target->qualified_name);
+            if (!keys[count] || !vals[count]) {
+                cbm_free(CBM_MEM_CLASS_OTHER, (void *)keys[count]);
+                cbm_free(CBM_MEM_CLASS_OTHER, (void *)vals[count]);
+                continue;
+            }
+            count++;
+        }
     }
     *out_keys = keys;
     *out_vals = vals;

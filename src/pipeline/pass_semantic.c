@@ -17,6 +17,7 @@
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -895,7 +896,13 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        bool shared_import_map = files[i].language == CBM_LANG_PYTHON;
+        if (shared_import_map) {
+            cbm_pxc_build_import_map(ctx, ctx->project_name, rel, files[i].language, result,
+                                     &imp_keys, &imp_vals, &imp_count);
+        } else {
+            build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        }
         cbm_php_vendor_names_t php_vendor;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
@@ -919,7 +926,11 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
 
         free(module_qn);
         cbm_pipeline_php_vendor_names_free(&php_vendor);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        if (shared_import_map) {
+            cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        } else {
+            free_import_map(imp_keys, imp_vals, imp_count);
+        }
         if (result_owned) {
             cbm_free_result(result);
         }

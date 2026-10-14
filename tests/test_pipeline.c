@@ -4250,6 +4250,22 @@ static void write_f1_guard_fixture(const char *tmp, int pad_files) {
     write_temp_file(tmp, "i1.py", "class AmbiguousBase:\n    pass\n");
     write_temp_file(tmp, "i2.py", "class AmbiguousBase:\n    pass\n");
     write_temp_file(tmp, "ichild.py", "class AmbiguousChild(AmbiguousBase):\n    pass\n");
+    write_temp_file(tmp, "app/__init__.py", "");
+    write_temp_file(tmp, "app/models.py", "class Base:\n    pass\n");
+    write_temp_file(tmp, "app/other.py", "class Base:\n    pass\n");
+    write_temp_file(tmp, "app/named.py",
+                    "from .models import Base\n"
+                    "class Named(Base):\n    pass\n"
+                    "def make_named():\n    return Base()\n");
+    write_temp_file(tmp, "app/star.py",
+                    "from .models import *\n"
+                    "class Star(Base):\n    pass\n"
+                    "def make_star():\n    return Base()\n");
+    write_temp_file(tmp, "app/alias.py",
+                    "from .models import Base as LocalBase\n"
+                    "class Alias(LocalBase):\n    pass\n"
+                    "def make_alias():\n    return LocalBase()\n");
+    write_temp_file(tmp, "app/unbound.py", "class Unbound(Base):\n    pass\n");
     write_temp_file(tmp, "t1.py", "class Problem(Exception):\n    pass\n");
     write_temp_file(tmp, "t2.py", "class Problem(Exception):\n    pass\n");
     write_temp_file(tmp, "tuser.py", "def fail():\n    raise Problem\n");
@@ -4381,6 +4397,56 @@ TEST(pipeline_multicandidate_inherits_records_name_binding_stop) {
     const char *sql = "SELECT count(*) FROM unresolved_sites WHERE file_path='ichild.py' "
                       "AND name='AmbiguousBase' AND reason='name_binding_not_proven'";
     ASSERT_EQ(f1_guard_query_both_modes("inherits-stop", sql, -1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_relative_named_import_binds_inherits_like_calls) {
+    const char *sql =
+        "SELECT 100 * (SELECT count(*) FROM edges e "
+        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.type='INHERITS' AND s.file_path='app/named.py' AND s.name='Named' "
+        "AND t.file_path='app/models.py' AND t.name='Base') + "
+        "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+        "AND s.file_path='app/named.py' AND s.name='make_named' "
+        "AND t.file_path='app/models.py' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-relative-named", sql, 101), 2);
+    PASS();
+}
+
+TEST(pipeline_python_relative_star_import_binds_inherits) {
+    const char *sql =
+        "SELECT count(*) FROM edges e "
+        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.type='INHERITS' AND s.file_path='app/star.py' AND s.name='Star' "
+        "AND t.file_path='app/models.py' AND t.name='Base'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-relative-star", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_relative_alias_import_binds_inherits_like_calls) {
+    const char *sql =
+        "SELECT 100 * (SELECT count(*) FROM edges e "
+        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.type='INHERITS' AND s.file_path='app/alias.py' AND s.name='Alias' "
+        "AND t.file_path='app/models.py' AND t.name='Base') + "
+        "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+        "AND s.file_path='app/alias.py' AND s.name='make_alias' "
+        "AND t.file_path='app/models.py' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-relative-alias", sql, 101), 2);
+    PASS();
+}
+
+TEST(pipeline_python_unbound_multicandidate_inherits_is_withheld) {
+    const char *sql =
+        "SELECT 100 * EXISTS(SELECT 1 FROM unresolved_sites "
+        "WHERE file_path='app/unbound.py' AND name='Base' "
+        "AND reason='name_binding_not_proven') + "
+        "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
+        "AND s.file_path='app/unbound.py' AND s.name='Unbound' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-unbound-inherits", sql, 100), 2);
     PASS();
 }
 
@@ -31209,6 +31275,10 @@ SUITE(pipeline_unresolved) {
     RUN_TEST(pipeline_multicandidate_usage_records_name_binding_stop);
     RUN_TEST(pipeline_multicandidate_write_records_name_binding_stop);
     RUN_TEST(pipeline_multicandidate_inherits_records_name_binding_stop);
+    RUN_TEST(pipeline_python_relative_named_import_binds_inherits_like_calls);
+    RUN_TEST(pipeline_python_relative_star_import_binds_inherits);
+    RUN_TEST(pipeline_python_relative_alias_import_binds_inherits_like_calls);
+    RUN_TEST(pipeline_python_unbound_multicandidate_inherits_is_withheld);
     RUN_TEST(pipeline_multicandidate_throw_records_name_binding_stop);
     RUN_TEST(pipeline_shell_call_never_targets_toml_and_records_stop);
     RUN_TEST(pipeline_rust_workspace_trait_reexport_and_block_import_are_proved);
