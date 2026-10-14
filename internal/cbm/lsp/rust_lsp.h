@@ -388,6 +388,7 @@ typedef struct {
     const char *receiver_spelling;      /* exact impl receiver spelling; registry-only */
     const char *impl_target;            /* impl relation: raw `type Target = ..;` text */
     const char *impl_item; /* written Item; empty when impl applicability is unproved */
+    const char *impl_output; /* written Output; empty when impl applicability is unproved */
     const char **decorators;            /* borrowed attribute texts (`#[derive(..)]`), NULL-ended */
     bool is_interface;           /* true for traits                          */
     bool is_rust_impl_relation;   /* independent type-level impl record       */

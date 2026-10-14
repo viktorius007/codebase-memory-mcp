@@ -90,6 +90,7 @@ static void rust_emit_field_reference(RustLSPContext *ctx, TSNode site, const ch
 static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
     const char *trait_qn, const char *method_name, bool allow_abstract);
 static char *rust_node_text(RustLSPContext *ctx, TSNode node);
+static bool rust_is_comment_node(TSNode n);
 static const char *convert_path_to_qn(CBMArena *arena, const char *path);
 static bool rust_type_derefs_to_first_arg(const char *type_qn);
 static const CBMType *rust_deref_step(RustLSPContext *ctx, const CBMType *t);
@@ -99,6 +100,10 @@ static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMT
                                                  const char *method);
 static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
     const char *trait_qn, const char *method_name, bool allow_abstract);
+static const CBMType *rust_strip_references(const CBMType *t);
+static const char *rust_std_type_head(const CBMType *t);
+static bool rust_method_in(const char *const *methods, const char *name);
+static const char *rust_binop_trait_method(const char *op_text);
 static const char *rust_impl_key_part(const char *key, int index, size_t *part_len);
 static const char *rust_trait_spelling_leaf(CBMArena *arena, const char *spelling);
 static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
@@ -2217,7 +2222,21 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
 
     /* function_type: fn(T1, T2) -> R */
     if (strcmp(kind, "function_type") == 0) {
-        return cbm_type_func(ctx->arena, NULL, NULL, NULL);
+        TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
+        uint32_t count = ts_node_named_child_count(params);
+        const CBMType **types = cbm_arena_alloc(ctx->arena, (count + 1) * sizeof(*types));
+        int n = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode param = ts_node_named_child(params, i);
+            if (rust_is_comment_node(param)) continue;
+            TSNode type = ts_node_child_by_field_name(param, "type", 4);
+            types[n++] = rust_parse_type_node(ctx, ts_node_is_null(type) ? param : type);
+        }
+        types[n] = NULL;
+        TSNode ret = ts_node_child_by_field_name(node, "return_type", 11);
+        const CBMType *returns[] = {ts_node_is_null(ret) ? cbm_type_builtin(ctx->arena, "()")
+                                                       : rust_parse_type_node(ctx, ret), NULL};
+        return cbm_type_func(ctx->arena, NULL, types, returns);
     }
 
     /* dynamic_type: dyn Trait — record as named on the trait QN */
@@ -2539,6 +2558,8 @@ static const char *rust_unsettled_generic_head_qn(CBMArena *arena, const char *h
     return head;
 }
 
+static const char *rust_type_text_group_end(const char *open);
+
 /* `own`, when given, is the module scope the text was written in: a generic
  * head it declares is that scope's item, not the prelude's namesake. */
 static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *text,
@@ -2722,6 +2743,45 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
         if (count == 1)
             return elems[0];
         return cbm_type_tuple(arena, elems, count);
+    }
+
+    /* Function pointers carry their written result, including nested fn returns. */
+    const char *fn = text;
+    if (strncmp(fn, "unsafe ", 7) == 0) fn += 7;
+    if (strncmp(fn, "extern ", 7) == 0) {
+        fn += 7;
+        if (*fn == '"') {
+            const char *abi_end = strchr(fn + 1, '"');
+            if (!abi_end) return cbm_type_unknown();
+            fn = abi_end + 1;
+        }
+        while (*fn == ' ') fn++;
+    }
+    if (strncmp(fn, "fn(", 3) == 0 || strncmp(fn, "fn (", 4) == 0) {
+        const char *open = strchr(fn, '(');
+        const char *close = rust_type_text_group_end(open);
+        if (!close) return cbm_type_unknown();
+        const CBMType *params[17] = {0};
+        int n = 0, depth = 0;
+        const char *start = open + 1;
+        for (const char *q = start; q <= close; q++) {
+            if (*q == '-' && q[1] == '>') { q++; continue; }
+            if (q < close && (*q == '<' || *q == '(' || *q == '[')) depth++;
+            if (q < close && (*q == '>' || *q == ')' || *q == ']')) depth--;
+            if (q != close && (*q != ',' || depth)) continue;
+            if (q > start) {
+                if (n == 16) return cbm_type_unknown();
+                const char *part = cbm_arena_strndup(arena, start, (size_t)(q - start));
+                params[n++] = parse_type_text_with_params(arena, part, module_qn, type_params, tree, own);
+            }
+            start = q + 1;
+        }
+        const char *result = close + 1;
+        while (*result == ' ') result++;
+        if (*result && strncmp(result, "->", 2) != 0) return cbm_type_unknown();
+        const CBMType *returns[] = {*result ? parse_type_text_with_params(
+            arena, result + 2, module_qn, type_params, tree, own) : cbm_type_builtin(arena, "()"), NULL};
+        return cbm_type_func(arena, NULL, params, returns);
     }
 
     /* Generic head: head<args> */
@@ -3577,6 +3637,14 @@ static const CBMType *rust_eval_literal_type(RustLSPContext *ctx, const char *ki
                 return cbm_type_builtin(ctx->arena, suffixes[i]);
             }
         }
+        /* Decimal integer tokens can carry a float suffix; hex digits f32/f64 are not suffixes. */
+        if (integer && text && !(text[0] == '0' && (text[1] == 'x' || text[1] == 'o' || text[1] == 'b'))) {
+            for (size_t i = 0; i < sizeof(float_suffixes) / sizeof(float_suffixes[0]); i++) {
+                size_t suffix_length = strlen(float_suffixes[i]);
+                if (length > suffix_length && strcmp(text + length - suffix_length, float_suffixes[i]) == 0)
+                    return cbm_type_builtin(ctx->arena, float_suffixes[i]);
+            }
+        }
         /* A default numeric type is not source evidence, including when the
          * literal flows through an inferred binding into impl selection. */
         return cbm_type_unknown();
@@ -3800,6 +3868,51 @@ static void rust_register_iterator_item(CBMArena *arena, CBMTypeRegistry *reg,
                           : cbm_type_unknown();
     impl->next = rt->rust_iterator_impls;
     rt->rust_iterator_impls = impl;
+}
+
+/* Keep the complete operand shapes with Output; an unreadable impl remains
+ * a competing candidate instead of letting another impl win by omission. */
+static void rust_register_operator_output(CBMArena *arena, CBMTypeRegistry *reg,
+                                          const CBMIdxMemo *type_idx, const char *trait,
+                                          const RustTraitScope *scope, const char *trait_text, const char *output,
+                                          const char *self_text, const char *module,
+                                          const CBMRustModTree *tree) {
+    if (!trait) {
+        const char *open = strchr(trait_text, '<');
+        const char *path = open ? cbm_arena_strndup(arena, trait_text, (size_t)(open - trait_text)) : trait_text;
+        if (scope && scope->tree) {
+            CBMRustPathResult resolved = cbm_rust_modtree_resolve_type_in_file(scope->tree, arena, module, path);
+            if (resolved.kind == CBM_RUST_PATH_NOT_FUNCTION) trait = resolved.qn;
+        } else {
+            trait = convert_path_to_qn(arena, path);
+            const char *used = rust_trait_path_through_use(arena, scope ? scope->imports : NULL, trait);
+            if (used) trait = used;
+        }
+    }
+    const char *leaf = trait && strncmp(trait, "core.ops.", 9) == 0 ? trait + 9 :
+                       trait && strncmp(trait, "std.ops.", 8) == 0 ? trait + 8 : NULL;
+    if (!leaf || strchr(leaf, '.')) return;
+    static const char *const operators[] = {"Add", "Sub", "Mul", "Div", "Rem", "BitAnd",
+        "BitOr", "BitXor", "Shl", "Shr", "Index", NULL};
+    if (!rust_method_in(operators, leaf)) return;
+    RustLSPContext types = {.arena = arena, .registry = reg, .module_qn = module};
+    const CBMType *self = rust_expand_type_aliases(
+        &types, rust_parse_def_type_text(arena, self_text, module, tree), 0);
+    const char *head = rust_std_type_head(rust_strip_references(self));
+    int32_t index = head ? cbm_idxmemo_get(type_idx, head) : -1;
+    if (index < 0) return;
+    CBMRustOperatorImpl *impl = cbm_arena_alloc(arena, sizeof(*impl));
+    impl->trait_qn = trait;
+    impl->self_type = output && *output ? self : cbm_type_unknown();
+    const char *open = strchr(trait_text, '<');
+    const char *close = open ? rust_type_text_group_end(open) : NULL;
+    impl->rhs_type = open && close ? rust_parse_def_type_text(arena,
+        cbm_arena_strndup(arena, open + 1, (size_t)(close - open - 1)), module, tree) : self;
+    const char *params[] = {"Self", NULL};
+    impl->output_type = output && *output ? parse_type_text_with_params(
+        arena, rust_type_text_canonical(arena, output), module, params, tree, NULL) : cbm_type_unknown();
+    impl->next = reg->types[index].rust_operator_impls;
+    reg->types[index].rust_operator_impls = impl;
 }
 
 /* Registered QN of the type a path head written as a declared alias stands
@@ -6078,7 +6191,8 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
     }
 
     /* Fallback: function expression's return type. */
-    const CBMType *func_type = rust_eval_expr_type(ctx, func_node);
+    const CBMType *func_type = rust_strip_references(
+        rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, func_node), 0));
     if (func_type && func_type->kind == CBM_TYPE_FUNC && func_type->data.func.return_types &&
         func_type->data.func.return_types[0]) {
         return func_type->data.func.return_types[0];
@@ -6499,6 +6613,130 @@ static const CBMType *rust_eval_match_value(RustLSPContext *ctx, TSNode node) {
     return rust_branch_join_type(ctx, &join);
 }
 
+/* Shared equality erases Rust reference mutability; impl operands cannot. */
+static bool rust_operator_operand_same(const CBMType *a, const CBMType *b) {
+    if (!cbm_type_equal(a, b)) return false;
+    if (!a || !b) return a == b;
+    switch (a->kind) {
+    case CBM_TYPE_REFERENCE:
+        return a->data.reference.rust_shared == b->data.reference.rust_shared &&
+               a->data.reference.rust_mutable == b->data.reference.rust_mutable &&
+               rust_operator_operand_same(a->data.reference.elem, b->data.reference.elem);
+    case CBM_TYPE_TEMPLATE:
+        for (int i = 0; i < a->data.template_type.arg_count; i++)
+            if (!rust_operator_operand_same(a->data.template_type.template_args[i],
+                                            b->data.template_type.template_args[i])) return false;
+        return true;
+    case CBM_TYPE_TUPLE:
+        for (int i = 0; i < a->data.tuple.count; i++)
+            if (!rust_operator_operand_same(a->data.tuple.elems[i], b->data.tuple.elems[i])) return false;
+        return true;
+    case CBM_TYPE_SLICE:
+        return rust_operator_operand_same(a->data.slice.elem, b->data.slice.elem);
+    case CBM_TYPE_POINTER:
+        return false;
+    default:
+        return true;
+    }
+}
+
+/* An operator's declared Output is selected by both complete operands, never
+ * by its method bucket. Unreadable candidates cannot prove a unique impl. */
+static const CBMType *rust_operator_output(RustLSPContext *ctx, const CBMType *left,
+                                          const CBMType *right, const char *method) {
+    left = rust_expand_type_aliases(ctx, left, 0);
+    right = rust_expand_type_aliases(ctx, right, 0);
+    const char *head = rust_std_type_head(rust_strip_references(left));
+    const CBMRegisteredType *owner = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
+    if (!owner || owner->rust_nominal_identity_ambiguous || cbm_type_is_unknown(right)) return NULL;
+    const CBMType *output = NULL;
+    for (const CBMRustOperatorImpl *it = owner->rust_operator_impls; it; it = it->next) {
+        const char *leaf = strrchr(it->trait_qn, '.') + 1;
+        char name[16];
+        size_t len = strlen(leaf);
+        if (len >= sizeof(name)) continue;
+        for (size_t i = 0; i <= len; i++) name[i] = (char)tolower((unsigned char)leaf[i]);
+        if (strcmp(name, method) != 0) continue;
+        if (cbm_type_is_unknown(it->self_type) || cbm_type_is_unknown(it->rhs_type)) return NULL;
+        if (!rust_operator_operand_same(it->self_type, left) ||
+            !rust_operator_operand_same(it->rhs_type, right)) continue;
+        if (output) return NULL;
+        const char *params[] = {"Self", NULL};
+        const CBMType *args[] = {left};
+        output = rust_expand_type_aliases(ctx,
+            rust_substitute_type(ctx->arena, it->output_type, params, args), 0);
+    }
+    return output;
+}
+
+static bool rust_numeric_primitive(const CBMType *t, bool integer_only) {
+    if (!t || t->kind != CBM_TYPE_BUILTIN) return false;
+    const char *name = t->data.builtin.name;
+    bool integer = name && (name[0] == 'i' || name[0] == 'u') &&
+        (isdigit((unsigned char)name[1]) || strcmp(name + 1, "size") == 0);
+    return integer || (!integer_only && name &&
+        (strcmp(name, "f32") == 0 || strcmp(name, "f64") == 0));
+}
+
+/* Unsuffixed integer literals in an index are constrained to usize. */
+static const CBMType *rust_index_operand_type(RustLSPContext *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "integer_literal") == 0) {
+        return rust_eval_expr_typed(ctx, node, cbm_type_builtin(ctx->arena, "usize"));
+    }
+    if (strcmp(ts_node_type(node), "range_expression") == 0) {
+        TSNode op = {0};
+        for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
+            TSNode child = ts_node_child(node, i);
+            if (strcmp(ts_node_type(child), "..") == 0 || strcmp(ts_node_type(child), "..=") == 0) op = child;
+        }
+        if (ts_node_is_null(op)) return cbm_type_unknown();
+        bool from = false, to = false;
+        const CBMType *elem = cbm_type_builtin(ctx->arena, "usize");
+        for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+            TSNode bound = ts_node_named_child(node, i);
+            if (rust_is_comment_node(bound)) continue;
+            if (!cbm_type_equal(elem, rust_index_operand_type(ctx, bound))) return cbm_type_unknown();
+            if (ts_node_start_byte(bound) < ts_node_start_byte(op)) from = true;
+            else to = true;
+        }
+        bool inclusive = strcmp(ts_node_type(op), "..=") == 0;
+        const char *range = from ? (to ? (inclusive ? "RangeInclusive" : "Range") : "RangeFrom")
+                                : (to ? (inclusive ? "RangeToInclusive" : "RangeTo") : "RangeFull");
+        const char *head = cbm_arena_sprintf(ctx->arena, "std.ops.%s", range);
+        return from || to ? cbm_type_template(ctx->arena, head, &elem, 1) : cbm_type_named(ctx->arena, head);
+    }
+    return rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, node), 0);
+}
+
+/* Built-in sequence indexing distinguishes usize from the six std range
+ * shapes. Qualified identity prevents a project's Range or Vec namesake winning. */
+static const CBMType *rust_sequence_index_output(RustLSPContext *ctx, const CBMType *base,
+                                                const CBMType *index) {
+    const CBMType *elem = NULL;
+    if (base && base->kind == CBM_TYPE_SLICE) elem = base->data.slice.elem;
+    const char *receiver = rust_std_type_head(base);
+    bool deque = receiver && (strcmp(receiver, "std.collections.VecDeque") == 0 ||
+                               strcmp(receiver, "alloc.collections.VecDeque") == 0);
+    if (base && base->kind == CBM_TYPE_TEMPLATE && base->data.template_type.arg_count > 0 &&
+        (deque || rust_std_family_of(ctx, base->data.template_type.template_name) == RUST_STD_VEC))
+        elem = base->data.template_type.template_args[0];
+    if (!elem || !index) return NULL;
+    if (index->kind == CBM_TYPE_BUILTIN && strcmp(index->data.builtin.name, "usize") == 0) return elem;
+    if (deque) return NULL; /* VecDeque has scalar Index, not range Index. */
+    const char *head = rust_std_type_head(index);
+    if (!head) return NULL;
+    if (strncmp(head, "std.ops.", 8) == 0) head += 8;
+    else if (strncmp(head, "core.ops.", 9) == 0) head += 9;
+    else return NULL;
+    if (strncmp(head, "range.", 6) == 0) head += 6;
+    static const char *const ranges[] = {"Range", "RangeFrom", "RangeTo", "RangeInclusive", "RangeToInclusive", NULL};
+    bool full = strcmp(head, "RangeFull") == 0;
+    if (!full && (!rust_method_in(ranges, head) || index->kind != CBM_TYPE_TEMPLATE ||
+        index->data.template_type.arg_count != 1 ||
+        !cbm_type_equal(index->data.template_type.template_args[0], cbm_type_builtin(ctx->arena, "usize")))) return NULL;
+    return cbm_type_slice(ctx->arena, elem);
+}
+
 const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
@@ -6512,7 +6750,7 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
             return cbm_type_unknown();
         }
         const CBMType *t = cbm_scope_lookup(ctx->current_scope, name);
-        if (!cbm_type_is_unknown(t)) {
+        if (!cbm_type_is_unknown(t) || cbm_scope_contains(ctx->current_scope, name)) {
             return t;
         }
         /* Module-level function. */
@@ -6705,9 +6943,8 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         }
         const CBMType *base = rust_strip_references(inner);
         const char *name = base && base->kind == CBM_TYPE_BUILTIN ? base->data.builtin.name : NULL;
-        bool integer = name && (name[0] == 'i' || name[0] == 'u') &&
-                       (isdigit((unsigned char)name[1]) || strcmp(name + 1, "size") == 0);
-        bool floating = name && (strcmp(name, "f32") == 0 || strcmp(name, "f64") == 0);
+        bool integer = rust_numeric_primitive(base, true);
+        bool floating = rust_numeric_primitive(base, false) && !integer;
         if (op && strcmp(op, "!") == 0 &&
             (integer || (name && strcmp(name, "bool") == 0))) {
             return base;
@@ -6718,52 +6955,51 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         return cbm_type_unknown();
     }
 
-    /* binary_expression — comparisons → bool, logical → bool, arith → left */
     if (strcmp(kind, "binary_expression") == 0) {
         TSNode left = ts_node_child_by_field_name(node, "left", 4);
-        for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
-            TSNode c = ts_node_child(node, i);
-            if (ts_node_is_named(c))
-                continue;
-            char *op = rust_node_text(ctx, c);
-            if (!op)
-                continue;
-            if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 || strcmp(op, "<") == 0 ||
-                strcmp(op, ">") == 0 || strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 ||
-                strcmp(op, "&&") == 0 || strcmp(op, "||") == 0) {
-                return cbm_type_builtin(ctx->arena, "bool");
-            }
-            break;
-        }
-        if (!ts_node_is_null(left)) {
-            return rust_eval_expr_type(ctx, left);
-        }
-        return cbm_type_unknown();
+        TSNode right = ts_node_child_by_field_name(node, "right", 5);
+        TSNode op_node = ts_node_child_by_field_name(node, "operator", 8);
+        char *op = rust_node_text(ctx, op_node);
+        if (!op) return cbm_type_unknown();
+        if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 || strcmp(op, "<") == 0 ||
+            strcmp(op, ">") == 0 || strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 ||
+            strcmp(op, "&&") == 0 || strcmp(op, "||") == 0) return cbm_type_builtin(ctx->arena, "bool");
+        const CBMType *a = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, left), 0);
+        const CBMType *b = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, right), 0);
+        if ((strcmp(ts_node_type(right), "integer_literal") == 0 && rust_numeric_primitive(a, true)) ||
+            (strcmp(ts_node_type(right), "float_literal") == 0 && rust_numeric_primitive(a, false) && !rust_numeric_primitive(a, true)))
+            b = rust_eval_expr_typed(ctx, right, a);
+        if ((strcmp(ts_node_type(left), "integer_literal") == 0 && rust_numeric_primitive(b, true)) ||
+            (strcmp(ts_node_type(left), "float_literal") == 0 && rust_numeric_primitive(b, false) && !rust_numeric_primitive(b, true)))
+            a = rust_eval_expr_typed(ctx, left, b);
+        bool shift = strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0;
+        bool bits = strcmp(op, "&") == 0 || strcmp(op, "|") == 0 || strcmp(op, "^") == 0;
+        if (rust_numeric_primitive(a, bits || shift) && rust_numeric_primitive(b, bits || shift) &&
+            (shift || cbm_type_equal(a, b))) return a;
+        if (bits && cbm_type_equal(a, cbm_type_builtin(ctx->arena, "bool")) && cbm_type_equal(a, b)) return a;
+        const char *method = rust_binop_trait_method(op);
+        const CBMType *output = method ? rust_operator_output(ctx, a, b, method) : NULL;
+        return output ? output : cbm_type_unknown();
     }
 
-    /* index_expression */
     if (strcmp(kind, "index_expression") == 0) {
-        TSNode value = ts_node_child_by_field_name(node, "value", 5);
-        if (ts_node_is_null(value) && ts_node_named_child_count(node) > 0) {
-            value = ts_node_named_child(node, 0);
-        }
-        const CBMType *op_type = rust_eval_expr_type(ctx, value);
-        const CBMType *base = op_type;
-        while (base && base->kind == CBM_TYPE_REFERENCE)
-            base = base->data.reference.elem;
-        if (base && base->kind == CBM_TYPE_SLICE) {
-            return base->data.slice.elem;
-        }
-        if (base && base->kind == CBM_TYPE_TEMPLATE) {
-            const char *nm = base->data.template_type.template_name;
-            if ((strstr(nm, "Vec") || strstr(nm, "VecDeque")) &&
-                base->data.template_type.arg_count > 0) {
-                return base->data.template_type.template_args[0];
-            }
-            if ((strstr(nm, "HashMap") || strstr(nm, "BTreeMap")) &&
-                base->data.template_type.arg_count > 1) {
-                return base->data.template_type.template_args[1];
-            }
+        TSNode value = ts_node_named_child(node, 0);
+        TSNode index = ts_node_named_child(node, 1);
+        const CBMType *actual = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, value), 0);
+        const CBMType *idx = rust_index_operand_type(ctx, index);
+        const CBMType *output = rust_operator_output(ctx, actual, idx, "index");
+        if (output) return output;
+        const CBMType *base = rust_strip_references(actual);
+        const char *head = rust_std_type_head(base);
+        const CBMRegisteredType *owner = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
+        if (actual != base && owner && owner->rust_operator_impls) return cbm_type_unknown();
+        for (int hop = 0; base && hop < RUST_DEREF_MAX_HOPS; hop++) {
+            output = rust_sequence_index_output(ctx, base, idx);
+            if (output) return output;
+            const char *deref_head = rust_std_type_head(base);
+            if (!deref_head || rust_std_family_of(ctx, deref_head) != RUST_STD_BOX) break;
+            base = rust_std_deref_target(ctx, base);
+            base = rust_strip_references(base);
         }
         return cbm_type_unknown();
     }
@@ -6886,14 +7122,10 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         return cbm_type_builtin(ctx->arena, "()");
     }
 
-    /* closure_expression: |a, b| body — best effort. Return type comes from
-     * the body's last expression if present. */
+    /* Reuse callable body typing, including its parameter scope and async stop. */
     if (strcmp(kind, "closure_expression") == 0) {
-        TSNode body = ts_node_child_by_field_name(node, "body", 4);
-        if (ts_node_is_null(body)) {
-            return cbm_type_func(ctx->arena, NULL, NULL, NULL);
-        }
-        return cbm_type_func(ctx->arena, NULL, NULL, NULL);
+        const CBMType *returns[] = {rust_std_callable_return(ctx, node, NULL), NULL};
+        return cbm_type_func(ctx->arena, NULL, NULL, returns);
     }
 
     /* Literals fall through. */
@@ -13319,7 +13551,8 @@ static const char *rust_expected_type_qn(RustLSPContext *ctx, TSNode expr) {
     if (rust_name_in_list(type_params, leaf) || rust_name_is_enclosing_type_param(ctx, expr, leaf)) {
         return NULL;
     }
-    return rust_registered_type_qn(ctx, qn);
+    const CBMRegisteredType *declared = rust_lookup_type_variants(ctx, qn);
+    return declared ? declared->qualified_name : NULL;
 }
 
 /* The `default` of the repository's `impl Default for <type_qn>`. NULL when
@@ -13417,7 +13650,7 @@ static const CBMRegisteredFunc *rust_bound_method(RustLSPContext *ctx, const cha
 }
 
 /* `Default::default()` (std's trait, spelled bare or through `std`/`core`)
- * links to the expected type's `impl Default`. True when it emitted. */
+ * handles a proved impl or records the missing proof. True when handled. */
 static bool rust_resolve_default_by_expected_type(RustLSPContext *ctx, TSNode call,
                                                   const char *path) {
     if (strcmp(path, "Default::default") == 0) {
@@ -13432,7 +13665,8 @@ static bool rust_resolve_default_by_expected_type(RustLSPContext *ctx, TSNode ca
     const char *type_qn = rust_expected_type_qn(ctx, call);
     const CBMRegisteredFunc *f = type_qn ? rust_default_impl_of(ctx, type_qn) : NULL;
     if (!f) {
-        return false;
+        rust_emit_unresolved_call(ctx, path, "default_impl_not_proven");
+        return true;
     }
     rust_emit_resolved_call(ctx, f->qualified_name, f->impl_key, "lsp_trait_dispatch",
                             CBM_RUST_CONF_UFCS);
@@ -14445,6 +14679,25 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         }
     }
 
+    if ((strcmp(kind, "binary_expression") == 0 || strcmp(kind, "index_expression") == 0) &&
+        cbm_type_is_unknown(rust_eval_expr_type(ctx, node))) {
+        uint32_t saved_start = ctx->emit_site_start_byte;
+        uint32_t saved_end = ctx->emit_site_end_byte;
+        uint32_t start = 0, end = 0;
+        if (rust_map_source_range(ctx, ts_node_start_byte(node), ts_node_end_byte(node), &start, &end)) {
+            ctx->emit_site_start_byte = start;
+            ctx->emit_site_end_byte = end;
+            TSNode op = ts_node_child_by_field_name(node, "operator", 8);
+            const char *expression = strcmp(kind, "index_expression") == 0 ? "index" :
+                rust_binop_trait_method(ts_node_is_null(op) ? NULL : rust_node_text(ctx, op));
+            rust_emit_unresolved_call(ctx, expression,
+                strcmp(kind, "index_expression") == 0 ? "index_output_not_proven" : "operator_output_not_proven");
+            rust_inject_syn_call(ctx, expression);
+        }
+        ctx->emit_site_start_byte = saved_start;
+        ctx->emit_site_end_byte = saved_end;
+    }
+
     /* Macro invocation: walk inner tokens for nested calls and try the
      * macro-as-function mapping. */
     if (strcmp(kind, "macro_invocation") == 0) {
@@ -14725,6 +14978,21 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
      * receivers can route via the bound trait. */
     int saved_bound_count = ctx->type_param_bound_count;
     rust_collect_item_bounds(ctx, func_node);
+
+    /* Const parameters are values of their written type, including impl parameters. */
+    for (TSNode item = func_node; !ts_node_is_null(item); item = ts_node_parent(item)) {
+        if (!ts_node_eq(item, func_node) && strcmp(ts_node_type(item), "function_item") == 0) break;
+        TSNode generics = ts_node_child_by_field_name(item, "type_parameters", 15);
+        if (ts_node_is_null(generics)) continue;
+        for (uint32_t i = 0; i < ts_node_named_child_count(generics); i++) {
+            TSNode param = ts_node_named_child(generics, i);
+            if (strcmp(ts_node_type(param), "const_parameter") != 0) continue;
+            TSNode name = ts_node_child_by_field_name(param, "name", 4);
+            TSNode type = ts_node_child_by_field_name(param, "type", 4);
+            if (!ts_node_is_null(name) && !ts_node_is_null(type))
+                cbm_scope_bind(ctx->current_scope, rust_node_text(ctx, name), rust_parse_type_node(ctx, type));
+        }
+    }
 
     /* Bind self for impl/trait methods. */
     TSNode params = ts_node_child_by_field_name(func_node, "parameters", 10);
@@ -16410,6 +16678,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                                   : cbm_arena_sprintf(arena, "%s.%s", module_qn, it->struct_name);
         const char *trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
                                                          it->trait_name, module_qn);
+        rust_register_operator_output(arena, reg, &type_idx, trait_qn, &trait_scope,
+                                      it->trait_name, it->output_type, it->struct_name, module_qn, NULL);
         if (!trait_qn) {
             continue;
         }
@@ -16780,6 +17050,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         }
         const char *trait_qn = rust_canonical_impl_trait(arena, reg, &trait_names, &trait_scope,
                                                          d->trait_qn, def_mod);
+        rust_register_operator_output(arena, reg, &type_idx, trait_qn, &trait_scope,
+                                      d->trait_qn, d->impl_output, d->receiver_spelling, def_mod, tree);
         if (!trait_qn) {
             continue;
         }
@@ -17397,6 +17669,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry_with_modtree(CBMArena *arena, CBM
             rdefs[i].receiver_spelling = defs[i].receiver_spelling;
             rdefs[i].impl_target = defs[i].impl_target;
             rdefs[i].impl_item = defs[i].impl_item;
+            rdefs[i].impl_output = defs[i].impl_output;
             rdefs[i].decorators = defs[i].decorators;
             rdefs[i].is_interface = defs[i].is_interface;
             rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;

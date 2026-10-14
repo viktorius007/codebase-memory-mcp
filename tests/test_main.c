@@ -1779,6 +1779,7 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_pipeline_expression(void);
 extern void suite_pipeline_unresolved(void);
 extern void suite_pipeline_objectscript_timeout(void);
 extern void suite_pipeline_conventions(void);
@@ -2255,6 +2256,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(pipeline_expression);
     RUN_SELECTED_SUITE(pipeline_unresolved);
     RUN_SELECTED_SUITE(pipeline_objectscript_timeout);
     RUN_SELECTED_SUITE(pipeline_conventions);

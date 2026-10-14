@@ -9984,6 +9984,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                                    rust_subtree_has_kind(type_node, "mutable_specifier", 0)
                                ? ""
                                : rust_impl_target_type(ctx, node, "Item");
+            it.output_type = item_param_count || !ts_node_is_null(item_where)
+                                 ? ""
+                                 : rust_impl_target_type(ctx, node, "Output");
             cbm_impltrait_push(&ctx->result->impl_traits, a, it);
             impl_trait = trait_name;
         }
