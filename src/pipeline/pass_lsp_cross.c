@@ -1735,6 +1735,138 @@ static const cbm_gbuf_node_t *pxc_python_fact_target(const cbm_pipeline_ctx_t *c
     return target;
 }
 
+/* What one directory on the module search path provides for a module path,
+ * in importlib's FileFinder order: a directory holding `__init__.py` is a
+ * regular package and wins over a same-named `.py` module, which wins over a
+ * directory without one (a namespace package portion, which also loses to a
+ * regular hit in any other search directory). */
+typedef enum {
+    PXC_PY_FINDS_NOTHING = 0,
+    PXC_PY_FINDS_NAMESPACE,
+    PXC_PY_FINDS_REGULAR
+} PXCPythonFinds;
+
+/* The node of `label` that carries `qn` (consumed) and stands for exactly the
+ * repo-relative `path`: a QN alone can collide (`a/b.py` and the folder `a/b`
+ * share one). */
+static const cbm_gbuf_node_t *pxc_python_node_at(const cbm_pipeline_ctx_t *ctx, char *qn,
+                                                 const char *label, const char *path) {
+    const cbm_gbuf_node_t *node = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    pxc_free_fqn(qn);
+    return node && node->label && strcmp(node->label, label) == 0 && node->file_path &&
+                   strcmp(node->file_path, path) == 0
+               ? node
+               : NULL;
+}
+
+static bool pxc_python_is_package_dir(const cbm_pipeline_ctx_t *ctx, const char *dir) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s%s__init__.py", dir, dir[0] ? "/" : "");
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return false;
+    char *qn = cbm_pipeline_fqn_compute(ctx->project_name, path, "__file__");
+    bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+    pxc_free_fqn(qn);
+    return found;
+}
+
+/* What the search directory `dir` provides for the slash-form module path
+ * `module`, and its node. A regular package is its Folder, or its `__init__`
+ * Module when no Folder carries the path. A hit without a node stays a hit
+ * (*out NULL), so it still counts against another directory's hit. */
+static PXCPythonFinds pxc_python_find_in(const cbm_pipeline_ctx_t *ctx, const char *dir,
+                                         const char *module, const cbm_gbuf_node_t **out) {
+    char path[CBM_PATH_MAX];
+    char file[CBM_PATH_MAX];
+    *out = NULL;
+    int n = snprintf(path, sizeof(path), "%s%s%s", dir, dir[0] && module[0] ? "/" : "", module);
+    int m = snprintf(file, sizeof(file), "%s/__init__.py", path);
+    if (n <= 0 || (size_t)n >= sizeof(path) || m <= 0 || (size_t)m >= sizeof(file))
+        return PXC_PY_FINDS_NOTHING;
+    const char *project = ctx->project_name;
+    if (pxc_python_is_package_dir(ctx, path)) {
+        *out = pxc_python_node_at(ctx, cbm_pipeline_fqn_folder(project, path), "Folder", path);
+        if (!*out)
+            *out = pxc_python_node_at(ctx, cbm_pipeline_fqn_module(project, file), "Module", file);
+        return PXC_PY_FINDS_REGULAR;
+    }
+    m = snprintf(file, sizeof(file), "%s.py", path);
+    if (m > 0 && (size_t)m < sizeof(file)) {
+        *out = pxc_python_node_at(ctx, cbm_pipeline_fqn_module(project, file), "Module", file);
+        if (*out)
+            return PXC_PY_FINDS_REGULAR;
+    }
+    *out = pxc_python_node_at(ctx, cbm_pipeline_fqn_folder(project, path), "Folder", path);
+    return *out ? PXC_PY_FINDS_NAMESPACE : PXC_PY_FINDS_NOTHING;
+}
+
+static bool pxc_python_pop_dir(char *dir) {
+    if (!dir[0])
+        return false;
+    char *slash = strrchr(dir, '/');
+    if (slash)
+        *slash = '\0';
+    else
+        dir[0] = '\0';
+    return true;
+}
+
+/* The project module or package `<level dots><dotted>` names when imported
+ * from `rel_path`. A relative import names one path under the importing
+ * file's package. An absolute one is searched the way the interpreter's
+ * search path finds it: in the nearest ancestor of the importing file that is
+ * no package (the directory a script there runs from) and in every directory
+ * above it up to the repository root; a package's own directory is never a
+ * search root, so `from tf.util import x` inside tf/ does not find tf/tf.py.
+ * The module is located only when exactly one of those directories provides
+ * it; two providers, or a hit without a node, leave it unlocated (NULL), and so
+ * does a module outside the project. */
+static const cbm_gbuf_node_t *pxc_python_import_module(const cbm_pipeline_ctx_t *ctx,
+                                                       const char *rel_path,
+                                                       uint32_t relative_level,
+                                                       const char *dotted) {
+    char module[CBM_PATH_MAX];
+    char dir[CBM_PATH_MAX];
+    size_t len = strlen(dotted);
+    int n = snprintf(dir, sizeof(dir), "%s", rel_path ? rel_path : "");
+    if (len >= sizeof(module) || n <= 0 || (size_t)n >= sizeof(dir))
+        return NULL;
+    for (size_t i = 0; i <= len; i++)
+        module[i] = dotted[i] == '.' ? '/' : dotted[i];
+    (void)pxc_python_pop_dir(dir);
+    const cbm_gbuf_node_t *node = NULL;
+    if (relative_level > 0) {
+        for (uint32_t up = 1; up < relative_level; up++) {
+            if (!pxc_python_pop_dir(dir))
+                return NULL;
+        }
+        if (!dir[0] && !module[0])
+            return NULL;
+        return pxc_python_find_in(ctx, dir, module, &node) == PXC_PY_FINDS_NOTHING ? NULL : node;
+    }
+    if (!module[0])
+        return NULL;
+    while (dir[0] && pxc_python_is_package_dir(ctx, dir))
+        (void)pxc_python_pop_dir(dir);
+    int regular = 0;
+    int portions = 0;
+    const cbm_gbuf_node_t *regular_node = NULL;
+    const cbm_gbuf_node_t *portion_node = NULL;
+    do {
+        PXCPythonFinds finds = pxc_python_find_in(ctx, dir, module, &node);
+        if (finds == PXC_PY_FINDS_REGULAR) {
+            regular++;
+            regular_node = node;
+        } else if (finds == PXC_PY_FINDS_NAMESPACE) {
+            portions++;
+            portion_node = node;
+        }
+    } while (pxc_python_pop_dir(dir));
+    if (regular > 0)
+        return regular == 1 ? regular_node : NULL;
+    return portions == 1 ? portion_node : NULL;
+}
+
 /* Standard-library decorators that return the decorated object, or an
  * equivalent of the very definition it decorates, so the name stays bound to
  * that definition. */
@@ -1913,6 +2045,25 @@ static const cbm_gbuf_node_t *pxc_python_owner_module(const cbm_gbuf_t *gbuf,
     return init && init->label && strcmp(init->label, "Module") == 0 ? init : NULL;
 }
 
+/* Whether `module`, the node the import resolver gave for `<level
+ * dots><dotted>` written in `rel_path`, is the module the interpreter's search
+ * finds there (pxc_python_import_module). The resolver can answer with a near
+ * miss: an absolute `from tf.util import x` inside the package tf/ comes back
+ * as the sibling module tf/tf.py, and reading that module's own bindings would
+ * publish whatever it binds under the name. Only a located module is read. */
+static bool pxc_python_module_located(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                      uint32_t relative_level, const char *dotted,
+                                      const cbm_gbuf_node_t *module) {
+    const cbm_gbuf_node_t *located =
+        module && dotted ? pxc_python_import_module(ctx, rel_path, relative_level, dotted) : NULL;
+    if (!located)
+        return false;
+    if (located == module)
+        return true;
+    const cbm_gbuf_node_t *owner = pxc_python_owner_module(ctx->gbuf, module);
+    return owner && owner == pxc_python_owner_module(ctx->gbuf, located);
+}
+
 /* The ordered namespace facts of one project module, read from its source once
  * per build. False when the source cannot be read or its facts are incomplete:
  * nothing about that module's names is then proven. */
@@ -1969,7 +2120,12 @@ static bool pxc_python_apply_star(PXCPythonResolver *pr, const char *rel_path, c
     const cbm_gbuf_node_t *module = pxc_python_fact_target(pr->ctx, rel_path, file_qn, fact, false);
     PXCPythonImportMap exported = {0};
     CBMPyNamespaceFacts source = {0};
-    if (!pxc_python_load_namespace(pr, module, &exported, &source, depth)) {
+    /* A package is read through its `__init__` module, which the resolver's
+     * answer alone does not prove is the package imported here. */
+    bool package = module && module->label && strcmp(module->label, "Folder") == 0;
+    if ((package && !pxc_python_module_located(pr->ctx, rel_path, fact->relative_level,
+                                               fact->module_name, module)) ||
+        !pxc_python_load_namespace(pr, module, &exported, &source, depth)) {
         pxc_python_map_free(&exported);
         return false;
     }
@@ -2049,11 +2205,18 @@ static PXCPythonVerdict pxc_python_member_binding(PXCPythonResolver *pr,
  * or the member the imported module binds under that name (its own definition,
  * or whatever its own imports bind it to: a package `__init__` that re-exports
  * `from .base import Base`). NULL when the import names nothing in the project
- * or the binding cannot be followed. */
+ * or the binding cannot be followed.
+ *
+ * The imported module's own bindings are read only when the interpreter's
+ * search locates the module the resolver answered (pxc_python_module_located).
+ * For an unlocated module the file whose map is built keeps the resolver's
+ * exact `<module>.<member>` node, as before; an import met while following a
+ * re-export (`followed`) answers nothing for it, nor for a module or package
+ * import whose target the search does not locate. */
 static const cbm_gbuf_node_t *pxc_python_import_fact_node(PXCPythonResolver *pr,
                                                           const char *rel_path, const char *file_qn,
-                                                          const CBMPyNamespaceFact *fact,
-                                                          int depth) {
+                                                          const CBMPyNamespaceFact *fact, int depth,
+                                                          bool followed) {
     const cbm_pipeline_ctx_t *ctx = pr->ctx;
     const cbm_gbuf_node_t *target = NULL;
     if (fact->kind == CBM_PY_NS_IMPORT_NAME && fact->module_name && fact->module_name[0]) {
@@ -2063,31 +2226,43 @@ static const cbm_gbuf_node_t *pxc_python_import_fact_node(PXCPythonResolver *pr,
             module =
                 cbm_pipeline_lsp_target_node(ctx->gbuf, pr->project_name, fact->module_name, false);
         }
-        if (module && module->label &&
-            (strcmp(module->label, "Module") == 0 || strcmp(module->label, "Folder") == 0) &&
-            fact->member_name &&
-            pxc_python_member_binding(pr, module, fact->member_name, depth, &target) !=
-                PXC_PY_BOUND) {
-            target = NULL;
+        if (!module || !module->label || !fact->member_name ||
+            (strcmp(module->label, "Module") != 0 && strcmp(module->label, "Folder") != 0))
+            return NULL;
+        if (pxc_python_module_located(ctx, rel_path, fact->relative_level, fact->module_name,
+                                      module)) {
+            if (pxc_python_member_binding(pr, module, fact->member_name, depth, &target) !=
+                PXC_PY_BOUND)
+                target = NULL;
+        } else if (!followed) {
+            char qn[CBM_PATH_MAX];
+            int n = snprintf(qn, sizeof(qn), "%s.%s", module->qualified_name, fact->member_name);
+            target = n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
         }
-    } else {
-        target = pxc_python_fact_target(ctx, rel_path, file_qn, fact,
-                                        fact->kind == CBM_PY_NS_IMPORT_NAME);
+        return target;
     }
+    char root_name[CBM_PATH_MAX];
+    const char *dotted =
+        fact->kind == CBM_PY_NS_IMPORT_NAME ? fact->member_name : fact->module_name;
     if (fact->kind == CBM_PY_NS_IMPORT_MODULE && (fact->flags & CBM_PY_NS_IMPORT_BINDS_ROOT) &&
         fact->module_name) {
         CBMPyNamespaceFact root_fact = *fact;
         const char *dot = strchr(fact->module_name, '.');
-        char root_name[CBM_PATH_MAX];
         size_t len = dot ? (size_t)(dot - fact->module_name) : strlen(fact->module_name);
-        target = NULL;
-        if (len < sizeof(root_name)) {
-            memcpy(root_name, fact->module_name, len);
-            root_name[len] = '\0';
-            root_fact.module_name = root_name;
-            target = pxc_python_fact_target(ctx, rel_path, file_qn, &root_fact, false);
-        }
+        if (len >= sizeof(root_name))
+            return NULL;
+        memcpy(root_name, fact->module_name, len);
+        root_name[len] = '\0';
+        root_fact.module_name = root_name;
+        dotted = root_name;
+        target = pxc_python_fact_target(ctx, rel_path, file_qn, &root_fact, false);
+    } else {
+        target = pxc_python_fact_target(ctx, rel_path, file_qn, fact,
+                                        fact->kind == CBM_PY_NS_IMPORT_NAME);
     }
+    if (followed && target &&
+        !pxc_python_module_located(ctx, rel_path, fact->relative_level, dotted, target))
+        return NULL;
     return target;
 }
 
@@ -2099,7 +2274,9 @@ static PXCPythonVerdict pxc_python_star_binding(PXCPythonResolver *pr, const cbm
     const cbm_gbuf_node_t *star =
         pxc_python_fact_target(pr->ctx, owner->file_path, file_qn, fact, false);
     CBMPyNamespaceFacts star_facts;
-    if (!pxc_python_module_facts(pr, pxc_python_owner_module(pr->ctx->gbuf, star), &star_facts))
+    if (!pxc_python_module_located(pr->ctx, owner->file_path, fact->relative_level,
+                                   fact->module_name, star) ||
+        !pxc_python_module_facts(pr, pxc_python_owner_module(pr->ctx->gbuf, star), &star_facts))
         return PXC_PY_OPAQUE;
     bool known = true;
     if (!pxc_python_name_is_exported(&star_facts, member, NULL, &known))
@@ -2131,7 +2308,7 @@ static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
         if (fact->kind == CBM_PY_NS_DELETE)
             break;
         if (fact->kind == CBM_PY_NS_IMPORT_NAME || fact->kind == CBM_PY_NS_IMPORT_MODULE)
-            *out = pxc_python_import_fact_node(pr, owner->file_path, file_qn, fact, depth);
+            *out = pxc_python_import_fact_node(pr, owner->file_path, file_qn, fact, depth, true);
         else if (fact->kind == CBM_PY_NS_OWN_DEF ||
                  pxc_python_shadow_binds_own(pr->ctx, owner->qualified_name, facts, i))
             *out = pxc_python_own_node(pr->ctx, owner->qualified_name, member);
@@ -2209,7 +2386,7 @@ static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_p
         } else if ((fact->kind == CBM_PY_NS_IMPORT_NAME || fact->kind == CBM_PY_NS_IMPORT_MODULE) &&
                    fact->local_name) {
             const cbm_gbuf_node_t *target =
-                pxc_python_import_fact_node(pr, rel_path, file_qn, fact, depth);
+                pxc_python_import_fact_node(pr, rel_path, file_qn, fact, depth, false);
             if ((target || fact->kind == CBM_PY_NS_IMPORT_NAME) &&
                 !pxc_python_map_set(map, fact->local_name,
                                     target ? target->qualified_name : NULL)) {

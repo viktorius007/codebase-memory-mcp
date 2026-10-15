@@ -921,6 +921,48 @@ TEST(ei_py_rebound_decorated_reference_keeps_its_row) {
     PASS();
 }
 
+/* `from tf.util import helper` written in test/functional/tf/user.py, inside
+ * the package tf/: Python finds tf/util.py from the script directory
+ * test/functional, and binds helper to tf.util.helper. The import resolver
+ * answers the sibling module tf/tf.py, whose own `from .other import helper`
+ * binds a different helper; following that module's bindings published
+ * go -> tf.other.helper. A module the interpreter's search does not locate is
+ * not read: go's call to helper links to tf.util.helper or stays withheld with
+ * its row, never to tf.other.helper. Returns 100 * calls to tf.other.helper +
+ * calls to tf.util.helper + go's rows for helper. */
+static int ei_py_unlocated_module_case(int pad) {
+    EILangFile f[] = {
+        {"test/functional/tf/__init__.py", ""},
+        {"test/functional/tf/tf.py",
+         "from .other import helper\n\n\ndef run_all():\n    return helper()\n"},
+        {"test/functional/tf/other.py", "def helper():\n    return 'other'\n"},
+        {"test/functional/tf/util.py", "def helper():\n    return 'util'\n"},
+        {"test/functional/tf/user.py",
+         "from tf.util import helper\n\n\ndef go():\n    return helper()\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 5, pad);
+    const char *calls = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='go' "
+                        "AND t.file_path='test/functional/tf/%s.py' AND t.name='helper'";
+    char sql[512];
+    snprintf(sql, sizeof(sql), calls, "other");
+    int wrong = ei_sql_int(store, sql);
+    snprintf(sql, sizeof(sql), calls, "util");
+    int right = ei_sql_int(store, sql);
+    int rows = ei_sql_int(store, EI_PY_ROWS_SQL("go", "helper"));
+    ei_cleanup(&lp, store);
+    if (wrong < 0 || right < 0 || rows < 0)
+        return -1;
+    return 100 * wrong + right + rows;
+}
+
+TEST(ei_py_unlocated_module_bindings_are_not_followed) {
+    ASSERT_EQ(ei_py_unlocated_module_case(0), 1);
+    ASSERT_EQ(ei_py_unlocated_module_case(60), 1);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2647,6 +2689,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_package_reexport_binds_reexported_definition);
     RUN_TEST(ei_py_comprehension_target_is_no_decorated_usage);
     RUN_TEST(ei_py_rebound_decorated_reference_keeps_its_row);
+    RUN_TEST(ei_py_unlocated_module_bindings_are_not_followed);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
