@@ -1656,16 +1656,6 @@ static bool cbm_is_directive_line(const char *line, int len) {
     return i < len && line[i] == '#';
 }
 
-/* True when the line ends with a backslash, so the directive carries on to
- * the next line. */
-static bool cbm_line_continues(const char *line, int len) {
-    int end = len;
-    while (end > 0 && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r')) {
-        end--;
-    }
-    return end > 0 && line[end - 1] == '\\';
-}
-
 /* Set CBM_LINE_NO_CODE on every line of `src` that holds no construct.
  * One pass over the file. Carries block-comment state across lines so a line
  * in the middle of a comment counts as no-code too. */
@@ -1707,7 +1697,7 @@ static void cbm_mark_no_code_lines(const char *src, int src_len, uint8_t *map,
         if (!has_code || directive) {
             map[line] |= CBM_LINE_NO_CODE;
         }
-        in_directive = directive && cbm_line_continues(src + i, end - i);
+        in_directive = directive && cbm_preprocessor_line_continues(src + i, end - i);
         line++;
         i = end + 1;
     }
@@ -2087,8 +2077,10 @@ static bool cbm_remap_preprocessed_def(CBMDefinition *def, const CBMPreprocessed
 }
 
 /* The line of this file that expanded-buffer line `eline` came from, or 0 when
- * the map gives it none: a directive, an included header, or a #line target
- * beyond the end of this file (`source_lines`). */
+ * the map gives it none: a directive the preprocessor emitted, or an included
+ * header. A `#line` the source writes never re-labels its rows
+ * (preprocessor.cpp blanks it), so a row of this file maps to the line it is
+ * written on; `source_lines` bounds it all the same. */
 static uint32_t cbm_preprocessed_original_line(const CBMPreprocessedSource *pp, int eline,
                                                uint32_t source_lines) {
     if (eline <= 0 || eline > pp->expanded_line_count || !pp->belongs_to_main_file[eline]) {

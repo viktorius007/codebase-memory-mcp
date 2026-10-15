@@ -30,6 +30,10 @@ typedef struct {
 int cbm_export_macro_candidates(const char *source, int source_len,
                                 char (*out)[CBM_EXPORT_MACRO_NAME_MAX], int max_out);
 
+// True when `line` (len bytes, no newline) ends with a backslash, trailing
+// blanks allowed: the line carries on to the next, as simplecpp reads it.
+bool cbm_preprocessor_line_continues(const char *line, int len);
+
 // Preprocess C/C++ source: expand macros, evaluate #ifdef, resolve #include.
 // Returns malloc-allocated expanded source, or NULL if no expansion needed/on failure.
 // extra_defines: NULL-terminated array of "NAME=VALUE" strings (can be NULL).
@@ -42,6 +46,9 @@ char *cbm_preprocess(const char *source, int source_len, const char *filename,
                      const char **extra_defines, const char **include_paths, int cpp_mode);
 
 // Preprocess and return source plus expanded-line -> original-line ownership map.
+// A line-number directive in the source (`#line 40 "parse.y"`) is ignored: a
+// row the source supplies maps to the line it is written on and belongs to the
+// main file; only a header from `include_paths` supplies rows of another file.
 // Returns NULL if no expansion is needed or preprocessing fails.
 // Free with cbm_preprocessed_source_free().
 CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_len,

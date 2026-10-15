@@ -7924,6 +7924,46 @@ TEST(extract_c_preprocessed_calls_carry_original_lines) {
     PASS();
 }
 
+/* A generated parser (bison, flex, lemon) writes its rule actions under
+ * `#line N "parse.y"`. Those lines are this file's code: with no include
+ * directory named -- how the pipeline runs -- no other file can supply a row of
+ * the expanded buffer. The directive re-labelled the rows after it as
+ * parse.y's, the line map took them for an included header's, and the call
+ * gen_rule makes through GEN_CALL, which only the preprocessed pass sees, was
+ * dropped without a trace. Each call carries the line it is written on in this
+ * file, under a directive naming another file (line 5) or this one (line 9). */
+TEST(extract_c_preprocessed_calls_under_line_directive_keep_physical_line) {
+    static const char src[] = "int gen_target(int v) { return v - 1; }\n"
+                              "#define GEN_CALL(v) gen_target(v)\n"
+                              "#line 40 \"parse.y\"\n"
+                              "int gen_rule(int v) {\n"
+                              "    return GEN_CALL(v);\n"
+                              "}\n"
+                              "#line 7 \"gen/parse.c\"\n"
+                              "int after_reset(int v) {\n"
+                              "    return GEN_CALL(v);\n"
+                              "}\n";
+    enum { GEN_RULE_CALL_LINE = 5, AFTER_RESET_CALL_LINE = 9 };
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_C, "t", "gen/parse.c", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    int lines[2] = {0, 0};
+    int found = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, "gen_target") == 0) {
+            ASSERT_EQ((int)c->source_origin, (int)CBM_SOURCE_ORIGIN_PREPROCESSED);
+            ASSERT_LT(found, 2);
+            lines[found++] = c->start_line;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(found, 2);
+    ASSERT_EQ(lines[0] < lines[1] ? lines[0] : lines[1], GEN_RULE_CALL_LINE);
+    ASSERT_EQ(lines[0] < lines[1] ? lines[1] : lines[0], AFTER_RESET_CALL_LINE);
+    PASS();
+}
+
 /* #961 inverse guard: a clean C file must not gain duplicate or phantom
  * defs from the recovery path (it only engages on raw-parse ERROR regions). */
 TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
@@ -13310,6 +13350,7 @@ SUITE(extraction) {
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
     RUN_TEST(extract_c_preprocessed_pass_ignores_working_directory);
     RUN_TEST(extract_c_preprocessed_calls_carry_original_lines);
+    RUN_TEST(extract_c_preprocessed_calls_under_line_directive_keep_physical_line);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling);
     RUN_TEST(extract_c_misnested_raw_struct_replaced_by_flat_copy);

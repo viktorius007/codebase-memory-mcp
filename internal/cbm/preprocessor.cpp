@@ -431,6 +431,82 @@ static std::string stringify_source_spacing(const simplecpp::TokenList &tokens) 
     return ret.str();
 }
 
+bool cbm_preprocessor_line_continues(const char *line, int len) {
+    int end = len;
+    while (end > 0 && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r')) {
+        end--;
+    }
+    return end > 0 && line[end - 1] == '\\';
+}
+
+// Whether `line` (no newline) is a line-number directive simplecpp honours:
+// `#line 40 "parse.y"`, `#line 40`, or the linemarker `# 40 "parse.y"`.
+static bool is_source_line_directive(const char *line, size_t len) {
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    if (i >= len || line[i++] != '#') {
+        return false;
+    }
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    static const char keyword[] = "line";
+    const size_t keyword_len = sizeof(keyword) - 1;
+    if (i + keyword_len < len && strncmp(line + i, keyword, keyword_len) == 0 &&
+        (line[i + keyword_len] == ' ' || line[i + keyword_len] == '\t')) {
+        i += keyword_len;
+        while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+            i++;
+        }
+    }
+    return i < len && line[i] >= '0' && line[i] <= '9';
+}
+
+// The source with every line-number directive blanked, its newlines kept (a
+// directive continued with a backslash blanks each of its lines; a line that
+// continues another line is never a directive).
+//
+// A directive re-labels the lines after it: under `#line 40 "parse.y"`, which
+// generated bison, flex and lemon parsers carry, the expanded buffer names
+// parse.y, line 40 on, for code written in this file. build_line_map then took
+// that code for another file's -- the test that drops an included header's
+// rows -- and the preprocessed pass dropped every call it found there; under
+// the same-file form `#line 7 "<this file>"` its calls took the declared line.
+// Every row this file supplies to the expanded buffer must map to the line it
+// is written on, the line the raw parse and every definition use; only a
+// header read through a named include directory supplies rows of another file.
+static std::string without_line_directives(const char *source, int source_len) {
+    std::string out(source, (size_t)source_len);
+    bool continued = false; // this line continues the one above
+    bool blanking = false;  // ... and that one was a directive being blanked
+    for (size_t start = 0; start < out.size();) {
+        size_t end = out.find('\n', start);
+        if (end == std::string::npos) {
+            end = out.size();
+        }
+        size_t content_end = end;
+        if (content_end > start && out[content_end - 1] == '\r') {
+            content_end--;
+        }
+        bool continues =
+            cbm_preprocessor_line_continues(out.c_str() + start, (int)(content_end - start));
+        if (continued ? blanking
+                      : is_source_line_directive(out.c_str() + start, content_end - start)) {
+            for (size_t k = start; k < content_end; k++) {
+                out[k] = ' ';
+            }
+            blanking = true;
+        } else {
+            blanking = false;
+        }
+        continued = continues;
+        start = end + 1;
+    }
+    return out;
+}
+
 static bool build_line_map(const std::string &expanded, const std::string &main_file,
                            uint32_t *original_line_by_expanded_line,
                            uint8_t *belongs_to_main_file) {
@@ -523,7 +599,7 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
         dui.includePathsOnly = true;
         dui.std = cpp_mode ? "c++17" : "c11";
 
-        std::string src(source, source_len);
+        std::string src = without_line_directives(source, source_len);
         std::istringstream istr(src);
         std::vector<std::string> files;
         files.push_back(filename ? filename : "<input>");
