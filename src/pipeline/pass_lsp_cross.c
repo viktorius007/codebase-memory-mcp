@@ -1851,93 +1851,162 @@ static bool pxc_python_decorators_keep_definition(const cbm_gbuf_node_t *node,
     return seen > 0 && *p == ']';
 }
 
-static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const char *project_name,
-                                        const char *rel_path, const char *module_qn,
-                                        const CBMPyNamespaceFacts *facts, PXCPythonImportMap *map,
-                                        bool collect_exports, int depth);
+/* The state one import-map build shares across the modules it reads: the
+ * namespace facts of each project module it consulted, and the verdict for each
+ * (module, name) it asked about. Both live for that build only, so a package
+ * many names are imported from is read once, and a re-export chain that
+ * branches through star imports visits each (module, name) once. A verdict
+ * still being computed is PXC_PY_PENDING: meeting it again is an import cycle. */
+typedef enum { PXC_PY_UNBOUND = 0, PXC_PY_OPAQUE, PXC_PY_BOUND, PXC_PY_PENDING } PXCPythonVerdict;
 
-static bool pxc_python_load_namespace(const cbm_pipeline_ctx_t *ctx, const char *project_name,
-                                      const cbm_gbuf_node_t *module, PXCPythonImportMap *map,
-                                      CBMFileResult **out_result, int depth) {
-    *out_result = NULL;
-    if (!ctx || !ctx->repo_path || !module || !module->file_path || !module->qualified_name ||
-        depth > CBM_SZ_16)
-        return false;
-    char path[CBM_PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, module->file_path);
-    if (n <= 0 || (size_t)n >= sizeof(path))
-        return false;
-    int source_len = 0;
-    char *source = pxc_read_file(path, &source_len);
-    if (!source)
-        return false;
-    CBMFileResult *result = cbm_extract_file(source, source_len, CBM_LANG_PYTHON, project_name,
-                                             module->file_path, CBM_EXTRACT_BUDGET, NULL, NULL);
-    cbm_free(CBM_MEM_CLASS_EXTRACT, source);
-    if (!result || result->py_namespace.status != CBM_PY_NS_COMPLETE ||
-        !cbm_py_namespace_facts_valid(&result->py_namespace)) {
-        cbm_free_result(result);
-        return false;
-    }
-    if (!pxc_python_replay_namespace(ctx, project_name, module->file_path, module->qualified_name,
-                                     &result->py_namespace, map, true, depth + 1)) {
-        cbm_free_result(result);
-        return false;
-    }
-    *out_result = result;
-    return true;
+typedef struct {
+    bool usable;
+    CBMPyNamespaceFacts facts;
+} PXCPythonModuleFacts;
+
+typedef struct {
+    PXCPythonVerdict verdict;
+    const cbm_gbuf_node_t *node;
+} PXCPythonMemberVerdict;
+
+typedef struct {
+    const cbm_pipeline_ctx_t *ctx;
+    const char *project_name;
+    CBMArena arena;
+    CBMHashTable *facts;   /* owner Module QN -> PXCPythonModuleFacts */
+    CBMHashTable *members; /* "<module QN>\n<name>" -> PXCPythonMemberVerdict */
+} PXCPythonResolver;
+
+static bool pxc_python_resolver_ready(PXCPythonResolver *pr) {
+    if (pr->facts)
+        return pr->members != NULL;
+    cbm_arena_init(&pr->arena);
+    pr->facts = cbm_ht_create_in(CBM_MEM_CLASS_OTHER, CBM_SZ_16);
+    pr->members = cbm_ht_create_in(CBM_MEM_CLASS_OTHER, CBM_SZ_16);
+    return pr->facts && pr->members;
 }
 
-static bool pxc_python_apply_star(const cbm_pipeline_ctx_t *ctx, const char *project_name,
-                                  const char *rel_path, const char *file_qn,
+static void pxc_python_resolver_free(PXCPythonResolver *pr) {
+    if (!pr->facts && !pr->members)
+        return;
+    cbm_ht_free(pr->facts);
+    cbm_ht_free(pr->members);
+    cbm_arena_destroy(&pr->arena);
+    pr->facts = NULL;
+    pr->members = NULL;
+}
+
+/* The Module node a package's own names are read from: a Module is its own
+ * owner, a package Folder is owned by its `__init__` module. */
+static const cbm_gbuf_node_t *pxc_python_owner_module(const cbm_gbuf_t *gbuf,
+                                                      const cbm_gbuf_node_t *module) {
+    if (!module || !module->label || !module->qualified_name)
+        return NULL;
+    if (strcmp(module->label, "Module") == 0)
+        return module;
+    if (strcmp(module->label, "Folder") != 0)
+        return NULL;
+    char qn[CBM_PATH_MAX];
+    int n = snprintf(qn, sizeof(qn), "%s.__init__", module->qualified_name);
+    const cbm_gbuf_node_t *init =
+        n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+    return init && init->label && strcmp(init->label, "Module") == 0 ? init : NULL;
+}
+
+/* The ordered namespace facts of one project module, read from its source once
+ * per build. False when the source cannot be read or its facts are incomplete:
+ * nothing about that module's names is then proven. */
+static bool pxc_python_module_facts(PXCPythonResolver *pr, const cbm_gbuf_node_t *owner,
+                                    CBMPyNamespaceFacts *out) {
+    memset(out, 0, sizeof(*out));
+    if (!owner || !owner->file_path || !owner->qualified_name || !pr->ctx->repo_path ||
+        !pxc_python_resolver_ready(pr))
+        return false;
+    PXCPythonModuleFacts *known = cbm_ht_get(pr->facts, owner->qualified_name);
+    if (known) {
+        *out = known->facts;
+        return known->usable;
+    }
+    PXCPythonModuleFacts *entry = cbm_arena_calloc(&pr->arena, sizeof(*entry));
+    char *key = cbm_arena_strdup(&pr->arena, owner->qualified_name);
+    if (!entry || !key)
+        return false;
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", pr->ctx->repo_path, owner->file_path);
+    int source_len = 0;
+    char *source = n > 0 && (size_t)n < sizeof(path) ? pxc_read_file(path, &source_len) : NULL;
+    CBMFileResult *result =
+        source ? cbm_extract_file(source, source_len, CBM_LANG_PYTHON, pr->project_name,
+                                  owner->file_path, CBM_EXTRACT_BUDGET, NULL, NULL)
+               : NULL;
+    cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+    entry->usable = result && result->py_namespace.status == CBM_PY_NS_COMPLETE &&
+                    cbm_py_namespace_facts_valid(&result->py_namespace) &&
+                    cbm_py_namespace_facts_copy(&pr->arena, &result->py_namespace, &entry->facts);
+    cbm_free_result(result);
+    (void)cbm_ht_set(pr->facts, key, entry);
+    *out = entry->facts;
+    return entry->usable;
+}
+
+static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_path,
+                                        const char *module_qn, const CBMPyNamespaceFacts *facts,
+                                        PXCPythonImportMap *map, bool collect_exports, int depth);
+
+static bool pxc_python_load_namespace(PXCPythonResolver *pr, const cbm_gbuf_node_t *module,
+                                      PXCPythonImportMap *map, CBMPyNamespaceFacts *out_facts,
+                                      int depth) {
+    const cbm_gbuf_node_t *owner = pxc_python_owner_module(pr->ctx->gbuf, module);
+    if (depth > CBM_SZ_16 || !pxc_python_module_facts(pr, owner, out_facts))
+        return false;
+    return pxc_python_replay_namespace(pr, owner->file_path, owner->qualified_name, out_facts, map,
+                                       true, depth + 1);
+}
+
+static bool pxc_python_apply_star(PXCPythonResolver *pr, const char *rel_path, const char *file_qn,
                                   const CBMPyNamespaceFact *fact, PXCPythonImportMap *map,
                                   int depth) {
-    const cbm_gbuf_node_t *module = pxc_python_fact_target(ctx, rel_path, file_qn, fact, false);
+    const cbm_gbuf_node_t *module = pxc_python_fact_target(pr->ctx, rel_path, file_qn, fact, false);
     PXCPythonImportMap exported = {0};
-    CBMFileResult *source = NULL;
-    if (!pxc_python_load_namespace(ctx, project_name, module, &exported, &source, depth)) {
+    CBMPyNamespaceFacts source = {0};
+    if (!pxc_python_load_namespace(pr, module, &exported, &source, depth)) {
         pxc_python_map_free(&exported);
         return false;
     }
     bool has_all = false;
     bool known = true;
-    (void)pxc_python_name_is_exported(&source->py_namespace, "", &has_all, &known);
+    (void)pxc_python_name_is_exported(&source, "", &has_all, &known);
     if (!known) {
-        cbm_free_result(source);
         pxc_python_map_free(&exported);
         return false;
     }
     for (int i = 0; i < exported.count; i++) {
-        const char *value =
-            pxc_python_name_is_exported(&source->py_namespace, exported.keys[i], NULL, NULL)
-                ? exported.vals[i]
-                : NULL;
+        const char *value = pxc_python_name_is_exported(&source, exported.keys[i], NULL, NULL)
+                                ? exported.vals[i]
+                                : NULL;
         if (!pxc_python_map_set(map, exported.keys[i], value)) {
-            cbm_free_result(source);
             pxc_python_map_free(&exported);
             return false;
         }
     }
     if (has_all) {
-        for (int i = 0; i < source->py_namespace.count; i++) {
-            const CBMPyNamespaceFact *all = &source->py_namespace.items[i];
+        for (int i = 0; i < source.count; i++) {
+            const CBMPyNamespaceFact *all = &source.items[i];
             if (all->kind != CBM_PY_NS_ALL_SET && all->kind != CBM_PY_NS_ALL_APPEND)
                 continue;
             for (int j = 0; j < all->name_count; j++) {
                 const char *name = all->names[j];
-                if (!name || !pxc_python_name_is_exported(&source->py_namespace, name, NULL, NULL))
+                if (!name || !pxc_python_name_is_exported(&source, name, NULL, NULL))
                     continue;
                 int found = pxc_python_map_find(&exported, name);
                 const char *value = found >= 0 ? exported.vals[found] : NULL;
                 if (!pxc_python_map_set(map, name, value)) {
-                    cbm_free_result(source);
                     pxc_python_map_free(&exported);
                     return false;
                 }
             }
         }
     }
-    cbm_free_result(source);
     pxc_python_map_free(&exported);
     return true;
 }
@@ -1960,13 +2029,173 @@ static bool pxc_python_decorated_node_kept(const cbm_pipeline_ctx_t *ctx, const 
     return pxc_python_decorators_keep_definition(node, facts, index);
 }
 
-static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const char *project_name,
-                                        const char *rel_path, const char *module_qn,
-                                        const CBMPyNamespaceFacts *facts, PXCPythonImportMap *map,
-                                        bool collect_exports, int depth) {
-    if (!ctx || !facts || !map || depth > CBM_SZ_16)
+/* A class statement, an assignment, or a decorated definition its own node
+ * keeps: the statement binds the name to the module's own node for it. */
+static bool pxc_python_shadow_binds_own(const cbm_pipeline_ctx_t *ctx, const char *module_qn,
+                                        const CBMPyNamespaceFacts *facts, int index) {
+    const CBMPyNamespaceFact *fact = &facts->items[index];
+    return fact->kind == CBM_PY_NS_SHADOW && fact->local_name &&
+           (fact->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS ||
+            fact->reason == CBM_PY_NS_REASON_VALUE ||
+            (fact->reason == CBM_PY_NS_REASON_DECORATED &&
+             pxc_python_decorated_node_kept(ctx, module_qn, facts, index)));
+}
+
+static PXCPythonVerdict pxc_python_member_binding(PXCPythonResolver *pr,
+                                                  const cbm_gbuf_node_t *module, const char *member,
+                                                  int depth, const cbm_gbuf_node_t **out);
+
+/* The node an import statement binds its local name to: the imported module,
+ * or the member the imported module binds under that name (its own definition,
+ * or whatever its own imports bind it to: a package `__init__` that re-exports
+ * `from .base import Base`). NULL when the import names nothing in the project
+ * or the binding cannot be followed. */
+static const cbm_gbuf_node_t *pxc_python_import_fact_node(PXCPythonResolver *pr,
+                                                          const char *rel_path, const char *file_qn,
+                                                          const CBMPyNamespaceFact *fact,
+                                                          int depth) {
+    const cbm_pipeline_ctx_t *ctx = pr->ctx;
+    const cbm_gbuf_node_t *target = NULL;
+    if (fact->kind == CBM_PY_NS_IMPORT_NAME && fact->module_name && fact->module_name[0]) {
+        const cbm_gbuf_node_t *module = pxc_python_fact_target(ctx, rel_path, file_qn, fact, false);
+        if ((!module || !module->label || strcmp(module->label, "Module") != 0) &&
+            fact->relative_level == 0) {
+            module =
+                cbm_pipeline_lsp_target_node(ctx->gbuf, pr->project_name, fact->module_name, false);
+        }
+        if (module && module->label &&
+            (strcmp(module->label, "Module") == 0 || strcmp(module->label, "Folder") == 0) &&
+            fact->member_name &&
+            pxc_python_member_binding(pr, module, fact->member_name, depth, &target) !=
+                PXC_PY_BOUND) {
+            target = NULL;
+        }
+    } else {
+        target = pxc_python_fact_target(ctx, rel_path, file_qn, fact,
+                                        fact->kind == CBM_PY_NS_IMPORT_NAME);
+    }
+    if (fact->kind == CBM_PY_NS_IMPORT_MODULE && (fact->flags & CBM_PY_NS_IMPORT_BINDS_ROOT) &&
+        fact->module_name) {
+        CBMPyNamespaceFact root_fact = *fact;
+        const char *dot = strchr(fact->module_name, '.');
+        char root_name[CBM_PATH_MAX];
+        size_t len = dot ? (size_t)(dot - fact->module_name) : strlen(fact->module_name);
+        target = NULL;
+        if (len < sizeof(root_name)) {
+            memcpy(root_name, fact->module_name, len);
+            root_name[len] = '\0';
+            root_fact.module_name = root_name;
+            target = pxc_python_fact_target(ctx, rel_path, file_qn, &root_fact, false);
+        }
+    }
+    return target;
+}
+
+/* Whether `from <star module> import *` in `owner` binds `member`, and to what. */
+static PXCPythonVerdict pxc_python_star_binding(PXCPythonResolver *pr, const cbm_gbuf_node_t *owner,
+                                                const char *file_qn, const CBMPyNamespaceFact *fact,
+                                                const char *member, int depth,
+                                                const cbm_gbuf_node_t **out) {
+    const cbm_gbuf_node_t *star =
+        pxc_python_fact_target(pr->ctx, owner->file_path, file_qn, fact, false);
+    CBMPyNamespaceFacts star_facts;
+    if (!pxc_python_module_facts(pr, pxc_python_owner_module(pr->ctx->gbuf, star), &star_facts))
+        return PXC_PY_OPAQUE;
+    bool known = true;
+    if (!pxc_python_name_is_exported(&star_facts, member, NULL, &known))
+        return known ? PXC_PY_UNBOUND : PXC_PY_OPAQUE;
+    return pxc_python_member_binding(pr, star, member, depth, out);
+}
+
+/* The binding `owner`'s top-level run leaves on `member`: the last statement
+ * that binds it decides. A star import binds it only when the starred module
+ * exports it; `del` leaves it unbound. Statements the facts do not model are
+ * passed over, as the replay passes over them. */
+static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
+                                                 const cbm_gbuf_node_t *owner,
+                                                 const CBMPyNamespaceFacts *facts,
+                                                 const char *member, int depth,
+                                                 const cbm_gbuf_node_t **out) {
+    char *file_qn = cbm_pipeline_fqn_compute(pr->project_name, owner->file_path, "__file__");
+    PXCPythonVerdict verdict = PXC_PY_UNBOUND;
+    for (int i = facts->count - 1; i >= 0; i--) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        if (fact->kind == CBM_PY_NS_IMPORT_STAR) {
+            verdict = pxc_python_star_binding(pr, owner, file_qn, fact, member, depth, out);
+            if (verdict != PXC_PY_UNBOUND)
+                break;
+            continue;
+        }
+        if (!fact->local_name || strcmp(fact->local_name, member) != 0)
+            continue;
+        if (fact->kind == CBM_PY_NS_DELETE)
+            break;
+        if (fact->kind == CBM_PY_NS_IMPORT_NAME || fact->kind == CBM_PY_NS_IMPORT_MODULE)
+            *out = pxc_python_import_fact_node(pr, owner->file_path, file_qn, fact, depth);
+        else if (fact->kind == CBM_PY_NS_OWN_DEF ||
+                 pxc_python_shadow_binds_own(pr->ctx, owner->qualified_name, facts, i))
+            *out = pxc_python_own_node(pr->ctx, owner->qualified_name, member);
+        verdict = *out ? PXC_PY_BOUND : PXC_PY_OPAQUE;
+        break;
+    }
+    pxc_free_fqn(file_qn);
+    return verdict;
+}
+
+/* What `module` binds `member` to once its top-level run has finished: a node
+ * of the project (PXC_PY_BOUND), something this resolver cannot name
+ * (PXC_PY_OPAQUE), or nothing (PXC_PY_UNBOUND). A member with a node under the
+ * module's QN is that node, as before; any other is read from the module's own
+ * namespace facts. A chain longer than CBM_SZ_16 hops, or one that returns to a
+ * (module, name) still being resolved, is opaque. */
+static PXCPythonVerdict pxc_python_member_binding(PXCPythonResolver *pr,
+                                                  const cbm_gbuf_node_t *module, const char *member,
+                                                  int depth, const cbm_gbuf_node_t **out) {
+    *out = NULL;
+    if (!module || !module->qualified_name || !member)
+        return PXC_PY_OPAQUE;
+    char qn[CBM_PATH_MAX];
+    int n = snprintf(qn, sizeof(qn), "%s.%s", module->qualified_name, member);
+    if (n <= 0 || (size_t)n >= sizeof(qn))
+        return PXC_PY_OPAQUE;
+    *out = cbm_gbuf_find_by_qn(pr->ctx->gbuf, qn);
+    if (*out)
+        return PXC_PY_BOUND;
+    const cbm_gbuf_node_t *owner = pxc_python_owner_module(pr->ctx->gbuf, module);
+    if (!owner || depth > CBM_SZ_16 || !pxc_python_resolver_ready(pr))
+        return PXC_PY_OPAQUE;
+    char *key = cbm_arena_sprintf(&pr->arena, "%s\n%s", owner->qualified_name, member);
+    if (!key)
+        return PXC_PY_OPAQUE;
+    PXCPythonMemberVerdict *seen = cbm_ht_get(pr->members, key);
+    if (seen) {
+        *out = seen->node;
+        return seen->verdict == PXC_PY_PENDING ? PXC_PY_OPAQUE : seen->verdict;
+    }
+    seen = cbm_arena_calloc(&pr->arena, sizeof(*seen));
+    if (!seen)
+        return PXC_PY_OPAQUE;
+    seen->verdict = PXC_PY_PENDING;
+    (void)cbm_ht_set(pr->members, key, seen);
+    CBMPyNamespaceFacts facts;
+    PXCPythonVerdict verdict =
+        pxc_python_module_facts(pr, owner, &facts)
+            ? pxc_python_final_binding(pr, owner, &facts, member, depth + 1, out)
+            : PXC_PY_OPAQUE;
+    if (verdict != PXC_PY_BOUND)
+        *out = NULL;
+    seen->verdict = verdict;
+    seen->node = *out;
+    return verdict;
+}
+
+static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_path,
+                                        const char *module_qn, const CBMPyNamespaceFacts *facts,
+                                        PXCPythonImportMap *map, bool collect_exports, int depth) {
+    if (!pr || !pr->ctx || !facts || !map || depth > CBM_SZ_16)
         return false;
-    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    const cbm_pipeline_ctx_t *ctx = pr->ctx;
+    char *file_qn = cbm_pipeline_fqn_compute(pr->project_name, rel_path, "__file__");
     for (int i = 0; i < facts->count; i++) {
         const CBMPyNamespaceFact *fact = &facts->items[i];
         if (fact->kind == CBM_PY_NS_OWN_DEF && fact->local_name) {
@@ -1979,45 +2208,8 @@ static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const cha
             }
         } else if ((fact->kind == CBM_PY_NS_IMPORT_NAME || fact->kind == CBM_PY_NS_IMPORT_MODULE) &&
                    fact->local_name) {
-            bool root = fact->kind == CBM_PY_NS_IMPORT_MODULE &&
-                        (fact->flags & CBM_PY_NS_IMPORT_BINDS_ROOT);
-            const cbm_gbuf_node_t *target = NULL;
-            if (fact->kind == CBM_PY_NS_IMPORT_NAME && fact->module_name && fact->module_name[0]) {
-                const cbm_gbuf_node_t *module =
-                    pxc_python_fact_target(ctx, rel_path, file_qn, fact, false);
-                if ((!module || !module->label || strcmp(module->label, "Module") != 0) &&
-                    fact->relative_level == 0) {
-                    module = cbm_pipeline_lsp_target_node(ctx->gbuf, project_name,
-                                                          fact->module_name, false);
-                }
-                if (module && module->label &&
-                    (strcmp(module->label, "Module") == 0 ||
-                     strcmp(module->label, "Folder") == 0) &&
-                    fact->member_name) {
-                    char qn[CBM_PATH_MAX];
-                    int n = snprintf(qn, sizeof(qn), "%s.%s", module->qualified_name,
-                                     fact->member_name);
-                    target =
-                        n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
-                }
-            } else {
-                target = pxc_python_fact_target(ctx, rel_path, file_qn, fact,
-                                                fact->kind == CBM_PY_NS_IMPORT_NAME);
-            }
-            if (root && fact->module_name) {
-                CBMPyNamespaceFact root_fact = *fact;
-                const char *dot = strchr(fact->module_name, '.');
-                char root_name[CBM_PATH_MAX];
-                size_t len = dot ? (size_t)(dot - fact->module_name) : strlen(fact->module_name);
-                if (len < sizeof(root_name)) {
-                    memcpy(root_name, fact->module_name, len);
-                    root_name[len] = '\0';
-                    root_fact.module_name = root_name;
-                    target = pxc_python_fact_target(ctx, rel_path, file_qn, &root_fact, false);
-                } else {
-                    target = NULL;
-                }
-            }
+            const cbm_gbuf_node_t *target =
+                pxc_python_import_fact_node(pr, rel_path, file_qn, fact, depth);
             if ((target || fact->kind == CBM_PY_NS_IMPORT_NAME) &&
                 !pxc_python_map_set(map, fact->local_name,
                                     target ? target->qualified_name : NULL)) {
@@ -2025,13 +2217,9 @@ static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const cha
                 return false;
             }
         } else if (fact->kind == CBM_PY_NS_IMPORT_STAR) {
-            if (!pxc_python_apply_star(ctx, project_name, rel_path, file_qn, fact, map, depth))
+            if (!pxc_python_apply_star(pr, rel_path, file_qn, fact, map, depth))
                 pxc_python_map_block_all(map);
-        } else if (fact->kind == CBM_PY_NS_SHADOW && fact->local_name &&
-                   (fact->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS ||
-                    fact->reason == CBM_PY_NS_REASON_VALUE ||
-                    (fact->reason == CBM_PY_NS_REASON_DECORATED &&
-                     pxc_python_decorated_node_kept(ctx, module_qn, facts, i)))) {
+        } else if (pxc_python_shadow_binds_own(ctx, module_qn, facts, i)) {
             /* A class statement and an assignment bind the name to the module's
              * own definition: the class object, or the assigned value, which the
              * extractor records as a module-level node under this QN. Python
@@ -2097,8 +2285,10 @@ static int pxc_python_build_import_map(const cbm_pipeline_ctx_t *ctx, const char
     }
     pxc_python_repair_module_attribute_imports(rel_path, result);
     char *module_qn = cbm_pipeline_fqn_module_dir(project_name, rel_path, false);
-    bool ok = module_qn && pxc_python_replay_namespace(ctx, project_name, rel_path, module_qn,
+    PXCPythonResolver resolver = {.ctx = ctx, .project_name = project_name};
+    bool ok = module_qn && pxc_python_replay_namespace(&resolver, rel_path, module_qn,
                                                        &result->py_namespace, &map, false, 0);
+    pxc_python_resolver_free(&resolver);
     pxc_free_fqn(module_qn);
     if (!ok) {
         pxc_python_map_free(&map);

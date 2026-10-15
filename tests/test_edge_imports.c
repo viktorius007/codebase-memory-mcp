@@ -753,6 +753,57 @@ TEST(ei_py_external_import_never_binds_project_symbol) {
     PASS();
 }
 
+/* `from pkg import Header, Thing` where `pkg/__init__.py` binds both names by
+ * its own imports (`from .params import Header as Header`): Python binds each
+ * name to what the package's run left under it, the function
+ * pkg.params.Header and the class pkg.shapes.Thing. `pkg.Header` is no node,
+ * so the namespace replay must follow the package's own import facts
+ * (pass_lsp_cross.c pxc_python_member_binding); stopping there blocked both
+ * calls, the FastAPI shape (`from fastapi import FastAPI`). The decoy class
+ * pkg.models.Header is what a name match picks and must never be called.
+ * Returns calls to the function Header + 10 * calls to Thing + 100 * calls to
+ * the decoy class Header. */
+static int ei_py_package_reexport_case(int pad) {
+    enum { EI_RX_BASE = 5, EI_RX_MAX = EI_RX_BASE + 64 };
+    static char names[EI_RX_MAX][32];
+    EILangFile f[EI_RX_MAX];
+    int n = 0;
+    f[n++] = (EILangFile){"pkg/__init__.py", "from .params import Header as Header\n"
+                                             "from .shapes import Thing as Thing\n"};
+    f[n++] = (EILangFile){"pkg/params.py", "def Header():\n    return 1\n"};
+    f[n++] = (EILangFile){"pkg/models.py", "class Header:\n    pass\n"};
+    f[n++] = (EILangFile){"pkg/shapes.py", "class Thing:\n    pass\n"};
+    f[n++] = (EILangFile){"app/use.py", "from pkg import Header, Thing\n\n\n"
+                                        "def read():\n    Header()\n    return Thing()\n"};
+    for (int i = 0; i < pad && n < EI_RX_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        f[n] = (EILangFile){names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int header = store ? ei_inbound_edges_on(store, lp.project, "Header", "Function", "CALLS") : -1;
+    int thing = store ? ei_inbound_edges_on(store, lp.project, "Thing", "Class", "CALLS") : -1;
+    int decoy = store ? ei_inbound_edges_on(store, lp.project, "Header", "Class", "CALLS") : -1;
+    ei_cleanup(&lp, store);
+    if (header < 0 || thing < 0 || decoy < 0)
+        return -1;
+    return header + 10 * thing + 100 * decoy;
+}
+
+TEST(ei_py_package_reexport_binds_reexported_definition) {
+    /* The parallel driver's CALLS pass reads the namespace-replay map. The
+     * sequential CALLS pass builds its own map from the IMPORTS resolver
+     * (pass_calls.c build_import_map), which binds `pkg` and no member: that
+     * leg proves only that the decoy is never called. */
+    int sequential = ei_py_package_reexport_case(0);
+    int parallel = ei_py_package_reexport_case(60);
+    ASSERT_GTE(sequential, 0);
+    ASSERT_LT(sequential, 100);
+    ASSERT_EQ(parallel, 11);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -890,12 +941,12 @@ static int ei_py_external_base_case(int pad) {
     /* #1278: TransactionTestCase declares no setUp. The nearest declaring
      * project ancestor of TestCase.setUp is SimpleTestCase.setUp. The missing
      * external INHERITS edge must still forbid the reverse override. */
-    int forward = store ? ei_testcases_override(store, lp.project, "TestCase.setUp",
-                                                "SimpleTestCase.setUp")
-                        : -1;
-    int reverse = store ? ei_testcases_override(store, lp.project, "SimpleTestCase.setUp",
-                                                "TestCase.setUp")
-                        : -1;
+    int forward =
+        store ? ei_testcases_override(store, lp.project, "TestCase.setUp", "SimpleTestCase.setUp")
+              : -1;
+    int reverse =
+        store ? ei_testcases_override(store, lp.project, "SimpleTestCase.setUp", "TestCase.setUp")
+              : -1;
     int ok = simple == 0 && bare == 0 && alias == 0 && tx == 1 && w_tx == 1 && tc == 1 &&
              w_tc == 1 && rel == 1 && w_rel == 1 && dot == 1 && w_dot == 1 && overrides == 1 &&
              forward == 1 && reverse == 0;
@@ -2476,6 +2527,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_two_consumers_same_package);
     RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_py_external_import_never_binds_project_symbol);
+    RUN_TEST(ei_py_package_reexport_binds_reexported_definition);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
