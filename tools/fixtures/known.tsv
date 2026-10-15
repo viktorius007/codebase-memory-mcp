@@ -2,19 +2,15 @@
 # The check fails on a mismatch not listed here and on an entry here that no longer mismatches.
 # Findings: R-W2, R-W3 (private review reports of integ/w1 32d11a53 and ba3ad3b2), R-W1 (f10b3151).
 # Rust: M3 (R4) is the method_not_found stop on a method the run reached; N2 a stop naming the wrong cause.
-rust/boundinst	CALLS src.main.call -> src.main.W.go[Ext2]	R-W3 B1
 rust/boundxf	CALLS src.main.calla -> src.ext.T.go[Ext]	R-W3 N2
 rust/boxbox	CALLS src.main.two_traits -> src.main.Box.n[Tb]	R-W3 M2 (R-W2 R2)
 rust/cells	CALLS src.main.cell_get_mut -> src.main.S.get_mut	R-W1 B4
 rust/cells	CALLS src.main.refcell_get_mut -> src.main.S.get_mut	R-W1 B4
 rust/cells	CALLS src.main.refcell_try_borrow_unguarded -> src.main.S.try_borrow_unguarded	R-W1 B4
-rust/copysubstr	CALLS src.main.call -> src.main.u8.go[Ext2]	R-W3 B1
-rust/fnlocaltrait	CALLS src.main.f -> src.main.S.go[Hid]	R-W3 B3
 rust/fwd	CALLS src.main.&'a T.frob[Ext] -> src.main.S.frob[Ext]	R-W3 N2
 rust/fwd	CALLS src.main.on_arc -> src.main.Arc.zap[Ext2]	R-W1 B6
 rust/fwd	CALLS src.main.on_box -> src.main.Box.frob[Ext]	R-W1 B6
 rust/fwd	CALLS src.main.on_rc -> src.main.Rc.frob[Ext]	R-W1 B6
-rust/genbound	CALLS src.main.ca -> src.main.A.go[Ext2]	R-W3 B1
 rust/matrix2	CALLS src.main.c126.probe -> src.main.c126.S126.m[Tr126]	R-W3 M3 (R-W2 R4)
 rust/matrix2	CALLS src.main.c130.probe -> src.main.c130.S130.m[Fa130]	R-W3 M3 (R-W2 R4)
 rust/matrix2	CALLS src.main.c133.probe -> src.main.c133.S133.m[Fa133]	R-W3 M3 (R-W2 R4)
@@ -74,7 +70,6 @@ rust/pinrc	CALLS src.main.pin_get_ref -> src.main.S.get_ref	R-W1 B5
 rust/pinrc	CALLS src.main.pin_set -> src.main.S.set	R-W1 B5
 rust/refcell	CALLS src.main.by_mut_ref -> src.main.S.get_mut	R-W1 B4
 rust/refcell	CALLS src.main.by_value -> src.main.S.get_mut	R-W1 B4
-rust/shapes	CALLS src.main.c1 -> src.main.A1.go[Tr]	R-W3 B2
 rust/wrap	CALLS src.main.refcell_take -> src.main.S.get_mut	R-W1 B4
 rust/xcrate	CALLS caller.src.main.c126.probe -> dep.src.lib.c126.S126.m[Tr126]	R-W3 M3 (R-W2 R4)
 rust/xcrate	CALLS caller.src.main.c130.probe -> dep.src.lib.c130.S130.m[Fa130]	R-W3 M3 (R-W2 R4)
