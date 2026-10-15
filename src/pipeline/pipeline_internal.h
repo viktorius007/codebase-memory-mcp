@@ -466,6 +466,13 @@ typedef struct {
     /* mem_core (CBM_MEM_CLASS_OTHER): the manifest that declared the entry
      * ("ws/dep/Cargo.toml"), stamped by cbm_pkgmap_try_parse. */
     char *manifest_rel;
+    /* mem_core (CBM_MEM_CLASS_OTHER), NULL on a name entry. Set on a
+     * crate-visibility record the Cargo
+     * parser adds: the files under manifest_rel's directory reach the crate
+     * `pkg_name` as the one this manifest declares ("ws/dep/Cargo.toml") --
+     * the manifest itself, or a path dependency's. entry_rel is NULL on it.
+     * cbm_pkgmap_build reads it only for a name two manifests declare. */
+    char *crate_manifest_rel;
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */

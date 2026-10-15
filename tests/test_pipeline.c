@@ -25648,35 +25648,143 @@ static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char 
     return NULL;
 }
 
-/* Two manifests declare one package name: sibling Cargo workspaces each with a
- * crate `dep` (tests/fixtures/graph/rust/ws and .../xcrate). Parallel workers
- * record the manifests they happen to reach, and the build merged the worker
- * lists in slot order keeping the first, so the name's target was a function
- * of thread scheduling: two indexes of one corpus by one binary disagreed on
- * the IMPORTS edges of ws/caller/src/main.rs. The same two manifests, split
- * across workers either way round, must give the name the same target. */
-TEST(pkgmap_duplicate_name_target_independent_of_worker_order) {
-    static const char manifest[] = "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n";
-    static const char *const paths[2] = {"ws/dep/Cargo.toml", "xcrate/dep/Cargo.toml"};
-    char kept[2][256] = {{0}, {0}};
+/* Two manifests declare one package name with different targets: sibling
+ * Cargo workspaces each with a crate `dep` (tests/fixtures/graph/rust/ws and
+ * .../xcrate). The name alone does not say which crate an import means.
+ * Keeping the first manifest a worker reached made the target follow thread
+ * scheduling; keeping the smallest manifest path made it stable and wrong for
+ * every importer of the other crate (z_ws/app path-depends on z_ws/dep and was
+ * linked to a_ws/dep, every run). The name is withheld -- whichever worker saw
+ * which manifest, each listed twice as the parallel pipeline lists it (a
+ * worker's list and the repo walk) -- and the collision is logged once. The
+ * crate-head presence key, only ever tested for existence, stays. */
+static char g_pkgmap_log_capture[4096];
+
+/* Keeps the pkgmap lines; cbm_pkgmap_build logs on the calling thread. */
+static void capture_pkgmap_log_sink(const char *line) {
+    size_t used = strlen(g_pkgmap_log_capture);
+    if (line && strstr(line, "pkgmap.") && used + 1 < sizeof(g_pkgmap_log_capture)) {
+        snprintf(g_pkgmap_log_capture + used, sizeof(g_pkgmap_log_capture) - used, "%s\n", line);
+    }
+}
+
+TEST(pkgmap_name_two_manifests_split_is_withheld_and_logged_once) {
+    static const char dep[] = "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n";
+    static const char app[] = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+                              "[dependencies]\ndep = { path = \"../dep\" }\n";
+    static const char *const paths[3] = {"a_ws/dep/Cargo.toml", "z_ws/dep/Cargo.toml",
+                                         "z_ws/app/Cargo.toml"};
+    static const char *const sources[3] = {dep, dep, app};
     for (int order = 0; order < 2; order++) {
         cbm_pkg_entries_t workers[2];
         for (int w = 0; w < 2; w++) {
             cbm_pkg_entries_init(&workers[w]);
-            ASSERT_TRUE(cbm_pkgmap_try_parse("Cargo.toml", paths[w ^ order], manifest,
-                                             (int)strlen(manifest), &workers[w]));
+            for (int m = 0; m < 3; m++) {
+                int k = (w ^ order) ? 2 - m : m;
+                ASSERT_TRUE(cbm_pkgmap_try_parse("Cargo.toml", paths[k], sources[k],
+                                                 (int)strlen(sources[k]), &workers[w]));
+            }
         }
+        g_pkgmap_log_capture[0] = '\0';
+        CBMLogLevel previous_level = cbm_log_get_level();
+        CBMLogFormat previous_format = cbm_log_get_format();
+        cbm_log_set_level(CBM_LOG_DEBUG);
+        cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+        cbm_log_set_sink(capture_pkgmap_log_sink);
         CBMHashTable *map = cbm_pkgmap_build(workers, 2, "p");
-        const char *target = map ? (const char *)cbm_ht_get(map, "dep") : NULL;
-        if (target) {
-            snprintf(kept[order], sizeof(kept[order]), "%s", target);
-        }
+        cbm_log_set_sink(NULL);
+        cbm_log_set_format(previous_format);
+        cbm_log_set_level(previous_level);
+        bool dep_mapped = map && cbm_ht_get(map, "dep") != NULL;
+        bool app_mapped = map && cbm_ht_get(map, "app") != NULL;
+        bool head_present = map && cbm_ht_get(map, "dep::") != NULL;
         cbm_pkgmap_free(map);
         cbm_pkg_entries_free(&workers[0]);
         cbm_pkg_entries_free(&workers[1]);
+        int collision_lines = 0;
+        for (const char *p = g_pkgmap_log_capture;
+             (p = strstr(p, "msg=pkgmap.name_collision")) != NULL; p++) {
+            collision_lines++;
+        }
+        ASSERT_FALSE(dep_mapped);
+        ASSERT_TRUE(app_mapped);
+        ASSERT_TRUE(head_present);
+        ASSERT_EQ(collision_lines, 1);
+        ASSERT_NOT_NULL(strstr(g_pkgmap_log_capture, "msg=pkgmap.name_collision name=dep "));
     }
-    ASSERT_TRUE(kept[0][0] != '\0');
-    ASSERT_STR_EQ(kept[0], kept[1]);
+    PASS();
+}
+
+/* The file targets of the IMPORTS edges written from `importer`, sorted and
+ * '|'-joined into `out` ("" when none). */
+static bool split_crate_import_targets(const char *db, const char *importer, char *out,
+                                       size_t cap) {
+    out[0] = '\0';
+    cbm_store_t *store = cbm_store_open_path(db);
+    sqlite3_stmt *stmt = NULL;
+    bool ok = store && sqlite3_prepare_v2(cbm_store_get_db(store),
+                                          "SELECT coalesce(group_concat(f, '|'), '') FROM "
+                                          "(SELECT DISTINCT t.file_path AS f FROM edges e "
+                                          "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+                                          "t.id=e.target_id WHERE e.type='IMPORTS' AND "
+                                          "s.file_path=?1 ORDER BY f)",
+                                          -1, &stmt, NULL) == SQLITE_OK;
+    ok = ok && sqlite3_bind_text(stmt, 1, importer, -1, SQLITE_STATIC) == SQLITE_OK &&
+         sqlite3_step(stmt) == SQLITE_ROW;
+    if (ok) {
+        snprintf(out, cap, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    return ok;
+}
+
+/* The crate a Rust `use` of a split name reaches is the one the importer's own
+ * Cargo manifest path-depends on (fixture /tmp/rv-cl/fx-r1, no root workspace,
+ * so no module tree decides first): z_ws/app reaches z_ws/dep and a_ws/user
+ * reaches a_ws/dep -- neither a smaller nor a larger manifest path picks both.
+ * solo declares no such dependency: nothing decides, and it links to neither. */
+TEST(pipeline_rust_import_of_split_crate_name_follows_importer_path_dependency) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-split-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char dep_manifest[] =
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    static const char importer_src[] = "use dep::shared_entry;\nfn main() { shared_entry(); }\n";
+    write_temp_file(tmp, "a_ws/dep/Cargo.toml", dep_manifest);
+    write_temp_file(tmp, "a_ws/dep/src/lib.rs", "pub fn shared_entry() -> u32 { 1 }\n");
+    write_temp_file(tmp, "z_ws/dep/Cargo.toml", dep_manifest);
+    write_temp_file(tmp, "z_ws/dep/src/lib.rs", "pub fn shared_entry() -> u32 { 2 }\n");
+    static const char *const users[2] = {"z_ws/app", "a_ws/user"};
+    for (int u = 0; u < 2; u++) {
+        char rel[128];
+        snprintf(rel, sizeof(rel), "%s/Cargo.toml", users[u]);
+        write_temp_file(tmp, rel,
+                        "[package]\nname = \"user\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                        "[dependencies]\ndep = { path = \"../dep\" }\n");
+        snprintf(rel, sizeof(rel), "%s/src/main.rs", users[u]);
+        write_temp_file(tmp, rel, importer_src);
+    }
+    write_temp_file(tmp, "solo/Cargo.toml",
+                    "[package]\nname = \"solo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "solo/src/main.rs", importer_src);
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/split.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    char app[256], user[256], solo[256];
+    bool read = rc == 0 && split_crate_import_targets(db, "z_ws/app/src/main.rs", app, 256) &&
+                split_crate_import_targets(db, "a_ws/user/src/main.rs", user, 256) &&
+                split_crate_import_targets(db, "solo/src/main.rs", solo, 256);
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(read);
+    ASSERT_STR_EQ(app, "z_ws/dep/src/lib.rs");
+    ASSERT_STR_EQ(user, "a_ws/dep/src/lib.rs");
+    ASSERT_STR_EQ(solo, "");
     PASS();
 }
 
@@ -31496,7 +31604,8 @@ SUITE(pipeline) {
     RUN_TEST(k8s_extract_manifest_no_name);
     RUN_TEST(k8s_extract_manifest_multidoc);
     /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
-    RUN_TEST(pkgmap_duplicate_name_target_independent_of_worker_order);
+    RUN_TEST(pkgmap_name_two_manifests_split_is_withheld_and_logged_once);
+    RUN_TEST(pipeline_rust_import_of_split_crate_name_follows_importer_path_dependency);
     RUN_TEST(pkgmap_manifest_primary_entry_survives_duplicate_listing);
     RUN_TEST(pkgmap_swift_targets_registers_module);
     RUN_TEST(pkgmap_swift_products_do_not_register_alias);
