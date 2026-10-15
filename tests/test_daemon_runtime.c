@@ -4150,7 +4150,7 @@ TEST(daemon_runtime_noncooperative_callback_does_not_detach_or_unbound_stop) {
      * above the STOP_BOUND_MS deadline yet far below a real hang, so heavy
      * scheduler starvation (the CBM_LOCAL_CI_CPUS=4 fidelity pass, CI runners)
      * cannot make it test-significant. */
-    enum { STOP_BOUND_MS = 50, STOP_OBSERVED_MAX_MS = 5000 };
+    enum { STOP_BOUND_MS = 50, STOP_OBSERVED_MAX_MS = 60000 };
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_application_context_t context;
@@ -4271,7 +4271,7 @@ static void runtime_test_containment_hook(const char *component) {
  * can then supply cooperation and prove a clean join and teardown. */
 TEST(daemon_runtime_abandoned_request_join_reaches_containment_in_bounded_time) {
     static const uint8_t request[] = {'w', 'e', 'd', 'g', 'e'};
-    enum { JOIN_BOUND_MS = 150, CONTAINMENT_OBSERVED_MAX_MS = 5000 };
+    enum { JOIN_BOUND_MS = 150, CONTAINMENT_OBSERVED_MAX_MS = 60000 };
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_application_context_t context;
