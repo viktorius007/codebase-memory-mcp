@@ -18068,13 +18068,15 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_issue1527_operator_chain_work_is_linear);
 }
 
-/* The two 20000-link chain cases dwarf the other ~780 tests in the ASan
- * build: usages extraction is quadratic in a binary chain (~70 s), and the
- * receiver chain, linear in the C resolver since the receiver-chain window
- * (clsp_issue1527_receiver_chain_work_is_linear), still takes ~6 s in the
- * rest of the extraction. Each runs as its own suite so the parallel harness
- * schedules them beside c_lsp rather than inside it. Same tests, same
- * assertions; only the suite that runs them changed. */
+/* The two 20000-link chain cases were the slowest tests in the ASan build.
+ * Both are linear now: the binary chain in usages extraction
+ * (clsp_issue1527_scale_work_is_linear) and in the C++ operator branch
+ * (clsp_issue1527_operator_chain_work_is_linear), the receiver chain in the
+ * C resolver (clsp_issue1527_receiver_chain_work_is_linear); the receiver
+ * chain still takes ~6 s in the rest of the extraction. Each runs as its own
+ * suite so the parallel harness schedules them beside c_lsp rather than
+ * inside it. Same tests, same assertions; only the suite that runs them
+ * changed. */
 SUITE(c_lsp_chain_binary) {
     RUN_TEST(clsp_issue1527_long_binary_chain_is_not_nesting);
 }
