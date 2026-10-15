@@ -280,20 +280,33 @@ sqlite3 -header -tabs 'file:/absolute/path/to/score.db?mode=ro' \
 An empty result means no records with that reason in that graph, not complete
 standard-library coverage.
 
-## Repository state
+## Repository state (2026-10-15)
 
-- `main` is `7c95c002`, the frozen comparison base.
-- `integ/w1` is `f10b3151`, the integration tip proposed for landing.
-- `w1/Q`, `w1/D`, `w1/H`, `w1/T`, `w1/P`, `w1/B1`, `w1/Y2`, `w1/Y1`,
-  `w1/B2`, and `w1/S` are the landed wave-one inputs.
-- `w2/std-inventory`, `integ/up`, `fix/arena`, `fix/f1`, `fix/f1b`,
-  `fix/m5b`, and `fix/m5c` are landed input or repair branches retained for
-  provenance. They are not alternatives to the integrated tip.
-- The upstream input is `24d02512`; U5 formed `integ/up` at `7feef206`, and U6
-  merged it into the integration line at `582bc055`.
-- The current gate command is the first command under "Reproduce". Corpora are
-  under `~/Developer/cbm-bench/`, outside all Git trees, and must never be
-  edited.
+- `main` is `59a67044`, pushed to `origin`, and is the installed binary. It holds
+  the wave-one integration, the 14 October std-dispatch work, the B1F/B1G method
+  selection, the RW3 Rust repair (B2, B3, M1 fixed; B1 one of three sites right,
+  two recorded stops), the Python own-name repair (ba953975), M8's mutation
+  seeds and tests, and `make -f Makefile.cbm fixtures`.
+- Scores on `main` against the 7c95c002 base (calls credited, flagged):
+  codex 226161 / 1 (base 225798 / 1), ruff 104067 / 1 (103252 / 1),
+  pm 39983 / 73 (39680 / 74), bevy 61367 / 35 (60018 / 76). No CALLS edge
+  present on the previous tip was removed on any corpus.
+- Open Rust findings are the 93 entries of `tools/fixtures/known.tsv`, each keyed
+  to its review finding: R2 (an impl on an intermediate `Deref` step, the only
+  class that still publishes a wrong edge), R4 (two traits with different self
+  shapes recorded `method_not_found`), the two remaining B1 bound sites, N2 stop
+  names, and R-W1 B4–B7. `make fixtures` fails when any entry stops mismatching
+  or a new mismatch appears. The mutation lane's one survivor is
+  `mutable-value-precedence`.
+- `fix/rw3-py` (fce3f3a1) is the unlanded Python statement-order repair: it
+  matches Python on 37 of 43 fixture modules in both modes but hangs the ruff
+  index in the package re-export lookup (`pxc_python_reexported_node` re-extracts
+  package files per lookup). `fix/e61` and `fix/h5h` are superseded alternatives
+  to ba953975, kept because the repository hook refuses to delete unmerged
+  branches. All wave-one, staging and landed repair branches are deleted; their
+  commits are on `main`.
+- The gate command is the first command under "Reproduce". Corpora are under
+  `~/Developer/cbm-bench/`, outside all Git trees, and must never be edited.
 - `rm` is blocked on this machine; use `trash`. Never touch `~/.cbm`, the
   installed binary, or its daemon. Never edit or re-index the corpus trees.
 
