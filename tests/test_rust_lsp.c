@@ -8036,6 +8036,119 @@ TEST(rustlsp_unrelated_derived_impl_does_not_veto_inherent_method) {
     PASS();
 }
 
+static const char *stop_reason_for(const CBMFileResult *r, const char *callerSub) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && strstr(rc->caller_qn, callerSub) && rc->reason)
+            return rc->reason;
+    }
+    return "(none)";
+}
+
+TEST(rustlsp_blanket_bound_is_checked_with_the_impl_generic_arguments) {
+    /* rustc +stable: on_u16 prints `Ext2::go W<u16>`, on_u8 prints `Ext::go blanket`.
+     * `impl Bound for W<u8>` does not make W<u16>: Bound, so the blanket impl is
+     * neither published for on_u16 nor dropped without a record. (The file-local
+     * registry of this harness does not publish on_u8; the cross pass does.) */
+    CBMFileResult *r = extract_rust(
+        "trait Bound {}\nstruct W<T>(T);\nimpl Bound for W<u8> {}\n"
+        "trait Ext { fn go(self); }\nimpl<T: Bound> Ext for T { fn go(self) {} }\n"
+        "trait Ext2 { fn go(&self); }\nimpl Ext2 for W<u16> { fn go(&self) {} }\n"
+        "fn on_u16(w: W<u16>) { w.go(); }\nfn on_u8(w: W<u8>) { w.go(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.on_u16", "go[Ext]"), -1);
+    ASSERT_STR_EQ(stop_reason_for(r, "main.on_u16"), "trait_receiver_partial");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_blanket_bound_is_checked_with_the_bound_trait_arguments) {
+    /* rustc +stable prints `Ext2::go A`: `A: Conv<u16>` is no `A: Conv<u8>`. */
+    CBMFileResult *r = extract_rust(
+        "trait Conv<X> {}\nstruct A;\nimpl Conv<u16> for A {}\n"
+        "trait Ext { fn go(self); }\nimpl<T: Conv<u8>> Ext for T { fn go(self) {} }\n"
+        "trait Ext2 { fn go(&self); }\nimpl Ext2 for A { fn go(&self) {} }\n"
+        "fn on_a(a: A) { a.go(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.on_a", "go[Ext]"), -1);
+    ASSERT_STR_EQ(stop_reason_for(r, "main.on_a"), "trait_receiver_partial");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_bound_named_like_copy_is_no_copy_evidence) {
+    /* rustc +stable: on_u8 prints `Ext2::go u8`, on_u16 prints `Ext::go blanket`.
+     * `CopyLike` is not `Copy`: a name that begins with it proves nothing for u8. */
+    CBMFileResult *r = extract_rust(
+        "trait CopyLike {}\nimpl CopyLike for u16 {}\n"
+        "trait Ext { fn go(self); }\nimpl<T: CopyLike> Ext for T { fn go(self) {} }\n"
+        "trait Ext2 { fn go(&self); }\nimpl Ext2 for u8 { fn go(&self) {} }\n"
+        "fn on_u8(x: u8) { x.go(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.on_u8", "go[Ext]"), -1);
+    ASSERT_STR_EQ(stop_reason_for(r, "main.on_u8"), "trait_receiver_partial");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_impl_on_type_alias_applies_to_the_aliased_type) {
+    /* rustc +stable prints `S1 Tr via alias`: by-value Tr::go precedes inherent &self go. */
+    CBMFileResult *r = extract_rust(
+        "trait Tr { fn go(self); }\nstruct S1;\nimpl S1 { fn go(&self) {} }\n"
+        "type A1 = S1;\nimpl Tr for A1 { fn go(self) {} }\n"
+        "fn c1(s: S1) { s.go(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.c1", "go[Tr]"), 0);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.c1", "S1.go"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_declared_in_the_calling_block_is_in_scope) {
+    /* rustc +stable: f prints `Hid::go (self)`, g prints `S::go inherent &self`. */
+    CBMFileResult *r = extract_rust(
+        "struct S;\nimpl S { fn go(&self) {} }\n"
+        "fn f() { trait Hid { fn go(self); } impl Hid for S { fn go(self) {} } "
+        "let s = S; s.go(); }\n"
+        "fn g() { let s = S; s.go(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.f", "go[Hid]"), 0);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.g", "S.go"), 0);
+    ASSERT_EQ(find_confident(&r->resolved_calls, "main.g", "[Hid]"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_derived_impl_on_another_type_does_not_withhold_inherent_clone) {
+    /* rustc +stable prints `S::clone inherent`; `Other`'s derived Clone cannot apply to S. */
+    CBMFileResult *r = extract_rust(
+        "struct S;\nimpl S { fn clone(&self) -> S { S } }\n"
+        "#[derive(Clone)] struct Other;\n"
+        "fn call_clone(s: S) -> S { s.clone() }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.call_clone", "S.clone"), 0);
+    ASSERT_STR_EQ(stop_reason_for(r, "main.call_clone"), "(none)");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_derived_ord_on_another_type_does_not_withhold_manual_cmp) {
+    /* rustc +stable runs `<LineColumn as Ord>::cmp` from partial_cmp and from eq. */
+    CBMFileResult *r = extract_rust(
+        "use std::cmp::Ordering;\nstruct LineColumn { line: u32 }\n"
+        "impl PartialOrd for LineColumn { fn partial_cmp(&self, o: &Self) -> Option<Ordering> "
+        "{ Some(self.cmp(o)) } }\n"
+        "impl Ord for LineColumn { fn cmp(&self, o: &Self) -> Ordering { self.line.cmp(&o.line) } }\n"
+        "impl PartialEq for LineColumn { fn eq(&self, o: &Self) -> bool "
+        "{ self.cmp(o) == Ordering::Equal } }\nimpl Eq for LineColumn {}\n"
+        "#[derive(PartialEq, Eq, PartialOrd, Ord)] struct Other(u8);\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "partial_cmp", "LineColumn.cmp"), 0);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "PartialEq", "LineColumn.cmp"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_unknown_reference_qualifier_is_not_promoted_by_alias_expansion) {
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -13221,7 +13334,10 @@ TEST(rustlsp_modtree_qualified_impl_trait_keeps_proven_identity) {
         ASSERT_NOT_NULL(widget);
         ASSERT_NOT_NULL(widget->embedded_types);
         ASSERT_STR_EQ(widget->embedded_types[0], "p.src.contract.Action");
-        ASSERT_NULL(widget->embedded_types[1]);
+        /* The impl's written header follows the trait QN; nothing else does. */
+        ASSERT_NOT_NULL(widget->embedded_types[1]);
+        ASSERT_TRUE(strncmp(widget->embedded_types[1], "Impl:p.src.contract.Action\x1f", 27) == 0);
+        ASSERT_NULL(widget->embedded_types[2]);
         cbm_arena_destroy(&arena);
         cbm_rust_modtree_free(tree);
     }
@@ -14728,6 +14844,13 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_nested_reference_impl_precedes_inner_inherent);
     RUN_TEST(rustlsp_by_value_probe_after_deref_does_not_require_visible_copy_impl);
     RUN_TEST(rustlsp_unrelated_derived_impl_does_not_veto_inherent_method);
+    RUN_TEST(rustlsp_blanket_bound_is_checked_with_the_impl_generic_arguments);
+    RUN_TEST(rustlsp_blanket_bound_is_checked_with_the_bound_trait_arguments);
+    RUN_TEST(rustlsp_bound_named_like_copy_is_no_copy_evidence);
+    RUN_TEST(rustlsp_impl_on_type_alias_applies_to_the_aliased_type);
+    RUN_TEST(rustlsp_trait_declared_in_the_calling_block_is_in_scope);
+    RUN_TEST(rustlsp_derived_impl_on_another_type_does_not_withhold_inherent_clone);
+    RUN_TEST(rustlsp_derived_ord_on_another_type_does_not_withhold_manual_cmp);
     RUN_TEST(rustlsp_unknown_reference_qualifier_is_not_promoted_by_alias_expansion);
     RUN_TEST(rustlsp_reference_impl_generic_shadowing_withholds_unproved_bound);
     RUN_TEST(rustlsp_inherent_shared_receiver_precedes_unproved_blanket);

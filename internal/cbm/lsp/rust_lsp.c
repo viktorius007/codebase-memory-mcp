@@ -9713,6 +9713,11 @@ static bool rust_method_probe_shape_free_cross_package(
     return caller && owner && caller != owner;
 }
 
+static bool rust_is_interface_qn(RustLSPContext *ctx, const char *qn) {
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
+    return type && type->is_interface;
+}
+
 static const CBMRegisteredFunc *rust_method_probe_choice(
     RustLSPContext *ctx, const CBMRegisteredFunc *inherent,
     const CBMRegisteredFunc *trait_method, const CBMType *recv, const char *name,
@@ -9750,9 +9755,20 @@ static const CBMRegisteredFunc *rust_method_probe_choice(
         proved_rank = reference_rank;
         proved_inherent = false;
     }
+    /* A trait-object receiver finds its own trait's methods as inherent
+     * candidates of the object type: at an equal rank they precede any impl. */
+    const CBMType *receiver_base = rust_strip_references(recv);
+    bool object_method = !inherent && trait_rank >= 0 && trait_method &&
+                         trait_method->receiver_type && receiver_base &&
+                         receiver_base->kind == CBM_TYPE_NAMED &&
+                         receiver_base->data.named.qualified_name &&
+                         strcmp(receiver_base->data.named.qualified_name,
+                                trait_method->receiver_type) == 0 &&
+                         rust_is_interface_qn(ctx, trait_method->receiver_type);
     bool reference_blocked = reference_uncertain_rank >= 0 &&
                              (proved_rank < 0 || reference_uncertain_rank < proved_rank ||
-                              (reference_uncertain_rank == proved_rank && !proved_inherent));
+                              (reference_uncertain_rank == proved_rank && !proved_inherent &&
+                               !object_method));
     /* A unique inherent target needs no precedence decision. This preserves
      * cross-file and built-in seed declarations that predate stored self
      * shapes. The moment a trait or reference candidate exists, every choice
