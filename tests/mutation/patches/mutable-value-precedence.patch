@@ -1,20 +1,12 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -14588,7 +14588,7 @@
-                     }
-                     const CBMRegisteredFunc *shared_candidate = rust_resolve_trait_method(
-                         ctx, type_qn, mname, NULL, NULL, true, true, NULL, NULL, recv);
--                    if (shared_candidate != m) {
-+                    if (false && shared_candidate != m) {
-                         if ((m->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0) {
-                             rust_emit_unresolved_call(ctx, mname,
-                                                       "trait_mutable_dispatch_unproved");
-@@ -14601,6 +14601,6 @@
-                     }
-                 }
--                if (rust_reference_impl_may_precede(ctx, recv, m)) {
-+                if (false && rust_reference_impl_may_precede(ctx, recv, m)) {
-                     rust_emit_unresolved_call(ctx, mname, "trait_reference_dispatch_unproved");
-                     return;
-                 }
+@@ -9475,7 +9475,7 @@
+     if (ctx->registry_is_file_local && inherent_rank >= 0 && !trait_method && !reference &&
+         rust_source_declares_trait_method(ctx, name))
+         return NULL;
+-    if (inherent_rank >= 0 && (trait_rank < 0 || inherent_rank <= trait_rank) &&
++    if (inherent_rank >= 0 &&
+         (reference_rank < 0 || inherent_rank <= reference_rank))
+         return inherent;
+     if (trait_rank >= 0 && (reference_rank < 0 || trait_rank < reference_rank))

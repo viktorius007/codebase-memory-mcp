@@ -89,6 +89,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <sqlite3.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -340,6 +341,46 @@ static int lrp_exact_edge_by_name(cbm_store_t *store, const char *project, const
 static int lrp_exact_calls_by_name(cbm_store_t *store, const char *project, const char *source_name,
                                    const char *target_name) {
     return lrp_exact_edge_by_name(store, project, "CALLS", source_name, target_name);
+}
+
+static int lrp_unresolved_call_count(cbm_store_t *store, const char *name,
+                                     const char *reason) {
+    if (!store || !name || !reason) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(store),
+                           "SELECT count(*) FROM unresolved_sites "
+                           "WHERE kind='call' AND name=?1 AND reason=?2",
+                           -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, reason, -1, SQLITE_STATIC);
+    int count = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+static int lrp_named_call_count(cbm_store_t *store, const char *source_name,
+                                const char *target_name) {
+    if (!store || !source_name || !target_name) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(store),
+                           "SELECT count(*) FROM edges e "
+                           "JOIN nodes s ON s.id=e.source_id "
+                           "JOIN nodes t ON t.id=e.target_id "
+                           "WHERE e.type='CALLS' AND s.name=?1 AND t.name=?2",
+                           -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, source_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, target_name, -1, SQLITE_STATIC);
+    int count = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 static int lrp_exact_edge_by_qn_suffix(cbm_store_t *store, const char *project,
@@ -828,18 +869,19 @@ TEST(lrp_rust_s5_chained) {
 /* S6 — Rust trait method call on concrete type. */
 TEST(lrp_rust_s6_trait_method) {
     /* Trait Display is defined in display.rs; Dog implements it in dog.rs.
-     * run() in main.rs calls d.show() on a Dog where show() comes from the trait. */
+     * run() imports Display before calling show() on a Dog. */
     static const LRP_File f[] = {
-        {"display.rs", "pub trait Display {\n    fn show(&self) -> String;\n}\n"},
-        {"dog.rs", "mod display;\n\npub struct Dog { pub name: String }\n\n"
+        {"Cargo.toml", "[package]\nname = \"trait-probe\"\nversion = \"0.1.0\"\n"
+                       "edition = \"2021\"\n"},
+        {"src/display.rs", "pub trait Display {\n    fn show(&self) -> String;\n}\n"},
+        {"src/dog.rs", "use crate::display;\n\npub struct Dog { pub name: String }\n\n"
                    "impl display::Display for Dog {\n"
                    "    fn show(&self) -> String { self.name.clone() }\n}\n"},
-        {"main.rs", "mod dog;\n\nfn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
-    /* GREEN since epoch 12: the keyed trait-impl class is admitted. The
-     * lsp_trait strategy proves the edge rode the impl-key resolution, not a
-     * short-name guess. */
+        {"src/main.rs", "mod display;\nmod dog;\nuse crate::display::Display;\n\n"
+                    "fn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
+    /* The strategy proves the edge rode impl-key resolution, not a short-name guess. */
     LRP_Proj lp;
-    cbm_store_t *store = lrp_index(&lp, f, 3);
+    cbm_store_t *store = lrp_index(&lp, f, 4);
     ASSERT_NOT_NULL(store);
     int trait_calls = lrp_count_calls_with_strategy(store, lp.project, "lsp_trait");
     if (trait_calls < 1) {
@@ -848,6 +890,27 @@ TEST(lrp_rust_s6_trait_method) {
     }
     lrp_cleanup(&lp, store);
     ASSERT_TRUE(trait_calls >= 1);
+    PASS();
+}
+
+TEST(lrp_rust_s6_trait_method_requires_scope) {
+    static const LRP_File f[] = {
+        {"Cargo.toml", "[package]\nname = \"trait-probe\"\nversion = \"0.1.0\"\n"
+                       "edition = \"2021\"\n"},
+        {"src/display.rs", "pub trait Display {\n    fn show(&self) -> String;\n}\n"},
+        {"src/dog.rs", "use crate::display;\n\npub struct Dog { pub name: String }\n\n"
+                   "impl display::Display for Dog {\n"
+                   "    fn show(&self) -> String { self.name.clone() }\n}\n"},
+        {"src/main.rs", "mod display;\nmod dog;\n\n"
+                    "fn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 4);
+    ASSERT_NOT_NULL(store);
+    int show_calls = lrp_named_call_count(store, "run", "show");
+    int scope_stops = lrp_unresolved_call_count(store, "show", "trait_scope_identity");
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(show_calls, 0);
+    ASSERT_EQ(scope_stops, 1);
     PASS();
 }
 
@@ -1893,6 +1956,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_rust_s4_static_method);
     RUN_TEST(lrp_rust_s5_chained);
     RUN_TEST(lrp_rust_s6_trait_method);
+    RUN_TEST(lrp_rust_s6_trait_method_requires_scope);
     RUN_TEST(lrp_rust_s7_generic);
     RUN_TEST(lrp_rust_s8_field_call);
     RUN_TEST(lrp_rust_crossfile_macro_hidden_call_carrier);

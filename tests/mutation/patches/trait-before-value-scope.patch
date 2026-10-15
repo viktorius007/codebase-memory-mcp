@@ -1,7 +1,7 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -8890,7 +8890,7 @@
+@@ -9570,7 +9570,7 @@
      bool trait_ambiguous = false;
      bool scope_filtered = false; /* a candidate was dropped for this file's scope */
      const CBMRegisteredFunc *impl_method = rust_registry_lookup_trait_impl_method_scoped(
@@ -10,12 +10,12 @@ diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
          &scope_filtered);
      /* An impl of a trait the registry does not hold is as much a candidate,
       * on a type declared in the project when the registry holds the whole
-@@ -8917,7 +8917,7 @@
-         if (inh) {
-             (void)rust_trait_out_of_scope(ctx, impl_method->impl_trait_qn, method_name,
-                                           impl_method->impl_key, &proved);
--            if (!proved) {
-+            if (false && !proved) {
-                 return NULL;
-             }
-         }
+@@ -14803,7 +14803,7 @@
+     }
+     if ((method->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0)
+         return NULL;
+-    if (prove_dispatch &&
++    if (false && prove_dispatch &&
+         (!method->impl_trait_qn ||
+          rust_trait_out_of_scope(ctx, method->impl_trait_qn, method->short_name, method->impl_key,
+                                  NULL)))
