@@ -1693,3 +1693,20 @@ security: cbm
 	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
 	scripts/security-vendored.sh
 	@echo "=== All security checks passed ==="
+
+# ── Graph fixtures: the graph against the compiler's own run ─────
+# Runs every program under tests/fixtures/graph under its own toolchain, indexes it with the
+# built binary in both pipeline modes and fails on every site where the graph differs from the
+# run and tools/fixtures/known.tsv does not list it.  Needs rustc and python3 (3.12+).
+#   make -f Makefile.cbm fixtures BUILD_DIR=<dir>
+#   make -f Makefile.cbm fixtures BIN=<binary>      (check another binary, build nothing)
+#   make -f Makefile.cbm fixtures FIXTURES_ONLY="shapes pyw"
+FIXTURES_BIN ?= $(or $(BIN),$(BUILD_DIR)/codebase-memory-mcp)
+FIXTURES_LOG ?= $(BUILD_DIR)/fixtures.log
+FIXTURES_ONLY ?=
+.PHONY: fixtures
+fixtures: $(if $(BIN),,$(BUILD_DIR)/codebase-memory-mcp)
+	@command -v python3 >/dev/null || { echo "fixtures: python3 not found"; exit 2; }
+	@mkdir -p $(dir $(FIXTURES_LOG))
+	@python3 -I -B tools/fixtures/fixtures.py --bin "$(FIXTURES_BIN)" --log "$(FIXTURES_LOG)" \
+		$(if $(FIXTURES_ONLY),--only $(FIXTURES_ONLY))
