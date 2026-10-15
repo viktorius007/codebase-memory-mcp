@@ -11,6 +11,15 @@
 #include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include "../src/foundation/compat_fs.h"
+#ifdef _WIN32
+#include <direct.h>
+#define extraction_test_chdir _chdir
+#define extraction_test_getcwd _getcwd
+#else
+#include <unistd.h>
+#define extraction_test_chdir chdir
+#define extraction_test_getcwd getcwd
+#endif
 #include <stdint.h>
 #include <time.h>
 #include "macro_table.h"
@@ -7790,6 +7799,90 @@ TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949) {
     PASS();
 }
 
+enum { PP_CALL_SITE_LINES = 5, PP_CALL_SITE_LINE = 4, PP_PAD_LINES = 40 };
+
+/* dir/pp_pad.h: PP_PAD_LINES one-line functions calling pp_pad_callee, then
+ * the macro PP_HDR_CALL, whose expansion calls pp_hdr_target. */
+static bool write_pp_pad_header(const char *dir, char *path_out, size_t path_cap) {
+    snprintf(path_out, path_cap, "%s/pp_pad.h", dir);
+    FILE *f = cbm_fopen(path_out, "wb");
+    if (!f) {
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < PP_PAD_LINES && ok; i++) {
+        ok = fprintf(f, "static int pp_pad_%d(void) { return pp_pad_callee(%d); }\n", i, i) > 0;
+    }
+    ok = ok && fprintf(f, "#define PP_HDR_CALL(x) pp_hdr_target(x)\n") > 0;
+    return fclose(f) == 0 && ok;
+}
+
+/* Five lines. pp_target is called only after expansion of a macro this file
+ * defines; pp_hdr_target only after expansion of one the header defines. Only
+ * the preprocessed pass sees either, on line 4. */
+static const char PP_CALL_SITE_SRC[] = "#include \"pp_pad.h\"\n"
+                                       "#define CALL_TARGET(x) pp_target(x)\n"
+                                       "int pp_caller(int v) {\n"
+                                       "    return CALL_TARGET(v) + PP_HDR_CALL(v);\n"
+                                       "}\n";
+
+/* The preprocessed pass reads the bytes it is handed and the include
+ * directories its caller names, nothing else. simplecpp looked a quoted
+ * include up next to the including file, and the extractor names that file by
+ * its repo-relative path, so the lookup resolved against the indexing
+ * process's working directory. The same corpus then indexed differently
+ * depending on where the process ran and on what that directory held at the
+ * time: from the repository root every C file spliced its headers into the
+ * expanded buffer, header function bodies became calls of the including file,
+ * header macros changed what this file calls, and macro-hidden calls carried
+ * expanded-buffer lines (cbm.c: line 6348 of 4775). Here the header sits in
+ * the working directory and no include directory is named: its macro must not
+ * expand, and the result must match the run from elsewhere. */
+TEST(extract_c_preprocessed_pass_ignores_working_directory) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cbm_pp_cwd_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char header_path[600];
+    bool written = write_pp_pad_header(tmpdir, header_path, sizeof(header_path));
+
+    char saved_cwd[1024];
+    bool saved = extraction_test_getcwd(saved_cwd, sizeof(saved_cwd)) != NULL;
+    bool entered = written && saved && extraction_test_chdir(tmpdir) == 0;
+    CBMFileResult *in_dir =
+        entered ? cbm_extract_file(PP_CALL_SITE_SRC, (int)strlen(PP_CALL_SITE_SRC), CBM_LANG_C,
+                                   "t", "pp_main.c", 0, NULL, NULL)
+                : NULL;
+    bool restored = saved && extraction_test_chdir(saved_cwd) == 0;
+    CBMFileResult *elsewhere = cbm_extract_file(PP_CALL_SITE_SRC, (int)strlen(PP_CALL_SITE_SRC),
+                                                CBM_LANG_C, "t", "pp_main.c", 0, NULL, NULL);
+    cbm_unlink(header_path);
+    cbm_rmdir(tmpdir);
+
+    ASSERT_TRUE(written);
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(restored);
+    ASSERT_NOT_NULL(in_dir);
+    ASSERT_NOT_NULL(elsewhere);
+    /* The header in the working directory contributed nothing. */
+    ASSERT_EQ(count_calls_named(in_dir, "pp_hdr_target"), 0);
+    ASSERT_EQ(count_calls_named(in_dir, "pp_pad_callee"), 0);
+    const CBMCall *target = find_call_by_callee(in_dir, "pp_target");
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ(target->start_line, PP_CALL_SITE_LINE);
+    /* Call for call, the same extraction as from any other directory. */
+    ASSERT_EQ(in_dir->calls.count, elsewhere->calls.count);
+    for (int i = 0; i < in_dir->calls.count; i++) {
+        const CBMCall *a = &in_dir->calls.items[i];
+        const CBMCall *b = &elsewhere->calls.items[i];
+        ASSERT_STR_EQ(a->callee_name, b->callee_name);
+        ASSERT_EQ(a->start_line, b->start_line);
+        ASSERT_EQ((int)a->source_origin, (int)b->source_origin);
+    }
+    cbm_free_result(in_dir);
+    cbm_free_result(elsewhere);
+    PASS();
+}
+
 /* #961 inverse guard: a clean C file must not gain duplicate or phantom
  * defs from the recovery path (it only engages on raw-parse ERROR regions). */
 TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
@@ -13174,6 +13267,7 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
+    RUN_TEST(extract_c_preprocessed_pass_ignores_working_directory);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling);
     RUN_TEST(extract_c_misnested_raw_struct_replaced_by_flat_copy);

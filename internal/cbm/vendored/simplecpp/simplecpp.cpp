@@ -3051,10 +3051,10 @@ static std::string openHeaderDirect(std::ifstream &f, const std::string &path)
 static std::string openHeader(std::ifstream &f, const simplecpp::DUI &dui, const std::string &sourcefile, const std::string &header, bool systemheader)
 {
     if (simplecpp::isAbsolutePath(header))
-        return openHeaderDirect(f, simplecpp::simplifyPath(header));
+        return dui.includePathsOnly ? "" : openHeaderDirect(f, simplecpp::simplifyPath(header)); // CBM patch
 
     // prefer first to search the header relatively to source file if found, when not a system header
-    if (!systemheader) {
+    if (!systemheader && !dui.includePathsOnly) { // CBM patch
         std::string path = openHeaderDirect(f, simplecpp::simplifyPath(dirPath(sourcefile) + header));
         if (!path.empty()) {
             return path;
@@ -3099,6 +3099,8 @@ std::pair<simplecpp::FileData *, bool> simplecpp::FileDataCache::tryload(FileDat
 std::pair<simplecpp::FileData *, bool> simplecpp::FileDataCache::get(const std::string &sourcefile, const std::string &header, const simplecpp::DUI &dui, bool systemheader, std::vector<std::string> &filenames, simplecpp::OutputList *outputList)
 {
     if (isAbsolutePath(header)) {
+        if (dui.includePathsOnly) // CBM patch
+            return {nullptr, false};
         auto ins = mNameMap.emplace(simplecpp::simplifyPath(header), nullptr);
 
         if (ins.second) {
@@ -3113,7 +3115,7 @@ std::pair<simplecpp::FileData *, bool> simplecpp::FileDataCache::get(const std::
         return {nullptr, false};
     }
 
-    if (!systemheader) {
+    if (!systemheader && !dui.includePathsOnly) { // CBM patch
         auto ins = mNameMap.emplace(simplecpp::simplifyPath(dirPath(sourcefile) + header), nullptr);
 
         if (ins.second) {

@@ -34,6 +34,9 @@ int cbm_export_macro_candidates(const char *source, int source_len,
 // Returns malloc-allocated expanded source, or NULL if no expansion needed/on failure.
 // extra_defines: NULL-terminated array of "NAME=VALUE" strings (can be NULL).
 // include_paths: NULL-terminated array of directory paths for #include resolution (can be NULL).
+//   These are the ONLY places a header is read from: not next to `filename` (a
+//   name, not a path on this machine) and not by an absolute #include. NULL
+//   means no header is read and every #include contributes nothing.
 // The returned string must be freed with cbm_preprocess_free().
 char *cbm_preprocess(const char *source, int source_len, const char *filename,
                      const char **extra_defines, const char **include_paths, int cpp_mode);

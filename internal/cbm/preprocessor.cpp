@@ -513,6 +513,14 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
             for (int i = 0; include_paths[i]; i++)
                 dui.includePaths.push_back(include_paths[i]);
         }
+        // Headers come only from the directories the caller names. `filename`
+        // is a name inside the indexed repository, not a path on this machine:
+        // simplecpp's own lookup next to the including file resolved it against
+        // the process's working directory, so the expansion -- its calls, their
+        // lines, the defs it rescues -- followed wherever the indexer happened
+        // to run and whatever that directory held at the time. An absolute
+        // #include names a file outside the input just the same.
+        dui.includePathsOnly = true;
         dui.std = cpp_mode ? "c++17" : "c11";
 
         std::string src(source, source_len);

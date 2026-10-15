@@ -438,6 +438,9 @@ namespace simplecpp {
         std::string std;
         bool clearIncludeCache{};
         bool removeComments{}; /** remove comment tokens from included files */
+        /** CBM patch (PATCHES.md): find headers only under includePaths -- never
+         *  next to the including file, never by absolute path. */
+        bool includePathsOnly{};
     };
 
     struct SIMPLECPP_LIB FileData {
