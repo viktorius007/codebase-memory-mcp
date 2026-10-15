@@ -1,0 +1,102 @@
+# Known mismatches of the graph against the run, one per site: fixture, site, finding (tab separated).
+# The check fails on a mismatch not listed here and on an entry here that no longer mismatches.
+# Findings: R-W2, R-W3 (private review reports of integ/w1 32d11a53 and ba3ad3b2), R-W1 (f10b3151).
+# Rust: M3 (R4) is the method_not_found stop on a method the run reached; N2 a stop naming the wrong cause.
+rust/boundinst	CALLS src.main.call -> src.main.W.go[Ext2]	R-W3 B1
+rust/boundxf	CALLS src.main.calla -> src.ext.T.go[Ext]	R-W3 N2
+rust/boxbox	CALLS src.main.two_traits -> src.main.Box.n[Tb]	R-W3 M2 (R-W2 R2)
+rust/cells	CALLS src.main.cell_get_mut -> src.main.S.get_mut	R-W1 B4
+rust/cells	CALLS src.main.refcell_get_mut -> src.main.S.get_mut	R-W1 B4
+rust/cells	CALLS src.main.refcell_try_borrow_unguarded -> src.main.S.try_borrow_unguarded	R-W1 B4
+rust/copysubstr	CALLS src.main.call -> src.main.u8.go[Ext2]	R-W3 B1
+rust/fnlocaltrait	CALLS src.main.f -> src.main.S.go[Hid]	R-W3 B3
+rust/fwd	CALLS src.main.&'a T.frob[Ext] -> src.main.S.frob[Ext]	R-W3 N2
+rust/fwd	CALLS src.main.on_arc -> src.main.Arc.zap[Ext2]	R-W1 B6
+rust/fwd	CALLS src.main.on_box -> src.main.Box.frob[Ext]	R-W1 B6
+rust/fwd	CALLS src.main.on_rc -> src.main.Rc.frob[Ext]	R-W1 B6
+rust/genbound	CALLS src.main.ca -> src.main.A.go[Ext2]	R-W3 B1
+rust/matrix2	CALLS src.main.c126.probe -> src.main.c126.S126.m[Tr126]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c130.probe -> src.main.c130.S130.m[Fa130]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c133.probe -> src.main.c133.S133.m[Fa133]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c139.probe -> src.main.c139.S139.m[Fa139]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c143.probe -> src.main.c143.S143.m[Tr143]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c145.probe -> src.main.c145.S145.m[Tr145]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c204.probe -> src.main.c204.S204.m[Fa204]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c208.probe -> src.main.c208.S208.m[Tr208]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c211.probe -> src.main.c211.S211.m[Tr211]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c217.probe -> src.main.c217.S217.m[Tr217]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c220.probe -> src.main.c220.S220.m[Fa220]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c223.probe -> src.main.c223.S223.m[Fa223]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c378.probe -> src.main.c378.S378.m[Tr378]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c382.probe -> src.main.c382.S382.m[Fa382]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c385.probe -> src.main.c385.S385.m[Fa385]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c391.probe -> src.main.c391.S391.m[Fa391]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c395.probe -> src.main.c395.S395.m[Tr395]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c397.probe -> src.main.c397.S397.m[Tr397]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c44.probe -> src.main.c44.S44.m[Fa44]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c48.probe -> src.main.c48.S48.m[Fa48]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c52.probe -> src.main.c52.S52.m[Tr52]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c58.probe -> src.main.c58.S58.m[Fa58]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c62.probe -> src.main.c62.S62.m[Tr62]	R-W3 M3 (R-W2 R4)
+rust/matrix2	CALLS src.main.c65.probe -> src.main.c65.S65.m[Tr65]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c114.probe -> src.main.c114.S114.m[Tr114]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c116.probe -> src.main.c116.S116.m[Fa116]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c122.probe -> src.main.c122.S122.m[Fa122]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c127.probe -> src.main.c127.S127.m[Tr127]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c174.probe -> src.main.c174.S174.m[Tr174]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c180.probe -> src.main.c180.S180.m[Tr180]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c183.probe -> src.main.c183.S183.m[Fa183]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c186.probe -> src.main.c186.S186.m[Fa186]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c352.probe -> src.main.c352.Box.m[Tr352]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c356.probe -> src.main.c356.Box.m[Tr356]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c360.probe -> src.main.c360.Box.m[Tr360]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c363.probe -> src.main.c363.Box.m[Tr363]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c366.probe -> src.main.c366.Box.m[Tr366]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c370.probe -> src.main.c370.Box.m[Tr370]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c373.probe -> src.main.c373.Box.m[Tr373]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c377.probe -> src.main.c377.Box.m[Tr377]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c380.probe -> src.main.c380.Box.m[Tr380]	R-W3 M2 (R-W2 R2)
+rust/matrix4	CALLS src.main.c44.probe -> src.main.c44.S44.m[Fa44]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c48.probe -> src.main.c48.S48.m[Fa48]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c52.probe -> src.main.c52.S52.m[Tr52]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c58.probe -> src.main.c58.S58.m[Fa58]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c62.probe -> src.main.c62.S62.m[Tr62]	R-W3 M3 (R-W2 R4)
+rust/matrix4	CALLS src.main.c65.probe -> src.main.c65.S65.m[Tr65]	R-W3 M3 (R-W2 R4)
+rust/misc	CALLS src.main.generic_ret -> src.main.Q.hello	R-W3 N2
+rust/ops	CALLS src.main.add_u8 -> src.main.V.add[Add<u8>]	R-W1 B7
+rust/ops	CALLS src.main.add_v -> src.main.V.add[Add<V>]	R-W1 B7
+rust/ops	CALLS src.main.idx_usize -> src.main.V.index[Index<usize>]	R-W1 B7
+rust/ops2	CALLS src.main.add_u8 -> src.main.V.add[Add<u8>]	R-W1 B7
+rust/ops2	CALLS src.main.add_v -> src.main.V.add[Add<V>]	R-W1 B7
+rust/ops2	CALLS src.main.idx_usize -> src.main.V.index[Index<usize>]	R-W1 B7
+rust/pinrc	CALLS src.main.pin_get_mut -> src.main.S.get_mut	R-W1 B5
+rust/pinrc	CALLS src.main.pin_get_ref -> src.main.S.get_ref	R-W1 B5
+rust/pinrc	CALLS src.main.pin_set -> src.main.S.set	R-W1 B5
+rust/refcell	CALLS src.main.by_mut_ref -> src.main.S.get_mut	R-W1 B4
+rust/refcell	CALLS src.main.by_value -> src.main.S.get_mut	R-W1 B4
+rust/shapes	CALLS src.main.c1 -> src.main.A1.go[Tr]	R-W3 B2
+rust/wrap	CALLS src.main.refcell_take -> src.main.S.get_mut	R-W1 B4
+rust/xcrate	CALLS caller.src.main.c126.probe -> dep.src.lib.c126.S126.m[Tr126]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c130.probe -> dep.src.lib.c130.S130.m[Fa130]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c133.probe -> dep.src.lib.c133.S133.m[Fa133]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c139.probe -> dep.src.lib.c139.S139.m[Fa139]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c143.probe -> dep.src.lib.c143.S143.m[Tr143]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c145.probe -> dep.src.lib.c145.S145.m[Tr145]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c204.probe -> dep.src.lib.c204.S204.m[Fa204]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c208.probe -> dep.src.lib.c208.S208.m[Tr208]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c211.probe -> dep.src.lib.c211.S211.m[Tr211]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c217.probe -> dep.src.lib.c217.S217.m[Tr217]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c220.probe -> dep.src.lib.c220.S220.m[Fa220]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c223.probe -> dep.src.lib.c223.S223.m[Fa223]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c378.probe -> dep.src.lib.c378.S378.m[Tr378]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c382.probe -> dep.src.lib.c382.S382.m[Fa382]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c385.probe -> dep.src.lib.c385.S385.m[Fa385]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c391.probe -> dep.src.lib.c391.S391.m[Fa391]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c395.probe -> dep.src.lib.c395.S395.m[Tr395]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c397.probe -> dep.src.lib.c397.S397.m[Tr397]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c44.probe -> dep.src.lib.c44.S44.m[Fa44]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c48.probe -> dep.src.lib.c48.S48.m[Fa48]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c52.probe -> dep.src.lib.c52.S52.m[Tr52]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c58.probe -> dep.src.lib.c58.S58.m[Fa58]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c62.probe -> dep.src.lib.c62.S62.m[Tr62]	R-W3 M3 (R-W2 R4)
+rust/xcrate	CALLS caller.src.main.c65.probe -> dep.src.lib.c65.S65.m[Tr65]	R-W3 M3 (R-W2 R4)

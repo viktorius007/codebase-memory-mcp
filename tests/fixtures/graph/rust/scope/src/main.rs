@@ -1,7 +1,8 @@
 pub struct S;
 pub mod a { pub trait Tr { fn go(&self); }
  use super::S; impl Tr for S { fn go(&self) { println!("a::Tr::go\n{}", std::backtrace::Backtrace::force_capture()); } } }
-pub mod b { pub trait Tr2 { fn go(&self); } use super::S; impl Tr2 for S { fn go(&self) { println!("b::Tr2::go\n{}", std::backtrace::Backtrace::force_capture()); } } }
+pub mod b { pub trait Tr2 { fn go(&self); }
+ use super::S; impl Tr2 for S { fn go(&self) { println!("b::Tr2::go\n{}", std::backtrace::Backtrace::force_capture()); } } }
 pub mod x { use crate::a::Tr; pub fn call(s: &crate::S) { s.go(); } }
 pub mod y { use crate::b::Tr2 as _; pub fn call(s: &crate::S) { s.go(); } }
 pub mod z {

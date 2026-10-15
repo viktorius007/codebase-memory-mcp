@@ -104,6 +104,14 @@ class Graph:
             self.unres.append(dict(file=fp, kind=kind, line=line, caller=caller, name=name,
                                    reason=reason))
         con.close()
+        self.by_qn = {n["qn"]: n for n in self.nodes.values()}
+
+    def declares(self, qn, impl_qn):
+        """True when qn is the declaration of a trait method that impl_qn (m[Trait]) implements."""
+        n = self.by_qn.get(qn)
+        owner = self.by_qn.get(qn.rsplit(".", 1)[0]) if n and "." in qn else None
+        return bool(owner and owner["label"] == "Interface" and impl_qn.endswith("[%s]" % owner["name"])
+                    and n["name"] == impl_qn.rsplit("[", 1)[0].rsplit(".", 1)[-1])
 
     def def_at(self, file, line):
         """Innermost Function/Method node whose lines contain file:line."""
@@ -151,6 +159,9 @@ def compare(g, facts, executed, judge_target):
         rival = [e for e in edges if f.name and e["dstnode"]["name"] == f.name
                  and (f.line is None or e["line"] in (None, f.line))
                  and (f.etype, f.src, e["dst"]) not in have]
+        if rival and all(g.declares(e["dst"], f.dst) for e in rival):
+            out[f.site] = "right"  # generic or dyn dispatch: the trait's declaration is the provable target
+            continue
         if rival:
             out[f.site] = "WRONG -> " + ", ".join(sorted({e["dst"] for e in rival}))
             rivals |= {(f.etype, f.src, e["dst"]) for e in rival}

@@ -1,10 +1,19 @@
-pub mod a { pub fn f() { println!("a::f\n{}", std::backtrace::Backtrace::force_capture()); } pub fn g() { println!("a::g\n{}", std::backtrace::Backtrace::force_capture()); } }
+pub mod a { pub fn f() { println!("a::f\n{}", std::backtrace::Backtrace::force_capture()); }
+pub fn g() { println!("a::g\n{}", std::backtrace::Backtrace::force_capture()); } }
 pub mod b { pub fn f() { println!("b::f\n{}", std::backtrace::Backtrace::force_capture()); } }
 pub fn outer1() {
  fn helper() { println!("outer1::helper\n{}", std::backtrace::Backtrace::force_capture()); }
  helper(); }
-pub fn outer2() { fn helper() { println!("outer2::helper\n{}", std::backtrace::Backtrace::force_capture()); } helper(); }
-pub fn outer3() { { fn helper() { println!("outer3 inner-block helper\n{}", std::backtrace::Backtrace::force_capture()); } helper(); } helper(); fn helper() { println!("outer3 fn-level helper\n{}", std::backtrace::Backtrace::force_capture()); } }
+pub fn outer2() {
+ fn helper() { println!("outer2::helper\n{}", std::backtrace::Backtrace::force_capture()); }
+ helper(); }
+pub fn outer3() {
+ {
+ fn helper() { println!("outer3 inner-block helper\n{}", std::backtrace::Backtrace::force_capture()); }
+ helper(); }
+ helper();
+ fn helper() { println!("outer3 fn-level helper\n{}", std::backtrace::Backtrace::force_capture()); }
+ }
 pub fn alias_call() { use crate::a::f as g; g(); }
 pub fn shadow_glob() { use crate::a::*; use crate::b::f; f(); g(); }
 pub enum E { One(Inner), Two }
