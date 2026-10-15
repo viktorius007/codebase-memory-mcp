@@ -1556,92 +1556,173 @@ TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation) {
     PASS();
 }
 
-/* RED: supervised process-tree cancellation permits one second of graceful
- * shutdown followed by one second of forced containment. The maintenance
- * observer must not _Exit the owning process before that bounded supervisor
- * window can finish and join the observer normally. */
-TEST(daemon_local_participant_monitor_allows_supervisor_containment_window) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Supervised process-tree cancellation permits a graceful shutdown followed by
+ * a forced containment settle. The maintenance observer must not _Exit the
+ * owning process while that bounded supervisor window is open, and must
+ * contain it when the window closes. The test takes the window under its own
+ * control (cbm_daemon_frontend_test_grace_set), so the verdict is the monitor's
+ * decision at an observed state, never the outcome of a race between the
+ * monitor's clock and a sleeping thread. The only time budgets left are the
+ * hang detectors, which sit far above any plausible scheduling delay. */
+enum { FRONTEND_TEST_WINDOW_POLLS = 5, FRONTEND_TEST_WINDOW_EXPIRED_EXIT = 38 };
+
+static bool frontend_test_wait_polls(uint64_t polls, uint64_t deadline_ms) {
+    while (cbm_daemon_frontend_test_grace_polls() < polls) {
+        if (cbm_now_ms() >= deadline_ms) {
+            return false;
+        }
+        cbm_usleep(1000);
+    }
+    return true;
+}
+
+/* Child of the window tests: a participant whose maintenance monitor has been
+ * asked to cancel. Never returns. open_window: keep the window open until the
+ * monitor has polled it repeatedly, then stop and join the monitor (exit 0).
+ * Otherwise close the window and wait for the monitor to contain the process
+ * (exit FRONTEND_TEST_WINDOW_EXPIRED_EXIT from the monitor). */
+static void frontend_test_window_child(const frontend_maintenance_fixture_t *fixture,
+                                       int ready_fd, bool open_window) {
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        cbm_daemon_ipc_endpoint_new("0123456789abcdef", fixture->parent);
+    cbm_version_cohort_manager_t *manager =
+        endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
+    cbm_version_cohort_lease_t *participant = NULL;
+    cbm_daemon_conflict_t conflict;
+    cbm_daemon_build_identity_t identity = frontend_test_identity();
+    cbm_version_cohort_status_t admitted =
+        manager ? cbm_version_cohort_acquire(manager, &identity,
+                                             cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
+                                             &participant, &conflict)
+                : CBM_VERSION_COHORT_IO;
+    atomic_bool cancelled;
+    atomic_init(&cancelled, false);
+    cbm_daemon_frontend_test_grace_set(CBM_FRONTEND_TEST_GRACE_OPEN);
+    cbm_daemon_maintenance_monitor_t *monitor =
+        admitted == CBM_VERSION_COHORT_OK
+            ? cbm_daemon_maintenance_monitor_start(manager, frontend_test_cancel_and_mark,
+                                                   &cancelled,
+                                                   FRONTEND_TEST_WINDOW_EXPIRED_EXIT,
+                                                   "test-supervisor-window")
+            : NULL;
+    const char ready = 'R';
+    bool announced = monitor && write(ready_fd, &ready, 1) == 1;
+    (void)close(ready_fd);
+    if (!announced) {
+        _exit(72);
+    }
+    uint64_t hang_deadline = cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS;
+    while (!atomic_load_explicit(&cancelled, memory_order_acquire)) {
+        if (cbm_now_ms() >= hang_deadline) {
+            _exit(74);
+        }
+        cbm_usleep(1000);
+    }
+
+    if (!open_window) {
+        cbm_daemon_frontend_test_grace_set(CBM_FRONTEND_TEST_GRACE_EXPIRED);
+        while (cbm_now_ms() < hang_deadline) {
+            cbm_usleep(1000);
+        }
+        _exit(75);
+    }
+
+    /* The supervisor is still draining: the monitor keeps polling the open
+     * window instead of containing the process. */
+    if (!frontend_test_wait_polls(FRONTEND_TEST_WINDOW_POLLS, hang_deadline)) {
+        _exit(76);
+    }
+    bool stopped = cbm_daemon_maintenance_monitor_stop(&monitor);
+    frontend_test_release_lease(&participant);
+    while (manager && cbm_version_cohort_manager_free(&manager) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    _exit(stopped ? 0 : 73);
+}
+
+/* Fork the window child, request maintenance from here, and return the child's
+ * exit status through exit_code (-1 when it did not exit normally). */
+static void frontend_test_window_run(bool open_window, const char *label, bool *announced_out,
+                                     cbm_version_cohort_status_t *status_out,
+                                     cbm_version_cohort_quiesce_result_t *quiesce_out,
+                                     int *exit_code_out) {
     frontend_maintenance_fixture_t fixture;
-    ASSERT_TRUE(frontend_maintenance_fixture_start(&fixture, "monitor-window"));
+    *announced_out = false;
+    *status_out = CBM_VERSION_COHORT_IO;
+    *quiesce_out = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
+    *exit_code_out = -1;
+    if (!frontend_maintenance_fixture_start(&fixture, label)) {
+        return;
+    }
     int ready_pipe[2] = {-1, -1};
     bool pipe_ready = pipe(ready_pipe) == 0;
     pid_t child = pipe_ready ? fork() : -1;
     if (child == 0) {
         (void)close(ready_pipe[0]);
-        cbm_daemon_ipc_endpoint_t *endpoint =
-            cbm_daemon_ipc_endpoint_new("0123456789abcdef", fixture.parent);
-        cbm_version_cohort_manager_t *manager =
-            endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
-        cbm_version_cohort_lease_t *participant = NULL;
-        cbm_daemon_conflict_t conflict;
-        cbm_daemon_build_identity_t identity = frontend_test_identity();
-        cbm_version_cohort_status_t admitted =
-            manager ? cbm_version_cohort_acquire(manager, &identity,
-                                                 cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
-                                                 &participant, &conflict)
-                    : CBM_VERSION_COHORT_IO;
-        atomic_bool cancelled;
-        atomic_init(&cancelled, false);
-        cbm_daemon_maintenance_monitor_t *monitor =
-            admitted == CBM_VERSION_COHORT_OK
-                ? cbm_daemon_maintenance_monitor_start(manager, frontend_test_cancel_and_mark,
-                                                       &cancelled, 38, "test-supervisor-window")
-                : NULL;
-        const char ready = 'R';
-        bool announced = monitor && write(ready_pipe[1], &ready, 1) == 1;
-        (void)close(ready_pipe[1]);
-        if (!announced) {
-            _exit(72);
-        }
-        while (!atomic_load_explicit(&cancelled, memory_order_acquire)) {
-            cbm_usleep(1000);
-        }
-
-        /* Model the maximum graceful + forced-settle supervisor bounds. */
-        cbm_usleep(2100U * 1000U);
-        bool stopped = cbm_daemon_maintenance_monitor_stop(&monitor);
-        frontend_test_release_lease(&participant);
-        while (manager && cbm_version_cohort_manager_free(&manager) != CBM_PRIVATE_FILE_LOCK_OK) {
-            cbm_usleep(1000);
-        }
-        cbm_daemon_ipc_endpoint_free(endpoint);
-        _exit(stopped ? 0 : 73);
+        frontend_test_window_child(&fixture, ready_pipe[1], open_window);
     }
-
     if (pipe_ready) {
         (void)close(ready_pipe[1]);
     }
-    bool announced =
+    *announced_out =
         child > 0 &&
         frontend_test_wait_byte(ready_pipe[0], 'R', cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     cbm_version_cohort_lease_t *mutation = NULL;
-    cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
-    cbm_version_cohort_status_t status =
-        announced ? cbm_version_cohort_reserve_for_mutation(
-                        fixture.manager, cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
-                        frontend_test_quiesce_requested, NULL, &quiesce, &mutation)
-                  : CBM_VERSION_COHORT_IO;
-    if (status != CBM_VERSION_COHORT_OK && child > 0) {
+    *status_out = *announced_out
+                      ? cbm_version_cohort_reserve_for_mutation(
+                            fixture.manager, cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
+                            frontend_test_quiesce_requested, NULL, quiesce_out, &mutation)
+                      : CBM_VERSION_COHORT_IO;
+    if (*status_out != CBM_VERSION_COHORT_OK && child > 0) {
         (void)kill(child, SIGKILL);
     }
     int child_status = 0;
     bool waited = child > 0 && waitpid(child, &child_status, 0) == child;
+    if (waited && WIFEXITED(child_status)) {
+        *exit_code_out = WEXITSTATUS(child_status);
+    }
     if (pipe_ready) {
         (void)close(ready_pipe[0]);
     }
     frontend_test_release_lease(&mutation);
     frontend_maintenance_fixture_finish(&fixture);
+}
 
-    ASSERT_TRUE(pipe_ready);
-    ASSERT_TRUE(child > 0);
+/* While the window is open the monitor must keep polling it and let the owner
+ * stop and join the monitor normally. */
+TEST(daemon_local_participant_monitor_allows_supervisor_containment_window) {
+    bool announced = false;
+    cbm_version_cohort_status_t status = CBM_VERSION_COHORT_IO;
+    cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
+    int exit_code = -1;
+    frontend_test_window_run(true, "monitor-window", &announced, &status, &quiesce, &exit_code);
+
     ASSERT_TRUE(announced);
     ASSERT_EQ(status, CBM_VERSION_COHORT_OK);
     ASSERT_EQ(quiesce, CBM_VERSION_COHORT_QUIESCE_REQUESTED);
-    ASSERT_TRUE(waited);
-    ASSERT_TRUE(WIFEXITED(child_status));
-    ASSERT_EQ(WEXITSTATUS(child_status), 0);
+    ASSERT_EQ(exit_code, 0);
     PASS();
 }
+
+/* The other side of the same decision: once the window closes the monitor must
+ * contain the process with the exit code it was given. */
+TEST(daemon_local_participant_monitor_contains_when_supervisor_window_closes) {
+    bool announced = false;
+    cbm_version_cohort_status_t status = CBM_VERSION_COHORT_IO;
+    cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
+    int exit_code = -1;
+    frontend_test_window_run(false, "monitor-window-closed", &announced, &status, &quiesce,
+                             &exit_code);
+
+    ASSERT_TRUE(announced);
+    ASSERT_EQ(status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(quiesce, CBM_VERSION_COHORT_QUIESCE_REQUESTED);
+    ASSERT_EQ(exit_code, FRONTEND_TEST_WINDOW_EXPIRED_EXIT);
+    PASS();
+}
+#endif
 
 /* RED: once a long request is active, a buffered writer can fill the bounded
  * frontend queue and close its pipe. Waiting indefinitely for queue capacity
@@ -1709,7 +1790,10 @@ SUITE(daemon_frontend) {
 #ifndef _WIN32
     RUN_TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked);
     RUN_TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     RUN_TEST(daemon_local_participant_monitor_allows_supervisor_containment_window);
+    RUN_TEST(daemon_local_participant_monitor_contains_when_supervisor_window_closes);
+#endif
     RUN_TEST(daemon_frontend_over_capacity_input_backpressures_without_loss);
     RUN_TEST(daemon_frontend_eof_drain_timeout_cancels_and_returns_success);
     RUN_TEST(daemon_frontend_stdout_backpressure_eof_fail_stops_and_cancels_session);
