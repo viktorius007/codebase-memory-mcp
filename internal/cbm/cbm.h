@@ -1391,8 +1391,9 @@ uint64_t cbm_ts_node_child_steps_test(void);
 #endif
 
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
-// Test-build-only work counter for resolving a node's field role while
-// classifying value references. Production builds retain no instrumentation.
+// Test-build-only work counter for classifying value references: one unit per
+// parent step a classifier climbs, plus one per level of every classifier
+// cursor copy. Production builds retain no instrumentation.
 void cbm_usage_field_lookup_test_reset(void);
 uint64_t cbm_usage_field_lookup_test_work(void);
 uint64_t cbm_usage_slow_parent_fallback_test_count(void);

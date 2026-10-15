@@ -39,9 +39,21 @@ static void usage_field_lookup_test_note_work(void) {
 static void usage_slow_parent_fallback_test_note(void) {
     atomic_fetch_add_explicit(&g_usage_slow_parent_fallbacks, 1, memory_order_relaxed);
 }
+
+/* A classifier cursor reset copies the walk cursor's whole stack: charge it
+ * one unit per level copied, so a copy per occurrence on a deep tree shows as
+ * the quadratic it is. */
+static void usage_cursor_copy_test_note(const TSTreeCursor *cursor) {
+    atomic_fetch_add_explicit(&g_usage_field_lookup_work,
+                              (uint64_t)ts_tree_cursor_current_depth(cursor) + 1U,
+                              memory_order_relaxed);
+}
 #else
 static void usage_field_lookup_test_note_work(void) {}
 static void usage_slow_parent_fallback_test_note(void) {}
+static void usage_cursor_copy_test_note(const TSTreeCursor *cursor) {
+    (void)cursor;
+}
 #endif
 
 // Forward declaration
@@ -301,6 +313,7 @@ static TSTreeCursor *reset_occurrence_cursor(WalkState *state, TSNode node) {
         !ts_node_eq(ts_tree_cursor_current_node(state->current_cursor), node)) {
         return NULL;
     }
+    usage_cursor_copy_test_note(state->current_cursor);
     ts_tree_cursor_reset_to(state->occurrence_cursor, state->current_cursor);
     return state->occurrence_cursor;
 }
