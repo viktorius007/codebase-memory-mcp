@@ -2331,10 +2331,14 @@ static bool pxc_python_in_function_body(const CBMFileResult *result, const CBMUs
  * that publishes here only ever emits USAGE. This rewrites a blocked resolution
  * of such an argument to the file's own module-level Function when the last
  * statement that binds the name is that decorated definition and no star
- * import follows it. Any other occurrence shape, a locally shadowed name, a
- * class, and a name bound any other way keep the blocked verdict and its
- * unresolved row: the resolvers behind them have no scope for attribute,
- * class-body or local names. */
+ * import follows it. Any other occurrence shape, a class, and a name bound any
+ * other way keep the blocked verdict and its unresolved row: the resolvers
+ * behind them have no scope for attribute, class-body or local names. So does
+ * a name some other binding may have replaced where it is read: a local
+ * shadow, a loop, comprehension, `as` or walrus target of an enclosing scope
+ * (`[accept(h) for h in xs]`), and any binding the extractor's lexical pass
+ * saw in force there (`global h; h = 3`, or a module-level `h = 5` inside an
+ * `if`), which the usage passes would otherwise drop without a row. */
 bool cbm_pxc_python_decorated_usage(const cbm_pipeline_ctx_t *ctx, const char *project_name,
                                     const char *rel_path, CBMLanguage lang,
                                     const CBMFileResult *result, const CBMUsage *usage,
@@ -2342,7 +2346,8 @@ bool cbm_pxc_python_decorated_usage(const cbm_pipeline_ctx_t *ctx, const char *p
     if (lang != CBM_LANG_PYTHON || !ctx || !result || !usage || !usage->ref_name || !res ||
         !res->strategy || strcmp(res->strategy, "import_map_blocked") != 0 ||
         usage->kind != CBM_USAGE_VALUE || usage->is_member_access ||
-        usage->semantic_reference_local_shadow || !pxc_python_bare_argument(usage) ||
+        usage->semantic_reference_local_shadow || usage->semantic_reference_blocked ||
+        usage->python_target_shadow || !pxc_python_bare_argument(usage) ||
         !pxc_python_in_function_body(result, usage) ||
         result->py_namespace.status != CBM_PY_NS_COMPLETE ||
         !cbm_py_namespace_facts_valid(&result->py_namespace))

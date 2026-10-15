@@ -877,6 +877,42 @@ static bool cfml_argument_tag_name_binding(CBMExtractCtx *ctx, TSNode node) {
     return false;
 }
 
+/* Python binds a name without an assignment in four statement shapes: the
+ * target of a `for` loop, of a comprehension's `for` clause, of `with ... as`
+ * and `except ... as`, and of a walrus `name := value`. A target may be
+ * unpacked (`for a, (b, c) in xs`), so the identifier climbs through the
+ * pattern containers first; an attribute or subscript target binds no name and
+ * stops the climb. */
+static bool is_python_target_binding(TSNode node) {
+    static const char *const unpacking[] = {"pattern_list",
+                                            "tuple_pattern",
+                                            "list_pattern",
+                                            "list_splat_pattern",
+                                            "tuple",
+                                            "list",
+                                            "list_splat",
+                                            "parenthesized_expression",
+                                            NULL};
+    if (strcmp(ts_node_type(node), "identifier") != 0) {
+        return false;
+    }
+    TSNode parent = ts_node_parent(node);
+    while (!ts_node_is_null(parent) && kind_in_exact_set(ts_node_type(parent), unpacking)) {
+        parent = ts_node_parent(parent);
+    }
+    if (ts_node_is_null(parent)) {
+        return false;
+    }
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "for_statement") == 0 || strcmp(kind, "for_in_clause") == 0) {
+        return field_contains_node(parent, "left", node);
+    }
+    if (strcmp(kind, "named_expression") == 0) {
+        return field_contains_node(parent, "name", node);
+    }
+    return strcmp(kind, "as_pattern_target") == 0;
+}
+
 static bool is_exact_language_binding(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
     const char *kind = ts_node_type(node);
     switch (ctx->language) {
@@ -2574,6 +2610,23 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     binding->active_end = 0;
     binding->name = name;
     binding->import_binding = import_binding;
+    binding->python_target = false;
+}
+
+/* Records a Python target (is_python_target_binding) in the scope Python binds
+ * it in. The occurrence itself stays whatever the walk makes of it, as before;
+ * the binding is marked so only CBMUsage.python_target_shadow sees it. */
+static void record_python_target_binding(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                         const CBMLangSpec *spec) {
+    char *name = reference_name(ctx, node);
+    if (!name || !name[0] || cbm_is_keyword(name, ctx->language)) {
+        return;
+    }
+    int recorded = state->lexical_binding_count;
+    record_lexical_binding(ctx, state, node, spec, name, false);
+    if (state->lexical_binding_count > recorded) {
+        state->lexical_bindings[recorded].python_target = true;
+    }
 }
 
 static int compare_lexical_bindings(const void *left_ptr, const void *right_ptr) {
@@ -2618,8 +2671,11 @@ static int lexical_binding_lower_bound(const WalkState *state, uint32_t scope_id
     return low;
 }
 
+/* The binding of `name` in force at `position`, among the Python target
+ * bindings when `python_targets`, else among all others. */
 static const CBMLexicalBinding *lexical_binding_active_at(const WalkState *state, uint32_t scope_id,
-                                                          const char *name, uint32_t position) {
+                                                          const char *name, uint32_t position,
+                                                          bool python_targets) {
     const CBMLexicalScope *scope = usage_lexical_scope(state, scope_id);
     if (!scope) {
         return NULL;
@@ -2631,6 +2687,9 @@ static const CBMLexicalBinding *lexical_binding_active_at(const WalkState *state
         if (binding->scope_id != scope_id || strcmp(binding->name, name) != 0) {
             break;
         }
+        if (binding->python_target != python_targets) {
+            continue;
+        }
         uint32_t active_end = binding->active_end ? binding->active_end : scope->end_byte;
         if (binding->active_start <= position && position < active_end) {
             best = binding;
@@ -2641,7 +2700,8 @@ static const CBMLexicalBinding *lexical_binding_active_at(const WalkState *state
 
 static const CBMLexicalScope *lexical_binding_scope_for_usage(const WalkState *state,
                                                               const CBMUsage *usage,
-                                                              const char *name) {
+                                                              const char *name,
+                                                              bool python_targets) {
     uint32_t scope_id = usage->lexical_scope_id;
     int remaining = state ? state->lexical_scope_count : 0;
     while (scope_id != 0 && remaining-- > 0) {
@@ -2649,8 +2709,8 @@ static const CBMLexicalScope *lexical_binding_scope_for_usage(const WalkState *s
         if (!scope) {
             return NULL;
         }
-        const CBMLexicalBinding *binding =
-            lexical_binding_active_at(state, scope_id, name, usage->site_start_byte);
+        const CBMLexicalBinding *binding = lexical_binding_active_at(
+            state, scope_id, name, usage->site_start_byte, python_targets);
         if (binding) {
             return scope;
         }
@@ -2677,7 +2737,12 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state) {
         if (!name) {
             continue;
         }
-        const CBMLexicalScope *binding_scope = lexical_binding_scope_for_usage(state, usage, name);
+        const CBMLexicalScope *binding_scope =
+            lexical_binding_scope_for_usage(state, usage, name, false);
+        if (ctx->language == CBM_LANG_PYTHON) {
+            usage->python_target_shadow =
+                lexical_binding_scope_for_usage(state, usage, name, true) != NULL;
+        }
         if (ctx->language == CBM_LANG_RUST && usage->scope_path && !usage->scope_path[0]) {
             usage->semantic_reference_blocked = true;
             usage->semantic_reference_local_shadow = true;
@@ -3025,6 +3090,9 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         return;
     }
 
+    if (ctx->language == CBM_LANG_PYTHON && is_python_target_binding(node)) {
+        record_python_target_binding(ctx, state, node, spec);
+    }
     bool python_scope_directive =
         ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
                                              lexical_ancestor_kind(node, "nonlocal_statement"));

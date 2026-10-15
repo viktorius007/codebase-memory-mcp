@@ -116,6 +116,10 @@ typedef struct {
     uint32_t active_end;
     const char *name;
     bool import_binding;
+    /* A Python loop, comprehension, `as` or walrus target. Main's blocked and
+     * local-shadow verdicts never counted these (the occurrence is emitted as
+     * an ordinary usage), so only CBMUsage.python_target_shadow reads them. */
+    bool python_target;
 } CBMLexicalBinding;
 
 typedef enum {

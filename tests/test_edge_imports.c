@@ -58,6 +58,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sqlite3.h>
 
 /* ── Harness (mirrors test_lang_contract.c) ─────────────────────────────── */
 
@@ -801,6 +802,122 @@ TEST(ei_py_package_reexport_binds_reexported_definition) {
     ASSERT_GTE(sequential, 0);
     ASSERT_LT(sequential, 100);
     ASSERT_EQ(parallel, 11);
+    PASS();
+}
+
+/* Indexes `files` plus `pad` filler modules: pad 0 stays under
+ * MIN_FILES_FOR_PARALLEL(50) and takes the sequential driver, pad 60 the
+ * parallel one. NULL on failure. */
+static cbm_store_t *ei_py_index_padded(EILangProj *lp, const EILangFile *files, int nfiles,
+                                       int pad) {
+    enum { EI_PAD_MAX = 80 };
+    static char names[EI_PAD_MAX][32];
+    EILangFile all[EI_PAD_MAX];
+    int n = 0;
+    for (int i = 0; i < nfiles && n < EI_PAD_MAX; i++)
+        all[n++] = files[i];
+    for (int i = 0; i < pad && n < EI_PAD_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        all[n] = (EILangFile){names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    return ei_index_files(lp, all, n);
+}
+
+/* First column of the first row of `sql` over the indexed graph, or -1. */
+static int ei_sql_int(cbm_store_t *store, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    int value = -1;
+    if (store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW)
+        value = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return value;
+}
+
+#define EI_PY_USAGE_SQL(source, target)                                              \
+    "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "                 \
+    "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' AND s.name='" source "' " \
+    "AND t.name='" target "'"
+#define EI_PY_ROWS_SQL(caller, name)                                                         \
+    "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%." caller "' AND name='" name \
+    "' AND reason='name_binding_not_proven'"
+
+static const char ei_py_decorated_prelude[] = "def wrap(f):\n    return f\n\n\n"
+                                              "def accept(x):\n    return x\n\n\n"
+                                              "@wrap\ndef handler():\n    return 1\n\n\n";
+
+/* `@wrap def handler` binds handler to wrap(handler); `accept(handler)` read in
+ * a function body is still a USAGE of that definition (plain), so the
+ * decorated-usage rewrite (pass_lsp_cross.c cbm_pxc_python_decorated_usage)
+ * publishes it. In `[accept(handler) for handler in xs]` the comprehension's
+ * own target binds handler, so the read is no reference to the module's
+ * definition: no USAGE, and the reference keeps its name_binding_not_proven
+ * row beside the target occurrence's own row. Returns plain's USAGE + 10 *
+ * comp's USAGE + 100 * comp's rows. */
+static int ei_py_comprehension_target_case(int pad) {
+    char deco[512];
+    snprintf(deco, sizeof(deco),
+             "%sdef plain():\n    return accept(handler)\n\n\n"
+             "def comp(xs):\n    return [accept(handler) for handler in xs]\n",
+             ei_py_decorated_prelude);
+    EILangFile f[] = {{"deco.py", deco}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 1, pad);
+    int plain = ei_sql_int(store, EI_PY_USAGE_SQL("plain", "handler"));
+    int comp = ei_sql_int(store, EI_PY_USAGE_SQL("comp", "handler"));
+    int rows = ei_sql_int(store, EI_PY_ROWS_SQL("comp", "handler"));
+    ei_cleanup(&lp, store);
+    if (plain < 0 || comp < 0 || rows < 0)
+        return -1;
+    return plain + 10 * comp + 100 * rows;
+}
+
+TEST(ei_py_comprehension_target_is_no_decorated_usage) {
+    ASSERT_EQ(ei_py_comprehension_target_case(0), 201);
+    ASSERT_EQ(ei_py_comprehension_target_case(60), 201);
+    PASS();
+}
+
+/* A decorated name some other binding may replace where it is read: `global
+ * handler; handler = 3` in glob (in force for glob's read and for K.m below
+ * it), and `handler2 = 5` inside a module-level `if`. Each read is withheld
+ * and keeps its row: glob's write and read, K.m's read and use2's read. The
+ * usage passes drop a blocked callable reference without a row, so the
+ * decorated-usage rewrite must not take these over. Returns the rows + 10 *
+ * the USAGE edges from glob, m and use2 to either definition. */
+static int ei_py_rebound_decorated_case(int pad) {
+    char deco[512];
+    char deco2[512];
+    snprintf(deco, sizeof(deco),
+             "%sdef glob():\n    global handler\n    handler = 3\n"
+             "    return accept(handler)\n\n\nclass K:\n    def m(self):\n"
+             "        return accept(handler)\n",
+             ei_py_decorated_prelude);
+    snprintf(deco2, sizeof(deco2),
+             "def wrap(f):\n    return f\n\n\n"
+             "def accept(x):\n    return x\n\n\n@wrap\ndef handler2():\n    return 1\n\n\n"
+             "if True:\n    handler2 = 5\n\n\ndef use2():\n    return accept(handler2)\n");
+    EILangFile f[] = {{"deco.py", deco}, {"deco2.py", deco2}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 2, pad);
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE "
+                                 "(caller LIKE '%.glob' OR caller LIKE '%.K.m' OR caller LIKE "
+                                 "'%.use2') AND name IN ('handler','handler2') AND "
+                                 "reason='name_binding_not_proven'");
+    int edges = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' AND "
+                                  "s.name IN ('glob','m','use2') AND "
+                                  "t.name IN ('handler','handler2')");
+    ei_cleanup(&lp, store);
+    if (rows < 0 || edges < 0)
+        return -1;
+    return rows + 10 * edges;
+}
+
+TEST(ei_py_rebound_decorated_reference_keeps_its_row) {
+    ASSERT_EQ(ei_py_rebound_decorated_case(0), 4);
+    ASSERT_EQ(ei_py_rebound_decorated_case(60), 4);
     PASS();
 }
 
@@ -2528,6 +2645,8 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_py_external_import_never_binds_project_symbol);
     RUN_TEST(ei_py_package_reexport_binds_reexported_definition);
+    RUN_TEST(ei_py_comprehension_target_is_no_decorated_usage);
+    RUN_TEST(ei_py_rebound_decorated_reference_keeps_its_row);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
