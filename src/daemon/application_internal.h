@@ -37,6 +37,14 @@ int cbm_daemon_application_background_initializes_for_test(void);
  * that a request QUEUED rather than erroring or starting. */
 int cbm_daemon_application_busy_queue_waits_for_test(void);
 
+/* Parks of a waiting session mutation behind a conflicting in-process
+ * reservation (another mutation, or an index job reserving the project), and
+ * parks of an index job behind a held mutation before its worker starts.
+ * Waiting for a delta replaces a fixed "must not complete within N ms"
+ * window: it proves the request reached the guard and is blocked on it. */
+int cbm_daemon_application_mutation_waits_for_test(void);
+int cbm_daemon_application_job_mutation_waits_for_test(void);
+
 /* Build the JSON-RPC error substituted for a reply too large to frame (#1375).
  * Exposed because the alternative — driving a real >10 MiB reply — needs a
  * ~20k-node index, a fixture cost the unit suite should not carry. The

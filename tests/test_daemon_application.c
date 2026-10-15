@@ -1950,6 +1950,27 @@ static bool app_wait_for_background_initializes(int minimum) {
     return false;
 }
 
+/* Waits for a product park counter to move past `baseline` — the positive
+ * signal that a request reached a guard and is blocked on it. Returns early,
+ * false, the moment `escaped` (the request finished, or the guarded work
+ * started) is observed, so a regression that skips the guard goes red at
+ * once instead of at the hang-detector budget. This replaces "the request
+ * did not finish within 100 ms", which a slow request passes too. */
+static bool app_wait_for_park(int (*parks)(void), int baseline, atomic_bool *finished,
+                              atomic_int *started) {
+    uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+    while (cbm_now_ms() < deadline) {
+        if ((finished && atomic_load(finished)) || (started && atomic_load(started) != 0)) {
+            return false;
+        }
+        if (parks() > baseline) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return false;
+}
+
 static bool app_wait_for_atomic_bool(atomic_bool *value, bool expected) {
     uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
     while (cbm_now_ms() < deadline) {
@@ -4679,12 +4700,12 @@ TEST(daemon_application_serializes_adr_mutation_with_index_job) {
     bool index_active = index_started && project &&
                         app_wait_for_subscribers(application, project, 1) &&
                         app_wait_for_atomic_int(&fake.starts, 1);
+    int adr_parks_baseline = cbm_daemon_application_mutation_waits_for_test();
     bool adr_started =
         index_active && cbm_thread_create(&adr_thread, 0, app_request_thread, &adr_request) == 0;
-    uint64_t early_deadline = cbm_now_ms() + 100;
-    while (adr_started && !atomic_load(&adr_request.done) && cbm_now_ms() < early_deadline) {
-        cbm_usleep(1000);
-    }
+    bool adr_parked =
+        adr_started && app_wait_for_park(cbm_daemon_application_mutation_waits_for_test,
+                                         adr_parks_baseline, &adr_request.done, NULL);
     bool adr_completed_while_index_active = adr_started && atomic_load(&adr_request.done);
 
     atomic_store(&fake.allow_completion, true);
@@ -4741,6 +4762,7 @@ TEST(daemon_application_serializes_adr_mutation_with_index_job) {
     ASSERT_TRUE(index_active);
     ASSERT_TRUE(adr_started);
     ASSERT_FALSE(adr_completed_while_index_active);
+    ASSERT_TRUE(adr_parked);
     ASSERT_EQ(index_request.status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
     ASSERT_EQ(adr_request.status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
     ASSERT_TRUE(adr_response_updated);
@@ -4775,13 +4797,13 @@ TEST(daemon_application_reserved_mutation_delays_worker_start) {
         .result = -1,
     };
     cbm_thread_t thread;
+    int job_parks_baseline = cbm_daemon_application_job_mutation_waits_for_test();
     bool thread_started =
         root_ok && lease_held && cbm_thread_create(&thread, 0, app_index_thread, &request) == 0;
     bool reserved = thread_started && app_wait_for_subscribers(application, project, 1);
-    uint64_t early_deadline = cbm_now_ms() + 100;
-    while (atomic_load(&fake.starts) == 0 && cbm_now_ms() < early_deadline) {
-        cbm_usleep(1000);
-    }
+    bool job_parked =
+        reserved && app_wait_for_park(cbm_daemon_application_job_mutation_waits_for_test,
+                                      job_parks_baseline, NULL, &fake.starts);
     bool worker_started_while_mutating = atomic_load(&fake.starts) != 0;
     if (lease_held) {
         cbm_daemon_application_project_mutation_end(application, project);
@@ -4800,6 +4822,7 @@ TEST(daemon_application_reserved_mutation_delays_worker_start) {
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(reserved);
     ASSERT_FALSE(worker_started_while_mutating);
+    ASSERT_TRUE(job_parked);
     ASSERT_TRUE(worker_started);
     ASSERT_EQ(request.result, 0);
     ASSERT_TRUE(stopped);
@@ -5329,15 +5352,15 @@ TEST(daemon_application_cancels_mutation_wait_without_cancelling_shared_job) {
         setup && cbm_thread_create(&index_thread, 0, app_request_thread, &index_request) == 0;
     bool index_active = index_started && app_wait_for_subscribers(application, project, 1) &&
                         app_wait_for_atomic_int(&fake.starts, 1);
+    int mutation_parks_baseline = cbm_daemon_application_mutation_waits_for_test();
     bool mutation_started =
         index_active &&
         cbm_thread_create(&mutation_thread, 0, app_request_thread, &mutation_request) == 0;
-    uint64_t blocked_deadline = cbm_now_ms() + 100;
-    while (mutation_started && !atomic_load(&mutation_request.done) &&
-           cbm_now_ms() < blocked_deadline) {
-        cbm_usleep(1000);
-    }
-    bool initially_blocked = mutation_started && !atomic_load(&mutation_request.done);
+    bool initially_blocked =
+        mutation_started &&
+        app_wait_for_park(cbm_daemon_application_mutation_waits_for_test, mutation_parks_baseline,
+                          &mutation_request.done, NULL) &&
+        !atomic_load(&mutation_request.done);
     if (initially_blocked) {
         callbacks.session_cancel(callbacks.context, mutation_session);
     }
