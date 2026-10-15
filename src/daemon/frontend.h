@@ -53,6 +53,18 @@ bool cbm_daemon_maintenance_monitor_stop(cbm_daemon_maintenance_monitor_t **moni
  * The hold is inert until reset(true), and production builds contain neither
  * these controls nor their counters. */
 void cbm_daemon_frontend_test_observer_reset(bool hold_monitor);
+
+/* Take the maintenance monitor's post-cancel grace window under test control.
+ * CLOCK is the production behaviour (wall clock). OPEN keeps the window open
+ * until the mode changes; EXPIRED closes it at the next poll. Every poll made
+ * under OPEN or EXPIRED is counted, and setting a mode zeroes the count. */
+typedef enum {
+    CBM_FRONTEND_TEST_GRACE_CLOCK = 0,
+    CBM_FRONTEND_TEST_GRACE_OPEN,
+    CBM_FRONTEND_TEST_GRACE_EXPIRED,
+} cbm_frontend_test_grace_mode_t;
+void cbm_daemon_frontend_test_grace_set(cbm_frontend_test_grace_mode_t mode);
+uint64_t cbm_daemon_frontend_test_grace_polls(void);
 void cbm_daemon_frontend_test_observer_release(void);
 bool cbm_daemon_frontend_test_monitor_waiting(void);
 uint64_t cbm_daemon_frontend_test_monitor_observations(void);

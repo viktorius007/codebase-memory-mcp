@@ -117,6 +117,17 @@ static atomic_bool frontend_test_monitor_is_waiting = ATOMIC_VAR_INIT(false);
 static atomic_uint_fast64_t frontend_test_monitor_observation_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t frontend_test_worker_observation_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t frontend_test_worker_idle_count = ATOMIC_VAR_INIT(0);
+static atomic_int frontend_test_grace_mode = ATOMIC_VAR_INIT(CBM_FRONTEND_TEST_GRACE_CLOCK);
+static atomic_uint_fast64_t frontend_test_grace_poll_count = ATOMIC_VAR_INIT(0);
+
+void cbm_daemon_frontend_test_grace_set(cbm_frontend_test_grace_mode_t mode) {
+    atomic_store_explicit(&frontend_test_grace_poll_count, 0, memory_order_release);
+    atomic_store_explicit(&frontend_test_grace_mode, (int)mode, memory_order_release);
+}
+
+uint64_t cbm_daemon_frontend_test_grace_polls(void) {
+    return atomic_load_explicit(&frontend_test_grace_poll_count, memory_order_acquire);
+}
 
 void cbm_daemon_frontend_test_observer_reset(bool hold_monitor) {
     atomic_store_explicit(&frontend_test_monitor_observation_count, 0, memory_order_release);
@@ -169,6 +180,22 @@ static cbm_version_cohort_maintenance_presence_t frontend_observe_maintenance(
     return cbm_version_cohort_maintenance_presence_terminal(manager);
 }
 
+/* Whether the post-cancel grace window is still open. Production reads the
+ * wall clock against the deadline. A test build can instead take the window
+ * under test control (open until released, or already expired), so a test
+ * observes the monitor's allow-or-contain decision rather than racing two
+ * sleeps. */
+static bool frontend_grace_window_open(uint64_t deadline_ms) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    int mode = atomic_load_explicit(&frontend_test_grace_mode, memory_order_acquire);
+    if (mode != CBM_FRONTEND_TEST_GRACE_CLOCK) {
+        atomic_fetch_add_explicit(&frontend_test_grace_poll_count, 1, memory_order_release);
+        return mode == CBM_FRONTEND_TEST_GRACE_OPEN;
+    }
+#endif
+    return cbm_now_ms() < deadline_ms;
+}
+
 static void *frontend_maintenance_monitor_worker(void *opaque) {
     cbm_daemon_maintenance_monitor_t *monitor = opaque;
     while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
@@ -198,7 +225,7 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
                                     ? UINT64_MAX
                                     : now + FRONTEND_MAINTENANCE_GRACE_MS;
             while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire) &&
-                   cbm_now_ms() < deadline) {
+                   frontend_grace_window_open(deadline)) {
                 cbm_usleep(FRONTEND_MAINTENANCE_POLL_MS * 1000U);
             }
             if (atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
