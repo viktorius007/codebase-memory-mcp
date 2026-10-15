@@ -1,12 +1,12 @@
 diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
 --- a/internal/cbm/lsp/rust_lsp.c
 +++ b/internal/cbm/lsp/rust_lsp.c
-@@ -9475,7 +9475,7 @@
-     if (ctx->registry_is_file_local && inherent_rank >= 0 && !trait_method && !reference &&
-         rust_source_declares_trait_method(ctx, name))
-         return NULL;
--    if (inherent_rank >= 0 && (trait_rank < 0 || inherent_rank <= trait_rank) &&
-+    if (inherent_rank >= 0 &&
+@@ -9479,7 +9479,7 @@
          (reference_rank < 0 || inherent_rank <= reference_rank))
          return inherent;
      if (trait_rank >= 0 && (reference_rank < 0 || trait_rank < reference_rank))
+-        return trait_method;
++        return inherent ? inherent : trait_method;
+     if (reference_rank >= 0 && (trait_rank < 0 || reference_rank < trait_rank))
+         return reference;
+     bool same_trait_reference = trait_method && reference &&

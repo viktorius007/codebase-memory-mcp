@@ -6,7 +6,7 @@ diff --git a/internal/cbm/lsp/rust_lsp.c b/internal/cbm/lsp/rust_lsp.c
      bool scope_filtered = false; /* a candidate was dropped for this file's scope */
      const CBMRegisteredFunc *impl_method = rust_registry_lookup_trait_impl_method_scoped(
 -        require_scope ? ctx : NULL, reg, receiver_type_qn, NULL, method_name, &trait_ambiguous,
-+        (!inh && require_scope) ? ctx : NULL, reg, receiver_type_qn, NULL, method_name, &trait_ambiguous,
++        NULL, reg, receiver_type_qn, NULL, method_name, &trait_ambiguous,
          &scope_filtered);
      /* An impl of a trait the registry does not hold is as much a candidate,
       * on a type declared in the project when the registry holds the whole
