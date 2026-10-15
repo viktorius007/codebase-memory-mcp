@@ -456,6 +456,64 @@ struct cbm_subprocess {
 #endif
 };
 
+/* Every supervision window (quiet timeout, cancel grace, force settle) reads
+ * this clock. Production reads the monotonic clock directly; test builds may
+ * substitute the manual clock declared in subprocess.h. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_bool g_manual_clock_enabled;
+static _Atomic uint64_t g_manual_clock_ms;
+static atomic_int g_terminations_begun;
+
+void cbm_subprocess_manual_clock_for_testing(bool enabled) {
+    if (enabled) {
+        atomic_store(&g_manual_clock_ms, cbm_now_ms());
+    }
+    atomic_store(&g_manual_clock_enabled, enabled);
+}
+
+void cbm_subprocess_advance_clock_for_testing(int ms) {
+    if (ms > 0) {
+        atomic_fetch_add(&g_manual_clock_ms, (uint64_t)ms);
+    }
+}
+
+int cbm_subprocess_terminations_begun_for_testing(void) {
+    return atomic_load(&g_terminations_begun);
+}
+
+static uint64_t cbm_subprocess_now_ms(void) {
+    return atomic_load(&g_manual_clock_enabled) ? atomic_load(&g_manual_clock_ms) : cbm_now_ms();
+}
+
+static void cbm_subprocess_note_termination_begun(void) {
+    atomic_fetch_add(&g_terminations_begun, 1);
+}
+
+cbm_subprocess_phase_t cbm_subprocess_phase_for_testing(const cbm_subprocess_t *process) {
+    int lifecycle = atomic_load_explicit(&process->lifecycle, memory_order_acquire);
+    if (lifecycle == CBM_SUBPROCESS_TERMINAL) {
+        return CBM_SUBPROCESS_PHASE_TERMINAL;
+    }
+    if (lifecycle == CBM_SUBPROCESS_DRAINING) {
+        return CBM_SUBPROCESS_PHASE_DRAINING;
+    }
+    if (process->force_started_ms != 0) {
+        return CBM_SUBPROCESS_PHASE_FORCED;
+    }
+    if (process->termination_started) {
+        return CBM_SUBPROCESS_PHASE_GRACE;
+    }
+    return lifecycle == CBM_SUBPROCESS_CANCEL_REQUESTED ? CBM_SUBPROCESS_PHASE_CANCEL_PENDING
+                                                        : CBM_SUBPROCESS_PHASE_RUNNING;
+}
+#else
+static uint64_t cbm_subprocess_now_ms(void) {
+    return cbm_now_ms();
+}
+
+static void cbm_subprocess_note_termination_begun(void) {}
+#endif
+
 static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->outcome = CBM_PROC_SPAWN_FAILED;
     result->exit_code = -1;
@@ -782,7 +840,7 @@ static cbm_tail_result_t cbm_subprocess_poll_log(cbm_subprocess_t *process, bool
     cbm_tail_result_t result = cbm_tail_log(process->log_file, &process->tail_pos,
                                             process->on_log_line, process->log_ud, final);
     if (result.progressed) {
-        process->last_activity_ms = cbm_now_ms();
+        process->last_activity_ms = cbm_subprocess_now_ms();
     }
     return result;
 }
@@ -1166,6 +1224,7 @@ static void cbm_win_begin_termination(cbm_subprocess_t *process, uint64_t now) {
     }
     process->termination_started = true;
     process->termination_started_ms = now;
+    cbm_subprocess_note_termination_begun();
     /* Best effort only: services and detached parents may have no shared console.
      * The Job Object remains the authoritative force-containment boundary. */
     (void)GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process->process_id);
@@ -1204,7 +1263,7 @@ static void cbm_win_capture_root(cbm_subprocess_t *process, DWORD code) {
 }
 
 static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_proc_result_t *out) {
-    uint64_t now = cbm_now_ms();
+    uint64_t now = cbm_subprocess_now_ms();
 
     if (!process->root_reaped) {
         DWORD waited = WaitForSingleObject(process->process, 0);
@@ -1325,6 +1384,18 @@ void cbm_subprocess_observe_exiting_child_for_testing(int spawns) {
 int cbm_subprocess_pending_spawn_eagain_for_testing(void) {
     return g_force_spawn_eagain;
 }
+static int g_backoff_waits = 0;
+static int g_backoff_waits_completed = 0;
+int cbm_subprocess_backoff_waits_for_testing(void) {
+    return g_backoff_waits;
+}
+int cbm_subprocess_backoff_waits_completed_for_testing(void) {
+    return g_backoff_waits_completed;
+}
+void cbm_subprocess_reset_backoff_waits_for_testing(void) {
+    g_backoff_waits = 0;
+    g_backoff_waits_completed = 0;
+}
 static bool cbm_spawn_eagain_injected(void) {
     if (g_force_spawn_eagain > 0) {
         g_force_spawn_eagain--;
@@ -1355,7 +1426,12 @@ static void cbm_spawn_backoff(int attempt) {
     int shift = attempt < CBM_SPAWN_BACKOFF_MAX_SHIFT ? attempt : CBM_SPAWN_BACKOFF_MAX_SHIFT;
     long ms = (long)CBM_SPAWN_BACKOFF_BASE_MS << shift;
     struct timespec delay = {ms / 1000L, (ms % 1000L) * 1000L * 1000L};
-    (void)cbm_nanosleep_full(&delay);
+    int slept = cbm_nanosleep_full(&delay);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_backoff_waits++;
+    g_backoff_waits_completed += slept == 0 ? 1 : 0;
+#endif
+    (void)slept;
 }
 
 /* fork() fails with EAGAIN under the same pressure posix_spawn does, and the
@@ -1822,6 +1898,7 @@ static void cbm_posix_begin_termination(cbm_subprocess_t *process, uint64_t now)
     }
     process->termination_started = true;
     process->termination_started_ms = now;
+    cbm_subprocess_note_termination_begun();
     (void)kill(-process->pgid, SIGTERM);
 }
 
@@ -1863,7 +1940,7 @@ static void cbm_posix_capture_root(cbm_subprocess_t *process, int status) {
 
 static cbm_proc_poll_t cbm_subprocess_poll_posix(cbm_subprocess_t *process,
                                                  cbm_proc_result_t *out) {
-    uint64_t now = cbm_now_ms();
+    uint64_t now = cbm_subprocess_now_ms();
 
     if (!process->root_reaped) {
         int status = 0;
@@ -1931,7 +2008,7 @@ int cbm_subprocess_spawn(const cbm_proc_opts_t *opts, cbm_subprocess_t **out) {
         cbm_subprocess_free_config(process);
         return -1;
     }
-    process->last_activity_ms = cbm_now_ms();
+    process->last_activity_ms = cbm_subprocess_now_ms();
     *out = process;
     return 0;
 }
@@ -2024,3 +2101,22 @@ int cbm_subprocess_run(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         (void)cbm_nanosleep(&delay, NULL);
     }
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_subprocess_root_exited_for_testing(cbm_subprocess_t *process) {
+    if (!process) {
+        return false;
+    }
+    if (process->root_reaped) {
+        return true;
+    }
+#ifdef _WIN32
+    return WaitForSingleObject(process->process, 0) == WAIT_OBJECT_0;
+#else
+    siginfo_t exited;
+    memset(&exited, 0, sizeof(exited));
+    return waitid(P_PID, (id_t)process->pid, &exited, WEXITED | WNOWAIT | WNOHANG) == 0 &&
+           exited.si_pid == process->pid;
+#endif
+}
+#endif

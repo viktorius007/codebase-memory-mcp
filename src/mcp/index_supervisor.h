@@ -212,6 +212,14 @@ const char *cbm_index_worker_log_path(const cbm_index_worker_handle_t *handle);
 /* Terminal handles only; never waits or implicitly cancels. */
 void cbm_index_worker_destroy(cbm_index_worker_handle_t *handle);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Test builds only: the contained worker's shutdown phase and whether its
+ * direct child has exited, observed without polling the handle (see the
+ * subprocess seams these forward to). */
+cbm_subprocess_phase_t cbm_index_worker_phase_for_testing(const cbm_index_worker_handle_t *handle);
+bool cbm_index_worker_root_exited_for_testing(cbm_index_worker_handle_t *handle);
+#endif
+
 /* Spawn `<self> cli --index-worker --index-worker-build <sha256>
  * index_repository <args_json> --response-out <tmp>`,
  * supervise it (quiet-timeout for hangs), reap, and classify. On a clean exit,

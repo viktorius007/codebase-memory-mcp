@@ -223,6 +223,39 @@ void cbm_subprocess_hold_parent_until_child_exits_for_testing(int spawns);
  * shows for a child that is EXITING: setpgid and getpgid answer ESRCH while
  * waitid does not report it yet. Test builds only. */
 void cbm_subprocess_observe_exiting_child_for_testing(int spawns);
+
+/* The supervision windows — quiet timeout, cancel grace, force settle — are
+ * wall-clock deadlines, so a test on the real clock races its verdict against
+ * the scheduler. Under the manual clock every handle's windows expire only
+ * when the test advances it; between advances no window expires, however long
+ * the child or the test is delayed. Enabling starts the manual clock at the
+ * current real time; disable only once every handle it timed is terminal.
+ * Test builds only. */
+void cbm_subprocess_manual_clock_for_testing(bool enabled);
+void cbm_subprocess_advance_clock_for_testing(int ms);
+
+/* Where a handle is in its shutdown, so a test asserts the transition itself
+ * instead of inferring it from elapsed time. Owner thread only. */
+typedef enum {
+    CBM_SUBPROCESS_PHASE_RUNNING = 0,    /* no termination requested or begun */
+    CBM_SUBPROCESS_PHASE_CANCEL_PENDING, /* cancel accepted; no poll has signalled the tree */
+    CBM_SUBPROCESS_PHASE_GRACE,          /* graceful termination sent; grace window open */
+    CBM_SUBPROCESS_PHASE_FORCED,         /* force sent; force-settle window open */
+    CBM_SUBPROCESS_PHASE_DRAINING,       /* tree settled; final log batches remain */
+    CBM_SUBPROCESS_PHASE_TERMINAL,
+} cbm_subprocess_phase_t;
+cbm_subprocess_phase_t cbm_subprocess_phase_for_testing(const cbm_subprocess_t *process);
+/* Process-wide count of graceful terminations begun (any handle, any thread):
+ * lets a test react to the GRACE transition of a handle it cannot reach, such
+ * as one owned by a blocking wrapper. */
+int cbm_subprocess_terminations_begun_for_testing(void);
+/* Nonblocking: the direct child has exited (it may still be unreaped). */
+bool cbm_subprocess_root_exited_for_testing(cbm_subprocess_t *process);
+/* Spawn-retry backoff waits begun, and how many of them slept their full
+ * duration (cbm_nanosleep_full returned success, resuming across EINTR). */
+int cbm_subprocess_backoff_waits_for_testing(void);
+int cbm_subprocess_backoff_waits_completed_for_testing(void);
+void cbm_subprocess_reset_backoff_waits_for_testing(void);
 #endif
 
 /* How the POSIX fork+exec child closed its inherited descriptors (#1484). */
