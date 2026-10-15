@@ -17120,6 +17120,33 @@ TEST(clsp_issue1527_receiver_chain_work_is_linear) {
     PASS();
 }
 
+/* The chain window keeps the memo only for the chain operand it names; a fresh
+ * chain starts from an empty memo (c_eval_window_open). The memo is keyed by
+ * node, so a node evaluated in one scope and visited again in another would
+ * answer with the first scope's type if the memo were kept.
+ *
+ * Lambda return-type inference evaluates the body's first return expression in
+ * the ENCLOSING scope (no lambda parameters bound) while the declaration is
+ * processed; the walk then visits the same nodes inside the lambda scope.
+ * Here the enclosing `x` is a B and the lambda parameter `x` is an A, and both
+ * classes have next() and on(): a memo carried over from the first evaluation
+ * types `x.next().next()` as B and links `.on()` to B::on, a wrong link. */
+TEST(clsp_issue1527_fresh_chain_does_not_inherit_the_memo_of_another_scope) {
+    CBMFileResult *r = extract_cpp("struct B;\n"
+                                   "struct A { B next(); int on(); };\n"
+                                   "struct B { A next(); int on(); };\n"
+                                   "int outer(B x) {\n"
+                                   "    auto g = [](A x) { return x.next().next().on(); };\n"
+                                   "    return g(x.next().next().next());\n"
+                                   "}\n");
+    ASSERT_NOT_NULL(r);
+    /* The lambda's parameter is an A: its chain links to A::on and never to B::on. */
+    ASSERT_GTE(find_resolved(r, "outer", "A.on"), 0);
+    ASSERT_EQ(count_resolved(r, "outer", "B.on"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* `auto x = a + a + ... + a;` over a C++ type with a member operator+: a
  * left-nested operator chain whose every link is an overloaded call.
  * Out-params: the links resolved to V::operator+, and whether `x.done()`
@@ -18066,6 +18093,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_issue1527_scale_work_is_linear);
     RUN_TEST(clsp_issue1527_receiver_chain_work_is_linear);
     RUN_TEST(clsp_issue1527_operator_chain_work_is_linear);
+    RUN_TEST(clsp_issue1527_fresh_chain_does_not_inherit_the_memo_of_another_scope);
 }
 
 /* The two 20000-link chain cases were the slowest tests in the ASan build.
