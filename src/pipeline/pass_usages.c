@@ -397,6 +397,13 @@ bool cbm_pipeline_rust_bare_field_target(CBMLanguage lang, const cbm_gbuf_node_t
     return lang == CBM_LANG_RUST && target && target->label && strcmp(target->label, "Field") == 0;
 }
 
+/* The registry's blocked verdict (see cbm_registry_resolve_lang): a name the
+ * interpreter binds to something this resolver cannot name. Weaker fallbacks
+ * that re-pick a candidate by name must not run for it. */
+static bool resolution_binding_blocked(const cbm_resolution_t *res) {
+    return res && res->strategy && strcmp(res->strategy, "import_map_blocked") == 0;
+}
+
 /* Resolve USAGE edges for one file's extracted usages. */
 static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
@@ -580,7 +587,8 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             /* TSX references cannot bind definitions from an incompatible
              * language; recover only when that filtering proves one target. */
             if ((!res.qualified_name || res.qualified_name[0] == '\0') && lang == CBM_LANG_TSX &&
-                res.candidate_count > SKIP_ONE && !strchr(usage->ref_name, '.')) {
+                !resolution_binding_blocked(&res) && res.candidate_count > SKIP_ONE &&
+                !strchr(usage->ref_name, '.')) {
                 const char **qns = NULL;
                 int count = 0;
                 const char *only = NULL;

@@ -1537,7 +1537,8 @@ TEST(pipeline_hcl_block_reference_resolves_to_its_block) {
     ASSERT_NOT_NULL(ts);
     const char *tf_project = cbm_pipeline_project_name(tp);
 
-    ASSERT(cross_file_edge_exists(ts, tf_project, "infra.tf", "resource.aws_instance.web", "USAGE"));
+    ASSERT(
+        cross_file_edge_exists(ts, tf_project, "infra.tf", "resource.aws_instance.web", "USAGE"));
 
     cbm_store_close(ts);
     cbm_pipeline_free(tp);
@@ -3838,9 +3839,12 @@ TEST(pipeline_rust_turbofish_method_binds_written_type_argument) {
         write_temp_file(tmp, path, "pub struct Filler;\n");
     }
     static const usage_expectation_t rows[] = {
-        {"run", "get", "src/store.rs", 1, NULL},   {"run", "ping", "src/store.rs", 1, NULL},
-        {"run", "ping", "src/other.rs", 0, NULL},  {"hole", "get", "src/store.rs", 1, NULL},
-        {"hole", "ping", "src/store.rs", 0, NULL}, {"hole", "ping", "src/other.rs", 0, NULL},
+        {"run", "get", "src/store.rs", 1, NULL},
+        {"run", "ping", "src/store.rs", 1, NULL},
+        {"run", "ping", "src/other.rs", 0, NULL},
+        {"hole", "get", "src/store.rs", 1, NULL},
+        {"hole", "ping", "src/store.rs", 0, NULL},
+        {"hole", "ping", "src/other.rs", 0, NULL},
         {"inferred", "pass", "src/store.rs", 1, NULL},
         {"inferred", "ping", "src/store.rs", 1, NULL},
         {"inferred", "ping", "src/other.rs", 0, NULL},
@@ -3864,23 +3868,25 @@ TEST(pipeline_rust_trait_method_return_types_chained_receiver) {
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs", "mod model;\nmod other;\nmod user;\n");
-    write_temp_file(tmp, "src/model.rs",
-                    "use crate::other::Action;\n"
-                    "pub struct Widget;\nimpl Widget { pub fn act(&self) {} }\n"
-                    "pub trait Make { fn value(&self) -> Widget; }\n"
-                    "pub trait Derived: Make {}\n"
-                    "pub trait Same { fn same(&self) -> Self; fn act(&self); }\n"
-                    "pub struct Source;\nimpl Make for Source { fn value(&self) -> Widget { Widget } }\n"
-                    "pub trait Project { type Output: Action; fn value(&self) -> Self::Output; }\n"
-                    "pub trait Generic<Widget> { fn value(&self) -> Widget; }\n"
-                    "pub trait Carrier { type Output: Action; }\n"
-                    "pub trait GenericProject<Param: Carrier> { fn value(&self) -> Param::Output; }\n");
+    write_temp_file(
+        tmp, "src/model.rs",
+        "use crate::other::Action;\n"
+        "pub struct Widget;\nimpl Widget { pub fn act(&self) {} }\n"
+        "pub trait Make { fn value(&self) -> Widget; }\n"
+        "pub trait Derived: Make {}\n"
+        "pub trait Same { fn same(&self) -> Self; fn act(&self); }\n"
+        "pub struct Source;\nimpl Make for Source { fn value(&self) -> Widget { Widget } }\n"
+        "pub trait Project { type Output: Action; fn value(&self) -> Self::Output; }\n"
+        "pub trait Generic<Widget> { fn value(&self) -> Widget; }\n"
+        "pub trait Carrier { type Output: Action; }\n"
+        "pub trait GenericProject<Param: Carrier> { fn value(&self) -> Param::Output; }\n");
     write_temp_file(tmp, "src/other.rs",
                     "pub struct Other;\nimpl Other { pub fn act(&self) {} }\n"
                     "pub struct Output;\nimpl Output { pub fn act(&self) {} }\n"
                     "pub trait Action { fn act(&self); }\n");
     write_temp_file(tmp, "src/user.rs",
-                    "use crate::model::{Make, Derived, Same, Project, Source, Generic, Carrier, GenericProject};\n"
+                    "use crate::model::{Make, Derived, Same, Project, Source, Generic, Carrier, "
+                    "GenericProject};\n"
                     "use crate::other::{Other, Action};\n"
                     "pub fn self_return<T: Same>(x: &T) { x.same().act(); }\n"
                     "pub fn inherited(x: &dyn Derived) { x.value().act(); }\n"
@@ -3909,9 +3915,11 @@ TEST(pipeline_rust_trait_method_return_types_chained_receiver) {
     cbm_store_t *store = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stop = NULL;
-    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
-        "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='act' "
-        "AND caller LIKE '%.shadow' AND reason='unknown_receiver_type'", -1, &stop, NULL),
+    ASSERT_EQ(
+        sqlite3_prepare_v2(cbm_store_get_db(store),
+                           "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='act' "
+                           "AND caller LIKE '%.shadow' AND reason='unknown_receiver_type'",
+                           -1, &stop, NULL),
         SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stop), SQLITE_ROW);
     int stopped = sqlite3_column_int(stop, 0);
@@ -3931,25 +3939,25 @@ TEST(pipeline_rust_trait_return_known_generic_constructor) {
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs", "mod model;\nmod user;\nmod concrete;\n");
-    write_temp_file(tmp, "src/model.rs",
-                    "pub struct Item;\nimpl Item { pub fn act(&self) {} }\n"
-                    "pub struct Container<T>(T);\n"
-                    "impl<T> Container<T> { pub fn act(&self) {} pub fn item(&self) -> &T { &self.0 } }\n"
-                    "pub trait Make<Item> { fn value(&self) -> Container<Item>; }\n"
-                    "pub trait Borrow<Item> { fn value(&self) -> &Container<Item>; }\n"
-                    "pub trait Sched {}\npub struct Config<T: Sched>(T);\n"
-                    "pub trait Build<T: Sched>: Sized { fn configs(self) -> Config<T>;\n"
-                    "fn chain(self) -> Config<T> { self.configs().chain() } }\n"
-                    "impl<T: Sched> Build<T> for Config<T> { fn configs(self) -> Self { self }\n"
-                    "fn chain(self) -> Self { self } }\n"
-                    "pub struct Pair<A, B>(A, B);\npub trait PairAct { fn pair_act(&self); }\n"
-                    "impl<T> PairAct for Pair<T, T> { fn pair_act(&self) {} }\n"
-                    "pub trait MakePair<A, B> { fn pair(&self) -> Pair<A, B>; }\n"
-                    "pub trait Split<Param> { fn parts(&self) -> (Param, Container<Param>); }\n"
-                    "pub trait Method { fn wrap<T>(&self) -> Container<T>;\n"
-                    "fn identity<T>(&self, value: T) -> T; }\n");
-    write_temp_file(tmp, "src/concrete.rs",
-                    "pub struct T;\nimpl T { pub fn own_act(&self) {} }\n");
+    write_temp_file(
+        tmp, "src/model.rs",
+        "pub struct Item;\nimpl Item { pub fn act(&self) {} }\n"
+        "pub struct Container<T>(T);\n"
+        "impl<T> Container<T> { pub fn act(&self) {} pub fn item(&self) -> &T { &self.0 } }\n"
+        "pub trait Make<Item> { fn value(&self) -> Container<Item>; }\n"
+        "pub trait Borrow<Item> { fn value(&self) -> &Container<Item>; }\n"
+        "pub trait Sched {}\npub struct Config<T: Sched>(T);\n"
+        "pub trait Build<T: Sched>: Sized { fn configs(self) -> Config<T>;\n"
+        "fn chain(self) -> Config<T> { self.configs().chain() } }\n"
+        "impl<T: Sched> Build<T> for Config<T> { fn configs(self) -> Self { self }\n"
+        "fn chain(self) -> Self { self } }\n"
+        "pub struct Pair<A, B>(A, B);\npub trait PairAct { fn pair_act(&self); }\n"
+        "impl<T> PairAct for Pair<T, T> { fn pair_act(&self) {} }\n"
+        "pub trait MakePair<A, B> { fn pair(&self) -> Pair<A, B>; }\n"
+        "pub trait Split<Param> { fn parts(&self) -> (Param, Container<Param>); }\n"
+        "pub trait Method { fn wrap<T>(&self) -> Container<T>;\n"
+        "fn identity<T>(&self, value: T) -> T; }\n");
+    write_temp_file(tmp, "src/concrete.rs", "pub struct T;\nimpl T { pub fn own_act(&self) {} }\n");
     write_temp_file(tmp, "src/user.rs",
                     "use crate::model::{Make, Borrow, Item, MakePair, PairAct, Split, Method};\n"
                     "pub fn bound<T: Make<Item>>(x: &T) { x.value().act(); }\n"
@@ -3959,7 +3967,8 @@ TEST(pipeline_rust_trait_return_known_generic_constructor) {
                     "pub fn repeated<T: MakePair<u8, u8>>(x: &T) { x.pair().pair_act(); }\n"
                     "pub fn split<T: Split<Item>>(x: &T) { let (_, c) = x.parts(); c.act(); }\n"
                     "pub fn method<M: Method>(x: &M) { x.wrap::<Item>().act(); }\n"
-                    "pub fn method_dependent<M: Method>(x: &M) { x.wrap::<crate::concrete::T>().item().own_act(); }\n"
+                    "pub fn method_dependent<M: Method>(x: &M) { "
+                    "x.wrap::<crate::concrete::T>().item().own_act(); }\n"
                     "pub fn inferred<M: Method>(x: &M, value: crate::concrete::T) {\n"
                     "x.identity(value).own_act(); }\n");
     static const usage_expectation_t rows[] = {
@@ -3980,9 +3989,11 @@ TEST(pipeline_rust_trait_return_known_generic_constructor) {
     cbm_store_t *store = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stop = NULL;
-    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
-        "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='act' "
-        "AND caller LIKE '%.dependent' AND reason='unknown_receiver_type'", -1, &stop, NULL),
+    ASSERT_EQ(
+        sqlite3_prepare_v2(cbm_store_get_db(store),
+                           "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='act' "
+                           "AND caller LIKE '%.dependent' AND reason='unknown_receiver_type'",
+                           -1, &stop, NULL),
         SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stop), SQLITE_ROW);
     int stopped = sqlite3_column_int(stop, 0);
@@ -4002,15 +4013,17 @@ TEST(pipeline_rust_trait_return_associated_bounds_in_default_body) {
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs", "mod model;\nmod other;\n");
-    write_temp_file(tmp, "src/model.rs",
-                    "use std::fmt::Debug;\npub trait Stack { fn pop(&mut self); fn fmt(&self); }\n"
-                    "pub trait Access { type Value: Stack + Debug; fn value(&mut self) -> &mut Self::Value;\n"
-                    "fn standard_fmt(&mut self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n"
-                    "self.value().fmt(f) }\nfn consume(&mut self) { self.value().pop(); } }\n");
-    write_temp_file(tmp, "src/other.rs",
-                    "pub trait Alt { fn pop(&mut self); }\n"
-                    "pub trait OtherAccess { type Value: Alt; fn value(&mut self) -> &mut Self::Value;\n"
-                    "fn consume_other(&mut self) { self.value().pop(); } }\n");
+    write_temp_file(
+        tmp, "src/model.rs",
+        "use std::fmt::Debug;\npub trait Stack { fn pop(&mut self); fn fmt(&self); }\n"
+        "pub trait Access { type Value: Stack + Debug; fn value(&mut self) -> &mut Self::Value;\n"
+        "fn standard_fmt(&mut self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n"
+        "self.value().fmt(f) }\nfn consume(&mut self) { self.value().pop(); } }\n");
+    write_temp_file(
+        tmp, "src/other.rs",
+        "pub trait Alt { fn pop(&mut self); }\n"
+        "pub trait OtherAccess { type Value: Alt; fn value(&mut self) -> &mut Self::Value;\n"
+        "fn consume_other(&mut self) { self.value().pop(); } }\n");
     static const usage_expectation_t rows[] = {
         {"consume", "pop", "src/model.rs", 1, NULL},
         {"consume", "pop", "src/other.rs", 0, NULL},
@@ -4024,10 +4037,12 @@ TEST(pipeline_rust_trait_return_associated_bounds_in_default_body) {
     cbm_store_t *store = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stop = NULL;
-    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
-        "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='fmt' "
-        "AND caller LIKE '%.standard_fmt' AND reason='bound_declaration_not_proven'",
-        -1, &stop, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  cbm_store_get_db(store),
+                  "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='fmt' "
+                  "AND caller LIKE '%.standard_fmt' AND reason='bound_declaration_not_proven'",
+                  -1, &stop, NULL),
+              SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stop), SQLITE_ROW);
     int stopped = sqlite3_column_int(stop, 0);
     sqlite3_finalize(stop);
@@ -4046,18 +4061,20 @@ TEST(pipeline_rust_callback_generic_input_types_closure_receiver) {
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs", "mod model;\nmod other;\nmod user;\n");
-    write_temp_file(tmp, "src/model.rs",
-                    "pub struct Widget<T>(pub T);\n"
-                    "pub struct Special<T>(pub T);\nimpl Special<u8> { pub fn only(&self) {} }\n"
-                    "pub fn special<T>(item: Special<T>, f: impl Fn(&Special<T>)) {}\n"
-                    "impl<T> Widget<T> { pub fn act(&self) {} pub fn inner(&self) -> &T { &self.0 } }\n"
-                    "pub fn visit<T>(item: Widget<T>, f: impl Fn(&Widget<T>)) {}\n"
-                    "pub fn bounded<T, F: Fn(&Widget<T>)>(item: Widget<T>, f: F) {}\n"
-                    "pub fn dynamic<T>(item: Widget<T>, f: &dyn Fn(&Widget<T>)) {}\n");
+    write_temp_file(
+        tmp, "src/model.rs",
+        "pub struct Widget<T>(pub T);\n"
+        "pub struct Special<T>(pub T);\nimpl Special<u8> { pub fn only(&self) {} }\n"
+        "pub fn special<T>(item: Special<T>, f: impl Fn(&Special<T>)) {}\n"
+        "impl<T> Widget<T> { pub fn act(&self) {} pub fn inner(&self) -> &T { &self.0 } }\n"
+        "pub fn visit<T>(item: Widget<T>, f: impl Fn(&Widget<T>)) {}\n"
+        "pub fn bounded<T, F: Fn(&Widget<T>)>(item: Widget<T>, f: F) {}\n"
+        "pub fn dynamic<T>(item: Widget<T>, f: &dyn Fn(&Widget<T>)) {}\n");
     write_temp_file(tmp, "src/other.rs",
                     "pub struct Other;\nimpl Other { pub fn act(&self) {} }\n");
     write_temp_file(tmp, "src/user.rs",
-                    "use crate::model::{visit, bounded, dynamic, Widget, Special, special};\nuse crate::other::Other;\n"
+                    "use crate::model::{visit, bounded, dynamic, Widget, Special, special};\nuse "
+                    "crate::other::Other;\n"
                     "pub fn written() { visit::<u8>(Widget(0u8), |x| x.act()); }\n"
                     "pub fn bound() { bounded::<u8, _>(Widget(0u8), |x| x.act()); }\n"
                     "pub fn object() { dynamic::<u8>(Widget(0u8), &|x| x.act()); }\n"
@@ -4193,7 +4210,9 @@ TEST(pipeline_same_language_suffix_without_binding_is_withheld) {
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "a.py", "def helper():\n    return 1\ndef get(key):\n    return key\n");
     write_temp_file(tmp, "b.py", "def helper():\n    return 2\ndef get(key):\n    return key\n");
-    write_temp_file(tmp, "caller.py", "def caller(box):\n    helper()\n    box.get('value')\n    box.get('/route')\n");
+    write_temp_file(
+        tmp, "caller.py",
+        "def caller(box):\n    helper()\n    box.get('value')\n    box.get('/route')\n");
     const usage_expectation_t rows[] = {
         {"caller", "helper", "a.py", 0, NULL},
         {"caller", "helper", "b.py", 0, NULL},
@@ -4207,14 +4226,19 @@ TEST(pipeline_same_language_suffix_without_binding_is_withheld) {
         ASSERT_NOT_NULL(store);
         sqlite3_stmt *stmt = NULL;
         ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
-            "SELECT count(*) FROM unresolved_sites WHERE name='helper' "
-            "AND reason='name_binding_not_proven'", -1, &stmt, NULL), SQLITE_OK);
+                                     "SELECT count(*) FROM unresolved_sites WHERE name='helper' "
+                                     "AND reason='name_binding_not_proven'",
+                                     -1, &stmt, NULL),
+                  SQLITE_OK);
         ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
         ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
         sqlite3_finalize(stmt);
-        ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
-            "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-            "WHERE e.type='CALLS' AND s.file_path='caller.py'", -1, &stmt, NULL), SQLITE_OK);
+        ASSERT_EQ(
+            sqlite3_prepare_v2(cbm_store_get_db(store),
+                               "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                               "WHERE e.type='CALLS' AND s.file_path='caller.py'",
+                               -1, &stmt, NULL),
+            SQLITE_OK);
         ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
         ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
         sqlite3_finalize(stmt);
@@ -4253,6 +4277,13 @@ static void write_f1_guard_fixture(const char *tmp, int pad_files) {
     write_temp_file(tmp, "app/__init__.py", "");
     write_temp_file(tmp, "app/models.py", "class Base:\n    pass\n");
     write_temp_file(tmp, "app/other.py", "class Base:\n    pass\n");
+    write_temp_file(tmp, "app/exports.py",
+                    "__all__ = ['Visible']\n"
+                    "class Base:\n    pass\n"
+                    "class Visible:\n    pass\n");
+    write_temp_file(tmp, "app/private.py",
+                    "class Public:\n    pass\n"
+                    "class _Private:\n    pass\n");
     write_temp_file(tmp, "app/named.py",
                     "from .models import Base\n"
                     "class Named(Base):\n    pass\n"
@@ -4261,10 +4292,56 @@ static void write_f1_guard_fixture(const char *tmp, int pad_files) {
                     "from .models import *\n"
                     "class Star(Base):\n    pass\n"
                     "def make_star():\n    return Base()\n");
+    write_temp_file(tmp, "app/star_all.py",
+                    "from .exports import *\n"
+                    "class Included(Visible):\n    pass\n"
+                    "def make_included():\n    return Visible()\n"
+                    "class Excluded(Base):\n    pass\n"
+                    "def make_excluded():\n    return Base()\n");
+    write_temp_file(tmp, "app/star_private.py",
+                    "from .private import *\n"
+                    "class Included(Public):\n    pass\n"
+                    "def make_included():\n    return Public()\n"
+                    "class Excluded(_Private):\n    pass\n"
+                    "def make_excluded():\n    return _Private()\n");
+    write_temp_file(tmp, "app/star_after_named.py",
+                    "from .other import Base\n"
+                    "from .models import *\n"
+                    "class Ordered(Base):\n    pass\n"
+                    "def make_ordered():\n    return Base()\n");
+    write_temp_file(tmp, "app/module_attribute.py",
+                    "from . import models\n"
+                    "class Attribute(models.Base):\n    pass\n"
+                    "def make_attribute():\n    return models.Base()\n");
     write_temp_file(tmp, "app/alias.py",
                     "from .models import Base as LocalBase\n"
                     "class Alias(LocalBase):\n    pass\n"
                     "def make_alias():\n    return LocalBase()\n");
+    write_temp_file(tmp, "app/assign_external.py",
+                    "import pathlib\n"
+                    "ASSIGNED_EXT = 'a.txt'\n"
+                    "def read_assigned_ext():\n    return ASSIGNED_EXT\n"
+                    "pathlib.Path(ASSIGNED_EXT)\n");
+    write_temp_file(tmp, "app/assign_plain.py",
+                    "ASSIGNED_PLAIN = 'b.txt'\n"
+                    "def read_assigned_plain():\n    return ASSIGNED_PLAIN\n");
+    write_temp_file(tmp, "app/assign_rebind.py",
+                    "from .models import Base\n"
+                    "Base = Base()\n"
+                    "def read_rebound():\n    return Base\n");
+    write_temp_file(tmp, "app/decorated_stdlib.py",
+                    "from dataclasses import dataclass\n"
+                    "@dataclass\n"
+                    "class StdlibDecorated:\n    size: int\n"
+                    "def read_stdlib_decorated(item: StdlibDecorated):\n    return item\n");
+    write_temp_file(tmp, "app/decorated_local.py",
+                    "def wrap(cls):\n    return cls\n"
+                    "@wrap\n"
+                    "class LocalDecorated:\n    pass\n"
+                    "def read_local_decorated(item: LocalDecorated):\n    return item\n");
+    write_temp_file(tmp, "initpkg/__init__.py",
+                    "INIT_VALUE = 1\n"
+                    "def read_init_value():\n    return INIT_VALUE\n");
     write_temp_file(tmp, "app/unbound.py", "class Unbound(Base):\n    pass\n");
     write_temp_file(tmp, "t1.py", "class Problem(Exception):\n    pass\n");
     write_temp_file(tmp, "t2.py", "class Problem(Exception):\n    pass\n");
@@ -4401,51 +4478,204 @@ TEST(pipeline_multicandidate_inherits_records_name_binding_stop) {
 }
 
 TEST(pipeline_python_relative_named_import_binds_inherits_like_calls) {
-    const char *sql =
-        "SELECT 100 * (SELECT count(*) FROM edges e "
-        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
-        "WHERE e.type='INHERITS' AND s.file_path='app/named.py' AND s.name='Named' "
-        "AND t.file_path='app/models.py' AND t.name='Base') + "
-        "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
-        "AND s.file_path='app/named.py' AND s.name='make_named' "
-        "AND t.file_path='app/models.py' AND t.name='Base')";
+    const char *sql = "SELECT 100 * (SELECT count(*) FROM edges e "
+                      "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+                      "WHERE e.type='INHERITS' AND s.file_path='app/named.py' AND s.name='Named' "
+                      "AND t.file_path='app/models.py' AND t.name='Base') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+                      "AND s.file_path='app/named.py' AND s.name='make_named' "
+                      "AND t.file_path='app/models.py' AND t.name='Base')";
     ASSERT_EQ(f1_guard_query_both_modes("py-relative-named", sql, 101), 2);
     PASS();
 }
 
-TEST(pipeline_python_relative_star_import_binds_inherits) {
+TEST(pipeline_python_relative_star_import_binds_inherits_like_calls) {
+    const char *sql = "SELECT 100 * (SELECT count(*) FROM edges e "
+                      "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+                      "WHERE e.type='INHERITS' AND s.file_path='app/star.py' AND s.name='Star' "
+                      "AND t.file_path='app/models.py' AND t.name='Base') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+                      "AND s.file_path='app/star.py' AND s.name='make_star' "
+                      "AND t.file_path='app/models.py' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-relative-star", sql, 101), 2);
+    PASS();
+}
+
+TEST(pipeline_python_star_import_obeys_dunder_all) {
     const char *sql =
-        "SELECT count(*) FROM edges e "
-        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
-        "WHERE e.type='INHERITS' AND s.file_path='app/star.py' AND s.name='Star' "
-        "AND t.file_path='app/models.py' AND t.name='Base'";
-    ASSERT_EQ(f1_guard_query_both_modes("py-relative-star", sql, 1), 2);
+        "SELECT 1000 * (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
+        "AND s.file_path='app/star_all.py' AND s.name='Included' "
+        "AND t.file_path='app/exports.py' AND t.name='Visible') + "
+        "100 * (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+        "AND s.file_path='app/star_all.py' AND s.name='make_included' "
+        "AND t.file_path='app/exports.py' AND t.name='Visible') + "
+        "10 * EXISTS(SELECT 1 FROM unresolved_sites WHERE file_path='app/star_all.py' "
+        "AND kind='type' AND name='Base' AND reason='name_binding_not_proven') + "
+        "NOT EXISTS(SELECT 1 FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+        "AND s.file_path='app/star_all.py' AND s.name='make_excluded' "
+        "AND t.file_path='app/exports.py' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-star-all", sql, 1111), 2);
+    PASS();
+}
+
+TEST(pipeline_python_star_import_excludes_underscore_names) {
+    const char *sql =
+        "SELECT 1000 * (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
+        "AND s.file_path='app/star_private.py' AND s.name='Included' "
+        "AND t.file_path='app/private.py' AND t.name='Public') + "
+        "100 * (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+        "AND s.file_path='app/star_private.py' AND s.name='make_included' "
+        "AND t.file_path='app/private.py' AND t.name='Public') + "
+        "10 * EXISTS(SELECT 1 FROM unresolved_sites WHERE file_path='app/star_private.py' "
+        "AND kind='type' AND name='_Private' AND reason='name_binding_not_proven') + "
+        "NOT EXISTS(SELECT 1 FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+        "AND s.file_path='app/star_private.py' AND s.name='make_excluded' "
+        "AND t.file_path='app/private.py' AND t.name='_Private')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-star-private", sql, 1111), 2);
+    PASS();
+}
+
+TEST(pipeline_python_star_import_rebinds_in_statement_order) {
+    const char *sql = "SELECT 100 * (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
+                      "AND s.file_path='app/star_after_named.py' AND s.name='Ordered' "
+                      "AND t.file_path='app/models.py' AND t.name='Base') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+                      "AND s.file_path='app/star_after_named.py' AND s.name='make_ordered' "
+                      "AND t.file_path='app/models.py' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-star-order", sql, 101), 2);
+    PASS();
+}
+
+TEST(pipeline_python_relative_module_attribute_binds_inherits_like_calls) {
+    const char *sql = "SELECT 100 * (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
+                      "AND s.file_path='app/module_attribute.py' AND s.name='Attribute' "
+                      "AND t.file_path='app/models.py' AND t.name='Base') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+                      "AND s.file_path='app/module_attribute.py' AND s.name='make_attribute' "
+                      "AND t.file_path='app/models.py' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-module-attribute", sql, 101), 2);
     PASS();
 }
 
 TEST(pipeline_python_relative_alias_import_binds_inherits_like_calls) {
-    const char *sql =
-        "SELECT 100 * (SELECT count(*) FROM edges e "
-        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
-        "WHERE e.type='INHERITS' AND s.file_path='app/alias.py' AND s.name='Alias' "
-        "AND t.file_path='app/models.py' AND t.name='Base') + "
-        "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
-        "AND s.file_path='app/alias.py' AND s.name='make_alias' "
-        "AND t.file_path='app/models.py' AND t.name='Base')";
+    const char *sql = "SELECT 100 * (SELECT count(*) FROM edges e "
+                      "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+                      "WHERE e.type='INHERITS' AND s.file_path='app/alias.py' AND s.name='Alias' "
+                      "AND t.file_path='app/models.py' AND t.name='Base') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+                      "AND s.file_path='app/alias.py' AND s.name='make_alias' "
+                      "AND t.file_path='app/models.py' AND t.name='Base')";
     ASSERT_EQ(f1_guard_query_both_modes("py-relative-alias", sql, 101), 2);
     PASS();
 }
 
+TEST(pipeline_python_assigned_name_usage_binds_own_variable_beside_external_import) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/assign_external.py' AND s.name='read_assigned_ext' "
+                      "AND t.file_path='app/assign_external.py' AND t.name='ASSIGNED_EXT'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-ext-usage", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_write_binds_own_variable_beside_external_import) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='WRITES' "
+                      "AND s.label='Module' AND s.file_path='app/assign_external.py' "
+                      "AND t.file_path='app/assign_external.py' AND t.name='ASSIGNED_EXT'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-ext-write", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_usage_binds_own_variable_without_any_import) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/assign_plain.py' AND s.name='read_assigned_plain' "
+                      "AND t.file_path='app/assign_plain.py' AND t.name='ASSIGNED_PLAIN'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-plain-usage", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_write_binds_own_variable_without_any_import) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='WRITES' "
+                      "AND s.label='Module' AND s.file_path='app/assign_plain.py' "
+                      "AND t.file_path='app/assign_plain.py' AND t.name='ASSIGNED_PLAIN'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-plain-write", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assignment_over_import_binds_own_variable_not_imported_class) {
+    const char *sql = "SELECT 10 * (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/assign_rebind.py' AND s.name='read_rebound' "
+                      "AND t.file_path='app/assign_rebind.py' AND t.name='Base') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/assign_rebind.py' AND s.name='read_rebound' "
+                      "AND t.file_path='app/models.py' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-rebind", sql, 10), 2);
+    PASS();
+}
+
+TEST(pipeline_python_usage_of_star_excluded_name_is_recorded_not_silent) {
+    const char *sql = "SELECT count(*) FROM unresolved_sites WHERE file_path='app/star_all.py' "
+                      "AND kind='reference' AND name='Base' AND reason='name_binding_not_proven'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-blocked-usage", sql, -1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_class_under_stdlib_dataclass_keeps_its_own_binding) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/decorated_stdlib.py' "
+                      "AND s.name='read_stdlib_decorated' "
+                      "AND t.file_path='app/decorated_stdlib.py' AND t.name='StdlibDecorated'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-dataclass-usage", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_class_under_local_decorator_is_withheld_and_recorded) {
+    const char *sql = "SELECT 100 * EXISTS(SELECT 1 FROM unresolved_sites "
+                      "WHERE file_path='app/decorated_local.py' AND name='LocalDecorated' "
+                      "AND reason='name_binding_not_proven') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/decorated_local.py' AND s.name='read_local_decorated' "
+                      "AND t.file_path='app/decorated_local.py' AND t.name='LocalDecorated')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-local-decorator", sql, 100), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_in_package_init_binds_own_variable) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='initpkg/__init__.py' AND s.name='read_init_value' "
+                      "AND t.file_path='initpkg/__init__.py' AND t.name='INIT_VALUE'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-init-assign-usage", sql, 1), 2);
+    PASS();
+}
+
 TEST(pipeline_python_unbound_multicandidate_inherits_is_withheld) {
-    const char *sql =
-        "SELECT 100 * EXISTS(SELECT 1 FROM unresolved_sites "
-        "WHERE file_path='app/unbound.py' AND name='Base' "
-        "AND reason='name_binding_not_proven') + "
-        "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
-        "AND s.file_path='app/unbound.py' AND s.name='Unbound' AND t.name='Base')";
+    const char *sql = "SELECT 100 * EXISTS(SELECT 1 FROM unresolved_sites "
+                      "WHERE file_path='app/unbound.py' AND name='Base' "
+                      "AND reason='name_binding_not_proven') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='INHERITS' "
+                      "AND s.file_path='app/unbound.py' AND s.name='Unbound' AND t.name='Base')";
     ASSERT_EQ(f1_guard_query_both_modes("py-unbound-inherits", sql, 100), 2);
     PASS();
 }
@@ -4676,17 +4906,19 @@ TEST(pipeline_rust_inherent_specialization_uses_receiver_arguments) {
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
-        "[package]\nname=\"specialized\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+                    "[package]\nname=\"specialized\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
-        "mod get; mod set; pub struct Get; pub struct Set; pub struct Builder<T>(T);\n"
-        "pub fn chain(b: Builder<Set>) { b.value(1).value(2); }\n"
-        "pub fn readonly(b: Builder<Get>) { b.value(); }\n"
-        "pub struct Solo<T>(T); impl Solo<u32> { pub fn only(&self) {} }\n"
-        "pub fn singleton() { Solo(1u32).only(); }\n");
-    write_temp_file(tmp, "src/get.rs",
+                    "mod get; mod set; pub struct Get; pub struct Set; pub struct Builder<T>(T);\n"
+                    "pub fn chain(b: Builder<Set>) { b.value(1).value(2); }\n"
+                    "pub fn readonly(b: Builder<Get>) { b.value(); }\n"
+                    "pub struct Solo<T>(T); impl Solo<u32> { pub fn only(&self) {} }\n"
+                    "pub fn singleton() { Solo(1u32).only(); }\n");
+    write_temp_file(
+        tmp, "src/get.rs",
         "use crate::{Builder, Get}; impl Builder<Get> { pub fn value(&self) -> u32 { 0 } }\n");
     write_temp_file(tmp, "src/set.rs",
-        "use crate::{Builder, Set}; impl Builder<Set> { pub fn value(self, _: u32) -> Self { self } }\n");
+                    "use crate::{Builder, Set}; impl Builder<Set> { pub fn value(self, _: u32) -> "
+                    "Self { self } }\n");
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
@@ -4697,17 +4929,17 @@ TEST(pipeline_rust_inherent_specialization_uses_receiver_arguments) {
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stmt = NULL;
     const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
-        "((s.name='chain' AND t.qualified_name LIKE '%.src.set.Builder.value') OR "
-        "(s.name='readonly' AND t.qualified_name LIKE '%.src.get.Builder.value') OR "
-        "(s.name='singleton' AND t.qualified_name LIKE '%.Solo.only'))";
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                      "((s.name='chain' AND t.qualified_name LIKE '%.src.set.Builder.value') OR "
+                      "(s.name='readonly' AND t.qualified_name LIKE '%.src.get.Builder.value') OR "
+                      "(s.name='singleton' AND t.qualified_name LIKE '%.Solo.only'))";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 3);
     sqlite3_finalize(stmt);
     sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
-        "AND s.name='chain' AND t.qualified_name LIKE '%.src.get.Builder.value'";
+          "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+          "AND s.name='chain' AND t.qualified_name LIKE '%.src.get.Builder.value'";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
@@ -4721,12 +4953,13 @@ TEST(pipeline_macro_argument_without_definition_records_stop) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm-q-macro-XXXXXX", cbm_tmpdir());
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "src/lib.rs",
-                    "pub struct Payload;\n"
-                    "macro_rules! accessor {\n"
-                    "    ($name:ident) => { impl Payload { pub fn $name(&self) -> Option<()> { None } } };\n"
-                    "}\naccessor!(generated_accessor);\n"
-                    "pub fn caller(x: Payload) { assert!(x.generated_accessor().is_none()); }\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub struct Payload;\n"
+        "macro_rules! accessor {\n"
+        "    ($name:ident) => { impl Payload { pub fn $name(&self) -> Option<()> { None } } };\n"
+        "}\naccessor!(generated_accessor);\n"
+        "pub fn caller(x: Payload) { assert!(x.generated_accessor().is_none()); }\n");
     char db[512];
     snprintf(db, sizeof(db), "%s/macro.db", tmp);
     cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
@@ -4757,8 +4990,9 @@ TEST(pipeline_rust_opaque_macro_call_has_a_stop_record) {
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
-        "[package]\nname=\"opaque\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
-    write_temp_file(tmp, "src/lib.rs",
+                    "[package]\nname=\"opaque\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
         "pub struct S; impl S { pub fn go(&self) {} }\n"
         "pub fn opaque(s: S) { unknown::select! { recv(channel) -> value => { s.go(); } } }\n");
     char dbpath[512];
@@ -4771,7 +5005,7 @@ TEST(pipeline_rust_opaque_macro_call_has_a_stop_record) {
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stmt = NULL;
     const char *sql = "SELECT count(*) FROM unresolved_sites WHERE kind='call' "
-        "AND caller LIKE '%.opaque' AND name='go' AND reason='macro_call_not_proven'";
+                      "AND caller LIKE '%.opaque' AND name='go' AND reason='macro_call_not_proven'";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
@@ -4828,15 +5062,18 @@ TEST(pipeline_rust_trait_scope_follows_reexports_and_anonymous_imports) {
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname=\"routes\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
-    write_temp_file(tmp, "src/lib.rs",
-                    "extern crate self as routes; pub mod defs; mod ancestor; mod anonymous; mod prelude;\n"
-                    "mod own { use routes::prelude::*; use routes::defs::S; pub fn own_alias(s: S) { s.describe(); } }\n"
-                    "use defs::S;\n"
-                    "pub fn block_glob(s: S) { use crate::prelude::*; s.describe(); }\n"
-                    "pub fn block_anonymous(s: S) { use crate::defs::Describe as _; use crate::Other as _; s.describe(); }\n"
-                    "pub trait Other {}\n"
-                    "pub fn after_impl(s: S) { use crate::defs::Describe; struct Other;\n"
-                    "impl Other { fn other(&self) {} } s.describe(); }\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "extern crate self as routes; pub mod defs; mod ancestor; mod anonymous; mod prelude;\n"
+        "mod own { use routes::prelude::*; use routes::defs::S; pub fn own_alias(s: S) { "
+        "s.describe(); } }\n"
+        "use defs::S;\n"
+        "pub fn block_glob(s: S) { use crate::prelude::*; s.describe(); }\n"
+        "pub fn block_anonymous(s: S) { use crate::defs::Describe as _; use crate::Other as _; "
+        "s.describe(); }\n"
+        "pub trait Other {}\n"
+        "pub fn after_impl(s: S) { use crate::defs::Describe; struct Other;\n"
+        "impl Other { fn other(&self) {} } s.describe(); }\n");
     write_temp_file(tmp, "src/defs.rs",
                     "pub struct S; pub trait Describe { fn describe(&self) {} }\n"
                     "impl Describe for S {}\n");
@@ -4864,7 +5101,8 @@ TEST(pipeline_rust_trait_scope_follows_reexports_and_anonymous_imports) {
     const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
                       "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
                       "AND t.name='describe' AND s.name IN "
-                      "('block_glob','block_anonymous','ancestor','anonymous','inherited','conditional','after_impl','own_alias')";
+                      "('block_glob','block_anonymous','ancestor','anonymous','inherited','"
+                      "conditional','after_impl','own_alias')";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 8);
@@ -4895,14 +5133,15 @@ TEST(pipeline_rust_mutable_copy_receiver_selects_inherent_method) {
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname=\"precedence\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
-    write_temp_file(tmp, "src/lib.rs",
-                    "#[derive(Clone, Copy)] pub struct Span;\n"
-                    "impl Span { pub fn end(self) -> u32 { 1 } }\n"
-                    "pub trait Ranged { fn end(&self) -> u32 { 2 } }\n"
-                    "impl Ranged for Span {}\n"
-                    "pub fn direct(s: &mut Span) { s.end(); }\n"
-                    "pub fn pattern(mut s: Option<Span>) { if let Some(ref mut s) = s { s.end(); } }\n"
-                    "pub fn inferred(s: &Span) { let owned = s.clone(); owned.end(); }\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "#[derive(Clone, Copy)] pub struct Span;\n"
+        "impl Span { pub fn end(self) -> u32 { 1 } }\n"
+        "pub trait Ranged { fn end(&self) -> u32 { 2 } }\n"
+        "impl Ranged for Span {}\n"
+        "pub fn direct(s: &mut Span) { s.end(); }\n"
+        "pub fn pattern(mut s: Option<Span>) { if let Some(ref mut s) = s { s.end(); } }\n"
+        "pub fn inferred(s: &Span) { let owned = s.clone(); owned.end(); }\n");
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
@@ -4940,31 +5179,34 @@ TEST(pipeline_rust_imported_external_traits_and_prelude_are_proved) {
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname=\"external\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
-    write_temp_file(tmp, "src/lib.rs",
-                    "#![no_std]\nextern crate std; pub struct S; use std::str::FromStr;\n"
-                    "impl FromStr for S { type Err=(); fn from_str(_: &str) -> Result<Self, ()> { Ok(S) } }\n"
-                    "impl std::iter::FromIterator<u32> for S { fn from_iter<T: IntoIterator<Item=u32>>(_: T) -> Self { S } }\n"
-                    "pub fn imported() { S::from_str(\"s\"); }\n"
-                    "pub fn prelude() { S::from_iter([1]); }\n"
-                    "pub trait Source { fn read(&mut self); }\n"
-                    "impl<T: Source + ?Sized> Source for &mut T { fn read(&mut self) { (**self).read(); } }\n"
-                    "pub fn dynamic(s: &mut dyn Source) { s.read(); }\n"
-                    "pub trait SubSource: Source {}\n"
-                    "pub fn inherited(s: &mut dyn SubSource) { s.read(); }\n"
-                    "impl Source for S { fn read(&mut self) {} }\n"
-                    "pub fn concrete(s: &mut S) { s.read(); }\n"
-                    "pub trait Checked: std::any::Any { fn check(); }\n"
-                    "pub fn undisclosed<T: Checked>() { T::check(); panic!(\"{:?}\", T::check()); }\n"
-                    "impl From<u32> for S { fn from(_: u32) -> Self { S } }\n"
-                    "impl From<bool> for S { fn from(_: bool) -> Self { S } }\n"
-                    "pub fn converted() { S::from(1u32); }\n"
-                    "mod conversions; macro_rules! hidden { () => { mod hidden; }; } hidden!();\n");
-    write_temp_file(tmp, "src/conversions.rs",
-                    "use std::{path::PathBuf, string::String}; pub struct Converted;\n"
-                    "impl From<PathBuf> for Converted { fn from(_: PathBuf) -> Self { Converted } }\n"
-                    "impl From<String> for Converted { fn from(_: String) -> Self { Converted } }\n"
-                    "impl Converted { pub fn kept(&self) {} }\n"
-                    "pub fn converted_external(p: PathBuf) { Converted::from(p).kept(); }\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "#![no_std]\nextern crate std; pub struct S; use std::str::FromStr;\n"
+        "impl FromStr for S { type Err=(); fn from_str(_: &str) -> Result<Self, ()> { Ok(S) } }\n"
+        "impl std::iter::FromIterator<u32> for S { fn from_iter<T: IntoIterator<Item=u32>>(_: T) "
+        "-> Self { S } }\n"
+        "pub fn imported() { S::from_str(\"s\"); }\n"
+        "pub fn prelude() { S::from_iter([1]); }\n"
+        "pub trait Source { fn read(&mut self); }\n"
+        "impl<T: Source + ?Sized> Source for &mut T { fn read(&mut self) { (**self).read(); } }\n"
+        "pub fn dynamic(s: &mut dyn Source) { s.read(); }\n"
+        "pub trait SubSource: Source {}\n"
+        "pub fn inherited(s: &mut dyn SubSource) { s.read(); }\n"
+        "impl Source for S { fn read(&mut self) {} }\n"
+        "pub fn concrete(s: &mut S) { s.read(); }\n"
+        "pub trait Checked: std::any::Any { fn check(); }\n"
+        "pub fn undisclosed<T: Checked>() { T::check(); panic!(\"{:?}\", T::check()); }\n"
+        "impl From<u32> for S { fn from(_: u32) -> Self { S } }\n"
+        "impl From<bool> for S { fn from(_: bool) -> Self { S } }\n"
+        "pub fn converted() { S::from(1u32); }\n"
+        "mod conversions; macro_rules! hidden { () => { mod hidden; }; } hidden!();\n");
+    write_temp_file(
+        tmp, "src/conversions.rs",
+        "use std::{path::PathBuf, string::String}; pub struct Converted;\n"
+        "impl From<PathBuf> for Converted { fn from(_: PathBuf) -> Self { Converted } }\n"
+        "impl From<String> for Converted { fn from(_: String) -> Self { Converted } }\n"
+        "impl Converted { pub fn kept(&self) {} }\n"
+        "pub fn converted_external(p: PathBuf) { Converted::from(p).kept(); }\n");
     write_temp_file(tmp, "src/hidden.rs",
                     "pub struct Hidden<'a>(&'a str);\n"
                     "impl<'a> Default for Hidden<'a> { fn default() -> Self { Hidden(\"\") } }\n"
@@ -4978,15 +5220,16 @@ TEST(pipeline_rust_imported_external_traits_and_prelude_are_proved) {
     cbm_store_t *store = cbm_store_open_path_query(dbpath);
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stmt = NULL;
-    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
-                      "AND ((s.name='imported' AND t.name='from_str') OR "
-                      "(s.name='prelude' AND t.name='from_iter') OR "
-                      "(s.name IN ('dynamic','inherited') AND t.qualified_name LIKE '%.Source.read') OR "
-                      "(s.name='concrete' AND t.qualified_name LIKE '%.S.read[Source]') OR "
-                      "(s.name='converted' AND t.name='from') OR "
-                      "(s.name='converted_external' AND t.name IN ('from','kept')) OR "
-                      "(s.name='new' AND t.qualified_name LIKE '%.Hidden.default[Default]'))";
+    const char *sql =
+        "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+        "AND ((s.name='imported' AND t.name='from_str') OR "
+        "(s.name='prelude' AND t.name='from_iter') OR "
+        "(s.name IN ('dynamic','inherited') AND t.qualified_name LIKE '%.Source.read') OR "
+        "(s.name='concrete' AND t.qualified_name LIKE '%.S.read[Source]') OR "
+        "(s.name='converted' AND t.name='from') OR "
+        "(s.name='converted_external' AND t.name IN ('from','kept')) OR "
+        "(s.name='new' AND t.qualified_name LIKE '%.Hidden.default[Default]'))";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 9);
@@ -5014,15 +5257,18 @@ TEST(pipeline_rust_macro_transcriber_proves_trait_declaration) {
                     "pub fn emitted(s: S) { s.read(); }\n"
                     "pub fn discarded(s: S) { s.fake(); }\n");
     char declarations[8192];
-    int used = snprintf(declarations, sizeof(declarations),
-        "macro_rules! emit { (pub trait Generated { $(fn $method:ident($($args:tt)*) -> $ret:ty;)* }) "
-        "=> { pub trait Generated { $(fn $method($($args)*) -> $ret { 0 })* } }; }\n"
-        "emit! { pub trait Generated { fn read(&self) -> i32;\n");
+    int used =
+        snprintf(declarations, sizeof(declarations),
+                 "macro_rules! emit { (pub trait Generated { $(fn $method:ident($($args:tt)*) -> "
+                 "$ret:ty;)* }) "
+                 "=> { pub trait Generated { $(fn $method($($args)*) -> $ret { 0 })* } }; }\n"
+                 "emit! { pub trait Generated { fn read(&self) -> i32;\n");
     /* More than 256 real bindings, without changing the matcher through a seam. */
     for (int i = 0; i < 35; i++)
         used += snprintf(declarations + used, sizeof(declarations) - (size_t)used,
-            "fn spare%d(&self, a: i32, b: i32) -> i32;\n", i);
-    snprintf(declarations + used, sizeof(declarations) - (size_t)used,
+                         "fn spare%d(&self, a: i32, b: i32) -> i32;\n", i);
+    snprintf(
+        declarations + used, sizeof(declarations) - (size_t)used,
         "} }\nmacro_rules! discard { ($item:item) => {} ; }\n"
         "discard! { pub trait Fake { fn fake(&self) {} } }\n"
         "pub struct S; impl Generated for S { fn read(&self) -> i32 { 0 } } impl Fake for S {}\n");
@@ -5059,26 +5305,27 @@ TEST(pipeline_rust_workspace_trait_reexport_and_block_import_are_proved) {
     snprintf(tmp, sizeof(tmp), "%s/cbm_workspace_trait_XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "Cargo.toml",
+    write_temp_file(
+        tmp, "Cargo.toml",
         "[workspace]\nmembers=[\"traits\",\"facade\",\"app\"]\n"
         "[workspace.dependencies]\ntraits={path=\"traits\"}\nfacade={path=\"facade\"}\n");
     write_temp_file(tmp, "traits/Cargo.toml",
-        "[package]\nname=\"traits\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+                    "[package]\nname=\"traits\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
     write_temp_file(tmp, "traits/src/lib.rs",
-        "pub struct Nominal; pub trait RootTrait { fn read(&self); }\n"
-        "impl RootTrait for Nominal { fn read(&self) {} }\n");
+                    "pub struct Nominal; pub trait RootTrait { fn read(&self); }\n"
+                    "impl RootTrait for Nominal { fn read(&self) {} }\n");
     write_temp_file(tmp, "facade/Cargo.toml",
-        "[package]\nname=\"facade\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
-        "[dependencies]\ntraits.workspace=true\n");
+                    "[package]\nname=\"facade\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[dependencies]\ntraits.workspace=true\n");
     write_temp_file(tmp, "facade/src/lib.rs", "pub use traits::RootTrait as Alias;\n");
     write_temp_file(tmp, "app/Cargo.toml",
-        "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
-        "[dependencies]\ntraits.workspace=true\nfacade.workspace=true\n");
+                    "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[dependencies]\ntraits.workspace=true\nfacade.workspace=true\n");
     write_temp_file(tmp, "app/src/lib.rs",
-        "use traits::Nominal; use std::prelude::v1::*;\n"
-        "pub fn anonymous(s: Nominal) { use facade::Alias as _; s.read(); }\n"
-        "pub fn renamed(s: Nominal) { use facade::Alias as Renamed; s.read(); }\n"
-        "pub fn absent(s: Nominal) { s.read(); }\n");
+                    "use traits::Nominal; use std::prelude::v1::*;\n"
+                    "pub fn anonymous(s: Nominal) { use facade::Alias as _; s.read(); }\n"
+                    "pub fn renamed(s: Nominal) { use facade::Alias as Renamed; s.read(); }\n"
+                    "pub fn absent(s: Nominal) { s.read(); }\n");
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
@@ -5089,14 +5336,14 @@ TEST(pipeline_rust_workspace_trait_reexport_and_block_import_are_proved) {
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stmt = NULL;
     const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND t.name='read' "
-        "AND s.name IN ('anonymous','renamed')";
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND t.name='read' "
+                      "AND s.name IN ('anonymous','renamed')";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
     sqlite3_finalize(stmt);
     sql = "SELECT count(*) FROM unresolved_sites WHERE kind='call' "
-        "AND caller LIKE '%.absent' AND reason='trait_scope_identity'";
+          "AND caller LIKE '%.absent' AND reason='trait_scope_identity'";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
@@ -5111,28 +5358,28 @@ TEST(pipeline_rust_macro_import_does_not_shadow_a_trait) {
     snprintf(tmp, sizeof(tmp), "%s/cbm_trait_namespace_XXXXXX",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "Cargo.toml",
-        "[workspace]\nmembers=[\"traits\",\"macros\",\"app\"]\n");
+    write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers=[\"traits\",\"macros\",\"app\"]\n");
     write_temp_file(tmp, "traits/Cargo.toml",
-        "[package]\nname=\"traits\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+                    "[package]\nname=\"traits\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
     write_temp_file(tmp, "traits/src/lib.rs",
-        "pub struct Nominal; pub trait Shared { fn read(&self); }\n"
-        "impl Shared for Nominal { fn read(&self) {} }\n");
+                    "pub struct Nominal; pub trait Shared { fn read(&self); }\n"
+                    "impl Shared for Nominal { fn read(&self) {} }\n");
     write_temp_file(tmp, "macros/Cargo.toml",
-        "[package]\nname=\"macros\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
-        "[lib]\nproc-macro=true\n");
-    write_temp_file(tmp, "macros/src/lib.rs",
+                    "[package]\nname=\"macros\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[lib]\nproc-macro=true\n");
+    write_temp_file(
+        tmp, "macros/src/lib.rs",
         "extern crate proc_macro; use proc_macro::TokenStream;\n"
         "#[proc_macro_derive(Shared)]\npub fn derive_shared(_: TokenStream) -> TokenStream {"
         " TokenStream::new() }\n");
     write_temp_file(tmp, "app/Cargo.toml",
-        "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
-        "[dependencies]\ntraits={path=\"../traits\"}\nmacros={path=\"../macros\"}\n");
+                    "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"
+                    "[dependencies]\ntraits={path=\"../traits\"}\nmacros={path=\"../macros\"}\n");
     write_temp_file(tmp, "app/src/lib.rs",
-        "pub mod named { use traits::{Nominal, Shared}; use macros::Shared;\n"
-        "pub fn call(s: Nominal) { s.read(); } }\n"
-        "pub mod glob { use traits::*; use macros::Shared;\n"
-        "pub fn call(s: Nominal) { s.read(); } }\n");
+                    "pub mod named { use traits::{Nominal, Shared}; use macros::Shared;\n"
+                    "pub fn call(s: Nominal) { s.read(); } }\n"
+                    "pub mod glob { use traits::*; use macros::Shared;\n"
+                    "pub fn call(s: Nominal) { s.read(); } }\n");
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
@@ -5143,8 +5390,8 @@ TEST(pipeline_rust_macro_import_does_not_shadow_a_trait) {
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stmt = NULL;
     const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='call' "
-        "AND t.qualified_name LIKE '%.traits.src.lib.Nominal.read[Shared]'";
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='call' "
+                      "AND t.qualified_name LIKE '%.traits.src.lib.Nominal.read[Shared]'";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
@@ -5160,12 +5407,12 @@ TEST(pipeline_rust_std_wrapper_trait_dispatch_is_disclosed) {
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
-        "[package]\nname=\"wrapper\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
+                    "[package]\nname=\"wrapper\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
-        "pub struct Local; pub trait Extension { fn read(&self); }\n"
-        "impl Extension for Local { fn read(&self) {} }\n"
-        "impl Local { pub fn kept(&self) {} }\n"
-        "pub fn call(s: Box<Local>) { s.read(); s.kept(); }\n");
+                    "pub struct Local; pub trait Extension { fn read(&self); }\n"
+                    "impl Extension for Local { fn read(&self) {} }\n"
+                    "impl Local { pub fn kept(&self) {} }\n"
+                    "pub fn call(s: Box<Local>) { s.read(); s.kept(); }\n");
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
@@ -5176,22 +5423,22 @@ TEST(pipeline_rust_std_wrapper_trait_dispatch_is_disclosed) {
     ASSERT_NOT_NULL(store);
     sqlite3_stmt *stmt = NULL;
     const char *sql = "SELECT count(*) FROM unresolved_sites WHERE kind='call' "
-        "AND caller LIKE '%.call' AND name='alloc.boxed.Box.read' "
-        "AND reason='unrecognised_std_method'";
+                      "AND caller LIKE '%.call' AND name='alloc.boxed.Box.read' "
+                      "AND reason='unrecognised_std_method'";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
     sqlite3_finalize(stmt);
     sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='call' "
-        "AND t.name IN ('read','kept')";
+          "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='call' "
+          "AND t.name IN ('read','kept')";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
     sqlite3_finalize(stmt);
     sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='call' "
-        "AND t.qualified_name LIKE '%.Local.kept'";
+          "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='call' "
+          "AND t.qualified_name LIKE '%.Local.kept'";
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
@@ -5208,11 +5455,12 @@ TEST(pipeline_rust_macro_std_stop_has_a_site_record) {
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname=\"macro_stop\"\nversion=\"0.1.0\"\nedition=\"2021\"\n");
-    write_temp_file(tmp, "src/lib.rs",
-                    "pub trait Extension { fn len(&self) -> usize; }\n"
-                    "impl Extension for Vec<u32> { fn len(&self) -> usize { 99 } }\n"
-                    "pub struct Local; impl Local { pub fn answer() -> usize { 0 } }\n"
-                    "pub fn macro_call(items: Vec<u32>) { assert_eq!(Local::answer(), items.len()); }\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub trait Extension { fn len(&self) -> usize; }\n"
+        "impl Extension for Vec<u32> { fn len(&self) -> usize { 99 } }\n"
+        "pub struct Local; impl Local { pub fn answer() -> usize { 0 } }\n"
+        "pub fn macro_call(items: Vec<u32>) { assert_eq!(Local::answer(), items.len()); }\n");
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
@@ -5717,8 +5965,9 @@ TEST(incremental_shell_deploy_edit_keeps_its_edges) {
     }
     write_temp_file(tmp, "manifests/app.yaml",
                     "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n");
-    write_temp_file(tmp, "hack/deploy.sh",
-                    "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
+    write_temp_file(
+        tmp, "hack/deploy.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/shinc.db", tmp);
     static const char deploys[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS'";
@@ -5772,8 +6021,7 @@ static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *rout
     snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
     (void)remove(path);
     if (!legacy) {
-        *after_script =
-            k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+        *after_script = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
         *route = cbm_pipeline_incremental_test_last_route();
     }
     snprintf(path, sizeof(path), "%s/app.py", tmp);
@@ -5976,7 +6224,8 @@ static char *incremental_env_edit(bool legacy, bool dockerfile, cbm_incremental_
         return NULL;
     }
     write_temp_file(tmp, "Dockerfile",
-                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n" : "FROM alpine:3.20\nENV KEEP_D=1\n");
+                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n"
+                               : "FROM alpine:3.20\nENV KEEP_D=1\n");
     write_temp_file(tmp, "compose.yaml",
                     "services:\n  web:\n    image: acme/web\n    environment:\n      OLD_C: x\n");
     write_temp_file(tmp, "compose.other.yaml",
@@ -6155,8 +6404,9 @@ static char *incremental_docker_build_keep(bool legacy, cbm_incremental_route_t 
         return NULL;
     }
     write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
-    write_temp_file(tmp, "build.sh",
-                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(
+        tmp, "build.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/dockerbuild.db", tmp);
     static const char builds[] =
@@ -6207,10 +6457,12 @@ TEST(incremental_second_build_declarer_keeps_the_edge) {
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_twodecl_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
-    write_temp_file(tmp, "a.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
-                                 "docker build -t ghcr.io/acme/svc:1 svc\n");
-    write_temp_file(tmp, "b.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
-                                 "docker build -t ghcr.io/acme/svc:2 svc\n");
+    write_temp_file(tmp, "a.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                    "docker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(tmp, "b.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                    "docker build -t ghcr.io/acme/svc:2 svc\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/twodecl.db", tmp);
     static const char builds[] =
@@ -6785,10 +7037,12 @@ static void stem_repo(const char *tmp, int fillers) {
     write_temp_file(tmp, "rs/foo.rs", "pub mod bar;\npub fn top() {}\n");
     write_temp_file(tmp, "rs/foo/bar.rs", "pub fn inner() {}\n");
     write_temp_file(tmp, "c/foo.h", "int foo_add(int a, int b);\n");
-    write_temp_file(tmp, "c/foo.c", "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    write_temp_file(tmp, "c/foo.c",
+                    "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
     write_temp_file(tmp, "c/foo/x.c", "int foo_x(void) { return 1; }\n");
     write_temp_file(tmp, "ts/foo.test.ts", "export function stemProbeA(): number { return 1; }\n");
-    write_temp_file(tmp, "ts/foo/test/a.ts", "export function stemProbeB(): number { return 2; }\n");
+    write_temp_file(tmp, "ts/foo/test/a.ts",
+                    "export function stemProbeB(): number { return 2; }\n");
     write_temp_file(tmp, "go.mod", "module example.com/stem\n\ngo 1.21\n");
     write_temp_file(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
     write_temp_file(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
@@ -6865,7 +7119,8 @@ TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
          "t.id=e.target_id WHERE e.type='DEFINES' AND s.label='File' AND "
          "s.file_path='genproto.sh' AND t.label='Module' AND t.qualified_name='stem.genproto'",
          "genproto.sh defines its Module"},
-        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo#module' AND "
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo#module' "
+         "AND "
          "file_path='rs/foo.rs'",
          "Rust foo.rs Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo.bar' AND "
@@ -6877,7 +7132,8 @@ TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
          "C stem pair Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.c.foo/'",
          "c/foo/ Folder marked"},
-        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' AND "
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' "
+         "AND "
          "file_path='ts/foo.test.ts'",
          "dotted foo.test.ts Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.ts.foo.test/'",
@@ -10894,9 +11150,9 @@ TEST(pipeline_c_call_reaches_header_function_beside_field) {
 
     /* Both namesakes must exist for the probe to mean anything. */
     ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
-    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
-                                  "Field"),
-               1);
+    ASSERT_GTE(
+        fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page", "Field"),
+        1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
     /* A bare C call never names the struct member. */
@@ -10930,9 +11186,9 @@ TEST(pipeline_c_call_reaches_header_function_beside_field_parallel) {
     ASSERT_NOT_NULL(s);
 
     ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
-    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
-                                  "Field"),
-               1);
+    ASSERT_GTE(
+        fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page", "Field"),
+        1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
@@ -12233,9 +12489,9 @@ static void observe_rust_published_call_rows(const char *dump_path, const char *
                          strcmp(fields[6], recursive_qn) == 0;
         observation->recursive_row = observation->recursive_row || recursive;
         observation->exact_rows =
-            observation->exact_rows && (recursive || (known_target &&
-            strcmp(fields[4], caller_qn) == 0)) && strcmp(fields[1], "lib.rs") == 0 &&
-            strcmp(fields[7], "lsp_direct") == 0;
+            observation->exact_rows &&
+            (recursive || (known_target && strcmp(fields[4], caller_qn) == 0)) &&
+            strcmp(fields[1], "lib.rs") == 0 && strcmp(fields[7], "lsp_direct") == 0;
         if (known_target && strcmp(fields[6], target_qn) == 0) {
             observation->nested_target_range = strtoul(fields[12], NULL, 10) == target_start &&
                                                strtoul(fields[13], NULL, 10) == target_end;
@@ -12261,7 +12517,8 @@ static RustPublishedCallDumpObservation observe_rust_published_call_dump(const c
     if (store && pipeline) {
         const char *project = cbm_pipeline_project_name(pipeline);
         observation.graph_calls = cbm_store_count_edges_by_type(store, project, "CALLS");
-        observation.recursive_graph = cross_file_call_exists(store, project, "recursive", "recursive");
+        observation.recursive_graph =
+            cross_file_call_exists(store, project, "recursive", "recursive");
         observe_rust_published_call_rows(dump_path, project, target_start, target_end,
                                          &observation);
     }
@@ -12601,11 +12858,11 @@ typedef struct {
     bool trait_impl_caller;  /* D.notify[Host] owns its body's calls */
     bool dyn_receiver;       /* Arc<dyn Host> follows an unlisted name to the project pointee */
     bool dyn_std_stop;
-    bool reexport_path;      /* crate::Runtime follows lib.rs `pub use a::Runtime` */
-    bool glob_import;        /* `use crate::a::*` binds a unique glob source */
-    bool cfg_caller;         /* a #[cfg] twin keeps its published caller identity */
-    bool super_path;         /* super::m_root() from m/inner.rs reaches m/mod.rs */
-    bool trait_ufcs_guess;   /* Default::default() with no declared type stays closed */
+    bool reexport_path;    /* crate::Runtime follows lib.rs `pub use a::Runtime` */
+    bool glob_import;      /* `use crate::a::*` binds a unique glob source */
+    bool cfg_caller;       /* a #[cfg] twin keeps its published caller identity */
+    bool super_path;       /* super::m_root() from m/inner.rs reaches m/mod.rs */
+    bool trait_ufcs_guess; /* Default::default() with no declared type stays closed */
 } RustModuleCallObservation;
 
 static RustModuleCallObservation observe_rust_module_calls(const char *root, const char *db_name) {
@@ -12630,10 +12887,12 @@ static RustModuleCallObservation observe_rust_module_calls(const char *root, con
         RS_EDGE(trait_impl_caller, "src.b.D.notify[Host]", "src.a.helper");
         RS_EDGE(dyn_receiver, "src.a.spawn", "src.a.Host.notify");
         sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(cbm_store_get_db(store),
-            "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.src.a.spawn' "
-            "AND name='std.sync.Arc.notify' AND reason='unrecognised_std_method'",
-            -1, &stmt, NULL) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
+        if (sqlite3_prepare_v2(
+                cbm_store_get_db(store),
+                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.src.a.spawn' "
+                "AND name='std.sync.Arc.notify' AND reason='unrecognised_std_method'",
+                -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW)
             o.dyn_std_stop = sqlite3_column_int(stmt, 0) == 1;
         sqlite3_finalize(stmt);
         RS_EDGE(reexport_path, "src.b.D.notify[Host]", "src.a.Runtime.execute");
@@ -12877,8 +13136,9 @@ static int check_rust_modtree_calls_in_both_modes(const char *root,
 TEST(pipeline_rust_captured_pattern_shadows_outer_type_and_binds_fields) {
     char tmp[256] = "/tmp/cbm_rust_captured_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "Cargo.toml",
-                    "[package]\nname = \"capture-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(
+        tmp, "Cargo.toml",
+        "[package]\nname = \"capture-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
                     "pub struct Leaf; impl Leaf { pub fn touch(&self) {} }\n"
                     "pub struct Inner { pub child: Leaf }\n"
@@ -12905,16 +13165,18 @@ TEST(pipeline_rust_inherent_typestate_candidates_are_not_chosen_by_order) {
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"state-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
-    write_temp_file(tmp, "src/lib.rs",
-                    "mod getter; mod setter; mod states; pub use states::{Get, Set};\n"
-                    "pub struct Address<T = Get>(pub T); pub struct Pair<T, S = Get>(pub T, pub S); pub struct Mixed<T, S>(pub T, pub S); pub struct Dependent<T = Get, S = T>(pub T, pub S);\n"
-                    "pub fn probe(a: Address<Set>) { a.name(1); }\n"
-                    "pub fn common<T: Clone>(a: Pair<T, Set>) { a.name(1); }\n"
-                    "pub fn wildcard<T: Clone>(a: Mixed<T, Get>) { a.name(); }\n"
-                    "pub fn defaulted(a: Address) { a.name(); }\n"
-                    "pub fn built() { Address::<Set>::new().name(1); }\n"
-                    "pub fn defaulted_pair<T: Clone>(a: Pair<T>) { a.name(); }\n"
-                    "pub fn dependent(a: Dependent) { a.name(); }\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "mod getter; mod setter; mod states; pub use states::{Get, Set};\n"
+        "pub struct Address<T = Get>(pub T); pub struct Pair<T, S = Get>(pub T, pub S); pub struct "
+        "Mixed<T, S>(pub T, pub S); pub struct Dependent<T = Get, S = T>(pub T, pub S);\n"
+        "pub fn probe(a: Address<Set>) { a.name(1); }\n"
+        "pub fn common<T: Clone>(a: Pair<T, Set>) { a.name(1); }\n"
+        "pub fn wildcard<T: Clone>(a: Mixed<T, Get>) { a.name(); }\n"
+        "pub fn defaulted(a: Address) { a.name(); }\n"
+        "pub fn built() { Address::<Set>::new().name(1); }\n"
+        "pub fn defaulted_pair<T: Clone>(a: Pair<T>) { a.name(); }\n"
+        "pub fn dependent(a: Dependent) { a.name(); }\n");
     write_temp_file(tmp, "src/states.rs", "pub struct Get; pub struct Set;\n");
     write_temp_file(tmp, "src/getter.rs",
                     "use crate::*;\n"
@@ -12924,25 +13186,37 @@ TEST(pipeline_rust_inherent_typestate_candidates_are_not_chosen_by_order) {
                     "impl Dependent<Get, Get> { pub fn name(&self) -> i32 { 0 } }\n");
     write_temp_file(tmp, "src/setter.rs",
                     "use crate::*; pub struct U;\n"
-                    "impl Address<Set> { pub fn new() -> Self { Address(Set) } pub fn name(&self, value: i32) {} }\n"
+                    "impl Address<Set> { pub fn new() -> Self { Address(Set) } pub fn name(&self, "
+                    "value: i32) {} }\n"
                     "impl<U: Clone> Pair<U, Set> { pub fn name(&self, value: i32) {} }\n"
                     "impl Mixed<Set, Set> { pub fn name(&self, value: i32) {} }\n"
                     "impl Dependent<Set, Set> { pub fn name(&self, value: i32) {} }\n");
     const RustModTreeCallCase cases[] = {
         {"getter is not a setter", "src.lib.probe", "src.getter.Address.name", false},
         {"proved setter argument selects setter", "src.lib.probe", "src.setter.Address.name", true},
-        {"common bounded parameters do not block getter rejection", "src.lib.common", "src.getter.Pair.name", false},
-        {"common bounded parameters retain selected setter", "src.lib.common", "src.setter.Pair.name", true},
-        {"bounded parameter matches unknown receiver argument", "src.lib.wildcard", "src.getter.Mixed.name", true},
-        {"other position rules out concrete candidate", "src.lib.wildcard", "src.setter.Mixed.name", false},
-        {"omitted argument uses source default", "src.lib.defaulted", "src.getter.Address.name", true},
+        {"common bounded parameters do not block getter rejection", "src.lib.common",
+         "src.getter.Pair.name", false},
+        {"common bounded parameters retain selected setter", "src.lib.common",
+         "src.setter.Pair.name", true},
+        {"bounded parameter matches unknown receiver argument", "src.lib.wildcard",
+         "src.getter.Mixed.name", true},
+        {"other position rules out concrete candidate", "src.lib.wildcard", "src.setter.Mixed.name",
+         false},
+        {"omitted argument uses source default", "src.lib.defaulted", "src.getter.Address.name",
+         true},
         {"source default excludes setter", "src.lib.defaulted", "src.setter.Address.name", false},
-        {"constructor Self retains written impl argument", "src.lib.built", "src.setter.Address.name", true},
-        {"constructor Self excludes declaration default", "src.lib.built", "src.getter.Address.name", false},
-        {"partial argument list fills default", "src.lib.defaulted_pair", "src.getter.Pair.name", true},
-        {"partial argument list excludes other state", "src.lib.defaulted_pair", "src.setter.Pair.name", false},
-        {"default refers to preceding argument", "src.lib.dependent", "src.getter.Dependent.name", true},
-        {"dependent default excludes other state", "src.lib.dependent", "src.setter.Dependent.name", false},
+        {"constructor Self retains written impl argument", "src.lib.built",
+         "src.setter.Address.name", true},
+        {"constructor Self excludes declaration default", "src.lib.built",
+         "src.getter.Address.name", false},
+        {"partial argument list fills default", "src.lib.defaulted_pair", "src.getter.Pair.name",
+         true},
+        {"partial argument list excludes other state", "src.lib.defaulted_pair",
+         "src.setter.Pair.name", false},
+        {"default refers to preceding argument", "src.lib.dependent", "src.getter.Dependent.name",
+         true},
+        {"dependent default excludes other state", "src.lib.dependent", "src.setter.Dependent.name",
+         false},
     };
     int mismatches = check_rust_modtree_calls_in_both_modes(tmp, cases, 14);
     th_rmtree(tmp);
@@ -12953,10 +13227,12 @@ TEST(pipeline_rust_inherent_typestate_candidates_are_not_chosen_by_order) {
 TEST(pipeline_rust_sole_generic_inherent_impl_accepts_bounded_arguments) {
     char tmp[256] = "/tmp/cbm_rust_specialized_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "Cargo.toml",
-                    "[package]\nname = \"specialized-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(
+        tmp, "Cargo.toml",
+        "[package]\nname = \"specialized-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
-                    "mod methods; #[derive(Clone)] pub struct A; #[derive(Clone)] pub struct B; pub struct W<T>(pub T);\n"
+                    "mod methods; #[derive(Clone)] pub struct A; #[derive(Clone)] pub struct B; "
+                    "pub struct W<T>(pub T);\n"
                     "pub fn good(w: W<A>) { w.hit(); }\n"
                     "pub fn wrong(w: W<B>) { w.hit(); }\n"
                     "pub fn unknown<T: Clone>(w: W<T>) { w.hit(); }\n");
@@ -12976,8 +13252,9 @@ TEST(pipeline_rust_sole_generic_inherent_impl_accepts_bounded_arguments) {
 TEST(pipeline_rust_method_syntax_cannot_select_associated_function) {
     char tmp[256] = "/tmp/cbm_rust_associated_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "Cargo.toml",
-                    "[package]\nname = \"associated-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(
+        tmp, "Cargo.toml",
+        "[package]\nname = \"associated-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
                     "pub struct W; impl W { pub fn copy(this: &Self) {} }\n"
                     "pub fn method(w: W) { w.copy(); }\n"
@@ -12995,8 +13272,9 @@ TEST(pipeline_rust_method_syntax_cannot_select_associated_function) {
 TEST(pipeline_rust_inherent_refusals_record_exact_stop_reasons) {
     char tmp[256] = "/tmp/cbm_rust_refusals_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "Cargo.toml",
-                    "[package]\nname = \"refusal-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(
+        tmp, "Cargo.toml",
+        "[package]\nname = \"refusal-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs",
                     "mod first; mod second; pub struct A; pub struct B;\n"
                     "pub struct W<T>(pub T); pub struct S<T>(pub T); pub struct C; pub struct D;\n"
@@ -13014,7 +13292,8 @@ TEST(pipeline_rust_inherent_refusals_record_exact_stop_reasons) {
                     "impl W<A> { pub fn hit(&self) {} }\n"
                     "impl S<A> { pub fn hit(&self) {} }\n");
     write_temp_file(tmp, "src/second.rs",
-                    "use crate::{B, D, W, S}; impl W<B> { pub fn hit(&self) {} } impl S<D> { pub fn hit(&self) {} }\n");
+                    "use crate::{B, D, W, S}; impl W<B> { pub fn hit(&self) {} } impl S<D> { pub "
+                    "fn hit(&self) {} }\n");
     char db[512];
     snprintf(db, sizeof(db), "%s/refusals.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
@@ -13027,17 +13306,16 @@ TEST(pipeline_rust_inherent_refusals_record_exact_stop_reasons) {
         int line;
         const char *reason;
     } expected[] = {
-        {4, "inherent_receiver_not_proven"},
-        {5, "inherent_receiver_mismatch"},
-        {6, "inherent_receiver_not_proven"},
-        {7, "inherent_associated_function"},
+        {4, "inherent_receiver_not_proven"},  {5, "inherent_receiver_mismatch"},
+        {6, "inherent_receiver_not_proven"},  {7, "inherent_associated_function"},
         {11, "inherent_receiver_not_proven"},
     };
     sqlite3_stmt *stmt = NULL;
     ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
                                  "SELECT count(*) FROM unresolved_sites WHERE kind='call' "
                                  "AND file_path='src/lib.rs' AND line=?1 AND reason=?2",
-                                 -1, &stmt, NULL), SQLITE_OK);
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
     for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
         sqlite3_bind_int(stmt, 1, expected[i].line);
         sqlite3_bind_text(stmt, 2, expected[i].reason, -1, SQLITE_STATIC);
@@ -13056,19 +13334,21 @@ TEST(pipeline_rust_generic_self_proves_only_its_enclosing_impl_methods) {
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Cargo.toml",
                     "[package]\nname = \"self-proof\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
-    write_temp_file(tmp, "src/lib.rs",
-                    "pub struct A; pub struct W<T>(pub T);\n"
-                    "impl<T: Clone> W<T> {\n"
-                    " pub fn own(&self) {}\n"
-                    " pub fn run(&self) { self.own(); self.specialized(); }\n"
-                    "}\n"
-                    "impl W<A> { pub fn specialized(&self) {} }\n"
-                    "pub struct B; impl W<B> { pub fn specialized(&self) {} }\n"
-                    "pub trait Tr { fn specialized(&self); }\n"
-                    "impl<T: Clone> Tr for W<T> { fn specialized(&self) { self.specialized(); } }\n");
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub struct A; pub struct W<T>(pub T);\n"
+        "impl<T: Clone> W<T> {\n"
+        " pub fn own(&self) {}\n"
+        " pub fn run(&self) { self.own(); self.specialized(); }\n"
+        "}\n"
+        "impl W<A> { pub fn specialized(&self) {} }\n"
+        "pub struct B; impl W<B> { pub fn specialized(&self) {} }\n"
+        "pub trait Tr { fn specialized(&self); }\n"
+        "impl<T: Clone> Tr for W<T> { fn specialized(&self) { self.specialized(); } }\n");
     const RustModTreeCallCase cases[] = {
         {"own impl establishes its method", "src.lib.W.run", "src.lib.W.own", true},
-        {"another impl is not established by self", "src.lib.W.run", "src.lib.W.specialized", false},
+        {"another impl is not established by self", "src.lib.W.run", "src.lib.W.specialized",
+         false},
         {"a trait body cannot prove an inherent impl", "src.lib.W.specialized[Tr]",
          "src.lib.W.specialized", false},
     };
@@ -13106,25 +13386,27 @@ TEST(pipeline_rust_type_headed_call_prefers_crossfile_inherent_method) {
 TEST(pipeline_rust_reference_and_type_headed_recursion_in_both_modes) {
     char tmp[256] = "/tmp/cbm_rs_proof_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "lib.rs",
-                    "pub struct Inner;\n"
-                    "impl Inner { pub fn ping(&self) {} }\n"
-                    "pub struct Managed { v: Inner }\n"
-                    "impl std::ops::Deref for Managed {\n"
-                    " type Target = Inner;\n"
-                    " fn deref(&self) -> &Inner { &self.v }\n"
-                    "}\n"
-                    "impl Managed { pub fn ping(&self) { (**self).ping(); } }\n"
-                    "pub trait Tr { fn reference(&self); }\n"
-                    "impl<T: Tr + ?Sized> Tr for &T { fn reference(&self) { self.reference(); } }\n"
-                    "pub trait AliasTr { fn alias(&self); }\n"
-                    "impl<T: AliasTr + ?Sized> AliasTr for &T { fn alias(&self) { let same = self; same.alias(); } }\n"
-                    "pub trait Generic { fn recurse(&self); }\n"
-                    "impl<T> Generic for T { fn recurse(&self) { T::recurse(self); } }\n"
-                    "pub struct S;\n"
-                    "impl S { pub fn concrete(&self) { S::concrete(self); } }\n"
-                    "pub trait Typed { fn typed(self: &Self); }\n"
-                    "impl<T: Typed + ?Sized> Typed for &T { fn typed(self: &Self) { self.typed(); } }\n");
+    write_temp_file(
+        tmp, "lib.rs",
+        "pub struct Inner;\n"
+        "impl Inner { pub fn ping(&self) {} }\n"
+        "pub struct Managed { v: Inner }\n"
+        "impl std::ops::Deref for Managed {\n"
+        " type Target = Inner;\n"
+        " fn deref(&self) -> &Inner { &self.v }\n"
+        "}\n"
+        "impl Managed { pub fn ping(&self) { (**self).ping(); } }\n"
+        "pub trait Tr { fn reference(&self); }\n"
+        "impl<T: Tr + ?Sized> Tr for &T { fn reference(&self) { self.reference(); } }\n"
+        "pub trait AliasTr { fn alias(&self); }\n"
+        "impl<T: AliasTr + ?Sized> AliasTr for &T { fn alias(&self) { let same = self; "
+        "same.alias(); } }\n"
+        "pub trait Generic { fn recurse(&self); }\n"
+        "impl<T> Generic for T { fn recurse(&self) { T::recurse(self); } }\n"
+        "pub struct S;\n"
+        "impl S { pub fn concrete(&self) { S::concrete(self); } }\n"
+        "pub trait Typed { fn typed(self: &Self); }\n"
+        "impl<T: Typed + ?Sized> Typed for &T { fn typed(self: &Self) { self.typed(); } }\n");
     for (int i = 0; i < 52; i++) {
         char name[64];
         snprintf(name, sizeof(name), "pad_%02d.rs", i);
@@ -13821,7 +14103,8 @@ static int check_rust_receiver_calls(const char *source, const RustReceiverCase 
 TEST(pipeline_rust_std_inventory_listed_complete_and_scope_verdicts_in_both_modes) {
     const char *source =
         "pub mod ext {\n"
-        " pub trait VecExt { fn inventory_complete_absent(&self); fn reserve(&mut self, n: usize); }\n"
+        " pub trait VecExt { fn inventory_complete_absent(&self); fn reserve(&mut self, n: usize); "
+        "}\n"
         " impl VecExt for Vec<u32> {\n"
         "  fn inventory_complete_absent(&self) {}\n"
         "  fn reserve(&mut self, _: usize) {}\n"
@@ -13855,7 +14138,8 @@ TEST(pipeline_rust_std_inventory_deref_and_uncertain_verdicts_in_both_modes) {
         " pub trait LocalExt { fn inventory_project_pointee(&self); }\n"
         " impl LocalExt for Local { fn inventory_project_pointee(&self) {} }\n"
         " pub trait VecExt { fn inventory_std_pointee(&self); fn reserve(&mut self, n: usize); }\n"
-        " impl VecExt for Vec<u32> { fn inventory_std_pointee(&self) {} fn reserve(&mut self, _: usize) {} }\n"
+        " impl VecExt for Vec<u32> { fn inventory_std_pointee(&self) {} fn reserve(&mut self, _: "
+        "usize) {} }\n"
         " pub trait GenericExt { fn inventory_unknown_pointee(&self); }\n"
         " impl<T> GenericExt for Arc<T> { fn inventory_unknown_pointee(&self) {} }\n"
         " pub trait AnyExt { fn inventory_incomplete(&self); }\n"
@@ -13936,12 +14220,12 @@ TEST(pipeline_rust_trait_ufcs_preserves_reference_self) {
                          "impl Generic for Adapter { fn read(&mut self) -> u8 { 3 } }\n"
                          "impl<T: Generic> Generic for &mut T { fn read(&mut self) -> u8 { 4 } }\n"
                          "pub fn unproved(mut x: Adapter) -> u8 { Generic::read(&mut &mut x) }\n"
-        "pub struct H;\n"
-        "impl std::hash::Hasher for H {\n"
-        " fn finish(&self) -> u64 { 5 }\n"
-        " fn write(&mut self, bytes: &[u8]) {}\n"
-        "}\n"
-        "pub fn external(h: H) -> u64 { core::hash::Hasher::finish(&h) }\n";
+                         "pub struct H;\n"
+                         "impl std::hash::Hasher for H {\n"
+                         " fn finish(&self) -> u64 { 5 }\n"
+                         " fn write(&mut self, bytes: &[u8]) {}\n"
+                         "}\n"
+                         "pub fn external(h: H) -> u64 { core::hash::Hasher::finish(&h) }\n";
     const RustReceiverCase cases[] = {
         {"forward", 4, NULL},
         {"direct", 3, NULL},
@@ -14320,11 +14604,14 @@ static int check_rust_expression_results(bool sequential, int scenario) {
         "impl Left { pub fn result(&self) {} }\n"
         "impl Product { pub fn result(&self) {} }\n"
         "impl Alternate { pub fn result(&self) {} }\n"
-        "impl Mul<Right> for Left { type Output = Product; fn mul(self, _: Right) -> Product { Product } }\n"
+        "impl Mul<Right> for Left { type Output = Product; fn mul(self, _: Right) -> Product { "
+        "Product } }\n"
         "pub fn product(x: Left, y: Right) { let z = x * y; z.result(); }\n"
-        "impl Mul<Left> for Left { type Output = Alternate; fn mul(self, _: Left) -> Alternate { Alternate } }\n"
+        "impl Mul<Left> for Left { type Output = Alternate; fn mul(self, _: Left) -> Alternate { "
+        "Alternate } }\n"
         "pub fn other_rhs(x: Left, y: Left) { let z = x * y; z.result(); }\n"
-        "impl Mul<f64> for Left { type Output = Product; fn mul(self, _: f64) -> Product { Product } }\n"
+        "impl Mul<f64> for Left { type Output = Product; fn mul(self, _: f64) -> Product { Product "
+        "} }\n"
         "pub fn explicit_literal(x: Left) { (x * 1f64).result(); }\n"
         "pub fn unsupported(x: std::time::Duration, y: u32) { let z = x * y; z.as_secs(); }\n",
         "pub struct Entity; impl Entity { pub fn iter(&self) {} }\n"
@@ -14338,18 +14625,23 @@ static int check_rust_expression_results(bool sequential, int scenario) {
         "pub fn array(v: [Entity; 2], i: usize) { v[i].iter(); }\n"
         "pub type Slot = usize; pub fn alias_index(v: Vec<Entity>, i: Slot) { v[i - 1].iter(); }\n"
         "pub fn boxed(v: Box<[Entity]>, i: usize) { v[i].iter(); }\n"
-        "pub fn opaque<I: std::slice::SliceIndex<[Entity], Output = [Entity]>>(v: Vec<Entity>, i: I) { v[i].iter(); }\n"
-        "pub fn opaque_slice<I: std::slice::SliceIndex<[Entity], Output = [Entity]>>(v: &[Entity], i: I) { v[i].iter(); }\n"
-        "pub fn const_index<const N: usize>(v: [Entity; N]) { for i in (0..N).rev() { v[i].iter(); } }\n"
+        "pub fn opaque<I: std::slice::SliceIndex<[Entity], Output = [Entity]>>(v: Vec<Entity>, i: "
+        "I) { v[i].iter(); }\n"
+        "pub fn opaque_slice<I: std::slice::SliceIndex<[Entity], Output = [Entity]>>(v: &[Entity], "
+        "i: I) { v[i].iter(); }\n"
+        "pub fn const_index<const N: usize>(v: [Entity; N]) { for i in (0..N).rev() { v[i].iter(); "
+        "} }\n"
         "pub struct ArrayHolder<const N: usize> { pub values: [Entity; N] }\n"
-        "impl<const N: usize> ArrayHolder<N> { pub fn const_impl(&self) { for i in (0..N).rev() { self.values[i].iter(); } } }\n"
+        "impl<const N: usize> ArrayHolder<N> { pub fn const_impl(&self) { for i in (0..N).rev() { "
+        "self.values[i].iter(); } } }\n"
         "pub struct Window; pub struct BorrowedWindow; pub struct Container;\n"
         "impl Window { pub fn result(&self) {} }\n"
         "impl BorrowedWindow { pub fn result(&self) {} }\n"
         "impl std::ops::Index<std::ops::Range<usize>> for Container { type Output = Window;\n"
         "fn index(&self, _: std::ops::Range<usize>) -> &Window { todo!() } }\n"
         "pub fn custom(c: Container) { c[1..2].result(); }\n"
-        "impl std::ops::Index<std::ops::Range<usize>> for &Container { type Output = BorrowedWindow;\n"
+        "impl std::ops::Index<std::ops::Range<usize>> for &Container { type Output = "
+        "BorrowedWindow;\n"
         "fn index(&self, _: std::ops::Range<usize>) -> &BorrowedWindow { todo!() } }\n"
         "pub fn borrowed(c: &Container) { c[1..2].result(); }\n",
         "pub struct IntoIter; impl Default for IntoIter { fn default() -> Self { Self } }\n"
@@ -14367,13 +14659,13 @@ static int check_rust_expression_results(bool sequential, int scenario) {
         "pub fn typed_closure() { let f = |value: Item| value; f(Item).result(); }\n"
         "pub struct Model { pub n: u8 } impl Model { pub fn result(&self) {} }\n"
         "pub struct Other; impl Other { pub fn result(&self) {} }\n"
-        "pub fn shadow() { let f = |Model| Model; f(Other).result(); }\n"
-    };
+        "pub fn shadow() { let f = |Model| Model; f(Other).result(); }\n"};
     char tmp[512];
     const char *temp_root = getenv("TMPDIR");
     snprintf(tmp, sizeof(tmp), "%s/expression_XXXXXX", temp_root ? temp_root : "/tmp");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"expr\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"expr\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     write_temp_file(tmp, "src/lib.rs", sources[scenario]);
     if (!sequential) {
         for (int i = 0; i < 55; i++) {
@@ -14384,8 +14676,10 @@ static int check_rust_expression_results(bool sequential, int scenario) {
     }
     const char *previous = getenv("CBM_INDEX_SINGLE_THREAD");
     char *saved = previous ? strdup(previous) : NULL;
-    if (sequential) cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
-    else cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    if (sequential)
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
     char db[512];
     snprintf(db, sizeof(db), "%s/graph.db", tmp);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
@@ -14396,8 +14690,10 @@ static int check_rust_expression_results(bool sequential, int scenario) {
         const char *project = cbm_pipeline_project_name(pipeline);
         char caller[512], target[512], wrong[512];
         snprintf(target, sizeof(target), "%s.src.lib.%s", project,
-                 scenario == 0 ? "Product.result" : scenario == 1 ? "Entity.iter" :
-                 scenario == 2 ? "IntoIter.default[Default]" : "Item.result");
+                 scenario == 0   ? "Product.result"
+                 : scenario == 1 ? "Entity.iter"
+                 : scenario == 2 ? "IntoIter.default[Default]"
+                                 : "Item.result");
         snprintf(wrong, sizeof(wrong), "%s.src.lib.Left.result", project);
         if (scenario == 0) {
             snprintf(caller, sizeof(caller), "%s.src.lib.product", project);
@@ -14412,7 +14708,10 @@ static int check_rust_expression_results(bool sequential, int scenario) {
             correct = correct && exact_call_qns_exist(store, project, caller, target) &&
                       !exact_call_qns_exist(store, project, caller, wrong);
         } else if (scenario == 1) {
-            static const char *const scalar_callers[] = {"element", "deque", "deque_alias", "slice", "array", "boxed", "const_index", "ArrayHolder.const_impl", "alias_index"};
+            static const char *const scalar_callers[] = {
+                "element",    "deque", "deque_alias", "slice",
+                "array",      "boxed", "const_index", "ArrayHolder.const_impl",
+                "alias_index"};
             correct = true;
             for (int i = 0; i < 9; i++) {
                 snprintf(caller, sizeof(caller), "%s.src.lib.%s", project, scalar_callers[i]);
@@ -14439,7 +14738,8 @@ static int check_rust_expression_results(bool sequential, int scenario) {
             snprintf(caller, sizeof(caller), "%s.src.lib.local_default", project);
             correct = correct && exact_call_qns_exist(store, project, caller, target);
         } else {
-            static const char *const callers[] = {"parameter", "field", "alias", "returned", "closure", "typed_closure"};
+            static const char *const callers[] = {"parameter", "field",   "alias",
+                                                  "returned",  "closure", "typed_closure"};
             correct = true;
             for (int i = 0; i < 6; i++) {
                 snprintf(caller, sizeof(caller), "%s.src.lib.%s", project, callers[i]);
@@ -14450,64 +14750,107 @@ static int check_rust_expression_results(bool sequential, int scenario) {
             correct = correct && !exact_call_qns_exist(store, project, caller, target);
             sqlite3_stmt *stmt = NULL;
             int count = 0;
-            if (sqlite3_prepare_v2(cbm_store_get_db(store),
-                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.shadow' AND name='result' AND reason='unknown_receiver_type'",
-                -1, &stmt, NULL) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
+            if (sqlite3_prepare_v2(
+                    cbm_store_get_db(store),
+                    "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.shadow' AND "
+                    "name='result' AND reason='unknown_receiver_type'",
+                    -1, &stmt, NULL) == SQLITE_OK &&
+                sqlite3_step(stmt) == SQLITE_ROW)
                 count = sqlite3_column_int(stmt, 0);
             sqlite3_finalize(stmt);
             correct = correct && count == 1;
         }
         if (scenario < 3) {
-            const char *sql = scenario == 0 ?
-                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.unsupported' AND kind='call' AND reason='unknown_receiver_type'" :
-                scenario == 1 ?
-                "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.literal' OR caller LIKE '%.bound') AND kind='call'" :
-                "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.foreign_default' AND name='default' AND kind='call' AND reason='default_impl_not_proven'";
+            const char *sql =
+                scenario == 0 ? "SELECT count(*) FROM unresolved_sites WHERE caller LIKE "
+                                "'%.unsupported' AND kind='call' AND reason='unknown_receiver_type'"
+                : scenario == 1
+                    ? "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.literal' OR "
+                      "caller LIKE '%.bound') AND kind='call'"
+                    : "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.foreign_default' "
+                      "AND name='default' AND kind='call' AND reason='default_impl_not_proven'";
             sqlite3_stmt *stmt = NULL;
             int count = 0;
             if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK &&
-                sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+                sqlite3_step(stmt) == SQLITE_ROW)
+                count = sqlite3_column_int(stmt, 0);
             sqlite3_finalize(stmt);
             correct = correct && count == (scenario == 1 ? 2 : 1);
             if (scenario == 0 || scenario == 1) {
                 count = -1;
-                const char *stop = scenario == 0 ?
-                    "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.unsupported' AND reason='operator_output_not_proven'" :
-                    "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.opaque' OR caller LIKE '%.opaque_slice') AND reason='index_output_not_proven'";
-                if (sqlite3_prepare_v2(cbm_store_get_db(store), stop, -1, &stmt, NULL) == SQLITE_OK &&
-                    sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+                const char *stop =
+                    scenario == 0
+                        ? "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.unsupported' "
+                          "AND reason='operator_output_not_proven'"
+                        : "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.opaque' OR "
+                          "caller LIKE '%.opaque_slice') AND reason='index_output_not_proven'";
+                if (sqlite3_prepare_v2(cbm_store_get_db(store), stop, -1, &stmt, NULL) ==
+                        SQLITE_OK &&
+                    sqlite3_step(stmt) == SQLITE_ROW)
+                    count = sqlite3_column_int(stmt, 0);
                 sqlite3_finalize(stmt);
                 correct = correct && count == (scenario == 1 ? 2 : 1);
             }
             if (scenario == 1) {
                 count = -1;
-                if (sqlite3_prepare_v2(cbm_store_get_db(store),
-                    "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.custom' OR caller LIKE '%.borrowed') AND reason='index_output_not_proven'",
-                    -1, &stmt, NULL) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
+                if (sqlite3_prepare_v2(
+                        cbm_store_get_db(store),
+                        "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE '%.custom' OR "
+                        "caller LIKE '%.borrowed') AND reason='index_output_not_proven'",
+                        -1, &stmt, NULL) == SQLITE_OK &&
+                    sqlite3_step(stmt) == SQLITE_ROW)
                     count = sqlite3_column_int(stmt, 0);
                 sqlite3_finalize(stmt);
                 correct = correct && count == 0;
             }
         }
     }
-    if (store) cbm_store_close(store);
+    if (store)
+        cbm_store_close(store);
     cbm_pipeline_free(pipeline);
-    if (saved) { cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved, 1); free(saved); }
-    else cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    if (saved) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved, 1);
+        free(saved);
+    } else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
     th_rmtree(tmp);
     ASSERT_EQ(status, 0);
     ASSERT_TRUE(correct);
     return 0;
 }
 
-TEST(pipeline_rust_operator_result_sequential) { ASSERT_EQ(check_rust_expression_results(true, 0), 0); PASS(); }
-TEST(pipeline_rust_operator_result_parallel) { ASSERT_EQ(check_rust_expression_results(false, 0), 0); PASS(); }
-TEST(pipeline_rust_range_index_result_sequential) { ASSERT_EQ(check_rust_expression_results(true, 1), 0); PASS(); }
-TEST(pipeline_rust_range_index_result_parallel) { ASSERT_EQ(check_rust_expression_results(false, 1), 0); PASS(); }
-TEST(pipeline_rust_default_expected_identity_sequential) { ASSERT_EQ(check_rust_expression_results(true, 2), 0); PASS(); }
-TEST(pipeline_rust_default_expected_identity_parallel) { ASSERT_EQ(check_rust_expression_results(false, 2), 0); PASS(); }
-TEST(pipeline_rust_callable_result_sequential) { ASSERT_EQ(check_rust_expression_results(true, 3), 0); PASS(); }
-TEST(pipeline_rust_callable_result_parallel) { ASSERT_EQ(check_rust_expression_results(false, 3), 0); PASS(); }
+TEST(pipeline_rust_operator_result_sequential) {
+    ASSERT_EQ(check_rust_expression_results(true, 0), 0);
+    PASS();
+}
+TEST(pipeline_rust_operator_result_parallel) {
+    ASSERT_EQ(check_rust_expression_results(false, 0), 0);
+    PASS();
+}
+TEST(pipeline_rust_range_index_result_sequential) {
+    ASSERT_EQ(check_rust_expression_results(true, 1), 0);
+    PASS();
+}
+TEST(pipeline_rust_range_index_result_parallel) {
+    ASSERT_EQ(check_rust_expression_results(false, 1), 0);
+    PASS();
+}
+TEST(pipeline_rust_default_expected_identity_sequential) {
+    ASSERT_EQ(check_rust_expression_results(true, 2), 0);
+    PASS();
+}
+TEST(pipeline_rust_default_expected_identity_parallel) {
+    ASSERT_EQ(check_rust_expression_results(false, 2), 0);
+    PASS();
+}
+TEST(pipeline_rust_callable_result_sequential) {
+    ASSERT_EQ(check_rust_expression_results(true, 3), 0);
+    PASS();
+}
+TEST(pipeline_rust_callable_result_parallel) {
+    ASSERT_EQ(check_rust_expression_results(false, 3), 0);
+    PASS();
+}
 
 SUITE(pipeline_expression) {
     RUN_TEST(pipeline_rust_operator_result_sequential);
@@ -14758,14 +15101,22 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
         "struct Owner; #[cfg(unix)] impl Owner { fn read(&self) {} } #[cfg(windows)] impl Owner { "
         "fn read(&self) {} } fn reference() { let _ = Owner::read; }\n",
         "use outside::*; use support::Item as Imported; mod child;\n",
-        "struct Same; impl Same { const LIMIT: u8 = 1; } mod child { pub struct Same; impl Same { pub const LIMIT: u8 = 2; } } fn reference() { let _ = child::Same::LIMIT; } fn generic<Same>() { let _ = Same::LIMIT; }\n",
-        "struct Owner; trait First { fn read(); } impl First for Owner { fn read() {} } mod child { use crate::Owner; trait Second { fn read(); } impl Second for Owner { fn read() {} } } fn reference() { let _ = Owner::read; }\n",
+        "struct Same; impl Same { const LIMIT: u8 = 1; } mod child { pub struct Same; impl Same { "
+        "pub const LIMIT: u8 = 2; } } fn reference() { let _ = child::Same::LIMIT; } fn "
+        "generic<Same>() { let _ = Same::LIMIT; }\n",
+        "struct Owner; trait First { fn read(); } impl First for Owner { fn read() {} } mod child "
+        "{ use crate::Owner; trait Second { fn read(); } impl Second for Owner { fn read() {} } } "
+        "fn reference() { let _ = Owner::read; }\n",
 
         "fn consume(_: dep::Item) {}\n",
-        "enum E { V } fn decode<T>() {} fn consume() { assert!({ decode::<E>(); true }); } fn generic<E>() { assert!({ decode::<E>(); true }); } fn comparison() { let E = 3; assert!({ decode::<Vec<u8>>(); 2 < E }); }\n",
+        "enum E { V } fn decode<T>() {} fn consume() { assert!({ decode::<E>(); true }); } fn "
+        "generic<E>() { assert!({ decode::<E>(); true }); } fn comparison() { let E = 3; assert!({ "
+        "decode::<Vec<u8>>(); 2 < E }); }\n",
 
-        "fn originator() {} fn loop_local() { for originator in [1u8] { let _ = originator; } } fn function_value() { let _ = originator; }\n",
-        "fn cell_id() {} struct Record { cell_id: u8 } fn field_label() { assert!(matches!(Record { cell_id: 1 }, Record { cell_id: 1 })); } fn function_value() { let _ = cell_id; }\n",
+        "fn originator() {} fn loop_local() { for originator in [1u8] { let _ = originator; } } fn "
+        "function_value() { let _ = originator; }\n",
+        "fn cell_id() {} struct Record { cell_id: u8 } fn field_label() { assert!(matches!(Record "
+        "{ cell_id: 1 }, Record { cell_id: 1 })); } fn function_value() { let _ = cell_id; }\n",
 
         "const KEY: &str = \"key\"; fn json_key() { let _ = serde_json::json!({ KEY: 1 }); }\n",
 
@@ -14788,7 +15139,8 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
         "fn quoted_arm() { choose!(quote, helper()); } "
         "fn kept() { choose!(keep, helper()); } fn both() { choose!(both, helper()); } "
         "fn twice() { choose!(twice, helper()); }\n",
-        "#![feature(log_syntax)]\nfn helper() {} fn literal() { let _ = std::concat!(stringify!(helper)); } "
+        "#![feature(log_syntax)]\nfn helper() {} fn literal() { let _ = "
+        "std::concat!(stringify!(helper)); } "
         "fn alias() { use std::stringify as quote; let _ = quote!(helper()); } "
         "fn logged() { std::log_syntax!(helper()); } "
         "fn standard_root_alias() { use std as base; base::stringify!(helper()); } "
@@ -14799,10 +15151,15 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
     };
     write_temp_file(tmp, "src/lib.rs", sources[scenario]);
     if (scenario == 25) {
-        write_temp_file(tmp, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"consumer\"]\n[workspace.dependencies]\ndep = { path = \"dep\" }\n");
-        write_temp_file(tmp, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        write_temp_file(tmp, "Cargo.toml",
+                        "[workspace]\nmembers = [\"dep\", "
+                        "\"consumer\"]\n[workspace.dependencies]\ndep = { path = \"dep\" }\n");
+        write_temp_file(tmp, "dep/Cargo.toml",
+                        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
         write_temp_file(tmp, "dep/src/lib.rs", "pub struct Item;\n");
-        write_temp_file(tmp, "consumer/Cargo.toml", "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep.workspace = true\n");
+        write_temp_file(tmp, "consumer/Cargo.toml",
+                        "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = "
+                        "\"2021\"\n[dependencies]\ndep.workspace = true\n");
         write_temp_file(tmp, "consumer/src/lib.rs", sources[scenario]);
     }
     if (scenario == 26 || scenario == 27) {
@@ -14829,8 +15186,11 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
         write_temp_file(tmp, "src/child.rs", "use super::*; fn consume(_: support::Item) {}\n");
     }
     if (scenario == 20) {
-        write_temp_file(tmp, "Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies.dep]\npath = \"dep\"\npackage = \"actual\"\n");
-        write_temp_file(tmp, "dep/Cargo.toml", "[package]\nname = \"actual\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        write_temp_file(tmp, "Cargo.toml",
+                        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = "
+                        "\"2021\"\n[dependencies.dep]\npath = \"dep\"\npackage = \"actual\"\n");
+        write_temp_file(tmp, "dep/Cargo.toml",
+                        "[package]\nname = \"actual\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
         write_temp_file(tmp, "dep/src/lib.rs", "pub struct Item;\n");
     }
     if (scenario == 13)
@@ -14879,7 +15239,8 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
             break;
         case 5:
             correct =
-                rust_inline_variable_edges("src.schema.proto", "src.schema.proto.Loader", store, project) &&
+                rust_inline_variable_edges("src.schema.proto", "src.schema.proto.Loader", store,
+                                           project) &&
                 !rust_inline_variable_edges("src.schema.proto", "src.lib.Loader", store, project);
             break;
         case 6:
@@ -14937,15 +15298,18 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
                                                  project);
             break;
         case 18:
-            correct = rust_inline_variable_edges("src.lib.reference", "src.lib.child.Same.LIMIT", store, project) &&
-                      !rust_inline_variable_edges("src.lib.reference", "src.lib.Same.LIMIT", store, project) &&
+            correct = rust_inline_variable_edges("src.lib.reference", "src.lib.child.Same.LIMIT",
+                                                 store, project) &&
+                      !rust_inline_variable_edges("src.lib.reference", "src.lib.Same.LIMIT", store,
+                                                  project) &&
                       !cross_file_edge_exists(store, project, "generic", "LIMIT", "USAGE");
             break;
         case 19:
             correct = !cross_file_edge_exists(store, project, "reference", "read", "USAGE");
             break;
         case 20:
-            correct = rust_inline_variable_edges("src.lib.consume", "dep.src.lib.Item", store, project);
+            correct =
+                rust_inline_variable_edges("src.lib.consume", "dep.src.lib.Item", store, project);
             break;
         case 21:
             correct = rust_inline_variable_edges("src.lib.consume", "src.lib.E", store, project) &&
@@ -14954,13 +15318,16 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
             break;
 
         case 22:
-            correct = !cross_file_edge_exists(store, project, "loop_local", "originator", "USAGE") &&
-                      cross_file_edge_exists(store, project, "function_value", "originator", "USAGE");
+            correct =
+                !cross_file_edge_exists(store, project, "loop_local", "originator", "USAGE") &&
+                cross_file_edge_exists(store, project, "function_value", "originator", "USAGE");
             break;
         case 23:
-            correct = !rust_inline_variable_edges("src.lib.field_label", "src.lib.cell_id", store, project);
+            correct = !rust_inline_variable_edges("src.lib.field_label", "src.lib.cell_id", store,
+                                                  project);
             /* The same spelling is still a function value outside the label. */
-            correct = correct && cross_file_edge_exists(store, project, "function_value", "cell_id", "USAGE");
+            correct = correct &&
+                      cross_file_edge_exists(store, project, "function_value", "cell_id", "USAGE");
             break;
 
         case 24:
@@ -15000,18 +15367,18 @@ static int check_rust_occurrence_proof(bool sequential, int scenario) {
                       cross_file_edge_exists(store, project, "both", "helper", "USAGE");
             break;
         case 31:
-            correct = !cross_file_edge_exists(store, project, "literal", "helper", "USAGE") &&
-                      !cross_file_edge_exists(store, project, "alias", "helper", "USAGE") &&
-                      !cross_file_edge_exists(store, project, "logged", "helper", "USAGE") &&
-                      !cross_file_edge_exists(store, project, "standard_root_alias", "helper", "USAGE") &&
-                      cross_file_edge_exists(store, project, "shadowed", "helper", "USAGE");
+            correct =
+                !cross_file_edge_exists(store, project, "literal", "helper", "USAGE") &&
+                !cross_file_edge_exists(store, project, "alias", "helper", "USAGE") &&
+                !cross_file_edge_exists(store, project, "logged", "helper", "USAGE") &&
+                !cross_file_edge_exists(store, project, "standard_root_alias", "helper", "USAGE") &&
+                cross_file_edge_exists(store, project, "shadowed", "helper", "USAGE");
             break;
 
         case 32:
             correct = cross_file_edge_exists(store, project, "parsed", "Marker", "USAGE") &&
                       cross_file_edge_exists(store, project, "nested", "Marker", "USAGE");
             break;
-
         }
     }
     if (store)
@@ -15244,21 +15611,23 @@ static int check_rust_block_scope(int scenario) {
             correct = sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0;
         sqlite3_finalize(stmt);
         sql = scenario == 13
-            ? "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='path' "
-              "AND reason='trait_receiver_shape'"
-            : "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='path' "
-              "AND reason='unsupported_receiver_shape'";
+                  ? "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='path' "
+                    "AND reason='trait_receiver_shape'"
+                  : "SELECT count(*) FROM unresolved_sites WHERE kind='call' AND name='path' "
+                    "AND reason='unsupported_receiver_shape'";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
-            correct = correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
+            correct =
+                correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1;
         else
             correct = false;
         sqlite3_finalize(stmt);
     } else if (scenario == 14) {
         sqlite3_stmt *stmt = NULL;
-        const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-                          "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND t.name='default' "
-                          "AND ((s.name='first' AND t.start_line=2) OR "
-                          "(s.name='second' AND t.start_line=3))";
+        const char *sql =
+            "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+            "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND t.name='default' "
+            "AND ((s.name='first' AND t.start_line=2) OR "
+            "(s.name='second' AND t.start_line=3))";
         correct = false;
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
             correct = sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 2;
@@ -15268,39 +15637,45 @@ static int check_rust_block_scope(int scenario) {
               "AND ((s.name='first' AND t.start_line!=2) OR "
               "(s.name='second' AND t.start_line!=3))";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
-            correct = correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0;
+            correct =
+                correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0;
         else
             correct = false;
         sqlite3_finalize(stmt);
     } else if (scenario >= 6) {
         sqlite3_stmt *stmt = NULL;
-        const char *sql = scenario == 7
-            ? "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-              "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
-              "((s.name='caller' AND t.name='read' AND t.start_line=2) OR "
-              "(s.name='read' AND t.qualified_name LIKE '%.Output.target') OR "
-              "(s.name='global_call' AND t.name='read' AND t.start_line=1))"
-            : "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-              "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='caller' "
-              "AND t.name IN ('target','new') AND t.start_line=2";
+        const char *sql =
+            scenario == 7
+                ? "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                  "((s.name='caller' AND t.name='read' AND t.start_line=2) OR "
+                  "(s.name='read' AND t.qualified_name LIKE '%.Output.target') OR "
+                  "(s.name='global_call' AND t.name='read' AND t.start_line=1))"
+                : "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='caller' "
+                  "AND t.name IN ('target','new') AND t.start_line=2";
         correct = false;
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
             correct = sqlite3_step(stmt) == SQLITE_ROW &&
-                      sqlite3_column_int(stmt, 0) == (scenario == 7 ? 3 : (scenario == 8 || scenario == 10 || scenario == 12) ? 2 : 1);
+                      sqlite3_column_int(stmt, 0) ==
+                          (scenario == 7                                         ? 3
+                           : (scenario == 8 || scenario == 10 || scenario == 12) ? 2
+                                                                                 : 1);
         sqlite3_finalize(stmt);
         sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
               "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='caller' "
               "AND t.name IN ('target','new','read') AND t.start_line=1";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
-            correct = correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0;
+            correct =
+                correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0;
         else
             correct = false;
         sqlite3_finalize(stmt);
-        sql = scenario == 7
-            ? "SELECT count(*) FROM nodes WHERE label='Struct' AND name='Local'"
-            : "SELECT count(*) FROM nodes WHERE label='Struct' AND name='Inner'";
+        sql = scenario == 7 ? "SELECT count(*) FROM nodes WHERE label='Struct' AND name='Local'"
+                            : "SELECT count(*) FROM nodes WHERE label='Struct' AND name='Inner'";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK)
-            correct = correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 2;
+            correct =
+                correct && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 2;
         else
             correct = false;
         sqlite3_finalize(stmt);
@@ -15942,8 +16317,7 @@ TEST(pipeline_rust_guard_mutable_value_precedence) {
     write_rust_pad_files(tmp, 52);
     const RustModTreeCallCase cases[] = {
         {"mutable receiver value unproved", "src.lib.probe", "src.lib.S.go", false},
-        {"mutable receiver selects mutable trait impl", "src.lib.probe", "src.lib.S.go[Go]",
-         true},
+        {"mutable receiver selects mutable trait impl", "src.lib.probe", "src.lib.S.go[Go]", true},
         {"indexing control", "src.lib.control", "src.lib.sentinel", true},
     };
     int mismatches =
@@ -20155,8 +20529,8 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
                              : body);
     }
     if (written && cross_walk_stage) {
-        written = python_module_write_fixture_file(root, "memo_def.py",
-                                                    "class S:\n    def m(self):\n        return 1\n");
+        written = python_module_write_fixture_file(
+            root, "memo_def.py", "class S:\n    def m(self):\n        return 1\n");
     }
     if (written && !failure_stage) {
         written = python_module_write_fixture_file(root, "plain.py", body) &&
@@ -20221,8 +20595,10 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
         correct = project &&
                   cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
                       CBM_STORE_OK &&
-                  file_count ==
-                      (cross_walk_stage ? 2 : failure_stage ? 1 : 5) + (parallel ? 52 : 0);
+                  file_count == (cross_walk_stage ? 2
+                                 : failure_stage  ? 1
+                                                  : 5) +
+                                    (parallel ? 52 : 0);
         cbm_store_free_nodes(files, file_count);
         if (project && !failure_stage) {
             const char *modules[] = {"plain", "pkg"};
@@ -20597,9 +20973,9 @@ static int python_typed_field_scope_case(bool external) {
         int import_count = 0;
         cbm_pxc_build_import_map(&ctx, "proj", "models.py", CBM_LANG_PYTHON, result, &keys, &vals,
                                  &import_count);
-        cbm_resolution_t raw = cbm_registry_resolve(
-            reg, external ? "unittest.TestCase" : "TestCase", "proj.models", keys, vals,
-            import_count);
+        cbm_resolution_t raw =
+            cbm_registry_resolve(reg, external ? "unittest.TestCase" : "TestCase", "proj.models",
+                                 keys, vals, import_count);
         bool candidate = raw.qualified_name && raw.strategy &&
                          strcmp(raw.qualified_name, "proj.models.TestCase") == 0 &&
                          strcmp(raw.strategy, "same_module") == 0;
@@ -23481,7 +23857,6 @@ TEST(pipeline_decorators_withhold_foreign_name_match) {
     ASSERT_EQ(cross_language_name_edges("DECORATES"), 0);
     PASS();
 }
-
 
 /* ── Git diff helpers (pass_gitdiff.c) ─────────────────────────── */
 
@@ -31313,7 +31688,20 @@ SUITE(pipeline_unresolved) {
     RUN_TEST(pipeline_multicandidate_write_records_name_binding_stop);
     RUN_TEST(pipeline_multicandidate_inherits_records_name_binding_stop);
     RUN_TEST(pipeline_python_relative_named_import_binds_inherits_like_calls);
-    RUN_TEST(pipeline_python_relative_star_import_binds_inherits);
+    RUN_TEST(pipeline_python_relative_star_import_binds_inherits_like_calls);
+    RUN_TEST(pipeline_python_star_import_obeys_dunder_all);
+    RUN_TEST(pipeline_python_star_import_excludes_underscore_names);
+    RUN_TEST(pipeline_python_star_import_rebinds_in_statement_order);
+    RUN_TEST(pipeline_python_assigned_name_usage_binds_own_variable_beside_external_import);
+    RUN_TEST(pipeline_python_assigned_name_write_binds_own_variable_beside_external_import);
+    RUN_TEST(pipeline_python_assigned_name_usage_binds_own_variable_without_any_import);
+    RUN_TEST(pipeline_python_assigned_name_write_binds_own_variable_without_any_import);
+    RUN_TEST(pipeline_python_assignment_over_import_binds_own_variable_not_imported_class);
+    RUN_TEST(pipeline_python_usage_of_star_excluded_name_is_recorded_not_silent);
+    RUN_TEST(pipeline_python_class_under_stdlib_dataclass_keeps_its_own_binding);
+    RUN_TEST(pipeline_python_class_under_local_decorator_is_withheld_and_recorded);
+    RUN_TEST(pipeline_python_assigned_name_in_package_init_binds_own_variable);
+    RUN_TEST(pipeline_python_relative_module_attribute_binds_inherits_like_calls);
     RUN_TEST(pipeline_python_relative_alias_import_binds_inherits_like_calls);
     RUN_TEST(pipeline_python_unbound_multicandidate_inherits_is_withheld);
     RUN_TEST(pipeline_multicandidate_throw_records_name_binding_stop);
