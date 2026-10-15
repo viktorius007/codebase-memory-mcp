@@ -13344,6 +13344,44 @@ TEST(rustlsp_modtree_qualified_impl_trait_keeps_proven_identity) {
     PASS();
 }
 
+TEST(rustlsp_modtree_trait_in_scope_finds_each_binding_kind) {
+    /* Each way a trait enters scope is found among many entries: a facade
+     * rename (core binding, std query), an anonymous import reached through a
+     * glob, and a rename that is not the trait's first entry. */
+    const char *rels[] = {"src/lib.rs", "src/t.rs", "src/m.rs", "src/n.rs"};
+    const char *qns[] = {"p.src.lib", "p.src.t", "p.src.m", "p.src.n"};
+    const char *sources[] = {
+        "mod t; mod m; mod n;\nuse m::*;\nuse core::fmt::Write as W;\nuse t::Later as L;\n",
+        "pub trait Tr {}\npub trait Later {}\npub trait Hidden {}\n",
+        "pub use crate::t::Tr as _;\n",
+        "pub use crate::t::Later as Renamed;\npub use crate::t::Hidden as _;\n"};
+    CBMRustModTree *tree = rust_modtree_from_sources(rels, qns, sources, 4);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    static const struct {
+        const char *trait_qn;
+        const char *module_qn;
+        bool in_scope;
+    } cases[] = {
+        {"std.fmt.Write", "p.src.lib", true},   {"core.fmt.Write", "p.src.lib", true},
+        {"alloc.fmt.Write", "p.src.lib", true}, {"p.src.t.Tr", "p.src.lib", true},
+        {"p.src.t.Later", "p.src.lib", true},   {"p.src.t.Hidden", "p.src.lib", false},
+        {"std.fmt.Debug", "p.src.lib", false},  {"p.src.t.Missing", "p.src.lib", false},
+        {"p.src.t.Hidden", "p.src.n", true},    {"p.src.t.Tr", "p.src.n", false},
+        {"std.fmt.Write", "p.src.n", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool in_scope = cbm_rust_modtree_trait_in_scope(
+            tree, &arena, cases[i].module_qn, 0, cases[i].trait_qn, NULL, NULL, 0, NULL, 0);
+        if (in_scope != cases[i].in_scope)
+            printf("  %s in %s: in_scope=%d\n", cases[i].trait_qn, cases[i].module_qn, in_scope);
+        ASSERT_EQ(in_scope, cases[i].in_scope);
+    }
+    cbm_arena_destroy(&arena);
+    cbm_rust_modtree_free(tree);
+    PASS();
+}
+
 TEST(rustlsp_modtree_super_glob_sees_parent_private_import) {
     /* `svc` only imports `Session`, privately. Its child's `use super::*`
      * may see that import; a sibling's `use crate::svc::*` may not. */
@@ -15323,6 +15361,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_qualified_impl_trait_keeps_proven_identity);
+    RUN_TEST(rustlsp_modtree_trait_in_scope_finds_each_binding_kind);
     RUN_TEST(rustlsp_modtree_super_glob_sees_parent_private_import);
     RUN_TEST(rustlsp_modtree_use_items_follow_reexport_and_path_module);
     RUN_TEST(rustlsp_associated_function_keeps_its_owner_when_a_free_function_shares_its_name);
