@@ -65,6 +65,10 @@ typedef enum {
 } cbm_frontend_test_grace_mode_t;
 void cbm_daemon_frontend_test_grace_set(cbm_frontend_test_grace_mode_t mode);
 uint64_t cbm_daemon_frontend_test_grace_polls(void);
+/* Length of the grace window the monitor last opened (deadline minus the instant
+ * it was computed from), 0 until a window has been opened. Read it after the first
+ * poll: the monitor stores it before polling. */
+uint64_t cbm_daemon_frontend_test_grace_span_ms(void);
 void cbm_daemon_frontend_test_observer_release(void);
 bool cbm_daemon_frontend_test_monitor_waiting(void);
 uint64_t cbm_daemon_frontend_test_monitor_observations(void);

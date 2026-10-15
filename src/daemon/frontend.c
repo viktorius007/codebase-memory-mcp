@@ -119,6 +119,7 @@ static atomic_uint_fast64_t frontend_test_worker_observation_count = ATOMIC_VAR_
 static atomic_uint_fast64_t frontend_test_worker_idle_count = ATOMIC_VAR_INIT(0);
 static atomic_int frontend_test_grace_mode = ATOMIC_VAR_INIT(CBM_FRONTEND_TEST_GRACE_CLOCK);
 static atomic_uint_fast64_t frontend_test_grace_poll_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t frontend_test_grace_span_ms = ATOMIC_VAR_INIT(0);
 
 void cbm_daemon_frontend_test_grace_set(cbm_frontend_test_grace_mode_t mode) {
     atomic_store_explicit(&frontend_test_grace_poll_count, 0, memory_order_release);
@@ -127,6 +128,10 @@ void cbm_daemon_frontend_test_grace_set(cbm_frontend_test_grace_mode_t mode) {
 
 uint64_t cbm_daemon_frontend_test_grace_polls(void) {
     return atomic_load_explicit(&frontend_test_grace_poll_count, memory_order_acquire);
+}
+
+uint64_t cbm_daemon_frontend_test_grace_span_ms(void) {
+    return atomic_load_explicit(&frontend_test_grace_span_ms, memory_order_acquire);
 }
 
 void cbm_daemon_frontend_test_observer_reset(bool hold_monitor) {
@@ -224,6 +229,10 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
             uint64_t deadline = now > UINT64_MAX - FRONTEND_MAINTENANCE_GRACE_MS
                                     ? UINT64_MAX
                                     : now + FRONTEND_MAINTENANCE_GRACE_MS;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+            atomic_store_explicit(&frontend_test_grace_span_ms, deadline - now,
+                                  memory_order_release);
+#endif
             while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire) &&
                    frontend_grace_window_open(deadline)) {
                 cbm_usleep(FRONTEND_MAINTENANCE_POLL_MS * 1000U);
