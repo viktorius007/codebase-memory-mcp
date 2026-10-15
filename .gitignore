@@ -96,3 +96,6 @@ soak-results-query-leak/
 /result
 /result-*
 *.tsbuildinfo
+
+# Session handoff: local working file read by the SessionStart hook; history lives in git (c3d37e62)
+/HANDOFF.md
