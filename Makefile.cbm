@@ -1447,9 +1447,16 @@ lint-tidy-diff:
 	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
 # cppcheck: complementary analysis (config in .cppcheck)
+# cppcheck runs one job per core and keeps per-file analysis in
+# CPPCHECK_BUILD_DIR, so an unchanged file is not re-analysed. The build dir is
+# what lets whole-program checks run under -j (cppcheck refuses them otherwise).
+CPPCHECK_JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+CPPCHECK_BUILD_DIR ?= $(BUILD_DIR)/cppcheck
 lint-cppcheck:
-	@echo "=== cppcheck ==="
-	@$(CPPCHECK) --enable=warning,style,performance,portability \
+	@echo "=== cppcheck ($(CPPCHECK_JOBS) jobs, cache $(CPPCHECK_BUILD_DIR)) ==="
+	@mkdir -p $(CPPCHECK_BUILD_DIR)
+	@$(CPPCHECK) -j $(CPPCHECK_JOBS) --cppcheck-build-dir=$(CPPCHECK_BUILD_DIR) \
+		--enable=warning,style,performance,portability \
 		--std=c11 --language=c \
 		--suppressions-list=.cppcheck \
 		--error-exitcode=1 \
