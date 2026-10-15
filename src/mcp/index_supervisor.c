@@ -948,6 +948,16 @@ void cbm_index_worker_destroy(cbm_index_worker_handle_t *handle) {
     free(handle);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+cbm_subprocess_phase_t cbm_index_worker_phase_for_testing(const cbm_index_worker_handle_t *handle) {
+    return cbm_subprocess_phase_for_testing(handle->process);
+}
+
+bool cbm_index_worker_root_exited_for_testing(cbm_index_worker_handle_t *handle) {
+    return handle && cbm_subprocess_root_exited_for_testing(handle->process);
+}
+#endif
+
 int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_thread,
                                            const char *marker_file, const char *quarantine_file,
                                            cbm_proc_log_cb log_callback, void *log_context,
