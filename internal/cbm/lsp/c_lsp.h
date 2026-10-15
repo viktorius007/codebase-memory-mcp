@@ -127,7 +127,7 @@ typedef struct {
     // step cap that used to hide that is gone. Evaluation never mutates scope
     // or context, so within one outermost call a node's type cannot change;
     // the memo is emptied when the next outermost call starts, because the
-    // resolver walk mutates scope between calls.
+    // resolver walk mutates scope between calls -- unless eval_window is open.
     struct CLSPEvalMemoSlot *eval_memo; // open addressing, arena-owned
     int *eval_memo_used;                // slots filled by the current evaluation
     int eval_memo_cap;                  // power of two, or 0
@@ -138,6 +138,16 @@ typedef struct {
     TSNode *eval_chain;
     int eval_chain_len;
     int eval_chain_cap;
+    // Receiver-chain window (#1527 follow-up): while open, an outermost
+    // evaluation keeps the memo instead of emptying it. The walk opens it in
+    // a member call or member access, where nothing mutates scope or context,
+    // and carries it only into the visit of eval_window_next, the chain
+    // operand below; every other visit, and the end of every visit, closes
+    // it. Each link of `b.a().a()...` then reads its receiver's type from
+    // the first evaluation of the chain instead of evaluating the rest of
+    // the chain again.
+    bool eval_window;
+    const void *eval_window_next;
     CBMLSPStatus eval_failure; // sticky: stop refinement rather than repeat uncached work
 #ifdef CBM_ENABLE_TEST_SEAMS
     int test_memo_allocations_left; // -1 = normal; 0 = fail the next memo allocation
