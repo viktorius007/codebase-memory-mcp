@@ -17128,8 +17128,6 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_issue1527_preprocessed_depth_failure_is_reported);
     RUN_TEST(registry_issue1527_index_preserves_registration_order);
     RUN_TEST(clsp_issue1527_cross_file_memo_failures_propagate);
-    RUN_TEST(clsp_issue1527_long_binary_chain_is_not_nesting);
-    RUN_TEST(clsp_issue1527_long_receiver_chain_is_not_nesting);
     RUN_TEST(clsp_c_reassigned_function_pointer_calls_join_exact_occurrences);
     RUN_TEST(clsp_c_nested_function_pointer_shadow_restores_outer_target);
     RUN_TEST(clsp_cpp_repeated_same_leaf_calls_join_exact_occurrences);
@@ -17898,4 +17896,17 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_easy_win_sfinaeconditional_return);
     RUN_TEST(clsp_issue1527_fluent_chain_work_is_polynomial);
     RUN_TEST(clsp_issue1527_scale_work_is_linear);
+}
+
+/* The two 20000-link chain cases are quadratic in the product (usages
+ * extraction and the receiver walk, ASan build: ~70 s and ~50 s) and dwarf the
+ * other ~780 tests. Each runs as its own suite so the parallel harness
+ * schedules them beside c_lsp rather than inside it. Same tests, same
+ * assertions; only the suite that runs them changed. */
+SUITE(c_lsp_chain_binary) {
+    RUN_TEST(clsp_issue1527_long_binary_chain_is_not_nesting);
+}
+
+SUITE(c_lsp_chain_receiver) {
+    RUN_TEST(clsp_issue1527_long_receiver_chain_is_not_nesting);
 }
