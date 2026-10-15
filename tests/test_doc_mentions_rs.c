@@ -1258,7 +1258,22 @@ TEST(doc_mentions_rs_reasons) {
 /* Deep nesting, long chains, cycles and crowds: every one resolves or ends
  * in a row; none may hang, crash or pick something at random. */
 TEST(doc_mentions_rs_untrusted_structure) {
-    enum { DEPTH = 600, CHAIN = 100, CROWD = 3000, RING = 40, BUF = 1 << 20 };
+    /* Each size is the least that is past the limit it tests, with a margin,
+     * because the indexer's definitions pass and the lsp_cross pass cost
+     * about the square of the crowd and the cube of the depth (the sizes
+     * this test used to have, 600 and 3000, took 5.5 minutes under ASan):
+     *  - DEPTH: more inline modules than a path carries segments;
+     *  - CHAIN: more globs than are followed (64 modules per name);
+     *  - CROWD: more candidates than are kept (8), and more impls of one
+     *    type than are searched for an item (256);
+     *  - RING: a cycle of imports; any ring is one. */
+    enum {
+        DEPTH = 4 * CBM_DOCLINK_RS_MAX_SEGS,
+        CHAIN = 100,
+        CROWD = 300,
+        RING = 40,
+        BUF = 1 << 20
+    };
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_dmrs_un_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
