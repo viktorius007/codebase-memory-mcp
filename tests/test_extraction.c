@@ -10041,12 +10041,14 @@ TEST(doc_divider_only_run_is_not_doc) {
 /* Extract a wide-flat comment-sibling fixture of n lines (the exact shape of
  * ms-typescript's reallyLargeFile.ts: hundreds of thousands of flat comment
  * children under the root, plus sparse real defs so the breadth check cannot
- * pass vacuously). Returns elapsed milliseconds; stores the def count. */
-static long extract_wide_flat_ms(int n, int *out_defs) {
+ * pass vacuously). Returns the tree-sitter node-navigation steps the extraction
+ * took (cbm_ts_node_child_steps_test), or UINT64_MAX when it failed; stores the
+ * def count. */
+static uint64_t extract_wide_flat_steps(int n, int *out_defs) {
     const size_t cap = (size_t)n * 24 + (size_t)8192; /* "// wide filler N\n" <= 24 chars */
     char *src = malloc(cap);
     if (!src) {
-        return -1;
+        return UINT64_MAX;
     }
     size_t off = 0;
     /* CONSTANT def count (10), independent of n: defs that scale WITH n make
@@ -10061,89 +10063,108 @@ static long extract_wide_flat_ms(int n, int *out_defs) {
             off += (size_t)snprintf(src + off, cap - off, "var wide_a%d = %d;\n", i, i);
         }
     }
-    struct timespec a;
-    struct timespec b;
-    cbm_clock_gettime(CLOCK_MONOTONIC, &a);
+    cbm_ts_node_child_steps_test_reset();
     CBMFileResult *r =
         cbm_extract_file(src, (int)off, CBM_LANG_JAVASCRIPT, "proj", "wide.js", 0, NULL, NULL);
-    cbm_clock_gettime(CLOCK_MONOTONIC, &b);
+    uint64_t steps = cbm_ts_node_child_steps_test();
     free(src);
     if (!r) {
-        return -1;
+        return UINT64_MAX;
     }
     *out_defs = r->defs.count;
     cbm_free_result(r);
-    return (b.tv_sec - a.tv_sec) * 1000L + (b.tv_nsec - a.tv_nsec) / 1000000L;
+    return steps;
 }
 
-/* Best-of-N. Timing noise only ever ADDS time, so the minimum of a few runs is
- * the cheapest good estimate of the noise-free cost. A single sample at each
- * size made the RATIO carry the noise of BOTH measurements: on a loaded Windows
- * VM this read 184ms -> 9387ms (51x) for code that measures ~20x unloaded, and
- * tripped a bound calibrated for exactly that linear case.
- *
- * Deliberately NOT solved by raising WF_RATIO_MAX: the bound sits where it does
- * because linear (~20x) and quadratic (~128x) are each >=2x away from it, so
- * inflating it moves the test toward the very signal it exists to catch. This
- * keeps the threshold and removes the variance instead. */
-static long extract_wide_flat_ms_best_of(int n, int reps, int *out_defs) {
-    long best = -1;
-    for (int i = 0; i < reps; i++) {
-        int defs = 0;
-        long ms = extract_wide_flat_ms(n, &defs);
-        if (ms < 0) {
-            return ms;
-        }
-        if (best < 0 || ms < best) {
-            best = ms;
-            *out_defs = defs;
-        }
+/* The signal the guard exists to catch, produced on purpose: visit every child
+ * of a flat comment file through ts_node_child(root, i), each call re-walking i
+ * siblings. Returns the node-navigation steps it took. */
+static uint64_t wide_flat_indexed_loop_steps(int n) {
+    const size_t cap = (size_t)n * 24 + (size_t)64;
+    char *src = malloc(cap);
+    if (!src) {
+        return UINT64_MAX;
     }
-    return best;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "// wide filler %d\n", i);
+    }
+    TSParser *parser = ts_parser_new();
+    TSTree *tree = NULL;
+    uint64_t steps = UINT64_MAX;
+    if (parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_JAVASCRIPT))) {
+        tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)off);
+    }
+    if (tree) {
+        TSNode root = ts_tree_root_node(tree);
+        uint32_t children = ts_node_child_count(root);
+        cbm_ts_node_child_steps_test_reset();
+        for (uint32_t i = 0; i < children; i++) {
+            (void)ts_node_child(root, i);
+        }
+        steps = cbm_ts_node_child_steps_test();
+        ts_tree_delete(tree);
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    free(src);
+    return steps;
 }
 
 TEST(extract_wide_flat_file_is_linear) {
-    /* SCALING-RATIO guard: assert the COMPLEXITY CLASS, not a wall-clock
-     * bound. Index-based ts_node_child(i) child loops are O(i) per call —
-     * quadratic per wide node — and hung a 580k-sibling file for hours
-     * (ms-typescript reallyLargeFile.ts). An absolute time bound conflates
-     * machine speed with complexity: the gcc-13-ARM ASan CI leg runs this
-     * extraction ~200x slower than clang at the SAME (measured perfectly
-     * linear: 27.1s/54.2s/108.3s for 50k/100k/200k) complexity, and flunked
-     * a 30s bound on linear code. Growing the input 4x must grow the time
-     * ~4x when linear and ~16x when quadratic; the 10x bound splits those
-     * decisively on every toolchain. The 120ms floor keeps clock noise from
-     * mattering on fast machines. */
-    /* Growth and bound CALIBRATED FROM MEASUREMENT, not models. The ASan
-     * test build carries a large LINEAR per-line baseline (~31us/line on
-     * clang-macOS, ~540us/line on gcc-13-ARM) that dilutes small-growth
-     * ratios: at 8x growth the measured quadratic ratio was 22.4 — a 24x
-     * bound false-passed the known-quadratic pre-merge walk. At 20x growth
-     * the measured ratios are ~20x for linear code (both toolchains) and
-     * ~128x for the quadratic walk (clang-macOS) — bound 40 sits >=2x from
-     * both. The 120ms floor keeps clock noise irrelevant on fast hosts. */
-    enum { WF_SMALL = 20 * 1000, WF_BIG = 400 * 1000, WF_RATIO_MAX = 40, WF_FLOOR_MS = 120 };
+    /* SCALING-RATIO guard: assert the COMPLEXITY CLASS on a deterministic work
+     * count, never on elapsed time. Index-based ts_node_child(i) child loops
+     * are O(i) per call — quadratic per wide node — and hung a 580k-sibling
+     * file for hours (ms-typescript reallyLargeFile.ts). The count is the
+     * number of steps the tree-sitter runtime took to answer node-navigation
+     * calls (cbm_ts_node_child_steps_test): a TSTreeCursor walk takes none, an
+     * index-based loop takes O(n^2). It is a function of the input and the
+     * code alone, so the verdict cannot move with the machine, the toolchain,
+     * the sanitizer, or what else is running — the previous wall-clock ratio
+     * read 18.5x alone and 54x in a loaded wave for the SAME linear code.
+     *
+     * Growth and bound CALIBRATED FROM MEASUREMENT (see the printed counts):
+     * 20x the input must grow the count ~20x when linear and ~400x when
+     * quadratic. The bound of 40 keeps the same margin the time-based bound
+     * was calibrated for: >=2x above the linear signal, and an order of
+     * magnitude below the quadratic one. */
+    enum { WF_SMALL = 20 * 1000, WF_BIG = 400 * 1000, WF_RATIO_MAX = 40 };
     int defs_small = 0;
     int defs_big = 0;
-    /* Small is cheap, so sample it more; big dominates runtime, so twice is the
-     * affordable compromise that still discards one unlucky sample. */
-    long t_small = extract_wide_flat_ms_best_of(WF_SMALL, 3, &defs_small);
-    long t_big = extract_wide_flat_ms_best_of(WF_BIG, 2, &defs_big);
-    ASSERT_GTE(t_small, 0);
-    ASSERT_GTE(t_big, 0);
+    uint64_t steps_small = extract_wide_flat_steps(WF_SMALL, &defs_small);
+    uint64_t steps_big = extract_wide_flat_steps(WF_BIG, &defs_big);
+    ASSERT_TRUE(steps_small != UINT64_MAX);
+    ASSERT_TRUE(steps_big != UINT64_MAX);
     /* Anti-vacuous guard: the breadth was actually walked at both sizes. */
     ASSERT_GTE(defs_small, 8);
     ASSERT_GTE(defs_big, 8);
-    fprintf(stderr, "  [wide-flat] t(%d)=%ldms t(%d)=%ldms\n", WF_SMALL, t_small, WF_BIG, t_big);
-    long base = t_small > WF_FLOOR_MS ? t_small : WF_FLOOR_MS;
-    if (t_big > WF_RATIO_MAX * base) {
-        char msg[160];
+    /* ... and the counter is live: an extraction that navigates nodes at all
+     * (it always does: the root, the defs) leaves a nonzero count, so a
+     * counter that stopped counting cannot pass this test as "linear". */
+    ASSERT_GTE(steps_small, 1);
+    fprintf(stderr, "  [wide-flat] steps(%d)=%llu steps(%d)=%llu\n", WF_SMALL,
+            (unsigned long long)steps_small, WF_BIG, (unsigned long long)steps_big);
+    if (steps_big > (uint64_t)WF_RATIO_MAX * steps_small) {
+        char msg[192];
         snprintf(msg, sizeof(msg),
-                 "wide-flat scaling 20x input: %ldms -> %ldms (> %dx base %ldms) — "
+                 "wide-flat scaling 20x input: %llu -> %llu node-navigation steps (> %dx) — "
                  "quadratic child access",
-                 t_small, t_big, WF_RATIO_MAX, base);
+                 (unsigned long long)steps_small, (unsigned long long)steps_big, WF_RATIO_MAX);
         FAIL(msg);
     }
+    /* The bound is only meaningful if the counter really separates the two
+     * classes, so show it: the index-based loop over the same 20x growth must
+     * land at least twice the bound, i.e. far on the quadratic side. Both
+     * sides of the calibration are therefore executed, not recalled. */
+    uint64_t quad_small = wide_flat_indexed_loop_steps(WF_SMALL / 40);
+    uint64_t quad_big = wide_flat_indexed_loop_steps(WF_BIG / 40);
+    ASSERT_TRUE(quad_small != UINT64_MAX && quad_small > 0);
+    ASSERT_TRUE(quad_big != UINT64_MAX);
+    fprintf(stderr, "  [wide-flat] indexed-loop probe steps(%d)=%llu steps(%d)=%llu\n",
+            WF_SMALL / 40, (unsigned long long)quad_small, WF_BIG / 40,
+            (unsigned long long)quad_big);
+    ASSERT_TRUE(quad_big >= (uint64_t)(2 * WF_RATIO_MAX) * quad_small);
     PASS();
 }
 

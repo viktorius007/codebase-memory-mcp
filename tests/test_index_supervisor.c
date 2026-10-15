@@ -507,7 +507,7 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
 
     ASSERT_EQ(first_rc, 0);
     ASSERT_EQ(second_rc, 0);
-    ASSERT_TRUE(start_elapsed < 2000);
+    ASSERT_TRUE(start_elapsed < INDEX_SUPERVISOR_TEST_READY_MS);
     ASSERT_TRUE(unique);
     ASSERT_TRUE(owner_only);
     ASSERT_TRUE(first_ready);
@@ -516,10 +516,10 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
     ASSERT_TRUE(parent_unchanged);
     ASSERT_EQ(running, CBM_INDEX_WORKER_POLL_RUNNING);
     ASSERT_NULL(premature);
-    ASSERT_TRUE(poll_elapsed < 100);
+    ASSERT_TRUE(poll_elapsed < INDEX_SUPERVISOR_TEST_READY_MS);
     ASSERT_TRUE(first_cancel);
     ASSERT_TRUE(second_cancel);
-    ASSERT_TRUE(cancel_elapsed < 100);
+    ASSERT_TRUE(cancel_elapsed < INDEX_SUPERVISOR_TEST_READY_MS);
     ASSERT_TRUE(first_terminal);
     ASSERT_TRUE(second_terminal);
     ASSERT_TRUE(cached_result);

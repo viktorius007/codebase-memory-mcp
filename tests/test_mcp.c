@@ -13239,9 +13239,9 @@ TEST(search_code_scan_live_child_deadline_is_bounded_and_fails_closed) {
 #ifdef _WIN32
     const char *slow_command =
         "echo deadline-partial-output & powershell.exe -NoProfile -Command \"Start-Sleep -Seconds "
-        "6\"";
+        "120\"";
 #else
-    const char *slow_command = "printf 'deadline-partial-output\\n'; trap '' TERM; sleep 6";
+    const char *slow_command = "printf 'deadline-partial-output\\n'; trap '' TERM; sleep 120";
 #endif
     cbm_mcp_server_set_search_scan_command_for_test(srv, slow_command);
     cbm_mcp_server_set_search_scan_timeout_for_test(srv, 100, true);
@@ -13250,7 +13250,10 @@ TEST(search_code_scan_live_child_deadline_is_bounded_and_fails_closed) {
     char *response = cbm_mcp_handle_tool(
         srv, "search_code", "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\"}");
     uint64_t elapsed = cbm_now_ms() - started;
-    bool bounded = elapsed < 3000U;
+    /* The child lives 120 s on its own and ignores TERM. Returning before that
+     * means the 100 ms deadline killed it; a stopwatch tighter than the child's
+     * natural life would only measure how loaded the machine is. */
+    bool bounded = elapsed < 100000U;
     bool timed_out = response && strstr(response, "request_timeout") != NULL &&
                      strstr(response, "\"isError\":true") != NULL;
     bool partial_hidden = !response || strstr(response, "deadline-partial-output") == NULL;

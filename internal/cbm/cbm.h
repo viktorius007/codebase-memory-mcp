@@ -1380,6 +1380,16 @@ void cbm_kotlin_operator_dedup_test_reset(void);
 uint64_t cbm_kotlin_operator_dedup_test_comparisons(void);
 #endif
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+// Test-build-only count of the steps TSNode navigation (ts_node_child,
+// ts_node_next_sibling, ts_node_parent, ...) took on the calling thread since
+// the last reset: the tree-sitter runtime's own cost of node-API access, which
+// is quadratic on a wide node when a loop indexes ts_node_child(i). Defined in
+// vendored/ts_runtime/src/node.c; production builds retain no instrumentation.
+void cbm_ts_node_child_steps_test_reset(void);
+uint64_t cbm_ts_node_child_steps_test(void);
+#endif
+
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 // Test-build-only work counter for resolving a node's field role while
 // classifying value references. Production builds retain no instrumentation.

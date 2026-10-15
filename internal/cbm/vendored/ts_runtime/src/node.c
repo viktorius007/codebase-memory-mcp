@@ -15,6 +15,29 @@ typedef struct {
 
 static inline bool ts_node__is_relevant(TSNode self, bool include_anonymous);
 
+// Test-build-only work counter (read-only instrumentation, no behaviour
+// change; absent from production builds). Every TSNode navigation call
+// (ts_node_child, ts_node_next_sibling, ts_node_parent, ...) re-walks its
+// parent's children through ts_node_child_iterator_next, so the number of
+// steps taken is the cost of node-API navigation. A loop that indexes
+// ts_node_child(i) pays O(i) steps per call and totals O(n^2) over a wide
+// node; a TSTreeCursor walk does not pass through here at all. The count is a
+// pure function of the input and the code, which wall time is not. Per-thread,
+// so a measurement is not disturbed by other threads' extraction.
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+#if defined(_MSC_VER)
+#define CBM_TS_STEPS_TLS __declspec(thread)
+#else
+#define CBM_TS_STEPS_TLS __thread
+#endif
+static CBM_TS_STEPS_TLS uint64_t cbm_ts_node_child_steps = 0;
+void cbm_ts_node_child_steps_test_reset(void) { cbm_ts_node_child_steps = 0; }
+uint64_t cbm_ts_node_child_steps_test(void) { return cbm_ts_node_child_steps; }
+#define CBM_TS_NOTE_CHILD_STEP() (cbm_ts_node_child_steps++)
+#else
+#define CBM_TS_NOTE_CHILD_STEP() ((void)0)
+#endif
+
 // TSNode - constructors
 
 TSNode ts_node_new(
@@ -82,6 +105,7 @@ static inline bool ts_node_child_iterator_next(
   TSNode *result
 ) {
   if (!self->parent.ptr || ts_node_child_iterator_done(self)) return false;
+  CBM_TS_NOTE_CHILD_STEP();
   const Subtree *child = &ts_subtree_children(self->parent)[self->child_index];
   TSSymbol alias_symbol = 0;
   if (!ts_subtree_extra(*child)) {

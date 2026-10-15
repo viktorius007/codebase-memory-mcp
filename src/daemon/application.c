@@ -275,6 +275,26 @@ int cbm_daemon_application_busy_queue_waits_for_test(void) {
     return atomic_load_explicit(&g_application_busy_queue_waits_for_test, memory_order_acquire);
 }
 
+/* Counts parks of a waiting session mutation (manage_adr, delete_project, ...)
+ * behind a conflicting in-process reservation: another mutation or an index
+ * job that reserves the project. A test asserting "this mutation does NOT run
+ * while the project is reserved" waits for a delta here — the positive signal
+ * that the request reached the guard and is blocked on it — before it checks
+ * the request is still outstanding. */
+static atomic_int g_application_mutation_waits_for_test = ATOMIC_VAR_INIT(0);
+
+int cbm_daemon_application_mutation_waits_for_test(void) {
+    return atomic_load_explicit(&g_application_mutation_waits_for_test, memory_order_acquire);
+}
+
+/* Counts parks of an index job thread behind a held project mutation, before
+ * its worker may start. The positive "the job is held off" signal. */
+static atomic_int g_application_job_mutation_waits_for_test = ATOMIC_VAR_INIT(0);
+
+int cbm_daemon_application_job_mutation_waits_for_test(void) {
+    return atomic_load_explicit(&g_application_job_mutation_waits_for_test, memory_order_acquire);
+}
+
 void cbm_daemon_application_hold_job_before_start_for_test(bool hold) {
     atomic_store_explicit(&g_application_hold_job_before_start_for_test, hold,
                           memory_order_release);
@@ -1170,6 +1190,7 @@ static bool application_mutation_begin_internal(cbm_daemon_application_t *applic
         if (cancelled || !wait) {
             return false;
         }
+        atomic_fetch_add_explicit(&g_application_mutation_waits_for_test, 1, memory_order_release);
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
 
@@ -1324,6 +1345,8 @@ static bool application_job_wait_for_mutations(cbm_daemon_application_job_t *job
         if (!busy) {
             return true;
         }
+        atomic_fetch_add_explicit(&g_application_job_mutation_waits_for_test, 1,
+                                  memory_order_release);
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
 }
