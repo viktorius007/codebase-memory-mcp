@@ -17120,6 +17120,70 @@ TEST(clsp_issue1527_receiver_chain_work_is_linear) {
     PASS();
 }
 
+/* `auto x = a + a + ... + a;` over a C++ type with a member operator+: a
+ * left-nested operator chain whose every link is an overloaded call.
+ * Out-params: the links resolved to V::operator+, and whether `x.done()`
+ * (typed through the whole chain) still resolves. */
+static uint64_t clsp_operator_chain_work(int links, int *out_overloads, bool *out_done) {
+    size_t sz = (size_t)links * 4 + 512;
+    char *src = malloc(sz);
+    *out_overloads = -1;
+    *out_done = false;
+    if (!src)
+        return 0;
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "struct V { V operator+(const V& o) const { return *this; }\n"
+                                  "           void done() {} };\n"
+                                  "void deep(V a) {\n  auto x = a");
+    for (int i = 1; i < links; i++)
+        pos += (size_t)snprintf(src + pos, sz - pos, " + a");
+    snprintf(src + pos, sz - pos, ";\n  x.done();\n}\n");
+    clsp_counted_work_begin();
+    CBMFileResult *r = extract_cpp(src);
+    uint64_t work = clsp_counted_work_take();
+    free(src);
+    if (!r)
+        return 0;
+    *out_overloads = count_real_resolved(r, ".V.operator+");
+    *out_done = find_resolved(r, "deep", "V.done") >= 0;
+    cbm_free_result(r);
+    return work;
+}
+
+/* Deterministic complexity gate for a binary-operator chain (O9: no clock).
+ * The walk visits every link, and each link's overload lookup needs the type
+ * of its left operand, the rest of the chain below it. The first evaluation
+ * of the chain computes all of those types; when every later link evaluates
+ * its left operand from scratch, an N-link chain costs ~N^2 real evaluations
+ * (~512*N once the walk's depth cap truncates the walk). Linear means the
+ * counted work per link does not grow with N: the smallest chain is fully
+ * walked, and every longer chain must cost no more per link. */
+TEST(clsp_issue1527_operator_chain_work_is_linear) {
+    static const int sizes[] = {64, 256, 1024, 4096};
+    enum { SIZES = (int)(sizeof(sizes) / sizeof(sizes[0])) };
+    double per_link[SIZES] = {0};
+    int overloads0 = -1;
+    bool done_resolved = true;
+    for (int i = 0; i < SIZES; i++) {
+        int overloads = 0;
+        bool done = false;
+        uint64_t work = clsp_operator_chain_work(sizes[i], &overloads, &done);
+        if (i == 0)
+            overloads0 = overloads;
+        done_resolved = done_resolved && done;
+        per_link[i] = (double)work / (double)sizes[i];
+        printf("    operator chain of %d: operator+=%d done=%d work=%llu per_link=%.1f\n",
+               sizes[i], overloads, (int)done, (unsigned long long)work, per_link[i]);
+    }
+    /* Every `+` of the fully walked chain still resolves to V::operator+. */
+    ASSERT_EQ(overloads0, sizes[0] - 1);
+    ASSERT_TRUE(done_resolved);
+    ASSERT_GT(per_link[0], 0.0);
+    for (int i = 1; i < SIZES; i++)
+        ASSERT(per_link[i] <= 1.5 * per_link[0]);
+    PASS();
+}
+
 TEST(registry_issue1527_index_preserves_registration_order) {
     CBMArena a;
     cbm_arena_init(&a);
@@ -18001,15 +18065,18 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_issue1527_fluent_chain_work_is_polynomial);
     RUN_TEST(clsp_issue1527_scale_work_is_linear);
     RUN_TEST(clsp_issue1527_receiver_chain_work_is_linear);
+    RUN_TEST(clsp_issue1527_operator_chain_work_is_linear);
 }
 
-/* The two 20000-link chain cases dwarf the other ~780 tests in the ASan
- * build: usages extraction is quadratic in a binary chain (~70 s), and the
- * receiver chain, linear in the C resolver since the receiver-chain window
- * (clsp_issue1527_receiver_chain_work_is_linear), still takes ~6 s in the
- * rest of the extraction. Each runs as its own suite so the parallel harness
- * schedules them beside c_lsp rather than inside it. Same tests, same
- * assertions; only the suite that runs them changed. */
+/* The two 20000-link chain cases were the slowest tests in the ASan build.
+ * Both are linear now: the binary chain in usages extraction
+ * (clsp_issue1527_scale_work_is_linear) and in the C++ operator branch
+ * (clsp_issue1527_operator_chain_work_is_linear), the receiver chain in the
+ * C resolver (clsp_issue1527_receiver_chain_work_is_linear); the receiver
+ * chain still takes ~6 s in the rest of the extraction. Each runs as its own
+ * suite so the parallel harness schedules them beside c_lsp rather than
+ * inside it. Same tests, same assertions; only the suite that runs them
+ * changed. */
 SUITE(c_lsp_chain_binary) {
     RUN_TEST(clsp_issue1527_long_binary_chain_is_not_nesting);
 }
