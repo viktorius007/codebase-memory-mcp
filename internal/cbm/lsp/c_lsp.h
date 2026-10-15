@@ -138,14 +138,14 @@ typedef struct {
     TSNode *eval_chain;
     int eval_chain_len;
     int eval_chain_cap;
-    // Receiver-chain window (#1527 follow-up): while open, an outermost
-    // evaluation keeps the memo instead of emptying it. The walk opens it in
-    // a member call or member access, where nothing mutates scope or context,
-    // and carries it only into the visit of eval_window_next, the chain
-    // operand below; every other visit, and the end of every visit, closes
-    // it. Each link of `b.a().a()...` then reads its receiver's type from
-    // the first evaluation of the chain instead of evaluating the rest of
-    // the chain again.
+    // Chain window (#1527 follow-up): while open, an outermost evaluation
+    // keeps the memo instead of emptying it. The walk opens it in a member
+    // call, a member access or a C++ binary operator, where nothing mutates
+    // scope or context, and carries it only into the visit of
+    // eval_window_next, the chain operand below; every other visit, and the
+    // end of every visit, closes it. Each link of `b.a().a()...` and of
+    // `a + a + ...` then reads its operand's type from the first evaluation
+    // of the chain instead of evaluating the rest of the chain again.
     bool eval_window;
     const void *eval_window_next;
     CBMLSPStatus eval_failure; // sticky: stop refinement rather than repeat uncached work

@@ -4671,19 +4671,20 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node, bool co
 
 #define C_LSP_MAX_WALK_DEPTH 512
 
-/* The receiver-chain window (see eval_window in c_lsp.h). A member call
- * `x.f(...)` and a member access `x.f` evaluate `x`; the walk then visits
- * `x`, whose own call or member access evaluates the receiver below it, and
+/* The chain window (see eval_window in c_lsp.h). A member call `x.f(...)`
+ * and a member access `x.f` evaluate `x`, and a C++ binary operator `x + y`
+ * evaluates `x` and `y` to pick the overload; the walk then visits `x`, whose
+ * own call, member access or operator evaluates the operand below it, and
  * so on down the chain. Each of those outermost evaluations used to start
  * from an empty memo and evaluate the whole rest of the chain again, so an
  * N-link chain cost ~N^2 evaluations. The visits on the way down are pure
- * (c_process_statement handles neither kind, nothing pushes a scope, the
- * handlers only evaluate, look up and emit), so the types the first
- * evaluation memoized still hold: the window keeps them.
+ * (c_process_statement handles none of the three kinds, nothing pushes a
+ * scope, the handlers only evaluate, look up and emit), so the types the
+ * first evaluation memoized still hold: the window keeps them.
  *
- * Opened by a member call or member access visit; `continued` says the visit
- * was entered as the chain operand of a visit whose window was open, and only
- * then is the memo kept. */
+ * Opened by a member call, member access or C++ binary operator visit;
+ * `continued` says the visit was entered as the chain operand of a visit
+ * whose window was open, and only then is the memo kept. */
 static void c_eval_window_open(CLSPContext *ctx, bool continued) {
     if (!continued) {
         c_eval_memo_reset(ctx);
@@ -5228,6 +5229,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node, bool co
         TSNode left = ts_node_child_by_field_name(node, "left", 4);
         TSNode right = ts_node_child_by_field_name(node, "right", 5);
         if (!ts_node_is_null(left) && !ts_node_is_null(right)) {
+            c_eval_window_open(ctx, continued);
             const CBMType *lhs_type = c_eval_expr_type(ctx, left);
             const CBMType *rhs_type = c_eval_expr_type(ctx, right);
             const CBMType *base = c_simplify_type(ctx, lhs_type, false);
@@ -5589,10 +5591,13 @@ recurse:;
     }
 
     // An open window continues into the chain operand only: the receiver of
-    // a member access, the member access of a member call.
+    // a member access, the member access of a member call, the left operand
+    // of a binary operator.
     if (ctx->eval_window) {
         TSNode operand = strcmp(kind, "field_expression") == 0
                              ? ts_node_child_by_field_name(node, "argument", 8)
+                         : strcmp(kind, "binary_expression") == 0
+                             ? ts_node_child_by_field_name(node, "left", 4)
                              : ts_node_child_by_field_name(node, "function", 8);
         ctx->eval_window_next = ts_node_is_null(operand) ? NULL : operand.id;
     }
