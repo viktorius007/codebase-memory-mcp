@@ -8005,6 +8005,37 @@ TEST(rustlsp_nested_reference_impl_precedes_inner_inherent) {
     PASS();
 }
 
+TEST(rustlsp_by_value_probe_after_deref_does_not_require_visible_copy_impl) {
+    /* rustc +stable prints `Outer::file`; method selection precedes move checking. */
+    CBMFileResult *r = extract_rust(
+        "use std::ops::Deref;\n"
+        "macro_rules! copy_impl { ($t:ty) => { impl Copy for $t {} impl Clone for $t { "
+        "fn clone(&self) -> Self { *self } } }; }\n"
+        "struct Inner; impl Inner { fn file(&self) { println!(\"Inner::file\"); } }\n"
+        "struct Outer; copy_impl!(Outer);\n"
+        "impl Outer { fn file(self) { println!(\"Outer::file\"); } }\n"
+        "impl Deref for Outer { type Target = Inner; fn deref(&self) -> &Inner { &Inner } }\n"
+        "fn call(value: &Outer) { value.file(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.call", "main.Outer.file"), 0);
+    ASSERT_EQ(find_resolved(r, "main.call", "main.Inner.file"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_unrelated_derived_impl_does_not_veto_inherent_method) {
+    /* rustc +stable prints `S::hash`; `Other`'s generated impl is inapplicable. */
+    CBMFileResult *r = extract_rust(
+        "struct S; impl S { fn hash(&self) { println!(\"S::hash\"); } }\n"
+        "#[derive(Hash)] struct Other;\n"
+        "fn call(value: &S) { value.hash(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_confident(&r->resolved_calls, "main.call", "main.S.hash"), 0);
+    ASSERT_EQ(find_resolved(r, "main.call", "main.Other.hash"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rustlsp_unknown_reference_qualifier_is_not_promoted_by_alias_expansion) {
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -14695,6 +14726,8 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_written_reference_impl_selects_borrowed_owner);
     RUN_TEST(rustlsp_written_primitive_impl_selects_canonical_owner);
     RUN_TEST(rustlsp_nested_reference_impl_precedes_inner_inherent);
+    RUN_TEST(rustlsp_by_value_probe_after_deref_does_not_require_visible_copy_impl);
+    RUN_TEST(rustlsp_unrelated_derived_impl_does_not_veto_inherent_method);
     RUN_TEST(rustlsp_unknown_reference_qualifier_is_not_promoted_by_alias_expansion);
     RUN_TEST(rustlsp_reference_impl_generic_shadowing_withholds_unproved_bound);
     RUN_TEST(rustlsp_inherent_shared_receiver_precedes_unproved_blanket);
