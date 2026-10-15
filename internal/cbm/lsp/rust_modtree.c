@@ -112,6 +112,24 @@ typedef struct {
     uint8_t prelude_restrictions;
 } RmtFile;
 
+/* Read-only lookup over a finished tree for trait-in-scope queries. `bound`
+ * groups the entries such a query can accept (not named `_`, binding a type
+ * with a QN) by the trait identity rmt_trait_identity_equal compares; `anon`
+ * groups the `_` imports by module. Both keep ascending entry ids. Not ready
+ * while the tree is unfinished, after an import was left undecided, or when
+ * memory ran out: queries then scan every entry. */
+typedef struct {
+    bool ready;
+    int entry_count; /* the tree's counts when the index was built */
+    int module_count;
+    CBMIdxMemo plain;  /* trait QN -> group */
+    CBMIdxMemo facade; /* std/core/alloc path after the crate -> group */
+    int *bound_start;  /* group g owns bound_ids[bound_start[g] .. bound_start[g + 1]) */
+    int *bound_ids;
+    int *anon_start; /* module m owns anon_ids[anon_start[m] .. anon_start[m + 1]) */
+    int *anon_ids;
+} RmtTraitIndex;
+
 struct CBMRustModTree {
     CBMArena arena;
     RmtFile *files;
@@ -129,6 +147,7 @@ struct CBMRustModTree {
     CBMIdxMemo names;     /* "<module>\x1f<name>" -> first entry */
     CBMIdxMemo externs;   /* "<crate>\x1f<name>" -> target crate + 1, 0 = outside project */
     CBMIdxMemo use_heads; /* "<module>\x1f<head>" -> 1 when a `use` declared there starts so */
+    RmtTraitIndex trait_index;
 };
 
 typedef struct {
@@ -159,10 +178,19 @@ CBMRustModTree *cbm_rust_modtree_new(void) {
     return tree;
 }
 
+static void rmt_trait_index_free(RmtTraitIndex *index) {
+    cbm_free(CBM_MEM_CLASS_OTHER, index->bound_start);
+    cbm_free(CBM_MEM_CLASS_OTHER, index->bound_ids);
+    cbm_free(CBM_MEM_CLASS_OTHER, index->anon_start);
+    cbm_free(CBM_MEM_CLASS_OTHER, index->anon_ids);
+    *index = (RmtTraitIndex){0}; /* memo slots live in the tree arena */
+}
+
 void cbm_rust_modtree_free(CBMRustModTree *tree) {
     if (!tree) {
         return;
     }
+    rmt_trait_index_free(&tree->trait_index);
     cbm_free(CBM_MEM_CLASS_OTHER, tree->files);
     cbm_free(CBM_MEM_CLASS_OTHER, tree->crates);
     cbm_free(CBM_MEM_CLASS_OTHER, tree->modules);
@@ -1627,6 +1655,8 @@ int cbm_rust_modtree_file_count(const CBMRustModTree *tree) {
     return tree ? tree->file_count : 0;
 }
 
+static void rmt_trait_index_build(CBMRustModTree *tree);
+
 void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const *facts) {
     /* Preserve restrictions even for files whose containing item macro leaves
      * their module mount unknown. No such file may assume a restricted prelude. */
@@ -1668,6 +1698,8 @@ void cbm_rust_modtree_finish(CBMRustModTree *tree, const CBMRustModFacts *const 
             if (tree->imports[i].result.open)
                 tree->imports[i].state = RMT_IMPORT_PENDING;
     }
+    /* Built here, before any reader sees the tree, so readers share it unlocked. */
+    rmt_trait_index_build(tree);
 }
 
 /* ── Queries ──────────────────────────────────────────────────────── */
@@ -2000,19 +2032,128 @@ CBMRustPathResult cbm_rust_modtree_resolve_type_in_file(const CBMRustModTree *tr
     return rmt_resolve_query(tree, arena, module_qn, 0, true, path, RMT_NS_TYPE, NULL, NULL, 0);
 }
 
+/* The module path after the crate of a std/core/alloc QN (".fmt.Debug"),
+ * NULL for any other QN. */
+static const char *rmt_facade_tail(const char *qn) {
+    bool facade = strncmp(qn, "std.", 4) == 0 || strncmp(qn, "core.", 5) == 0 ||
+                  strncmp(qn, "alloc.", 6) == 0;
+    return facade ? strchr(qn, '.') : NULL;
+}
+
 /* The standard facade re-exports a trait under the same module path. */
 static bool rmt_trait_identity_equal(const char *a, const char *b) {
     if (!a || !b)
         return false;
     if (strcmp(a, b) == 0)
         return true;
-    const char *at = strchr(a, '.');
-    const char *bt = strchr(b, '.');
-    bool af = strncmp(a, "std.", 4) == 0 || strncmp(a, "core.", 5) == 0 ||
-              strncmp(a, "alloc.", 6) == 0;
-    bool bf = strncmp(b, "std.", 4) == 0 || strncmp(b, "core.", 5) == 0 ||
-              strncmp(b, "alloc.", 6) == 0;
-    return af && bf && at && bt && strcmp(at, bt) == 0;
+    const char *at = rmt_facade_tail(a);
+    const char *bt = rmt_facade_tail(b);
+    return at && bt && strcmp(at, bt) == 0;
+}
+
+/* What a trait-in-scope query compares an entry's binding by: the type
+ * namespace item it binds, read from the finished imports. */
+static CBMRustPathResult rmt_entry_type(CBMRustModTree *tree, const RmtEntry *entry) {
+    RmtDefs bound = {0};
+    if (entry->import >= 0)
+        rmt_import_defs(tree, entry->import, false, RMT_NS_TYPE, &bound);
+    else
+        rmt_defs_add(&bound, &entry->def);
+    return rmt_classify_type(&bound);
+}
+
+/* The bound group of the trait identity of `qn`, -1 when no entry binds it.
+ * Two QNs share a group exactly when rmt_trait_identity_equal holds. */
+static int rmt_trait_group(const RmtTraitIndex *index, const char *qn) {
+    const char *tail = rmt_facade_tail(qn);
+    return tail ? cbm_idxmemo_get(&index->facade, tail) : cbm_idxmemo_get(&index->plain, qn);
+}
+
+/* Count one member of `group` into `start` (two slots longer than the
+ * group count), to be turned into offsets by rmt_index_offsets. */
+static void rmt_index_count(int *start, int group) {
+    start[group + 2]++;
+}
+
+/* After counting: start[g + 1] is where group g's ids begin, so that
+ * filling with ids[start[g + 1]++] leaves start[g] .. start[g + 1] per group. */
+static void rmt_index_offsets(int *start, int groups) {
+    for (int g = 2; g <= groups; g++)
+        start[g] += start[g - 1];
+}
+
+static bool rmt_trait_index_fill(CBMRustModTree *tree, RmtTraitIndex *index, int *group_of) {
+    int groups = 0;
+    for (int i = 0; i < tree->entry_count; i++) {
+        const RmtEntry *entry = &tree->entries[i];
+        group_of[i] = -1;
+        if (strcmp(entry->name, "_") == 0) {
+            if (entry->import >= 0)
+                rmt_index_count(index->anon_start, entry->module);
+            continue;
+        }
+        const char *qn = rmt_entry_type(tree, entry).qn;
+        if (!qn)
+            continue;
+        int group = rmt_trait_group(index, qn);
+        if (group < 0) {
+            const char *tail = rmt_facade_tail(qn);
+            const char *key = cbm_arena_strdup(&tree->arena, tail ? tail : qn);
+            group = groups++;
+            cbm_idxmemo_put_if_absent(tail ? &index->facade : &index->plain, &tree->arena, key,
+                                      group);
+            if (rmt_trait_group(index, qn) != group)
+                return false;
+        }
+        group_of[i] = group;
+        rmt_index_count(index->bound_start, group);
+    }
+    rmt_index_offsets(index->bound_start, groups);
+    rmt_index_offsets(index->anon_start, tree->module_count);
+    for (int i = 0; i < tree->entry_count; i++) {
+        const RmtEntry *entry = &tree->entries[i];
+        if (group_of[i] >= 0)
+            index->bound_ids[index->bound_start[group_of[i] + 1]++] = i;
+        else if (entry->import >= 0 && strcmp(entry->name, "_") == 0)
+            index->anon_ids[index->anon_start[entry->module + 1]++] = i;
+    }
+    return true;
+}
+
+/* Index the entries a trait-in-scope query can accept. Only a finished tree
+ * whose imports are all decided is indexed: then each entry's binding is a
+ * fixed fact, the same one every query reads. */
+static void rmt_trait_index_build(CBMRustModTree *tree) {
+    RmtTraitIndex *index = &tree->trait_index;
+    rmt_trait_index_free(index);
+    for (int i = 0; i < tree->import_count; i++)
+        if (tree->imports[i].state != RMT_IMPORT_DONE)
+            return;
+    size_t entries = (size_t)tree->entry_count;
+    size_t modules = (size_t)tree->module_count;
+    int *group_of = cbm_alloc(CBM_MEM_CLASS_OTHER, (entries + 1) * sizeof(int));
+    index->bound_start = cbm_calloc(CBM_MEM_CLASS_OTHER, (entries + 2) * sizeof(int));
+    index->bound_ids = cbm_alloc(CBM_MEM_CLASS_OTHER, (entries + 1) * sizeof(int));
+    index->anon_start = cbm_calloc(CBM_MEM_CLASS_OTHER, (modules + 2) * sizeof(int));
+    index->anon_ids = cbm_alloc(CBM_MEM_CLASS_OTHER, (entries + 1) * sizeof(int));
+    bool ready = group_of && index->bound_start && index->bound_ids && index->anon_start &&
+                 index->anon_ids && rmt_trait_index_fill(tree, index, group_of);
+    cbm_free(CBM_MEM_CLASS_OTHER, group_of);
+    if (!ready) {
+        rmt_trait_index_free(index);
+        return;
+    }
+    index->entry_count = tree->entry_count;
+    index->module_count = tree->module_count;
+    index->ready = true;
+}
+
+/* The tree's trait index, NULL when queries must scan every entry. */
+static const RmtTraitIndex *rmt_trait_index(const CBMRustModTree *tree) {
+    const RmtTraitIndex *index = &tree->trait_index;
+    bool current =
+        index->entry_count == tree->entry_count && index->module_count == tree->module_count;
+    return index->ready && current ? index : NULL;
 }
 
 /* Anonymous imports introduce no name, but their traits are in scope and
@@ -2021,7 +2162,12 @@ static bool rmt_anonymous_trait(CBMRustModTree *tree, int module, const char *qn
                                 RmtVisit *visit, const RmtSeers *seers) {
     if (!rmt_visit(visit, module))
         return false;
-    for (int i = 0; i < tree->entry_count; i++) {
+    /* The index lists exactly the entries the module and `_` tests below keep. */
+    const RmtTraitIndex *index = rmt_trait_index(tree);
+    int first = index ? index->anon_start[module] : 0;
+    int last = index ? index->anon_start[module + 1] : tree->entry_count;
+    for (int k = first; k < last; k++) {
+        int i = index ? index->anon_ids[k] : k;
         const RmtEntry *entry = &tree->entries[i];
         if (entry->module != module || strcmp(entry->name, "_") != 0 ||
             entry->import < 0 || !rmt_seen(tree, entry->vis, seers))
@@ -2058,6 +2204,14 @@ bool cbm_rust_modtree_trait_in_scope(const CBMRustModTree *tree, CBMArena *arena
     if (file < 0 || !qn)
         return false;
     CBMRustModTree *readonly = (CBMRustModTree *)tree;
+    /* The index lists exactly the entries the identity and `_` tests below
+     * keep, in the same order; without it every entry is tried. */
+    const RmtTraitIndex *index = rmt_trait_index(tree);
+    int group = index ? rmt_trait_group(index, qn) : -1;
+    const int *ids = index && group >= 0 ? index->bound_ids + index->bound_start[group] : NULL;
+    int candidates = !index ? tree->entry_count
+                     : ids  ? index->bound_start[group + 1] - index->bound_start[group]
+                            : 0;
     bool any = false;
     for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
         if (!rmt_contains(&tree->modules[m], offset) || !rmt_innermost(tree, file, m, offset))
@@ -2082,14 +2236,9 @@ bool cbm_rust_modtree_trait_in_scope(const CBMRustModTree *tree, CBMArena *arena
                 rmt_resolve_path(readonly, arena, m, segs, count, RMT_NS_TYPE, is_use, &found, false);
             visible = rmt_trait_identity_equal(rmt_classify_type(&found).qn, qn);
         }
-        for (int i = 0; !visible && i < tree->entry_count; i++) {
-            const RmtEntry *entry = &tree->entries[i];
-            RmtDefs bound = {0};
-            if (entry->import >= 0)
-                rmt_import_defs(readonly, entry->import, false, RMT_NS_TYPE, &bound);
-            else
-                rmt_defs_add(&bound, &entry->def);
-            CBMRustPathResult candidate = rmt_classify_type(&bound);
+        for (int k = 0; !visible && k < candidates; k++) {
+            const RmtEntry *entry = &tree->entries[ids ? ids[k] : k];
+            CBMRustPathResult candidate = rmt_entry_type(readonly, entry);
             if (!rmt_trait_identity_equal(candidate.qn, qn) || strcmp(entry->name, "_") == 0)
                 continue;
             const char *segs[RMT_MAX_SEGS] = {entry->name};
