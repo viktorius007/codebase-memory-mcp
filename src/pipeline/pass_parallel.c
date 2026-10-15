@@ -455,6 +455,13 @@ static bool is_checked_exception(const char *name) {
     return true;
 }
 
+/* The registry's blocked verdict (see cbm_registry_resolve_lang): a name the
+ * interpreter binds to something this resolver cannot name. Weaker fallbacks
+ * that re-pick a candidate by name must not run for it. */
+static bool resolution_binding_blocked(const cbm_resolution_t *res) {
+    return res && res->strategy && strcmp(res->strategy, "import_map_blocked") == 0;
+}
+
 static const char *resolve_as_class(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
                                     const char *name, const char *module_qn, const char **imp_keys,
                                     const char **imp_vals, int imp_count, CBMLanguage lang,
@@ -467,7 +474,7 @@ static const char *resolve_as_class(const cbm_registry_t *reg, const cbm_gbuf_t 
     /* The generic ambiguity set mixes languages. For Python inheritance, a
      * single Python type is the only candidate that can satisfy this edge. */
     if ((!res.qualified_name || res.qualified_name[0] == '\0') && lang == CBM_LANG_PYTHON &&
-        res.candidate_count > SKIP_ONE && !strchr(name, '.')) {
+        !resolution_binding_blocked(&res) && res.candidate_count > SKIP_ONE && !strchr(name, '.')) {
         const char **qns = NULL;
         int count = 0;
         const char *only = NULL;
@@ -3832,7 +3839,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             /* TSX references cannot bind definitions from an incompatible
              * language; recover only when that filtering proves one target. */
             if ((!res.qualified_name || res.qualified_name[0] == '\0') && lang == CBM_LANG_TSX &&
-                res.candidate_count > SKIP_ONE && !strchr(usage->ref_name, '.')) {
+                !resolution_binding_blocked(&res) && res.candidate_count > SKIP_ONE &&
+                !strchr(usage->ref_name, '.')) {
                 const char **qns = NULL;
                 int count = 0;
                 const char *only = NULL;
@@ -4176,7 +4184,8 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
             continue;
         }
         cbm_resolution_t res = cbm_registry_resolve_lang(rc->registry, fn, mq, ik, iv, ic, lang);
-        if ((!res.qualified_name || res.qualified_name[0] == '\0') && !strchr(fn, '.')) {
+        if ((!res.qualified_name || res.qualified_name[0] == '\0') &&
+            !resolution_binding_blocked(&res) && !strchr(fn, '.')) {
             /* C# attributes are referenced by their short name (`[Log]`) but
              * declared with an `Attribute` suffix (`class LogAttribute`). */
             char with_suffix[CBM_SZ_256];

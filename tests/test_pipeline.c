@@ -4317,6 +4317,31 @@ static void write_f1_guard_fixture(const char *tmp, int pad_files) {
                     "from .models import Base as LocalBase\n"
                     "class Alias(LocalBase):\n    pass\n"
                     "def make_alias():\n    return LocalBase()\n");
+    write_temp_file(tmp, "app/assign_external.py",
+                    "import pathlib\n"
+                    "ASSIGNED_EXT = 'a.txt'\n"
+                    "def read_assigned_ext():\n    return ASSIGNED_EXT\n"
+                    "pathlib.Path(ASSIGNED_EXT)\n");
+    write_temp_file(tmp, "app/assign_plain.py",
+                    "ASSIGNED_PLAIN = 'b.txt'\n"
+                    "def read_assigned_plain():\n    return ASSIGNED_PLAIN\n");
+    write_temp_file(tmp, "app/assign_rebind.py",
+                    "from .models import Base\n"
+                    "Base = Base()\n"
+                    "def read_rebound():\n    return Base\n");
+    write_temp_file(tmp, "app/decorated_stdlib.py",
+                    "from dataclasses import dataclass\n"
+                    "@dataclass\n"
+                    "class StdlibDecorated:\n    size: int\n"
+                    "def read_stdlib_decorated(item: StdlibDecorated):\n    return item\n");
+    write_temp_file(tmp, "app/decorated_local.py",
+                    "def wrap(cls):\n    return cls\n"
+                    "@wrap\n"
+                    "class LocalDecorated:\n    pass\n"
+                    "def read_local_decorated(item: LocalDecorated):\n    return item\n");
+    write_temp_file(tmp, "initpkg/__init__.py",
+                    "INIT_VALUE = 1\n"
+                    "def read_init_value():\n    return INIT_VALUE\n");
     write_temp_file(tmp, "app/unbound.py", "class Unbound(Base):\n    pass\n");
     write_temp_file(tmp, "t1.py", "class Problem(Exception):\n    pass\n");
     write_temp_file(tmp, "t2.py", "class Problem(Exception):\n    pass\n");
@@ -4554,6 +4579,93 @@ TEST(pipeline_python_relative_alias_import_binds_inherits_like_calls) {
                       "AND s.file_path='app/alias.py' AND s.name='make_alias' "
                       "AND t.file_path='app/models.py' AND t.name='Base')";
     ASSERT_EQ(f1_guard_query_both_modes("py-relative-alias", sql, 101), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_usage_binds_own_variable_beside_external_import) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/assign_external.py' AND s.name='read_assigned_ext' "
+                      "AND t.file_path='app/assign_external.py' AND t.name='ASSIGNED_EXT'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-ext-usage", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_write_binds_own_variable_beside_external_import) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='WRITES' "
+                      "AND s.label='Module' AND s.file_path='app/assign_external.py' "
+                      "AND t.file_path='app/assign_external.py' AND t.name='ASSIGNED_EXT'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-ext-write", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_usage_binds_own_variable_without_any_import) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/assign_plain.py' AND s.name='read_assigned_plain' "
+                      "AND t.file_path='app/assign_plain.py' AND t.name='ASSIGNED_PLAIN'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-plain-usage", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_write_binds_own_variable_without_any_import) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='WRITES' "
+                      "AND s.label='Module' AND s.file_path='app/assign_plain.py' "
+                      "AND t.file_path='app/assign_plain.py' AND t.name='ASSIGNED_PLAIN'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-plain-write", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assignment_over_import_binds_own_variable_not_imported_class) {
+    const char *sql = "SELECT 10 * (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/assign_rebind.py' AND s.name='read_rebound' "
+                      "AND t.file_path='app/assign_rebind.py' AND t.name='Base') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/assign_rebind.py' AND s.name='read_rebound' "
+                      "AND t.file_path='app/models.py' AND t.name='Base')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-assign-rebind", sql, 10), 2);
+    PASS();
+}
+
+TEST(pipeline_python_usage_of_star_excluded_name_is_recorded_not_silent) {
+    const char *sql = "SELECT count(*) FROM unresolved_sites WHERE file_path='app/star_all.py' "
+                      "AND kind='reference' AND name='Base' AND reason='name_binding_not_proven'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-blocked-usage", sql, -1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_class_under_stdlib_dataclass_keeps_its_own_binding) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/decorated_stdlib.py' "
+                      "AND s.name='read_stdlib_decorated' "
+                      "AND t.file_path='app/decorated_stdlib.py' AND t.name='StdlibDecorated'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-dataclass-usage", sql, 1), 2);
+    PASS();
+}
+
+TEST(pipeline_python_class_under_local_decorator_is_withheld_and_recorded) {
+    const char *sql = "SELECT 100 * EXISTS(SELECT 1 FROM unresolved_sites "
+                      "WHERE file_path='app/decorated_local.py' AND name='LocalDecorated' "
+                      "AND reason='name_binding_not_proven') + "
+                      "(SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='app/decorated_local.py' AND s.name='read_local_decorated' "
+                      "AND t.file_path='app/decorated_local.py' AND t.name='LocalDecorated')";
+    ASSERT_EQ(f1_guard_query_both_modes("py-local-decorator", sql, 100), 2);
+    PASS();
+}
+
+TEST(pipeline_python_assigned_name_in_package_init_binds_own_variable) {
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' "
+                      "AND s.file_path='initpkg/__init__.py' AND s.name='read_init_value' "
+                      "AND t.file_path='initpkg/__init__.py' AND t.name='INIT_VALUE'";
+    ASSERT_EQ(f1_guard_query_both_modes("py-init-assign-usage", sql, 1), 2);
     PASS();
 }
 
@@ -31543,6 +31655,15 @@ SUITE(pipeline_unresolved) {
     RUN_TEST(pipeline_python_star_import_obeys_dunder_all);
     RUN_TEST(pipeline_python_star_import_excludes_underscore_names);
     RUN_TEST(pipeline_python_star_import_rebinds_in_statement_order);
+    RUN_TEST(pipeline_python_assigned_name_usage_binds_own_variable_beside_external_import);
+    RUN_TEST(pipeline_python_assigned_name_write_binds_own_variable_beside_external_import);
+    RUN_TEST(pipeline_python_assigned_name_usage_binds_own_variable_without_any_import);
+    RUN_TEST(pipeline_python_assigned_name_write_binds_own_variable_without_any_import);
+    RUN_TEST(pipeline_python_assignment_over_import_binds_own_variable_not_imported_class);
+    RUN_TEST(pipeline_python_usage_of_star_excluded_name_is_recorded_not_silent);
+    RUN_TEST(pipeline_python_class_under_stdlib_dataclass_keeps_its_own_binding);
+    RUN_TEST(pipeline_python_class_under_local_decorator_is_withheld_and_recorded);
+    RUN_TEST(pipeline_python_assigned_name_in_package_init_binds_own_variable);
     RUN_TEST(pipeline_python_relative_module_attribute_binds_inherits_like_calls);
     RUN_TEST(pipeline_python_relative_alias_import_binds_inherits_like_calls);
     RUN_TEST(pipeline_python_unbound_multicandidate_inherits_is_withheld);

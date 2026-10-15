@@ -2258,8 +2258,17 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            const char *module_qn, const char **import_map_keys,
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
-    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false);
+    cbm_resolution_t res =
+        registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, lang_scope_len(module_qn, lang), false);
+    /* The blocked verdict is the answer "the name is bound, to nothing the
+     * resolver can name". Its sentinel QN is not a node, so no caller may look
+     * it up: it leaves here as an empty resolution that keeps the strategy (a
+     * caller with a weaker fallback must not run it) and the ambiguity-sized
+     * candidate count (a caller that records the unresolved site records it). */
+    if (res.strategy && strcmp(res.strategy, "import_map_blocked") == 0)
+        return (cbm_resolution_t){.strategy = res.strategy, .candidate_count = res.candidate_count};
+    return res;
 }
 
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,

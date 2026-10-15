@@ -180,6 +180,13 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
+/* The registry's blocked verdict (see cbm_registry_resolve_lang): a name the
+ * interpreter binds to something this resolver cannot name. Weaker fallbacks
+ * that re-pick a candidate by name must not run for it. */
+static bool resolution_binding_blocked(const cbm_resolution_t *res) {
+    return res && res->strategy && strcmp(res->strategy, "import_map_blocked") == 0;
+}
+
 /* Resolve a class/type name through the registry. Returns borrowed QN or NULL. */
 static const char *resolve_as_class(const cbm_registry_t *reg, const cbm_gbuf_t *gbuf,
                                     const char *name, const char *module_qn, const char **imp_keys,
@@ -197,7 +204,7 @@ static const char *resolve_as_class(const cbm_registry_t *reg, const cbm_gbuf_t 
     /* The generic ambiguity set mixes languages. For Python inheritance, a
      * single Python type is the only candidate that can satisfy this edge. */
     if ((!res.qualified_name || res.qualified_name[0] == '\0') && lang == CBM_LANG_PYTHON &&
-        res.candidate_count > SKIP_ONE && !strchr(name, '.')) {
+        !resolution_binding_blocked(&res) && res.candidate_count > SKIP_ONE && !strchr(name, '.')) {
         const char **qns = NULL;
         int count = 0;
         const char *only = NULL;
@@ -605,7 +612,8 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     }
     cbm_resolution_t res = cbm_registry_resolve_lang(ctx->registry, func_name, module_qn, imp_keys,
                                                      imp_vals, imp_count, lang);
-    if ((!res.qualified_name || res.qualified_name[0] == '\0') && !strchr(func_name, '.')) {
+    if ((!res.qualified_name || res.qualified_name[0] == '\0') &&
+        !resolution_binding_blocked(&res) && !strchr(func_name, '.')) {
         /* C# attributes are referenced by their short name (`[Log]`) but declared
          * with the conventional `Attribute` suffix (`class LogAttribute`).  Retry
          * with the suffix appended so the declaration resolves. */

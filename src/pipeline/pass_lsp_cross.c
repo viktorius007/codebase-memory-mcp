@@ -41,6 +41,7 @@
 #include "foundation/compat.h" /* CBM_TLS */
 #include "pipeline/worker_pool.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -1734,6 +1735,122 @@ static const cbm_gbuf_node_t *pxc_python_fact_target(const cbm_pipeline_ctx_t *c
     return target;
 }
 
+/* Standard-library decorators that return the decorated object, or an
+ * equivalent of the very definition it decorates, so the name stays bound to
+ * that definition. */
+static const struct {
+    const char *module;
+    const char *member;
+} PXC_IDENTITY_DECORATORS[] = {
+    {"dataclasses", "dataclass"},
+    {"typing", "final"},
+    {"typing_extensions", "final"},
+    {"typing", "runtime_checkable"},
+    {"typing_extensions", "runtime_checkable"},
+    {"functools", "total_ordering"},
+    {"enum", "unique"},
+};
+
+/* True when the facts before `upto` bind `head` (a dotted decorator head) to
+ * the standard-library decorator module.member and no star import follows that
+ * binding. */
+static bool pxc_python_decorator_is_stdlib(const CBMPyNamespaceFacts *facts, int upto,
+                                           const char *head, const char *module,
+                                           const char *member) {
+    const char *dot = strchr(head, '.');
+    if (dot && strchr(dot + 1, '.'))
+        return false;
+    char first[CBM_SZ_128];
+    size_t first_len = dot ? (size_t)(dot - head) : strlen(head);
+    if (first_len == 0 || first_len >= sizeof(first))
+        return false;
+    memcpy(first, head, first_len);
+    first[first_len] = '\0';
+    if (dot && strcmp(dot + 1, member) != 0)
+        return false;
+    for (int i = upto - 1; i >= 0; i--) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        /* A star import may rebind the name to anything. An unmodelled statement
+         * is not scanned: the replay keeps every other proven binding across
+         * it as well. */
+        if (fact->kind == CBM_PY_NS_IMPORT_STAR)
+            return false;
+        if (!fact->local_name || strcmp(fact->local_name, first) != 0)
+            continue;
+        if (dot)
+            return fact->kind == CBM_PY_NS_IMPORT_MODULE && fact->module_name &&
+                   strcmp(fact->module_name, module) == 0;
+        return fact->kind == CBM_PY_NS_IMPORT_NAME && fact->relative_level == 0 &&
+               fact->module_name && strcmp(fact->module_name, module) == 0 && fact->member_name &&
+               strcmp(fact->member_name, member) == 0;
+    }
+    return false;
+}
+
+static bool pxc_python_decorator_preserves(const CBMPyNamespaceFacts *facts, int upto,
+                                           const char *text) {
+    while (*text == '@' || *text == ' ')
+        text++;
+    char head[CBM_SZ_128];
+    size_t len = 0;
+    while ((isalnum((unsigned char)text[len]) || text[len] == '_' || text[len] == '.') &&
+           len + 1 < sizeof(head)) {
+        head[len] = text[len];
+        len++;
+    }
+    head[len] = '\0';
+    if (len == 0)
+        return false;
+    for (size_t k = 0; k < sizeof(PXC_IDENTITY_DECORATORS) / sizeof(PXC_IDENTITY_DECORATORS[0]);
+         k++) {
+        if (pxc_python_decorator_is_stdlib(facts, upto, head, PXC_IDENTITY_DECORATORS[k].module,
+                                           PXC_IDENTITY_DECORATORS[k].member))
+            return true;
+    }
+    return false;
+}
+
+/* A decorated definition keeps its name bound to its own definition when every
+ * decorator is one of the identity-preserving standard-library decorators
+ * above, resolved through the imports that precede it. Any other decorator may
+ * return anything, so the name stays blocked. The decorators are read from the
+ * definition's node, as the extractor wrote them. */
+static bool pxc_python_decorators_keep_definition(const cbm_gbuf_node_t *node,
+                                                  const CBMPyNamespaceFacts *facts, int upto) {
+    const char *p =
+        node && node->properties_json ? strstr(node->properties_json, "\"decorators\":[") : NULL;
+    if (!p)
+        return false;
+    p += strlen("\"decorators\":[");
+    int seen = 0;
+    while (*p && *p != ']') {
+        if (*p == ',' || *p == ' ') {
+            p++;
+            continue;
+        }
+        if (*p != '"')
+            return false;
+        p++;
+        char text[CBM_SZ_256];
+        size_t n = 0;
+        while (*p && *p != '"') {
+            if (*p == '\\' && p[1])
+                p++;
+            if (n + 1 < sizeof(text))
+                text[n++] = *p;
+            p++;
+        }
+        if (*p != '"')
+            return false;
+        p++;
+        text[n] = '\0';
+        if (!pxc_python_decorator_preserves(facts, upto, text))
+            return false;
+        seen++;
+    }
+    return seen > 0 && *p == ']';
+}
+
 static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const char *project_name,
                                         const char *rel_path, const char *module_qn,
                                         const CBMPyNamespaceFacts *facts, PXCPythonImportMap *map,
@@ -1825,6 +1942,24 @@ static bool pxc_python_apply_star(const cbm_pipeline_ctx_t *ctx, const char *pro
     return true;
 }
 
+/* The module-level node a name defined in this file lands on. A package
+ * `__init__` file defines its names on the package QN, so the symbol scope, not
+ * the module QN, prefixes the name. */
+static const cbm_gbuf_node_t *pxc_python_own_node(const cbm_pipeline_ctx_t *ctx,
+                                                  const char *module_qn, const char *name) {
+    char qn[CBM_PATH_MAX];
+    int n = snprintf(qn, sizeof(qn), "%.*s.%s", (int)cbm_fqn_symbol_scope_len(module_qn), module_qn,
+                     name);
+    return n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+}
+
+static bool pxc_python_decorated_node_kept(const cbm_pipeline_ctx_t *ctx, const char *module_qn,
+                                           const CBMPyNamespaceFacts *facts, int index) {
+    const cbm_gbuf_node_t *node =
+        pxc_python_own_node(ctx, module_qn, facts->items[index].local_name);
+    return pxc_python_decorators_keep_definition(node, facts, index);
+}
+
 static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const char *project_name,
                                         const char *rel_path, const char *module_qn,
                                         const CBMPyNamespaceFacts *facts, PXCPythonImportMap *map,
@@ -1836,10 +1971,7 @@ static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const cha
         const CBMPyNamespaceFact *fact = &facts->items[i];
         if (fact->kind == CBM_PY_NS_OWN_DEF && fact->local_name) {
             int existing = pxc_python_map_find(map, fact->local_name);
-            char qn[CBM_PATH_MAX];
-            int n = snprintf(qn, sizeof(qn), "%s.%s", module_qn, fact->local_name);
-            const cbm_gbuf_node_t *node =
-                n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+            const cbm_gbuf_node_t *node = pxc_python_own_node(ctx, module_qn, fact->local_name);
             if ((collect_exports || existing >= 0) &&
                 !pxc_python_map_set(map, fact->local_name, node ? node->qualified_name : NULL)) {
                 pxc_free_fqn(file_qn);
@@ -1896,13 +2028,22 @@ static bool pxc_python_replay_namespace(const cbm_pipeline_ctx_t *ctx, const cha
             if (!pxc_python_apply_star(ctx, project_name, rel_path, file_qn, fact, map, depth))
                 pxc_python_map_block_all(map);
         } else if (fact->kind == CBM_PY_NS_SHADOW && fact->local_name &&
-                   fact->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS) {
+                   (fact->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS ||
+                    fact->reason == CBM_PY_NS_REASON_VALUE ||
+                    (fact->reason == CBM_PY_NS_REASON_DECORATED &&
+                     pxc_python_decorated_node_kept(ctx, module_qn, facts, i)))) {
+            /* A class statement and an assignment bind the name to the module's
+             * own definition: the class object, or the assigned value, which the
+             * extractor records as a module-level node under this QN. Python
+             * binds that node at this statement, so the entry holds it and only
+             * replaces or creates a binding that already exists (an absent entry
+             * resolves to the same node as a same-module name). When no node
+             * carries the QN, the interpreter binds a value this resolver cannot
+             * see; only a recorded block keeps a weaker name guess away. */
             int existing = pxc_python_map_find(map, fact->local_name);
-            char qn[CBM_PATH_MAX];
-            int n = snprintf(qn, sizeof(qn), "%s.%s", module_qn, fact->local_name);
-            const cbm_gbuf_node_t *node =
-                n > 0 && (size_t)n < sizeof(qn) ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
-            if ((collect_exports || existing >= 0) &&
+            const cbm_gbuf_node_t *node = pxc_python_own_node(ctx, module_qn, fact->local_name);
+            bool unseen_value = !node && fact->reason == CBM_PY_NS_REASON_VALUE;
+            if ((collect_exports || existing >= 0 || unseen_value) &&
                 !pxc_python_map_set(map, fact->local_name, node ? node->qualified_name : NULL)) {
                 pxc_free_fqn(file_qn);
                 return false;
