@@ -23,9 +23,12 @@ Modes:
   --suites LIST  ITERATION mode: comma- or space-separated suite names, e.g.
                  --suites daemon,daemon_ipc. Rebuilds the test-runner
                  INCREMENTALLY (make dependency tracking, no clean) and runs
-                 only those suites — seconds, not minutes. Skips the contract
-                 steps and prod-binary guards; the full default run remains
-                 the merge gate. Suite names: build/c/test-runner --list-suites.
+                 only those suites, one process per suite through the parallel
+                 harness (same schedule as the full run: timing-sensitive
+                 suites in a quiet tail). CBM_TEST_SEQUENTIAL=1 runs them in
+                 one process instead. Skips the contract steps and prod-binary
+                 guards; the full default run remains the merge gate. Suite
+                 names: build/c/test-runner --list-suites.
   --tsan         ThreadSanitizer leg (data-race gate): builds and runs the
                  widened TSan runner via make test-tsan — the same leg CI's
                  tsan jobs and the compose test-tsan service run.
@@ -263,8 +266,22 @@ if [ -n "$SUITES" ]; then
     echo "=== test.sh: ITERATION mode — suites: $SUITES (incremental build) ==="
     make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
     assert_test_runner_build_config "$BUILD_DIR/test-runner" "$EXPECTED_SANITIZED"
+    if [ "${CBM_TEST_SEQUENTIAL:-0}" = "1" ]; then
+        # shellcheck disable=SC2086  # suite list is deliberately word-split
+        "$BUILD_DIR/test-runner" $SUITES
+        exit "$?"
+    fi
+    # One process per suite: the five-suite merge gate ran 88 s in one process
+    # and 52 s as concurrent processes (the runner is single-threaded; the
+    # pipeline suite alone is 59 s). The parallel harness takes the subset as
+    # a selection file of whole-suite tokens, validates every name against
+    # --list-suites, keeps its quiet tail for the timing-sensitive suites, and
+    # prints the same "N passed[, M failed]" summary. The file lives beside
+    # the runner, not under its log directory, which the harness empties.
+    SELECTION_FILE="$BUILD_DIR/suites-selection.txt"
     # shellcheck disable=SC2086  # suite list is deliberately word-split
-    "$BUILD_DIR/test-runner" $SUITES
+    printf '%s\n' $SUITES > "$SELECTION_FILE"
+    CBM_TEST_SELECTION_FILE="$SELECTION_FILE" bash scripts/run-tests-parallel.sh "$BUILD_DIR/test-runner"
     exit "$?"
 fi
 
