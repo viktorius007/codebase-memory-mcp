@@ -6,6 +6,7 @@
 #include "daemon/bootstrap.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/profile.h"
@@ -34,6 +35,12 @@ enum {
     INDEX_SUPERVISOR_TEST_READY_MS = 60000,
     INDEX_SUPERVISOR_TEST_BACKLOG_LINES = 1024,
 };
+
+/* The supervision windows (cancel grace, force settle, quiet timeout) run on
+ * the subprocess manual clock in every test that cancels a worker: a window
+ * closes only when the test advances that clock, so no scheduling delay of the
+ * worker, its reaper or this thread can close one first. The deadlines above
+ * bound real waits for a worker to start or finish and never decide a verdict. */
 
 static void index_supervisor_test_pause(void) {
     const struct timespec pause = {0, 10000000L};
@@ -96,19 +103,43 @@ static void index_supervisor_test_dump(const char *label, const char *path) {
     (void)fprintf(stderr, "%s%s", content, used > 0 && content[used - 1] == '\n' ? "" : "\n");
 }
 
+static bool index_supervisor_test_file_has_text(const char *path, const char *needle) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+    char content[4096] = {0};
+    size_t used = fread(content, 1, sizeof(content) - 1, file);
+    content[used] = '\0';
+    (void)fclose(file);
+    return strstr(content, needle) != NULL;
+}
+
 static bool index_supervisor_test_wait_file_text(const char *path, const char *needle,
                                                  uint32_t timeout_ms) {
     uint64_t deadline = cbm_now_ms() + timeout_ms;
     do {
-        FILE *file = cbm_fopen(path, "rb");
-        if (file) {
-            char content[4096] = {0};
-            size_t used = fread(content, 1, sizeof(content) - 1, file);
-            content[used] = '\0';
-            (void)fclose(file);
-            if (strstr(content, needle)) {
-                return true;
-            }
+        if (index_supervisor_test_file_has_text(path, needle)) {
+            return true;
+        }
+        index_supervisor_test_pause();
+    } while (cbm_now_ms() < deadline);
+    return false;
+}
+
+/* One poll, then the shutdown phase it left the worker's process tree in. */
+static cbm_subprocess_phase_t index_supervisor_test_poll_phase(cbm_index_worker_handle_t *handle) {
+    const cbm_index_worker_result_t *ignored = NULL;
+    (void)cbm_index_worker_poll(handle, &ignored);
+    return cbm_index_worker_phase_for_testing(handle);
+}
+
+/* The worker has exited (unreaped), observed without polling its handle. */
+static bool index_supervisor_test_wait_root_exit(cbm_index_worker_handle_t *handle) {
+    uint64_t deadline = cbm_now_ms() + INDEX_SUPERVISOR_TEST_TERMINAL_MS;
+    do {
+        if (cbm_index_worker_root_exited_for_testing(handle)) {
+            return true;
         }
         index_supervisor_test_pause();
     } while (cbm_now_ms() < deadline);
@@ -144,6 +175,10 @@ static void index_supervisor_test_cleanup_handle(cbm_index_worker_handle_t *hand
         return;
     }
     (void)cbm_index_worker_request_cancel(handle);
+    /* Under the manual clock a TERM-ignoring worker is forced only once its
+     * grace window is closed; on the real clock the advance has no effect. */
+    (void)index_supervisor_test_poll_phase(handle);
+    cbm_subprocess_advance_clock_for_testing(CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS);
     const cbm_index_worker_result_t *result = NULL;
     if (index_supervisor_test_poll_terminal(handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result)) {
         cbm_index_worker_destroy(handle);
@@ -388,14 +423,15 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
     cbm_index_worker_handle_t *second = NULL;
     index_supervisor_log_capture_t first_capture = {0};
     index_supervisor_log_capture_t second_capture = {0};
-    uint64_t start_before = cbm_now_ms();
+    cbm_subprocess_manual_clock_for_testing(true);
+    /* Start and poll return while the hang-tree workers run until killed, so
+     * returning at all — first poll RUNNING — is the nonblocking proof. */
     int first_rc =
         cbm_index_worker_start_with_log(args, 4096, true, marker_a, quarantine_a,
                                         index_supervisor_test_capture_log, &first_capture, &first);
     int second_rc = cbm_index_worker_start_with_log(args, 8192, true, marker_b, quarantine_b,
                                                     index_supervisor_test_capture_log,
                                                     &second_capture, &second);
-    uint64_t start_elapsed = cbm_now_ms() - start_before;
 
     char response_a[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
     char response_b[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
@@ -442,14 +478,19 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
                                    index_supervisor_test_append_log(log_b, "request-b-only\n");
 
     const cbm_index_worker_result_t *premature = (const cbm_index_worker_result_t *)1;
-    uint64_t poll_before = cbm_now_ms();
     cbm_index_worker_poll_t running =
         first ? cbm_index_worker_poll(first, &premature) : CBM_INDEX_WORKER_POLL_ERROR;
-    uint64_t poll_elapsed = cbm_now_ms() - poll_before;
-    uint64_t cancel_before = cbm_now_ms();
     bool first_cancel = first && cbm_index_worker_request_cancel(first);
     bool second_cancel = second && cbm_index_worker_request_cancel(second);
-    uint64_t cancel_elapsed = cbm_now_ms() - cancel_before;
+    cbm_subprocess_phase_t first_pending =
+        first ? cbm_index_worker_phase_for_testing(first) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    /* Both ready workers ignore SIGTERM, so the first poll after cancel leaves
+     * each in grace; closing the grace window is what forces them. */
+    cbm_subprocess_phase_t first_graceful =
+        first_ready ? index_supervisor_test_poll_phase(first) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_phase_t second_graceful =
+        second_ready ? index_supervisor_test_poll_phase(second) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_advance_clock_for_testing(CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS);
 
     const cbm_index_worker_result_t *first_result = NULL;
     const cbm_index_worker_result_t *second_result = NULL;
@@ -489,6 +530,7 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
     } else {
         index_supervisor_test_cleanup_handle(second);
     }
+    cbm_subprocess_manual_clock_for_testing(false);
     if (!first_ready || !second_ready) {
         index_supervisor_test_dump("worker-a log", log_a);
         index_supervisor_test_dump("worker-b log", log_b);
@@ -507,7 +549,6 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
 
     ASSERT_EQ(first_rc, 0);
     ASSERT_EQ(second_rc, 0);
-    ASSERT_TRUE(start_elapsed < INDEX_SUPERVISOR_TEST_READY_MS);
     ASSERT_TRUE(unique);
     ASSERT_TRUE(owner_only);
     ASSERT_TRUE(first_ready);
@@ -516,10 +557,11 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
     ASSERT_TRUE(parent_unchanged);
     ASSERT_EQ(running, CBM_INDEX_WORKER_POLL_RUNNING);
     ASSERT_NULL(premature);
-    ASSERT_TRUE(poll_elapsed < INDEX_SUPERVISOR_TEST_READY_MS);
     ASSERT_TRUE(first_cancel);
     ASSERT_TRUE(second_cancel);
-    ASSERT_TRUE(cancel_elapsed < INDEX_SUPERVISOR_TEST_READY_MS);
+    ASSERT_EQ(first_pending, CBM_SUBPROCESS_PHASE_CANCEL_PENDING);
+    ASSERT_EQ(first_graceful, CBM_SUBPROCESS_PHASE_GRACE);
+    ASSERT_EQ(second_graceful, CBM_SUBPROCESS_PHASE_GRACE);
     ASSERT_TRUE(first_terminal);
     ASSERT_TRUE(second_terminal);
     ASSERT_TRUE(cached_result);
@@ -532,6 +574,36 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
     PASS();
 }
 
+/* The blocking wrapper owns its handle, so the test watches for the GRACE
+ * transition process-wide and then closes exactly the grace window. */
+typedef struct {
+    int terminations_before;
+    atomic_bool wrapper_returned;
+    bool grace_observed;
+} index_supervisor_grace_driver_t;
+
+static void *index_supervisor_test_drive_grace(void *arg) {
+    index_supervisor_grace_driver_t *driver = arg;
+    uint64_t deadline = cbm_now_ms() + INDEX_SUPERVISOR_TEST_TERMINAL_MS;
+    while (cbm_subprocess_terminations_begun_for_testing() == driver->terminations_before &&
+           cbm_now_ms() < deadline) {
+        index_supervisor_test_pause();
+    }
+    driver->grace_observed =
+        cbm_subprocess_terminations_begun_for_testing() > driver->terminations_before;
+    if (driver->grace_observed) {
+        cbm_subprocess_advance_clock_for_testing(CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS);
+        return NULL;
+    }
+    /* The cancel never reached the worker: run every window out so the
+     * wrapper returns and the test fails on grace_observed instead of hanging. */
+    while (!atomic_load(&driver->wrapper_returned)) {
+        cbm_subprocess_advance_clock_for_testing(CBM_SUBPROCESS_FORCE_SETTLE_MS);
+        index_supervisor_test_pause();
+    }
+    return NULL;
+}
+
 TEST(index_supervisor_sync_wrapper_forwards_cancel_and_drains_tree) {
     char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-index-sync-cancel-XXXXXX", cbm_tmpdir());
@@ -540,18 +612,34 @@ TEST(index_supervisor_sync_wrapper_forwards_cancel_and_drains_tree) {
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
+    cbm_subprocess_manual_clock_for_testing(true);
+    index_supervisor_grace_driver_t driver = {.terminations_before =
+                                                  cbm_subprocess_terminations_begun_for_testing()};
+    atomic_init(&driver.wrapper_returned, false);
+    cbm_thread_t driver_thread;
+    bool driving =
+        cbm_thread_create(&driver_thread, 0, index_supervisor_test_drive_grace, &driver) == 0;
+
     atomic_int cancel_requested;
     atomic_init(&cancel_requested, 1);
     cbm_index_worker_result_t result = {0};
-    int run_status =
-        cbm_index_spawn_worker_with_log_cancel("{\"__cbm_test_worker\":\"hang-tree\"}", false, NULL,
-                                               NULL, NULL, NULL, &cancel_requested, &result);
+    int run_status = driving ? cbm_index_spawn_worker_with_log_cancel(
+                                   "{\"__cbm_test_worker\":\"hang-tree\"}", false, NULL, NULL, NULL,
+                                   NULL, &cancel_requested, &result)
+                             : -1;
+    atomic_store(&driver.wrapper_returned, true);
+    if (driving) {
+        (void)cbm_thread_join(&driver_thread);
+    }
+    cbm_subprocess_manual_clock_for_testing(false);
     bool contained = run_status == 0 && result.cancellation_requested && result.tree_quiesced &&
                      !result.supervision_failed && result.response == NULL;
     cbm_index_worker_result_free(&result);
     index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
     (void)th_rmtree(cache);
 
+    ASSERT_TRUE(driving);
+    ASSERT_TRUE(driver.grace_observed);
     ASSERT_TRUE(contained);
     PASS();
 }
@@ -689,8 +777,8 @@ TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat) {
     (void)cbm_unsetenv("CBM_LOG_LEVEL");
 
     cbm_index_worker_handle_t *handle = NULL;
-    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"heartbeat\"}", 0, false,
-                                          NULL, NULL, &handle);
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"heartbeat\"}", 0, false, NULL,
+                                          NULL, &handle);
     char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
     if (handle) {
         (void)snprintf(log_path, sizeof(log_path), "%s", cbm_index_worker_log_path(handle));
@@ -698,8 +786,10 @@ TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat) {
     bool ready = log_path[0] && index_supervisor_test_wait_file_text(
                                     log_path, "async worker heartbeat probe ready",
                                     INDEX_SUPERVISOR_TEST_READY_MS);
-    bool heartbeat = ready && index_supervisor_test_wait_file_text(
-                                  log_path, "msg=pipeline.discover", 1000);
+    /* The probe logs its heartbeat before the ready line it then flushes, and
+     * both go to this one log, so the heartbeat is already there once ready is. */
+    bool heartbeat =
+        ready && index_supervisor_test_file_has_text(log_path, "msg=pipeline.discover");
     const cbm_index_worker_result_t *result = NULL;
     bool terminal = handle && index_supervisor_test_poll_terminal(
                                   handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
@@ -744,13 +834,10 @@ TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback) {
     bool worker_logged =
         log_path[0] && index_supervisor_test_wait_file_text(log_path, "async worker clean probe",
                                                             INDEX_SUPERVISOR_TEST_READY_MS);
-    if (worker_logged) {
-        /* Seeing the flushed probe places the child immediately before _Exit.
-         * Give it time to become waitable without polling: the regression is a
-         * backlog already present when the first terminal poll occurs. */
-        cbm_usleep(250000);
-    }
-    bool backlog_written = worker_logged && index_supervisor_test_append_terminal_backlog(log_path);
+    /* The regression is a backlog already present when the first terminal poll
+     * occurs: wait, without polling, until the worker has exited. */
+    bool worker_exited = worker_logged && index_supervisor_test_wait_root_exit(handle);
+    bool backlog_written = worker_exited && index_supervisor_test_append_terminal_backlog(log_path);
     const cbm_index_worker_result_t *result = NULL;
     bool terminal = handle && index_supervisor_test_poll_terminal(
                                   handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
@@ -780,6 +867,7 @@ TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback) {
 
     ASSERT_EQ(start_rc, 0);
     ASSERT_TRUE(worker_logged);
+    ASSERT_TRUE(worker_exited);
     ASSERT_TRUE(backlog_written);
     ASSERT_TRUE(terminal);
     ASSERT_EQ(outcome, CBM_PROC_CLEAN);

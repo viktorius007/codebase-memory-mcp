@@ -43,6 +43,13 @@
 #include "../src/foundation/win_utf8.h"
 #endif
 
+/* Every test-side wait below is a hang detector, never an oracle: it only
+ * stops a broken build from blocking the runner, and a verdict never turns on
+ * it expiring. Supervision windows (quiet timeout, cancel grace, force settle)
+ * are driven by the subprocess manual clock, so a test reaches each of them by
+ * advancing that clock, never by waiting for wall-clock time to pass. */
+enum { SUBPROCESS_TEST_HANG_GUARD_MS = 30000 };
+
 /* ── Layer 1: pure classifier (all platforms) ─────────────────────────────── */
 
 TEST(subprocess_classify_clean) {
@@ -139,7 +146,7 @@ TEST(subprocess_environment_is_child_local) {
     cbm_proc_opts_t opts = {.bin = cbm_test_program_path,
                             .argv = args,
                             .env_overrides = overrides,
-                            .quiet_timeout_ms = 5000};
+                            .quiet_timeout_ms = SUBPROCESS_TEST_HANG_GUARD_MS};
     cbm_proc_result_t result;
     int rc = cbm_subprocess_run(&opts, &result);
     bool parent_unchanged = strcmp(getenv(names[0]), "parent") == 0 &&
@@ -167,7 +174,7 @@ TEST(subprocess_environment_rejects_invalid_override) {
         cbm_proc_opts_t opts = {.bin = cbm_test_program_path,
                                 .argv = args,
                                 .env_overrides = overrides,
-                                .quiet_timeout_ms = 5000};
+                                .quiet_timeout_ms = SUBPROCESS_TEST_HANG_GUARD_MS};
         cbm_proc_result_t result;
         ASSERT_EQ(cbm_subprocess_run(&opts, &result), -1);
         ASSERT_EQ(result.outcome, CBM_PROC_SPAWN_FAILED);
@@ -212,7 +219,7 @@ TEST(subprocess_environment_overrides_preserve_git_isolation) {
                             .argv = args,
                             .env_overrides = overrides,
                             .strip_git_repo_env = true,
-                            .quiet_timeout_ms = 5000};
+                            .quiet_timeout_ms = SUBPROCESS_TEST_HANG_GUARD_MS};
     cbm_proc_result_t result = {0};
     int rc = setup ? cbm_subprocess_run(&opts, &result) : -1;
     bool parent_unchanged = true;
@@ -244,7 +251,7 @@ TEST(subprocess_environment_core_ownership) {
     cbm_proc_opts_t opts = {.bin = cbm_test_program_path,
                             .argv = args,
                             .env_overrides = overrides,
-                            .quiet_timeout_ms = 5000};
+                            .quiet_timeout_ms = SUBPROCESS_TEST_HANG_GUARD_MS};
     size_t before = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
     cbm_subprocess_t *process = NULL;
     int rc = cbm_subprocess_spawn(&opts, &process);
@@ -390,8 +397,10 @@ TEST(subprocess_environment_path_preserves_caller_lookup) {
     int spawn_rc[3] = {-1, -1, -1};
     const char *args[] = {"cbm-env-probe", child_dir, NULL};
     const char *overrides[] = {path_override, NULL};
-    cbm_proc_opts_t opts = {
-        .bin = args[0], .argv = args, .env_overrides = overrides, .quiet_timeout_ms = 5000};
+    cbm_proc_opts_t opts = {.bin = args[0],
+                            .argv = args,
+                            .env_overrides = overrides,
+                            .quiet_timeout_ms = SUBPROCESS_TEST_HANG_GUARD_MS};
     for (int i = 0; setup && i < 2; i++) {
         FILE *parent_file = fopen(parent_tool, "w");
         FILE *child_file = fopen(child_tool, "w");
@@ -471,18 +480,6 @@ TEST(subprocess_run_crash_is_crash) {
 #endif
 }
 
-/* A child that makes no progress within the quiet-timeout is killed and reported
- * as HANG — the sibling failure mode of a crash (external-scanner infinite loop). */
-TEST(subprocess_run_hang_is_hang) {
-#ifdef _WIN32
-    SKIP_PLATFORM("POSIX /bin/sh spawn");
-#else
-    cbm_proc_result_t r = run_sh("sleep 30", 300 /* ms quiet-timeout */);
-    ASSERT_EQ(r.outcome, CBM_PROC_HANG);
-    PASS();
-#endif
-}
-
 /* A spawn of a non-existent binary fails cleanly (no child), not a crash. */
 /* The kernel refusing a spawn with EAGAIN means "not right now", not "never" —
  * a momentarily full process table on a busy machine. We used to treat it as a
@@ -533,10 +530,11 @@ TEST(subprocess_spawn_backoff_resumes_after_eintr) {
     g_spawn_backoff_alarm_count = 0;
     bool timer_started = handler_installed && setitimer(ITIMER_REAL, &timer, NULL) == 0;
 
-    uint64_t started_at = cbm_now_ms();
+    cbm_subprocess_reset_backoff_waits_for_testing();
     cbm_subprocess_force_spawn_eagain_for_testing(3);
     cbm_proc_result_t result = run_sh("exit 0", 0);
-    uint64_t elapsed_ms = cbm_now_ms() - started_at;
+    int backoff_waits = cbm_subprocess_backoff_waits_for_testing();
+    int backoff_waits_completed = cbm_subprocess_backoff_waits_completed_for_testing();
 
     struct itimerval disabled = {0};
     (void)setitimer(ITIMER_REAL, &disabled, NULL);
@@ -547,7 +545,10 @@ TEST(subprocess_spawn_backoff_resumes_after_eintr) {
     ASSERT_TRUE(handler_installed);
     ASSERT_TRUE(timer_started);
     ASSERT_TRUE(g_spawn_backoff_alarm_count > 0);
-    ASSERT_TRUE(elapsed_ms >= 50);
+    /* One wait per refusal, and each slept to completion under a 1 ms SIGALRM
+     * storm: a wait that gave up at EINTR reports failure here. */
+    ASSERT_EQ(backoff_waits, 3);
+    ASSERT_EQ(backoff_waits_completed, 3);
     ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
     PASS();
 #endif
@@ -615,7 +616,11 @@ TEST(subprocess_run_null_bin_rejected) {
  * subscriber leaves. These probes deliberately use /bin/sh descendants which
  * ignore SIGTERM: a direct-child-only implementation leaves the grandchild alive,
  * while a correct process-group implementation escalates and reports quiescence.
- * All test-side waits have explicit monotonic deadlines. */
+ *
+ * Shutdown is asserted as the product's own transitions (cbm_subprocess_phase):
+ * cancel pending -> grace -> forced -> terminal. Each window opens and closes
+ * only when the test advances the manual clock, so the order of events is the
+ * same however long the scheduler delays the child, its reaper or this thread. */
 
 #ifndef _WIN32
 
@@ -624,8 +629,8 @@ static void subprocess_test_pause(void) {
     (void)cbm_nanosleep(&delay, NULL);
 }
 
-static bool poll_until_terminal(cbm_subprocess_t *process, int timeout_ms, cbm_proc_result_t *out) {
-    uint64_t deadline = cbm_now_ms() + (uint64_t)timeout_ms;
+static bool poll_until_terminal(cbm_subprocess_t *process, cbm_proc_result_t *out) {
+    uint64_t guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
     do {
         cbm_proc_poll_t state = cbm_subprocess_poll(process, out);
         if (state == CBM_PROC_POLL_TERMINAL) {
@@ -635,8 +640,15 @@ static bool poll_until_terminal(cbm_subprocess_t *process, int timeout_ms, cbm_p
             return false;
         }
         subprocess_test_pause();
-    } while (cbm_now_ms() < deadline);
+    } while (cbm_now_ms() < guard);
     return cbm_subprocess_poll(process, out) == CBM_PROC_POLL_TERMINAL;
+}
+
+/* One poll, then the phase it left the handle in. */
+static cbm_subprocess_phase_t poll_then_phase(cbm_subprocess_t *process) {
+    cbm_proc_result_t ignored;
+    (void)cbm_subprocess_poll(process, &ignored);
+    return cbm_subprocess_phase_for_testing(process);
 }
 
 static bool make_tree_pid_path(char path[64]) {
@@ -650,8 +662,8 @@ static bool make_tree_pid_path(char path[64]) {
 }
 
 static bool wait_for_tree_pids(const char *path, cbm_subprocess_t *process, pid_t *parent_pid,
-                               pid_t *grandchild_pid, int timeout_ms) {
-    uint64_t deadline = cbm_now_ms() + (uint64_t)timeout_ms;
+                               pid_t *grandchild_pid) {
+    uint64_t guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
     do {
         FILE *f = fopen(path, "r");
         if (f) {
@@ -670,19 +682,13 @@ static bool wait_for_tree_pids(const char *path, cbm_subprocess_t *process, pid_
             return false;
         }
         subprocess_test_pause();
-    } while (cbm_now_ms() < deadline);
+    } while (cbm_now_ms() < guard);
     return false;
 }
 
-static bool wait_pid_gone(pid_t pid, int timeout_ms) {
-    uint64_t deadline = cbm_now_ms() + (uint64_t)timeout_ms;
-    do {
-        errno = 0;
-        if (kill(pid, 0) < 0 && errno == ESRCH) {
-            return true;
-        }
-        subprocess_test_pause();
-    } while (cbm_now_ms() < deadline);
+/* A quiescent terminal result means the whole group is reaped, so every member
+ * is gone at that instant: checked once, never waited for. */
+static bool pid_gone(pid_t pid) {
     errno = 0;
     return kill(pid, 0) < 0 && errno == ESRCH;
 }
@@ -700,15 +706,46 @@ static void force_probe_cleanup(pid_t parent_pid, pid_t grandchild_pid) {
     }
 }
 
+/* Destroy a terminal handle; otherwise kill the probe tree directly and drain
+ * the handle so no live handle or probe outlives a red test. */
+static void release_tree(cbm_subprocess_t *process, bool terminal, pid_t parent_pid,
+                         pid_t grandchild_pid) {
+    if (!process) {
+        return;
+    }
+    if (!terminal) {
+        force_probe_cleanup(parent_pid, grandchild_pid);
+        cbm_proc_result_t cleanup_result;
+        terminal = poll_until_terminal(process, &cleanup_result);
+    }
+    if (terminal) {
+        cbm_subprocess_destroy(process);
+    }
+}
+
 static int spawn_ignoring_tree(const char *pid_path, int quiet_timeout_ms, int cancel_grace_ms,
                                cbm_subprocess_t **out) {
-    /* The direct child installs its trap before starting a nested shell. The two
+    /* The direct child installs its trap before starting a nested shell, which
+     * inherits the ignored disposition and installs its own trap too. The two
      * PIDs are written only after the nested process exists, eliminating the
      * cancellation-before-trap race from the test. */
     const char *script = "trap '' TERM; "
                          "/bin/sh -c 'trap \"\" TERM; while :; do sleep 1; done' cbm-grandchild & "
                          "grandchild=$!; echo \"$$ $grandchild\" > \"$1\"; wait";
     const char *argv[] = {"/bin/sh", "-c", script, "cbm-parent", pid_path, NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    opts.quiet_timeout_ms = quiet_timeout_ms;
+    opts.cancel_grace_ms = cancel_grace_ms;
+    return cbm_subprocess_spawn(&opts, out);
+}
+
+/* A child that neither exits nor logs on its own and dies on SIGTERM: nothing
+ * but the supervisor can end it, so no delay can change how it ends. */
+static int spawn_until_terminated(int quiet_timeout_ms, int cancel_grace_ms,
+                                  cbm_subprocess_t **out) {
+    const char *argv[] = {"/bin/sh", "-c", "while :; do sleep 1; done", NULL};
     cbm_proc_opts_t opts = {0};
     opts.bin = "/bin/sh";
     opts.argv = argv;
@@ -738,7 +775,8 @@ static void ordered_log_callback(const char *line, void *opaque) {
     }
 }
 
-static bool wait_for_log_marker(const char *path, const char *marker, uint64_t deadline_ms) {
+static bool wait_for_log_marker(const char *path, const char *marker) {
+    uint64_t guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
     char contents[8192];
     do {
         FILE *file = fopen(path, "rb");
@@ -751,51 +789,79 @@ static bool wait_for_log_marker(const char *path, const char *marker, uint64_t d
             }
         }
         subprocess_test_pause();
-    } while (cbm_now_ms() < deadline_ms);
+    } while (cbm_now_ms() < guard);
     return false;
 }
 
 #endif /* !_WIN32 */
 
+/* A child that makes no progress within the quiet-timeout is stopped and
+ * reported as HANG — the sibling failure mode of a crash (external-scanner
+ * infinite loop). The window expires at exactly quiet_timeout_ms of supervisor
+ * time, and a child that honours SIGTERM ends without force. */
+TEST(subprocess_quiet_timeout_expiry_is_hang) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    enum { QUIET_MS = 300 };
+    cbm_subprocess_manual_clock_for_testing(true);
+    cbm_subprocess_t *process = NULL;
+    int spawn_rc = spawn_until_terminated(QUIET_MS, 100, &process);
+    bool spawned = spawn_rc == 0 && process;
+    cbm_subprocess_advance_clock_for_testing(QUIET_MS - 1);
+    cbm_subprocess_phase_t before_expiry =
+        spawned ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_advance_clock_for_testing(1);
+    cbm_subprocess_phase_t at_expiry =
+        spawned ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_proc_result_t result = {0};
+    bool terminal = spawned && poll_until_terminal(process, &result);
+    if (terminal) {
+        cbm_subprocess_destroy(process);
+    }
+    cbm_subprocess_manual_clock_for_testing(false);
+
+    ASSERT_EQ(spawn_rc, 0);
+    ASSERT_EQ(before_expiry, CBM_SUBPROCESS_PHASE_RUNNING);
+    ASSERT_EQ(at_expiry, CBM_SUBPROCESS_PHASE_GRACE);
+    ASSERT_TRUE(terminal);
+    ASSERT_EQ(result.outcome, CBM_PROC_HANG);
+    ASSERT_FALSE(result.cancellation_requested);
+    ASSERT_FALSE(result.forced);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    PASS();
+#endif
+}
+
 TEST(subprocess_spawn_returns_while_child_is_running) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX /bin/sh nonblocking spawn probe; native Job Object coverage pending");
 #else
-    const char *argv[] = {"/bin/sh", "-c", "sleep 4", NULL};
-    cbm_proc_opts_t opts = {0};
-    opts.bin = "/bin/sh";
-    opts.argv = argv;
-    opts.cancel_grace_ms = 100;
+    cbm_subprocess_manual_clock_for_testing(true);
     cbm_subprocess_t *process = NULL;
-
-    uint64_t before_spawn = cbm_now_ms();
-    int spawn_rc = cbm_subprocess_spawn(&opts, &process);
-    uint64_t spawn_elapsed = cbm_now_ms() - before_spawn;
-    ASSERT_EQ(spawn_rc, 0);
-    ASSERT_NOT_NULL(process);
-
-    cbm_proc_result_t result;
-    uint64_t before_poll = cbm_now_ms();
-    cbm_proc_poll_t first_poll = cbm_subprocess_poll(process, &result);
-    uint64_t poll_elapsed = cbm_now_ms() - before_poll;
-    bool cancel_accepted = cbm_subprocess_request_cancel(process);
-    bool terminal = poll_until_terminal(process, 2000, &result);
+    int spawn_rc = spawn_until_terminated(0, 100, &process);
+    bool spawned = spawn_rc == 0 && process;
+    cbm_proc_result_t result = {0};
+    /* The child only ends when signalled, so spawn and this poll returning at
+     * all — the poll reporting RUNNING — is the proof that neither blocks on it. */
+    cbm_proc_poll_t first_poll =
+        spawned ? cbm_subprocess_poll(process, &result) : CBM_PROC_POLL_ERROR;
+    bool cancel_accepted = spawned && cbm_subprocess_request_cancel(process);
+    bool terminal = cancel_accepted && poll_until_terminal(process, &result);
     if (terminal) {
         cbm_subprocess_destroy(process);
     }
+    cbm_subprocess_manual_clock_for_testing(false);
 
-    /* first_poll == RUNNING is the authoritative proof of non-blocking: the
-     * 4s child is still running when spawn+poll returned. The wall-clock bounds
-     * are only a coarse backstop against a regression that blocks on the child;
-     * they stay well under the 4s child so heavy scheduler starvation (the
-     * CBM_LOCAL_CI_CPUS=4 fidelity pass, CI runners) can never make them
-     * test-significant. */
+    ASSERT_EQ(spawn_rc, 0);
+    ASSERT_NOT_NULL(process);
     ASSERT_EQ(first_poll, CBM_PROC_POLL_RUNNING);
-    ASSERT_LT(spawn_elapsed, 3500);
-    ASSERT_LT(poll_elapsed, 3500);
     ASSERT_TRUE(cancel_accepted);
     ASSERT_TRUE(terminal);
+    ASSERT_EQ(result.outcome, CBM_PROC_KILLED);
     ASSERT_TRUE(result.cancellation_requested);
+    ASSERT_FALSE(result.forced); /* SIGTERM sufficed; the grace window never closed */
     ASSERT_TRUE(result.tree_quiesced);
     PASS();
 #endif
@@ -815,7 +881,7 @@ TEST(subprocess_natural_completion_is_cached_across_polls) {
     ASSERT_NOT_NULL(process);
 
     cbm_proc_result_t first;
-    ASSERT_TRUE(poll_until_terminal(process, 2000, &first));
+    ASSERT_TRUE(poll_until_terminal(process, &first));
     cbm_proc_result_t second;
     cbm_proc_result_t third;
     cbm_proc_poll_t second_poll = cbm_subprocess_poll(process, &second);
@@ -849,40 +915,47 @@ TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group probe; native Windows Job Object tree probe pending");
 #else
+    enum { GRACE_MS = 100 };
     char pid_path[64];
     ASSERT_TRUE(make_tree_pid_path(pid_path));
+    cbm_subprocess_manual_clock_for_testing(true);
     cbm_subprocess_t *process = NULL;
-    ASSERT_EQ(spawn_ignoring_tree(pid_path, 0, 100, &process), 0);
-    ASSERT_NOT_NULL(process);
+    int spawn_rc = spawn_ignoring_tree(pid_path, 0, GRACE_MS, &process);
 
     pid_t parent_pid = -1;
     pid_t grandchild_pid = -1;
-    bool ready = wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid, 1000);
+    bool ready =
+        spawn_rc == 0 && wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid);
     bool first_cancel = ready && cbm_subprocess_request_cancel(process);
     bool second_cancel = ready && cbm_subprocess_request_cancel(process);
-    cbm_proc_result_t result;
-    bool terminal = ready && poll_until_terminal(process, 2500, &result);
-    bool parent_gone = terminal && wait_pid_gone(parent_pid, 1000);
-    bool grandchild_gone = terminal && wait_pid_gone(grandchild_pid, 1000);
-    if (!terminal) {
-        force_probe_cleanup(parent_pid, grandchild_pid);
-        cbm_proc_result_t cleanup_result;
-        if (poll_until_terminal(process, 1000, &cleanup_result)) {
-            cbm_subprocess_destroy(process);
-        }
-    } else {
-        cbm_subprocess_destroy(process);
-    }
+    cbm_subprocess_phase_t pending =
+        ready ? cbm_subprocess_phase_for_testing(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_phase_t graceful =
+        ready ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_advance_clock_for_testing(GRACE_MS);
+    cbm_subprocess_phase_t escalated =
+        ready ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_proc_result_t result = {0};
+    bool terminal = ready && poll_until_terminal(process, &result);
+    bool parent_gone = terminal && pid_gone(parent_pid);
+    bool grandchild_gone = terminal && pid_gone(grandchild_pid);
+    release_tree(process, terminal, parent_pid, grandchild_pid);
+    cbm_subprocess_manual_clock_for_testing(false);
     (void)unlink(pid_path);
 
+    ASSERT_EQ(spawn_rc, 0);
     ASSERT_TRUE(ready);
     ASSERT_TRUE(first_cancel);
     ASSERT_TRUE(second_cancel);
+    ASSERT_EQ(pending, CBM_SUBPROCESS_PHASE_CANCEL_PENDING);
+    ASSERT_EQ(graceful, CBM_SUBPROCESS_PHASE_GRACE);
+    ASSERT_EQ(escalated, CBM_SUBPROCESS_PHASE_FORCED);
     ASSERT_TRUE(terminal);
     ASSERT_EQ(result.outcome, CBM_PROC_KILLED);
     ASSERT_TRUE(result.cancellation_requested);
     ASSERT_TRUE(result.forced);
     ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
     ASSERT_TRUE(parent_gone);
     ASSERT_TRUE(grandchild_gone);
     PASS();
@@ -893,36 +966,44 @@ TEST(subprocess_quiet_timeout_kills_ignoring_tree) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group probe; native Windows Job Object tree probe pending");
 #else
+    enum { QUIET_MS = 750, GRACE_MS = 100 };
     char pid_path[64];
     ASSERT_TRUE(make_tree_pid_path(pid_path));
+    cbm_subprocess_manual_clock_for_testing(true);
     cbm_subprocess_t *process = NULL;
-    ASSERT_EQ(spawn_ignoring_tree(pid_path, 750, 100, &process), 0);
-    ASSERT_NOT_NULL(process);
+    int spawn_rc = spawn_ignoring_tree(pid_path, QUIET_MS, GRACE_MS, &process);
 
     pid_t parent_pid = -1;
     pid_t grandchild_pid = -1;
-    bool ready = wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid, 500);
-    cbm_proc_result_t result;
-    bool terminal = ready && poll_until_terminal(process, 3000, &result);
-    bool parent_gone = terminal && wait_pid_gone(parent_pid, 1000);
-    bool grandchild_gone = terminal && wait_pid_gone(grandchild_pid, 1000);
-    if (!terminal) {
-        force_probe_cleanup(parent_pid, grandchild_pid);
-        cbm_proc_result_t cleanup_result;
-        if (poll_until_terminal(process, 1000, &cleanup_result)) {
-            cbm_subprocess_destroy(process);
-        }
-    } else {
-        cbm_subprocess_destroy(process);
-    }
+    bool ready =
+        spawn_rc == 0 && wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid);
+    cbm_subprocess_advance_clock_for_testing(QUIET_MS - 1);
+    cbm_subprocess_phase_t quiet = ready ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_advance_clock_for_testing(1);
+    cbm_subprocess_phase_t expired =
+        ready ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_advance_clock_for_testing(GRACE_MS);
+    cbm_subprocess_phase_t escalated =
+        ready ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_proc_result_t result = {0};
+    bool terminal = ready && poll_until_terminal(process, &result);
+    bool parent_gone = terminal && pid_gone(parent_pid);
+    bool grandchild_gone = terminal && pid_gone(grandchild_pid);
+    release_tree(process, terminal, parent_pid, grandchild_pid);
+    cbm_subprocess_manual_clock_for_testing(false);
     (void)unlink(pid_path);
 
+    ASSERT_EQ(spawn_rc, 0);
     ASSERT_TRUE(ready);
+    ASSERT_EQ(quiet, CBM_SUBPROCESS_PHASE_RUNNING);
+    ASSERT_EQ(expired, CBM_SUBPROCESS_PHASE_GRACE);
+    ASSERT_EQ(escalated, CBM_SUBPROCESS_PHASE_FORCED);
     ASSERT_TRUE(terminal);
     ASSERT_EQ(result.outcome, CBM_PROC_HANG);
     ASSERT_FALSE(result.cancellation_requested);
     ASSERT_TRUE(result.forced);
     ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
     ASSERT_TRUE(parent_gone);
     ASSERT_TRUE(grandchild_gone);
     PASS();
@@ -963,15 +1044,20 @@ TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
     opts.bin = powershell_path;
     opts.argv = argv;
     opts.cancel_grace_ms = 100;
+    cbm_subprocess_manual_clock_for_testing(true);
     cbm_subprocess_t *process = NULL;
-    ASSERT_EQ(cbm_subprocess_spawn(&opts, &process), 0);
+    int spawn_rc = cbm_subprocess_spawn(&opts, &process);
+    if (spawn_rc != 0) {
+        cbm_subprocess_manual_clock_for_testing(false);
+    }
+    ASSERT_EQ(spawn_rc, 0);
     ASSERT_NOT_NULL(process);
 
     DWORD root_pid = 0;
     DWORD grandchild_pid = 0;
-    uint64_t ready_deadline = cbm_now_ms() + 3000U;
+    uint64_t ready_guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
     bool ready = false;
-    while (cbm_now_ms() < ready_deadline) {
+    while (cbm_now_ms() < ready_guard) {
         FILE *pid_file = fopen(pid_path, "r");
         if (pid_file) {
             unsigned long root_value = 0;
@@ -1001,8 +1087,14 @@ TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
     bool cancelled = cbm_subprocess_request_cancel(process);
     cbm_proc_result_t result = {0};
     bool terminal = false;
-    uint64_t terminal_deadline = cbm_now_ms() + 4000U;
-    while (cbm_now_ms() < terminal_deadline) {
+    /* The first poll after cancel opens the grace window; the console break is
+     * best effort, so close the window and let the Job Object force the tree. */
+    cbm_proc_poll_t signalled = cbm_subprocess_poll(process, &result);
+    cbm_subprocess_phase_t graceful = cbm_subprocess_phase_for_testing(process);
+    cbm_subprocess_advance_clock_for_testing(opts.cancel_grace_ms);
+    terminal = signalled == CBM_PROC_POLL_TERMINAL;
+    uint64_t terminal_guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
+    while (!terminal && cbm_now_ms() < terminal_guard) {
         cbm_proc_poll_t state = cbm_subprocess_poll(process, &result);
         if (state == CBM_PROC_POLL_TERMINAL) {
             terminal = true;
@@ -1026,8 +1118,8 @@ TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
             (void)TerminateProcess(root_handle, 1);
         }
         (void)cbm_subprocess_request_cancel(process);
-        uint64_t cleanup_deadline = cbm_now_ms() + 2000U;
-        while (cbm_now_ms() < cleanup_deadline) {
+        uint64_t cleanup_guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
+        while (cbm_now_ms() < cleanup_guard) {
             cbm_proc_result_t cleanup_result;
             cbm_proc_poll_t state = cbm_subprocess_poll(process, &cleanup_result);
             if (state == CBM_PROC_POLL_TERMINAL) {
@@ -1040,9 +1132,10 @@ TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
             Sleep(10);
         }
     }
-    bool root_gone = root_handle && WaitForSingleObject(root_handle, 2000) == WAIT_OBJECT_0;
+    /* A quiescent Job has no live member, so both are signalled at terminal. */
+    bool root_gone = root_handle && WaitForSingleObject(root_handle, 0) == WAIT_OBJECT_0;
     bool grandchild_gone =
-        grandchild_handle && WaitForSingleObject(grandchild_handle, 2000) == WAIT_OBJECT_0;
+        grandchild_handle && WaitForSingleObject(grandchild_handle, 0) == WAIT_OBJECT_0;
     if (root_handle) {
         CloseHandle(root_handle);
     }
@@ -1052,10 +1145,12 @@ TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
     if (cleanup_terminal) {
         cbm_subprocess_destroy(process);
     }
+    cbm_subprocess_manual_clock_for_testing(false);
     (void)DeleteFileA(pid_path);
 
     ASSERT_TRUE(ready);
     ASSERT_TRUE(cancelled);
+    ASSERT_EQ(graceful, CBM_SUBPROCESS_PHASE_GRACE);
     ASSERT_TRUE(terminal);
     ASSERT_TRUE(result.cancellation_requested);
     ASSERT_TRUE(result.tree_quiesced);
@@ -1076,7 +1171,7 @@ TEST(subprocess_windows_job_object_enforces_memory_limit) {
     cbm_proc_opts_t opts = {0};
     opts.bin = self_path;
     opts.argv = argv;
-    opts.quiet_timeout_ms = 5000;
+    opts.quiet_timeout_ms = SUBPROCESS_TEST_HANG_GUARD_MS;
 
     /* Without the cap the SAME allocation must succeed. A machine-wide commit
      * shortage must fail this test, not masquerade as Job Object enforcement. */
@@ -1106,38 +1201,135 @@ TEST(subprocess_windows_job_object_enforces_memory_limit) {
 #endif
 }
 
+/* A caller asking for an unbounded grace still gets force at exactly
+ * CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS of supervisor time: one millisecond short
+ * the TERM-ignoring tree is still in grace, at the cap it is forced. The clock
+ * then stays put, so the force-settle window cannot close before the killed
+ * tree is reaped, however slowly the machine reaps it. */
 TEST(subprocess_cancel_grace_is_hard_capped) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group grace cap probe; native Windows coverage pending");
 #else
     char pid_path[64];
     ASSERT_TRUE(make_tree_pid_path(pid_path));
+    cbm_subprocess_manual_clock_for_testing(true);
     cbm_subprocess_t *process = NULL;
-    ASSERT_EQ(spawn_ignoring_tree(pid_path, 0, INT_MAX, &process), 0);
-    ASSERT_NOT_NULL(process);
+    int spawn_rc = spawn_ignoring_tree(pid_path, 0, INT_MAX, &process);
 
     pid_t parent_pid = -1;
     pid_t grandchild_pid = -1;
-    bool ready = wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid, 1000);
+    bool ready =
+        spawn_rc == 0 && wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid);
     bool cancel_accepted = ready && cbm_subprocess_request_cancel(process);
+    cbm_subprocess_phase_t graceful =
+        cancel_accepted ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_advance_clock_for_testing(CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS - 1);
+    cbm_subprocess_phase_t short_of_cap =
+        cancel_accepted ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_advance_clock_for_testing(1);
+    cbm_subprocess_phase_t at_cap =
+        cancel_accepted ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
     cbm_proc_result_t result = {0};
-    bool terminal = cancel_accepted && poll_until_terminal(process, 3500, &result);
-    if (!terminal) {
-        force_probe_cleanup(parent_pid, grandchild_pid);
-        cbm_proc_result_t cleanup_result;
-        if (poll_until_terminal(process, 1000, &cleanup_result)) {
-            cbm_subprocess_destroy(process);
-        }
-    } else {
-        cbm_subprocess_destroy(process);
-    }
+    bool terminal = cancel_accepted && poll_until_terminal(process, &result);
+    bool parent_gone = terminal && pid_gone(parent_pid);
+    bool grandchild_gone = terminal && pid_gone(grandchild_pid);
+    release_tree(process, terminal, parent_pid, grandchild_pid);
+    cbm_subprocess_manual_clock_for_testing(false);
     (void)unlink(pid_path);
 
+    ASSERT_EQ(spawn_rc, 0);
     ASSERT_TRUE(ready);
     ASSERT_TRUE(cancel_accepted);
+    ASSERT_EQ(graceful, CBM_SUBPROCESS_PHASE_GRACE);
+    ASSERT_EQ(short_of_cap, CBM_SUBPROCESS_PHASE_GRACE);
+    ASSERT_EQ(at_cap, CBM_SUBPROCESS_PHASE_FORCED);
     ASSERT_TRUE(terminal);
+    ASSERT_TRUE(result.cancellation_requested);
     ASSERT_TRUE(result.forced);
     ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    ASSERT_TRUE(parent_gone);
+    ASSERT_TRUE(grandchild_gone);
+    PASS();
+#endif
+}
+
+/* After force, a group member that cannot be reaped by the supervisor keeps
+ * the tree non-quiescent. Short of CBM_SUBPROCESS_FORCE_SETTLE_MS of supervisor
+ * time the handle keeps waiting; at it, terminal reports the containment
+ * failure instead of claiming quiescence. The lingering member is a zombie of
+ * this runner placed in the supervised group, so it outlives SIGKILL until the
+ * test reaps it — a deterministic stand-in for a descendant the OS is slow to
+ * retire. */
+TEST(subprocess_force_settle_expiry_reports_supervision_failure) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX process-group settle probe; native Windows coverage pending");
+#else
+    enum { GRACE_MS = 100 };
+    char pid_path[64];
+    ASSERT_TRUE(make_tree_pid_path(pid_path));
+    cbm_subprocess_manual_clock_for_testing(true);
+    cbm_subprocess_t *process = NULL;
+    int spawn_rc = spawn_ignoring_tree(pid_path, 0, GRACE_MS, &process);
+
+    pid_t parent_pid = -1;
+    pid_t grandchild_pid = -1;
+    bool ready =
+        spawn_rc == 0 && wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid);
+    pid_t lingering = ready ? fork() : -1;
+    if (lingering == 0) {
+        for (;;) {
+            pause();
+        }
+    }
+    /* The supervised root leads its own group, so its pid is the group id. */
+    bool joined = lingering > 0 && setpgid(lingering, parent_pid) == 0;
+    bool cancel_accepted = joined && cbm_subprocess_request_cancel(process);
+    cbm_subprocess_phase_t graceful =
+        cancel_accepted ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    cbm_subprocess_advance_clock_for_testing(GRACE_MS);
+    cbm_subprocess_phase_t escalated =
+        cancel_accepted ? poll_then_phase(process) : CBM_SUBPROCESS_PHASE_TERMINAL;
+    /* Every member but the zombie is gone once the root is reaped. */
+    uint64_t guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
+    bool others_gone = false;
+    while (cancel_accepted && !others_gone && cbm_now_ms() < guard) {
+        (void)poll_then_phase(process);
+        others_gone = pid_gone(parent_pid) && pid_gone(grandchild_pid);
+        if (!others_gone) {
+            subprocess_test_pause();
+        }
+    }
+    cbm_subprocess_advance_clock_for_testing(CBM_SUBPROCESS_FORCE_SETTLE_MS - 1);
+    cbm_proc_result_t result = {0};
+    cbm_proc_poll_t short_of_settle =
+        others_gone ? cbm_subprocess_poll(process, &result) : CBM_PROC_POLL_ERROR;
+    cbm_subprocess_advance_clock_for_testing(1);
+    cbm_proc_poll_t at_settle =
+        others_gone ? cbm_subprocess_poll(process, &result) : CBM_PROC_POLL_ERROR;
+    bool terminal = at_settle == CBM_PROC_POLL_TERMINAL;
+    if (lingering > 0) {
+        (void)kill(lingering, SIGKILL);
+        int status = 0;
+        (void)waitpid(lingering, &status, 0);
+    }
+    release_tree(process, terminal, parent_pid, grandchild_pid);
+    cbm_subprocess_manual_clock_for_testing(false);
+    (void)unlink(pid_path);
+
+    ASSERT_EQ(spawn_rc, 0);
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(joined);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_EQ(graceful, CBM_SUBPROCESS_PHASE_GRACE);
+    ASSERT_EQ(escalated, CBM_SUBPROCESS_PHASE_FORCED);
+    ASSERT_TRUE(others_gone);
+    ASSERT_EQ(short_of_settle, CBM_PROC_POLL_RUNNING);
+    ASSERT_EQ(at_settle, CBM_PROC_POLL_TERMINAL);
+    ASSERT_TRUE(result.cancellation_requested);
+    ASSERT_TRUE(result.forced);
+    ASSERT_TRUE(result.supervision_failed);
+    ASSERT_FALSE(result.tree_quiesced);
     PASS();
 #endif
 }
@@ -1168,12 +1360,12 @@ TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless) {
     ASSERT_NOT_NULL(process);
     capture.process = process;
 
-    bool backlog_ready = wait_for_log_marker(log_path, "line-399", cbm_now_ms() + 2000U);
+    bool backlog_ready = wait_for_log_marker(log_path, "line-399");
     cbm_proc_result_t result = {0};
     bool terminal = false;
     int max_poll_delivery = 0;
-    uint64_t deadline = cbm_now_ms() + 5000U;
-    while (backlog_ready && cbm_now_ms() < deadline) {
+    uint64_t guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
+    while (backlog_ready && cbm_now_ms() < guard) {
         int before = capture.count;
         cbm_proc_poll_t state = cbm_subprocess_poll(process, &result);
         int delivered = capture.count - before;
@@ -1195,7 +1387,7 @@ TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless) {
     } else {
         (void)cbm_subprocess_request_cancel(process);
         cbm_proc_result_t cleanup_result;
-        if (poll_until_terminal(process, 1000, &cleanup_result)) {
+        if (poll_until_terminal(process, &cleanup_result)) {
             cbm_subprocess_destroy(process);
         }
     }
@@ -1242,13 +1434,13 @@ TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification) 
     ASSERT_NOT_NULL(process);
     capture.process = process;
 
-    bool backlog_ready = wait_for_log_marker(log_path, "line-129", cbm_now_ms() + 2000U);
+    bool backlog_ready = wait_for_log_marker(log_path, "line-129");
     cbm_proc_result_t result = {0};
     cbm_proc_poll_t first =
         backlog_ready ? cbm_subprocess_poll(process, &result) : CBM_PROC_POLL_ERROR;
     int first_delivery = capture.count;
     bool moved = first == CBM_PROC_POLL_RUNNING && rename(log_path, saved_path) == 0;
-    bool terminal = moved && poll_until_terminal(process, 2000, &result);
+    bool terminal = moved && poll_until_terminal(process, &result);
     int callbacks_at_terminal = capture.count;
     cbm_proc_result_t cached = {0};
     cbm_proc_poll_t cached_state =
@@ -1261,7 +1453,7 @@ TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification) 
     } else {
         (void)cbm_subprocess_request_cancel(process);
         cbm_proc_result_t cleanup_result;
-        if (poll_until_terminal(process, 1000, &cleanup_result)) {
+        if (poll_until_terminal(process, &cleanup_result)) {
             cbm_subprocess_destroy(process);
         }
     }
@@ -1407,25 +1599,31 @@ TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop) {
 #endif
 }
 
+/* A root that exits while its group lives on is not terminal: the surviving
+ * descendant is drained through the graceful path, and the root's own exit
+ * classification is kept. The descendant never exits on its own, so the drain
+ * is always the supervisor's doing, and the frozen clock keeps it graceful. */
 TEST(subprocess_root_exit_drains_surviving_descendant) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group descendant probe; native Windows coverage pending");
 #else
     char pid_path[64];
     ASSERT_TRUE(make_tree_pid_path(pid_path));
-    const char *script = "sleep 30 & child=$!; echo $child > \"$1\"; exit 0";
+    const char *script =
+        "/bin/sh -c 'while :; do sleep 1; done' & child=$!; echo $child > \"$1\"; exit 0";
     const char *argv[] = {"/bin/sh", "-c", script, "cbm-root-exit", pid_path, NULL};
     cbm_proc_opts_t opts = {0};
     opts.bin = "/bin/sh";
     opts.argv = argv;
     opts.cancel_grace_ms = 100;
+    cbm_subprocess_manual_clock_for_testing(true);
+    int terminations_before = cbm_subprocess_terminations_begun_for_testing();
     cbm_subprocess_t *process = NULL;
-    ASSERT_EQ(cbm_subprocess_spawn(&opts, &process), 0);
-    ASSERT_NOT_NULL(process);
+    int spawn_rc = cbm_subprocess_spawn(&opts, &process);
 
     pid_t descendant = -1;
-    uint64_t deadline = cbm_now_ms() + 1000;
-    while (descendant <= 1 && cbm_now_ms() < deadline) {
+    uint64_t guard = cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS;
+    while (spawn_rc == 0 && descendant <= 1 && cbm_now_ms() < guard) {
         FILE *file = fopen(pid_path, "r");
         long value = -1;
         if (file) {
@@ -1437,23 +1635,22 @@ TEST(subprocess_root_exit_drains_surviving_descendant) {
         subprocess_test_pause();
     }
     cbm_proc_result_t result = {0};
-    bool terminal = descendant > 1 && poll_until_terminal(process, 2500, &result);
-    bool descendant_gone = terminal && wait_pid_gone(descendant, 1000);
-    if (!terminal) {
-        force_probe_cleanup(-1, descendant);
-        cbm_proc_result_t cleanup_result;
-        if (poll_until_terminal(process, 1000, &cleanup_result)) {
-            cbm_subprocess_destroy(process);
-        }
-    } else {
-        cbm_subprocess_destroy(process);
+    bool terminal = descendant > 1 && poll_until_terminal(process, &result);
+    int terminations = cbm_subprocess_terminations_begun_for_testing() - terminations_before;
+    bool descendant_gone = terminal && pid_gone(descendant);
+    if (spawn_rc == 0) {
+        release_tree(process, terminal, -1, descendant);
     }
+    cbm_subprocess_manual_clock_for_testing(false);
     (void)unlink(pid_path);
 
+    ASSERT_EQ(spawn_rc, 0);
     ASSERT_TRUE(descendant > 1);
     ASSERT_TRUE(terminal);
+    ASSERT_EQ(terminations, 1);
     ASSERT_TRUE(descendant_gone);
     ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_FALSE(result.forced);
     ASSERT_TRUE(result.tree_quiesced);
     PASS();
 #endif
@@ -1927,11 +2124,13 @@ static bool sp_stdout_poll_terminal(cbm_subprocess_t *process, cbm_proc_result_t
 /* The finite child normally exits immediately. On a RED path, cancel and drain
  * before destroying; never pass a live handle to destroy. */
 static bool sp_stdout_reap(cbm_subprocess_t *process, cbm_proc_result_t *result) {
-    bool terminal = sp_stdout_poll_terminal(process, result, cbm_now_ms() + 10000U);
+    bool terminal =
+        sp_stdout_poll_terminal(process, result, cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS);
     bool cleaned = terminal;
     if (!cleaned) {
         (void)cbm_subprocess_request_cancel(process);
-        cleaned = sp_stdout_poll_terminal(process, result, cbm_now_ms() + 4000U);
+        cleaned =
+            sp_stdout_poll_terminal(process, result, cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS);
     }
     if (cleaned)
         cbm_subprocess_destroy(process);
@@ -2147,10 +2346,12 @@ static bool sp_stdin_safe_run(int rc, const cbm_proc_result_t *result) {
 }
 
 static bool sp_stdin_finish(cbm_subprocess_t *process, cbm_proc_result_t *result) {
-    bool terminal = sp_stdout_poll_terminal(process, result, cbm_now_ms() + 10000U);
+    bool terminal =
+        sp_stdout_poll_terminal(process, result, cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS);
     if (!terminal) {
         (void)cbm_subprocess_request_cancel(process);
-        terminal = sp_stdout_poll_terminal(process, result, cbm_now_ms() + 4000U);
+        terminal =
+            sp_stdout_poll_terminal(process, result, cbm_now_ms() + SUBPROCESS_TEST_HANG_GUARD_MS);
     }
     if (terminal)
         cbm_subprocess_destroy(process);
@@ -2636,7 +2837,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_child_exiting_at_group_check);
     RUN_TEST(subprocess_run_resolves_literal_binary_name_from_path);
     RUN_TEST(subprocess_run_crash_is_crash);
-    RUN_TEST(subprocess_run_hang_is_hang);
+    RUN_TEST(subprocess_quiet_timeout_expiry_is_hang);
     RUN_TEST(subprocess_retries_transient_spawn_refusal);
     RUN_TEST(subprocess_spawn_backoff_resumes_after_eintr);
     RUN_TEST(subprocess_gives_up_after_the_retry_budget);
@@ -2649,6 +2850,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree);
     RUN_TEST(subprocess_windows_job_object_enforces_memory_limit);
     RUN_TEST(subprocess_cancel_grace_is_hard_capped);
+    RUN_TEST(subprocess_force_settle_expiry_reports_supervision_failure);
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
