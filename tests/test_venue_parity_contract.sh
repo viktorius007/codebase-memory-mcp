@@ -482,13 +482,23 @@ if [ -d "$ROOT/scripts" ] && [ -f "$ROOT/scripts/test.sh" ]; then
     trap 'rm -rf "$asan_tmp"' EXIT
     mkdir -p "$asan_tmp/bin" "$asan_tmp/build"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$asan_tmp/bin/make"
+    # The probe speaks the per-suite harness protocol that --suites mode
+    # drives (scripts/run-tests-parallel.sh -> run-test-wave.py): it lists
+    # one suite, and a suite run ends in the "  N passed" summary line the
+    # scheduler requires, otherwise the run is rc=97 and the case fails for
+    # the wrong reason.
     cat > "$asan_tmp/build/test-runner" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--build-config" ]; then
     printf 'sanitized=1 test_seams=1\n'
     exit 0
 fi
+if [ "${1:-}" = "--list-suites" ]; then
+    printf 'probe\n'
+    exit 0
+fi
 printf '%s' "${ASAN_OPTIONS-<unset>}" > "$CBM_ASAN_PROBE_OUT"
+printf '  1 passed\n'
 EOF
     chmod +x "$asan_tmp/bin/make" "$asan_tmp/build/test-runner"
 
