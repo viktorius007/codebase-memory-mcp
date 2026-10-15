@@ -98,22 +98,22 @@ static cbm_daemon_runtime_application_status_t frontend_idle_request(
     return CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
-static void frontend_idle_request_cancel(
-    void *context, cbm_daemon_runtime_application_session_t *session,
-    cbm_daemon_runtime_application_token_t request_token) {
+static void frontend_idle_request_cancel(void *context,
+                                         cbm_daemon_runtime_application_session_t *session,
+                                         cbm_daemon_runtime_application_token_t request_token) {
     (void)context;
     (void)session;
     (void)request_token;
 }
 
-static void frontend_idle_session_cancel(
-    void *context, cbm_daemon_runtime_application_session_t *session) {
+static void frontend_idle_session_cancel(void *context,
+                                         cbm_daemon_runtime_application_session_t *session) {
     (void)context;
     (void)session;
 }
 
-static void frontend_idle_session_close(
-    void *context, cbm_daemon_runtime_application_session_t *session) {
+static void frontend_idle_session_close(void *context,
+                                        cbm_daemon_runtime_application_session_t *session) {
     (void)context;
     (void)session;
 }
@@ -127,8 +127,7 @@ static uint64_t frontend_test_process_id(void) {
 }
 
 static bool frontend_idle_fixture_start(frontend_idle_fixture_t *fixture) {
-    static const char cache[] =
-        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    static const char cache[] = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     memset(fixture, 0, sizeof(*fixture));
     if (!frontend_maintenance_fixture_start(&fixture->maintenance, "idle-observer")) {
         return false;
@@ -170,8 +169,8 @@ static bool frontend_idle_fixture_start(frontend_idle_fixture_t *fixture) {
     fixture->service = cbm_daemon_runtime_service_start(&config);
     cbm_daemon_runtime_connect_result_t connect_result = {0};
     fixture->client = fixture->service
-                          ? cbm_daemon_runtime_client_connect(fixture->maintenance.endpoint, &identity,
-                                                              30000, &connect_result)
+                          ? cbm_daemon_runtime_client_connect(fixture->maintenance.endpoint,
+                                                              &identity, 30000, &connect_result)
                           : NULL;
     return fixture->client && connect_result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED;
 }
@@ -212,8 +211,7 @@ static int frontend_test_close_fd(int fd) {
 
 static void *frontend_idle_run(void *opaque) {
     frontend_idle_run_t *run = opaque;
-    run->result =
-        cbm_daemon_frontend_mcp_run(run->client, run->manager, run->input, run->output);
+    run->result = cbm_daemon_frontend_mcp_run(run->client, run->manager, run->input, run->output);
     return NULL;
 }
 #endif
@@ -235,6 +233,13 @@ enum {
     FRONTEND_BACKPRESSURE_DAEMON_TIMEOUT_S = 90,
     FRONTEND_BACKPRESSURE_RUNTIME_TIMEOUT_MS = 90000,
     FRONTEND_BACKPRESSURE_CLEANUP_TIMEOUT_MS = 30000,
+    /* Budget for every wait on an event this file's tests then assert: a
+     * child's pipe byte, a cohort admission, a mutation reservation that
+     * returns once the participant leaves. A hang detector like the ones
+     * above: each waiter returns the moment its event happens, so only a
+     * hang pays it. The old 1-8 s literals sat close enough to a starved
+     * runner's startup cost to turn scheduling into a verdict. */
+    FRONTEND_TEST_EVENT_TIMEOUT_MS = 30000,
     /* The production queue is deliberately bounded below this count. Keep the
      * regression black-box: it must remain valid if the exact capacity changes
      * while still proving that overload cannot hide an already-pending EOF. */
@@ -873,8 +878,9 @@ static int frontend_backpressure_frontend_run(const char *parent, int input_fd, 
     cbm_version_cohort_lease_t *participant = NULL;
     cbm_daemon_conflict_t conflict;
     cbm_version_cohort_status_t admitted =
-        manager ? cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 2000U, &participant,
-                                             &conflict)
+        manager ? cbm_version_cohort_acquire(manager, &identity,
+                                             cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
+                                             &participant, &conflict)
                 : CBM_VERSION_COHORT_IO;
     cbm_daemon_runtime_connect_result_t connect_result = {0};
     cbm_daemon_runtime_client_t *client =
@@ -1064,13 +1070,15 @@ static bool frontend_backpressure_run_isolated(bool maintenance) {
     }
 
     char request_marker = '\0';
-    bool request_read = frontend > 0 && frontend_test_read_byte(ready_pipe[0], &request_marker,
-                                                                cbm_now_ms() + 4000U);
+    bool request_read =
+        frontend > 0 && frontend_test_read_byte(ready_pipe[0], &request_marker,
+                                                cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     bool request_observed = request_read && request_marker == 'Q';
     char output_marker = '\0';
     bool output_observed =
-        !maintenance || (request_observed && frontend_test_read_byte(output_pipe[0], &output_marker,
-                                                                     cbm_now_ms() + 4000U));
+        !maintenance || (request_observed &&
+                         frontend_test_read_byte(output_pipe[0], &output_marker,
+                                                 cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS));
 
     cbm_daemon_ipc_endpoint_t *mutation_endpoint = NULL;
     cbm_version_cohort_manager_t *mutation_manager = NULL;
@@ -1086,7 +1094,7 @@ static bool frontend_backpressure_run_isolated(bool maintenance) {
             mutation_endpoint ? cbm_version_cohort_manager_new(mutation_endpoint) : NULL;
         mutation_status = mutation_manager
                               ? cbm_version_cohort_reserve_for_mutation(
-                                    mutation_manager, cbm_now_ms() + 8000U,
+                                    mutation_manager, cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
                                     frontend_test_quiesce_requested, NULL, &quiesce, &mutation)
                               : CBM_VERSION_COHORT_IO;
         if (mutation_status != CBM_VERSION_COHORT_OK && frontend > 0) {
@@ -1104,12 +1112,13 @@ static bool frontend_backpressure_run_isolated(bool maintenance) {
         frontend_waited = -1;
     }
     char cancel_marker = '\0';
-    bool cancel_read = request_observed && frontend_test_read_byte(cancel_pipe[0], &cancel_marker,
-                                                                   cbm_now_ms() + 4000U);
+    bool cancel_read =
+        request_observed && frontend_test_read_byte(cancel_pipe[0], &cancel_marker,
+                                                    cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     bool cancelled = cancel_read && cancel_marker == 'C';
     char checkpoint_marker = '\0';
-    bool checkpoint_read =
-        frontend_test_read_byte(ready_pipe[0], &checkpoint_marker, cbm_now_ms() + 4000U);
+    bool checkpoint_read = frontend_test_read_byte(ready_pipe[0], &checkpoint_marker,
+                                                   cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     bool target_cancelled_exactly_once = checkpoint_read && checkpoint_marker == 'T';
     bool sentinel_usable =
         cancelled && target_cancelled_exactly_once && sentinel_ready &&
@@ -1127,7 +1136,8 @@ static bool frontend_backpressure_run_isolated(bool maintenance) {
     }
     char done_marker = '\0';
     bool done_read =
-        shutdown_sent && frontend_test_read_byte(ready_pipe[0], &done_marker, cbm_now_ms() + 4000U);
+        shutdown_sent && frontend_test_read_byte(ready_pipe[0], &done_marker,
+                                                 cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     bool daemon_done = done_read && done_marker == 'D';
     if (!daemon_done && daemon > 0) {
         (void)kill(daemon, SIGKILL);
@@ -1348,7 +1358,7 @@ TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
     cbm_thread_t frontend_thread;
     bool thread_started =
         output && cbm_thread_create(&frontend_thread, 0, frontend_idle_run, &run) == 0;
-    uint64_t deadline = cbm_now_ms() + 10000U;
+    uint64_t deadline = cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS;
     while (thread_started && cbm_now_ms() < deadline &&
            (!cbm_daemon_frontend_test_monitor_waiting() ||
             cbm_daemon_frontend_test_worker_idle_cycles() == 0)) {
@@ -1407,7 +1417,8 @@ TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked) {
         cbm_daemon_conflict_t conflict;
         cbm_daemon_build_identity_t identity = frontend_test_identity();
         cbm_version_cohort_status_t admitted =
-            manager ? cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 2000U,
+            manager ? cbm_version_cohort_acquire(manager, &identity,
+                                                 cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
                                                  &participant, &conflict)
                     : CBM_VERSION_COHORT_IO;
         FILE *input = admitted == CBM_VERSION_COHORT_OK ? fdopen(input_pipe[0], "rb") : NULL;
@@ -1428,13 +1439,15 @@ TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked) {
         (void)close(input_pipe[0]);
         (void)close(ready_pipe[1]);
     }
-    bool announced = child > 0 && frontend_test_wait_byte(ready_pipe[0], 'R', cbm_now_ms() + 2000U);
+    bool announced =
+        child > 0 &&
+        frontend_test_wait_byte(ready_pipe[0], 'R', cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     cbm_version_cohort_lease_t *mutation = NULL;
     cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
     cbm_version_cohort_status_t status =
-        announced ? cbm_version_cohort_reserve_for_mutation(fixture.manager, cbm_now_ms() + 3000U,
-                                                            frontend_test_quiesce_requested, NULL,
-                                                            &quiesce, &mutation)
+        announced ? cbm_version_cohort_reserve_for_mutation(
+                        fixture.manager, cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
+                        frontend_test_quiesce_requested, NULL, &quiesce, &mutation)
                   : CBM_VERSION_COHORT_IO;
     if (status != CBM_VERSION_COHORT_OK && child > 0) {
         (void)kill(child, SIGKILL);
@@ -1482,7 +1495,8 @@ TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation) {
         cbm_daemon_conflict_t conflict;
         cbm_daemon_build_identity_t identity = frontend_test_identity();
         cbm_version_cohort_status_t admitted =
-            manager ? cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 2000U,
+            manager ? cbm_version_cohort_acquire(manager, &identity,
+                                                 cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
                                                  &participant, &conflict)
                     : CBM_VERSION_COHORT_IO;
         cbm_daemon_maintenance_monitor_t *monitor =
@@ -1505,16 +1519,19 @@ TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation) {
         (void)close(ready_pipe[1]);
         (void)close(cancel_pipe[1]);
     }
-    bool announced = child > 0 && frontend_test_wait_byte(ready_pipe[0], 'R', cbm_now_ms() + 2000U);
+    bool announced =
+        child > 0 &&
+        frontend_test_wait_byte(ready_pipe[0], 'R', cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     cbm_version_cohort_lease_t *mutation = NULL;
     cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
     cbm_version_cohort_status_t status =
-        announced ? cbm_version_cohort_reserve_for_mutation(fixture.manager, cbm_now_ms() + 5000U,
-                                                            frontend_test_quiesce_requested, NULL,
-                                                            &quiesce, &mutation)
+        announced ? cbm_version_cohort_reserve_for_mutation(
+                        fixture.manager, cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
+                        frontend_test_quiesce_requested, NULL, &quiesce, &mutation)
                   : CBM_VERSION_COHORT_IO;
-    bool cancelled = status == CBM_VERSION_COHORT_OK &&
-                     frontend_test_wait_byte(cancel_pipe[0], 'C', cbm_now_ms() + 1000U);
+    bool cancelled =
+        status == CBM_VERSION_COHORT_OK &&
+        frontend_test_wait_byte(cancel_pipe[0], 'C', cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     if (status != CBM_VERSION_COHORT_OK && child > 0) {
         (void)kill(child, SIGKILL);
     }
@@ -1559,7 +1576,8 @@ TEST(daemon_local_participant_monitor_allows_supervisor_containment_window) {
         cbm_daemon_conflict_t conflict;
         cbm_daemon_build_identity_t identity = frontend_test_identity();
         cbm_version_cohort_status_t admitted =
-            manager ? cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 2000U,
+            manager ? cbm_version_cohort_acquire(manager, &identity,
+                                                 cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
                                                  &participant, &conflict)
                     : CBM_VERSION_COHORT_IO;
         atomic_bool cancelled;
@@ -1593,13 +1611,15 @@ TEST(daemon_local_participant_monitor_allows_supervisor_containment_window) {
     if (pipe_ready) {
         (void)close(ready_pipe[1]);
     }
-    bool announced = child > 0 && frontend_test_wait_byte(ready_pipe[0], 'R', cbm_now_ms() + 2000U);
+    bool announced =
+        child > 0 &&
+        frontend_test_wait_byte(ready_pipe[0], 'R', cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS);
     cbm_version_cohort_lease_t *mutation = NULL;
     cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
     cbm_version_cohort_status_t status =
-        announced ? cbm_version_cohort_reserve_for_mutation(fixture.manager, cbm_now_ms() + 5000U,
-                                                            frontend_test_quiesce_requested, NULL,
-                                                            &quiesce, &mutation)
+        announced ? cbm_version_cohort_reserve_for_mutation(
+                        fixture.manager, cbm_now_ms() + FRONTEND_TEST_EVENT_TIMEOUT_MS,
+                        frontend_test_quiesce_requested, NULL, &quiesce, &mutation)
                   : CBM_VERSION_COHORT_IO;
     if (status != CBM_VERSION_COHORT_OK && child > 0) {
         (void)kill(child, SIGKILL);
