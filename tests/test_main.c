@@ -1799,6 +1799,8 @@ extern void suite_artifact(void);
 extern void suite_sqlite_writer(void);
 extern void suite_go_lsp(void);
 extern void suite_c_lsp(void);
+extern void suite_c_lsp_chain_binary(void);
+extern void suite_c_lsp_chain_receiver(void);
 extern void suite_php_lsp(void);
 extern void suite_cs_lsp(void);
 extern void suite_cs_lsp_bench(void);
@@ -2301,6 +2303,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(type_rep);
     RUN_SELECTED_SUITE(go_lsp);
     RUN_SELECTED_SUITE(c_lsp);
+    RUN_SELECTED_SUITE(c_lsp_chain_binary);
+    RUN_SELECTED_SUITE(c_lsp_chain_receiver);
     RUN_SELECTED_SUITE(php_lsp);
     RUN_SELECTED_SUITE(cs_lsp);
     RUN_SELECTED_SUITE_PERF(cs_lsp_bench);
