@@ -7883,6 +7883,47 @@ TEST(extract_c_preprocessed_pass_ignores_working_directory) {
     PASS();
 }
 
+/* A call the preprocessed pass extracts carries the line it is written on in
+ * this file. That pass parses the expanded buffer, where an included header
+ * occupies lines of its own, so the tree's row is an expanded-buffer line: the
+ * macro-hidden call below sat 40+ lines past line 4, past the end of a
+ * five-line file. The pass's own line map translates the row, and a call the
+ * map places inside the header is the header's call, not this file's. The
+ * header is reached through a named include directory, the one way the
+ * preprocessed pass may read it. */
+TEST(extract_c_preprocessed_calls_carry_original_lines) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cbm_pp_line_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char header_path[600];
+    bool written = write_pp_pad_header(tmpdir, header_path, sizeof(header_path));
+    const char *includes[] = {tmpdir, NULL};
+    CBMFileResult *r =
+        written ? cbm_extract_file(PP_CALL_SITE_SRC, (int)strlen(PP_CALL_SITE_SRC), CBM_LANG_C,
+                                   "t", "pp_main.c", 0, NULL, includes)
+                : NULL;
+    cbm_unlink(header_path);
+    cbm_rmdir(tmpdir);
+
+    ASSERT_TRUE(written);
+    ASSERT_NOT_NULL(r);
+    const CBMCall *target = find_call_by_callee(r, "pp_target");
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ((int)target->source_origin, (int)CBM_SOURCE_ORIGIN_PREPROCESSED);
+    ASSERT_EQ(target->start_line, PP_CALL_SITE_LINE);
+    /* The named directory is read: the header's macro expands, on line 4. */
+    const CBMCall *hdr_target = find_call_by_callee(r, "pp_hdr_target");
+    ASSERT_NOT_NULL(hdr_target);
+    ASSERT_EQ(hdr_target->start_line, PP_CALL_SITE_LINE);
+    ASSERT_EQ(count_calls_named(r, "pp_pad_callee"), 0);
+    for (int i = 0; i < r->calls.count; i++) {
+        ASSERT_GTE(r->calls.items[i].start_line, 1);
+        ASSERT_LTE(r->calls.items[i].start_line, PP_CALL_SITE_LINES);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #961 inverse guard: a clean C file must not gain duplicate or phantom
  * defs from the recovery path (it only engages on raw-parse ERROR regions). */
 TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
@@ -13268,6 +13309,7 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
     RUN_TEST(extract_c_preprocessed_pass_ignores_working_directory);
+    RUN_TEST(extract_c_preprocessed_calls_carry_original_lines);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling);
     RUN_TEST(extract_c_misnested_raw_struct_replaced_by_flat_copy);

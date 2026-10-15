@@ -2086,6 +2086,50 @@ static bool cbm_remap_preprocessed_def(CBMDefinition *def, const CBMPreprocessed
     return true;
 }
 
+/* The line of this file that expanded-buffer line `eline` came from, or 0 when
+ * the map gives it none: a directive, an included header, or a #line target
+ * beyond the end of this file (`source_lines`). */
+static uint32_t cbm_preprocessed_original_line(const CBMPreprocessedSource *pp, int eline,
+                                               uint32_t source_lines) {
+    if (eline <= 0 || eline > pp->expanded_line_count || !pp->belongs_to_main_file[eline]) {
+        return 0;
+    }
+    uint32_t original = pp->original_line_by_expanded_line[eline];
+    return original <= source_lines ? original : 0;
+}
+
+/* Calls the preprocessed pass appended, [first, count), carry the expanded
+ * buffer's rows, and an included header occupies rows of its own: a call after
+ * it sat that many lines past where it is written, past the end of a short
+ * file. Translate each to the line of this file it came from. A call the map
+ * places in no line of this file is code from a header -- the header's call,
+ * indexed with the header -- and is dropped, as cbm_remap_preprocessed_def
+ * drops such a definition. */
+static void cbm_remap_preprocessed_calls(CBMFileResult *result, int first,
+                                         const CBMPreprocessedSource *pp, const char *source,
+                                         int source_len) {
+    if (!pp->original_line_by_expanded_line || !pp->belongs_to_main_file) {
+        result->calls.count = first; /* no map: no line of these calls is known */
+        return;
+    }
+    uint32_t source_lines = cbm_source_line_count(source, source_len);
+    int kept = first;
+    for (int i = first; i < result->calls.count; i++) {
+        CBMCall call = result->calls.items[i];
+        uint32_t line = cbm_preprocessed_original_line(pp, call.start_line, source_lines);
+        if (line == 0) {
+            continue;
+        }
+        call.start_line = (int)line;
+        if (call.unresolved_line > 0) {
+            call.unresolved_line =
+                (int)cbm_preprocessed_original_line(pp, call.unresolved_line, source_lines);
+        }
+        result->calls.items[kept++] = call;
+    }
+    result->calls.count = kept;
+}
+
 /* ── One definition, two parses: which copy the rescue keeps ──────────────
  *
  * The #961/#1989 rescue re-extracts definitions from the preprocessed parse to
@@ -3961,10 +4005,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
     atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
-    // Calls extracted so far all carry ORIGINAL-source line numbers; the C/C++
-    // preprocessor second pass below appends calls with EXPANDED-source lines,
-    // which must not be used for the def line-range attribution of the bottleneck
-    // metrics. Remember the boundary.
+    // Calls extracted so far come from the raw parse. The C/C++ preprocessor
+    // second pass below appends its own (remapped to original lines, but mostly
+    // second sightings of raw calls), which must not be counted again by the def
+    // line-range attribution of the bottleneck metrics. Remember the boundary.
     int orig_calls_count = result->calls.count;
 
     /* Phase 2 line map, built by the second (preprocessed) pass below and read
@@ -4063,6 +4107,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                         result->resolved_calls.items[i].source_origin =
                             CBM_SOURCE_ORIGIN_PREPROCESSED;
                     }
+
+                    /* Last reader of the expanded rows was the C-LSP above
+                     * (it pairs calls by byte span and origin, not by line). */
+                    cbm_remap_preprocessed_calls(result, calls_before, preprocessed, source,
+                                                 source_len);
 
                     /* #961: a def whose body braces are split across
                      * #ifdef/#else branches parses as an ERROR region on the
