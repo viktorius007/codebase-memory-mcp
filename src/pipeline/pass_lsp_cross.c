@@ -2300,6 +2300,74 @@ static int pxc_python_build_import_map(const cbm_pipeline_ctx_t *ctx, const char
     return 0;
 }
 
+/* A bare name passed directly as a call argument (`accept(handler)`): the
+ * extractor marks that callable-reference candidate and stamps the argument
+ * itself as its site, so the site is exactly the name. An attribute argument
+ * (`isinstance(self.tool, T)`) is stamped over the whole attribute, and a name
+ * anywhere else is no candidate. Python attribute names carry no member flag,
+ * so this shape is the one where the name is known to be a free name read in
+ * the enclosing function. */
+static bool pxc_python_bare_argument(const CBMUsage *usage) {
+    return usage->may_be_call_reference && usage->site_end_byte > usage->site_start_byte &&
+           (size_t)(usage->site_end_byte - usage->site_start_byte) == strlen(usage->ref_name);
+}
+
+/* A function body runs after the module's top-level run has bound its names,
+ * so the file's final binding is the one it reads. A statement of the module's
+ * own run (a class body included) reads the binding in force where it stands,
+ * which the final binding does not give: `class C(x=f)` above `@d def f` reads
+ * an unbound name. */
+static bool pxc_python_in_function_body(const CBMFileResult *result, const CBMUsage *usage) {
+    return usage->enclosing_func_qn && result->module_qn &&
+           strcmp(usage->enclosing_func_qn, result->module_qn) != 0;
+}
+
+/* `@d def f` binds f to d(f). The import map withholds that name
+ * (pxc_python_decorated_node_kept), so no CALLS, CALL_REFERENCE, WRITES,
+ * INHERITS or RAISES edge can take the definition for the value. A bare name
+ * passed as a call argument is still a reference to that definition: the
+ * Python LSP fails a decorated value closed to ordinary USAGE instead of
+ * CALL_REFERENCE (py_func_is_exact_callable_value), and the registry fallback
+ * that publishes here only ever emits USAGE. This rewrites a blocked resolution
+ * of such an argument to the file's own module-level Function when the last
+ * statement that binds the name is that decorated definition and no star
+ * import follows it. Any other occurrence shape, a locally shadowed name, a
+ * class, and a name bound any other way keep the blocked verdict and its
+ * unresolved row: the resolvers behind them have no scope for attribute,
+ * class-body or local names. */
+bool cbm_pxc_python_decorated_usage(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                    const char *rel_path, CBMLanguage lang,
+                                    const CBMFileResult *result, const CBMUsage *usage,
+                                    cbm_resolution_t *res) {
+    if (lang != CBM_LANG_PYTHON || !ctx || !result || !usage || !usage->ref_name || !res ||
+        !res->strategy || strcmp(res->strategy, "import_map_blocked") != 0 ||
+        usage->kind != CBM_USAGE_VALUE || usage->is_member_access ||
+        usage->semantic_reference_local_shadow || !pxc_python_bare_argument(usage) ||
+        !pxc_python_in_function_body(result, usage) ||
+        result->py_namespace.status != CBM_PY_NS_COMPLETE ||
+        !cbm_py_namespace_facts_valid(&result->py_namespace))
+        return false;
+    const CBMPyNamespaceFacts *facts = &result->py_namespace;
+    for (int i = facts->count - 1; i >= 0; i--) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        if (fact->kind == CBM_PY_NS_IMPORT_STAR)
+            return false;
+        if (!fact->local_name || strcmp(fact->local_name, usage->ref_name) != 0)
+            continue;
+        if (fact->kind != CBM_PY_NS_SHADOW || fact->reason != CBM_PY_NS_REASON_DECORATED)
+            return false;
+        char *module_qn = cbm_pipeline_fqn_module_dir(project_name, rel_path, false);
+        const cbm_gbuf_node_t *node =
+            module_qn ? pxc_python_own_node(ctx, module_qn, usage->ref_name) : NULL;
+        pxc_free_fqn(module_qn);
+        if (!node || !node->label || strcmp(node->label, "Function") != 0)
+            return false;
+        *res = (cbm_resolution_t){node->qualified_name, "python_decorated_definition", 0.95, 1};
+        return true;
+    }
+    return false;
+}
+
 /* Build the private per-file import map from graph and extraction bindings.
  * Both pipeline drivers call this implementation; publishing producers apply
  * the language guard even when a rejected import remains in this map. */
