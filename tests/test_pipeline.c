@@ -25648,6 +25648,65 @@ static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char 
     return NULL;
 }
 
+/* Two manifests declare one package name: sibling Cargo workspaces each with a
+ * crate `dep` (tests/fixtures/graph/rust/ws and .../xcrate). Parallel workers
+ * record the manifests they happen to reach, and the build merged the worker
+ * lists in slot order keeping the first, so the name's target was a function
+ * of thread scheduling: two indexes of one corpus by one binary disagreed on
+ * the IMPORTS edges of ws/caller/src/main.rs. The same two manifests, split
+ * across workers either way round, must give the name the same target. */
+TEST(pkgmap_duplicate_name_target_independent_of_worker_order) {
+    static const char manifest[] = "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n";
+    static const char *const paths[2] = {"ws/dep/Cargo.toml", "xcrate/dep/Cargo.toml"};
+    char kept[2][256] = {{0}, {0}};
+    for (int order = 0; order < 2; order++) {
+        cbm_pkg_entries_t workers[2];
+        for (int w = 0; w < 2; w++) {
+            cbm_pkg_entries_init(&workers[w]);
+            ASSERT_TRUE(cbm_pkgmap_try_parse("Cargo.toml", paths[w ^ order], manifest,
+                                             (int)strlen(manifest), &workers[w]));
+        }
+        CBMHashTable *map = cbm_pkgmap_build(workers, 2, "p");
+        const char *target = map ? (const char *)cbm_ht_get(map, "dep") : NULL;
+        if (target) {
+            snprintf(kept[order], sizeof(kept[order]), "%s", target);
+        }
+        cbm_pkgmap_free(map);
+        cbm_pkg_entries_free(&workers[0]);
+        cbm_pkg_entries_free(&workers[1]);
+    }
+    ASSERT_TRUE(kept[0][0] != '\0');
+    ASSERT_STR_EQ(kept[0], kept[1]);
+    PASS();
+}
+
+/* One manifest names a package twice, primary first: pyproject.toml registers
+ * src/<name>/__init__, then <name>/__init__ as the alternative. The parallel
+ * pipeline hands the merge the same manifest twice (a worker's list and the
+ * repo walk appended to worker 0's), and the manifest's own primary must stay
+ * the target -- an order between the two entries' targets is not the
+ * manifest's precedence. */
+TEST(pkgmap_manifest_primary_entry_survives_duplicate_listing) {
+    static const char manifest[] = "[project]\nname = \"fastapi\"\n";
+    cbm_pkg_entries_t workers[2];
+    for (int w = 0; w < 2; w++) {
+        cbm_pkg_entries_init(&workers[w]);
+        ASSERT_TRUE(cbm_pkgmap_try_parse("pyproject.toml", "pyproject.toml", manifest,
+                                         (int)strlen(manifest), &workers[w]));
+    }
+    CBMHashTable *map = cbm_pkgmap_build(workers, 2, "p");
+    char kept[256] = {0};
+    const char *target = map ? (const char *)cbm_ht_get(map, "fastapi") : NULL;
+    if (target) {
+        snprintf(kept, sizeof(kept), "%s", target);
+    }
+    cbm_pkgmap_free(map);
+    cbm_pkg_entries_free(&workers[0]);
+    cbm_pkg_entries_free(&workers[1]);
+    ASSERT_STR_EQ(kept, "p.src.fastapi.__init__");
+    PASS();
+}
+
 /* ── SwiftPM Package.swift manifest resolution (issue #551 item 1) ──
  *
  * parse_package_swift is a literal pattern-extractor (mirrors
@@ -31437,6 +31496,8 @@ SUITE(pipeline) {
     RUN_TEST(k8s_extract_manifest_no_name);
     RUN_TEST(k8s_extract_manifest_multidoc);
     /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
+    RUN_TEST(pkgmap_duplicate_name_target_independent_of_worker_order);
+    RUN_TEST(pkgmap_manifest_primary_entry_survives_duplicate_listing);
     RUN_TEST(pkgmap_swift_targets_registers_module);
     RUN_TEST(pkgmap_swift_products_do_not_register_alias);
     RUN_TEST(pkgmap_swift_target_name_immediately_before_close_paren);

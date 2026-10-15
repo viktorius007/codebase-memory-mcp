@@ -125,6 +125,7 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     }
     e->items[e->count].pkg_name = pkg_name;
     e->items[e->count].entry_rel = entry_rel;
+    e->items[e->count].manifest_rel = NULL;
     e->count++;
 }
 
@@ -132,6 +133,7 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
     for (int i = 0; i < e->count; i++) {
         free(e->items[i].pkg_name);
         free(e->items[i].entry_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].manifest_rel);
     }
     free(e->items);
     e->items = NULL;
@@ -990,8 +992,8 @@ static void parse_package_swift(const char *source, int source_len, const char *
 
 /* ── Public: manifest detection + parsing ──────────────────────── */
 
-bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
-                          int source_len, cbm_pkg_entries_t *entries) {
+static bool pkgmap_parse_manifest(const char *basename, const char *rel_path, const char *source,
+                                  int source_len, cbm_pkg_entries_t *entries) {
     if (!basename || !source || source_len <= 0) {
         return false;
     }
@@ -1043,6 +1045,20 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
     return false;
 }
 
+/* Every entry remembers the manifest that declared it: cbm_pkgmap_build
+ * keeps a manifest's own precedence among its entries and orders manifests
+ * by path when two declare one name. */
+bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
+                          int source_len, cbm_pkg_entries_t *entries) {
+    int first = entries ? entries->count : 0;
+    bool parsed = pkgmap_parse_manifest(basename, rel_path, source, source_len, entries);
+    for (int i = first; parsed && i < entries->count; i++) {
+        entries->items[i].manifest_rel =
+            cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path ? rel_path : "");
+    }
+    return parsed;
+}
+
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
 /* A composer.json `autoload.psr-4` key: a namespace prefix ending in '\\'. */
@@ -1063,6 +1079,9 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
     }
 
     CBMHashTable *map = cbm_ht_create(PKGMAP_HT_INIT);
+    /* name (the map's own key) -> manifest that supplied its target, borrowed
+     * from the entries, which outlive this call */
+    CBMHashTable *from = cbm_ht_create(PKGMAP_HT_INIT);
     int merged = 0;
 
     for (int w = 0; w < worker_count; w++) {
@@ -1080,8 +1099,32 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
                 continue;
             }
 
-            /* Check for duplicate — first wins */
-            if (cbm_ht_has(map, we->items[i].pkg_name)) {
+            /* One manifest may name a package twice, primary entry first
+             * (pyproject: src/<name>/__init__, then <name>/__init__); its
+             * first entry stays. Two manifests may declare one name (two
+             * crates called `dep` in sibling workspaces): workers record the
+             * manifests they happen to reach and the lists merge in worker
+             * order, so "first wins" made the target a function of thread
+             * scheduling. The manifest with the smallest path wins instead,
+             * a total order, so the target is the same whichever worker saw
+             * which manifest. Which manifest the importer meant is not known
+             * here; the collision is logged so the choice is on record. */
+            const char *manifest = we->items[i].manifest_rel ? we->items[i].manifest_rel : "";
+            char *held = cbm_ht_get(map, we->items[i].pkg_name);
+            if (held) {
+                const char *name = cbm_ht_get_key(map, we->items[i].pkg_name);
+                const char *held_from = from ? cbm_ht_get(from, name) : NULL;
+                int order = strcmp(manifest, held_from ? held_from : "");
+                if (order != 0 && strcmp(qn, held) != 0) {
+                    cbm_log_info("pkgmap.name_collision", "name", name, "kept",
+                                 order < 0 ? qn : held, "dropped", order < 0 ? held : qn);
+                }
+                if (order < 0) { /* the map keeps qn; qn now names the dropped one */
+                    qn = cbm_ht_set(map, name, qn);
+                    if (from) {
+                        cbm_ht_set(from, name, (void *)manifest);
+                    }
+                }
                 free(qn);
                 continue;
             }
@@ -1089,9 +1132,13 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
             /* Transfer ownership: key = strdup'd pkg_name, value = qn */
             char *key = strdup(we->items[i].pkg_name);
             cbm_ht_set(map, key, qn);
+            if (from && key) {
+                cbm_ht_set(from, key, (void *)manifest);
+            }
             merged++;
         }
     }
+    cbm_ht_free(from); /* keys belong to map, values to the entries */
 
     if (merged == 0) {
         cbm_ht_free(map);

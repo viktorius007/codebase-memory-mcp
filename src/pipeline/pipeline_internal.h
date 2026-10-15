@@ -463,6 +463,9 @@ static inline bool cbm_pipeline_carried_edge_fits(const char *source_file_path, 
 typedef struct {
     char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
     char *entry_rel; /* heap: "packages/pkg/src/index" (no extension) */
+    /* mem_core (CBM_MEM_CLASS_OTHER): the manifest that declared the entry
+     * ("ws/dep/Cargo.toml"), stamped by cbm_pkgmap_try_parse. */
+    char *manifest_rel;
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
