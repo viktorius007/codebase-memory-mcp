@@ -16658,13 +16658,32 @@ TEST(clsp_issue1527_fluent_chain_work_is_polynomial) {
     PASS();
 }
 
-/* Deterministic complexity gate for the C/C++ resolver (O9: no clock): 4x the
- * definitions and calls must cost ~4x the counted work (scope-frame probes,
- * registry lookup probes, enclosing-definition candidates, real
- * evaluations). Methods are DEFINED (out of class), so they are registered
- * before the registry is indexed. Declaration-only methods are registered by
- * the walk itself, after indexing, and are still found by a linear tail scan
- * -- a separate, known quadratic (see the #1527 follow-up), not measured here. */
+/* Every unit of work one extraction is counted for (O9: no clock), so a
+ * linearity gate cannot pass while a cost it does not see grows:
+ *  - the resolver's scope-frame probes, registry probes, enclosing-definition
+ *    candidates and real evaluations (cbm_lsp_work_take);
+ *  - the tree-sitter runtime's node-navigation steps (cbm_ts_node_child_steps_test).
+ *    ts_node_parent answers by descending from the ROOT, so a parent lookup is
+ *    charged every child it scans on the way down -- O(depth) on a deep tree;
+ *  - the usage walk's own parent climbs and cursor copies
+ *    (cbm_usage_field_lookup_test_work), each copy charged per entry copied. */
+static void clsp_counted_work_begin(void) {
+    (void)cbm_lsp_work_take();
+    cbm_ts_node_child_steps_test_reset();
+    cbm_usage_field_lookup_test_reset();
+}
+
+static uint64_t clsp_counted_work_take(void) {
+    return cbm_lsp_work_take() + cbm_ts_node_child_steps_test() +
+           cbm_usage_field_lookup_test_work();
+}
+
+/* Deterministic complexity gate for C/C++ extraction: 4x the input must cost
+ * ~4x the counted work above. Methods are DEFINED (out of class), so they are
+ * registered before the registry is indexed. Declaration-only methods are
+ * registered by the walk itself, after indexing, and are still found by a
+ * linear tail scan -- a separate, known quadratic (see the #1527 follow-up),
+ * not measured here. */
 static uint64_t clsp_member_calls_work(int n, int *out_real) {
     size_t sz = (size_t)n * 128 + 512;
     char *src = malloc(sz);
@@ -16680,13 +16699,44 @@ static uint64_t clsp_member_calls_work(int n, int *out_real) {
     for (int i = 0; i < n; i++)
         pos += (size_t)snprintf(src + pos, sz - pos, "  s.m%d().m%d();\n", i, (i + 1) % n);
     snprintf(src + pos, sz - pos, "}\n");
-    (void)cbm_lsp_work_take();
+    clsp_counted_work_begin();
     CBMFileResult *r = extract_cpp(src);
-    uint64_t work = cbm_lsp_work_take();
+    uint64_t work = clsp_counted_work_take();
     free(src);
     *out_real = r ? count_real_resolved(r, ".S.m") : -1;
     if (r)
         cbm_free_result(r);
+    return work;
+}
+
+/* `int x = a + a + ... + a;` in C: a left-nested binary chain whose deepest
+ * operand sits `links` levels down. C has no operator overloads, so the
+ * resolver evaluates no operand here and the count is the extraction walk's.
+ * Out-param: the value usages of `a` the extraction recorded. */
+static uint64_t clsp_c_binary_chain_work(int links, int *out_operand_usages) {
+    size_t sz = (size_t)links * 4 + 128;
+    char *src = malloc(sz);
+    *out_operand_usages = -1;
+    if (!src)
+        return 0;
+    size_t pos = (size_t)snprintf(src, sz, "int deep(int a) {\n  int x = a");
+    for (int i = 1; i < links; i++)
+        pos += (size_t)snprintf(src + pos, sz - pos, " + a");
+    snprintf(src + pos, sz - pos, ";\n  return x;\n}\n");
+    clsp_counted_work_begin();
+    CBMFileResult *r = extract_c(src);
+    uint64_t work = clsp_counted_work_take();
+    free(src);
+    if (!r)
+        return 0;
+    int usages = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const char *name = r->usages.items[i].ref_name;
+        if (name && strcmp(name, "a") == 0)
+            usages++;
+    }
+    *out_operand_usages = usages;
+    cbm_free_result(r);
     return work;
 }
 
@@ -16695,12 +16745,26 @@ TEST(clsp_issue1527_scale_work_is_linear) {
     uint64_t w1 = clsp_member_calls_work(1000, &real1);
     uint64_t w4 = clsp_member_calls_work(4000, &real4);
     double ratio = w1 ? (double)w4 / (double)w1 : 0.0;
-    printf("    work: 1000=%llu (real=%d)  4000=%llu (real=%d)  ratio=%.2fx\n",
+    printf("    member calls: 1000=%llu (real=%d)  4000=%llu (real=%d)  ratio=%.2fx\n",
            (unsigned long long)w1, real1, (unsigned long long)w4, real4, ratio);
+    /* A chain of N links is N deep: a per-operand cost that scales with the
+     * operand's depth (a root-descending parent lookup, a copy of the walk
+     * cursor's stack, a climb to the root) makes the chain quadratic. */
+    int operands1 = 0, operands4 = 0;
+    uint64_t c1 = clsp_c_binary_chain_work(500, &operands1);
+    uint64_t c4 = clsp_c_binary_chain_work(2000, &operands4);
+    double chain_ratio = c1 ? (double)c4 / (double)c1 : 0.0;
+    printf("    binary chain: 500=%llu (usages=%d)  2000=%llu (usages=%d)  ratio=%.2fx\n",
+           (unsigned long long)c1, operands1, (unsigned long long)c4, operands4, chain_ratio);
     ASSERT_EQ(real1, 2 * 1000);
     ASSERT_EQ(real4, 2 * 4000);
     ASSERT_GT(w1, 0);
     ASSERT(ratio < 5.0);
+    /* Every operand is still recorded as a value usage. */
+    ASSERT_EQ(operands1, 500);
+    ASSERT_EQ(operands4, 2000);
+    ASSERT_GT(c1, 0);
+    ASSERT(chain_ratio < 5.0);
     PASS();
 }
 
