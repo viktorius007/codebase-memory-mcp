@@ -142,6 +142,7 @@ static void rust_bound_trait_declarations(RustLSPContext *ctx, const char *trait
                                           const char *method, bool receiver_method, int depth,
                                           const char *param, const CBMRegisteredFunc **selected, bool *ambiguous);
 static void rust_collect_item_bounds(RustLSPContext *ctx, TSNode item);
+static bool rust_name_in_list(const char **names, const char *name);
 static void rust_collect_trait_bounds(RustLSPContext *ctx, const char *param, TSNode node);
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root);
 static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_name,
@@ -987,6 +988,63 @@ static void rust_registered_type_add_embedded(CBMArena *arena, CBMRegisteredType
     items[count] = embedded_qn;
     items[count + 1] = NULL;
     type->embedded_types = items;
+}
+
+/* `embedded_types` names the traits a type implements, with every written
+ * argument erased. A bound `T: Conv<u8>` or an impl on `W<u8>` cannot be
+ * checked against that: each impl also leaves its written header here, as
+ * `Impl:<trait QN>\x1f<module>\x1f<self type>\x1f<trait>` (type and trait
+ * as spelled, in the module that wrote them), so a bound is checked against
+ * the impls of every file with the arguments of both sides. */
+#define RUST_IMPL_HEADER_PREFIX "Impl:"
+#define RUST_IMPL_HEADER_SEP '\x1f'
+enum { RUST_IMPL_HEADER_PREFIX_LEN = sizeof(RUST_IMPL_HEADER_PREFIX) - 1,
+       RUST_IMPL_HEADER_PARTS = 4 };
+
+typedef struct {
+    const char *trait_qn;
+    const char *module;
+    const char *self_spelling;
+    const char *trait_spelling;
+} RustImplHeader;
+
+static void rust_registered_type_add_impl_header(CBMArena *arena, CBMRegisteredType *type,
+                                                 const char *trait_qn, const char *module,
+                                                 const char *self_spelling,
+                                                 const char *trait_spelling) {
+    if (!type || !trait_qn || !module || !self_spelling || !trait_spelling ||
+        strchr(trait_qn, RUST_IMPL_HEADER_SEP) || strchr(module, RUST_IMPL_HEADER_SEP) ||
+        strchr(self_spelling, RUST_IMPL_HEADER_SEP) ||
+        strchr(trait_spelling, RUST_IMPL_HEADER_SEP)) {
+        return;
+    }
+    rust_registered_type_add_embedded(
+        arena, type,
+        cbm_arena_sprintf(arena, "%s%s%c%s%c%s%c%s", RUST_IMPL_HEADER_PREFIX, trait_qn,
+                          RUST_IMPL_HEADER_SEP, module, RUST_IMPL_HEADER_SEP, self_spelling,
+                          RUST_IMPL_HEADER_SEP, trait_spelling));
+}
+
+static bool rust_impl_header_parse(CBMArena *arena, const char *entry, RustImplHeader *out) {
+    if (!entry || strncmp(entry, RUST_IMPL_HEADER_PREFIX, RUST_IMPL_HEADER_PREFIX_LEN) != 0)
+        return false;
+    char *copy = cbm_arena_strdup(arena, entry + RUST_IMPL_HEADER_PREFIX_LEN);
+    const char *parts[RUST_IMPL_HEADER_PARTS];
+    char *cursor = copy;
+    for (int i = 0; i < RUST_IMPL_HEADER_PARTS; i++) {
+        if (!cursor)
+            return false;
+        parts[i] = cursor;
+        char *sep = strchr(cursor, RUST_IMPL_HEADER_SEP);
+        if (sep)
+            *sep = '\0';
+        cursor = sep ? sep + 1 : NULL;
+    }
+    out->trait_qn = parts[0];
+    out->module = parts[1];
+    out->self_spelling = parts[2];
+    out->trait_spelling = parts[3];
+    return true;
 }
 
 /* Strip a leading `&` / `&mut` reference prefix from a textual type so we
@@ -8159,6 +8217,43 @@ static bool rust_source_declares_trait_method(RustLSPContext *ctx, const char *m
     return false;
 }
 
+/* A trait declared directly in a block is in scope throughout that block and
+ * every item nested in it, with or without a `use`. The `#B<byte>` segment of
+ * its QN only locates the declaration; the declaration's own identity is
+ * verified before the position is trusted, so a QN from another file never
+ * matches. A call site without a source range proves nothing. */
+static bool rust_block_trait_encloses_site(RustLSPContext *ctx, const char *trait_qn) {
+    const char *block = strstr(trait_qn, ".#B");
+    if (!block || ts_node_is_null(ctx->root_node) ||
+        ctx->emit_site_end_byte <= ctx->emit_site_start_byte)
+        return false;
+    char *end = NULL;
+    unsigned long byte = strtoul(block + 3, &end, 10);
+    if (end == block + 3 || *end != '.' || byte >= (unsigned long)ctx->root_source_len)
+        return false;
+    TSNode item = ts_node_descendant_for_byte_range(ctx->root_node, (uint32_t)byte,
+                                                    (uint32_t)byte + 1);
+    while (!ts_node_is_null(item)) {
+        TSNode name = ts_node_child_by_field_name(item, "name", 4);
+        if (ts_node_start_byte(item) == byte && strcmp(ts_node_type(item), "trait_item") == 0 &&
+            !ts_node_is_null(name)) {
+            const char *text = cbm_node_text(ctx->arena, name, ctx->root_source);
+            const char *identity = text && text[0]
+                ? cbm_rust_item_qn(ctx->arena, item, ctx->root_source, ctx->module_qn, text)
+                : NULL;
+            if (identity && strcmp(identity, trait_qn) == 0)
+                break;
+        }
+        item = ts_node_parent(item);
+    }
+    if (ts_node_is_null(item))
+        return false;
+    TSNode scope = ts_node_parent(item);
+    return !ts_node_is_null(scope) && strcmp(ts_node_type(scope), "block") == 0 &&
+           ts_node_start_byte(scope) <= ctx->emit_site_start_byte &&
+           ctx->emit_site_end_byte <= ts_node_end_byte(scope);
+}
+
 static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
                                     const char *method_name, const char *impl_key, bool *proved) {
     if (proved)
@@ -8168,6 +8263,11 @@ static bool rust_trait_out_of_scope(RustLSPContext *ctx, const char *trait_qn,
     const CBMRegisteredType *canonical = cbm_registry_resolve_alias(ctx->registry, trait_qn);
     if (canonical && !canonical->alias_of)
         trait_qn = canonical->qualified_name;
+    if (rust_block_trait_encloses_site(ctx, trait_qn)) {
+        if (proved)
+            *proved = true;
+        return false;
+    }
     const char *dot = strrchr(trait_qn, '.');
     const char *leaf = dot ? dot + 1 : trait_qn;
     size_t spelling_len = 0;
@@ -8897,9 +8997,9 @@ static bool rust_method_probe_concrete_kinds_differ(const CBMType *candidate,
            candidate->kind == CBM_TYPE_TUPLE || probe->kind == CBM_TYPE_TUPLE;
 }
 
-static const CBMType *rust_method_impl_self(RustLSPContext *ctx,
-                                            const CBMRegisteredFunc *method,
-                                            const CBMType *recv) {
+static const CBMType *rust_method_impl_self_written(RustLSPContext *ctx,
+                                                    const CBMRegisteredFunc *method,
+                                                    const CBMType *recv) {
     if (!method || !(method->flags & CBM_FUNC_FLAG_RUST_SELF))
         return NULL;
     if (method->rust_reference_impl_self)
@@ -9014,6 +9114,54 @@ static const CBMType *rust_method_impl_self(RustLSPContext *ctx,
     return cbm_type_named(ctx->arena, method->receiver_type);
 }
 
+/* The self type of the impl `method` belongs to. An impl written on a type
+ * alias applies to the aliased type, so the alias is resolved here once for
+ * every consumer: a name that stands for another type is no shape of its own. */
+static const CBMType *rust_method_impl_self(RustLSPContext *ctx,
+                                            const CBMRegisteredFunc *method,
+                                            const CBMType *recv) {
+    return rust_expand_type_aliases(ctx, rust_method_impl_self_written(ctx, method, recv), 0);
+}
+
+/* A trait impl the extractor kept without a readable header, such as a derived
+ * one, still has its declaring type as the head of its self type. It cannot
+ * apply when every type the receiver derefs through is a known concrete type
+ * other than that one: declared nominal types by their QN, primitives, slices
+ * and tuples by kind. A type whose Deref target is unread, or any type this
+ * cannot ground, leaves the impl unknown. */
+static bool rust_unkeyed_impl_cannot_apply(RustLSPContext *ctx, const CBMRegisteredFunc *method,
+                                           const CBMType *recv) {
+    if (method->impl_key || (method->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0 ||
+        !method->receiver_type || !recv)
+        return false;
+    const CBMRegisteredType *owner = cbm_registry_lookup_type(ctx->registry,
+                                                              method->receiver_type);
+    if (!owner || owner->rust_undeclared || owner->alias_of || owner->alias_type ||
+        owner->rust_nominal_identity_ambiguous || owner->is_interface)
+        return false;
+    const CBMType *shape = recv;
+    for (int step = 0; shape && step < RUST_DEREF_MAX_HOPS; step++) {
+        const CBMType *base = rust_strip_references(shape);
+        if (base->kind == CBM_TYPE_NAMED || base->kind == CBM_TYPE_TEMPLATE) {
+            const char *head = rust_method_probe_head(base);
+            const CBMRegisteredType *type = head ? cbm_registry_lookup_type(ctx->registry, head)
+                                                 : NULL;
+            if (!type || type->rust_undeclared || type->alias_of || type->alias_type ||
+                type->rust_nominal_identity_ambiguous || type->is_interface ||
+                strcmp(type->qualified_name, owner->qualified_name) == 0 ||
+                (type->deref_target && cbm_type_is_unknown(type->deref_target)))
+                return false;
+        } else if (base->kind != CBM_TYPE_BUILTIN && base->kind != CBM_TYPE_SLICE &&
+                   base->kind != CBM_TYPE_TUPLE) {
+            return false;
+        }
+        shape = rust_std_deref_target(ctx, base);
+        if (!shape)
+            return true;
+    }
+    return false;
+}
+
 /* Rust probes T, &T, then &mut T at each autoderef step. The impl self type
  * supplies T; the method self parameter supplies which of those three shapes
  * the candidate accepts. Move legality is checked after method selection, so
@@ -9023,6 +9171,8 @@ static int rust_method_probe_rank(RustLSPContext *ctx, const CBMRegisteredFunc *
                                   const CBMType *recv, int *possible_rank) {
     if (possible_rank)
         *possible_rank = RUST_METHOD_PROBE_INAPPLICABLE;
+    if (rust_unkeyed_impl_cannot_apply(ctx, method, recv))
+        return RUST_METHOD_PROBE_INAPPLICABLE;
     const CBMType *impl_self = rust_expand_type_aliases(
         ctx, rust_method_impl_self(ctx, method, recv), 0);
     if (!impl_self || !recv)
@@ -9090,9 +9240,24 @@ static int rust_method_probe_rank(RustLSPContext *ctx, const CBMRegisteredFunc *
     return RUST_METHOD_PROBE_INAPPLICABLE;
 }
 
-static bool rust_method_probe_refusal_proves_mismatch(const char *refusal) {
+/* A shape refusal proves that an impl cannot apply only when both types are
+ * what they are written to be. A name that still stands for an alias has not
+ * been resolved to the type it denotes, so it is no shape. */
+static bool rust_method_probe_refusal_proves_mismatch(RustLSPContext *ctx, const char *refusal) {
     static const char prefix[] = "trait_receiver_shape";
-    return refusal && strncmp(refusal, prefix, sizeof(prefix) - 1) == 0;
+    if (!refusal || strncmp(refusal, prefix, sizeof(prefix) - 1) != 0)
+        return false;
+    char *copy = cbm_arena_strdup(ctx->arena, refusal);
+    char *fields[5] = {0};
+    int count = 0;
+    for (char *save = NULL, *f = copy ? strtok_r(copy, ":", &save) : NULL; f && count < 5;
+         f = strtok_r(NULL, ":", &save))
+        fields[count++] = f;
+    for (int heads = 2; count == 5 && heads <= 4; heads += 2) {
+        if (rust_lookup_type_alias(ctx, fields[heads]))
+            return false;
+    }
+    return true;
 }
 
 static void rust_method_probe_note_uncertain(int rank, const char *stop,
@@ -9107,6 +9272,157 @@ static void rust_method_probe_note_uncertain(int rank, const char *stop,
     } else if (rank == *uncertain_rank && uncertain_stop && !*uncertain_stop) {
         *uncertain_stop = stop;
     }
+}
+
+enum { RUST_BOUND_MAX = 16 };
+
+/* Whether two trait QNs name one trait: equal, or the same path below two of
+ * the std facade roots. */
+static bool rust_trait_qn_same(const char *a, const char *b) {
+    if (!a || !b)
+        return false;
+    if (strcmp(a, b) == 0)
+        return true;
+    return rust_qn_has_facade_root(a) && rust_qn_has_facade_root(b) &&
+           strcmp(strchr(a, '.'), strchr(b, '.')) == 0;
+}
+
+/* The trait a parsed bound names: the registered interface, its aliases
+ * resolved. NULL for anything that is no registered trait. */
+static const char *rust_bound_trait_qn(RustLSPContext *ctx, const CBMType *bound) {
+    const char *name = bound && bound->kind == CBM_TYPE_NAMED ? bound->data.named.qualified_name
+                       : bound && bound->kind == CBM_TYPE_TEMPLATE
+                           ? bound->data.template_type.template_name
+                           : NULL;
+    const CBMRegisteredType *trait = name ? cbm_registry_lookup_type(ctx->registry, name) : NULL;
+    if (trait && trait->alias_of)
+        trait = cbm_registry_resolve_alias(ctx->registry, name);
+    return trait && trait->is_interface ? trait->qualified_name : NULL;
+}
+
+/* Parse each bound listed in `bounds_node` (a `trait_bounds`). A bound that is
+ * no plain trait path (higher-ranked, `Fn(..)`) is opaque: it exists, and the
+ * resolver cannot check it. Lifetimes and `?Sized` constrain nothing. */
+static void rust_collect_bound_list(RustLSPContext *ctx, TSNode bounds_node,
+                                    const CBMType **out, int *count, bool *opaque) {
+    for (uint32_t i = 0; !ts_node_is_null(bounds_node) &&
+                         i < ts_node_named_child_count(bounds_node); i++) {
+        TSNode bound = ts_node_named_child(bounds_node, i);
+        const char *kind = ts_node_type(bound);
+        if (strcmp(kind, "lifetime") == 0 || strcmp(kind, "removed_trait_bound") == 0)
+            continue;
+        const CBMType *type = strcmp(kind, "type_identifier") == 0 ||
+                                      strcmp(kind, "scoped_type_identifier") == 0 ||
+                                      strcmp(kind, "generic_type") == 0
+                                  ? rust_parse_type_node(ctx, bound)
+                                  : NULL;
+        if (!type || !rust_bound_trait_qn(ctx, type) || *count >= RUST_BOUND_MAX) {
+            *opaque = true;
+            continue;
+        }
+        out[(*count)++] = type;
+    }
+}
+
+/* The trait bounds an impl item writes on its type parameter `param`, in the
+ * parameter list and in `where` predicates, each with its written arguments. */
+static void rust_collect_param_bound_types(RustLSPContext *ctx, TSNode item, const char *param,
+                                           const CBMType **out, int *count, bool *opaque) {
+    TSNode params = ts_node_child_by_field_name(item, "type_parameters", 15);
+    for (uint32_t i = 0; !ts_node_is_null(params) && i < ts_node_named_child_count(params); i++) {
+        TSNode decl = ts_node_named_child(params, i);
+        if (strcmp(ts_node_type(decl), "type_parameter") != 0)
+            continue;
+        char *name = rust_node_text(ctx, ts_node_child_by_field_name(decl, "name", 4));
+        if (name && strcmp(name, param) == 0)
+            rust_collect_bound_list(ctx, ts_node_child_by_field_name(decl, "bounds", 6), out,
+                                    count, opaque);
+    }
+    for (uint32_t i = 0; i < ts_node_named_child_count(item); i++) {
+        TSNode clause = ts_node_named_child(item, i);
+        if (strcmp(ts_node_type(clause), "where_clause") != 0)
+            continue;
+        for (uint32_t j = 0; j < ts_node_named_child_count(clause); j++) {
+            TSNode predicate = ts_node_named_child(clause, j);
+            TSNode left = ts_node_child_by_field_name(predicate, "left", 4);
+            if (ts_node_is_null(left) || strcmp(ts_node_type(left), "type_identifier") != 0)
+                continue;
+            char *name = rust_node_text(ctx, left);
+            if (name && strcmp(name, param) == 0)
+                rust_collect_bound_list(ctx, ts_node_child_by_field_name(predicate, "bounds", 6),
+                                        out, count, opaque);
+        }
+    }
+}
+
+/* Whether two written types are one concrete type. Aliases are resolved on
+ * both sides; a parameter or an unregistered name is not one. */
+static bool rust_types_same_concrete(RustLSPContext *ctx, const CBMType *a, const CBMType *b) {
+    return rust_impl_self_match(ctx, rust_expand_type_aliases(ctx, a, 0),
+                                rust_expand_type_aliases(ctx, b, 0), false,
+                                NULL) == RUST_IMPL_SELF_SAME;
+}
+
+/* The written arguments of a trait path (`Conv<u8>`): none for a bare name. */
+static int rust_trait_args(const CBMType *trait, const CBMType *const **args) {
+    if (trait && trait->kind == CBM_TYPE_TEMPLATE) {
+        *args = trait->data.template_type.template_args;
+        return trait->data.template_type.arg_count;
+    }
+    *args = NULL;
+    return 0;
+}
+
+/* Whether `actual` implements the trait `bound` names, argument for argument.
+ * Every impl of the trait written for the receiver's head, in any file, is
+ * read from its stored header: the self type must be the receiver and each
+ * trait argument must be the bound's. An impl whose header cannot be settled
+ * proves nothing. A derived or seeded impl has no header; it proves only a
+ * type and a trait that take no arguments. */
+static bool rust_type_implements_bound(RustLSPContext *ctx, const CBMType *actual,
+                                       const CBMType *bound) {
+    const char *trait_qn = rust_bound_trait_qn(ctx, bound);
+    if (!actual || !trait_qn)
+        return false;
+    if (rust_trait_qn_same(trait_qn, "core.marker.Copy") && actual->kind == CBM_TYPE_BUILTIN &&
+        actual->data.builtin.name && is_rust_primitive(actual->data.builtin.name) &&
+        strcmp(actual->data.builtin.name, "str") != 0)
+        return true;
+    const char *head = rust_method_probe_head(actual);
+    const CBMRegisteredType *registered = head ? cbm_registry_lookup_type(ctx->registry, head)
+                                               : NULL;
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    const CBMType *const *bound_args = NULL;
+    int bound_argc = rust_trait_args(bound, &bound_args);
+    bool header_seen = false;
+    bool plain = false;
+    for (int i = 0; registered && registered->embedded_types && registered->embedded_types[i]; i++) {
+        RustImplHeader header;
+        const char *entry = registered->embedded_types[i];
+        if (!rust_impl_header_parse(ctx->arena, entry, &header)) {
+            plain |= rust_trait_qn_same(entry, trait_qn);
+            continue;
+        }
+        if (!rust_trait_qn_same(header.trait_qn, trait_qn))
+            continue;
+        header_seen = true;
+        const CBMType *self = rust_parse_def_type_text(ctx->arena, header.self_spelling,
+                                                       header.module, tree);
+        const CBMType *written = rust_parse_def_type_text(ctx->arena, header.trait_spelling,
+                                                          header.module, tree);
+        const CBMType *const *written_args = NULL;
+        int written_argc = rust_trait_args(written, &written_args);
+        bool same = written_argc == bound_argc && rust_types_same_concrete(ctx, self, actual);
+        for (int a = 0; same && a < bound_argc; a++)
+            same = rust_types_same_concrete(ctx, written_args[a], bound_args[a]);
+        if (same)
+            return true;
+    }
+    const CBMRegisteredType *trait = cbm_registry_lookup_type(ctx->registry, trait_qn);
+    bool trait_generic = trait && trait->type_param_names && trait->type_param_names[0];
+    bool type_generic = !registered || actual->kind == CBM_TYPE_TEMPLATE ||
+                        (registered->type_param_names && registered->type_param_names[0]);
+    return plain && !header_seen && bound_argc == 0 && !trait_generic && !type_generic;
 }
 
 /* A generic impl candidate is placeable only when its source bounds are
@@ -9192,40 +9508,29 @@ static bool rust_method_probe_bounds_proven(RustLSPContext *ctx,
         }
     }
     ts_tree_cursor_delete(&cursor);
-    if (duplicate || ts_node_is_null(found))
-        return false;
-
-    const CBMType *actual = rust_strip_references(recv);
-    const char *head = rust_method_probe_head(actual);
-    const CBMRegisteredType *registered = head
-                                              ? cbm_registry_lookup_type(ctx->registry, head)
-                                              : NULL;
-    int saved_bound_count = ctx->type_param_bound_count;
-    rust_collect_item_bounds(ctx, found);
-    bool saw_bound = false;
-    bool proved = true;
     const char *param = method->rust_impl_type_params[param_index];
-    for (int i = saved_bound_count; i < ctx->type_param_bound_count; i++) {
-        if (strcmp(ctx->type_param_bounds[i].param_name, param) != 0 ||
-            !ctx->type_param_bounds[i].trait_qn)
-            continue;
-        saw_bound = true;
-        const char *bound = ctx->type_param_bounds[i].trait_qn;
-        bool copy = strstr(bound, ".Copy") && actual &&
-                    ((actual->kind == CBM_TYPE_BUILTIN && actual->data.builtin.name &&
-                      strcmp(actual->data.builtin.name, "str") != 0) ||
-                     (actual->kind == CBM_TYPE_REFERENCE &&
-                      actual->data.reference.rust_shared));
-        bool embedded = false;
-        for (int j = 0; registered && registered->embedded_types &&
-                        registered->embedded_types[j]; j++)
-            embedded |= strcmp(registered->embedded_types[j], bound) == 0;
-        proved &= copy || embedded;
+    if (duplicate || ts_node_is_null(found)) {
+        /* The impl is written in a file this resolver does not hold. A
+         * parameter its header leaves unbounded needs no proof; any other
+         * carries bounds that cannot be read, so they are unproved. */
+        if (has_bounds)
+            *has_bounds = !rust_name_in_list(method->rust_unbounded_impl_params, param);
+        return false;
     }
-    ctx->type_param_bound_count = saved_bound_count;
+
+    const CBMType *actual = rust_expand_type_aliases(ctx, rust_strip_references(recv), 0);
+    const CBMType *bounds[RUST_BOUND_MAX];
+    int bound_count = 0;
+    bool opaque = false;
+    rust_collect_param_bound_types(ctx, found, param, bounds, &bound_count, &opaque);
     if (has_bounds)
-        *has_bounds = saw_bound;
-    return saw_bound && proved;
+        *has_bounds = bound_count > 0 || opaque;
+    if (bound_count == 0 && !opaque)
+        return false;
+    bool proved = !opaque;
+    for (int i = 0; proved && i < bound_count; i++)
+        proved = rust_type_implements_bound(ctx, actual, bounds[i]);
+    return proved;
 }
 
 static const CBMRegisteredFunc *rust_reference_probe_candidate(
@@ -9265,9 +9570,13 @@ static const CBMRegisteredFunc *rust_reference_probe_candidate(
             if (defer_wrapper_pointee && possible_rank >= 3)
                 continue;
             const char *refusal = rust_trait_receiver_refusal(ctx, candidate, recv, true);
-            if (!refusal && has_bounds && !bounds_proven)
+            /* The self type of a bounded blanket impl is its parameter: it
+             * compares as a shape against nothing, and what is unproved is
+             * the bound. */
+            if (has_bounds && !bounds_proven &&
+                (!refusal || rust_method_probe_refusal_proves_mismatch(ctx, refusal)))
                 refusal = "trait_receiver_partial";
-            if (rust_method_probe_refusal_proves_mismatch(refusal))
+            if (rust_method_probe_refusal_proves_mismatch(ctx, refusal))
                 continue;
             rust_method_probe_note_uncertain(possible_rank, refusal, uncertain_rank,
                                              uncertain_stop);
@@ -9282,7 +9591,7 @@ static const CBMRegisteredFunc *rust_reference_probe_candidate(
                                   : rust_trait_receiver_refusal(
                                         ctx, candidate, candidate->rust_reference_impl_self, true);
         if (refusal) {
-            if (!rust_method_probe_refusal_proves_mismatch(refusal))
+            if (!rust_method_probe_refusal_proves_mismatch(ctx, refusal))
                 rust_method_probe_note_uncertain(candidate_rank, refusal, uncertain_rank,
                                                  uncertain_stop);
             continue;
@@ -9345,9 +9654,10 @@ static const CBMRegisteredFunc *rust_reference_probe_candidate(
                     refusal = "deref_receiver_identity_not_proven";
                 if (!refusal)
                     refusal = rust_trait_receiver_refusal(ctx, candidate, recv, true);
-                if (!refusal && has_bounds && !bounds_proven)
+                if (has_bounds && !bounds_proven &&
+                    (!refusal || rust_method_probe_refusal_proves_mismatch(ctx, refusal)))
                     refusal = "trait_receiver_partial";
-                if (rust_method_probe_refusal_proves_mismatch(refusal))
+                if (rust_method_probe_refusal_proves_mismatch(ctx, refusal))
                     continue;
                 rust_method_probe_note_uncertain(possible_rank, refusal, uncertain_rank,
                                                  uncertain_stop);
@@ -9361,7 +9671,7 @@ static const CBMRegisteredFunc *rust_reference_probe_candidate(
                                       : rust_method_receiver_refusal_at_type(
                                             ctx, candidate, actual, true, true, actual);
             if (refusal) {
-                if (!rust_method_probe_refusal_proves_mismatch(refusal))
+                if (!rust_method_probe_refusal_proves_mismatch(ctx, refusal))
                     rust_method_probe_note_uncertain(candidate_rank, refusal, uncertain_rank,
                                                      uncertain_stop);
                 continue;
@@ -17881,6 +18191,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name, reg->type_count - 1);
         }
         rust_registered_type_add_embedded(arena, rt, trait_qn);
+        rust_registered_type_add_impl_header(arena, rt, trait_qn, module_qn, it->struct_name,
+                                             it->trait_name);
         rust_register_iterator_item(arena, reg, &type_idx, trait_qn, it->item_type, it->struct_name,
                                     module_qn, NULL);
         if (rust_impl_trait_is_deref(trait_qn)) {
@@ -18255,6 +18567,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name, type_index);
         }
         rust_registered_type_add_embedded(arena, &reg->types[type_index], trait_qn);
+        rust_registered_type_add_impl_header(arena, &reg->types[type_index], trait_qn, def_mod,
+                                             d->receiver_spelling, d->trait_qn);
         rust_register_iterator_item(arena, reg, &type_idx, trait_qn, d->impl_item,
                                     d->receiver_spelling, def_mod, tree);
         if (rust_impl_trait_is_deref(trait_qn)) {
