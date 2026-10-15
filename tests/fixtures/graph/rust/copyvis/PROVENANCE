@@ -1,1 +1,1 @@
-stub
+R-W2 R1 (Copy supplied by a macro). Origin /tmp/RW*/fx/copyvis. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

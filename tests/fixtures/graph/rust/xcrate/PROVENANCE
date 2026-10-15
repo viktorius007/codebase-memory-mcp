@@ -1,1 +1,1 @@
-stub
+R-W1/R-W2/R-W3 cross-crate matrix (B1); generated, two crates dep and caller. Origin /tmp/RW*/fx/xcrate. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

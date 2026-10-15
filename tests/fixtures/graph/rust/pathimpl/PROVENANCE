@@ -1,1 +1,1 @@
-stub
+R-W1 M3 (path-qualified impl self types). Origin /tmp/RW*/fx/pathimpl. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

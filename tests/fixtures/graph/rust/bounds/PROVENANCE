@@ -1,1 +1,1 @@
-stub
+R-W1 held check (generic dispatch, bounds). Origin /tmp/RW*/fx/bounds. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

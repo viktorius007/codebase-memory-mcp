@@ -1,1 +1,1 @@
-stub
+R-W1 B2, B3 (impl on &mut S; two traits on S and &S). Origin /tmp/RW*/fx/mutimpl. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

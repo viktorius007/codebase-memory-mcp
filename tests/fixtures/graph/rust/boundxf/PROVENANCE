@@ -1,1 +1,1 @@
-stub
+R-W3 N2, N3. Origin /tmp/RW*/fx/boundxf. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

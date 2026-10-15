@@ -1,1 +1,1 @@
-stub
+R-W2 R2 (impl on an intermediate Deref step). Origin /tmp/RW*/fx/boxbox. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

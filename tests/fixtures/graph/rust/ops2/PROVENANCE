@@ -1,1 +1,1 @@
-stub
+R-W1 B7 (operator site with two impls dropped silently), M4. Origin /tmp/RW*/fx/ops2. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

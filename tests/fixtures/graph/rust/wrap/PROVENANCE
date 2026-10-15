@@ -1,1 +1,1 @@
-stub
+R-W1 B4 (wrapper own-method probe, refcell_take). Origin /tmp/RW*/fx/wrap. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

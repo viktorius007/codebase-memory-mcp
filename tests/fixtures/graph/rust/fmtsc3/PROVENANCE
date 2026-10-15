@@ -1,1 +1,1 @@
-stub
+R-W2 R3. Origin /tmp/RW*/fx/fmtsc3. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

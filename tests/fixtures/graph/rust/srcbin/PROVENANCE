@@ -1,0 +1,1 @@
+HANDOFF 14 Oct footgun: a src/bin/*.rs target must keep its definitions; written for this check.

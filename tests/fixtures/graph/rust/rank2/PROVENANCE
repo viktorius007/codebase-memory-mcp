@@ -1,1 +1,1 @@
-stub
+R-W1 M2 (same-named types in sibling modules). Origin /tmp/RW*/fx/rank2. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

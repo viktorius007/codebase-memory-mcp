@@ -1,1 +1,1 @@
-stub
+R-W1 held check (std inventory and Deref chains). Origin /tmp/RW*/fx/derefch. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

@@ -1,1 +1,1 @@
-stub
+R-W1 matrix of receiver/probe dimensions (B1-B3); generated, generator not in the repository. Origin /tmp/RW*/fx/matrix. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

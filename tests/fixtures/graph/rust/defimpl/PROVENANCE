@@ -1,1 +1,1 @@
-stub
+R-W2 held check (default methods on reference impls). Origin /tmp/RW*/fx/defimpl. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

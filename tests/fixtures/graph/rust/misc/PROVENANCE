@@ -1,1 +1,1 @@
-stub
+R-W1 held check (block items, aliases); R-W3 N2 (generic_ret stop). Origin /tmp/RW*/fx/misc. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged. Lines split so that one line holds one function (no change of meaning).

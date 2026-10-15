@@ -1,1 +1,1 @@
-stub
+R-W1 B1 (owned and autoderef receivers pick the inherent method). Origin /tmp/RW*/fx/ownprobe. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

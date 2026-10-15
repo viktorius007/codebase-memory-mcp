@@ -336,3 +336,7 @@ oracle in `tools/std-inventory/probe.py` may use rustc, but indexing never does.
 Its current 32,123 rows and 111 / 11 / 4 stamp split are source- and
 compiler-probed development artifacts compiled into the binary. The six known
 inventory limitations remain open above.
+
+## The edit loop
+
+Run `make -f Makefile.cbm fixtures BUILD_DIR=<dir>` after every resolver change: it runs each program under `tests/fixtures/graph` with its own compiler or interpreter, indexes it with the built binary in both pipeline modes, compares the graph's edges and `unresolved_sites` rows with what the run did, and exits non-zero naming every site that differs and is not in `tools/fixtures/known.tsv` (about two minutes). A fix removes its entries from that list in the same commit. Run the coordinator's gate (build, suites, lint, corpus scores) once, before a merge.

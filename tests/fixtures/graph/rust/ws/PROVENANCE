@@ -1,1 +1,1 @@
-stub
+R-W1 B1 (cross-crate regression, workspace dep/caller). Origin /tmp/RW*/fx/ws. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

@@ -1,1 +1,1 @@
-stub
+R-W1 B6 (forwarding impls on Box/Rc/Arc); R-W3 N2 (stop in impl for &T). Origin /tmp/RW*/fx/fwd. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged.

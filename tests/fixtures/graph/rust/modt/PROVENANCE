@@ -1,1 +1,1 @@
-stub
+R-W1 held check (module tree). Origin /tmp/RW*/fx/modt. println! statements extended to also print a backtrace (the run is the truth); semantics unchanged. Lines split so that one line holds one function (no change of meaning).
