@@ -1565,7 +1565,15 @@ TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation) {
  * decision at an observed state, never the outcome of a race between the
  * monitor's clock and a sleeping thread. The only time budgets left are the
  * hang detectors, which sit far above any plausible scheduling delay. */
-enum { FRONTEND_TEST_WINDOW_POLLS = 5, FRONTEND_TEST_WINDOW_EXPIRED_EXIT = 38 };
+enum {
+    FRONTEND_TEST_WINDOW_POLLS = 5,
+    FRONTEND_TEST_WINDOW_EXPIRED_EXIT = 38,
+    FRONTEND_TEST_WINDOW_SPAN_EXIT = 77,
+    /* The grace the monitor owes the supervisor: the graceful and forced-settle
+     * windows plus 1 s of margin, 3 s in all. Spelled out here on purpose:
+     * the test pins the product's value and must not follow it. */
+    FRONTEND_TEST_WINDOW_GRACE_MS = 3000,
+};
 
 static bool frontend_test_wait_polls(uint64_t polls, uint64_t deadline_ms) {
     while (cbm_daemon_frontend_test_grace_polls() < polls) {
@@ -1583,7 +1591,7 @@ static bool frontend_test_wait_polls(uint64_t polls, uint64_t deadline_ms) {
  * Otherwise close the window and wait for the monitor to contain the process
  * (exit FRONTEND_TEST_WINDOW_EXPIRED_EXIT from the monitor). */
 static void frontend_test_window_child(const frontend_maintenance_fixture_t *fixture,
-                                       int ready_fd, bool open_window) {
+                                       int ready_fd, bool open_window, bool pin_span) {
     cbm_daemon_ipc_endpoint_t *endpoint =
         cbm_daemon_ipc_endpoint_new("0123456789abcdef", fixture->parent);
     cbm_version_cohort_manager_t *manager =
@@ -1633,6 +1641,11 @@ static void frontend_test_window_child(const frontend_maintenance_fixture_t *fix
     if (!frontend_test_wait_polls(FRONTEND_TEST_WINDOW_POLLS, hang_deadline)) {
         _exit(76);
     }
+    /* The monitor stored the length it gave itself before its first poll. */
+    if (pin_span &&
+        cbm_daemon_frontend_test_grace_span_ms() != (uint64_t)FRONTEND_TEST_WINDOW_GRACE_MS) {
+        _exit(FRONTEND_TEST_WINDOW_SPAN_EXIT);
+    }
     bool stopped = cbm_daemon_maintenance_monitor_stop(&monitor);
     frontend_test_release_lease(&participant);
     while (manager && cbm_version_cohort_manager_free(&manager) != CBM_PRIVATE_FILE_LOCK_OK) {
@@ -1644,7 +1657,8 @@ static void frontend_test_window_child(const frontend_maintenance_fixture_t *fix
 
 /* Fork the window child, request maintenance from here, and return the child's
  * exit status through exit_code (-1 when it did not exit normally). */
-static void frontend_test_window_run(bool open_window, const char *label, bool *announced_out,
+static void frontend_test_window_run(bool open_window, bool pin_span, const char *label,
+                                     bool *announced_out,
                                      cbm_version_cohort_status_t *status_out,
                                      cbm_version_cohort_quiesce_result_t *quiesce_out,
                                      int *exit_code_out) {
@@ -1661,7 +1675,7 @@ static void frontend_test_window_run(bool open_window, const char *label, bool *
     pid_t child = pipe_ready ? fork() : -1;
     if (child == 0) {
         (void)close(ready_pipe[0]);
-        frontend_test_window_child(&fixture, ready_pipe[1], open_window);
+        frontend_test_window_child(&fixture, ready_pipe[1], open_window, pin_span);
     }
     if (pipe_ready) {
         (void)close(ready_pipe[1]);
@@ -1697,7 +1711,27 @@ TEST(daemon_local_participant_monitor_allows_supervisor_containment_window) {
     cbm_version_cohort_status_t status = CBM_VERSION_COHORT_IO;
     cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
     int exit_code = -1;
-    frontend_test_window_run(true, "monitor-window", &announced, &status, &quiesce, &exit_code);
+    frontend_test_window_run(true, false, "monitor-window", &announced, &status, &quiesce, &exit_code);
+
+    ASSERT_TRUE(announced);
+    ASSERT_EQ(status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(quiesce, CBM_VERSION_COHORT_QUIESCE_REQUESTED);
+    ASSERT_EQ(exit_code, 0);
+    PASS();
+}
+
+/* The window's length is pinned through the monitor's own bookkeeping, not by
+ * sleeping against its clock: the monitor records the span it opened (deadline
+ * minus the instant the deadline was computed from), and the test reads it
+ * after the monitor has polled. A grace of 0 would let the monitor contain a
+ * supervisor that is still draining; this fails it, with no race. */
+TEST(daemon_local_participant_monitor_grace_window_is_three_seconds) {
+    bool announced = false;
+    cbm_version_cohort_status_t status = CBM_VERSION_COHORT_IO;
+    cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
+    int exit_code = -1;
+    frontend_test_window_run(true, true, "monitor-window-span", &announced, &status, &quiesce,
+                             &exit_code);
 
     ASSERT_TRUE(announced);
     ASSERT_EQ(status, CBM_VERSION_COHORT_OK);
@@ -1713,8 +1747,8 @@ TEST(daemon_local_participant_monitor_contains_when_supervisor_window_closes) {
     cbm_version_cohort_status_t status = CBM_VERSION_COHORT_IO;
     cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
     int exit_code = -1;
-    frontend_test_window_run(false, "monitor-window-closed", &announced, &status, &quiesce,
-                             &exit_code);
+    frontend_test_window_run(false, false, "monitor-window-closed", &announced, &status,
+                             &quiesce, &exit_code);
 
     ASSERT_TRUE(announced);
     ASSERT_EQ(status, CBM_VERSION_COHORT_OK);
@@ -1792,6 +1826,7 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     RUN_TEST(daemon_local_participant_monitor_allows_supervisor_containment_window);
+    RUN_TEST(daemon_local_participant_monitor_grace_window_is_three_seconds);
     RUN_TEST(daemon_local_participant_monitor_contains_when_supervisor_window_closes);
 #endif
     RUN_TEST(daemon_frontend_over_capacity_input_backpressures_without_loss);
