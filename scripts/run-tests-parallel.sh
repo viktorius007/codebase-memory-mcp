@@ -233,39 +233,36 @@ shard_filter() {
         }
     '
 }
-# Timing-sensitive suites run SEQUENTIALLY after the parallel wave: they
-# spawn subprocesses / watch the filesystem / bind ports with fixed
-# deadlines, and a saturated 4-core CI runner starves those deadlines into
-# flakes (3 cli-suite failures on the ubuntu legs of the first CI run).
-# Same suites, same tests, same gates — only the schedule differs; the
-# union guard below still checks the COMBINED result set.
+# Timing-sensitive suites run after the parallel wave, CBM_TAIL_JOBS (default
+# 2) at a time: they spawn subprocesses / watch the filesystem / bind ports
+# with fixed deadlines that a saturated 4-core CI runner starved into flakes
+# (3 cli-suite failures on the ubuntu legs of the first CI run). Same suites,
+# same tests, same gates; only the schedule differs, and the union guard
+# below still checks the COMBINED result set.
 # stack_overflow_a/b/c: their giant-recursion ASan allocations stall ~100x
 # when co-STARTED with a large wave on Apple Silicon (2s staggered vs ~230s
-# simultaneous — a local scheduler/zone quirk, not contention: job count
-# does not change it). Staggered in the tail they cost seconds.
-# The daemon-family suites spawn coordinated worker subprocesses (a re-exec
-# of this ASan runner plus the full admission handshake) and bind local
-# endpoints under fixed readiness deadlines (3 s marker waits in
-# index_supervisor); the saturated 3-core macOS CI runners starve those
-# deadlines into deterministic failures while an idle machine passes 6/6.
-# They also all rendezvous through the shared per-account runtime namespace,
-# which the quiet tail keeps free of cross-suite admission traffic.
-# extraction carries the wide-flat SCALING-RATIO guard, which grows the input
-# 20x and asserts the time grows ~20x (linear) rather than ~128x (quadratic),
-# with a bound of 40x between them. Contention does not cancel out of that
-# ratio: the 400k-node measurement loses far more to memory pressure and
-# scheduling than the 20k one, so oversubscription inflates the ratio itself.
-# Measured on the Windows arm64 VM: 18.5x alone (passes) vs 53.8x and 55x in
-# the 18-job wave (fails) — reproducible, 3 of 3. The bound is deliberately NOT
-# widened; see the calibration note in tests/test_extraction.c, which records
-# that 40 sits >=2x from both the linear and quadratic signals, so inflating it
-# would move the test toward the very thing it exists to catch. Quiet is the
-# fix, and at ~22s the suite is cheap to run alone.
-SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience mcp \
-    extraction \
-    stack_overflow_a stack_overflow_b stack_overflow_c \
-    index_supervisor daemon_application daemon_runtime daemon_frontend \
-    daemon_bootstrap daemon_ipc"
+# simultaneous; a local scheduler/zone quirk, not contention: job count does
+# not change it). Staggered in the tail they cost seconds.
+# A suite whose verdict depends on the schedule has a flawed test, and the
+# fix is the test. cli, mcp, extraction and the daemon family
+# (index_supervisor, daemon_application, daemon_runtime, daemon_frontend,
+# daemon_bootstrap, daemon_ipc) used to run here strictly one at a time; they
+# run in the wave now because each wall-clock proxy in them was replaced by
+# the event it stood for: extraction's scaling guard counts tree-sitter
+# navigation steps instead of timing them, the bootstrap/supervisor/runtime/
+# mcp stopwatches became hang detectors on events the tests already observe,
+# and the daemon_application "must not finish within 100 ms" windows wait for
+# a product park counter. They share no runtime namespace either: each runner
+# process gets a private HOME and CBM_RUNTIME_DIR (tests/test_main.c). A suite
+# goes back on this list only with one line naming what still binds it.
+SERIAL_SUITES="subprocess watcher incremental httpd ui index_resilience \
+    stack_overflow_a stack_overflow_b stack_overflow_c"
+# Windows only, cli: its install-flow tests check the build directory's DACL,
+# which wave suites' Cygwin tooling can rewrite behind the pre-wave stamp (see
+# stamp_windows_build_dir pre-tail below). What binds it is that DACL, not a clock.
+case "$(uname -s 2>/dev/null)" in
+MINGW* | MSYS*) SERIAL_SUITES="$SERIAL_SUITES cli" ;;
+esac
 is_serial() {
     case " $SERIAL_SUITES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
@@ -341,34 +338,6 @@ run_wave() {
 
 run_wave "$PAR_FILE" "$JOBS"
 
-# Tail scheduling in two phases. The FLEX suites are timing-shaped but do
-# not rendezvous through the shared per-account daemon runtime namespace,
-# so a small fixed overlap (CBM_TAIL_JOBS, default 2) is safe and converts
-# idle cores into wall time — the old fully-serial tail ran them one at a
-# time on an idle machine. The EXCL group (daemon-family plus the suites
-# that drive daemon one-shots or supervisor rendezvous) then runs strictly
-# sequentially on a machine exactly as quiet as the old tail gave it.
-# extraction is in this group for a DIFFERENT reason than the rest: it does not
-# rendezvous through the daemon namespace, it measures a scaling ratio, and even
-# the FLEX group's small fixed overlap is load the measurement would absorb.
-# Strictly sequential is what makes its verdict a function of the code instead
-# of the scheduler.
-TAIL_EXCL="cli mcp index_supervisor daemon_application daemon_runtime \
-    daemon_frontend daemon_bootstrap daemon_ipc extraction"
-is_tail_excl() {
-    case " $TAIL_EXCL " in *" $1 "*) return 0 ;; *) return 1 ;; esac
-}
-FLEX_FILE="$LOGDIR/suites-tail-flex.txt"
-EXCL_FILE="$LOGDIR/suites-tail-excl.txt"
-: > "$FLEX_FILE"
-: > "$EXCL_FILE"
-while IFS= read -r sname; do
-    if is_tail_excl "$sname"; then
-        echo "$sname" >> "$EXCL_FILE"
-    else
-        echo "$sname" >> "$FLEX_FILE"
-    fi
-done < "$SER_FILE"
 # Wave suites spawn Cygwin-family tooling that can rewrite the build
 # directory's DACL behind the first stamp (observed: an arm shard whose
 # tail held the install-flow suites failed the source-directory policy
@@ -376,8 +345,9 @@ done < "$SER_FILE"
 # Re-stamp at the tail boundary so the deadline-sensitive tail — which
 # hosts those suites — always starts from the verified-clean shape.
 stamp_windows_build_dir pre-tail
-run_wave "$FLEX_FILE" "${CBM_TAIL_JOBS:-2}"
-run_wave "$EXCL_FILE" 1
+TAIL_START=$SECONDS
+run_wave "$SER_FILE" "${CBM_TAIL_JOBS:-2}"
+echo "=== post-wave phase: $((SECONDS - TAIL_START))s ($(wc -l < "$SER_FILE" | tr -d ' ') suites, ${CBM_TAIL_JOBS:-2} jobs) ==="
 
 # ── Union guard: every suite in this shard's slice produced exactly one
 # result. The slice is deterministic, so N green shard jobs = full coverage;
