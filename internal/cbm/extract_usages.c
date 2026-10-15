@@ -39,21 +39,9 @@ static void usage_field_lookup_test_note_work(void) {
 static void usage_slow_parent_fallback_test_note(void) {
     atomic_fetch_add_explicit(&g_usage_slow_parent_fallbacks, 1, memory_order_relaxed);
 }
-
-/* A classifier cursor reset copies the walk cursor's whole stack: charge it
- * one unit per level copied, so a copy per occurrence on a deep tree shows as
- * the quadratic it is. */
-static void usage_cursor_copy_test_note(const TSTreeCursor *cursor) {
-    atomic_fetch_add_explicit(&g_usage_field_lookup_work,
-                              (uint64_t)ts_tree_cursor_current_depth(cursor) + 1U,
-                              memory_order_relaxed);
-}
 #else
 static void usage_field_lookup_test_note_work(void) {}
 static void usage_slow_parent_fallback_test_note(void) {}
-static void usage_cursor_copy_test_note(const TSTreeCursor *cursor) {
-    (void)cursor;
-}
 #endif
 
 // Forward declaration
@@ -304,31 +292,41 @@ static const char *field_name_for_node(TSNode parent, TSNode child) {
     return field;
 }
 
-/* The unified walk already owns the exact cursor path to the current node.
- * Reset one reusable scratch cursor to that path before each occurrence
- * classifier, then walk its parents without restarting a sibling scan at
- * every level. Legacy extraction callers retain the node-based fallback. */
-static TSTreeCursor *reset_occurrence_cursor(WalkState *state, TSNode node) {
-    if (!state || !state->current_cursor || !state->occurrence_cursor ||
-        !ts_node_eq(ts_tree_cursor_current_node(state->current_cursor), node)) {
+/* The unified walk already holds the path from the root to the current node,
+ * with the field each node occupies. Point one reusable climb position at the
+ * top of that path before each occurrence classifier, so every step up is
+ * O(1): no root descent and no copy of the path. Copying the walk cursor here
+ * instead (ts_tree_cursor_reset_to) cost O(depth) per classifier call, which
+ * made a left-nested chain quadratic. Legacy extraction callers retain the
+ * node-based fallback. */
+static WalkAncestorCursor *reset_occurrence_cursor(WalkState *state, TSNode node) {
+    if (!state || !state->ancestors || state->ancestor_count == 0 ||
+        !ts_node_eq(state->ancestors[state->ancestor_count - 1].node, node)) {
         return NULL;
     }
-    usage_cursor_copy_test_note(state->current_cursor);
-    ts_tree_cursor_reset_to(state->occurrence_cursor, state->current_cursor);
-    return state->occurrence_cursor;
+    state->occurrence_cursor.frames = state->ancestors;
+    state->occurrence_cursor.at = state->ancestor_count - 1;
+    return &state->occurrence_cursor;
 }
 
-static bool occurrence_parent(TSTreeCursor *cursor, TSNode current, TSNode *parent,
+/* One step up the walk path: the field the climb's node occupies, then its
+ * parent, or false at the root. */
+static bool ancestor_cursor_up(WalkAncestorCursor *cursor, TSNode *parent, const char **field) {
+    *field = cursor->frames[cursor->at].field;
+    usage_field_lookup_test_note_work();
+    if (cursor->at == 0) {
+        *parent = (TSNode){0};
+        return false;
+    }
+    cursor->at--;
+    *parent = cursor->frames[cursor->at].node;
+    return true;
+}
+
+static bool occurrence_parent(WalkAncestorCursor *cursor, TSNode current, TSNode *parent,
                               const char **field) {
     if (cursor) {
-        *field = ts_tree_cursor_current_field_name(cursor);
-        usage_field_lookup_test_note_work();
-        if (!ts_tree_cursor_goto_parent(cursor)) {
-            *parent = (TSNode){0};
-            return false;
-        }
-        *parent = ts_tree_cursor_current_node(cursor);
-        return true;
+        return ancestor_cursor_up(cursor, parent, field);
     }
 
     *parent = ts_node_parent(current);
@@ -341,10 +339,10 @@ static bool occurrence_parent(TSTreeCursor *cursor, TSNode current, TSNode *pare
 }
 
 static const char *field_name_for_walk_node(WalkState *state, TSNode parent, TSNode node) {
-    if (state && state->current_cursor &&
-        ts_node_eq(ts_tree_cursor_current_node(state->current_cursor), node)) {
+    if (state && state->ancestors && state->ancestor_count > 0 &&
+        ts_node_eq(state->ancestors[state->ancestor_count - 1].node, node)) {
         usage_field_lookup_test_note_work();
-        return ts_tree_cursor_current_field_name(state->current_cursor);
+        return state->ancestors[state->ancestor_count - 1].field;
     }
     return field_name_for_node(parent, node);
 }
@@ -656,15 +654,15 @@ static bool is_elixir_def_binding(CBMExtractCtx *ctx, TSNode node) {
  * 1 MB spent 46 s in this walk, 4.7 MB never finished). The node-based climb
  * remains only for callers outside the walk. */
 static bool is_first_named_part_of(TSNode node, const char *container_kind, WalkState *state) {
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    WalkAncestorCursor *cursor = reset_occurrence_cursor(state, node);
     TSNode current = node;
     for (;;) {
         TSNode parent;
         if (cursor) {
-            if (!ts_tree_cursor_goto_parent(cursor)) {
+            const char *field;
+            if (!ancestor_cursor_up(cursor, &parent, &field)) {
                 return false;
             }
-            parent = ts_tree_cursor_current_node(cursor);
         } else {
             usage_slow_parent_fallback_test_note(); /* one root descent per hop */
             parent = ts_node_parent(current);
@@ -1176,7 +1174,7 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
     }
 
     TSNode current = node;
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    WalkAncestorCursor *cursor = reset_occurrence_cursor(state, node);
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
@@ -1276,7 +1274,7 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
                                 WalkState *state) {
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
     TSNode current = node;
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    WalkAncestorCursor *cursor = reset_occurrence_cursor(state, node);
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
@@ -1352,7 +1350,12 @@ static bool is_call_argument_label(TSNode node) {
 }
 
 static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    /* Without a labeled-argument kind in the grammar the climb below can only
+     * end in false -- after reaching the root, for an operand of a deep
+     * expression outside any call, which is O(depth) per occurrence. */
+    if (state && !state->grammar_has_labeled_arguments)
+        return false;
+    WalkAncestorCursor *cursor = reset_occurrence_cursor(state, node);
     if (!cursor)
         return is_call_argument_label(node);
     TSNode current = node;
@@ -1422,7 +1425,8 @@ static bool is_direct_argument_value(TSNode node) {
  * node below occupies. A caller that climbed to find its site has that pair in
  * hand, and re-deriving it would mean either stepping the cursor twice or
  * paying ts_node_parent for what the cursor just told us. */
-static bool is_direct_argument_value_from(TSNode parent, const char *field, TSTreeCursor *cursor) {
+static bool is_direct_argument_value_from(TSNode parent, const char *field,
+                                          WalkAncestorCursor *cursor) {
     for (;;) {
         const char *parent_kind = ts_node_type(parent);
         if (is_labeled_argument_kind(parent_kind)) {
@@ -1455,7 +1459,7 @@ static bool is_direct_argument_value_from(TSNode parent, const char *field, TSTr
 
 /* Cursor-backed counterpart for the unified walker. `cursor` must currently
  * point at `node`; it is consumed while walking toward the argument owner. */
-static bool is_direct_argument_value_cursor(TSNode node, TSTreeCursor *cursor) {
+static bool is_direct_argument_value_cursor(TSNode node, WalkAncestorCursor *cursor) {
     TSNode parent;
     const char *field;
     if (!occurrence_parent(cursor, node, &parent, &field))
@@ -1464,7 +1468,7 @@ static bool is_direct_argument_value_cursor(TSNode node, TSTreeCursor *cursor) {
 }
 
 static bool is_direct_argument_value_walk(TSNode node, WalkState *state) {
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    WalkAncestorCursor *cursor = reset_occurrence_cursor(state, node);
     return cursor ? is_direct_argument_value_cursor(node, cursor) : is_direct_argument_value(node);
 }
 
@@ -1524,7 +1528,7 @@ static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage langua
  * ts_node_child_with_descendant). Those files are also the ones the old CPU
  * deadline used to cut off mid-walk, so the slow path and the nondeterminism
  * it forced were the same defect seen from two ends. */
-static bool csharp_site_parent(TSTreeCursor *cursor, TSNode site, TSNode *parent,
+static bool csharp_site_parent(WalkAncestorCursor *cursor, TSNode site, TSNode *parent,
                                const char **field) {
     if (!cursor) {
         usage_slow_parent_fallback_test_note();
@@ -1533,7 +1537,7 @@ static bool csharp_site_parent(TSTreeCursor *cursor, TSNode site, TSNode *parent
 }
 
 static TSNode csharp_callable_value_site(TSNode node, TSNode parent, const char *parent_field,
-                                         TSTreeCursor *cursor) {
+                                         WalkAncestorCursor *cursor) {
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "identifier") != 0 && strcmp(kind, "simple_identifier") != 0) {
         return (TSNode){0};
@@ -1596,8 +1600,8 @@ static TSNode csharp_callable_value_site(TSNode node, TSNode parent, const char 
  * outermost wrapper, or null when the node is not a parenthesised direct
  * argument. Mirrors python_direct_callable_attribute_site so the bare
  * identifier and bound method forms agree on one occurrence. */
-static TSNode paren_wrapped_direct_argument_site(TSNode node, TSNode parent, TSTreeCursor *cursor,
-                                                 WalkState *state) {
+static TSNode paren_wrapped_direct_argument_site(TSNode node, TSNode parent,
+                                                 WalkAncestorCursor *cursor, WalkState *state) {
     /* The caller already resolved `parent`; checking its kind first keeps the
      * common case (an identifier that is not parenthesised at all) free of any
      * extra parent resolution. Walking up with ts_node_parent here instead
@@ -1641,7 +1645,7 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         return (TSNode){0};
     }
     const char *kind = ts_node_type(node);
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    WalkAncestorCursor *cursor = reset_occurrence_cursor(state, node);
     TSNode parent = {0};
     const char *parent_field = NULL;
     if (!cursor) {
@@ -3036,7 +3040,10 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         usage.is_member_access = strcmp(ts_node_type(node), "field_identifier") == 0;
         stamp_usage_site(ctx, &usage, node, name, state);
         cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
-        TSNode parent = ts_node_parent(node);
+        /* Only Rust reads the parent, and ts_node_parent descends from the
+         * root: asking for it on every reference of every language cost
+         * O(depth) per reference. */
+        TSNode parent = ctx->language == CBM_LANG_RUST ? ts_node_parent(node) : (TSNode){0};
         if (ctx->language == CBM_LANG_RUST && !ts_node_is_null(parent) &&
             strcmp(ts_node_type(parent), "token_tree") == 0) {
             /* Preserve the ordinary reference carrier for unreadable macros.

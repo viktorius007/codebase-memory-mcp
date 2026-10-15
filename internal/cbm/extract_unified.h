@@ -129,19 +129,43 @@ typedef struct {
     uint8_t kind;
 } CBMPythonDirective;
 
+/* One node on the unified walk's path from the root to the current node, with
+ * the field it occupies in the frame below it (NULL for the root and for
+ * unnamed positions) -- what ts_tree_cursor_current_field_name answered when
+ * the walk cursor stood on it. */
+typedef struct {
+    TSNode node;
+    const char *field;
+} WalkAncestor;
+
+/* A position on the ancestor path that an occurrence classifier climbs. One
+ * step up is an index decrement: no root descent (ts_node_parent) and no copy
+ * of the walk cursor's stack, either of which costs O(depth) per occurrence
+ * and made a left-nested chain of N links quadratic (#1527 follow-up). */
+typedef struct {
+    const WalkAncestor *frames;
+    uint32_t at; // index of the climb's current node in frames
+} WalkAncestorCursor;
+
 // WalkState tracks scope context during the unified cursor walk.
 // Replaces parent-chain walks for enclosing_func_qn, import context, etc.
 typedef struct {
-    const char *enclosing_func_qn;      // current function QN (module_qn at top level)
-    const char *enclosing_class_qn;     // current class QN (NULL outside class)
-    const TSTreeCursor *current_cursor; // unified walk cursor at the current node
-    TSTreeCursor *occurrence_cursor;    // reusable parent-preserving classifier cursor
-    CBMInvocationKind invocation_kind;  // exact active invocation/reference role
-    TSNode callee_expr;                 // exact active callee expression, if any
-    TSNode callee_leaf;                 // exact active terminal callee, if any
-    bool inside_import;                 // within an import_node_types subtree
-    int loop_depth;                     // count of enclosing loop scopes (for bottleneck metrics)
-    int branch_depth;                   // count of enclosing branch scopes
+    const char *enclosing_func_qn;  // current function QN (module_qn at top level)
+    const char *enclosing_class_qn; // current class QN (NULL outside class)
+    /* Root-to-current path of the walk; ancestors[ancestor_count - 1] is the
+     * current node. NULL when the path could not be allocated, which sends
+     * the classifiers to their node-based fallback. */
+    WalkAncestor *ancestors;
+    uint32_t ancestor_count;
+    uint32_t ancestor_capacity;
+    WalkAncestorCursor occurrence_cursor; // reusable classifier climb position
+    bool grammar_has_labeled_arguments;   // a call argument can carry a label
+    CBMInvocationKind invocation_kind;    // exact active invocation/reference role
+    TSNode callee_expr;                   // exact active callee expression, if any
+    TSNode callee_leaf;                   // exact active terminal callee, if any
+    bool inside_import;                   // within an import_node_types subtree
+    int loop_depth;                       // count of enclosing loop scopes (for bottleneck metrics)
+    int branch_depth;                     // count of enclosing branch scopes
 
     CBMArena *arena;
     CBMWalkScope *scopes;

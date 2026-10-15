@@ -2659,6 +2659,58 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     }
 }
 
+/* Record the walk cursor's node as the deepest frame of the ancestor path.
+ * `depth` is the cursor's visible depth, so frames [0, depth) are already the
+ * node's ancestors. On allocation failure the path is dropped for the rest of
+ * the file and the classifiers take their node-based fallback, which answers
+ * the same questions at a higher cost. */
+static void record_walk_ancestor(WalkState *state, const TSTreeCursor *cursor, TSNode node,
+                                 uint32_t depth) {
+    if (!state->ancestors) {
+        return;
+    }
+    if (depth >= state->ancestor_capacity) {
+        uint32_t new_capacity = state->ancestor_capacity;
+        while (new_capacity <= depth && new_capacity <= UINT32_MAX / 2U) {
+            new_capacity *= 2U;
+        }
+        WalkAncestor *grown = new_capacity > depth
+                                  ? (WalkAncestor *)cbm_arena_alloc(
+                                        state->arena, (size_t)new_capacity * sizeof(*grown))
+                                  : NULL;
+        if (!grown) {
+            state->ancestors = NULL;
+            state->ancestor_count = 0;
+            return;
+        }
+        memcpy(grown, state->ancestors, (size_t)state->ancestor_count * sizeof(*grown));
+        state->ancestors = grown;
+        state->ancestor_capacity = new_capacity;
+    }
+    state->ancestors[depth] = (WalkAncestor){node, ts_tree_cursor_current_field_name(cursor)};
+    state->ancestor_count = depth + 1U;
+}
+
+/* Whether any visible node of the grammar, named or not, can have the type of
+ * a labeled call argument (the kinds is_labeled_argument_kind in
+ * extract_usages.c names). Without one no occurrence is an argument label, so
+ * that classifier's climb -- to the root, for an operand of a deep expression
+ * outside any call -- is never needed. */
+static bool grammar_has_labeled_arguments(TSNode root) {
+    static const char *const kinds[] = {"keyword_argument", "named_argument", "labeled_argument"};
+    const TSLanguage *language = ts_node_language(root);
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        uint32_t length = (uint32_t)strlen(kinds[i]);
+        if (ts_language_symbol_for_name(language, kinds[i], length, true) != 0 ||
+            ts_language_symbol_for_name(language, kinds[i], length, false) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum { INITIAL_WALK_ANCESTORS = 64 };
+
 void cbm_extract_unified(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -2666,11 +2718,12 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     }
 
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
-    TSTreeCursor occurrence_cursor = ts_tree_cursor_copy(&cursor);
     WalkState state;
     memset(&state, 0, sizeof(state));
-    state.current_cursor = &cursor;
-    state.occurrence_cursor = &occurrence_cursor;
+    state.ancestors = (WalkAncestor *)cbm_arena_alloc(ctx->arena, (size_t)INITIAL_WALK_ANCESTORS *
+                                                                      sizeof(*state.ancestors));
+    state.ancestor_capacity = state.ancestors ? INITIAL_WALK_ANCESTORS : 0;
+    state.grammar_has_labeled_arguments = grammar_has_labeled_arguments(ctx->root);
     state.arena = ctx->arena;
     state.language = ctx->language;
     state.scopes = state.inline_scopes;
@@ -2717,6 +2770,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        record_walk_ancestor(&state, &cursor, node, depth);
         visited++;
         /* The budget is spent in nodes, so the walk of a given file always ends
          * on the same node — on any machine, under any load. A CPU deadline
@@ -2780,6 +2834,5 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
 
     cbm_finalize_lexical_usages(ctx, &state);
     ctx->walk_nodes_visited = visited;
-    ts_tree_cursor_delete(&occurrence_cursor);
     ts_tree_cursor_delete(&cursor);
 }
