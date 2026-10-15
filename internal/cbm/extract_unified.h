@@ -233,6 +233,8 @@ typedef struct {
  * currently open on the walk stack? O(1). Answers false on any failure, so a
  * caller can only ever lose a suppression, never a true edge. */
 bool cbm_walk_python_param_is_bound(const WalkState *state, const char *name);
+/* Whether the grammar has any labeled-argument kind (extract_usages.c owns the list). */
+bool cbm_grammar_has_labeled_arguments(TSNode root);
 
 // Per-node handler prototypes. Each is called once per node during the
 // unified cursor walk, replacing the old recursive walk_* functions.

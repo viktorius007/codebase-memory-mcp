@@ -19,6 +19,7 @@
 #include "iris_export_xml.h"
 #include "helpers.h"    /* cbm_count_branching (walker stack cap) */
 #include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
+#include "extract_unified.h" /* cbm_grammar_has_labeled_arguments */
 
 /* Deep-nesting probes: extraction on a worker-sized stack, crash-isolated. */
 #include "pipeline/worker_pool.h"            /* CBM_WORKER_STACK_SIZE */
@@ -12148,6 +12149,50 @@ static int deep_argument_nesting_probe(void) {
     return rc;
 }
 
+/* The labeled-argument kinds live in one list (extract_usages.c); the per-file
+ * grammar probe and the per-node label classifier both read it. Each grammar
+ * below owns exactly one of the three kinds, so a kind missing from the list
+ * turns that grammar's probe false: Python has only keyword_argument, Pony
+ * only named_argument, OCaml only labeled_argument. C has none. */
+static bool grammar_probe_for(CBMLanguage lang, const char *src) {
+    TSParser *parser = ts_parser_new();
+    if (!parser || !ts_parser_set_language(parser, cbm_ts_language(lang))) {
+        return false;
+    }
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    bool has = tree && cbm_grammar_has_labeled_arguments(ts_tree_root_node(tree));
+    if (tree) {
+        ts_tree_delete(tree);
+    }
+    ts_parser_delete(parser);
+    return has;
+}
+
+TEST(extract_labeled_argument_kinds_are_one_list_covering_every_kind) {
+    ASSERT_TRUE(grammar_probe_for(CBM_LANG_PYTHON, "f(a=1)\n"));
+    ASSERT_TRUE(grammar_probe_for(CBM_LANG_PONY, "actor Main\n  new create(env: Env) => None\n"));
+    ASSERT_TRUE(grammar_probe_for(CBM_LANG_OCAML, "let r = f ~a:1\n"));
+    ASSERT_FALSE(grammar_probe_for(CBM_LANG_C, "int f(void) { return 0; }\n"));
+    /* The classifier reads the same list: an OCaml label is not a value read. */
+    CBMFileResult *r = extract("let handler () = ()\nlet accept ~callback = callback ()\n"
+                               "let run () = accept ~callback:handler\n",
+                               CBM_LANG_OCAML, "t", "labeled.ml");
+    ASSERT_NOT_NULL(r);
+    int label_usages = 0;
+    int value_usages = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *u = &r->usages.items[i];
+        if (u->enclosing_func_qn && strstr(u->enclosing_func_qn, ".run") && u->ref_name) {
+            label_usages += strcmp(u->ref_name, "callback") == 0;
+            value_usages += strcmp(u->ref_name, "handler") == 0;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(label_usages, 0);
+    ASSERT_EQ(value_usages, 1);
+    PASS();
+}
+
 TEST(extract_deep_argument_nesting_completes) {
     char why[160];
     if (!deep_probe_passed(deep_argument_nesting_probe, why, sizeof(why))) {
@@ -13210,6 +13255,7 @@ SUITE(extraction) {
     /* Syntax-tree walkers spend no stack per nesting level */
     RUN_TEST(extract_deep_callee_chain_completes);
     RUN_TEST(extract_deep_error_regions_complete);
+    RUN_TEST(extract_labeled_argument_kinds_are_one_list_covering_every_kind);
     RUN_TEST(extract_deep_argument_nesting_completes);
 
     cbm_shutdown();

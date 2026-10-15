@@ -1320,9 +1320,40 @@ static bool is_argument_container_kind(const char *kind) {
                     strcmp(kind, "value_arguments") == 0);
 }
 
+/* The kinds of a labeled call argument: the single definition. The classifier
+ * below reads it per node; cbm_grammar_has_labeled_arguments reads it per
+ * grammar (extract_unified.c asks it once per file). */
+static const char *const labeled_argument_kinds[] = {"keyword_argument", "named_argument",
+                                                     "labeled_argument"};
+#define LABELED_ARGUMENT_KIND_COUNT \
+    (sizeof(labeled_argument_kinds) / sizeof(labeled_argument_kinds[0]))
+
 static bool is_labeled_argument_kind(const char *kind) {
-    return kind && (strcmp(kind, "keyword_argument") == 0 || strcmp(kind, "named_argument") == 0 ||
-                    strcmp(kind, "labeled_argument") == 0);
+    if (!kind) {
+        return false;
+    }
+    for (size_t i = 0; i < LABELED_ARGUMENT_KIND_COUNT; i++) {
+        if (strcmp(kind, labeled_argument_kinds[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Whether any visible node of the grammar, named or not, can have the type of
+ * a labeled call argument. Without one no occurrence is an argument label, so
+ * that classifier's climb -- to the root, for an operand of a deep expression
+ * outside any call -- is never needed. */
+bool cbm_grammar_has_labeled_arguments(TSNode root) {
+    const TSLanguage *language = ts_node_language(root);
+    for (size_t i = 0; i < LABELED_ARGUMENT_KIND_COUNT; i++) {
+        uint32_t length = (uint32_t)strlen(labeled_argument_kinds[i]);
+        if (ts_language_symbol_for_name(language, labeled_argument_kinds[i], length, true) != 0 ||
+            ts_language_symbol_for_name(language, labeled_argument_kinds[i], length, false) != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* A named/labeled argument's key describes the callee parameter; it is not a

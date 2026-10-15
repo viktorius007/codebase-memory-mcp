@@ -2691,24 +2691,6 @@ static void record_walk_ancestor(WalkState *state, const TSTreeCursor *cursor, T
     state->ancestor_count = depth + 1U;
 }
 
-/* Whether any visible node of the grammar, named or not, can have the type of
- * a labeled call argument (the kinds is_labeled_argument_kind in
- * extract_usages.c names). Without one no occurrence is an argument label, so
- * that classifier's climb -- to the root, for an operand of a deep expression
- * outside any call -- is never needed. */
-static bool grammar_has_labeled_arguments(TSNode root) {
-    static const char *const kinds[] = {"keyword_argument", "named_argument", "labeled_argument"};
-    const TSLanguage *language = ts_node_language(root);
-    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
-        uint32_t length = (uint32_t)strlen(kinds[i]);
-        if (ts_language_symbol_for_name(language, kinds[i], length, true) != 0 ||
-            ts_language_symbol_for_name(language, kinds[i], length, false) != 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 enum { INITIAL_WALK_ANCESTORS = 64 };
 
 void cbm_extract_unified(CBMExtractCtx *ctx) {
@@ -2723,7 +2705,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.ancestors = (WalkAncestor *)cbm_arena_alloc(ctx->arena, (size_t)INITIAL_WALK_ANCESTORS *
                                                                       sizeof(*state.ancestors));
     state.ancestor_capacity = state.ancestors ? INITIAL_WALK_ANCESTORS : 0;
-    state.grammar_has_labeled_arguments = grammar_has_labeled_arguments(ctx->root);
+    state.grammar_has_labeled_arguments = cbm_grammar_has_labeled_arguments(ctx->root);
     state.arena = ctx->arena;
     state.language = ctx->language;
     state.scopes = state.inline_scopes;
