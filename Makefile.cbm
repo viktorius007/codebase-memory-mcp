@@ -701,9 +701,10 @@ PROD_SRCS = $(MEMWASTE_SRCS) $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(M
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
-# Project headers, as prerequisites for the targets built in one compiler
-# invocation from sources (test-runner, test-repro-runner, test-runner-tsan,
-# codebase-memory-mcp, test-foundation). Those rules list only .c files, so
+# Project headers, as prerequisites of every per-file object rule
+# (OBJS_TEST_RUNNER, OBJS_TSAN_RUNNER, OBJS_CBM) and of the targets still built
+# in one compiler invocation (test-foundation, cbm-with-ui, cbm-fuzz). A rule
+# that lists only .c files misses header edits, so
 # editing a header changed nothing make could see and the target was NOT
 # rebuilt — an incremental build then silently tested the OLD header value.
 # Found while revert-checking a constants.h change: the check passed because
@@ -1160,12 +1161,40 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 OBJS_VENDORED_TSAN = $(MIMALLOC_OBJ_TSAN) $(SQLITE3_OBJ_TSAN) $(TRE_OBJ_TSAN) $(GRAMMAR_OBJS_TSAN) $(TS_RUNTIME_OBJ_TSAN) $(LSP_OBJ_TSAN) $(PP_OBJ_TSAN) $(LZ4_OBJ_TSAN) $(ZSTD_OBJ_TSAN) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
-		$(ALL_TEST_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_TEST) \
-		$(LDFLAGS_TEST)
+# ── Per-file objects for our own sources ─────────────────────────
+# One object per source, path-mirrored under $(BUILD_DIR)/obj/<flavour>/, so
+# make compiles them in parallel and ccache can cache them (it caches only
+# single-source `-c` compiles). The one-shot link rules these replace handed
+# ~450 sources to one compiler process: 240 s serial per test-runner build,
+# uncacheable, cold or warm. Each flag set gets its own tree; the stamp
+# prerequisite rebuilds every object when the build configuration changes.
+OBJ_TEST_DIR = $(BUILD_DIR)/obj/test
+OBJ_TSAN_DIR = $(BUILD_DIR)/obj/tsan
+OBJ_PROD_DIR = $(BUILD_DIR)/obj/prod
+MAIN_SRC = src/main.c
+CORE_LINK_SRCS = $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
+TEST_RUNNER_SRCS = $(ALL_TEST_SRCS) $(CORE_LINK_SRCS)
+TEST_REPRO_RUNNER_SRCS = $(TEST_REPRO_SRCS) $(CORE_LINK_SRCS)
+CBM_SRCS = $(MAIN_SRC) $(CORE_LINK_SRCS)
+OBJS_TEST_RUNNER = $(patsubst %.c,$(OBJ_TEST_DIR)/%.o,$(TEST_RUNNER_SRCS))
+OBJS_TEST_REPRO  = $(patsubst %.c,$(OBJ_TEST_DIR)/%.o,$(TEST_REPRO_RUNNER_SRCS))
+OBJS_TSAN_RUNNER = $(patsubst %.c,$(OBJ_TSAN_DIR)/%.o,$(TEST_RUNNER_SRCS))
+OBJS_CBM         = $(patsubst %.c,$(OBJ_PROD_DIR)/%.o,$(CBM_SRCS))
+
+$(sort $(OBJS_TEST_RUNNER) $(OBJS_TEST_REPRO)): $(OBJ_TEST_DIR)/%.o: %.c $(PROJECT_HDRS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -c -o $@ $<
+
+$(OBJS_TSAN_RUNNER): $(OBJ_TSAN_DIR)/%.o: %.c $(PROJECT_HDRS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS_TSAN) -Itests -Itests/repro -c -o $@ $<
+
+$(OBJS_CBM): $(OBJ_PROD_DIR)/%.o: %.c $(PROJECT_HDRS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS_PROD) -c -o $@ $<
+
+$(BUILD_DIR)/test-runner: $(OBJS_TEST_RUNNER) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -o $@ $(OBJS_TEST_RUNNER) $(OBJS_VENDORED_TEST) $(LDFLAGS_TEST)
 
 test: $(BUILD_DIR)/test-runner
 	cd "$(CURDIR)" && $(BUILD_DIR)/test-runner
@@ -1211,12 +1240,8 @@ scip-rust:
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
 # and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
 # still reproduced (the expected state); bug-repro.yml surfaces it as a board.
-$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -Itests -o $@ \
-		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_TEST) \
-		$(LDFLAGS_TEST)
+$(BUILD_DIR)/test-repro-runner: $(OBJS_TEST_REPRO) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -o $@ $(OBJS_TEST_REPRO) $(OBJS_VENDORED_TEST) $(LDFLAGS_TEST)
 
 test-repro: $(BUILD_DIR)/test-repro-runner
 	cd $(CURDIR) && bash tests/repro/repro_script_summary.sh
@@ -1271,12 +1296,8 @@ TSAN_OPTIONS ?= halt_on_error=1:report_thread_leaks=0
 # Normal ASan/native/soak paths remain uncapped. High-worker TSan diagnostics
 # invoke test-runner-tsan directly so release gates cannot drift accidentally.
 
-$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TSAN) -Itests -Itests/repro -o $@ \
-		$(ALL_TEST_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_TSAN) \
-		$(LDFLAGS_TSAN)
+$(BUILD_DIR)/test-runner-tsan: $(OBJS_TSAN_RUNNER) $(OBJS_VENDORED_TSAN) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TSAN) -o $@ $(OBJS_TSAN_RUNNER) $(OBJS_VENDORED_TSAN) $(LDFLAGS_TSAN)
 
 test-tsan: $(BUILD_DIR)/test-runner-tsan
 	@echo "ThreadSanitizer workers: 4"
@@ -1330,10 +1351,8 @@ $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c $(BUILD_DIR)/.build-co
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
-MAIN_SRC = src/main.c
-
 # Rebuild when the build CONFIGURATION changes, not only when sources do. The
-# product binary is compiled in ONE shot from sources, so after a TEST_SEAMS or
+# product binary was compiled in ONE shot from sources, so after a TEST_SEAMS or
 # version flip make finds the binary newer than every source and skips the recipe
 # entirely, handing back a binary built with the PREVIOUS configuration. The
 # dangerous direction is a release build silently keeping test seams, which is a
@@ -1358,12 +1377,8 @@ $(BUILD_DIR)/.build-config: build-config-check | $(BUILD_DIR)
 	else mv -f $@.tmp $@; rm -f $(BUILD_DIR)/codebase-memory-mcp; \
 	echo "=== build config changed -> full rebuild: $(BUILD_CONFIG_SIG) ==="; fi
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(BUILD_DIR)/.build-config $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -o $@ \
-		$(MAIN_SRC) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_PROD) \
-		$(LDFLAGS)
+$(BUILD_DIR)/codebase-memory-mcp: $(OBJS_CBM) $(OBJS_VENDORED_PROD) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) -o $@ $(OBJS_CBM) $(OBJS_VENDORED_PROD) $(LDFLAGS)
 
 cbm: $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
