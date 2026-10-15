@@ -1826,7 +1826,7 @@ const CBMType *c_eval_expr_type(CLSPContext *ctx, TSNode node) {
         ctx->eval_failure = CBM_LSP_DEPTH_EXCEEDED;
         return cbm_type_unknown();
     }
-    if (ctx->eval_depth == 0) {
+    if (ctx->eval_depth == 0 && !ctx->eval_window) {
         c_eval_memo_reset(ctx); /* scope may have changed since the last evaluation */
     }
     const CBMType *cached = c_eval_memo_lookup(ctx, node.id);
@@ -4667,26 +4667,57 @@ static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, cons
 // resolve_calls_in_node: walk AST and resolve calls
 // ============================================================================
 
-static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node);
+static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node, bool continued);
 
 #define C_LSP_MAX_WALK_DEPTH 512
+
+/* The receiver-chain window (see eval_window in c_lsp.h). A member call
+ * `x.f(...)` and a member access `x.f` evaluate `x`; the walk then visits
+ * `x`, whose own call or member access evaluates the receiver below it, and
+ * so on down the chain. Each of those outermost evaluations used to start
+ * from an empty memo and evaluate the whole rest of the chain again, so an
+ * N-link chain cost ~N^2 evaluations. The visits on the way down are pure
+ * (c_process_statement handles neither kind, nothing pushes a scope, the
+ * handlers only evaluate, look up and emit), so the types the first
+ * evaluation memoized still hold: the window keeps them.
+ *
+ * Opened by a member call or member access visit; `continued` says the visit
+ * was entered as the chain operand of a visit whose window was open, and only
+ * then is the memo kept. */
+static void c_eval_window_open(CLSPContext *ctx, bool continued) {
+    if (!continued) {
+        c_eval_memo_reset(ctx);
+    }
+    ctx->eval_window = true;
+}
+
+static void c_eval_window_close(CLSPContext *ctx) {
+    ctx->eval_window = false;
+    ctx->eval_window_next = NULL;
+}
 
 /* Depth-guarded entry: the AST walk recurses per nesting level and crashed
  * with a stack overflow on deeply nested real-world C++ (bitcoin, SIGSEGV in
  * cbm_type_substitute under hundreds of recursive c_resolve_calls_in_node
  * frames via c_adl_resolve). Past the cap the subtree is skipped — its calls
- * stay unresolved, which is graceful degradation, not a crash. */
+ * stay unresolved, which is graceful degradation, not a crash.
+ *
+ * Every entry and every exit closes the receiver-chain window: only the
+ * chain operand the open window named may continue it. */
 static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode node) {
+    bool continued = ctx->eval_window && node.id == ctx->eval_window_next;
+    c_eval_window_close(ctx);
     if (ctx->eval_failure)
         return;
     if (ctx->walk_depth >= C_LSP_MAX_WALK_DEPTH)
         return;
     ctx->walk_depth++;
-    c_resolve_calls_in_node_inner(ctx, node);
+    c_resolve_calls_in_node_inner(ctx, node, continued);
     ctx->walk_depth--;
+    c_eval_window_close(ctx);
 }
 
-static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
+static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node, bool continued) {
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);
@@ -4722,6 +4753,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
 
     // --- Member access: publish which type owns the field ---
     if (strcmp(kind, "field_expression") == 0) {
+        c_eval_window_open(ctx, continued);
         c_emit_field_reference(ctx, node);
     }
 
@@ -4739,6 +4771,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                 if (!ts_node_is_null(arg_node) && !ts_node_is_null(field_node)) {
                     char *field_name = c_node_text(ctx, field_node);
                     if (field_name) {
+                        c_eval_window_open(ctx, continued);
                         const CBMType *obj_type = c_eval_expr_type(ctx, arg_node);
 
                         // Determine if arrow or dot
@@ -5553,6 +5586,15 @@ recurse:;
                 break; // only one capture specifier per lambda
             }
         }
+    }
+
+    // An open window continues into the chain operand only: the receiver of
+    // a member access, the member access of a member call.
+    if (ctx->eval_window) {
+        TSNode operand = strcmp(kind, "field_expression") == 0
+                             ? ts_node_child_by_field_name(node, "argument", 8)
+                             : ts_node_child_by_field_name(node, "function", 8);
+        ctx->eval_window_next = ts_node_is_null(operand) ? NULL : operand.id;
     }
 
     // Recurse into children via a cursor (O(n)); ts_node_child(node,i) is O(i)
