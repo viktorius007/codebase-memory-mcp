@@ -1656,22 +1656,13 @@ static bool cbm_is_directive_line(const char *line, int len) {
     return i < len && line[i] == '#';
 }
 
-/* True when the line ends with a backslash, so the directive carries on to
- * the next line. */
-static bool cbm_line_continues(const char *line, int len) {
-    int end = len;
-    while (end > 0 && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r')) {
-        end--;
-    }
-    return end > 0 && line[end - 1] == '\\';
-}
-
 /* Set CBM_LINE_NO_CODE on every line of `src` that holds no construct.
- * One pass over the file. Carries block-comment state across lines so a line
- * in the middle of a comment counts as no-code too. */
+ * One pass over the file, reading comments and literals as the preprocessor
+ * does (cbm_source_lex_line), so a line in the middle of a comment counts as
+ * no-code too and a comment opener inside a string opens nothing. */
 static void cbm_mark_no_code_lines(const char *src, int src_len, uint8_t *map,
                                    uint32_t line_count) {
-    bool in_block = false;
+    cbm_source_lexer_t lexer = {0};
     bool in_directive = false;
     uint32_t line = 1;
     int i = 0;
@@ -1680,34 +1671,16 @@ static void cbm_mark_no_code_lines(const char *src, int src_len, uint8_t *map,
         while (end < src_len && src[end] != '\n') {
             end++;
         }
-        bool has_code = false;
-        bool line_starts_in_block = in_block;
-        for (int j = i; j < end; j++) {
-            if (in_block) {
-                if (src[j] == '*' && j + 1 < end && src[j + 1] == '/') {
-                    in_block = false;
-                    j++;
-                }
-                continue;
-            }
-            if (src[j] == '/' && j + 1 < end && src[j + 1] == '*') {
-                in_block = true;
-                j++;
-                continue;
-            }
-            if (src[j] == '/' && j + 1 < end && src[j + 1] == '/') {
-                break; /* rest of the line is a comment */
-            }
-            if (src[j] != ' ' && src[j] != '\t' && src[j] != '\r') {
-                has_code = true;
-            }
-        }
+        bool line_starts_in_block =
+            lexer.mode == CBM_SOURCE_BLOCK_COMMENT || lexer.mode == CBM_SOURCE_RAW;
+        bool continues = cbm_preprocessor_line_continues(src + i, end - i);
+        bool has_code = cbm_source_lex_line(&lexer, src + i, end - i, continues, NULL);
         bool directive =
             !line_starts_in_block && (in_directive || cbm_is_directive_line(src + i, end - i));
         if (!has_code || directive) {
             map[line] |= CBM_LINE_NO_CODE;
         }
-        in_directive = directive && cbm_line_continues(src + i, end - i);
+        in_directive = directive && continues;
         line++;
         i = end + 1;
     }
@@ -2084,6 +2057,52 @@ static bool cbm_remap_preprocessed_def(CBMDefinition *def, const CBMPreprocessed
     def->end_line = original_end;
     def->lines = (int)(original_end - original_start + 1);
     return true;
+}
+
+/* The line of this file that expanded-buffer line `eline` came from, or 0 when
+ * the map gives it none: a directive the preprocessor emitted, or an included
+ * header. A `#line` the source writes never re-labels its rows
+ * (preprocessor.cpp blanks it), so a row of this file maps to the line it is
+ * written on; `source_lines` bounds it all the same. */
+static uint32_t cbm_preprocessed_original_line(const CBMPreprocessedSource *pp, int eline,
+                                               uint32_t source_lines) {
+    if (eline <= 0 || eline > pp->expanded_line_count || !pp->belongs_to_main_file[eline]) {
+        return 0;
+    }
+    uint32_t original = pp->original_line_by_expanded_line[eline];
+    return original <= source_lines ? original : 0;
+}
+
+/* Calls the preprocessed pass appended, [first, count), carry the expanded
+ * buffer's rows, and an included header occupies rows of its own: a call after
+ * it sat that many lines past where it is written, past the end of a short
+ * file. Translate each to the line of this file it came from. A call the map
+ * places in no line of this file is code from a header -- the header's call,
+ * indexed with the header -- and is dropped, as cbm_remap_preprocessed_def
+ * drops such a definition. */
+static void cbm_remap_preprocessed_calls(CBMFileResult *result, int first,
+                                         const CBMPreprocessedSource *pp, const char *source,
+                                         int source_len) {
+    if (!pp->original_line_by_expanded_line || !pp->belongs_to_main_file) {
+        result->calls.count = first; /* no map: no line of these calls is known */
+        return;
+    }
+    uint32_t source_lines = cbm_source_line_count(source, source_len);
+    int kept = first;
+    for (int i = first; i < result->calls.count; i++) {
+        CBMCall call = result->calls.items[i];
+        uint32_t line = cbm_preprocessed_original_line(pp, call.start_line, source_lines);
+        if (line == 0) {
+            continue;
+        }
+        call.start_line = (int)line;
+        if (call.unresolved_line > 0) {
+            call.unresolved_line =
+                (int)cbm_preprocessed_original_line(pp, call.unresolved_line, source_lines);
+        }
+        result->calls.items[kept++] = call;
+    }
+    result->calls.count = kept;
 }
 
 /* ── One definition, two parses: which copy the rescue keeps ──────────────
@@ -3961,10 +3980,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
     atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
-    // Calls extracted so far all carry ORIGINAL-source line numbers; the C/C++
-    // preprocessor second pass below appends calls with EXPANDED-source lines,
-    // which must not be used for the def line-range attribution of the bottleneck
-    // metrics. Remember the boundary.
+    // Calls extracted so far come from the raw parse. The C/C++ preprocessor
+    // second pass below appends its own (remapped to original lines, but mostly
+    // second sightings of raw calls), which must not be counted again by the def
+    // line-range attribution of the bottleneck metrics. Remember the boundary.
     int orig_calls_count = result->calls.count;
 
     /* Phase 2 line map, built by the second (preprocessed) pass below and read
@@ -4063,6 +4082,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                         result->resolved_calls.items[i].source_origin =
                             CBM_SOURCE_ORIGIN_PREPROCESSED;
                     }
+
+                    /* Last reader of the expanded rows was the C-LSP above
+                     * (it pairs calls by byte span and origin, not by line). */
+                    cbm_remap_preprocessed_calls(result, calls_before, preprocessed, source,
+                                                 source_len);
 
                     /* #961: a def whose body braces are split across
                      * #ifdef/#else branches parses as an ERROR region on the

@@ -114,7 +114,8 @@ void cbm_pkg_entries_init(cbm_pkg_entries_t *e) {
 static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_rel) {
     if (e->count >= e->cap) {
         int new_cap = e->cap == 0 ? PKGMAP_INIT_CAP : e->cap * SKIP_ONE * PAIR_LEN;
-        cbm_pkg_entry_t *tmp = realloc(e->items, new_cap * sizeof(cbm_pkg_entry_t));
+        cbm_pkg_entry_t *tmp =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, e->items, new_cap * sizeof(cbm_pkg_entry_t));
         if (!tmp) {
             free(pkg_name);
             free(entry_rel);
@@ -125,6 +126,9 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     }
     e->items[e->count].pkg_name = pkg_name;
     e->items[e->count].entry_rel = entry_rel;
+    e->items[e->count].manifest_rel = NULL;
+    e->items[e->count].crate = CBM_CRATE_NONE;
+    e->items[e->count].crate_manifest_rel = NULL;
     e->count++;
 }
 
@@ -132,8 +136,10 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
     for (int i = 0; i < e->count; i++) {
         free(e->items[i].pkg_name);
         free(e->items[i].entry_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].manifest_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].crate_manifest_rel);
     }
-    free(e->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, e->items);
     e->items = NULL;
     e->count = 0;
     e->cap = 0;
@@ -410,10 +416,78 @@ static void push_rust_crate_head(cbm_pkg_entries_t *entries, const char *ident,
     pkg_entries_push(entries, strdup(key), build_entry_path(rel_path, "src/lib"));
 }
 
+/* The manifest of the crate a path dependency of manifest `rel_path` names:
+ * "<dir>/<dep_path>/Cargo.toml" normalized, NULL when the path is absolute or
+ * leaves the repository (that crate is not indexed, and a same-named crate
+ * inside must not stand in for it). mem_core (CBM_MEM_CLASS_OTHER). */
+static char *rust_path_dep_manifest(const char *rel_path, const char *dep_path) {
+    if (!dep_path[0] || dep_path[0] == '/' || dep_path[0] == '\\' || strchr(dep_path, ':')) {
+        return NULL;
+    }
+    char out[PKGMAP_PATH_BUF];
+    const char *dir_end = strrchr(rel_path, '/');
+    size_t used = dir_end ? (size_t)(dir_end - rel_path) : 0;
+    if (used >= sizeof(out)) {
+        return NULL;
+    }
+    memcpy(out, rel_path, used);
+    for (const char *seg = dep_path; *seg;) {
+        size_t len = strcspn(seg, "/");
+        if (len == PAIR_LEN && seg[0] == '.' && seg[1] == '.') {
+            if (used == 0) {
+                return NULL; /* above the repository root */
+            }
+            while (used > 0 && out[used - SKIP_ONE] != '/') {
+                used--;
+            }
+            used -= used > 0;
+        } else if (len > 0 && !(len == SKIP_ONE && seg[0] == '.')) {
+            if (used + SKIP_ONE + len >= sizeof(out)) {
+                return NULL;
+            }
+            if (used > 0) {
+                out[used++] = '/';
+            }
+            memcpy(out + used, seg, len);
+            used += len;
+        }
+        seg += len + (seg[len] == '/');
+    }
+    int n = snprintf(out + used, sizeof(out) - used, "%sCargo.toml", used > 0 ? "/" : "");
+    if (n <= 0 || (size_t)n >= sizeof(out) - used) {
+        return NULL;
+    }
+    return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, out);
+}
+
+/* Record what the files of the manifest being parsed reach by `name`: a
+ * crate record of `kind` naming `crate_manifest` (mem_core, taken; NULL for a
+ * kind that names no crate, or a path out of the repository). */
+static void push_rust_crate_record(cbm_pkg_entries_t *entries, const char *name,
+                                   cbm_crate_record_t kind, char *crate_manifest) {
+    /* heap like every entry's pkg_name, which cbm_pkg_entries_free releases */
+    char *key = name ? strdup(name) : NULL;
+    int slot = entries->count;
+    if (key) {
+        pkg_entries_push(entries, key, NULL);
+    }
+    if (entries->count > slot) {
+        entries->items[slot].crate = kind;
+        entries->items[slot].crate_manifest_rel = crate_manifest;
+    } else {
+        cbm_free(CBM_MEM_CLASS_OTHER, crate_manifest);
+    }
+}
+
 /* Rust: Cargo.toml — [package] name, plus every name a `use` can give a crate:
  * the package name and [lib] name of this manifest and the key of each `path`
  * dependency (which may rename it) name crates of the repository; the key of
- * any other dependency names an external crate. */
+ * any other dependency names an external crate. What this manifest's files
+ * reach by a name is recorded too (push_rust_crate_record): the manifest
+ * itself (and whether it roots a workspace), its own package, each path
+ * dependency's crate, each dependency inherited with `workspace = true`, and
+ * for a workspace root each [workspace.dependencies] path entry. A registry
+ * dependency records nothing: what it names is outside the repository. */
 static void parse_cargo_toml(const char *source, int source_len, const char *rel_path,
                              cbm_pkg_entries_t *entries) {
     CBMCargoManifest *manifest =
@@ -422,11 +496,25 @@ static void parse_cargo_toml(const char *source, int source_len, const char *rel
         CBMArena arena;
         cbm_arena_init(&arena);
         cbm_cargo_parse(&arena, source, source_len, manifest);
+        push_rust_crate_record(
+            entries, "", manifest->is_workspace_root ? CBM_CRATE_WORKSPACE : CBM_CRATE_MANIFEST,
+            NULL);
         push_rust_crate_head(entries, manifest->package_name, rel_path, false);
         push_rust_crate_head(entries, manifest->lib_name, rel_path, false);
         for (int i = 0; i < manifest->dep_count; i++) {
             push_rust_crate_head(entries, manifest->deps[i].name, rel_path,
                                  manifest->deps[i].path == NULL);
+        }
+        for (int i = 0; i < manifest->dep_count; i++) {
+            const CBMCargoDep *dep = &manifest->deps[i];
+            if (dep->workspace && !dep->workspace_table) {
+                push_rust_crate_record(entries, dep->name, CBM_CRATE_INHERIT, NULL);
+            } else if (dep->path) {
+                push_rust_crate_record(entries, dep->name,
+                                       dep->workspace_table ? CBM_CRATE_WORKSPACE_DEP
+                                                            : CBM_CRATE_REACH,
+                                       rust_path_dep_manifest(rel_path, dep->path));
+            }
         }
         cbm_arena_destroy(&arena);
         cbm_free(CBM_MEM_CLASS_OTHER, manifest);
@@ -441,7 +529,12 @@ static void parse_cargo_toml(const char *source, int source_len, const char *rel
         return;
     }
     char *entry = build_entry_path(rel_path, "src/lib");
+    int slot = entries->count;
     pkg_entries_push(entries, name, entry);
+    if (entries->count > slot) {
+        push_rust_crate_record(entries, entries->items[slot].pkg_name, CBM_CRATE_REACH,
+                               cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path));
+    }
 }
 
 /* Python: pyproject.toml — [project] name */
@@ -990,8 +1083,8 @@ static void parse_package_swift(const char *source, int source_len, const char *
 
 /* ── Public: manifest detection + parsing ──────────────────────── */
 
-bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
-                          int source_len, cbm_pkg_entries_t *entries) {
+static bool pkgmap_parse_manifest(const char *basename, const char *rel_path, const char *source,
+                                  int source_len, cbm_pkg_entries_t *entries) {
     if (!basename || !source || source_len <= 0) {
         return false;
     }
@@ -1043,6 +1136,20 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
     return false;
 }
 
+/* Every entry remembers the manifest that declared it: cbm_pkgmap_build
+ * keeps a manifest's own precedence among its entries and orders manifests
+ * by path when two declare one name. */
+bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
+                          int source_len, cbm_pkg_entries_t *entries) {
+    int first = entries ? entries->count : 0;
+    bool parsed = pkgmap_parse_manifest(basename, rel_path, source, source_len, entries);
+    for (int i = first; parsed && i < entries->count; i++) {
+        entries->items[i].manifest_rel =
+            cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path ? rel_path : "");
+    }
+    return parsed;
+}
+
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
 /* A composer.json `autoload.psr-4` key: a namespace prefix ending in '\\'. */
@@ -1051,9 +1158,468 @@ static bool pkgmap_is_psr4_prefix(const char *pkg_name) {
     return n > 0 && pkg_name[n - SKIP_ONE] == '\\';
 }
 
+/* ── Ecosystems ────────────────────────────────────────────────────
+ *
+ * A package name means something only inside the ecosystem whose manifests
+ * declare it. `[package] name = "ruff"` in Cargo.toml and `[project] name =
+ * "ruff"` in pyproject.toml are two packages (maturin's default layout), and no
+ * importer means both: a Rust `use ruff::` reaches the crate, a Python `import
+ * ruff` the package. A manifest's basename gives its entries their ecosystem,
+ * the importing file's language the ecosystem it imports from, and names are
+ * compared, withheld and looked up per ecosystem. */
+
+typedef enum {
+    PKG_ECO_NONE,
+    PKG_ECO_CARGO,
+    PKG_ECO_PYPI,
+    PKG_ECO_NPM,
+    PKG_ECO_COMPOSER,
+    PKG_ECO_GO,
+    PKG_ECO_PUB,
+    PKG_ECO_MAVEN,
+    PKG_ECO_HEX,
+    PKG_ECO_GEM,
+    PKG_ECO_SWIFTPM,
+    PKG_ECO_COUNT,
+} pkg_eco_t;
+
+/* The ecosystem of a manifest basename; PKG_ECO_NONE for a file no parser
+ * reads. */
+static pkg_eco_t pkgmap_manifest_ecosystem(const char *basename) {
+    static const struct {
+        const char *basename;
+        pkg_eco_t eco;
+    } kinds[] = {
+        {"Cargo.toml", PKG_ECO_CARGO},
+        {"pyproject.toml", PKG_ECO_PYPI},
+        {"package.json", PKG_ECO_NPM},
+        {"composer.json", PKG_ECO_COMPOSER},
+        {"go.mod", PKG_ECO_GO},
+        {"pubspec.yaml", PKG_ECO_PUB},
+        {"pom.xml", PKG_ECO_MAVEN},
+        {"build.gradle", PKG_ECO_MAVEN},
+        {"build.gradle.kts", PKG_ECO_MAVEN},
+        {"mix.exs", PKG_ECO_HEX},
+        {"Package.swift", PKG_ECO_SWIFTPM},
+    };
+    if (!basename) {
+        return PKG_ECO_NONE;
+    }
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        if (strcmp(basename, kinds[i].basename) == 0) {
+            return kinds[i].eco;
+        }
+    }
+    return ends_with(basename, ".gemspec") ? PKG_ECO_GEM : PKG_ECO_NONE;
+}
+
+/* The ecosystem whose packages a file of `lang` imports; PKG_ECO_NONE for a
+ * language no manifest kind here serves. */
+static pkg_eco_t pkgmap_language_ecosystem(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_RUST:
+        return PKG_ECO_CARGO;
+    case CBM_LANG_PYTHON:
+        return PKG_ECO_PYPI;
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_VUE:
+    case CBM_LANG_SVELTE:
+    case CBM_LANG_ASTRO:
+        return PKG_ECO_NPM;
+    case CBM_LANG_PHP:
+        return PKG_ECO_COMPOSER;
+    case CBM_LANG_GO:
+        return PKG_ECO_GO;
+    case CBM_LANG_DART:
+        return PKG_ECO_PUB;
+    case CBM_LANG_JAVA:
+    case CBM_LANG_KOTLIN:
+    case CBM_LANG_SCALA:
+    case CBM_LANG_GROOVY:
+        return PKG_ECO_MAVEN;
+    case CBM_LANG_ELIXIR:
+        return PKG_ECO_HEX;
+    case CBM_LANG_RUBY:
+        return PKG_ECO_GEM;
+    case CBM_LANG_SWIFT:
+        return PKG_ECO_SWIFTPM;
+    default:
+        return PKG_ECO_NONE;
+    }
+}
+
+static pkg_eco_t pkgmap_importer_ecosystem(const char *source_rel) {
+    return source_rel
+               ? pkgmap_language_ecosystem(cbm_language_for_filename(path_basename(source_rel)))
+               : PKG_ECO_NONE;
+}
+
+/* ── A name two manifests disagree on ──────────────────────────────
+ *
+ * Two manifests of one ecosystem can declare one name with different targets:
+ * two crates called `dep` in sibling workspaces, a fixture tree of pyproject
+ * files all named `test`. The name alone does not say which one an import
+ * means, and any fixed choice (first seen, smallest path) is a wrong link for
+ * every importer that meant the other -- one that a deterministic index then
+ * repeats every run. Such a name is withheld in its ecosystem: present with a
+ * NULL target, logged once. A lookup that reaches a withheld name ends there,
+ * unresolved (pkgmap_lookup). A Rust importer's own Cargo manifest can still
+ * decide it (pkgmap_crate_decision): the package itself, a path dependency,
+ * or through `workspace = true` its workspace root's entry.
+ *
+ * Every map key and value is mem_core (CBM_MEM_CLASS_OTHER). Beside the names,
+ * the map holds side records under keys no module path spells (a specifier
+ * holds no newline), each PKGMAP_SIDE_MARK and a kind byte:
+ *   "\nE<e><name>"     the target ecosystem <e> ('a' + pkg_eco_t) gives
+ *                      <name>, when two ecosystems declare it; the bare name
+ *                      is then withheld for every other importer
+ *   "\nM\n<dir>"       <dir> holds a Cargo manifest: "w" a workspace root, "p"
+ *                      any other
+ *   "\nR<name>\n<dir>" what the Rust files of <dir>'s manifest reach by a
+ *                      withheld <name>: a target; PKGMAP_INHERIT, their
+ *                      workspace root's "W" record; "" undecided (a path out
+ *                      of the repository, two crates for one name)
+ *   "\nW<name>\n<dir>" the [workspace.dependencies] path entry of the
+ *                      workspace rooted at <dir> for <name>: a target or ""
+ * These records exist only when a name Rust files read is withheld.
+ * Presence keys ("<crate>::", "<crate>::#extern") are only ever tested for
+ * existence and keep the smallest manifest's entry. */
+
+enum {
+    PKGMAP_SIDE_MARK = '\n',
+    PKGMAP_ECO_KIND = 'E',
+    PKGMAP_MANIFEST_KIND = 'M',
+    PKGMAP_REACH_KIND = 'R',
+    PKGMAP_WORKSPACE_KIND = 'W',
+};
+
+/* An "R" value no target spells (a QN holds no newline). */
+#define PKGMAP_INHERIT "\n"
+
+/* Release a table whose keys and values are both mem_core. */
+static void pkgmap_free_core_entry(const char *key, void *value, void *userdata) {
+    (void)userdata;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+}
+
+/* "<name>\n<manifest>", mem_core. */
+static char *pkgmap_primary_key(const char *name, const char *manifest) {
+    size_t name_len = strlen(name);
+    size_t manifest_len = strlen(manifest);
+    char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, name_len + manifest_len + PAIR_LEN);
+    if (key) {
+        memcpy(key, name, name_len);
+        key[name_len] = '\n';
+        memcpy(key + name_len + SKIP_ONE, manifest, manifest_len + SKIP_ONE);
+    }
+    return key;
+}
+
+/* Record the target the first entry of `manifest` gives `name`, the
+ * manifest's own precedence among its entries. */
+static void pkgmap_note_primary(CBMHashTable *primaries, const char *name, const char *manifest,
+                                const char *qn) {
+    char *key = pkgmap_primary_key(name, manifest);
+    char *value =
+        key && !cbm_ht_has(primaries, key) ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, qn) : NULL;
+    if (value) {
+        cbm_ht_set(primaries, key, value);
+    } else {
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+    }
+}
+
+/* The side key of `kind` for `name` under `dir` ("<dir>" is the first
+ * `dir_len` bytes). False when it does not fit: nothing decides the name
+ * there. */
+static bool pkgmap_side_key(char *buf, size_t cap, char kind, const char *name, const char *dir,
+                            size_t dir_len) {
+    int n = snprintf(buf, cap, "%c%c%s%c%.*s", PKGMAP_SIDE_MARK, kind, name, PKGMAP_SIDE_MARK,
+                     (int)dir_len, dir);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* The key of `name` as ecosystem `eco` declares it. False when it does not
+ * fit. */
+static bool pkgmap_eco_key(char *buf, size_t cap, const char *name, pkg_eco_t eco) {
+    int n = snprintf(buf, cap, "%c%c%c%s", PKGMAP_SIDE_MARK, PKGMAP_ECO_KIND, 'a' + (int)eco, name);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* The key an importer of ecosystem `eco` reads `name` under: the ecosystem's
+ * own when two ecosystems declare the name, else the name (`buf` holds the
+ * former). */
+static const char *pkgmap_view_key(const CBMHashTable *map, const char *name, pkg_eco_t eco,
+                                   char *buf, size_t cap) {
+    return eco != PKG_ECO_NONE && pkgmap_eco_key(buf, cap, name, eco) && cbm_ht_has(map, buf)
+               ? buf
+               : name;
+}
+
+/* A name two manifests split: present, with no target. */
+static bool pkgmap_name_withheld(const CBMHashTable *map, const char *name) {
+    return map && name && cbm_ht_has(map, name) && !cbm_ht_get(map, name);
+}
+
+/* `name` as an importer of ecosystem `eco` reads it is withheld. */
+static bool pkgmap_withheld_for(const CBMHashTable *map, const char *name, pkg_eco_t eco) {
+    char key[PKGMAP_PATH_BUF];
+    return map && name &&
+           pkgmap_name_withheld(map, pkgmap_view_key(map, name, eco, key, sizeof(key)));
+}
+
+static bool pkgmap_is_presence_key(const char *name) {
+    static const char extern_suffix[] = RUST_PATH_SEP RUST_EXTERN_CRATE_SUFFIX;
+    size_t n = strlen(name);
+    size_t sep = sizeof(RUST_PATH_SEP) - SKIP_ONE;
+    size_t ext = sizeof(extern_suffix) - SKIP_ONE;
+    return (n >= sep && strcmp(name + n - sep, RUST_PATH_SEP) == 0) ||
+           (n >= ext && strcmp(name + n - ext, extern_suffix) == 0);
+}
+
+typedef struct {
+    int manifests;      /* manifests of the ecosystem giving the name a target */
+    bool split;         /* two of them give different targets */
+    const char *qn;     /* the smallest one's target, */
+    const char *first;  /* the two smallest of them (log only), */
+    const char *second; /* all borrowed from the primaries */
+} pkgmap_eco_split_t;
+
+typedef struct {
+    pkgmap_eco_split_t eco[PKG_ECO_COUNT];
+} pkgmap_name_split_t;
+
+typedef struct {
+    CBMHashTable *map;
+    CBMHashTable *names; /* name -> pkgmap_name_split_t, both mem_core */
+    int merged;          /* targets the map holds */
+    bool cargo_withheld; /* a name Rust importers read is withheld */
+} pkgmap_merge_t;
+
+/* One primary ("<name>\n<manifest>" -> its target): count the manifest for
+ * the name in the manifest's ecosystem, keep the smallest manifest's target,
+ * and mark the name split there when two targets differ. */
+// cppcheck-suppress constParameterCallback
+static void pkgmap_scan_primary(const char *key, void *value, void *userdata) {
+    pkgmap_merge_t *merge = userdata;
+    const char *sep = strchr(key, '\n');
+    pkgmap_name_split_t *stats = NULL;
+    char *name = sep ? cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)(sep - key) + SKIP_ONE) : NULL;
+    if (name) {
+        memcpy(name, key, (size_t)(sep - key));
+        name[sep - key] = '\0';
+        stats = cbm_ht_get(merge->names, name);
+    }
+    if (name && !stats) {
+        stats = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*stats));
+        if (stats) {
+            cbm_ht_set(merge->names, name, stats);
+            name = NULL; /* the table's key now */
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, name);
+    if (!stats) {
+        return;
+    }
+    const char *manifest = sep + SKIP_ONE;
+    pkgmap_eco_split_t *eco = &stats->eco[pkgmap_manifest_ecosystem(path_basename(manifest))];
+    eco->manifests++;
+    eco->split = eco->split || (eco->qn && strcmp(eco->qn, (const char *)value) != 0);
+    if (!eco->first || strcmp(manifest, eco->first) < 0) {
+        eco->second = eco->first;
+        eco->first = manifest;
+        eco->qn = value;
+    } else if (!eco->second || strcmp(manifest, eco->second) < 0) {
+        eco->second = manifest;
+    }
+}
+
+/* Set `key` -> a mem_core copy of `qn` (NULL: withheld) in the map; a new
+ * key is copied too, a held one keeps its stored key. */
+static bool pkgmap_put(CBMHashTable *map, const char *key, const char *qn) {
+    const char *held = cbm_ht_get_key(map, key);
+    char *owned_key = held ? (char *)held : cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+    char *owned_qn = qn ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, qn) : NULL;
+    if (!owned_key || (qn && !owned_qn)) {
+        if (!held) {
+            cbm_free(CBM_MEM_CLASS_OTHER, owned_key);
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, owned_qn);
+        return false;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, cbm_ht_set(map, owned_key, owned_qn));
+    return true;
+}
+
+/* One scanned name into the map: per ecosystem declaring it, the smallest
+ * manifest's target, or NULL with one log line when that ecosystem splits
+ * it. A name one ecosystem declares keeps its own key; a name several
+ * declare is kept under each ecosystem's key and withheld bare. */
+// cppcheck-suppress constParameterCallback
+static void pkgmap_emit_name(const char *name, void *value, void *userdata) {
+    pkgmap_merge_t *merge = userdata;
+    const pkgmap_name_split_t *stats = value;
+    bool presence = pkgmap_is_presence_key(name);
+    int ecosystems = 0;
+    for (int e = 0; e < PKG_ECO_COUNT; e++) {
+        ecosystems += stats->eco[e].manifests > 0;
+    }
+    for (int e = 0; e < PKG_ECO_COUNT; e++) {
+        const pkgmap_eco_split_t *eco = &stats->eco[e];
+        char key[PKGMAP_PATH_BUF];
+        if (eco->manifests == 0 ||
+            (ecosystems > SKIP_ONE && !pkgmap_eco_key(key, sizeof(key), name, (pkg_eco_t)e))) {
+            continue;
+        }
+        bool withhold = eco->split && !presence;
+        if (withhold) {
+            cbm_log_info("pkgmap.name_collision", "name", name, "manifests",
+                         pkgmap_itoa(eco->manifests), "first", eco->first, "second",
+                         eco->second ? eco->second : "", "withheld", "true");
+            merge->cargo_withheld = merge->cargo_withheld || e == PKG_ECO_CARGO;
+        }
+        if (pkgmap_put(merge->map, ecosystems > SKIP_ONE ? key : name, withhold ? NULL : eco->qn)) {
+            merge->merged += !withhold;
+        }
+    }
+    if (ecosystems > SKIP_ONE && pkgmap_put(merge->map, name, NULL)) {
+        cbm_log_info("pkgmap.name_ecosystems", "name", name, "ecosystems", pkgmap_itoa(ecosystems));
+    }
+}
+
+/* The value a crate record gives its side key: the target the named crate's
+ * manifest gives the name ("" when it gives none, or the path leaves the
+ * repository), or PKGMAP_INHERIT. */
+static const char *pkgmap_crate_record_value(const CBMHashTable *primaries,
+                                             const cbm_pkg_entry_t *e) {
+    if (e->crate == CBM_CRATE_INHERIT) {
+        return PKGMAP_INHERIT;
+    }
+    char *primary =
+        e->crate_manifest_rel ? pkgmap_primary_key(e->pkg_name, e->crate_manifest_rel) : NULL;
+    const char *target = primary ? cbm_ht_get(primaries, primary) : NULL;
+    cbm_free(CBM_MEM_CLASS_OTHER, primary);
+    return target ? target : "";
+}
+
+/* The side records of the crate records (see the key scheme above), written
+ * once a name Rust files read is withheld. Two records of one directory that
+ * disagree on a name leave it undecided (""). */
+static void pkgmap_add_crate_decisions(CBMHashTable *map, const CBMHashTable *primaries,
+                                       const cbm_pkg_entries_t *worker_entries, int worker_count) {
+    for (int w = 0; w < worker_count; w++) {
+        const cbm_pkg_entries_t *we = &worker_entries[w];
+        for (int i = 0; i < we->count; i++) {
+            const cbm_pkg_entry_t *e = &we->items[i];
+            bool marker = e->crate == CBM_CRATE_MANIFEST || e->crate == CBM_CRATE_WORKSPACE;
+            if (e->crate == CBM_CRATE_NONE || !e->manifest_rel ||
+                (!marker && !pkgmap_withheld_for(map, e->pkg_name, PKG_ECO_CARGO))) {
+                continue;
+            }
+            const char *dir_end = strrchr(e->manifest_rel, '/');
+            size_t dir_len = dir_end ? (size_t)(dir_end - e->manifest_rel) : 0;
+            char kind = marker                                ? PKGMAP_MANIFEST_KIND
+                        : e->crate == CBM_CRATE_WORKSPACE_DEP ? PKGMAP_WORKSPACE_KIND
+                                                              : PKGMAP_REACH_KIND;
+            char side[PKGMAP_PATH_BUF];
+            if (!pkgmap_side_key(side, sizeof(side), kind, marker ? "" : e->pkg_name,
+                                 e->manifest_rel, dir_len)) {
+                continue;
+            }
+            const char *value = marker ? (e->crate == CBM_CRATE_WORKSPACE ? "w" : "p")
+                                       : pkgmap_crate_record_value(primaries, e);
+            const char *held = cbm_ht_get(map, side);
+            if (!held || (!marker && strcmp(held, value) != 0)) {
+                pkgmap_put(map, side, held ? "" : value);
+            }
+        }
+    }
+}
+
+/* Move `*dir_len` (a directory of `path`: its first `*dir_len` bytes) to the
+ * nearest directory at or above it holding a Cargo manifest -- a workspace
+ * root's when `workspace_root`. False when there is none. */
+static bool pkgmap_manifest_dir(const CBMHashTable *map, const char *path, size_t *dir_len,
+                                bool workspace_root) {
+    for (;;) {
+        char side[PKGMAP_PATH_BUF];
+        const char *kind =
+            pkgmap_side_key(side, sizeof(side), PKGMAP_MANIFEST_KIND, "", path, *dir_len)
+                ? cbm_ht_get(map, side)
+                : NULL;
+        if (kind && (!workspace_root || kind[0] == 'w')) {
+            return true;
+        }
+        if (*dir_len == 0) {
+            return false;
+        }
+        while (*dir_len > 0 && path[*dir_len - SKIP_ONE] != '/') {
+            (*dir_len)--;
+        }
+        *dir_len -= *dir_len > 0;
+    }
+}
+
+/* What a Rust file `source_rel` reaches by a withheld `name`: what its own
+ * Cargo manifest -- the nearest one at or above the file -- records, and
+ * through `workspace = true` what the workspace root at or above that
+ * manifest records in [workspace.dependencies]. Nothing above the file's own
+ * manifest decides for it. NULL when nothing decides: no manifest, no record
+ * (a registry dependency, or none), a path out of the repository, two crates
+ * for one name. */
+static const char *pkgmap_crate_decision(const CBMHashTable *map, const char *name,
+                                         const char *source_rel) {
+    const char *leaf = strrchr(source_rel, '/');
+    size_t dir_len = leaf ? (size_t)(leaf - source_rel) : 0;
+    char side[PKGMAP_PATH_BUF];
+    const char *decided =
+        pkgmap_manifest_dir(map, source_rel, &dir_len, false) &&
+                pkgmap_side_key(side, sizeof(side), PKGMAP_REACH_KIND, name, source_rel, dir_len)
+            ? cbm_ht_get(map, side)
+            : NULL;
+    if (decided && strcmp(decided, PKGMAP_INHERIT) == 0) {
+        decided = pkgmap_manifest_dir(map, source_rel, &dir_len, true) &&
+                          pkgmap_side_key(side, sizeof(side), PKGMAP_WORKSPACE_KIND, name,
+                                          source_rel, dir_len)
+                      ? cbm_ht_get(map, side)
+                      : NULL;
+    }
+    return decided && decided[0] ? decided : NULL;
+}
+
+typedef enum { PKGMAP_ABSENT, PKGMAP_FOUND, PKGMAP_WITHHELD } pkgmap_hit_t;
+
+/* What `name` reaches for an import written in `source_rel` (NULL: no
+ * importer known): the target of the importer's ecosystem, else of the one
+ * ecosystem declaring it. PKGMAP_WITHHELD for a name withheld from this
+ * importer -- one the ecosystem splits and, for a Rust importer, no manifest
+ * decides, or one several other ecosystems declare. */
+static pkgmap_hit_t pkgmap_lookup(const CBMHashTable *map, const char *name, const char *source_rel,
+                                  const char **out) {
+    *out = NULL;
+    pkg_eco_t eco = pkgmap_importer_ecosystem(source_rel);
+    char key[PKGMAP_PATH_BUF];
+    const char *view = map && name ? pkgmap_view_key(map, name, eco, key, sizeof(key)) : NULL;
+    if (!view || !cbm_ht_has(map, view)) {
+        return PKGMAP_ABSENT;
+    }
+    *out = cbm_ht_get(map, view);
+    if (!*out && eco == PKG_ECO_CARGO) {
+        *out = pkgmap_crate_decision(map, name, source_rel);
+    }
+    return *out ? PKGMAP_FOUND : PKGMAP_WITHHELD;
+}
+
+const char *cbm_pkgmap_target(const CBMHashTable *map, const char *name, const char *importer_rel) {
+    const char *qn = NULL;
+    return pkgmap_lookup(map, name, importer_rel, &qn) == PKGMAP_FOUND ? qn : NULL;
+}
+
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name) {
-    /* Count total entries */
     int total = 0;
     for (int w = 0; w < worker_count; w++) {
         total += worker_entries[w].count;
@@ -1062,12 +1628,16 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
         return NULL;
     }
 
-    CBMHashTable *map = cbm_ht_create(PKGMAP_HT_INIT);
-    int merged = 0;
-
-    for (int w = 0; w < worker_count; w++) {
+    /* "<name>\n<manifest>" -> the target that manifest's first entry gives */
+    CBMHashTable *primaries = cbm_ht_create(PKGMAP_HT_INIT);
+    pkgmap_merge_t merge = {.map = cbm_ht_create(PKGMAP_HT_INIT),
+                            .names = cbm_ht_create(PKGMAP_HT_INIT)};
+    for (int w = 0; primaries && merge.names && w < worker_count; w++) {
         cbm_pkg_entries_t *we = &worker_entries[w];
         for (int i = 0; i < we->count; i++) {
+            if (we->items[i].crate != CBM_CRATE_NONE) {
+                continue; /* a crate record: pkgmap_add_crate_decisions */
+            }
             /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
              * prefix (key ends in '\\') keeps its repo-relative DIRECTORY
              * instead: its readers map `Prefix\Sub\Class` onto a file path
@@ -1079,44 +1649,48 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
             if (!qn) {
                 continue;
             }
-
-            /* Check for duplicate — first wins */
-            if (cbm_ht_has(map, we->items[i].pkg_name)) {
-                free(qn);
-                continue;
-            }
-
-            /* Transfer ownership: key = strdup'd pkg_name, value = qn */
-            char *key = strdup(we->items[i].pkg_name);
-            cbm_ht_set(map, key, qn);
-            merged++;
+            /* One manifest may name a package twice, primary entry first
+             * (pyproject: src/<name>/__init__, then <name>/__init__); its
+             * first entry is the manifest's target. Workers record the
+             * manifests they happen to reach and the lists merge in worker
+             * order, so between manifests the one with the smallest path is
+             * kept (pkgmap_scan_primary), a total order; when two disagree
+             * the name is withheld (pkgmap_emit_name). */
+            const char *manifest = we->items[i].manifest_rel ? we->items[i].manifest_rel : "";
+            pkgmap_note_primary(primaries, we->items[i].pkg_name, manifest, qn);
+            free(qn);
         }
     }
-
-    if (merged == 0) {
-        cbm_ht_free(map);
-        return NULL;
+    if (primaries && merge.map && merge.names) {
+        cbm_ht_foreach(primaries, pkgmap_scan_primary, &merge);
+        cbm_ht_foreach(merge.names, pkgmap_emit_name, &merge);
+        if (merge.cargo_withheld) {
+            pkgmap_add_crate_decisions(merge.map, primaries, worker_entries, worker_count);
+        }
     }
-    cbm_log_info("pkgmap.build", "entries", pkgmap_itoa(merged));
-    return map;
+    if (merge.names) {
+        cbm_ht_foreach(merge.names, pkgmap_free_core_entry, NULL);
+        cbm_ht_free(merge.names);
+    }
+    if (primaries) {
+        cbm_ht_foreach(primaries, pkgmap_free_core_entry, NULL);
+        cbm_ht_free(primaries);
+    }
+    if (merge.map && cbm_ht_count(merge.map) == 0) {
+        cbm_ht_free(merge.map);
+        merge.map = NULL;
+    }
+    if (merge.map) {
+        cbm_log_info("pkgmap.build", "entries", pkgmap_itoa(merge.merged));
+    }
+    return merge.map;
 }
 
 /* Returns true if basename is a package manifest we know how to parse.
  * Used by the filesystem walker; cbm_pkgmap_try_parse is the source of
  * truth for which basenames produce entries. */
 static bool is_pkgmap_manifest_basename(const char *basename) {
-    if (!basename) {
-        return false;
-    }
-    if (strcmp(basename, "package.json") == 0 || strcmp(basename, "go.mod") == 0 ||
-        strcmp(basename, "Cargo.toml") == 0 || strcmp(basename, "pyproject.toml") == 0 ||
-        strcmp(basename, "composer.json") == 0 || strcmp(basename, "pubspec.yaml") == 0 ||
-        strcmp(basename, "pom.xml") == 0 || strcmp(basename, "build.gradle") == 0 ||
-        strcmp(basename, "build.gradle.kts") == 0 || strcmp(basename, "mix.exs") == 0 ||
-        strcmp(basename, "Package.swift") == 0) {
-        return true;
-    }
-    return ends_with(basename, ".gemspec");
+    return pkgmap_manifest_ecosystem(basename) != PKG_ECO_NONE;
 }
 
 /* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip.
@@ -1342,39 +1916,56 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
     return map;
 }
 
-static void pkgmap_free_entry(const char *key, void *value, void *userdata) {
-    (void)userdata;
-    free((void *)key);
-    free(value);
-}
-
 void cbm_pkgmap_free(CBMHashTable *pkgmap) {
     if (!pkgmap) {
         return;
     }
-    cbm_ht_foreach(pkgmap, pkgmap_free_entry, NULL);
+    cbm_ht_foreach(pkgmap, pkgmap_free_core_entry, NULL);
     cbm_ht_free(pkgmap);
 }
 
 /* ── Resolver ──────────────────────────────────────────────────── */
 
-/* Try slash-based prefix matching (Go: github.com/foo/bar/pkg/utils).
- * Returns heap QN or NULL. */
-static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
-    char *buf = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, module_path);
-    if (!buf) {
-        return NULL;
+/* Prefix matching: the longest prefix of a module path, cut before a
+ * separator `sep`, that the map holds for the importer `source_rel` decides
+ * it, a withheld one included (the import is then unresolved). A PSR-4 key
+ * keeps its trailing separator (`keep_sep`). On PKGMAP_FOUND `*target` is the
+ * prefix's target and `*subpath` the rest of `module_path` after the
+ * separator. */
+static pkgmap_hit_t pkgmap_longest_prefix(const CBMHashTable *map, const char *module_path,
+                                          char sep, bool keep_sep, const char *source_rel,
+                                          const char **target, const char **subpath) {
+    *target = NULL;
+    *subpath = NULL;
+    size_t len = strlen(module_path);
+    char *prefix = cbm_alloc(CBM_MEM_CLASS_OTHER, len + PAIR_LEN);
+    pkgmap_hit_t hit = PKGMAP_ABSENT;
+    for (size_t cut = len; prefix && hit == PKGMAP_ABSENT && cut-- > SKIP_ONE;) {
+        if (module_path[cut] != sep) {
+            continue;
+        }
+        size_t kept = cut + (keep_sep ? SKIP_ONE : 0);
+        memcpy(prefix, module_path, kept);
+        prefix[kept] = '\0';
+        hit = pkgmap_lookup(map, prefix, source_rel, target);
+        *subpath = module_path + cut + SKIP_ONE;
     }
-    for (char *slash = buf + strlen(buf) - SKIP_ONE; slash > buf; slash--) {
-        if (*slash != '/') {
-            continue;
-        }
-        *slash = '\0';
-        const char *base_qn = (const char *)cbm_ht_get(map, buf);
-        if (!base_qn) {
-            continue;
-        }
-        const char *subpath = module_path + (size_t)(slash - buf) + SKIP_ONE;
+    cbm_free(CBM_MEM_CLASS_OTHER, prefix);
+    return hit;
+}
+
+/* Each returns the prefix scan's outcome and on PKGMAP_FOUND sets `*out` to a
+ * heap QN. */
+
+/* Slash-separated (Go: github.com/foo/bar/pkg/utils). */
+static pkgmap_hit_t resolve_slash_prefix(CBMHashTable *map, const char *module_path,
+                                         const char *source_rel, char **out) {
+    const char *base_qn = NULL;
+    const char *subpath = NULL;
+    *out = NULL;
+    pkgmap_hit_t hit =
+        pkgmap_longest_prefix(map, module_path, '/', false, source_rel, &base_qn, &subpath);
+    if (hit == PKGMAP_FOUND) {
         char result[PKGMAP_PATH_BUF];
         snprintf(result, sizeof(result), "%s.%s", base_qn, subpath);
         /* Replace / with . in the appended part */
@@ -1383,31 +1974,21 @@ static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
                 *c = '.';
             }
         }
-        cbm_free(CBM_MEM_CLASS_OTHER, buf);
-        return strdup(result);
+        *out = strdup(result);
     }
-    cbm_free(CBM_MEM_CLASS_OTHER, buf);
-    return NULL;
+    return hit;
 }
 
-/* Try dot-based prefix matching (Java: com.myorg.pkg.Foo).
- * Returns heap QN or NULL. */
-static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
-                                const char *project_name) {
-    char *buf = strdup(module_path);
-    if (!buf) {
-        return NULL;
-    }
-    for (char *dot = buf + strlen(buf) - SKIP_ONE; dot > buf; dot--) {
-        if (*dot != '.') {
-            continue;
-        }
-        *dot = '\0';
-        const char *base_qn = (const char *)cbm_ht_get(map, buf);
-        if (!base_qn) {
-            continue;
-        }
-        const char *subpath = module_path + (size_t)(dot - buf) + SKIP_ONE;
+/* Dot-separated (Java: com.myorg.pkg.Foo). */
+static pkgmap_hit_t resolve_dot_prefix(CBMHashTable *map, const char *module_path,
+                                       const char *source_rel, const char *project_name,
+                                       char **out) {
+    const char *base_qn = NULL;
+    const char *subpath = NULL;
+    *out = NULL;
+    pkgmap_hit_t hit =
+        pkgmap_longest_prefix(map, module_path, '.', false, source_rel, &base_qn, &subpath);
+    if (hit == PKGMAP_FOUND) {
         char subpath_slashed[PKGMAP_PATH_BUF];
         snprintf(subpath_slashed, sizeof(subpath_slashed), "%s", subpath);
         for (char *c = subpath_slashed; *c; c++) {
@@ -1417,34 +1998,22 @@ static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
         }
         char result[PKGMAP_PATH_BUF];
         snprintf(result, sizeof(result), "%s/%s", base_qn, subpath_slashed);
-        free(buf);
-        return cbm_pipeline_fqn_module(project_name, result);
+        *out = cbm_pipeline_fqn_module(project_name, result);
     }
-    free(buf);
-    return NULL;
+    return hit;
 }
 
-/* Try backslash-based prefix matching (PHP PSR-4: App\\Controllers\\Foo).
- * The map value of a PSR-4 prefix is its repo-relative directory (see
- * cbm_pkgmap_build). Returns heap QN or NULL. */
-static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path,
-                                      const char *project_name) {
-    char *buf = strdup(module_path);
-    if (!buf) {
-        return NULL;
-    }
-    for (char *bs = buf + strlen(buf) - SKIP_ONE; bs > buf; bs--) {
-        if (*bs != '\\') {
-            continue;
-        }
-        *bs = '\0';
-        char prefix[PKGMAP_PATH_BUF];
-        snprintf(prefix, sizeof(prefix), "%s\\", buf);
-        const char *base_dir = (const char *)cbm_ht_get(map, prefix);
-        if (!base_dir) {
-            continue;
-        }
-        const char *subpath = module_path + (size_t)(bs - buf) + SKIP_ONE;
+/* Backslash-separated (PHP PSR-4: App\\Controllers\\Foo). The map value of a
+ * PSR-4 prefix is its repo-relative directory (see cbm_pkgmap_build). */
+static pkgmap_hit_t resolve_backslash_prefix(CBMHashTable *map, const char *module_path,
+                                             const char *source_rel, const char *project_name,
+                                             char **out) {
+    const char *base_dir = NULL;
+    const char *subpath = NULL;
+    *out = NULL;
+    pkgmap_hit_t hit =
+        pkgmap_longest_prefix(map, module_path, '\\', true, source_rel, &base_dir, &subpath);
+    if (hit == PKGMAP_FOUND) {
         char path_result[PKGMAP_PATH_BUF];
         snprintf(path_result, sizeof(path_result), "%s%s%s", base_dir, base_dir[0] ? "/" : "",
                  subpath);
@@ -1453,11 +2022,9 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
                 *c = '/';
             }
         }
-        free(buf);
-        return cbm_pipeline_fqn_module(project_name, path_result);
+        *out = cbm_pipeline_fqn_module(project_name, path_result);
     }
-    free(buf);
-    return NULL;
+    return hit;
 }
 
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
@@ -1499,21 +2066,25 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         return cbm_pipeline_fqn_module(ctx->project_name, module_path);
     }
 
-    /* 3. Exact lookup */
-    const char *mapped_qn = (const char *)cbm_ht_get(pkgmap, module_path);
-    if (mapped_qn) {
-        return strdup(mapped_qn);
+    /* 3. Exact lookup, then 4. prefix matching by separator type. A name
+     *    withheld from this importer ends resolution: the import stays
+     *    unresolved. Step 5 would guess `<project>.<module_path>`, which binds
+     *    to whatever node holds that QN -- the folder of a package named like
+     *    the withheld one. */
+    const char *mapped_qn = NULL;
+    pkgmap_hit_t hit = pkgmap_lookup(pkgmap, module_path, source_rel, &mapped_qn);
+    if (hit != PKGMAP_ABSENT) {
+        return hit == PKGMAP_FOUND ? strdup(mapped_qn) : NULL;
     }
-
-    /* 4. Prefix matching by separator type */
-    char *result = resolve_slash_prefix(pkgmap, module_path);
-    if (!result) {
-        result = resolve_dot_prefix(pkgmap, module_path, ctx->project_name);
+    char *result = NULL;
+    hit = resolve_slash_prefix(pkgmap, module_path, source_rel, &result);
+    if (hit == PKGMAP_ABSENT) {
+        hit = resolve_dot_prefix(pkgmap, module_path, source_rel, ctx->project_name, &result);
     }
-    if (!result) {
-        result = resolve_backslash_prefix(pkgmap, module_path, ctx->project_name);
+    if (hit == PKGMAP_ABSENT) {
+        hit = resolve_backslash_prefix(pkgmap, module_path, source_rel, ctx->project_name, &result);
     }
-    if (result) {
+    if (hit != PKGMAP_ABSENT) {
         return result;
     }
 
@@ -2403,6 +2974,9 @@ static psr4_outcome_t resolve_php_psr4_class(const cbm_gbuf_t *gbuf, const char 
         key[cut] = '\0';
         const char *dir = (const char *)cbm_ht_get(pkgmap, key);
         if (!dir) {
+            /* Two composer.json files map the prefix to different
+             * directories: covered, and neither is the class's. */
+            covered = covered || pkgmap_name_withheld(pkgmap, key);
             continue;
         }
         covered = true;
@@ -3080,14 +3654,15 @@ static bool php_import_known_absent(const char *rel, const CBMImport *imp,
     if (pkgmap && imp->kind == CBM_IMPORT_KIND_DEFAULT) {
         /* The resolver does not handle Composer's fallback empty prefix.
          * Its presence therefore cannot support a negative proof either. */
-        if (cbm_ht_get(pkgmap, ""))
+        if (cbm_ht_get(pkgmap, "") || pkgmap_name_withheld(pkgmap, ""))
             return false;
         for (size_t cut = length - 1; cut > 0; cut--) {
             if (name[cut - 1] != '\\')
                 continue;
             memcpy(key, name, cut);
             key[cut] = '\0';
-            if (cbm_ht_get(pkgmap, key))
+            /* a withheld prefix covers the name as much as a kept one */
+            if (cbm_ht_get(pkgmap, key) || pkgmap_name_withheld(pkgmap, key))
                 return false;
         }
     }

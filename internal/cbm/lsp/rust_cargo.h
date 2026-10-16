@@ -38,8 +38,10 @@ typedef struct {
 } CBMCargoTarget;
 
 typedef struct {
-    const char *name; /* declared dependency name */
-    const char *path; /* path = "../foo" if local, else NULL */
+    const char *name;     /* declared dependency name */
+    const char *path;     /* path = "../foo" if local, else NULL */
+    bool workspace;       /* workspace = true: the root's [workspace.dependencies] entry */
+    bool workspace_table; /* declared in [workspace.dependencies] */
 } CBMCargoDep;
 
 typedef struct {

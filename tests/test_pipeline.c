@@ -25648,6 +25648,450 @@ static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char 
     return NULL;
 }
 
+/* Two manifests declare one package name with different targets: sibling
+ * Cargo workspaces each with a crate `dep` (tests/fixtures/graph/rust/ws and
+ * .../xcrate). The name alone does not say which crate an import means.
+ * Keeping the first manifest a worker reached made the target follow thread
+ * scheduling; keeping the smallest manifest path made it stable and wrong for
+ * every importer of the other crate (z_ws/app path-depends on z_ws/dep and was
+ * linked to a_ws/dep, every run). The name is withheld -- whichever worker saw
+ * which manifest, each listed twice as the parallel pipeline lists it (a
+ * worker's list and the repo walk) -- and the collision is logged once. The
+ * crate-head presence key, only ever tested for existence, stays. */
+static char g_pkgmap_log_capture[4096];
+
+/* Keeps the pkgmap lines; cbm_pkgmap_build logs on the calling thread. */
+static void capture_pkgmap_log_sink(const char *line) {
+    size_t used = strlen(g_pkgmap_log_capture);
+    if (line && strstr(line, "pkgmap.") && used + 1 < sizeof(g_pkgmap_log_capture)) {
+        snprintf(g_pkgmap_log_capture + used, sizeof(g_pkgmap_log_capture) - used, "%s\n", line);
+    }
+}
+
+TEST(pkgmap_name_two_manifests_split_is_withheld_and_logged_once) {
+    static const char dep[] = "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n";
+    static const char app[] = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+                              "[dependencies]\ndep = { path = \"../dep\" }\n";
+    static const char *const paths[3] = {"a_ws/dep/Cargo.toml", "z_ws/dep/Cargo.toml",
+                                         "z_ws/app/Cargo.toml"};
+    static const char *const sources[3] = {dep, dep, app};
+    for (int order = 0; order < 2; order++) {
+        cbm_pkg_entries_t workers[2];
+        for (int w = 0; w < 2; w++) {
+            cbm_pkg_entries_init(&workers[w]);
+            for (int m = 0; m < 3; m++) {
+                int k = (w ^ order) ? 2 - m : m;
+                ASSERT_TRUE(cbm_pkgmap_try_parse("Cargo.toml", paths[k], sources[k],
+                                                 (int)strlen(sources[k]), &workers[w]));
+            }
+        }
+        g_pkgmap_log_capture[0] = '\0';
+        CBMLogLevel previous_level = cbm_log_get_level();
+        CBMLogFormat previous_format = cbm_log_get_format();
+        cbm_log_set_level(CBM_LOG_DEBUG);
+        cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+        cbm_log_set_sink(capture_pkgmap_log_sink);
+        CBMHashTable *map = cbm_pkgmap_build(workers, 2, "p");
+        cbm_log_set_sink(NULL);
+        cbm_log_set_format(previous_format);
+        cbm_log_set_level(previous_level);
+        bool dep_mapped = map && cbm_ht_get(map, "dep") != NULL;
+        bool app_mapped = map && cbm_ht_get(map, "app") != NULL;
+        bool head_present = map && cbm_ht_get(map, "dep::") != NULL;
+        cbm_pkgmap_free(map);
+        cbm_pkg_entries_free(&workers[0]);
+        cbm_pkg_entries_free(&workers[1]);
+        int collision_lines = 0;
+        for (const char *p = g_pkgmap_log_capture;
+             (p = strstr(p, "msg=pkgmap.name_collision")) != NULL; p++) {
+            collision_lines++;
+        }
+        ASSERT_FALSE(dep_mapped);
+        ASSERT_TRUE(app_mapped);
+        ASSERT_TRUE(head_present);
+        ASSERT_EQ(collision_lines, 1);
+        ASSERT_NOT_NULL(strstr(g_pkgmap_log_capture, "msg=pkgmap.name_collision name=dep "));
+    }
+    PASS();
+}
+
+/* The file targets of the IMPORTS edges written from `importer`, sorted and
+ * '|'-joined into `out` ("" when none). */
+static bool split_crate_import_targets(const char *db, const char *importer, char *out,
+                                       size_t cap) {
+    out[0] = '\0';
+    cbm_store_t *store = cbm_store_open_path(db);
+    sqlite3_stmt *stmt = NULL;
+    bool ok = store && sqlite3_prepare_v2(cbm_store_get_db(store),
+                                          "SELECT coalesce(group_concat(f, '|'), '') FROM "
+                                          "(SELECT DISTINCT t.file_path AS f FROM edges e "
+                                          "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+                                          "t.id=e.target_id WHERE e.type='IMPORTS' AND "
+                                          "s.file_path=?1 ORDER BY f)",
+                                          -1, &stmt, NULL) == SQLITE_OK;
+    ok = ok && sqlite3_bind_text(stmt, 1, importer, -1, SQLITE_STATIC) == SQLITE_OK &&
+         sqlite3_step(stmt) == SQLITE_ROW;
+    if (ok) {
+        snprintf(out, cap, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    return ok;
+}
+
+/* The crate a Rust `use` of a split name reaches is the one the importer's own
+ * Cargo manifest path-depends on (fixture /tmp/rv-cl/fx-r1, no root workspace,
+ * so no module tree decides first): z_ws/app reaches z_ws/dep and a_ws/user
+ * reaches a_ws/dep -- neither a smaller nor a larger manifest path picks both.
+ * solo declares no such dependency: nothing decides, and it links to neither. */
+TEST(pipeline_rust_import_of_split_crate_name_follows_importer_path_dependency) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-split-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char dep_manifest[] =
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    static const char importer_src[] = "use dep::shared_entry;\nfn main() { shared_entry(); }\n";
+    write_temp_file(tmp, "a_ws/dep/Cargo.toml", dep_manifest);
+    write_temp_file(tmp, "a_ws/dep/src/lib.rs", "pub fn shared_entry() -> u32 { 1 }\n");
+    write_temp_file(tmp, "z_ws/dep/Cargo.toml", dep_manifest);
+    write_temp_file(tmp, "z_ws/dep/src/lib.rs", "pub fn shared_entry() -> u32 { 2 }\n");
+    static const char *const users[2] = {"z_ws/app", "a_ws/user"};
+    for (int u = 0; u < 2; u++) {
+        char rel[128];
+        snprintf(rel, sizeof(rel), "%s/Cargo.toml", users[u]);
+        write_temp_file(tmp, rel,
+                        "[package]\nname = \"user\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                        "[dependencies]\ndep = { path = \"../dep\" }\n");
+        snprintf(rel, sizeof(rel), "%s/src/main.rs", users[u]);
+        write_temp_file(tmp, rel, importer_src);
+    }
+    write_temp_file(tmp, "solo/Cargo.toml",
+                    "[package]\nname = \"solo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "solo/src/main.rs", importer_src);
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/split.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    char app[256], user[256], solo[256];
+    bool read = rc == 0 && split_crate_import_targets(db, "z_ws/app/src/main.rs", app, 256) &&
+                split_crate_import_targets(db, "a_ws/user/src/main.rs", user, 256) &&
+                split_crate_import_targets(db, "solo/src/main.rs", solo, 256);
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(read);
+    ASSERT_STR_EQ(app, "z_ws/dep/src/lib.rs");
+    ASSERT_STR_EQ(user, "a_ws/dep/src/lib.rs");
+    ASSERT_STR_EQ(solo, "");
+    PASS();
+}
+
+/* One manifest names a package twice, primary first: pyproject.toml registers
+ * src/<name>/__init__, then <name>/__init__ as the alternative. The parallel
+ * pipeline hands the merge the same manifest twice (a worker's list and the
+ * repo walk appended to worker 0's), and the manifest's own primary must stay
+ * the target -- an order between the two entries' targets is not the
+ * manifest's precedence. */
+TEST(pkgmap_manifest_primary_entry_survives_duplicate_listing) {
+    static const char manifest[] = "[project]\nname = \"fastapi\"\n";
+    cbm_pkg_entries_t workers[2];
+    for (int w = 0; w < 2; w++) {
+        cbm_pkg_entries_init(&workers[w]);
+        ASSERT_TRUE(cbm_pkgmap_try_parse("pyproject.toml", "pyproject.toml", manifest,
+                                         (int)strlen(manifest), &workers[w]));
+    }
+    CBMHashTable *map = cbm_pkgmap_build(workers, 2, "p");
+    char kept[256] = {0};
+    const char *target = map ? (const char *)cbm_ht_get(map, "fastapi") : NULL;
+    if (target) {
+        snprintf(kept, sizeof(kept), "%s", target);
+    }
+    cbm_pkgmap_free(map);
+    cbm_pkg_entries_free(&workers[0]);
+    cbm_pkg_entries_free(&workers[1]);
+    ASSERT_STR_EQ(kept, "p.src.fastapi.__init__");
+    PASS();
+}
+
+/* Build a package map from the manifests `paths` (basename from each path)
+ * with `sources`, the way the parallel pipeline lists them, and make it the
+ * pipeline's. */
+static CBMHashTable *pkgmap_from_manifests(const char *const *paths, const char *const *sources,
+                                           int count) {
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    for (int m = 0; m < count; m++) {
+        const char *slash = strrchr(paths[m], '/');
+        cbm_pkgmap_try_parse(slash ? slash + 1 : paths[m], paths[m], sources[m],
+                             (int)strlen(sources[m]), &entries);
+    }
+    CBMHashTable *map = cbm_pkgmap_build(&entries, 1, "p");
+    cbm_pkg_entries_free(&entries);
+    cbm_pipeline_set_pkgmap(map);
+    return map;
+}
+
+/* What cbm_pipeline_resolve_module gives `module` imported from `importer`
+ * under project "p", copied into `out` ("" when unresolved). */
+static void pkgmap_resolve_into(const char *importer, const char *module, char *out, size_t cap) {
+    cbm_pipeline_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.project_name = "p";
+    char *qn = cbm_pipeline_resolve_module(&ctx, importer, module);
+    snprintf(out, cap, "%s", qn ? qn : "");
+    free(qn);
+}
+
+/* A Cargo crate and a Python package share a name (maturin's default layout:
+ * the Python module takes the crate's name). No importer can mean both, so the
+ * two manifests are not a split: a Rust importer reaches the crate, a Python
+ * importer the package, nothing is withheld or logged. A file of a language
+ * neither ecosystem serves gets neither. */
+TEST(pkgmap_name_two_ecosystems_declare_is_each_ecosystems_own) {
+    static const char *const paths[2] = {"rs/Cargo.toml", "pyproject.toml"};
+    static const char *const sources[2] = {"[package]\nname = \"foo\"\nversion = \"0.1.0\"\n",
+                                           "[project]\nname = \"foo\"\n"};
+    g_pkgmap_log_capture[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    CBMLogFormat previous_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink(capture_pkgmap_log_sink);
+    CBMHashTable *map = pkgmap_from_manifests(paths, sources, 2);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_format(previous_format);
+    cbm_log_set_level(previous_level);
+    char rust[256], python[256], c_file[256];
+    pkgmap_resolve_into("rs/src/main.rs", "foo", rust, sizeof(rust));
+    pkgmap_resolve_into("app/main.py", "foo", python, sizeof(python));
+    pkgmap_resolve_into("app/main.c", "foo", c_file, sizeof(c_file));
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(map);
+    ASSERT_STR_EQ(rust, "p.rs.src.lib");
+    ASSERT_STR_EQ(python, "p.src.foo.__init__");
+    ASSERT_STR_EQ(c_file, "");
+    ASSERT_NULL(strstr(g_pkgmap_log_capture, "pkgmap.name_collision"));
+    PASS();
+}
+
+/* A name two manifests of one ecosystem split ends module resolution for an
+ * importer of that ecosystem's language: unresolved, exact or as the prefix
+ * of a longer path. The fallback it replaced spelled `<project>.<path>` and
+ * bound the import to whatever node held that QN -- the folder of a package
+ * named like the withheld one. One row per manifest kind; each row's control
+ * (one manifest of the two) shows the path reaches the map: its target names
+ * that manifest's directory "a", where the fallback would spell the path. */
+TEST(pkgmap_withheld_name_leaves_import_unresolved_in_every_ecosystem) {
+    static const struct {
+        const char *basename;
+        const char *source;
+        const char *withheld; /* the map key the two manifests split */
+        const char *importer;
+        const char *modules[2];
+    } rows[] = {
+        {"Cargo.toml", "[package]\nname = \"foo\"\n", "foo", "app/src/main.rs", {"foo", "foo/bar"}},
+        {"pyproject.toml", "[project]\nname = \"foo\"\n", "foo", "app/main.py", {"foo", "foo.bar"}},
+        {"package.json", "{\"name\": \"foo\", \"main\": \"index.js\"}", "foo", "app/main.ts",
+         {"foo", "foo/bar"}},
+        {"composer.json", "{\"autoload\": {\"psr-4\": {\"Foo\\\\\": \"src/\"}}}", "Foo\\",
+         "app/main.php", {"Foo\\Bar", "Foo\\Sub\\Bar"}},
+        {"go.mod", "module example.com/foo\n", "example.com/foo", "app/main.go",
+         {"example.com/foo", "example.com/foo/bar"}},
+        {"pubspec.yaml", "name: foo\n", "foo", "app/main.dart", {"foo", "foo/bar"}},
+        {"pom.xml", "<project><groupId>com.acme</groupId><artifactId>foo</artifactId></project>",
+         "com.acme.foo", "app/Main.java", {"com.acme.foo", "com.acme.foo.Bar"}},
+        {"build.gradle", "group = 'com.acme'\n", "com.acme", "app/Main.kt",
+         {"com.acme", "com.acme.Bar"}},
+        {"mix.exs", "def project do\n  [\n    app: :foo,\n  ]\nend\n", "foo", "app/main.ex",
+         {"foo", "foo/bar"}},
+        {"foo.gemspec", "Gem::Specification.new do |s|\n  s.name = \"foo\"\nend\n", "foo",
+         "app/main.rb", {"foo", "foo/bar"}},
+        {"Package.swift", "let package = Package(name: \"x\", targets: [.target(name: \"Foo\")])\n",
+         "Foo", "app/main.swift", {"Foo", "Foo/Bar"}},
+    };
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        char a[64], b[64];
+        snprintf(a, sizeof(a), "a/%s", rows[r].basename);
+        snprintf(b, sizeof(b), "b/%s", rows[r].basename);
+        const char *const paths[2] = {a, b};
+        const char *const sources[2] = {rows[r].source, rows[r].source};
+        CBMHashTable *map = pkgmap_from_manifests(paths, sources, 2);
+        bool withheld = map && cbm_ht_has(map, rows[r].withheld) &&
+                        cbm_ht_get(map, rows[r].withheld) == NULL;
+        char split[2][256];
+        for (int m = 0; m < 2; m++) {
+            pkgmap_resolve_into(rows[r].importer, rows[r].modules[m], split[m], 256);
+        }
+        cbm_pipeline_set_pkgmap(NULL);
+        cbm_pkgmap_free(map);
+        map = pkgmap_from_manifests(paths, sources, 1);
+        char control[2][256];
+        for (int m = 0; m < 2; m++) {
+            pkgmap_resolve_into(rows[r].importer, rows[r].modules[m], control[m], 256);
+        }
+        cbm_pipeline_set_pkgmap(NULL);
+        cbm_pkgmap_free(map);
+        bool reached[2];
+        for (int m = 0; m < 2; m++) {
+            reached[m] = strcmp(control[m], "p.a") == 0 || strstr(control[m], "p.a.") != NULL;
+        }
+        if (!withheld || split[0][0] || split[1][0] || !reached[0] || !reached[1]) {
+            printf("  row %s: withheld=%d split=[%s|%s] control=[%s|%s]\n", rows[r].basename,
+                   withheld, split[0], split[1], control[0], control[1]);
+        }
+        ASSERT_TRUE(withheld);
+        ASSERT_STR_EQ(split[0], "");
+        ASSERT_STR_EQ(split[1], "");
+        ASSERT_TRUE(reached[0]);
+        ASSERT_TRUE(reached[1]);
+    }
+    PASS();
+}
+
+/* A crate name two manifests split is decided for a Rust importer by its own
+ * Cargo manifest only -- the nearest one at or above the file -- and above it
+ * only through `workspace = true`, which reaches the workspace root's
+ * [workspace.dependencies] entry. Review fixtures p5, p1 and p2:
+ * - a path dependency out of the repository or absolute, a registry
+ *   dependency, and one a non-root [patch] table replaces (Cargo ignores it)
+ *   decide nothing, where the old walk took the root crate's decision;
+ * - `workspace = true` in each spelling (inline, dotted, table) reaches the
+ *   workspace's entry; a `[dependencies.dep]` table path dependency and a
+ *   relative one reach their crate; a file under the root package's tests/
+ *   reaches the root package. */
+TEST(pkgmap_split_crate_name_is_decided_by_the_importers_own_manifest) {
+    static const char dep[] = "[package]\nname = \"dep\"\n";
+    static const struct {
+        const char *path;
+        const char *source;
+    } manifests[] = {
+        /* p5 */
+        {"p5/Cargo.toml", dep},
+        {"p5/forks/dep/Cargo.toml", dep},
+        {"p5/tools/abs/Cargo.toml",
+         "[package]\nname = \"abs\"\n[dependencies]\ndep = { path = \"/abs/p5/forks/dep\" }\n"},
+        {"p5/tools/out/Cargo.toml", "[package]\nname = \"outp\"\n[dependencies]\n"
+                                    "dep = { path = \"../../../../elsewhere/dep\" }\n"},
+        {"p5/tools/reg/Cargo.toml", "[package]\nname = \"reg\"\n[dependencies]\ndep = \"1.0\"\n"},
+        {"p5/tools/rel/Cargo.toml",
+         "[package]\nname = \"rel\"\n[dependencies]\ndep = { path = \"../../forks/dep\" }\n"},
+        /* p1 */
+        {"p1/other/dep/Cargo.toml", dep},
+        {"p1/ws/Cargo.toml", "[workspace]\nmembers = [\"dep\", \"reg\", \"inh\"]\n\n"
+                             "[workspace.dependencies]\ndep = { path = \"dep\" }\n"},
+        {"p1/ws/dep/Cargo.toml", dep},
+        {"p1/ws/reg/Cargo.toml", "[package]\nname = \"reg\"\n[dependencies]\ndep = \"1.0\"\n"},
+        {"p1/ws/inh/Cargo.toml",
+         "[package]\nname = \"inh\"\n[dependencies]\ndep = { workspace = true }\n"},
+        {"p1/ws/dotted/Cargo.toml",
+         "[package]\nname = \"dotted\"\n[dependencies]\ndep.workspace = true\n"},
+        {"p1/ws/table/Cargo.toml",
+         "[package]\nname = \"table\"\n[dependencies.dep]\nworkspace = true\n"},
+        /* p2 */
+        {"p2/Cargo.toml", "[workspace]\nmembers = [\"z/*\"]\n\n"
+                          "[workspace.dependencies]\ndep = { path = \"a/dep\" }\n"},
+        {"p2/a/dep/Cargo.toml", dep},
+        {"p2/z/dep/Cargo.toml", dep},
+        {"p2/z/patch/Cargo.toml", "[package]\nname = \"patchu\"\n[dependencies]\ndep = \"1.0\"\n\n"
+                                  "[patch.crates-io]\ndep = { path = \"../dep\" }\n"},
+        {"p2/z/tbl/Cargo.toml", "[package]\nname = \"tbl\"\n[dependencies.dep]\npath = \"../dep\"\n"},
+    };
+    static const struct {
+        const char *importer;
+        const char *reaches; /* "" : unresolved */
+    } rows[] = {
+        {"p5/tests/it.rs", "p.p5.src.lib.shared_entry"},
+        {"p5/tools/rel/src/lib.rs", "p.p5.forks.dep.src.lib.shared_entry"},
+        {"p5/tools/abs/src/lib.rs", ""},
+        {"p5/tools/out/src/lib.rs", ""},
+        {"p5/tools/reg/src/lib.rs", ""},
+        {"p1/ws/reg/src/lib.rs", ""},
+        {"p1/ws/inh/src/lib.rs", "p.p1.ws.dep.src.lib.shared_entry"},
+        {"p1/ws/dotted/src/lib.rs", "p.p1.ws.dep.src.lib.shared_entry"},
+        {"p1/ws/table/src/lib.rs", "p.p1.ws.dep.src.lib.shared_entry"},
+        {"p2/z/patch/src/lib.rs", ""},
+        {"p2/z/tbl/src/lib.rs", "p.p2.z.dep.src.lib.shared_entry"},
+    };
+    enum { MANIFESTS = sizeof(manifests) / sizeof(manifests[0]) };
+    const char *paths[MANIFESTS];
+    const char *sources[MANIFESTS];
+    for (int m = 0; m < MANIFESTS; m++) {
+        paths[m] = manifests[m].path;
+        sources[m] = manifests[m].source;
+    }
+    CBMHashTable *map = pkgmap_from_manifests(paths, sources, MANIFESTS);
+    char got[sizeof(rows) / sizeof(rows[0])][256];
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        pkgmap_resolve_into(rows[r].importer, "dep/shared_entry", got[r], sizeof(got[r]));
+    }
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(map);
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        if (strcmp(got[r], rows[r].reaches) != 0) {
+            printf("  %s: got [%s] want [%s]\n", rows[r].importer, got[r], rows[r].reaches);
+        }
+    }
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        ASSERT_STR_EQ(got[r], rows[r].reaches);
+    }
+    PASS();
+}
+
+/* The IMPORTS targets written from `importer`, each "<label>:<file_path>",
+ * sorted and '|'-joined into `out` ("" when none). */
+static bool import_target_labels(const char *db, const char *importer, char *out, size_t cap) {
+    out[0] = '\0';
+    cbm_store_t *store = cbm_store_open_path(db);
+    sqlite3_stmt *stmt = NULL;
+    bool ok = store && sqlite3_prepare_v2(cbm_store_get_db(store),
+                                          "SELECT coalesce(group_concat(t, '|'), '') FROM "
+                                          "(SELECT t.label || ':' || coalesce(t.file_path, '') "
+                                          "AS t FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                          "JOIN nodes t ON t.id=e.target_id WHERE "
+                                          "e.type='IMPORTS' AND s.file_path=?1 ORDER BY t)",
+                                          -1, &stmt, NULL) == SQLITE_OK;
+    ok = ok && sqlite3_bind_text(stmt, 1, importer, -1, SQLITE_STATIC) == SQLITE_OK &&
+         sqlite3_step(stmt) == SQLITE_ROW;
+    if (ok) {
+        snprintf(out, cap, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(store);
+    return ok;
+}
+
+/* The maturin layout end to end (review fixture mx1): a root Cargo.toml and a
+ * pyproject.toml both name `foo`, the Python package foo/ defines bar, and
+ * `from foo import bar` imports it. The import reaches the function, as it did
+ * before names were compared; with the two ecosystems in one namespace it
+ * reached the folder foo/ instead. */
+TEST(pipeline_python_import_of_a_name_a_crate_shares_reaches_the_function) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-q-maturin-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"foo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs", "pub fn native() -> u32 { 1 }\n");
+    write_temp_file(tmp, "pyproject.toml", "[project]\nname = \"foo\"\nversion = \"0.1.0\"\n");
+    write_temp_file(tmp, "foo/__init__.py", "def bar():\n    return 1\n");
+    write_temp_file(tmp, "foo/cli.py", "from foo import bar\n\n\ndef main():\n    return bar()\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/maturin.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    char targets[256];
+    bool read = rc == 0 && import_target_labels(db, "foo/cli.py", targets, sizeof(targets));
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(read);
+    ASSERT_STR_EQ(targets, "Function:foo/__init__.py");
+    PASS();
+}
+
 /* ── SwiftPM Package.swift manifest resolution (issue #551 item 1) ──
  *
  * parse_package_swift is a literal pattern-extractor (mirrors
@@ -31641,6 +32085,13 @@ SUITE(pipeline) {
     RUN_TEST(k8s_extract_manifest_no_name);
     RUN_TEST(k8s_extract_manifest_multidoc);
     /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
+    RUN_TEST(pkgmap_name_two_manifests_split_is_withheld_and_logged_once);
+    RUN_TEST(pipeline_rust_import_of_split_crate_name_follows_importer_path_dependency);
+    RUN_TEST(pkgmap_manifest_primary_entry_survives_duplicate_listing);
+    RUN_TEST(pkgmap_name_two_ecosystems_declare_is_each_ecosystems_own);
+    RUN_TEST(pkgmap_withheld_name_leaves_import_unresolved_in_every_ecosystem);
+    RUN_TEST(pkgmap_split_crate_name_is_decided_by_the_importers_own_manifest);
+    RUN_TEST(pipeline_python_import_of_a_name_a_crate_shares_reaches_the_function);
     RUN_TEST(pkgmap_swift_targets_registers_module);
     RUN_TEST(pkgmap_swift_products_do_not_register_alias);
     RUN_TEST(pkgmap_swift_target_name_immediately_before_close_paren);

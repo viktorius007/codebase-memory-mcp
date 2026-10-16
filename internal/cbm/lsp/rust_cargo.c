@@ -249,13 +249,34 @@ static int cargo_key_path(CBMArena *arena, const char *s, int len, int from,
     return from;
 }
 
+/* The section a workspace root's inheritable dependencies are declared in. */
+#define CARGO_WORKSPACE_DEPS "workspace\x1f" "dependencies"
+
+/* One field of a dependency, in any of its spellings (`dep.path = ...`,
+ * `dep = { path = ... }`, a `[dependencies.dep]` table): `path` (a local
+ * crate) and `workspace = true` (inherited from the workspace root) are kept,
+ * any other value skipped. */
+static int parse_dep_field(CBMArena *a, const char *s, int len, int from, const char *field,
+                           CBMCargoDep *dep) {
+    if (dep && field && strcmp(field, "path") == 0) return parse_string(a, s, len, from, &dep->path);
+    if (dep && field && strcmp(field, "workspace") == 0) {
+        bool inherited = false;
+        int end = parse_bool(s, len, from, &inherited);
+        if (end > from) {
+            dep->workspace = inherited;
+            return end;
+        }
+    }
+    return skip_value(s, len, from);
+}
+
 /* For the `[dependencies]` / `[dev-dependencies]` / `[workspace.dependencies]`
  * sections, parse `key = value` lines until the next section. The value
  * may be a string (the version) or an inline table. We capture both
- * shapes — only the key (crate name) and optional `path = "..."` field
- * matter for us. */
+ * shapes — only the key (crate name), its `path = "..."` and
+ * `workspace = true` matter for us. */
 static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
-    CBMCargoManifest* out) {
+    CBMCargoManifest* out, bool workspace_table) {
     from = skip_ws_and_comment(s, len, from);
     if (from >= len || s[from] == '[') return from;
     const char* key = NULL;
@@ -274,13 +295,13 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
         if (!dep && out->dep_count < CBM_CARGO_MAX_DEPS) {
             dep = &out->deps[out->dep_count++];
             dep->name = name;
+            dep->workspace_table = workspace_table;
         }
-        return dep && strcmp(field + 1, "path") == 0
-            ? parse_string(a, s, len, from, &dep->path) : skip_value(s, len, from);
+        return parse_dep_field(a, s, len, from, field + 1, dep);
     }
-    const char* path_val = NULL;
+    CBMCargoDep fields = {0};
     if (from < len && s[from] == '{') {
-        /* Inline table — scan for `path = "..."`. */
+        /* Inline table — scan for `path = "..."` and `workspace = true`. */
         int depth = 1;
         from++;
         while (from < len && depth > 0) {
@@ -297,19 +318,15 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
                 from++;
                 from = skip_ws_and_comment(s, len, from);
             }
-            if (sub_key && strcmp(sub_key, "path") == 0) {
-                from = parse_string(a, s, len, from, &path_val);
-            } else {
-                from = skip_value(s, len, from);
-            }
+            from = parse_dep_field(a, s, len, from, sub_key, &fields);
         }
     } else {
         from = skip_value(s, len, from);
     }
     if (key && out->dep_count < CBM_CARGO_MAX_DEPS) {
-        out->deps[out->dep_count].name = key;
-        out->deps[out->dep_count].path = path_val;
-        out->dep_count++;
+        fields.name = key;
+        fields.workspace_table = workspace_table;
+        out->deps[out->dep_count++] = fields;
     }
     return from;
 }
@@ -460,7 +477,7 @@ static bool cargo_is_dependency_section(const char *section) {
             return true;
         }
     }
-    return strcmp(section, "workspace\x1f" "dependencies") == 0;
+    return strcmp(section, CARGO_WORKSPACE_DEPS) == 0;
 }
 
 /* The last component of a dependency table is the declared crate alias,
@@ -480,9 +497,7 @@ static int parse_dependency_table_field(CBMArena *arena, const char *source, int
     from = skip_ws_and_comment(source, length, from);
     if (from < length && source[from] == '=') from++;
     from = skip_ws_and_comment(source, length, from);
-    return key && strcmp(key, "path") == 0
-        ? parse_string(arena, source, length, from, &dep->path)
-        : skip_value(source, length, from);
+    return parse_dep_field(arena, source, length, from, key, dep);
 }
 
 void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoManifest *out) {
@@ -517,6 +532,8 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
             if (dependency_name && out->dep_count < CBM_CARGO_MAX_DEPS) {
                 dependency_table = &out->deps[out->dep_count++];
                 dependency_table->name = dependency_name;
+                dependency_table->workspace_table =
+                    strncmp(section, CARGO_WORKSPACE_DEPS "\x1f", sizeof(CARGO_WORKSPACE_DEPS)) == 0;
             }
             static const char *const kinds[] = {"lib", "bin", "test", "example", "bench"};
             for (int t = 0; t < 5; t++)
@@ -541,7 +558,8 @@ void cbm_cargo_parse(CBMArena *arena, const char *src, int src_len, CBMCargoMani
             else from = parse_workspace_kv(arena, src, src_len, from, out);
         } else if (dependency_table) {
             from = parse_dependency_table_field(arena, src, src_len, from, dependency_table);
-        } else if (cargo_is_dependency_section(section)) from = parse_dep_entry(arena, src, src_len, from, out);
+        } else if (cargo_is_dependency_section(section)) from = parse_dep_entry(arena, src, src_len, from, out,
+                                            strcmp(section, CARGO_WORKSPACE_DEPS) == 0);
         else {
             const char *key = NULL;
             from = cargo_key_path(arena, src, src_len, from, &key);

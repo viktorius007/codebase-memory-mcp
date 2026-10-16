@@ -459,10 +459,33 @@ static inline bool cbm_pipeline_carried_edge_fits(const char *source_file_path, 
 
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
+/* What a crate record the Cargo parser adds says about the Rust files whose
+ * own manifest is manifest_rel. */
+typedef enum {
+    CBM_CRATE_NONE,          /* not a crate record: a name entry */
+    CBM_CRATE_MANIFEST,      /* manifest_rel is a Cargo manifest (pkg_name "") */
+    CBM_CRATE_WORKSPACE,     /* ... and the root of a workspace */
+    CBM_CRATE_REACH,         /* by pkg_name they reach the crate crate_manifest_rel
+                              * declares; NULL for a path out of the repository */
+    CBM_CRATE_INHERIT,       /* by pkg_name they reach what their workspace's
+                              * [workspace.dependencies] names (workspace = true) */
+    CBM_CRATE_WORKSPACE_DEP, /* this workspace's [workspace.dependencies] path
+                              * entry for pkg_name: crate_manifest_rel, as REACH */
+} cbm_crate_record_t;
+
 /* Per-worker manifest collection entry. */
 typedef struct {
     char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
     char *entry_rel; /* heap: "packages/pkg/src/index" (no extension) */
+    /* mem_core (CBM_MEM_CLASS_OTHER): the manifest that declared the entry
+     * ("ws/dep/Cargo.toml"), stamped by cbm_pkgmap_try_parse. */
+    char *manifest_rel;
+    /* A crate record (crate != CBM_CRATE_NONE; entry_rel NULL): see
+     * cbm_crate_record_t. cbm_pkgmap_build reads them only when a name Rust
+     * files import is withheld. crate_manifest_rel is mem_core
+     * (CBM_MEM_CLASS_OTHER), NULL where the kind names no crate. */
+    cbm_crate_record_t crate;
+    char *crate_manifest_rel;
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
@@ -1008,6 +1031,11 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
 /* Merge per-worker entries into a hash table. Returns NULL if no entries. */
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name);
+
+/* The target package `name` reaches for an import written in `importer_rel`:
+ * the one the importer's ecosystem declares, else the one ecosystem declaring
+ * it. NULL when absent or withheld from this importer. Borrowed from `map`. */
+const char *cbm_pkgmap_target(const CBMHashTable *map, const char *name, const char *importer_rel);
 
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,

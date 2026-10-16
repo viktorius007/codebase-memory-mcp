@@ -11,6 +11,15 @@
 #include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include "../src/foundation/compat_fs.h"
+#ifdef _WIN32
+#include <direct.h>
+#define extraction_test_chdir _chdir
+#define extraction_test_getcwd _getcwd
+#else
+#include <unistd.h>
+#define extraction_test_chdir chdir
+#define extraction_test_getcwd getcwd
+#endif
 #include <stdint.h>
 #include <time.h>
 #include "macro_table.h"
@@ -7790,6 +7799,244 @@ TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949) {
     PASS();
 }
 
+enum { PP_CALL_SITE_LINES = 5, PP_CALL_SITE_LINE = 4, PP_PAD_LINES = 40 };
+
+/* dir/pp_pad.h: PP_PAD_LINES one-line functions calling pp_pad_callee, then
+ * the macro PP_HDR_CALL, whose expansion calls pp_hdr_target. */
+static bool write_pp_pad_header(const char *dir, char *path_out, size_t path_cap) {
+    snprintf(path_out, path_cap, "%s/pp_pad.h", dir);
+    FILE *f = cbm_fopen(path_out, "wb");
+    if (!f) {
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < PP_PAD_LINES && ok; i++) {
+        ok = fprintf(f, "static int pp_pad_%d(void) { return pp_pad_callee(%d); }\n", i, i) > 0;
+    }
+    ok = ok && fprintf(f, "#define PP_HDR_CALL(x) pp_hdr_target(x)\n") > 0;
+    return fclose(f) == 0 && ok;
+}
+
+/* Five lines. pp_target is called only after expansion of a macro this file
+ * defines; pp_hdr_target only after expansion of one the header defines. Only
+ * the preprocessed pass sees either, on line 4. */
+static const char PP_CALL_SITE_SRC[] = "#include \"pp_pad.h\"\n"
+                                       "#define CALL_TARGET(x) pp_target(x)\n"
+                                       "int pp_caller(int v) {\n"
+                                       "    return CALL_TARGET(v) + PP_HDR_CALL(v);\n"
+                                       "}\n";
+
+/* The preprocessed pass reads the bytes it is handed and the include
+ * directories its caller names, nothing else. simplecpp looked a quoted
+ * include up next to the including file, and the extractor names that file by
+ * its repo-relative path, so the lookup resolved against the indexing
+ * process's working directory. The same corpus then indexed differently
+ * depending on where the process ran and on what that directory held at the
+ * time: from the repository root every C file spliced its headers into the
+ * expanded buffer, header function bodies became calls of the including file,
+ * header macros changed what this file calls, and macro-hidden calls carried
+ * expanded-buffer lines (cbm.c: line 6348 of 4775). Here the header sits in
+ * the working directory and no include directory is named: its macro must not
+ * expand, and the result must match the run from elsewhere. */
+TEST(extract_c_preprocessed_pass_ignores_working_directory) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cbm_pp_cwd_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char header_path[600];
+    bool written = write_pp_pad_header(tmpdir, header_path, sizeof(header_path));
+
+    char saved_cwd[1024];
+    bool saved = extraction_test_getcwd(saved_cwd, sizeof(saved_cwd)) != NULL;
+    bool entered = written && saved && extraction_test_chdir(tmpdir) == 0;
+    CBMFileResult *in_dir =
+        entered ? cbm_extract_file(PP_CALL_SITE_SRC, (int)strlen(PP_CALL_SITE_SRC), CBM_LANG_C,
+                                   "t", "pp_main.c", 0, NULL, NULL)
+                : NULL;
+    bool restored = saved && extraction_test_chdir(saved_cwd) == 0;
+    CBMFileResult *elsewhere = cbm_extract_file(PP_CALL_SITE_SRC, (int)strlen(PP_CALL_SITE_SRC),
+                                                CBM_LANG_C, "t", "pp_main.c", 0, NULL, NULL);
+    cbm_unlink(header_path);
+    cbm_rmdir(tmpdir);
+
+    ASSERT_TRUE(written);
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(restored);
+    ASSERT_NOT_NULL(in_dir);
+    ASSERT_NOT_NULL(elsewhere);
+    /* The header in the working directory contributed nothing. */
+    ASSERT_EQ(count_calls_named(in_dir, "pp_hdr_target"), 0);
+    ASSERT_EQ(count_calls_named(in_dir, "pp_pad_callee"), 0);
+    const CBMCall *target = find_call_by_callee(in_dir, "pp_target");
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ(target->start_line, PP_CALL_SITE_LINE);
+    /* Call for call, the same extraction as from any other directory. */
+    ASSERT_EQ(in_dir->calls.count, elsewhere->calls.count);
+    for (int i = 0; i < in_dir->calls.count; i++) {
+        const CBMCall *a = &in_dir->calls.items[i];
+        const CBMCall *b = &elsewhere->calls.items[i];
+        ASSERT_STR_EQ(a->callee_name, b->callee_name);
+        ASSERT_EQ(a->start_line, b->start_line);
+        ASSERT_EQ((int)a->source_origin, (int)b->source_origin);
+    }
+    cbm_free_result(in_dir);
+    cbm_free_result(elsewhere);
+    PASS();
+}
+
+/* A call the preprocessed pass extracts carries the line it is written on in
+ * this file. That pass parses the expanded buffer, where an included header
+ * occupies lines of its own, so the tree's row is an expanded-buffer line: the
+ * macro-hidden call below sat 40+ lines past line 4, past the end of a
+ * five-line file. The pass's own line map translates the row, and a call the
+ * map places inside the header is the header's call, not this file's. The
+ * header is reached through a named include directory, the one way the
+ * preprocessed pass may read it. */
+TEST(extract_c_preprocessed_calls_carry_original_lines) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cbm_pp_line_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char header_path[600];
+    bool written = write_pp_pad_header(tmpdir, header_path, sizeof(header_path));
+    const char *includes[] = {tmpdir, NULL};
+    CBMFileResult *r =
+        written ? cbm_extract_file(PP_CALL_SITE_SRC, (int)strlen(PP_CALL_SITE_SRC), CBM_LANG_C,
+                                   "t", "pp_main.c", 0, NULL, includes)
+                : NULL;
+    cbm_unlink(header_path);
+    cbm_rmdir(tmpdir);
+
+    ASSERT_TRUE(written);
+    ASSERT_NOT_NULL(r);
+    const CBMCall *target = find_call_by_callee(r, "pp_target");
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ((int)target->source_origin, (int)CBM_SOURCE_ORIGIN_PREPROCESSED);
+    ASSERT_EQ(target->start_line, PP_CALL_SITE_LINE);
+    /* The named directory is read: the header's macro expands, on line 4. */
+    const CBMCall *hdr_target = find_call_by_callee(r, "pp_hdr_target");
+    ASSERT_NOT_NULL(hdr_target);
+    ASSERT_EQ(hdr_target->start_line, PP_CALL_SITE_LINE);
+    ASSERT_EQ(count_calls_named(r, "pp_pad_callee"), 0);
+    for (int i = 0; i < r->calls.count; i++) {
+        ASSERT_GTE(r->calls.items[i].start_line, 1);
+        ASSERT_LTE(r->calls.items[i].start_line, PP_CALL_SITE_LINES);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A generated parser (bison, flex, lemon) writes its rule actions under
+ * `#line N "parse.y"`. Those lines are this file's code: with no include
+ * directory named -- how the pipeline runs -- no other file can supply a row of
+ * the expanded buffer. The directive re-labelled the rows after it as
+ * parse.y's, the line map took them for an included header's, and the call
+ * gen_rule makes through GEN_CALL, which only the preprocessed pass sees, was
+ * dropped without a trace. Each call carries the line it is written on in this
+ * file, under a directive naming another file (line 5) or this one (line 9). */
+TEST(extract_c_preprocessed_calls_under_line_directive_keep_physical_line) {
+    static const char src[] = "int gen_target(int v) { return v - 1; }\n"
+                              "#define GEN_CALL(v) gen_target(v)\n"
+                              "#line 40 \"parse.y\"\n"
+                              "int gen_rule(int v) {\n"
+                              "    return GEN_CALL(v);\n"
+                              "}\n"
+                              "#line 7 \"gen/parse.c\"\n"
+                              "int after_reset(int v) {\n"
+                              "    return GEN_CALL(v);\n"
+                              "}\n";
+    enum { GEN_RULE_CALL_LINE = 5, AFTER_RESET_CALL_LINE = 9 };
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_C, "t", "gen/parse.c", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    int lines[2] = {0, 0};
+    int found = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, "gen_target") == 0) {
+            ASSERT_EQ((int)c->source_origin, (int)CBM_SOURCE_ORIGIN_PREPROCESSED);
+            ASSERT_LT(found, 2);
+            lines[found++] = c->start_line;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(found, 2);
+    ASSERT_EQ(lines[0] < lines[1] ? lines[0] : lines[1], GEN_RULE_CALL_LINE);
+    ASSERT_EQ(lines[0] < lines[1] ? lines[1] : lines[0], AFTER_RESET_CALL_LINE);
+    PASS();
+}
+
+/* A line-number directive is blanked before the preprocessor reads the file,
+ * and the scan that finds it reads comments as the preprocessor does: a
+ * `# N "f"` that is comment text is no directive, and a directive's comment
+ * stays a comment. Each row is a C file whose call to `target` happens through
+ * CALL, which only the preprocessed pass sees, and the lines that call is
+ * reported on (0: none).
+ * - `# 2 "items"` followed by a comment's closing star-slash, inside the
+ *   comment: blanked, it took the closer with it, the comment ran over caller,
+ *   and its call was dropped without a record;
+ * - `#line 20 "gen.y"` followed by a comment opener: blanked whole, the
+ *   commented-out call after it became code and was published;
+ * - bison's `#line 40 "parse.y"` with a comment closed on its line: both calls
+ *   keep their physical lines;
+ * - a comment opener inside a string, or after a character literal's quote,
+ *   opens no comment: the directive after it is still blanked. */
+TEST(extract_c_line_directive_scan_reads_comments_as_the_preprocessor_does) {
+    static const struct {
+        const char *name;
+        const char *src;
+        int lines[2];
+    } rows[] = {
+        {"directive text closing a comment",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\n/* release notes\n"
+         "# 2 \"items\" */\nint caller(int v) {\n    return CALL(v);\n}\n",
+         {6, 0}},
+        {"directive opening a comment",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\nint caller(int v) {\n"
+         "#line 20 \"gen.y\" /* disabled:\n    CALL(v);\n*/\n    return v;\n}\n",
+         {0, 0}},
+        {"directive with a closed comment",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\n"
+         "#line 40 \"parse.y\" /* yacc.c:339  */\nint gen_rule(int v) {\n    return CALL(v);\n}\n"
+         "# 9 \"gen/parse.c\"\nint after(int v) {\n    return CALL(v);\n}\n",
+         {5, 9}},
+        {"comment opener in a string",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\n"
+         "const char *glob = \"image/*\";\n#line 40 \"parse.y\"\nint rule(int v) {\n"
+         "    return CALL(v);\n}\n",
+         {6, 0}},
+        {"comment opener after a character literal quote",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\n"
+         "char quote = '\"'; /* \" */\n#line 40 \"parse.y\"\nint rule(int v) {\n"
+         "    return CALL(v);\n}\n",
+         {6, 0}},
+    };
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        CBMFileResult *res = cbm_extract_file(rows[r].src, (int)strlen(rows[r].src), CBM_LANG_C,
+                                              "t", "gen/parse.c", 0, NULL, NULL);
+        ASSERT_NOT_NULL(res);
+        int lines[2] = {0, 0};
+        int found = 0;
+        for (int i = 0; i < res->calls.count; i++) {
+            const CBMCall *c = &res->calls.items[i];
+            if (c->callee_name && strcmp(c->callee_name, "target") == 0 && found < 2) {
+                lines[found++] = c->start_line;
+            }
+        }
+        cbm_free_result(res);
+        if (lines[0] > lines[1] && lines[1] != 0) {
+            int swap = lines[0];
+            lines[0] = lines[1];
+            lines[1] = swap;
+        }
+        if (lines[0] != rows[r].lines[0] || lines[1] != rows[r].lines[1]) {
+            printf("  %s: calls on lines %d,%d, want %d,%d\n", rows[r].name, lines[0], lines[1],
+                   rows[r].lines[0], rows[r].lines[1]);
+        }
+        ASSERT_EQ(lines[0], rows[r].lines[0]);
+        ASSERT_EQ(lines[1], rows[r].lines[1]);
+    }
+    PASS();
+}
+
 /* #961 inverse guard: a clean C file must not gain duplicate or phantom
  * defs from the recovery path (it only engages on raw-parse ERROR regions). */
 TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
@@ -13174,6 +13421,10 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
+    RUN_TEST(extract_c_preprocessed_pass_ignores_working_directory);
+    RUN_TEST(extract_c_preprocessed_calls_carry_original_lines);
+    RUN_TEST(extract_c_preprocessed_calls_under_line_directive_keep_physical_line);
+    RUN_TEST(extract_c_line_directive_scan_reads_comments_as_the_preprocessor_does);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling);
     RUN_TEST(extract_c_misnested_raw_struct_replaced_by_flat_copy);

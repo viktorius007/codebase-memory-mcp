@@ -155,6 +155,18 @@ typedef struct {
     int count;
 } RmtVisit;
 
+/* Test builds scribble every grown slot: a field a record setter forgets then
+ * reads as garbage in every test run, not as whatever zero or stale byte the
+ * allocator happened to hand back (RmtFile.prelude_restrictions read leftover
+ * heap bytes, and only under load did they disable the prelude). */
+#ifdef CBM_ENABLE_TEST_SEAMS
+#define RMT_SCRIBBLE(next, old_cap, grown, size)                                         \
+    memset((char *)(next) + (size_t)(old_cap) * (size), 0xFF,                            \
+           (size_t)((grown) - (old_cap)) * (size))
+#else
+#define RMT_SCRIBBLE(next, old_cap, grown, size) ((void)0)
+#endif
+
 #define RMT_GROW(tree, field, count, cap)                                     \
     do {                                                                      \
         if ((tree)->count >= (tree)->cap) {                                   \
@@ -163,6 +175,7 @@ typedef struct {
                                      (size_t)grown * sizeof(*(tree)->field)); \
             if (!next)                                                        \
                 return -1;                                                    \
+            RMT_SCRIBBLE(next, (tree)->cap, grown, sizeof(*(tree)->field));   \
             (tree)->field = next;                                             \
             (tree)->cap = grown;                                              \
         }                                                                     \
@@ -240,10 +253,15 @@ int cbm_rust_modtree_add_file(CBMRustModTree *tree, const char *rel_path, const 
     RMT_GROW(tree, files, file_count, file_cap);
     int id = tree->file_count++;
     RmtFile *file = &tree->files[id];
-    file->rel = cbm_arena_strdup(&tree->arena, rel_path);
-    file->qn = cbm_arena_strdup(&tree->arena, module_qn);
-    file->dir = rmt_dirname(&tree->arena, file->rel);
-    file->first_module = -1;
+    /* The whole record: a field left out keeps the grown array's bytes
+     * (prelude_restrictions did, and leftover bits disabled the prelude). */
+    const char *rel = cbm_arena_strdup(&tree->arena, rel_path);
+    *file = (RmtFile){
+        .rel = rel,
+        .qn = cbm_arena_strdup(&tree->arena, module_qn),
+        .dir = rmt_dirname(&tree->arena, rel),
+        .first_module = -1,
+    };
     cbm_idxmemo_put_if_absent(&tree->file_by_rel, &tree->arena, file->rel, id);
     cbm_idxmemo_put_if_absent(&tree->file_by_qn, &tree->arena, file->qn, id);
     return id;

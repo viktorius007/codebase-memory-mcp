@@ -20,6 +20,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lsp/rust_lsp.h"
+#include "foundation/mem_core.h" /* cbm_alloc: heap poisoning in the modtree prelude test */
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 
@@ -13246,6 +13247,42 @@ TEST(rustlsp_cargo_edition_selects_import_scope_and_unknown_refuses_links) {
     PASS();
 }
 
+/* A file the tree holds but no crate mounts has no prelude restriction unless
+ * its source records one. The file record left prelude_restrictions as
+ * whatever the grown array's memory held, and prelude_allows ORs the field
+ * over every file: leftover heap bytes with CBM_RUST_PRELUDE_DISABLED set took
+ * `Ord` out of scope for the whole project. Under load, 1 index in 6 of one
+ * corpus resolved `self.cmp(other)` in tests/fixtures/graph/rust/ordpoison to
+ * <LineColumn as Ord>::cmp; the other 5 withheld it. The heap is poisoned
+ * first so the record's memory is not zero by luck. */
+TEST(rustlsp_modtree_unmounted_files_allow_prelude) {
+    enum { POISON_BYTES = 64 * 64, FILES = 70 }; /* > 64: the array grows once */
+    unsigned char *poison = cbm_alloc(CBM_MEM_CLASS_OTHER, POISON_BYTES);
+    if (poison) {
+        memset(poison, 0xFF, POISON_BYTES);
+        cbm_free(CBM_MEM_CLASS_OTHER, poison);
+    }
+    static const char source[] = "pub fn act() {}\n";
+    CBMRustModTree *tree = cbm_rust_modtree_new();
+    ASSERT_NOT_NULL(tree);
+    CBMRustModFacts *facts[FILES];
+    char rel[64];
+    char qn[64];
+    for (int i = 0; i < FILES; i++) {
+        snprintf(rel, sizeof(rel), "pad/f%02d.rs", i);
+        snprintf(qn, sizeof(qn), "p.pad.f%02d", i);
+        ASSERT_GTE(cbm_rust_modtree_add_file(tree, rel, qn), 0);
+        facts[i] = cbm_rust_modfacts_scan(source, (int)strlen(source));
+    }
+    cbm_rust_modtree_finish(tree, (const CBMRustModFacts *const *)facts);
+    bool allows = cbm_rust_modtree_prelude_allows(tree, "p.pad.f00", 0, "Ord");
+    for (int i = 0; i < FILES; i++)
+        cbm_rust_modfacts_free(facts[i]);
+    cbm_rust_modtree_free(tree);
+    ASSERT_TRUE(allows);
+    PASS();
+}
+
 TEST(rustlsp_modtree_built_from_scanned_facts) {
     RustModTreeFixture fx = rust_modtree_from_facts(true);
     ASSERT_EQ(cbm_rust_modtree_file_count(fx.tree), 3);
@@ -15358,6 +15395,7 @@ void suite_rust_lsp(void) {
 
     /* Crate module tree from scanned facts */
     RUN_TEST(rustlsp_cargo_edition_selects_import_scope_and_unknown_refuses_links);
+    RUN_TEST(rustlsp_modtree_unmounted_files_allow_prelude);
     RUN_TEST(rustlsp_modtree_built_from_scanned_facts);
     RUN_TEST(rustlsp_modtree_unscanned_file_leaves_unsupplied_names_open);
     RUN_TEST(rustlsp_modtree_qualified_impl_trait_keeps_proven_identity);
