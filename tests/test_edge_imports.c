@@ -1252,6 +1252,79 @@ TEST(ei_py_module_type_statement_rebinds_decorated_name) {
     PASS();
 }
 
+/* Each module binds a name only to its own node, in a way the facts do not
+ * model as one unconditional statement: a def in both branches of an
+ * if/else (vers, sep in a package), a def under `if True:` (in_if), a class
+ * in both branches (Plat), `AUG = [1]` then `AUG += [2]`, a def in both arms
+ * of a try (both), a package `__init__` that imports its own submodule
+ * (`from hu import sub`), and `__all__` read through
+ * `from .cat import __all__ as _base`. The node at `<module>.<name>` is the
+ * only thing the module's run can leave bound, so main's link stands: 8 edges
+ * to those nodes. Three names are withheld with their rows: fast (a try import
+ * of `_cspeedups.fast` may bind another module's function), f (a def that a
+ * branch reassigns to `impl`) and alt (a def in one branch, `impl` in the
+ * other); an edge to cd.fast, a1.f or a2.alt would be wrong. Returns the 8
+ * links + 10 * the wrong edges + 100 * the three rows. */
+static int ei_py_own_binder_case(int pad) {
+    EILangFile f[] = {
+        {"shapes.py", "import sys\n\nif sys.version_info >= (3, 8):\n    def vers():\n"
+                      "        return 1\nelse:\n    def vers():\n        return 2\n\n"
+                      "if True:\n    def in_if():\n        return 3\n\n"
+                      "AUG = [1]\nAUG += [2]\n\n"
+                      "if sys.platform == 'win32':\n    class Plat:\n        pass\nelse:\n"
+                      "    class Plat:\n        pass\n"},
+        {"cd.py", "try:\n    def both():\n        return 1\nexcept ImportError:\n"
+                  "    def both():\n        return 2\n\n"
+                  "try:\n    from _cspeedups import fast\nexcept ImportError:\n"
+                  "    def fast():\n        return 3\n"},
+        {"pc/__init__.py", "import os\n\nif os.sep == '/':\n    def sep():\n        return 1\n"
+                           "else:\n    def sep():\n        return 2\n"},
+        {"hu/__init__.py", "from hu import sub\n"},
+        {"hu/sub.py", "def g():\n    return 1\n"},
+        {"sa/__init__.py", ""},
+        {"sa/cat.py", "__all__ = ['a']\n\n\ndef a():\n    return 1\n"},
+        {"sa/ext.py", "from .cat import __all__ as _base\n\n__all__ = list(_base) + ['c']\n"},
+        {"other.py", "def impl():\n    return 0\n"},
+        {"a1.py", "import sys\nfrom other import impl\n\n\ndef f():\n    return 1\n\n\n"
+                  "if sys.platform == 'win32':\n    f = impl\n"},
+        {"a2.py", "import sys\nfrom other import impl\n\nif sys.platform == 'win32':\n"
+                  "    def alt():\n        return 1\nelse:\n    alt = impl\n"},
+        {"use.py", "from shapes import vers, in_if, AUG, Plat\nfrom cd import both, fast\n"
+                   "from pc import sep\nfrom hu import sub\nfrom a1 import f\nfrom a2 import alt\n\n\n"
+                   "def u():\n    vers()\n    in_if()\n    print(AUG)\n    Plat()\n    both()\n"
+                   "    fast()\n    sep()\n    sub.g()\n    f()\n    alt()\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, (int)(sizeof(f) / sizeof(f[0])), pad);
+    int linked = ei_sql_int(
+        store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+               "t.id=e.target_id WHERE e.type IN ('CALLS','USAGE') AND "
+               "((s.name='u' AND ((t.file_path='shapes.py' AND t.name IN "
+               "('vers','in_if','AUG','Plat')) OR (t.file_path='cd.py' AND t.name='both') OR "
+               "(t.file_path='pc/__init__.py' AND t.name='sep') OR "
+               "(t.file_path='hu/sub.py' AND t.name='g'))) OR "
+               "(s.file_path='sa/ext.py' AND t.file_path='sa/cat.py' AND t.name='__all__'))");
+    int wrong = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type IN "
+                                  "('CALLS','USAGE') AND s.name='u' AND "
+                                  "((t.file_path='cd.py' AND t.name='fast') OR "
+                                  "(t.file_path='a1.py' AND t.name='f') OR "
+                                  "(t.file_path='a2.py' AND t.name='alt'))");
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.u' "
+                                 "AND name IN ('fast','f','alt') AND "
+                                 "reason='name_binding_not_proven'");
+    ei_cleanup(&lp, store);
+    if (linked < 0 || wrong < 0 || rows < 0)
+        return -1;
+    return linked + 10 * wrong + 100 * rows;
+}
+
+TEST(ei_py_module_own_binder_keeps_its_link) {
+    ASSERT_EQ(ei_py_own_binder_case(0), 308);
+    ASSERT_EQ(ei_py_own_binder_case(60), 308);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2985,6 +3058,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_capture_and_type_param_are_no_decorated_usage);
     RUN_TEST(ei_py_del_and_type_alias_are_no_decorated_usage);
     RUN_TEST(ei_py_module_type_statement_rebinds_decorated_name);
+    RUN_TEST(ei_py_module_own_binder_keeps_its_link);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
