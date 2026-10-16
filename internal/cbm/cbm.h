@@ -443,8 +443,13 @@ typedef struct {
 /* Content-only ordered Python namespace facts; no resolved target identities.
  * Version 2: a statement the facts do not model emits a SHADOW of reason
  * UNSUPPORTED for each module name it may bind, and one of CBM_PY_NS_ANY_NAME
- * when it may bind any. */
-#define CBM_PY_NAMESPACE_FACTS_VERSION 2u
+ * when it may bind any. Version 3: a name such a statement binds only through
+ * undecorated defs, only through undecorated classes, or only through plain
+ * or augmented assignments to the whole name is a SHADOW of reason
+ * OWN_OR_KEPT instead, with that def_kind (CBM_PY_NS_DEF_NONE for a value), as
+ * is the target of a module-level augmented assignment; the name a `type`
+ * statement declares is a binding. */
+#define CBM_PY_NAMESPACE_FACTS_VERSION 3u
 /* The SHADOW name of a statement that may bind any module name: a star import
  * inside a compound statement, globals()/vars()/locals()/exec()/eval(),
  * sys.modules, a match statement. No identifier spells it. */
@@ -493,7 +498,13 @@ typedef enum {
     CBM_PY_NS_REASON_COMPOUND = 4,
     CBM_PY_NS_REASON_EFFECT = 5,
     CBM_PY_NS_REASON_UNSUPPORTED = 6,
-    CBM_PY_NS_REASON_PARSE = 7
+    CBM_PY_NS_REASON_PARSE = 7,
+    /* A SHADOW whose statement binds the name, if it runs that binding at
+     * all, to the module's own function, class or value for it (its def_kind:
+     * an undecorated def, an undecorated class, a plain or augmented
+     * assignment), and may leave the earlier binding in place (an `if` or
+     * `try` branch; `x += v` keeps x's object when that object is mutable). */
+    CBM_PY_NS_REASON_OWN_OR_KEPT = 8
 } CBMPyNamespaceUnknownReason;
 enum { CBM_PY_NS_IMPORT_BINDS_ROOT = 1u << 0 };
 

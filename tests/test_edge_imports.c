@@ -1220,6 +1220,38 @@ TEST(ei_py_del_and_type_alias_are_no_decorated_usage) {
     PASS();
 }
 
+/* A module-level `type handler = int` after the reader's definition rebinds
+ * handler before the reader can run: the module's run ends with handler bound
+ * to the type alias, not to `@wrap def handler`, so the decorated-usage
+ * rewrite must not take reader's read over, and it keeps its
+ * name_binding_not_proven row. The same reader in a module without the `type`
+ * statement (ctl.py) reads the definition: one USAGE. Returns ctl's USAGE + 10
+ * * reader's USAGE + 100 * reader's rows. */
+static int ei_py_module_type_statement_case(int pad) {
+    char deco[1024], ctl[1024];
+    snprintf(deco, sizeof(deco),
+             "%sdef reader():\n    return accept(handler)\n\n\ntype handler = int\n",
+             ei_py_decorated_prelude);
+    snprintf(ctl, sizeof(ctl), "%sdef ctl_reader():\n    return accept(handler)\n",
+             ei_py_decorated_prelude);
+    EILangFile f[] = {{"deco.py", deco}, {"ctl.py", ctl}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 2, pad);
+    int control = ei_sql_int(store, EI_PY_USAGE_SQL("ctl_reader", "handler"));
+    int usage = ei_sql_int(store, EI_PY_USAGE_SQL("reader", "handler"));
+    int rows = ei_sql_int(store, EI_PY_ROWS_SQL("reader", "handler"));
+    ei_cleanup(&lp, store);
+    if (control < 0 || usage < 0 || rows < 0)
+        return -1;
+    return control + 10 * usage + 100 * rows;
+}
+
+TEST(ei_py_module_type_statement_rebinds_decorated_name) {
+    ASSERT_EQ(ei_py_module_type_statement_case(0), 101);
+    ASSERT_EQ(ei_py_module_type_statement_case(60), 101);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2952,6 +2984,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_replaced_own_def_is_no_reexport_target);
     RUN_TEST(ei_py_capture_and_type_param_are_no_decorated_usage);
     RUN_TEST(ei_py_del_and_type_alias_are_no_decorated_usage);
+    RUN_TEST(ei_py_module_type_statement_rebinds_decorated_name);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 

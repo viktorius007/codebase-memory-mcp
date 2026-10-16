@@ -127,7 +127,11 @@ static bool py_namespace_fact_valid(const CBMPyNamespaceFact *f) {
     bool literal = f->kind == CBM_PY_NS_ALL_SET || f->kind == CBM_PY_NS_ALL_APPEND;
     if (!literal && (f->names || f->name_count || f->sequence_kind != CBM_PY_NS_SEQUENCE_NONE))
         return false;
-    if (f->kind != CBM_PY_NS_OWN_DEF && f->def_kind != CBM_PY_NS_DEF_NONE)
+    bool own_or_kept = f->kind == CBM_PY_NS_SHADOW && f->reason == CBM_PY_NS_REASON_OWN_OR_KEPT;
+    if (f->kind != CBM_PY_NS_OWN_DEF && !own_or_kept && f->def_kind != CBM_PY_NS_DEF_NONE)
+        return false;
+    if (f->def_kind != CBM_PY_NS_DEF_NONE && f->def_kind != CBM_PY_NS_DEF_FUNCTION &&
+        f->def_kind != CBM_PY_NS_DEF_CLASS)
         return false;
     if (f->kind != CBM_PY_NS_IMPORT_MODULE && f->flags)
         return false;
@@ -155,7 +159,8 @@ static bool py_namespace_fact_valid(const CBMPyNamespaceFact *f) {
         return py_namespace_nonempty(f->local_name) && !f->module_name && !f->member_name &&
                (f->reason == CBM_PY_NS_REASON_VALUE || f->reason == CBM_PY_NS_REASON_DECORATED ||
                 f->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS ||
-                f->reason == CBM_PY_NS_REASON_UNSUPPORTED);
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED ||
+                f->reason == CBM_PY_NS_REASON_OWN_OR_KEPT);
     case CBM_PY_NS_DELETE:
         return py_namespace_nonempty(f->local_name) && strcmp(f->local_name, "__all__") != 0 &&
                !f->module_name && !f->member_name;

@@ -28407,12 +28407,18 @@ TEST(pipeline_python_namespace_codec_owns_ordered_facts) {
 }
 
 TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
-    /* Numeric values below are the frozen version-2 namespace wire values.
+    /* Numeric values below are the frozen version-3 namespace wire values.
      * Even an empty LSP array must validate its namespace envelope. Version 1
      * wrote no rebinding SHADOW for a statement the facts do not model (an
-     * `if` branch re-importing a name), so a version-1 surface is not read. */
+     * `if` branch re-importing a name), and version 2 wrote the def, class or
+     * assignment in such a branch as UNSUPPORTED, where version 3 writes
+     * OWN_OR_KEPT, so neither older surface is read. */
     const char *bad[] = {
         "{\"v\":15,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
+        "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
+        "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
+        "{\"v\":15,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -28421,18 +28427,18 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":null}",
         "{\"v\":15,\"lang\":1.0,\"lsp\":[],\"py\":null}",
         "{\"v\":15,\"v\":15,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":3,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
         "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":3,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":3,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":15,\"lang\":1,\"lsp\":[],\"py\":{\"v\":3,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -28452,7 +28458,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":15,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":15,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":3,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";

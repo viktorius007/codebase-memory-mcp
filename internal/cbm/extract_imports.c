@@ -670,27 +670,62 @@ static bool py_ns_all_literal(PyNamespaceBuilder *b, TSNode node, CBMPyNamespace
     return true;
 }
 
+/* How a statement the facts do not model binds a name (py_ns_rebinds): to the
+ * module's own value for it (the whole target of a plain or augmented
+ * assignment), its own function or class (an undecorated def or class), or
+ * to anything else (an import, a loop, `as`, walrus, `del` or `type` target, a
+ * decorated definition, an unpacked target). */
+typedef enum {
+    PY_NS_BINDS_OTHER = 0,
+    PY_NS_BINDS_VALUE,
+    PY_NS_BINDS_FUNCTION,
+    PY_NS_BINDS_CLASS,
+} PyNsBinder;
+
+static CBMPyNamespaceDefKind py_ns_binder_def_kind(PyNsBinder binder) {
+    return binder == PY_NS_BINDS_FUNCTION ? CBM_PY_NS_DEF_FUNCTION
+           : binder == PY_NS_BINDS_CLASS  ? CBM_PY_NS_DEF_CLASS
+                                          : CBM_PY_NS_DEF_NONE;
+}
+
 /* A statement the facts do not model may still bind module names. Each name
- * it may bind becomes a SHADOW of reason UNSUPPORTED after its UNKNOWN fact,
- * once per statement (`start` is the statement's first such SHADOW): the
- * name's earlier binding no longer decides what it holds. */
-static bool py_ns_rebinds(PyNamespaceBuilder *b, int start, const char *name) {
+ * it may bind becomes one SHADOW after its UNKNOWN fact, once per statement
+ * (`start` is the statement's first such SHADOW): the name's earlier binding
+ * no longer decides alone what it holds. While every binding of the name in
+ * the statement is one own binder of one kind (all values, all functions, or
+ * all classes), the SHADOW is of reason OWN_OR_KEPT with that kind as its
+ * def_kind (CBM_PY_NS_DEF_NONE for a value); any other binding of the name
+ * makes it of reason UNSUPPORTED. */
+static bool py_ns_rebinds(PyNamespaceBuilder *b, int start, const char *name, PyNsBinder binder) {
+    CBMPyNamespaceDefKind def_kind = py_ns_binder_def_kind(binder);
     for (int i = start; i < b->facts.count; i++) {
-        const CBMPyNamespaceFact *f = &b->facts.items[i];
-        if (f->kind == CBM_PY_NS_SHADOW && f->reason == CBM_PY_NS_REASON_UNSUPPORTED &&
-            strcmp(f->local_name, name) == 0)
+        CBMPyNamespaceFact *f = &b->facts.items[i];
+        if (f->kind == CBM_PY_NS_SHADOW &&
+            (f->reason == CBM_PY_NS_REASON_UNSUPPORTED ||
+             f->reason == CBM_PY_NS_REASON_OWN_OR_KEPT) &&
+            strcmp(f->local_name, name) == 0) {
+            if (binder == PY_NS_BINDS_OTHER || f->def_kind != def_kind) {
+                f->reason = CBM_PY_NS_REASON_UNSUPPORTED;
+                f->def_kind = CBM_PY_NS_DEF_NONE;
+            }
             return true;
+        }
     }
+    bool own = binder != PY_NS_BINDS_OTHER;
     return py_ns_push(b, (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
                                               .local_name = name,
-                                              .reason = CBM_PY_NS_REASON_UNSUPPORTED});
+                                              .def_kind = def_kind,
+                                              .reason = own ? CBM_PY_NS_REASON_OWN_OR_KEPT
+                                                            : CBM_PY_NS_REASON_UNSUPPORTED});
 }
 
 /* Whether the identifier `node` is a name its statement binds in the module
  * namespace: an assignment, augmented-assignment, `for`, `as` or walrus
- * target, possibly unpacked, or a `del` target. A comprehension's own `for`
- * target is local to the comprehension. */
+ * target, possibly unpacked, a `del` target, or the name a `type` statement
+ * declares. A comprehension's own `for` target is local to the comprehension. */
 static bool py_ns_binding_identifier(TSNode node) {
+    if (cbm_python_type_alias_name(node))
+        return true;
     static const char *const unpacking[] = {
         "pattern_list",   "tuple_pattern", "list_pattern", "list_splat_pattern",
         "tuple",          "list",          "list_splat",   "parenthesized_expression",
@@ -719,6 +754,18 @@ static bool py_ns_binding_identifier(TSNode node) {
     else
         return strcmp(kind, "as_pattern_target") == 0 || strcmp(kind, "delete_statement") == 0;
     return ts_node_eq(child, ts_node_child_by_field_name(parent, field, (uint32_t)strlen(field)));
+}
+
+/* Whether the binding identifier `node` is the whole target of a plain or
+ * augmented assignment (`x = v`, `x += v`): the statement binds the module's
+ * own value for the name. */
+static bool py_ns_own_target(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent))
+        return false;
+    const char *kind = ts_node_type(parent);
+    return (strcmp(kind, "assignment") == 0 || strcmp(kind, "augmented_assignment") == 0) &&
+           ts_node_eq(node, ts_node_child_by_field_name(parent, TS_FIELD("left")));
 }
 
 /* A call or attribute that can bind any module name: globals(), vars(),
@@ -762,17 +809,20 @@ static bool py_ns_import_rebinds(PyNamespaceBuilder *b, TSNode node, int start) 
     for (int i = first; i < last; i++) {
         const CBMPyNamespaceFact f = b->facts.items[i];
         const char *name = f.kind == CBM_PY_NS_IMPORT_STAR ? CBM_PY_NS_ANY_NAME : f.local_name;
-        if (!name || !py_ns_rebinds(b, start, name))
+        if (!name || !py_ns_rebinds(b, start, name, PY_NS_BINDS_OTHER))
             return false;
     }
-    return (ok || !b->failure) && (ok || py_ns_rebinds(b, start, CBM_PY_NS_ANY_NAME));
+    return (ok || !b->failure) &&
+           (ok || py_ns_rebinds(b, start, CBM_PY_NS_ANY_NAME, PY_NS_BINDS_OTHER));
 }
 
 /* Every module name the statement or expression `root` may bind, in source
  * order: nested imports, definitions and classes (their bodies are their own
- * scopes), assignment, `for`, `as`, walrus and `del` targets. A star import, a
- * dynamic namespace access (py_ns_dynamic_namespace) or a match statement may
- * bind any name. Lambda bodies are their own scopes. */
+ * scopes), assignment, `for`, `as`, walrus, `del` and `type` targets. An
+ * undecorated definition or class and a plain or augmented assignment's whole
+ * target are own binders (PyNsBinder). A star
+ * import, a dynamic namespace access (py_ns_dynamic_namespace) or a match
+ * statement may bind any name. Lambda bodies are their own scopes. */
 static bool py_ns_scan_rebinds(PyNamespaceBuilder *b, TSNode root) {
     int start = b->facts.count;
     TSTreeCursor cursor = ts_tree_cursor_new(root);
@@ -784,7 +834,13 @@ static bool py_ns_scan_rebinds(PyNamespaceBuilder *b, TSNode root) {
         if (strcmp(kind, "function_definition") == 0 || strcmp(kind, "class_definition") == 0) {
             const char *name =
                 py_ns_name(b, ts_node_child_by_field_name(node, TS_FIELD("name")), false);
-            ok = py_ns_rebinds(b, start, name ? name : CBM_PY_NS_ANY_NAME);
+            TSNode holder = ts_node_parent(node);
+            bool decorated = !ts_node_is_null(holder) &&
+                             strcmp(ts_node_type(holder), "decorated_definition") == 0;
+            PyNsBinder binder = !name || decorated                         ? PY_NS_BINDS_OTHER
+                                : strcmp(kind, "function_definition") == 0 ? PY_NS_BINDS_FUNCTION
+                                                                           : PY_NS_BINDS_CLASS;
+            ok = py_ns_rebinds(b, start, name ? name : CBM_PY_NS_ANY_NAME, binder);
             descend = false;
         } else if (strcmp(kind, "lambda") == 0) {
             descend = false;
@@ -793,10 +849,12 @@ static bool py_ns_scan_rebinds(PyNamespaceBuilder *b, TSNode root) {
             ok = py_ns_import_rebinds(b, node, start);
             descend = false;
         } else if (strcmp(kind, "match_statement") == 0 || py_ns_dynamic_namespace(b, node)) {
-            ok = py_ns_rebinds(b, start, CBM_PY_NS_ANY_NAME);
+            ok = py_ns_rebinds(b, start, CBM_PY_NS_ANY_NAME, PY_NS_BINDS_OTHER);
         } else if (strcmp(kind, "identifier") == 0 && py_ns_binding_identifier(node)) {
             const char *name = py_ns_name(b, node, false);
-            ok = py_ns_rebinds(b, start, name ? name : CBM_PY_NS_ANY_NAME);
+            ok = py_ns_rebinds(b, start, name ? name : CBM_PY_NS_ANY_NAME,
+                               name && py_ns_own_target(node) ? PY_NS_BINDS_VALUE
+                                                              : PY_NS_BINDS_OTHER);
         }
         if (!ok)
             break;
@@ -834,7 +892,7 @@ static bool py_ns_unpacking_assignment(PyNamespaceBuilder *b, TSNode node, TSNod
     for (;;) {
         TSNode child = ts_tree_cursor_current_node(&cursor);
         if (py_ns_dynamic_namespace(b, child)) {
-            ok = py_ns_rebinds(b, b->facts.count, CBM_PY_NS_ANY_NAME);
+            ok = py_ns_rebinds(b, b->facts.count, CBM_PY_NS_ANY_NAME, PY_NS_BINDS_OTHER);
         } else if (strcmp(ts_node_type(child), "identifier") == 0 &&
                    py_ns_binding_identifier(child)) {
             const char *name = py_ns_name(b, child, false);
@@ -876,14 +934,14 @@ static bool py_ns_assignment(PyNamespaceBuilder *b, TSNode node) {
         return true; /* annotation alone does not bind the target */
     bool augmented = strcmp(ts_node_type(node), "augmented_assignment") == 0;
     if (strcmp(name, "__all__") != 0) {
-        if (augmented)
-            return py_ns_unknown(b, CBM_PY_NS_REASON_UNSUPPORTED) &&
-                   py_ns_rebinds(b, b->facts.count, name);
+        /* `x += v` binds x to x.__iadd__(v): the module's own value for x, or
+         * the object x held before when that object is mutable. */
         if (!py_ns_safe_expr(b, right, 0) && !py_ns_scan_rebinds(b, right))
             return false;
         return py_ns_push(b, (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
                                                   .local_name = name,
-                                                  .reason = CBM_PY_NS_REASON_VALUE});
+                                                  .reason = augmented ? CBM_PY_NS_REASON_OWN_OR_KEPT
+                                                                      : CBM_PY_NS_REASON_VALUE});
     }
     CBMPyNamespaceFact fact = {.kind = augmented ? CBM_PY_NS_ALL_APPEND : CBM_PY_NS_ALL_SET};
     bool plus = true;

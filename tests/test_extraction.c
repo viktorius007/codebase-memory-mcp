@@ -12731,6 +12731,63 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
     PASS();
 }
 
+/* A compound statement the facts do not model writes one SHADOW per name it
+ * may bind. While every binding of the name in the statement is an undecorated
+ * def, an undecorated class, or a plain or augmented assignment to the whole
+ * name, all of one kind, the SHADOW is of reason OWN_OR_KEPT and carries that
+ * kind (FUNCTION, CLASS, or NONE for a value): the statement binds the
+ * module's own node of that kind or leaves the earlier binding. A def in one
+ * branch and an assignment in the other, or a decorated def, is UNSUPPORTED.
+ * A module-level `x += v` is OWN_OR_KEPT of a value, and the name a `type`
+ * statement declares is a binding (UNSUPPORTED after the statement's unknown). */
+TEST(python_namespace_facts_branch_own_binders_keep_their_kind) {
+    static const char source[] = "if c:\n    def f():\n        pass\n"
+                                 "else:\n    def f():\n        pass\n"
+                                 "try:\n    class K:\n        pass\nexcept E:\n    pass\n"
+                                 "if c:\n    x = 1\n"
+                                 "X = [1]\nX += [2]\n"
+                                 "if c:\n    def m():\n        pass\nelse:\n    m = other\n"
+                                 "if c:\n    @deco\n    def d():\n        pass\n"
+                                 "type T = int\n";
+    static const struct {
+        CBMPyNamespaceFactKind kind;
+        CBMPyNamespaceUnknownReason reason;
+        CBMPyNamespaceDefKind def_kind;
+        const char *name;
+    } want[] = {
+        {CBM_PY_NS_UNKNOWN, CBM_PY_NS_REASON_COMPOUND, CBM_PY_NS_DEF_NONE, NULL},
+        {CBM_PY_NS_SHADOW, CBM_PY_NS_REASON_OWN_OR_KEPT, CBM_PY_NS_DEF_FUNCTION, "f"},
+        {CBM_PY_NS_UNKNOWN, CBM_PY_NS_REASON_COMPOUND, CBM_PY_NS_DEF_NONE, NULL},
+        {CBM_PY_NS_SHADOW, CBM_PY_NS_REASON_OWN_OR_KEPT, CBM_PY_NS_DEF_CLASS, "K"},
+        {CBM_PY_NS_UNKNOWN, CBM_PY_NS_REASON_COMPOUND, CBM_PY_NS_DEF_NONE, NULL},
+        {CBM_PY_NS_SHADOW, CBM_PY_NS_REASON_OWN_OR_KEPT, CBM_PY_NS_DEF_NONE, "x"},
+        {CBM_PY_NS_SHADOW, CBM_PY_NS_REASON_VALUE, CBM_PY_NS_DEF_NONE, "X"},
+        {CBM_PY_NS_SHADOW, CBM_PY_NS_REASON_OWN_OR_KEPT, CBM_PY_NS_DEF_NONE, "X"},
+        {CBM_PY_NS_UNKNOWN, CBM_PY_NS_REASON_COMPOUND, CBM_PY_NS_DEF_NONE, NULL},
+        {CBM_PY_NS_SHADOW, CBM_PY_NS_REASON_UNSUPPORTED, CBM_PY_NS_DEF_NONE, "m"},
+        {CBM_PY_NS_UNKNOWN, CBM_PY_NS_REASON_COMPOUND, CBM_PY_NS_DEF_NONE, NULL},
+        {CBM_PY_NS_SHADOW, CBM_PY_NS_REASON_UNSUPPORTED, CBM_PY_NS_DEF_NONE, "d"},
+        {CBM_PY_NS_UNKNOWN, CBM_PY_NS_REASON_UNSUPPORTED, CBM_PY_NS_DEF_NONE, NULL},
+        {CBM_PY_NS_SHADOW, CBM_PY_NS_REASON_UNSUPPORTED, CBM_PY_NS_DEF_NONE, "T"},
+    };
+    enum { WANT = sizeof(want) / sizeof(want[0]) };
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "main.py");
+    bool ok = r && !r->has_error && !r->parse_incomplete &&
+              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == WANT &&
+              cbm_py_namespace_facts_valid(&r->py_namespace);
+    for (int i = 0; ok && i < WANT; i++) {
+        const CBMPyNamespaceFact *f = &r->py_namespace.items[i];
+        ok = f->kind == want[i].kind && f->reason == want[i].reason &&
+             f->def_kind == want[i].def_kind &&
+             (want[i].name ? f->local_name && strcmp(f->local_name, want[i].name) == 0
+                           : !f->local_name);
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
@@ -12751,6 +12808,7 @@ SUITE(extraction) {
     RUN_TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload);
     RUN_TEST(python_namespace_facts_unavailable_and_empty_survive_spill);
     RUN_TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects);
+    RUN_TEST(python_namespace_facts_branch_own_binders_keep_their_kind);
 
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);

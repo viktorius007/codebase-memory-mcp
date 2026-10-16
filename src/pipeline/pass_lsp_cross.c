@@ -2567,14 +2567,16 @@ static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_p
                 pxc_free_fqn(file_qn);
                 return false;
             }
-        } else if (fact->kind == CBM_PY_NS_SHADOW && fact->reason == CBM_PY_NS_REASON_UNSUPPORTED &&
+        } else if (fact->kind == CBM_PY_NS_SHADOW &&
+                   (fact->reason == CBM_PY_NS_REASON_UNSUPPORTED ||
+                    fact->reason == CBM_PY_NS_REASON_OWN_OR_KEPT) &&
                    fact->local_name) {
             /* A statement the facts do not model may rebind the name (an `if`
-             * or `try` branch re-importing it, a loop or tuple target): the
-             * binding an earlier statement proved no longer decides it. A name
-             * that statement binds first keeps no entry, as before, and the
-             * any-name SHADOW is left to the re-export reader
-             * (pxc_python_final_binding). */
+             * or `try` branch re-importing it or defining it, a loop or tuple
+             * target, `x += v`): the binding an earlier statement proved no
+             * longer decides it. A name that statement binds first keeps no
+             * entry, as before, and the any-name SHADOW is left to the
+             * re-export reader (pxc_python_final_binding). */
             if (strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) != 0 &&
                 pxc_python_map_find(map, fact->local_name) >= 0 &&
                 !pxc_python_map_set(map, fact->local_name, NULL)) {
