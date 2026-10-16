@@ -877,24 +877,25 @@ static bool cfml_argument_tag_name_binding(CBMExtractCtx *ctx, TSNode node) {
     return false;
 }
 
-/* Python binds a name without an assignment in four statement shapes: the
+/* Python binds a name without an assignment in six statement shapes: the
  * target of a `for` loop, of a comprehension's `for` clause, of `with ... as`
- * and `except ... as`, and of a walrus `name := value`. A target may be
- * unpacked (`for a, (b, c) in xs`), so the identifier climbs through the
- * pattern containers first; an attribute or subscript target binds no name and
- * stops the climb. */
+ * and `except ... as`, of a walrus `name := value`, of `del name` (deleting a
+ * name makes it local to its scope, as assigning it does), and the name a
+ * `type name = ...` statement declares. A target may be unpacked
+ * (`for a, (b, c) in xs`, `del a, (b, c)`), so the identifier climbs through
+ * the pattern containers first; an attribute or subscript target binds no name
+ * and stops the climb. */
 static bool is_python_target_binding(TSNode node) {
-    static const char *const unpacking[] = {"pattern_list",
-                                            "tuple_pattern",
-                                            "list_pattern",
-                                            "list_splat_pattern",
-                                            "tuple",
-                                            "list",
-                                            "list_splat",
-                                            "parenthesized_expression",
-                                            NULL};
+    static const char *const unpacking[] = {"pattern_list",    "tuple_pattern",
+                                            "list_pattern",    "list_splat_pattern",
+                                            "tuple",           "list",
+                                            "list_splat",      "parenthesized_expression",
+                                            "expression_list", NULL};
     if (strcmp(ts_node_type(node), "identifier") != 0) {
         return false;
+    }
+    if (cbm_python_type_alias_name(node)) {
+        return true;
     }
     TSNode parent = ts_node_parent(node);
     while (!ts_node_is_null(parent) && kind_in_exact_set(ts_node_type(parent), unpacking)) {
@@ -910,7 +911,7 @@ static bool is_python_target_binding(TSNode node) {
     if (strcmp(kind, "named_expression") == 0) {
         return field_contains_node(parent, "name", node);
     }
-    return strcmp(kind, "as_pattern_target") == 0;
+    return strcmp(kind, "as_pattern_target") == 0 || strcmp(kind, "delete_statement") == 0;
 }
 
 /* A name a `match` case pattern captures: a bare name (`case h:`, also inside

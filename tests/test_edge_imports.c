@@ -1169,6 +1169,57 @@ TEST(ei_py_capture_and_type_param_are_no_decorated_usage) {
     PASS();
 }
 
+/* `del handler` and `type handler = ...` bind handler in the function that
+ * holds them, as an assignment does: CPython's symbol table reports the name
+ * local there, also for a read before the `del`, and free in a nested
+ * function that reads it (inner). None of these reads is the module's
+ * `@wrap def handler`, so the decorated-usage rewrite (pass_lsp_cross.c
+ * cbm_pxc_python_decorated_usage) must not take them over: each keeps its
+ * name_binding_not_proven row, beside the rows of the `del` and `type`
+ * occurrences themselves. A read that only deletes an attribute or an item of
+ * something else (`del handler.attr`, `del d[handler]`) binds nothing, and the
+ * plain read is the definition: those three stay USAGE. Returns the USAGE
+ * edges to handler from the three global readers + 10 * the USAGE edges to
+ * handler from anything else in the file + 100 * the shadowed readers' rows. */
+static int ei_py_del_and_type_alias_case(int pad) {
+    char deco[1536];
+    snprintf(deco, sizeof(deco),
+             "%sdef plain():\n    return accept(handler)\n\n\n"
+             "def del_attr():\n    accept(handler)\n    del handler.attr\n\n\n"
+             "def del_item(d):\n    accept(handler)\n    del d[handler]\n\n\n"
+             "def dele():\n    accept(handler)\n    del handler\n\n\n"
+             "def dele_tuple():\n    accept(handler)\n    del (accept, handler)\n\n\n"
+             "def dele_list():\n    accept(handler)\n    del [handler]\n\n\n"
+             "def type_alias():\n    type handler = int\n    accept(handler)\n\n\n"
+             "def type_alias_generic():\n    type handler[T] = list[T]\n    accept(handler)\n\n\n"
+             "def outer_del():\n    def inner():\n        return accept(handler)\n\n"
+             "    del handler\n    return inner\n",
+             ei_py_decorated_prelude);
+    EILangFile f[] = {{"deco.py", deco}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 1, pad);
+    int global = ei_sql_int(store, EI_PY_USAGE_SQL("plain", "handler")) +
+                 ei_sql_int(store, EI_PY_USAGE_SQL("del_attr", "handler")) +
+                 ei_sql_int(store, EI_PY_USAGE_SQL("del_item", "handler"));
+    int all = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes t ON t.id=e.target_id "
+                                "WHERE e.type='USAGE' AND t.name='handler'");
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE name='handler' AND "
+                                 "reason='name_binding_not_proven' AND (caller LIKE '%.dele' OR "
+                                 "caller LIKE '%.dele_tuple' OR caller LIKE '%.dele_list' OR "
+                                 "caller LIKE '%.type_alias' OR caller LIKE "
+                                 "'%.type_alias_generic' OR caller LIKE '%.inner')");
+    ei_cleanup(&lp, store);
+    if (global < 0 || all < 0 || rows < 0)
+        return -1;
+    return global + 10 * (all - global) + 100 * rows;
+}
+
+TEST(ei_py_del_and_type_alias_are_no_decorated_usage) {
+    ASSERT_EQ(ei_py_del_and_type_alias_case(0), 1103);
+    ASSERT_EQ(ei_py_del_and_type_alias_case(60), 1103);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2900,6 +2951,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_star_excluded_name_keeps_its_row);
     RUN_TEST(ei_py_replaced_own_def_is_no_reexport_target);
     RUN_TEST(ei_py_capture_and_type_param_are_no_decorated_usage);
+    RUN_TEST(ei_py_del_and_type_alias_are_no_decorated_usage);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
