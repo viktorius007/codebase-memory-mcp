@@ -558,8 +558,9 @@ typedef struct {
                                           // (Go x.f — field_identifier). The extractor strips
                                           // the receiver, so this is the only surviving record
                                           // of selector shape (#1962). Default false.
-    bool python_target_shadow; // Python: a loop, comprehension, `as` or walrus target of an
-                               // enclosing scope binds the name where it is read
+    bool python_target_shadow; // Python: a loop, comprehension, `as`, walrus or match-capture
+                               // target, or a PEP 695 type parameter, of an enclosing scope
+                               // binds the name where it is read
     CBMUsageFilter unresolved_filter;
 } CBMUsage;
 

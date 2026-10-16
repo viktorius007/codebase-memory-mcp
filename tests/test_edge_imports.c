@@ -1105,6 +1105,70 @@ TEST(ei_py_replaced_own_def_is_no_reexport_target) {
     PASS();
 }
 
+/* A match capture and a PEP 695 type parameter bind the name in the function
+ * that reads it, or, for `class K[handler]`, in the annotation scope its
+ * methods see. Neither read is the module's `@wrap def handler`, so the
+ * decorated-usage rewrite (pass_lsp_cross.c cbm_pxc_python_decorated_usage)
+ * must not take it over: each of the seven reads keeps its
+ * name_binding_not_proven row, beside the seven rows of the binding
+ * occurrences themselves (the capture, the type parameter and its annotation
+ * use). plain's read and a value pattern's (`case C.handler:` reads C's
+ * attribute, then the module's handler) are that definition and stay USAGE.
+ * Returns the USAGE edges from plain and from the value-pattern reader + 10 *
+ * the USAGE edges from the shadowed readers + 100 * the shadowed readers'
+ * rows. */
+static int ei_py_capture_and_type_param_case(int pad) {
+    char deco[1536];
+    snprintf(deco, sizeof(deco),
+             "%sdef plain():\n    return accept(handler)\n\n\n"
+             "class C:\n    handler = 1\n\n\n"
+             "def by_value(v):\n    match v:\n        case C.handler:\n"
+             "            return accept(handler)\n\n\n"
+             "def by_capture(v):\n    match v:\n        case handler:\n"
+             "            return accept(handler)\n\n\n"
+             "def by_keyword(v):\n    match v:\n        case object(real=handler):\n"
+             "            return accept(handler)\n\n\n"
+             "def by_star(v):\n    match v:\n        case [*handler]:\n"
+             "            return accept(handler)\n\n\n"
+             "def by_alias(v):\n    match v:\n        case [1] as handler:\n"
+             "            return accept(handler)\n\n\n"
+             "def by_type_param[handler](x: handler):\n    return accept(handler)\n\n\n"
+             "def by_splat_param[*handler](x):\n    return accept(handler)\n\n\n"
+             "class K[handler]:\n    def by_class_param(self):\n"
+             "        return accept(handler)\n",
+             ei_py_decorated_prelude);
+    EILangFile f[] = {{"deco.py", deco}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 1, pad);
+    static const char shadowed[] =
+        "('by_capture','by_keyword','by_star','by_alias','by_type_param','by_splat_param',"
+        "'by_class_param')";
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+             "t.id=e.target_id WHERE e.type='USAGE' AND t.name='handler' AND s.name IN %s",
+             shadowed);
+    int wrong = ei_sql_int(store, sql);
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE name='handler' AND "
+                                 "reason='name_binding_not_proven' AND (caller LIKE "
+                                 "'%.by_capture' OR caller LIKE '%.by_keyword' OR caller LIKE "
+                                 "'%.by_star' OR caller LIKE '%.by_alias' OR caller LIKE "
+                                 "'%.by_type_param' OR caller LIKE '%.by_splat_param' OR "
+                                 "caller LIKE '%.by_class_param')");
+    int read = ei_sql_int(store, EI_PY_USAGE_SQL("plain", "handler")) +
+               ei_sql_int(store, EI_PY_USAGE_SQL("by_value", "handler"));
+    ei_cleanup(&lp, store);
+    if (wrong < 0 || rows < 0 || read < 0)
+        return -1;
+    return read + 10 * wrong + 100 * rows;
+}
+
+TEST(ei_py_capture_and_type_param_are_no_decorated_usage) {
+    ASSERT_EQ(ei_py_capture_and_type_param_case(0), 1402);
+    ASSERT_EQ(ei_py_capture_and_type_param_case(60), 1402);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2835,6 +2899,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_compound_rebinding_leaves_reexport_unproven);
     RUN_TEST(ei_py_star_excluded_name_keeps_its_row);
     RUN_TEST(ei_py_replaced_own_def_is_no_reexport_target);
+    RUN_TEST(ei_py_capture_and_type_param_are_no_decorated_usage);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
