@@ -34,6 +34,33 @@ int cbm_export_macro_candidates(const char *source, int source_len,
 // blanks allowed: the line carries on to the next, as simplecpp reads it.
 bool cbm_preprocessor_line_continues(const char *line, int len);
 
+// Where a point of C or C++ source stands lexically, as far as telling a
+// comment from code needs. A block comment and a raw string literal run on
+// past a newline by themselves; a line comment, a string or a character
+// literal only through a backslash ending its line. Zero-initialised: code.
+enum {
+    CBM_SOURCE_CODE,
+    CBM_SOURCE_BLOCK_COMMENT,
+    CBM_SOURCE_LINE_COMMENT,
+    CBM_SOURCE_STRING,
+    CBM_SOURCE_CHAR,
+    CBM_SOURCE_RAW,
+};
+enum { CBM_SOURCE_RAW_DELIM_MAX = 16 }; // the longest raw-string delimiter
+typedef struct {
+    int mode;                                     // CBM_SOURCE_*
+    char raw_close[CBM_SOURCE_RAW_DELIM_MAX + 3]; // `)delim"`, ending the raw string
+} cbm_source_lexer_t;
+
+// Read one line of C or C++ source (`len` bytes, no newline) from the state
+// `lexer` holds, and leave it in the state the next line starts in
+// (`continues`: a backslash ends this line). Returns whether a byte outside
+// comments is not blank: the line holds code. With `blank_out` (the line's
+// bytes in a writable copy), every byte outside comments there becomes a
+// space.
+bool cbm_source_lex_line(cbm_source_lexer_t *lexer, const char *line, int len, bool continues,
+                         char *blank_out);
+
 // Preprocess C/C++ source: expand macros, evaluate #ifdef, resolve #include.
 // Returns malloc-allocated expanded source, or NULL if no expansion needed/on failure.
 // extra_defines: NULL-terminated array of "NAME=VALUE" strings (can be NULL).

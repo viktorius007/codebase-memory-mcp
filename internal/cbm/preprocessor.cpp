@@ -5,6 +5,7 @@
 #include "preprocessor.h"
 #include "vendored/simplecpp/simplecpp.h"
 
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -92,7 +93,9 @@ static bool is_identifier_char(char c) {
 // (unterminated, malformed delimiter) — the caller then STOPS collecting so
 // the mis-modeled literal cannot poison the scan state of the rest of the
 // file (#1989 review).
-static int skip_raw_string(const char *source, int source_len, int quote) {
+// The index of the `(` ending the delimiter of a raw string whose quote is at
+// `quote`, or -1 when no valid delimiter ends there.
+static int raw_string_delimiter_end(const char *source, int source_len, int quote) {
     int j = quote + 1;
     int delim_start = j;
     while (j < source_len) {
@@ -105,12 +108,18 @@ static int skip_raw_string(const char *source, int source_len, int quote) {
         // (R"""(...)""" compiles), so it must not end the delimiter (#1989
         // review round 3).
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ')' || c == '\\' ||
-            j - delim_start >= 16) {
+            j - delim_start >= CBM_SOURCE_RAW_DELIM_MAX) {
             return -1;
         }
         j++;
     }
-    if (j >= source_len || source[j] != '(') {
+    return j < source_len && source[j] == '(' ? j : -1;
+}
+
+static int skip_raw_string(const char *source, int source_len, int quote) {
+    int delim_start = quote + 1;
+    int j = raw_string_delimiter_end(source, source_len, quote);
+    if (j < 0) {
         return -1;
     }
     int delim_len = j - delim_start;
@@ -137,17 +146,19 @@ static int skip_raw_string(const char *source, int source_len, int quote) {
 // an ordinary identifier (including an identifier merely ENDING in R — only a
 // standalone prefix token starts a raw string) and -1 on an unrecognizable
 // raw form.
-static int raw_string_after_prefix(const char *source, int source_len, int start, int end) {
+static bool is_raw_string_prefix(const char *id, size_t idlen) {
     static const char *prefixes[] = {"R", "LR", "uR", "UR", "u8R", NULL};
-    size_t idlen = (size_t)(end - start);
-    bool is_prefix = false;
     for (int p = 0; prefixes[p]; p++) {
-        if (idlen == strlen(prefixes[p]) && strncmp(source + start, prefixes[p], idlen) == 0) {
-            is_prefix = true;
-            break;
+        if (idlen == strlen(prefixes[p]) && strncmp(id, prefixes[p], idlen) == 0) {
+            return true;
         }
     }
-    if (!is_prefix || end >= source_len || source[end] != '"') {
+    return false;
+}
+
+static int raw_string_after_prefix(const char *source, int source_len, int start, int end) {
+    if (!is_raw_string_prefix(source + start, (size_t)(end - start)) || end >= source_len ||
+        source[end] != '"') {
         return 0;
     }
     return skip_raw_string(source, source_len, end);
@@ -464,9 +475,113 @@ static bool is_source_line_directive(const char *line, size_t len) {
     return i < len && line[i] >= '0' && line[i] <= '9';
 }
 
-// The source with every line-number directive blanked, its newlines kept (a
-// directive continued with a backslash blanks each of its lines; a line that
-// continues another line is never a directive).
+// Whether the quote at `line[quote]` opens a raw string: a prefix token
+// (R, LR, uR, UR, u8R) before it.
+static bool opens_raw_string(const char *line, int quote) {
+    int token = quote;
+    while (token > 0 && is_identifier_char(line[token - 1])) {
+        token--;
+    }
+    return is_raw_string_prefix(line + token, (size_t)(quote - token));
+}
+
+// Whether the apostrophe at `line[quote]` separates digits (C++14 `1'000`)
+// rather than opening a character literal: it continues a number.
+static bool is_digit_separator(const char *line, int quote) {
+    int token = quote;
+    while (token > 0 && (is_identifier_char(line[token - 1]) || line[token - 1] == '.')) {
+        token--;
+    }
+    return token < quote && line[token] >= '0' && line[token] <= '9';
+}
+
+// One step of the lexer from code at `line[k]`: the mode it enters and the
+// bytes the step reads.
+static int lex_from_code(cbm_source_lexer_t *lexer, const char *line, int len, int k) {
+    const char c = line[k];
+    const char next = k + 1 < len ? line[k + 1] : '\0';
+    if (c == '/' && next == '*') {
+        lexer->mode = CBM_SOURCE_BLOCK_COMMENT;
+        return 2;
+    }
+    if (c == '/' && next == '/') {
+        lexer->mode = CBM_SOURCE_LINE_COMMENT;
+        return 1;
+    }
+    const int open =
+        c == '"' && opens_raw_string(line, k) ? raw_string_delimiter_end(line, len, k) : -1;
+    if (open > 0) {
+        snprintf(lexer->raw_close, sizeof(lexer->raw_close), ")%.*s\"", open - k - 1, line + k + 1);
+        lexer->mode = CBM_SOURCE_RAW;
+        return open - k + 1;
+    }
+    if (c == '"') {
+        lexer->mode = CBM_SOURCE_STRING;
+    } else if (c == '\'' && !is_digit_separator(line, k)) {
+        lexer->mode = CBM_SOURCE_CHAR;
+    }
+    return 1;
+}
+
+bool cbm_source_lex_line(cbm_source_lexer_t *lexer, const char *line, int len, bool continues,
+                         char *blank_out) {
+    bool code = false;
+    for (int k = 0; k < len;) {
+        bool comment =
+            lexer->mode == CBM_SOURCE_BLOCK_COMMENT || lexer->mode == CBM_SOURCE_LINE_COMMENT;
+        int unit = 1;
+        const char c = line[k];
+        switch (lexer->mode) {
+        case CBM_SOURCE_CODE:
+            unit = lex_from_code(lexer, line, len, k);
+            comment =
+                lexer->mode == CBM_SOURCE_BLOCK_COMMENT || lexer->mode == CBM_SOURCE_LINE_COMMENT;
+            break;
+        case CBM_SOURCE_BLOCK_COMMENT:
+            if (c == '*' && k + 1 < len && line[k + 1] == '/') {
+                lexer->mode = CBM_SOURCE_CODE;
+                unit = 2;
+            }
+            break;
+        case CBM_SOURCE_STRING:
+        case CBM_SOURCE_CHAR:
+            if (c == '\\') {
+                unit = 2;
+            } else if (c == (lexer->mode == CBM_SOURCE_STRING ? '"' : '\'')) {
+                lexer->mode = CBM_SOURCE_CODE;
+            }
+            break;
+        case CBM_SOURCE_RAW: {
+            const size_t close_len = std::strlen(lexer->raw_close);
+            if ((size_t)(len - k) >= close_len &&
+                std::strncmp(line + k, lexer->raw_close, close_len) == 0) {
+                lexer->mode = CBM_SOURCE_CODE;
+                unit = (int)close_len;
+            }
+            break;
+        }
+        default: // CBM_SOURCE_LINE_COMMENT: to the end of the line
+            break;
+        }
+        unit = std::min(unit, len - k);
+        for (int b = k; !comment && b < k + unit; b++) {
+            code = code || (line[b] != ' ' && line[b] != '\t' && line[b] != '\r');
+            if (blank_out) {
+                blank_out[b] = ' ';
+            }
+        }
+        k += unit;
+    }
+    if (lexer->mode != CBM_SOURCE_BLOCK_COMMENT && lexer->mode != CBM_SOURCE_RAW && !continues) {
+        lexer->mode = CBM_SOURCE_CODE;
+    }
+    return code;
+}
+
+// The source with every line-number directive blanked, its newlines and its
+// comments kept (a directive continued with a backslash blanks each of its
+// lines; a line that continues another line, or starts inside a comment or a
+// raw string, is never a directive).
 //
 // A directive re-labels the lines after it: under `#line 40 "parse.y"`, which
 // generated bison, flex and lemon parsers carry, the expanded buffer names
@@ -477,8 +592,15 @@ static bool is_source_line_directive(const char *line, size_t len) {
 // Every row this file supplies to the expanded buffer must map to the line it
 // is written on, the line the raw parse and every definition use; only a
 // header read through a named include directory supplies rows of another file.
+//
+// The scan reads comments and literals as the preprocessor does
+// (cbm_source_lex_line). `# 2 "notes"` inside a block comment is comment
+// text: blanked, it took the comment's closer with it and hid the code after
+// it. `#line 20 "gen.y"` followed by a comment opener keeps the comment:
+// blanked whole, the commented-out lines after it became code.
 static std::string without_line_directives(const char *source, int source_len) {
     std::string out(source, (size_t)source_len);
+    cbm_source_lexer_t lexer = {};
     bool continued = false; // this line continues the one above
     bool blanking = false;  // ... and that one was a directive being blanked
     for (size_t start = 0; start < out.size();) {
@@ -490,17 +612,13 @@ static std::string without_line_directives(const char *source, int source_len) {
         if (content_end > start && out[content_end - 1] == '\r') {
             content_end--;
         }
-        bool continues =
-            cbm_preprocessor_line_continues(out.c_str() + start, (int)(content_end - start));
-        if (continued ? blanking
-                      : is_source_line_directive(out.c_str() + start, content_end - start)) {
-            for (size_t k = start; k < content_end; k++) {
-                out[k] = ' ';
-            }
-            blanking = true;
-        } else {
-            blanking = false;
+        const char *line = source + start;
+        const int len = (int)(content_end - start);
+        const bool continues = cbm_preprocessor_line_continues(line, len);
+        if (!continued) {
+            blanking = lexer.mode == CBM_SOURCE_CODE && is_source_line_directive(line, (size_t)len);
         }
+        cbm_source_lex_line(&lexer, line, len, continues, blanking ? &out[start] : nullptr);
         continued = continues;
         start = end + 1;
     }

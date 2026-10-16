@@ -7964,6 +7964,79 @@ TEST(extract_c_preprocessed_calls_under_line_directive_keep_physical_line) {
     PASS();
 }
 
+/* A line-number directive is blanked before the preprocessor reads the file,
+ * and the scan that finds it reads comments as the preprocessor does: a
+ * `# N "f"` that is comment text is no directive, and a directive's comment
+ * stays a comment. Each row is a C file whose call to `target` happens through
+ * CALL, which only the preprocessed pass sees, and the lines that call is
+ * reported on (0: none).
+ * - `# 2 "items"` followed by a comment's closing star-slash, inside the
+ *   comment: blanked, it took the closer with it, the comment ran over caller,
+ *   and its call was dropped without a record;
+ * - `#line 20 "gen.y"` followed by a comment opener: blanked whole, the
+ *   commented-out call after it became code and was published;
+ * - bison's `#line 40 "parse.y"` with a comment closed on its line: both calls
+ *   keep their physical lines;
+ * - a comment opener inside a string, or after a character literal's quote,
+ *   opens no comment: the directive after it is still blanked. */
+TEST(extract_c_line_directive_scan_reads_comments_as_the_preprocessor_does) {
+    static const struct {
+        const char *name;
+        const char *src;
+        int lines[2];
+    } rows[] = {
+        {"directive text closing a comment",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\n/* release notes\n"
+         "# 2 \"items\" */\nint caller(int v) {\n    return CALL(v);\n}\n",
+         {6, 0}},
+        {"directive opening a comment",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\nint caller(int v) {\n"
+         "#line 20 \"gen.y\" /* disabled:\n    CALL(v);\n*/\n    return v;\n}\n",
+         {0, 0}},
+        {"directive with a closed comment",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\n"
+         "#line 40 \"parse.y\" /* yacc.c:339  */\nint gen_rule(int v) {\n    return CALL(v);\n}\n"
+         "# 9 \"gen/parse.c\"\nint after(int v) {\n    return CALL(v);\n}\n",
+         {5, 9}},
+        {"comment opener in a string",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\n"
+         "const char *glob = \"image/*\";\n#line 40 \"parse.y\"\nint rule(int v) {\n"
+         "    return CALL(v);\n}\n",
+         {6, 0}},
+        {"comment opener after a character literal quote",
+         "int target(int v) { return v; }\n#define CALL(v) target(v)\n"
+         "char quote = '\"'; /* \" */\n#line 40 \"parse.y\"\nint rule(int v) {\n"
+         "    return CALL(v);\n}\n",
+         {6, 0}},
+    };
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        CBMFileResult *res = cbm_extract_file(rows[r].src, (int)strlen(rows[r].src), CBM_LANG_C,
+                                              "t", "gen/parse.c", 0, NULL, NULL);
+        ASSERT_NOT_NULL(res);
+        int lines[2] = {0, 0};
+        int found = 0;
+        for (int i = 0; i < res->calls.count; i++) {
+            const CBMCall *c = &res->calls.items[i];
+            if (c->callee_name && strcmp(c->callee_name, "target") == 0 && found < 2) {
+                lines[found++] = c->start_line;
+            }
+        }
+        cbm_free_result(res);
+        if (lines[0] > lines[1] && lines[1] != 0) {
+            int swap = lines[0];
+            lines[0] = lines[1];
+            lines[1] = swap;
+        }
+        if (lines[0] != rows[r].lines[0] || lines[1] != rows[r].lines[1]) {
+            printf("  %s: calls on lines %d,%d, want %d,%d\n", rows[r].name, lines[0], lines[1],
+                   rows[r].lines[0], rows[r].lines[1]);
+        }
+        ASSERT_EQ(lines[0], rows[r].lines[0]);
+        ASSERT_EQ(lines[1], rows[r].lines[1]);
+    }
+    PASS();
+}
+
 /* #961 inverse guard: a clean C file must not gain duplicate or phantom
  * defs from the recovery path (it only engages on raw-parse ERROR regions). */
 TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
@@ -13351,6 +13424,7 @@ SUITE(extraction) {
     RUN_TEST(extract_c_preprocessed_pass_ignores_working_directory);
     RUN_TEST(extract_c_preprocessed_calls_carry_original_lines);
     RUN_TEST(extract_c_preprocessed_calls_under_line_directive_keep_physical_line);
+    RUN_TEST(extract_c_line_directive_scan_reads_comments_as_the_preprocessor_does);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling);
     RUN_TEST(extract_c_misnested_raw_struct_replaced_by_flat_copy);

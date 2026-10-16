@@ -1657,11 +1657,12 @@ static bool cbm_is_directive_line(const char *line, int len) {
 }
 
 /* Set CBM_LINE_NO_CODE on every line of `src` that holds no construct.
- * One pass over the file. Carries block-comment state across lines so a line
- * in the middle of a comment counts as no-code too. */
+ * One pass over the file, reading comments and literals as the preprocessor
+ * does (cbm_source_lex_line), so a line in the middle of a comment counts as
+ * no-code too and a comment opener inside a string opens nothing. */
 static void cbm_mark_no_code_lines(const char *src, int src_len, uint8_t *map,
                                    uint32_t line_count) {
-    bool in_block = false;
+    cbm_source_lexer_t lexer = {0};
     bool in_directive = false;
     uint32_t line = 1;
     int i = 0;
@@ -1670,34 +1671,16 @@ static void cbm_mark_no_code_lines(const char *src, int src_len, uint8_t *map,
         while (end < src_len && src[end] != '\n') {
             end++;
         }
-        bool has_code = false;
-        bool line_starts_in_block = in_block;
-        for (int j = i; j < end; j++) {
-            if (in_block) {
-                if (src[j] == '*' && j + 1 < end && src[j + 1] == '/') {
-                    in_block = false;
-                    j++;
-                }
-                continue;
-            }
-            if (src[j] == '/' && j + 1 < end && src[j + 1] == '*') {
-                in_block = true;
-                j++;
-                continue;
-            }
-            if (src[j] == '/' && j + 1 < end && src[j + 1] == '/') {
-                break; /* rest of the line is a comment */
-            }
-            if (src[j] != ' ' && src[j] != '\t' && src[j] != '\r') {
-                has_code = true;
-            }
-        }
+        bool line_starts_in_block =
+            lexer.mode == CBM_SOURCE_BLOCK_COMMENT || lexer.mode == CBM_SOURCE_RAW;
+        bool continues = cbm_preprocessor_line_continues(src + i, end - i);
+        bool has_code = cbm_source_lex_line(&lexer, src + i, end - i, continues, NULL);
         bool directive =
             !line_starts_in_block && (in_directive || cbm_is_directive_line(src + i, end - i));
         if (!has_code || directive) {
             map[line] |= CBM_LINE_NO_CODE;
         }
-        in_directive = directive && cbm_preprocessor_line_continues(src + i, end - i);
+        in_directive = directive && continues;
         line++;
         i = end + 1;
     }
