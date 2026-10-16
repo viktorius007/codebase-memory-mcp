@@ -2064,9 +2064,111 @@ static bool pxc_python_module_located(const cbm_pipeline_ctx_t *ctx, const char 
     return owner && owner == pxc_python_owner_module(ctx->gbuf, located);
 }
 
+/* The namespace facts of every module source an import-map build has read,
+ * shared by all builds of the process. A pass builds one file's map at a time,
+ * up to four times per file (lsp_cross, calls, usages, semantic), and every
+ * imported module is read to find the statement that last binds the name; a
+ * module many files import from would otherwise be parsed once per importing
+ * file and pass. An entry is keyed by the source's absolute path and answers
+ * only when the bytes read now equal the bytes it was extracted from, so an
+ * edited file is extracted again; the facts are content-only (cbm.h), so equal
+ * bytes give equal facts. A build copies the facts into its own arena. The
+ * cache is emptied when an entry would take it past PXC_PY_FACTS_CACHE_BYTES. */
+enum { PXC_PY_FACTS_CACHE_BYTES = CBM_SZ_64 * CBM_SZ_1K * CBM_SZ_1K };
+
+typedef struct {
+    CBMArena arena;
+    const char *path;
+    const char *source;
+    int source_len;
+    bool usable;
+    CBMPyNamespaceFacts facts;
+} PXCPythonCachedFacts;
+
+static atomic_flag g_pxc_py_facts_lock = ATOMIC_FLAG_INIT;
+static CBMHashTable *g_pxc_py_facts; /* absolute path -> PXCPythonCachedFacts */
+static size_t g_pxc_py_facts_bytes;
+
+static void pxc_py_facts_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_pxc_py_facts_lock, memory_order_acquire)) {}
+}
+
+static void pxc_py_facts_unlock(void) {
+    atomic_flag_clear_explicit(&g_pxc_py_facts_lock, memory_order_release);
+}
+
+static void pxc_py_cached_facts_free(PXCPythonCachedFacts *entry) {
+    if (!entry)
+        return;
+    cbm_arena_destroy(&entry->arena);
+    cbm_free(CBM_MEM_CLASS_OTHER, entry);
+}
+
+static void pxc_py_cached_facts_free_each(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    pxc_py_cached_facts_free(value);
+}
+
+/* Copies the cached facts of `path` into `arena` when the cache holds them
+ * for exactly `source`. True on such a hit, with *usable set. */
+static bool pxc_py_facts_cache_get(const char *path, const char *source, int source_len,
+                                   CBMArena *arena, CBMPyNamespaceFacts *out, bool *usable) {
+    bool hit = false;
+    pxc_py_facts_lock();
+    const PXCPythonCachedFacts *entry = g_pxc_py_facts ? cbm_ht_get(g_pxc_py_facts, path) : NULL;
+    if (entry && entry->source_len == source_len &&
+        memcmp(entry->source, source, (size_t)source_len) == 0) {
+        hit = true;
+        *usable = entry->usable && cbm_py_namespace_facts_copy(arena, &entry->facts, out);
+    }
+    pxc_py_facts_unlock();
+    return hit;
+}
+
+static void pxc_py_facts_cache_put(const char *path, const char *source, int source_len,
+                                   bool usable, const CBMPyNamespaceFacts *facts) {
+    PXCPythonCachedFacts *entry = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*entry));
+    if (!entry)
+        return;
+    cbm_arena_init_sized(&entry->arena, CBM_SZ_4K);
+    char *copy = cbm_arena_alloc(&entry->arena, (size_t)source_len);
+    if (copy)
+        memcpy(copy, source, (size_t)source_len);
+    entry->path = cbm_arena_strdup(&entry->arena, path);
+    entry->source = copy;
+    entry->source_len = source_len;
+    entry->usable = usable && cbm_py_namespace_facts_copy(&entry->arena, facts, &entry->facts);
+    if (!entry->path || !entry->source || (usable && !entry->usable)) {
+        pxc_py_cached_facts_free(entry);
+        return;
+    }
+    size_t bytes = cbm_arena_capacity(&entry->arena);
+    pxc_py_facts_lock();
+    if (!g_pxc_py_facts)
+        g_pxc_py_facts = cbm_ht_create_in(CBM_MEM_CLASS_OTHER, CBM_SZ_64);
+    PXCPythonCachedFacts *old = g_pxc_py_facts ? cbm_ht_delete(g_pxc_py_facts, path) : NULL;
+    if (old)
+        g_pxc_py_facts_bytes -= cbm_arena_capacity(&old->arena);
+    if (g_pxc_py_facts && g_pxc_py_facts_bytes + bytes > (size_t)PXC_PY_FACTS_CACHE_BYTES) {
+        cbm_ht_foreach(g_pxc_py_facts, pxc_py_cached_facts_free_each, NULL);
+        cbm_ht_clear(g_pxc_py_facts);
+        g_pxc_py_facts_bytes = 0;
+    }
+    if (g_pxc_py_facts && bytes <= (size_t)PXC_PY_FACTS_CACHE_BYTES) {
+        (void)cbm_ht_set(g_pxc_py_facts, entry->path, entry);
+        g_pxc_py_facts_bytes += bytes;
+        entry = NULL;
+    }
+    pxc_py_facts_unlock();
+    pxc_py_cached_facts_free(old);
+    pxc_py_cached_facts_free(entry);
+}
+
 /* The ordered namespace facts of one project module, read from its source once
- * per build. False when the source cannot be read or its facts are incomplete:
- * nothing about that module's names is then proven. */
+ * per build and extracted once per source content (pxc_py_facts_cache_get).
+ * False when the source cannot be read or its facts are incomplete: nothing
+ * about that module's names is then proven. */
 static bool pxc_python_module_facts(PXCPythonResolver *pr, const cbm_gbuf_node_t *owner,
                                     CBMPyNamespaceFacts *out) {
     memset(out, 0, sizeof(*out));
@@ -2086,15 +2188,21 @@ static bool pxc_python_module_facts(PXCPythonResolver *pr, const cbm_gbuf_node_t
     int n = snprintf(path, sizeof(path), "%s/%s", pr->ctx->repo_path, owner->file_path);
     int source_len = 0;
     char *source = n > 0 && (size_t)n < sizeof(path) ? pxc_read_file(path, &source_len) : NULL;
-    CBMFileResult *result =
-        source ? cbm_extract_file(source, source_len, CBM_LANG_PYTHON, pr->project_name,
-                                  owner->file_path, CBM_EXTRACT_BUDGET, NULL, NULL)
-               : NULL;
+    if (!source || !pxc_py_facts_cache_get(path, source, source_len, &pr->arena, &entry->facts,
+                                           &entry->usable)) {
+        CBMFileResult *result =
+            source ? cbm_extract_file(source, source_len, CBM_LANG_PYTHON, pr->project_name,
+                                      owner->file_path, CBM_EXTRACT_BUDGET, NULL, NULL)
+                   : NULL;
+        entry->usable =
+            result && result->py_namespace.status == CBM_PY_NS_COMPLETE &&
+            cbm_py_namespace_facts_valid(&result->py_namespace) &&
+            cbm_py_namespace_facts_copy(&pr->arena, &result->py_namespace, &entry->facts);
+        if (source && result)
+            pxc_py_facts_cache_put(path, source, source_len, entry->usable, &entry->facts);
+        cbm_free_result(result);
+    }
     cbm_free(CBM_MEM_CLASS_EXTRACT, source);
-    entry->usable = result && result->py_namespace.status == CBM_PY_NS_COMPLETE &&
-                    cbm_py_namespace_facts_valid(&result->py_namespace) &&
-                    cbm_py_namespace_facts_copy(&pr->arena, &result->py_namespace, &entry->facts);
-    cbm_free_result(result);
     (void)cbm_ht_set(pr->facts, key, entry);
     *out = entry->facts;
     return entry->usable;
