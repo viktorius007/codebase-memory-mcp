@@ -127,6 +127,7 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     e->items[e->count].pkg_name = pkg_name;
     e->items[e->count].entry_rel = entry_rel;
     e->items[e->count].manifest_rel = NULL;
+    e->items[e->count].crate = CBM_CRATE_NONE;
     e->items[e->count].crate_manifest_rel = NULL;
     e->count++;
 }
@@ -459,17 +460,19 @@ static char *rust_path_dep_manifest(const char *rel_path, const char *dep_path) 
     return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, out);
 }
 
-/* Record that the files under manifest `rel_path` reach crate `name` as the
- * one `crate_manifest` declares (mem_core, taken; NULL records nothing). */
-static void push_rust_crate_visibility(cbm_pkg_entries_t *entries, const char *name,
-                                       char *crate_manifest) {
+/* Record what the files of the manifest being parsed reach by `name`: a
+ * crate record of `kind` naming `crate_manifest` (mem_core, taken; NULL for a
+ * kind that names no crate, or a path out of the repository). */
+static void push_rust_crate_record(cbm_pkg_entries_t *entries, const char *name,
+                                   cbm_crate_record_t kind, char *crate_manifest) {
     /* heap like every entry's pkg_name, which cbm_pkg_entries_free releases */
-    char *key = name && crate_manifest ? strdup(name) : NULL;
+    char *key = name ? strdup(name) : NULL;
     int slot = entries->count;
     if (key) {
         pkg_entries_push(entries, key, NULL);
     }
     if (entries->count > slot) {
+        entries->items[slot].crate = kind;
         entries->items[slot].crate_manifest_rel = crate_manifest;
     } else {
         cbm_free(CBM_MEM_CLASS_OTHER, crate_manifest);
@@ -479,9 +482,12 @@ static void push_rust_crate_visibility(cbm_pkg_entries_t *entries, const char *n
 /* Rust: Cargo.toml — [package] name, plus every name a `use` can give a crate:
  * the package name and [lib] name of this manifest and the key of each `path`
  * dependency (which may rename it) name crates of the repository; the key of
- * any other dependency names an external crate. Which crate a name reaches
- * from this manifest's files is recorded too (push_rust_crate_visibility):
- * its own package, and each path dependency's crate. */
+ * any other dependency names an external crate. What this manifest's files
+ * reach by a name is recorded too (push_rust_crate_record): the manifest
+ * itself (and whether it roots a workspace), its own package, each path
+ * dependency's crate, each dependency inherited with `workspace = true`, and
+ * for a workspace root each [workspace.dependencies] path entry. A registry
+ * dependency records nothing: what it names is outside the repository. */
 static void parse_cargo_toml(const char *source, int source_len, const char *rel_path,
                              cbm_pkg_entries_t *entries) {
     CBMCargoManifest *manifest =
@@ -490,6 +496,9 @@ static void parse_cargo_toml(const char *source, int source_len, const char *rel
         CBMArena arena;
         cbm_arena_init(&arena);
         cbm_cargo_parse(&arena, source, source_len, manifest);
+        push_rust_crate_record(
+            entries, "", manifest->is_workspace_root ? CBM_CRATE_WORKSPACE : CBM_CRATE_MANIFEST,
+            NULL);
         push_rust_crate_head(entries, manifest->package_name, rel_path, false);
         push_rust_crate_head(entries, manifest->lib_name, rel_path, false);
         for (int i = 0; i < manifest->dep_count; i++) {
@@ -497,10 +506,14 @@ static void parse_cargo_toml(const char *source, int source_len, const char *rel
                                  manifest->deps[i].path == NULL);
         }
         for (int i = 0; i < manifest->dep_count; i++) {
-            if (manifest->deps[i].path) {
-                push_rust_crate_visibility(
-                    entries, manifest->deps[i].name,
-                    rust_path_dep_manifest(rel_path, manifest->deps[i].path));
+            const CBMCargoDep *dep = &manifest->deps[i];
+            if (dep->workspace && !dep->workspace_table) {
+                push_rust_crate_record(entries, dep->name, CBM_CRATE_INHERIT, NULL);
+            } else if (dep->path) {
+                push_rust_crate_record(entries, dep->name,
+                                       dep->workspace_table ? CBM_CRATE_WORKSPACE_DEP
+                                                            : CBM_CRATE_REACH,
+                                       rust_path_dep_manifest(rel_path, dep->path));
             }
         }
         cbm_arena_destroy(&arena);
@@ -519,8 +532,8 @@ static void parse_cargo_toml(const char *source, int source_len, const char *rel
     int slot = entries->count;
     pkg_entries_push(entries, name, entry);
     if (entries->count > slot) {
-        push_rust_crate_visibility(entries, entries->items[slot].pkg_name,
-                                   cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path));
+        push_rust_crate_record(entries, entries->items[slot].pkg_name, CBM_CRATE_REACH,
+                               cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path));
     }
 }
 
@@ -1252,9 +1265,9 @@ static pkg_eco_t pkgmap_importer_ecosystem(const char *source_rel) {
  * every importer that meant the other -- one that a deterministic index then
  * repeats every run. Such a name is withheld in its ecosystem: present with a
  * NULL target, logged once. A lookup that reaches a withheld name ends there,
- * unresolved (pkgmap_lookup). The importer can still decide it: a Rust file
- * reaches the crate its own Cargo manifest declares -- the package itself, or
- * a path dependency.
+ * unresolved (pkgmap_lookup). A Rust importer's own Cargo manifest can still
+ * decide it (pkgmap_crate_decision): the package itself, a path dependency,
+ * or through `workspace = true` its workspace root's entry.
  *
  * Every map key and value is mem_core (CBM_MEM_CLASS_OTHER). Beside the names,
  * the map holds side records under keys no module path spells (a specifier
@@ -1262,12 +1275,28 @@ static pkg_eco_t pkgmap_importer_ecosystem(const char *source_rel) {
  *   "\nE<e><name>"     the target ecosystem <e> ('a' + pkg_eco_t) gives
  *                      <name>, when two ecosystems declare it; the bare name
  *                      is then withheld for every other importer
- *   "\nR<name>\n<dir>" the target Rust files under <dir> reach by a withheld
- *                      <name>; "" when <dir>'s manifest names two
+ *   "\nM\n<dir>"       <dir> holds a Cargo manifest: "w" a workspace root, "p"
+ *                      any other
+ *   "\nR<name>\n<dir>" what the Rust files of <dir>'s manifest reach by a
+ *                      withheld <name>: a target; PKGMAP_INHERIT, their
+ *                      workspace root's "W" record; "" undecided (a path out
+ *                      of the repository, two crates for one name)
+ *   "\nW<name>\n<dir>" the [workspace.dependencies] path entry of the
+ *                      workspace rooted at <dir> for <name>: a target or ""
+ * These records exist only when a name Rust files read is withheld.
  * Presence keys ("<crate>::", "<crate>::#extern") are only ever tested for
  * existence and keep the smallest manifest's entry. */
 
-enum { PKGMAP_SIDE_MARK = '\n', PKGMAP_ECO_KIND = 'E', PKGMAP_REACH_KIND = 'R' };
+enum {
+    PKGMAP_SIDE_MARK = '\n',
+    PKGMAP_ECO_KIND = 'E',
+    PKGMAP_MANIFEST_KIND = 'M',
+    PKGMAP_REACH_KIND = 'R',
+    PKGMAP_WORKSPACE_KIND = 'W',
+};
+
+/* An "R" value no target spells (a QN holds no newline). */
+#define PKGMAP_INHERIT "\n"
 
 /* Release a table whose keys and values are both mem_core. */
 static void pkgmap_free_core_entry(const char *key, void *value, void *userdata) {
@@ -1303,12 +1332,13 @@ static void pkgmap_note_primary(CBMHashTable *primaries, const char *name, const
     }
 }
 
-/* The side key for `name` under `dir` ("<dir>" is the first `dir_len` bytes).
- * False when it does not fit: nothing decides the name there. */
-static bool pkgmap_side_key(char *buf, size_t cap, const char *name, const char *dir,
+/* The side key of `kind` for `name` under `dir` ("<dir>" is the first
+ * `dir_len` bytes). False when it does not fit: nothing decides the name
+ * there. */
+static bool pkgmap_side_key(char *buf, size_t cap, char kind, const char *name, const char *dir,
                             size_t dir_len) {
-    int n = snprintf(buf, cap, "%c%c%s%c%.*s", PKGMAP_SIDE_MARK, PKGMAP_REACH_KIND, name,
-                     PKGMAP_SIDE_MARK, (int)dir_len, dir);
+    int n = snprintf(buf, cap, "%c%c%s%c%.*s", PKGMAP_SIDE_MARK, kind, name, PKGMAP_SIDE_MARK,
+                     (int)dir_len, dir);
     return n > 0 && (size_t)n < cap;
 }
 
@@ -1407,12 +1437,16 @@ static void pkgmap_scan_primary(const char *key, void *value, void *userdata) {
     }
 }
 
-/* Put a mem_core copy of `key` -> `qn` (NULL: withheld) into the map. */
+/* Set `key` -> a mem_core copy of `qn` (NULL: withheld) in the map; a new
+ * key is copied too, a held one keeps its stored key. */
 static bool pkgmap_put(CBMHashTable *map, const char *key, const char *qn) {
-    char *owned_key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+    const char *held = cbm_ht_get_key(map, key);
+    char *owned_key = held ? (char *)held : cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
     char *owned_qn = qn ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, qn) : NULL;
     if (!owned_key || (qn && !owned_qn)) {
-        cbm_free(CBM_MEM_CLASS_OTHER, owned_key);
+        if (!held) {
+            cbm_free(CBM_MEM_CLASS_OTHER, owned_key);
+        }
         cbm_free(CBM_MEM_CLASS_OTHER, owned_qn);
         return false;
     }
@@ -1456,64 +1490,104 @@ static void pkgmap_emit_name(const char *name, void *value, void *userdata) {
     }
 }
 
-/* For each name a Rust importer reads withheld, what a Rust file reaches by it
- * from the directory of a Cargo manifest that declares the crate
- * (crate_manifest_rel): that manifest's own target for the name. A crate whose
- * manifest gives the name no target decides nothing; two different crates
- * under one directory make the directory undecided (""). */
+/* The value a crate record gives its side key: the target the named crate's
+ * manifest gives the name ("" when it gives none, or the path leaves the
+ * repository), or PKGMAP_INHERIT. */
+static const char *pkgmap_crate_record_value(const CBMHashTable *primaries,
+                                             const cbm_pkg_entry_t *e) {
+    if (e->crate == CBM_CRATE_INHERIT) {
+        return PKGMAP_INHERIT;
+    }
+    char *primary =
+        e->crate_manifest_rel ? pkgmap_primary_key(e->pkg_name, e->crate_manifest_rel) : NULL;
+    const char *target = primary ? cbm_ht_get(primaries, primary) : NULL;
+    cbm_free(CBM_MEM_CLASS_OTHER, primary);
+    return target ? target : "";
+}
+
+/* The side records of the crate records (see the key scheme above), written
+ * once a name Rust files read is withheld. Two records of one directory that
+ * disagree on a name leave it undecided (""). */
 static void pkgmap_add_crate_decisions(CBMHashTable *map, const CBMHashTable *primaries,
                                        const cbm_pkg_entries_t *worker_entries, int worker_count) {
     for (int w = 0; w < worker_count; w++) {
         const cbm_pkg_entries_t *we = &worker_entries[w];
         for (int i = 0; i < we->count; i++) {
             const cbm_pkg_entry_t *e = &we->items[i];
-            if (!e->crate_manifest_rel || !e->manifest_rel ||
-                !pkgmap_withheld_for(map, e->pkg_name, PKG_ECO_CARGO)) {
+            bool marker = e->crate == CBM_CRATE_MANIFEST || e->crate == CBM_CRATE_WORKSPACE;
+            if (e->crate == CBM_CRATE_NONE || !e->manifest_rel ||
+                (!marker && !pkgmap_withheld_for(map, e->pkg_name, PKG_ECO_CARGO))) {
                 continue;
             }
-            char *primary = pkgmap_primary_key(e->pkg_name, e->crate_manifest_rel);
-            const char *target = primary ? cbm_ht_get(primaries, primary) : NULL;
-            cbm_free(CBM_MEM_CLASS_OTHER, primary);
             const char *dir_end = strrchr(e->manifest_rel, '/');
             size_t dir_len = dir_end ? (size_t)(dir_end - e->manifest_rel) : 0;
+            char kind = marker                                ? PKGMAP_MANIFEST_KIND
+                        : e->crate == CBM_CRATE_WORKSPACE_DEP ? PKGMAP_WORKSPACE_KIND
+                                                              : PKGMAP_REACH_KIND;
             char side[PKGMAP_PATH_BUF];
-            if (!target ||
-                !pkgmap_side_key(side, sizeof(side), e->pkg_name, e->manifest_rel, dir_len)) {
+            if (!pkgmap_side_key(side, sizeof(side), kind, marker ? "" : e->pkg_name,
+                                 e->manifest_rel, dir_len)) {
                 continue;
             }
+            const char *value = marker ? (e->crate == CBM_CRATE_WORKSPACE ? "w" : "p")
+                                       : pkgmap_crate_record_value(primaries, e);
             const char *held = cbm_ht_get(map, side);
-            if (held && (!held[0] || strcmp(held, target) == 0)) {
-                continue;
+            if (!held || (!marker && strcmp(held, value) != 0)) {
+                pkgmap_put(map, side, held ? "" : value);
             }
-            pkgmap_put(map, side, held ? "" : target);
         }
     }
 }
 
-/* What a Rust file `source_rel` reaches by a withheld `name`: the decision of
- * the nearest directory above it that holds one -- its own manifest's, or a
- * workspace root's for an inherited dependency. NULL when nothing decides. */
+/* Move `*dir_len` (a directory of `path`: its first `*dir_len` bytes) to the
+ * nearest directory at or above it holding a Cargo manifest -- a workspace
+ * root's when `workspace_root`. False when there is none. */
+static bool pkgmap_manifest_dir(const CBMHashTable *map, const char *path, size_t *dir_len,
+                                bool workspace_root) {
+    for (;;) {
+        char side[PKGMAP_PATH_BUF];
+        const char *kind =
+            pkgmap_side_key(side, sizeof(side), PKGMAP_MANIFEST_KIND, "", path, *dir_len)
+                ? cbm_ht_get(map, side)
+                : NULL;
+        if (kind && (!workspace_root || kind[0] == 'w')) {
+            return true;
+        }
+        if (*dir_len == 0) {
+            return false;
+        }
+        while (*dir_len > 0 && path[*dir_len - SKIP_ONE] != '/') {
+            (*dir_len)--;
+        }
+        *dir_len -= *dir_len > 0;
+    }
+}
+
+/* What a Rust file `source_rel` reaches by a withheld `name`: what its own
+ * Cargo manifest -- the nearest one at or above the file -- records, and
+ * through `workspace = true` what the workspace root at or above that
+ * manifest records in [workspace.dependencies]. Nothing above the file's own
+ * manifest decides for it. NULL when nothing decides: no manifest, no record
+ * (a registry dependency, or none), a path out of the repository, two crates
+ * for one name. */
 static const char *pkgmap_crate_decision(const CBMHashTable *map, const char *name,
                                          const char *source_rel) {
     const char *leaf = strrchr(source_rel, '/');
-    /* the importer's own directory first, then each one above it */
     size_t dir_len = leaf ? (size_t)(leaf - source_rel) : 0;
-    for (;;) {
-        char side[PKGMAP_PATH_BUF];
-        const char *decided = pkgmap_side_key(side, sizeof(side), name, source_rel, dir_len)
-                                  ? cbm_ht_get(map, side)
-                                  : NULL;
-        if (decided) {
-            return decided[0] ? decided : NULL;
-        }
-        if (dir_len == 0) {
-            return NULL;
-        }
-        while (dir_len > 0 && source_rel[dir_len - SKIP_ONE] != '/') {
-            dir_len--;
-        }
-        dir_len -= dir_len > 0;
+    char side[PKGMAP_PATH_BUF];
+    const char *decided =
+        pkgmap_manifest_dir(map, source_rel, &dir_len, false) &&
+                pkgmap_side_key(side, sizeof(side), PKGMAP_REACH_KIND, name, source_rel, dir_len)
+            ? cbm_ht_get(map, side)
+            : NULL;
+    if (decided && strcmp(decided, PKGMAP_INHERIT) == 0) {
+        decided = pkgmap_manifest_dir(map, source_rel, &dir_len, true) &&
+                          pkgmap_side_key(side, sizeof(side), PKGMAP_WORKSPACE_KIND, name,
+                                          source_rel, dir_len)
+                      ? cbm_ht_get(map, side)
+                      : NULL;
     }
+    return decided && decided[0] ? decided : NULL;
 }
 
 typedef enum { PKGMAP_ABSENT, PKGMAP_FOUND, PKGMAP_WITHHELD } pkgmap_hit_t;
@@ -1561,8 +1635,8 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
     for (int w = 0; primaries && merge.names && w < worker_count; w++) {
         cbm_pkg_entries_t *we = &worker_entries[w];
         for (int i = 0; i < we->count; i++) {
-            if (we->items[i].crate_manifest_rel) {
-                continue; /* a crate-visibility record: pkgmap_add_crate_decisions */
+            if (we->items[i].crate != CBM_CRATE_NONE) {
+                continue; /* a crate record: pkgmap_add_crate_decisions */
             }
             /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
              * prefix (key ends in '\\') keeps its repo-relative DIRECTORY

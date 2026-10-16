@@ -25950,6 +25950,95 @@ TEST(pkgmap_withheld_name_leaves_import_unresolved_in_every_ecosystem) {
     PASS();
 }
 
+/* A crate name two manifests split is decided for a Rust importer by its own
+ * Cargo manifest only -- the nearest one at or above the file -- and above it
+ * only through `workspace = true`, which reaches the workspace root's
+ * [workspace.dependencies] entry. Review fixtures p5, p1 and p2:
+ * - a path dependency out of the repository or absolute, a registry
+ *   dependency, and one a non-root [patch] table replaces (Cargo ignores it)
+ *   decide nothing, where the old walk took the root crate's decision;
+ * - `workspace = true` in each spelling (inline, dotted, table) reaches the
+ *   workspace's entry; a `[dependencies.dep]` table path dependency and a
+ *   relative one reach their crate; a file under the root package's tests/
+ *   reaches the root package. */
+TEST(pkgmap_split_crate_name_is_decided_by_the_importers_own_manifest) {
+    static const char dep[] = "[package]\nname = \"dep\"\n";
+    static const struct {
+        const char *path;
+        const char *source;
+    } manifests[] = {
+        /* p5 */
+        {"p5/Cargo.toml", dep},
+        {"p5/forks/dep/Cargo.toml", dep},
+        {"p5/tools/abs/Cargo.toml",
+         "[package]\nname = \"abs\"\n[dependencies]\ndep = { path = \"/abs/p5/forks/dep\" }\n"},
+        {"p5/tools/out/Cargo.toml", "[package]\nname = \"outp\"\n[dependencies]\n"
+                                    "dep = { path = \"../../../../elsewhere/dep\" }\n"},
+        {"p5/tools/reg/Cargo.toml", "[package]\nname = \"reg\"\n[dependencies]\ndep = \"1.0\"\n"},
+        {"p5/tools/rel/Cargo.toml",
+         "[package]\nname = \"rel\"\n[dependencies]\ndep = { path = \"../../forks/dep\" }\n"},
+        /* p1 */
+        {"p1/other/dep/Cargo.toml", dep},
+        {"p1/ws/Cargo.toml", "[workspace]\nmembers = [\"dep\", \"reg\", \"inh\"]\n\n"
+                             "[workspace.dependencies]\ndep = { path = \"dep\" }\n"},
+        {"p1/ws/dep/Cargo.toml", dep},
+        {"p1/ws/reg/Cargo.toml", "[package]\nname = \"reg\"\n[dependencies]\ndep = \"1.0\"\n"},
+        {"p1/ws/inh/Cargo.toml",
+         "[package]\nname = \"inh\"\n[dependencies]\ndep = { workspace = true }\n"},
+        {"p1/ws/dotted/Cargo.toml",
+         "[package]\nname = \"dotted\"\n[dependencies]\ndep.workspace = true\n"},
+        {"p1/ws/table/Cargo.toml",
+         "[package]\nname = \"table\"\n[dependencies.dep]\nworkspace = true\n"},
+        /* p2 */
+        {"p2/Cargo.toml", "[workspace]\nmembers = [\"z/*\"]\n\n"
+                          "[workspace.dependencies]\ndep = { path = \"a/dep\" }\n"},
+        {"p2/a/dep/Cargo.toml", dep},
+        {"p2/z/dep/Cargo.toml", dep},
+        {"p2/z/patch/Cargo.toml", "[package]\nname = \"patchu\"\n[dependencies]\ndep = \"1.0\"\n\n"
+                                  "[patch.crates-io]\ndep = { path = \"../dep\" }\n"},
+        {"p2/z/tbl/Cargo.toml", "[package]\nname = \"tbl\"\n[dependencies.dep]\npath = \"../dep\"\n"},
+    };
+    static const struct {
+        const char *importer;
+        const char *reaches; /* "" : unresolved */
+    } rows[] = {
+        {"p5/tests/it.rs", "p.p5.src.lib.shared_entry"},
+        {"p5/tools/rel/src/lib.rs", "p.p5.forks.dep.src.lib.shared_entry"},
+        {"p5/tools/abs/src/lib.rs", ""},
+        {"p5/tools/out/src/lib.rs", ""},
+        {"p5/tools/reg/src/lib.rs", ""},
+        {"p1/ws/reg/src/lib.rs", ""},
+        {"p1/ws/inh/src/lib.rs", "p.p1.ws.dep.src.lib.shared_entry"},
+        {"p1/ws/dotted/src/lib.rs", "p.p1.ws.dep.src.lib.shared_entry"},
+        {"p1/ws/table/src/lib.rs", "p.p1.ws.dep.src.lib.shared_entry"},
+        {"p2/z/patch/src/lib.rs", ""},
+        {"p2/z/tbl/src/lib.rs", "p.p2.z.dep.src.lib.shared_entry"},
+    };
+    enum { MANIFESTS = sizeof(manifests) / sizeof(manifests[0]) };
+    const char *paths[MANIFESTS];
+    const char *sources[MANIFESTS];
+    for (int m = 0; m < MANIFESTS; m++) {
+        paths[m] = manifests[m].path;
+        sources[m] = manifests[m].source;
+    }
+    CBMHashTable *map = pkgmap_from_manifests(paths, sources, MANIFESTS);
+    char got[sizeof(rows) / sizeof(rows[0])][256];
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        pkgmap_resolve_into(rows[r].importer, "dep/shared_entry", got[r], sizeof(got[r]));
+    }
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(map);
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        if (strcmp(got[r], rows[r].reaches) != 0) {
+            printf("  %s: got [%s] want [%s]\n", rows[r].importer, got[r], rows[r].reaches);
+        }
+    }
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        ASSERT_STR_EQ(got[r], rows[r].reaches);
+    }
+    PASS();
+}
+
 /* The IMPORTS targets written from `importer`, each "<label>:<file_path>",
  * sorted and '|'-joined into `out` ("" when none). */
 static bool import_target_labels(const char *db, const char *importer, char *out, size_t cap) {
@@ -31797,6 +31886,7 @@ SUITE(pipeline) {
     RUN_TEST(pkgmap_manifest_primary_entry_survives_duplicate_listing);
     RUN_TEST(pkgmap_name_two_ecosystems_declare_is_each_ecosystems_own);
     RUN_TEST(pkgmap_withheld_name_leaves_import_unresolved_in_every_ecosystem);
+    RUN_TEST(pkgmap_split_crate_name_is_decided_by_the_importers_own_manifest);
     RUN_TEST(pipeline_python_import_of_a_name_a_crate_shares_reaches_the_function);
     RUN_TEST(pkgmap_swift_targets_registers_module);
     RUN_TEST(pkgmap_swift_products_do_not_register_alias);

@@ -459,6 +459,20 @@ static inline bool cbm_pipeline_carried_edge_fits(const char *source_file_path, 
 
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
+/* What a crate record the Cargo parser adds says about the Rust files whose
+ * own manifest is manifest_rel. */
+typedef enum {
+    CBM_CRATE_NONE,          /* not a crate record: a name entry */
+    CBM_CRATE_MANIFEST,      /* manifest_rel is a Cargo manifest (pkg_name "") */
+    CBM_CRATE_WORKSPACE,     /* ... and the root of a workspace */
+    CBM_CRATE_REACH,         /* by pkg_name they reach the crate crate_manifest_rel
+                              * declares; NULL for a path out of the repository */
+    CBM_CRATE_INHERIT,       /* by pkg_name they reach what their workspace's
+                              * [workspace.dependencies] names (workspace = true) */
+    CBM_CRATE_WORKSPACE_DEP, /* this workspace's [workspace.dependencies] path
+                              * entry for pkg_name: crate_manifest_rel, as REACH */
+} cbm_crate_record_t;
+
 /* Per-worker manifest collection entry. */
 typedef struct {
     char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
@@ -466,12 +480,11 @@ typedef struct {
     /* mem_core (CBM_MEM_CLASS_OTHER): the manifest that declared the entry
      * ("ws/dep/Cargo.toml"), stamped by cbm_pkgmap_try_parse. */
     char *manifest_rel;
-    /* mem_core (CBM_MEM_CLASS_OTHER), NULL on a name entry. Set on a
-     * crate-visibility record the Cargo
-     * parser adds: the files under manifest_rel's directory reach the crate
-     * `pkg_name` as the one this manifest declares ("ws/dep/Cargo.toml") --
-     * the manifest itself, or a path dependency's. entry_rel is NULL on it.
-     * cbm_pkgmap_build reads it only for a name two manifests declare. */
+    /* A crate record (crate != CBM_CRATE_NONE; entry_rel NULL): see
+     * cbm_crate_record_t. cbm_pkgmap_build reads them only when a name Rust
+     * files import is withheld. crate_manifest_rel is mem_core
+     * (CBM_MEM_CLASS_OTHER), NULL where the kind names no crate. */
+    cbm_crate_record_t crate;
     char *crate_manifest_rel;
 } cbm_pkg_entry_t;
 
