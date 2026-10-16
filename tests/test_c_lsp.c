@@ -17450,6 +17450,43 @@ TEST(clsp_member_chain_beyond_the_walk_depth_cap_is_recorded) {
     PASS();
 }
 
+/* A local class's method inside a subtree the walk withheld owns its calls
+ * under its own name. The cap stop speaks for the walked function only: the
+ * outer function's own withheld link keeps its row, the method's call gets
+ * none under the outer function. */
+TEST(clsp_walk_cap_stop_leaves_a_local_class_method_to_its_owner) {
+    enum { DEPTH = 600 };
+    size_t cap = (size_t)DEPTH * 4 + 256;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t n = (size_t)snprintf(src, cap, "struct A { A &m1(); A &m3(); };\nvoid outer() {\n");
+    for (int d = 0; d < DEPTH; d++)
+        n += (size_t)snprintf(src + n, cap - n, "{ ");
+    n += (size_t)snprintf(src + n, cap - n,
+                          "A a; a.m1(); struct L { void run() { A b; b.m3(); } };");
+    for (int d = 0; d < DEPTH; d++)
+        n += (size_t)snprintf(src + n, cap - n, " }");
+    snprintf(src + n, cap - n, "\n}\n");
+    CBMFileResult *r = extract_cpp(src);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    int outer_m1 = 0;
+    int outer_m3 = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        size_t len = rc->caller_qn ? strlen(rc->caller_qn) : 0;
+        if (!rc->reason || strcmp(rc->reason, "walk_depth_cap_512") != 0 || len < 6 ||
+            strcmp(rc->caller_qn + len - 6, ".outer") != 0 || !rc->callee_qn)
+            continue;
+        outer_m1 += strcmp(rc->callee_qn, "m1") == 0;
+        outer_m3 += strcmp(rc->callee_qn, "m3") == 0;
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(outer_m1, 1);
+    ASSERT_EQ(outer_m3, 0);
+    PASS();
+}
+
 TEST(registry_issue1527_index_preserves_registration_order) {
     CBMArena a;
     cbm_arena_init(&a);
@@ -18338,6 +18375,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_lambda_parameter_and_plain_capture_bind_as_before);
     RUN_TEST(clsp_operator_chain_beyond_the_walk_depth_cap_is_recorded);
     RUN_TEST(clsp_member_chain_beyond_the_walk_depth_cap_is_recorded);
+    RUN_TEST(clsp_walk_cap_stop_leaves_a_local_class_method_to_its_owner);
 }
 
 /* The two 20000-link chain cases were the slowest tests in the ASan build.

@@ -4650,8 +4650,12 @@ static void c_resolve_callable_argument_references(CLSPContext *ctx, TSNode call
     }
 }
 
-/* `site`, when not null, is the exact occurrence the row speaks for: the
- * pipeline joins a stop to the call it describes by that span. */
+/* `site`, when not null, is the exact occurrence the row speaks for. The
+ * pipeline joins a sited row to the extracted call (or C++ operator
+ * candidate) with the same caller and span (cbm_pipeline_record_unresolved_call),
+ * and that call's unresolved_sites row carries `reason` in place of the
+ * pipeline's own stop. Only a reason that is a fact about the call gets a site:
+ * the walk depth cap (c_record_walk_cap_stops). */
 static void c_emit_unresolved_call_at(CLSPContext *ctx, const char *expr_text, const char *reason,
                                       TSNode site) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn)
@@ -4670,6 +4674,11 @@ static void c_emit_unresolved_call_at(CLSPContext *ctx, const char *expr_text, c
     c_publish_resolved_call(ctx, rc);
 }
 
+/* A lookup failure is said about this resolver's registry, not the project's:
+ * the project may define the name once (the pipeline then binds it) or several
+ * times (the pipeline's stop is then name_binding_not_proven), and bitcoin has
+ * method_not_found rows for methods it defines (CChain::Tip). So the row has no
+ * site and never becomes the reason of an unresolved_sites row. */
 static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason) {
     c_emit_unresolved_call_at(ctx, expr_text, reason, (TSNode){0});
 }
@@ -4689,7 +4698,13 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node, bool co
 #define C_LSP_WALK_CAP_REASON "walk_depth_cap_" C_LSP_STRINGIFY(C_LSP_MAX_WALK_DEPTH)
 
 /* A link is a node the walk would have tried to resolve into a call: a call
- * expression, and in C++ the operator expressions that may be overloaded. */
+ * expression, and in C++ the operator expressions that may be overloaded.
+ * The walk never typed a withheld operator's operands, so a primitive `i + 1`
+ * gets a row too: the reason says the link was not examined, not that it is
+ * an overloaded call. The pipeline writes such a row to unresolved_sites for
+ * the operator candidate the extractor made of the same expression
+ * (extract_cpp_operator_call). An operator candidate in walked code that the
+ * resolver did not bind gets no row: a primitive operator is no call. */
 static bool c_walk_cap_link_kind(const CLSPContext *ctx, const char *kind) {
     if (strcmp(kind, "call_expression") == 0)
         return true;
@@ -4732,19 +4747,26 @@ static const char *c_walk_cap_link_name(CLSPContext *ctx, TSNode node, const cha
 /* The walk stopped at the depth cap: the subtree is not walked, so none of
  * its links is resolved. Say so for each one. The subtree is visited with a
  * cursor, not by recursion: a chain of N links nests N deep, and the cap
- * exists because the native stack cannot take that. */
+ * exists because the native stack cannot take that.
+ *
+ * A row speaks for the function being walked. A function definition inside
+ * the subtree (a local class's method) owns its calls under its own name,
+ * which the cursor cannot derive, so its body gets no row here: those calls
+ * keep the pipeline's default stop rather than a row under the wrong caller. */
 __attribute__((noinline)) static void c_record_walk_cap_stops(CLSPContext *ctx, TSNode root) {
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     bool more = true;
     while (more) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool descend = true;
         if (ts_node_is_named(node)) {
             const char *kind = ts_node_type(node);
+            descend = strcmp(kind, "function_definition") != 0;
             if (c_walk_cap_link_kind(ctx, kind))
                 c_emit_unresolved_call_at(ctx, c_walk_cap_link_name(ctx, node, kind),
                                           C_LSP_WALK_CAP_REASON, node);
         }
-        if (ts_tree_cursor_goto_first_child(&cursor))
+        if (descend && ts_tree_cursor_goto_first_child(&cursor))
             continue;
         while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
             if (!ts_tree_cursor_goto_parent(&cursor)) {
@@ -4787,8 +4809,10 @@ static void c_eval_window_close(CLSPContext *ctx) {
  * cbm_type_substitute under hundreds of recursive c_resolve_calls_in_node
  * frames via c_adl_resolve). Past the cap the subtree is skipped, which is
  * graceful degradation, not a crash; every call and operator link in it gets a
- * lsp_unresolved row naming the cap (c_record_walk_cap_stops), so a withheld
- * link is a recorded one.
+ * lsp_unresolved row naming the cap (c_record_walk_cap_stops), and the
+ * pipeline writes that reason to the link's unresolved_sites row, so a
+ * withheld link is a recorded one in the graph (a local-class method body in
+ * the subtree is the exception named there).
  *
  * Every entry and every exit closes the receiver-chain window: only the
  * chain operand the open window named may continue it. */
