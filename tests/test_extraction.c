@@ -12406,15 +12406,21 @@ TEST(python_namespace_facts_unknown_effects_and_body_stability) {
                                   "class Derived(Base):\n    pass\n"
                                   "Item = factory()\n";
     a = extract(unknown, CBM_LANG_PYTHON, "t", "main.py");
-    ok = a && !a->has_error && !a->parse_incomplete && a->py_namespace.count == 8 && ok;
-    if (a && a->py_namespace.count == 8) {
+    ok = a && !a->has_error && !a->parse_incomplete && a->py_namespace.count == 9 && ok;
+    if (a && a->py_namespace.count == 9) {
+        /* The `if` branch's import is no binding the replay can prove, but the
+         * branch may rebind Item: its SHADOW (reason UNSUPPORTED) follows the
+         * compound statement's unknown, so the earlier import no longer decides
+         * Item. */
         const CBMPyNamespaceFact *f = a->py_namespace.items;
         ok = f[0].kind == CBM_PY_NS_IMPORT_NAME && f[1].kind == CBM_PY_NS_UNKNOWN &&
-             f[1].reason == CBM_PY_NS_REASON_COMPOUND && f[2].kind == CBM_PY_NS_UNKNOWN &&
-             f[3].kind == CBM_PY_NS_SHADOW && f[3].reason == CBM_PY_NS_REASON_DECORATED &&
-             strcmp(f[3].local_name, "wrapped") == 0 && f[4].kind == CBM_PY_NS_UNKNOWN &&
-             f[5].kind == CBM_PY_NS_SHADOW && f[5].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS &&
-             f[6].kind == CBM_PY_NS_UNKNOWN && f[7].kind == CBM_PY_NS_SHADOW && ok;
+             f[1].reason == CBM_PY_NS_REASON_COMPOUND && f[2].kind == CBM_PY_NS_SHADOW &&
+             f[2].reason == CBM_PY_NS_REASON_UNSUPPORTED && strcmp(f[2].local_name, "Item") == 0 &&
+             f[3].kind == CBM_PY_NS_UNKNOWN && f[4].kind == CBM_PY_NS_SHADOW &&
+             f[4].reason == CBM_PY_NS_REASON_DECORATED && strcmp(f[4].local_name, "wrapped") == 0 &&
+             f[5].kind == CBM_PY_NS_UNKNOWN && f[6].kind == CBM_PY_NS_SHADOW &&
+             f[6].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS && f[7].kind == CBM_PY_NS_UNKNOWN &&
+             f[8].kind == CBM_PY_NS_SHADOW && ok;
     }
     if (a)
         cbm_free_result(a);
@@ -12574,7 +12580,7 @@ TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload) {
     CBMArena retained;
     cbm_arena_init(&retained);
     CBMPyNamespaceFacts expected = {0};
-    bool ok = r && !r->has_error && !r->parse_incomplete && r->py_namespace.count == 4 &&
+    bool ok = r && !r->has_error && !r->parse_incomplete && r->py_namespace.count == 5 &&
               cbm_py_namespace_facts_copy(&retained, &r->py_namespace, &expected);
     memset(source, 'x', strlen(source)); /* facts cannot borrow the caller's input */
     char dir[512];
@@ -12594,7 +12600,7 @@ TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload) {
             r = NULL;
             CBMFileResult header = {0};
             ok = cbm_result_spill_peek_header(spill, 0, &header) &&
-                 header.py_namespace.status == CBM_PY_NS_COMPLETE && header.py_namespace.count == 4;
+                 header.py_namespace.status == CBM_PY_NS_COMPLETE && header.py_namespace.count == 5;
             for (int round = 0; round < 2; round++) {
                 CBMFileResult *loaded = cbm_result_spill_load(spill, 0);
                 ok = loaded && loaded->cached_tree == NULL &&
@@ -12619,7 +12625,7 @@ TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload) {
     /* Original result/source tree and both reloads are gone; the independent
      * copied payload still owns the relative empty module and literal strings. */
     ok = py_facts_owned(&retained, &expected) && cbm_py_namespace_facts_valid(&expected) &&
-         expected.count == 4 && expected.items[0].relative_level == 1 &&
+         expected.count == 5 && expected.items[0].relative_level == 1 &&
          strcmp(expected.items[0].module_name, "") == 0 && expected.items[1].name_count == 4 &&
          strcmp(expected.items[1].names[2], "a,b") == 0 && ok;
     cbm_arena_destroy(&retained);

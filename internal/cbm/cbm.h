@@ -440,8 +440,15 @@ typedef struct {
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
 
-/* Content-only ordered Python namespace facts; no resolved target identities. */
-#define CBM_PY_NAMESPACE_FACTS_VERSION 1u
+/* Content-only ordered Python namespace facts; no resolved target identities.
+ * Version 2: a statement the facts do not model emits a SHADOW of reason
+ * UNSUPPORTED for each module name it may bind, and one of CBM_PY_NS_ANY_NAME
+ * when it may bind any. */
+#define CBM_PY_NAMESPACE_FACTS_VERSION 2u
+/* The SHADOW name of a statement that may bind any module name: a star import
+ * inside a compound statement, globals()/vars()/locals()/exec()/eval(),
+ * sys.modules, a match statement. No identifier spells it. */
+#define CBM_PY_NS_ANY_NAME "*"
 
 typedef enum {
     CBM_PY_NS_NOT_CAPTURED = 0,

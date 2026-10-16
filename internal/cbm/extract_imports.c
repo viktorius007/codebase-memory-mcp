@@ -670,13 +670,204 @@ static bool py_ns_all_literal(PyNamespaceBuilder *b, TSNode node, CBMPyNamespace
     return true;
 }
 
+/* A statement the facts do not model may still bind module names. Each name
+ * it may bind becomes a SHADOW of reason UNSUPPORTED after its UNKNOWN fact,
+ * once per statement (`start` is the statement's first such SHADOW): the
+ * name's earlier binding no longer decides what it holds. */
+static bool py_ns_rebinds(PyNamespaceBuilder *b, int start, const char *name) {
+    for (int i = start; i < b->facts.count; i++) {
+        const CBMPyNamespaceFact *f = &b->facts.items[i];
+        if (f->kind == CBM_PY_NS_SHADOW && f->reason == CBM_PY_NS_REASON_UNSUPPORTED &&
+            strcmp(f->local_name, name) == 0)
+            return true;
+    }
+    return py_ns_push(b, (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
+                                              .local_name = name,
+                                              .reason = CBM_PY_NS_REASON_UNSUPPORTED});
+}
+
+/* Whether the identifier `node` is a name its statement binds in the module
+ * namespace: an assignment, augmented-assignment, `for`, `as` or walrus
+ * target, possibly unpacked, or a `del` target. A comprehension's own `for`
+ * target is local to the comprehension. */
+static bool py_ns_binding_identifier(TSNode node) {
+    static const char *const unpacking[] = {
+        "pattern_list",   "tuple_pattern", "list_pattern", "list_splat_pattern",
+        "tuple",          "list",          "list_splat",   "parenthesized_expression",
+        "expression_list"};
+    TSNode child = node;
+    TSNode parent = ts_node_parent(node);
+    for (;;) {
+        if (ts_node_is_null(parent))
+            return false;
+        const char *kind = ts_node_type(parent);
+        bool climb = false;
+        for (size_t i = 0; i < sizeof(unpacking) / sizeof(unpacking[0]); i++)
+            climb = climb || strcmp(kind, unpacking[i]) == 0;
+        if (!climb)
+            break;
+        child = parent;
+        parent = ts_node_parent(parent);
+    }
+    const char *kind = ts_node_type(parent);
+    const char *field = NULL;
+    if (strcmp(kind, "assignment") == 0 || strcmp(kind, "augmented_assignment") == 0 ||
+        strcmp(kind, "for_statement") == 0)
+        field = "left";
+    else if (strcmp(kind, "named_expression") == 0)
+        field = "name";
+    else
+        return strcmp(kind, "as_pattern_target") == 0 || strcmp(kind, "delete_statement") == 0;
+    return ts_node_eq(child, ts_node_child_by_field_name(parent, field, (uint32_t)strlen(field)));
+}
+
+/* A call or attribute that can bind any module name: globals(), vars(),
+ * locals(), exec(), eval(), or sys.modules. */
+static bool py_ns_dynamic_namespace(PyNamespaceBuilder *b, TSNode node) {
+    const char *kind = ts_node_type(node);
+    const char *text = NULL;
+    size_t len = 0;
+    if (strcmp(kind, "call") == 0) {
+        static const char *const dynamic[] = {"globals", "vars", "locals", "exec", "eval"};
+        TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+        if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "identifier") != 0 ||
+            !py_ns_slice(b, fn, &text, &len))
+            return false;
+        for (size_t i = 0; i < sizeof(dynamic) / sizeof(dynamic[0]); i++) {
+            if (len == strlen(dynamic[i]) && memcmp(text, dynamic[i], len) == 0)
+                return true;
+        }
+        return false;
+    }
+    if (strcmp(kind, "attribute") != 0)
+        return false;
+    TSNode object = ts_node_child_by_field_name(node, TS_FIELD("object"));
+    TSNode attr = ts_node_child_by_field_name(node, TS_FIELD("attribute"));
+    const char *attr_text = NULL;
+    size_t attr_len = 0;
+    return !ts_node_is_null(object) && strcmp(ts_node_type(object), "identifier") == 0 &&
+           py_ns_slice(b, object, &text, &len) && len == 3 && memcmp(text, "sys", 3) == 0 &&
+           py_ns_slice(b, attr, &attr_text, &attr_len) && attr_len == 7 &&
+           memcmp(attr_text, "modules", 7) == 0;
+}
+
+/* The names an import statement nested in an unmodelled statement binds: its
+ * import facts, turned into rebinding SHADOWs (a star into the any-name one). */
+static bool py_ns_import_rebinds(PyNamespaceBuilder *b, TSNode node, int start) {
+    int first = b->facts.count;
+    bool from = strcmp(ts_node_type(node), "import_from_statement") == 0;
+    bool ok = py_ns_import(b, node, from);
+    int last = b->facts.count;
+    b->facts.count = first;
+    for (int i = first; i < last; i++) {
+        const CBMPyNamespaceFact f = b->facts.items[i];
+        const char *name = f.kind == CBM_PY_NS_IMPORT_STAR ? CBM_PY_NS_ANY_NAME : f.local_name;
+        if (!name || !py_ns_rebinds(b, start, name))
+            return false;
+    }
+    return (ok || !b->failure) && (ok || py_ns_rebinds(b, start, CBM_PY_NS_ANY_NAME));
+}
+
+/* Every module name the statement or expression `root` may bind, in source
+ * order: nested imports, definitions and classes (their bodies are their own
+ * scopes), assignment, `for`, `as`, walrus and `del` targets. A star import, a
+ * dynamic namespace access (py_ns_dynamic_namespace) or a match statement may
+ * bind any name. Lambda bodies are their own scopes. */
+static bool py_ns_scan_rebinds(PyNamespaceBuilder *b, TSNode root) {
+    int start = b->facts.count;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool ok = true;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool descend = true;
+        if (strcmp(kind, "function_definition") == 0 || strcmp(kind, "class_definition") == 0) {
+            const char *name =
+                py_ns_name(b, ts_node_child_by_field_name(node, TS_FIELD("name")), false);
+            ok = py_ns_rebinds(b, start, name ? name : CBM_PY_NS_ANY_NAME);
+            descend = false;
+        } else if (strcmp(kind, "lambda") == 0) {
+            descend = false;
+        } else if (strcmp(kind, "import_statement") == 0 ||
+                   strcmp(kind, "import_from_statement") == 0) {
+            ok = py_ns_import_rebinds(b, node, start);
+            descend = false;
+        } else if (strcmp(kind, "match_statement") == 0 || py_ns_dynamic_namespace(b, node)) {
+            ok = py_ns_rebinds(b, start, CBM_PY_NS_ANY_NAME);
+        } else if (strcmp(kind, "identifier") == 0 && py_ns_binding_identifier(node)) {
+            const char *name = py_ns_name(b, node, false);
+            ok = py_ns_rebinds(b, start, name ? name : CBM_PY_NS_ANY_NAME);
+        }
+        if (!ok)
+            break;
+        if (descend && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        bool next = false;
+        do {
+            next = ts_tree_cursor_goto_next_sibling(&cursor);
+        } while (!next && ts_tree_cursor_goto_parent(&cursor));
+        if (!next)
+            break;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok;
+}
+
+/* `a, (b, *c) = value`: an unconditional assignment binds each target name to
+ * a value, as `a = value` does (a VALUE SHADOW); a subscript or attribute
+ * target binds no name. The value runs first, so what it may bind comes
+ * before the targets. */
+static bool py_ns_unpacking_assignment(PyNamespaceBuilder *b, TSNode node, TSNode left,
+                                       TSNode right) {
+    static const char *const patterns[] = {"pattern_list", "tuple_pattern", "list_pattern", "tuple",
+                                           "list"};
+    bool unpacking = false;
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
+        unpacking = unpacking || strcmp(ts_node_type(left), patterns[i]) == 0;
+    if (!unpacking || strcmp(ts_node_type(node), "assignment") != 0 || ts_node_is_null(right))
+        return false;
+    if (!py_ns_safe_expr(b, right, 0) &&
+        !(py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT) && py_ns_scan_rebinds(b, right)))
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(left);
+    bool ok = true;
+    for (;;) {
+        TSNode child = ts_tree_cursor_current_node(&cursor);
+        if (py_ns_dynamic_namespace(b, child)) {
+            ok = py_ns_rebinds(b, b->facts.count, CBM_PY_NS_ANY_NAME);
+        } else if (strcmp(ts_node_type(child), "identifier") == 0 &&
+                   py_ns_binding_identifier(child)) {
+            const char *name = py_ns_name(b, child, false);
+            ok =
+                name && py_ns_push(b, strcmp(name, "__all__") == 0
+                                          ? (CBMPyNamespaceFact){.kind = CBM_PY_NS_ALL_UNKNOWN,
+                                                                 .reason = CBM_PY_NS_REASON_VALUE}
+                                          : (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
+                                                                 .local_name = name,
+                                                                 .reason = CBM_PY_NS_REASON_VALUE});
+        }
+        if (!ok)
+            break;
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        bool next = false;
+        do {
+            next = ts_tree_cursor_goto_next_sibling(&cursor);
+        } while (!next && ts_tree_cursor_goto_parent(&cursor));
+        if (!next)
+            break;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok;
+}
+
 static bool py_ns_assignment(PyNamespaceBuilder *b, TSNode node) {
     TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
     TSNode right = ts_node_child_by_field_name(node, TS_FIELD("right"));
     TSNode annotation = ts_node_child_by_field_name(node, TS_FIELD("type"));
     const char *name = py_ns_name(b, left, false);
     if (!name)
-        return false;
+        return py_ns_unpacking_assignment(b, node, left, right);
     if (!py_ns_safe_expr(b, right, 0) || !py_ns_safe_expr(b, annotation, 0)) {
         if (!py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT))
             return false;
@@ -686,7 +877,10 @@ static bool py_ns_assignment(PyNamespaceBuilder *b, TSNode node) {
     bool augmented = strcmp(ts_node_type(node), "augmented_assignment") == 0;
     if (strcmp(name, "__all__") != 0) {
         if (augmented)
-            return py_ns_unknown(b, CBM_PY_NS_REASON_UNSUPPORTED);
+            return py_ns_unknown(b, CBM_PY_NS_REASON_UNSUPPORTED) &&
+                   py_ns_rebinds(b, b->facts.count, name);
+        if (!py_ns_safe_expr(b, right, 0) && !py_ns_scan_rebinds(b, right))
+            return false;
         return py_ns_push(b, (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
                                                   .local_name = name,
                                                   .reason = CBM_PY_NS_REASON_VALUE});
@@ -779,12 +973,13 @@ static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node) {
         const char *ek = ts_node_type(expr);
         if (strcmp(ek, "assignment") == 0 || strcmp(ek, "augmented_assignment") == 0)
             return py_ns_assignment(b, expr);
-        return py_ns_safe_expr(b, expr, 0) || py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT);
+        return py_ns_safe_expr(b, expr, 0) ||
+               (py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT) && py_ns_scan_rebinds(b, expr));
     }
     if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "try_statement") == 0 ||
         strcmp(kind, "for_statement") == 0 || strcmp(kind, "while_statement") == 0 ||
         strcmp(kind, "with_statement") == 0 || strcmp(kind, "match_statement") == 0)
-        return py_ns_unknown(b, CBM_PY_NS_REASON_COMPOUND);
+        return py_ns_unknown(b, CBM_PY_NS_REASON_COMPOUND) && py_ns_scan_rebinds(b, node);
     return false;
 }
 
@@ -811,7 +1006,8 @@ CBMPyNamespaceStatus cbm_extract_python_namespace_facts(CBMExtractCtx *ctx) {
                 int start = b.facts.count;
                 if (!py_ns_statement(&b, node) && !b.failure) {
                     b.facts.count = start;
-                    py_ns_unknown(&b, CBM_PY_NS_REASON_UNSUPPORTED);
+                    if (py_ns_unknown(&b, CBM_PY_NS_REASON_UNSUPPORTED))
+                        (void)py_ns_scan_rebinds(&b, node);
                 }
                 if (b.failure)
                     break;

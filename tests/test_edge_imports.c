@@ -963,6 +963,65 @@ TEST(ei_py_unlocated_module_bindings_are_not_followed) {
     PASS();
 }
 
+/* A package re-export binds what the package's top-level run leaves under the
+ * name, and the statement that last binds it decides. A statement the
+ * namespace facts do not model can be that statement: a `try` or `if` branch
+ * re-importing the name (the C speedup over the fallback), a module-level loop
+ * target, a `globals()` write. Each leaves the name unproven, so the call is
+ * withheld with its row instead of linking the overridden binding; so is a
+ * name the importing file itself re-imports in a `try` branch. A plain
+ * re-export still links (pkg_ok). Returns 100 * calls to an overridden
+ * binding + 10 * calls to pkg_ok.impl.helper + the withheld calls' rows. */
+static int ei_py_compound_rebinding_case(int pad) {
+    EILangFile f[] = {
+        {"pkg_try/__init__.py",
+         "from .slow import encode\ntry:\n    from .fast import encode\nexcept ImportError:\n"
+         "    pass\n"},
+        {"pkg_try/slow.py", "def encode(x):\n    return x\n"},
+        {"pkg_try/fast.py", "def encode(x):\n    return x\n"},
+        {"pkg_if/__init__.py", "import sys\nfrom .old import parse\n"
+                               "if sys.version_info >= (3, 8):\n    from .new import parse\n"},
+        {"pkg_if/old.py", "def parse(x):\n    return x\n"},
+        {"pkg_if/new.py", "def parse(x):\n    return x\n"},
+        {"pkg_for/__init__.py", "from .impl import cb\nfor cb in [print]:\n    pass\n"},
+        {"pkg_for/impl.py", "def cb():\n    return 1\n"},
+        {"pkg_eff/__init__.py", "from .impl import fn\nglobals()['fn'] = print\n"},
+        {"pkg_eff/impl.py", "def fn():\n    return 1\n"},
+        {"pkg_ok/__init__.py", "from .impl import helper\n"},
+        {"pkg_ok/impl.py", "def helper():\n    return 1\n"},
+        {"use.py", "from pkg_try import encode\nfrom pkg_if import parse\nfrom pkg_for import cb\n"
+                   "from pkg_eff import fn\nfrom pkg_ok import helper\n\n\ndef run():\n"
+                   "    encode(1)\n    parse(1)\n    cb()\n    helper()\n    return fn()\n"},
+        {"inline.py",
+         "from pkg_try.slow import encode\ntry:\n    from pkg_try.fast import encode\n"
+         "except ImportError:\n    pass\n\n\ndef run_inline():\n    return encode(1)\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, (int)(sizeof(f) / sizeof(f[0])), pad);
+    int wrong = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                                  "s.name IN ('run','run_inline') AND "
+                                  "t.name IN ('encode','parse','cb','fn')");
+    int control = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                    "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                                    "s.name='run' AND t.file_path='pkg_ok/impl.py' AND "
+                                    "t.name='helper'");
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE "
+                                 "'%.run' OR caller LIKE '%.run_inline') AND "
+                                 "name IN ('encode','parse','cb','fn') AND "
+                                 "reason='name_binding_not_proven'");
+    ei_cleanup(&lp, store);
+    if (wrong < 0 || control < 0 || rows < 0)
+        return -1;
+    return 100 * wrong + 10 * control + rows;
+}
+
+TEST(ei_py_compound_rebinding_leaves_reexport_unproven) {
+    /* The parallel driver's CALLS pass reads the namespace-replay map. */
+    ASSERT_EQ(ei_py_compound_rebinding_case(60), 15);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2690,6 +2749,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_comprehension_target_is_no_decorated_usage);
     RUN_TEST(ei_py_rebound_decorated_reference_keeps_its_row);
     RUN_TEST(ei_py_unlocated_module_bindings_are_not_followed);
+    RUN_TEST(ei_py_compound_rebinding_leaves_reexport_unproven);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 

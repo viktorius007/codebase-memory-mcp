@@ -2286,8 +2286,11 @@ static PXCPythonVerdict pxc_python_star_binding(PXCPythonResolver *pr, const cbm
 
 /* The binding `owner`'s top-level run leaves on `member`: the last statement
  * that binds it decides. A star import binds it only when the starred module
- * exports it; `del` leaves it unbound. Statements the facts do not model are
- * passed over, as the replay passes over them. */
+ * exports it; `del` leaves it unbound. A statement the facts do not model
+ * names each module name it may bind (a SHADOW of reason UNSUPPORTED: an `if`
+ * or `try` branch, a loop target, a tuple target), or CBM_PY_NS_ANY_NAME when
+ * it may bind any (globals(), exec(), a star import in a branch): the binding
+ * after it is not proven, so the name is opaque. */
 static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
                                                  const cbm_gbuf_node_t *owner,
                                                  const CBMPyNamespaceFacts *facts,
@@ -2297,6 +2300,11 @@ static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
     PXCPythonVerdict verdict = PXC_PY_UNBOUND;
     for (int i = facts->count - 1; i >= 0; i--) {
         const CBMPyNamespaceFact *fact = &facts->items[i];
+        if (fact->kind == CBM_PY_NS_SHADOW && fact->local_name &&
+            strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) == 0) {
+            verdict = PXC_PY_OPAQUE;
+            break;
+        }
         if (fact->kind == CBM_PY_NS_IMPORT_STAR) {
             verdict = pxc_python_star_binding(pr, owner, file_qn, fact, member, depth, out);
             if (verdict != PXC_PY_UNBOUND)
@@ -2410,6 +2418,20 @@ static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_p
             bool unseen_value = !node && fact->reason == CBM_PY_NS_REASON_VALUE;
             if ((collect_exports || existing >= 0 || unseen_value) &&
                 !pxc_python_map_set(map, fact->local_name, node ? node->qualified_name : NULL)) {
+                pxc_free_fqn(file_qn);
+                return false;
+            }
+        } else if (fact->kind == CBM_PY_NS_SHADOW && fact->reason == CBM_PY_NS_REASON_UNSUPPORTED &&
+                   fact->local_name) {
+            /* A statement the facts do not model may rebind the name (an `if`
+             * or `try` branch re-importing it, a loop or tuple target): the
+             * binding an earlier statement proved no longer decides it. A name
+             * that statement binds first keeps no entry, as before, and the
+             * any-name SHADOW is left to the re-export reader
+             * (pxc_python_final_binding). */
+            if (strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) != 0 &&
+                pxc_python_map_find(map, fact->local_name) >= 0 &&
+                !pxc_python_map_set(map, fact->local_name, NULL)) {
                 pxc_free_fqn(file_qn);
                 return false;
             }
@@ -2532,7 +2554,9 @@ bool cbm_pxc_python_decorated_usage(const cbm_pipeline_ctx_t *ctx, const char *p
     const CBMPyNamespaceFacts *facts = &result->py_namespace;
     for (int i = facts->count - 1; i >= 0; i--) {
         const CBMPyNamespaceFact *fact = &facts->items[i];
-        if (fact->kind == CBM_PY_NS_IMPORT_STAR)
+        if (fact->kind == CBM_PY_NS_IMPORT_STAR ||
+            (fact->kind == CBM_PY_NS_SHADOW && fact->local_name &&
+             strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) == 0))
             return false;
         if (!fact->local_name || strcmp(fact->local_name, usage->ref_name) != 0)
             continue;
