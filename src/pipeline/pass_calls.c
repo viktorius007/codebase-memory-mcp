@@ -1033,7 +1033,20 @@ static char *unresolved_occurrence_key(const char *caller, uint32_t start, uint3
     return key;
 }
 
+static bool unresolved_reason_row(const CBMResolvedCall *row) {
+    return row->kind == CBM_RESOLVED_INVOCATION && row->site_end_byte > row->site_start_byte &&
+           row->reason && row->strategy && strcmp(row->strategy, "lsp_unresolved") == 0;
+}
+
+/* A file whose resolver left no sited lsp_unresolved invocation row gets no
+ * table: a null table and one without such a row record the same stops, and
+ * most C and C++ files have none (c_lsp sites only its walk depth cap). */
 CBMHashTable *cbm_pipeline_unresolved_reasons(const CBMResolvedCallArray *rows) {
+    int first = 0;
+    while (first < rows->count && !unresolved_reason_row(&rows->items[first]))
+        first++;
+    if (first == rows->count)
+        return NULL;
     CBMHashTable *reasons = cbm_ht_create((uint32_t)rows->count + 1);
     for (int i = 0; reasons && i < rows->count; i++) {
         const CBMResolvedCall *row = &rows->items[i];
@@ -1067,6 +1080,10 @@ void cbm_pipeline_unresolved_reasons_free(CBMHashTable *reasons) {
     }
 }
 
+/* `stop` is the pipeline's own reason, replaced by the resolver's when it left
+ * an lsp_unresolved row at this exact occurrence. A null `stop` records the
+ * site only on the resolver's account: a synthetic candidate (a C++ operator
+ * expression) is not a call unless the resolver says it may be one. */
 void cbm_pipeline_record_unresolved_call(cbm_gbuf_t *gbuf, const char *project, const char *rel,
                                          const CBMCall *call, const CBMHashTable *reasons,
                                          const char *stop) {
@@ -1077,13 +1094,14 @@ void cbm_pipeline_record_unresolved_call(cbm_gbuf_t *gbuf, const char *project, 
     /* The index retains the last exact occurrence, including successful rows.
      * An earlier failure must never describe a later semantic pass's result. */
     const char *name = cbm_lsp_bare_segment(call->callee_name);
-    if (row && row->reason && row->strategy && strcmp(row->strategy, "lsp_unresolved") == 0 &&
-        cbm_pipeline_invocation_leaf_matches(row, call, 2)) {
+    if (row && unresolved_reason_row(row) && cbm_pipeline_invocation_leaf_matches(row, call, 2)) {
         if (strcmp(row->reason, "unrecognised_std_method") == 0)
             name = row->callee_qn;
         stop = strncmp(row->reason, "trait_receiver_shape:", 21) == 0 ? "trait_receiver_shape"
                                                                       : row->reason;
     }
+    if (!stop)
+        return;
     cbm_pipeline_record_unresolved(gbuf, project, rel, call->enclosing_func_qn, name, "call", stop,
                                    call->unresolved_line > 0 ? call->unresolved_line
                                                              : call->start_line,
@@ -1264,11 +1282,14 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * valid calls only when the language resolver identifies a concrete
      * invocation target. Textual registry/service fallbacks would bind an
      * unresolved primitive expression such as `int + int` to an unrelated
-     * project `operator+`, fabricating a CALLS edge. */
+     * project `operator+`, fabricating a CALLS edge. Such a candidate is a
+     * stop only on the resolver's account (a C++ operator past c_lsp's walk
+     * depth cap); a primitive operator the resolver typed is no call and
+     * leaves no row. MUST match pp_unmaterialized_call in pass_parallel.c. */
     if (call->requires_lsp_resolution || lang == CBM_LANG_RUST) {
-        if (lang == CBM_LANG_RUST)
-            cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
-                                                "target_not_materialized");
+        cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+                                            lang == CBM_LANG_RUST ? "target_not_materialized"
+                                                                  : NULL);
         return 0;
     }
 
@@ -1477,7 +1498,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * Store.commit() call to a JS function named commit (or a Bash main
      * to a Python main). Drop that weak cross-language edge. */
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
-        cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+        /* No resolver reason here: the pipeline found a candidate and refused
+         * it, a later and more specific stop than the resolver's. Rust never
+         * reaches this point. MUST match pass_parallel.c. */
+        cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, NULL,
                                             "cross_language_candidate_rejected");
         /* Refusing the binding leaves the callee unresolved, and an
          * unresolved route-registration callee is still a registration:
@@ -1514,7 +1538,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         cbm_suppress_cross_language_code_match(source_lang, ctx->repo_path, target_node->file_path);
     drop_plain_call |= cross_language;
     if (cross_language) {
-        cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, reasons,
+        cbm_pipeline_record_unresolved_call(ctx->gbuf, ctx->project_name, rel, call, NULL,
                                             "cross_language_candidate_rejected");
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
@@ -1692,7 +1716,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             cbm_pxc_rust_dump_file(rel, result);
         }
 
-        CBMHashTable *reasons = files[i].language == CBM_LANG_RUST
+        CBMHashTable *reasons = cbm_pipeline_lsp_reasons_reach_ledger(files[i].language)
                                     ? cbm_pipeline_unresolved_reasons(&result->resolved_calls)
                                     : NULL;
         /* Framework mount of this file's routes (Laravel 11+ withRouting, #1146). */

@@ -175,6 +175,29 @@ static inline bool cbm_pipeline_lsp_allow_tail_match(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN;
 }
 
+/* Languages whose resolver's sited lsp_unresolved reasons are facts about the
+ * call, so an unresolved_sites row takes the resolver's reason in place of the
+ * pipeline's (cbm_pipeline_record_unresolved_call). Rust's are pinned by the
+ * pipeline_rust_* suites. c_lsp (C, C++, CUDA) sites only the walk depth cap,
+ * "not examined", and leaves its lookup failures siteless.
+ * The other sited reasons are diagnostics of the resolver's own view and are
+ * wrong as graph facts, so those languages keep the pipeline's stops:
+ *  - JavaScript/TypeScript/TSX: `func_not_in_registry` on a bare call to a
+ *    function the project defines in two files (the pipeline's correct stop is
+ *    name_binding_not_proven: two candidates).
+ *  - Java: `no_enclosing_class` on an implicit call inside a class whose
+ *    method is inherited from an external base (react-native ReactTextView
+ *    `getPaint()`).
+ *  - Go: `function_not_in_registry` and `symbol_not_in_registry` are the same
+ *    resolver-view absence claims, not measured against a Go corpus.
+ *  - Python: `operator_method_not_in_registry` sits on an operator span no
+ *    call carrier has, so it would never join.
+ * Kotlin, PHP, C# and Perl emit no sited lsp_unresolved row. */
+static inline bool cbm_pipeline_lsp_reasons_reach_ledger(CBMLanguage lang) {
+    return lang == CBM_LANG_RUST || lang == CBM_LANG_C || lang == CBM_LANG_CPP ||
+           lang == CBM_LANG_CUDA;
+}
+
 /* When a JVM callable-reference occurrence has no exact semantic target, its
  * ordinary-USAGE fallback must still respect package/import reachability.
  * `unique_name` and `suffix_match` are project-wide guesses: admitting either

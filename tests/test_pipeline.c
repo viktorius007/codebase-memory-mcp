@@ -30999,6 +30999,210 @@ TEST(pipeline_calls_args_overlong_argument_stops_cleanly) {
     PASS();
 }
 
+/* A member chain `a.m0().m1()...` nests one call per link, the innermost link
+ * (m0) deepest. c_lsp walks it down to C_LSP_MAX_WALK_DEPTH (512) and withholds
+ * the deeper links, recording each with reason walk_depth_cap_512 at the
+ * link's span. The graph must carry that reason: every unresolved row under
+ * chain() is a cap row at the exact span of one link, no site has two rows,
+ * and the cap rows plus the CALLS edges of the walked links account for every
+ * link exactly once. Struct Z repeats A's method names so no name-only
+ * fallback can bind a withheld link. */
+enum { CAP_CHAIN_LINKS = 400, CAP_CHAIN_PAD = 55 };
+
+typedef struct {
+    uint32_t chain_start;
+    uint32_t link_end[CAP_CHAIN_LINKS];
+    unsigned char row[CAP_CHAIN_LINKS];
+    unsigned char edge[CAP_CHAIN_LINKS];
+} cap_chain_t;
+
+static char *cap_chain_source(cap_chain_t *chain) {
+    size_t cap = (size_t)CAP_CHAIN_LINKS * 128 + 1024;
+    char *src = malloc(cap);
+    if (!src)
+        return NULL;
+    size_t n = 0;
+    for (int s = 0; s < 2; s++) {
+        const char *t = s ? "Z" : "A";
+        n += (size_t)snprintf(src + n, cap - n, "struct %s {\n", t);
+        for (int i = 0; i < CAP_CHAIN_LINKS; i++)
+            n += (size_t)snprintf(src + n, cap - n, "    %s &m%d();\n", t, i);
+        n += (size_t)snprintf(src + n, cap - n, "};\n");
+    }
+    for (int s = 0; s < 2; s++) {
+        const char *t = s ? "Z" : "A";
+        for (int i = 0; i < CAP_CHAIN_LINKS; i++)
+            n += (size_t)snprintf(src + n, cap - n, "%s &%s::m%d() { return *this; }\n", t, t, i);
+    }
+    n += (size_t)snprintf(src + n, cap - n, "void chain() {\n    A a;\n    ");
+    chain->chain_start = (uint32_t)n;
+    n += (size_t)snprintf(src + n, cap - n, "a");
+    for (int i = 0; i < CAP_CHAIN_LINKS; i++) {
+        n += (size_t)snprintf(src + n, cap - n, ".m%d()", i);
+        chain->link_end[i] = (uint32_t)n;
+    }
+    snprintf(src + n, cap - n, ";\n}\n");
+    return src;
+}
+
+/* The link a callee name `m<i>` names, or -1. */
+static int cap_chain_link(const unsigned char *name) {
+    int i = -1;
+    char tail = 0;
+    if (!name || sscanf((const char *)name, "m%d%c", &i, &tail) != 1 || i < 0 ||
+        i >= CAP_CHAIN_LINKS)
+        return -1;
+    return i;
+}
+
+/* Index the chain (plus `pad` one-function C files) and check the ledger.
+ * Returns NULL when every check holds, else what failed. */
+static const char *cap_chain_check(int pad, char *why, size_t why_size) {
+    static cap_chain_t chain;
+    memset(&chain, 0, sizeof(chain));
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_capchain_XXXXXX");
+    if (!cbm_mkdtemp(tmp))
+        return "mkdtemp failed";
+    char *src = cap_chain_source(&chain);
+    if (!src) {
+        th_rmtree(tmp);
+        return "fixture allocation failed";
+    }
+    write_temp_file(tmp, "chain.cpp", src);
+    free(src);
+    for (int i = 0; i < pad; i++) {
+        char name[32];
+        char body[64];
+        snprintf(name, sizeof(name), "pad%02d.c", i);
+        snprintf(body, sizeof(body), "int pad%02d(void) { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
+    int rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = rc == 0 ? cbm_store_open_path_query(dbpath) : NULL;
+    const char *fail = rc != 0 ? "pipeline run failed" : !store ? "store open failed" : NULL;
+    sqlite3 *db = store ? cbm_store_get_db(store) : NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rows = 0;
+    int edges = 0;
+    if (!fail && sqlite3_prepare_v2(db,
+                                    "SELECT name, reason, site_start_byte, site_end_byte "
+                                    "FROM unresolved_sites WHERE file_path='chain.cpp' "
+                                    "AND caller LIKE '%.chain'",
+                                    -1, &stmt, NULL) != SQLITE_OK)
+        fail = "unresolved_sites query failed";
+    while (!fail && sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *reason = sqlite3_column_text(stmt, 1);
+        int i = cap_chain_link(sqlite3_column_text(stmt, 0));
+        snprintf(why, why_size, "row %s reason %s span %d-%d",
+                 (const char *)sqlite3_column_text(stmt, 0), reason ? (const char *)reason : "",
+                 sqlite3_column_int(stmt, 2), sqlite3_column_int(stmt, 3));
+        if (!reason || strcmp((const char *)reason, "walk_depth_cap_512") != 0 || i < 0 ||
+            (uint32_t)sqlite3_column_int(stmt, 2) != chain.chain_start ||
+            (uint32_t)sqlite3_column_int(stmt, 3) != chain.link_end[i] || chain.row[i]++)
+            fail = why;
+        rows++;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (!fail && sqlite3_prepare_v2(db,
+                                    "SELECT t.name FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                    "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
+                                    "AND s.name='chain' AND t.qualified_name LIKE '%.A.m%'",
+                                    -1, &stmt, NULL) != SQLITE_OK)
+        fail = "edge query failed";
+    while (!fail && sqlite3_step(stmt) == SQLITE_ROW) {
+        int i = cap_chain_link(sqlite3_column_text(stmt, 0));
+        if (i < 0 || chain.edge[i]++)
+            fail = "a CALLS edge names no link, or one link twice";
+        edges++;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (!fail && sqlite3_prepare_v2(db,
+                                    "SELECT count(*) FROM (SELECT 1 FROM unresolved_sites "
+                                    "GROUP BY file_path, site_start_byte, site_end_byte "
+                                    "HAVING count(*) > 1)",
+                                    -1, &stmt, NULL) != SQLITE_OK)
+        fail = "duplicate-site query failed";
+    if (!fail && (sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_int(stmt, 0) != 0))
+        fail = "a site carries two unresolved rows";
+    sqlite3_finalize(stmt);
+    for (int i = 0; !fail && i < CAP_CHAIN_LINKS; i++) {
+        if (chain.row[i] + chain.edge[i] != 1) {
+            snprintf(why, why_size, "link m%d has %d rows and %d edges", i, chain.row[i],
+                     chain.edge[i]);
+            fail = why;
+        }
+    }
+    if (!fail && (rows == 0 || edges == 0)) {
+        snprintf(why, why_size, "%d cap rows and %d edges: the chain must cross the cap", rows,
+                 edges);
+        fail = why;
+    }
+    if (store)
+        cbm_store_close(store);
+    th_rmtree(tmp);
+    return fail;
+}
+
+typedef struct {
+    int pad;
+    const char *fail;
+    char why[256];
+} cap_chain_run_t;
+
+static void *cap_chain_thread(void *arg) {
+    cap_chain_run_t *run = arg;
+    run->fail = cap_chain_check(run->pad, run->why, sizeof(run->why));
+    return NULL;
+}
+
+/* The walk goes down to C_LSP_MAX_WALK_DEPTH before it stops, and a sanitizer
+ * build's frames are several times a release build's: on that build the
+ * pipeline route overflows an 8 MB stack before the cap. This run gets 64 MB
+ * on the thread that runs the pipeline and on every worker it starts
+ * (CBM_THREAD_STACK_MB, read only by sanitized builds). `pad` > 50 one-file C
+ * functions take the parallel route, 0 the sequential one. */
+static void cap_chain_run(cap_chain_run_t *run) {
+    const char *old_stack = getenv("CBM_THREAD_STACK_MB");
+    char *saved_stack = old_stack ? strdup(old_stack) : NULL;
+    cbm_setenv("CBM_THREAD_STACK_MB", "64", 1);
+    XlangEnvSave route = xlang_env_select(run->pad > 0);
+    cbm_thread_t thread;
+    if (cbm_thread_create(&thread, (size_t)64 * 1024 * 1024, cap_chain_thread, run) == 0)
+        (void)cbm_thread_join(&thread);
+    else
+        run->fail = "thread create failed";
+    xlang_env_restore(&route);
+    if (saved_stack) {
+        cbm_setenv("CBM_THREAD_STACK_MB", saved_stack, 1);
+        free(saved_stack);
+    } else {
+        cbm_unsetenv("CBM_THREAD_STACK_MB");
+    }
+}
+
+TEST(pipeline_cpp_chain_past_walk_cap_records_cap_rows_sequential) {
+    cap_chain_run_t run = {.pad = 0};
+    cap_chain_run(&run);
+    if (run.fail)
+        FAIL(run.fail);
+    PASS();
+}
+
+TEST(pipeline_cpp_chain_past_walk_cap_records_cap_rows_parallel) {
+    cap_chain_run_t run = {.pad = CAP_CHAIN_PAD};
+    cap_chain_run(&run);
+    if (run.fail)
+        FAIL(run.fail);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);
@@ -31588,6 +31792,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cpp_static_factory_shared_ptr_receiver_issue1153);
     RUN_TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153);
     RUN_TEST(pipeline_calls_args_overlong_argument_stops_cleanly);
+    RUN_TEST(pipeline_cpp_chain_past_walk_cap_records_cap_rows_sequential);
+    RUN_TEST(pipeline_cpp_chain_past_walk_cap_records_cap_rows_parallel);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
