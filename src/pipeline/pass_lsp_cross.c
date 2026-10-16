@@ -2435,12 +2435,45 @@ static PXCPythonVerdict pxc_python_final_binding(PXCPythonResolver *pr,
     return verdict;
 }
 
+/* Whether `node`, the node at `<package>.<member>`, is a submodule: what
+ * `from <package> import <member>` binds when the package's own run leaves the
+ * name unbound. */
+static bool pxc_python_is_submodule(const cbm_gbuf_node_t *node) {
+    return node && node->label &&
+           (strcmp(node->label, "Module") == 0 || strcmp(node->label, "Folder") == 0);
+}
+
+/* Whether the statement of `facts` that last binds `member` is a decorated
+ * definition of it (`@d def member`), with no star import or any-name write
+ * after it. */
+static bool pxc_python_last_binder_is_decorated_def(const CBMPyNamespaceFacts *facts,
+                                                    const char *member) {
+    for (int i = facts->count - 1; i >= 0; i--) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        if (fact->kind == CBM_PY_NS_IMPORT_STAR)
+            return false;
+        if (!fact->local_name)
+            continue;
+        if (fact->kind == CBM_PY_NS_SHADOW && strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) == 0)
+            return false;
+        if (strcmp(fact->local_name, member) == 0)
+            return fact->kind == CBM_PY_NS_SHADOW && fact->reason == CBM_PY_NS_REASON_DECORATED;
+    }
+    return false;
+}
+
 /* What `module` binds `member` to once its top-level run has finished: a node
  * of the project (PXC_PY_BOUND), something this resolver cannot name
- * (PXC_PY_OPAQUE), or nothing (PXC_PY_UNBOUND). A member with a node under the
- * module's QN is that node, as before; any other is read from the module's own
- * namespace facts. A chain longer than CBM_SZ_16 hops, or one that returns to a
- * (module, name) still being resolved, is opaque. */
+ * (PXC_PY_OPAQUE), or nothing (PXC_PY_UNBOUND). The module's own namespace
+ * facts decide, through the last statement that binds the name, also when the
+ * module has its own definition of it (`def enc` and then `try: from
+ * ._speedups import enc`). The node at `<module>.<member>` answers, as before,
+ * when that statement is the decorated definition the node is (an importer
+ * calls `@asynccontextmanager def f` through its definition, unlike the
+ * defining file's own map), for a submodule the run leaves unbound, and for a
+ * module whose facts cannot be read (no `__init__` module, an unreadable or
+ * incomplete source). A chain longer than CBM_SZ_16 hops, or one that returns
+ * to a (module, name) still being resolved, is opaque. */
 static PXCPythonVerdict pxc_python_member_binding(PXCPythonResolver *pr,
                                                   const cbm_gbuf_node_t *module, const char *member,
                                                   int depth, const cbm_gbuf_node_t **out) {
@@ -2451,11 +2484,16 @@ static PXCPythonVerdict pxc_python_member_binding(PXCPythonResolver *pr,
     int n = snprintf(qn, sizeof(qn), "%s.%s", module->qualified_name, member);
     if (n <= 0 || (size_t)n >= sizeof(qn))
         return PXC_PY_OPAQUE;
-    *out = cbm_gbuf_find_by_qn(pr->ctx->gbuf, qn);
-    if (*out)
-        return PXC_PY_BOUND;
+    const cbm_gbuf_node_t *exact = cbm_gbuf_find_by_qn(pr->ctx->gbuf, qn);
     const cbm_gbuf_node_t *owner = pxc_python_owner_module(pr->ctx->gbuf, module);
-    if (!owner || depth > CBM_SZ_16 || !pxc_python_resolver_ready(pr))
+    CBMPyNamespaceFacts facts;
+    if (!owner || !pxc_python_module_facts(pr, owner, &facts) ||
+        (exact && !pxc_python_is_submodule(exact) &&
+         pxc_python_last_binder_is_decorated_def(&facts, member))) {
+        *out = exact;
+        return exact ? PXC_PY_BOUND : PXC_PY_OPAQUE;
+    }
+    if (depth > CBM_SZ_16)
         return PXC_PY_OPAQUE;
     char *key = cbm_arena_sprintf(&pr->arena, "%s\n%s", owner->qualified_name, member);
     if (!key)
@@ -2470,11 +2508,11 @@ static PXCPythonVerdict pxc_python_member_binding(PXCPythonResolver *pr,
         return PXC_PY_OPAQUE;
     seen->verdict = PXC_PY_PENDING;
     (void)cbm_ht_set(pr->members, key, seen);
-    CBMPyNamespaceFacts facts;
-    PXCPythonVerdict verdict =
-        pxc_python_module_facts(pr, owner, &facts)
-            ? pxc_python_final_binding(pr, owner, &facts, member, depth + 1, out)
-            : PXC_PY_OPAQUE;
+    PXCPythonVerdict verdict = pxc_python_final_binding(pr, owner, &facts, member, depth + 1, out);
+    if (verdict == PXC_PY_UNBOUND && pxc_python_is_submodule(exact)) {
+        verdict = PXC_PY_BOUND;
+        *out = exact;
+    }
     if (verdict != PXC_PY_BOUND)
         *out = NULL;
     seen->verdict = verdict;
@@ -2657,29 +2695,17 @@ bool cbm_pxc_python_decorated_usage(const cbm_pipeline_ctx_t *ctx, const char *p
         usage->python_target_shadow || !pxc_python_bare_argument(usage) ||
         !pxc_python_in_function_body(result, usage) ||
         result->py_namespace.status != CBM_PY_NS_COMPLETE ||
-        !cbm_py_namespace_facts_valid(&result->py_namespace))
+        !cbm_py_namespace_facts_valid(&result->py_namespace) ||
+        !pxc_python_last_binder_is_decorated_def(&result->py_namespace, usage->ref_name))
         return false;
-    const CBMPyNamespaceFacts *facts = &result->py_namespace;
-    for (int i = facts->count - 1; i >= 0; i--) {
-        const CBMPyNamespaceFact *fact = &facts->items[i];
-        if (fact->kind == CBM_PY_NS_IMPORT_STAR ||
-            (fact->kind == CBM_PY_NS_SHADOW && fact->local_name &&
-             strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) == 0))
-            return false;
-        if (!fact->local_name || strcmp(fact->local_name, usage->ref_name) != 0)
-            continue;
-        if (fact->kind != CBM_PY_NS_SHADOW || fact->reason != CBM_PY_NS_REASON_DECORATED)
-            return false;
-        char *module_qn = cbm_pipeline_fqn_module_dir(project_name, rel_path, false);
-        const cbm_gbuf_node_t *node =
-            module_qn ? pxc_python_own_node(ctx, module_qn, usage->ref_name) : NULL;
-        pxc_free_fqn(module_qn);
-        if (!node || !node->label || strcmp(node->label, "Function") != 0)
-            return false;
-        *res = (cbm_resolution_t){node->qualified_name, "python_decorated_definition", 0.95, 1};
-        return true;
-    }
-    return false;
+    char *module_qn = cbm_pipeline_fqn_module_dir(project_name, rel_path, false);
+    const cbm_gbuf_node_t *node =
+        module_qn ? pxc_python_own_node(ctx, module_qn, usage->ref_name) : NULL;
+    pxc_free_fqn(module_qn);
+    if (!node || !node->label || strcmp(node->label, "Function") != 0)
+        return false;
+    *res = (cbm_resolution_t){node->qualified_name, "python_decorated_definition", 0.95, 1};
+    return true;
 }
 
 /* Build the private per-file import map from graph and extraction bindings.

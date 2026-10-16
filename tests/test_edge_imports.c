@@ -1053,6 +1053,58 @@ TEST(ei_py_star_excluded_name_keeps_its_row) {
     PASS();
 }
 
+/* Each package defines its own function and then replaces the binding: a
+ * plain import (rm), a star import (rf), a `try` import of the speedup (rg),
+ * `del` (ro). hop/__init__.py re-exports all four, and the users reach them
+ * through hop by name (hopped) and by star (hopstar). Python binds what the
+ * package's run left last, so the package's own def (a node at
+ * `<package>.<name>`) is never the target: thing and dup link to rm.impl.thing
+ * and rf.a.dup, and enc and gone, which the resolver cannot prove, are withheld
+ * with their rows. Returns 100 * calls to a def in a package `__init__` + 10 *
+ * calls to rm.impl.thing or rf.a.dup + the rows for enc and gone. */
+static int ei_py_own_def_rebinding_case(int pad) {
+    EILangFile f[] = {
+        {"rm/__init__.py", "def thing():\n    return 0\n\n\nfrom .impl import thing\n"},
+        {"rm/impl.py", "def thing():\n    return 1\n"},
+        {"rf/__init__.py", "def dup():\n    return 0\n\n\nfrom .a import *\n"},
+        {"rf/a.py", "def dup():\n    return 1\n"},
+        {"rg/__init__.py", "def enc():\n    return 0\n\n\ntry:\n    from ._speedups import enc\n"
+                           "except ImportError:\n    pass\n"},
+        {"rg/_speedups.py", "def enc():\n    return 1\n"},
+        {"ro/__init__.py", "def gone():\n    return 0\n\n\ndel gone\n"},
+        {"hop/__init__.py",
+         "from rm import thing\nfrom rf import dup\nfrom rg import enc\nfrom ro import gone\n"},
+        {"use_hop.py", "from hop import thing, dup, enc, gone\n\n\ndef hopped():\n"
+                       "    thing()\n    dup()\n    enc()\n    gone()\n"},
+        {"use_hopstar.py", "from hop import *\n\n\ndef hopstar():\n"
+                           "    thing()\n    dup()\n    enc()\n    gone()\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, (int)(sizeof(f) / sizeof(f[0])), pad);
+    int replaced = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON "
+                                     "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE "
+                                     "e.type='CALLS' AND s.name IN ('hopped','hopstar') AND "
+                                     "t.file_path LIKE '%/__init__.py'");
+    int bound = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                                  "s.name IN ('hopped','hopstar') AND "
+                                  "((t.file_path='rm/impl.py' AND t.name='thing') OR "
+                                  "(t.file_path='rf/a.py' AND t.name='dup'))");
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE "
+                                 "'%.hopped' OR caller LIKE '%.hopstar') AND "
+                                 "name IN ('enc','gone') AND reason='name_binding_not_proven'");
+    ei_cleanup(&lp, store);
+    if (replaced < 0 || bound < 0 || rows < 0)
+        return -1;
+    return 100 * replaced + 10 * bound + rows;
+}
+
+TEST(ei_py_replaced_own_def_is_no_reexport_target) {
+    ASSERT_EQ(ei_py_own_def_rebinding_case(0), 44);
+    ASSERT_EQ(ei_py_own_def_rebinding_case(60), 44);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2782,6 +2834,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_unlocated_module_bindings_are_not_followed);
     RUN_TEST(ei_py_compound_rebinding_leaves_reexport_unproven);
     RUN_TEST(ei_py_star_excluded_name_keeps_its_row);
+    RUN_TEST(ei_py_replaced_own_def_is_no_reexport_target);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
