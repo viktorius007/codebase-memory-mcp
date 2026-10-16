@@ -3882,6 +3882,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                     res = (cbm_resolution_t){only, "unique_name", 1.0, SKIP_ONE};
                 }
             }
+            (void)cbm_pxc_python_decorated_usage(rc->pctx, rc->project_name, rel, lang, result,
+                                                 usage, &res);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 if (res.candidate_count > SKIP_ONE) {
                     int line = usage->start_line;

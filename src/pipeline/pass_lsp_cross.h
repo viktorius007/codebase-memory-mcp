@@ -85,6 +85,14 @@ int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *project_
 
 void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
 
+/* A blocked Python value reference to the file's own decorated module-level
+ * function: rewrites *res to that function for a plain USAGE and returns true.
+ * Both usage passes call it before recording the blocked site. */
+bool cbm_pxc_python_decorated_usage(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                    const char *rel_path, CBMLanguage lang,
+                                    const CBMFileResult *result, const CBMUsage *usage,
+                                    cbm_resolution_t *res);
+
 /* ── Per-module def index (the gopls "package summary" pattern) ──
  *
  * The hot path used to register ALL all_defs[] into a fresh registry

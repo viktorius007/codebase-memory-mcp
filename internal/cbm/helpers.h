@@ -285,6 +285,11 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang);
 // node being classified.
 bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang);
 
+// Python: is the identifier `node` the name a `type` statement declares (`h` in
+// `type h = int` and in `type h[T] = list[T]`), not one of the alias's type
+// parameters or a name its value reads?
+bool cbm_python_type_alias_name(TSNode node);
+
 // --- FQN computation ---
 
 // Compute qualified name: project.rel_path_parts.name

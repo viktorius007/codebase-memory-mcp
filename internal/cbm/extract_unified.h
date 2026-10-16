@@ -116,6 +116,14 @@ typedef struct {
     uint32_t active_end;
     const char *name;
     bool import_binding;
+    /* A Python loop, comprehension, `as`, walrus or match-capture target, or a
+     * PEP 695 type parameter. Main's blocked and local-shadow verdicts never
+     * counted these (the occurrence is emitted as an ordinary usage), so only
+     * CBMUsage.python_target_shadow reads them. */
+    bool python_target;
+    /* A python_target that is a type parameter: a class's type parameters are
+     * also in force inside its methods, which skip the class namespace. */
+    bool python_type_param;
 } CBMLexicalBinding;
 
 typedef enum {

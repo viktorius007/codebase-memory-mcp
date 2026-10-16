@@ -1811,6 +1811,24 @@ bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang) {
     return false;
 }
 
+bool cbm_python_type_alias_name(TSNode node) {
+    TSNode type = ts_node_parent(node);
+    if (!ts_node_is_null(type) && strcmp(ts_node_type(type), "generic_type") == 0) {
+        if (!ts_node_eq(ts_node_named_child(type, 0), node)) {
+            return false;
+        }
+        type = ts_node_parent(type);
+    }
+    if (ts_node_is_null(type) || strcmp(ts_node_type(type), "type") != 0) {
+        return false;
+    }
+    TSNode statement = ts_node_parent(type);
+    return !ts_node_is_null(statement) &&
+           strcmp(ts_node_type(statement), "type_alias_statement") == 0 &&
+           ts_node_eq(ts_node_child_by_field_name(statement, "left", (uint32_t)strlen("left")),
+                      type);
+}
+
 /* Back-compat wrapper: computes the parent via ts_node_parent (O(n)).
  * Prefer cbm_is_module_level_p at call sites that already know the
  * parent (the common case — iterating a parent's children). */

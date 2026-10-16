@@ -58,6 +58,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sqlite3.h>
 
 /* ── Harness (mirrors test_lang_contract.c) ─────────────────────────────── */
 
@@ -753,6 +754,577 @@ TEST(ei_py_external_import_never_binds_project_symbol) {
     PASS();
 }
 
+/* `from pkg import Header, Thing` where `pkg/__init__.py` binds both names by
+ * its own imports (`from .params import Header as Header`): Python binds each
+ * name to what the package's run left under it, the function
+ * pkg.params.Header and the class pkg.shapes.Thing. `pkg.Header` is no node,
+ * so the namespace replay must follow the package's own import facts
+ * (pass_lsp_cross.c pxc_python_member_binding); stopping there blocked both
+ * calls, the FastAPI shape (`from fastapi import FastAPI`). The decoy class
+ * pkg.models.Header is what a name match picks and must never be called.
+ * Returns calls to the function Header + 10 * calls to Thing + 100 * calls to
+ * the decoy class Header. */
+static int ei_py_package_reexport_case(int pad) {
+    enum { EI_RX_BASE = 5, EI_RX_MAX = EI_RX_BASE + 64 };
+    static char names[EI_RX_MAX][32];
+    EILangFile f[EI_RX_MAX];
+    int n = 0;
+    f[n++] = (EILangFile){"pkg/__init__.py", "from .params import Header as Header\n"
+                                             "from .shapes import Thing as Thing\n"};
+    f[n++] = (EILangFile){"pkg/params.py", "def Header():\n    return 1\n"};
+    f[n++] = (EILangFile){"pkg/models.py", "class Header:\n    pass\n"};
+    f[n++] = (EILangFile){"pkg/shapes.py", "class Thing:\n    pass\n"};
+    f[n++] = (EILangFile){"app/use.py", "from pkg import Header, Thing\n\n\n"
+                                        "def read():\n    Header()\n    return Thing()\n"};
+    for (int i = 0; i < pad && n < EI_RX_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        f[n] = (EILangFile){names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int header = store ? ei_inbound_edges_on(store, lp.project, "Header", "Function", "CALLS") : -1;
+    int thing = store ? ei_inbound_edges_on(store, lp.project, "Thing", "Class", "CALLS") : -1;
+    int decoy = store ? ei_inbound_edges_on(store, lp.project, "Header", "Class", "CALLS") : -1;
+    ei_cleanup(&lp, store);
+    if (header < 0 || thing < 0 || decoy < 0)
+        return -1;
+    return header + 10 * thing + 100 * decoy;
+}
+
+TEST(ei_py_package_reexport_binds_reexported_definition) {
+    /* Both drivers' CALLS passes read the namespace-replay map. */
+    ASSERT_EQ(ei_py_package_reexport_case(0), 11);
+    ASSERT_EQ(ei_py_package_reexport_case(60), 11);
+    PASS();
+}
+
+/* Indexes `files` plus `pad` filler modules: pad 0 stays under
+ * MIN_FILES_FOR_PARALLEL(50) and takes the sequential driver, pad 60 the
+ * parallel one. NULL on failure. */
+static cbm_store_t *ei_py_index_padded(EILangProj *lp, const EILangFile *files, int nfiles,
+                                       int pad) {
+    enum { EI_PAD_MAX = 80 };
+    static char names[EI_PAD_MAX][32];
+    EILangFile all[EI_PAD_MAX];
+    int n = 0;
+    for (int i = 0; i < nfiles && n < EI_PAD_MAX; i++)
+        all[n++] = files[i];
+    for (int i = 0; i < pad && n < EI_PAD_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        all[n] = (EILangFile){names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    return ei_index_files(lp, all, n);
+}
+
+/* First column of the first row of `sql` over the indexed graph, or -1. */
+static int ei_sql_int(cbm_store_t *store, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    int value = -1;
+    if (store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW)
+        value = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return value;
+}
+
+#define EI_PY_USAGE_SQL(source, target)                                              \
+    "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "                 \
+    "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' AND s.name='" source "' " \
+    "AND t.name='" target "'"
+#define EI_PY_ROWS_SQL(caller, name)                                                         \
+    "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%." caller "' AND name='" name \
+    "' AND reason='name_binding_not_proven'"
+
+static const char ei_py_decorated_prelude[] = "def wrap(f):\n    return f\n\n\n"
+                                              "def accept(x):\n    return x\n\n\n"
+                                              "@wrap\ndef handler():\n    return 1\n\n\n";
+
+/* `@wrap def handler` binds handler to wrap(handler); `accept(handler)` read in
+ * a function body is still a USAGE of that definition (plain), so the
+ * decorated-usage rewrite (pass_lsp_cross.c cbm_pxc_python_decorated_usage)
+ * publishes it. In `[accept(handler) for handler in xs]` the comprehension's
+ * own target binds handler, so the read is no reference to the module's
+ * definition: no USAGE, and the reference keeps its name_binding_not_proven
+ * row beside the target occurrence's own row. Returns plain's USAGE + 10 *
+ * comp's USAGE + 100 * comp's rows. */
+static int ei_py_comprehension_target_case(int pad) {
+    char deco[512];
+    snprintf(deco, sizeof(deco),
+             "%sdef plain():\n    return accept(handler)\n\n\n"
+             "def comp(xs):\n    return [accept(handler) for handler in xs]\n",
+             ei_py_decorated_prelude);
+    EILangFile f[] = {{"deco.py", deco}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 1, pad);
+    int plain = ei_sql_int(store, EI_PY_USAGE_SQL("plain", "handler"));
+    int comp = ei_sql_int(store, EI_PY_USAGE_SQL("comp", "handler"));
+    int rows = ei_sql_int(store, EI_PY_ROWS_SQL("comp", "handler"));
+    ei_cleanup(&lp, store);
+    if (plain < 0 || comp < 0 || rows < 0)
+        return -1;
+    return plain + 10 * comp + 100 * rows;
+}
+
+TEST(ei_py_comprehension_target_is_no_decorated_usage) {
+    ASSERT_EQ(ei_py_comprehension_target_case(0), 201);
+    ASSERT_EQ(ei_py_comprehension_target_case(60), 201);
+    PASS();
+}
+
+/* A decorated name some other binding may replace where it is read: `global
+ * handler; handler = 3` in glob (in force for glob's read and for K.m below
+ * it), and `handler2 = 5` inside a module-level `if`. Each read is withheld
+ * and keeps its row: glob's write and read, K.m's read and use2's read. The
+ * usage passes drop a blocked callable reference without a row, so the
+ * decorated-usage rewrite must not take these over. Returns the rows + 10 *
+ * the USAGE edges from glob, m and use2 to either definition. */
+static int ei_py_rebound_decorated_case(int pad) {
+    char deco[512];
+    char deco2[512];
+    snprintf(deco, sizeof(deco),
+             "%sdef glob():\n    global handler\n    handler = 3\n"
+             "    return accept(handler)\n\n\nclass K:\n    def m(self):\n"
+             "        return accept(handler)\n",
+             ei_py_decorated_prelude);
+    snprintf(deco2, sizeof(deco2),
+             "def wrap(f):\n    return f\n\n\n"
+             "def accept(x):\n    return x\n\n\n@wrap\ndef handler2():\n    return 1\n\n\n"
+             "if True:\n    handler2 = 5\n\n\ndef use2():\n    return accept(handler2)\n");
+    EILangFile f[] = {{"deco.py", deco}, {"deco2.py", deco2}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 2, pad);
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE "
+                                 "(caller LIKE '%.glob' OR caller LIKE '%.K.m' OR caller LIKE "
+                                 "'%.use2') AND name IN ('handler','handler2') AND "
+                                 "reason='name_binding_not_proven'");
+    int edges = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='USAGE' AND "
+                                  "s.name IN ('glob','m','use2') AND "
+                                  "t.name IN ('handler','handler2')");
+    ei_cleanup(&lp, store);
+    if (rows < 0 || edges < 0)
+        return -1;
+    return rows + 10 * edges;
+}
+
+TEST(ei_py_rebound_decorated_reference_keeps_its_row) {
+    ASSERT_EQ(ei_py_rebound_decorated_case(0), 4);
+    ASSERT_EQ(ei_py_rebound_decorated_case(60), 4);
+    PASS();
+}
+
+/* `from tf.util import helper` written in test/functional/tf/user.py, inside
+ * the package tf/: Python finds tf/util.py from the script directory
+ * test/functional, and binds helper to tf.util.helper. The import resolver
+ * answers the sibling module tf/tf.py, whose own `from .other import helper`
+ * binds a different helper; following that module's bindings published
+ * go -> tf.other.helper. A module the interpreter's search does not locate is
+ * not read: go's call to helper links to tf.util.helper or stays withheld with
+ * its row, never to tf.other.helper. Returns 100 * calls to tf.other.helper +
+ * calls to tf.util.helper + go's rows for helper. */
+static int ei_py_unlocated_module_case(int pad) {
+    EILangFile f[] = {
+        {"test/functional/tf/__init__.py", ""},
+        {"test/functional/tf/tf.py",
+         "from .other import helper\n\n\ndef run_all():\n    return helper()\n"},
+        {"test/functional/tf/other.py", "def helper():\n    return 'other'\n"},
+        {"test/functional/tf/util.py", "def helper():\n    return 'util'\n"},
+        {"test/functional/tf/user.py",
+         "from tf.util import helper\n\n\ndef go():\n    return helper()\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 5, pad);
+    const char *calls = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='go' "
+                        "AND t.file_path='test/functional/tf/%s.py' AND t.name='helper'";
+    char sql[512];
+    snprintf(sql, sizeof(sql), calls, "other");
+    int wrong = ei_sql_int(store, sql);
+    snprintf(sql, sizeof(sql), calls, "util");
+    int right = ei_sql_int(store, sql);
+    int rows = ei_sql_int(store, EI_PY_ROWS_SQL("go", "helper"));
+    ei_cleanup(&lp, store);
+    if (wrong < 0 || right < 0 || rows < 0)
+        return -1;
+    return 100 * wrong + right + rows;
+}
+
+TEST(ei_py_unlocated_module_bindings_are_not_followed) {
+    ASSERT_EQ(ei_py_unlocated_module_case(0), 1);
+    ASSERT_EQ(ei_py_unlocated_module_case(60), 1);
+    PASS();
+}
+
+/* A package re-export binds what the package's top-level run leaves under the
+ * name, and the statement that last binds it decides. A statement the
+ * namespace facts do not model can be that statement: a `try` or `if` branch
+ * re-importing the name (the C speedup over the fallback), a module-level loop
+ * target, a `globals()` write. Each leaves the name unproven, so the call is
+ * withheld with its row instead of linking the overridden binding; so is a
+ * name the importing file itself re-imports in a `try` branch. A plain
+ * re-export still links (pkg_ok). Returns 100 * calls to an overridden
+ * binding + 10 * calls to pkg_ok.impl.helper + the withheld calls' rows. */
+static int ei_py_compound_rebinding_case(int pad) {
+    EILangFile f[] = {
+        {"pkg_try/__init__.py",
+         "from .slow import encode\ntry:\n    from .fast import encode\nexcept ImportError:\n"
+         "    pass\n"},
+        {"pkg_try/slow.py", "def encode(x):\n    return x\n"},
+        {"pkg_try/fast.py", "def encode(x):\n    return x\n"},
+        {"pkg_if/__init__.py", "import sys\nfrom .old import parse\n"
+                               "if sys.version_info >= (3, 8):\n    from .new import parse\n"},
+        {"pkg_if/old.py", "def parse(x):\n    return x\n"},
+        {"pkg_if/new.py", "def parse(x):\n    return x\n"},
+        {"pkg_for/__init__.py", "from .impl import cb\nfor cb in [print]:\n    pass\n"},
+        {"pkg_for/impl.py", "def cb():\n    return 1\n"},
+        {"pkg_eff/__init__.py", "from .impl import fn\nglobals()['fn'] = print\n"},
+        {"pkg_eff/impl.py", "def fn():\n    return 1\n"},
+        {"pkg_ok/__init__.py", "from .impl import helper\n"},
+        {"pkg_ok/impl.py", "def helper():\n    return 1\n"},
+        {"use.py", "from pkg_try import encode\nfrom pkg_if import parse\nfrom pkg_for import cb\n"
+                   "from pkg_eff import fn\nfrom pkg_ok import helper\n\n\ndef run():\n"
+                   "    encode(1)\n    parse(1)\n    cb()\n    helper()\n    return fn()\n"},
+        {"inline.py",
+         "from pkg_try.slow import encode\ntry:\n    from pkg_try.fast import encode\n"
+         "except ImportError:\n    pass\n\n\ndef run_inline():\n    return encode(1)\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, (int)(sizeof(f) / sizeof(f[0])), pad);
+    int wrong = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                                  "s.name IN ('run','run_inline') AND "
+                                  "t.name IN ('encode','parse','cb','fn')");
+    int control = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                    "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                                    "s.name='run' AND t.file_path='pkg_ok/impl.py' AND "
+                                    "t.name='helper'");
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE "
+                                 "'%.run' OR caller LIKE '%.run_inline') AND "
+                                 "name IN ('encode','parse','cb','fn') AND "
+                                 "reason='name_binding_not_proven'");
+    ei_cleanup(&lp, store);
+    if (wrong < 0 || control < 0 || rows < 0)
+        return -1;
+    return 100 * wrong + 10 * control + rows;
+}
+
+TEST(ei_py_compound_rebinding_leaves_reexport_unproven) {
+    /* Both drivers' CALLS passes read the namespace-replay map. */
+    ASSERT_EQ(ei_py_compound_rebinding_case(0), 15);
+    ASSERT_EQ(ei_py_compound_rebinding_case(60), 15);
+    PASS();
+}
+
+/* `from rc import *` over a package whose `__all__ = ['delta']` precedes its
+ * own `from .impl import *`: the user's star binds delta to rc.impl.delta and
+ * leaves eps unbound, so `eps()` calls nothing this graph has. The star
+ * restorer (pass_lsp_cross.c pxc_python_append_star_calls) meets eps's empty
+ * map value; the call is withheld with its name_binding_not_proven row, never
+ * dropped without one, and never linked to rc.impl.eps by name. Returns 100 *
+ * calls to eps + 10 * calls to rc.impl.delta + use_rcs's rows for eps. */
+static int ei_py_star_all_exclusion_case(int pad) {
+    EILangFile f[] = {
+        {"rc/__init__.py", "__all__ = ['delta']\nfrom .impl import *\n"},
+        {"rc/impl.py", "def delta():\n    return 1\n\n\ndef eps():\n    return 2\n"},
+        {"use_rc_star.py", "from rc import *\n\n\ndef use_rcs():\n    delta()\n    eps()\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 3, pad);
+    const char *calls = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                        "s.name='use_rcs' AND t.name='%s'";
+    char sql[512];
+    snprintf(sql, sizeof(sql), calls, "eps");
+    int excluded = ei_sql_int(store, sql);
+    snprintf(sql, sizeof(sql), calls, "delta");
+    int exported = ei_sql_int(store, sql);
+    int rows = ei_sql_int(store, EI_PY_ROWS_SQL("use_rcs", "eps"));
+    ei_cleanup(&lp, store);
+    if (excluded < 0 || exported < 0 || rows < 0)
+        return -1;
+    return 100 * excluded + 10 * exported + rows;
+}
+
+TEST(ei_py_star_excluded_name_keeps_its_row) {
+    ASSERT_EQ(ei_py_star_all_exclusion_case(0), 11);
+    ASSERT_EQ(ei_py_star_all_exclusion_case(60), 11);
+    PASS();
+}
+
+/* Each package defines its own function and then replaces the binding: a
+ * plain import (rm), a star import (rf), a `try` import of the speedup (rg),
+ * `del` (ro). hop/__init__.py re-exports all four, and the users reach them
+ * through hop by name (hopped) and by star (hopstar). Python binds what the
+ * package's run left last, so the package's own def (a node at
+ * `<package>.<name>`) is never the target: thing and dup link to rm.impl.thing
+ * and rf.a.dup, and enc and gone, which the resolver cannot prove, are withheld
+ * with their rows. Returns 100 * calls to a def in a package `__init__` + 10 *
+ * calls to rm.impl.thing or rf.a.dup + the rows for enc and gone. */
+static int ei_py_own_def_rebinding_case(int pad) {
+    EILangFile f[] = {
+        {"rm/__init__.py", "def thing():\n    return 0\n\n\nfrom .impl import thing\n"},
+        {"rm/impl.py", "def thing():\n    return 1\n"},
+        {"rf/__init__.py", "def dup():\n    return 0\n\n\nfrom .a import *\n"},
+        {"rf/a.py", "def dup():\n    return 1\n"},
+        {"rg/__init__.py", "def enc():\n    return 0\n\n\ntry:\n    from ._speedups import enc\n"
+                           "except ImportError:\n    pass\n"},
+        {"rg/_speedups.py", "def enc():\n    return 1\n"},
+        {"ro/__init__.py", "def gone():\n    return 0\n\n\ndel gone\n"},
+        {"hop/__init__.py",
+         "from rm import thing\nfrom rf import dup\nfrom rg import enc\nfrom ro import gone\n"},
+        {"use_hop.py", "from hop import thing, dup, enc, gone\n\n\ndef hopped():\n"
+                       "    thing()\n    dup()\n    enc()\n    gone()\n"},
+        {"use_hopstar.py", "from hop import *\n\n\ndef hopstar():\n"
+                           "    thing()\n    dup()\n    enc()\n    gone()\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, (int)(sizeof(f) / sizeof(f[0])), pad);
+    int replaced = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON "
+                                     "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE "
+                                     "e.type='CALLS' AND s.name IN ('hopped','hopstar') AND "
+                                     "t.file_path LIKE '%/__init__.py'");
+    int bound = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                                  "s.name IN ('hopped','hopstar') AND "
+                                  "((t.file_path='rm/impl.py' AND t.name='thing') OR "
+                                  "(t.file_path='rf/a.py' AND t.name='dup'))");
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE (caller LIKE "
+                                 "'%.hopped' OR caller LIKE '%.hopstar') AND "
+                                 "name IN ('enc','gone') AND reason='name_binding_not_proven'");
+    ei_cleanup(&lp, store);
+    if (replaced < 0 || bound < 0 || rows < 0)
+        return -1;
+    return 100 * replaced + 10 * bound + rows;
+}
+
+TEST(ei_py_replaced_own_def_is_no_reexport_target) {
+    ASSERT_EQ(ei_py_own_def_rebinding_case(0), 44);
+    ASSERT_EQ(ei_py_own_def_rebinding_case(60), 44);
+    PASS();
+}
+
+/* A match capture and a PEP 695 type parameter bind the name in the function
+ * that reads it, or, for `class K[handler]`, in the annotation scope its
+ * methods see. Neither read is the module's `@wrap def handler`, so the
+ * decorated-usage rewrite (pass_lsp_cross.c cbm_pxc_python_decorated_usage)
+ * must not take it over: each of the seven reads keeps its
+ * name_binding_not_proven row, beside the seven rows of the binding
+ * occurrences themselves (the capture, the type parameter and its annotation
+ * use). plain's read and a value pattern's (`case C.handler:` reads C's
+ * attribute, then the module's handler) are that definition and stay USAGE.
+ * Returns the USAGE edges from plain and from the value-pattern reader + 10 *
+ * the USAGE edges from the shadowed readers + 100 * the shadowed readers'
+ * rows. */
+static int ei_py_capture_and_type_param_case(int pad) {
+    char deco[1536];
+    snprintf(deco, sizeof(deco),
+             "%sdef plain():\n    return accept(handler)\n\n\n"
+             "class C:\n    handler = 1\n\n\n"
+             "def by_value(v):\n    match v:\n        case C.handler:\n"
+             "            return accept(handler)\n\n\n"
+             "def by_capture(v):\n    match v:\n        case handler:\n"
+             "            return accept(handler)\n\n\n"
+             "def by_keyword(v):\n    match v:\n        case object(real=handler):\n"
+             "            return accept(handler)\n\n\n"
+             "def by_star(v):\n    match v:\n        case [*handler]:\n"
+             "            return accept(handler)\n\n\n"
+             "def by_alias(v):\n    match v:\n        case [1] as handler:\n"
+             "            return accept(handler)\n\n\n"
+             "def by_type_param[handler](x: handler):\n    return accept(handler)\n\n\n"
+             "def by_splat_param[*handler](x):\n    return accept(handler)\n\n\n"
+             "class K[handler]:\n    def by_class_param(self):\n"
+             "        return accept(handler)\n",
+             ei_py_decorated_prelude);
+    EILangFile f[] = {{"deco.py", deco}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 1, pad);
+    static const char shadowed[] =
+        "('by_capture','by_keyword','by_star','by_alias','by_type_param','by_splat_param',"
+        "'by_class_param')";
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+             "t.id=e.target_id WHERE e.type='USAGE' AND t.name='handler' AND s.name IN %s",
+             shadowed);
+    int wrong = ei_sql_int(store, sql);
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE name='handler' AND "
+                                 "reason='name_binding_not_proven' AND (caller LIKE "
+                                 "'%.by_capture' OR caller LIKE '%.by_keyword' OR caller LIKE "
+                                 "'%.by_star' OR caller LIKE '%.by_alias' OR caller LIKE "
+                                 "'%.by_type_param' OR caller LIKE '%.by_splat_param' OR "
+                                 "caller LIKE '%.by_class_param')");
+    int read = ei_sql_int(store, EI_PY_USAGE_SQL("plain", "handler")) +
+               ei_sql_int(store, EI_PY_USAGE_SQL("by_value", "handler"));
+    ei_cleanup(&lp, store);
+    if (wrong < 0 || rows < 0 || read < 0)
+        return -1;
+    return read + 10 * wrong + 100 * rows;
+}
+
+TEST(ei_py_capture_and_type_param_are_no_decorated_usage) {
+    ASSERT_EQ(ei_py_capture_and_type_param_case(0), 1402);
+    ASSERT_EQ(ei_py_capture_and_type_param_case(60), 1402);
+    PASS();
+}
+
+/* `del handler` and `type handler = ...` bind handler in the function that
+ * holds them, as an assignment does: CPython's symbol table reports the name
+ * local there, also for a read before the `del`, and free in a nested
+ * function that reads it (inner). None of these reads is the module's
+ * `@wrap def handler`, so the decorated-usage rewrite (pass_lsp_cross.c
+ * cbm_pxc_python_decorated_usage) must not take them over: each keeps its
+ * name_binding_not_proven row, beside the rows of the `del` and `type`
+ * occurrences themselves. A read that only deletes an attribute or an item of
+ * something else (`del handler.attr`, `del d[handler]`) binds nothing, and the
+ * plain read is the definition: those three stay USAGE. Returns the USAGE
+ * edges to handler from the three global readers + 10 * the USAGE edges to
+ * handler from anything else in the file + 100 * the shadowed readers' rows. */
+static int ei_py_del_and_type_alias_case(int pad) {
+    char deco[1536];
+    snprintf(deco, sizeof(deco),
+             "%sdef plain():\n    return accept(handler)\n\n\n"
+             "def del_attr():\n    accept(handler)\n    del handler.attr\n\n\n"
+             "def del_item(d):\n    accept(handler)\n    del d[handler]\n\n\n"
+             "def dele():\n    accept(handler)\n    del handler\n\n\n"
+             "def dele_tuple():\n    accept(handler)\n    del (accept, handler)\n\n\n"
+             "def dele_list():\n    accept(handler)\n    del [handler]\n\n\n"
+             "def type_alias():\n    type handler = int\n    accept(handler)\n\n\n"
+             "def type_alias_generic():\n    type handler[T] = list[T]\n    accept(handler)\n\n\n"
+             "def outer_del():\n    def inner():\n        return accept(handler)\n\n"
+             "    del handler\n    return inner\n",
+             ei_py_decorated_prelude);
+    EILangFile f[] = {{"deco.py", deco}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 1, pad);
+    int global = ei_sql_int(store, EI_PY_USAGE_SQL("plain", "handler")) +
+                 ei_sql_int(store, EI_PY_USAGE_SQL("del_attr", "handler")) +
+                 ei_sql_int(store, EI_PY_USAGE_SQL("del_item", "handler"));
+    int all = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes t ON t.id=e.target_id "
+                                "WHERE e.type='USAGE' AND t.name='handler'");
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE name='handler' AND "
+                                 "reason='name_binding_not_proven' AND (caller LIKE '%.dele' OR "
+                                 "caller LIKE '%.dele_tuple' OR caller LIKE '%.dele_list' OR "
+                                 "caller LIKE '%.type_alias' OR caller LIKE "
+                                 "'%.type_alias_generic' OR caller LIKE '%.inner')");
+    ei_cleanup(&lp, store);
+    if (global < 0 || all < 0 || rows < 0)
+        return -1;
+    return global + 10 * (all - global) + 100 * rows;
+}
+
+TEST(ei_py_del_and_type_alias_are_no_decorated_usage) {
+    ASSERT_EQ(ei_py_del_and_type_alias_case(0), 1103);
+    ASSERT_EQ(ei_py_del_and_type_alias_case(60), 1103);
+    PASS();
+}
+
+/* A module-level `type handler = int` after the reader's definition rebinds
+ * handler before the reader can run: the module's run ends with handler bound
+ * to the type alias, not to `@wrap def handler`, so the decorated-usage
+ * rewrite must not take reader's read over, and it keeps its
+ * name_binding_not_proven row. The same reader in a module without the `type`
+ * statement (ctl.py) reads the definition: one USAGE. Returns ctl's USAGE + 10
+ * * reader's USAGE + 100 * reader's rows. */
+static int ei_py_module_type_statement_case(int pad) {
+    char deco[1024], ctl[1024];
+    snprintf(deco, sizeof(deco),
+             "%sdef reader():\n    return accept(handler)\n\n\ntype handler = int\n",
+             ei_py_decorated_prelude);
+    snprintf(ctl, sizeof(ctl), "%sdef ctl_reader():\n    return accept(handler)\n",
+             ei_py_decorated_prelude);
+    EILangFile f[] = {{"deco.py", deco}, {"ctl.py", ctl}};
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 2, pad);
+    int control = ei_sql_int(store, EI_PY_USAGE_SQL("ctl_reader", "handler"));
+    int usage = ei_sql_int(store, EI_PY_USAGE_SQL("reader", "handler"));
+    int rows = ei_sql_int(store, EI_PY_ROWS_SQL("reader", "handler"));
+    ei_cleanup(&lp, store);
+    if (control < 0 || usage < 0 || rows < 0)
+        return -1;
+    return control + 10 * usage + 100 * rows;
+}
+
+TEST(ei_py_module_type_statement_rebinds_decorated_name) {
+    ASSERT_EQ(ei_py_module_type_statement_case(0), 101);
+    ASSERT_EQ(ei_py_module_type_statement_case(60), 101);
+    PASS();
+}
+
+/* Each module binds a name only to its own node, in a way the facts do not
+ * model as one unconditional statement: a def in both branches of an
+ * if/else (vers, sep in a package), a def under `if True:` (in_if), a class
+ * in both branches (Plat), `AUG = [1]` then `AUG += [2]`, a def in both arms
+ * of a try (both), a package `__init__` that imports its own submodule
+ * (`from hu import sub`), and `__all__` read through
+ * `from .cat import __all__ as _base`. The node at `<module>.<name>` is the
+ * only thing the module's run can leave bound, so main's link stands: 8 edges
+ * to those nodes. Three names are withheld with their rows: fast (a try import
+ * of `_cspeedups.fast` may bind another module's function), f (a def that a
+ * branch reassigns to `impl`) and alt (a def in one branch, `impl` in the
+ * other); an edge to cd.fast, a1.f or a2.alt would be wrong. Returns the 8
+ * links + 10 * the wrong edges + 100 * the three rows. */
+static int ei_py_own_binder_case(int pad) {
+    EILangFile f[] = {
+        {"shapes.py", "import sys\n\nif sys.version_info >= (3, 8):\n    def vers():\n"
+                      "        return 1\nelse:\n    def vers():\n        return 2\n\n"
+                      "if True:\n    def in_if():\n        return 3\n\n"
+                      "AUG = [1]\nAUG += [2]\n\n"
+                      "if sys.platform == 'win32':\n    class Plat:\n        pass\nelse:\n"
+                      "    class Plat:\n        pass\n"},
+        {"cd.py", "try:\n    def both():\n        return 1\nexcept ImportError:\n"
+                  "    def both():\n        return 2\n\n"
+                  "try:\n    from _cspeedups import fast\nexcept ImportError:\n"
+                  "    def fast():\n        return 3\n"},
+        {"pc/__init__.py", "import os\n\nif os.sep == '/':\n    def sep():\n        return 1\n"
+                           "else:\n    def sep():\n        return 2\n"},
+        {"hu/__init__.py", "from hu import sub\n"},
+        {"hu/sub.py", "def g():\n    return 1\n"},
+        {"sa/__init__.py", ""},
+        {"sa/cat.py", "__all__ = ['a']\n\n\ndef a():\n    return 1\n"},
+        {"sa/ext.py", "from .cat import __all__ as _base\n\n__all__ = list(_base) + ['c']\n"},
+        {"other.py", "def impl():\n    return 0\n"},
+        {"a1.py", "import sys\nfrom other import impl\n\n\ndef f():\n    return 1\n\n\n"
+                  "if sys.platform == 'win32':\n    f = impl\n"},
+        {"a2.py", "import sys\nfrom other import impl\n\nif sys.platform == 'win32':\n"
+                  "    def alt():\n        return 1\nelse:\n    alt = impl\n"},
+        {"use.py", "from shapes import vers, in_if, AUG, Plat\nfrom cd import both, fast\n"
+                   "from pc import sep\nfrom hu import sub\nfrom a1 import f\nfrom a2 import alt\n\n\n"
+                   "def u():\n    vers()\n    in_if()\n    print(AUG)\n    Plat()\n    both()\n"
+                   "    fast()\n    sep()\n    sub.g()\n    f()\n    alt()\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, (int)(sizeof(f) / sizeof(f[0])), pad);
+    int linked = ei_sql_int(
+        store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+               "t.id=e.target_id WHERE e.type IN ('CALLS','USAGE') AND "
+               "((s.name='u' AND ((t.file_path='shapes.py' AND t.name IN "
+               "('vers','in_if','AUG','Plat')) OR (t.file_path='cd.py' AND t.name='both') OR "
+               "(t.file_path='pc/__init__.py' AND t.name='sep') OR "
+               "(t.file_path='hu/sub.py' AND t.name='g'))) OR "
+               "(s.file_path='sa/ext.py' AND t.file_path='sa/cat.py' AND t.name='__all__'))");
+    int wrong = ei_sql_int(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type IN "
+                                  "('CALLS','USAGE') AND s.name='u' AND "
+                                  "((t.file_path='cd.py' AND t.name='fast') OR "
+                                  "(t.file_path='a1.py' AND t.name='f') OR "
+                                  "(t.file_path='a2.py' AND t.name='alt'))");
+    int rows = ei_sql_int(store, "SELECT count(*) FROM unresolved_sites WHERE caller LIKE '%.u' "
+                                 "AND name IN ('fast','f','alt') AND "
+                                 "reason='name_binding_not_proven'");
+    ei_cleanup(&lp, store);
+    if (linked < 0 || wrong < 0 || rows < 0)
+        return -1;
+    return linked + 10 * wrong + 100 * rows;
+}
+
+TEST(ei_py_module_own_binder_keeps_its_link) {
+    ASSERT_EQ(ei_py_own_binder_case(0), 308);
+    ASSERT_EQ(ei_py_own_binder_case(60), 308);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -890,12 +1462,12 @@ static int ei_py_external_base_case(int pad) {
     /* #1278: TransactionTestCase declares no setUp. The nearest declaring
      * project ancestor of TestCase.setUp is SimpleTestCase.setUp. The missing
      * external INHERITS edge must still forbid the reverse override. */
-    int forward = store ? ei_testcases_override(store, lp.project, "TestCase.setUp",
-                                                "SimpleTestCase.setUp")
-                        : -1;
-    int reverse = store ? ei_testcases_override(store, lp.project, "SimpleTestCase.setUp",
-                                                "TestCase.setUp")
-                        : -1;
+    int forward =
+        store ? ei_testcases_override(store, lp.project, "TestCase.setUp", "SimpleTestCase.setUp")
+              : -1;
+    int reverse =
+        store ? ei_testcases_override(store, lp.project, "SimpleTestCase.setUp", "TestCase.setUp")
+              : -1;
     int ok = simple == 0 && bare == 0 && alias == 0 && tx == 1 && w_tx == 1 && tc == 1 &&
              w_tc == 1 && rel == 1 && w_rel == 1 && dot == 1 && w_dot == 1 && overrides == 1 &&
              forward == 1 && reverse == 0;
@@ -2476,6 +3048,17 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_two_consumers_same_package);
     RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_py_external_import_never_binds_project_symbol);
+    RUN_TEST(ei_py_package_reexport_binds_reexported_definition);
+    RUN_TEST(ei_py_comprehension_target_is_no_decorated_usage);
+    RUN_TEST(ei_py_rebound_decorated_reference_keeps_its_row);
+    RUN_TEST(ei_py_unlocated_module_bindings_are_not_followed);
+    RUN_TEST(ei_py_compound_rebinding_leaves_reexport_unproven);
+    RUN_TEST(ei_py_star_excluded_name_keeps_its_row);
+    RUN_TEST(ei_py_replaced_own_def_is_no_reexport_target);
+    RUN_TEST(ei_py_capture_and_type_param_are_no_decorated_usage);
+    RUN_TEST(ei_py_del_and_type_alias_are_no_decorated_usage);
+    RUN_TEST(ei_py_module_type_statement_rebinds_decorated_name);
+    RUN_TEST(ei_py_module_own_binder_keeps_its_link);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 

@@ -1700,11 +1700,20 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             continue;
         }
 
-        /* Build import map for this file */
+        /* Build import map for this file. A Python file's names are what its
+         * own top-level run binds (the namespace replay), the map the parallel
+         * driver's CALLS pass and both usage passes read; the IMPORTS
+         * resolver behind build_import_map binds by name. */
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        bool shared_import_map = files[i].language == CBM_LANG_PYTHON;
+        if (shared_import_map) {
+            cbm_pxc_build_import_map(ctx, ctx->project_name, rel, files[i].language, result,
+                                     &imp_keys, &imp_vals, &imp_count);
+        } else {
+            build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        }
         cbm_php_vendor_names_t php_vendor;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
@@ -1745,7 +1754,11 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_pipeline_unresolved_reasons_free(reasons);
         free(module_qn);
         cbm_pipeline_php_vendor_names_free(&php_vendor);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        if (shared_import_map) {
+            cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        } else {
+            free_import_map(imp_keys, imp_vals, imp_count);
+        }
         if (result_owned) {
             cbm_free_result(result);
         }
