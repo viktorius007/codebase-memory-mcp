@@ -3154,11 +3154,10 @@ static void pxc_python_append_star_calls(CBMArena *arena, CBMFileResult *result,
             if (!imp_keys[j] || !imp_vals[j] || strcmp(imp_keys[j], call->callee_name) != 0)
                 continue;
             if (!imp_vals[j][0]) {
-                /* The sequential CALLS pass rebuilds a legacy import map that
-                 * cannot carry an empty exact binding. Preserve the proof
-                 * requirement so its short-name fallback cannot publish the
-                 * excluded target; the paired type site records the stop. */
-                call->requires_lsp_resolution = true;
+                /* The star binds the name to nothing this resolver can name
+                 * (an `__all__` exclusion, a re-export it cannot follow). Both
+                 * CALLS drivers read this map, so the registry meets the empty
+                 * value, withholds the call and records its row. */
                 call->callee_is_locally_bound = false;
                 blocked = true;
                 break;

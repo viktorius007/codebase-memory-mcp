@@ -1017,6 +1017,42 @@ TEST(ei_py_compound_rebinding_leaves_reexport_unproven) {
     PASS();
 }
 
+/* `from rc import *` over a package whose `__all__ = ['delta']` precedes its
+ * own `from .impl import *`: the user's star binds delta to rc.impl.delta and
+ * leaves eps unbound, so `eps()` calls nothing this graph has. The star
+ * restorer (pass_lsp_cross.c pxc_python_append_star_calls) meets eps's empty
+ * map value; the call is withheld with its name_binding_not_proven row, never
+ * dropped without one, and never linked to rc.impl.eps by name. Returns 100 *
+ * calls to eps + 10 * calls to rc.impl.delta + use_rcs's rows for eps. */
+static int ei_py_star_all_exclusion_case(int pad) {
+    EILangFile f[] = {
+        {"rc/__init__.py", "__all__ = ['delta']\nfrom .impl import *\n"},
+        {"rc/impl.py", "def delta():\n    return 1\n\n\ndef eps():\n    return 2\n"},
+        {"use_rc_star.py", "from rc import *\n\n\ndef use_rcs():\n    delta()\n    eps()\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_py_index_padded(&lp, f, 3, pad);
+    const char *calls = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                        "s.name='use_rcs' AND t.name='%s'";
+    char sql[512];
+    snprintf(sql, sizeof(sql), calls, "eps");
+    int excluded = ei_sql_int(store, sql);
+    snprintf(sql, sizeof(sql), calls, "delta");
+    int exported = ei_sql_int(store, sql);
+    int rows = ei_sql_int(store, EI_PY_ROWS_SQL("use_rcs", "eps"));
+    ei_cleanup(&lp, store);
+    if (excluded < 0 || exported < 0 || rows < 0)
+        return -1;
+    return 100 * excluded + 10 * exported + rows;
+}
+
+TEST(ei_py_star_excluded_name_keeps_its_row) {
+    ASSERT_EQ(ei_py_star_all_exclusion_case(0), 11);
+    ASSERT_EQ(ei_py_star_all_exclusion_case(60), 11);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2745,6 +2781,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_py_rebound_decorated_reference_keeps_its_row);
     RUN_TEST(ei_py_unlocated_module_bindings_are_not_followed);
     RUN_TEST(ei_py_compound_rebinding_leaves_reexport_unproven);
+    RUN_TEST(ei_py_star_excluded_name_keeps_its_row);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
