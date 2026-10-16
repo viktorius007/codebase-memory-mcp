@@ -1,5 +1,5 @@
 # Frozen graph digests per corpus (graphcmp.py, 16 hex chars of the sorted multiset sha256).
 # Re-freeze only on a landed commit whose graph change is explained edge class by edge class.
 # binary    corpus              nodes  edges   nodes-digest      edges-digest
-ac66c020    react-native-0.88   30271  101054  781dfa903897fa32  5c72193847331571
-ac66c020    bitcoin-v27         32345  116590  21421120ad3bfcb7  f235d0179c67ef32
+b9a7012c    react-native-0.88   30271  101054  781dfa903897fa32  5c72193847331571
+b9a7012c    bitcoin-v27         32345  116593  4a2995e3aca581d7  9530dc0370801005
