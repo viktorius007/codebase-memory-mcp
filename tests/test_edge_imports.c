@@ -793,15 +793,9 @@ static int ei_py_package_reexport_case(int pad) {
 }
 
 TEST(ei_py_package_reexport_binds_reexported_definition) {
-    /* The parallel driver's CALLS pass reads the namespace-replay map. The
-     * sequential CALLS pass builds its own map from the IMPORTS resolver
-     * (pass_calls.c build_import_map), which binds `pkg` and no member: that
-     * leg proves only that the decoy is never called. */
-    int sequential = ei_py_package_reexport_case(0);
-    int parallel = ei_py_package_reexport_case(60);
-    ASSERT_GTE(sequential, 0);
-    ASSERT_LT(sequential, 100);
-    ASSERT_EQ(parallel, 11);
+    /* Both drivers' CALLS passes read the namespace-replay map. */
+    ASSERT_EQ(ei_py_package_reexport_case(0), 11);
+    ASSERT_EQ(ei_py_package_reexport_case(60), 11);
     PASS();
 }
 
@@ -1017,7 +1011,8 @@ static int ei_py_compound_rebinding_case(int pad) {
 }
 
 TEST(ei_py_compound_rebinding_leaves_reexport_unproven) {
-    /* The parallel driver's CALLS pass reads the namespace-replay map. */
+    /* Both drivers' CALLS passes read the namespace-replay map. */
+    ASSERT_EQ(ei_py_compound_rebinding_case(0), 15);
     ASSERT_EQ(ei_py_compound_rebinding_case(60), 15);
     PASS();
 }
