@@ -1019,6 +1019,11 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name);
 
+/* The target package `name` reaches for an import written in `importer_rel`:
+ * the one the importer's ecosystem declares, else the one ecosystem declaring
+ * it. NULL when absent or withheld from this importer. Borrowed from `map`. */
+const char *cbm_pkgmap_target(const CBMHashTable *map, const char *name, const char *importer_rel);
+
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count);

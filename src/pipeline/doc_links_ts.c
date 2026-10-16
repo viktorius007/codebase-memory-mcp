@@ -529,10 +529,10 @@ static int tr_path_file(const tr_index_t *ix, const char *base) {
     return hit;
 }
 
-/* The workspace package a bare specifier names (`name` or `@scope/name`, no
- * subpath): the file of its entry module, as the pipeline's package map
- * holds it. */
-static int tr_package_file(const tr_index_t *ix, const char *spec) {
+/* The workspace package a bare specifier of file `from` names (`name` or
+ * `@scope/name`, no subpath): the file of its entry module, as the
+ * pipeline's package map holds it for that file. */
+static int tr_package_file(const tr_index_t *ix, int from, const char *spec) {
     const char *slash = strchr(spec, '/');
     if (spec[0] == '@' && slash) {
         slash = strchr(slash + SKIP_ONE, '/');
@@ -540,7 +540,7 @@ static int tr_package_file(const tr_index_t *ix, const char *spec) {
     if (slash || !ix->pkgmap || !ix->by_module) {
         return CBM_NOT_FOUND;
     }
-    const char *qn = (const char *)cbm_ht_get(ix->pkgmap, spec);
+    const char *qn = cbm_pkgmap_target(ix->pkgmap, spec, ix->files[from].path);
     void *v = qn ? cbm_ht_get(ix->by_module, qn) : NULL;
     return v ? (int)((uintptr_t)v - SKIP_ONE) : CBM_NOT_FOUND;
 }
@@ -557,7 +557,7 @@ static int tr_bare_file(const tr_index_t *ix, int from, const char *spec) {
             return hit;
         }
     }
-    return tr_package_file(ix, spec);
+    return tr_package_file(ix, from, spec);
 }
 
 /* The file a module specifier written in file `from` names: -1 with
