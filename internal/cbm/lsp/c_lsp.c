@@ -4650,7 +4650,14 @@ static void c_resolve_callable_argument_references(CLSPContext *ctx, TSNode call
     }
 }
 
-static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason) {
+/* `site`, when not null, is the exact occurrence the row speaks for. The
+ * pipeline joins a sited row to the extracted call (or C++ operator
+ * candidate) with the same caller and span (cbm_pipeline_record_unresolved_call),
+ * and that call's unresolved_sites row carries `reason` in place of the
+ * pipeline's own stop. Only a reason that is a fact about the call gets a site:
+ * the walk depth cap (c_record_walk_cap_stops). */
+static void c_emit_unresolved_call_at(CLSPContext *ctx, const char *expr_text, const char *reason,
+                                      TSNode site) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn)
         return;
     CBMResolvedCall rc = {0};
@@ -4660,7 +4667,20 @@ static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, cons
     rc.confidence = 0.0f;
     rc.reason = reason;
     rc.source_origin = ctx->source_origin;
+    if (!ts_node_is_null(site)) {
+        rc.site_start_byte = ts_node_start_byte(site);
+        rc.site_end_byte = ts_node_end_byte(site);
+    }
     c_publish_resolved_call(ctx, rc);
+}
+
+/* A lookup failure is said about this resolver's registry, not the project's:
+ * the project may define the name once (the pipeline then binds it) or several
+ * times (the pipeline's stop is then name_binding_not_proven), and bitcoin has
+ * method_not_found rows for methods it defines (CChain::Tip). So the row has no
+ * site and never becomes the reason of an unresolved_sites row. */
+static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason) {
+    c_emit_unresolved_call_at(ctx, expr_text, reason, (TSNode){0});
 }
 
 // ============================================================================
@@ -4670,6 +4690,93 @@ static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, cons
 static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node, bool continued);
 
 #define C_LSP_MAX_WALK_DEPTH 512
+
+#define C_LSP_STRINGIFY_(x) #x
+#define C_LSP_STRINGIFY(x) C_LSP_STRINGIFY_(x)
+/* The stop recorded for every link the cap withholds. Built from the cap, so
+ * the reason names the number that stopped the walk and cannot drift from it. */
+#define C_LSP_WALK_CAP_REASON "walk_depth_cap_" C_LSP_STRINGIFY(C_LSP_MAX_WALK_DEPTH)
+
+/* A link is a node the walk would have tried to resolve into a call: a call
+ * expression, and in C++ the operator expressions that may be overloaded.
+ * The walk never typed a withheld operator's operands, so a primitive `i + 1`
+ * gets a row too: the reason says the link was not examined, not that it is
+ * an overloaded call. The pipeline writes such a row to unresolved_sites for
+ * the operator candidate the extractor made of the same expression
+ * (extract_cpp_operator_call). An operator candidate in walked code that the
+ * resolver did not bind gets no row: a primitive operator is no call. */
+static bool c_walk_cap_link_kind(const CLSPContext *ctx, const char *kind) {
+    if (strcmp(kind, "call_expression") == 0)
+        return true;
+    return ctx->cpp_mode &&
+           (strcmp(kind, "binary_expression") == 0 || strcmp(kind, "assignment_expression") == 0 ||
+            strcmp(kind, "subscript_expression") == 0 || strcmp(kind, "unary_expression") == 0 ||
+            strcmp(kind, "pointer_expression") == 0 || strcmp(kind, "update_expression") == 0);
+}
+
+/* The short text a stop row carries as its callee: the called member or
+ * function name, or the operator. Never the text of a receiver: a chain's
+ * receiver is the rest of the chain, and copying it per link is quadratic. */
+static const char *c_walk_cap_link_name(CLSPContext *ctx, TSNode node, const char *kind) {
+    if (strcmp(kind, "call_expression") != 0) {
+        TSNode op = ts_node_child_by_field_name(node, "operator", 8);
+        char *text = ts_node_is_null(op) ? NULL : c_node_text(ctx, op);
+        if (!text)
+            return "operator";
+        size_t n = strlen(text) + sizeof("operator");
+        char *name = (char *)cbm_arena_alloc(ctx->arena, n);
+        if (!name)
+            return "operator";
+        snprintf(name, n, "operator%s", text);
+        return name;
+    }
+    TSNode fn = ts_node_child_by_field_name(node, "function", 8);
+    if (ts_node_is_null(fn))
+        return NULL;
+    const char *fk = ts_node_type(fn);
+    if (strcmp(fk, "field_expression") == 0) {
+        TSNode field = ts_node_child_by_field_name(fn, "field", 5);
+        return ts_node_is_null(field) ? NULL : c_node_text(ctx, field);
+    }
+    if (strcmp(fk, "identifier") == 0 || strcmp(fk, "qualified_identifier") == 0 ||
+        strcmp(fk, "template_function") == 0)
+        return c_node_text(ctx, fn);
+    return NULL;
+}
+
+/* The walk stopped at the depth cap: the subtree is not walked, so none of
+ * its links is resolved. Say so for each one. The subtree is visited with a
+ * cursor, not by recursion: a chain of N links nests N deep, and the cap
+ * exists because the native stack cannot take that.
+ *
+ * A row speaks for the function being walked. A function definition inside
+ * the subtree (a local class's method) owns its calls under its own name,
+ * which the cursor cannot derive, so its body gets no row here: those calls
+ * keep the pipeline's default stop rather than a row under the wrong caller. */
+__attribute__((noinline)) static void c_record_walk_cap_stops(CLSPContext *ctx, TSNode root) {
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool more = true;
+    while (more) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool descend = true;
+        if (ts_node_is_named(node)) {
+            const char *kind = ts_node_type(node);
+            descend = strcmp(kind, "function_definition") != 0;
+            if (c_walk_cap_link_kind(ctx, kind))
+                c_emit_unresolved_call_at(ctx, c_walk_cap_link_name(ctx, node, kind),
+                                          C_LSP_WALK_CAP_REASON, node);
+        }
+        if (descend && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+}
 
 /* The chain window (see eval_window in c_lsp.h). A member call `x.f(...)`
  * and a member access `x.f` evaluate `x`, and a C++ binary operator `x + y`
@@ -4700,8 +4807,12 @@ static void c_eval_window_close(CLSPContext *ctx) {
 /* Depth-guarded entry: the AST walk recurses per nesting level and crashed
  * with a stack overflow on deeply nested real-world C++ (bitcoin, SIGSEGV in
  * cbm_type_substitute under hundreds of recursive c_resolve_calls_in_node
- * frames via c_adl_resolve). Past the cap the subtree is skipped — its calls
- * stay unresolved, which is graceful degradation, not a crash.
+ * frames via c_adl_resolve). Past the cap the subtree is skipped, which is
+ * graceful degradation, not a crash; every call and operator link in it gets a
+ * lsp_unresolved row naming the cap (c_record_walk_cap_stops), and the
+ * pipeline writes that reason to the link's unresolved_sites row, so a
+ * withheld link is a recorded one in the graph (a local-class method body in
+ * the subtree is the exception named there).
  *
  * Every entry and every exit closes the receiver-chain window: only the
  * chain operand the open window named may continue it. */
@@ -4710,12 +4821,104 @@ static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode node) {
     c_eval_window_close(ctx);
     if (ctx->eval_failure)
         return;
-    if (ctx->walk_depth >= C_LSP_MAX_WALK_DEPTH)
+    if (ctx->walk_depth >= C_LSP_MAX_WALK_DEPTH) {
+        c_record_walk_cap_stops(ctx, node);
         return;
+    }
     ctx->walk_depth++;
     c_resolve_calls_in_node_inner(ctx, node, continued);
     ctx->walk_depth--;
     c_eval_window_close(ctx);
+}
+
+/* An init-capture of a lambda: the name it binds in the lambda body and the
+ * type of its initialiser, as seen from the enclosing scope. */
+typedef struct {
+    const char *name;
+    const CBMType *type;
+} CLambdaCapture;
+
+/* Walk a lambda's capture list in the CURRENT (enclosing) scope and return its
+ * init-captures. The grammar admits `[x = e]`, `[&x = e]`, `[...x = e]` and
+ * `[&...x = e]`; each is a lambda_capture_initializer whose `left` is the
+ * name and `right` the initialiser. `e` is an expression of the enclosing
+ * scope: the capture only exists in the body, so `x` in `[x = x.b()]` is the
+ * outer `x`, and no capture of the list sees another. Every initialiser is
+ * therefore walked and typed before any capture is bound.
+ * Returns an arena array of *count entries (NULL when there are none). */
+static const CLambdaCapture *c_lambda_walk_captures(CLSPContext *ctx, TSNode list,
+                                                    uint32_t *count) {
+    *count = 0;
+    if (ts_node_is_null(list))
+        return NULL;
+    c_resolve_calls_in_node(ctx, list);
+    uint32_t nc = ts_node_named_child_count(list);
+    CLambdaCapture *found =
+        nc ? (CLambdaCapture *)cbm_arena_alloc(ctx->arena, nc * sizeof(CLambdaCapture)) : NULL;
+    if (!found)
+        return NULL;
+    uint32_t n = 0;
+    for (uint32_t ci = 0; ci < nc; ci++) {
+        TSNode cap = ts_node_named_child(list, ci);
+        if (ts_node_is_null(cap) || strcmp(ts_node_type(cap), "lambda_capture_initializer") != 0)
+            continue;
+        TSNode name_node = ts_node_child_by_field_name(cap, "left", 4);
+        TSNode val_node = ts_node_child_by_field_name(cap, "right", 5);
+        // Older grammar shapes: "name"/"value" fields, then positional (name, value)
+        if (ts_node_is_null(name_node) || ts_node_is_null(val_node)) {
+            name_node = ts_node_child_by_field_name(cap, "name", 4);
+            val_node = ts_node_child_by_field_name(cap, "value", 5);
+        }
+        if ((ts_node_is_null(name_node) || ts_node_is_null(val_node)) &&
+            ts_node_named_child_count(cap) >= 2) {
+            name_node = ts_node_named_child(cap, 0);
+            val_node = ts_node_named_child(cap, 1);
+        }
+        if (ts_node_is_null(name_node) || ts_node_is_null(val_node))
+            continue;
+        char *cap_name = c_node_text(ctx, name_node);
+        const CBMType *cap_type = c_eval_expr_type(ctx, val_node);
+        if (cap_name && !cbm_type_is_unknown(cap_type)) {
+            found[n].name = cap_name;
+            found[n].type = cap_type;
+            n++;
+        }
+    }
+    *count = n;
+    return found;
+}
+
+/* The lambda walk: the capture list in the enclosing scope, then the lambda's
+ * own scope with its init-captures bound, then the parameters and the body.
+ *
+ * It is a function of its own, and not inlined, so that the frame of
+ * c_resolve_calls_in_node_inner, which every level of the walk pays for up to
+ * C_LSP_MAX_WALK_DEPTH, does not carry the lambda's locals. The sanitized test
+ * build runs the walk to the cap on an 8 MB stack with little to spare. */
+__attribute__((noinline)) static void c_walk_lambda(CLSPContext *ctx, TSNode node) {
+    TSNode capture_list = ts_node_child_by_field_name(node, "captures", 8);
+    uint32_t capture_count = 0;
+    const CLambdaCapture *captures = c_lambda_walk_captures(ctx, capture_list, &capture_count);
+
+    int saved_fp_count = ctx->fp_count;
+    ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    for (uint32_t i = 0; i < capture_count; i++) {
+        cbm_scope_bind(ctx->current_scope, captures[i].name, captures[i].type);
+    }
+
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_null(capture_list) && ts_node_eq(child, capture_list))
+                continue; /* walked above, in the enclosing scope */
+            c_resolve_calls_in_node(ctx, child);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+
+    ctx->current_scope = cbm_scope_pop(ctx->current_scope);
+    ctx->fp_count = saved_fp_count;
 }
 
 static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node, bool continued) {
@@ -5520,13 +5723,16 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node, bool co
     }
 
 recurse:;
+    if (strcmp(kind, "lambda_expression") == 0) {
+        c_walk_lambda(ctx, node);
+        return;
+    }
     // Push scope for blocks and control structures
     bool push_scope =
         (strcmp(kind, "compound_statement") == 0 || strcmp(kind, "if_statement") == 0 ||
          strcmp(kind, "for_statement") == 0 || strcmp(kind, "for_range_loop") == 0 ||
          strcmp(kind, "while_statement") == 0 || strcmp(kind, "do_statement") == 0 ||
-         strcmp(kind, "switch_statement") == 0 || strcmp(kind, "catch_clause") == 0 ||
-         strcmp(kind, "lambda_expression") == 0);
+         strcmp(kind, "switch_statement") == 0 || strcmp(kind, "catch_clause") == 0);
     bool control_flow_scope =
         strcmp(kind, "if_statement") == 0 || strcmp(kind, "for_statement") == 0 ||
         strcmp(kind, "for_range_loop") == 0 || strcmp(kind, "while_statement") == 0 ||
@@ -5548,44 +5754,6 @@ recurse:;
             uint32_t pnc = ts_node_named_child_count(params);
             for (uint32_t pi = 0; pi < pnc; pi++) {
                 c_process_statement(ctx, ts_node_named_child(params, pi));
-            }
-        }
-    }
-
-    // Process lambda init-captures: [captured = expr] binds 'captured' in lambda scope
-    if (strcmp(kind, "lambda_expression") == 0) {
-        uint32_t lnc = ts_node_named_child_count(node);
-        for (uint32_t li = 0; li < lnc; li++) {
-            TSNode child = ts_node_named_child(node, li);
-            if (ts_node_is_null(child))
-                continue;
-            if (strcmp(ts_node_type(child), "lambda_capture_specifier") == 0) {
-                uint32_t cnc = ts_node_named_child_count(child);
-                for (uint32_t ci = 0; ci < cnc; ci++) {
-                    TSNode cap = ts_node_named_child(child, ci);
-                    if (ts_node_is_null(cap))
-                        continue;
-                    const char *ck = ts_node_type(cap);
-                    if (strcmp(ck, "lambda_capture_initializer") == 0) {
-                        // Init-capture: name = value
-                        // Try field-based access first (name field = 4 chars)
-                        TSNode name_node = ts_node_child_by_field_name(cap, "name", 4);
-                        TSNode val_node = ts_node_child_by_field_name(cap, "value", 5);
-                        // Fallback: positional — first named child is name, second is value
-                        if (ts_node_is_null(name_node) && ts_node_named_child_count(cap) >= 2) {
-                            name_node = ts_node_named_child(cap, 0);
-                            val_node = ts_node_named_child(cap, 1);
-                        }
-                        if (!ts_node_is_null(name_node) && !ts_node_is_null(val_node)) {
-                            char *cap_name = c_node_text(ctx, name_node);
-                            const CBMType *cap_type = c_eval_expr_type(ctx, val_node);
-                            if (cap_name && !cbm_type_is_unknown(cap_type)) {
-                                cbm_scope_bind(ctx->current_scope, cap_name, cap_type);
-                            }
-                        }
-                    }
-                }
-                break; // only one capture specifier per lambda
             }
         }
     }

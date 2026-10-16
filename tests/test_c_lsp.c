@@ -17211,6 +17211,282 @@ TEST(clsp_issue1527_operator_chain_work_is_linear) {
     PASS();
 }
 
+/* ── Lambda init-capture initialisers are evaluated in the enclosing scope ──
+ *
+ * `[x = x.b()]` names the capture `x` and initialises it from the `x` that
+ * exists OUTSIDE the lambda: the capture's scope begins at the lambda body, so
+ * the initialiser never sees it. The resolver used to bind the capture into
+ * the lambda scope first and then walk the capture list inside that scope, so
+ * `x.b()` was resolved against the capture's type (B) instead of the
+ * enclosing `x` (A) and linked to B::b.
+ *
+ * Both classes declare b(); only the receiver type tells them apart. */
+#define CLSP_CAPTURE_TYPES                      \
+    "struct B;\n"                               \
+    "struct A { B b(); };\n"                    \
+    "struct B { B b(); int c(); };\n"
+
+/* Each form of the capture the grammar admits, spelled on one line:
+ * `[x = x.b()]` (by value), `[&x = x.b()]` (by reference), `[...x = x.b()]`
+ * and `[&...x = x.b()]` (pack, by value and by reference). The resolver does
+ * not check pack-ness; the form only has to parse as lambda_capture_initializer. */
+static const char *const clsp_init_capture_forms[] = {"x = x.b()", "&x = x.b()", "...x = x.b()",
+                                                      "&...x = x.b()"};
+
+TEST(clsp_lambda_init_capture_initialiser_binds_in_the_enclosing_scope) {
+    for (size_t i = 0; i < sizeof(clsp_init_capture_forms) / sizeof(clsp_init_capture_forms[0]);
+         i++) {
+        char src[512];
+        snprintf(src, sizeof(src),
+                 CLSP_CAPTURE_TYPES "void f(A x) { auto g = [%s]() { return x.c(); }; }\n",
+                 clsp_init_capture_forms[i]);
+        CBMFileResult *r = extract_cpp(src);
+        ASSERT_NOT_NULL(r);
+        /* The initialiser's `x` is the enclosing A: the call is A::b, never B::b. */
+        ASSERT_EQ(count_real_resolved(r, ".A.b"), 1);
+        ASSERT_EQ(count_real_resolved(r, ".B.b"), 0);
+        /* The capture still binds in the body, with the type the initialiser has: B. */
+        ASSERT_EQ(count_real_resolved(r, ".B.c"), 1);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* An init-capture does not see the captures declared before it in the same
+ * list: `y = x.b()` reads the enclosing `x` too. */
+TEST(clsp_lambda_init_capture_does_not_see_an_earlier_capture) {
+    CBMFileResult *r = extract_cpp(CLSP_CAPTURE_TYPES
+                                   "void f(A x) { auto g = [x = x.b(), y = x.b()]() {"
+                                   " return y.c(); }; }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_real_resolved(r, ".A.b"), 2);
+    ASSERT_EQ(count_real_resolved(r, ".B.b"), 0);
+    ASSERT_EQ(count_real_resolved(r, ".B.c"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A lambda parameter and a plain capture are not init-captures: the parameter
+ * still shadows the enclosing name in the body, and a plain `[x]` capture
+ * leaves the body's `x` the enclosing variable. */
+TEST(clsp_lambda_parameter_and_plain_capture_bind_as_before) {
+    CBMFileResult *r = extract_cpp(CLSP_CAPTURE_TYPES
+                                   "void shadow(A x) { auto g = [&](B x) { return x.b(); }; }\n"
+                                   "void plain(A x) { auto g = [x]() { return x.b(); }; }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_real_resolved(r, ".B.b"), 1);
+    ASSERT_EQ(count_real_resolved(r, ".A.b"), 1);
+    int shadow_b = -1;
+    int plain_a = -1;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (!rc->caller_qn || !rc->callee_qn)
+            continue;
+        if (strstr(rc->caller_qn, "shadow") && strstr(rc->callee_qn, ".B.b"))
+            shadow_b = i;
+        if (strstr(rc->caller_qn, "plain") && strstr(rc->callee_qn, ".A.b"))
+            plain_a = i;
+    }
+    ASSERT_GTE(shadow_b, 0);
+    ASSERT_GTE(plain_a, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── A chain longer than the walk depth cap is resolved or recorded ─────────
+ *
+ * The walk recurses once per nesting level of the syntax tree and stops at
+ * C_LSP_MAX_WALK_DEPTH (512): native stack is finite. A left-nested operator
+ * chain nests one level per link, so past 512 links the walk used to return
+ * without a word: the links below the cap neither resolved nor said why.
+ *
+ * The expectation is exact. Every link of the chain is a node with a known
+ * byte span (they all start at the chain's first operand and each ends one
+ * operand later); each span must carry exactly one disposition: a resolved
+ * row, or a lsp_unresolved row whose reason names the cap. */
+#define CLSP_CAP_REASON "walk_depth_cap_512"
+
+typedef struct {
+    int resolved;  /* links with a resolved row at their exact span */
+    int stopped;   /* links with a stop row naming the cap at their exact span */
+    int silent;    /* links with neither */
+    int ambiguous; /* links with more than one row */
+    int bad_reason; /* lsp_unresolved rows at a link span whose reason is not the cap's */
+} clsp_link_ledger;
+
+static clsp_link_ledger clsp_chain_ledger(const CBMFileResult *r, const char *caller_sub,
+                                          const char *resolved_sub, const uint32_t *ends,
+                                          int links, uint32_t start) {
+    clsp_link_ledger led = {0};
+    for (int j = 0; j < links; j++) {
+        int hits = 0;
+        for (int i = 0; i < r->resolved_calls.count; i++) {
+            const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+            if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+                !strstr(rc->caller_qn, caller_sub) || rc->site_start_byte != start ||
+                rc->site_end_byte != ends[j])
+                continue;
+            bool stop = rc->strategy && strcmp(rc->strategy, "lsp_unresolved") == 0;
+            if (stop) {
+                if (rc->reason && strcmp(rc->reason, CLSP_CAP_REASON) == 0) {
+                    led.stopped++;
+                    hits++;
+                } else {
+                    led.bad_reason++;
+                }
+            } else if (strstr(rc->callee_qn, resolved_sub)) {
+                led.resolved++;
+                hits++;
+            }
+        }
+        if (hits == 0)
+            led.silent++;
+        if (hits > 1)
+            led.ambiguous++;
+    }
+    return led;
+}
+
+/* `auto x = a + a + ... + a;` with `links` operators. Returns the source and
+ * fills ends[j] (the end byte of link j) and *start (where every link begins). */
+static char *clsp_operator_chain_with_spans(int links, uint32_t *ends, uint32_t *start) {
+    size_t sz = (size_t)links * 4 + 512;
+    char *src = malloc(sz);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "struct V { V operator+(const V& o) const { return *this; } };\n"
+                                  "void deep(V a) {\n  auto x = ");
+    *start = (uint32_t)pos;
+    pos += (size_t)snprintf(src + pos, sz - pos, "a");
+    for (int j = 0; j < links; j++) {
+        pos += (size_t)snprintf(src + pos, sz - pos, " + a");
+        ends[j] = (uint32_t)pos;
+    }
+    snprintf(src + pos, sz - pos, ";\n}\n");
+    return src;
+}
+
+/* `b.a().a()...a();` with `links` calls. ends[j] is the end byte of call j. */
+static char *clsp_member_chain_with_spans(int links, uint32_t *ends, uint32_t *start) {
+    size_t sz = (size_t)links * 4 + 512;
+    char *src = malloc(sz);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "struct B { B& a() { return *this; } };\n"
+                                  "void chain(B b) {\n  ");
+    *start = (uint32_t)pos;
+    pos += (size_t)snprintf(src + pos, sz - pos, "b");
+    for (int j = 0; j < links; j++) {
+        pos += (size_t)snprintf(src + pos, sz - pos, ".a()");
+        ends[j] = (uint32_t)pos;
+    }
+    snprintf(src + pos, sz - pos, ";\n}\n");
+    return src;
+}
+
+/* Runs one chain shape at one length and returns its ledger; -1 resolved on failure. */
+static clsp_link_ledger clsp_chain_case(bool member, int links, const char *caller,
+                                        const char *resolved_sub) {
+    clsp_link_ledger bad = {.resolved = -1};
+    uint32_t *ends = malloc((size_t)links * sizeof(uint32_t));
+    uint32_t start = 0;
+    if (!ends)
+        return bad;
+    char *src = member ? clsp_member_chain_with_spans(links, ends, &start)
+                       : clsp_operator_chain_with_spans(links, ends, &start);
+    if (!src) {
+        free(ends);
+        return bad;
+    }
+    CBMFileResult *r = extract_cpp(src);
+    free(src);
+    if (!r) {
+        free(ends);
+        return bad;
+    }
+    clsp_link_ledger led = clsp_chain_ledger(r, caller, resolved_sub, ends, links, start);
+    printf("    %s chain of %d: resolved=%d stopped=%d silent=%d\n", member ? "member" : "operator",
+           links, led.resolved, led.stopped, led.silent);
+    free(ends);
+    cbm_free_result(r);
+    return led;
+}
+
+/* A chain shorter than the cap resolves every link and records no stop; a
+ * chain of 2000 resolves what the walk reaches and records a stop, naming the
+ * cap, on every link it does not. No link is silent, none carries two rows. */
+TEST(clsp_operator_chain_beyond_the_walk_depth_cap_is_recorded) {
+    clsp_link_ledger within = clsp_chain_case(false, 100, "deep", "V.operator+");
+    ASSERT_EQ(within.resolved, 100);
+    ASSERT_EQ(within.stopped, 0);
+    ASSERT_EQ(within.silent, 0);
+
+    clsp_link_ledger beyond = clsp_chain_case(false, 2000, "deep", "V.operator+");
+    ASSERT_EQ(beyond.silent, 0);
+    ASSERT_EQ(beyond.ambiguous, 0);
+    ASSERT_EQ(beyond.bad_reason, 0);
+    ASSERT_EQ(beyond.resolved + beyond.stopped, 2000);
+    /* The cap is what stops the walk, so some links resolve and some are recorded. */
+    ASSERT_GT(beyond.resolved, 0);
+    ASSERT_GT(beyond.stopped, 0);
+    PASS();
+}
+
+TEST(clsp_member_chain_beyond_the_walk_depth_cap_is_recorded) {
+    clsp_link_ledger within = clsp_chain_case(true, 100, "chain", "B.a");
+    ASSERT_EQ(within.resolved, 100);
+    ASSERT_EQ(within.stopped, 0);
+    ASSERT_EQ(within.silent, 0);
+
+    clsp_link_ledger beyond = clsp_chain_case(true, 2000, "chain", "B.a");
+    ASSERT_EQ(beyond.silent, 0);
+    ASSERT_EQ(beyond.ambiguous, 0);
+    ASSERT_EQ(beyond.bad_reason, 0);
+    ASSERT_EQ(beyond.resolved + beyond.stopped, 2000);
+    ASSERT_GT(beyond.resolved, 0);
+    ASSERT_GT(beyond.stopped, 0);
+    PASS();
+}
+
+/* A local class's method inside a subtree the walk withheld owns its calls
+ * under its own name. The cap stop speaks for the walked function only: the
+ * outer function's own withheld link keeps its row, the method's call gets
+ * none under the outer function. */
+TEST(clsp_walk_cap_stop_leaves_a_local_class_method_to_its_owner) {
+    enum { DEPTH = 600 };
+    size_t cap = (size_t)DEPTH * 4 + 256;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t n = (size_t)snprintf(src, cap, "struct A { A &m1(); A &m3(); };\nvoid outer() {\n");
+    for (int d = 0; d < DEPTH; d++)
+        n += (size_t)snprintf(src + n, cap - n, "{ ");
+    n += (size_t)snprintf(src + n, cap - n,
+                          "A a; a.m1(); struct L { void run() { A b; b.m3(); } };");
+    for (int d = 0; d < DEPTH; d++)
+        n += (size_t)snprintf(src + n, cap - n, " }");
+    snprintf(src + n, cap - n, "\n}\n");
+    CBMFileResult *r = extract_cpp(src);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    int outer_m1 = 0;
+    int outer_m3 = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        size_t len = rc->caller_qn ? strlen(rc->caller_qn) : 0;
+        if (!rc->reason || strcmp(rc->reason, "walk_depth_cap_512") != 0 || len < 6 ||
+            strcmp(rc->caller_qn + len - 6, ".outer") != 0 || !rc->callee_qn)
+            continue;
+        outer_m1 += strcmp(rc->callee_qn, "m1") == 0;
+        outer_m3 += strcmp(rc->callee_qn, "m3") == 0;
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(outer_m1, 1);
+    ASSERT_EQ(outer_m3, 0);
+    PASS();
+}
+
 TEST(registry_issue1527_index_preserves_registration_order) {
     CBMArena a;
     cbm_arena_init(&a);
@@ -18094,6 +18370,12 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_issue1527_receiver_chain_work_is_linear);
     RUN_TEST(clsp_issue1527_operator_chain_work_is_linear);
     RUN_TEST(clsp_issue1527_fresh_chain_does_not_inherit_the_memo_of_another_scope);
+    RUN_TEST(clsp_lambda_init_capture_initialiser_binds_in_the_enclosing_scope);
+    RUN_TEST(clsp_lambda_init_capture_does_not_see_an_earlier_capture);
+    RUN_TEST(clsp_lambda_parameter_and_plain_capture_bind_as_before);
+    RUN_TEST(clsp_operator_chain_beyond_the_walk_depth_cap_is_recorded);
+    RUN_TEST(clsp_member_chain_beyond_the_walk_depth_cap_is_recorded);
+    RUN_TEST(clsp_walk_cap_stop_leaves_a_local_class_method_to_its_owner);
 }
 
 /* The two 20000-link chain cases were the slowest tests in the ASan build.

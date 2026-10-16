@@ -3104,7 +3104,8 @@ typedef struct {
     CBMLanguage lang;
     const cbm_php_vendor_names_t *php_vendor;
     cbm_external_import_index_t *ext_imports;
-    const char *route_mount; /* framework mount of this file's routes, or "" */
+    const char *route_mount;     /* framework mount of this file's routes, or "" */
+    const CBMHashTable *reasons; /* resolver stops by occurrence, or NULL */
     cbm_pipeline_lsp_field_index_t field_index;
     bool field_index_built;
     bool field_index_ready;
@@ -3434,8 +3435,8 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
         return;
     }
     if (!res.qualified_name || !res.qualified_name[0]) {
-        cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call, NULL,
-                                            "name_binding_not_proven");
+        cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, rel, call,
+                                            fc->reasons, "name_binding_not_proven");
         return;
     }
     /* Reuse lsp_target as target_node when LSP resolved — avoids a
@@ -3535,7 +3536,9 @@ static void emit_resolved_file_call(resolve_ctx_t *rc, resolve_worker_state_t *w
 
 /* A Rust call (or a synthetic semantic candidate) the LSP did not place on a
  * graph node gets no textual target. Rust also skips every service and spawn
- * fallback here. Returns true when the call is handled here. */
+ * fallback here. Returns true when the call is handled here. A synthetic
+ * candidate is a stop only on the resolver's account (a C++ operator past
+ * c_lsp's walk depth cap), as in pass_calls.c. */
 static bool pp_unmaterialized_call(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                    pp_file_calls_t *fc, CBMCall *call,
                                    const cbm_gbuf_node_t *source_node, const cbm_resolution_t *res,
@@ -3543,6 +3546,9 @@ static bool pp_unmaterialized_call(resolve_ctx_t *rc, resolve_worker_state_t *ws
     (void)source_node;
     (void)res;
     if (fc->lang != CBM_LANG_RUST) {
+        if (call->requires_lsp_resolution)
+            cbm_pipeline_record_unresolved_call(ws->local_edge_buf, rc->project_name, fc->rel, call,
+                                                reasons, NULL);
         return call->requires_lsp_resolution;
     }
     /* Rust fails closed, as in pass_calls.c: a call the resolver did not
@@ -3604,8 +3610,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
     }
 
-    CBMHashTable *reasons =
-        lang == CBM_LANG_RUST ? cbm_pipeline_unresolved_reasons(&result->resolved_calls) : NULL;
+    CBMHashTable *reasons = cbm_pipeline_lsp_reasons_reach_ledger(lang)
+                                ? cbm_pipeline_unresolved_reasons(&result->resolved_calls)
+                                : NULL;
+    fc.reasons = reasons;
     if (lang == CBM_LANG_RUST) {
         cbm_pxc_rust_dump_file(rel, result);
     }
