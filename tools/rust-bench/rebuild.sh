@@ -12,12 +12,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/../.." && pwd)"
 source "$HERE/corpora.sh"
 SHA="${1:?usage: $0 <base-sha> [bench-dir]}"; BENCH=$(bench_dir "${2:-}")
 fail() { echo "REBUILD: FAIL $1" >&2; exit 1; }
-for tool in gh rustup cargo make python3 sqlite3 curl shasum tar git; do
+for tool in gh rustup cargo make cc c++ python3 sqlite3 curl shasum tar git; do
   command -v "$tool" > /dev/null || fail "prerequisite: $tool not on PATH"
 done
 gh auth status > /dev/null || fail "prerequisite: gh is not logged in (gh auth login)"
-rustup toolchain install 1.99.0 --profile minimal --component rust-analyzer > /dev/null ||
-  fail "prerequisite: rustup toolchain install 1.99.0 --component rust-analyzer"
+# component add covers a 1.99.0 toolchain that was already installed without rust-analyzer.
+{ rustup toolchain install 1.99.0 --profile minimal && rustup component add rust-analyzer --toolchain 1.99.0; } > /dev/null ||
+  fail "prerequisite: rustup toolchain install 1.99.0; rustup component add rust-analyzer --toolchain 1.99.0"
 [ ! -e "$BENCH/rust-base" ] && [ ! -e "$BENCH/cpp/base" ] ||
   fail "existing base in $BENCH: trash rust-base and cpp/base first"
 "$HERE/fetch-corpora.sh" "$BENCH" || fail fetch
