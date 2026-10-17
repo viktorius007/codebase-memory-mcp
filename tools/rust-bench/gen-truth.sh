@@ -19,16 +19,17 @@ TARGET="${CARGO_TARGET_DIR:-$BENCH/.tsdiff-target}"
 (cd "$HERE/../rust-audit/tsdiff" && CARGO_TARGET_DIR="$TARGET" cargo build --release --quiet)
 T="$TARGET/release"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+die() { echo "$1: $2 failed, log $3; its last 40 lines:" >&2; tail -40 "$3" >&2; exit 1; } # <name> <step> <log>
 for name in $NAMES; do
   root="$BENCH/$name"; corpus=$(corpus_dir "$BENCH" "$name")
   [ -d "$corpus" ] || { echo "no checkout at $corpus: run fetch-corpora.sh first" >&2; exit 2; }
   SECONDS=0
   # rust-analyzer runs build scripts through cargo; their output stays out of the scored corpus.
   (cd "$corpus" && CARGO_TARGET_DIR="$TMP/target" "$RA" scip . --output "$TMP/$name.scip") > "$root/scip.log" 2>&1 ||
-    { echo "$name: rust-analyzer scip failed, log $root/scip.log" >&2; exit 1; }
+    die "$name" "rust-analyzer scip" "$root/scip.log"
   (cd "$root" && "$T/truth" "$TMP/$name.scip" "$corpus" truth.tsv > truth.log 2>&1) ||
-    { echo "$name: truth failed, log $root/truth.log" >&2; exit 1; }
+    die "$name" "truth" "$root/truth.log"
   (cd "$root" && "$T/refs" "$TMP/$name.scip" "$corpus" refs.tsv > refs.log 2>&1) ||
-    { echo "$name: refs failed, log $root/refs.log" >&2; exit 1; }
+    die "$name" "refs" "$root/refs.log"
   echo "OK: $name truth $(wc -l < "$root/truth.tsv" | tr -d ' ') refs $(wc -l < "$root/refs.tsv" | tr -d ' ') rows, ${SECONDS}s"
 done

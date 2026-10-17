@@ -13,7 +13,7 @@ for name in $(corpus_names); do
   mkdir -p "$BASE/$name"
   CBM_RUST_BENCH="$BENCH/$name" CBM_RUST_CORPUS=$(corpus_dir "$BENCH" "$name") \
     "$HERE/../../scripts/rust-score.sh" "$BIN" "$BASE/$name" > "$BASE/$name/score.log" 2>&1 ||
-    { echo "$name: score failed, log $BASE/$name/score.log" >&2; exit 1; }
+    { tail -40 "$BASE/$name/score.log" >&2; echo "$name: score failed, log $BASE/$name/score.log (last 40 lines above)" >&2; exit 1; }
   echo "OK: $name $(grep -E '^calls ALL' "$BASE/$name/score.log")"
 done
 echo "$SHA" > "$BASE/BINARY_SHA"

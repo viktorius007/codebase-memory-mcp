@@ -27,7 +27,7 @@ SRC="$BENCH/.base-src"; BUILD="$BENCH/.base-build"
 git -C "$ROOT" worktree add --detach "$SRC" "$SHA" > /dev/null || fail "worktree at $SHA"
 trap 'git -C "$ROOT" worktree remove --force "$SRC"; rm -rf "$BUILD"' EXIT
 make -C "$SRC" -f Makefile.cbm cbm BUILD_DIR="$BUILD" -j8 > "$BENCH/base-build.log" 2>&1 ||
-  fail "build of $SHA, log $BENCH/base-build.log"
+  { tail -40 "$BENCH/base-build.log" >&2; fail "build of $SHA, log $BENCH/base-build.log (last 40 lines above)"; }
 "$HERE/baseline.sh" "$BUILD/codebase-memory-mcp" "$SHA" "$BENCH" || fail baseline
 bash "$ROOT/scripts/graph-identity/check.sh" "$BUILD/codebase-memory-mcp" "$BENCH/cpp" "$BENCH/.cpp-freeze" freeze ||
   fail "cpp freeze"
