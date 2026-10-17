@@ -61,7 +61,8 @@ The current bench roots are outside every Git tree and are read-only:
 Each bench root contains `truth.tsv` and `refs.tsv`. The truth was generated
 from rust-analyzer SCIP data. `tools/rust-bench/fetch-corpora.sh` fetches the
 corpora at the commits pinned in `tools/rust-bench/corpora.tsv`,
-`gen-truth.sh` regenerates the truth with the pinned rust-analyzer 1.99.0, and
+`gen-truth.sh` regenerates the truth with the pinned rust-analyzer 1.99.0,
+`rebuild.sh <base-sha>` runs every step on a new machine, and
 `baseline.sh` freezes the base score the gate diffs against. On 17 October
 the truth was regenerated with these scripts: the earlier truth came from an
 unrecorded older rust-analyzer and could not be reproduced. The codex
