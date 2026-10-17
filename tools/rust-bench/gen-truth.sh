@@ -24,8 +24,13 @@ for name in $NAMES; do
   root="$BENCH/$name"; corpus=$(corpus_dir "$BENCH" "$name")
   [ -d "$corpus" ] || { echo "no checkout at $corpus: run fetch-corpora.sh first" >&2; exit 2; }
   SECONDS=0
-  # rust-analyzer runs build scripts through cargo; their output stays out of the scored corpus.
-  (cd "$corpus" && CARGO_TARGET_DIR="$TMP/target" "$RA" scip . --output "$TMP/$name.scip") > "$root/scip.log" 2>&1 ||
+  # rust-analyzer loads the corpus through cargo and rustc with rustup auto-install off, and reads
+  # the standard library from the toolchain's rust-src, so the truth depends on that toolchain.
+  toolchain=$(corpus_field "$name" 5)
+  rustup toolchain install "$toolchain" --profile minimal --component rust-src > "$root/toolchain.log" 2>&1 ||
+    die "$name" "rustup toolchain install $toolchain" "$root/toolchain.log"
+  # Build-script output stays out of the scored corpus.
+  (cd "$corpus" && RUSTUP_TOOLCHAIN="$toolchain" CARGO_TARGET_DIR="$TMP/target" "$RA" scip . --output "$TMP/$name.scip") > "$root/scip.log" 2>&1 ||
     die "$name" "rust-analyzer scip" "$root/scip.log"
   (cd "$root" && "$T/truth" "$TMP/$name.scip" "$corpus" truth.tsv > truth.log 2>&1) ||
     die "$name" "truth" "$root/truth.log"

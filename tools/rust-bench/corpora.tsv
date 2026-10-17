@@ -1,6 +1,8 @@
 # Rust scoring corpora, one per row: name, GitHub repository, pinned commit, corpus directory
-# inside the checkout (the directory truth paths are relative to). Read by every script here.
-codex	openai/codex	bc98fc69f80ac517b574ee1a169b0483b1f9f10f	codex-rs
-ruff	astral-sh/ruff	b8c5e73abe5b15a74fb066e474d30397d1421cfe	.
-pm	viktorius007/project-management	dffb94f165a7aeceea7619683c1dfaec2ea1ac21	.
-bevy	bevyengine/bevy	7107093556e4069db8399760ba5151b719107c71	.
+# inside the checkout (the directory truth paths are relative to), and the Rust toolchain
+# rust-analyzer loads the corpus with: the corpus's own rust-toolchain.toml channel, or, for a
+# corpus without one, the stable release the recorded truth was made with. Read by every script here.
+codex	openai/codex	bc98fc69f80ac517b574ee1a169b0483b1f9f10f	codex-rs	1.95.0
+ruff	astral-sh/ruff	b8c5e73abe5b15a74fb066e474d30397d1421cfe	.	1.97.1
+pm	viktorius007/project-management	dffb94f165a7aeceea7619683c1dfaec2ea1ac21	.	1.98.1
+bevy	bevyengine/bevy	7107093556e4069db8399760ba5151b719107c71	.	1.99.0

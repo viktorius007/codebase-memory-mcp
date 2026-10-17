@@ -16,6 +16,8 @@ for tool in gh rustup cargo make cc c++ python3 sqlite3 curl shasum tar git; do
   command -v "$tool" > /dev/null || fail "prerequisite: $tool not on PATH"
 done
 gh auth status > /dev/null || fail "prerequisite: gh is not logged in (gh auth login)"
+printf '#include <zlib.h>\nint main(void) { return zlibVersion() == 0; }\n' | cc -x c - -lz -o /dev/null ||
+  fail "prerequisite: zlib headers and library (Ubuntu: apt-get install zlib1g-dev)"
 # component add covers a 1.99.0 toolchain that was already installed without rust-analyzer.
 { rustup toolchain install 1.99.0 --profile minimal && rustup component add rust-analyzer --toolchain 1.99.0; } > /dev/null ||
   fail "prerequisite: rustup toolchain install 1.99.0; rustup component add rust-analyzer --toolchain 1.99.0"
