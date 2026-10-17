@@ -20,21 +20,27 @@ TARGET="${CARGO_TARGET_DIR:-$BENCH/.tsdiff-target}"
 T="$TARGET/release"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 die() { echo "$1: $2 failed, log $3; its last 40 lines:" >&2; tail -40 "$3" >&2; exit 1; } # <name> <step> <log>
+# rust-analyzer loads the corpus through cargo and rustc with rustup auto-install off, and reads
+# the standard library from the toolchain's rust-src, so the truth depends on that toolchain.
+# Installed one at a time: concurrent rustup installs share its download directory.
 for name in $NAMES; do
   root="$BENCH/$name"; corpus=$(corpus_dir "$BENCH" "$name")
   [ -d "$corpus" ] || { echo "no checkout at $corpus: run fetch-corpora.sh first" >&2; exit 2; }
-  SECONDS=0
-  # rust-analyzer loads the corpus through cargo and rustc with rustup auto-install off, and reads
-  # the standard library from the toolchain's rust-src, so the truth depends on that toolchain.
   toolchain=$(corpus_field "$name" 5)
   rustup toolchain install "$toolchain" --profile minimal --component rust-src > "$root/toolchain.log" 2>&1 ||
     die "$name" "rustup toolchain install $toolchain" "$root/toolchain.log"
+done
+truth_one() { # <name>; rust-analyzer analyses on one thread, so the corpora run side by side.
+  local name="$1" root="$BENCH/$1" corpus toolchain; SECONDS=0
+  corpus=$(corpus_dir "$BENCH" "$name"); toolchain=$(corpus_field "$name" 5)
   # Build-script output stays out of the scored corpus.
-  (cd "$corpus" && RUSTUP_TOOLCHAIN="$toolchain" CARGO_TARGET_DIR="$TMP/target" "$RA" scip . --output "$TMP/$name.scip") > "$root/scip.log" 2>&1 ||
+  (cd "$corpus" && RUSTUP_TOOLCHAIN="$toolchain" CARGO_TARGET_DIR="$TMP/$name.target" "$RA" scip . --output "$TMP/$name.scip") > "$root/scip.log" 2>&1 ||
     die "$name" "rust-analyzer scip" "$root/scip.log"
   (cd "$root" && "$T/truth" "$TMP/$name.scip" "$corpus" truth.tsv > truth.log 2>&1) ||
     die "$name" "truth" "$root/truth.log"
   (cd "$root" && "$T/refs" "$TMP/$name.scip" "$corpus" refs.tsv > refs.log 2>&1) ||
     die "$name" "refs" "$root/refs.log"
   echo "OK: $name truth $(wc -l < "$root/truth.tsv" | tr -d ' ') refs $(wc -l < "$root/refs.tsv" | tr -d ' ') rows, ${SECONDS}s"
-done
+}
+# shellcheck disable=SC2086 # NAMES is a word list
+parallel_each truth_one $NAMES

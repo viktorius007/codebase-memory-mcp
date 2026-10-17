@@ -9,12 +9,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=corpora.sh
 source "$HERE/corpora.sh"
 BENCH=$(bench_dir "${1:-}")
-for name in $(corpus_names); do
-  dest="$BENCH/$name/$name"
-  if [ -d "$dest" ]; then echo "SKIP: $name (exists)"; continue; fi
+fetch_one() { # <name>, or cpp for the C/C++ corpora
+  if [ "$1" = cpp ]; then bash "$HERE/../../scripts/graph-identity/fetch-corpora.sh" "$BENCH/cpp"; return; fi
+  local name="$1" dest="$BENCH/$1/$1" repo sha
+  if [ -d "$dest" ]; then echo "SKIP: $name (exists)"; return; fi
   repo=$(corpus_field "$name" 2); sha=$(corpus_field "$name" 3)
   mkdir -p "$dest"
   gh api "repos/$repo/tarball/$sha" | tar -xz --strip-components=1 -C "$dest"
   echo "OK: $name $repo@${sha:0:10} $(find "$dest" -type f | wc -l | tr -d ' ') files"
-done
-bash "$HERE/../../scripts/graph-identity/fetch-corpora.sh" "$BENCH/cpp"
+}
+# Downloads are network-bound, so all of them at once.
+# shellcheck disable=SC2046 # corpus names are single words
+CBM_BENCH_JOBS=99 parallel_each fetch_one $(corpus_names) cpp

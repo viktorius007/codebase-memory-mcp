@@ -23,15 +23,20 @@ printf '#include <zlib.h>\nint main(void) { return zlibVersion() == 0; }\n' | cc
   fail "prerequisite: rustup toolchain install 1.99.0; rustup component add rust-analyzer --toolchain 1.99.0"
 [ ! -e "$BENCH/rust-base" ] && [ ! -e "$BENCH/cpp/base" ] ||
   fail "existing base in $BENCH: trash rust-base and cpp/base first"
-"$HERE/fetch-corpora.sh" "$BENCH" || fail fetch
-"$HERE/gen-truth.sh" "$BENCH" || fail truth
-SRC="$BENCH/.base-src"; BUILD="$BENCH/.base-build"
+SRC="$BENCH/.base-src"; BUILD="$BENCH/.base-build"; mkdir -p "$BENCH"
 git -C "$ROOT" worktree add --detach "$SRC" "$SHA" > /dev/null || fail "worktree at $SHA"
-trap 'git -C "$ROOT" worktree remove --force "$SRC"; rm -rf "$BUILD"' EXIT
+BUILD_PID=
+trap '[ -z "$BUILD_PID" ] || kill "$BUILD_PID" 2> /dev/null; git -C "$ROOT" worktree remove --force "$SRC"; rm -rf "$BUILD"' EXIT
+# The build needs none of the corpora, so it runs on the cores the fetch and truth leave idle.
 # GCC 14+ makes incompatible-pointer-types an error that -w cannot silence; Apple Clang only
 # warns, and the base was built there. The flag changes diagnostics only, not code generation.
-make -C "$SRC" -f Makefile.cbm cbm BUILD_DIR="$BUILD" -j8 CC="cc -Wno-error=incompatible-pointer-types" >"$BENCH/base-build.log" 2>&1 ||
-  { tail -40 "$BENCH/base-build.log" >&2; fail "build of $SHA, log $BENCH/base-build.log (last 40 lines above)"; }
+make -C "$SRC" -f Makefile.cbm cbm BUILD_DIR="$BUILD" -j"$(getconf _NPROCESSORS_ONLN)" \
+  CC="cc -Wno-error=incompatible-pointer-types" > "$BENCH/base-build.log" 2>&1 & BUILD_PID=$!
+"$HERE/fetch-corpora.sh" "$BENCH" || fail fetch
+"$HERE/gen-truth.sh" "$BENCH" || fail truth
+wait "$BUILD_PID" ||
+  { BUILD_PID=; tail -40 "$BENCH/base-build.log" >&2; fail "build of $SHA, log $BENCH/base-build.log (last 40 lines above)"; }
+BUILD_PID=
 "$HERE/baseline.sh" "$BUILD/codebase-memory-mcp" "$SHA" "$BENCH" || fail baseline
 bash "$ROOT/scripts/graph-identity/check.sh" "$BUILD/codebase-memory-mcp" "$BENCH/cpp" "$BENCH/.cpp-freeze" freeze ||
   fail "cpp freeze"
