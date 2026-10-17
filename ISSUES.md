@@ -366,20 +366,18 @@ inspect.
 
 ### Preserved artifacts
 
-Raw artifacts are under `private/audit-2026-09-20/` — gitignored, 81 MB, local
-to the machine that ran the audit:
+Raw artifacts are under `private/audit-2026-09-20/`:
 
 | Path | Contents |
 |------|----------|
-| `index.scip` | rust-analyzer 1.95.0 SCIP index of the pm corpus, 55 MB |
-| `scip.log` | its generation log, including duplicate-symbol warnings |
-| `scip.pkl` | decoded `(caller, target, path)` triples, for re-analysis without re-parsing |
+| `scip.log` | the SCIP generation log, including duplicate-symbol warnings |
 | `index.log` | `index_repository` response for `cbm-audit-pm` |
 | `graph-pages/` | every paged `query_graph` JSON response behind the CALLS and IMPORTS counts |
 | `synth/` | the `cbm-audit-synth` corpus as indexed |
 
-`index.scip` was generated with `rust-analyzer scip <repo> --output index.scip`
-(1.95.0, 531 documents, 76 s).
+The 55 MB SCIP index of the pm corpus is not kept. Regenerate it on the snapshot
+below with `rust-analyzer scip <repo> --output index.scip` (1.95.0, 531
+documents, 76 s).
 
 ### Corpus identity
 

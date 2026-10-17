@@ -43,8 +43,8 @@ Thumbs.db
 memory/
 reference/
 
-# Local-only scratch / session notes (never pushed)
-private/
+# Agent output (transcripts, logs); reports a later session needs move to merge/reports/
+/private/rust-run/merge/out/
 
 # Build artifacts
 build/
@@ -97,8 +97,6 @@ soak-results-query-leak/
 /result-*
 *.tsbuildinfo
 
-# Session handoff: local working file read by the SessionStart hook; history lives in git (c3d37e62)
-/HANDOFF.md
 
 # Agent worktrees created by the Agent tool (registered in .git, never committed)
 /.claude/worktrees/

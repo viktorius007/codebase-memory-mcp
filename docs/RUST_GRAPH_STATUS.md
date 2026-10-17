@@ -59,7 +59,14 @@ The current bench roots are outside every Git tree and are read-only:
 | bevy | `~/Developer/cbm-bench/bevy` | `~/Developer/cbm-bench/bevy/bevy` |
 
 Each bench root contains `truth.tsv` and `refs.tsv`. The truth was generated
-from rust-analyzer SCIP data; rust-analyzer is an offline oracle, not an index
+from rust-analyzer SCIP data. `tools/rust-bench/fetch-corpora.sh` fetches the
+corpora at the commits pinned in `tools/rust-bench/corpora.tsv`,
+`gen-truth.sh` regenerates the truth with the pinned rust-analyzer 1.99.0, and
+`baseline.sh` freezes the base score the gate diffs against. On 17 October
+the truth was regenerated with these scripts: the earlier truth came from an
+unrecorded older rust-analyzer and could not be reproduced. The codex
+denominator moved from 229,961 to 229,953; ruff, pm, and bevy totals are
+unchanged. Figures dated before 17 October use the earlier truth; rust-analyzer is an offline oracle, not an index
 dependency. A corpus placed under this repository inherits its ignore and Git
 history rules: on 14 October that placement lost 103 codex call credits. The
 bench roots above avoid that artefact.
@@ -206,22 +213,22 @@ non-independent branches.
    same-named fixture definitions. The occurrence scope needed for a safe
    file-wide repair is not retained on those raw edges. Source: the OPEN
    section of
-   `/Users/viktor/Developer/github/codebase-memory-mcp/private/rust-run/merge/out/F1b.report.md`.
+   `private/rust-run/merge/reports/F1b.report.md`.
 8. **Open: silent Rust withholds.** Ten bevy_reflect dyn-trait calls are absent
    without a matching stop record after block-key normalization. Source: the
    2026-10-14 18:50 M5 ledger entry in
-   `/Users/viktor/Developer/github/codebase-memory-mcp/private/rust-run/merge/run-ledger.md`.
+   `private/rust-run/merge/run-ledger.md`.
 9. **Open: inventory completeness.** `tools/std-inventory/generate.py` still
    lacks complete `dyn Any` and `dyn Error` inherent-method data;
    `tools/std-inventory/receivers.json` lacks concrete `Option.Inner` and
    `Option.Item` receivers; declaring-trait provenance and the generic-self
    over-list remain approximate. These are the six OPEN items in
-   `/Users/viktor/Developer/github/codebase-memory-mcp/private/rust-run/merge/out/STD3.report.md`.
+   `private/rust-run/merge/reports/STD3.report.md`.
 10. **Open: identity and macro proof.** Block-local node identity landed, but
     some impl-receiver and field-type consumers still use module-scoped
     spellings, and unknown macro arguments can still be admitted by the
     builtin macro policy. Source: the OPEN section of the B2 resume report at
-    `/Users/viktor/Developer/github/codebase-memory-mcp/private/rust-run/wave1/out/w1-B2.r.report.md`.
+    `private/rust-run/merge/reports/w1-B2.r.report.md`.
 11. **Open: the dated queue.** `From` argument proof; EnumVariant, Macro, and
     Module USAGE; ruff impl and constant/static recall; broader registry/FQN
     identity; and invalid UTF-8 in truncated edge properties were not closed
@@ -245,8 +252,7 @@ non-independent branches.
 The canonical full reproduction on this machine is:
 
 ```sh
-/Users/viktor/Developer/github/codebase-memory-mcp/private/rust-run/merge/gate.sh \
-  /absolute/path/to/codebase-memory-mcp /absolute/path/to/scratch
+tools/rust-bench/gate.sh /absolute/path/to/codebase-memory-mcp /absolute/path/to/scratch
 ```
 
 Both arguments are parameters. The scratch directory must be private and may
