@@ -7,12 +7,14 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=corpora.sh
 source "$HERE/corpora.sh"
-RA_VERSION="rust-analyzer 1.99.0 (b940084d 2026-09-28)"
+# The release commit, in full: builds print it abbreviated to different lengths (macOS 8, Linux 7).
+RA_RELEASE=1.99.0; RA_COMMIT=b940084d7eb6a299eb4bfeb8e34901bc051e7ac4
 RA="${CBM_RUST_ANALYZER:-$(rustup which --toolchain 1.99.0 rust-analyzer)}"
 BENCH=$(bench_dir "${1:-}"); shift || true
 NAMES="${*:-$(corpus_names)}"
 given=$("$RA" --version)
-[ "$given" = "$RA_VERSION" ] || { echo "rust-analyzer at $RA is '$given', expected '$RA_VERSION'" >&2; exit 2; }
+[[ "$given" =~ ^rust-analyzer\ $RA_RELEASE\ \(([0-9a-f]{7,})\  && "$RA_COMMIT" == "${BASH_REMATCH[1]}"* ]] ||
+  { echo "rust-analyzer at $RA is '$given', expected release $RA_RELEASE at commit $RA_COMMIT" >&2; exit 2; }
 TARGET="${CARGO_TARGET_DIR:-$BENCH/.tsdiff-target}"
 (cd "$HERE/../rust-audit/tsdiff" && CARGO_TARGET_DIR="$TARGET" cargo build --release --quiet)
 T="$TARGET/release"
