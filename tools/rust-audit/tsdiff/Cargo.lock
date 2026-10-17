@@ -70,6 +70,7 @@ checksum = "9bda8e21c04aca2ae33ffc2fd8c23134f3cac46db123ba97bd9d3f3b8a4a85e1"
 [[package]]
 name = "edition"
 version = "0.0.0"
+source = "git+https://github.com/rust-lang/rust-analyzer?rev=068bb508581477a5e3f753e1e206d34288dfa9c9#068bb508581477a5e3f753e1e206d34288dfa9c9"
 
 [[package]]
 name = "either"
@@ -165,6 +166,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "parser"
 version = "0.0.0"
+source = "git+https://github.com/rust-lang/rust-analyzer?rev=068bb508581477a5e3f753e1e206d34288dfa9c9#068bb508581477a5e3f753e1e206d34288dfa9c9"
 dependencies = [
  "drop_bomb",
  "edition",
@@ -303,6 +305,7 @@ dependencies = [
 [[package]]
 name = "stdx"
 version = "0.0.0"
+source = "git+https://github.com/rust-lang/rust-analyzer?rev=068bb508581477a5e3f753e1e206d34288dfa9c9#068bb508581477a5e3f753e1e206d34288dfa9c9"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-utils",
@@ -328,6 +331,7 @@ dependencies = [
 [[package]]
 name = "syntax"
 version = "0.0.0"
+source = "git+https://github.com/rust-lang/rust-analyzer?rev=068bb508581477a5e3f753e1e206d34288dfa9c9#068bb508581477a5e3f753e1e206d34288dfa9c9"
 dependencies = [
  "either",
  "itertools",

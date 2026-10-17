@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-syntax = { path = "../../../../rust-analyzer/crates/syntax" }
+syntax = { git = "https://github.com/rust-lang/rust-analyzer", rev = "068bb508581477a5e3f753e1e206d34288dfa9c9" }
 
 toml = "0.8.23"
 

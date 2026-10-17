@@ -16,7 +16,7 @@ scripts/test.sh needs BUILD_DIR to be a direct child of build/ (default is fine)
 BENCH — consolidated 17 Oct (owner decision: one source of truth; bulky data is never kept, only regenerated).
 - tools/rust-bench/: corpora.tsv (4 Rust corpora, full pinned SHAs), fetch-corpora.sh (gh tarballs, no .git; C/C++ via scripts/graph-identity/fetch-corpora.sh),
   gen-truth.sh (rust-analyzer pinned to 1.99.0 b940084d, refuses another version; build output kept out of the corpus), baseline.sh (freezes <bench>/rust-base), gate.sh, edgediff.py.
-  On a new machine, from the repo root: `tools/rust-bench/rebuild.sh b9a7012c` (about 25 min). It checks prerequisites (gh logged in with access to the
+  On a new machine, from the repo root: `tools/rust-bench/rebuild.sh b9a7012c [bench-dir]` (about 25 min; bench-dir defaults to ~/Developer/cbm-bench, which every script here uses when not given one). It checks prerequisites (gh logged in with access to the
   private pm repo; installs rustup toolchain 1.99.0 + rust-analyzer), fetches, generates truth, builds the base binary in a temporary worktree,
   freezes rust-base and cpp/base, and fails if the C/C++ digests differ from scripts/graph-identity/DIGESTS. Last line REBUILD: PASS|FAIL <step>.
   Then the gate: tools/rust-bench/gate.sh <clone> <scratch>.
