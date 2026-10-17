@@ -4,6 +4,8 @@
 # graphs from it. Ends with one line: REBUILD: PASS or REBUILD: FAIL <step>. The C/C++ freeze
 # rewrites scripts/graph-identity/DIGESTS; the run fails when that differs from the committed
 # file, which means this machine indexes the C/C++ corpora differently from the recorded base.
+# It also fails when fingerprint.py's hashes of the corpora, truth and base edges differ from
+# FINGERPRINTS, the values of the recorded bench; regenerate that file only on a deliberate rebase.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=corpora.sh
@@ -31,4 +33,7 @@ bash "$ROOT/scripts/graph-identity/check.sh" "$BUILD/codebase-memory-mcp" "$BENC
 rm -rf "$BENCH/.cpp-freeze"
 echo "$SHA" > "$BENCH/cpp/base/BINARY_SHA"
 git -C "$ROOT" diff --exit-code --stat scripts/graph-identity/DIGESTS || fail "cpp digests differ from the committed DIGESTS"
+IFS=$'\n' read -r -d '' -a names < <(corpus_names) || true # bash 3.2 has no mapfile
+python3 "$HERE/fingerprint.py" "$BENCH" "${names[@]}" > "$BENCH/FINGERPRINTS"
+diff "$HERE/FINGERPRINTS" "$BENCH/FINGERPRINTS" || fail "fingerprints differ from tools/rust-bench/FINGERPRINTS (lines above)"
 echo "REBUILD: PASS base $SHA in $BENCH"

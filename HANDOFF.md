@@ -20,7 +20,8 @@ BENCH — consolidated 17 Oct (owner decision: one source of truth; bulky data i
   gen-truth.sh (rust-analyzer pinned to 1.99.0 b940084d, refuses another version; build output kept out of the corpus), baseline.sh (freezes <bench>/rust-base), gate.sh, edgediff.py.
   On a new machine, from the repo root: `tools/rust-bench/rebuild.sh b9a7012c [bench-dir]` (about 25 min; bench-dir defaults to ~/Developer/cbm-bench, which every script here uses when not given one). It checks prerequisites (gh logged in with access to the
   private pm repo; installs rustup toolchain 1.99.0 + rust-analyzer), fetches, generates truth, builds the base binary in a temporary worktree,
-  freezes rust-base and cpp/base, and fails if the C/C++ digests differ from scripts/graph-identity/DIGESTS. Last line REBUILD: PASS|FAIL <step>.
+  freezes rust-base and cpp/base, and fails if the C/C++ digests differ from scripts/graph-identity/DIGESTS or the Rust corpus/truth/refs/base-edge
+  hashes (fingerprint.py) differ from tools/rust-bench/FINGERPRINTS. Linux untested as of 17 Oct; a FAIL there on fingerprints means the platform changes the data. Last line REBUILD: PASS|FAIL <step>.
   Then the gate: tools/rust-bench/gate.sh <clone> <scratch>.
 - ~/Developer/cbm-bench was rebuilt 17 Oct entirely by these scripts; the old copy is in the macOS Trash. Verified, do not re-investigate:
   fresh corpora identical to the old ones; truth deterministic (all four regenerated twice, byte-identical); old truth was NOT reproducible with 1.99.0
