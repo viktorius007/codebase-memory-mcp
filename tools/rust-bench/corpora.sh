@@ -14,10 +14,9 @@ corpus_dir() { # <bench> <name>: the directory scored and given to rust-analyzer
   if [ "$sub" = . ]; then echo "$1/$2/$2"; else echo "$1/$2/$2/$sub"; fi
 }
 # parallel_each <fn> <name...>: run `<fn> <name>` for every name, CBM_BENCH_JOBS (default 2) at a
-# time, in the order given: put the longest first. Two is the default because one rust-analyzer
-# holds 6 GB or more. Prints the output of the jobs that passed in name order, then that of the
-# jobs that failed on stderr, so a failing run still ends with the failing job's own lines;
-# returns 1 if any job failed. Polls instead of `wait -n`, which bash 3.2 lacks.
+# time, in the order given: put the longest first. Prints the output of the jobs that passed in
+# name order, then that of the jobs that failed on stderr, so a failing run still ends with the
+# failing job's own lines; returns 1 if any job failed. Polls instead of `wait -n`: bash 3.2.
 parallel_each() {
   local fn="$1" out name i=0 failed=() pids=(); shift
   out=$(mktemp -d)

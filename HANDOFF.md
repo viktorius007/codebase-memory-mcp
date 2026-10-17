@@ -22,7 +22,10 @@ BENCH — consolidated 17 Oct (owner decision: one source of truth; bulky data i
   private pm repo; installs rustup toolchain 1.99.0 + rust-analyzer), fetches, generates truth, builds the base binary in a temporary worktree,
   freezes rust-base and cpp/base, and fails if the C/C++ digests differ from scripts/graph-identity/DIGESTS or the Rust corpus/truth/refs/base-edge
   hashes (fingerprint.py) differ from tools/rust-bench/FINGERPRINTS. Each corpus is loaded with its own toolchain (corpora.tsv column 5: codex 1.95.0, ruff 1.97.1, pm 1.98.1, bevy 1.99.0), installed by gen-truth.sh.
-  Linux: Ubuntu 26.04 runs hit, in turn, missing sqlite3, rust-analyzer's 7-char commit hash, and codex's 1.95.0 toolchain (all fixed); no full Linux run yet.
+  Linux: 17 Oct, Ubuntu 26.04 x86_64 (16 vCPU, 31 GB, no swap): REBUILD: PASS, all 16 FINGERPRINTS and DIGESTS identical to macOS, 1778 s. Needs zlib1g-dev (root).
+  Fixed on the way: GCC 14+ rejects b9a7012c's rust_lsp.c pointer mismatch (built with -Wno-error=incompatible-pointer-types); the truth was host-dependent
+  because rust-analyzer resolves #[cfg(target_os)] for the host, so gen-truth.sh pins cargo.target aarch64-apple-darwin on every host (Mac output unchanged).
+  Truth runs one corpus at a time (CBM_TRUTH_JOBS): codex peaks at 19 GB, and codex + bevy together thrashed a 31 GB box for 2 h without finishing.
   A FAIL there on fingerprints means the platform changes the data. Last line REBUILD: PASS|FAIL <step>.
   Then the gate: tools/rust-bench/gate.sh <clone> <scratch>.
 - ~/Developer/cbm-bench was rebuilt 17 Oct entirely by these scripts; the old copy is in the macOS Trash. Verified, do not re-investigate:

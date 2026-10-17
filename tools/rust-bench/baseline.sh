@@ -17,6 +17,7 @@ score_one() { # <name>
     { tail -40 "$BASE/$name/score.log" >&2; echo "$name: score failed, log $BASE/$name/score.log (last 40 lines above)" >&2; exit 1; }
   echo "OK: $name $(grep -E '^calls ALL' "$BASE/$name/score.log")"
 }
+# Two at a time (parallel_each's default): an index of these corpora peaks at about 3.3 GB.
 # shellcheck disable=SC2046 # corpus names are single words
 parallel_each score_one $(corpus_names)
 echo "$SHA" > "$BASE/BINARY_SHA"
