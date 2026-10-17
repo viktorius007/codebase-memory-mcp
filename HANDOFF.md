@@ -1,4 +1,6 @@
-## STATE — 17 Oct: main = origin/main (bench consolidation commit on 93a2275e). Nothing running; no lane, branch, worktree or scratch left.
+## STATE — 17 Oct: main = origin/main (bench consolidation, a477a034 and its HANDOFF follow-up). Nothing running; no lane, branch, worktree or scratch left.
+Product code is unchanged since 93a2275e; the bench base binary is b9a7012c. Verified 17 Oct: a fresh agent given only this file ran rebuild.sh from a clean
+GitHub clone, got REBUILD: PASS, and every corpus, truth/refs file and base edge set was identical to ~/Developer/cbm-bench.
 History before this point: private/rust-run/merge/run-ledger.md (authoritative) and private/rust-run/merge/handover/HANDOFF-pre-closeout-16oct.md (previous HANDOFF).
 HANDOFF.md and private/ are tracked and pushed (17 Oct); the GitHub repo is public, so neither may hold secrets or personal data.
 
