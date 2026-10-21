@@ -18285,7 +18285,7 @@ static const char **rust_registered_receivers(CBMArena *arena, const CBMTypeRegi
                                               const CBMIdxMemo *type_idx,
                                               const CBMRustModTree *tree, CBMRustLSPDef *defs,
                                               int def_count, const char *module_qn,
-                                              const char *const **out_more) {
+                                              const char *const ***out_more) {
     size_t slots = (size_t)(def_count > 0 ? def_count : 1);
     const char **receivers = (const char **)cbm_arena_alloc(arena, slots * sizeof(const char *));
     const char *const *more_none = NULL;
