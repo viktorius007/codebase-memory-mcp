@@ -24,7 +24,7 @@ cd "$C" || exit 2
 # env.sh sets -e; this script continues past failing steps, so restore +e.
 source scripts/env.sh >/dev/null 2>&1; set +e
 echo "gate: base $(cat "$BASE/BINARY_SHA") at $BASE; $(git rev-parse --short=8 HEAD) ($(git rev-parse --abbrev-ref HEAD)) in $C at $(date '+%F %T'); uncommitted files: $(git status --porcelain | wc -l | tr -d ' ')" > "$G/SUMMARY.txt"
-step build make -f Makefile.cbm cbm BUILD_DIR="$S/build" -j8 || { echo "GATE: FAIL (build)" >> "$G/SUMMARY.txt"; cat "$G/SUMMARY.txt"; exit 1; }
+step build make -f Makefile.cbm cbm BUILD_DIR="$S/build" -j"$(getconf _NPROCESSORS_ONLN)" || { echo "GATE: FAIL (build)" >> "$G/SUMMARY.txt"; cat "$G/SUMMARY.txt"; exit 1; }
 BIN="$S/build/codebase-memory-mcp"
 step suites env CBM_RUNTIME_DIR="$S/rt" CBM_CACHE_DIR="$S/cache" \
   scripts/test.sh --suites "rust_lsp pipeline edge_structural lang_contract extraction call_reference_contract edge_imports incremental" BUILD_DIR="$S/build-tests"

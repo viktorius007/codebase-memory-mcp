@@ -22,11 +22,14 @@ usage() {
 Usage: scripts/build.sh [--with-ui] [--version V] [--arch ARCH] [VAR=VAL ...]
 
 The canonical production-build entry: identical in local CI, PR CI, dry run
-and release. Always a CLEAN build of BUILD_DIR (build/c by default) — the
-content-verified compiler cache (ccache via scripts/env.sh) makes repeat
-builds fast without ever reusing a stale object: every object is re-derived
-from current sources; a cache hit is byte-identical to a cold compile by
-construction (CCACHE_COMPILERCHECK=content).
+and release. An INCREMENTAL build of BUILD_DIR (build/c by default): make
+recompiles an object when its source, a header it includes (compiler
+depfiles) or the build configuration (CC, CXX, TEST_SEAMS, --version, STATIC,
+MEMWASTE: the .build-config stamp) changed, and keeps everything else. CI
+checkouts start without BUILD_DIR, so their builds are clean. For a clean
+local build: make -f Makefile.cbm clean BUILD_DIR=<dir>. A compiler cache
+(ccache via scripts/env.sh, or any compiler shim on PATH) serves repeat
+compiles.
 
 Options:
   --with-ui       Build the web UI as a content-addressed sidecar (needs node).
@@ -36,9 +39,9 @@ Options:
 
 Make passthrough (VAR=VAL, forwarded verbatim):
   CC= CXX=        Compiler override (venues pass their matrix compiler).
-  BUILD_DIR=      Build in an isolated directory — REQUIRED when a clean
-                  product build must not wipe build/c's test-runner (e.g.
-                  build/smoke for the local ladder smoke).
+  BUILD_DIR=      Build in an isolated directory (e.g. build/smoke for the
+                  local ladder smoke). build/c's test-runner survives a
+                  product build in build/c too; nothing is deleted.
   STATIC=1        Fully static portable build (Alpine/musl leg).
   EXTRA_CFLAGS= EXTRA_LDFLAGS=   Sanitizer soak builds (see _soak.yml).
 
@@ -72,12 +75,10 @@ done
 
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
-# shellcheck source=path-safety.sh
-source "$ROOT/scripts/path-safety.sh"
 
-# Parse remaining arguments. BUILD_DIR is tracked for the clean step below so
-# containerized legs can build in their own directory instead of deleting and
-# clobbering the host's native build/c artifacts.
+# Parse remaining arguments. BUILD_DIR is tracked for the completion message;
+# containerized legs build in their own directory so they never touch the
+# host's native build/c artifacts.
 WITH_UI=false
 VERSION=""
 BUILD_DIR="build/c"
@@ -144,10 +145,9 @@ echo "  ui=$WITH_UI version=${VERSION:-dev}"
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
-# Step 1: Clean C build artifacts only (not node_modules — npm ci handles that)
-cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
-
-# Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
+# Build incrementally (Makefile applies $ARCHFLAGS for the target arch on
+# macOS). BUILD_DIR is kept: the depfiles and the .build-config stamp decide
+# what is stale, so deleting it would only throw away up-to-date objects.
 if $WITH_UI; then
     make -j"$NPROC" -f Makefile.cbm cbm-with-ui \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"

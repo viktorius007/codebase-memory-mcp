@@ -159,8 +159,8 @@ services:
     volumes:
       - ..:/src
     command: >-
-      make -j4 -f Makefile.cbm clean-c BUILD_DIR=build/win-cross &&
-      make -j4 -f Makefile.cbm build/win-cross/test-runner
+      make -j$$(nproc) -f Makefile.cbm clean-c BUILD_DIR=build/win-cross &&
+      make -j$$(nproc) -f Makefile.cbm build/win-cross/test-runner
         BUILD_DIR=build/win-cross
         CC=x86_64-w64-mingw32-clang
         CXX=x86_64-w64-mingw32-clang++ &&

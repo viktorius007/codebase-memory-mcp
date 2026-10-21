@@ -1,59 +1,68 @@
 #!/usr/bin/env bash
-# Reproduce linked targets ignoring shared test or production-header changes,
-# which can execute a stale binary after a header-only semantic fix.
+# Reproduce objects ignoring shared test or production-header changes, which
+# can execute a stale binary after a header-only semantic fix, and objects
+# rebuilding for headers they do not include, which makes every header edit a
+# full rebuild of its flavour.
+#
+# Builds one object per flavour (ASan test, TSan, production) in a scratch
+# BUILD_DIR, then asks make (-q, nothing is compiled) whether a header the
+# object includes, and a header it does not include, would rebuild it. The
+# answer comes from the depfile the compile wrote, so this checks the real
+# compiler output, not a list in the Makefile. The config stamps are held old
+# (-o) because their phony check makes every -q answer "out of date".
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-MAKE_DB="$(mktemp "${TMPDIR:-/tmp}/cbm-repro-make-db.XXXXXX")"
-trap 'rm -f "$MAKE_DB"' EXIT
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/cbm-repro-make-headers.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+BUILD_DIR="$WORKDIR/build"
 
 cd "$PROJECT_ROOT"
-make -f Makefile.cbm -pn build/c/test-repro-runner >"$MAKE_DB"
-repro_target_line="$(grep '^build/c/test-repro-runner:' "$MAKE_DB" | head -1 || true)"
-test_target_line="$(grep '^build/c/test-runner:' "$MAKE_DB" | head -1 || true)"
-tsan_target_line="$(grep '^build/c/test-runner-tsan:' "$MAKE_DB" | head -1 || true)"
-production_target_line="$(grep '^build/c/codebase-memory-mcp:' "$MAKE_DB" | head -1 || true)"
 
-if [[ "$repro_target_line" != *'tests/repro/repro_harness.h'* ||
-      "$repro_target_line" != *'tests/test_framework.h'* ||
-      "$repro_target_line" != *'tests/test_helpers.h'* ]]; then
-    printf '[repro-make-headers] invariant=shared_headers_missing_from_target\n' >&2
-    exit 1
-fi
+# object | header it includes | header it does not include
+CASES=(
+    "$BUILD_DIR/obj/test/tests/test_arena.o|tests/test_framework.h|src/pipeline/lsp_resolve.h"
+    "$BUILD_DIR/obj/tsan/tests/test_arena.o|tests/test_framework.h|src/pipeline/lsp_resolve.h"
+    "$BUILD_DIR/obj/prod/src/foundation/arena.o|src/foundation/arena.h|tests/test_framework.h"
+)
 
-missing_test_header=0
-for target_name in build/c/test-runner build/c/test-runner-tsan; do
-    target_line="$test_target_line"
-    if [[ "$target_name" == 'build/c/test-runner-tsan' ]]; then
-        target_line="$tsan_target_line"
+OLD_STAMPS=(-o "$BUILD_DIR/.build-config" -o "$BUILD_DIR/.build-config-test"
+            -o "$BUILD_DIR/.build-config-tsan")
+
+failed=0
+for case in "${CASES[@]}"; do
+    IFS='|' read -r object included unrelated <<<"$case"
+    make -s -f Makefile.cbm BUILD_DIR="$BUILD_DIR" "$object" >/dev/null
+
+    status=0
+    make -f Makefile.cbm -q "${OLD_STAMPS[@]}" BUILD_DIR="$BUILD_DIR" "$object" || status=$?
+    if [[ $status -ne 0 ]]; then
+        printf '[repro-make-headers] invariant=fresh_object_not_up_to_date object=%s status=%s\n' \
+            "$object" "$status" >&2
+        failed=1
+        continue
     fi
-    for header in tests/test_framework.h tests/test_helpers.h tests/grammar_cases.h; do
-        if [[ "$target_line" != *"$header"* ]]; then
-            printf '[repro-make-headers] invariant=test_header_missing_from_target target=%s header=%s\n' \
-                "$target_name" "$header" >&2
-            missing_test_header=1
-        fi
-    done
+
+    status=0
+    make -f Makefile.cbm -q "${OLD_STAMPS[@]}" -W "$included" BUILD_DIR="$BUILD_DIR" "$object" \
+        || status=$?
+    if [[ $status -ne 1 ]]; then
+        printf '[repro-make-headers] invariant=included_header_ignored object=%s header=%s status=%s\n' \
+            "$object" "$included" "$status" >&2
+        failed=1
+    fi
+
+    status=0
+    make -f Makefile.cbm -q "${OLD_STAMPS[@]}" -W "$unrelated" BUILD_DIR="$BUILD_DIR" "$object" \
+        || status=$?
+    if [[ $status -ne 0 ]]; then
+        printf '[repro-make-headers] invariant=unrelated_header_rebuilds object=%s header=%s status=%s\n' \
+            "$object" "$unrelated" "$status" >&2
+        failed=1
+    fi
 done
-missing_production_header=0
-for target_name in build/c/test-runner build/c/test-repro-runner build/c/test-runner-tsan \
-                   build/c/codebase-memory-mcp; do
-    case "$target_name" in
-        build/c/test-runner) target_line="$test_target_line" ;;
-        build/c/test-repro-runner) target_line="$repro_target_line" ;;
-        build/c/test-runner-tsan) target_line="$tsan_target_line" ;;
-        *) target_line="$production_target_line" ;;
-    esac
-    for header in src/pipeline/lsp_resolve.h internal/cbm/lsp/type_registry.h; do
-        if [[ "$target_line" != *"$header"* ]]; then
-            printf '[repro-make-headers] invariant=production_header_missing_from_target target=%s header=%s\n' \
-                "$target_name" "$header" >&2
-            missing_production_header=1
-        fi
-    done
-done
-if [[ "$missing_test_header" -ne 0 || "$missing_production_header" -ne 0 ]]; then
+if [[ "$failed" -ne 0 ]]; then
     exit 1
 fi
 
-printf '[repro-make-headers] shared headers tracked by runner and production targets\n'
+printf '[repro-make-headers] each flavour rebuilds an object for its own headers only\n'

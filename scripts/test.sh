@@ -14,12 +14,15 @@ Usage: scripts/test.sh [--suites LIST | --tsan | --contracts-only] [--arch ARCH]
 
 The canonical test entry: identical in local CI, PR CI, dry run and release.
 DEFAULT (no --suites) is exactly what CI runs: static contract checks
-(Step 0a-0t), a CLEAN sanitizer build, every suite via the parallel harness,
-then the prod-binary regression guards (Steps 4-6).
+(Step 0a-0t), an incremental sanitizer build (clean on CI's fresh checkouts),
+every suite via the parallel harness, then the prod-binary regression guards
+(Steps 4-6).
 
 Modes:
-  (default)      The venue leg. Clean build (scripts/clean.sh) + all suites +
-                 all contract steps. This is the shape every gate runs.
+  (default)      The venue leg. Incremental build (make's depfiles and config
+                 stamps decide what is stale; BUILD_DIR is kept) + all suites
+                 + all contract steps. This is the shape every gate runs. For
+                 a from-scratch build run scripts/clean.sh first.
   --suites LIST  ITERATION mode: comma- or space-separated suite names, e.g.
                  --suites daemon,daemon_ipc. Rebuilds the test-runner
                  INCREMENTALLY (make dependency tracking, no clean) and runs
@@ -439,8 +442,10 @@ fi
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
-# Step 1: Clean (scoped to this leg's build directory)
-BUILD_DIR="$BUILD_DIR" scripts/clean.sh
+# Step 1: remove test fixtures an earlier run left behind. BUILD_DIR is kept:
+# make rebuilds exactly what changed (depfiles, .build-config* stamps), and the
+# objects of the other flavours, and cppcheck's cache, survive.
+scripts/clean.sh --fixtures-only
 
 # Step 2 + 3: Build, then run every suite as parallel processes (identical
 # gate quality — see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh:

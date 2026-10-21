@@ -6,12 +6,15 @@ set -euo pipefail
 # Activated automatically via scripts/setup.sh or manually:
 #   git config core.hooksPath scripts/hooks
 
+# One job per core for every make below (same fallbacks as scripts/env.sh).
+NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+
 echo "pre-commit: running all linters in parallel..."
 # clang-tidy runs diff-scoped (lint-tidy-diff, see scripts/lint-tidy-diff.sh):
 # the full lint-tidy sweep surfaces thousands of pre-existing findings that
 # have nothing to do with this commit and would block every contributor who
 # has clang-tidy on PATH. `make lint-tidy` remains available for a full audit.
-make -j3 -f Makefile.cbm lint-ci lint-tidy-diff
+make -j"$NPROC" -f Makefile.cbm lint-ci lint-tidy-diff
 
 echo "pre-commit: security audit (source-level)..."
 scripts/security-audit.sh
@@ -25,5 +28,8 @@ echo "pre-commit: building and running tests..."
         unset "$variable"
     done < <(git rev-parse --local-env-vars)
 
-    make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" -f Makefile.cbm test
+    # test-par runs the same suites as `make test` (the harness checks its set
+    # against the runner's --list-suites), one process per suite instead of
+    # all of them in one process.
+    make -j"$NPROC" -f Makefile.cbm test-par
 )

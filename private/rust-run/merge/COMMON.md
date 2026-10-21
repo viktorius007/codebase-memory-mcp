@@ -41,7 +41,7 @@ so without redoing your work.
 ## Environment (measured by the coordinator on 14 October)
 
 - Your clone is `@CLONE@`, on the branch your task names, clean at start. Build:
-  `make -f Makefile.cbm cbm BUILD_DIR=@SCRATCH@/build -j8` (about 1 min clean, 10 s with a warm ccache; binary
+  `make -f Makefile.cbm cbm BUILD_DIR=@SCRATCH@/build -j"$(nproc)"` (about 1 min clean, 10 s with a warm ccache; binary
   `@SCRATCH@/build/codebase-memory-mcp`). A vendored grammar `parser.c` change needs a clean BUILD_DIR.
 - Suites: `CBM_RUNTIME_DIR=@SCRATCH@/rt CBM_CACHE_DIR=@SCRATCH@/cache
   scripts/test.sh --suites "rust_lsp pipeline edge_structural lang_contract extraction"

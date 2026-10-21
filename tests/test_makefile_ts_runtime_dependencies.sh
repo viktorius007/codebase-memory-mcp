@@ -24,7 +24,25 @@ TARGETS=(
     "$BUILD_DIR/prod_ts_runtime.o"
 )
 
+# The config stamps' phony check makes every -q answer "out of date"; holding
+# them old (-o) lets -q answer for the dependency alone. The baseline probe
+# below proves it does.
+OLD_STAMPS=(-o "$BUILD_DIR/.build-config" -o "$BUILD_DIR/.build-config-test"
+            -o "$BUILD_DIR/.build-config-tsan")
+
 cd "$ROOT"
+
+for target in "${TARGETS[@]}"; do
+    # An object without a depfile is rebuilt once by design; an empty one
+    # records no extra headers and leaves the explicit list under test.
+    touch "$target" "${target%.o}.d"
+    status=0
+    make -f Makefile.cbm -q "${OLD_STAMPS[@]}" BUILD_DIR="$BUILD_DIR" "$target" || status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "FAIL: $target is not up to date before any change (exit $status); the probe cannot discriminate"
+        exit 1
+    fi
+done
 
 for dependency in "${DEPENDENCIES[@]}"; do
     if [[ ! -f "$dependency" ]]; then
@@ -36,10 +54,10 @@ for dependency in "${DEPENDENCIES[@]}"; do
         # Make the object newer than its currently-declared prerequisites.  -W
         # then asks make whether changing the unity-included file would rebuild
         # it, without compiling or modifying the source tree.
-        touch "$target"
+        touch "$target" "${target%.o}.d"
 
         status=0
-        make -f Makefile.cbm -q -W "$dependency" \
+        make -f Makefile.cbm -q "${OLD_STAMPS[@]}" -W "$dependency" \
             BUILD_DIR="$BUILD_DIR" "$target" || status=$?
 
         if [[ $status -eq 0 ]]; then

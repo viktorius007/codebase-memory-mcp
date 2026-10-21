@@ -583,7 +583,7 @@ Counts on `main` at `4d9592b5`, where CBM Lens arrived. Native and Go counts use
 Run the test suite (9,388 tests across 189 suites):
 
 ```bash
-scripts/test.sh                     # full: clean sanitizer build + all suites + guards
+scripts/test.sh                     # full: incremental sanitizer build + all suites + guards
 scripts/test.sh --suites <name>     # one suite, incremental, seconds
 build/c/test-runner --list-suites   # what is available
 ```
