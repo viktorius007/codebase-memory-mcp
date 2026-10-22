@@ -1,3 +1,6 @@
+## STATE — 22 Oct: main = origin/main (22526ac6). Build, test and gate conventions, measurements and host facts for every repository on this host: `~/src/build-cycle-standard/README.md`, section 0 first.
+Landed 21–22 Oct on this fork: incremental all-core builds with depfiles and no build-dir deletion (`reports/lanes/cbm-build.md` in that standard; no-change build 108 s to 0.4 s, header edit 45 s to 16 s); GCC 15 LSP fix; two time-based tests now assert the mechanism (`reports/lanes/cbm-time-assertions.md`; the lock registry gained a settable clock, TSan clean). Known and not re-reported: clang-format findings in four untouched src files, LeakSanitizer exits in eleven suites, the umask-0002 `cli` failure. Lint tools on this host: clang-format/clang-tidy 21 (apt), cppcheck 2.20.0 in `~/.local/bin`.
+
 ## STATE — 17 Oct: main = origin/main (bench consolidation, a477a034 and its HANDOFF follow-up). Nothing running; no lane, branch, worktree or scratch left.
 Product code is unchanged since 93a2275e; the bench base binary is b9a7012c. Verified 17 Oct: a fresh agent given only this file ran rebuild.sh from a clean
 GitHub clone, got REBUILD: PASS, and every corpus, truth/refs file and base edge set was identical to ~/Developer/cbm-bench.
