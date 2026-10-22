@@ -34,6 +34,8 @@ enum {
     LOCK_REGISTRY_STRESS_ITERATIONS = 160,
     LOCK_REGISTRY_PARKING_WAITERS = 64,
     LOCK_REGISTRY_DEADLINE_WAIT_MS = 200,
+    LOCK_REGISTRY_DEADLINE_WAKES = 16,
+    LOCK_REGISTRY_TEST_CLOCK_LEAD_MS = 3600000,
 };
 
 typedef struct {
@@ -1016,36 +1018,54 @@ TEST(lock_registry_cancel_request_wakes_parked_tail) {
 }
 
 typedef struct {
+    atomic_uint_fast64_t now_ms;
+} lock_registry_test_clock_t;
+
+typedef struct {
     cbm_lock_registry_t *registry;
+    uint64_t deadline_ms;
     cbm_lock_cancel_token_t cancel_token;
-    atomic_bool ready;
-    atomic_bool go;
     atomic_bool finished;
-    uint64_t wait_ms;
-    uint64_t started_ms;
-    uint64_t returned_ms;
     cbm_private_file_lock_status_t status;
     cbm_lock_lease_t *lease;
 } lock_registry_deadline_waiter_t;
 
 #ifndef _WIN32
+static uint64_t lock_registry_test_clock_read(void *opaque) {
+    lock_registry_test_clock_t *clock = opaque;
+    return (uint64_t)atomic_load_explicit(&clock->now_ms, memory_order_acquire);
+}
+
 static void *lock_registry_deadline_waiter_run(void *opaque) {
     lock_registry_deadline_waiter_t *waiter = opaque;
-    atomic_store_explicit(&waiter->ready, true, memory_order_release);
-    while (!atomic_load_explicit(&waiter->go, memory_order_acquire)) {
-        lock_registry_test_yield();
-    }
-    /* The absolute deadline is anchored here, in the thread it bounds, right
-     * before the call it bounds. An anchor taken by the observer is already
-     * running while this thread is still waiting to be scheduled, so on a
-     * loaded host it can expire before the acquire even starts. */
-    waiter->started_ms = cbm_now_ms();
-    waiter->status = cbm_lock_registry_acquire(
-        waiter->registry, "absolute-deadline", CBM_PRIVATE_FILE_LOCK_EX,
-        waiter->started_ms + waiter->wait_ms, &waiter->cancel_token, &waiter->lease);
-    waiter->returned_ms = cbm_now_ms();
+    waiter->status =
+        cbm_lock_registry_acquire(waiter->registry, "absolute-deadline", CBM_PRIVATE_FILE_LOCK_EX,
+                                  waiter->deadline_ms, &waiter->cancel_token, &waiter->lease);
     atomic_store_explicit(&waiter->finished, true, memory_order_release);
     return NULL;
+}
+
+/* Wakes every condition waiter through an unrelated cancel token, then waits
+ * until the parked head and the queued tail have both entered a fresh wait, or
+ * the tail has returned. */
+static bool lock_registry_wake_and_settle(cbm_lock_registry_t *registry,
+                                          lock_registry_deadline_waiter_t *tail) {
+    cbm_lock_cancel_token_t unrelated_token;
+    atomic_init(&unrelated_token, false);
+    uint64_t waits_before = cbm_lock_registry_condition_wait_call_count_for_test(registry);
+    if (cbm_lock_registry_request_cancel(registry, &unrelated_token) != CBM_PRIVATE_FILE_LOCK_OK) {
+        return false;
+    }
+    uint64_t settle_deadline = cbm_now_ms() + LOCK_REGISTRY_TEST_TIMEOUT_MS;
+    while (cbm_now_ms() < settle_deadline) {
+        if (atomic_load_explicit(&tail->finished, memory_order_acquire) ||
+            (cbm_lock_registry_condition_wait_call_count_for_test(registry) >= waits_before + 2 &&
+             cbm_lock_registry_condition_waiter_count_for_test(registry) == 2)) {
+            return true;
+        }
+        lock_registry_test_yield();
+    }
+    return false;
 }
 #endif
 
@@ -1053,79 +1073,111 @@ TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
 #ifdef _WIN32
     SKIP_PLATFORM("native registry deadline fixture runs on POSIX");
 #else
+    /* The registry reads a test clock that only this test advances. It starts
+     * an hour past the real clock, so no condition wait times out on its own:
+     * every wake is a broadcast, and the deadline is reached by stepping the
+     * clock onto it, not by waiting for it. */
     lock_registry_fixture_t fixture;
     bool started = lock_registry_fixture_start(&fixture);
+    lock_registry_test_clock_t clock;
+    uint64_t clock_start_ms = cbm_now_ms() + LOCK_REGISTRY_TEST_CLOCK_LEAD_MS;
+    atomic_init(&clock.now_ms, clock_start_ms);
+    bool clock_installed = started && cbm_lock_registry_set_clock_for_test(
+                                          fixture.registry, lock_registry_test_clock_read, &clock);
     cbm_lock_lease_t *holder = NULL;
     cbm_private_file_lock_status_t holder_status =
-        started
-            ? cbm_lock_registry_acquire(fixture.registry, "absolute-deadline",
-                                        CBM_PRIVATE_FILE_LOCK_SH,
-                                        cbm_now_ms() + LOCK_REGISTRY_TEST_TIMEOUT_MS, NULL, &holder)
-            : CBM_PRIVATE_FILE_LOCK_IO;
+        clock_installed ? cbm_lock_registry_try_acquire(fixture.registry, "absolute-deadline",
+                                                        CBM_PRIVATE_FILE_LOCK_SH, &holder)
+                        : CBM_PRIVATE_FILE_LOCK_IO;
 
-    lock_registry_waiter_t head = {.registry = fixture.registry,
-                                   .resource_key = "absolute-deadline",
-                                   .mode = CBM_PRIVATE_FILE_LOCK_EX,
-                                   .status = CBM_PRIVATE_FILE_LOCK_IO};
+    /* The head has no deadline. It owns the attempt and parks on the native
+     * lock the holder keeps, so the tail can only wait in the queue. */
+    lock_registry_deadline_waiter_t head = {.registry = fixture.registry,
+                                            .deadline_ms = UINT64_MAX,
+                                            .status = CBM_PRIVATE_FILE_LOCK_IO};
     atomic_init(&head.cancel_token, false);
     atomic_init(&head.finished, false);
     cbm_thread_t head_thread;
-    bool head_started = holder_status == CBM_PRIVATE_FILE_LOCK_OK &&
-                        cbm_thread_create(&head_thread, 0, lock_registry_waiter_run, &head) == 0;
-    bool head_attempting = false;
+    bool head_started =
+        holder_status == CBM_PRIVATE_FILE_LOCK_OK &&
+        cbm_thread_create(&head_thread, 0, lock_registry_deadline_waiter_run, &head) == 0;
+    bool head_parked = false;
     uint64_t head_deadline = cbm_now_ms() + LOCK_REGISTRY_TEST_TIMEOUT_MS;
     while (head_started && cbm_now_ms() < head_deadline) {
-        head_attempting = cbm_lock_registry_waiter_count(fixture.registry) == 1 &&
-                          cbm_lock_registry_attempting_waiter_count_for_test(fixture.registry) == 1;
-        if (head_attempting) {
+        head_parked = cbm_lock_registry_attempting_waiter_count_for_test(fixture.registry) == 1 &&
+                      cbm_lock_registry_condition_waiter_count_for_test(fixture.registry) == 1;
+        if (head_parked) {
             break;
         }
         lock_registry_test_yield();
     }
 
+    uint64_t tail_deadline_ms = clock_start_ms + LOCK_REGISTRY_DEADLINE_WAIT_MS;
     lock_registry_deadline_waiter_t tail = {.registry = fixture.registry,
-                                            .wait_ms = LOCK_REGISTRY_DEADLINE_WAIT_MS,
+                                            .deadline_ms = tail_deadline_ms,
                                             .status = CBM_PRIVATE_FILE_LOCK_IO};
     atomic_init(&tail.cancel_token, false);
-    atomic_init(&tail.ready, false);
-    atomic_init(&tail.go, false);
     atomic_init(&tail.finished, false);
-    cbm_thread_t tail_thread;
-    bool tail_started =
-        head_attempting &&
-        cbm_thread_create(&tail_thread, 0, lock_registry_deadline_waiter_run, &tail) == 0;
-    uint64_t ready_deadline = cbm_now_ms() + LOCK_REGISTRY_TEST_TIMEOUT_MS;
-    while (tail_started && !atomic_load_explicit(&tail.ready, memory_order_acquire) &&
-           cbm_now_ms() < ready_deadline) {
-        lock_registry_test_yield();
-    }
-    bool tail_ready = tail_started && atomic_load_explicit(&tail.ready, memory_order_acquire);
     uint64_t enqueues_before_tail =
         cbm_lock_registry_waiter_enqueue_count_for_test(fixture.registry);
-    atomic_store_explicit(&tail.go, true, memory_order_release);
+    cbm_thread_t tail_thread;
+    bool tail_started =
+        head_parked &&
+        cbm_thread_create(&tail_thread, 0, lock_registry_deadline_waiter_run, &tail) == 0;
+    bool tail_waiting = false;
+    uint64_t tail_wait_deadline = cbm_now_ms() + LOCK_REGISTRY_TEST_TIMEOUT_MS;
+    while (tail_started && cbm_now_ms() < tail_wait_deadline) {
+        tail_waiting = cbm_lock_registry_waiter_enqueue_count_for_test(fixture.registry) >
+                           enqueues_before_tail &&
+                       cbm_lock_registry_condition_waiter_count_for_test(fixture.registry) == 2;
+        if (tail_waiting) {
+            break;
+        }
+        lock_registry_test_yield();
+    }
 
+    /* Each wake lands before the deadline, the last one a single tick short of
+     * it. The tail must check the deadline it was given and wait again. */
+    int wakes_survived = 0;
+    bool returned_before_deadline = false;
+    for (int wake = 1; tail_waiting && wake <= LOCK_REGISTRY_DEADLINE_WAKES; wake++) {
+        atomic_store_explicit(&clock.now_ms,
+                              clock_start_ms + (uint64_t)(LOCK_REGISTRY_DEADLINE_WAIT_MS - 1) *
+                                                   (uint64_t)wake / LOCK_REGISTRY_DEADLINE_WAKES,
+                              memory_order_release);
+        if (!lock_registry_wake_and_settle(fixture.registry, &tail)) {
+            break;
+        }
+        if (atomic_load_explicit(&tail.finished, memory_order_acquire)) {
+            returned_before_deadline = true;
+            break;
+        }
+        wakes_survived++;
+    }
+    size_t waiters_before_deadline = cbm_lock_registry_waiter_count(fixture.registry);
+
+    /* The clock now stands exactly on the absolute deadline; one more wake must
+     * end the tail's wait however many wakes came before. */
+    atomic_store_explicit(&clock.now_ms, tail_deadline_ms, memory_order_release);
     cbm_lock_cancel_token_t unrelated_token;
     atomic_init(&unrelated_token, false);
-    bool broadcasts_ok = true;
-    uint64_t observe_deadline = cbm_now_ms() + LOCK_REGISTRY_TEST_TIMEOUT_MS;
-    while (tail_ready && !atomic_load_explicit(&tail.finished, memory_order_acquire) &&
-           cbm_now_ms() < observe_deadline) {
-        broadcasts_ok = cbm_lock_registry_request_cancel(fixture.registry, &unrelated_token) ==
-                            CBM_PRIVATE_FILE_LOCK_OK &&
-                        broadcasts_ok;
-        cbm_usleep(5000);
+    bool deadline_wake_sent = wakes_survived == LOCK_REGISTRY_DEADLINE_WAKES &&
+                              cbm_lock_registry_request_cancel(
+                                  fixture.registry, &unrelated_token) == CBM_PRIVATE_FILE_LOCK_OK;
+    bool returned_at_deadline = false;
+    uint64_t return_deadline = cbm_now_ms() + LOCK_REGISTRY_TEST_TIMEOUT_MS;
+    while (deadline_wake_sent && cbm_now_ms() < return_deadline) {
+        returned_at_deadline = atomic_load_explicit(&tail.finished, memory_order_acquire);
+        if (returned_at_deadline) {
+            break;
+        }
+        lock_registry_test_yield();
     }
-    bool returned_at_deadline =
-        tail_ready && atomic_load_explicit(&tail.finished, memory_order_acquire);
-    /* The enqueue count only ever grows, so this stays true once the tail has
-     * joined the queue behind the attempting head. Reading it after the tail
-     * has returned removes the window the observer used to have to catch. */
-    uint64_t enqueues_after_tail =
-        cbm_lock_registry_waiter_enqueue_count_for_test(fixture.registry);
-    bool tail_queued = returned_at_deadline && enqueues_after_tail > enqueues_before_tail;
-    uint64_t elapsed_ms = returned_at_deadline ? tail.returned_ms - tail.started_ms : UINT64_MAX;
+    size_t waiters_after_deadline = cbm_lock_registry_waiter_count(fixture.registry);
+    bool head_still_waiting =
+        head_started && !atomic_load_explicit(&head.finished, memory_order_acquire);
 
-    if (!returned_at_deadline && tail_started) {
+    if (tail_started && !atomic_load_explicit(&tail.finished, memory_order_acquire)) {
         (void)cbm_lock_registry_request_cancel(fixture.registry, &tail.cancel_token);
     }
     if (head_started) {
@@ -1148,18 +1200,21 @@ TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
     lock_registry_fixture_finish(&fixture);
 
     ASSERT_TRUE(started);
+    ASSERT_TRUE(clock_installed);
     ASSERT_EQ(holder_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_TRUE(head_started);
-    ASSERT_TRUE(head_attempting);
+    ASSERT_TRUE(head_parked);
     ASSERT_TRUE(tail_started);
-    ASSERT_TRUE(tail_ready);
-    ASSERT_TRUE(tail_queued);
-    ASSERT_TRUE(broadcasts_ok);
+    ASSERT_TRUE(tail_waiting);
+    ASSERT_FALSE(returned_before_deadline);
+    ASSERT_EQ(wakes_survived, LOCK_REGISTRY_DEADLINE_WAKES);
+    ASSERT_EQ(waiters_before_deadline, 2);
+    ASSERT_TRUE(deadline_wake_sent);
     ASSERT_TRUE(returned_at_deadline);
-    ASSERT_GTE(elapsed_ms, 150);
-    ASSERT_TRUE(elapsed_ms < 350);
     ASSERT_EQ(tail.status, CBM_PRIVATE_FILE_LOCK_BUSY);
     ASSERT_NULL(tail.lease);
+    ASSERT_EQ(waiters_after_deadline, 1);
+    ASSERT_TRUE(head_still_waiting);
     ASSERT_EQ(head.status, CBM_PRIVATE_FILE_LOCK_BUSY);
     ASSERT_NULL(head.lease);
     ASSERT_EQ(holder_release, CBM_PRIVATE_FILE_LOCK_OK);

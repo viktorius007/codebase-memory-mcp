@@ -60,6 +60,8 @@ struct cbm_lock_registry {
     bool closing;
     cbm_lock_registry_stage_hook_fn stage_hook;
     void *stage_context;
+    cbm_lock_registry_clock_fn test_clock;
+    void *test_clock_context;
     cbm_lock_registry_release_handle_t test_release_fault_handle;
     cbm_private_file_lock_release_step_t test_release_fault_step;
     bool test_release_fault_armed;
@@ -163,8 +165,16 @@ static cbm_private_fork_wait_status_t lock_registry_wait_locked(cbm_lock_registr
     return status;
 }
 
-static uint64_t lock_registry_bounded_deadline(uint64_t deadline_ms, uint64_t interval_ms) {
-    uint64_t now_ms = cbm_now_ms();
+/* The one time source every deadline decision reads. Deadlines are absolute
+ * in this clock's domain, so the stop check and the native retry bound must
+ * read the same clock. */
+static uint64_t lock_registry_now_ms(const cbm_lock_registry_t *registry) {
+    return registry->test_clock ? registry->test_clock(registry->test_clock_context) : cbm_now_ms();
+}
+
+static uint64_t lock_registry_bounded_deadline(const cbm_lock_registry_t *registry,
+                                               uint64_t deadline_ms, uint64_t interval_ms) {
+    uint64_t now_ms = lock_registry_now_ms(registry);
     uint64_t bounded = now_ms > UINT64_MAX - interval_ms ? UINT64_MAX : now_ms + interval_ms;
     return deadline_ms < bounded ? deadline_ms : bounded;
 }
@@ -179,18 +189,19 @@ static bool lock_registry_park_native(cbm_lock_registry_t *registry, uint64_t de
     cbm_private_fork_wait_status_t status = CBM_PRIVATE_FORK_WAIT_SIGNALED;
     if (!cancel_token || !atomic_load_explicit(cancel_token, memory_order_acquire)) {
         status = lock_registry_wait_locked(
-            registry, lock_registry_bounded_deadline(deadline_ms, LOCK_REGISTRY_NATIVE_RETRY_MS));
+            registry,
+            lock_registry_bounded_deadline(registry, deadline_ms, LOCK_REGISTRY_NATIVE_RETRY_MS));
     }
     lock_registry_unlock(registry);
     return status != CBM_PRIVATE_FORK_WAIT_ERROR;
 }
 
-static bool lock_registry_should_stop(uint64_t deadline_ms,
+static bool lock_registry_should_stop(const cbm_lock_registry_t *registry, uint64_t deadline_ms,
                                       const cbm_lock_cancel_token_t *cancel_token) {
     if (cancel_token && atomic_load_explicit(cancel_token, memory_order_acquire)) {
         return true;
     }
-    return deadline_ms != UINT64_MAX && cbm_now_ms() >= deadline_ms;
+    return deadline_ms != UINT64_MAX && lock_registry_now_ms(registry) >= deadline_ms;
 }
 
 static void lock_registry_notify(cbm_lock_registry_t *registry, cbm_private_file_lock_mode_t mode,
@@ -447,7 +458,7 @@ static cbm_private_file_lock_status_t lock_registry_attempt_native(
     cbm_private_file_lock_status_t status = CBM_PRIVATE_FILE_LOCK_BUSY;
 
     while (!rw) {
-        if (!try_once && lock_registry_should_stop(deadline_ms, cancel_token)) {
+        if (!try_once && lock_registry_should_stop(registry, deadline_ms, cancel_token)) {
             status = CBM_PRIVATE_FILE_LOCK_BUSY;
             break;
         }
@@ -474,7 +485,7 @@ static cbm_private_file_lock_status_t lock_registry_attempt_native(
             lock_registry_notify(registry, waiter->mode, CBM_LOCK_REGISTRY_STAGE_TURN_HELD);
         }
 
-        if (!try_once && lock_registry_should_stop(deadline_ms, cancel_token)) {
+        if (!try_once && lock_registry_should_stop(registry, deadline_ms, cancel_token)) {
             status = CBM_PRIVATE_FILE_LOCK_BUSY;
             break;
         }
@@ -509,7 +520,7 @@ static cbm_private_file_lock_status_t lock_registry_attempt_native(
     }
 
     for (;;) {
-        if (!try_once && lock_registry_should_stop(deadline_ms, cancel_token)) {
+        if (!try_once && lock_registry_should_stop(registry, deadline_ms, cancel_token)) {
             return lock_registry_abort_attempt(registry, entry, waiter, &rw, &turn,
                                                CBM_PRIVATE_FILE_LOCK_BUSY, lease, lease_out);
         }
@@ -584,7 +595,7 @@ static cbm_private_file_lock_status_t lock_registry_acquire_internal(
     if (!cbm_lock_registry_resource_names(resource_key, turn_name, rw_name)) {
         return CBM_PRIVATE_FILE_LOCK_UNSAFE;
     }
-    if (!try_once && lock_registry_should_stop(deadline_ms, cancel_token)) {
+    if (!try_once && lock_registry_should_stop(registry, deadline_ms, cancel_token)) {
         return CBM_PRIVATE_FILE_LOCK_BUSY;
     }
 
@@ -620,7 +631,8 @@ static cbm_private_file_lock_status_t lock_registry_acquire_internal(
     free(candidate);
 
     for (;;) {
-        bool should_stop = !try_once && lock_registry_should_stop(deadline_ms, cancel_token);
+        bool should_stop =
+            !try_once && lock_registry_should_stop(registry, deadline_ms, cancel_token);
         if (!lock_registry_lock(registry)) {
             lease->cleanup_only = true;
             lease->waiter_cleanup_pending = true;
@@ -910,6 +922,8 @@ cbm_private_file_lock_status_t cbm_lock_registry_free(cbm_lock_registry_t **regi
     registry->owner_pid = 0;
     registry->stage_hook = NULL;
     registry->stage_context = NULL;
+    registry->test_clock = NULL;
+    registry->test_clock_context = NULL;
     registry->test_release_fault_handle = 0;
     registry->test_release_fault_step = 0;
     registry->test_release_fault_armed = false;
@@ -1096,6 +1110,21 @@ bool cbm_lock_registry_set_stage_hook_for_test(cbm_lock_registry_t *registry,
     if (idle) {
         registry->stage_hook = hook;
         registry->stage_context = context;
+    }
+    lock_registry_unlock(registry);
+    return idle;
+}
+
+bool cbm_lock_registry_set_clock_for_test(cbm_lock_registry_t *registry,
+                                          cbm_lock_registry_clock_fn clock, void *context) {
+    if (!lock_registry_lock(registry)) {
+        return false;
+    }
+    bool idle = registry->waiter_count == 0 && registry->active_lease_count == 0 &&
+                registry->pending_cleanup_count == 0;
+    if (idle) {
+        registry->test_clock = clock;
+        registry->test_clock_context = context;
     }
     lock_registry_unlock(registry);
     return idle;

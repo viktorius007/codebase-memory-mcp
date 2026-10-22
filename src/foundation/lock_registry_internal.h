@@ -60,4 +60,13 @@ bool cbm_lock_registry_fail_next_abort_bookkeeping_for_test(
 bool cbm_lock_registry_set_stage_hook_for_test(cbm_lock_registry_t *registry,
                                                cbm_lock_registry_stage_hook_fn hook, void *context);
 
+typedef uint64_t (*cbm_lock_registry_clock_fn)(void *context);
+
+/* Deterministic time seam: replaces cbm_now_ms() in the registry's deadline
+ * checks so a test can step the clock to a deadline instead of waiting for it.
+ * Condition waits still time out on the real clock. May only be changed while
+ * the registry is idle; NULL restores cbm_now_ms(). */
+bool cbm_lock_registry_set_clock_for_test(cbm_lock_registry_t *registry,
+                                          cbm_lock_registry_clock_fn clock, void *context);
+
 #endif /* CBM_LOCK_REGISTRY_INTERNAL_H */
