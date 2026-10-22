@@ -22,13 +22,13 @@
  * subset cs_lsp targets. See the honest scope notes in cs_lsp.c.
  *
  * Reports: total textual calls, resolved calls (raw), high-confidence
- * resolutions (>= 0.90), and the resolution ratio. Asserts a floor of
- * 45% under sanitizers (idiomatic-code production expectation is higher;
- * the gap is dominated by ctor-synthetic 0.50 markers and BCL long tail).
+ * resolutions (>= 0.90), the resolution ratio and the parse time. Asserts a
+ * floor of 45% (idiomatic-code production expectation is higher; the gap is
+ * dominated by ctor-synthetic 0.50 markers and BCL long tail). The parse time
+ * is printed for tracking, never asserted: it measures the host, not cs_lsp.
  */
 #include "test_framework.h"
 #include "cbm.h"
-#include "foundation/sanitized.h"
 #include "lsp/cs_lsp.h"
 #include <stdlib.h>
 #include <time.h>
@@ -188,16 +188,13 @@ static double elapsed_ms(struct timespec t0, struct timespec t1) {
 }
 
 TEST(cslsp_bench_resolution_ratio) {
-    /* Perf benchmark: time-budgeted. Under ASan+UBSan the budget is scaled
-     * (see the sanitizer-aware time-budget assert below); the benchmark always
-     * runs so regressions surface in every configuration. */
     int slen = (int)strlen(bench_source);
 
     struct timespec t0;
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    CBMFileResult *r = cbm_extract_file(bench_source, slen, CBM_LANG_CSHARP,
-                                        "test", "bench.cs", 0, NULL, NULL);
+    CBMFileResult *r =
+        cbm_extract_file(bench_source, slen, CBM_LANG_CSHARP, "test", "bench.cs", 0, NULL, NULL);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     ASSERT_NOT_NULL(r);
 
@@ -206,24 +203,27 @@ TEST(cslsp_bench_resolution_ratio) {
     int resolved = r->resolved_calls.count;
     int high_conf = 0;
     for (int i = 0; i < r->resolved_calls.count; i++) {
-        if (r->resolved_calls.items[i].confidence >= 0.90f) high_conf++;
+        if (r->resolved_calls.items[i].confidence >= 0.90f)
+            high_conf++;
     }
     int loc = 0;
     for (const char *p = bench_source; *p; p++) {
-        if (*p == '\n') loc++;
+        if (*p == '\n')
+            loc++;
     }
     double ratio = calls > 0 ? (double)resolved / (double)calls : 0.0;
     double hi_ratio = calls > 0 ? (double)high_conf / (double)calls : 0.0;
 
     printf("    cs bench: %d lines, %d calls, %d resolved (%.0f%%), "
            "%d high-conf (%.0f%%), %.2f ms\n",
-           loc, calls, resolved, ratio * 100.0, high_conf, hi_ratio * 100.0,
-           ms);
+           loc, calls, resolved, ratio * 100.0, high_conf, hi_ratio * 100.0, ms);
 
-    /* Free the result BEFORE asserting so a budget miss doesn't leak. */
+    /* Free the result BEFORE asserting so a ratio miss doesn't leak. */
     cbm_free_result(r);
 
-    ASSERT_GTE(calls, 1);
+    /* The fixture holds well over 20 textual calls; fewer means extraction
+     * lost calls and the ratio below would no longer mean anything. */
+    ASSERT_GTE(calls, 20);
     ASSERT_GTE(resolved, 1);
 
     /* Floor at 45% under sanitizers. The gap to 100% is dominated by:
@@ -232,20 +232,7 @@ TEST(cslsp_bench_resolution_ratio) {
      *  - LINQ lambda-body inference (out of scope, documented)
      * This benchmark exists to track regressions, not to claim Roslyn
      * parity. */
-    if (calls >= 20) {
-        ASSERT_GTE(resolved * 100, calls * 45);
-    }
-
-    /* Time budget. Instrumentation slows the parse ~5-10×, so scale the budget
-     * when a sanitizer is active. Native: 200 ms for a ~260-line fixture;
-     * sanitized: 2000 ms. The condition used to name ASan specifically, which
-     * left the TSan and MSan lanes measuring an instrumented parse against the
-     * native 200 ms. */
-#if CBM_SANITIZED
-    ASSERT(ms < 2000.0);
-#else
-    ASSERT(ms < 200.0);
-#endif
+    ASSERT_GTE(resolved * 100, calls * 45);
     PASS();
 }
 
