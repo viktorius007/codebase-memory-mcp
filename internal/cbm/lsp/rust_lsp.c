@@ -12566,7 +12566,8 @@ static bool macro_env_record_reps(MacroEnv *env, const char *body, int body_len,
             continue;
         int ns = macro_skip_ws(body, body_len, p + 1);
         int ne = macro_consume_ident(body, body_len, ns);
-        if (ne == ns || ne >= body_len || body[ne] != ':')
+        int colon = macro_skip_ws(body, body_len, ne);
+        if (ne == ns || colon >= body_len || body[colon] != ':')
             continue;
         if (env->rep_count >= RUST_MACRO_MAX_REPS)
             return false;
@@ -12694,9 +12695,11 @@ static int macro_match_seq(const char *pat, int pat_len, const char *in, int in_
         if (name_end == name_start)
             return MACRO_UNMODELLED;
         char frag[16] = "tt";
-        if (pp < pat_len && pat[pp] == ':') {
-            int frag_start = ++pp;
-            pp = macro_consume_ident(pat, pat_len, pp);
+        /* `$name:frag` is three tokens; `$expr: expr` spaces them. */
+        int colon = macro_skip_ws(pat, pat_len, pp);
+        if (colon < pat_len && pat[colon] == ':') {
+            int frag_start = macro_skip_ws(pat, pat_len, colon + 1);
+            pp = macro_consume_ident(pat, pat_len, frag_start);
             int fl = pp - frag_start;
             if (fl <= 0 || fl >= (int)sizeof(frag))
                 return MACRO_UNMODELLED;
