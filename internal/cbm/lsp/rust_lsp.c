@@ -16451,6 +16451,24 @@ static const CBMRegisteredFunc *rust_module_function_node(RustLSPContext *ctx, c
     return f ? f : cbm_registry_lookup_func(ctx->registry, qn);
 }
 
+/* True when trait `trait_qn` declares `name` without a default body, so
+ * every impl of the trait defines it. */
+static bool rust_trait_requires_method(RustLSPContext *ctx, const char *trait_qn,
+                                       const char *name) {
+    CBMMethodIter methods;
+    cbm_registry_methods_chain(ctx->registry, trait_qn, name, &methods);
+    bool required = false;
+    for (int mi; (mi = cbm_method_iter_next(&methods)) >= 0;) {
+        const CBMRegisteredFunc *f = &methods.reg->funcs[mi];
+        if ((f->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) != 0)
+            continue;
+        if ((f->flags & CBM_FUNC_FLAG_RUST_ABSTRACT) == 0)
+            return false;
+        required = true;
+    }
+    return required;
+}
+
 /* An explicit trait path supplies both Self and the trait arguments. Match
  * those written types against the impl, never the erased method bucket. */
 static bool rust_explicit_trait_target(RustLSPContext *ctx, TSNode callee, RustCallTarget *out) {
@@ -16530,8 +16548,11 @@ static bool rust_explicit_trait_target(RustLSPContext *ctx, TSNode callee, RustC
     /* The written arguments may not spell the impl's (`CreateTypeData<T>`
      * against `impl CreateTypeData<S, ()>`, `&SubEntity<L>` against `&T`):
      * when the self type's bucket holds exactly one impl of the trait head
-     * that may apply, the compiling path names that impl. */
-    if ((exact_open || !selected) && head_impls == 1) {
+     * that may apply, the compiling path names that impl. Only a method the
+     * trait requires (no default body) puts every impl in that bucket; with
+     * a default body an impl inheriting it is unseen there, so it withholds. */
+    if ((exact_open || !selected) && head_impls == 1 &&
+        rust_trait_requires_method(ctx, trait_qn, name)) {
         selected = head_only;
         exact_open = false;
     }
@@ -17560,17 +17581,23 @@ static const CBMRegisteredFunc *rust_sole_blanket_impl_method(RustLSPContext *ct
             continue;
         CBMMethodIter methods;
         cbm_registry_methods_chain(ctx->registry, trait->qualified_name, name, &methods);
-        bool declared = false;
+        const CBMRegisteredFunc *declared = NULL;
         for (int mi; (mi = cbm_method_iter_next(&methods)) >= 0;)
-            declared |= (methods.reg->funcs[mi].flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0;
+            if ((methods.reg->funcs[mi].flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0)
+                declared = &methods.reg->funcs[mi];
         if (!declared || rust_trait_out_of_scope(ctx, trait->qualified_name, name, NULL, NULL))
             continue;
         for (int i = 0; type->embedded_types && type->embedded_types[i]; i++)
             if (rust_trait_qn_same(type->embedded_types[i], trait->qualified_name))
                 return NULL; /* its own impl of a trait declaring `name` */
         const CBMRegisteredFunc *blanket = rust_trait_blanket_method(ctx, trait->qualified_name, name);
-        if (!blanket)
+        if (!blanket) {
+            /* A default body may reach `Type` through an impl that defines
+             * nothing (`impl<T> B for T {}`), which registers no method. */
+            if ((declared->flags & CBM_FUNC_FLAG_RUST_ABSTRACT) == 0)
+                return NULL;
             continue;
+        }
         if (selected && strcmp(selected->qualified_name, blanket->qualified_name) != 0)
             return NULL;
         selected = blanket;

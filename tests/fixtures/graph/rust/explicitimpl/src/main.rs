@@ -26,6 +26,28 @@ impl<T> Query for &T {
     }
 }
 
+pub trait Tr<A, B = ()> {
+    fn f() -> u8 {
+        println!("Tr::f\n{}", std::backtrace::Backtrace::force_capture());
+        0
+    }
+}
+
+pub struct S;
+
+impl Tr<u8> for S {}
+
+impl Tr<u8, u16> for S {
+    fn f() -> u8 {
+        println!("S::f\n{}", std::backtrace::Backtrace::force_capture());
+        1
+    }
+}
+
+fn inherit() -> u8 {
+    <S as Tr<u8>>::f()
+}
+
 fn make<T: Default>() -> u8 {
     <ReflectState as CreateTypeData<T>>::create_type_data(()).0
 }
@@ -36,6 +58,7 @@ fn fetch<L>() -> u8 {
 
 fn main() {
     make::<u8>();
+    inherit();
     fetch::<u8>();
     println!("end\n{}", std::backtrace::Backtrace::force_capture());
 }
