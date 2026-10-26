@@ -1,0 +1,1 @@
+rs-recv lane: a dependency crate's own HashMap/HashSet re-exported through collections/mod.rs (bevy_platform shape); receivers typed by field, param, qualified param, local annotation and constructor.

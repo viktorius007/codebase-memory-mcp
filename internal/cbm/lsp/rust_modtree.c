@@ -793,6 +793,68 @@ static void rmf_scan_macro_traits(RmfScan *scan, TSNode invocation) {
     ts_parser_delete(parser);
 }
 
+/* The brace body of an item-position macro call, parsed as items, when it
+ * holds at least one out-of-line `mod name;`. NULL otherwise or when the body
+ * is not a clean item list. The caller deletes the tree; *body_out is the
+ * arena text its byte offsets refer to. */
+static TSTree *rmt_parse_macro_mod_body(CBMArena *arena, const char *source, TSNode invocation,
+                                        const char **body_out) {
+    TSNode tokens = cbm_find_child_by_kind(invocation, "token_tree");
+    if (ts_node_is_null(tokens))
+        return NULL;
+    uint32_t start = ts_node_start_byte(tokens);
+    uint32_t end = ts_node_end_byte(tokens);
+    if (end < start + 2 || source[start] != '{' || source[end - 1] != '}')
+        return NULL;
+    char *body = cbm_arena_strndup(arena, source + start + 1, end - start - 2);
+    if (!body || !strstr(body, "mod "))
+        return NULL;
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return NULL;
+    TSTree *tree = NULL;
+    if (ts_parser_set_language(parser, tree_sitter_rust()))
+        tree = ts_parser_parse_string(parser, NULL, body, (uint32_t)strlen(body));
+    ts_parser_delete(parser);
+    if (tree && ts_node_has_error(ts_tree_root_node(tree))) {
+        ts_tree_delete(tree);
+        tree = NULL;
+    }
+    *body_out = body;
+    return tree;
+}
+
+/* `cfg_alias! { pub mod name; }` (bevy_platform's `cfg::alloc!`) gates an
+ * out-of-line module the way `#[cfg(..)] pub mod name;` does, and is read the
+ * same way: the module exists in the builds that compile any path through it.
+ * Bounded assumption: an item macro either emits such a `mod` item as written
+ * or drops it; it does not rename or move it. A dropped module's file is not
+ * in the crate, so no compiling path reaches it. Inline `mod name { .. }`
+ * bodies are left to the macro expander. */
+static void rmf_scan_macro_mods(RmfScan *scan, TSNode invocation) {
+    const char *body = NULL;
+    TSTree *tree = rmt_parse_macro_mod_body(&scan->facts->arena, scan->source, invocation, &body);
+    if (!tree)
+        return;
+    TSNode items = ts_tree_root_node(tree);
+    for (uint32_t i = 0; i < ts_node_named_child_count(items); i++) {
+        TSNode item = ts_node_named_child(items, i);
+        if (strcmp(ts_node_type(item), "mod_item") != 0 ||
+            !ts_node_is_null(ts_node_child_by_field_name(item, "body", 4)))
+            continue;
+        TSNode name = ts_node_child_by_field_name(item, "name", 4);
+        if (ts_node_is_null(name))
+            continue;
+        rmf_push(scan,
+                 (RmfRecord){.op = RMF_MOD_DECL,
+                             .item = cbm_rust_prelude_restrictions(&scan->facts->arena, body, item),
+                             .vis = rmf_visibility(body, item),
+                             .name = cbm_node_text(&scan->facts->arena, name, body),
+                             .text = cbm_rust_path_attribute(&scan->facts->arena, body, item)});
+    }
+    ts_tree_delete(tree);
+}
+
 /* Proc macros export a macro name, not the implementation function as a
  * value. In particular the derive name comes from the attribute, not fn. */
 static bool rmf_scan_proc_macro(RmfScan *scan, TSNode item) {
@@ -844,6 +906,7 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
     } else if (strcmp(kind, "macro_invocation") == 0) {
         rmf_push(scan, (RmfRecord){.op = RMF_MACRO});
         rmf_scan_macro_traits(scan, item);
+        rmf_scan_macro_mods(scan, item);
     } else {
         for (size_t i = 0; i < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); i++) {
             if (strcmp(kind, RMT_ITEM_KINDS[i].node_kind) != 0) {
@@ -1099,6 +1162,30 @@ static void rmt_digest_node(RmtDigest *d, TSNode node) {
     rmt_digest_bytes(d, d->source + start, ts_node_end_byte(node) - start);
 }
 
+/* The `mod name;` facts rmf_scan_macro_mods reads from an item macro. */
+static void rmt_digest_macro_mods(RmtDigest *d, CBMArena *arena, TSNode invocation) {
+    const char *body = NULL;
+    TSTree *tree = rmt_parse_macro_mod_body(arena, d->source, invocation, &body);
+    if (!tree)
+        return;
+    const char *outer = d->source;
+    d->source = body;
+    TSNode items = ts_tree_root_node(tree);
+    for (uint32_t i = 0; i < ts_node_named_child_count(items); i++) {
+        TSNode item = ts_node_named_child(items, i);
+        if (strcmp(ts_node_type(item), "mod_item") != 0 ||
+            !ts_node_is_null(ts_node_child_by_field_name(item, "body", 4)))
+            continue;
+        rmt_digest_str(d, "macromod");
+        rmt_digest_node(d, rmt_visibility_node(item));
+        rmt_digest_node(d, ts_node_child_by_field_name(item, "name", 4));
+        const char *attr = cbm_rust_path_attribute(arena, body, item);
+        rmt_digest_str(d, attr ? attr : "");
+    }
+    d->source = outer;
+    ts_tree_delete(tree);
+}
+
 /* Every fact rmt_walk_item reads from an item, without byte offsets: an edit
  * that leaves the digest unchanged leaves every other file's resolution
  * through the tree unchanged. */
@@ -1141,6 +1228,7 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
             rmt_digest_node(d, item);
         } else if (strcmp(kind, "macro_invocation") == 0) {
             rmt_digest_str(d, "macro");
+            rmt_digest_macro_mods(d, arena, item);
         } else {
             for (size_t k = 0; k < sizeof(RMT_ITEM_KINDS) / sizeof(RMT_ITEM_KINDS[0]); k++) {
                 if (strcmp(kind, RMT_ITEM_KINDS[k].node_kind) == 0) {
