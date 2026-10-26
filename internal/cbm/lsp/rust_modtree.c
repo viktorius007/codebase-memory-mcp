@@ -746,6 +746,11 @@ static void rmf_scan_extern_crate(RmfScan *scan, TSNode item) {
                                .item = 1});
 }
 
+/* `name` without a leading raw-identifier `r#`; NULL stays NULL. */
+static const char *rmt_unraw(const char *name) {
+    return name && strncmp(name, "r#", 2) == 0 ? name + 2 : name;
+}
+
 /* True when `attribute_item` is `#[cfg ..]` or `#[cfg_attr ..]`, read by
  * its name token so spacing and comments before the arguments do not hide
  * it. */
@@ -753,7 +758,7 @@ static bool rmf_attribute_is_cfg(CBMArena *arena, const char *source, TSNode att
     TSNode attr = cbm_find_child_by_kind(attribute_item, "attribute");
     if (ts_node_is_null(attr) || ts_node_named_child_count(attr) == 0)
         return false;
-    const char *name = cbm_node_text(arena, ts_node_named_child(attr, 0), source);
+    const char *name = rmt_unraw(cbm_node_text(arena, ts_node_named_child(attr, 0), source));
     return name && (strcmp(name, "cfg") == 0 || strcmp(name, "cfg_attr") == 0);
 }
 
@@ -1803,18 +1808,22 @@ static bool rmt_package_binds(const CBMRustModTree *tree, int crate, const char 
 static void rmt_mount_macro_mods(CBMRustModTree *tree, RmtMacroMods *pending) {
     for (int i = 0; i < pending->count; i++) {
         const RmtMacroMod cand = pending->items[i];
-        const char *name = cand.decl->name;
+        /* Raw identifiers compare by their bare spelling on both sides. */
+        const char *name = rmt_unraw(cand.decl->name);
         int rivals = 0;
         for (int j = 0; j < pending->count; j++)
             rivals += pending->items[j].module == cand.module &&
-                      strcmp(pending->items[j].decl->name, name) == 0;
+                      strcmp(rmt_unraw(pending->items[j].decl->name), name) == 0;
         char key[RMT_KEY_MAX];
+        char raw_key[RMT_KEY_MAX];
         int written = snprintf(key, sizeof(key), "%d\x1f%s", cand.module, name);
+        int raw_written = snprintf(raw_key, sizeof(raw_key), "%d\x1fr#%s", cand.module, name);
         RmtDef external;
         const char *children_dir = NULL;
-        if (rivals != 1 || written < 0 || written >= (int)sizeof(key) ||
-            tree->modules[cand.module].first_glob >= 0 ||
-            cbm_idxmemo_get(&tree->names, key) >= 0 || rmt_in_list(RMT_PRELUDE, name) ||
+        if (rivals != 1 || written < 0 || written >= (int)sizeof(key) || raw_written < 0 ||
+            raw_written >= (int)sizeof(raw_key) || tree->modules[cand.module].first_glob >= 0 ||
+            cbm_idxmemo_get(&tree->names, key) >= 0 ||
+            cbm_idxmemo_get(&tree->names, raw_key) >= 0 || rmt_in_list(RMT_PRELUDE, name) ||
             rmt_package_binds(tree, tree->modules[cand.module].crate, name) ||
             rmt_extern_prelude(tree, tree->modules[cand.module].crate, name, &external, true) ||
             rmt_out_of_line_file(&cand.build, cand.decl, cand.child_dir, cand.inline_scope,
