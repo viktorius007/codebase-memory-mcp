@@ -9,6 +9,41 @@ pub trait AtomicPod: Default {
     fn read_from_blob(blob: &u32) -> Self;
 }
 
+pub trait IntoSystem {
+    fn into_system(this: Self) -> u32;
+}
+
+pub trait System {}
+
+impl<T: System> IntoSystem for T {
+    fn into_system(_this: Self) -> u32 {
+        0
+    }
+}
+
+fn boxed<H: IntoSystem + Send>(handler: H) -> u32 {
+    IntoSystem::into_system(handler)
+}
+
+pub trait Section {
+    fn name(&self) -> u32;
+}
+
+pub trait ErasedSection {
+    fn snapshot(&self) -> u32;
+}
+
+impl<S: Section> ErasedSection for S {
+    fn snapshot(&self) -> u32 {
+        println!("S::snapshot\n{}", std::backtrace::Backtrace::force_capture());
+        self.name()
+    }
+}
+
+fn snapshot_value<S: Section>(section: &S) -> u32 {
+    ErasedSection::snapshot(section)
+}
+
 pub trait CreateTypeData<T> {
     fn create_type_data() -> Self;
 }
@@ -60,7 +95,22 @@ impl AtomicPod for Window {
     }
 }
 
+impl IntoSystem for Window {
+    fn into_system(this: Self) -> u32 {
+        println!("Window::into_system\n{}", std::backtrace::Backtrace::force_capture());
+        this.0
+    }
+}
+
+impl Section for Window {
+    fn name(&self) -> u32 {
+        self.0
+    }
+}
+
 fn main() {
+    snapshot_value(&Window(5));
+    boxed(Window(3));
     let group = <ReflectSettingsGroup as CreateTypeData<Window>>::create_type_data();
     let buffer = AtomicRawBufferVec::<Window> { values: vec![7], marker: None };
     let window = buffer.get(0);

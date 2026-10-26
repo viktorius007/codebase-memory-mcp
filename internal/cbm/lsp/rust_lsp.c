@@ -15857,12 +15857,34 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
     return exact;
 }
 
+/* True when the first argument of a call to `f` is its Self value: a `self`
+ * receiver, or a first parameter declared `Self` (`fn into_system(this:
+ * Self)`), which a path call passes the same way. */
+static bool rust_first_param_is_self(const CBMRegisteredFunc *f) {
+    if ((f->flags & CBM_FUNC_FLAG_RUST_SELF) != 0)
+        return true;
+    const CBMType *sig = f->signature;
+    const CBMType *first = sig && sig->kind == CBM_TYPE_FUNC && sig->data.func.param_types
+                               ? sig->data.func.param_types[0]
+                               : NULL;
+    if (!first)
+        return false;
+    const char *name = first->kind == CBM_TYPE_NAMED        ? first->data.named.qualified_name
+                       : first->kind == CBM_TYPE_TYPE_PARAM ? first->data.type_param.name
+                                                            : NULL;
+    const char *leaf = name ? strrchr(name, '.') : NULL;
+    leaf = leaf ? leaf + 1 : name;
+    return leaf && strcmp(leaf, "Self") == 0;
+}
+
 /* `Trait::m(x, ..)` where `x` is a trait object or a bounded type parameter
  * of the enclosing item (an unregistered name a bound declares): the
  * self type is not a concrete type with an impl, so the call names the
  * trait's declaration of `m` (reached through supertraits; every reachable
- * declaration must agree), as rust-analyzer resolves the path. A blanket
- * impl that defines `m` can apply to such a self, so it withholds.
+ * declaration must agree), as rust-analyzer resolves the path. For a trait
+ * object, or a type parameter not bounded by the trait itself, a blanket
+ * impl that defines `m` can apply, so it withholds; a parameter bounded by
+ * the trait resolves through that bound whatever impls may cover it.
  * `*open_self` is set whenever the self is such a type, linked or not: no
  * single concrete impl may then be assumed. Assumes no corpus impl of the
  * trait has a trait-object self type. */
@@ -15878,6 +15900,7 @@ static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPCon
     if (!self_t)
         return NULL;
     bool open = self_t->kind == CBM_TYPE_TYPE_PARAM;
+    bool param_self = open;
     const char *head = self_t->kind == CBM_TYPE_NAMED      ? self_t->data.named.qualified_name
                        : self_t->kind == CBM_TYPE_TEMPLATE ? self_t->data.template_type.template_name
                                                            : NULL;
@@ -15900,15 +15923,31 @@ static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPCon
                       cbm_arena_strndup(ctx->arena, head, (size_t)(leaf - 1 - head)), leaf)
                 : NULL;
         open = !registered || !nominal || strcmp(nominal, head) != 0;
+        param_self = open;
     }
     if (!open)
         return NULL;
     *open_self = true;
+    /* The parameter resolves through its own bound only when that bound is
+     * the path's trait; through another bound the trait reaches it by an
+     * impl (a blanket one), which is what the path then names. */
+    const char *param_name = self_t->kind == CBM_TYPE_TYPE_PARAM ? self_t->data.type_param.name
+                                                                 : leaf;
+    bool bound_by_trait = false;
+    for (int i = ctx->type_param_bound_count - 1; param_self && param_name && i >= 0; i--)
+        bound_by_trait |= strcmp(ctx->type_param_bounds[i].param_name, param_name) == 0 &&
+                          ctx->type_param_bounds[i].trait_qn &&
+                          strcmp(ctx->type_param_bounds[i].trait_qn, trait_qn) == 0;
+    param_self = bound_by_trait;
     const CBMRegisteredFunc *declaration = NULL;
     bool ambiguous = false;
-    rust_bound_trait_declarations(ctx, trait_qn, method, true, 0, NULL, &declaration, &ambiguous);
-    if (ambiguous || !declaration || (declaration->flags & CBM_FUNC_FLAG_RUST_SELF) == 0 ||
-        rust_trait_method_overridden_open(ctx, declaration->receiver_type, method))
+    /* An unread supertrait (`Sized`) cannot hold a competing `method`: a
+     * second declaration would make the path ambiguous (E0034). */
+    rust_bound_trait_declarations(ctx, trait_qn, method, false, 0, NULL, &declaration, &ambiguous);
+    /* A generic self resolves through its bound, before any blanket impl
+     * that may also cover it is selected. */
+    if (!declaration || !rust_first_param_is_self(declaration) ||
+        (!param_self && rust_trait_method_overridden_open(ctx, declaration->receiver_type, method)))
         return NULL;
     return declaration;
 }
