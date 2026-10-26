@@ -21,3 +21,11 @@ macro_rules! check {
         }
     };
 }
+
+#[macro_export]
+macro_rules! check_both {
+    ($a:expr, $b:expr) => {{
+        $crate::check!($a, "first holds");
+        $crate::check!($b, "second holds");
+    }};
+}

@@ -10408,6 +10408,7 @@ typedef struct RustMacroRule {
      * inherited by textual scope; `external_text` identifies it. */
     bool path_scoped;
     const char *external_text;
+    const char *crate_path; /* path-scoped: what `$crate` reads as at the call site */
 } RustMacroRule;
 
 /* Strip a single outer pair of matching brackets from a token-tree
@@ -10928,11 +10929,43 @@ static const char *rust_inherited_macro_text(RustLSPContext *ctx, const char *na
     return NULL;
 }
 
+/* `$crate` in a transcriber names the defining crate's root. At the call
+ * site that crate is `crate_path`: `crate` for this crate's own definition,
+ * else the extern-prelude name the `use` path proved for it. The transcriber
+ * has no source site, so the rewrite moves no mapped fragment. */
+static void rust_macro_bind_crate(RustLSPContext *ctx, RustMacroRule *rule,
+                                  const char *crate_path) {
+    const char *t = rule->transcriber_text;
+    if (!t || !strstr(t, "$crate"))
+        return;
+    size_t path_len = strlen(crate_path);
+    size_t cap = (size_t)rule->transcriber_len * (path_len + 1) + 1;
+    char *out = (char *)cbm_arena_alloc(ctx->arena, cap);
+    if (!out)
+        return;
+    size_t n = 0;
+    for (int i = 0; i < rule->transcriber_len;) {
+        bool at = i + 6 <= rule->transcriber_len && memcmp(t + i, "$crate", 6) == 0 &&
+                  (i + 6 == rule->transcriber_len ||
+                   !(isalnum((unsigned char)t[i + 6]) || t[i + 6] == '_'));
+        if (at) {
+            memcpy(out + n, crate_path, path_len);
+            n += path_len;
+            i += 6;
+        } else {
+            out[n++] = t[i++];
+        }
+    }
+    out[n] = '\0';
+    rule->transcriber_text = out;
+    rule->transcriber_len = (int)n;
+}
+
 /* Record the rules of the macro_rules! item `text` as one external
  * definition of `name`, or a miss when there is none, and return its first
  * rule (NULL for a miss). */
 static RustMacroRule *rust_record_external_macro(RustLSPContext *ctx, const char *name,
-                                                 const char *text, bool path_scoped) {
+                                                 const char *text, const char *crate_path) {
     int first = ctx->macro_rules_count;
     TSParser *parser = text ? ts_parser_new() : NULL;
     TSTree *tree = NULL;
@@ -10966,8 +10999,11 @@ static RustMacroRule *rust_record_external_macro(RustLSPContext *ctx, const char
     }
     for (int i = first; i < ctx->macro_rules_count; i++) {
         ctx->macro_rules_arr[i]->external_id = (uint32_t)first + 1;
-        ctx->macro_rules_arr[i]->path_scoped = path_scoped;
+        ctx->macro_rules_arr[i]->path_scoped = crate_path != NULL;
         ctx->macro_rules_arr[i]->external_text = text;
+        ctx->macro_rules_arr[i]->crate_path = crate_path;
+        if (crate_path)
+            rust_macro_bind_crate(ctx, ctx->macro_rules_arr[i], crate_path);
     }
     return miss ? NULL : ctx->macro_rules_arr[first];
 }
@@ -11014,9 +11050,8 @@ static const char *rust_exported_macro_text(const CBMRustMacroTable *table, cons
 static const char *rust_reexported_macro_file_text(RustLSPContext *ctx, const char *file,
                                                    const char *name) {
     const CBMRustMacroFacts *facts = rust_macro_table_file(ctx->imports->macros, file);
-    const char *bound = facts && ctx->imports->lookup
-                            ? ctx->imports->lookup(ctx->imports->ctx, file, name)
-                            : NULL;
+    const char *bound =
+        facts && ctx->imports->lookup ? ctx->imports->lookup(ctx->imports->ctx, file, name) : NULL;
     if (!bound || strcmp(bound, name) != 0)
         return NULL;
     const RustMacroFactDef *best = NULL;
@@ -11030,15 +11065,16 @@ static const char *rust_reexported_macro_file_text(RustLSPContext *ctx, const ch
 /* The macro_rules! item that the `use` path `raw` (already resolved to the
  * item QN `resolved` when relative) names as `name`, or NULL. */
 static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw,
-                                            const char *resolved, const char *name) {
+                                            const char *resolved, const char *name,
+                                            const char **crate_path) {
     if (strncmp(raw, "::", 2) == 0)
         raw += 2;
     const char *sep = strstr(raw, "::");
     if (!sep)
         return NULL;
     char *head = cbm_arena_strndup(ctx->arena, raw, (size_t)(sep - raw));
-    bool relative = strcmp(head, "crate") == 0 || strcmp(head, "self") == 0 ||
-                    strcmp(head, "super") == 0;
+    bool relative =
+        strcmp(head, "crate") == 0 || strcmp(head, "self") == 0 || strcmp(head, "super") == 0;
     const CBMCargoMember *member =
         !relative && ctx->cargo_manifest
             ? cbm_cargo_find_member((const CBMCargoManifest *)ctx->cargo_manifest, head)
@@ -11078,16 +11114,23 @@ static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw
     }
     if (exported && reexported && strcmp(exported, reexported) != 0)
         return NULL;
+    *crate_path = relative ? "crate" : head;
     return exported ? exported : reexported;
 }
 
 /* The macro_rules! item an invocation of `macro_name` names through path
  * scope: the written path, or every `use` binding its single segment. Two
  * bindings naming different items withhold. */
-static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *macro_name) {
-    if (strstr(macro_name, "::"))
-        return rust_use_path_macro_text(ctx, macro_name, NULL,
-                                        strrchr(macro_name, ':') + 1);
+static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *macro_name,
+                                               const char **crate_path) {
+    if (strstr(macro_name, "::")) {
+        bool relative = strncmp(macro_name, "crate::", 7) == 0 ||
+                        strncmp(macro_name, "self::", 6) == 0 ||
+                        strncmp(macro_name, "super::", 7) == 0;
+        return rust_use_path_macro_text(ctx, macro_name,
+                                        relative ? rust_resolve_path_expr(ctx, macro_name) : NULL,
+                                        strrchr(macro_name, ':') + 1, crate_path);
+    }
     const char *found = NULL;
     for (int i = ctx->use_count - 1; i >= 0; i--) {
         if (strcmp(ctx->use_local_names[i], macro_name) != 0 || !ctx->use_raw_paths[i])
@@ -11095,7 +11138,7 @@ static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *
         const char *raw = ctx->use_raw_paths[i];
         const char *leaf = strrchr(raw, ':');
         const char *text = rust_use_path_macro_text(ctx, raw, ctx->use_module_paths[i],
-                                                    leaf ? leaf + 1 : raw);
+                                                    leaf ? leaf + 1 : raw, crate_path);
         if (text && found && strcmp(text, found) != 0)
             return NULL;
         found = text ? text : found;
@@ -11122,21 +11165,23 @@ static RustMacroRule *rust_macro_definition_for(RustLSPContext *ctx, const char 
     }
     if (!cached)
         inherited = rust_record_external_macro(ctx, macro_name,
-                                               rust_inherited_macro_text(ctx, macro_name), false);
+                                               rust_inherited_macro_text(ctx, macro_name), NULL);
     if (inherited)
         return inherited;
     /* The `use` bindings in scope differ between invocations, so the path
      * is resolved each time and only the parsed definition is shared. */
-    const char *text = rust_path_scoped_macro_text(ctx, macro_name);
+    const char *crate_path = NULL;
+    const char *text = rust_path_scoped_macro_text(ctx, macro_name, &crate_path);
     if (!text)
         return NULL;
     for (int i = 0; i < ctx->macro_rules_count; i++) {
         RustMacroRule *rule = ctx->macro_rules_arr[i];
         if (rule->path_scoped && rule->external_text == text && rule->macro_name &&
-            strcmp(rule->macro_name, macro_name) == 0)
+            strcmp(rule->macro_name, macro_name) == 0 && crate_path &&
+            strcmp(rule->crate_path, crate_path) == 0)
             return rule->miss ? NULL : rule;
     }
-    return rust_record_external_macro(ctx, macro_name, text, true);
+    return crate_path ? rust_record_external_macro(ctx, macro_name, text, crate_path) : NULL;
 }
 
 static bool rust_has_visible_macro_definition(RustLSPContext *ctx, const char *macro_name,

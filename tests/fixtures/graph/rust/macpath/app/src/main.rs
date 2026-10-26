@@ -1,6 +1,7 @@
 //! Calls written inside the arguments of corpus macros reached through path scope.
-use chk::{check, check_eq};
+use chk::{check, check_both, check_eq};
 
+mod emit;
 mod helpers;
 mod user;
 
@@ -12,6 +13,10 @@ fn direct() {
     check!(truthy(), "truthy holds");
 }
 
+fn nested() {
+    check_both!(truthy(), seven() == 7);
+}
+
 fn qualified() {
     chk::check_eq!(seven(), 7, "qualified path");
 }
@@ -19,5 +24,6 @@ fn qualified() {
 fn main() {
     direct();
     qualified();
+    nested();
     user::run();
 }

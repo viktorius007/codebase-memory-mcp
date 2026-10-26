@@ -1921,9 +1921,8 @@ const char *cbm_rust_modtree_extern_root(const CBMRustModTree *tree, const char 
     for (int m = tree->files[file].first_module; m >= 0; m = tree->modules[m].next_in_file) {
         char key[RMT_KEY_MAX];
         int written = snprintf(key, sizeof(key), "%d\x1f%s", tree->modules[m].crate, name);
-        int32_t target = written > 0 && written < (int)sizeof(key)
-                             ? cbm_idxmemo_get(&tree->externs, key)
-                             : -1;
+        int32_t target =
+            written > 0 && written < (int)sizeof(key) ? cbm_idxmemo_get(&tree->externs, key) : -1;
         int root_module = target > 0 ? tree->crates[target - 1].root_module : -1;
         const char *qn = root_module >= 0 ? tree->files[tree->modules[root_module].file].qn : NULL;
         if (!qn || (root && strcmp(root, qn) != 0)) {
