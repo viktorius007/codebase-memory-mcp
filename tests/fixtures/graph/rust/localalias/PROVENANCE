@@ -1,0 +1,1 @@
+Receiver lane w3-locals, class D1: a corpus Deref wrapper whose argument is a type alias, declared in other files (bevy ResMut<ViewSortedRenderPhases<T>>). println! statements print a backtrace (the run is the truth).

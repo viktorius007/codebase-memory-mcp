@@ -16558,16 +16558,36 @@ static bool rust_open_arg_impl_self_fits(RustLSPContext *ctx, const CBMRegistere
  * type fits the receiver (rust_open_arg_impl_self_fits). A blanket or
  * reference impl of the trait defining `m` withholds. Assumes a nominal
  * impl on the head is chosen over the trait's blanket impls. */
+static const CBMRegisteredFunc *rust_sole_head_impl_method(RustLSPContext *ctx,
+                                                           const CBMType *base,
+                                                           const char *method);
+
 static const CBMRegisteredFunc *rust_open_arg_sole_impl_method(RustLSPContext *ctx,
                                                                const CBMType *base,
                                                                const char *method) {
-    if (!method || !ctx->imports || !ctx->imports->modtree ||
-        !rust_type_has_open_arg(ctx, base) || rust_deref_step(ctx, base))
+    return rust_type_has_open_arg(ctx, base) ? rust_sole_head_impl_method(ctx, base, method)
+                                             : NULL;
+}
+
+/* The impl `rust_open_arg_sole_impl_method` selects, for any receiver headed
+ * by a corpus struct, enum or union `H` (`H` or `H<..>`): with no inherent
+ * `m`, no Deref target and exactly one in-scope corpus trait declaring `m`,
+ * the one impl of that trait on `H` defining `m` is the only candidate a
+ * compiling call reaches, whatever its bounds say. Same named assumption: no
+ * std or dependency trait supplies `m` on `H`. */
+static const CBMRegisteredFunc *rust_sole_head_impl_method(RustLSPContext *ctx,
+                                                           const CBMType *base,
+                                                           const char *method) {
+    if (!method || !base || !ctx->imports || !ctx->imports->modtree ||
+        (base->kind != CBM_TYPE_TEMPLATE && base->kind != CBM_TYPE_NAMED) ||
+        rust_deref_step(ctx, base))
         return NULL;
     for (int i = 0; RUST_OPEN_RECEIVER_STD_METHODS[i]; i++)
         if (strcmp(RUST_OPEN_RECEIVER_STD_METHODS[i], method) == 0)
             return NULL;
-    const char *head = rust_registered_type_qn(ctx, base->data.template_type.template_name);
+    const char *head = rust_registered_type_qn(
+        ctx, base->kind == CBM_TYPE_TEMPLATE ? base->data.template_type.template_name
+                                             : base->data.named.qualified_name);
     const CBMRegisteredType *head_type = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
     if (!head_type || head_type->is_interface)
         return NULL;
@@ -16991,6 +17011,15 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             const CBMRegisteredFunc *m = rust_resolve_trait_method(
                 ctx, type_qn, mname, &impl_count, &trait_dispatch, false, true, &scope_filtered,
                 &inherent_stop, recv);
+            const CBMRegisteredFunc *sole_impl =
+                inherent_stop && strncmp(inherent_stop, "trait_receiver_shape", 20) == 0
+                    ? rust_sole_head_impl_method(ctx, base, mname)
+                    : NULL;
+            if (sole_impl && !rust_std_trait_collision(ctx, recv, sole_impl).reason) {
+                rust_emit_resolved_call(ctx, sole_impl->qualified_name, sole_impl->impl_key,
+                                        "lsp_trait_dispatch", CBM_RUST_CONF_TRAIT_SOLE);
+                return;
+            }
             if (inherent_stop) {
                 rust_emit_unresolved_call(
                     ctx, rust_method_stop_name(ctx, recv, mname, inherent_stop), inherent_stop);
@@ -17033,7 +17062,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                         ? NULL : rust_trait_receiver_refusal(ctx, m, recv, true);
                     if (refusal && strncmp(refusal, "trait_receiver_shape", 20) == 0 &&
                         (rust_method_probe_rank(ctx, m, recv, NULL) >= 0 ||
-                         rust_method_probe_bounds_proven(ctx, m, recv, NULL)))
+                         rust_method_probe_bounds_proven(ctx, m, recv, NULL) ||
+                         rust_sole_head_impl_method(ctx, base, mname) == m))
                         refusal = NULL;
                     if (refusal) {
                         rust_emit_trait_refusal(ctx, m, recv, refusal);
@@ -17065,7 +17095,13 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                 const CBMType *next = rust_deref_step(ctx, cur);
                 if (!next)
                     break;
-                /* Unwrap reference layers introduced by deref. */
+                /* Unwrap reference layers introduced by deref. A target
+                 * substituted from the wrapper's argument may be an alias
+                 * (`Res<Phases>` with `type Phases = HashMap<..>`). */
+                while (next && next->kind == CBM_TYPE_REFERENCE) {
+                    next = next->data.reference.elem;
+                }
+                next = rust_expand_type_aliases(ctx, next, 0);
                 while (next && next->kind == CBM_TYPE_REFERENCE) {
                     next = next->data.reference.elem;
                 }
