@@ -2661,14 +2661,15 @@ static bool pxc_python_bound_before(const CBMPyNamespaceFacts *facts, int end, c
  * (pxc_python_binder_fits) and the entry, if any, already holds that node;
  * otherwise it is no longer proven (`def f` then `if c: f = g`). A name the
  * statement binds first keeps no entry, as an absent entry resolves to the
- * same-module name. */
+ * same-module name; collecting a star import's exports, it is blocked, as the
+ * star may or may not replace the importer's own binding of it. */
 static bool pxc_python_replay_own_or_kept(const cbm_pipeline_ctx_t *ctx, const char *module_qn,
                                           const CBMPyNamespaceFacts *facts, int index,
-                                          PXCPythonImportMap *map) {
+                                          PXCPythonImportMap *map, bool collect_exports) {
     const CBMPyNamespaceFact *fact = &facts->items[index];
     int existing = pxc_python_map_find(map, fact->local_name);
     if (existing < 0 && !pxc_python_bound_before(facts, index, fact->local_name))
-        return true;
+        return !collect_exports || pxc_python_map_set(map, fact->local_name, NULL);
     const cbm_gbuf_node_t *node = pxc_python_own_node(ctx, module_qn, fact->local_name);
     const char *held = existing >= 0 ? map->vals[existing] : NULL;
     if (pxc_python_binder_fits(node, fact) &&
@@ -2726,7 +2727,7 @@ static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_p
             }
         } else if (fact->kind == CBM_PY_NS_SHADOW && fact->reason == CBM_PY_NS_REASON_OWN_OR_KEPT &&
                    fact->local_name) {
-            if (!pxc_python_replay_own_or_kept(ctx, module_qn, facts, i, map)) {
+            if (!pxc_python_replay_own_or_kept(ctx, module_qn, facts, i, map, collect_exports)) {
                 pxc_free_fqn(file_qn);
                 return false;
             }
@@ -2736,11 +2737,13 @@ static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_p
              * or `try` branch re-importing it, a loop or tuple target): the
              * binding an earlier statement proved (an entry, or an own
              * definition that keeps none) no longer decides it. A name that
-             * statement binds first keeps no entry, as before, and the
-             * any-name SHADOW is left to the re-export reader
+             * statement binds first keeps no entry, as before, except among a
+             * star import's exports: there the star may replace the
+             * importer's binding of it, so the entry is blocked. The any-name
+             * SHADOW is left to the re-export reader
              * (pxc_python_final_binding). */
             if (strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) != 0 &&
-                (pxc_python_map_find(map, fact->local_name) >= 0 ||
+                (collect_exports || pxc_python_map_find(map, fact->local_name) >= 0 ||
                  pxc_python_bound_before(facts, i, fact->local_name)) &&
                 !pxc_python_map_set(map, fact->local_name, NULL)) {
                 pxc_free_fqn(file_qn);
