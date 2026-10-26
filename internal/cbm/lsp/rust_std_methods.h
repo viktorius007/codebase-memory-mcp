@@ -302,6 +302,10 @@ CBM_STD_RETURN(RUST_STD_REFCELL, "replace_with", "T", false,
                "2026-10-07")
 CBM_STD_RETURN(RUST_STD_REFCELL, "clone", "Self", false,
                "https://doc.rust-lang.org/std/cell/struct.RefCell.html#method.clone", "2026-10-07")
+CBM_STD_RETURN(RUST_STD_NONNULL, "as_ref", "&T", false,
+               "https://doc.rust-lang.org/std/ptr/struct.NonNull.html#method.as_ref", "2026-10-26")
+CBM_STD_RETURN(RUST_STD_NONNULL, "as_mut", "!T", false,
+               "https://doc.rust-lang.org/std/ptr/struct.NonNull.html#method.as_mut", "2026-10-26")
 CBM_STD_RETURN(RUST_STD_CELL, "get", "T", false,
                "https://doc.rust-lang.org/std/cell/struct.Cell.html#method.get", "2026-10-07")
 CBM_STD_RETURN(RUST_STD_CELL, "take", "T", false,

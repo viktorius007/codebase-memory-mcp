@@ -1,0 +1,1 @@
+w7-bind G009/G002: `NonNull<T>::as_ref` / `as_mut` return `&T` / `&mut T` (std table rows), so a binding from `unsafe { ptr.as_mut() }` dispatches on T. println! statements print a backtrace (the run is the truth).
