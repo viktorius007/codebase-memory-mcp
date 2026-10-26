@@ -2302,7 +2302,12 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
         if (count == 0) {
             return cbm_type_builtin(ctx->arena, "()");
         }
-        if (count == 1) {
+        /* `(T)` is T parenthesised; `(T,)` is a one-element tuple. */
+        bool comma = false;
+        for (uint32_t i = 0; i < ts_node_child_count(node) && !comma; i++) {
+            comma = strcmp(ts_node_type(ts_node_child(node, i)), ",") == 0;
+        }
+        if (count == 1 && !comma) {
             return elems[0];
         }
         return cbm_type_tuple(ctx->arena, elems, count);
@@ -2875,10 +2880,9 @@ static const CBMType *parse_type_text_with_params(CBMArena *arena, const char *t
                 start = q + 1;
             }
         }
+        /* A top-level comma makes `(T,)` a one-element tuple. */
         if (count == 0)
             return cbm_type_builtin(arena, "()");
-        if (count == 1)
-            return elems[0];
         return cbm_type_tuple(arena, elems, count);
     }
 
@@ -4726,7 +4730,7 @@ static const char *rust_std_type_head(const CBMType *t) {
  * `QueryData` struct included, has no item here. The types are recognised
  * by their place in bevy_ecs's own source tree. */
 #define RUST_BEVY_ECS_SRC "crates.bevy_ecs.src."
-enum { RUST_BEVY_ITEM_MAX_DEPTH = 8 };
+enum { RUST_BEVY_ITEM_MAX_DEPTH = 64 };
 
 /* The registered QN of `t`'s head when it is bevy_ecs's `<path>` (a path
  * under crates/bevy_ecs/src), else NULL. `*ecs` receives the QN prefix

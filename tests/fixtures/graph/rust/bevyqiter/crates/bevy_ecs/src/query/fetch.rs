@@ -66,6 +66,14 @@ impl<D: QueryData> QueryData for Option<D> {
     }
 }
 
+impl<A: QueryData> QueryData for (A,) {
+    type ReadOnly = (A::ReadOnly,);
+    type Item<'w, 's> = (A::Item<'w, 's>,);
+    fn fetch<'w, 's>(world: &'w World, row: usize) -> Option<Self::Item<'w, 's>> {
+        Some((A::fetch(world, row)?,))
+    }
+}
+
 impl<A: QueryData, B: QueryData> QueryData for (A, B) {
     type ReadOnly = (A::ReadOnly, B::ReadOnly);
     type Item<'w, 's> = (A::Item<'w, 's>, B::Item<'w, 's>);

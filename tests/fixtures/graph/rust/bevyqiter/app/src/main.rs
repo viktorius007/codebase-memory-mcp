@@ -75,6 +75,12 @@ fn for_mut(mut query: Query<(&mut Transform, &Velocity)>) {
     }
 }
 
+fn singleton(query: Query<(&Transform,)>) {
+    for (transform,) in &query {
+        transform.x();
+    }
+}
+
 fn closures(query: Query<(&Transform, &Velocity)>) {
     query.iter().for_each(|(transform, velocity)| {
         transform.x();
@@ -106,6 +112,7 @@ fn main() {
     for_iter(Query::new(&world));
     for_ref(Query::new(&world));
     for_mut(Query::new(&world));
+    singleton(Query::new(&world));
     closures(Query::new(&world));
     wrappers(Query::new(&world));
 }
