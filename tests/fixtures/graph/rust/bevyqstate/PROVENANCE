@@ -1,0 +1,1 @@
+w5-bind G002/G003: `QueryState<D, F>::get / single_mut` read their item like `Query`, and the entity-access query data (EntityRef, EntityMut and their read-only swap) yield themselves (crate bevy_ecs laid out as bevy lays it out). println! statements print a backtrace (the run is the truth).
