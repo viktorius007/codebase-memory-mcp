@@ -11,6 +11,7 @@ rust/fwd	CALLS src.main.&'a T.frob[Ext] -> src.main.S.frob[Ext]	R-W3 N2
 rust/fwd	CALLS src.main.on_arc -> src.main.Arc.zap[Ext2]	R-W1 B6
 rust/fwd	CALLS src.main.on_box -> src.main.Box.frob[Ext]	R-W1 B6
 rust/fwd	CALLS src.main.on_rc -> src.main.Rc.frob[Ext]	R-W1 B6
+rust/globwide	CALLS app.src.main.wide_user.shape -> facade.src.lib.wide.mesh.Mesh.new	W4-PATH G1 (glob walk past 512 modules withholds)
 rust/matrix2	CALLS src.main.c126.probe -> src.main.c126.S126.m[Tr126]	R-W3 M3 (R-W2 R4)
 rust/matrix2	CALLS src.main.c130.probe -> src.main.c130.S130.m[Fa130]	R-W3 M3 (R-W2 R4)
 rust/matrix2	CALLS src.main.c133.probe -> src.main.c133.S133.m[Fa133]	R-W3 M3 (R-W2 R4)

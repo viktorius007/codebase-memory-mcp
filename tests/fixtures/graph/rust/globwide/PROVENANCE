@@ -1,0 +1,1 @@
+Lane w4-path (2026-10-26): a facade crate's prelude that globs many sub-preludes (the bevy::prelude::* shape) still names the type its last glob chain reaches; a namesake type outside the prelude is not linked. println! statements print a backtrace (the run is the truth).
