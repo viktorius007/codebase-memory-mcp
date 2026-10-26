@@ -19,9 +19,11 @@ for c in $CORPORA; do
   if [ -z "$db" ]; then echo "cpp-$c: FAIL no graph.db ($(head -1 "$G/cpp-$c.log"))"; ok=0; continue; fi
   if [ "$MODE" = freeze ]; then
     mkdir -p "$CPP/base/$c" && cp "$db" "$CPP/base/$c/graph.db"
-    d=$(python3 -I "$HERE/graphcmp.py" "$db" "$db" | sed -n 's/^edges:.*digest before=\([0-9a-f]*\).*/\1/p')
-    n=$(python3 -I "$HERE/graphcmp.py" "$db" "$db" | sed -n 's/^nodes:.*digest before=\([0-9a-f]*\).*/\1/p')
-    echo "cpp-$c: FROZEN nodes=$n edges=$d -> $CPP/base/$c/graph.db"
+    cmp=$(python3 -I "$HERE/graphcmp.py" "$db" "$db")
+    d=$(sed -n 's/^edges:.*digest before=\([0-9a-f]*\).*/\1/p' <<< "$cmp")
+    n=$(sed -n 's/^nodes:.*digest before=\([0-9a-f]*\).*/\1/p' <<< "$cmp")
+    s=$(sed -n 's/^semantic:.*digest before=\([0-9a-f]*\).*/\1/p' <<< "$cmp")
+    echo "cpp-$c: FROZEN nodes=$n edges=$d sr=$s -> $CPP/base/$c/graph.db (record all three in DIGESTS)"
     continue
   fi
   base="$CPP/base/$c/graph.db"

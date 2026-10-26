@@ -1,5 +1,8 @@
 # Frozen graph digests per corpus (graphcmp.py, 16 hex chars of the sorted multiset sha256).
 # Re-freeze only on a landed commit whose graph change is explained edge class by edge class.
-# binary    corpus              nodes  edges   nodes-digest      edges-digest
-b9a7012c    react-native-0.88   30271  101054  781dfa903897fa32  5c72193847331571
-b9a7012c    bitcoin-v27         32345  116593  4a2995e3aca581d7  9530dc0370801005
+# The edges columns exclude SEMANTICALLY_RELATED; the sr columns are that derived class alone.
+# 0cac5290: re-frozen after the drivers' CALLS properties were unified (edge sets keyed by
+# source, target and type identical to the b9a7012c base; only the args text changed).
+# binary    corpus               nodes  nodes-digest       edges  edges-digest        sr  sr-digest
+0cac5290    react-native-0.88    30271 aef816a0c74c12a0  100835 87cbf4f461a86fe4    22 445b8b1da0953ca7
+0cac5290    bitcoin-v27          32344 7c631ba092b6bc07  115991 440dd55463e0b2fe   139 70e46241089c2fe5
