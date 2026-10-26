@@ -4830,10 +4830,69 @@ static bool c_walk_cap_link_kind(const CLSPContext *ctx, const char *kind) {
             strcmp(kind, "pointer_expression") == 0 || strcmp(kind, "update_expression") == 0);
 }
 
+/* Whether node has a direct anonymous child spelled token. */
+static bool c_has_token_child(CLSPContext *ctx, TSNode node, const char *token) {
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_child(node, i);
+        if (ts_node_is_named(child))
+            continue;
+        char *text = c_node_text(ctx, child);
+        if (text && strcmp(text, token) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* The name of a C++ call the source spells without a call or operator
+ * expression of its own, for the shapes extract_cpp_implicit_calls and
+ * extract_cpp_operator_call make candidates of at the same span: `delete p`
+ * ("~"), `if (x)`/`while (x)` with a lone identifier condition
+ * ("operator bool"), the copy-initialisation `T a = b;` of a plain name
+ * (T's last name segment) and `p->m` ("operator->"). NULL for every other node. The
+ * pipeline joins a stop row to a candidate by span and name, so each name is
+ * the candidate's own. */
+static const char *c_walk_cap_implicit_name(CLSPContext *ctx, TSNode node, const char *kind) {
+    if (!ctx->cpp_mode)
+        return NULL;
+    if (strcmp(kind, "delete_expression") == 0)
+        return ts_node_named_child_count(node) > 0 ? "~" : NULL;
+    if (strcmp(kind, "field_expression") == 0)
+        return c_has_token_child(ctx, node, "->") ? "operator->" : NULL;
+    if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "while_statement") == 0 ||
+        strcmp(kind, "do_statement") == 0) {
+        TSNode cond = ts_node_child_by_field_name(node, "condition", 9);
+        if (ts_node_is_null(cond))
+            return NULL;
+        if (strcmp(ts_node_type(cond), "condition_clause") == 0 &&
+            ts_node_named_child_count(cond) == 1)
+            cond = ts_node_named_child(cond, 0);
+        return strcmp(ts_node_type(cond), "identifier") == 0 ? "operator bool" : NULL;
+    }
+    if (strcmp(kind, "declaration") != 0)
+        return NULL;
+    TSNode type = ts_node_child_by_field_name(node, "type", 4);
+    TSNode decl = ts_node_child_by_field_name(node, "declarator", 10);
+    if (ts_node_is_null(type) || ts_node_is_null(decl) ||
+        strcmp(ts_node_type(decl), "init_declarator") != 0)
+        return NULL;
+    /* `T &r = b;` and `T *p = q;` bind without constructing a T. */
+    TSNode name = ts_node_child_by_field_name(decl, "declarator", 10);
+    TSNode value = ts_node_child_by_field_name(decl, "value", 5);
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0 ||
+        ts_node_is_null(value) || strcmp(ts_node_type(value), "identifier") != 0)
+        return NULL;
+    char *type_name = c_node_text(ctx, type);
+    const char *colon = type_name ? strrchr(type_name, ':') : NULL;
+    return colon ? colon + 1 : type_name;
+}
+
 /* The short text a stop row carries as its callee: the called member or
  * function name, or the operator. Never the text of a receiver: a chain's
  * receiver is the rest of the chain, and copying it per link is quadratic. */
 static const char *c_walk_cap_link_name(CLSPContext *ctx, TSNode node, const char *kind) {
+    if (strcmp(kind, "subscript_expression") == 0)
+        return "operator[]";
     if (strcmp(kind, "call_expression") != 0) {
         TSNode op = ts_node_child_by_field_name(node, "operator", 8);
         char *text = ts_node_is_null(op) ? NULL : c_node_text(ctx, op);
@@ -4878,7 +4937,10 @@ __attribute__((noinline)) static void c_record_walk_cap_stops(CLSPContext *ctx, 
         if (ts_node_is_named(node)) {
             const char *kind = ts_node_type(node);
             descend = strcmp(kind, "function_definition") != 0;
-            if (c_walk_cap_link_kind(ctx, kind))
+            const char *implicit = c_walk_cap_implicit_name(ctx, node, kind);
+            if (implicit)
+                c_emit_unresolved_call_at(ctx, implicit, C_LSP_WALK_CAP_REASON, node);
+            else if (c_walk_cap_link_kind(ctx, kind))
                 c_emit_unresolved_call_at(ctx, c_walk_cap_link_name(ctx, node, kind),
                                           C_LSP_WALK_CAP_REASON, node);
         }

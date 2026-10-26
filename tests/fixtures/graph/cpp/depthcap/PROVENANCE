@@ -1,0 +1,6 @@
+Written for the C/C++ lane of the graph-accuracy run (HANDOFF.md, OPEN product
+defects, C/C++: operator[]/->/bool/copy-ctor/delete past depth cap silent).
+Before the fix the five sites in the innermost block had no unresolved_sites
+row: operator[] carried the name "operator" (no join to the candidate
+"operator[]"), and operator->, operator bool, the copy constructor and the
+destructor were not visited as links by the cap's stop walk.
