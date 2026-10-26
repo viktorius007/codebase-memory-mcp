@@ -2515,64 +2515,85 @@ static bool pxc_python_package_has_submodule(const cbm_pipeline_ctx_t *ctx,
 
 static bool pxc_python_is_submodule(const cbm_gbuf_node_t *node);
 
-/* Whether the dotted `name` starts with the component `first` (`x` or
- * `x.y` for first `x`). */
-static bool pxc_python_dotted_starts(const char *name, const char *first, size_t len) {
-    return name && strncmp(name, first, len) == 0 && (name[len] == '\0' || name[len] == '.');
-}
-
-/* Whether the import `fact` of the package `__init__` whose directory's last
- * component is `pkg` loads its submodule `member`: `from . import member`,
- * `from .member[...] import y`, or the absolute spellings `import
- * [...].pkg.member[...]` and `from [...].pkg.member[...] import y`. */
-static bool pxc_python_fact_loads_submodule(const CBMPyNamespaceFact *fact, const char *pkg,
-                                            size_t pkg_len, const char *member) {
-    if (fact->kind != CBM_PY_NS_IMPORT_NAME && fact->kind != CBM_PY_NS_IMPORT_MODULE &&
-        fact->kind != CBM_PY_NS_IMPORT_STAR)
+/* Whether the import `fact`, a top-level statement of the package
+ * `__init__` in directory `dir`, loads that package's submodule `member`: a
+ * relative `from <dots><module> import ...` whose target module path is
+ * `dir/member` or under it (`from .member import y`,
+ * `from ..pkg.member.z import y` in pkg/__init__.py). `from . import member`
+ * reads an existing attribute first and loads nothing over it; an absolute
+ * import is not matched, as the package's own dotted name is not known
+ * here. */
+static bool pxc_python_fact_loads_submodule(const CBMPyNamespaceFact *fact, const char *dir,
+                                            const char *member) {
+    if ((fact->kind != CBM_PY_NS_IMPORT_NAME && fact->kind != CBM_PY_NS_IMPORT_MODULE &&
+         fact->kind != CBM_PY_NS_IMPORT_STAR) ||
+        fact->relative_level == 0 || !fact->module_name || !fact->module_name[0])
         return false;
-    const char *module = fact->module_name;
-    size_t member_len = strlen(member);
-    if (fact->relative_level == 1)
-        return pxc_python_dotted_starts(module, member, member_len) ||
-               (module && !module[0] && fact->kind == CBM_PY_NS_IMPORT_NAME && fact->member_name &&
-                strcmp(fact->member_name, member) == 0);
-    if (fact->relative_level != 0 || !module)
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s", dir);
+    if (n < 0 || (size_t)n >= sizeof(path))
         return false;
-    for (const char *at = module; at; at = strchr(at, '.')) {
-        if (*at == '.')
-            at++;
-        if (pxc_python_dotted_starts(at, pkg, pkg_len) && at[pkg_len] == '.' &&
-            pxc_python_dotted_starts(at + pkg_len + 1, member, member_len))
-            return true;
+    for (uint32_t up = 1; up < fact->relative_level; up++) {
+        char *slash = strrchr(path, '/');
+        if (!path[0])
+            return false;
+        if (slash)
+            *slash = '\0';
+        else
+            path[0] = '\0';
     }
-    return false;
+    size_t len = strlen(path);
+    n = snprintf(path + len, sizeof(path) - len, "%s%s", len ? "/" : "", fact->module_name);
+    if (n < 0 || (size_t)n >= sizeof(path) - len)
+        return false;
+    for (char *c = path + len; *c; c++) {
+        if (*c == '.')
+            *c = '/';
+    }
+    char want[CBM_PATH_MAX];
+    n = snprintf(want, sizeof(want), "%s%s%s", dir, dir[0] ? "/" : "", member);
+    if (n < 0 || (size_t)n >= sizeof(want))
+        return false;
+    size_t want_len = (size_t)n;
+    return strncmp(path, want, want_len) == 0 && (path[want_len] == '\0' || path[want_len] == '/');
 }
 
-/* Whether the package `__init__` `owner` imports its submodule `member`
- * (pxc_python_fact_loads_submodule) no later than the last statement that
- * binds `member`: the submodule is then loaded before that binding, so no
- * later import of it resets the package attribute. */
+/* Whether the top-level statement `fact` binds `member` whenever it runs:
+ * a definition, class, import or assignment, not a binder inside an
+ * unmodelled statement (SHADOW UNSUPPORTED or OWN_OR_KEPT). */
+static bool pxc_python_binds_unconditionally(const CBMPyNamespaceFact *fact, const char *member) {
+    if (!fact->local_name || strcmp(fact->local_name, member) != 0)
+        return false;
+    return fact->kind == CBM_PY_NS_OWN_DEF || fact->kind == CBM_PY_NS_IMPORT_NAME ||
+           fact->kind == CBM_PY_NS_IMPORT_MODULE ||
+           (fact->kind == CBM_PY_NS_SHADOW &&
+            (fact->reason == CBM_PY_NS_REASON_VALUE || fact->reason == CBM_PY_NS_REASON_DECORATED ||
+             fact->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS));
+}
+
+/* Whether the package `__init__` `owner` loads its submodule `member`
+ * (pxc_python_fact_loads_submodule) and a statement that always runs binds
+ * `member` at or after that load: the load set the attribute to the
+ * submodule once, that statement replaced it, and no later import of the
+ * submodule sets it again. */
 static bool pxc_python_submodule_loaded_first(const cbm_gbuf_node_t *owner,
                                               const CBMPyNamespaceFacts *facts,
                                               const char *member) {
     const char *path = owner->file_path;
     const char *slash = path ? strrchr(path, '/') : NULL;
-    if (!slash)
+    char dir[CBM_PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%.*s", slash ? (int)(slash - path) : 0, path ? path : "");
+    if (n < 0 || (size_t)n >= sizeof(dir))
         return false;
-    const char *pkg = slash;
-    while (pkg > path && pkg[-1] != '/')
-        pkg--;
-    size_t pkg_len = (size_t)(slash - pkg);
-    int last_binder = -1;
     int loads = -1;
     for (int i = 0; i < facts->count; i++) {
         const CBMPyNamespaceFact *fact = &facts->items[i];
-        if (fact->local_name && strcmp(fact->local_name, member) == 0)
-            last_binder = i;
-        if (loads < 0 && pkg_len && pxc_python_fact_loads_submodule(fact, pkg, pkg_len, member))
+        if (loads < 0 && pxc_python_fact_loads_submodule(fact, dir, member))
             loads = i;
+        if (loads >= 0 && pxc_python_binds_unconditionally(fact, member))
+            return true;
     }
-    return loads >= 0 && loads <= last_binder;
+    return false;
 }
 
 /* Whether something other than `owner`'s own binding can answer `member`
