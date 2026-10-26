@@ -2013,89 +2013,45 @@ typedef struct {
     cbm_pipeline_ctx_t *pctx; /* spill store access */
 } resolve_ctx_t;
 
-/* Minimum buffer space needed per arg JSON object */
-#define CBM_ARG_JSON_GUARD CBM_SZ_32
-
 /* Append arg data as JSON to edge properties: ,"args":[{"i":0,"e":"x","v":"val"},...]
- * Returns new position in buffer. */
-/* Sanitize expression string for JSON (in-place). */
-static void sanitize_expr(char *expr_buf, const char *expr) {
-    if (expr) {
-        size_t length = strnlen(expr, 120);
-        while (length > 0 && ((unsigned char)expr[length] & 0xc0) == 0x80) {
-            length--;
-        }
-        memcpy(expr_buf, expr, length);
-        expr_buf[length] = '\0';
-        for (char *p = expr_buf; *p; p++) {
-            if (*p == '"') {
-                *p = '\'';
-            }
-            if (*p == '\n' || *p == '\r') {
-                *p = ' ';
-            }
-        }
-    } else {
-        expr_buf[0] = '\0';
-    }
-}
-
-/* Format one call arg as JSON. Returns snprintf result. */
-static int format_call_arg(char *buf, size_t bufsize, const CBMCallArg *a, const char *expr) {
-    char esc_k[CBM_SZ_128];
-    char esc_e[CBM_SZ_128];
-    char esc_v[CBM_SZ_128];
-    cbm_json_escape(esc_e, sizeof(esc_e), expr);
-    if (a->keyword && a->value) {
-        cbm_json_escape(esc_k, sizeof(esc_k), a->keyword);
-        cbm_json_escape(esc_v, sizeof(esc_v), a->value);
-        return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\",\"v\":\"%s\"}", a->index,
-                        esc_k, esc_e, esc_v);
-    }
-    if (a->keyword) {
-        cbm_json_escape(esc_k, sizeof(esc_k), a->keyword);
-        return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\"}", a->index, esc_k,
-                        esc_e);
-    }
-    if (a->value) {
-        cbm_json_escape(esc_v, sizeof(esc_v), a->value);
-        return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}", a->index, esc_e,
-                        esc_v);
-    }
-    return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\"}", a->index, esc_e);
-}
+ * Returns new position in buffer. The text is byte-for-byte what the sequential pass
+ * (pass_calls.c calls_append_args) writes: the raw expression JSON-escaped (no quote
+ * rewriting), no keyword member, and an argument whose formatted object does not fit
+ * whole ends the array. Both drivers must emit identical CALLS properties. */
+enum { PP_ARG_ESC = CBM_SZ_256, PP_ARG_OBJ = CBM_SZ_512, PP_ARG_TAIL = 2 };
 
 static size_t append_args_json(char *buf, size_t bufsize, size_t pos, const CBMCall *call) {
-    if (call->arg_count == 0 || pos >= bufsize - PP_ARGS_MARGIN) {
+    if (call->arg_count == 0) {
         return pos;
     }
     int n = snprintf(buf + pos, bufsize - pos, ",\"args\":[");
-    if (n <= 0) {
+    if (n <= 0 || (size_t)n >= bufsize - pos) {
         return pos;
     }
     pos += (size_t)n;
-    for (int i = 0; i < call->arg_count && pos < bufsize - CBM_ARG_JSON_GUARD; i++) {
+    for (int i = 0; i < call->arg_count; i++) {
         const CBMCallArg *a = &call->args[i];
-        size_t mark = pos; /* rollback point (before the separator) */
-        if (i > 0 && pos < bufsize - SKIP_ONE) {
-            buf[pos++] = ',';
+        char esc_e[PP_ARG_ESC];
+        cbm_json_escape(esc_e, sizeof(esc_e), a->expr ? a->expr : "");
+        char one[PP_ARG_OBJ];
+        if (a->value) {
+            char esc_v[PP_ARG_ESC];
+            cbm_json_escape(esc_v, sizeof(esc_v), a->value);
+            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}",
+                         i > 0 ? "," : "", a->index, esc_e, esc_v);
+        } else {
+            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "",
+                         a->index, esc_e);
         }
-        char expr_buf[CBM_SZ_128];
-        sanitize_expr(expr_buf, a->expr);
-        n = format_call_arg(buf + pos, bufsize - pos, a, expr_buf);
-        /* snprintf returns the UNtruncated length: if the arg did not fully
-         * fit, advancing pos by n would push it past buf and the buf[pos]
-         * writes below would overflow. Drop the arg whole (atomic field —
-         * keeps the array valid) and stop appending. */
-        if (n <= 0 || (size_t)n >= bufsize - pos) {
-            pos = mark;
+        /* snprintf reports the untruncated length; an object the local or the props
+         * buffer cannot hold whole is dropped and closes the array. */
+        if (n <= 0 || (size_t)n >= sizeof(one) || pos + (size_t)n + PP_ARG_TAIL >= bufsize) {
             break;
         }
+        memcpy(buf + pos, one, (size_t)n);
         pos += (size_t)n;
     }
-    if (pos < bufsize - SKIP_ONE) {
-        buf[pos++] = ']';
-    }
+    buf[pos++] = ']';
     buf[pos] = '\0';
     return pos;
 }
@@ -2163,19 +2119,28 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
  * brace. Shared with the sequential pass, whose service edges must carry the
  * same bytes (pass_calls.c emit_http_async_edge). */
 void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line) {
-    if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
-        size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
-        if (with_line && call->start_line > 0 && pos < CBM_SZ_2K - PP_LINE_MARGIN) {
-            int ln = snprintf(props + pos, CBM_SZ_2K - pos, ",\"line\":%d", call->start_line);
-            if (ln > 0) {
-                pos += (size_t)ln;
-            }
-        }
-        if (pos < CBM_SZ_2K - SKIP_ONE) {
-            props[pos] = '}';
-            props[pos + SKIP_ONE] = '\0';
+    /* A CALLS edge is budgeted exactly as the sequential pass_calls.c builds it, in a
+     * CBM_SZ_512 buffer (calls_emit_edge + calls_append_args): the line needs 32 bytes
+     * of room, and an argument that does not fit ends the array. Both drivers must
+     * keep the same arguments whatever the input. Other edge types keep CBM_SZ_2K. */
+    size_t cap = with_line ? CBM_SZ_512 : CBM_SZ_2K;
+    if (n <= 0 || (size_t)n + SKIP_ONE >= cap) {
+        return;
+    }
+    size_t pos = (size_t)n;
+    /* The line goes BEFORE the args, as in calls_emit_edge. The graph buffer settles two
+     * CALLS edges between the same pair of nodes (equal confidence) by strcmp of the
+     * props text; with the fields in a different order the drivers compared different
+     * fields first and kept a different call site's line. */
+    if (with_line && call->start_line > 0 && pos + SKIP_ONE + CBM_SZ_32 < cap) {
+        int ln = snprintf(props + pos, cap - pos, ",\"line\":%d", call->start_line);
+        if (ln > 0) {
+            pos += (size_t)ln;
         }
     }
+    pos = append_args_json(props, cap, pos, call);
+    props[pos] = '}';
+    props[pos + SKIP_ONE] = '\0';
 }
 
 /* Build props JSON, append args, close brace, emit edge. */
