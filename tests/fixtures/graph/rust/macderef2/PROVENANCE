@@ -1,0 +1,1 @@
+Receiver-typing lane w2-recv, review of the D1 macro Deref rule: a cfg-gated invocation must not register its Deref (the written impl stays the only one), and a method the same macro emits on the wrapper must not be read through the Deref target. println! statements print a backtrace (the run is the truth).

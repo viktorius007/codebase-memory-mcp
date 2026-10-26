@@ -1,0 +1,1 @@
+Receiver-typing lane w2-recv, class D1: a Deref impl emitted by a file-level invocation of a macro_rules! defined in a sibling file (bevy change_detection_impl!(Res<'w, T>, T, Resource) shape), including a lifetime as a tt fragment and a path fragment with generic arguments. println! statements print a backtrace (the run is the truth).

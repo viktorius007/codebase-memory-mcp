@@ -1,0 +1,1 @@
+Receiver-typing lane w2-recv: an inherent iter/iter_mut on a type imported from a sibling module, which the file-local pass could only guess as a prelude Iterator method. println! statements print a backtrace (the run is the truth).

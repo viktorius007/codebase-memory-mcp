@@ -167,6 +167,10 @@ typedef struct {
      * implementations over the trait method when only one impl exists. */
     const char *self_type_qn;
     const CBMType *self_value_type; /* actual Self shape for a reference impl */
+    /* The impl's self-type arguments by position (`impl<C> Tr for Map<C>`
+     * gives {"C"}); "" where the argument is not a bare name. NULL outside
+     * a non-blanket impl or when the self type has no arguments. */
+    const char **self_param_names;
     const char *self_trait_qn;
     const char *self_trait_spelling; /* raw `impl <Trait> for` text, NULL outside trait impls */
 
@@ -467,6 +471,34 @@ CBMRustMacroTable *cbm_rust_macro_table_new(void);
 void cbm_rust_macro_table_add(CBMRustMacroTable *table, const char *module_qn,
                               CBMRustMacroFacts *facts);
 void cbm_rust_macro_table_free(CBMRustMacroTable *table);
+
+/* What a file-level invocation of a corpus macro_rules! declares on the impl
+ * self type `receiver` (spelling as the expansion reads): the `target` of an
+ * `impl Deref` naming core::ops::Deref, or (target NULL) the name `method` of
+ * a method another emitted impl gives the type. */
+typedef struct {
+    const char *receiver;
+    const char *target;
+    const char *method;
+} CBMRustMacroDeref;
+typedef struct {
+    CBMRustMacroDeref *items;
+    int count;
+    int cap;
+} CBMRustMacroDerefArray;
+/* NULL-terminated names of the file-level macro_rules! in `table` whose
+ * transcriber writes a Deref impl, each defined exactly once in the corpus
+ * (an invocation of a name defined twice could reach either). Arena-owned;
+ * NULL when there are none. */
+const char **cbm_rust_deref_macro_names(CBMArena *arena, const CBMRustMacroTable *table);
+/* When `source` invokes one of `names`: append to `out` what its file-level,
+ * non-cfg-gated invocations of corpus macro_rules! emit, each expanded through
+ * the first matching arm of the one corpus definition of its name. An
+ * invocation whose name a file-level `use` may bind outside the corpus is
+ * skipped. Arena-owned strings. */
+void cbm_rust_macro_deref_impls(CBMArena *arena, const CBMRustMacroTable *table,
+                                const char **names, const char *source, int len,
+                                CBMRustMacroDerefArray *out);
 
 void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
                                           const char *module_qn, const char *relative_module_qn,

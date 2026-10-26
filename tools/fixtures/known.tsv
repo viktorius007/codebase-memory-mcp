@@ -95,3 +95,4 @@ rust/xcrate	CALLS caller.src.main.c52.probe -> dep.src.lib.c52.S52.m[Tr52]	R-W3 
 rust/xcrate	CALLS caller.src.main.c58.probe -> dep.src.lib.c58.S58.m[Fa58]	R-W3 M3 (R-W2 R4)
 rust/xcrate	CALLS caller.src.main.c62.probe -> dep.src.lib.c62.S62.m[Tr62]	R-W3 M3 (R-W2 R4)
 rust/xcrate	CALLS caller.src.main.c65.probe -> dep.src.lib.c65.S65.m[Tr65]	R-W3 M3 (R-W2 R4)
+rust/macderef2	UNMAPPED src/wrap.rs:16	w2-recv: a method that a macro_rules! transcriber emits has no graph node; the check is that o.load() is not linked to Inner::load through the Deref

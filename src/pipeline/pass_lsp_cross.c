@@ -1320,6 +1320,85 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
     return 0;
 }
 
+/* Per Rust file, the Deref impls that its file-level invocations of corpus
+ * macro_rules! emit (`change_detection_impl!(Res<'w, T>, T, Resource)`): the
+ * extractor sees only the invocation, and the macro's body is in another file.
+ * NULL when the project has no such macro or no macro table. */
+static CBMRustMacroDerefArray *pxc_rust_macro_derefs(const cbm_pipeline_ctx_t *ctx,
+                                                     CBMArena *arena,
+                                                     const cbm_file_info_t *files,
+                                                     int file_count, int *out_total) {
+    *out_total = 0;
+    const char **names =
+        ctx && ctx->rust_use_macros ? cbm_rust_deref_macro_names(arena, ctx->rust_use_macros)
+                                    : NULL;
+    if (!names) {
+        return NULL;
+    }
+    CBMRustMacroDerefArray *per_file = (CBMRustMacroDerefArray *)cbm_arena_alloc(
+        arena, (size_t)file_count * sizeof(*per_file));
+    if (!per_file) {
+        return NULL;
+    }
+    memset(per_file, 0, (size_t)file_count * sizeof(*per_file));
+    for (int fi = 0; fi < file_count; fi++) {
+        if (files[fi].language != CBM_LANG_RUST || !files[fi].path) {
+            continue;
+        }
+        int len = 0;
+        char *source = pxc_read_file(files[fi].path, &len);
+        if (source) {
+            cbm_rust_macro_deref_impls(arena, ctx->rust_use_macros, names, source, len,
+                                       &per_file[fi]);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+            *out_total += per_file[fi].count;
+        }
+    }
+    return per_file;
+}
+
+/* Append what one file's corpus macro invocations declare on the types its
+ * own module names: each Deref as an impl relation, as a written
+ * `impl Deref` there would be, and each other emitted method as an inherent
+ * method of the type. The method has no graph node, so a call it answers
+ * publishes nothing, but it is no longer read through the Deref target. */
+static int pxc_append_rust_macro_derefs(CBMArena *arena, const CBMRustMacroDerefArray *derefs,
+                                        const char *project_name, const char *rel_path,
+                                        const char *module_qn, CBMLSPDef *dst) {
+    int added = 0;
+    for (int i = 0; derefs && module_qn && i < derefs->count; i++) {
+        const CBMRustMacroDeref *entry = &derefs->items[i];
+        const char *owner = cbm_rust_impl_owner_name(arena, entry->receiver);
+        if (!owner || !owner[0] || strchr(owner, ':')) {
+            continue;
+        }
+        const char *owner_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, owner);
+        if (entry->method) {
+            CBMLSPDef *def = &dst[added++];
+            memset(def, 0, sizeof(*def));
+            def->qualified_name = cbm_arena_sprintf(arena, "%s.%s", owner_qn, entry->method);
+            def->short_name = entry->method;
+            def->label = "Method";
+            def->receiver_type = owner_qn;
+            def->receiver_spelling = entry->receiver;
+            def->def_module_qn = module_qn;
+            def->lang = CBM_LANG_RUST;
+            continue;
+        }
+        CBMImplTrait impl = {
+            .trait_name = "core::ops::Deref",
+            .struct_name = entry->receiver,
+            .struct_qn = owner_qn,
+            .target_type = entry->target,
+        };
+        if (pxc_build_rust_impl_relation(arena, &impl, project_name, rel_path, module_qn,
+                                         &dst[added]) == 0) {
+            added++;
+        }
+    }
+    return added;
+}
+
 /* Collect a project-wide CBMLSPDef[] from all cached results. Returns a
  * malloc'd array (caller frees) of length *out_count. String fields are
  * borrowed from cache[i]->arena and from def_modules[i] (also borrowed).
@@ -1347,6 +1426,10 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             total += impls;
         }
     }
+    int macro_deref_total = 0;
+    CBMRustMacroDerefArray *macro_derefs =
+        pxc_rust_macro_derefs(ctx, arena, files, file_count, &macro_deref_total);
+    total += macro_deref_total;
     if (total == 0) {
         *out_count = 0;
         if (out_def_starts) {
@@ -1445,6 +1528,11 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                                  &defs[idx]) == 0) {
                     idx++;
                 }
+            }
+            if (macro_derefs) {
+                idx += pxc_append_rust_macro_derefs(arena, &macro_derefs[fi], project_name,
+                                                    files[fi].rel_path, def_modules[fi],
+                                                    &defs[idx]);
             }
         }
         if (fr_loaded) {
