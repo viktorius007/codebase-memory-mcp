@@ -12371,7 +12371,9 @@ static bool macro_capture_rebound(const char *t, int len, const MacroEnv *env) {
             !macro_ident_char(t[i + 3])) {
             from = i + 3;
             to = from;
-            while (to < len && t[to] != '=' && t[to] != ';')
+            /* The pattern ends at its type ascription, `=` or `;`. */
+            while (to < len && t[to] != '=' && t[to] != ';' &&
+                   !(t[to] == ':' && t[to + 1] != ':' && (to == 0 || t[to - 1] != ':')))
                 to++;
         } else if (word_start && i + 3 < len && memcmp(t + i, "for", 3) == 0 &&
                    !macro_ident_char(t[i + 3])) {
