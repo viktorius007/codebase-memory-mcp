@@ -1088,6 +1088,96 @@ static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node) {
     return false;
 }
 
+/* How the function body `body` binds `name` in its own scope, if at all
+ * (*binder): VALUE when every binding is the whole target of a plain or
+ * augmented assignment (py_ns_own_target), OTHER when any is another
+ * assignment, `for`, `as`, walrus or `del` target or a nested definition or
+ * class of that name. Nested function, class and lambda bodies are their own
+ * scopes. */
+static bool py_ns_body_binds(PyNamespaceBuilder *b, TSNode body, const char *name,
+                             PyNsBinder *binder) {
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    bool binds = false;
+    *binder = PY_NS_BINDS_VALUE;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool lambda = strcmp(kind, "lambda") == 0;
+        bool scope = lambda || strcmp(kind, "function_definition") == 0 ||
+                     strcmp(kind, "class_definition") == 0;
+        bool definition = scope && !lambda;
+        if (definition || (strcmp(kind, "identifier") == 0 && py_ns_binding_identifier(node))) {
+            TSNode target = definition ? ts_node_child_by_field_name(node, TS_FIELD("name")) : node;
+            const char *text = NULL;
+            size_t len = 0;
+            if (py_ns_slice(b, target, &text, &len) && len == strlen(name) &&
+                memcmp(text, name, len) == 0) {
+                binds = true;
+                if (definition || !py_ns_own_target(node))
+                    *binder = PY_NS_BINDS_OTHER;
+            }
+        }
+        if (!scope && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        bool next = false;
+        do {
+            next = ts_tree_cursor_goto_next_sibling(&cursor);
+        } while (!next && ts_tree_cursor_goto_parent(&cursor));
+        if (!next)
+            break;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return binds;
+}
+
+/* A function that declares a name `global` and binds it rebinds the module
+ * name whenever it runs, which the module's own run does not order: after
+ * the module's facts, one EFFECT UNKNOWN and one SHADOW per such name
+ * (py_ns_rebinds; `def init(): global f; f = g`), of reason OWN_OR_KEPT when
+ * every such binding assigns the module's own value (a lazily set module
+ * variable), else UNSUPPORTED, so no reading takes a last top-level binding
+ * the function may replace as proven. Every function in the file counts,
+ * nested and method ones included. */
+static bool py_ns_global_writes(PyNamespaceBuilder *b, TSNode root) {
+    int start = -1;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool ok = true;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "global_statement") == 0) {
+            TSNode body = ts_node_parent(node);
+            while (!ts_node_is_null(body) && strcmp(ts_node_type(body), "function_definition") != 0)
+                body = ts_node_parent(body);
+            body =
+                ts_node_is_null(body) ? body : ts_node_child_by_field_name(body, TS_FIELD("body"));
+            uint32_t count = ts_node_named_child_count(node);
+            for (uint32_t i = 0; ok && !ts_node_is_null(body) && i < count; i++) {
+                const char *name = py_ns_name(b, ts_node_named_child(node, i), false);
+                PyNsBinder binder = PY_NS_BINDS_OTHER;
+                if (!name || !py_ns_body_binds(b, body, name, &binder))
+                    continue;
+                if (start < 0) {
+                    ok = py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT);
+                    start = b->facts.count;
+                }
+                ok = ok && py_ns_rebinds(b, start, name, binder);
+            }
+        }
+        if (!ok)
+            break;
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        bool next = false;
+        do {
+            next = ts_tree_cursor_goto_next_sibling(&cursor);
+        } while (!next && ts_tree_cursor_goto_parent(&cursor));
+        if (!next)
+            break;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok;
+}
+
 CBMPyNamespaceStatus cbm_extract_python_namespace_facts(CBMExtractCtx *ctx) {
     if (!ctx || !ctx->result)
         return CBM_PY_NS_INCOMPLETE;
@@ -1119,6 +1209,8 @@ CBMPyNamespaceStatus cbm_extract_python_namespace_facts(CBMExtractCtx *ctx) {
             } while (ts_tree_cursor_goto_next_sibling(&cursor));
         }
         ts_tree_cursor_delete(&cursor);
+        if (!b.failure)
+            (void)py_ns_global_writes(&b, ctx->root);
     }
     if (!b.failure && !cbm_py_namespace_facts_valid(&b.facts))
         b.failure = CBM_PY_NS_FAILURE_INVALID_INPUT;
