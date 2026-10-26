@@ -17406,13 +17406,13 @@ static const CBMType *rust_expected_tuple_element(RustLSPContext *ctx, TSNode tu
 }
 
 /* The value a closure's body produces where the std adapter it is passed to
- * returns that value (`entry.or_insert_with(|| v)` returns `&mut V`,
- * `option.unwrap_or_else(|| v)` returns `T`): the call's own result, its
- * borrow removed. NULL for any other closure. */
+ * returns that value: `Entry::or_insert_with(|| v)` (the std entry table's
+ * value type), `Option::unwrap_or_else` / `Option::get_or_insert_with` and
+ * `Result::unwrap_or_else` (the Option's or Result's value type). Only a
+ * receiver that is the std type itself qualifies: a corpus method of the same
+ * name declares its own parameter and is not read here. NULL otherwise. */
 static const CBMType *rust_expected_closure_value(RustLSPContext *ctx, TSNode closure,
                                                   TSNode body) {
-    static const char *const producers[] = {"or_insert_with", "unwrap_or_else",
-                                            "get_or_insert_with", NULL};
     TSNode written = ts_node_child_by_field_name(closure, "body", 4);
     TSNode args = ts_node_parent(closure);
     TSNode call = ts_node_is_null(args) ? (TSNode){0} : ts_node_parent(args);
@@ -17423,15 +17423,31 @@ static const CBMType *rust_expected_closure_value(RustLSPContext *ctx, TSNode cl
         return NULL;
     }
     TSNode fn = ts_node_child_by_field_name(call, "function", 8);
-    TSNode field = ts_node_is_null(fn) || strcmp(ts_node_type(fn), "field_expression") != 0
-                       ? (TSNode){0}
-                       : ts_node_child_by_field_name(fn, "field", 5);
-    char *name = ts_node_is_null(field) ? NULL : rust_node_text(ctx, field);
-    if (!name || !rust_method_in(producers, name)) {
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "field_expression") != 0) {
         return NULL;
     }
-    const CBMType *value = rust_strip_references(rust_eval_expr_type(ctx, call));
-    return value && !cbm_type_is_unknown(value) ? value : NULL;
+    TSNode field = ts_node_child_by_field_name(fn, "field", 5);
+    TSNode value = ts_node_child_by_field_name(fn, "value", 5);
+    char *name = ts_node_is_null(field) ? NULL : rust_node_text(ctx, field);
+    if (!name || ts_node_is_null(value)) {
+        return NULL;
+    }
+    const CBMType *recv = rust_eval_expr_type(ctx, value);
+    const CBMType *produced = NULL;
+    if (strcmp(name, "or_insert_with") == 0) {
+        produced = rust_strip_references(rust_std_entry_return(ctx, recv, name));
+    } else if (strcmp(name, "unwrap_or_else") == 0 || strcmp(name, "get_or_insert_with") == 0) {
+        const CBMType *base = rust_strip_references(rust_expand_type_aliases(ctx, recv, 0));
+        const char *head = rust_std_type_head(base);
+        int family = head ? rust_std_family_of(ctx, head) : -1;
+        bool option = family == RUST_STD_OPTION;
+        bool result = family == RUST_STD_RESULT && strcmp(name, "unwrap_or_else") == 0;
+        if ((option || result) && base->kind == CBM_TYPE_TEMPLATE &&
+            base->data.template_type.arg_count >= 1) {
+            produced = base->data.template_type.template_args[0];
+        }
+    }
+    return produced && !cbm_type_is_unknown(produced) ? produced : NULL;
 }
 
 /* Registered QN of the declared type `expr` is expected to have, or NULL. */
