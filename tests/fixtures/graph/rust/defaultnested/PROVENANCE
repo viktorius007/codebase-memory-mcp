@@ -1,0 +1,1 @@
+w6-default G042: `Default::default()` as a tuple element, under a borrow (`&mut Default::default()`), and as the value an `or_insert_with` / `unwrap_or_else` closure returns takes the expected type of that position. println! statements print a backtrace (the run is the truth).

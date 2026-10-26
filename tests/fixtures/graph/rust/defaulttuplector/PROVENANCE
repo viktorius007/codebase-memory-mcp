@@ -1,0 +1,1 @@
+w6-default G042: `Default::default()` as an argument of a tuple-struct or tuple-variant constructor (`Wrap(Default::default())`, `Self(..)`, `E::V(..)`) takes the declared field type and links its corpus Default impl. println! statements print a backtrace (the run is the truth).
