@@ -4459,15 +4459,17 @@ static const char *pxc_rust_dep_dir(const PXCRustCrates *crates, const PXCRustPa
                    ? NULL
                    : pxc_rel_join(crates->arena, package->dir, dep->path);
     }
-    /* Without `path`, only `workspace = true` reaches the project, through the
-     * root's [workspace.dependencies] entry; a registry or git dependency
-     * names a crate outside it, whatever its name. */
-    if (!dep->workspace) {
-        return NULL;
-    }
+    /* Without `path`, `workspace = true` reaches the project through the
+     * root's [workspace.dependencies] path entry, and a registry or git
+     * dependency through a root `[patch.<source>]` path entry (the parser
+     * marks those workspace-table entries with `workspace`); otherwise it
+     * names a crate outside the project, whatever its name. Non-root patch
+     * tables are never read here: Cargo ignores them. */
     for (int i = 0; crates->root && dep->name && i < crates->root->dep_count; i++) {
         const CBMCargoDep *ws = &crates->root->deps[i];
-        if (ws->workspace_table && ws->path && ws->name && strcmp(ws->name, dep->name) == 0) {
+        bool patch = ws->workspace_table && ws->workspace;
+        if (ws->workspace_table && patch != dep->workspace && ws->path && ws->name &&
+            strcmp(ws->name, dep->name) == 0) {
             return pxc_rel_escapes("", ws->path) ? NULL : pxc_rel_join(crates->arena, "", ws->path);
         }
     }
