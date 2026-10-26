@@ -16766,6 +16766,38 @@ static void rust_callee_closure_param_types(RustLSPContext *ctx, TSNode closure,
     }
 }
 
+/* The parameter types a struct field of function-pointer type declares for
+ * the closure written as that field's value (`set: |world, value| ..` for
+ * `set: fn(&mut World, &dyn Reflect)`), written into `out` where the earlier
+ * rules left them unknown. A parameter naming one of the struct's own type
+ * parameters stays unknown: the literal does not prove its argument. */
+static void rust_field_closure_param_types(RustLSPContext *ctx, TSNode closure,
+                                           const CBMType **out) {
+    TSNode init = ts_node_parent(closure);
+    if (ts_node_is_null(init) || strcmp(ts_node_type(init), "field_initializer") != 0) {
+        return;
+    }
+    TSNode value = ts_node_child_by_field_name(init, "value", 5);
+    TSNode field = ts_node_child_by_field_name(init, "field", 5);
+    if (ts_node_is_null(value) || !ts_node_eq(value, closure) || ts_node_is_null(field)) {
+        return;
+    }
+    const char *owner = rust_struct_literal_type_qn(ctx, ts_node_parent(ts_node_parent(init)));
+    char *name = owner ? rust_node_text(ctx, field) : NULL;
+    const CBMRegisteredType *rt = name ? cbm_registry_lookup_type(ctx->registry, owner) : NULL;
+    const CBMType *sig = rt ? rust_lookup_field(ctx, owner, name, 0) : NULL;
+    if (!sig || sig->kind != CBM_TYPE_FUNC || !sig->data.func.param_types) {
+        return;
+    }
+    const CBMType *const *declared = sig->data.func.param_types;
+    for (int i = 0; i < RUST_CLOSURE_PARAM_MAX && declared[i]; i++) {
+        if (cbm_type_is_unknown(out[i]) &&
+            !rust_type_unproven(declared[i], rt->type_param_names, 0)) {
+            out[i] = declared[i];
+        }
+    }
+}
+
 /* Declared return type of the function whose result `expr` is: `return
  * expr` or the tail of the function body. A closure or async block in
  * between owns the result, so it has none. */
@@ -18557,12 +18589,14 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     /* closure_expression: bind closure parameters. A written type
      * (`|n: &i32|`) binds the parameter to it; otherwise the std method the
      * closure is passed to declares it (rust_std_closure_param_types), or the
-     * project function it is passed to (rust_callee_closure_param_types);
+     * project function it is passed to (rust_callee_closure_param_types), or
+     * the function-pointer field it initialises (rust_field_closure_param_types);
      * otherwise it is unknown. */
     if (strcmp(kind, "closure_expression") == 0) {
         const CBMType *declared[RUST_CLOSURE_PARAM_MAX];
         rust_std_closure_param_types(ctx, node, declared);
         rust_callee_closure_param_types(ctx, node, declared);
+        rust_field_closure_param_types(ctx, node, declared);
         TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
         uint32_t pc = ts_node_is_null(params) ? 0 : ts_node_child_count(params);
         /* A `_` parameter is an unnamed node that still takes a position. */
