@@ -12300,11 +12300,111 @@ char *cbm_rust_expand_local_item_macro(CBMArena *arena, const char *source, TSNo
     return expanded;
 }
 
-static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
+static bool macro_ident_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* Whether the identifier token `w` (`n` bytes) occurs in `s`. */
+static bool macro_text_has_ident(const char *s, int len, const char *w, int n) {
+    for (int i = 0; i + n <= len; i++) {
+        if (memcmp(s + i, w, (size_t)n) == 0 && (i == 0 || !macro_ident_char(s[i - 1])) &&
+            (i + n == len || !macro_ident_char(s[i + n])))
+            return true;
+    }
+    return false;
+}
+
+/* Whether a binder in transcriber span [from, to) names an identifier that
+ * occurs in a captured fragment. A binder is an identifier token that is no
+ * metavariable, keyword, path segment, call or struct head. */
+static bool macro_span_rebinds(const char *t, int from, int to, const MacroEnv *env) {
+    static const char *const keywords[] = {"mut", "ref", "in", "let", "if", "_", "box"};
+    for (int i = from; i < to;) {
+        if (!macro_ident_char(t[i]) || (i > 0 && (macro_ident_char(t[i - 1]) || t[i - 1] == '$'))) {
+            i++;
+            continue;
+        }
+        int end = i;
+        while (end < to && macro_ident_char(t[end]))
+            end++;
+        int next = end;
+        while (next < to && isspace((unsigned char)t[next]))
+            next++;
+        bool path = (i >= 2 && t[i - 1] == ':' && t[i - 2] == ':') ||
+                    (next + 1 < to && t[next] == ':' && t[next + 1] == ':') ||
+                    (next < to && (t[next] == '(' || t[next] == '{' || t[next] == '!'));
+        bool keyword = isdigit((unsigned char)t[i]);
+        for (size_t k = 0; k < sizeof(keywords) / sizeof(keywords[0]); k++)
+            keyword |= (size_t)(end - i) == strlen(keywords[k]) &&
+                       memcmp(t + i, keywords[k], strlen(keywords[k])) == 0;
+        for (int b = 0; !path && !keyword && b < env->count; b++) {
+            if (macro_text_has_ident(env->kv[b].value, env->kv[b].value_len, t + i, end - i))
+                return true;
+        }
+        i = end;
+    }
+    return false;
+}
+
+/* macro_rules! hygiene: a name the transcriber binds (`let`, `for`, closure
+ * parameters, match-arm patterns) is invisible to the captured fragments,
+ * which resolve in the caller's scope. The expansion is walked in one scope,
+ * so when such a binder's name also occurs in a captured fragment the
+ * fragment's calls cannot be attributed: the whole expansion withholds. */
+static bool macro_capture_rebound(const char *t, int len, const MacroEnv *env) {
+    for (int i = 0; t && i < len; i++) {
+        bool word_start = i == 0 || !macro_ident_char(t[i - 1]);
+        int from = -1;
+        int to = -1;
+        if (word_start && i + 3 < len && memcmp(t + i, "let", 3) == 0 &&
+            !macro_ident_char(t[i + 3])) {
+            from = i + 3;
+            to = from;
+            while (to < len && t[to] != '=' && t[to] != ';')
+                to++;
+        } else if (word_start && i + 3 < len && memcmp(t + i, "for", 3) == 0 &&
+                   !macro_ident_char(t[i + 3])) {
+            from = i + 3;
+            to = from;
+            while (to + 2 < len && !(t[to] == 'i' && t[to + 1] == 'n' &&
+                                     !macro_ident_char(t[to - 1]) && !macro_ident_char(t[to + 2])))
+                to++;
+        } else if (t[i] == '|' && (i + 1 >= len || t[i + 1] != '|') &&
+                   (i == 0 || t[i - 1] != '|')) {
+            from = i + 1;
+            to = from;
+            while (to < len && t[to] != '|')
+                to++;
+            i = to;
+        } else if (t[i] == '=' && i + 1 < len && t[i + 1] == '>') {
+            int depth = 0;
+            from = i;
+            to = i;
+            while (from > 0) {
+                char c = t[from - 1];
+                if (c == ')' || c == ']')
+                    depth++;
+                else if ((c == '(' || c == '[') && depth > 0)
+                    depth--;
+                else if (depth == 0 && (c == '{' || c == '}' || c == ',' || c == ';' || c == '('))
+                    break;
+                from--;
+            }
+        }
+        if (from >= 0 && macro_span_rebinds(t, from, to < len ? to : len, env))
+            return true;
+    }
+    return false;
+}
+
+/* Whether the expansion of `mname` at `invocation` was walked. False when no
+ * rule applies or hygiene cannot be modelled (macro_capture_rebound): the
+ * caller then discloses the argument tokens' calls as unproven. */
+static bool rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
     if (!ctx || !mname)
-        return;
+        return false;
     if (ctx->macro_expand_depth >= 8)
-        return;
+        return false;
 
     RustMacroRule *hit = NULL;
     const char *inv_args = NULL;
@@ -12313,12 +12413,16 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     MacroEnv *env = rust_macro_bind_invocation(ctx, mname, invocation, &hit, &inv_args,
                                                &inv_args_len, &inv_src_start);
     if (!env)
-        return;
+        return false;
+    if (macro_capture_rebound(hit->transcriber_text, hit->transcriber_len, env)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, env);
+        return false;
+    }
 
     if (hit->transcriber_len == 0) {
         cbm_free(CBM_MEM_CLASS_OTHER, env);
         rust_filter_discarded_macro_arguments(ctx, invocation);
-        return;
+        return true;
     }
 
     RustSiteWindows input = {.arena = ctx->arena}, outside = {.arena = ctx->arena};
@@ -12343,7 +12447,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
                                          env, &sites, (uint32_t)strlen(expand_prefix));
     cbm_free(CBM_MEM_CLASS_OTHER, env);
     if (!substituted)
-        return;
+        return false;
 
     /* Expansion memo (see RustLSPContext.macro_memo): reset per top-level
      * invocation, dedup identical (macro, substituted body) within the
@@ -12355,18 +12459,18 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     }
     uint64_t mm_key = cbm_negmemo_key(3, mname, substituted);
     if (cbm_negmemo_contains(&ctx->macro_memo, mm_key)) {
-        return;
+        return true;
     }
     cbm_negmemo_insert(&ctx->macro_memo, ctx->arena, mm_key);
 
     /* Wrap and parse. */
     char *wrapped = cbm_arena_sprintf(ctx->arena, "%s%s; }\n", expand_prefix, substituted);
     if (!wrapped)
-        return;
+        return false;
 
     TSParser *parser = ts_parser_new();
     if (!parser)
-        return;
+        return false;
     ts_parser_set_language(parser, tree_sitter_rust());
     TSTree *tree = ts_parser_parse_string(parser, NULL, wrapped, (uint32_t)strlen(wrapped));
     if (tree) {
@@ -12416,6 +12520,7 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
         ts_tree_delete(tree);
     }
     ts_parser_delete(parser);
+    return true;
 }
 
 /* Re-parse the arguments of a built-in macro whose arguments are ordinary Rust
@@ -16512,8 +16617,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                  * macros with the same name. Do this before applying any
                  * built-in argument grammar or canonical std path. */
                 if (rust_has_visible_macro_definition(ctx, mname, node)) {
-                    args_proven = true;
-                    rust_expand_user_macro(ctx, mname, node);
+                    args_proven = rust_expand_user_macro(ctx, mname, node);
                 } else {
                     /* For known std macros emit a synthetic call under their
                      * canonical paths so trace tools can see the dependency. */

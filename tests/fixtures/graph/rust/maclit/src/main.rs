@@ -26,6 +26,25 @@ macro_rules! pick {
 
 fn picked() -> &'static str { println!("picked\n{}", std::backtrace::Backtrace::force_capture()); "picked" }
 
+// The transcriber's own `v` is invisible to the captured `$e` (hygiene).
+macro_rules! scoped {
+    ($e:expr) => {{
+        let v: crate::B = crate::B;
+        let _ = &v;
+        $e
+    }};
+}
+
+struct A;
+struct B;
+impl A { fn go(&self) { println!("A::go\n{}", std::backtrace::Backtrace::force_capture()); } }
+impl B { fn go(&self) { println!("B::go\n{}", std::backtrace::Backtrace::force_capture()); } }
+
+fn hygiene() {
+    let v = A;
+    scoped!(v.go());
+}
+
 fn four() -> u32 { println!("four\n{}", std::backtrace::Backtrace::force_capture()); 4 }
 fn name(s: &str) -> usize { println!("name\n{}", std::backtrace::Backtrace::force_capture()); s.len() }
 fn bytes() -> u8 { println!("bytes\n{}", std::backtrace::Backtrace::force_capture()); 1 }
@@ -51,6 +70,8 @@ fn literal_arm_taken() {
 fn main() {
     ident_is_no_literal();
     literal_arm_taken();
+    hygiene();
+    B.go();
     literal_arm();
     tt_arm();
 }
