@@ -11456,7 +11456,8 @@ static int macro_consume_balanced(const char *s, int len, int from) {
 /* End of the one numeric literal token starting with the digit at `p`:
  * digits and underscores (hex, octal, binary after `0x`/`0o`/`0b`), a
  * fractional part when `.` is followed by a digit, or a bare trailing `.`
- * when it is followed by neither `.` nor an identifier start (`1.` is a
+ * when it is followed by neither `.` nor an identifier start (a letter, `_`
+ * or any non-ASCII byte; `1.` is a
  * float, `1..2` a range, `1.f()` a method call), an exponent whose digits
  * may follow underscores (`1e+_2`), then an optional suffix. */
 static int macro_consume_number(const char *s, int len, int p) {
@@ -11472,8 +11473,9 @@ static int macro_consume_number(const char *s, int len, int p) {
             while (p < len && (isdigit((unsigned char)s[p]) || s[p] == '_'))
                 p++;
         } else if (p < len && s[p] == '.' &&
-                   (p + 1 >= len || !(s[p + 1] == '.' || s[p + 1] == '_' ||
-                                      isalpha((unsigned char)s[p + 1])))) {
+                   (p + 1 >= len ||
+                    !(s[p + 1] == '.' || s[p + 1] == '_' || isalpha((unsigned char)s[p + 1]) ||
+                      (unsigned char)s[p + 1] >= 0x80))) {
             return p + 1; /* `1.`: a float with no fraction takes no suffix */
         }
         if (p < len && (s[p] == 'e' || s[p] == 'E')) {
@@ -12496,7 +12498,8 @@ static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
 static bool rust_node_names(TSNode node, int depth) {
     const char *kind = ts_node_type(node);
     if (depth > RUST_HYGIENE_MAX_DEPTH || strcmp(kind, "identifier") == 0 ||
-        strcmp(kind, "metavariable") == 0 || strcmp(kind, "ERROR") == 0)
+        strcmp(kind, "shorthand_field_identifier") == 0 || strcmp(kind, "metavariable") == 0 ||
+        strcmp(kind, "ERROR") == 0)
         return true;
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
