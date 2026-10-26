@@ -4197,6 +4197,7 @@ typedef enum {
     RUST_STD_ANY,
     RUST_STD_ERROR,
     RUST_STD_ONCELOCK,
+    RUST_STD_NONNULL,
     RUST_TOKIO_MUTEX,
     RUST_TOKIO_RWLOCK,
     /* Future types: what `.await` reads (rust_future_output). */
@@ -4242,6 +4243,8 @@ static const RustStdFamilyQN RUST_STD_FAMILY_QNS[] = {
     {RUST_STD_ANY, "core.any.Any"},           {RUST_STD_ANY, "std.any.Any"},
     {RUST_STD_ERROR, "core.error.Error"},     {RUST_STD_ERROR, "std.error.Error"},
     {RUST_STD_ONCELOCK, "std.sync.OnceLock"}, {RUST_TOKIO_MUTEX, "tokio.sync.Mutex"},
+    {RUST_STD_NONNULL, "core.ptr.NonNull"},   {RUST_STD_NONNULL, "core.ptr.non_null.NonNull"},
+    {RUST_STD_NONNULL, "std.ptr.NonNull"},
     {RUST_TOKIO_RWLOCK, "tokio.sync.RwLock"},
     {RUST_STD_PIN, "core.pin.Pin"},           {RUST_STD_PIN, "std.pin.Pin"},
     {RUST_STD_BOX, "alloc.boxed.Box"},        {RUST_STD_BOX, "std.boxed.Box"},
