@@ -140,6 +140,9 @@ static const CBMRegisteredFunc *rust_open_receiver_trait_method(RustLSPContext *
                                                                 const char *method);
 static bool rust_trait_method_overridden_open(RustLSPContext *ctx, const char *trait_qn,
                                               const char *method);
+static const CBMRegisteredFunc *rust_open_arg_sole_impl_method(RustLSPContext *ctx,
+                                                               const CBMType *base,
+                                                               const char *method);
 static bool rust_type_unproven(const CBMType *t, const char *const *params, int depth);
 static const CBMType *rust_trait_return_type(RustLSPContext *ctx, const CBMType *t,
                                              const CBMRegisteredType *owner, int depth);
@@ -6074,6 +6077,14 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                     *callee = open_decl;
                     t = open_decl->signature;
                 }
+                const CBMRegisteredFunc *open_impl =
+                    !*callee && strcmp(ts_node_type(value), "tuple_expression") != 0
+                        ? rust_open_arg_sole_impl_method(ctx, base, mname)
+                        : NULL;
+                if (open_impl) {
+                    *callee = open_impl;
+                    t = open_impl->signature;
+                }
                 if (t && t->kind == CBM_TYPE_FUNC && t->data.func.return_types &&
                     t->data.func.return_types[0]) {
                     const CBMType *ret = t->data.func.return_types[0];
@@ -6088,6 +6099,10 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                             rb = rb->data.reference.elem;
                         if (rb && rb->kind == CBM_TYPE_NAMED) {
                             return cbm_type_named(ctx->arena, rb->data.named.qualified_name);
+                        }
+                        if (rb && rb->kind == CBM_TYPE_TEMPLATE && *callee &&
+                            *callee == rust_open_arg_sole_impl_method(ctx, rb, mname)) {
+                            return rb;
                         }
                     }
                     const CBMType *inferred =
@@ -16270,22 +16285,10 @@ static bool rust_trait_method_overridden_open(RustLSPContext *ctx, const char *t
     return false;
 }
 
-/* The trait declaration of method `method` called on a fn item or tuple
- * receiver. Such a receiver has no inherent method and implements a corpus
- * trait only through a blanket or tuple impl, so the one in-scope corpus
- * trait that declares `method` with a self receiver and a default body no
- * such impl overrides is the target, as rust-analyzer resolves it. Assumes no dependency trait in scope declares
- * `method`; std traits are excluded by name. NULL unless exactly one. */
-static const CBMRegisteredFunc *rust_open_receiver_trait_method(RustLSPContext *ctx,
-                                                                TSNode value,
-                                                                const char *method) {
-    if (!method || !ctx->imports || !ctx->imports->modtree)
-        return NULL;
-    for (int i = 0; RUST_OPEN_RECEIVER_STD_METHODS[i]; i++)
-        if (strcmp(RUST_OPEN_RECEIVER_STD_METHODS[i], method) == 0)
-            return NULL;
-    if (!rust_open_trait_receiver(ctx, value))
-        return NULL;
+/* The declaration of `method` in the one in-scope corpus trait declaring it,
+ * every corpus trait considered; NULL when none or two do. */
+static const CBMRegisteredFunc *rust_sole_in_scope_trait_declaration(RustLSPContext *ctx,
+                                                                     const char *method) {
     const CBMRegisteredFunc *selected = NULL;
     CBMTypeShortIter it;
     cbm_registry_all_types_chain(ctx->registry, &it);
@@ -16308,10 +16311,85 @@ static const CBMRegisteredFunc *rust_open_receiver_trait_method(RustLSPContext *
             return NULL;
         selected = declared;
     }
+    return selected;
+}
+
+/* The trait declaration of method `method` called on a fn item or tuple
+ * receiver. Such a receiver has no inherent method and implements a corpus
+ * trait only through a blanket or tuple impl, so the one in-scope corpus
+ * trait that declares `method` with a self receiver and a default body no
+ * such impl overrides is the target, as rust-analyzer resolves it. Assumes no dependency trait in scope declares
+ * `method`; std traits are excluded by name. NULL unless exactly one. */
+static const CBMRegisteredFunc *rust_open_receiver_trait_method(RustLSPContext *ctx,
+                                                                TSNode value,
+                                                                const char *method) {
+    if (!method || !ctx->imports || !ctx->imports->modtree)
+        return NULL;
+    for (int i = 0; RUST_OPEN_RECEIVER_STD_METHODS[i]; i++)
+        if (strcmp(RUST_OPEN_RECEIVER_STD_METHODS[i], method) == 0)
+            return NULL;
+    if (!rust_open_trait_receiver(ctx, value))
+        return NULL;
+    const CBMRegisteredFunc *selected = rust_sole_in_scope_trait_declaration(ctx, method);
     if (!selected || (selected->flags & CBM_FUNC_FLAG_RUST_SELF) == 0 ||
         (selected->flags & CBM_FUNC_FLAG_RUST_ABSTRACT) != 0 ||
         rust_trait_method_overridden_open(ctx, selected->receiver_type, method))
         return NULL;
+    return selected;
+}
+
+/* True when `t` holds an argument this file cannot name: a type parameter,
+ * an unknown, or an unregistered single-segment name (a parameter carried
+ * out of a trait declaration's return type). */
+static bool rust_type_has_open_arg(RustLSPContext *ctx, const CBMType *t) {
+    if (!t || t->kind != CBM_TYPE_TEMPLATE)
+        return false;
+    for (int i = 0; i < t->data.template_type.arg_count; i++) {
+        const CBMType *arg = t->data.template_type.template_args[i];
+        if (!arg || cbm_type_is_unknown(arg) || arg->kind == CBM_TYPE_TYPE_PARAM ||
+            (arg->kind == CBM_TYPE_NAMED && !strchr(arg->data.named.qualified_name, '.') &&
+             !cbm_registry_lookup_type(ctx->registry, arg->data.named.qualified_name)))
+            return true;
+    }
+    return false;
+}
+
+/* `recv.m()` where `recv` is `H<..>` with an argument left open and the probe
+ * cannot prove the impl's bounds. When `H` has no inherent `m` and no Deref
+ * target, `m` is no std-trait name, exactly one in-scope corpus trait
+ * declares `m`, and exactly one impl of that trait on `H` defines it, that
+ * impl is the only candidate a compiling call can reach. Assumes a nominal
+ * impl on the head is chosen over the trait's blanket impls. */
+static const CBMRegisteredFunc *rust_open_arg_sole_impl_method(RustLSPContext *ctx,
+                                                               const CBMType *base,
+                                                               const char *method) {
+    if (!method || !ctx->imports || !ctx->imports->modtree ||
+        !rust_type_has_open_arg(ctx, base) || rust_deref_step(ctx, base))
+        return NULL;
+    for (int i = 0; RUST_OPEN_RECEIVER_STD_METHODS[i]; i++)
+        if (strcmp(RUST_OPEN_RECEIVER_STD_METHODS[i], method) == 0)
+            return NULL;
+    const char *head = rust_registered_type_qn(ctx, base->data.template_type.template_name);
+    const CBMRegisteredType *head_type = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
+    if (!head_type || head_type->is_interface)
+        return NULL;
+    const CBMRegisteredFunc *declaration = rust_sole_in_scope_trait_declaration(ctx, method);
+    if (!declaration || !declaration->receiver_type)
+        return NULL;
+    const CBMRegisteredFunc *selected = NULL;
+    CBMMethodIter methods;
+    cbm_registry_methods_chain(ctx->registry, head, method, &methods);
+    for (int mi; (mi = cbm_method_iter_next(&methods)) >= 0;) {
+        const CBMRegisteredFunc *f = &methods.reg->funcs[mi];
+        if ((f->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0)
+            return NULL; /* inherent `m` */
+        if (!f->impl_trait_qn || !rust_trait_qn_same(f->impl_trait_qn, declaration->receiver_type))
+            return NULL;
+        if (selected && (!selected->impl_key || !f->impl_key ||
+                         strcmp(selected->impl_key, f->impl_key) != 0))
+            return NULL;
+        selected = f;
+    }
     return selected;
 }
 
@@ -16650,6 +16728,16 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         }
         if (wrapper_blocked) {
             rust_emit_unresolved_call(ctx, mname, "trait_wrapper_dispatch_unproved");
+            return;
+        }
+        /* A tuple receiver is never `H<..>`, even when `(x,)` types as `x`. */
+        const CBMRegisteredFunc *open_impl =
+            strcmp(ts_node_type(value), "tuple_expression") != 0
+                ? rust_open_arg_sole_impl_method(ctx, base, mname)
+                : NULL;
+        if (open_impl) {
+            rust_emit_resolved_call(ctx, open_impl->qualified_name, open_impl->impl_key,
+                                    "lsp_trait_dispatch", CBM_RUST_CONF_TRAIT_AMB);
             return;
         }
         if (type_qn) {

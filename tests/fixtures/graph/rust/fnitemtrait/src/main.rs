@@ -76,6 +76,27 @@ pub trait TwinOther {
 }
 impl TwinOther for u32 {}
 
+pub trait Sched {}
+pub struct SysKind;
+impl Sched for SysKind {}
+pub struct Steps<T>(Option<T>);
+pub trait IntoSteps<T: Sched> {
+    fn step(self) -> Steps<T>
+    where
+        Self: Sized,
+    {
+        println!("IntoSteps::step default\n{}", std::backtrace::Backtrace::force_capture());
+        Steps(None)
+    }
+}
+impl<F: Fn() -> u8> IntoSteps<SysKind> for F {}
+impl<T: Sched> IntoSteps<T> for Steps<T> {
+    fn step(self) -> Steps<T> {
+        println!("Steps::step\n{}", std::backtrace::Backtrace::force_capture());
+        self
+    }
+}
+
 fn sys() -> u8 {
     1
 }
@@ -91,6 +112,11 @@ fn tupled() -> u32 {
     (sys, other).after()
 }
 
+fn stepped() -> u32 {
+    let steps = sys.step().step();
+    steps.0.map_or(0, |_| 1)
+}
+
 fn tupled_chain() -> u32 {
     (sys, other).configure().finish()
 }
@@ -102,7 +128,7 @@ fn withheld() {
 }
 
 fn main() {
-    let configured = single() + tupled() + tupled_chain() + sys.into_c() + sys() as u32 + other() as u32;
+    let configured = single() + stepped() + tupled() + tupled_chain() + sys.into_c() + sys() as u32 + other() as u32;
     withheld();
     println!("{configured}");
 }
