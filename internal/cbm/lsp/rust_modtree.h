@@ -81,6 +81,9 @@ typedef struct {
     /* FUNCTION: 1-based line of the declaring `fn`, 0 when two declarations
      * of `qn` stand in one module (cfg twins). Inline modules have their own QN. */
     uint32_t line;
+    /* NOT_FUNCTION naming a `const` or `static` item: its declared type as
+     * written, to be read in the module that declares `qn`; NULL otherwise. */
+    const char *value_type;
 } CBMRustPathResult;
 
 CBMRustModTree *cbm_rust_modtree_new(void);

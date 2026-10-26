@@ -47,6 +47,7 @@ typedef struct {
     uint32_t start;
     bool conditional;
     const char *qn;
+    const char *value_type; /* RMT_VALUE: a `const`/`static` item's declared type as written */
 } RmtDef;
 
 typedef struct {
@@ -1115,13 +1116,21 @@ static void rmf_scan_item(RmfScan *scan, TSNode item) {
             }
             TSNode name = ts_node_child_by_field_name(item, "name", 4);
             if (!ts_node_is_null(name)) {
+                /* A `const`/`static` keeps its declared type for value typing. */
+                TSNode type = RMT_ITEM_KINDS[i].kind == RMT_VALUE
+                                  ? ts_node_child_by_field_name(item, "type", 4)
+                                  : (TSNode){0};
                 rmf_push(scan, (RmfRecord){
                                    .op = RMF_ITEM,
                                    .item = (uint8_t)i,
                                    .vis = rmf_visibility(scan->source, item),
                                    .line = ts_node_start_point(item).row + 1,
                                    .start = ts_node_start_byte(item),
-                                   .name = cbm_node_text(&scan->facts->arena, name, scan->source)});
+                                   .name = cbm_node_text(&scan->facts->arena, name, scan->source),
+                                   .text = ts_node_is_null(type)
+                                               ? NULL
+                                               : cbm_node_text(&scan->facts->arena, type,
+                                                               scan->source)});
             }
             return;
         }
@@ -1508,6 +1517,9 @@ static int rmt_build_items(const RmtBuild *build, const CBMRustModFacts *facts, 
                          record->start);
             tree->entries[tree->entry_count - 1].def.conditional =
                 record->conditional && cfg != RMT_CFG_TRUE;
+            if (record->text)
+                tree->entries[tree->entry_count - 1].def.value_type =
+                    cbm_arena_strdup(&tree->arena, record->text);
             break;
         }
         default:
@@ -1631,6 +1643,8 @@ static void rmt_digest_items(RmtDigest *d, CBMArena *arena, TSNode container, in
                     rmt_digest_str(d, kind);
                     rmt_digest_node(d, rmt_visibility_node(item));
                     rmt_digest_node(d, ts_node_child_by_field_name(item, "name", 4));
+                    if (RMT_ITEM_KINDS[k].kind == RMT_VALUE)
+                        rmt_digest_node(d, ts_node_child_by_field_name(item, "type", 4));
                     break;
                 }
             }
@@ -2445,7 +2459,9 @@ static CBMRustPathResult rmt_classify(const RmtDefs *defs) {
         return (CBMRustPathResult){
             .kind = CBM_RUST_PATH_FUNCTION, .qn = def->qn, .line = def->line};
     }
-    return (CBMRustPathResult){.kind = CBM_RUST_PATH_NOT_FUNCTION, .qn = def->qn};
+    return (CBMRustPathResult){.kind = CBM_RUST_PATH_NOT_FUNCTION,
+                               .qn = def->qn,
+                               .value_type = def->kind == RMT_VALUE ? def->value_type : NULL};
 }
 
 static bool rmt_same_result(const CBMRustPathResult *a, const CBMRustPathResult *b) {

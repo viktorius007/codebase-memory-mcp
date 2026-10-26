@@ -6732,6 +6732,34 @@ static const char *rust_value_path_owner(RustLSPContext *ctx, TSNode node, const
  * (`E::V`, `Self::V`, or `E::V(..)`) with written type arguments, or its
  * unit struct's type (`Marker`). NULL when the module tree and registry
  * do not prove the item; UNKNOWN when its declaration leaves the type open. */
+/* The declared type of the `const` or `static` item the value path `node`
+ * (text `path`, turbofish stripped) names through the module tree, read in
+ * the module that declares it (`ANTIQUE_WHITE` through a palette glob is a
+ * `Srgba`). NULL when the tree names no such item or the type is unreadable. */
+static const CBMType *rust_const_path_type(RustLSPContext *ctx, TSNode node, const char *path) {
+    const CBMRustModTree *tree = ctx->imports ? ctx->imports->modtree : NULL;
+    uint32_t offset = 0;
+    if (!tree || !ctx->module_qn || ctx->glob_count > ctx->file_glob_count ||
+        !rust_original_offset(ctx, node, &offset)) {
+        return NULL;
+    }
+    int block_uses = ctx->use_count > ctx->file_use_count ? ctx->use_count - ctx->file_use_count : 0;
+    CBMRustPathResult r =
+        cbm_rust_modtree_resolve(tree, ctx->arena, ctx->module_qn, offset, path,
+                                 block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
+                                 block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL,
+                                 block_uses);
+    const char *dot = r.kind == CBM_RUST_PATH_NOT_FUNCTION && r.value_type && r.qn
+                          ? strrchr(r.qn, '.')
+                          : NULL;
+    if (!dot) {
+        return NULL;
+    }
+    const char *module = cbm_arena_strndup(ctx->arena, r.qn, (size_t)(dot - r.qn));
+    const CBMType *type = rust_parse_def_type_text(ctx->arena, r.value_type, module, tree);
+    return type && !cbm_type_is_unknown(type) ? type : NULL;
+}
+
 static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node) {
     const char *kind = ts_node_type(node);
     bool bare = strcmp(kind, "identifier") == 0;
@@ -6745,7 +6773,10 @@ static const CBMType *rust_eval_value_path_type(RustLSPContext *ctx, TSNode node
     rust_strip_turbofish(path);
     const char *assoc = NULL;
     const char *owner = rust_value_path_owner(ctx, node, path, &assoc);
-    const CBMRegisteredType *rt = owner ? cbm_registry_lookup_type(ctx->registry, owner) : NULL;
+    if (!owner) {
+        return rust_const_path_type(ctx, node, path);
+    }
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, owner);
     if (!rt || rt->alias_of || rt->alias_type) {
         return NULL;
     }
