@@ -44,6 +44,24 @@ fn via_generic<S: Exec>(store: &S) -> u32 {
     Erased::erased(store)
 }
 
+pub trait Marker {}
+pub trait Parent {
+    fn ping(&self) -> u32;
+}
+impl<T: Marker + ?Sized> Parent for T {
+    fn ping(&self) -> u32 {
+        println!("Parent::ping blanket\n{}", std::backtrace::Backtrace::force_capture());
+        7
+    }
+}
+pub trait Child: Marker {}
+impl Marker for Mem {}
+impl Child for Mem {}
+
+fn via_child(child: &dyn Child) -> u32 {
+    Parent::ping(child)
+}
+
 fn via_dyn(store: &mut dyn Exec) -> u32 {
     Store::get(store)
 }
@@ -53,6 +71,6 @@ fn via_concrete(mem: &mut Mem) -> u32 {
 }
 
 fn main() {
-    let total = via_dyn(&mut Mem) + via_dyn(&mut Disk) + via_concrete(&mut Mem) + Disk.fetch() + via_generic(&Mem);
+    let total = via_dyn(&mut Mem) + via_dyn(&mut Disk) + via_concrete(&mut Mem) + Disk.fetch() + via_generic(&Mem) + via_child(&Mem);
     println!("{total}");
 }

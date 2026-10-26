@@ -14962,12 +14962,16 @@ static const CBMRegisteredFunc *rust_trait_impl_by_argument(RustLSPContext *ctx,
  * self type is not a concrete type with an impl, so the call names the
  * trait's declaration of `m` (reached through supertraits; every reachable
  * declaration must agree), as rust-analyzer resolves the path. A blanket
- * impl that defines `m` can apply to such a self, so it withholds. Assumes
- * no corpus impl of the trait has a trait-object self type. */
+ * impl that defines `m` can apply to such a self, so it withholds.
+ * `*open_self` is set whenever the self is such a type, linked or not: no
+ * single concrete impl may then be assumed. Assumes no corpus impl of the
+ * trait has a trait-object self type. */
 static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPContext *ctx,
                                                                       const char *trait_qn,
                                                                       const char *method,
-                                                                      TSNode first_arg) {
+                                                                      TSNode first_arg,
+                                                                      bool *open_self) {
+    *open_self = false;
     if (ts_node_is_null(first_arg))
         return NULL;
     const CBMType *self_t = rust_strip_references(rust_eval_expr_type(ctx, first_arg));
@@ -14999,6 +15003,7 @@ static const CBMRegisteredFunc *rust_trait_path_open_self_declaration(RustLSPCon
     }
     if (!open)
         return NULL;
+    *open_self = true;
     const CBMRegisteredFunc *declaration = NULL;
     bool ambiguous = false;
     rust_bound_trait_declarations(ctx, trait_qn, method, true, 0, NULL, &declaration, &ambiguous);
@@ -15116,11 +15121,17 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
             out->receiver_qn = typed->receiver_type;
             return true;
         }
+        bool open_self = false;
         const CBMRegisteredFunc *declared =
-            rust_trait_path_open_self_declaration(ctx, trait_qn, short_name, first_arg);
+            rust_trait_path_open_self_declaration(ctx, trait_qn, short_name, first_arg, &open_self);
         if (declared) {
             rust_call_target_set(out, declared, declared->qualified_name, "lsp_bound_dispatch",
                                  CBM_RUST_CONF_TRAIT_AMB);
+            return true;
+        }
+        if (open_self) {
+            out->open_qn = qn;
+            out->open_reason = "bound_declaration_not_proven";
             return true;
         }
         int tn = 0;
