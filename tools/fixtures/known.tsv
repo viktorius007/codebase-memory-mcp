@@ -96,3 +96,5 @@ rust/xcrate	CALLS caller.src.main.c58.probe -> dep.src.lib.c58.S58.m[Fa58]	R-W3 
 rust/xcrate	CALLS caller.src.main.c62.probe -> dep.src.lib.c62.S62.m[Tr62]	R-W3 M3 (R-W2 R4)
 rust/xcrate	CALLS caller.src.main.c65.probe -> dep.src.lib.c65.S65.m[Tr65]	R-W3 M3 (R-W2 R4)
 rust/macderef2	UNMAPPED src/wrap.rs:16	w2-recv: a method that a macro_rules! transcriber emits has no graph node; the check is that o.load() is not linked to Inner::load through the Deref
+rust/tprojneg	CALLS src.main.shape_gat -> src.main.Right.hit	R-W3 M3 (w3-tparam review: generic associated type projection withheld)
+rust/tprojneg	CALLS src.main.shape_generic_impl -> src.main.Right.hit	R-W3 M3 (w3-tparam review: generic impl of the bounding trait withheld)

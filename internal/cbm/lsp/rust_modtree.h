@@ -237,4 +237,21 @@ int cbm_rust_modtree_use_items_at(const CBMRustModTree *tree, CBMArena *arena, c
                                   uint32_t offset, const char *local_name, const char *path,
                                   const char **out_qns, int max);
 
+/* One `type name = value;` written in a project trait impl
+ * (`impl Trait for Self { .. }`): the impl's self type as written, the value
+ * as written, the impl's physical module, and whether the value depends on
+ * impl or associated-type parameters the record does not carry. */
+typedef struct {
+    const char *self_text;
+    const char *value;
+    const char *module_qn;
+    bool unreadable;
+} CBMRustImplAssoc;
+
+/* Every such record of `name` on the project type `self_qn`, at most `max`,
+ * into `out`. Returns their count, 0 when none, -1 when more than `max`. */
+int cbm_rust_modtree_impl_assocs(const CBMRustModTree *tree, CBMArena *arena,
+                                 const char *self_qn, const char *name, CBMRustImplAssoc *out,
+                                 int max);
+
 #endif /* CBM_LSP_RUST_MODTREE_H */
