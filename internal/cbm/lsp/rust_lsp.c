@@ -16737,6 +16737,31 @@ static const CBMType *rust_callee_self_type(RustLSPContext *ctx, TSNode fn,
     return NULL;
 }
 
+/* The function-pointer signature a parameter declares through a type alias
+ * (`hook: ComponentHook` with `type ComponentHook = for<'w> fn(DeferredWorld<'w>,
+ * HookContext)`), which the written-text reading of rust_callable_param_sig
+ * cannot see. NULL when the parameter's declared type is no alias of a
+ * function pointer. */
+static const CBMType *rust_alias_fn_param_sig(RustLSPContext *ctx,
+                                              const CBMRegisteredFunc *callee, int index) {
+    if (!callee || !callee->signature || callee->signature->kind != CBM_TYPE_FUNC ||
+        !callee->signature->data.func.param_types || index < 0) {
+        return NULL;
+    }
+    const CBMType *const *declared = callee->signature->data.func.param_types;
+    for (int i = 0; i < index; i++) {
+        if (!declared[i]) {
+            return NULL;
+        }
+    }
+    const CBMType *written = declared[index];
+    if (!written || written->kind != CBM_TYPE_NAMED) {
+        return NULL;
+    }
+    const CBMType *t = rust_expand_type_aliases(ctx, written, 0);
+    return t && t != written && t->kind == CBM_TYPE_FUNC && t->data.func.param_types ? t : NULL;
+}
+
 /* The parameter types the project function `closure` is passed to declares
  * for it, written into `out[RUST_CLOSURE_PARAM_MAX]` where the std table left
  * them unknown. The callee is the one of the call the closure is an argument
@@ -16764,6 +16789,9 @@ static void rust_callee_closure_param_types(RustLSPContext *ctx, TSNode closure,
     const CBMRegisteredFunc *callee = rust_argument_callee(ctx, call, arg, args, &index);
     const CBMType *sig =
         callee && callee->rust_callable_params ? callee->rust_callable_params[index] : NULL;
+    if (!sig) {
+        sig = rust_alias_fn_param_sig(ctx, callee, index);
+    }
     if (!sig) {
         return;
     }
