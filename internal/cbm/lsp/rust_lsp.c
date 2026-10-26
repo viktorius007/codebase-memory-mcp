@@ -8467,6 +8467,27 @@ static bool rust_wrapper_has_corpus_trait_method(RustLSPContext *ctx, const CBMT
     return rust_wrapper_corpus_trait_method(ctx, base, method, &blocked, NULL) != NULL || blocked;
 }
 
+/* bevy's `SystemParamItem<'w, 's, P>` (`<P as SystemParam>::Item<'w, 's>`)
+ * for the parameters whose impl in system_param.rs declares the item as the
+ * parameter itself with the system's lifetimes: `Query<D, F>`, `Res<T>` and
+ * `ResMut<T>` (lifetimes are not modelled, so the item is P). NULL for any
+ * other type or parameter. */
+static const CBMType *rust_bevy_system_param_item(RustLSPContext *ctx, const CBMType *t) {
+    static const char *const same_item[] = {"system.query.Query", "change_detection.params.Res",
+                                            "change_detection.params.ResMut", NULL};
+    if (!t || t->kind != CBM_TYPE_TEMPLATE || t->data.template_type.arg_count != 1 ||
+        !rust_bevy_ecs_type(ctx, t, "system.system_param.SystemParamItem", NULL)) {
+        return NULL;
+    }
+    const CBMType *param = t->data.template_type.template_args[0];
+    for (const char *const *p = same_item; *p; p++) {
+        if (rust_bevy_ecs_type(ctx, param, *p, NULL)) {
+            return param;
+        }
+    }
+    return NULL;
+}
+
 /* The `Target` of the project's `impl Deref` for the type named `qn`, the
  * receiver's written type arguments substituted for the names the impl's self
  * type spells. NULL when the type has no single readable Deref target. */
@@ -8502,8 +8523,9 @@ static const CBMType *rust_user_deref_target(RustLSPContext *ctx, const char *qn
     }
     names[n] = NULL;
     subst[n] = NULL;
-    return rust_expand_type_aliases(ctx, rust_substitute_type(ctx->arena, target, names, subst),
-                                    0);
+    target = rust_substitute_type(ctx->arena, target, names, subst);
+    const CBMType *param = rust_bevy_system_param_item(ctx, target);
+    return param ? param : rust_expand_type_aliases(ctx, target, 0);
 }
 
 /* Returns the inner type after one Deref step: the first template arg of

@@ -1,0 +1,1 @@
+w5-bind G037/G002: bevy_render `Extract<P>` derefs to `SystemParamItem<P>`, read as P for Query (closed reading of system_param.rs), and `&Extract<P>` iterates as `&P` (crates laid out as bevy lays them out). println! statements print a backtrace (the run is the truth).
