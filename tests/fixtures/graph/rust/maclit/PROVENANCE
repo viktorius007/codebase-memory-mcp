@@ -1,0 +1,1 @@
+Written for lane rs-macro: string, raw-string and byte-string literals bound by `$x:literal` and `$x:tt` in a textual-scope macro_rules!, with calls in the other arguments; instrumented prints are the truth.

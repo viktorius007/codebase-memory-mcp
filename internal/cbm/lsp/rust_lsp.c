@@ -11139,6 +11139,38 @@ static int macro_consume_balanced(const char *s, int len, int from) {
 
 /* Consume a fragment from the input matching the given fragment kind.
  * Returns end position or `from` if the consumption failed. */
+/* End of the string literal token at `from` (`"…"`, `b"…"`, `c"…"`, raw
+ * `r#"…"#` and `br"…"`), or `from` when none starts there. */
+static int macro_consume_string(const char *s, int len, int from) {
+    int p = from;
+    if (p < len && (s[p] == 'b' || s[p] == 'c'))
+        p++;
+    bool raw = p < len && s[p] == 'r';
+    if (raw)
+        p++;
+    int hashes = 0;
+    while (raw && p < len && s[p] == '#') {
+        hashes++;
+        p++;
+    }
+    if (p >= len || s[p] != '"')
+        return from;
+    for (p++; p < len; p++) {
+        if (!raw && s[p] == '\\') {
+            p++;
+            continue;
+        }
+        if (s[p] != '"')
+            continue;
+        int h = 0;
+        while (h < hashes && p + 1 + h < len && s[p + 1 + h] == '#')
+            h++;
+        if (h == hashes)
+            return p + 1 + hashes;
+    }
+    return from;
+}
+
 static int macro_consume_fragment(const char *s, int len, int from, const char *frag) {
     from = macro_skip_ws(s, len, from);
     if (from >= len)
@@ -11152,8 +11184,9 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
     if (strcmp(frag, "literal") == 0) {
         /* Numeric, string, char, bool literal. */
         char c = s[from];
-        if (c == '"')
-            return macro_consume_balanced(s, len, from);
+        int string_end = macro_consume_string(s, len, from);
+        if (string_end > from)
+            return string_end;
         if (c == '\'') {
             int q = from + 1;
             if (q < len && s[q] == '\\') {
@@ -11186,6 +11219,9 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
             return macro_consume_balanced(s, len, from);
         }
         /* Single token: identifier, literal, or single-char punct. */
+        int string_end = macro_consume_string(s, len, from);
+        if (string_end > from)
+            return string_end;
         if (c == '"' || c == '\'') {
             return macro_consume_fragment(s, len, from, "literal");
         }
@@ -11214,6 +11250,11 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
     int p = from;
     while (p < len) {
         char c = s[p];
+        int string_end = macro_consume_string(s, len, p);
+        if (string_end > p) {
+            p = string_end;
+            continue;
+        }
         if (c == '"' || c == '\'') {
             int q = macro_consume_fragment(s, len, p, "literal");
             if (q == p) {
