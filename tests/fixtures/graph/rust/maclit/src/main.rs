@@ -76,6 +76,36 @@ macro_rules! span {
     };
 }
 
+// `1.` is one float literal: rustc takes the literal arm.
+macro_rules! float_first {
+    ($l:literal, $e:expr) => {
+        stringify!($e)
+    };
+    ($r:expr, $e:expr) => {
+        $e
+    };
+}
+
+// The caller's names bound by the transcriber's `let`: `v` becomes B here.
+macro_rules! rebind {
+    ($p:ident, $q:ident, $e:expr) => {{
+        let $p = crate::B;
+        let $q = $p;
+        $e
+    }};
+}
+
+// `if let` binds `v` in the consequence only; `else` sees the caller's `v`.
+macro_rules! if_let_else {
+    ($e:expr) => {
+        if let Some(v) = None::<crate::B> {
+            let _ = &v;
+        } else {
+            $e
+        }
+    };
+}
+
 struct W {
     field: B,
 }
@@ -102,6 +132,21 @@ fn struct_arm() {
 
 fn spanned() {
     println!("{}", span!(0..10, four()));
+}
+
+fn trailing_dot() {
+    println!("{}", float_first!(1., four()));
+}
+
+fn rebound() {
+    let v = A;
+    let _ = &v;
+    rebind!(v, y, y.go());
+}
+
+fn else_branch() {
+    let v = A;
+    if_let_else!(v.go());
 }
 
 fn scrutinee() {
@@ -137,6 +182,9 @@ fn main() {
     struct_let();
     struct_arm();
     scrutinee();
+    trailing_dot();
+    rebound();
+    else_branch();
     spanned();
     B.go();
     literal_arm();

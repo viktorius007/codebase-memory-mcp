@@ -11455,8 +11455,10 @@ static int macro_consume_balanced(const char *s, int len, int from) {
  * Returns end position or `from` if the consumption failed. */
 /* End of the one numeric literal token starting with the digit at `p`:
  * digits and underscores (hex, octal, binary after `0x`/`0o`/`0b`), a
- * fractional part only when `.` is followed by a digit (`1..2` is a range),
- * an exponent, then an optional suffix. */
+ * fractional part when `.` is followed by a digit, or a bare trailing `.`
+ * when it is followed by neither `.` nor an identifier start (`1.` is a
+ * float, `1..2` a range, `1.f()` a method call), an exponent whose digits
+ * may follow underscores (`1e+_2`), then an optional suffix. */
 static int macro_consume_number(const char *s, int len, int p) {
     if (p + 1 < len && s[p] == '0' && (s[p + 1] == 'x' || s[p + 1] == 'o' || s[p + 1] == 'b')) {
         p += 2;
@@ -11469,10 +11471,16 @@ static int macro_consume_number(const char *s, int len, int p) {
             p++;
             while (p < len && (isdigit((unsigned char)s[p]) || s[p] == '_'))
                 p++;
+        } else if (p < len && s[p] == '.' &&
+                   (p + 1 >= len || !(s[p + 1] == '.' || s[p + 1] == '_' ||
+                                      isalpha((unsigned char)s[p + 1])))) {
+            return p + 1; /* `1.`: a float with no fraction takes no suffix */
         }
         if (p < len && (s[p] == 'e' || s[p] == 'E')) {
             int q = p + 1;
             if (q < len && (s[q] == '+' || s[q] == '-'))
+                q++;
+            while (q < len && s[q] == '_')
                 q++;
             if (q < len && isdigit((unsigned char)s[q])) {
                 p = q;
@@ -12421,13 +12429,30 @@ typedef struct {
     uint32_t len[32];
     int count;
     bool all;
+    bool withhold; /* a captured fragment stands in a binding position */
 } RustBinders;
+
+/* Nesting bound of the hygiene traversal; deeper expansions withhold. */
+enum { RUST_HYGIENE_MAX_DEPTH = 64 };
 
 /* Add the identifiers of a transcriber-written pattern to `b`. Variant and
  * path identifiers are added too (conservative). */
-static void rust_pattern_binders(const RustLSPContext *ctx, TSNode pattern, RustBinders *b) {
-    if (ts_node_is_null(pattern) || rust_node_captured(ctx, pattern))
+static bool rust_node_names(TSNode node, int depth);
+
+static void rust_pattern_binders(const RustLSPContext *ctx, TSNode pattern, RustBinders *b,
+                                 int depth) {
+    if (ts_node_is_null(pattern))
         return;
+    if (depth > RUST_HYGIENE_MAX_DEPTH) {
+        b->withhold = true;
+        return;
+    }
+    if (rust_node_captured(ctx, pattern)) {
+        /* A call-site fragment in a binding position binds a call-site name
+         * the one-scope walk would see from the transcriber's code. */
+        b->withhold |= rust_node_names(pattern, depth);
+        return;
+    }
     const char *kind = ts_node_type(pattern);
     if (strcmp(kind, "identifier") == 0 || strcmp(kind, "shorthand_field_identifier") == 0) {
         if (b->count == 32) {
@@ -12441,7 +12466,7 @@ static void rust_pattern_binders(const RustLSPContext *ctx, TSNode pattern, Rust
     }
     uint32_t count = ts_node_named_child_count(pattern);
     for (uint32_t i = 0; i < count; i++)
-        rust_pattern_binders(ctx, ts_node_named_child(pattern, i), b);
+        rust_pattern_binders(ctx, ts_node_named_child(pattern, i), b, depth + 1);
 }
 
 static bool rust_kind_is_item(const char *kind) {
@@ -12465,11 +12490,28 @@ static bool rust_pattern_macro(const char *name) {
 }
 
 static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
-                                      const RustBinders *bound);
+                                      const RustBinders *bound, int depth);
+
+/* Whether a node holds a name (a literal holds none). */
+static bool rust_node_names(TSNode node, int depth) {
+    const char *kind = ts_node_type(node);
+    if (depth > RUST_HYGIENE_MAX_DEPTH || strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "metavariable") == 0 || strcmp(kind, "ERROR") == 0)
+        return true;
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (rust_node_names(ts_node_named_child(node, i), depth + 1))
+            return true;
+    }
+    return false;
+}
 
 /* Whether a captured node names an identifier that a binder in `b` binds
  * (any name at all when `b->all`). Literals name nothing. */
-static bool rust_capture_hits(const RustLSPContext *ctx, TSNode node, const RustBinders *b) {
+static bool rust_capture_hits(const RustLSPContext *ctx, TSNode node, const RustBinders *b,
+                              int depth) {
+    if (depth > RUST_HYGIENE_MAX_DEPTH)
+        return true;
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "identifier") == 0 || strcmp(kind, "metavariable") == 0 ||
         strcmp(kind, "ERROR") == 0) {
@@ -12485,7 +12527,7 @@ static bool rust_capture_hits(const RustLSPContext *ctx, TSNode node, const Rust
     }
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
-        if (rust_capture_hits(ctx, ts_node_named_child(node, i), b))
+        if (rust_capture_hits(ctx, ts_node_named_child(node, i), b, depth + 1))
             return true;
     }
     return false;
@@ -12493,23 +12535,30 @@ static bool rust_capture_hits(const RustLSPContext *ctx, TSNode node, const Rust
 
 /* Binders of a transcriber `let` pattern inside a condition (if let,
  * while let, let chains). */
-static void rust_condition_binders(const RustLSPContext *ctx, TSNode node, RustBinders *b) {
+static void rust_condition_binders(const RustLSPContext *ctx, TSNode node, RustBinders *b,
+                                   int depth) {
     if (ts_node_is_null(node) || rust_node_captured(ctx, node))
         return;
+    if (depth > RUST_HYGIENE_MAX_DEPTH) {
+        b->withhold = true;
+        return;
+    }
     if (strcmp(ts_node_type(node), "let_condition") == 0) {
-        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), b);
+        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), b, depth + 1);
         return;
     }
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++)
-        rust_condition_binders(ctx, ts_node_named_child(node, i), b);
+        rust_condition_binders(ctx, ts_node_named_child(node, i), b, depth + 1);
 }
 
 static bool rust_children_under_binder(const RustLSPContext *ctx, TSNode node,
-                                       const RustBinders *bound) {
+                                       const RustBinders *bound, int depth) {
+    if (bound->withhold)
+        return true;
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
-        if (rust_capture_under_binder(ctx, ts_node_named_child(node, i), bound))
+        if (rust_capture_under_binder(ctx, ts_node_named_child(node, i), bound, depth + 1))
             return true;
     }
     return false;
@@ -12526,11 +12575,13 @@ static bool rust_children_under_binder(const RustLSPContext *ctx, TSNode node,
  * An item declared in a block or a pattern-taking macro binds unknown
  * names, so any named capture in its scope hits. True: withhold. */
 static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
-                                      const RustBinders *bound) {
+                                      const RustBinders *bound, int depth) {
     if (ts_node_is_null(node))
         return false;
+    if (depth > RUST_HYGIENE_MAX_DEPTH || bound->withhold)
+        return true;
     if (rust_node_captured(ctx, node))
-        return rust_capture_hits(ctx, node, bound);
+        return rust_capture_hits(ctx, node, bound, depth);
     const char *kind = ts_node_type(node);
     RustBinders inner = *bound;
     if (strcmp(kind, "block") == 0 || strcmp(kind, "source_file") == 0) {
@@ -12539,36 +12590,51 @@ static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
             inner.all = rust_kind_is_item(ts_node_type(ts_node_named_child(node, i)));
         for (uint32_t i = 0; i < count; i++) {
             TSNode child = ts_node_named_child(node, i);
-            if (rust_capture_under_binder(ctx, child, &inner))
+            if (rust_capture_under_binder(ctx, child, &inner, depth + 1))
                 return true;
             if (strcmp(ts_node_type(child), "let_declaration") == 0)
                 rust_pattern_binders(ctx, ts_node_child_by_field_name(child, "pattern", 7),
-                                     &inner);
+                                     &inner, depth + 1);
+            if (inner.withhold)
+                return true;
         }
         return false;
     }
     if (rust_kind_is_item(kind)) {
         inner.all = true;
-        return rust_children_under_binder(ctx, node, &inner);
+        return rust_children_under_binder(ctx, node, &inner, depth);
     }
     if (strcmp(kind, "closure_expression") == 0) {
-        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "parameters", 10), &inner);
-        return rust_children_under_binder(ctx, node, &inner);
+        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "parameters", 10), &inner,
+                             depth + 1);
+        return rust_children_under_binder(ctx, node, &inner, depth);
     }
     if (strcmp(kind, "match_arm") == 0) {
-        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), &inner);
-        return rust_children_under_binder(ctx, node, &inner);
+        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), &inner,
+                             depth + 1);
+        return rust_children_under_binder(ctx, node, &inner, depth);
     }
     if (strcmp(kind, "for_expression") == 0) {
-        if (rust_capture_under_binder(ctx, ts_node_child_by_field_name(node, "value", 5), bound))
+        if (rust_capture_under_binder(ctx, ts_node_child_by_field_name(node, "value", 5), bound,
+                                      depth + 1))
             return true;
-        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), &inner);
+        rust_pattern_binders(ctx, ts_node_child_by_field_name(node, "pattern", 7), &inner,
+                             depth + 1);
         return rust_capture_under_binder(ctx, ts_node_child_by_field_name(node, "body", 4),
-                                         &inner);
+                                         &inner, depth + 1);
     }
     if (strcmp(kind, "if_expression") == 0 || strcmp(kind, "while_expression") == 0) {
-        rust_condition_binders(ctx, ts_node_child_by_field_name(node, "condition", 9), &inner);
-        return rust_children_under_binder(ctx, node, &inner);
+        /* The `let` binders reach the condition and the body, not `else`. */
+        rust_condition_binders(ctx, ts_node_child_by_field_name(node, "condition", 9), &inner,
+                               depth + 1);
+        static const char *const scoped[] = {"condition", "consequence", "body"};
+        for (size_t f = 0; f < sizeof(scoped) / sizeof(scoped[0]); f++) {
+            TSNode part = ts_node_child_by_field_name(node, scoped[f], (uint32_t)strlen(scoped[f]));
+            if (rust_capture_under_binder(ctx, part, &inner, depth + 1))
+                return true;
+        }
+        return rust_capture_under_binder(
+            ctx, ts_node_child_by_field_name(node, "alternative", 11), bound, depth + 1);
     }
     if (strcmp(kind, "macro_invocation") == 0) {
         TSNode name = ts_node_child_by_field_name(node, "macro", 5);
@@ -12579,11 +12645,11 @@ static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
             text[len] = '\0';
             if (rust_pattern_macro(text)) {
                 inner.all = true;
-                return rust_children_under_binder(ctx, node, &inner);
+                return rust_children_under_binder(ctx, node, &inner, depth);
             }
         }
     }
-    return rust_children_under_binder(ctx, node, bound);
+    return rust_children_under_binder(ctx, node, bound, depth);
 }
 
 /* Whether the expansion of `mname` at `invocation` was walked. False when no
@@ -12691,7 +12757,7 @@ static bool rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
             ctx->emit_site_start_byte = 0;
             ctx->emit_site_end_byte = 0;
             RustBinders none = {.count = 0};
-            bool hygienic = !rust_capture_under_binder(ctx, body, &none);
+            bool hygienic = !rust_capture_under_binder(ctx, body, &none, 0);
             walked = walked && hygienic;
             ctx->inject_syn_calls++;
             if (hygienic) {
