@@ -1840,6 +1840,141 @@ const CBMType *c_eval_expr_type(CLSPContext *ctx, TSNode node) {
     return c_eval_expr_type_node(ctx, node);
 }
 
+/* An init-capture of a lambda: the name it binds in the lambda body and the
+ * type of its initialiser, as seen from the enclosing scope. */
+typedef struct {
+    const char *name;
+    const CBMType *type;
+} CLambdaCapture;
+
+/* The init-captures of a lambda's capture list, typed in the CURRENT
+ * (enclosing) scope. The grammar admits `[x = e]`, `[&x = e]`, `[...x = e]`
+ * and `[&...x = e]`; each is a lambda_capture_initializer whose `left` is the
+ * name and `right` the initialiser. `e` is an expression of the enclosing
+ * scope: the capture only exists in the body, so `x` in `[x = x.b()]` is the
+ * outer `x`, and no capture of the list sees another. Every initialiser is
+ * therefore typed before any capture is bound. A capture whose initialiser
+ * has no known type is returned with the unknown type: bound, it still hides
+ * the outer name it spells. Typing only: no call is resolved. Returns an arena array of *count entries (NULL when there are
+ * none). */
+static const CLambdaCapture *c_lambda_capture_types(CLSPContext *ctx, TSNode list,
+                                                    uint32_t *count) {
+    *count = 0;
+    if (ts_node_is_null(list))
+        return NULL;
+    uint32_t nc = ts_node_named_child_count(list);
+    CLambdaCapture *found =
+        nc ? (CLambdaCapture *)cbm_arena_alloc(ctx->arena, nc * sizeof(CLambdaCapture)) : NULL;
+    if (!found)
+        return NULL;
+    uint32_t n = 0;
+    for (uint32_t ci = 0; ci < nc; ci++) {
+        TSNode cap = ts_node_named_child(list, ci);
+        if (ts_node_is_null(cap) || strcmp(ts_node_type(cap), "lambda_capture_initializer") != 0)
+            continue;
+        TSNode name_node = ts_node_child_by_field_name(cap, "left", 4);
+        TSNode val_node = ts_node_child_by_field_name(cap, "right", 5);
+        // Older grammar shapes: "name"/"value" fields, then positional (name, value)
+        if (ts_node_is_null(name_node) || ts_node_is_null(val_node)) {
+            name_node = ts_node_child_by_field_name(cap, "name", 4);
+            val_node = ts_node_child_by_field_name(cap, "value", 5);
+        }
+        if ((ts_node_is_null(name_node) || ts_node_is_null(val_node)) &&
+            ts_node_named_child_count(cap) >= 2) {
+            name_node = ts_node_named_child(cap, 0);
+            val_node = ts_node_named_child(cap, 1);
+        }
+        if (ts_node_is_null(name_node) || ts_node_is_null(val_node))
+            continue;
+        char *cap_name = c_node_text(ctx, name_node);
+        const CBMType *cap_type = c_eval_expr_type(ctx, val_node);
+        if (cap_name) {
+            found[n].name = cap_name;
+            found[n].type = cap_type;
+            n++;
+        }
+    }
+    *count = n;
+    return found;
+}
+
+/* True when expr names a binding of frame whose type is unknown. Such a name
+ * shadows every outer name of the same spelling, so evaluating it through the
+ * outer scope or the registry would type it as something it is not. */
+static bool c_expr_names_unknown_local(CLSPContext *ctx, const CBMScope *frame, TSNode expr) {
+    if (ts_node_is_null(expr))
+        return false;
+    if (strcmp(ts_node_type(expr), "identifier") == 0) {
+        char *name = c_node_text(ctx, expr);
+        const CBMVarBinding *b = name ? cbm_scope_lookup_local(frame, name) : NULL;
+        return b && cbm_type_is_unknown(b->type);
+    }
+    uint32_t nc = ts_node_named_child_count(expr);
+    for (uint32_t i = 0; i < nc; i++) {
+        if (c_expr_names_unknown_local(ctx, frame, ts_node_named_child(expr, i)))
+            return true;
+    }
+    return false;
+}
+
+/* Bind, in the current (lambda) frame, the lambda's parameters and the body's
+ * declarations before the body statement stop. */
+static void c_lambda_bind_names(CLSPContext *ctx, TSNode declarator, TSNode body, uint32_t stop) {
+    TSNode params = ts_node_is_null(declarator)
+                        ? declarator
+                        : ts_node_child_by_field_name(declarator, "parameters", 10);
+    uint32_t pnc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < pnc; i++) {
+        TSNode param = ts_node_named_child(params, i);
+        const char *pk = ts_node_type(param);
+        if (strcmp(pk, "parameter_declaration") == 0 ||
+            strcmp(pk, "optional_parameter_declaration") == 0)
+            c_process_statement(ctx, param);
+    }
+    for (uint32_t i = 0; i < stop; i++) {
+        TSNode stmt = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(stmt), "declaration") == 0)
+            c_process_statement(ctx, stmt);
+    }
+}
+
+/* The return type of a lambda without a trailing return type: the type of its
+ * first immediate `return` operand, evaluated in the lambda's own scope. The
+ * operand sees the lambda's init-captures, parameters and the body's earlier
+ * declarations, not same-named variables of the enclosing function. A name
+ * the lambda binds to an unknown type (an `auto` parameter of a generic
+ * lambda) makes the result unknown. */
+static const CBMType *c_lambda_body_return_type(CLSPContext *ctx, TSNode node,
+                                                TSNode declarator) {
+    TSNode body = ts_node_child_by_field_name(node, "body", 4);
+    if (ts_node_is_null(body))
+        return NULL;
+    uint32_t bnc = ts_node_named_child_count(body);
+    uint32_t ri = 0;
+    while (ri < bnc && strcmp(ts_node_type(ts_node_named_child(body, ri)), "return_statement") != 0)
+        ri++;
+    if (ri == bnc || ts_node_named_child_count(ts_node_named_child(body, ri)) == 0)
+        return NULL;
+    TSNode ret_expr = ts_node_named_child(ts_node_named_child(body, ri), 0);
+
+    uint32_t capture_count = 0;
+    const CLambdaCapture *captures = c_lambda_capture_types(
+        ctx, ts_node_child_by_field_name(node, "captures", 8), &capture_count);
+
+    int saved_fp_count = ctx->fp_count;
+    CBMScope *saved_scope = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
+    for (uint32_t i = 0; i < capture_count; i++)
+        cbm_scope_bind(ctx->current_scope, captures[i].name, captures[i].type);
+    c_lambda_bind_names(ctx, declarator, body, ri);
+    const CBMType *ret = c_expr_names_unknown_local(ctx, ctx->current_scope, ret_expr)
+                             ? NULL
+                             : c_eval_expr_type(ctx, ret_expr);
+    ctx->current_scope = saved_scope;
+    ctx->fp_count = saved_fp_count;
+    return ret;
+}
+
 static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
     const char *kind = ts_node_type(node);
 
@@ -2809,28 +2944,9 @@ static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
             }
         }
 
-        // Phase B: infer from body's immediate return statements (no descent into nested lambdas)
-        if (!ret_type || cbm_type_is_unknown(ret_type)) {
-            TSNode body = ts_node_child_by_field_name(node, "body", 4);
-            if (!ts_node_is_null(body)) {
-                uint32_t bnc = ts_node_named_child_count(body);
-                for (uint32_t bi = 0; bi < bnc; bi++) {
-                    TSNode stmt = ts_node_named_child(body, bi);
-                    if (ts_node_is_null(stmt))
-                        continue;
-                    const char *sk = ts_node_type(stmt);
-                    // Skip nested lambdas, loops, etc. — only immediate returns
-                    if (strcmp(sk, "return_statement") == 0) {
-                        if (ts_node_named_child_count(stmt) > 0) {
-                            TSNode ret_expr = ts_node_named_child(stmt, 0);
-                            ret_type = c_eval_expr_type(ctx, ret_expr);
-                        }
-                        break; // first return only
-                    }
-                }
-            }
-        }
-
+        // Phase B: infer from the body's first immediate return statement
+        if (!ret_type || cbm_type_is_unknown(ret_type))
+            ret_type = c_lambda_body_return_type(ctx, node, declarator);
         if (ret_type && !cbm_type_is_unknown(ret_type)) {
             const CBMType **ret_types =
                 (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(const CBMType *));
@@ -4831,61 +4947,16 @@ static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode node) {
     c_eval_window_close(ctx);
 }
 
-/* An init-capture of a lambda: the name it binds in the lambda body and the
- * type of its initialiser, as seen from the enclosing scope. */
-typedef struct {
-    const char *name;
-    const CBMType *type;
-} CLambdaCapture;
-
-/* Walk a lambda's capture list in the CURRENT (enclosing) scope and return its
- * init-captures. The grammar admits `[x = e]`, `[&x = e]`, `[...x = e]` and
- * `[&...x = e]`; each is a lambda_capture_initializer whose `left` is the
- * name and `right` the initialiser. `e` is an expression of the enclosing
- * scope: the capture only exists in the body, so `x` in `[x = x.b()]` is the
- * outer `x`, and no capture of the list sees another. Every initialiser is
- * therefore walked and typed before any capture is bound.
- * Returns an arena array of *count entries (NULL when there are none). */
+/* Walk a lambda's capture list in the CURRENT (enclosing) scope, resolving
+ * the calls of its initialisers, and return its init-captures
+ * (c_lambda_capture_types). */
 static const CLambdaCapture *c_lambda_walk_captures(CLSPContext *ctx, TSNode list,
                                                     uint32_t *count) {
     *count = 0;
     if (ts_node_is_null(list))
         return NULL;
     c_resolve_calls_in_node(ctx, list);
-    uint32_t nc = ts_node_named_child_count(list);
-    CLambdaCapture *found =
-        nc ? (CLambdaCapture *)cbm_arena_alloc(ctx->arena, nc * sizeof(CLambdaCapture)) : NULL;
-    if (!found)
-        return NULL;
-    uint32_t n = 0;
-    for (uint32_t ci = 0; ci < nc; ci++) {
-        TSNode cap = ts_node_named_child(list, ci);
-        if (ts_node_is_null(cap) || strcmp(ts_node_type(cap), "lambda_capture_initializer") != 0)
-            continue;
-        TSNode name_node = ts_node_child_by_field_name(cap, "left", 4);
-        TSNode val_node = ts_node_child_by_field_name(cap, "right", 5);
-        // Older grammar shapes: "name"/"value" fields, then positional (name, value)
-        if (ts_node_is_null(name_node) || ts_node_is_null(val_node)) {
-            name_node = ts_node_child_by_field_name(cap, "name", 4);
-            val_node = ts_node_child_by_field_name(cap, "value", 5);
-        }
-        if ((ts_node_is_null(name_node) || ts_node_is_null(val_node)) &&
-            ts_node_named_child_count(cap) >= 2) {
-            name_node = ts_node_named_child(cap, 0);
-            val_node = ts_node_named_child(cap, 1);
-        }
-        if (ts_node_is_null(name_node) || ts_node_is_null(val_node))
-            continue;
-        char *cap_name = c_node_text(ctx, name_node);
-        const CBMType *cap_type = c_eval_expr_type(ctx, val_node);
-        if (cap_name && !cbm_type_is_unknown(cap_type)) {
-            found[n].name = cap_name;
-            found[n].type = cap_type;
-            n++;
-        }
-    }
-    *count = n;
-    return found;
+    return c_lambda_capture_types(ctx, list, count);
 }
 
 /* The lambda walk: the capture list in the enclosing scope, then the lambda's

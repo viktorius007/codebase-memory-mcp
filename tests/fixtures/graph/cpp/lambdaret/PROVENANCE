@@ -1,0 +1,4 @@
+Written for the C/C++ lane of the graph-accuracy run (HANDOFF.md, OPEN product
+defects, C/C++: lambda return-type inference wrong links). Before the fix the
+three lambda calls typed their result through the enclosing function's
+Outer w/v/c and linked .run() to Outer::run.
