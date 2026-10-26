@@ -132,6 +132,9 @@ static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char 
 static const CBMRegisteredFunc *rust_lookup_method_depth(RustLSPContext *ctx,
     const char *type_qn, const char *member_name, int depth, const CBMType *recv);
 
+static const CBMRegisteredFunc *rust_bound_path_declaration(RustLSPContext *ctx,
+                                                            const char *param,
+                                                            const char *method);
 static const CBMRegisteredFunc *rust_bound_method(RustLSPContext *ctx, const char *param,
                                                   const char *method, bool receiver_method,
                                                   bool *bounded);
@@ -15934,6 +15937,9 @@ static bool rust_ufcs_target(RustLSPContext *ctx, const char *qn, TSNode callee,
         bool bounded = false;
         const CBMRegisteredFunc *bound =
             rust_bound_method(ctx, param_name, short_name, false, &bounded);
+        if (bounded && !bound) {
+            bound = rust_bound_path_declaration(ctx, param_name, short_name);
+        }
         if (bounded) {
             if (bound) {
                 rust_call_target_set(out, bound, bound->qualified_name, "lsp_trait_dispatch",
@@ -17220,6 +17226,34 @@ static const CBMRegisteredFunc *rust_bound_method(RustLSPContext *ctx, const cha
                                       &ambiguous);
     }
     return ambiguous ? NULL : declaration;
+}
+
+/* `T::name(..)` with T a bounded parameter, when rust_bound_method cannot
+ * prove every bound silent (a bound or supertrait it cannot read). Code that
+ * compiles names one item by `T::name`: two bounds or supertraits declaring
+ * `name` make the path ambiguous (E0034), so a declaration found in a read
+ * bound is the target whatever the unread ones declare. NULL when no read
+ * bound declares it or two read bounds name different declarations. */
+static const CBMRegisteredFunc *rust_bound_path_declaration(RustLSPContext *ctx,
+                                                            const char *param,
+                                                            const char *method) {
+    const CBMRegisteredFunc *found = NULL;
+    for (int i = ctx->type_param_bound_count - 1; param && i >= 0; i--) {
+        if (strcmp(ctx->type_param_bounds[i].param_name, param) != 0)
+            continue;
+        const char *trait = ctx->type_param_bounds[i].trait_qn;
+        if (!trait)
+            break; /* the parameter's scope starts here */
+        const CBMRegisteredFunc *declaration = NULL;
+        bool unread = false;
+        rust_bound_trait_declarations(ctx, trait, method, false, 0, param, &declaration, &unread);
+        if (!declaration)
+            continue; /* an unread supertrait never removes a declaration found */
+        if (found && strcmp(found->qualified_name, declaration->qualified_name) != 0)
+            return NULL;
+        found = declaration;
+    }
+    return found;
 }
 
 /* Methods a std or common dependency trait gives a fn item or a tuple:

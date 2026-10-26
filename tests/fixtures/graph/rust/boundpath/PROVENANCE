@@ -1,0 +1,1 @@
+Lane w5-path (2026-10-26): `T::f()` with T bound by a trait declaring f links that declaration: impl-level bounds with several traits (bevy_settings CreateTypeData shape) and where-clause bounds (bevy_render AtomicRawBufferVec shape). println! statements print a backtrace (the run is the truth).

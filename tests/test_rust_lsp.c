@@ -10960,18 +10960,16 @@ TEST(rustlsp_gap_bidir_inferred_from_struct_init) {
 
 /* ── Cov §U: Trait bounds + multi-impl dispatch (15 tests) ──── */
 
-TEST(rustlsp_generic_static_unknown_bound_withholds_declaration) {
+/* `T::check()` with `T: Static + external::Missing`: a second bound declaring
+ * `check` would make the path ambiguous (E0034), so the unread bound cannot
+ * hold a competing declaration and the read bound's declaration is linked. */
+TEST(rustlsp_generic_static_unread_bound_links_declaration) {
     CBMFileResult *r = extract_rust(
         "trait Static { fn check(); } "
         "impl<T> Static for T { fn check() {} } "
         "fn call<T: Static + external::Missing>() { T::check(); }");
     ASSERT_NOT_NULL(r);
-    ASSERT_EQ(find_resolved(r, "call", "Static.check"), -1);
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall *call = &r->resolved_calls.items[i];
-        if (call->caller_qn && strstr(call->caller_qn, "call"))
-            ASSERT_FALSE(cbm_pipeline_rust_strategy_admitted(call->strategy));
-    }
+    ASSERT_GTE(find_resolved(r, "call", "Static.check"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -15278,7 +15276,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_gap_bidir_inferred_from_struct_init);
 
     /* Cov §U: Trait bounds + multi-impl dispatch */
-    RUN_TEST(rustlsp_generic_static_unknown_bound_withholds_declaration);
+    RUN_TEST(rustlsp_generic_static_unread_bound_links_declaration);
     RUN_TEST(rustlsp_written_bounds_select_only_the_trait_declaration);
     RUN_TEST(rustlsp_bound_declaration_return_type_preserves_chained_calls);
     RUN_TEST(rustlsp_generic_bound_does_not_replace_a_qualified_concrete_receiver);
