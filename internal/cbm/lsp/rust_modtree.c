@@ -19,6 +19,7 @@ enum {
     RMT_MAX_SEGS = 32,
     RMT_MAX_DEPTH = 48,
     RMT_VISIT_MAX = 64,
+    RMT_VISIT_SLOTS = 1024, /* power of two; a walk stops at half */
     RMT_KEY_MAX = 512,
 };
 
@@ -172,9 +173,14 @@ struct CBMRustModTree {
     CBMIdxMemo impl_assoc_by_self; /* "<self QN>\x1f<name>" -> first impl_assocs entry */
 };
 
+/* Modules one name lookup has entered through globs. A facade crate's
+ * prelude reaches hundreds of modules (`bevy::prelude::*` globs every
+ * sub-crate's prelude, and those glob their own modules), so the set is
+ * hashed; `full` records that the walk stopped before covering them all. */
 typedef struct {
-    int items[RMT_VISIT_MAX];
+    int slots[RMT_VISIT_SLOTS]; /* module id + 1; 0 is an empty slot */
     int count;
+    bool full;
 } RmtVisit;
 
 /* Test builds scribble every grown slot: a field a record setter forgets then
@@ -1676,16 +1682,22 @@ static void rmt_resolve_path(CBMRustModTree *tree, CBMArena *arena, int module,
                              const char *const *segs, int count, uint8_t final_ns, bool is_use,
                              RmtDefs *out, bool building);
 
+/* Enter `module`: false when this walk has entered it already, or when the
+ * walk is full (then `visit->full` is set). */
 static bool rmt_visit(RmtVisit *visit, int module) {
-    for (int i = 0; i < visit->count; i++) {
-        if (visit->items[i] == module) {
+    unsigned slot = ((unsigned)module * 2654435761u) & (RMT_VISIT_SLOTS - 1);
+    while (visit->slots[slot] != 0) {
+        if (visit->slots[slot] == module + 1) {
             return false;
         }
+        slot = (slot + 1) & (RMT_VISIT_SLOTS - 1);
     }
-    if (visit->count >= RMT_VISIT_MAX) {
+    if (visit->count >= RMT_VISIT_SLOTS / 2) {
+        visit->full = true;
         return false;
     }
-    visit->items[visit->count++] = module;
+    visit->slots[slot] = module + 1;
+    visit->count++;
     return true;
 }
 
@@ -1793,7 +1805,9 @@ static void rmt_lookup_globs(CBMRustModTree *tree, int module, const char *name,
         rmt_defs_merge(&supplied, &found, ns);
     }
     rmt_defs_merge(out, &supplied, ns);
-    if (supplied.count == 0 && unknown_source) {
+    /* A walk that ran out skipped globs that may supply the name too, so a
+     * candidate another branch found does not settle it. */
+    if ((supplied.count == 0 && unknown_source) || visit->full) {
         out->open = true;
     }
 }
@@ -1858,7 +1872,11 @@ static void rmt_lookup(CBMRustModTree *tree, int module, const char *name, uint8
         }
         hidden |= unseen.count > 0 || unseen.open;
     }
-    if (out->count > 0 || out->open || hidden || !rmt_visit(visit, module)) {
+    if (out->count > 0 || out->open || hidden) {
+        return;
+    }
+    if (!rmt_visit(visit, module)) {
+        out->open |= visit->full;
         return;
     }
     rmt_lookup_globs(tree, module, name, ns, out, visit, building, seers);
