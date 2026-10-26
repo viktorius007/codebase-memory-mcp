@@ -175,7 +175,21 @@ fn literal_arm_taken() {
     let _ = pick!(-1, "message", picked());
 }
 
+// A `ty` fragment ends before the `[` that follows the type.
+macro_rules! typed_list {
+    ($t:ty [$($e:expr),*]) => {
+        [$($e as $t),*]
+    };
+}
+
+fn listed() -> u8 { println!("listed\n{}", std::backtrace::Backtrace::force_capture()); 1 }
+
+fn type_then_bracket() {
+    let _ = typed_list!(u32 [listed(), listed()]);
+}
+
 fn main() {
+    type_then_bracket();
     ident_is_no_literal();
     literal_arm_taken();
     hygiene();

@@ -11693,6 +11693,33 @@ static int macro_consume_string(const char *s, int len, int from) {
     return from;
 }
 
+/* Whether the type text s[from, at) already forms a complete type: it ends
+ * in a path segment, a closed generic list or a closed group, and not in a
+ * keyword that a type still continues after (`&mut [T]`, `*const [T]`,
+ * `dyn`, `impl`). */
+static bool macro_type_complete(const char *s, int from, int at) {
+    int end = at;
+    while (end > from && isspace((unsigned char)s[end - 1]))
+        end--;
+    if (end == from)
+        return false;
+    char last = s[end - 1];
+    if (last == '>' || last == ')' || last == ']')
+        return true;
+    if (!(isalnum((unsigned char)last) || last == '_'))
+        return false;
+    int start = end;
+    while (start > from && (isalnum((unsigned char)s[start - 1]) || s[start - 1] == '_'))
+        start--;
+    static const char *const continuing[] = {"mut", "const", "dyn", "impl"};
+    for (size_t i = 0; i < sizeof(continuing) / sizeof(continuing[0]); i++) {
+        if ((size_t)(end - start) == strlen(continuing[i]) &&
+            memcmp(s + start, continuing[i], (size_t)(end - start)) == 0)
+            return false;
+    }
+    return true;
+}
+
 static int macro_consume_fragment(const char *s, int len, int from, const char *frag) {
     from = macro_skip_ws(s, len, from);
     if (from >= len)
@@ -11778,11 +11805,32 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
         return from;
     }
     /* For expr/ty/path/pat/stmt: greedy balanced span up to a token none
-     * of them holds outside brackets (`,` `;` `=>`). */
+     * of them holds outside brackets (`,` `;` `=>`). A type or path also
+     * holds `,` and `=` inside its generic arguments, and ends before a `[`
+     * or `{` that follows a completed type (the reference's follow set of
+     * `ty` and `path` admits both). */
     bool item = strcmp(frag, "item") == 0;
+    bool typed = strcmp(frag, "ty") == 0 || strcmp(frag, "path") == 0;
+    int angle = 0;
     int p = from;
     while (p < len) {
         char c = s[p];
+        if (typed && c == '<') {
+            angle++;
+            p++;
+            continue;
+        }
+        if (typed && c == '>' && angle > 0 && !(p > from && s[p - 1] == '-')) {
+            angle--;
+            p++;
+            continue;
+        }
+        if (typed && angle == 0 && (c == '[' || c == '{') && macro_type_complete(s, from, p))
+            break;
+        if (angle > 0 && (c == ',' || c == '=' || c == ';')) {
+            p++;
+            continue;
+        }
         int string_end = macro_consume_string(s, len, p);
         if (string_end > p) {
             p = string_end;
