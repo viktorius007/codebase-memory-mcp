@@ -4346,6 +4346,7 @@ typedef struct {
 static const RustStdProducer RUST_STD_PRODUCERS[] = {
 #define CBM_STD_PRODUCER(receiver, method, ret, source, date) {receiver "." method, ret},
 #include "rust_std_methods.h"
+#include "rust_std_projections.h"
 #undef CBM_STD_PRODUCER
     {NULL, NULL}};
 
@@ -5047,6 +5048,46 @@ static bool rust_std_closure_method_known(const char *method, int arg) {
 
 /* The receiver class of `*self` (references stripped). A slice is rewritten
  * to the `Vec` of its element so the specs read `T` off it. */
+typedef struct {
+    const char *iter;
+    const char *item;
+} RustStdIterItem;
+
+static const RustStdIterItem RUST_STD_ITER_ITEMS[] = {
+#define CBM_STD_ITER_ITEM(iter, item, source) {iter, item},
+#include "rust_std_projections.h"
+#undef CBM_STD_ITER_ITEM
+    {NULL, NULL}};
+
+/* The Item of a map or set iterator rust_std_projections.h lists, over the
+ * iterator's own type arguments (T and E in the row are its first and
+ * second). A pair row ("&T,&E") yields a tuple. NULL for any other head or
+ * when an argument it needs is unknown. */
+static const CBMType *rust_std_table_iter_item(RustLSPContext *ctx, const char *qn,
+                                               const CBMType *t) {
+    if (t->kind != CBM_TYPE_TEMPLATE) {
+        return NULL;
+    }
+    for (const RustStdIterItem *row = RUST_STD_ITER_ITEMS; row->iter; row++) {
+        if (strcmp(row->iter, qn) != 0) {
+            continue;
+        }
+        const CBMType *parts[2];
+        int count = 0;
+        const char *sp = row->item;
+        while (*sp && count < 2) {
+            parts[count] = rust_std_spec_parse(ctx, &sp, t, NULL);
+            if (!parts[count] || cbm_type_is_unknown(parts[count])) {
+                return NULL;
+            }
+            count++;
+            sp += *sp == ',' ? 1 : 0;
+        }
+        return count == 2 ? cbm_type_tuple(ctx->arena, parts, 2) : count == 1 ? parts[0] : NULL;
+    }
+    return NULL;
+}
+
 static RustClosureRecv rust_closure_recv_of(RustLSPContext *ctx, const CBMType **self) {
     static const char *const iters[] = {"core.iter.Iterator", "std.iter.Iterator", NULL};
     static const char *const sets[] = {"std.collections.VecDeque",
@@ -5113,6 +5154,11 @@ static RustClosureRecv rust_closure_recv_of(RustLSPContext *ctx, const CBMType *
             item = rust_reference_type(ctx->arena, item, !strstr(qn, "IterMut"));
         }
         *self = cbm_type_template(ctx->arena, "core.iter.Iterator", &item, 1);
+        return RUST_CLOSURE_RECV_ITER;
+    }
+    const CBMType *table_item = rust_std_table_iter_item(ctx, qn, t);
+    if (table_item) {
+        *self = cbm_type_template(ctx->arena, "core.iter.Iterator", &table_item, 1);
         return RUST_CLOSURE_RECV_ITER;
     }
     if (rust_method_in(sets, qn)) {
@@ -5291,6 +5337,164 @@ static const CBMType *rust_std_into_iter_item(RustLSPContext *ctx, const CBMType
     return item && !cbm_type_is_unknown(item) ? item : NULL;
 }
 
+/* The QN a type head names, to match against rust_std_projections.h rows:
+ * the dotted head, or a bare name's `use` or prelude entry. A corpus type
+ * keeps its own module path and so matches no row. */
+static const char *rust_std_table_qn(RustLSPContext *ctx, const char *head) {
+    if (!head) {
+        return NULL;
+    }
+    const char *qn = convert_path_to_qn(ctx->arena, head);
+    if (strchr(qn, '.')) {
+        return qn;
+    }
+    const char *imported = rust_resolve_use(ctx, qn);
+    return imported ? convert_path_to_qn(ctx->arena, imported) : rust_prelude_in_scope(ctx, qn);
+}
+
+typedef struct {
+    const char *owner;
+    const char *method;
+    const char *result;
+} RustStdProjection;
+
+static const RustStdProjection RUST_STD_ENTRY_OF[] = {
+#define CBM_STD_ENTRY_OF(map, method, entry, source) {map, method, entry},
+#include "rust_std_projections.h"
+#undef CBM_STD_ENTRY_OF
+    {NULL, NULL, NULL}};
+
+static const RustStdProjection RUST_STD_ENTRY_VALUE[] = {
+#define CBM_STD_ENTRY_VALUE(entry, method, source) {entry, method, NULL},
+#include "rust_std_projections.h"
+#undef CBM_STD_ENTRY_VALUE
+    {NULL, NULL, NULL}};
+
+static const RustStdProjection RUST_STD_INDEX_VALUE[] = {
+#define CBM_STD_INDEX_VALUE(map, source) {map, "index", NULL},
+#include "rust_std_projections.h"
+#undef CBM_STD_INDEX_VALUE
+    {NULL, NULL, NULL}};
+
+static const RustStdProjection *rust_std_projection_row(const RustStdProjection *rows,
+                                                        const char *qn, const char *method) {
+    for (const RustStdProjection *row = rows; qn && row->owner; row++) {
+        if (strcmp(row->owner, qn) == 0 && strcmp(row->method, method) == 0) {
+            return row;
+        }
+    }
+    return NULL;
+}
+
+/* Whether the corpus registers any method `method` on the std type `qn` (a
+ * corpus trait impl for it or for a reference to it). rustc may pick such a
+ * method before the std inherent one, so a table projection withholds. */
+static bool rust_std_corpus_method_on(RustLSPContext *ctx, const char *qn, const char *method) {
+    CBMMethodIter it;
+    cbm_registry_methods_chain(ctx->registry, qn, method, &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        const CBMRegisteredFunc *f = &it.reg->funcs[index];
+        if ((f->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) && f->impl_trait_qn) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `map.entry(k)` and `entry.or_insert(..)` family on the maps
+ * rust_std_projections.h lists: the Entry over the map's <K, V>, then `&mut V`.
+ * NULL for any other receiver, method or argument shape. */
+static const CBMType *rust_std_entry_return(RustLSPContext *ctx, const CBMType *recv,
+                                            const char *method) {
+    const CBMType *base = rust_strip_references(rust_expand_type_aliases(ctx, recv, 0));
+    if (!base || base->kind != CBM_TYPE_TEMPLATE || base->data.template_type.arg_count < 2) {
+        return NULL;
+    }
+    const char *qn = rust_std_table_qn(ctx, base->data.template_type.template_name);
+    const CBMType *value = base->data.template_type.template_args[1];
+    if (!qn || cbm_type_is_unknown(value)) {
+        return NULL;
+    }
+    const char *registered = rust_registered_type_qn(ctx, qn);
+    if (rust_std_corpus_method_on(ctx, qn, method) ||
+        (registered && rust_std_corpus_method_on(ctx, registered, method))) {
+        return NULL;
+    }
+    const RustStdProjection *row = rust_std_projection_row(RUST_STD_ENTRY_OF, qn, method);
+    if (row) {
+        return cbm_type_template(ctx->arena, row->result, base->data.template_type.template_args,
+                                 2);
+    }
+    if (rust_std_projection_row(RUST_STD_ENTRY_VALUE, qn, method)) {
+        return rust_reference_type(ctx->arena, value, false);
+    }
+    return NULL;
+}
+
+typedef struct {
+    const char *method;
+    const char *ret;
+} RustStdSeqElem;
+
+static const RustStdSeqElem RUST_STD_SEQ_ELEMS[] = {
+#define CBM_STD_SEQ_ELEM(method, ret, source) {method, ret},
+#include "rust_std_projections.h"
+#undef CBM_STD_SEQ_ELEM
+    {NULL, NULL}};
+
+/* `v.get_mut(i)` on a Vec or slice, rust_std_projections.h's sequence rows:
+ * the row's return when the index argument is not a range (a range yields
+ * a subslice instead). NULL otherwise. */
+static bool rust_numeric_primitive(const CBMType *t, bool integer_only);
+static const CBMType *rust_index_operand_type(RustLSPContext *ctx, TSNode node);
+
+static const CBMType *rust_std_seq_elem_return(RustLSPContext *ctx, const CBMType *recv,
+                                               const char *method, const RustStdCall *call) {
+    const CBMType *base = rust_strip_references(rust_expand_type_aliases(ctx, recv, 0));
+    TSNode index = rust_std_call_first_arg(call);
+    if (!base || ts_node_is_null(index) || strcmp(ts_node_type(index), "range_expression") == 0) {
+        return NULL;
+    }
+    /* Only an index proven to be an integer selects one element. */
+    const CBMType *index_type = rust_index_operand_type(ctx, index);
+    if (!rust_numeric_primitive(index_type, true)) {
+        return NULL;
+    }
+    static const char *const owners[] = {"alloc.vec.Vec", "std.vec.Vec", "[]", NULL};
+    for (const char *const *owner = owners; *owner; owner++) {
+        if (rust_std_corpus_method_on(ctx, *owner, method)) {
+            return NULL;
+        }
+    }
+    if (base->kind == CBM_TYPE_SLICE) {
+        const CBMType *elem = base->data.slice.elem;
+        base = elem ? cbm_type_template(ctx->arena, "alloc.vec.Vec", &elem, 1) : NULL;
+    }
+    const char *head = rust_std_type_head(base);
+    if (!head || rust_std_family_of(ctx, head) != RUST_STD_VEC) {
+        return NULL;
+    }
+    for (const RustStdSeqElem *row = RUST_STD_SEQ_ELEMS; row->method; row++) {
+        if (strcmp(row->method, method) == 0) {
+            return rust_std_return_type(ctx, row->ret, base, call);
+        }
+    }
+    return NULL;
+}
+
+/* `map[&k]` on a map rust_std_projections.h lists: its value type. */
+static const CBMType *rust_std_map_index_output(RustLSPContext *ctx, const CBMType *base) {
+    if (!base || base->kind != CBM_TYPE_TEMPLATE || base->data.template_type.arg_count < 2) {
+        return NULL;
+    }
+    const char *qn = rust_std_table_qn(ctx, base->data.template_type.template_name);
+    const CBMType *value = base->data.template_type.template_args[1];
+    return rust_std_projection_row(RUST_STD_INDEX_VALUE, qn, "index") &&
+                   !cbm_type_is_unknown(value)
+               ? value
+               : NULL;
+}
+
 typedef struct {
     const char *receiver_pattern;
     const char *method;
@@ -5362,6 +5566,11 @@ static const CBMType *rust_std_producer_return(RustLSPContext *ctx, TSNode func_
     char *path = rust_node_text(ctx, func_node);
     if (path) {
         rust_strip_turbofish(path);
+    }
+    /* A local value binding shadows any imported function of its name. */
+    if (path && strcmp(fk, "identifier") == 0 &&
+        cbm_scope_lookup_binding(ctx->current_scope, path)) {
+        return NULL;
     }
     const char *leaf = path ? strrchr(path, ':') : NULL;
     leaf = leaf ? leaf + 1 : path;
@@ -6128,6 +6337,12 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                 }
                 RustStdCall call = {args_node, type_args};
                 const CBMType *declared = rust_std_method_return(ctx, recv, mname, &call);
+                if (!declared) {
+                    declared = rust_std_entry_return(ctx, recv, mname);
+                }
+                if (!declared) {
+                    declared = rust_std_seq_elem_return(ctx, recv, mname, &call);
+                }
                 if (declared) {
                     return declared;
                 }
@@ -6822,6 +7037,22 @@ static const CBMType *rust_operator_output(RustLSPContext *ctx, const CBMType *l
     return output;
 }
 
+/* Whether every corpus `Index` impl of the type under `t`'s references is
+ * written on the owned type: an impl on a reference, or one whose self type
+ * was not read, may be the one rustc takes before autoderef. */
+static bool rust_index_impls_all_owned(RustLSPContext *ctx, const CBMType *t) {
+    const char *head = rust_std_type_head(rust_strip_references(t));
+    const CBMRegisteredType *owner = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
+    for (const CBMRustOperatorImpl *it = owner ? owner->rust_operator_impls : NULL; it;
+         it = it->next) {
+        const char *leaf = strrchr(it->trait_qn, '.');
+        if (!leaf || strcmp(leaf + 1, "Index") != 0) continue;
+        if (cbm_type_is_unknown(it->self_type) || it->self_type->kind == CBM_TYPE_REFERENCE)
+            return false;
+    }
+    return true;
+}
+
 static bool rust_numeric_primitive(const CBMType *t, bool integer_only) {
     if (!t || t->kind != CBM_TYPE_BUILTIN) return false;
     const char *name = t->data.builtin.name;
@@ -7151,8 +7382,16 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         const CBMType *actual = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, value), 0);
         const CBMType *idx = rust_index_operand_type(ctx, index);
         const CBMType *output = rust_operator_output(ctx, actual, idx, "index");
+        /* Indexing autoderefs its base: past `&T`, T's own `Index` impl. */
+        for (const CBMType *cur = actual; !output && cur && cur->kind == CBM_TYPE_REFERENCE &&
+                                          rust_index_impls_all_owned(ctx, cur);) {
+            cur = cur->data.reference.elem;
+            output = rust_operator_output(ctx, cur, idx, "index");
+        }
         if (output) return output;
         const CBMType *base = rust_strip_references(actual);
+        output = rust_std_map_index_output(ctx, base);
+        if (output) return output;
         const char *head = rust_std_type_head(base);
         const CBMRegisteredType *owner = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
         if (actual != base && owner && owner->rust_operator_impls) return cbm_type_unknown();
@@ -7896,6 +8135,32 @@ static const char *rust_std_wrapper_canonical(const char *qn) {
     return prelude && rust_type_derefs_to_first_arg(prelude) ? prelude : qn;
 }
 
+typedef struct {
+    const char *leaf;
+    const char *qn;
+} RustStdGuardLeaf;
+
+static const RustStdGuardLeaf RUST_STD_GUARD_LEAVES[] = {
+#define CBM_STD_GUARD_LEAF(leaf, qn, source) {leaf, qn},
+#include "rust_std_projections.h"
+#undef CBM_STD_GUARD_LEAF
+    {NULL, NULL}};
+
+/* A lock guard named through a path the use graph does not settle (a
+ * cfg-selected re-export such as `bevy_platform::sync::RwLockWriteGuard`):
+ * no corpus type holds the QN, so its last segment decides, per the
+ * rust_std_projections.h guard rows. NULL for any other name. */
+static const char *rust_std_guard_by_leaf(const char *qn) {
+    const char *dot = qn ? strrchr(qn, '.') : NULL;
+    const char *leaf = dot ? dot + 1 : qn;
+    for (const RustStdGuardLeaf *row = RUST_STD_GUARD_LEAVES; leaf && row->leaf; row++) {
+        if (strcmp(row->leaf, leaf) == 0) {
+            return row->qn;
+        }
+    }
+    return NULL;
+}
+
 /* A template head as written (`Arc`, `std::sync::Arc`, or a name some
  * signature recorded under its defining module) names a std Deref wrapper
  * once it is resolved like any other type name: through the file's `use`
@@ -7913,9 +8178,10 @@ static const char *rust_wrapper_head_qn(RustLSPContext *ctx, const char *head) {
     if (registered) {
         return rust_std_wrapper_canonical(registered);
     }
-    return !strchr(qn, '.') && !rust_resolve_use(ctx, qn)
-               ? rust_std_wrapper_canonical(rust_prelude_in_scope(ctx, qn))
-               : NULL;
+    const char *prelude = !strchr(qn, '.') && !rust_resolve_use(ctx, qn)
+                              ? rust_std_wrapper_canonical(rust_prelude_in_scope(ctx, qn))
+                              : NULL;
+    return prelude ? prelude : rust_std_guard_by_leaf(qn);
 }
 
 static bool rust_wrapper_head_derefs(RustLSPContext *ctx, const char *head) {
