@@ -1,0 +1,5 @@
+Written for the C/C++ lane of the graph-accuracy run (HANDOFF.md, OPEN product
+defects, C/C++: `#line` after same-line comment not blanked,
+preprocessor.cpp). The compiler honours both directives (the program prints
+"main at 951" and "helper at 900"); the graph must report helper at line 8
+and main at line 11 of main.c, the call main -> helper at line 13.

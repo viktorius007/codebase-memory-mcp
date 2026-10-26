@@ -450,26 +450,49 @@ bool cbm_preprocessor_line_continues(const char *line, int len) {
     return end > 0 && line[end - 1] == '\\';
 }
 
-// Whether `line` (no newline) is a line-number directive simplecpp honours:
-// `#line 40 "parse.y"`, `#line 40`, or the linemarker `# 40 "parse.y"`.
-static bool is_source_line_directive(const char *line, size_t len) {
-    size_t i = 0;
-    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
-        i++;
+// The index of the first character at or after `i` that is neither a blank
+// nor inside a block comment closed on this line. Translation phase 3 turns
+// each comment into one space before phase 4 sees directives, so such a
+// comment counts as a blank. A comment left open or a `//` comment ends the
+// line's tokens: `len` is returned.
+static size_t skip_blanks_and_comments(const char *line, size_t len, size_t i) {
+    while (i < len) {
+        if (line[i] == ' ' || line[i] == '\t') {
+            i++;
+        } else if (i + 1 < len && line[i] == '/' && line[i + 1] == '*') {
+            size_t close = i + 2;
+            while (close + 1 < len && !(line[close] == '*' && line[close + 1] == '/')) {
+                close++;
+            }
+            if (close + 1 >= len) {
+                return len;
+            }
+            i = close + 2;
+        } else if (i + 1 < len && line[i] == '/' && line[i + 1] == '/') {
+            return len;
+        } else {
+            break;
+        }
     }
+    return i;
+}
+
+// Whether `line` (no newline) is a line-number directive simplecpp honours:
+// `#line 40 "parse.y"`, `#line 40`, or the linemarker `# 40 "parse.y"`, with
+// any blank between its tokens possibly a closed block comment
+// (`/* c */ #line 40`).
+static bool is_source_line_directive(const char *line, size_t len) {
+    size_t i = skip_blanks_and_comments(line, len, 0);
     if (i >= len || line[i++] != '#') {
         return false;
     }
-    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
-        i++;
-    }
+    i = skip_blanks_and_comments(line, len, i);
     static const char keyword[] = "line";
     const size_t keyword_len = sizeof(keyword) - 1;
-    if (i + keyword_len < len && strncmp(line + i, keyword, keyword_len) == 0 &&
-        (line[i + keyword_len] == ' ' || line[i + keyword_len] == '\t')) {
-        i += keyword_len;
-        while (i < len && (line[i] == ' ' || line[i] == '\t')) {
-            i++;
+    if (i + keyword_len < len && strncmp(line + i, keyword, keyword_len) == 0) {
+        const size_t after = skip_blanks_and_comments(line, len, i + keyword_len);
+        if (after > i + keyword_len) {
+            i = after;
         }
     }
     return i < len && line[i] >= '0' && line[i] <= '9';
