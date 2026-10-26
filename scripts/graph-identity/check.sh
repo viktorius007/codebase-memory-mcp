@@ -3,7 +3,8 @@
 # Graph identity for the C/C++ corpora: index each corpus under <corpora-dir> with <binary> and
 # compare the complete node and edge multisets (graphcmp.py) against the frozen base graph
 # <corpora-dir>/base/<corpus>/graph.db. "freeze" writes that base from this binary and records
-# the digests in DIGESTS beside this script. Exit 0 only when every corpus is IDENTICAL or frozen.
+# the digests in DIGESTS beside this script. SEMANTICALLY_RELATED edges are reported on their own
+# "semantic:" line and do not decide the verdict. Exit 0 only when every corpus is IDENTICAL or frozen.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$1"; CPP="$2"; G="$3"; MODE="${4:-check}"
@@ -27,7 +28,7 @@ for c in $CORPORA; do
   if [ ! -f "$base" ]; then echo "cpp-$c: FAIL no frozen base at $base (run with freeze on a trusted binary)"; ok=0; continue; fi
   python3 -I "$HERE/graphcmp.py" "$base" "$db" > "$G/cpp-$c.cmp" 2>&1
   verdict=$(tail -1 "$G/cpp-$c.cmp")
-  echo "cpp-$c: $([ "$verdict" = IDENTICAL ] && echo PASS || echo FAIL) $verdict $(grep -E '^edges:' "$G/cpp-$c.cmp" | head -1) diff=$G/cpp-$c.cmp"
+  echo "cpp-$c: $([ "$verdict" = IDENTICAL ] && echo PASS || echo FAIL) $verdict $(grep -E '^edges:' "$G/cpp-$c.cmp" | head -1) $(grep -E '^semantic:' "$G/cpp-$c.cmp" | head -1 | cut -d' ' -f1-5) diff=$G/cpp-$c.cmp"
   [ "$verdict" = IDENTICAL ] || ok=0
 done
 [ $ok = 1 ]
