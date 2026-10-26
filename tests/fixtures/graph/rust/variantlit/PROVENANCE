@@ -1,0 +1,1 @@
+Lane w6-recv (2026-10-26): a struct-variant literal `Enum::Variant { .. }` is a value of the enum, so `Enum::Variant { .. }.method()` dispatches on the enum (bevy `GltfAssetLabel::Primitive { .. }.from_asset(..)`). println! statements print a backtrace (the run is the truth).

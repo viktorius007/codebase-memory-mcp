@@ -1,0 +1,1 @@
+Lane w6-recv (2026-10-26): `<Type as Trait<T>>::f` where the written trait arguments do not spell the impl's (`impl CreateTypeData<S, ()>`, bevy_state reflect.rs) and `<&Sub<L> as Query>::f` against `impl<T> Query for &T` (bevy_render sync_world.rs): the self type holds one impl of the trait head. println! statements print a backtrace (the run is the truth).

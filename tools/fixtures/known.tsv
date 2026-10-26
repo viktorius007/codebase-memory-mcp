@@ -2,6 +2,7 @@
 # The check fails on a mismatch not listed here and on an entry here that no longer mismatches.
 # Findings: R-W2, R-W3 (private review reports of integ/w1 32d11a53 and ba3ad3b2), R-W1 (f10b3151).
 # Rust: M3 (R4) is the method_not_found stop on a method the run reached; N2 a stop naming the wrong cause.
+rust/blanketpath	CALLS src.main.attach -> src.main.T.attach[Attach]	W6-RECV R1 (an in-scope trait with a default-bodied competitor withholds)
 rust/boundxf	CALLS src.main.calla -> src.ext.T.go[Ext]	R-W3 N2
 rust/boxbox	CALLS src.main.two_traits -> src.main.Box.n[Tb]	R-W3 M2 (R-W2 R2)
 rust/cells	CALLS src.main.cell_get_mut -> src.main.S.get_mut	R-W1 B4
