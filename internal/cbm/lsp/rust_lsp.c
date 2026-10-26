@@ -16250,6 +16250,42 @@ static TSNode rust_enclosing_module_impl(TSNode node) {
     return none;
 }
 
+/* True when the impl's generic parameter list declares type parameter
+ * `name` (`impl<T>`, `impl<T: Bound>`). */
+static bool rust_impl_declares_type_param(RustLSPContext *ctx, TSNode impl, const char *name) {
+    TSNode params = ts_node_child_by_field_name(impl, "type_parameters", 15);
+    for (uint32_t i = 0; !ts_node_is_null(params) && i < ts_node_named_child_count(params); i++) {
+        TSNode param = ts_node_named_child(params, i);
+        const char *kind = ts_node_type(param);
+        TSNode id = strcmp(kind, "type_parameter") == 0
+                        ? ts_node_child_by_field_name(param, "name", 4)
+                        : strcmp(kind, "type_identifier") == 0 ? param : (TSNode){0};
+        char *text = ts_node_is_null(id) ? NULL : rust_node_text(ctx, id);
+        if (text && strcmp(text, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `Self::name` inside a blanket impl (`impl<T: Bound> Trait for T`): Self
+ * is the parameter, and a bound of it that declares `name` is a where-clause
+ * candidate, which rustc prefers to the trait impls (this blanket impl
+ * included) that also supply `name`. True with that declaration; false when
+ * no bound declares exactly one, leaving the impls to the other paths. */
+static bool rust_self_param_bound_target(RustLSPContext *ctx, const char *param,
+                                         const char *name, RustCallTarget *out) {
+    bool bounded = false;
+    const CBMRegisteredFunc *declaration = rust_bound_method(ctx, param, name, false, &bounded);
+    if (!declaration) {
+        return false;
+    }
+    rust_call_target_set(out, declaration, declaration->qualified_name, "lsp_trait_dispatch",
+                         CBM_RUST_CONF_UFCS);
+    out->names_function = true;
+    return true;
+}
+
 /* `Self::name` inside an impl body: `Self` is the impl's self type, so the
  * path is that type's associated item. The self type is resolved through the
  * module tree where the impl spells it, generic arguments dropped; true when
@@ -16270,6 +16306,10 @@ static bool rust_self_path_target(RustLSPContext *ctx, TSNode callee, const char
     }
     char *spelling = rust_node_text(ctx, type_node);
     const char *self_path = spelling ? rust_impl_self_path(ctx->arena, spelling) : NULL;
+    if (self_path && strcmp(spelling, self_path) == 0 &&
+        rust_impl_declares_type_param(ctx, impl, self_path)) {
+        return rust_self_param_bound_target(ctx, self_path, name, out);
+    }
     if (!self_path || rust_impl_has_type_param(ctx, impl, self_path)) {
         return false;
     }
