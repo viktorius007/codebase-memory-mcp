@@ -5291,6 +5291,93 @@ static const CBMType *rust_std_into_iter_item(RustLSPContext *ctx, const CBMType
     return item && !cbm_type_is_unknown(item) ? item : NULL;
 }
 
+/* The QN a type head names, to match against rust_std_projections.h rows:
+ * the dotted head, or a bare name's `use` or prelude entry. A corpus type
+ * keeps its own module path and so matches no row. */
+static const char *rust_std_table_qn(RustLSPContext *ctx, const char *head) {
+    if (!head) {
+        return NULL;
+    }
+    const char *qn = convert_path_to_qn(ctx->arena, head);
+    if (strchr(qn, '.')) {
+        return qn;
+    }
+    const char *imported = rust_resolve_use(ctx, qn);
+    return imported ? convert_path_to_qn(ctx->arena, imported) : rust_prelude_in_scope(ctx, qn);
+}
+
+typedef struct {
+    const char *owner;
+    const char *method;
+    const char *result;
+} RustStdProjection;
+
+static const RustStdProjection RUST_STD_ENTRY_OF[] = {
+#define CBM_STD_ENTRY_OF(map, method, entry, source) {map, method, entry},
+#include "rust_std_projections.h"
+#undef CBM_STD_ENTRY_OF
+    {NULL, NULL, NULL}};
+
+static const RustStdProjection RUST_STD_ENTRY_VALUE[] = {
+#define CBM_STD_ENTRY_VALUE(entry, method, source) {entry, method, NULL},
+#include "rust_std_projections.h"
+#undef CBM_STD_ENTRY_VALUE
+    {NULL, NULL, NULL}};
+
+static const RustStdProjection RUST_STD_INDEX_VALUE[] = {
+#define CBM_STD_INDEX_VALUE(map, source) {map, "index", NULL},
+#include "rust_std_projections.h"
+#undef CBM_STD_INDEX_VALUE
+    {NULL, NULL, NULL}};
+
+static const RustStdProjection *rust_std_projection_row(const RustStdProjection *rows,
+                                                        const char *qn, const char *method) {
+    for (const RustStdProjection *row = rows; qn && row->owner; row++) {
+        if (strcmp(row->owner, qn) == 0 && strcmp(row->method, method) == 0) {
+            return row;
+        }
+    }
+    return NULL;
+}
+
+/* `map.entry(k)` and `entry.or_insert(..)` family on the maps
+ * rust_std_projections.h lists: the Entry over the map's <K, V>, then `&mut V`.
+ * NULL for any other receiver, method or argument shape. */
+static const CBMType *rust_std_entry_return(RustLSPContext *ctx, const CBMType *recv,
+                                            const char *method) {
+    const CBMType *base = rust_strip_references(rust_expand_type_aliases(ctx, recv, 0));
+    if (!base || base->kind != CBM_TYPE_TEMPLATE || base->data.template_type.arg_count < 2) {
+        return NULL;
+    }
+    const char *qn = rust_std_table_qn(ctx, base->data.template_type.template_name);
+    const CBMType *value = base->data.template_type.template_args[1];
+    if (!qn || cbm_type_is_unknown(value)) {
+        return NULL;
+    }
+    const RustStdProjection *row = rust_std_projection_row(RUST_STD_ENTRY_OF, qn, method);
+    if (row) {
+        return cbm_type_template(ctx->arena, row->result, base->data.template_type.template_args,
+                                 2);
+    }
+    if (rust_std_projection_row(RUST_STD_ENTRY_VALUE, qn, method)) {
+        return rust_reference_type(ctx->arena, value, false);
+    }
+    return NULL;
+}
+
+/* `map[&k]` on a map rust_std_projections.h lists: its value type. */
+static const CBMType *rust_std_map_index_output(RustLSPContext *ctx, const CBMType *base) {
+    if (!base || base->kind != CBM_TYPE_TEMPLATE || base->data.template_type.arg_count < 2) {
+        return NULL;
+    }
+    const char *qn = rust_std_table_qn(ctx, base->data.template_type.template_name);
+    const CBMType *value = base->data.template_type.template_args[1];
+    return rust_std_projection_row(RUST_STD_INDEX_VALUE, qn, "index") &&
+                   !cbm_type_is_unknown(value)
+               ? value
+               : NULL;
+}
+
 typedef struct {
     const char *receiver_pattern;
     const char *method;
@@ -6128,6 +6215,9 @@ static const CBMType *rust_eval_call_type_of(RustLSPContext *ctx, TSNode node,
                 }
                 RustStdCall call = {args_node, type_args};
                 const CBMType *declared = rust_std_method_return(ctx, recv, mname, &call);
+                if (!declared) {
+                    declared = rust_std_entry_return(ctx, recv, mname);
+                }
                 if (declared) {
                     return declared;
                 }
@@ -7151,8 +7241,15 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
         const CBMType *actual = rust_expand_type_aliases(ctx, rust_eval_expr_type(ctx, value), 0);
         const CBMType *idx = rust_index_operand_type(ctx, index);
         const CBMType *output = rust_operator_output(ctx, actual, idx, "index");
+        /* Indexing autoderefs its base: past `&T`, T's own `Index` impl. */
+        for (const CBMType *cur = actual; !output && cur && cur->kind == CBM_TYPE_REFERENCE;) {
+            cur = cur->data.reference.elem;
+            output = rust_operator_output(ctx, cur, idx, "index");
+        }
         if (output) return output;
         const CBMType *base = rust_strip_references(actual);
+        output = rust_std_map_index_output(ctx, base);
+        if (output) return output;
         const char *head = rust_std_type_head(base);
         const CBMRegisteredType *owner = head ? cbm_registry_lookup_type(ctx->registry, head) : NULL;
         if (actual != base && owner && owner->rust_operator_impls) return cbm_type_unknown();
