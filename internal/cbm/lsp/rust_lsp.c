@@ -11124,9 +11124,61 @@ static const char *rust_reexported_macro_file_text(RustLSPContext *ctx, const ch
 
 /* The macro_rules! item that the `use` path `raw` (already resolved to the
  * item QN `resolved` when relative) names as `name`, or NULL. */
+static bool rust_kind_is_item(const char *kind);
+
+/* Whether `node` (of the file's own tree) declares an item named `name`:
+ * a module, type, function, constant, macro or `extern crate` alias. With
+ * `written`, an item-position macro invocation counts too: it may declare
+ * one unseen. */
+static bool rust_file_declares(const RustLSPContext *ctx, TSNode node, const char *name,
+                               bool written) {
+    const char *kind = ts_node_type(node);
+    if (rust_kind_is_item(kind) && strcmp(kind, "use_declaration") != 0 &&
+        strcmp(kind, "impl_item") != 0) {
+        static const char *const fields[] = {"name", "alias"};
+        for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++) {
+            TSNode id = ts_node_child_by_field_name(node, fields[f], (uint32_t)strlen(fields[f]));
+            size_t len = ts_node_is_null(id) ? 0 : ts_node_end_byte(id) - ts_node_start_byte(id);
+            if (len == strlen(name) &&
+                memcmp(ctx->root_source + ts_node_start_byte(id), name, len) == 0)
+                return true;
+        }
+    }
+    if (written && strcmp(kind, "macro_invocation") == 0) {
+        TSNode parent = ts_node_parent(node);
+        const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+        if (strcmp(parent_kind, "source_file") == 0 || strcmp(parent_kind, "declaration_list") == 0)
+            return true;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (rust_file_declares(ctx, ts_node_named_child(node, i), name, written))
+            return true;
+    }
+    return false;
+}
+
+/* Whether the invoking file binds `head` lexically, so a dependency key of
+ * that name may not be what the path means: a source `use` naming it, an
+ * item declared with it, and for a path written outside a `use` (where a
+ * local name silently shadows the extern prelude) any glob import or
+ * item-position macro invocation. In a `use` path rustc rejects an
+ * ambiguous head (E0659), so globs and macro items there cannot shadow it. */
+static bool rust_head_bound_locally(const RustLSPContext *ctx, const char *head, bool written) {
+    for (int i = 0; i < ctx->use_count; i++) {
+        if (ctx->use_raw_paths[i] && ctx->use_raw_paths[i] != ctx->use_module_paths[i] &&
+            strcmp(ctx->use_local_names[i], head) == 0)
+            return true;
+    }
+    if (written && ctx->glob_count > 0)
+        return true;
+    return ts_node_is_null(ctx->root_node) ||
+           rust_file_declares(ctx, ctx->root_node, head, written);
+}
+
 static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw,
                                             const char *resolved, const char *name,
-                                            const char **crate_path) {
+                                            const char **crate_path, bool written) {
     if (strncmp(raw, "::", 2) == 0)
         raw += 2;
     const char *sep = strstr(raw, "::");
@@ -11139,7 +11191,7 @@ static const char *rust_use_path_macro_text(RustLSPContext *ctx, const char *raw
      * prelude, whose keys are its dependency names (renamed ones included):
      * the crate graph decides the head, never a workspace member's name. */
     const char *extern_root =
-        !relative && ctx->imports->modtree
+        !relative && ctx->imports->modtree && !rust_head_bound_locally(ctx, head, written)
             ? cbm_rust_modtree_extern_root(ctx->imports->modtree, ctx->module_qn, head)
             : NULL;
     if (!relative && !extern_root)
@@ -11186,7 +11238,7 @@ static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *
                         strncmp(macro_name, "super::", 7) == 0;
         return rust_use_path_macro_text(ctx, macro_name,
                                         relative ? rust_resolve_path_expr(ctx, macro_name) : NULL,
-                                        strrchr(macro_name, ':') + 1, crate_path);
+                                        strrchr(macro_name, ':') + 1, crate_path, true);
     }
     /* Block `use`s follow the file's, so the last source binding is the
      * innermost; it alone decides, and one the corpus cannot read withholds.
@@ -11198,7 +11250,7 @@ static const char *rust_path_scoped_macro_text(RustLSPContext *ctx, const char *
             continue;
         const char *leaf = strrchr(raw, ':');
         return rust_use_path_macro_text(ctx, raw, ctx->use_module_paths[i],
-                                        leaf ? leaf + 1 : raw, crate_path);
+                                        leaf ? leaf + 1 : raw, crate_path, false);
     }
     return NULL;
 }

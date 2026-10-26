@@ -3,6 +3,7 @@ use chk::{check, check_both, check_eq};
 
 mod emit;
 mod helpers;
+mod shadow;
 mod user;
 
 fn seven() -> u32 { println!("seven\n{}", std::backtrace::Backtrace::force_capture()); 7 }
@@ -31,6 +32,7 @@ fn main() {
     nested();
     literal_kept();
     user::run();
+    shadow::run();
     user::shadowed();
     user::reexported_first();
 }
