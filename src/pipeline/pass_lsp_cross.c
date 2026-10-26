@@ -1324,19 +1324,18 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
  * macro_rules! emit (`change_detection_impl!(Res<'w, T>, T, Resource)`): the
  * extractor sees only the invocation, and the macro's body is in another file.
  * NULL when the project has no such macro or no macro table. */
-static CBMRustMacroDerefArray *pxc_rust_macro_derefs(const cbm_pipeline_ctx_t *ctx,
-                                                     CBMArena *arena,
-                                                     const cbm_file_info_t *files,
-                                                     int file_count, int *out_total) {
+static CBMRustMacroDerefArray *pxc_rust_macro_derefs(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                                     const cbm_file_info_t *files, int file_count,
+                                                     int *out_total) {
     *out_total = 0;
-    const char **names =
-        ctx && ctx->rust_use_macros ? cbm_rust_deref_macro_names(arena, ctx->rust_use_macros)
-                                    : NULL;
+    const char **names = ctx && ctx->rust_use_macros
+                             ? cbm_rust_deref_macro_names(arena, ctx->rust_use_macros)
+                             : NULL;
     if (!names) {
         return NULL;
     }
-    CBMRustMacroDerefArray *per_file = (CBMRustMacroDerefArray *)cbm_arena_alloc(
-        arena, (size_t)file_count * sizeof(*per_file));
+    CBMRustMacroDerefArray *per_file =
+        (CBMRustMacroDerefArray *)cbm_arena_alloc(arena, (size_t)file_count * sizeof(*per_file));
     if (!per_file) {
         return NULL;
     }
@@ -1530,9 +1529,9 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                 }
             }
             if (macro_derefs) {
-                idx += pxc_append_rust_macro_derefs(arena, &macro_derefs[fi], project_name,
-                                                    files[fi].rel_path, def_modules[fi],
-                                                    &defs[idx]);
+                idx +=
+                    pxc_append_rust_macro_derefs(arena, &macro_derefs[fi], project_name,
+                                                 files[fi].rel_path, def_modules[fi], &defs[idx]);
             }
         }
         if (fr_loaded) {
@@ -5067,7 +5066,8 @@ static bool pxc_rust_feature_pass(PXCRustCrates *crates, PXCRustPackageFeatures 
             const char *slash = strchr(value, '/');
             if (strncmp(value, "dep:", 4) == 0) {
                 if (pxc_rust_optional_dep(m, value + 4)) {
-                    changed |= pxc_rust_feature_set_add(crates->arena, &states[p].active, value + 4);
+                    changed |=
+                        pxc_rust_feature_set_add(crates->arena, &states[p].active, value + 4);
                 }
                 continue;
             }
@@ -5101,10 +5101,11 @@ static bool pxc_rust_feature_pass(PXCRustCrates *crates, PXCRustPackageFeatures 
             changed |= pxc_rust_enable(crates, states, target, dep->features[f]);
         }
         /* `workspace = true` also takes the workspace entry's features. */
-        for (int w = 0; target >= 0 && dep->workspace && crates->root &&
-                        w < crates->root->dep_count; w++) {
+        for (int w = 0;
+             target >= 0 && dep->workspace && crates->root && w < crates->root->dep_count; w++) {
             const CBMCargoDep *ws = &crates->root->deps[w];
-            if (!ws->workspace_table || !ws->name || !dep->name || strcmp(ws->name, dep->name) != 0) {
+            if (!ws->workspace_table || !ws->name || !dep->name ||
+                strcmp(ws->name, dep->name) != 0) {
                 continue;
             }
             for (int f = 0; f < ws->feature_count; f++) {
