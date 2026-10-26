@@ -1558,8 +1558,11 @@ static int crossfile_derived_default_resolves(const char **decorators) {
  * type resolves on the wrapper. The derive is read from a `derive(..)` list
  * only, at any position and through a path; a doc string quoting one is not a
  * derive. Returns the call's index, -1 when it stays unresolved. */
-static int crossfile_derived_deref_resolves(const char *attribute) {
-    const char *caller = "fn run(w: demo::Wrapper) { w.work(); }\n";
+static int crossfile_derived_deref_resolves_with(const char *attribute, const char *param,
+                                                 const char *field) {
+    const char *caller = param ? "fn run(w: demo::Wrapper<u8>) { w.work(); }\n"
+                               : "fn run(w: demo::Wrapper) { w.work(); }\n";
+    const char *params[] = {param, NULL};
     const char *decorators[] = {attribute, NULL};
     CBMArena a;
     cbm_arena_init(&a);
@@ -1570,7 +1573,9 @@ static int crossfile_derived_deref_resolves(const char *attribute) {
     defs[0].label = "Struct";
     defs[0].def_module_qn = "test.demo";
     defs[0].decorators = decorators;
-    defs[0].field_defs = "0:Inner";
+    defs[0].field_defs = field;
+    defs[0].signature_param_types = param ? params : NULL;
+    defs[0].signature_param_count = param ? 1 : 0;
     defs[1].qualified_name = "test.demo.Inner";
     defs[1].short_name = "Inner";
     defs[1].label = "Struct";
@@ -1591,7 +1596,13 @@ static int crossfile_derived_deref_resolves(const char *attribute) {
     return found;
 }
 
+static int crossfile_derived_deref_resolves(const char *attribute) {
+    return crossfile_derived_deref_resolves_with(attribute, NULL, "0:Inner");
+}
+
 TEST(rustlsp_crossfile_derived_deref_reaches_field) {
+    /* A generic newtype's field is read against its own parameter. */
+    ASSERT_GTE(crossfile_derived_deref_resolves_with("#[derive(Deref)]", "T", "0:Inner"), 0);
     ASSERT_GTE(crossfile_derived_deref_resolves("#[derive(Deref)]"), 0);
     ASSERT_GTE(crossfile_derived_deref_resolves("#[derive(Component, Deref, DerefMut)]"), 0);
     ASSERT_GTE(crossfile_derived_deref_resolves("#[derive(Clone, bevy::prelude::Deref)]"), 0);
