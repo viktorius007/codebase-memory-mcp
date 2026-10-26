@@ -66,6 +66,16 @@ macro_rules! scrutinised {
     };
 }
 
+// `0..10` is two literals around `..`: rustc takes the first arm.
+macro_rules! span {
+    ($lo:literal .. $hi:literal, $e:expr) => {
+        stringify!($e)
+    };
+    ($r:expr, $e:expr) => {
+        $e
+    };
+}
+
 struct W {
     field: B,
 }
@@ -88,6 +98,10 @@ fn struct_let() {
 fn struct_arm() {
     let v = A;
     arm_bound!(v.go());
+}
+
+fn spanned() {
+    println!("{}", span!(0..10, four()));
 }
 
 fn scrutinee() {
@@ -123,6 +137,7 @@ fn main() {
     struct_let();
     struct_arm();
     scrutinee();
+    spanned();
     B.go();
     literal_arm();
     tt_arm();

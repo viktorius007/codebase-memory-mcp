@@ -11401,6 +11401,39 @@ static int macro_consume_balanced(const char *s, int len, int from) {
 
 /* Consume a fragment from the input matching the given fragment kind.
  * Returns end position or `from` if the consumption failed. */
+/* End of the one numeric literal token starting with the digit at `p`:
+ * digits and underscores (hex, octal, binary after `0x`/`0o`/`0b`), a
+ * fractional part only when `.` is followed by a digit (`1..2` is a range),
+ * an exponent, then an optional suffix. */
+static int macro_consume_number(const char *s, int len, int p) {
+    if (p + 1 < len && s[p] == '0' && (s[p + 1] == 'x' || s[p + 1] == 'o' || s[p + 1] == 'b')) {
+        p += 2;
+        while (p < len && (isxdigit((unsigned char)s[p]) || s[p] == '_'))
+            p++;
+    } else {
+        while (p < len && (isdigit((unsigned char)s[p]) || s[p] == '_'))
+            p++;
+        if (p + 1 < len && s[p] == '.' && isdigit((unsigned char)s[p + 1])) {
+            p++;
+            while (p < len && (isdigit((unsigned char)s[p]) || s[p] == '_'))
+                p++;
+        }
+        if (p < len && (s[p] == 'e' || s[p] == 'E')) {
+            int q = p + 1;
+            if (q < len && (s[q] == '+' || s[q] == '-'))
+                q++;
+            if (q < len && isdigit((unsigned char)s[q])) {
+                p = q;
+                while (p < len && (isdigit((unsigned char)s[p]) || s[p] == '_'))
+                    p++;
+            }
+        }
+    }
+    if (p < len && (isalpha((unsigned char)s[p]) || s[p] == '_'))
+        p = macro_consume_ident(s, len, p);
+    return p;
+}
+
 /* End of the string literal token at `from` (`"…"`, `b"…"`, `c"…"`, raw
  * `r#"…"#` and `br"…"`), or `from` when none starts there. */
 static int macro_consume_string(const char *s, int len, int from) {
@@ -11469,15 +11502,9 @@ static int macro_consume_fragment(const char *s, int len, int from, const char *
             int p = from;
             if (c == '-')
                 p = macro_skip_ws(s, len, p + 1);
-            if (p >= len || s[p] < '0' || s[p] > '9')
+            if (p >= len || !isdigit((unsigned char)s[p]))
                 return from; /* `-` alone is no literal */
-            while (p < len && ((s[p] >= '0' && s[p] <= '9') || s[p] == '_' || s[p] == '.' ||
-                               s[p] == 'x' || s[p] == 'X' || s[p] == 'b' || s[p] == 'o' ||
-                               (s[p] >= 'a' && s[p] <= 'f') || (s[p] >= 'A' && s[p] <= 'F')))
-                p++;
-            /* Allow type suffix. */
-            int after = macro_consume_ident(s, len, p);
-            return after;
+            return macro_consume_number(s, len, p);
         }
         /* Of the identifier-shaped tokens only `true` and `false` are
          * literals; any other identifier leaves this arm for the next. */
