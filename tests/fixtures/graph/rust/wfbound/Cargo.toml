@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/bevy_asset", "app"]
+resolver = "2"
