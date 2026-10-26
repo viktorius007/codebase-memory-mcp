@@ -1091,16 +1091,17 @@ static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node) {
 }
 
 /* How the function body `body` binds `name` in its own scope, if at all
- * (*binder): VALUE when every binding is the whole target of a plain or
- * augmented assignment (py_ns_own_target), OTHER when any is another
- * assignment, `for`, `as`, walrus or `del` target or a nested definition or
- * class of that name. Nested function, class and lambda bodies are their own
- * scopes. */
+ * (*binder, left as is when it does not): VALUE when every binding is the
+ * whole target of a plain or augmented assignment (py_ns_own_target), OTHER
+ * when any is another assignment, `for`, `as`, walrus or `del` target or a
+ * nested definition or class of that name. Nested function, class and lambda
+ * bodies are their own scopes; their headers (py_ns_header_rebinds) run in
+ * this one. */
 static bool py_ns_body_binds(PyNamespaceBuilder *b, TSNode body, const char *name,
                              PyNsBinder *binder) {
+    static const char *const header[] = {"parameters", "return_type", "superclasses"};
     TSTreeCursor cursor = ts_tree_cursor_new(body);
     bool binds = false;
-    *binder = PY_NS_BINDS_VALUE;
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
@@ -1118,6 +1119,10 @@ static bool py_ns_body_binds(PyNamespaceBuilder *b, TSNode body, const char *nam
                 if (definition || !py_ns_own_target(node))
                     *binder = PY_NS_BINDS_OTHER;
             }
+        }
+        for (size_t i = 0; scope && i < sizeof(header) / sizeof(header[0]); i++) {
+            TSNode part = ts_node_child_by_field_name(node, header[i], (uint32_t)strlen(header[i]));
+            binds = (!ts_node_is_null(part) && py_ns_body_binds(b, part, name, binder)) || binds;
         }
         if (!scope && ts_tree_cursor_goto_first_child(&cursor))
             continue;
@@ -1155,7 +1160,7 @@ static bool py_ns_global_writes(PyNamespaceBuilder *b, TSNode root) {
             uint32_t count = ts_node_named_child_count(node);
             for (uint32_t i = 0; ok && !ts_node_is_null(body) && i < count; i++) {
                 const char *name = py_ns_name(b, ts_node_named_child(node, i), false);
-                PyNsBinder binder = PY_NS_BINDS_OTHER;
+                PyNsBinder binder = PY_NS_BINDS_VALUE;
                 if (!name || !py_ns_body_binds(b, body, name, &binder))
                     continue;
                 if (start < 0) {
