@@ -17636,7 +17636,9 @@ static const char *const RUST_OPEN_RECEIVER_STD_METHODS[] = {
 /* True when `value` is a path naming a function item of the project (not a
  * binding, constant, constructor or associated item), or a tuple expression:
  * receivers with no inherent methods whose std trait methods are closed. */
-static bool rust_open_trait_receiver(RustLSPContext *ctx, TSNode value) {
+static bool rust_open_trait_receiver(RustLSPContext *ctx, TSNode value, const char **fn_qn) {
+    if (fn_qn)
+        *fn_qn = NULL;
     const char *kind = ts_node_type(value);
     if (strcmp(kind, "tuple_expression") == 0)
         return ts_node_named_child_count(value) > 0;
@@ -17664,6 +17666,8 @@ static bool rust_open_trait_receiver(RustLSPContext *ctx, TSNode value) {
                                  block_uses ? ctx->use_local_names + ctx->file_use_count : NULL,
                                  block_uses ? ctx->use_raw_paths + ctx->file_use_count : NULL,
                                  block_uses);
+    if (fn_qn && r.kind == CBM_RUST_PATH_FUNCTION)
+        *fn_qn = r.qn;
     return r.kind == CBM_RUST_PATH_FUNCTION;
 }
 
@@ -17719,6 +17723,64 @@ static const CBMRegisteredFunc *rust_sole_in_scope_trait_declaration(RustLSPCont
         selected = declared;
     }
     return selected;
+}
+
+/* bevy's two system-extension traits that both declare `run_if`: a fn item
+ * is a schedule system (`IntoSystem<(), (), M>`, IntoScheduleConfigs) unless
+ * its first parameter is the observer input `On<E, B>` (formerly `Trigger`),
+ * which makes it an observer system (`IntoSystem<On<..>, ..>`,
+ * ObserverSystemExt). Leaf names of the two corpus traits, unit input first. */
+static const char *const RUST_SYSTEM_INPUT_TRAITS[2] = {"IntoScheduleConfigs", "ObserverSystemExt"};
+static const char *const RUST_OBSERVER_INPUTS[] = {"On", "Trigger", NULL};
+
+/* The declaration of `method` that a fn item `fn_qn` reaches when exactly
+ * the two RUST_SYSTEM_INPUT_TRAITS, in scope, declare it: the fn's first
+ * parameter decides by its written head (no parameter is unit input). NULL
+ * for any other trait set, or when the fn's signature is not registered. */
+static const CBMRegisteredFunc *rust_system_input_trait_declaration(RustLSPContext *ctx,
+                                                                    const char *method,
+                                                                    const char *fn_qn) {
+    const CBMRegisteredFunc *fn = fn_qn ? cbm_registry_lookup_func(ctx->registry, fn_qn) : NULL;
+    if (!fn || !fn->signature || fn->signature->kind != CBM_TYPE_FUNC)
+        return NULL;
+    const CBMRegisteredFunc *found[2] = {NULL, NULL};
+    CBMTypeShortIter it;
+    cbm_registry_all_types_chain(ctx->registry, &it);
+    for (int ti; (ti = cbm_type_short_iter_next(&it)) >= 0;) {
+        const CBMRegisteredType *trait = &it.reg->types[ti];
+        if (!trait->is_interface || trait->alias_of || !trait->qualified_name ||
+            rust_qn_has_facade_root(trait->qualified_name))
+            continue;
+        CBMMethodIter methods;
+        cbm_registry_methods_chain(ctx->registry, trait->qualified_name, method, &methods);
+        const CBMRegisteredFunc *declared = NULL;
+        for (int mi; (mi = cbm_method_iter_next(&methods)) >= 0;) {
+            const CBMRegisteredFunc *f = &methods.reg->funcs[mi];
+            if ((f->flags & CBM_FUNC_FLAG_RUST_TRAIT_IMPL) == 0)
+                declared = f;
+        }
+        if (!declared || rust_trait_out_of_scope(ctx, trait->qualified_name, method, NULL, NULL))
+            continue;
+        const char *leaf = strrchr(trait->qualified_name, '.');
+        leaf = leaf ? leaf + 1 : trait->qualified_name;
+        int slot = strcmp(leaf, RUST_SYSTEM_INPUT_TRAITS[0]) == 0   ? 0
+                   : strcmp(leaf, RUST_SYSTEM_INPUT_TRAITS[1]) == 0 ? 1
+                                                                    : -1;
+        if (slot < 0 ||
+            (found[slot] && strcmp(found[slot]->qualified_name, declared->qualified_name) != 0))
+            return NULL;
+        found[slot] = declared;
+    }
+    if (!found[0] || !found[1])
+        return NULL;
+    const CBMType *const *params = fn->signature->data.func.param_types;
+    const CBMType *first = params && params[0] ? rust_strip_references(params[0]) : NULL;
+    const char *head = rust_method_probe_head(first);
+    const char *head_leaf = head ? strrchr(head, '.') : NULL;
+    head_leaf = head_leaf ? head_leaf + 1 : head;
+    if (params && params[0] && !head_leaf)
+        return NULL;
+    return head_leaf && rust_method_in(RUST_OBSERVER_INPUTS, head_leaf) ? found[1] : found[0];
 }
 
 /* The method a blanket impl over a bare parameter `T` written beside trait
@@ -17850,9 +17912,12 @@ static const CBMRegisteredFunc *rust_open_receiver_trait_method(RustLSPContext *
     for (int i = 0; RUST_OPEN_RECEIVER_STD_METHODS[i]; i++)
         if (strcmp(RUST_OPEN_RECEIVER_STD_METHODS[i], method) == 0)
             return NULL;
-    if (!rust_open_trait_receiver(ctx, value))
+    const char *fn_qn = NULL;
+    if (!rust_open_trait_receiver(ctx, value, &fn_qn))
         return NULL;
     const CBMRegisteredFunc *selected = rust_sole_in_scope_trait_declaration(ctx, method);
+    if (!selected)
+        selected = rust_system_input_trait_declaration(ctx, method, fn_qn);
     if (!selected || (selected->flags & CBM_FUNC_FLAG_RUST_SELF) == 0 ||
         (selected->flags & CBM_FUNC_FLAG_RUST_ABSTRACT) != 0 ||
         rust_trait_method_overridden_open(ctx, selected->receiver_type, method))
