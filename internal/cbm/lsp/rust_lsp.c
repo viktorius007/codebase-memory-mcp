@@ -11050,8 +11050,10 @@ static void rust_emit_operator_call(RustLSPContext *ctx, const CBMType *recv, co
  * function body so any calls inside the body are attributed to the
  * enclosing function of the invocation site.
  *
- * Recursion guard caps expansion depth at 8 (matches the rustc
- * default for macro recursion safety). */
+ * Recursion guard: RUST_MACRO_MAX_EXPANSION_DEPTH nested expansions and
+ * argument re-parses. One level of bevy's `children![..]` costs three
+ * (children!, related!, recursive_spawn!), and bevy nests it five deep. */
+enum { RUST_MACRO_MAX_EXPANSION_DEPTH = 16 };
 
 typedef struct RustMacroRule {
     const char *macro_name;
@@ -13766,7 +13768,7 @@ static bool rust_capture_under_binder(const RustLSPContext *ctx, TSNode node,
 static bool rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNode invocation) {
     if (!ctx || !mname)
         return false;
-    if (ctx->macro_expand_depth >= 8)
+    if (ctx->macro_expand_depth >= RUST_MACRO_MAX_EXPANSION_DEPTH)
         return false;
 
     RustMacroRule *hit = NULL;
@@ -14363,7 +14365,7 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation,
                                          RustMacroArgForm form) {
     if (!ctx || ts_node_is_null(invocation))
         return;
-    if (ctx->macro_expand_depth >= 8)
+    if (ctx->macro_expand_depth >= RUST_MACRO_MAX_EXPANSION_DEPTH)
         return;
 
     /* The grammar exposes the argument list as a `token_tree` child rather
