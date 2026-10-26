@@ -13,6 +13,10 @@ fn direct() {
     check!(truthy(), "truthy holds");
 }
 
+fn literal_kept() {
+    println!("{}", chk::via_tag!(truthy()));
+}
+
 fn nested() {
     check_both!(truthy(), seven() == 7);
 }
@@ -25,6 +29,7 @@ fn main() {
     direct();
     qualified();
     nested();
+    literal_kept();
     user::run();
     user::shadowed();
     user::reexported_first();

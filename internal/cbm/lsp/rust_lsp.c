@@ -10964,6 +10964,9 @@ static const char *rust_inherited_macro_text(RustLSPContext *ctx, const char *na
     return NULL;
 }
 
+static int macro_consume_string(const char *s, int len, int from);
+static int macro_consume_fragment(const char *s, int len, int from, const char *frag);
+
 /* `$crate` in a transcriber names the defining crate's root. At the call
  * site that crate is `crate_path`: `crate` for this crate's own definition,
  * else the extern-prelude name the `use` path proved for it. The transcriber
@@ -10980,6 +10983,17 @@ static void rust_macro_bind_crate(RustLSPContext *ctx, RustMacroRule *rule,
         return;
     size_t n = 0;
     for (int i = 0; i < rule->transcriber_len;) {
+        /* String, raw-string and char literals are copied untouched. */
+        bool word_start = i == 0 || !(isalnum((unsigned char)t[i - 1]) || t[i - 1] == '_');
+        int literal_end = word_start ? macro_consume_string(t, rule->transcriber_len, i) : i;
+        if (literal_end == i && t[i] == '\'')
+            literal_end = macro_consume_fragment(t, rule->transcriber_len, i, "literal");
+        if (literal_end > i) {
+            memcpy(out + n, t + i, (size_t)(literal_end - i));
+            n += (size_t)(literal_end - i);
+            i = literal_end;
+            continue;
+        }
         bool at = i + 6 <= rule->transcriber_len && memcmp(t + i, "$crate", 6) == 0 &&
                   (i + 6 == rule->transcriber_len ||
                    !(isalnum((unsigned char)t[i + 6]) || t[i + 6] == '_'));

@@ -29,3 +29,22 @@ macro_rules! check_both {
         $crate::check!($b, "second holds");
     }};
 }
+
+/// Selects its arm by the string it is given.
+#[macro_export]
+macro_rules! tagged {
+    ("chk", $e:expr) => {
+        $e
+    };
+    ($t:literal, $e:expr) => {
+        stringify!($e)
+    };
+}
+
+/// Passes the string "$crate" itself: `$crate` inside a literal is text.
+#[macro_export]
+macro_rules! via_tag {
+    ($e:expr) => {
+        $crate::tagged!("$crate", $e)
+    };
+}
