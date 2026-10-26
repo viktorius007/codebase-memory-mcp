@@ -188,7 +188,28 @@ fn type_then_bracket() {
     let _ = typed_list!(u32 [listed(), listed()]);
 }
 
+// A reference with a lifetime and a function type with an arrow are not
+// complete before `[`: the `ty` arm takes the whole type and drops the call.
+macro_rules! choose_ref {
+    ($t:ty, $e:expr) => { () };
+    (&'static [u8], $e:expr) => { $e };
+}
+
+macro_rules! choose_fn {
+    ($t:ty, $e:expr) => { () };
+    (fn() -> [u8; 1], $e:expr) => { $e };
+}
+
+fn dropped_ref() -> u8 { println!("dropped_ref\n{}", std::backtrace::Backtrace::force_capture()); 1 }
+fn dropped_fn() -> u8 { println!("dropped_fn\n{}", std::backtrace::Backtrace::force_capture()); 1 }
+
+fn type_arm_taken() {
+    let _ = choose_ref!(&'static [u8], dropped_ref());
+    let _ = choose_fn!(fn() -> [u8; 1], dropped_fn());
+}
+
 fn main() {
+    type_arm_taken();
     type_then_bracket();
     ident_is_no_literal();
     literal_arm_taken();

@@ -11694,9 +11694,10 @@ static int macro_consume_string(const char *s, int len, int from) {
 }
 
 /* Whether the type text s[from, at) already forms a complete type: it ends
- * in a path segment, a closed generic list or a closed group, and not in a
- * keyword that a type still continues after (`&mut [T]`, `*const [T]`,
- * `dyn`, `impl`). */
+ * in a path segment, a closed generic list or a closed group, and not in
+ * what a type still continues after: a reference's lifetime (`&'a [T]`), a
+ * function type's arrow (`fn() -> [T; 1]`), or a keyword (`&mut [T]`,
+ * `*const [T]`, `dyn`, `impl`). */
 static bool macro_type_complete(const char *s, int from, int at) {
     int end = at;
     while (end > from && isspace((unsigned char)s[end - 1]))
@@ -11704,13 +11705,17 @@ static bool macro_type_complete(const char *s, int from, int at) {
     if (end == from)
         return false;
     char last = s[end - 1];
-    if (last == '>' || last == ')' || last == ']')
+    if (last == '>')
+        return !(end - 1 > from && s[end - 2] == '-');
+    if (last == ')' || last == ']')
         return true;
     if (!(isalnum((unsigned char)last) || last == '_'))
         return false;
     int start = end;
     while (start > from && (isalnum((unsigned char)s[start - 1]) || s[start - 1] == '_'))
         start--;
+    if (start > from && s[start - 1] == '\'')
+        return false;
     static const char *const continuing[] = {"mut", "const", "dyn", "impl"};
     for (size_t i = 0; i < sizeof(continuing) / sizeof(continuing[0]); i++) {
         if ((size_t)(end - start) == strlen(continuing[i]) &&
