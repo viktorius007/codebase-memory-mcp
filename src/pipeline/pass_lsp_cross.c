@@ -2641,8 +2641,8 @@ static bool pxc_python_submodule_loaded_first(const cbm_gbuf_node_t *owner,
 
 /* Whether something other than `owner`'s own binding can answer `member`
  * when its run leaves the name unbound: a module-level `__getattr__` (PEP
- * 562) its run leaves bound (a later `del __getattr__` removes it; an
- * any-name binder may restore it), or a submodule `member` the import
+ * 562) its run may leave bound (a later `del __getattr__` removes it; a
+ * star import or an any-name binder after that may restore it), or a submodule `member` the import
  * system loads for `from <package> import <member>`
  * (pxc_python_package_has_submodule). */
 static bool pxc_python_unbound_has_fallback(const cbm_pipeline_ctx_t *ctx,
@@ -2651,7 +2651,8 @@ static bool pxc_python_unbound_has_fallback(const cbm_pipeline_ctx_t *ctx,
     bool hook = false; /* the last statement naming __getattr__ leaves it bound */
     for (int i = 0; i < facts->count; i++) {
         const CBMPyNamespaceFact *fact = &facts->items[i];
-        if (fact->local_name && strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) == 0)
+        if (fact->kind == CBM_PY_NS_IMPORT_STAR ||
+            (fact->local_name && strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) == 0))
             hook = true;
         else if (fact->local_name && strcmp(fact->local_name, "__getattr__") == 0)
             hook = fact->kind != CBM_PY_NS_DELETE;
