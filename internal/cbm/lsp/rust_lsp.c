@@ -8017,6 +8017,11 @@ static const CBMType *rust_eval_member_access_at(RustLSPContext *ctx, const CBMT
             type_qn = nm;
     } else if (base->kind == CBM_TYPE_SLICE) {
         type_qn = "core.slice";
+    } else if (base->kind == CBM_TYPE_TYPE_PARAM && method_call) {
+        /* A parameter read through the enclosing impl (`self.first` with
+         * `first: C`, `C: Curve<T>`) takes its method from its bounds, as the
+         * call step's bound dispatch does. */
+        type_qn = base->data.type_param.name;
     } else {
         return cbm_type_unknown();
     }

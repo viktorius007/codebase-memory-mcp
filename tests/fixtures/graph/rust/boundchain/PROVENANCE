@@ -1,0 +1,1 @@
+w5-bind G025/G014: a method call on a value typed by an impl parameter (`self.first.domain()` with `C: Curve<T>`) takes the return type the bound trait declares, so the chain continues. println! statements print a backtrace (the run is the truth).
