@@ -2644,20 +2644,35 @@ static PXCPythonVerdict pxc_python_member_binding(PXCPythonResolver *pr,
     return verdict;
 }
 
+/* Whether a fact before `end` names `name`: an earlier statement bound it.
+ * An own definition bound that way keeps no map entry (an absent entry
+ * resolves to the same-module name), so the entry alone does not tell. */
+static bool pxc_python_bound_before(const CBMPyNamespaceFacts *facts, int end, const char *name) {
+    for (int i = 0; i < end; i++) {
+        if (facts->items[i].local_name && strcmp(facts->items[i].local_name, name) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* A statement that binds its name to the module's own node or leaves the
- * earlier binding (`fact`, a SHADOW of reason OWN_OR_KEPT): an entry that
- * already holds that node stays when the node is what the statement binds
- * (pxc_python_binder_fits); any other entry is no longer proven. A name the
+ * earlier binding (`fact`, the SHADOW of reason OWN_OR_KEPT at `index`): the
+ * binding stays proven when the node is what the statement binds
+ * (pxc_python_binder_fits) and the entry, if any, already holds that node;
+ * otherwise it is no longer proven (`def f` then `if c: f = g`). A name the
  * statement binds first keeps no entry, as an absent entry resolves to the
  * same-module name. */
 static bool pxc_python_replay_own_or_kept(const cbm_pipeline_ctx_t *ctx, const char *module_qn,
-                                          const CBMPyNamespaceFact *fact, PXCPythonImportMap *map) {
+                                          const CBMPyNamespaceFacts *facts, int index,
+                                          PXCPythonImportMap *map) {
+    const CBMPyNamespaceFact *fact = &facts->items[index];
     int existing = pxc_python_map_find(map, fact->local_name);
-    if (existing < 0)
+    if (existing < 0 && !pxc_python_bound_before(facts, index, fact->local_name))
         return true;
     const cbm_gbuf_node_t *node = pxc_python_own_node(ctx, module_qn, fact->local_name);
-    const char *held = map->vals[existing];
-    if (pxc_python_binder_fits(node, fact) && held && strcmp(held, node->qualified_name) == 0)
+    const char *held = existing >= 0 ? map->vals[existing] : NULL;
+    if (pxc_python_binder_fits(node, fact) &&
+        (existing < 0 || (held && strcmp(held, node->qualified_name) == 0)))
         return true;
     return pxc_python_map_set(map, fact->local_name, NULL);
 }
@@ -2711,7 +2726,7 @@ static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_p
             }
         } else if (fact->kind == CBM_PY_NS_SHADOW && fact->reason == CBM_PY_NS_REASON_OWN_OR_KEPT &&
                    fact->local_name) {
-            if (!pxc_python_replay_own_or_kept(ctx, module_qn, fact, map)) {
+            if (!pxc_python_replay_own_or_kept(ctx, module_qn, facts, i, map)) {
                 pxc_free_fqn(file_qn);
                 return false;
             }
@@ -2719,12 +2734,14 @@ static bool pxc_python_replay_namespace(PXCPythonResolver *pr, const char *rel_p
                    fact->local_name) {
             /* A statement the facts do not model may rebind the name (an `if`
              * or `try` branch re-importing it, a loop or tuple target): the
-             * binding an earlier statement proved no longer decides it. A name
-             * that statement binds first keeps no entry, as before, and the
+             * binding an earlier statement proved (an entry, or an own
+             * definition that keeps none) no longer decides it. A name that
+             * statement binds first keeps no entry, as before, and the
              * any-name SHADOW is left to the re-export reader
              * (pxc_python_final_binding). */
             if (strcmp(fact->local_name, CBM_PY_NS_ANY_NAME) != 0 &&
-                pxc_python_map_find(map, fact->local_name) >= 0 &&
+                (pxc_python_map_find(map, fact->local_name) >= 0 ||
+                 pxc_python_bound_before(facts, i, fact->local_name)) &&
                 !pxc_python_map_set(map, fact->local_name, NULL)) {
                 pxc_free_fqn(file_qn);
                 return false;
